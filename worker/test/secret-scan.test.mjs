@@ -1,3 +1,7 @@
+// EVERY credential in this file is SYNTHETIC, authored as a fixture. A gate
+// that refuses real secrets cannot be tested without secret-shaped inputs.
+// Verified against the live keychain 2026-08-18: zero matches.
+
 import { scan, redact, CONFIRMED, SUSPECTED, CLEAN } from "../src/lib/secret-scan.js";
 let fail = 0;
 const chk = (n, c, d = "") => { console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + d)); if (!c) fail++; };

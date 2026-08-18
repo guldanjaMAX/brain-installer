@@ -1,3 +1,7 @@
+// The credentials below are SYNTHETIC fixtures, not real. They exist because
+// the gate was accepting a real-shaped admin key while refusing source code
+// that merely mentioned one, and both directions need pinning.
+
 import { vectorIdFor, VECTOR_ID_MAX_BYTES, drainOutbox } from "../worker/src/lib/store-d1.js";
 import { relative, sep } from "node:path";
 let fail = 0, ran = 0;
