@@ -30,6 +30,34 @@
 
 const RRF_K = 60;
 
+/**
+ * Vectorize caps a vector id at 64 BYTES.
+ *
+ * Chunk ids are derived from the document path, so any realistically-named file
+ * blows through it: "Financial/2026/Q3 Statements/Wells Fargo Business Checking
+ * Statement 2026-07.pdf#12" is 89 bytes. The upsert then throws, the drain stops
+ * on it, and every chunk behind it in the queue is stranded.
+ *
+ * What made it dangerous rather than merely broken: ingest still reported
+ * documents created, /health still returned ok, setup still said the brain was
+ * live, and keyword search still answered. The only signal anywhere was a
+ * backlog number that stopped going down. A client hitting this concludes the
+ * retrieval is mediocre, not that something failed.
+ *
+ * So the id sent to Vectorize is a hash. It stays stable across runs, always
+ * fits, and the readable chunk_uid remains the join key everywhere else.
+ */
+export const VECTOR_ID_MAX_BYTES = 64;
+
+export async function vectorIdFor(chunkUid) {
+  const bytes = new TextEncoder().encode(chunkUid);
+  if (bytes.length <= VECTOR_ID_MAX_BYTES) return chunkUid;
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  // Prefixed so a stray id in a log is recognisable as ours rather than opaque.
+  return `h:${hex.slice(0, 60)}`;
+}
+
 // Vectorize caps topK at 100, and only when no metadata or values are
 // returned; 50 otherwise. This is a hard platform limit that does NOT scale
 // with corpus size, so candidate depth shrinks as a fraction of the corpus as
@@ -154,23 +182,36 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
   const ids = (res?.matches || []).map((m) => m.id);
   if (!ids.length) return [];
 
+  // A hashed id cannot be looked up in D1 directly, so those are resolved via
+  // the mapping column written at upsert time.
+  const hashed = ids.filter((i) => i.startsWith("h:"));
+  let hashMap = new Map();
+  if (hashed.length) {
+    const ph = hashed.map((_, i) => "?" + (i + 1)).join(",");
+    const { results: mapped } = await env.DB.prepare(
+      `SELECT chunk_uid, vector_id FROM chunks WHERE vector_id IN (${ph})`
+    ).bind(...hashed).all();
+    hashMap = new Map((mapped || []).map((r) => [r.vector_id, r.chunk_uid]));
+  }
+  const resolved = ids.map((i) => hashMap.get(i) || i);
+
   // Hydrate in ONE query, then restore Vectorize's ordering. A DB that returns
   // rows in its own order would silently destroy the ranking, which is the
   // whole point of having called the vector index.
-  const placeholders = ids.map((_, i) => "?" + (i + 1)).join(",");
-  const f = filterSql(filters, "c", ids.length + 1);
+  const placeholders = resolved.map((_, i) => "?" + (i + 1)).join(",");
+  const f = filterSql(filters, "c", resolved.length + 1);
   const { results } = await env.DB.prepare(
     `SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
             c.client, c.category
      FROM chunks c WHERE c.chunk_uid IN (${placeholders})${f.clause}`
   )
-    .bind(...ids, ...f.params)
+    .bind(...resolved, ...f.params)
     .all();
 
   const byUid = new Map((results || []).map((r) => [r.chunk_uid, r]));
   // A vector whose chunk is missing from D1 means the two systems have drifted.
   // Dropping it silently would hide that, so it is counted by the caller.
-  return ids.map((id) => byUid.get(id)).filter(Boolean);
+  return resolved.map((id) => byUid.get(id)).filter(Boolean);
 }
 
 /**
@@ -225,16 +266,20 @@ export async function upsertChunks(env, chunks) {
 
   const stmts = [];
   for (const c of chunks) {
+    // Computed at write time so a search hit can be resolved back to its chunk
+    // even when the id had to be hashed to fit Vectorize's 64-byte ceiling.
+    c.vector_id = await vectorIdFor(c.chunk_uid);
     stmts.push(
       env.DB.prepare(
-        `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+        `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, vector_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
          ON CONFLICT(chunk_uid) DO UPDATE SET
            text = excluded.text, title = excluded.title,
            document_date = excluded.document_date,
-           client = excluded.client, category = excluded.category`
+           client = excluded.client, category = excluded.category,
+           vector_id = excluded.vector_id`
       ).bind(c.chunk_uid, c.doc_uid, c.chunk_ix, c.text, c.source, c.title ?? null,
-             c.document_date ?? null, c.client ?? null, c.category ?? null)
+             c.document_date ?? null, c.client ?? null, c.category ?? null, c.vector_id)
     );
     stmts.push(
       env.DB.prepare(
@@ -267,10 +312,22 @@ export async function drainOutbox(env, { embed, batchSize = 100 } = {}) {
   if (!pending?.length) return { drained: 0, remaining: 0 };
 
   const vectors = [];
+  const idToChunk = new Map();
+  const poisoned = [];
   for (const row of pending) {
-    const values = await embed(row.text);
+    let values;
+    try {
+      values = await embed(row.text);
+    } catch (e) {
+      // One unembeddable chunk must not strand every chunk behind it. Record the
+      // failure against that row and carry on; the queue keeps draining.
+      poisoned.push({ chunk_uid: row.chunk_uid, error: String(e.message || e).slice(0, 200) });
+      continue;
+    }
+    const vid = await vectorIdFor(row.chunk_uid);
+    idToChunk.set(vid, row.chunk_uid);
     vectors.push({
-      id: row.chunk_uid,
+      id: vid,
       values,
       // Metadata strings are INDEXED to 64 bytes and truncate silently, so two
       // long client names sharing a prefix would become indistinguishable to a
@@ -280,14 +337,52 @@ export async function drainOutbox(env, { embed, batchSize = 100 } = {}) {
     });
   }
 
-  await env.VECTORIZE.upsert(vectors);
+  if (vectors.length) {
+    try {
+      await env.VECTORIZE.upsert(vectors);
+    } catch (e) {
+      // The whole batch failed. Leave every row queued so nothing is lost, and
+      // surface the reason rather than letting the backlog silently plateau.
+      const err = String(e.message || e).slice(0, 300);
+      await env.DB.batch(
+        vectors.map((v) =>
+          env.DB.prepare(
+            "UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2 WHERE chunk_uid = ?1"
+          ).bind(idToChunk.get(v.id), err)
+        )
+      ).catch(() => {});
+      const e2 = new Error(`the vector index refused this batch: ${err}`);
+      e2.vectorUpsertFailed = true;
+      throw e2;
+    }
+  }
 
-  await env.DB.batch(
-    pending.map((p) => env.DB.prepare("DELETE FROM vector_outbox WHERE chunk_uid = ?1").bind(p.chunk_uid))
-  );
+  // Only rows that actually made it are cleared. A poisoned row stays queued
+  // with its attempt count and error recorded, so it is visible and bounded
+  // rather than an invisible permanent stall.
+  const landed = vectors.map((v) => idToChunk.get(v.id)).filter(Boolean);
+  if (landed.length) {
+    await env.DB.batch(
+      landed.map((cu) => env.DB.prepare("DELETE FROM vector_outbox WHERE chunk_uid = ?1").bind(cu))
+    );
+  }
+  if (poisoned.length) {
+    await env.DB.batch(
+      poisoned.map((p) =>
+        env.DB.prepare(
+          "UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2 WHERE chunk_uid = ?1"
+        ).bind(p.chunk_uid, p.error)
+      )
+    ).catch(() => {});
+  }
 
   const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
-  return { drained: pending.length, remaining: Number(rest?.n || 0) };
+  return {
+    drained: landed.length,
+    failed: poisoned.length,
+    remaining: Number(rest?.n || 0),
+    errors: poisoned.slice(0, 3).map((p) => p.error),
+  };
 }
 
 /** How far the vector index is behind the text. Surfaced by health and report. */
@@ -326,9 +421,13 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
 
   const marks = targets.map((_, i) => "?" + (i + 1)).join(",");
   const { results: chunkRows } = await env.DB.prepare(
-    `SELECT chunk_uid FROM chunks WHERE doc_uid IN (${marks})`
+    `SELECT chunk_uid, vector_id FROM chunks WHERE doc_uid IN (${marks})`
   ).bind(...targets).all();
   const chunkUids = (chunkRows || []).map((r) => r.chunk_uid);
+  // Delete by the id the vector was actually STORED under, which is the hash
+  // when the readable id was too long. Deleting by chunk_uid alone would leave
+  // those vectors orphaned and still competing for retrieval slots.
+  const vectorIds = (chunkRows || []).map((r) => r.vector_id || r.chunk_uid);
 
   if (dryRun) {
     return { documents: targets.length, chunks: chunkUids.length, vectors: chunkUids.length, dry_run: true, targets };
@@ -345,8 +444,8 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
 
   let vectors = 0;
   let vectorError = null;
-  for (let i = 0; i < chunkUids.length; i += DELETE_BATCH) {
-    const slice = chunkUids.slice(i, i + DELETE_BATCH);
+  for (let i = 0; i < vectorIds.length; i += DELETE_BATCH) {
+    const slice = vectorIds.slice(i, i + DELETE_BATCH);
     try {
       await env.VECTORIZE.deleteByIds(slice);
       vectors += slice.length;

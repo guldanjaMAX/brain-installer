@@ -30,7 +30,7 @@
  */
 
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, chmodSync, realpathSync } from "node:fs";
-import { join, dirname, relative, resolve } from "node:path";
+import { join, dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -482,7 +482,13 @@ async function cmdDeploy(manifestPath) {
   const form = new FormData();
   for (const f of files) {
     // Module specifiers are relative to src/, matching the import paths.
-    const rel = relative(srcRoot, f);
+    // POSIX separators ALWAYS. A module specifier is a URL, not a filesystem
+    // path, and the worker imports "./lib/core.js". On Windows relative()
+    // returns "lib\\core.js", so every module uploads under a name the runtime
+    // cannot resolve and the worker dies with: No such module "lib/core.js".
+    // Found by the first real Windows install; CI could not catch it because
+    // deploying needs live Cloudflare credentials.
+    const rel = relative(srcRoot, f).split(sep).join("/");
     form.append(
       rel,
       new Blob([readFileSync(f, "utf-8")], { type: "application/javascript+module" }),
