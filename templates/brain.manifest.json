@@ -1,0 +1,196 @@
+{
+  "$schema": "../manifest.schema.json",
+  "_comment": [
+    "One manifest per client install. This file is the ONLY thing that differs",
+    "between installs. Everything else (worker code, schema, migrations, the MCP",
+    "server) is identical across every client, which is what makes an upgrade",
+    "possible without rebuilding by hand.",
+    "",
+    "It lives in the CLIENT's repo, in the CLIENT's account. We keep a copy only",
+    "while engaged, and it contains no secrets: every credential is a reference",
+    "to a secret store, never a value."
+  ],
+  "manifest_version": 1,
+  "client": {
+    "slug": "acme",
+    "display_name": "Acme Consulting",
+    "primary_contact": "owner@acme.com",
+    "timezone": "America/Phoenix"
+  },
+  "brain": {
+    "version": "0.1.0",
+    "domain": "brain.acme.com",
+    "worker_name": "acme-brain"
+  },
+  "infrastructure": {
+    "_comment": "Client-owned. We hold a scoped, expiring token and nothing else.",
+    "cloudflare": {
+      "_token_scopes": [
+        "The API token the client issues us needs exactly these, no more:",
+        "  Account > Workers Scripts: Edit",
+        "  Account > D1: Edit",
+        "  Account > Vectorize: Edit",
+        "  Account > Workers R2 Storage: Edit   (only if r2_bucket is set)",
+        "  Account > Workers AI: Read",
+        "Vectorize is the one people miss. Its absence does not look like a",
+        "permissions problem: provision fails with a flat authentication error",
+        "on a token that verifies as valid and active.",
+        "",
+        "The account must ALSO be on the Workers Paid plan, 5 USD a month.",
+        "Vectorize cannot create an index on the free tier at all."
+      ],
+      "account_id": "REQUIRED_client_account_id",
+      "storage": "d1",
+      "_storage_options": "d1 | supabase",
+      "d1_database_name": "brain",
+      "d1_database_id": "filled_in_by_provisioner",
+      "vectorize_index": "filled_in_by_provisioner",
+      "drain_cron": "*/5 * * * *",
+      "_drain_cron_comment": [
+        "Moves newly ingested chunks from D1 into Vectorize. It exists because",
+        "there is no transaction across the two, so a chunk lands in D1 first and",
+        "is embedded after. Until it drains, that chunk is findable by keyword and",
+        "invisible to semantic search, and NOTHING else reports that: both systems",
+        "are up and every health probe passes. `brain health` reads the backlog."
+      ],
+      "r2_bucket": "brain-assets",
+      "kv_namespace": "BRAIN_KV",
+      "kv_namespace_id": "filled_in_by_provisioner"
+    },
+    "supabase": {
+      "_comment": [
+        "The upgrade path, not the starting point. D1 plus Vectorize keeps the",
+        "whole brain inside the one Cloudflare account the client already owns,",
+        "which is the entire custody story. Adding Supabase means a second vendor",
+        "for them to own, and its free tier PAUSES after inactivity, so a brain",
+        "queried twice a week is asleep exactly when it is wanted.",
+        "",
+        "Switch when the trigger below is hit. It is not about storage size:",
+        "Vectorize holds 20M vectors and D1 holds 10GB, neither of which anyone",
+        "here will reach. It is that Vectorize caps topK at 100 results per query,",
+        "and that cap does NOT grow with the corpus. Fusion can only rank what it",
+        "retrieved, so as the corpus grows those 100 candidates become a thinner",
+        "and thinner slice of it, and recall decays quietly."
+      ],
+      "enabled": false,
+      "project_ref": null,
+      "trigger_for_enabling": "roughly 250k chunks, or measured recall decay on the eval set, whichever comes first",
+      "comfortable_below": "roughly 100k chunks"
+    }
+  },
+  "corpora": {
+    "_comment": "Which sources this install ingests. Each maps to a connector.",
+    "google_drive": {
+      "enabled": true,
+      "root_folder_ids": [],
+      "service_account_secret": "secret://GOOGLE_SERVICE_ACCOUNT",
+      "exclude_paths": [],
+      "exclude_name_parts": []
+    },
+    "gmail": {
+      "enabled": false,
+      "oauth_secret": "secret://GMAIL_OAUTH"
+    },
+    "calendar": {
+      "enabled": false,
+      "oauth_secret": "secret://GCAL_OAUTH"
+    },
+    "slack": {
+      "enabled": false,
+      "bot_token_secret": "secret://SLACK_BOT_TOKEN"
+    },
+    "notion": {
+      "enabled": false,
+      "token_secret": "secret://NOTION_TOKEN"
+    },
+    "upload": {
+      "_comment": "Manual drop zone. Always on: it is the fallback for anything with no connector.",
+      "enabled": true
+    }
+  },
+  "retrieval": {
+    "embed_model": "@cf/baai/bge-base-en-v1.5",
+    "embed_dimensions": 768,
+    "chunk_size": 2000,
+    "chunk_overlap": 500,
+    "default_result_limit": 8,
+    "answer_model": "claude-sonnet-5",
+    "rerank": false,
+    "_comment": "answer_model runs on the CLIENT's own API key, so cost and data both stay theirs."
+  },
+  "safety": {
+    "_comment": "Non-negotiable defaults. The scanner is what makes 'we store nothing dangerous' true rather than aspirational.",
+    "credential_scanner": {
+      "enabled": true,
+      "gate_version": 2,
+      "mode": "refuse",
+      "_mode_options": "refuse | flag_only"
+    },
+    "private_path_prefixes": [
+      "_private",
+      "_Private"
+    ],
+    "daily_llm_spend_cap_usd": 10
+  },
+  "operations": {
+    "ingest_cron": "0 9 * * *",
+    "health_cron": "0 13 * * *",
+    "health_report_email": "owner@acme.com",
+    "alert_webhook_secret": "secret://ALERT_WEBHOOK_URL"
+  },
+  "testing": {
+    "_comment": [
+      "Filled from section 6 of the intake questionnaire, in the CLIENT'S OWN",
+      "WORDS. Do not tidy them into better English: 'why did we stop using",
+      "those guys' retrieves differently than 'vendor termination rationale',",
+      "and theirs is the phrasing that has to work.",
+      "",
+      "These do double duty. The acceptance suite uses them as retrieval probes,",
+      "so a passing install is one that answers THIS client's questions rather",
+      "than generic ones. And they are the kickoff script: the first thing the",
+      "client sees is their own ten questions answered with citations."
+    ],
+    "probe_questions": [],
+    "things_only_they_know": [],
+    "expected_to_fail": [],
+    "_expected_to_fail_note": [
+      "Two questions the client predicts it will get wrong, captured at intake.",
+      "Shown at kickoff alongside the wins. A tool that says what it does not",
+      "know is worth more than one that always sounds confident, and predicting",
+      "the misses in advance turns the gap list into honesty rather than failure."
+    ]
+  },
+  "ingest": {
+    "_comment": [
+      "The priority slice goes in FIRST and gets proven before the long tail",
+      "streams in behind it. Do NOT ingest chronologically: order by likely",
+      "answer value, usually the last 12 to 24 months plus every meeting",
+      "transcript. A default tuned for steady state quietly ruins the first",
+      "impression, which is the one that decides whether they trust it."
+    ],
+    "priority_slice": {
+      "source": null,
+      "since": null,
+      "note": "from intake question 2.4, the single folder that would already be worth it"
+    },
+    "full_backfill_since": null
+  },
+  "access": {
+    "_comment": [
+      "As of v0.1 everyone with access sees everything indexed. Document-level",
+      "permissions are NOT built. Any client with employees who must not share",
+      "sight of every document is out of scope until ACLs ship. This field exists",
+      "so the limitation is explicit in the install record rather than discovered",
+      "later."
+    ],
+    "model": "single_tenant_all_access",
+    "authorized_emails": [
+      "owner@acme.com"
+    ]
+  },
+  "handoff": {
+    "installer_token_expires": null,
+    "handoff_completed_at": null,
+    "_comment": "On handoff, the client revokes our token and this records the date. After that we hold nothing."
+  }
+}

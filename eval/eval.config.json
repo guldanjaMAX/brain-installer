@@ -1,0 +1,25 @@
+{
+  "_comment": [
+    "Copy this to eval.config.local.json and point it at YOUR install. That copy",
+    "is gitignored, so a real hostname and a real key lookup never land in a",
+    "public repo.",
+    "",
+    "NO SECRET IS STORED HERE. admin_key_command is an argv array executed",
+    "directly, never through a shell, so this file cannot smuggle in a command",
+    "substitution. Prefer admin_key_env on a machine with no keychain: set the",
+    "named variable and leave the command out.",
+    "",
+    "rerank and graph_boost are OFF here on purpose. A ranking that changes",
+    "between two identical runs cannot answer whether a change helped. Measure",
+    "them as variants:  node eval/run.mjs --rerank --graph-boost"
+  ],
+  "base": "https://your-brain.example.workers.dev",
+  "golden": "golden/your-brain.golden.json",
+  "admin_key_env": "BRAIN_ADMIN_KEY",
+  "limit": 10,
+  "k": 5,
+  "rerank": false,
+  "graph_boost": false,
+  "concurrency": 4,
+  "timeout_ms": 30000
+}

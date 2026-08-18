@@ -1,0 +1,235 @@
+import { api, listFiles, listChanges, startPageToken, triage, toEnvelope, DriveError, EXPORTS } from "../connectors/google-drive.mjs";
+import { buildAuthUrl, pkce, exchangeCode, createTokenProvider, redirectUri } from "../connectors/google-auth.mjs";
+
+let fail = 0, ran = 0;
+const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 240))); if (!c) fail++; };
+const tok = async () => "at-1";
+const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body, arrayBuffer: async () => new TextEncoder().encode(body).buffer });
+const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () => ({}), arrayBuffer: async () => new TextEncoder().encode(s).buffer });
+
+/* ================= auth ================= */
+{
+  const { verifier, challenge } = pkce();
+  check("PKCE verifier and challenge differ", verifier !== challenge && challenge.length > 30);
+  const u = new URL(buildAuthUrl({ clientId: "cid", scopes: ["s1", "s2"], challenge, state: "st", port: 47811 }));
+  check("asks for offline access", u.searchParams.get("access_type") === "offline");
+  // Without prompt=consent a re-auth returns NO refresh token and the next
+  // unattended run has nothing to refresh from.
+  check("forces the consent screen, so a refresh token is issued", u.searchParams.get("prompt") === "consent");
+  check("uses S256, not plain", u.searchParams.get("code_challenge_method") === "S256");
+  check("redirects to loopback only", u.searchParams.get("redirect_uri") === "http://127.0.0.1:47811");
+  check("carries state", u.searchParams.get("state") === "st");
+  check("scopes are space separated", u.searchParams.get("scope") === "s1 s2");
+}
+{
+  // A token response with no refresh_token must fail LOUDLY: it works for an
+  // hour and then dies unattended, which is the worst way to find out.
+  let threw = null;
+  await exchangeCode({ clientId: "c", code: "x", verifier: "v", fetchImpl: async () => json({ access_token: "at", expires_in: 3600 }) })
+    .catch((e) => (threw = e));
+  check("a missing refresh token is refused at exchange time", !!threw && /refresh token/i.test(threw.message), threw?.message);
+}
+{
+  let calls = 0;
+  const get = createTokenProvider({ clientId: "c", refreshToken: "r", fetchImpl: async () => { calls++; return json({ access_token: "a" + calls, expires_in: 3600 }); } });
+  check("first call fetches", (await get()) === "a1");
+  check("second call is cached, not a second round trip", (await get()) === "a1" && calls === 1);
+  check("force bypasses the cache", (await get({ force: true })) === "a2");
+}
+{
+  const get = createTokenProvider({ clientId: "c", refreshToken: "dead", fetchImpl: async () => json({ error: "invalid_grant" }, 400) });
+  let e = null;
+  await get().catch((x) => (e = x));
+  check("a dead refresh token is flagged for re-auth, not retried", e?.needsReauth === true);
+  check("and the message names the 7-day Testing trap", /Testing/.test(e.message), e.message.slice(0, 90));
+}
+
+/* ================= retry policy ================= */
+{
+  let n = 0;
+  const fetchImpl = async () => { n++; return n < 3 ? json({ error: { errors: [{ reason: "rateLimitExceeded" }] } }, 403) : json({ files: [] }); };
+  const r = await api(tok, "/files", { fetchImpl, sleep: async () => {} });
+  check("403 rateLimitExceeded is retried", n === 3 && !!r, String(n));
+}
+{
+  let n = 0;
+  const fetchImpl = async () => { n++; return json({ error: { errors: [{ reason: "insufficientFilePermissions" }], message: "no access" } }, 403); };
+  let e = null;
+  await api(tok, "/files", { fetchImpl, sleep: async () => {} }).catch((x) => (e = x));
+  // A permission 403 retried five times is five identical failures and a long
+  // silence. It must fail on the first.
+  check("403 for a permission problem fails FAST", n === 1 && e instanceof DriveError, `${n} attempts`);
+  check("and reports the reason", e.reason === "insufficientFilePermissions", e.reason);
+}
+{
+  let n = 0;
+  const fetchImpl = async () => { n++; return n < 2 ? json({}, 500) : json({ files: [] }); };
+  await api(tok, "/files", { fetchImpl, sleep: async () => {} });
+  check("5xx is retried", n === 2);
+}
+
+/* ================= listing ================= */
+{
+  const pages = [
+    { files: [{ id: "1", name: "a.md" }], nextPageToken: "p2" },
+    { files: [{ id: "2", name: "b.md" }] },
+  ];
+  let i = 0, seen = [];
+  const fetchImpl = async (url) => { seen.push(url); return json(pages[i++]); };
+  const out = [];
+  for await (const f of listFiles(tok, { opts: { fetchImpl, sleep: async () => {} } })) out.push(f.id);
+  check("pagination follows nextPageToken", out.join(",") === "1,2", out.join(","));
+  const u = new URL(seen[0]);
+  // Without all three, files on Shared Drives are invisible and the walk
+  // silently returns only My Drive.
+  check("shared drives are included", u.searchParams.get("includeItemsFromAllDrives") === "true" &&
+    u.searchParams.get("supportsAllDrives") === "true" && u.searchParams.get("corpora") === "allDrives",
+    u.search);
+  check("trashed files are excluded by default", /trashed = false/.test(u.searchParams.get("q") || ""));
+}
+
+/* ================= changes feed ================= */
+{
+  const pages = [
+    { changes: [{ fileId: "a", file: { id: "a", name: "a.md" } }, { fileId: "b", removed: true }], nextPageToken: "p2" },
+    { changes: [{ fileId: "c", file: { id: "c", name: "c.md", trashed: true } }], newStartPageToken: "T99" },
+  ];
+  let i = 0;
+  const r = await listChanges(tok, "T1", { fetchImpl: async () => json(pages[i++]), sleep: async () => {} });
+  check("changed files are collected", r.changed.map((f) => f.id).join(",") === "a", JSON.stringify(r.changed));
+  check("removed files are reported", r.removed.includes("b"));
+  // Trashing is how deletion usually looks. Treating it as a change would leave
+  // the brain answering from a document the client believes they deleted.
+  check("a trashed file counts as removed, not changed", r.removed.includes("c"), JSON.stringify(r));
+  check("the next token is returned for the following run", r.nextToken === "T99");
+}
+{
+  const t = await startPageToken(tok, { fetchImpl: async () => json({ startPageToken: "T1" }), sleep: async () => {} });
+  check("a start token can be fetched before the first walk", t === "T1");
+}
+
+/* ================= triage ================= */
+{
+  check("a folder is neither indexed nor an error", triage({ mimeType: "application/vnd.google-apps.folder" }).folder === true);
+  check("a Google Doc is exported, not downloaded", triage({ mimeType: "application/vnd.google-apps.document", name: "x" }).export.mime === "text/plain");
+  check("a Sheet exports as CSV, which the extractor renders header-aware", triage({ mimeType: "application/vnd.google-apps.spreadsheet", name: "x" }).export.mime === "text/csv");
+  check("a Google Form is skipped with a reason", /cannot be exported/.test(triage({ mimeType: "application/vnd.google-apps.form", name: "f" }).skip));
+  check("an image is skipped before spending a request", /carries no text/.test(triage({ mimeType: "image/png", name: "a.png" }).skip));
+  check("an unsupported extension is skipped", /no extractor/.test(triage({ mimeType: "application/octet-stream", name: "a.bin" }).skip));
+  check("a PDF is downloaded", triage({ mimeType: "application/pdf", name: "a.pdf", size: "1000" }).download === true);
+  check("an oversized file is skipped with its size", /over the/.test(triage({ mimeType: "application/pdf", name: "a.pdf", size: String(99 * 1048576) }).skip));
+  check("trashed is skipped", /trash/.test(triage({ trashed: true, name: "a.md" }).skip));
+}
+
+/* ================= envelope ================= */
+{
+  const file = { id: "F1", name: "2026-03-14 board notes.txt", mimeType: "text/plain", size: "400",
+    createdTime: "2020-01-01T00:00:00Z", modifiedTime: "2026-08-17T00:00:00Z", md5Checksum: "abc", webViewLink: "https://drive/F1" };
+  const body = "The board agreed to defer the retainer increase until the following quarter, pending the coverage review.";
+  const r = await toEnvelope(tok, file, {}, { fetchImpl: async () => bytes(body), sleep: async () => {} });
+  check("a text file becomes an envelope", !!r.envelope, JSON.stringify(r.skip));
+  check("the id is the Drive id, so a rename does not duplicate it", r.envelope.source_id === "drive:F1", r.envelope.source_id);
+  // modifiedTime here is 2026; createdTime is 2020; the FILENAME says 2026-03-14.
+  check("the filename date wins over Drive metadata", r.envelope.occurred_at.startsWith("2026-03-14"), r.envelope.occurred_at);
+  check("and it records where the date came from", r.envelope.date_source === "filename");
+  check("modifiedTime is used only as a change signal", r.version.includes("2026-08-17") && !r.envelope.occurred_at.includes("2026-08-17"));
+  check("the web link is kept for citations", r.envelope.uri === "https://drive/F1");
+}
+{
+  // No filename date: createdTime is used, NOT modifiedTime. Storing modifiedTime
+  // as the document date is what once made 80% of a corpus look current.
+  const file = { id: "F2", name: "notes.txt", mimeType: "text/plain", size: "300",
+    createdTime: "2019-05-02T00:00:00Z", modifiedTime: "2026-08-17T00:00:00Z" };
+  const r = await toEnvelope(tok, file, {}, { fetchImpl: async () => bytes("A note with enough text in it to pass the quality floor comfortably."), sleep: async () => {} });
+  check("falls back to createdTime, never modifiedTime", r.envelope.occurred_at.startsWith("2019-05-02"), r.envelope.occurred_at);
+  check("and says so", r.envelope.date_source === "drive_created");
+}
+{
+  const file = { id: "F3", name: "Budget", mimeType: "application/vnd.google-apps.spreadsheet", size: "500", createdTime: "2026-01-01T00:00:00Z" };
+  let exported = null;
+  const r = await toEnvelope(tok, file, {}, {
+    fetchImpl: async (url) => { exported = url; return bytes("Account,Balance\nChecking,15234.11\n"); }, sleep: async () => {},
+  });
+  check("a Sheet is exported as CSV", new URL(exported).searchParams.get("mimeType") === "text/csv", String(exported));
+  check("and rendered header-aware, so a value is retrievable", /Account: Checking/.test(r.envelope.content), r.envelope?.content);
+}
+{
+  const file = { id: "F4", name: "junk.txt", mimeType: "text/plain", size: "50", createdTime: "2026-01-01T00:00:00Z" };
+  const r = await toEnvelope(tok, file, {}, { fetchImpl: async () => bytes("hi"), sleep: async () => {} });
+  check("a file with too little text is skipped, not indexed empty", !!r.skip && !r.envelope, JSON.stringify(r));
+  check("and the skip carries the Drive id so it can be chased", r.skip.id === "F4");
+}
+{
+  const file = { id: "F5", name: "locked.pdf", mimeType: "application/pdf", size: "1000", createdTime: "2026-01-01T00:00:00Z" };
+  const r = await toEnvelope(tok, file, {}, {
+    fetchImpl: async () => json({ error: { errors: [{ reason: "insufficientFilePermissions" }], message: "no access" } }, 403), sleep: async () => {},
+  });
+  check("a fetch failure is a reasoned skip, not a crash", !!r.skip && /could not be fetched/.test(r.skip.reason), r.skip?.reason);
+}
+
+/* ================= gmail ================= */
+const gm = await import("../connectors/gmail.mjs");
+{
+  const q = gm.DEFAULT_QUERY;
+  // Volume alone lets bulk mail dominate retrieval; in a previous corpus
+  // newsletter HTML took the top six citations on a real client question.
+  for (const c of ["promotions", "social", "forums", "updates"]) {
+    check(`bulk mail category "${c}" is excluded by default`, q.includes(`-category:${c}`), q);
+  }
+  check("chats and drafts are excluded", q.includes("-in:chats") && q.includes("-in:drafts"));
+  check("spam and trash are excluded", q.includes("-in:spam") && q.includes("-in:trash"));
+}
+{
+  const pages = [{ messages: [{ id: "m1" }, { id: "m2" }], nextPageToken: "p2" }, { messages: [{ id: "m3" }] }];
+  let i = 0;
+  const out = [];
+  for await (const id of gm.listMessages(tok, { opts: { fetchImpl: async () => json(pages[i++]), sleep: async () => {} } })) out.push(id);
+  check("message listing paginates", out.join(",") === "m1,m2,m3", out.join(","));
+}
+{
+  let i = 0;
+  const out = [];
+  for await (const id of gm.listMessages(tok, { max: 2, opts: { fetchImpl: async () => json({ messages: [{ id: "a" }, { id: "b" }, { id: "c" }] }), sleep: async () => {} } })) out.push(id);
+  check("--limit stops the walk early", out.length === 2, out.join(","));
+}
+{
+  const raw = Buffer.from(
+    "From: Eli <eli@azlawns.com>\r\nTo: james@jamesguldan.com\r\nSubject: Retainer\r\nDate: Fri, 14 Aug 2026 10:00:00 -0700\r\n\r\n" +
+    "Confirming we agreed to hold the retainer at the current rate through October, and revisit at the quarterly review."
+  ).toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
+  const r = await gm.toEnvelope(tok, "M1", {}, {
+    fetchImpl: async () => json({ raw, internalDate: "1755172800000", threadId: "T1", historyId: "H9", labelIds: ["INBOX"] }),
+    sleep: async () => {},
+  });
+  check("a message becomes an envelope", !!r.envelope, JSON.stringify(r.skip));
+  check("the subject becomes the title", r.envelope.title === "Retainer", r.envelope?.title);
+  check("the sender survives into the text, so it is searchable", /eli@azlawns\.com/.test(r.envelope.content), r.envelope?.content?.slice(0, 120));
+  check("the body survives", /hold the retainer/.test(r.envelope.content));
+  // internalDate is a receipt time; unlike a file mtime nothing rewrites it.
+  check("internalDate is the document date", r.envelope.occurred_at === new Date(1755172800000).toISOString(), r.envelope?.occurred_at);
+  check("and it is marked reliable", r.envelope.date_reliable === true);
+  check("the id is stable and namespaced", r.envelope.source_id === "gmail:M1");
+  check("the thread is kept", r.envelope.metadata.thread_id === "T1");
+}
+{
+  const r = await gm.toEnvelope(tok, "M2", {}, { fetchImpl: async () => json({ internalDate: "1" }), sleep: async () => {} });
+  check("a message with no content is a reasoned skip", !!r.skip && /no content/.test(r.skip.reason), r.skip?.reason);
+}
+{
+  // A history id older than roughly a week is unanswerable. That is not an
+  // error; it means fall back to a full list, and the caller must be TOLD.
+  const r = await gm.listHistory(tok, "1", { fetchImpl: async () => json({ error: { message: "not found" } }, 404), sleep: async () => {} });
+  check("an expired history id reports expired rather than throwing", r.expired === true && r.ids.length === 0, JSON.stringify(r));
+}
+{
+  const r = await gm.listHistory(tok, "5", {
+    fetchImpl: async () => json({ history: [{ id: "7", messagesAdded: [{ message: { id: "n1" } }, { message: { id: "n2" } }] }] }),
+    sleep: async () => {},
+  });
+  check("history returns only what was added", r.ids.sort().join(",") === "n1,n2", JSON.stringify(r.ids));
+  check("and advances the history id", r.historyId === "7");
+  check("and does not claim expiry", r.expired === false);
+}
+
+console.log(fail ? `\n${fail} FAILURES` : `\ngoogle-drive: all ${ran} tests passed`);
+process.exit(fail ? 1 : 0);

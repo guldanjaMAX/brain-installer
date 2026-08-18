@@ -1,0 +1,267 @@
+/**
+ * Google Drive as an ingest source.
+ *
+ * Produces the SAME envelopes the local folder walker produces, so everything
+ * downstream (splitting, batching, the credential gate, resume state) is shared
+ * rather than reimplemented.
+ *
+ * THE THREE THINGS THAT MAKE THIS NON-OBVIOUS
+ *
+ * 1. A Google Doc has no bytes. files.get?alt=media returns 403 for native
+ *    types; they must be exported, and the export format decides retrieval
+ *    quality. text/plain for Docs, CSV for Sheets (one request per sheet is not
+ *    worth it), text/plain for Slides.
+ *
+ * 2. modifiedTime is a TRAP as a document date. A sync, a permission change or
+ *    a bulk move rewrites it. Storing it made 80% of a real corpus look like it
+ *    was written this year, which silently disabled staleness reporting. This
+ *    uses createdTime, and lets the shared date ladder override from the
+ *    filename when one is present. modifiedTime is used ONLY to decide whether
+ *    a file changed, which is what it is actually for.
+ *
+ * 3. The second run must be cheap or nobody re-runs it. The changes feed makes
+ *    it proportional to what changed rather than to the corpus, and it is the
+ *    only way deletions are ever learned.
+ */
+
+import { extract, canExtract, extensionOf } from "../ingest/extract.mjs";
+import "../ingest/formats.mjs";
+import { textQuality, isLikelyBinary } from "../ingest/quality.mjs";
+import { documentDate } from "../ingest/doc-date.mjs";
+import { isBinaryFormat } from "../ingest/extract.mjs";
+
+export const API = "https://www.googleapis.com/drive/v3";
+export const SOURCE_TYPE = "drive";
+
+/** Native Google types, and what to ask for instead of bytes. */
+export const EXPORTS = {
+  "application/vnd.google-apps.document": { mime: "text/plain", ext: ".txt" },
+  "application/vnd.google-apps.spreadsheet": { mime: "text/csv", ext: ".csv" },
+  "application/vnd.google-apps.presentation": { mime: "text/plain", ext: ".txt" },
+};
+
+/** Google's export ceiling. Past this it returns 403 exportSizeLimitExceeded. */
+export const EXPORT_LIMIT = 10 * 1024 * 1024;
+export const DOWNLOAD_LIMIT = 8 * 1024 * 1024;
+
+const FIELDS =
+  "nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, trashed, parents, webViewLink, md5Checksum)";
+
+/** Never worth fetching: they carry no text and cost a request each. */
+const SKIP_MIME = /^(image|video|audio)\//;
+
+export class DriveError extends Error {
+  constructor(message, status, reason) {
+    super(message);
+    this.name = "DriveError";
+    this.status = status;
+    this.reason = reason;
+  }
+}
+
+/**
+ * One API call with the retry policy Google actually requires.
+ *
+ * 403 rateLimitExceeded and 429 are RETRYABLE and common on a large walk; 403
+ * for any other reason is a permission problem and must fail fast rather than
+ * being retried into a long silence.
+ */
+export async function api(getAccessToken, path, { search, raw = false, attempts = 5, fetchImpl = fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    const token = await getAccessToken({ force: i > 0 && lastErr?.status === 401 });
+    const url = new URL(path.startsWith("http") ? path : API + path);
+    for (const [k, v] of Object.entries(search || {})) if (v != null) url.searchParams.set(k, String(v));
+
+    const res = await fetchImpl(url, { headers: { authorization: `Bearer ${token}` } });
+    if (res.ok) return raw ? new Uint8Array(await res.arrayBuffer()) : res.json();
+
+    const body = await res.json().catch(() => ({}));
+    const reason = body?.error?.errors?.[0]?.reason || body?.error?.status || "";
+    const retryable =
+      res.status === 429 ||
+      res.status >= 500 ||
+      (res.status === 403 && /rateLimit|userRateLimit|quotaExceeded|backendError/i.test(reason));
+
+    lastErr = new DriveError(body?.error?.message || `HTTP ${res.status}`, res.status, reason);
+    if (!retryable) throw lastErr;
+    // Exponential with jitter. Google's own guidance, and without the jitter a
+    // large parallel walk re-collides on every retry.
+    await sleep(Math.min(2 ** i * 1000, 32_000) + Math.random() * 1000);
+  }
+  throw lastErr;
+}
+
+/** Walk every file the token can see, including shared drives. */
+export async function* listFiles(getAccessToken, { pageSize = 1000, query, opts = {} } = {}) {
+  let pageToken;
+  do {
+    const page = await api(getAccessToken, "/files", {
+      search: {
+        pageSize,
+        pageToken,
+        fields: FIELDS,
+        // Without all three of these, files on Shared Drives are invisible and
+        // the walk silently returns only My Drive.
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+        corpora: "allDrives",
+        q: query || "trashed = false",
+        orderBy: "modifiedTime desc",
+      },
+      ...opts,
+    });
+    for (const f of page.files || []) yield f;
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+}
+
+/** The token that makes the NEXT run incremental. Fetch before the first walk. */
+export async function startPageToken(getAccessToken, opts = {}) {
+  const r = await api(getAccessToken, "/changes/startPageToken", {
+    search: { supportsAllDrives: true },
+    ...opts,
+  });
+  return r.startPageToken;
+}
+
+/**
+ * Everything that changed since a saved token.
+ *
+ * Returns { changed, removed, nextToken }. `removed` covers both deletion and
+ * trashing, and also a file that merely left the token's view. All three mean
+ * the same thing to a brain: stop answering from it.
+ */
+export async function listChanges(getAccessToken, pageToken, opts = {}) {
+  const changed = [];
+  const removed = [];
+  let token = pageToken;
+  let nextToken = null;
+
+  while (token) {
+    const page = await api(getAccessToken, "/changes", {
+      search: {
+        pageToken: token,
+        pageSize: 1000,
+        fields: `nextPageToken, newStartPageToken, changes(fileId, removed, file(${FIELDS.replace(/^nextPageToken, files\(|\)$/g, "")}))`,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+        includeRemoved: true,
+      },
+      ...opts,
+    });
+    for (const c of page.changes || []) {
+      if (c.removed || c.file?.trashed) removed.push(c.fileId);
+      else if (c.file) changed.push(c.file);
+    }
+    if (page.newStartPageToken) {
+      nextToken = page.newStartPageToken;
+      break;
+    }
+    token = page.nextPageToken;
+  }
+  return { changed, removed, nextToken };
+}
+
+/** Should this file be fetched at all? Decided before spending a request. */
+export function triage(file) {
+  if (file.trashed) return { skip: "the file is in the trash" };
+  if (file.mimeType === "application/vnd.google-apps.folder") return { skip: null, folder: true };
+  if (file.mimeType?.startsWith("application/vnd.google-apps.")) {
+    const e = EXPORTS[file.mimeType];
+    if (!e) return { skip: `Google ${file.mimeType.split(".").pop()} files cannot be exported as text` };
+    return { export: e };
+  }
+  if (SKIP_MIME.test(file.mimeType || "")) return { skip: `${file.mimeType} carries no text` };
+  if (!canExtract(file.name)) return { skip: `no extractor for "${extensionOf(file.name) || "(no extension)"}" files` };
+  if (Number(file.size) > DOWNLOAD_LIMIT) {
+    return { skip: `${(Number(file.size) / 1048576).toFixed(1)}MB, over the ${DOWNLOAD_LIMIT / 1048576}MB limit` };
+  }
+  return { download: true };
+}
+
+/** Fetch one file's bytes, exporting when it is a native Google type. */
+export async function fetchContent(getAccessToken, file, plan, opts = {}) {
+  if (plan.export) {
+    if (Number(file.size) > EXPORT_LIMIT) {
+      throw new DriveError(`Google's export limit is ${EXPORT_LIMIT / 1048576}MB and this file is larger`, 403, "exportSizeLimitExceeded");
+    }
+    return api(getAccessToken, `/files/${file.id}/export`, {
+      search: { mimeType: plan.export.mime, supportsAllDrives: true },
+      raw: true,
+      ...opts,
+    });
+  }
+  return api(getAccessToken, `/files/${file.id}`, {
+    search: { alt: "media", supportsAllDrives: true },
+    raw: true,
+    ...opts,
+  });
+}
+
+/**
+ * One Drive file to one ingest envelope, or a reasoned skip.
+ *
+ * Deliberately mirrors ingest/run.mjs prepare() so a Drive document and a local
+ * one are judged by exactly the same rules.
+ */
+export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYPE, pathOf = () => "" } = {}, opts = {}) {
+  const plan = triage(file);
+  if (plan.folder) return null;
+  if (plan.skip) return { skip: { path: file.name, id: file.id, reason: plan.skip } };
+
+  let buf;
+  try {
+    buf = await fetchContent(getAccessToken, file, plan, opts);
+  } catch (e) {
+    return { skip: { path: file.name, id: file.id, reason: `could not be fetched: ${e.message.slice(0, 120)}` } };
+  }
+
+  const name = plan.export ? file.name + plan.export.ext : file.name;
+  if (!isBinaryFormat(name) && isLikelyBinary(buf)) {
+    return { skip: { path: file.name, id: file.id, reason: "the file is binary, not text" } };
+  }
+
+  const got = await extract(buf, name);
+  if (got.error || got.text == null) {
+    return { skip: { path: file.name, id: file.id, reason: got.error || "extraction produced nothing" } };
+  }
+  const q = textQuality(got.text);
+  if (!q.ok) return { skip: { path: file.name, id: file.id, reason: q.reason, metrics: q.metrics } };
+
+  // createdTime, never modifiedTime. The filename still wins when it carries a
+  // date, because a human naming a file "2026-03 statement" is stating the
+  // document's date more reliably than Drive's metadata ever does.
+  const folder = pathOf(file);
+  const dd = documentDate({ filename: file.name, relPath: folder, contentHead: got.text.slice(0, 1200) });
+  const created = file.createdTime ? Date.parse(file.createdTime) : NaN;
+  const occurred = dd.value ?? (Number.isFinite(created) ? created : null);
+
+  return {
+    // The Drive file id, not the name. Names are duplicated and renamed; the id
+    // is what makes a re-sync update rather than duplicate, and what lets a
+    // deletion later find its document.
+    envelope: {
+      source_type: sourceName,
+      source_id: `drive:${file.id}`,
+      title: file.name,
+      content: got.text,
+      occurred_at: occurred ? new Date(occurred).toISOString() : null,
+      date_source: dd.value ? dd.source : Number.isFinite(created) ? "drive_created" : "none",
+      date_reliable: dd.value ? dd.reliable : false,
+      uri: file.webViewLink || null,
+      metadata: {
+        category: sourceName,
+        extracted_as: got.how,
+        drive_id: file.id,
+        mime: file.mimeType,
+        folder: folder || undefined,
+        ...(got.note ? { extraction_note: got.note } : {}),
+      },
+    },
+    // Drive's own change signal. Cheaper than hashing content we already have,
+    // and it is what the changes feed reports against.
+    version: `${file.modifiedTime || ""}|${file.md5Checksum || file.size || ""}`,
+    note: got.note || null,
+  };
+}

@@ -1,0 +1,24 @@
+node_modules/
+.env
+.env.*
+*.log
+.DS_Store
+
+# Filled manifests carry a client's account id and their brain's hostname.
+# The template is tracked; real ones are not.
+manifests/
+*.manifest.local.json
+
+# James's OWN evaluation set and its baselines. It measures retrieval quality
+# against his real brain, so it names real clients, real prices, and his child's
+# school fee. It is already excluded from the published package by the allowlist
+# in package.json; keeping it out of git as well means the only copy lives on
+# his machine, which is the right default for that content even in a private
+# repo. Remove these two lines if the backup value ever outweighs that.
+eval/golden/
+eval/baselines/
+
+# A real eval config names a real brain's hostname and how its admin key is
+# looked up. No secret value, but it is a targeting aid in a public repo, so the
+# tracked file is a template and the real one stays local.
+eval/eval.config.local.json

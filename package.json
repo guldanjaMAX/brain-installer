@@ -1,0 +1,50 @@
+{
+  "name": "brain-installer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Provision and manage a client-owned retrieval brain inside their own Cloudflare account",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "brain": "./brain.mjs"
+  },
+  "scripts": {
+    "test": "node test/errors.test.mjs && node test/doctor.test.mjs && node test/migrations.test.mjs && node test/doc-date.test.mjs && node test/quality.test.mjs && node test/ingest-run.test.mjs && node test/google-calendar.test.mjs && node test/google-drive.test.mjs && node worker/test/worker.test.mjs && node worker/test/store.test.mjs && node worker/test/store-d1.test.mjs && node worker/test/routes.test.mjs && node worker/test/secret-scan.test.mjs"
+  },
+  "_files_comment": [
+    "ALLOWLIST, deliberately. eval/ holds a golden question set built from the",
+    "author's OWN brain, naming real clients, real prices and a child's school.",
+    "A denylist would eventually miss something like that; an allowlist cannot.",
+    "test/ and worker/test/ are excluded for size, not secrecy."
+  ],
+  "files": [
+    "brain.mjs",
+    "CHANGELOG.md",
+    "README.md",
+    "acceptance.mjs",
+    "components/",
+    "connectors/",
+    "docs/",
+    "doctor.mjs",
+    "ingest/",
+    "manifest.schema.json",
+    "migrations/",
+    "onboarding/",
+    "report-html.mjs",
+    "report.mjs",
+    "templates/",
+    "worker/src/"
+  ],
+  "dependencies": {
+    "@e965/xlsx": "^0.20.3",
+    "fflate": "^0.8.3",
+    "postal-mime": "^3.0.0",
+    "unpdf": "^1.8.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guldanjaMAX/brain-installer.git"
+  }
+}

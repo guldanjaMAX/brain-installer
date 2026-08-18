@@ -1,0 +1,111 @@
+# CI exists for ONE reason above all others: this installer has never run on
+# Windows, and the first client install is on Windows. A green macOS run proves
+# nothing about the platform that matters.
+#
+# The Windows job is not a nice-to-have here. Three of the defects found by
+# review were Windows-specific (npm .cmd shims needing a shell since
+# CVE-2024-27980, percent-encoded paths, PowerShell quoting), and every one was
+# written from documentation rather than observation. This is the cheapest way
+# to turn that inference into evidence.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Never cancel the Windows job because macOS failed. Windows is the one we
+      # are actually here to learn from.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # --ignore-scripts is what the client is told to run, so CI runs the same
+      # thing. If a dependency needs a postinstall script, better to find out
+      # here than on someone's laptop.
+      - name: install
+        run: npm ci --ignore-scripts
+
+      - name: unit and integration suite
+        run: npm test
+
+      # The CLI must START. On Windows a symlinked bin, a percent-encoded path
+      # or a .cmd shim can make it exit 0 having done nothing, which is worse
+      # than crashing because every exit-code check passes.
+      - name: cli starts and prints usage
+        shell: bash
+        run: |
+          out=$(node brain.mjs)
+          echo "$out"
+          echo "$out" | grep -q "brain setup" || { echo "::error::usage did not print"; exit 1; }
+
+      # doctor must RUN and report, with no Cloudflare credentials present. It
+      # is expected to report failures here; what is NOT acceptable is a crash,
+      # because doctor is the tool whose whole job is diagnosing a bare machine.
+      - name: doctor reports rather than crashing
+        shell: bash
+        run: |
+          set +e
+          out=$(node brain.mjs doctor 2>&1); code=$?
+          echo "$out"
+          echo "$out" | grep -q "Node" || { echo "::error::doctor produced no report"; exit 1; }
+          echo "$out" | grep -qi "cannot find module" && { echo "::error::doctor crashed on imports"; exit 1; }
+          echo "doctor exited $code, which is expected without credentials"
+          exit 0
+
+      # The real client entry point is a global install of the packed tarball,
+      # not `node brain.mjs`. That path has its own failure modes (bin symlink
+      # resolution, the shebang, PATHEXT on Windows) that direct invocation
+      # never exercises, and one of them already shipped once: the installed
+      # command ran and did nothing, exit 0.
+      - name: packed tarball installs globally and the bin works
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --silent prints just the filename, so this stays version-agnostic
+          # and does not depend on a glob matching.
+          name=$(npm pack --pack-destination "$RUNNER_TEMP" --silent | tail -1)
+          tgz="$RUNNER_TEMP/$name"
+          echo "packed: $tgz"
+          echo "TARBALL=$tgz" >> "$GITHUB_ENV"
+
+          npm install -g "$tgz"
+
+          # Locate the bin explicitly rather than trusting PATH: on Windows npm
+          # writes brain.cmd into the prefix root, on POSIX a symlink into bin/.
+          prefix=$(npm prefix -g)
+          if [ -x "$prefix/bin/brain" ]; then bin="$prefix/bin/brain";
+          elif [ -f "$prefix/brain.cmd" ]; then bin="$prefix/brain.cmd";
+          elif command -v brain >/dev/null 2>&1; then bin="brain";
+          else echo "::error::no brain bin found under $prefix"; ls -la "$prefix" "$prefix/bin" 2>/dev/null; exit 1; fi
+          echo "bin: $bin"
+
+          out=$("$bin")
+          echo "$out"
+          echo "$out" | grep -q "brain setup" || { echo "::error::installed bin ran but printed nothing"; exit 1; }
+
+      # An install must never carry the author's own client data. package.json
+      # uses an allowlist; this fails loudly if a future edit turns it into a
+      # denylist that misses something.
+      - name: package contains no private data
+        shell: bash
+        run: |
+          set -euo pipefail
+          if tar -tzf "$TARBALL" | grep -Ei "golden|eval/"; then
+            echo "::error::private evaluation data is in the published package"
+            exit 1
+          fi
+          echo "clean"
