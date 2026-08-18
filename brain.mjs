@@ -1845,10 +1845,14 @@ async function cmdIngest(manifestPath) {
   const { walk, prepare, batchStream, loadState, saveState } = await ingestLib();
 
   const sourceName = assertSourceName(flags.source === true ? null : flags.source || "upload");
-  const acct = await resolveAccount(m);
+  // A dry run sends nothing, so it must not demand credentials it will never
+  // use. Requiring a Cloudflare token to preview what WOULD be loaded turns the
+  // safest command in the tool into one of the hardest to reach.
+  const dry = !!flags["dry-run"];
+  const acct = dry ? null : await resolveAccount(m);
   const dbId = m.infrastructure?.cloudflare?.d1_database_id;
-  const base = await resolveBaseUrl(m, acct);
-  const adminKey = resolveAdminKey(manifestPath);
+  const base = dry ? null : await resolveBaseUrl(m, acct);
+  const adminKey = dry ? null : resolveAdminKey(manifestPath);
   if (!adminKey && !flags["dry-run"]) {
     die("no admin key found: not in the environment, and no .brain-admin-key file next to the manifest. Export ADMIN_KEY or re-run `brain setup`.");
   }

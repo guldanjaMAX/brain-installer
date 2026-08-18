@@ -99,11 +99,30 @@ const STRUCTURAL = [
     // The leading \b in v1 could not fire inside RESEND_API_KEY=, so it missed
     // every .env and wrangler.toml line.
     label: "env_assignment",
+    // The VALUE has to look like a secret, not merely sit to the right of a
+    // secret-ish name. The previous version was wrong in both directions at
+    // once, which a real client found by quoting our own source at us:
+    //
+    //   `const adminKey = resolveAdminKey(manifestPath);`  was REFUSED
+    //   `ADMIN_KEY=8f3a2b1c9d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a`  was ACCEPTED
+    //
+    // The first is a variable reference and the second is an actual key, so the
+    // gate was rejecting documentation while passing the thing it exists to
+    // catch. Requiring the value to be secret-SHAPED fixes both: at least 16
+    // characters of key-like alphabet, and not an identifier or a call.
     pattern:
-      /(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_\-]){0,4}(?:password|passwd|pwd|secret|api[_-]?key|api[_-]?token|access[_-]?token|auth[_-]?token|bearer[_-]?token|private[_-]?key|client[_-]?secret|signing[_-]?secret|webhook[_-]?secret|admin[_-]?key|service[_-]?role)\s*[:=]\s*["'`]?([^\s"'`,;]{8,})/gi,
+      /(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_\-]){0,4}(?:password|passwd|pwd|secret|api[_-]?key|api[_-]?token|access[_-]?token|auth[_-]?token|bearer[_-]?token|private[_-]?key|client[_-]?secret|signing[_-]?secret|webhook[_-]?secret|admin[_-]?key|brain[_-]?key|service[_-]?role)\s*[:=]\s*["'`]?([A-Za-z0-9+/_\-]{16,})["'`]?(?![\w(.])/gi,
     severity: CONFIRMED,
     group: 1,
     allowlist: true,
+    // A value that is plainly a reference rather than a literal is not a leak:
+    // process.env.X, a function call, a placeholder, or an ordinary identifier.
+    reject: (v) =>
+      /^(process|env|config|opts|options|args|this|self)\b/i.test(v) ||
+      /^[a-z][A-Za-z0-9]*$/.test(v) ||
+      /^(your|the|a|some|placeholder|example|redacted|xxx+|changeme|todo)/i.test(v) ||
+      /^<.*>$/.test(v) ||
+      !/[0-9]/.test(v),
   },
   {
     // The header alone must fire: chunking splits a PEM block so BEGIN lands in
@@ -191,8 +210,14 @@ const PLACEHOLDER =
 const SHELL_SUBST = /^\$[({]|^\$[A-Z_]+$|^\{\{|^%[A-Z_]+%$/;
 const ID_CONTEXT =
   /(account|zone|database|hyperdrive|namespace|bucket|commit|sha|d1|version|prod|product|price|location|folder|file|run|job)[_ ]?(id|hash)?\s*[:=|]?\s*$/i;
+// admin[_-]?key and brain[_-]?key are here because this product GENERATES a hex
+// admin key, and a bare hex value is otherwise allowlisted as a probable git
+// SHA. Without them the gate could not catch the one credential the system
+// creates for itself, which is also the one most likely to end up pasted into
+// a document. Found when a client quoted our own source back at us and the
+// scanner refused the quote while passing the real key.
 const SECRET_CONTEXT =
-  /(auth|token|secret|password|passwd|api[_-]?key|private[_-]?key|credential|bearer)/i;
+  /(auth|token|secret|password|passwd|api[_-]?key|private[_-]?key|credential|bearer|admin[_-]?key|brain[_-]?key)/i;
 
 // Total Shannon material, not bits per character. Per-char wrongly clears
 // numeric secrets: "1234567890123456" scores 3.25/char but only 52 bits total.
@@ -239,6 +264,10 @@ function matches(text) {
     while ((m = rule.pattern.exec(text)) !== null) {
       const val = rule.group ? m[rule.group] : m[0];
       if (val === undefined || val === null) continue;
+      // A rule may declare values that match its shape but are plainly not a
+      // secret: a variable reference, a function call, a placeholder. Without
+      // this the gate refused our own source code while passing real keys.
+      if (typeof rule.reject === "function" && rule.reject(val)) continue;
       // Context measured from the SECRET, not the match start.
       const secretStart = rule.group ? text.indexOf(val, m.index) : m.index;
       if (rule.allowlist && isAllowlisted(val, text.slice(0, secretStart))) continue;

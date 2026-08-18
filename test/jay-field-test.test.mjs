@@ -80,5 +80,47 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("the transform produces what the worker imports", winStyle === "lib/core.js");
 }
 
+/* ---- the credential gate was wrong in BOTH directions ----
+   Found when Jay quoted a line of our own source in his bug report and the
+   scanner refused the report. Worse than the false positive: it ACCEPTED a real
+   hex admin key, because a bare hex value is allowlisted as a probable git SHA
+   unless the surrounding text is recognised as secret context, and the list did
+   not include the name of the key this product generates for itself. */
+{
+  const { scan } = await import("../worker/src/lib/secret-scan.js");
+  const mustPass = [
+    ["  const adminKey = resolveAdminKey(manifestPath);", "our own source"],
+    ["const clientSecret = process.env.GOOGLE_CLIENT_SECRET;", "an env reference"],
+    ["api_key: opts.apiKey", "a property reference"],
+    ["ADMIN_KEY=your-key-here", "a placeholder"],
+    ["password: <your password>", "a documented placeholder"],
+    ["commit 8f3a2b1c9d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a", "a git SHA"],
+  ];
+  for (const [t, d] of mustPass) {
+    check(`gate accepts ${d}`, !scan(t).shouldRefuse, JSON.stringify(scan(t).labels));
+  }
+  const mustRefuse = [
+    ["ADMIN_KEY=8f3a2b1c9d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a", "the admin key this product generates"],
+    ["BRAIN_KEY=1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b", "the same key under its MCP name"],
+    ['client_secret: "GOCSPX-8fJ2kL9mN0pQrS3tU4vW5xY6z"', "a real client secret"],
+    ["webhook_secret = whsec_1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p", "a real webhook secret"],
+  ];
+  for (const [t, d] of mustRefuse) {
+    check(`gate refuses ${d}`, scan(t).shouldRefuse, "PASSED a real credential");
+  }
+  // A refusal must never quote the value back.
+  const r = scan("ADMIN_KEY=8f3a2b1c9d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a");
+  check("and never echoes the secret it refused", !JSON.stringify(r).includes("2b1c9d4e5f6a"), JSON.stringify(r));
+}
+
+/* ---- a dry run sends nothing, so it must not demand credentials ---- */
+{
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../brain.mjs", import.meta.url), "utf-8");
+  const body = src.slice(src.indexOf("async function cmdIngest(manifestPath)"));
+  check("dry-run skips account resolution", /const acct = dry \? null : await resolveAccount/.test(body));
+  check("dry-run skips the admin key", /const adminKey = dry \? null : resolveAdminKey/.test(body));
+}
+
 console.log(fail ? `\n${fail} FAILURES` : `\njay-field-test: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);
