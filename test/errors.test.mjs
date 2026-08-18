@@ -21,7 +21,9 @@ function cli(args, env = {}) {
   const e = { ...process.env, ...env };
   delete e.CLOUDFLARE_API_TOKEN;
   delete e.ADMIN_KEY;
-  const r = spawnSync("node", [CLI, ...args], { encoding: "utf-8", env: e, timeout: 60_000 });
+    // Generous: on a cold machine the Cloudflare checks download wrangler before
+  // they can answer, which is minutes, not seconds.
+  const r = spawnSync("node", [CLI, ...args], { encoding: "utf-8", env: e, timeout: 300_000 });
   return { code: r.status, out: strip(`${r.stdout || ""}${r.stderr || ""}`) };
 }
 

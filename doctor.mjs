@@ -275,11 +275,18 @@ export async function checkNetwork() {
 }
 
 /** Every check, in the order a person should fix them. */
-export async function runAll({ accountId } = {}) {
+export async function runAll({ accountId, onResult } = {}) {
   const out = [];
-  out.push(checkNode());
-  out.push(await checkNetwork());
-  out.push(checkWrangler());
+  // Each result is handed to the caller the moment it exists, so a slow check
+  // shows the ones before it rather than holding the whole report hostage.
+  const push = (x) => {
+    out.push(x);
+    if (onResult) onResult(x);
+    return x;
+  };
+  push(checkNode());
+  push(await checkNetwork());
+  push(checkWrangler());
   // Skip the ones that cannot possibly pass, rather than emitting a cascade of
   // failures that all trace back to one cause.
   out.push(checkCfToken());

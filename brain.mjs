@@ -2377,15 +2377,19 @@ async function cmdDoctor(manifestPath) {
   }
 
   console.log(`\n  ${c.bold("brain doctor")}${accountId ? c.dim(`  account ${accountId}`) : ""}\n`);
-  info("checking, this takes a few seconds because it actually runs the tools");
+  info("checking your machine. The Cloudflare checks download a tool on first run,");
+  info("so the first time can take a couple of minutes. Each line appears as it finishes.\n");
 
-  const checks = await doctorRunAll({ accountId });
-  const width = Math.max(...checks.map((x) => x.name.length));
-  console.log("");
-  for (const x of checks) {
-    const mark = x.status === D_OK ? c.green("ok  ") : x.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
-    console.log(`  ${mark}  ${x.name.padEnd(width)}  ${x.detail}`);
-  }
+  // Printed as each check completes, not collected and dumped at the end.
+  // Otherwise a first run sits silent for minutes while npx fetches wrangler,
+  // and silence is indistinguishable from a hang to the person watching.
+  const checks = await doctorRunAll({
+    accountId,
+    onResult: (x) => {
+      const mark = x.status === D_OK ? c.green("ok  ") : x.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
+      console.log(`  ${mark}  ${x.name.padEnd(18)}  ${x.detail}`);
+    },
+  });
 
   const s = doctorSummarize(checks);
   console.log("");
