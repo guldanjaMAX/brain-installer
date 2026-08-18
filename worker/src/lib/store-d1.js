@@ -357,6 +357,25 @@ export async function drainOutbox(env, { embed, batchSize = 100 } = {}) {
     }
   }
 
+  // Record the id each chunk was ACTUALLY stored under, at drain time.
+  //
+  // upsertChunks writes this at ingest, which covers anything loaded on a fixed
+  // build. It does NOT cover rows already queued by an older build: those drain
+  // fine, embed fine, and are then unreachable, because search resolves a hashed
+  // id back through this column and finds nothing. The chunk is silently
+  // keyword-only. Found by replaying a real 0.1.0 install through the upgrade
+  // rather than trusting a fresh install to represent it.
+  const remap = vectors
+    .map((v) => [idToChunk.get(v.id), v.id])
+    .filter(([cu, vid]) => cu && vid !== cu);
+  if (remap.length) {
+    await env.DB.batch(
+      remap.map(([cu, vid]) =>
+        env.DB.prepare("UPDATE chunks SET vector_id = ?2 WHERE chunk_uid = ?1").bind(cu, vid)
+      )
+    ).catch(() => {});
+  }
+
   // Only rows that actually made it are cleared. A poisoned row stays queued
   // with its attempt count and error recorded, so it is visible and bounded
   // rather than an invisible permanent stall.

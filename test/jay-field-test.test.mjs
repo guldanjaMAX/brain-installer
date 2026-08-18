@@ -122,5 +122,45 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("dry-run skips the admin key", /const adminKey = dry \? null : resolveAdminKey/.test(body));
 }
 
+/* ---- the RECOVERY path, which a fresh install does not represent ----
+   Rows queued by an older build drain and embed fine, then stay unreachable by
+   meaning unless the id they were actually stored under is written back. A
+   fresh install hides this, because ingest writes the column. Only replaying a
+   real old install through the upgrade exposes it. */
+{
+  const stored = [];
+  const env = {
+    DB: {
+      prepare(q) {
+        const shape = (b = []) => ({
+          all: async () => ({ results: [
+            // 97 bytes: exactly the shape that must be hashed
+            { chunk_uid: "docs:Financial/2026/Q3 Statements/Wells Fargo Business Checking Statement 2026-07 Reconciled.md#0", text: "t", source: "docs", doc_uid: "d" },
+          ] }),
+          first: async () => ({ n: 0 }),
+          run: async () => ({}),
+          _q: q, _b: b,
+        });
+        const o = shape();
+        o.bind = (...b) => shape(b);
+        return o;
+      },
+      batch: async (stmts) => {
+        for (const st of stmts) {
+          if (/UPDATE chunks SET vector_id/.test(st._q)) stored.push(st._b);
+        }
+      },
+    },
+    VECTORIZE: { upsert: async (v) => { stored.push(["__upserted__", v[0].id]); } },
+  };
+  const r = await drainOutbox(env, { embed: async () => [0.1] });
+  const upserted = stored.find((x) => x[0] === "__upserted__");
+  check("a long chunk_uid is stored under a hashed id", upserted && upserted[1].startsWith("h:"), JSON.stringify(upserted));
+  const written = stored.find((x) => x[0] !== "__upserted__" && String(x[1] || "").startsWith("h:"));
+  check("and the drain writes that id BACK to the chunk row", !!written,
+    "without this the chunk embeds and is then unreachable by meaning, keyword-only and silent");
+  check("the drain still reports success", r.drained === 1, JSON.stringify(r));
+}
+
 console.log(fail ? `\n${fail} FAILURES` : `\njay-field-test: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);
