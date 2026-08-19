@@ -741,7 +741,29 @@ async function cmdSecrets(manifestPath) {
   }
 }
 
-async function cmdHealth(manifestPath) {
+/**
+ * Decide what a /health probe means during a deploy.
+ *
+ * Pulled out and exported because this is the exact logic that failed in the
+ * field: a 200 was treated as proof the new build was live, but Cloudflare keeps
+ * serving the PREVIOUS worker for a few seconds after a deploy. The probe read
+ * 0.1.1, and the tool announced "now at 0.1.2". A genuinely broken deploy would
+ * have passed the same check green.
+ *
+ * Returns "accept" | "retry" | "fail".
+ */
+export function healthProbeVerdict({ ok, body, expectVersion = null, attempt = 1, attempts = 6 }) {
+  if (ok) {
+    if (!expectVersion) return "accept";
+    let live = null;
+    try { live = JSON.parse(body)?.version || null; } catch { /* not JSON */ }
+    if (live === expectVersion) return "accept";
+    return attempt < attempts ? "retry" : "fail";
+  }
+  return attempt < attempts ? "retry" : "fail";
+}
+
+async function cmdHealth(manifestPath, { expectVersion = null } = {}) {
   const { m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
   const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
@@ -767,8 +789,30 @@ async function cmdHealth(manifestPath) {
   for (let i = 1; i <= healthAttempts; i++) {
     res = await http(`${base}/health?cb=${i}`, {}, { timeoutMs: 20_000, what: "the health check" });
     body = await res.text();
-    if (res.ok) break;
-    if (i < healthAttempts && (res.status === 404 || res.status >= 500)) {
+    // A 200 is NOT proof the new build is live. Cloudflare keeps serving the
+    // PREVIOUS worker for a few seconds after a deploy, so breaking on the first
+    // 200 verifies the build that was just replaced and reports it as success.
+    // Found in the field on a real upgrade: the probe read 0.1.1 and the tool
+    // said "now at 0.1.2". A genuinely broken deploy would pass this green.
+    const verdict = healthProbeVerdict({ ok: res.ok, body, expectVersion, attempt: i, attempts: healthAttempts });
+    if (verdict === "accept") break;
+
+    if (res.ok && expectVersion) {
+      let live = null;
+      try { live = JSON.parse(body)?.version || null; } catch { /* not JSON */ }
+      if (verdict === "retry") {
+        info(`/health is still answering ${live || "an unknown version"}, waiting for ${expectVersion} to take over`);
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
+      die(
+        `the deploy is not live. /health still reports ${live || "no version"} after ${healthAttempts} attempts,` + "\n" +
+          `  but ${expectVersion} was just deployed.` + "\n" +
+          "  The upgrade is NOT verified. Re-run it, and if this repeats the worker is" + "\n" +
+          "  not being replaced: check the script name in the manifest against Cloudflare."
+      );
+    }
+    if (verdict === "retry" && (res.status === 404 || res.status >= 500)) {
       info(`${res.status} on attempt ${i}/${healthAttempts}, waiting for the route to propagate`);
       await new Promise((r) => setTimeout(r, 5000));
       continue;
@@ -815,7 +859,9 @@ async function cmdHealth(manifestPath) {
               (stalled
                 ? ".\n        Older than 30 minutes means the drain cron is NOT running. Those\n" +
                   "        chunks are findable by keyword and invisible to semantic search.\n" +
-                  "        Check the schedule on the worker in the Cloudflare dashboard."
+                  "        Clear it now with:  brain drain <manifest>" + "\n" +
+                  "        If it keeps returning, the drain cron is not firing: check the" + "\n" +
+                  "        schedule on the worker in the Cloudflare dashboard."
                 : " (the drain cron will clear these).")
           );
         } else if (backlog) {
@@ -1141,8 +1187,12 @@ async function cmdUpgrade(manifestPath) {
   }
 
   // Verify. An upgrade that is not verified is a belief.
+  //
+  // expectVersion is the whole point: without it this probed /health, got a 200
+  // from the worker being REPLACED, printed its old version, and declared the
+  // new one verified.
   try {
-    await cmdHealth(manifestPath);
+    await cmdHealth(manifestPath, { expectVersion: toVersion });
   } catch (e) {
     await logRun("failed", `verification: ${e.message}`.slice(0, 400));
     die(`upgrade deployed but verification failed: ${e.message}`);

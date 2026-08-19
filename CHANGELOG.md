@@ -4,6 +4,22 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.5
+
+Two fixes from the second field report, and the first one matters.
+
+- **`brain upgrade` was checking the wrong worker.** After deploying, it asked
+  the brain whether it was healthy and accepted the first answer it got. But
+  Cloudflare keeps serving the previous version for a few seconds, so the check
+  was reading the build being replaced and reporting the new one as verified. It
+  now waits until the version actually answering is the one it just shipped, and
+  says plainly if that never happens. Nothing was ever harmed by this, but a
+  broken upgrade could have passed it.
+- **The stalled-embedding warning now tells you what to run.** It used to send
+  you to the Cloudflare dashboard to read a schedule. It now says
+  `brain drain <manifest>`, which is the actual fix, and mentions the dashboard
+  only if the problem comes back.
+
 ## 0.1.4
 
 The brain now knows how current it is, and says so.
