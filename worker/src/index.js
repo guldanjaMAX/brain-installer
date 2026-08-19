@@ -20,7 +20,7 @@
 import { jsonResponse, cachedJson, validateAdminKey, callLLM } from "./lib/core.js";
 import { scan as scanSecrets } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { drainOutbox, outboxDepth, forget, reindex } from "./lib/store-d1.js";
+import { drainOutbox, outboxDepth, forget, reindex, coverageGaps, freshnessReport } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 
 /* ------------------------------------------------------------ retrieval */
@@ -276,6 +276,16 @@ async function handleThink(env, request) {
   }
 
   const gaps = computeGaps(results);
+
+  // Coverage staleness goes in FRONT of the content gaps, because it qualifies
+  // all of them. "The newest thing I found is 40 days old" reads very
+  // differently once you know the source has not been read since July: the first
+  // is a fact about the corpus, the second is a fact about our blind spot.
+  try {
+    const cov = await coverageGaps(env);
+    if (cov.length) gaps.unshift(...cov);
+  } catch { /* an answer must never fail because the freshness check did */ }
+
   // An unapplied filter belongs in the gaps, not in a footnote. The reader is
   // about to trust an answer they believe was scoped to one client.
   if (ignoredFilters.length) {
@@ -582,6 +592,13 @@ export default {
       }
       if (path === "/api/admin/brain/documents" && request.method === "GET") {
         return await handleDocuments(env);
+      }
+      // Per-source freshness. Separate from /documents on purpose: that endpoint
+      // answers "how much is in here", this one answers "how much of it is
+      // current", and conflating them is how staleness stayed invisible.
+      if (path === "/api/admin/brain/freshness" && request.method === "GET") {
+        if (backendOf(env) !== D1) return jsonResponse({ error: "freshness applies to the d1 backend only" }, 400);
+        return jsonResponse(await freshnessReport(env));
       }
       /**
        * Remove documents. DRY RUN BY DEFAULT.

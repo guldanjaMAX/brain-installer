@@ -4,6 +4,27 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.4
+
+The brain now knows how current it is, and says so.
+
+- **Answers tell you when the brain has not looked recently.** There is a
+  difference between "the newest thing I found is 40 days old" and "I have not
+  read that source since July, so there may be material I have never seen." The
+  second one was invisible before, because a source nobody re-reads looks exactly
+  like a source with nothing new in it. Now it appears with the answer, next to
+  the citations, at the moment it changes what you should believe.
+- **`brain sources` shows freshness per source,** and distinguishes three things
+  that used to look the same: a source that is genuinely behind, a source that
+  could refresh on its own but has no schedule, and a source loaded by hand from
+  a machine we cannot reach.
+- **Set the expectation with** `brain sources <manifest> --source <name>
+  --refresh <hourly|daily|weekly|monthly|never>`. A source with no expectation is
+  **never** reported as stale. That is deliberate: a one-off folder load is not
+  stale, it is finished, and a warning that fires every day for something nobody
+  can act on teaches you to ignore the warning that matters.
+- Being late is not being broken. A daily source six hours overdue says nothing.
+
 ## 0.1.3
 
 One new command, and it is the one that gets you out of trouble.

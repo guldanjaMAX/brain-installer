@@ -458,6 +458,119 @@ export async function drainOutbox(env, { embed, embedBatch, batchSize = 100, emb
  * drain's batching, poison quarantine and vector_id write-back all apply
  * unchanged. INSERT OR IGNORE keeps it safe to run twice.
  */
+/**
+ * Coverage staleness: what the brain has not LOOKED at recently.
+ *
+ * The gap engine already reports the age of what a query retrieved. That is
+ * content staleness, and it is the easier half. This is the other half: a source
+ * that is never re-read looks exactly like a source with nothing new in it, so
+ * the brain cannot tell "nothing has changed" from "I stopped checking in July".
+ * Every signal we had was blind to it.
+ *
+ * Two deliberate refusals to overclaim:
+ *
+ *  - A source with no expected_refresh_seconds makes NO staleness claim. A
+ *    one-off folder upload is not stale, it is finished, and warning about it
+ *    every day would train the client to ignore the warning that matters.
+ *  - A source we cannot reach on our own (a folder on a laptop) is reported as
+ *    manual rather than broken. Calling it stale would be blaming the client for
+ *    a limit of the architecture.
+ */
+export async function coverageGaps(env, { now = Date.now() } = {}) {
+  let rows;
+  try {
+    const r = await env.DB.prepare(
+      `SELECT name, kind, status, last_ingest_at, last_complete_sweep_at,
+              expected_refresh_seconds, stale_reason, document_count
+       FROM sources`
+    ).all();
+    rows = r?.results || [];
+  } catch {
+    return []; // never fail an answer because the freshness check could not run
+  }
+
+  const gaps = [];
+  for (const s of rows) {
+    const last = s.last_ingest_at ? Date.parse(s.last_ingest_at) : NaN;
+    const ageSec = Number.isFinite(last) ? Math.floor((now - last) / 1000) : null;
+    const days = ageSec === null ? null : Math.floor(ageSec / 86400);
+
+    if (s.stale_reason) {
+      gaps.push({
+        type: "sync_broken",
+        source: s.name,
+        days_since_ingest: days,
+        detail: `The "${s.name}" source stopped updating${days === null ? "" : ` ${days} day(s) ago`}: ${s.stale_reason}. Anything added since is not in the brain.`,
+      });
+      continue;
+    }
+
+    const expected = Number(s.expected_refresh_seconds) || null;
+    if (!expected) continue; // no expectation set, so no claim made
+
+    if (ageSec === null) {
+      gaps.push({
+        type: "never_synced",
+        source: s.name,
+        detail: `The "${s.name}" source is expected to refresh but has never completed one, so its contents may be missing entirely.`,
+      });
+      continue;
+    }
+
+    // 1.5x before complaining: a cron that runs daily and is six hours late is
+    // working. Warning at the first minute past due is how alerts get ignored.
+    if (ageSec > expected * 1.5) {
+      gaps.push({
+        type: "coverage_stale",
+        source: s.name,
+        days_since_ingest: days,
+        expected_every_days: Math.round(expected / 86400) || null,
+        detail: `The "${s.name}" source was last read ${days} day(s) ago and is expected to refresh about every ${Math.max(1, Math.round(expected / 86400))} day(s). Material added since then is not in the brain, and would not show up as a missing answer.`,
+      });
+    }
+  }
+  return gaps;
+}
+
+/** Per-source freshness for `brain health` and `brain sources`, not for answers. */
+export async function freshnessReport(env, { now = Date.now() } = {}) {
+  let rows;
+  try {
+    const r = await env.DB.prepare(
+      `SELECT name, kind, status, last_ingest_at, last_complete_sweep_at,
+              expected_refresh_seconds, stale_reason, document_count
+       FROM sources ORDER BY name`
+    ).all();
+    rows = r?.results || [];
+  } catch {
+    return { sources: [], unavailable: true };
+  }
+  // Kinds we can refresh without the client's machine being on.
+  const AUTOMATABLE = new Set(["drive", "gmail", "calendar"]);
+  return {
+    sources: rows.map((s) => {
+      const last = s.last_ingest_at ? Date.parse(s.last_ingest_at) : NaN;
+      const days = Number.isFinite(last) ? Math.floor((now - last) / 86400000) : null;
+      const expected = Number(s.expected_refresh_seconds) || null;
+      const automatable = AUTOMATABLE.has(String(s.kind));
+      let state = "ok";
+      if (s.stale_reason) state = "broken";
+      else if (!expected) state = automatable ? "unscheduled" : "manual";
+      else if (!Number.isFinite(last)) state = "never_synced";
+      else if (days !== null && days * 86400 > expected * 1.5) state = "stale";
+      return {
+        name: s.name, kind: s.kind, state,
+        documents: Number(s.document_count || 0),
+        days_since_ingest: days,
+        expected_every_days: expected ? Math.max(1, Math.round(expected / 86400)) : null,
+        last_complete_sweep_at: s.last_complete_sweep_at || null,
+        reason: s.stale_reason || null,
+        automatable,
+      };
+    }),
+  };
+}
+
 export async function reindex(env, { source = null, dryRun = true } = {}) {
   const where = source ? "WHERE d.source = ?1" : "";
   const bind = source ? [source] : [];

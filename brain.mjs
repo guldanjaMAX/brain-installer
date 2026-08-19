@@ -1583,6 +1583,59 @@ async function readSources(acctId, dbId) {
 
 const num = (n) => Number(n || 0).toLocaleString("en-US");
 
+/**
+ * Print how CURRENT each source is, as distinct from how big it is.
+ *
+ * Deliberately says "manual" rather than "stale" for a source we cannot refresh
+ * on our own, like a folder on the client's laptop. Calling that stale would be
+ * blaming them for a limit of the architecture, and a warning that fires every
+ * day for something nobody can fix is how clients learn to ignore warnings.
+ */
+async function reportFreshness(m, acct, manifestPath) {
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) return;
+  const res = await http(`${base}/api/admin/brain/freshness`, { headers: { "X-Admin-Key": adminKey } },
+    { timeoutMs: 30_000, what: "the freshness check" });
+  if (!res.ok) return;
+  const { sources } = await res.json();
+  if (!sources?.length) return;
+
+  const LABEL = {
+    ok: () => c.green("current"),
+    stale: (s) => c.red(`STALE, ${s.days_since_ingest}d since last read`),
+    broken: (s) => c.red(`BROKEN: ${s.reason}`),
+    never_synced: () => c.red("never synced"),
+    unscheduled: () => c.yellow("no refresh scheduled"),
+    manual: (s) => c.dim(`manual, ${s.days_since_ingest ?? "?"}d since last load`),
+  };
+  console.log(`\n  ${c.bold("freshness")}`);
+  for (const s of sources) {
+    console.log(`    ${s.name.padEnd(16)} ${(LABEL[s.state] || (() => s.state))(s)}`);
+  }
+  const bad = sources.filter((s) => s.state === "stale" || s.state === "broken" || s.state === "never_synced");
+  const unsched = sources.filter((s) => s.state === "unscheduled");
+  const manual = sources.filter((s) => s.state === "manual");
+  if (bad.length) {
+    warn(
+      `${bad.length} source(s) are not current. The brain will say so in its answers` + "\n" +
+        "        rather than answering as if nothing were missing."
+    );
+  }
+  if (unsched.length) {
+    info(
+      `${unsched.length} source(s) could refresh on their own but have no schedule set.` + "\n" +
+        "        Until one is set, no staleness claim is made about them either way."
+    );
+  }
+  if (manual.length) {
+    info(
+      `${manual.length} source(s) are loaded by hand from a machine we cannot reach,` + "\n" +
+        "        so they are never reported as stale. Re-run `brain ingest` to refresh one."
+    );
+  }
+}
+
 async function cmdSources(manifestPath) {
   const { m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
@@ -1620,6 +1673,25 @@ async function cmdSources(manifestPath) {
     }
   }
 
+  // Set (or clear) how often a source is EXPECTED to refresh. Without this
+  // nothing ever has an expectation, so no staleness claim is ever made and the
+  // whole freshness signal stays silent, which is worse than not having it.
+  if (flags.refresh !== undefined) {
+    const name = assertSourceName(flags.source === true ? null : flags.source);
+    const spec = String(flags.refresh === true ? "" : flags.refresh).toLowerCase();
+    const SECONDS = { hourly: 3600, daily: 86400, weekly: 604800, monthly: 2592000, never: null, off: null };
+    if (!(spec in SECONDS)) {
+      die(
+        `--refresh needs one of: hourly, daily, weekly, monthly, never.` + "\n" +
+          `  "never" clears the expectation, and a source with no expectation is never` + "\n" +
+          "  reported as stale, which is the right default for a one-off folder load."
+      );
+    }
+    await d1Query(acct.id, dbId, "UPDATE sources SET expected_refresh_seconds = ? WHERE name = ?", [SECONDS[spec], name]);
+    if (SECONDS[spec] === null) ok(`"${name}" will no longer be reported as stale`);
+    else ok(`"${name}" is expected to refresh ${spec}; it will be reported stale past 1.5x that`);
+  }
+
   const rows = await readSources(acct.id, dbId);
   const base = await resolveBase(m, acct);
   const live = await liveSourceCounts(base, resolveAdminKey(manifestPath));
@@ -1651,6 +1723,10 @@ async function cmdSources(manifestPath) {
       );
     }
   }
+
+  // Freshness, stated per source. This is the half that was invisible: a source
+  // nobody re-reads looks exactly like a source with nothing new in it.
+  await reportFreshness(m, acct, manifestPath).catch(() => {});
 
   if (!live) {
     console.log(
@@ -3260,7 +3336,9 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
   brain ingest takes --source <name>, --limit <n>, --dry-run, and --reset. It is
   resumable: re-run the same command to continue an interrupted load.
 
-  brain sources takes --add <name> [--kind <drive|gmail|calendar|upload>] to register one.
+  brain sources takes --add <name> [--kind <drive|gmail|calendar|upload>] to register one,
+  and --source <name> --refresh <hourly|daily|weekly|monthly|never> to say how often it
+  should refresh. A source with no expectation is never reported as stale.
   brain forget needs --source <name>, and --yes before it removes anything. Without
   --yes it prints exactly what would go and stops.
 
