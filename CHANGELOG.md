@@ -4,6 +4,43 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.2
+
+The rest of the findings from the first Windows install, plus one thing that
+turned out to be worse than reported.
+
+- **Provisioning could adopt a database that was not ours.** The default name
+  was the generic `brain`, and an existing database of that name was adopted
+  rather than refused. On an account that already had one, the install would
+  have run its migrations into somebody else's data and relabelled it. It now
+  refuses anything it cannot prove is empty or already this client's brain, and
+  the generic name is gone entirely.
+- **A missing metadata index silently broke source filtering, permanently.**
+  Measured against Vectorize on 2026-08-18: a document embedded before that
+  index exists can never be filtered by source afterwards, even though it is
+  present and answers ordinary searches. Provisioning used to warn and carry on.
+  It now retries and then stops, because there is no repair except loading
+  everything again.
+- **Embedding is far faster.** Chunks were embedded one at a time, roughly 1,200
+  an hour, so a small folder took most of an hour to become searchable by
+  meaning. They are now embedded in groups.
+- **The install stopped saying "a few minutes".** After loading, you get the
+  real number of chunks still queued, and `brain drain <manifest>` finishes them
+  now with a live estimate instead of leaving it to the schedule. "Your brain is
+  live" now says plainly when meaning-based search is still catching up.
+- **The admin key is treated as the secret it is.** It is refused into system
+  directories, flagged in synced folders like OneDrive or Dropbox, added to
+  `.gitignore` inside a repository, permission-restricted on Windows as well as
+  Mac and Linux, and announced as a secret rather than as a note.
+- **A flag typed without its value now says so.** `--path` with nothing after it
+  used to report "no such folder: true", and `--limit` silently loaded nothing.
+- **Setup no longer sends you to add a Cloudflare permission that may do
+  nothing.** Vectorize is reached through `wrangler login`, and that is now the
+  only thing any part of the tool tells you to do.
+
+**Worth checking after you update:** run `brain drain <manifest>` once. If your
+backlog had stalled, this clears it and tells you how long it will take.
+
 ## 0.1.1
 
 Fixes from the first real Windows install. If you are on 0.1.0, update.

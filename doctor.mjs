@@ -25,6 +25,40 @@ export const OK = "ok";
 export const WARN = "warn";
 export const FAIL = "fail";
 
+/**
+ * The ONE description of how Vectorize is reached, so the CLI, the doctor, the
+ * README and the template manifest cannot drift apart again. They already had:
+ * doctor omitted the Vectorize scope while brain.mjs told clients to add it.
+ *
+ * What is actually established, measured 2026-08-18:
+ *   - An API token CAN reach the Vectorize API. A full-access account-owned
+ *     token listed indexes successfully. So the earlier blanket claim that "no
+ *     API token can reach Vectorize" was wrong, and is retracted here.
+ *   - The tokens that failed simply lacked the permission. Every one of them
+ *     returned `Authentication error 10000`, which is indistinguishable from an
+ *     invalid token and is why this was misdiagnosed as a platform limit.
+ *   - What is still UNPROVEN is whether adding `Vectorize: Edit` to an ordinary
+ *     user-owned token is enough for provision's create call. Read was proven on
+ *     an account-owned token; create was not tested.
+ *
+ * So this text still points at wrangler, because that is the path measured end
+ * to end. It no longer claims a token cannot work. If a scoped token is shown to
+ * create an index, the login can be dropped from every install and this constant
+ * is the one place to change.
+ */
+export const VECTORIZE_REMEDY =
+  "  Vectorize is reached through wrangler's own session, and that is the proven path:\n" +
+  "      npx wrangler@4 login\n" +
+  "  This is needed ALONGSIDE the API token, not instead of it: the token drives the\n" +
+  "  API steps. For a live install the login is also the better posture, because the\n" +
+  "  session is the client's, it expires on its own, and no long-lived key to their\n" +
+  "  account is ever stored on the installer's machine.\n" +
+  "  The account must ALSO be on the Workers Paid plan (5 USD a month). Vectorize\n" +
+  "  cannot create an index on the free tier at all.";
+
+/** The token scopes, in one place, for the same reason. */
+export const CF_TOKEN_SCOPES = ["Workers Scripts: Edit", "D1: Edit", "Workers AI: Read"];
+
 const IS_WIN = platform() === "win32";
 
 /**
@@ -248,10 +282,11 @@ export function checkCfToken() {
     FAIL,
     "CLOUDFLARE_API_TOKEN is not set",
     "Create one in the CLIENT's account: dash.cloudflare.com > My Profile > API Tokens.\n" +
-      "  Scopes: Workers Scripts Edit, D1 Edit, Workers AI Read.\n" +
-      "  Then: export CLOUDFLARE_API_TOKEN='...'\n" +
-      "  This is needed ALONGSIDE the wrangler login, not instead of it: the token\n" +
-      "  drives the API steps, and the login exists because no token can reach Vectorize."
+      `  Scopes: ${CF_TOKEN_SCOPES.join(", ")}.
+` +
+      "  Set \'Expires on\' to 7 days. Nothing here needs to outlive the install.\n" +
+      "  Then: export CLOUDFLARE_API_TOKEN=\'...\'\n" +
+      VECTORIZE_REMEDY
   );
 }
 

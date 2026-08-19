@@ -300,7 +300,7 @@ export async function upsertChunks(env, chunks) {
  * pretending the write completed inline would make read-after-write look
  * broken. Draining separately makes the lag a visible queue instead.
  */
-export async function drainOutbox(env, { embed, batchSize = 100 } = {}) {
+export async function drainOutbox(env, { embed, embedBatch, batchSize = 100, embedGroup = 50 } = {}) {
   const { results: pending } = await env.DB.prepare(
     `SELECT o.chunk_uid, c.text, c.source, c.doc_uid
      FROM vector_outbox o JOIN chunks c ON c.chunk_uid = o.chunk_uid
@@ -314,15 +314,49 @@ export async function drainOutbox(env, { embed, batchSize = 100 } = {}) {
   const vectors = [];
   const idToChunk = new Map();
   const poisoned = [];
-  for (const row of pending) {
-    let values;
-    try {
-      values = await embed(row.text);
-    } catch (e) {
-      // One unembeddable chunk must not strand every chunk behind it. Record the
-      // failure against that row and carry on; the queue keeps draining.
-      poisoned.push({ chunk_uid: row.chunk_uid, error: String(e.message || e).slice(0, 200) });
-      continue;
+
+  // Embed in groups when the caller can. One round trip per group instead of one
+  // per chunk is the difference between 1,200 chunks/hour and a number that
+  // finishes while the client is still on the call.
+  //
+  // A failed group falls back to embedding its members one at a time. That keeps
+  // the poison-isolation guarantee exactly as it was: a single bad chunk
+  // quarantines itself rather than taking the other 49 down with it.
+  const embedded = new Array(pending.length).fill(undefined);
+  if (embedBatch) {
+    for (let i = 0; i < pending.length; i += embedGroup) {
+      const group = pending.slice(i, i + embedGroup);
+      try {
+        const out = await embedBatch(group.map((r) => r.text));
+        if (!Array.isArray(out) || out.length !== group.length) {
+          throw new Error(`embedBatch returned ${out?.length ?? 0} vectors for ${group.length} texts`);
+        }
+        out.forEach((v, k) => { embedded[i + k] = v; });
+      } catch {
+        for (let k = 0; k < group.length; k++) {
+          try {
+            embedded[i + k] = await embed(group[k].text);
+          } catch (e) {
+            poisoned.push({ chunk_uid: group[k].chunk_uid, error: String(e.message || e).slice(0, 200) });
+          }
+        }
+      }
+    }
+  }
+
+  for (let idx = 0; idx < pending.length; idx++) {
+    const row = pending[idx];
+    let values = embedded[idx];
+    if (values === undefined) {
+      if (embedBatch && poisoned.some((p) => p.chunk_uid === row.chunk_uid)) continue;
+      try {
+        values = await embed(row.text);
+      } catch (e) {
+        // One unembeddable chunk must not strand every chunk behind it. Record the
+        // failure against that row and carry on; the queue keeps draining.
+        poisoned.push({ chunk_uid: row.chunk_uid, error: String(e.message || e).slice(0, 200) });
+        continue;
+      }
     }
     const vid = await vectorIdFor(row.chunk_uid);
     idToChunk.set(vid, row.chunk_uid);

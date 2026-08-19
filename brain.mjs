@@ -56,7 +56,7 @@ async function ingestLib() {
 }
 import { authorize, loadTokens, saveTokens, createTokenProvider, tokenPath, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
 import { run } from "./doctor.mjs";
-import { runAll as doctorRunAll, summarize as doctorSummarize, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL } from "./doctor.mjs";
+import { runAll as doctorRunAll, summarize as doctorSummarize, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
 
 // fileURLToPath, never `new URL(...).pathname`. The latter is percent-encoded,
 // so any install path containing a space resolves to a directory that does not
@@ -237,15 +237,14 @@ async function cmdVerify(manifestPath) {
     await cf(`/accounts/${acct.id}/vectorize/v2/indexes`);
     ok("Vectorize is reachable");
   } catch (e) {
-    warn(
-      "Vectorize is NOT reachable. Two separate causes, both need fixing:\n" +
-        "        1. TOKEN SCOPE. Add \"Vectorize: Edit\" to the API token.\n" +
-        "           dash.cloudflare.com > My Profile > API Tokens > edit the token.\n" +
-        "           An auth error here does NOT mean the token is invalid overall;\n" +
-        "           it means this one permission is missing.\n" +
-        "        2. PLAN. Vectorize requires the Workers Paid plan, 5 USD a month\n" +
-        "           minimum. The free tier cannot create an index at all.\n" +
-        `        detail: ${e.message.slice(0, 120)}`
+    // Expected on a correctly scoped token, so this is information rather than a
+    // warning. Calling it a problem sends clients off editing a token that was
+    // never the cause.
+    info(
+      "the API token cannot reach Vectorize. That is normal and does not mean your" + "\n" +
+        "      token is wrong; provision uses wrangler's session for this one step." + "\n" +
+        VECTORIZE_REMEDY + "\n" +
+        `      detail: ${e.message.slice(0, 120)}`
     );
   }
   return acct;
@@ -285,6 +284,117 @@ function wranglerAvailable(accountId) {
   return r.ok && /You are logged in|Account Name/i.test(r.out);
 }
 
+/**
+ * Pick the D1 database name, refusing any name too generic to adopt safely.
+ *
+ * Pure and exported so this is covered by a real test rather than a source grep.
+ * There is deliberately no generic default: a shared name is the one way
+ * provision can reach something that is not ours.
+ */
+/**
+ * Create the Vectorize metadata index on "source", and refuse to continue without it.
+ *
+ * Fatal on purpose. Measured against Vectorize on 2026-08-18: a vector written
+ * BEFORE the metadata index exists is not filterable afterwards, even though it
+ * is present in the index and comes back from unfiltered queries. Two vectors
+ * with identical metadata, one written before and one after; only the second was
+ * returned by a filtered query. So there is no repair short of re-ingesting
+ * everything, and a warning here buys a corpus that silently cannot be filtered.
+ *
+ * Injectable so the retry and the refusal are covered by a real test.
+ */
+export async function ensureMetadataIndex({ create, attempts = 3, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = ok, onFatal = die }) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await create();
+      log('metadata index on "source" created');
+      return true;
+    } catch (e) {
+      const msg = e?.message || String(e);
+      if (/already|exists|conflict/i.test(msg)) {
+        log('metadata index on "source" already present');
+        return true;
+      }
+      if (attempt === attempts) {
+        return onFatal(
+          `the metadata index on "source" could not be created: ${msg.slice(0, 120)}` + "\n" +
+            "  This CANNOT be added later. Vectorize applies a metadata index only to" + "\n" +
+            "  vectors written after it exists, so continuing would leave source filtering" + "\n" +
+            "  permanently broken for everything ingested from here on." + "\n" +
+            "  Nothing has been ingested yet, so re-running `brain provision` costs nothing."
+        );
+      }
+      await sleep(3000);
+    }
+  }
+}
+
+export function chooseDbName(cfg, slug) {
+  const name = cfg?.d1_database_name || (slug ? `${slug}-brain` : null);
+  if (!name || name === "brain" || /^REPLACE-WITH/i.test(name)) {
+    die(
+      `cannot use the D1 database name ${name ? `"${name}"` : "(none set)"}: it is too generic` + "\n" +
+        "  to provision safely. If this account already has one, it very likely belongs to" + "\n" +
+        "  something else, and provisioning would adopt it rather than create a new one." + "\n" +
+        `  Set infrastructure.cloudflare.d1_database_name to "${slug || "<client>"}-brain".`
+    );
+  }
+  return name;
+}
+
+/**
+ * Decide whether an existing D1 database may be adopted.
+ *
+ * Adoptable: an empty database (a re-run of provision after it created the
+ * database but before migrate), or one whose install_state names this same
+ * client (an ordinary re-run).
+ *
+ * NOT adoptable: a database holding tables that are not ours, or one that is
+ * another client's brain. Both die rather than warn, because by the time anyone
+ * reads a warning the damage is done: migrate writes into it, and the
+ * client_slug upsert relabels another client's brain as this one.
+ */
+export async function assertAdoptable(acctId, db, dbName, slug, query = d1Query) {
+  let names;
+  try {
+    const res = await query(
+      acctId, db.uuid,
+      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'"
+    );
+    names = (res?.results || []).map((r) => r.name);
+  } catch {
+    die(
+      `D1 "${dbName}" (${db.uuid}) already exists here but could not be inspected, so` + "\n" +
+        "  there is no way to tell whether it is ours. Refusing to adopt it." + "\n" +
+        "  Set infrastructure.cloudflare.d1_database_name to a name this account does not use."
+    );
+  }
+
+  if (!names.length) return; // empty: safe, this is a normal provision re-run
+
+  if (!names.includes("install_state")) {
+    die(
+      `D1 "${dbName}" (${db.uuid}) already exists in this account and is NOT a brain.` + "\n" +
+        `  It holds ${names.length} table(s): ${names.slice(0, 6).join(", ")}${names.length > 6 ? ", ..." : ""}` + "\n" +
+        "  Refusing to adopt someone else's database. Nothing has been changed." + "\n" +
+        "  Set infrastructure.cloudflare.d1_database_name to a name this account does not use."
+    );
+  }
+
+  let owner = null;
+  try {
+    const res = await query(acctId, db.uuid, "SELECT client_slug FROM install_state WHERE id = 1");
+    owner = res?.results?.[0]?.client_slug || null;
+  } catch { /* older schema */ }
+  if (owner && slug && owner !== slug) {
+    die(
+      `D1 "${dbName}" (${db.uuid}) is already the brain for "${owner}", not "${slug}".` + "\n" +
+        "  Refusing to adopt it: migrating would relabel their install as this one." + "\n" +
+        "  Set infrastructure.cloudflare.d1_database_name to a name this account does not use."
+    );
+  }
+}
+
 async function cmdProvision(manifestPath) {
   const { path, m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
@@ -297,10 +407,15 @@ async function cmdProvision(manifestPath) {
 
   // D1. Adopt an existing database of the same name rather than failing or
   // creating a second one, so provision is safe to re-run.
-  const dbName = cfg.d1_database_name || "brain";
+  // A name match is NOT proof of ownership: a client account can already hold a
+  // production database that happens to share the name, and adopting it would run
+  // our migrations into their data and bind a second worker to it.
+  const slug = m.client?.slug;
+  const dbName = chooseDbName(cfg, slug);
   const existing = await cf(`/accounts/${acct.id}/d1/database`);
   let db = (existing || []).find((d) => d.name === dbName);
   if (db) {
+    await assertAdoptable(acct.id, db, dbName, slug);
     ok(`D1 "${dbName}" already exists (${db.uuid}), adopting it`);
   } else {
     db = await cf(`/accounts/${acct.id}/d1/database`, {
@@ -351,14 +466,7 @@ async function cmdProvision(manifestPath) {
           `Vectorize is unreachable both ways, so the install cannot continue.\n` +
             `  API token: ${e.message.slice(0, 100)}\n` +
             "  wrangler:  not logged in.\n\n" +
-            "  Fix EITHER of these:\n" +
-            '    1. Add "Vectorize: Edit" to the API token at\n' +
-            "       dash.cloudflare.com > My Profile > API Tokens\n" +
-            "    2. Or run `npx wrangler@4 login` and re-run provision. For a live install\n" +
-            "       this is the better option: the session is the client's, it expires on\n" +
-            "       its own, and no long-lived key to their account is ever stored here.\n\n" +
-            "  Either way the account must be on the Workers Paid plan (5 USD a month);\n" +
-            "  Vectorize cannot create an index on the free tier at all."
+            VECTORIZE_REMEDY + "\n  Then re-run provision."
         );
       }
       const r = wrangler(["vectorize", "list"], { accountId: acct.id });
@@ -410,24 +518,20 @@ async function cmdProvision(manifestPath) {
       // A metadata index must exist BEFORE any vector is written; it does not
       // apply retroactively. Creating it after ingest means source filtering
       // silently matches nothing for everything already indexed.
-      try {
-        if (viaApi) {
-          await cf(`/accounts/${acct.id}/vectorize/v2/indexes/${idxName}/metadata_index`, {
-            method: "POST",
-            body: { propertyName: "source", indexType: "string" },
-          });
-        } else {
-          const r = wrangler(
-            ["vectorize", "create-metadata-index", idxName, "--property-name=source", "--type=string"],
-            { accountId: acct.id }
-          );
-          if (!r.ok && !/already|exists/i.test(r.out)) throw new Error(r.out.slice(-200));
-        }
-        ok('metadata index on "source" created');
-      } catch (e) {
-        if (/already|exists|conflict/i.test(e.message)) ok('metadata index on "source" already present');
-        else warn(`metadata index not created, source filtering will fall back to post-filtering: ${e.message.slice(0, 100)}`);
-      }
+      await ensureMetadataIndex({
+        create: viaApi
+          ? () => cf(`/accounts/${acct.id}/vectorize/v2/indexes/${idxName}/metadata_index`, {
+              method: "POST",
+              body: { propertyName: "source", indexType: "string" },
+            })
+          : async () => {
+              const r = wrangler(
+                ["vectorize", "create-metadata-index", idxName, "--property-name=source", "--type=string"],
+                { accountId: acct.id }
+              );
+              if (!r.ok && !/already|exists/i.test(r.out)) throw new Error(r.out.slice(-200));
+            },
+      });
 
       cfg.vectorize_index = idxName;
     } catch (e) {
@@ -435,8 +539,7 @@ async function cmdProvision(manifestPath) {
       die(
         `Vectorize could not be provisioned: ${e.message.slice(0, 140)}\n` +
           "  This is the storage backend, so the install cannot continue without it.\n" +
-          '  Fix: add "Vectorize: Edit" to the API token, and confirm the account is on\n' +
-          "  the Workers Paid plan (5 USD a month, which Vectorize requires).\n" +
+          VECTORIZE_REMEDY + "\n" +
           "  To install against Postgres instead, set infrastructure.cloudflare.storage\n" +
           '  to "supabase" in the manifest.'
       );
@@ -1339,6 +1442,67 @@ function assertSourceName(name) {
   return name;
 }
 
+/**
+ * Flags that mean nothing without a value. Given bare, they used to parse to
+ * boolean `true`, which is truthy, so the good error message was skipped and the
+ * value flowed on: `--path` reached existsSync(true) and reported "no such
+ * folder: true", and `--limit` silently ingested nothing at all.
+ *
+ * `--report` is deliberately absent: a bare --report means "use the generated
+ * filename", which is intended.
+ */
+export const VALUE_FLAGS = new Set(["path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark"]);
+
+/**
+ * Refuse to write a secret somewhere it will be published or lost.
+ *
+ * The key lands next to the manifest, which is wherever the operator happened to
+ * be standing. In the field test that was C:\\Windows\\system32, the default
+ * directory of an elevated PowerShell. A sync root is worse: it uploads the key
+ * to a third party without anyone doing anything they would call careless.
+ */
+export function assertKeyDirSafe(dir) {
+  const sys = [
+    /^[a-z]:[\\/](windows|program files( \(x86\))?)([\\/]|$)/i,
+    /^\/(usr|bin|sbin|etc|var|System|Library)(\/|$)/,
+  ];
+  if (sys.some((re) => re.test(dir))) {
+    die(
+      `refusing to write the admin key into a system directory:` + "\n" +
+        `    ${dir}` + "\n" +
+        "  Run this from a folder you own, for example:" + "\n" +
+        "    cd ~/brain    (or  cd %USERPROFILE%\\brain  on Windows)"
+    );
+  }
+  const synced = [/OneDrive/i, /Dropbox/i, /Google ?Drive/i, /CloudStorage/i, /Mobile Documents/i, /[\\/]Box[\\/]/i];
+  if (synced.some((re) => re.test(dir))) {
+    warn(
+      `${dir}` + "\n" +
+        "        looks like a synced folder. The admin key is about to be written there," + "\n" +
+        "        which uploads it to a third party. Moving the install elsewhere is safer."
+    );
+  }
+}
+
+/** Defuse the likeliest accident: committing the key. */
+function gitignoreTheKey(dir) {
+  let d = dir;
+  for (let i = 0; i < 8; i++) {
+    if (existsSync(join(d, ".git"))) {
+      const gi = join(dir, ".gitignore");
+      const cur = existsSync(gi) ? readFileSync(gi, "utf-8") : "";
+      if (!/^\.brain-admin-key\s*$/m.test(cur)) {
+        writeFileSync(gi, (cur && !cur.endsWith("\n") ? cur + "\n" : cur) + ".brain-admin-key\n");
+      }
+      warn(`the admin key is inside a git repository. Added it to ${relative(process.cwd(), gi)}.`);
+      return;
+    }
+    const up = dirname(d);
+    if (up === d) return;
+    d = up;
+  }
+}
+
 function parseFlags(argv) {
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
@@ -1348,6 +1512,8 @@ function parseFlags(argv) {
     if (next && !next.startsWith("--")) {
       flags[key] = next;
       i++;
+    } else if (VALUE_FLAGS.has(key)) {
+      die(`--${key} needs a value, for example: --${key} <value>`);
     } else {
       flags[key] = true;
     }
@@ -1958,7 +2124,7 @@ async function cmdIngest(manifestPath) {
   await reportSkips(skips);
 
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
-  info("the vector index trails the text by a few minutes; check with `brain health`");
+  await reportBacklog(manifestPath);
 }
 
 
@@ -2180,7 +2346,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   if (tally.failed) warn(`${tally.failed} failed. Re-running will retry them.`);
   await reportSkips(skips);
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
-  info("the vector index trails the text by a few minutes; check with `brain health`");
+  await reportBacklog(manifestPath);
 }
 
 /** POST every batch, recording progress after each so a stop is resumable. */
@@ -2600,10 +2766,27 @@ async function cmdSetup(manifestPath) {
     // worker and into the MCP registrations, and exited. Nothing on disk held
     // it, so `brain ingest` and `brain test` died the next morning asking for a
     // key the client had never seen.
-    const keyPath = join(dirname(resolve(target)), ".brain-admin-key");
-    writeFileSync(keyPath, process.env.ADMIN_KEY + "\n");
-    try { chmodSync(keyPath, 0o600); } catch { /* Windows has no POSIX mode */ }
-    info(`admin key saved to ${relative(process.cwd(), keyPath)} (commands read it from there automatically)`);
+    const keyDir = dirname(resolve(target));
+    assertKeyDirSafe(keyDir);
+    const keyPath = join(keyDir, ".brain-admin-key");
+    // mode on the WRITE, so the file never exists as 0644 even briefly.
+    writeFileSync(keyPath, process.env.ADMIN_KEY + "\n", { mode: 0o600 });
+    if (process.platform === "win32") {
+      // chmodSync on Windows only toggles the read-only bit and does not throw,
+      // so the POSIX call above is silently a no-op on the one platform this
+      // finding came from. Restrict the ACL properly instead.
+      const who = process.env.USERNAME || process.env.USER;
+      const r = who ? run("icacls", [keyPath, "/inheritance:r", "/grant:r", `${who}:F`]) : { ok: false };
+      if (!r.ok) warn(`could not restrict permissions on ${keyPath}. Check who can read it.`);
+    } else {
+      try { chmodSync(keyPath, 0o600); } catch { /* best effort */ }
+    }
+    gitignoreTheKey(keyDir);
+    warn(
+      `SECRET: ${relative(process.cwd(), keyPath)}` + "\n" +
+        "        This key reads the entire brain. Commands pick it up from there" + "\n" +
+        "        automatically. Do not commit it and do not leave it in a synced folder."
+    );
   }
   if (!process.env.ANTHROPIC_API_KEY) {
     console.log(
@@ -2635,7 +2818,14 @@ async function cmdSetup(manifestPath) {
   }
 
   closePrompts();
+  const outstanding = await backlogCount(target).catch(() => 0);
   console.log(`\n  ${c.green(c.bold("Your brain is live."))}\n`);
+  if (outstanding > 0) {
+    console.log(
+      `  ${c.yellow("Keyword search works now.")} ${outstanding} chunk(s) are still embedding, so\n` +
+        `  meaning-based search is incomplete until they finish. Run:\n    brain drain ${relative(process.cwd(), target)}\n`
+    );
+  }
   if (wired.length) {
     console.log(`  It is connected to: ${wired.join(", ")}.`);
     console.log(`  ${c.dim("Restart them, then ask a question about your own material.")}\n`);
@@ -2871,6 +3061,97 @@ const IS_MAIN = (() => {
 })();
 
 const [, , cmd, manifestPath] = process.argv;
+/**
+ * Drive the vector drain to completion instead of waiting for the cron.
+ *
+ * The initial load is a one-off bulk event, unlike the steady trickle the cron
+ * is sized for. Waiting it out is what makes an install look mediocre: the brain
+ * answers keyword queries confidently while most of its own material is
+ * semantically invisible, and nothing on screen explains why.
+ *
+ * The rate printed here is MEASURED from the drain in progress, not assumed.
+ */
+/**
+ * Say what is actually outstanding after an ingest, rather than "a few minutes".
+ *
+ * Jay measured the real figure on a 2 MB folder: 1,001 chunks, ~50 minutes, and
+ * a message promising minutes. Understating this is a first-impression risk on
+ * the highest-stakes interaction of the engagement, so the number is read from
+ * the install rather than guessed at.
+ */
+/** Chunks still awaiting embedding, or 0 if it cannot be determined. */
+async function backlogCount(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  const acct = await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) return 0;
+  const res = await http(`${base}/api/admin/brain/documents`, { headers: { "X-Admin-Key": adminKey } },
+    { timeoutMs: 30_000, what: "the backlog check" });
+  if (!res.ok) return 0;
+  return Number((await res.json())?.vector_backlog?.pending || 0);
+}
+
+async function reportBacklog(manifestPath) {
+  try {
+    const { m } = loadManifest(manifestPath);
+    const acct = await resolveAccount(m);
+    const base = await resolveBaseUrl(m, acct);
+    const adminKey = resolveAdminKey(manifestPath);
+    if (!adminKey) return;
+    const res = await http(`${base}/api/admin/brain/documents`, { headers: { "X-Admin-Key": adminKey } },
+      { timeoutMs: 30_000, what: "the backlog check" });
+    if (!res.ok) return;
+    const pending = Number((await res.json())?.vector_backlog?.pending || 0);
+    if (!pending) { ok("the vector index is already caught up: semantic search is live now"); return; }
+    const rel = relative(process.cwd(), manifestPath || "./brain.manifest.json");
+    warn(
+      `${pending} chunk(s) are queued for embedding. Until they drain they are findable` + "\n" +
+        "        by keyword and INVISIBLE to meaning-based search, and nothing else reports that." + "\n" +
+        `        Finish it now instead of waiting for the cron:  brain drain ${rel}`
+    );
+  } catch {
+    // Never fail an ingest because the follow-up report could not be fetched.
+    info("the vector index trails the text; check with `brain health`");
+  }
+}
+
+async function cmdDrain(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  const acct = await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
+
+  const started = Date.now();
+  let drained = 0;
+  let remaining = null;
+  for (let round = 1; round <= 400; round++) {
+    const res = await http(`${base}/api/admin/brain/drain`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey },
+    }, { timeoutMs: 180_000, what: "the drain" });
+    if (!res.ok) die(`drain failed (${res.status}): ${(await res.text()).slice(0, 200)}`);
+    const j = await res.json().catch(() => ({}));
+    drained += Number(j.drained || 0);
+    remaining = Number(j.remaining || 0);
+    const mins = (Date.now() - started) / 60000;
+    const rate = mins > 0.05 ? Math.round(drained / mins) : null;
+    info(
+      `${drained} embedded, ${remaining} to go` +
+        (rate ? `, ~${rate}/min` : "") +
+        (rate && remaining ? `, about ${Math.max(1, Math.ceil(remaining / rate))} min left` : "")
+    );
+    if (!remaining) break;
+    if (!j.drained) {
+      warn("the drain stopped making progress. `brain health` will show why.");
+      break;
+    }
+  }
+  if (remaining === 0) ok(`vector index is caught up (${drained} embedded)`);
+  return { drained, remaining };
+}
+
 const commands = {
   setup: cmdSetup,
   doctor: cmdDoctor,
@@ -2888,6 +3169,7 @@ const commands = {
   status: cmdStatus,
   sources: cmdSources,
   forget: cmdForget,
+  drain: cmdDrain,
   upgrade: cmdUpgrade,
   rollback: cmdRollback,
 };
@@ -2904,6 +3186,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain migrate    <manifest>            apply pending schema migrations
     brain deploy     <manifest>            upload the worker with its bindings
     brain health     <manifest>            prove the install actually works
+    brain drain      <manifest>            finish the vector embedding now, with a live ETA
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail  authorise the client's own Google account
     brain ingest     <manifest> --path <dir>  load a folder into the brain
@@ -2943,7 +3226,11 @@ if (IS_MAIN) {
     // point, so print it plainly. Anything else is a bug, and crash() says so
     // rather than dressing it up as the client's problem.
     if (e instanceof Fatal) {
-      console.error(`${c.red("fail")}  ${e.message}`);
+      // stdout, not stderr. This message is anticipated, already formatted, and
+      // addressed to the user; the exit code is the machine-readable part.
+      // PowerShell wraps anything on stderr in a NativeCommandError block, which
+      // makes a clear explanation look like the tool itself fell over.
+      console.log(`${c.red("fail")}  ${e.message}`);
       process.exit(1);
     }
     crash(e);

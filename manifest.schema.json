@@ -47,7 +47,7 @@
               "default": "d1",
               "description": "d1 keeps the entire brain inside the client's own Cloudflare account. supabase is the upgrade, taken at roughly 250k chunks."
             },
-            "d1_database_name": { "type": "string", "default": "brain" },
+            "d1_database_name": { "type": "string", "description": "Must be scoped to the client, e.g. acme-brain. A bare \"brain\" is refused at provision: it may already exist in the account and belong to something else." },
             "d1_database_id": { "type": "string" },
             "vectorize_index": {
               "type": "string",

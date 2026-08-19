@@ -21,7 +21,7 @@ import { jsonResponse, cachedJson, validateAdminKey, callLLM } from "./lib/core.
 import { scan as scanSecrets } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
 import { drainOutbox, outboxDepth, forget } from "./lib/store-d1.js";
-import { embedText } from "./lib/supabase.js";
+import { embedText, embedTexts } from "./lib/supabase.js";
 
 /* ------------------------------------------------------------ retrieval */
 
@@ -618,7 +618,7 @@ export default {
         let total = 0;
         let remaining = 0;
         for (let i = 0; i < 10; i++) {
-          const r = await drainOutbox(env, { embed: (text) => embedText(env, text) });
+          const r = await drainOutbox(env, { embed: (text) => embedText(env, text), embedBatch: (texts) => embedTexts(env, texts) });
           total += r.drained;
           remaining = r.remaining;
           if (!r.drained || !r.remaining) break;
@@ -648,7 +648,7 @@ export default {
         // Bounded, because a Worker invocation has a wall clock and an unbounded
         // loop on a large backfill would be killed mid-batch every time.
         for (let i = 0; i < 10; i++) {
-          const r = await drainOutbox(env, { embed: (text) => embedText(env, text) });
+          const r = await drainOutbox(env, { embed: (text) => embedText(env, text), embedBatch: (texts) => embedTexts(env, texts) });
           total += r.drained;
           if (!r.drained || !r.remaining) break;
         }
