@@ -47,6 +47,20 @@ const VALUE_FLAGS = new Set(["config", "golden", "base", "limit", "k", "baseline
 const BOOL_FLAGS = new Set(["rerank", "graph-boost", "no-think", "json", "help"]);
 
 /**
+ * Effects this harness cannot resolve.
+ *
+ * Two runs 29 seconds apart with identical effective configuration differed by
+ * 3.8 points of recall@1 AND recall@5, and flipped 8 of 30 questions. Retrieval
+ * here is approximate-nearest-neighbour, so it is not deterministic, and until
+ * 2026-08-18 nobody had measured the spread. Anything smaller than the measured
+ * floor is noise wearing the costume of a result.
+ *
+ * Run with --repeat N to measure the floor for YOUR install before believing a
+ * small win. The default is the value observed on james-ring0.
+ */
+const ASSUMED_NOISE_FLOOR_PTS = 3.8;
+
+/**
  * Unknown flags are a hard error rather than a shrug.
  *
  * A misspelled `--reranker` that silently falls back to the default config
@@ -175,6 +189,14 @@ function report(run, regressions, improvements, k) {
   L.push(`  variant    limit=${variant.limit} rerank=${variant.rerank} graph_boost=${variant.graphBoost}`);
   L.push("");
   L.push(`  RECALL@${k}   ${pct(agg.recall[k])}   <- headline`);
+  if (run.noise) {
+    const n = run.noise;
+    L.push("");
+    L.push(`  NOISE FLOOR  measured over ${n.passes} identical passes`);
+    L.push(`    recall@1 varied ${n.recall_1.spread_pts.toFixed(1)} pts, recall@${k} varied ${n.recall_k.spread_pts.toFixed(1)} pts`);
+    L.push(`    ${n.questions_flipped} of ${n.questions_total} questions landed on a different rank between passes`);
+    L.push(`    -> treat any change smaller than ${n.floor_pts.toFixed(1)} points as UNPROVEN.`);
+  }
   L.push("");
   L.push(`  recall@1   ${pct(agg.recall[1])}       recall@${k} by document  ${pct(aggByDoc.recall[k])}`);
   L.push(`  MRR        ${agg.mrr.toFixed(3)}       recall@1 by document  ${pct(aggByDoc.recall[1])}`);
@@ -248,8 +270,47 @@ function trunc(s, n) {
 
 /* -------------------------------------------------------------------- main */
 
+/**
+ * Record WHAT was measured, not just the score.
+ *
+ * The saved baselines carried no corpus size, no worker version and no commit,
+ * so two of them could differ because the code changed, because the corpus grew,
+ * or because ANN retrieval simply landed differently, and nothing on disk could
+ * tell you which.
+ */
+async function collectProvenance(client, base) {
+  const p = { base, corpus: null, worker: null, git: null };
+  try {
+    const docs = await client.documents?.();
+    if (docs) p.corpus = { documents: docs.documents ?? null, chunks: docs.chunks ?? null, embedded: docs.embedded ?? null,
+                           vector_backlog: docs.vector_backlog?.pending ?? null };
+  } catch { /* provenance is best effort and must never fail a run */ }
+  try {
+    const { execFileSync } = await import("node:child_process");
+    p.git = execFileSync("git", ["rev-parse", "--short", "HEAD"], { encoding: "utf-8" }).trim();
+  } catch { /* not a repo */ }
+  return p;
+}
+
 async function main() {
   const { flags, bools } = parseArgs(process.argv.slice(2));
+
+  // Refuse an impossible flag BEFORE reading a config or a golden set, so the
+  // refusal cannot be masked by an unrelated path error.
+  //
+  // graph_boost is accepted here and handled NOWHERE in the worker. It was
+  // silently inert, and two baselines were saved under its name, so a 3.8 point
+  // swing that was pure run-to-run noise got recorded as its effect. That is how
+  // eval/baselines/2026-08-16_graphboost.json came to exist.
+  if (bools.has("graph-boost")) {
+    throw new Error(
+      "--graph-boost does nothing.\n" +
+        "  The worker has no handler for graph_boost, so this run would measure the\n" +
+        "  DEFAULT configuration and save it under another name. Two baselines were\n" +
+        "  created that way and the difference between them was pure noise.\n" +
+        "  Implement it in the worker first, or drop the flag."
+    );
+  }
 
   if (bools.has("help")) {
     console.log(
@@ -262,7 +323,10 @@ async function main() {
         "  --limit <n>         results requested per question (default 10)",
         "  --k <n>             the k in the headline recall@k (default 5)",
         "  --rerank            turn the reranker on for this run",
-        "  --graph-boost       turn the knowledge graph boost on for this run",
+        "  --repeat <n>        run the SAME config n times and report the noise floor.",
+        "                      Do this before believing a small win: retrieval is",
+        "                      approximate, so identical runs differ.",
+        "  --graph-boost       REFUSED: the worker has no handler for it",
         "  --no-think          skip the unanswerable probes (they cost LLM calls)",
         "  --baseline <path>   compare against a saved run",
         "  --save <path>       write this run to disk",
@@ -310,6 +374,9 @@ async function main() {
   };
   if (opts.limit < k) throw new Error(`--limit ${opts.limit} is below --k ${k}, recall@${k} would be meaningless.`);
 
+
+  const repeat = Math.max(1, Number(flags.repeat || 1));
+
   const adminKey = await resolveAdminKey(cfg);
   const client = new BrainClient({ base, adminKey, timeoutMs: Number(cfg.timeout_ms || 30000) });
 
@@ -335,9 +402,14 @@ async function main() {
     );
   }
 
-  const scored = await mapWithConcurrency(golden.questions, Number(cfg.concurrency || 4), (q) =>
-    runOne(client, q, opts)
-  );
+  const passes = [];
+  for (let i = 0; i < repeat; i++) {
+    if (repeat > 1) console.error(`  pass ${i + 1} of ${repeat}...`);
+    passes.push(
+      await mapWithConcurrency(golden.questions, Number(cfg.concurrency || 4), (q) => runOne(client, q, opts))
+    );
+  }
+  const scored = passes[0];
 
   // A transport failure partway through is not a retrieval result. Saying so is
   // the difference between a bad number and no number.
@@ -363,9 +435,41 @@ async function main() {
     passed: conclusive.filter((s) => s.refusal.pass).length,
   };
 
+  // What this harness can and cannot resolve, measured rather than assumed.
+  let noise = null;
+  if (repeat > 1) {
+    const aggs = passes.map((p) => {
+      const r = p.filter((s) => s.kind !== "unanswerable");
+      return aggregate(r, [1, k]);
+    });
+    const spread = (f) => {
+      const xs = aggs.map(f);
+      return { min: Math.min(...xs), max: Math.max(...xs), spread_pts: (Math.max(...xs) - Math.min(...xs)) * 100 };
+    };
+    // How many questions land on a different rank between passes.
+    const ranks = passes.map((p) => Object.fromEntries(p.map((q) => [q.id, q.satisfiedAt])));
+    let flipped = 0;
+    for (const id of Object.keys(ranks[0])) {
+      if (ranks.some((r) => r[id] !== ranks[0][id])) flipped++;
+    }
+    noise = {
+      passes: repeat,
+      recall_1: spread((a) => a.recall[1]),
+      recall_k: spread((a) => a.recall[k]),
+      mrr: spread((a) => a.mrr),
+      questions_flipped: flipped,
+      questions_total: Object.keys(ranks[0]).length,
+      floor_pts: Math.max(spread((a) => a.recall[1]).spread_pts, spread((a) => a.recall[k]).spread_pts),
+    };
+  }
+
   const run = {
     ran_at: new Date().toISOString(),
     base,
+    // Provenance. Without it a baseline is a number with no idea what produced
+    // it, and six months later nobody can say whether two are comparable.
+    provenance: await collectProvenance(client, base),
+    noise,
     goldenLabel: `${golden.install || "unnamed"} (${golden.questions.length} questions)`,
     golden_path: goldenPath,
     variant: { limit: opts.limit, rerank: opts.rerank, graphBoost: opts.graphBoost },
