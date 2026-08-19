@@ -439,6 +439,53 @@ export async function drainOutbox(env, { embed, embedBatch, batchSize = 100, emb
 }
 
 /** How far the vector index is behind the text. Surfaced by health and report. */
+/**
+ * Re-queue every chunk for embedding, rebuilding Vectorize from D1.
+ *
+ * D1 holds the chunk TEXT, so the vector store is fully reconstructible without
+ * the original source files. That matters more than it sounds:
+ *
+ *  - `brain rollback` restores D1 and cannot rewind Vectorize, so the two
+ *    stores silently desynchronise. This is the resync.
+ *  - Vectorize has no backup, no export and no point-in-time restore. D1 is the
+ *    only copy of the text, and this is what turns that into a recovery path.
+ *  - A metadata index added after ingest does not apply to vectors already
+ *    written. Verified 2026-08-18: re-upserting the SAME vector id after the
+ *    index exists DOES make it filterable, so this repairs that too, without
+ *    the client needing the original folder in the state it was in.
+ *
+ * Deliberately reuses the outbox rather than writing vectors directly, so the
+ * drain's batching, poison quarantine and vector_id write-back all apply
+ * unchanged. INSERT OR IGNORE keeps it safe to run twice.
+ */
+export async function reindex(env, { source = null, dryRun = true } = {}) {
+  const where = source ? "WHERE d.source = ?1" : "";
+  const bind = source ? [source] : [];
+
+  const countRow = await env.DB.prepare(
+    `SELECT count(*) AS n FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid ${where}`
+  ).bind(...bind).first();
+  const chunks = Number(countRow?.n || 0);
+
+  if (!chunks) return { chunks: 0, queued: 0, already_queued: 0, dry_run: dryRun, source };
+
+  const beforeRow = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+  const before = Number(beforeRow?.n || 0);
+
+  if (dryRun) return { chunks, queued: 0, already_queued: before, dry_run: true, source };
+
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO vector_outbox (chunk_uid, op, queued_at, attempts, last_error)
+     SELECT c.chunk_uid, 'upsert', ?${source ? "2" : "1"}, 0, NULL
+     FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid ${where}`
+  ).bind(...bind, Date.now()).run();
+
+  const afterRow = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+  const after = Number(afterRow?.n || 0);
+
+  return { chunks, queued: after - before, already_queued: before, pending: after, dry_run: false, source };
+}
+
 export async function outboxDepth(env) {
   const row = await env.DB.prepare(
     "SELECT count(*) AS n, min(queued_at) AS oldest FROM vector_outbox"

@@ -4,6 +4,21 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.3
+
+One new command, and it is the one that gets you out of trouble.
+
+- **`brain reindex <manifest>`** rebuilds the search index from your own brain,
+  without needing the original documents. Your text lives in the brain's
+  database, so the index can always be rebuilt from it. That covers every way
+  the two can drift apart: a restore that rolled back one and not the other, a
+  setting that only applies to documents added after it, or an index that is
+  simply lost. It previews first and changes nothing until you add `--yes`, and
+  it never deletes anything.
+
+**If your source filtering has ever looked wrong,** this is the fix, and you do
+not need the original folder to run it.
+
 ## 0.1.2
 
 The rest of the findings from the first Windows install, plus one thing that

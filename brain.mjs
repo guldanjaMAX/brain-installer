@@ -3116,6 +3116,60 @@ async function reportBacklog(manifestPath) {
   }
 }
 
+/**
+ * Rebuild the vector index from D1, without the original source files.
+ *
+ * D1 holds the chunk text, so this is the recovery path for every way the two
+ * stores can drift apart: a rollback that restored D1 and left Vectorize where
+ * it was, a metadata index created after ingest (verified 2026-08-18: a
+ * re-upsert of the same id DOES become filterable, so this repairs it), or a
+ * Vectorize index that was lost, since it has no backup or export of its own.
+ *
+ * Dry runs by default, like forget, and arms with --yes.
+ */
+async function cmdReindex(manifestPath) {
+  const flags = parseFlags(process.argv.slice(3));
+  const { m } = loadManifest(manifestPath);
+  const acct = await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
+  const source = flags.source && flags.source !== true ? assertSourceName(flags.source) : null;
+
+  const call = async (confirm) => {
+    const res = await http(`${base}/api/admin/brain/reindex`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ source, confirm }),
+    }, { timeoutMs: 120_000, what: "the reindex" });
+    if (!res.ok) die(`reindex failed (${res.status}): ${(await res.text()).slice(0, 200)}`);
+    return res.json();
+  };
+
+  const plan = await call(false);
+  if (!plan.chunks) {
+    ok(source ? `nothing to reindex for source "${source}"` : "nothing to reindex: this brain has no chunks yet");
+    return plan;
+  }
+
+  info(`${plan.chunks} chunk(s) would be re-embedded${source ? ` from source "${source}"` : ""}.`);
+  if (!flags.yes) {
+    warn(
+      "nothing has changed. This was a preview." + "\n" +
+        `        Re-run with --yes to rebuild the vector index from D1.` + "\n" +
+        "        Your documents are not re-read, so the source folder is not needed."
+    );
+    return plan;
+  }
+
+  const done = await call(true);
+  ok(`${done.queued} chunk(s) queued for re-embedding`);
+  if (!done.queued) {
+    info("everything was already queued; draining what is there.");
+  }
+  return cmdDrain(manifestPath);
+}
+
 async function cmdDrain(manifestPath) {
   const { m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
@@ -3170,6 +3224,7 @@ const commands = {
   sources: cmdSources,
   forget: cmdForget,
   drain: cmdDrain,
+  reindex: cmdReindex,
   upgrade: cmdUpgrade,
   rollback: cmdRollback,
 };
@@ -3187,6 +3242,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain deploy     <manifest>            upload the worker with its bindings
     brain health     <manifest>            prove the install actually works
     brain drain      <manifest>            finish the vector embedding now, with a live ETA
+    brain reindex    <manifest>            rebuild the vector index from D1, no source files needed
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail  authorise the client's own Google account
     brain ingest     <manifest> --path <dir>  load a folder into the brain

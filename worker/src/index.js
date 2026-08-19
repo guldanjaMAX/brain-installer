@@ -20,7 +20,7 @@
 import { jsonResponse, cachedJson, validateAdminKey, callLLM } from "./lib/core.js";
 import { scan as scanSecrets } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { drainOutbox, outboxDepth, forget } from "./lib/store-d1.js";
+import { drainOutbox, outboxDepth, forget, reindex } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 
 /* ------------------------------------------------------------ retrieval */
@@ -613,6 +613,12 @@ export default {
       // Force a drain. The cron normally does this, but when the cron is wedged
       // the backlog only clears by hand, and the alternative for whoever is
       // holding the pager is waiting and hoping.
+      if (path === "/api/admin/brain/reindex" && request.method === "POST") {
+        if (backendOf(env) !== D1) return jsonResponse({ error: "reindex applies to the d1 backend only" }, 400);
+        const body = await request.json().catch(() => ({}));
+        const r = await reindex(env, { source: body.source || null, dryRun: body.confirm !== true });
+        return jsonResponse(r);
+      }
       if (path === "/api/admin/brain/drain" && request.method === "POST") {
         if (backendOf(env) !== D1) return jsonResponse({ error: "drain applies to the d1 backend only" }, 400);
         let total = 0;
