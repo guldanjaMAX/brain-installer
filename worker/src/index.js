@@ -20,7 +20,7 @@
 import { jsonResponse, cachedJson, validateAdminKey, callLLM } from "./lib/core.js";
 import { scan as scanSecrets } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { drainOutbox, outboxDepth, forget, reindex, coverageGaps, freshnessReport } from "./lib/store-d1.js";
+import { drainOutbox, outboxDepth, forget, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 
 /* ------------------------------------------------------------ retrieval */
@@ -596,6 +596,13 @@ export default {
       // Per-source freshness. Separate from /documents on purpose: that endpoint
       // answers "how much is in here", this one answers "how much of it is
       // current", and conflating them is how staleness stayed invisible.
+      // Post-install diagnostic. Deliberately separate from /health: health
+      // answers "is it up", this answers "is what is in it correct and complete",
+      // and every failure this product has had lived in the gap between those.
+      if (path === "/api/admin/brain/diagnose" && request.method === "GET") {
+        if (backendOf(env) !== D1) return jsonResponse({ error: "diagnose applies to the d1 backend only" }, 400);
+        return jsonResponse(await diagnose(env));
+      }
       if (path === "/api/admin/brain/freshness" && request.method === "GET") {
         if (backendOf(env) !== D1) return jsonResponse({ error: "freshness applies to the d1 backend only" }, 400);
         return jsonResponse(await freshnessReport(env));

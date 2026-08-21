@@ -4,6 +4,28 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.6
+
+**`brain diagnose <manifest>`** — run this after a load. It answers three
+questions that nothing else answered:
+
+- **Is anything missing?** Documents that were indexed but hold no text, which is
+  almost always a scanned PDF. Sources registered but never loaded. Documents
+  that no source owns, which means they cannot be removed later.
+- **Is it stored correctly?** Above all, it compares the number of chunks in your
+  brain against the number actually in the search index. **Nothing compared those
+  two numbers before**, and that single comparison would have caught the one
+  serious failure this product has had, on the day it happened rather than a week
+  later.
+- **Is it stored well?** One spreadsheet that has become most of your corpus. Text
+  long enough to be silently cut before it is indexed. The same document loaded
+  twice under two names.
+
+Every finding says what it means and what to do about it. The point is that all
+of these are invisible to an ordinary health check: the brain reports itself well
+and is quietly incomplete, and the client concludes the product is mediocre
+rather than that something broke.
+
 ## 0.1.5
 
 Two fixes from the second field report, and the first one matters.

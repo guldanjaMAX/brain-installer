@@ -3253,6 +3253,72 @@ async function reportBacklog(manifestPath) {
  *
  * Dry runs by default, like forget, and arms with --yes.
  */
+/** Render a diagnosis for a human. Exported so it can be exercised without a network. */
+export function renderDiagnosis(r) {
+  console.log(`\n  ${c.bold("what is in the brain")}`);
+  console.log(`    ${num(r.totals.documents).padStart(9)}  documents`);
+  console.log(`    ${num(r.totals.chunks).padStart(9)}  chunks`);
+  console.log(`    ${num(r.totals.sources).padStart(9)}  sources`);
+
+  const AREAS = [
+    ["coverage", "is anything missing"],
+    ["integrity", "is it stored correctly"],
+    ["efficiency", "is it stored well"],
+    ["meta", "checks that could not run"],
+  ];
+  const MARK = { crit: c.red("!!"), warn: c.yellow(" !"), info: c.dim(" ·"), ok: c.green(" ok") };
+
+  for (const [area, label] of AREAS) {
+    const fs = (r.findings || []).filter((f) => f.area === area);
+    if (!fs.length) continue;
+    console.log(`\n  ${c.bold(label)}`);
+    for (const f of fs) {
+      console.log(`    ${MARK[f.severity] || "  "}  ${f.title}`);
+      if (f.detail) console.log(`         ${c.dim(f.detail)}`);
+      for (const sm of (f.samples || []).slice(0, 5)) console.log(`           ${c.dim("- " + String(sm).slice(0, 96))}`);
+      if (f.action) console.log(`         ${c.bold("do:")} ${f.action}`);
+    }
+  }
+
+  const s = r.summary || {};
+  console.log("");
+  if (r.verdict === "healthy") {
+    ok("nothing is missing, nothing is stored wrong, and nothing is being wasted.");
+  } else if (r.verdict === "usable_with_gaps") {
+    warn(`the brain works, with ${s.warn} thing(s) worth fixing. Nothing here makes an answer wrong.`);
+  } else {
+    warn(
+      `${s.crit} problem(s) that WILL make answers wrong or incomplete, and ${s.warn} worth fixing.` + "\n" +
+        "        Each one above says what to do. None of them would show up in `brain health`."
+    );
+  }
+  return r;
+}
+
+/**
+ * Post-install diagnostic. What is missing, what is stored wrong, what is stored
+ * wastefully.
+ *
+ * Written to be read by the person who paid for the install, not by whoever
+ * built it. Every finding says what it means and what to do, because a number
+ * without an action just moves the problem.
+ */
+async function cmdDiagnose(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  const acct = await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
+
+  const res = await http(`${base}/api/admin/brain/diagnose`, { headers: { "X-Admin-Key": adminKey } },
+    { timeoutMs: 120_000, what: "the diagnostic" });
+  if (!res.ok) die(`diagnose failed (${res.status}): ${(await res.text()).slice(0, 200)}`);
+  const r = await res.json();
+
+  renderDiagnosis(r);
+  return r;
+}
+
 async function cmdReindex(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
   const { m } = loadManifest(manifestPath);
@@ -3351,6 +3417,7 @@ const commands = {
   forget: cmdForget,
   drain: cmdDrain,
   reindex: cmdReindex,
+  diagnose: cmdDiagnose,
   upgrade: cmdUpgrade,
   rollback: cmdRollback,
 };
@@ -3369,6 +3436,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain health     <manifest>            prove the install actually works
     brain drain      <manifest>            finish the vector embedding now, with a live ETA
     brain reindex    <manifest>            rebuild the vector index from D1, no source files needed
+    brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail  authorise the client's own Google account
     brain ingest     <manifest> --path <dir>  load a folder into the brain

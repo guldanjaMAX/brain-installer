@@ -458,6 +458,259 @@ export async function drainOutbox(env, { embed, embedBatch, batchSize = 100, emb
  * drain's batching, poison quarantine and vector_id write-back all apply
  * unchanged. INSERT OR IGNORE keeps it safe to run twice.
  */
+/** Chunks past this are near the embedding model's 512-token ceiling and risk silent truncation. */
+const CHUNK_CHAR_WARN = 1800;
+/** Past this many chunks, recall degrades quietly rather than failing. */
+const CORPUS_COMFORT_CEILING = 100000;
+
+const q1 = async (env, sql, ...bind) => {
+  const st = env.DB.prepare(sql);
+  return await (bind.length ? st.bind(...bind) : st).first();
+};
+const qAll = async (env, sql, ...bind) => {
+  const st = env.DB.prepare(sql);
+  const r = await (bind.length ? st.bind(...bind) : st).all();
+  return r?.results || [];
+};
+
+/**
+ * Post-install diagnostic: what is missing, what is stored wrong, what is stored
+ * wastefully.
+ *
+ * This exists because every failure this product has actually had was SILENT.
+ * The vector queue stalled while every health probe passed. A metadata index was
+ * absent while search kept answering. Scanned PDFs indexed as empty documents.
+ * Each time the brain reported itself well and was quietly wrong, and the
+ * client's conclusion was "the retrieval is mediocre" rather than "something
+ * broke".
+ *
+ * The most important check here is chunks-in-D1 versus vectors-in-Vectorize.
+ * Nothing compared those two numbers before, and that comparison alone would
+ * have caught the field stall on day one.
+ *
+ * Every finding carries an action. A diagnostic that reports a number without
+ * saying what to do about it has only relocated the problem.
+ */
+export async function diagnose(env, { sampleLimit = 10 } = {}) {
+  const findings = [];
+  const add = (f) => findings.push(f);
+  const safe = async (id, fn) => {
+    try { return await fn(); } catch (e) {
+      add({ id, area: "meta", severity: "warn", title: `check "${id}" could not run`,
+        detail: String(e.message || e).slice(0, 200),
+        action: "Usually a schema older than this version. Run `brain upgrade`." });
+      return null;
+    }
+  };
+
+  const totals = (await safe("totals", async () => ({
+    documents: Number((await q1(env, "SELECT count(*) n FROM documents WHERE deleted_at IS NULL"))?.n || 0),
+    chunks: Number((await q1(env, "SELECT count(*) n FROM chunks"))?.n || 0),
+    sources: Number((await q1(env, "SELECT count(*) n FROM sources"))?.n || 0),
+  }))) || { documents: 0, chunks: 0, sources: 0 };
+
+  /* ---------------- COVERAGE: what did not make it in ---------------- */
+
+  await safe("empty_documents", async () => {
+    const n = Number((await q1(env,
+      `SELECT count(*) n FROM documents d LEFT JOIN chunks c ON c.doc_uid = d.doc_uid
+       WHERE d.deleted_at IS NULL AND c.chunk_uid IS NULL`))?.n || 0);
+    if (!n) return;
+    const rows = await qAll(env,
+      `SELECT d.doc_uid, d.title, d.uri FROM documents d
+       LEFT JOIN chunks c ON c.doc_uid = d.doc_uid
+       WHERE d.deleted_at IS NULL AND c.chunk_uid IS NULL LIMIT ?1`, sampleLimit);
+    add({ id: "empty_documents", area: "coverage", severity: "crit", count: n,
+      title: `${n} document(s) were indexed but hold no text`,
+      detail: "The brain believes it has these and can never answer from them. Almost always a scanned PDF with no text layer, or a format that extracted nothing.",
+      samples: rows.map((r) => r.title || r.uri || r.doc_uid),
+      action: "Re-ingest with OCR, or remove them so the document count stops overstating what the brain knows." });
+  });
+
+  await safe("undated", async () => {
+    const n = Number((await q1(env, "SELECT count(*) n FROM documents WHERE deleted_at IS NULL AND document_date IS NULL"))?.n || 0);
+    if (!n) return;
+    const pct = totals.documents ? Math.round((n / totals.documents) * 100) : 0;
+    add({ id: "undated", area: "coverage", severity: pct >= 34 ? "warn" : "info", count: n,
+      title: `${n} document(s) (${pct}%) carry no date`,
+      detail: "Recency cannot be judged for these, so any question about what is most recent silently rests only on the dated remainder.",
+      action: pct >= 34
+        ? "Worth fixing: over a third of the corpus is invisible to any recency judgement."
+        : "Usually fine. The gap engine already says so when it matters." });
+  });
+
+  await safe("unregistered_sources", async () => {
+    const rows = await qAll(env,
+      `SELECT d.source, count(*) n FROM documents d
+       LEFT JOIN sources s ON s.name = d.source
+       WHERE d.deleted_at IS NULL AND s.name IS NULL GROUP BY d.source`);
+    for (const r of rows) add({ id: "unregistered_source", area: "coverage", severity: "warn", count: Number(r.n),
+      title: `${r.n} document(s) sit under an unregistered source "${r.source}"`,
+      detail: "They exist in the brain but no source owns them, so `brain forget` cannot remove them and freshness reporting cannot see them.",
+      action: `Register it: brain sources <manifest> --add ${r.source}` });
+  });
+
+  await safe("empty_sources", async () => {
+    const rows = await qAll(env,
+      `SELECT s.name FROM sources s
+       LEFT JOIN documents d ON d.source = s.name AND d.deleted_at IS NULL
+       GROUP BY s.name HAVING count(d.doc_uid) = 0`);
+    for (const r of rows) add({ id: "empty_source", area: "coverage", severity: "warn",
+      title: `source "${r.name}" is registered but holds nothing`,
+      detail: "Either it was never loaded, or a load failed and left no trace.",
+      action: "Run its ingest, or remove the registration so it stops implying coverage that does not exist." });
+  });
+
+  /* ---------------- INTEGRITY: is it stored correctly ---------------- */
+
+  await safe("store_agreement", async () => {
+    let vectors = null;
+    try {
+      const d = await env.VECTORIZE.describe();
+      const v = Number(d?.vectorCount ?? d?.vectorsCount ?? d?.count);
+      if (Number.isFinite(v)) vectors = v;
+    } catch { /* older binding without describe() */ }
+
+    const pending = Number((await q1(env, "SELECT count(*) n FROM vector_outbox"))?.n || 0);
+    const expected = totals.chunks - pending;
+
+    if (vectors === null) {
+      add({ id: "store_agreement", area: "integrity", severity: "info",
+        title: "the vector count could not be read from Vectorize",
+        detail: `D1 holds ${totals.chunks} chunk(s) with ${pending} still queued, so ${expected} should be embedded. The vector store could not be asked how many it holds, so the two cannot be compared.`,
+        action: "Not a fault. This check needs a Vectorize binding that supports describe()." });
+      return;
+    }
+    const drift = Math.abs(vectors - expected);
+    const tolerance = Math.max(5, Math.round(expected * 0.01));
+    if (drift <= tolerance) {
+      add({ id: "store_agreement", area: "integrity", severity: "ok",
+        title: `both stores agree: ${vectors} vector(s) for ${expected} embedded chunk(s)`,
+        detail: "The text store and the vector store hold the same corpus.", action: null });
+      return;
+    }
+    const missing = vectors < expected;
+    add({ id: "store_agreement", area: "integrity", severity: "crit", count: drift,
+      title: `the two stores disagree by ${drift} vector(s)`,
+      detail: `D1 says ${totals.chunks} chunk(s) with ${pending} queued, so ${expected} should be embedded. Vectorize holds ${vectors}. ` + (missing
+        ? "Vectors are MISSING: those chunks still answer keyword queries and are invisible to meaning-based search, which reads as poor retrieval rather than as a fault."
+        : "There are MORE vectors than chunks: deleted documents likely left theirs behind, and they still compete for retrieval slots."),
+      action: missing
+        ? "Run `brain reindex <manifest> --yes`. It rebuilds the index from D1 and needs no source files."
+        : "Run `brain reindex <manifest> --yes`, then re-check. Persistent excess means deletions are not reaching Vectorize." });
+  });
+
+  await safe("backlog", async () => {
+    const row = await q1(env, "SELECT count(*) n, min(queued_at) oldest FROM vector_outbox");
+    const n = Number(row?.n || 0);
+    if (!n) return;
+    const mins = row?.oldest ? Math.floor((Date.now() - Number(row.oldest)) / 60000) : null;
+    const stalled = mins !== null && mins > 30;
+    add({ id: "backlog", area: "integrity", severity: stalled ? "crit" : "warn", count: n,
+      title: `${n} chunk(s) are waiting to be embedded${mins !== null ? `, oldest ${mins} min ago` : ""}`,
+      detail: stalled
+        ? "Older than 30 minutes means the drain is not running. Until it clears these are findable by keyword and invisible to meaning, and nothing else reports that."
+        : "Normal right after a load.",
+      action: "Clear it now with `brain drain <manifest>`." });
+  });
+
+  await safe("quarantined", async () => {
+    const n = Number((await q1(env, "SELECT count(*) n FROM vector_outbox WHERE attempts > 0"))?.n || 0);
+    if (!n) return;
+    const rows = await qAll(env,
+      "SELECT chunk_uid, attempts, last_error FROM vector_outbox WHERE attempts > 0 ORDER BY attempts DESC LIMIT ?1", sampleLimit);
+    add({ id: "quarantined", area: "integrity", severity: "crit", count: n,
+      title: `${n} chunk(s) failed to embed and were set aside`,
+      detail: "These will never be searchable by meaning until the cause is fixed. The queue kept moving, which is exactly why nothing else reported it.",
+      samples: rows.map((r) => `${r.chunk_uid}: ${String(r.last_error || "").slice(0, 90)}`),
+      action: "Read the errors above. Once the cause is fixed, `brain reindex <manifest> --yes` re-queues them." });
+  });
+
+  await safe("orphan_chunks", async () => {
+    const n = Number((await q1(env,
+      "SELECT count(*) n FROM chunks c LEFT JOIN documents d ON d.doc_uid = c.doc_uid WHERE d.doc_uid IS NULL"))?.n || 0);
+    if (n) add({ id: "orphan_chunks", area: "integrity", severity: "crit", count: n,
+      title: `${n} chunk(s) belong to no document`,
+      detail: "They can still be retrieved and cited, but the document behind the citation is gone.",
+      action: "Report this, it should not happen. `brain reindex <manifest> --yes` will not clear it on its own." });
+  });
+
+  await safe("blank_chunks", async () => {
+    const n = Number((await q1(env, "SELECT count(*) n FROM chunks WHERE trim(text) = ''"))?.n || 0);
+    if (n) add({ id: "blank_chunks", area: "integrity", severity: "warn", count: n,
+      title: `${n} chunk(s) hold no text`,
+      detail: "Each occupies a vector and can be returned as a hit while carrying nothing.",
+      action: "Re-ingest the documents they came from." });
+  });
+
+  await safe("duplicate_documents", async () => {
+    const rows = await qAll(env,
+      `SELECT content_hash, count(*) n FROM documents
+       WHERE deleted_at IS NULL AND content_hash IS NOT NULL AND content_hash != ''
+       GROUP BY content_hash HAVING count(*) > 1 ORDER BY n DESC LIMIT ?1`, sampleLimit);
+    const extra = rows.reduce((a, r) => a + (Number(r.n) - 1), 0);
+    if (extra) add({ id: "duplicate_documents", area: "integrity", severity: "warn", count: extra,
+      title: `${extra} duplicate document(s) are stored more than once`,
+      detail: "Identical content under different paths. Each copy competes for the same retrieval slots, so one can push out a different and better source.",
+      action: "Usually one folder loaded twice under two source names. Check `brain sources`." });
+  });
+
+  /* ---------------- EFFICIENCY: is it stored well ---------------- */
+
+  await safe("chunk_outliers", async () => {
+    const rows = await qAll(env,
+      `SELECT d.title, d.uri, count(*) n FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid
+       WHERE d.deleted_at IS NULL GROUP BY c.doc_uid ORDER BY n DESC LIMIT ?1`, sampleLimit);
+    if (!rows.length) return;
+    const top = Number(rows[0].n);
+    const share = totals.chunks ? Math.round((top / totals.chunks) * 100) : 0;
+    // A share threshold is meaningless on a small corpus: three documents with
+    // one chunk each makes the largest 33% of everything. Firing there would
+    // warn on every healthy small install, which is how a client learns to
+    // ignore this report entirely.
+    if (totals.chunks >= 50 && share >= 20) add({ id: "chunk_outliers", area: "efficiency", severity: "warn", count: top,
+      title: `one document produced ${top} chunks, ${share}% of the entire corpus`,
+      detail: "Usually a spreadsheet. It crowds out every other document in retrieval and dominates cost, while rarely being what anyone is actually asking about.",
+      samples: rows.slice(0, 5).map((r) => `${r.n} chunks: ${(r.title || r.uri || "?").slice(0, 60)}`),
+      action: "Consider loading a summary instead of the raw sheet, or excluding it." });
+  });
+
+  await safe("oversized_chunks", async () => {
+    const n = Number((await q1(env, "SELECT count(*) n FROM chunks WHERE length(text) > ?1", CHUNK_CHAR_WARN))?.n || 0);
+    if (!n) return;
+    const pct = totals.chunks ? Math.round((n / totals.chunks) * 100) : 0;
+    add({ id: "oversized_chunks", area: "efficiency", severity: pct >= 20 ? "warn" : "info", count: n,
+      title: `${n} chunk(s) (${pct}%) are long enough to be truncated before embedding`,
+      detail: `The embedding model reads about 512 tokens. Past roughly ${CHUNK_CHAR_WARN} characters the rest is silently cut, so the tail is stored but never searchable by meaning.`,
+      action: "Not urgent, and invisible in every other way. Worth knowing before blaming retrieval quality." });
+  });
+
+  await safe("duplicate_chunks", async () => {
+    const rows = await qAll(env,
+      "SELECT count(*) n FROM (SELECT text FROM chunks GROUP BY text HAVING count(*) > 1 LIMIT 5000)");
+    const groups = Number(rows?.[0]?.n || 0);
+    if (groups > 10) add({ id: "duplicate_chunks", area: "efficiency", severity: "info", count: groups,
+      title: `${groups}+ groups of identical chunk text`,
+      detail: "Repeated headers, footers or boilerplate. Each copy is embedded and stored separately and can occupy a retrieval slot.",
+      action: "Harmless at small scale. Worth trimming on a large corpus." });
+  });
+
+  await safe("scale", async () => {
+    if (totals.chunks > CORPUS_COMFORT_CEILING) add({ id: "scale", area: "efficiency", severity: "warn", count: totals.chunks,
+      title: `${totals.chunks} chunks is past the comfortable ceiling for this storage design`,
+      detail: `Past roughly ${CORPUS_COMFORT_CEILING} chunks recall degrades quietly rather than failing, which is easy to mistake for the product simply being poor.`,
+      action: "Narrow what is loaded, or plan a move to a larger backing store." });
+  });
+
+  const count = (s) => findings.filter((f) => f.severity === s).length;
+  return {
+    totals,
+    findings,
+    summary: { crit: count("crit"), warn: count("warn"), info: count("info"), ok: count("ok") },
+    verdict: count("crit") ? "problems" : count("warn") ? "usable_with_gaps" : "healthy",
+  };
+}
+
 /**
  * Coverage staleness: what the brain has not LOOKED at recently.
  *
