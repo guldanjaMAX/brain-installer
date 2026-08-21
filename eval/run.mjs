@@ -43,7 +43,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 
 /* ------------------------------------------------------------------ config */
 
-const VALUE_FLAGS = new Set(["config", "golden", "base", "limit", "k", "baseline", "save"]);
+const VALUE_FLAGS = new Set(["config", "golden", "base", "limit", "k", "baseline", "save", "repeat"]);
 const BOOL_FLAGS = new Set(["rerank", "graph-boost", "no-think", "json", "help"]);
 
 /**
@@ -295,22 +295,6 @@ async function collectProvenance(client, base) {
 async function main() {
   const { flags, bools } = parseArgs(process.argv.slice(2));
 
-  // Refuse an impossible flag BEFORE reading a config or a golden set, so the
-  // refusal cannot be masked by an unrelated path error.
-  //
-  // graph_boost is accepted here and handled NOWHERE in the worker. It was
-  // silently inert, and two baselines were saved under its name, so a 3.8 point
-  // swing that was pure run-to-run noise got recorded as its effect. That is how
-  // eval/baselines/2026-08-16_graphboost.json came to exist.
-  if (bools.has("graph-boost")) {
-    throw new Error(
-      "--graph-boost does nothing.\n" +
-        "  The worker has no handler for graph_boost, so this run would measure the\n" +
-        "  DEFAULT configuration and save it under another name. Two baselines were\n" +
-        "  created that way and the difference between them was pure noise.\n" +
-        "  Implement it in the worker first, or drop the flag."
-    );
-  }
 
   if (bools.has("help")) {
     console.log(
@@ -326,7 +310,7 @@ async function main() {
         "  --repeat <n>        run the SAME config n times and report the noise floor.",
         "                      Do this before believing a small win: retrieval is",
         "                      approximate, so identical runs differ.",
-        "  --graph-boost       REFUSED: the worker has no handler for it",
+        "  --graph-boost       only if the target implements it; probed before use",
         "  --no-think          skip the unanswerable probes (they cost LLM calls)",
         "  --baseline <path>   compare against a saved run",
         "  --save <path>       write this run to disk",
@@ -379,6 +363,34 @@ async function main() {
 
   const adminKey = await resolveAdminKey(cfg);
   const client = new BrainClient({ base, adminKey, timeoutMs: Number(cfg.timeout_ms || 30000) });
+
+  // graph_boost is implemented on SOME brains and not others, so whether this
+  // flag means anything depends entirely on the target. It was previously
+  // refused outright here, on the strength of one worker's source carrying no
+  // handler. That was wrong: the worker those saved baselines were measured
+  // against DOES implement it, so a real effect was written off as noise.
+  //
+  // Probe rather than assume. Two identical queries differing only in
+  // graph_boost either change the ranking or they do not, and that is the
+  // entire question.
+  if (opts.graphBoost) {
+    const [off, on] = await Promise.all([
+      client.retrieve("what did we decide", { limit: 10, rerank: false, graphBoost: false }),
+      client.retrieve("what did we decide", { limit: 10, rerank: false, graphBoost: true }),
+    ]).catch(() => [null, null]);
+    const key = (rs) => (rs || []).map((r) => r.ref_key || r.id).join("|");
+    if (off && on && key(off) === key(on)) {
+      throw new Error(
+        "--graph-boost does nothing on this brain.\n" +
+          "  Two identical queries differing only in graph_boost returned the same\n" +
+          "  ranking, so this run would measure the DEFAULT configuration and save it\n" +
+          "  under another name. Two baselines were created that way once already.\n" +
+          "  Drop the flag, or point at a brain that implements it."
+      );
+    }
+    console.error("  graph_boost verified active on this brain: the probe changed the ranking");
+  }
+
 
   const health = await client.health().catch((e) => ({ status: 0, ok: false, error: e.message }));
   if (!health.ok) {
