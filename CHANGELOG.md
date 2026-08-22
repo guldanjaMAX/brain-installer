@@ -4,6 +4,30 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.7
+
+**`brain eval <manifest>`** — score your brain on your own questions.
+
+- **`brain eval <manifest> --init`** writes a question-set template. You fill it
+  in with questions about your own material. There is deliberately no generic
+  test: a score against someone else's questions tells you nothing about your
+  brain.
+- **Include questions you know it cannot answer.** The template asks for four or
+  five, and they are the most valuable entries in the file. Anyone can show a
+  brain finding something. A brain that declines a question it genuinely cannot
+  answer is what makes the rest of its answers worth believing.
+- Write the questions before you look at your files. A question written while
+  reading a document borrows that document's wording, and the brain then finds it
+  by matching words rather than meaning, which flatters the score.
+- `--repeat 3` runs the same test several times and reports how much it varies,
+  so you know whether a small change is real.
+
+**These commands no longer need a Cloudflare token when your brain has a
+domain:** `eval`, `diagnose`, `drain`, `reindex` and `health`. They talk to your
+brain over HTTPS with your own admin key. That matters at handoff: the commands
+that prove your brain works have to keep working after our access is revoked, or
+they are proving the wrong thing.
+
 ## 0.1.6
 
 **`brain diagnose <manifest>`** — run this after a load. It answers three

@@ -29,7 +29,7 @@
  * command-line argument where `ps` could read it.
  */
 
-import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, chmodSync, realpathSync } from "node:fs";
+import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, chmodSync, realpathSync, copyFileSync} from "node:fs";
 import { join, dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
@@ -765,7 +765,11 @@ export function healthProbeVerdict({ ok, body, expectVersion = null, attempt = 1
 
 async function cmdHealth(manifestPath, { expectVersion = null } = {}) {
   const { m } = loadManifest(manifestPath);
-  const acct = await resolveAccount(m);
+  // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker
+  // over plain HTTPS with the admin key, so it must keep working after our token
+  // is revoked at handoff. A command that proves the brain works, but only while
+  // we still hold a key to the client's account, proves the wrong thing.
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
   const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
 
   const sub = await cf(`/accounts/${acct.id}/workers/subdomain`).catch(() => null);
@@ -3303,9 +3307,87 @@ export function renderDiagnosis(r) {
  * built it. Every finding says what it means and what to do, because a number
  * without an action just moves the problem.
  */
+/**
+ * Run the acceptance test for THIS brain, on the owner's own questions.
+ *
+ * Two things a client could not do before this existed. They could not run the
+ * quality test at all, because the harness was a development tool that never
+ * shipped. And there was no way to author a question set, so the only one in
+ * existence was the author's own, full of his private business.
+ *
+ * The unanswerable questions are the point. Anyone can demonstrate a brain
+ * finding something. A brain that declines a question it genuinely cannot answer
+ * is the thing that makes the rest of its answers worth believing.
+ */
+async function cmdEval(manifestPath) {
+  const flags = parseFlags(process.argv.slice(3));
+  const { m } = loadManifest(manifestPath);
+  const dir = dirname(resolve(manifestPath || "./brain.manifest.json"));
+  const goldenPath = flags.golden && flags.golden !== true
+    ? resolve(String(flags.golden))
+    : join(dir, "brain.golden.json");
+
+  if (flags.init) {
+    if (existsSync(goldenPath) && !flags.force) {
+      die(
+        `${relative(process.cwd(), goldenPath)} already exists.` + "\n" +
+          "  Edit it, or pass --force to overwrite it with a fresh template."
+      );
+    }
+    copyFileSync(join(HERE, "eval", "golden", "TEMPLATE.golden.json"), goldenPath);
+    ok(`wrote ${relative(process.cwd(), goldenPath)}`);
+    console.log(
+      "\n  Fill it in, and do it in this order, because the order is what makes the\n" +
+      "  result mean anything:\n\n" +
+      `    1. Write the questions FIRST, from memory, without opening your files.\n` +
+      `       A question written while reading a document borrows its wording, and\n` +
+      `       the brain then finds it by matching words instead of meaning. That\n` +
+      `       flatters the score and teaches you nothing.\n\n` +
+      `    2. THEN find which document should answer each one and name it.\n\n` +
+      `    3. Add 4 or 5 questions you KNOW it cannot answer, marked unanswerable.\n` +
+      `       These are the most valuable entries in the file.\n\n` +
+      `  Then run:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")}\n`
+    );
+    return;
+  }
+
+  if (!existsSync(goldenPath)) {
+    die(
+      `no question set at ${relative(process.cwd(), goldenPath)}.` + "\n" +
+        `  Create one with:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")} --init` + "\n" +
+        "  It has to be YOUR questions about YOUR documents. A generic test would" + "\n" +
+        "  measure nothing about this brain."
+    );
+  }
+
+  // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker
+  // over plain HTTPS with the admin key, so it must keep working after our token
+  // is revoked at handoff. A command that proves the brain works, but only while
+  // we still hold a key to the client's account, proves the wrong thing.
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
+
+  const args = [join(HERE, "eval", "run.mjs"), "--base", base, "--golden", goldenPath];
+  for (const f of ["limit", "k", "repeat", "baseline", "save"]) {
+    if (flags[f] && flags[f] !== true) args.push(`--${f}`, String(flags[f]));
+  }
+  for (const f of ["rerank", "no-think", "json"]) if (flags[f]) args.push(`--${f}`);
+
+  const r = run(process.execPath, args, { env: { ...process.env, BRAIN_ADMIN_KEY: adminKey }, timeout: 600_000 });
+  process.stdout.write(r.out || "");
+  if (!r.ok) process.exitCode = 1;
+  return r;
+}
+
 async function cmdDiagnose(manifestPath) {
   const { m } = loadManifest(manifestPath);
-  const acct = await resolveAccount(m);
+  // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker
+  // over plain HTTPS with the admin key, so it must keep working after our token
+  // is revoked at handoff. A command that proves the brain works, but only while
+  // we still hold a key to the client's account, proves the wrong thing.
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
   const base = await resolveBaseUrl(m, acct);
   const adminKey = resolveAdminKey(manifestPath);
   if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
@@ -3322,7 +3404,11 @@ async function cmdDiagnose(manifestPath) {
 async function cmdReindex(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
   const { m } = loadManifest(manifestPath);
-  const acct = await resolveAccount(m);
+  // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker
+  // over plain HTTPS with the admin key, so it must keep working after our token
+  // is revoked at handoff. A command that proves the brain works, but only while
+  // we still hold a key to the client's account, proves the wrong thing.
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
   const base = await resolveBaseUrl(m, acct);
   const adminKey = resolveAdminKey(manifestPath);
   if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
@@ -3364,7 +3450,11 @@ async function cmdReindex(manifestPath) {
 
 async function cmdDrain(manifestPath) {
   const { m } = loadManifest(manifestPath);
-  const acct = await resolveAccount(m);
+  // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker
+  // over plain HTTPS with the admin key, so it must keep working after our token
+  // is revoked at handoff. A command that proves the brain works, but only while
+  // we still hold a key to the client's account, proves the wrong thing.
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
   const base = await resolveBaseUrl(m, acct);
   const adminKey = resolveAdminKey(manifestPath);
   if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
@@ -3418,6 +3508,7 @@ const commands = {
   drain: cmdDrain,
   reindex: cmdReindex,
   diagnose: cmdDiagnose,
+  eval: cmdEval,
   upgrade: cmdUpgrade,
   rollback: cmdRollback,
 };
@@ -3437,6 +3528,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain drain      <manifest>            finish the vector embedding now, with a live ETA
     brain reindex    <manifest>            rebuild the vector index from D1, no source files needed
     brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
+    brain eval       <manifest>            score the brain on YOUR questions (--init to start one)
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail  authorise the client's own Google account
     brain ingest     <manifest> --path <dir>  load a folder into the brain

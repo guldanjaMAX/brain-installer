@@ -133,5 +133,59 @@ const throws = async (fn) => { try { await fn(); return null; } catch (e) { retu
   check("and still exits 1, because that is the machine-readable part", /process\.exit\(1\)/.test(block));
 }
 
+
+/* ---- custody: the commands that prove the brain works must outlive our token ---- */
+{
+  // The acceptance suite and the quality test exist so a client can verify their
+  // own install AFTER our access is revoked at handoff. A command that proves
+  // the brain works, but only while we still hold a key to their account, proves
+  // the wrong thing.
+  //
+  // Sliced PER FUNCTION rather than grepped across the file. A whole-file
+  // assertion is what let the dry-run regression pass while the remote path was
+  // still broken: its slice spanned two functions and matched the fixed one.
+  const fs = await import("node:fs/promises");
+  const src = await fs.readFile(new URL("../brain.mjs", import.meta.url), "utf-8");
+  const bodyOf = (name) => {
+    const i = src.indexOf(`async function ${name}(`);
+    if (i === -1) return null;
+    const nxt = src.indexOf("\nasync function ", i + 20);
+    return src.slice(i, nxt === -1 ? src.length : nxt);
+  };
+
+  for (const name of ["cmdEval", "cmdDiagnose", "cmdDrain", "cmdReindex", "cmdHealth"]) {
+    const b = bodyOf(name);
+    check(`${name} exists`, b !== null);
+    if (!b) continue;
+    check(`${name} does not demand a Cloudflare token when the manifest has a domain`,
+      !/^\s*const acct = await resolveAccount\(m\);/m.test(b),
+      "it resolves the account unconditionally");
+    check(`${name} resolves the account only as a fallback`,
+      /m\.brain\?\.domain \? null : await resolveAccount\(m\)/.test(b));
+  }
+
+  // And the ones that genuinely need Cloudflare should NOT have been changed.
+  for (const name of ["cmdProvision", "cmdDeploy", "cmdMigrate"]) {
+    const b = bodyOf(name);
+    check(`${name} still requires Cloudflare, as it must`,
+      b !== null && /const acct = await resolveAccount\(m\);/.test(b));
+  }
+}
+
+/* ---- the quality test must never ship someone else's questions ---- */
+{
+  const fs = await import("node:fs/promises");
+  const pkg = JSON.parse(await fs.readFile(new URL("../package.json", import.meta.url), "utf-8"));
+  const files = pkg.files || [];
+  check("the eval runner ships, so a client can actually run it",
+    files.includes("eval/run.mjs") && files.includes("eval/scorer.mjs"));
+  check("a blank question template ships", files.includes("eval/golden/TEMPLATE.golden.json"));
+  check("no real golden set is in the allowlist",
+    !files.some((f) => /eval\/golden\//.test(f) && !/TEMPLATE/.test(f)),
+    JSON.stringify(files.filter((f) => /golden/.test(f))));
+  check("no baselines are in the allowlist", !files.some((f) => /baselines/.test(f)));
+  check("no local config is in the allowlist", !files.some((f) => /config\.local/.test(f)));
+}
+
 console.log(`\nprovision guards: ${ran - fail}/${ran} passed`);
 if (fail) process.exit(1);

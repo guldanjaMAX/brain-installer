@@ -1,6 +1,6 @@
 {
   "name": "brain-installer",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "description": "Provision and manage a client-owned retrieval brain inside their own Cloudflare account",
   "type": "module",
@@ -20,14 +20,19 @@
     "test/ and worker/test/ are excluded for size, not secrecy."
   ],
   "files": [
-    "brain.mjs",
     "CHANGELOG.md",
     "README.md",
     "acceptance.mjs",
+    "brain.mjs",
     "components/",
     "connectors/",
     "docs/",
     "doctor.mjs",
+    "eval/brain-client.mjs",
+    "eval/eval.config.json",
+    "eval/golden/TEMPLATE.golden.json",
+    "eval/run.mjs",
+    "eval/scorer.mjs",
     "ingest/",
     "manifest.schema.json",
     "migrations/",
