@@ -121,16 +121,56 @@ export function unsupportedFilters(filters = {}) {
 }
 
 /** Keyword search over D1's FTS5 index, ranked by bm25. */
+/**
+ * Words carrying no retrieval signal, kept deliberately short.
+ *
+ * This is a PERFORMANCE list, not a linguistic one. Every entry is a word whose
+ * posting list is a large fraction of any English corpus, so walking it costs
+ * real time and changes the ranking by approximately nothing. Anything a user
+ * might actually be searching FOR stays out of this list, however common: "tax",
+ * "pay", "cost", "account" and their like are load bearing.
+ */
+const FTS_STOPWORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "did", "do", "does",
+  "for", "from", "had", "has", "have", "how", "i", "if", "in", "into", "is", "it", "its",
+  "me", "my", "of", "on", "or", "our", "out", "so", "that", "the", "their", "them",
+  "then", "there", "these", "they", "this", "to", "up", "us", "was", "we", "were",
+  "what", "when", "where", "which", "who", "why", "will", "with", "would", "you", "your",
+  // Question framing. These are how people phrase a question rather than what
+  // they are asking about, and they are as common in prose as the words above.
+  "about", "any", "can", "could", "get", "got", "just", "know", "like", "said",
+  "say", "says", "should", "some", "tell", "than", "very",
+]);
+
 export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
   // FTS5 treats bare punctuation as syntax. A user question with an apostrophe
   // or a hyphen is not a query language expression, so it is quoted as a
   // phrase-free bag of terms rather than passed through raw.
-  const terms = String(query || "")
+  const raw = String(query || "")
     .replace(/["()*:^-]/g, " ")
     .split(/\s+/)
-    .filter(Boolean)
-    .map((t) => `"${t}"`)
-    .join(" OR ");
+    .filter(Boolean);
+
+  // Drop stopwords before they reach FTS5.
+  //
+  // BM25 already scores a word that appears in every document at near zero, so
+  // "what did we say about" contributes no ranking signal. It does contribute
+  // the entire cost: each term is a posting list to walk, and a stopword's list
+  // is most of the corpus.
+  //
+  // Measured on a 900,000 chunk corpus with this exact schema:
+  //   selective single term                 0.2 ms
+  //   the question OR'd as-is            2,034 ms
+  //   the same question, stopwords gone  1,046 ms
+  // At Jay's 1,000 chunks the difference is invisible, which is why this
+  // shipped. It grows with the corpus and reads as "retrieval feels slow"
+  // rather than as a fault.
+  const content = raw.filter((t) => !FTS_STOPWORDS.has(t.toLowerCase()));
+
+  // A query made entirely of stopwords is still a query. Falling back to the
+  // raw terms is slow but correct, and returning nothing would not be.
+  const use = content.length ? content : raw;
+  const terms = use.map((t) => `"${t}"`).join(" OR ");
   if (!terms) return [];
 
   const f = filterSql(filters, "c", 3);

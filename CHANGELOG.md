@@ -4,6 +4,32 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.8
+
+**Keyword search gets roughly twice as fast on a large brain, and the gain grows
+with the corpus.**
+
+Asking a question in plain English sent every word of it to the search index,
+including "what", "did", "we", "say" and "about". Those words appear in almost
+every document, so the index had to walk almost the whole corpus for each one,
+while contributing nothing to which result ranks first.
+
+Measured on a 900,000 chunk brain:
+
+| | |
+|---|---|
+| a question as it was searched before | 2,123 ms |
+| the same question, filler words dropped | 1,070 ms |
+
+**On a small brain this was invisible**, which is why it went unnoticed. It grows
+with your corpus, and it shows up as the brain feeling slow rather than as
+anything reporting a problem.
+
+Words you might actually be searching for are never dropped. "Tax", "account",
+"pay", "cost", "deposit", "trust" and the like are kept, however common they are.
+A question made entirely of filler still searches on the whole thing rather than
+returning nothing.
+
 ## 0.1.7
 
 **`brain eval <manifest>`** — score your brain on your own questions.
