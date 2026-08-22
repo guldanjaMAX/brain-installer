@@ -81,6 +81,15 @@ export class BrainClient {
       limit: String(limit),
       rerank: rerank ? "1" : "0",
       graph_boost: graphBoost ? "1" : "0",
+      // Bust the edge cache on every request.
+      //
+      // Both brains cache this endpoint for 120 seconds, keyed by URL. Without
+      // this, --repeat re-read ONE cached response N times and reported a noise
+      // floor of 0.0, which is what a cache looks like and not what the system
+      // does. Verified 2026-08-22: with the cache busted and the reranker on,
+      // 3 of 4 identical requests returned a different ranking. The reranker is
+      // an LLM and is not deterministic; the cache was hiding that completely.
+      _cb: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
     });
     const body = await this.#get(`/api/rag/unified?${qs}`);
     return Array.isArray(body?.results) ? body.results : [];
@@ -88,7 +97,11 @@ export class BrainClient {
 
   /** Cited answer plus the gap list. Used only for the unanswerable questions. */
   async think(question, { limit = 8 } = {}) {
-    const qs = new URLSearchParams({ q: question, limit: String(limit) });
+    const qs = new URLSearchParams({
+      q: question,
+      limit: String(limit),
+      _cb: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    });
     return this.#get(`/api/rag/think?${qs}`);
   }
 

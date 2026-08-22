@@ -58,7 +58,17 @@ const BOOL_FLAGS = new Set(["rerank", "graph-boost", "no-think", "json", "help"]
  * Run with --repeat N to measure the floor for YOUR install before believing a
  * small win. The default is the value observed on james-ring0.
  */
-const ASSUMED_NOISE_FLOOR_PTS = 3.8;
+// There is deliberately no assumed noise floor.
+//
+// A previous version hardcoded 3.8 points, taken from comparing two runs that
+// turned out to be different CONFIGURATIONS rather than repeats. A later
+// "measured" 0.0 was read through a 120-second edge cache. Both were artifacts.
+//
+// The floor is a per-install property and it depends on the configuration: with
+// the reranker off this brain is deterministic, and with it on 3 of 4 identical
+// requests returned a different ranking. So it is measured with --repeat, per
+// install, per config, or it is not claimed at all.
+const ASSUMED_NOISE_FLOOR_PTS = null;
 
 /**
  * Unknown flags are a hard error rather than a shrug.

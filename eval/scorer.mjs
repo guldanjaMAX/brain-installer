@@ -79,10 +79,30 @@ export function dedupeByDocument(results) {
  * slot, or Infinity when the slot never appears.
  */
 function slotRank(slot, results) {
-  const accept = new Set(slot.any_of || []);
+  const raw = slot.any_of || [];
+  const accept = new Set(raw);
+
+  // Also accept a BARE reference, with no "curated:" / "drive:" / "message:"
+  // prefix.
+  //
+  // identitiesOf builds "<source>:<ref_key>", and a golden set written by hand
+  // naturally records the ref_key it saw in the API response, which carries no
+  // prefix. That mismatch scores every question as a miss and reports a clean
+  // 0.0% recall, which reads as catastrophic retrieval rather than as a
+  // malformed file. It cost a full evaluation run on 2026-08-22 before anyone
+  // noticed the number was too round to be real.
+  //
+  // Matching the suffix is safe: a ref_key is already unique within its source,
+  // and being generous here can only turn a false miss into a true hit.
+  const bare = new Set(raw.filter((k) => !/^(curated|drive|message):/.test(k)));
+
   for (let i = 0; i < results.length; i++) {
     for (const id of identitiesOf(results[i])) {
       if (accept.has(id)) return i + 1;
+      if (bare.size) {
+        const suffix = id.slice(id.indexOf(":") + 1);
+        if (bare.has(suffix)) return i + 1;
+      }
     }
   }
   return Infinity;
