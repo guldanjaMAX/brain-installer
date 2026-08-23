@@ -83,6 +83,32 @@ const row = (overrides = {}) => ({
 }
 
 {
+  let calls = 0;
+  const envelope = emailEnvelope(row({ id: "network-retry", platform: "email", body: "Body" }));
+  const receipt = await sendMessageEnvelopes([envelope], async () => {
+    calls++;
+    return calls === 1
+      ? { results: [{ status: "failed", error: "D1_ERROR: Network connection lost." }] }
+      : { results: [{ status: "unchanged", chunks: 2 }] };
+  }, { delayMs: 1, sleep: async () => {} });
+  check("a transient D1 receipt is retried idempotently", calls === 2 && receipt.unchanged === 1, JSON.stringify({ calls, receipt }));
+}
+
+{
+  let calls = 0, error = null;
+  const envelope = emailEnvelope(row({ id: "permanent-failure", platform: "email", body: "Body" }));
+  try {
+    await sendMessageEnvelopes([envelope], async () => {
+      calls++;
+      return { results: [{ status: "failed", error: "D1 constraint violation" }] };
+    }, { delayMs: 1, sleep: async () => {} });
+  } catch (caught) {
+    error = caught;
+  }
+  check("a permanent D1 failure is not retried", calls === 1 && /constraint violation/.test(error?.message || ""), JSON.stringify({ calls, error: error?.message }));
+}
+
+{
   let posted = 0;
   const envelope = emailEnvelope(row({
     id: "secret-email", platform: "email",

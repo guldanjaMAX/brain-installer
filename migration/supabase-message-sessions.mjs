@@ -110,7 +110,13 @@ const emptyTally = () => ({
   refusals: [],
 });
 
-export async function sendMessageEnvelopes(envelopes, postFn) {
+const transientTargetError = (value) => /(?:network connection lost|timed? ?out|fetch failed|connection reset|econnreset|eai_again|temporar(?:y|ily)|overloaded|returned (?:429|5\d\d))/i.test(String(value || ""));
+
+export async function sendMessageEnvelopes(envelopes, postFn, {
+  attempts = 3,
+  delayMs = 1000,
+  sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)),
+} = {}) {
   const tally = emptyTally();
   tally.candidate_documents = envelopes.length;
   const safe = [];
@@ -128,7 +134,23 @@ export async function sendMessageEnvelopes(envelopes, postFn) {
   }
   const items = itemize(safe);
   for (const group of batches(items)) {
-    const receipt = await postFn(group);
+    let receipt;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        receipt = await postFn(group);
+      } catch (error) {
+        if (attempt >= attempts || !transientTargetError(error?.message || error)) throw error;
+        await sleep(delayMs * attempt);
+        continue;
+      }
+      const transientFailures = receipt?.results?.filter((slot) =>
+        slot?.status === "failed" && transientTargetError(slot?.error)
+      ) || [];
+      if (!transientFailures.length || attempt >= attempts) break;
+      // Batch ingest is idempotent. Replaying the whole group is safer than
+      // trying to manufacture a partial receipt after D1 accepted some rows.
+      await sleep(delayMs * attempt);
+    }
     if (!Array.isArray(receipt?.results) || receipt.results.length !== group.length) {
       throw new Error(`message target receipt has ${receipt?.results?.length ?? 0} slots for ${group.length} documents`);
     }
