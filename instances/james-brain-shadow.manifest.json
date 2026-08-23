@@ -1,0 +1,56 @@
+{
+  "$schema": "../manifest.schema.json",
+  "manifest_version": 1,
+  "client": {
+    "slug": "james-brain-shadow",
+    "display_name": "James Brain Shadow",
+    "primary_contact": "james@jamesguldan.com",
+    "timezone": "America/Phoenix"
+  },
+  "brain": {
+    "version": "0.1.8",
+    "worker_name": "james-brain-shadow"
+  },
+  "infrastructure": {
+    "cloudflare": {
+      "account_id": "bd13f1dff62d4ccbea47440e45b48ec2",
+      "storage": "d1",
+      "d1_database_name": "james-brain-shadow",
+      "vectorize_index": "james-brain-shadow",
+      "drain_cron": "*/5 * * * *",
+      "d1_database_id": "c3d65f96-84f2-42a4-b7e4-193915e280e2"
+    },
+    "supabase": {
+      "enabled": false,
+      "project_ref": null
+    }
+  },
+  "retrieval": {
+    "embed_model": "@cf/baai/bge-base-en-v1.5",
+    "embed_dimensions": 768,
+    "answer_model": "claude-sonnet-5"
+  },
+  "safety": {
+    "credential_scanner": {
+      "enabled": true,
+      "gate_version": 2,
+      "mode": "refuse"
+    },
+    "private_path_prefixes": [
+      "_private",
+      "_Private"
+    ],
+    "daily_llm_spend_cap_usd": 10
+  },
+  "testing": {
+    "probe_questions": [],
+    "things_only_they_know": [],
+    "expected_to_fail": []
+  },
+  "access": {
+    "model": "single_tenant_all_access",
+    "authorized_emails": [
+      "james@jamesguldan.com"
+    ]
+  }
+}

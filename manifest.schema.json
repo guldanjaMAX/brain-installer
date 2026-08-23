@@ -45,7 +45,7 @@
             "storage": {
               "enum": ["d1", "supabase"],
               "default": "d1",
-              "description": "d1 keeps the entire brain inside the client's own Cloudflare account. supabase is the upgrade, taken at roughly 250k chunks."
+              "description": "d1 keeps the entire brain inside the client's own Cloudflare account and is the standard backend at every corpus size. supabase exists only for migration or an explicitly measured retrieval limitation."
             },
             "d1_database_name": { "type": "string", "description": "Must be scoped to the client, e.g. acme-brain. A bare \"brain\" is refused at provision: it may already exist in the account and belong to something else." },
             "d1_database_id": { "type": "string" },

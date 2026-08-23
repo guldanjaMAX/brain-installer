@@ -15,7 +15,7 @@ account alone.
 |---|---|---|---|
 | 1 | A Cloudflare account | 5 min | Everything lives here. Theirs, not ours |
 | 2 | **Workers Paid plan on it** | 2 min | 5 USD/month. **Vectorize cannot create an index on the free tier at all** |
-| 3 | A scoped API token **and** `wrangler login`, both | 5 min | See "Credentials: you need BOTH" below |
+| 3 | An account-scoped, expiring API token | 5 min | One token drives every Cloudflare step |
 | 4 | An Anthropic API key | 5 min | The answers run on their key, so cost and data both stay theirs |
 
 Nothing else. No Supabase, no second vendor, no database password.
@@ -35,50 +35,36 @@ of a client, which is the worst possible ten minutes to burn.
 
 ---
 
-## Credentials: you need BOTH
-
-An earlier version of this document offered these as alternatives. That was
-wrong, and following it stalls the install at step three. The API token drives
-verify, provisioning, migrations, deploy and secrets; the wrangler login exists
-because no API token can reach Vectorize. `brain doctor` checks for both.
-
-### Part 1: a scoped API token
+## Credential: one scoped API token
 
 The client issues a token at dash.cloudflare.com, My Profile, API Tokens,
 Create Token, Custom token, with exactly these permissions:
 
     Account > Workers Scripts        Edit
     Account > D1                     Edit
+    Account > Vectorize              Edit
     Account > Workers AI             Read
     Account > Workers R2 Storage     Edit    (only if the manifest sets r2_bucket)
 
 Set an expiry. Nothing here needs to outlive the engagement.
 
-**Do not bother adding a Vectorize scope to the token.** A token carrying it
-still returns a flat `Authentication error 10000` while verifying as *valid and
-active* (measured 2026-08-17 on every available token). Vectorize goes through
-the wrangler login below; the token covers everything else.
+Vectorize Edit was verified end to end on 2026-08-23: the account-scoped token
+created the 768-dimensional index and all six metadata indexes through the API.
 
 `brain verify <manifest>` probes all five and names whichever is missing, so run
 it the moment the token arrives rather than at the start of the session.
 
-### Part 2: the client's own browser session
+### Compatibility fallback
 
-On the install call, at the client's keyboard:
+If an older token cannot reach Vectorize, the account owner can temporarily run:
 
 ```bash
 npx wrangler@4 login
 ```
 
-They approve in their own browser. That is all: **leave the API token exported.**
-The installer strips the token from wrangler's own child processes itself, so
-the two never conflict. (Unsetting it by hand, as an older version of this page
-said to, breaks every API step.)
-
-The session is theirs and expires on its own. Since the client also creates the
-token in their own account and it never leaves their machine, the custody story
-holds either way: nothing long-lived to their business ever exists on mine. The
-login is, as of 2026-08-17, the only path verified working for Vectorize.
+They approve in their own browser and leave the API token exported. Provision
+uses this session only for Vectorize. New installs should fix the token scope
+instead so every client follows the same token-only path.
 
 ---
 

@@ -112,7 +112,7 @@ const throws = async (fn) => { try { await fn(); return null; } catch (e) { retu
   check("provision refuses an index that was requested but never active", /never became active/.test(inactiveFatal || ""), inactiveFatal);
 }
 
-/* ---- no copy of the code may send a client after a scope we have never proven ---- */
+/* ---- every install asks for the Vectorize permission proven live on 2026-08-23 ---- */
 {
   const fs = await import("node:fs/promises");
   const u = (f) => new URL("../" + f, import.meta.url);
@@ -121,8 +121,10 @@ const throws = async (fn) => { try { await fn(); return null; } catch (e) { retu
   const tmpl = await fs.readFile(u("templates/brain.manifest.json"), "utf-8");
   const doctor = await fs.readFile(u("doctor.mjs"), "utf-8");
 
-  for (const [name, txt] of [["brain.mjs", brain], ["README.md", readme], ["templates/brain.manifest.json", tmpl]])
-    check(`${name} does not tell anyone to add a Vectorize scope`, !/add[^\n]{0,40}"?Vectorize: Edit/i.test(txt));
+  for (const [name, txt] of [["README.md", readme], ["templates/brain.manifest.json", tmpl]])
+    check(`${name} includes Vectorize Edit in the scoped token`, /Vectorize(?::)?\s+(?:Edit|edit)/.test(txt), `${name} omitted it`);
+
+  check("the installer does not claim tokens cannot reach Vectorize", !/no API token can reach Vectorize/i.test(brain));
 
   check("the Vectorize remedy exists in exactly one place", (doctor.match(/export const VECTORIZE_REMEDY/g) || []).length === 1);
   check("and brain.mjs uses that constant rather than its own copy", /VECTORIZE_REMEDY/.test(brain));

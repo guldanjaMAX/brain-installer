@@ -37,27 +37,21 @@ export const FAIL = "fail";
  *   - The tokens that failed simply lacked the permission. Every one of them
  *     returned `Authentication error 10000`, which is indistinguishable from an
  *     invalid token and is why this was misdiagnosed as a platform limit.
- *   - What is still UNPROVEN is whether adding `Vectorize: Edit` to an ordinary
- *     user-owned token is enough for provision's create call. Read was proven on
- *     an account-owned token; create was not tested.
- *
- * So this text still points at wrangler, because that is the path measured end
- * to end. It no longer claims a token cannot work. If a scoped token is shown to
- * create an index, the login can be dropped from every install and this constant
- * is the one place to change.
+ *   - On 2026-08-23 a user-owned token scoped to one account with Vectorize Edit
+ *     created a 768-dimensional index and all six metadata indexes through the
+ *     API. Wrangler login is therefore a fallback, not a prerequisite.
  */
 export const VECTORIZE_REMEDY =
-  "  Vectorize is reached through wrangler's own session, and that is the proven path:\n" +
-  "      npx wrangler@4 login\n" +
-  "  This is needed ALONGSIDE the API token, not instead of it: the token drives the\n" +
-  "  API steps. For a live install the login is also the better posture, because the\n" +
-  "  session is the client's, it expires on its own, and no long-lived key to their\n" +
-  "  account is ever stored on the installer's machine.\n" +
+  "  Recreate the account-scoped token with Vectorize: Edit. That is the standard\n" +
+  "  path and has been verified for index and metadata-index creation.\n" +
+  "  Temporary fallback: run `npx wrangler@4 login` in the account owner's browser.\n" +
+  "  Provision can use that session for Vectorize while the API token drives the\n" +
+  "  remaining steps.\n" +
   "  The account must ALSO be on the Workers Paid plan (5 USD a month). Vectorize\n" +
   "  cannot create an index on the free tier at all.";
 
 /** The token scopes, in one place, for the same reason. */
-export const CF_TOKEN_SCOPES = ["Workers Scripts: Edit", "D1: Edit", "Workers AI: Read"];
+export const CF_TOKEN_SCOPES = ["Workers Scripts: Edit", "D1: Edit", "Vectorize: Edit", "Workers AI: Read"];
 
 const IS_WIN = platform() === "win32";
 
@@ -152,8 +146,7 @@ export function checkWrangler() {
 /**
  * Wrangler's OAuth session.
  *
- * Load-bearing, not a nicety: no Cloudflare API token can create a Vectorize
- * index, so without this login the install cannot provision its storage.
+ * Optional fallback for an older token that lacks Vectorize Edit.
  */
 /**
  * Only set CLOUDFLARE_ACCOUNT_ID when we actually have one.
@@ -179,13 +172,46 @@ export function checkWranglerLogin(accountId) {
   }
   return check(
     "wrangler login",
-    FAIL,
+    WARN,
     "not signed in",
     "Run: npx wrangler@4 login\n" +
       "  This opens the browser and the session belongs to whoever signs in.\n" +
-      "  It is REQUIRED: no Cloudflare API token can create a Vectorize index,\n" +
-      "  so provisioning cannot complete without it."
+      "  This is only a fallback when the scoped API token cannot reach Vectorize."
   );
+}
+
+export async function checkVectorizeApi(accountId) {
+  const token = process.env.CLOUDFLARE_API_TOKEN;
+  if (!token) {
+    return check("Vectorize", WARN, "not checked: Cloudflare token is missing", "Set CLOUDFLARE_API_TOKEN and re-run.");
+  }
+  if (!accountId) {
+    return check(
+      "Vectorize",
+      WARN,
+      "not checked: Cloudflare account id is not known yet",
+      "Run `brain doctor <manifest>` after setup has written the account id. `brain verify` also probes it before provisioning."
+    );
+  }
+  try {
+    const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/vectorize/v2/indexes`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(20_000),
+    });
+    let payload = null;
+    try { payload = await res.json(); } catch { /* status below is enough */ }
+    if (res.ok && payload?.success !== false) return check("Vectorize", OK, "reachable with the scoped API token");
+    const detail = (payload?.errors || []).map((x) => x.message).filter(Boolean).join("; ") || `HTTP ${res.status}`;
+    const paid = /workers paid|not entitled|upgrade|subscription|billing/i.test(detail);
+    return check(
+      "Vectorize",
+      FAIL,
+      paid ? "the account is not on the Workers Paid plan" : `token cannot reach it: ${detail.slice(0, 120)}`,
+      VECTORIZE_REMEDY
+    );
+  } catch (e) {
+    return check("Vectorize", FAIL, `probe failed: ${String(e.message).slice(0, 100)}`, VECTORIZE_REMEDY);
+  }
 }
 
 export function checkVectorize(accountId) {
@@ -267,13 +293,8 @@ export function checkGoogleConnection() {
 }
 
 /**
- * BOTH credentials are required today, and the docs used to say "pick one".
- *
- * The API token drives verify, D1 creation, migrations, deploy and secrets.
- * Wrangler's login exists ONLY because no API token can reach Vectorize. A
- * machine with just the login passes every other check and then dies at the
- * first API call, three steps into setup, which is exactly where a preflight
- * is supposed to have looked.
+ * The scoped API token drives every Cloudflare step. Wrangler login is only a
+ * fallback for an older or incorrectly scoped token.
  */
 export function checkCfToken() {
   if (process.env.CLOUDFLARE_API_TOKEN) return check("Cloudflare token", OK, "present in the environment");
@@ -321,29 +342,8 @@ export async function runAll({ accountId, onResult } = {}) {
   };
   push(checkNode());
   push(await checkNetwork());
-  push(checkWrangler());
-  // Skip the ones that cannot possibly pass, rather than emitting a cascade of
-  // failures that all trace back to one cause.
   out.push(checkCfToken());
-  if (out.find((c) => c.name === "wrangler")?.status === OK) {
-    out.push(checkWranglerLogin(accountId));
-    if (out.find((c) => c.name === "wrangler login")?.status === OK) out.push(checkVectorize(accountId));
-    else
-      out.push(
-        check(
-          "Vectorize",
-          WARN,
-          "not checked, because wrangler is not signed in",
-          // Every non-ok check owes the reader a next step. This branch only
-          // runs on a machine with no wrangler login, which is every client
-          // machine and never the developer's, so CI on a clean runner is what
-          // caught it.
-          "Sign in first, then re-run this: npx wrangler@4 login\n" +
-            "  Vectorize is where meaning-based search lives, and it can only be created\n" +
-            "  through that session. It also requires the Workers Paid plan, 5 USD a month."
-        )
-      );
-  }
+  out.push(await checkVectorizeApi(accountId));
   out.push(checkAnthropicKey());
   out.push(checkClaudeCode());
   out.push(checkCodex());

@@ -1,5 +1,6 @@
 import { run, checkNode, checkClaudeCode, checkCodex, checkAnthropicKey, checkGoogleConnection,
-         checkWranglerLogin, checkVectorize, summarize, runAll, OK, WARN, FAIL } from "../doctor.mjs";
+         checkWranglerLogin, checkVectorize, checkVectorizeApi, CF_TOKEN_SCOPES,
+         summarize, runAll, OK, WARN, FAIL } from "../doctor.mjs";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
 
@@ -34,16 +35,22 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   if (k) process.env.ANTHROPIC_API_KEY = k; else delete process.env.ANTHROPIC_API_KEY;
 }
 
-/* ---- the two messages that must not send someone in the wrong direction ---- */
+/* ---- the standard token owns Vectorize; browser login is only a fallback ---- */
 {
-  // No API token can reach Vectorize, so a login failure must say the login is
-  // REQUIRED rather than reading as an optional convenience.
   const l = checkWranglerLogin("0000");
   if (l.status !== OK) {
-    check("the login fix explains why it is required", /no Cloudflare API token/i.test(l.fix), l.fix);
+    check("wrangler login is described as a fallback", l.status === WARN && /fallback/i.test(l.fix), l.fix);
   } else {
     check("wrangler login reports signed in cleanly", !/\\.$/.test(l.detail.trim()), l.detail);
   }
+  check("the scoped token includes Vectorize Edit", CF_TOKEN_SCOPES.includes("Vectorize: Edit"), JSON.stringify(CF_TOKEN_SCOPES));
+}
+{
+  const saved = process.env.CLOUDFLARE_API_TOKEN;
+  delete process.env.CLOUDFLARE_API_TOKEN;
+  const v = await checkVectorizeApi("0000");
+  check("a missing token skips the API probe with a useful warning", v.status === WARN && /token is missing/.test(v.detail), JSON.stringify(v));
+  if (saved) process.env.CLOUDFLARE_API_TOKEN = saved;
 }
 {
   const v = checkVectorize("00000000000000000000000000000000");

@@ -19,20 +19,14 @@ not built" before promising anything to anyone.
 - Node 22 or newer (uses `node:sqlite` for the migration tests)
 - A Cloudflare account **on the Workers Paid plan**, 5 USD a month. Vectorize
   cannot create an index on the free tier at all.
-- **BOTH of these, not one or the other:**
-  - A Cloudflare API token (created in the client's own account) with: Workers
-    Scripts Edit, D1 Edit, Workers AI Read. It drives verify, provisioning,
-    migrations, deploy and secrets.
-  - `npx wrangler@4 login` in the client's browser. It exists for exactly one
-    reason: no API token can reach Vectorize, so the index is created through
-    wrangler's own session. An earlier version of this README said the login
-    could replace the token; it cannot yet. `brain doctor` checks for both.
+- A Cloudflare API token created in the client's own account with: Workers
+  Scripts Edit, D1 Edit, Vectorize Edit and Workers AI Read. It drives verify,
+  provisioning, migrations, deploy and secrets. Add Workers R2 Storage Edit only
+  when the manifest actually sets an R2 bucket.
 
-A note on token scopes: adding "Vectorize: Edit" to the token does NOT work.
-A token carrying it still returns `Authentication error 10000` on the Vectorize
-API while verifying as valid and active (measured 2026-08-17 against every
-token available). That is why the wrangler login is required alongside the token
-rather than instead of it.
+Vectorize Edit was verified end to end on 2026-08-23: an account-scoped token
+created the index and all six metadata indexes through the API. `wrangler login`
+remains a compatibility fallback for an older token, not an install requirement.
 
 ---
 

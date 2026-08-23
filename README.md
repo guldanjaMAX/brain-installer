@@ -33,9 +33,9 @@ exactly what to do about anything missing.
 1. **A Cloudflare account on the Workers Paid plan.** 5 USD a month. The
    meaning-based search index cannot be created on the free tier at all, and
    this is the one requirement with no workaround.
-2. **A Cloudflare API token**, created in your own account, with exactly three
-   permissions: Workers Scripts Edit, D1 Edit, Workers AI Read. Plus
-   `npx wrangler@4 login`, which opens your browser.
+2. **A Cloudflare API token**, created in your own account, with exactly four
+   permissions: Workers Scripts Edit, D1 Edit, Vectorize Edit and Workers AI
+   Read. The token can be limited to your account and given an expiry.
 3. **An Anthropic API key** from console.anthropic.com. Answers are written on
    your key, so the cost and the data both stay yours.
 

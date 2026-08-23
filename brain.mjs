@@ -237,12 +237,9 @@ async function cmdVerify(manifestPath) {
     await cf(`/accounts/${acct.id}/vectorize/v2/indexes`);
     ok("Vectorize is reachable");
   } catch (e) {
-    // Expected on a correctly scoped token, so this is information rather than a
-    // warning. Calling it a problem sends clients off editing a token that was
-    // never the cause.
-    info(
-      "the API token cannot reach Vectorize. That is normal and does not mean your" + "\n" +
-        "      token is wrong; provision uses wrangler's session for this one step." + "\n" +
+    warn(
+      "the API token cannot reach Vectorize. The standard token needs Vectorize: Edit." + "\n" +
+        "      Provision can use wrangler login as a temporary fallback." + "\n" +
         VECTORIZE_REMEDY + "\n" +
         `      detail: ${e.message.slice(0, 120)}`
     );
@@ -252,17 +249,12 @@ async function cmdVerify(manifestPath) {
 
 
 /**
- * Vectorize through wrangler, because no API token can reach it.
+ * Vectorize through the API token, with wrangler as a compatibility fallback.
  *
- * Verified 2026-08-17: every stored Cloudflare API token returns
- * "Authentication error 10000" on /vectorize/v2/indexes while /user/tokens/verify
- * reports the same token active and valid. Cloudflare surfaces a missing scope as
- * a flat auth failure, so this looks like a broken token and is not one.
- *
- * Wrangler's own OAuth session CAN do it. That matters beyond convenience: for a
- * live install the client running `wrangler login` in their own browser is the
- * better custody story anyway, because the session is theirs, it expires on its
- * own, and no long-lived credential to their business ever lands on our machine.
+ * The earlier tokens failed because they lacked Vectorize Edit. A user-owned,
+ * account-scoped token with that permission created the index and all metadata
+ * indexes through the API on 2026-08-23. Wrangler's OAuth session remains a
+ * fallback so an older install can still be repaired without deleting resources.
  *
  * CLOUDFLARE_API_TOKEN must be cleared for the child process. Wrangler prefers it
  * when set and will silently authenticate as the wrong identity.
@@ -327,7 +319,11 @@ export async function ensureMetadataIndex({
   create,
   exists,
   attempts = 3,
-  verifyAttempts = 10,
+  // Cloudflare took just over 30 seconds to expose a newly-created metadata
+  // index during the first live shadow provision on 2026-08-23. Ten polls at
+  // three seconds stopped one check too early. Allow up to 90 seconds while
+  // preserving the fail-closed rule before any vectors are written.
+  verifyAttempts = 30,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   log = ok,
   onFatal = die,
@@ -512,7 +508,7 @@ async function cmdProvision(manifestPath) {
     try {
       list = await cf(`/accounts/${acct.id}/vectorize/v2/indexes`);
     } catch (e) {
-      // A missing scope, not a broken token. Fall through to wrangler rather
+      // An older token may lack Vectorize Edit. Fall through to wrangler rather
       // than stopping an install that can still complete.
       viaApi = false;
       info("the API token cannot reach Vectorize, trying wrangler's own session");
@@ -916,8 +912,10 @@ async function cmdHealth(manifestPath, { expectVersion = null } = {}) {
   // Secrets take a few seconds to reach every edge location. Running `secrets`
   // and `health` back to back therefore races, and the failure looks exactly
   // like a wrong key: a flat 401. Retrying turns a confusing false alarm into
-  // a short wait. Measured on a real install: ready between 5 and 10 seconds.
-  const attempts = 5;
+  // a short wait. A live shadow install on 2026-08-23 was still returning 401
+  // after the old 16-second window, then accepted the same Keychain value. Give
+  // Cloudflare up to roughly a minute before calling the value wrong.
+  const attempts = 15;
   for (let i = 1; i <= attempts; i++) {
     const docs = await http(`${base}/api/admin/brain/documents`, {
       headers: { "X-Admin-Key": key },
@@ -2868,10 +2866,9 @@ async function askSecret(question) {
  * brain setup — nothing to a working brain, in one command.
  *
  * The step ORDER here is not cosmetic. A clean-room rehearsal established that
- * secrets must come after deploy (a secret is set ON a worker script, so the
- * script has to exist) and that provisioning needs wrangler's own session
- * because no API token can reach Vectorize. Running these by hand in the
- * obvious order fails on both counts.
+ * secrets must come after deploy because a secret is set on an existing worker
+ * script. Vectorize uses the scoped API token and only falls back to wrangler's
+ * own session for older tokens.
  *
  * Every step is idempotent and the manifest is written after each, so an
  * interrupted setup is resumed by re-running the same command.
