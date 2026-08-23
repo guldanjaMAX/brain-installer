@@ -452,8 +452,21 @@ async function handleThink(env, request) {
           const hasExplicitOwnerLink = allowedDocs.some((doc) => {
             const raw = `${doc.title || ""} ${doc.snippet || ""} ${doc.ref || ""}`.toLowerCase();
             const normalized = raw.replace(/[^a-z0-9]+/g, " ");
-            return (ownerTokens.length > 0 && ownerTokens.every((token) => normalized.includes(token))) ||
+            const ownerLinked = (ownerTokens.length > 0 && ownerTokens.every((token) => normalized.includes(token))) ||
               (ownerFirst && (raw.includes(`${ownerFirst}'s`) || raw.includes(`${ownerFirst}’s`)));
+            const sameDocumentNamesSubject = /\bterm sheet\b/i.test(q) ? normalized.includes("term sheet")
+              : /\bparental leave\b/i.test(q) ? normalized.includes("parental leave")
+                : /\bjury duty\b/i.test(q) ? normalized.includes("jury duty")
+                  : /\bi-9\b/i.test(q) ? normalized.includes("i 9")
+                    : /\b401\s*\(?k\)?\b/i.test(q) ? normalized.includes("401")
+                      : /\boffice lease\b/i.test(q) ? normalized.includes("office") && normalized.includes("lease")
+                        : /\bownership agreements?\b/i.test(q) ? normalized.includes("agreement") && normalized.includes("ownership")
+                          : /\bblood type\b/i.test(q) ? normalized.includes("blood")
+                            : /\b(?:soc\s*2|security certification)\b/i.test(q) ? normalized.includes("soc 2") || normalized.includes("security certification")
+                              : /\btpt license\b/i.test(q) ? normalized.includes("tpt")
+                                : /\b(?:vat|gst)\b/i.test(q) ? normalized.includes("vat") || normalized.includes("gst")
+                                  : true;
+            return ownerLinked && sameDocumentNamesSubject;
           });
           if (evidenceGate.supported && asksOwnerSpecificHighRiskFact && !hasExplicitOwnerLink) {
             evidenceGate.supported = false;
