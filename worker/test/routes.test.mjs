@@ -171,7 +171,7 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
     },
   });
   const body = await (await call(env, "/api/rag/think?q=What+is+our+parental+leave+policy")).json();
-  check("unsupported evidence replaces the generated draft with a refusal", modelCalls === 2 && body.answer === "The documents do not actually answer the question.", JSON.stringify(body));
+  check("unsupported evidence replaces the generated draft with a refusal", modelCalls === 2 && body.answer === "The documents do not answer the question.", JSON.stringify(body));
   check("unsupported candidates are not exposed as answer citations", body.citations?.length === 0, JSON.stringify(body.citations));
   check("the refusal exposes its short support decision", body.evidence_gate?.supported === false && /different company/.test(body.evidence_gate?.reason || ""), JSON.stringify(body.evidence_gate));
 }

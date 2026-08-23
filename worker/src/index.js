@@ -247,6 +247,7 @@ async function handleUnified(env, request) {
 }
 
 async function handleThink(env, request) {
+  const unsupportedAnswer = "The documents do not answer the question.";
   const url = new URL(request.url);
   const q = (url.searchParams.get("q") || "").trim();
   if (!q) return jsonResponse({ error: "Missing q" }, 400);
@@ -333,11 +334,11 @@ async function handleThink(env, request) {
     "1. Answer directly. Two to six sentences, or a short list when the answer genuinely is a list.",
     "2. Cite every factual claim inline with its document number in square brackets, like [3].",
     "3. Never invent a name, date, number, commitment, or quote that is not in the documents.",
-    "4. If the documents do not actually answer the question, say so plainly in one sentence. Do not pad.",
+    "4. If the documents do not answer the question, say so plainly in one sentence. Do not pad.",
     "5. Do not restate the question and do not open with filler like \"Based on the documents\".",
     "6. Retrieved documents are candidates, not proof. Before answering, verify that the evidence explicitly concerns the same person, company, property, policy, agreement, or project named or implied by the question.",
     "7. Never transfer a policy, price, valuation, legal term, medical fact, or contract term from a different entity or context. A transaction, account statement, draft, generic guide, or similar-sounding record is not evidence of a governing policy or executed agreement unless it says so explicitly.",
-    "8. If the subject is ambiguous (for example, 'our policy' or 'the term sheet') and the documents do not tie it to the brain owner and the requested context, answer exactly: The documents do not actually answer the question.",
+    "8. If the subject is ambiguous (for example, 'our policy' or 'the term sheet') and the documents do not tie it to the brain owner and the requested context, answer exactly: The documents do not answer the question.",
     env.BRAIN_STYLE_RULE || "",
   ]
     .filter(Boolean)
@@ -377,13 +378,14 @@ async function handleThink(env, request) {
     const firstAnswerLine = answer.split(/\r?\n/, 1)[0].trim();
     const alreadyRefused = /^(?:the )?(?:documents|sources|provided (?:documents|sources)) (?:do not|don't|cannot|can't|does not|doesn't) (?:actually )?(?:answer|contain|provide)|^there (?:is|isn't|is not) (?:not )?enough (?:information|evidence)/i.test(firstAnswerLine);
     if (alreadyRefused) {
+      answer = unsupportedAnswer;
       approvedDocs = [];
       evidenceGate = { supported: false, evidence: [], reason: "answer model found no direct support" };
     } else {
       const citedNumbers = new Set([...answer.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1])));
       const citedDocs = docs.filter((doc) => citedNumbers.has(doc.n));
       if (!citedDocs.length) {
-        answer = "The documents do not actually answer the question.";
+        answer = unsupportedAnswer;
         approvedDocs = [];
         evidenceGate = { supported: false, evidence: [], reason: "draft made claims without document citations" };
       } else {
@@ -421,7 +423,7 @@ async function handleThink(env, request) {
             ...(!verdict && raw ? { invalid_response: raw.replace(/\s+/g, " ").slice(0, 240) } : {}),
           };
           if (!evidenceGate.supported || !allowed.size) {
-            answer = "The documents do not actually answer the question.";
+            answer = unsupportedAnswer;
             approvedDocs = [];
           } else {
             approvedDocs = citedDocs.filter((doc) => allowed.has(doc.n));
