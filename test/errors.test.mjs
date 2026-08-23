@@ -82,6 +82,32 @@ function cli(args, env = {}) {
 {
   const mod = await import("../brain.mjs");
   check("brain.mjs imports without running the CLI", true);
+
+  let calls = 0, sleeps = 0, retries = 0;
+  const value = await mod.retryTransient(async () => {
+    calls++;
+    if (calls < 3) throw new Error("temporary fetch failure");
+    return "recovered";
+  }, {
+    attempts: 3,
+    delayMs: 1,
+    sleep: async () => { sleeps++; },
+    onRetry: () => { retries++; },
+  });
+  check("a resumable operation retries transient failures", value === "recovered" && calls === 3, `${value}, calls=${calls}`);
+  check("and waits plus reports only between attempts", sleeps === 2 && retries === 2, `sleeps=${sleeps} retries=${retries}`);
+
+  let terminalCalls = 0, terminal = null;
+  try {
+    await mod.retryTransient(async () => {
+      terminalCalls++;
+      throw new Error("still offline");
+    }, { attempts: 3, delayMs: 1, sleep: async () => {} });
+  } catch (error) {
+    terminal = error;
+  }
+  check("retry remains bounded and preserves the final error",
+    terminalCalls === 3 && terminal?.message === "still offline", `calls=${terminalCalls} error=${terminal?.message}`);
 }
 {
   // A hang is worse than a failure: every network call must have a deadline.

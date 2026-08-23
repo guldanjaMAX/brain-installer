@@ -3234,6 +3234,34 @@ async function http(url, opts = {}, { timeoutMs = HTTP_TIMEOUT_MS, what = "the r
   }
 }
 
+/**
+ * Retry an operation that is already safe to repeat.
+ *
+ * This is deliberately opt-in rather than built into http(): a lost response
+ * to an arbitrary POST is not proof that the write did not happen. The vector
+ * drain is different. It removes an outbox row only after Vectorize accepts
+ * that exact id, and a second drain call simply continues with what remains.
+ */
+export async function retryTransient(operation, {
+  attempts = 3,
+  delayMs = 2_000,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  onRetry = () => {},
+} = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await operation(attempt);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) throw error;
+      onRetry(error, attempt, attempts);
+      await sleep(delayMs * attempt);
+    }
+  }
+  throw lastError;
+}
+
 
 /**
  * brain whatsnew — what changed, in the client's own terminal.
@@ -3567,10 +3595,15 @@ async function cmdDrain(manifestPath) {
   let drained = 0;
   let remaining = null;
   for (let round = 1; round <= 400; round++) {
-    const res = await http(`${base}/api/admin/brain/drain`, {
+    const res = await retryTransient(() => http(`${base}/api/admin/brain/drain`, {
       method: "POST",
       headers: { "X-Admin-Key": adminKey },
-    }, { timeoutMs: 180_000, what: "the drain" });
+    }, { timeoutMs: 180_000, what: "the drain" }), {
+      onRetry: (error, attempt, attempts) => info(
+        `the drain request hit a network error (${String(error?.message || error).split("\n", 1)[0]}). ` +
+        `Retrying ${attempt}/${attempts - 1}; completed chunks are already safe.`
+      ),
+    });
     if (!res.ok) die(`drain failed (${res.status}): ${(await res.text()).slice(0, 200)}`);
     const j = await res.json().catch(() => ({}));
     drained += Number(j.drained || 0);
