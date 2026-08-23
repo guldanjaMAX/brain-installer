@@ -176,6 +176,38 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   check("the refusal exposes its short support decision", body.evidence_gate?.supported === false && /different company/.test(body.evidence_gate?.reason || ""), JSON.stringify(body.evidence_gate));
 }
 
+/* ---- planning notes do not establish binding legal obligations ---- */
+{
+  const rows = [{
+    chunk_uid: "legal-planning",
+    document_uid: "legal-planning-doc",
+    source_type: "drive",
+    source_id: "legal-planning-doc",
+    title: "Operating Agreement, Decisions So Far",
+    text: "Planning notes say a right of first refusal and drag along should both be included.",
+    occurred_at: null,
+    metadata_json: "{}",
+    ref_key: "legal-planning-doc",
+  }];
+  const { env } = mkEnv(rows, {
+    vectorIds: [],
+    extra: {
+      BRAIN_OWNER: "James Guldan",
+      AI: {
+        run: async (model, input) => {
+          if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+            ? { response: { supported: true, evidence: [1], reason: "the planning note says so" }, usage: {} }
+            : { response: "You are bound by a right of first refusal and drag along [1].", usage: {} };
+        },
+      },
+    },
+  });
+  const body = await (await call(env, "/api/rag/think?q=What+am+I+actually+bound+by+under+the+ownership+agreement%3F")).json();
+  check("non-final planning notes cannot establish binding legal obligations", body.answer === "The documents do not answer the question." && body.evidence_gate?.supported === false, JSON.stringify(body));
+  check("the legal refusal says why it failed closed", /non-final planning material/.test(body.evidence_gate?.reason || ""), JSON.stringify(body.evidence_gate));
+}
+
 /* ---- a missing metadata index must not take search down ---- */
 {
   const { env } = mkEnv([ROW], { vectorThrows: true });
