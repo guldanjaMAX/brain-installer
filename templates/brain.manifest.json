@@ -60,23 +60,17 @@
     },
     "supabase": {
       "_comment": [
-        "The upgrade path, not the starting point. D1 plus Vectorize keeps the",
-        "whole brain inside the one Cloudflare account the client already owns,",
-        "which is the entire custody story. Adding Supabase means a second vendor",
-        "for them to own, and its free tier PAUSES after inactivity, so a brain",
-        "queried twice a week is asleep exactly when it is wanted.",
+        "Migration and temporary rollback compatibility only. It is not a higher",
+        "product tier and it is not enabled automatically at any corpus size.",
         "",
-        "Switch when the trigger below is hit. It is not about storage size:",
-        "Vectorize holds 20M vectors and D1 holds 10GB, neither of which anyone",
-        "here will reach. It is that Vectorize caps topK at 100 results per query,",
-        "and that cap does NOT grow with the corpus. Fusion can only rank what it",
-        "retrieved, so as the corpus grows those 100 candidates become a thinner",
-        "and thinner slice of it, and recall decays quietly."
+        "D1 plus Vectorize is the standard architecture every client installs.",
+        "A different backend requires a measured eval failure, a diagnosed cause",
+        "and an explicit architecture decision. Chunk count alone is not a trigger."
       ],
       "enabled": false,
       "project_ref": null,
-      "trigger_for_enabling": "roughly 250k chunks, or measured recall decay on the eval set, whichever comes first",
-      "comfortable_below": "roughly 100k chunks"
+      "trigger_for_enabling": "no automatic trigger; migration or temporary rollback only",
+      "comfortable_below": "not defined; prove retrieval quality with the full eval set"
     }
   },
   "corpora": {

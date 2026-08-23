@@ -71,6 +71,18 @@ for (const t of ["chunks_ai", "chunks_ad", "chunks_au"]) {
   check(`trigger ${t} exists`, names.has(t), "MISSING — keyword search would silently return nothing forever");
 }
 
+for (const table of ["documents", "chunks"]) {
+  const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name));
+  for (const column of ["client", "category", "top_folder", "platform", "document_date"]) {
+    check(`${table}.${column} exists for the retrieval filter contract`, columns.has(column), [...columns].join(", "));
+  }
+}
+for (const index of ["idx_chunks_category", "idx_chunks_top_folder", "idx_chunks_platform"]) {
+  check(`${index} exists`, names.has(index), "filtered hydration would otherwise scan the chunk table");
+}
+check("vector_outbox retains vector_id after a chunk row is gone",
+  new Set(db.prepare("PRAGMA table_info(vector_outbox)").all().map((r) => r.name)).has("vector_id"));
+
 /* ---- and the triggers must actually keep the FTS index in step ---- */
 {
   db.exec(`INSERT INTO documents (doc_uid,source,source_id,title,ingested_at,content_hash)

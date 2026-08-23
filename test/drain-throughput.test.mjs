@@ -15,7 +15,7 @@ const mkEnv = (rows, upserted, deleted = [], updates = []) => ({
   DB: {
     prepare(q) {
       const shape = (b = []) => ({
-        all: async () => ({ results: rows }), first: async () => ({ n: 1 }),
+        all: async () => ({ results: /WHERE op = 'delete'/.test(q) ? [] : rows }), first: async () => ({ n: 1 }),
         run: async () => ({}), _q: q, _b: b,
       });
       const o = shape(); o.bind = (...b) => shape(b); return o;
@@ -30,7 +30,11 @@ const mkEnv = (rows, upserted, deleted = [], updates = []) => ({
   VECTORIZE: { upsert: async (v) => { upserted.push(...v); } },
 });
 
-const rows = (n) => Array.from({ length: n }, (_, i) => ({ chunk_uid: `c${i}#0`, text: `text ${i}`, source: "s", doc_uid: `c${i}` }));
+const rows = (n) => Array.from({ length: n }, (_, i) => ({
+  chunk_uid: `c${i}#0`, text: `text ${i}`, source: "s", doc_uid: `c${i}`,
+  client: "Acme", category: "note", top_folder: "Clients", platform: "drive",
+  document_date: 1750000000000,
+}));
 
 /* ---- the round trips actually collapse ---- */
 {
@@ -42,6 +46,11 @@ const rows = (n) => Array.from({ length: n }, (_, i) => ({ chunk_uid: `c${i}#0`,
   });
   check("100 chunks embed in 2 calls, not 100", batchCalls === 2 && singleCalls === 0, `batch=${batchCalls} single=${singleCalls}`);
   check("and all 100 are drained", r.drained === 100, JSON.stringify(r));
+  check("every vector carries the full pre-filter metadata contract",
+    up.every((v) => v.metadata.source === "s" && v.metadata.client === "Acme" &&
+      v.metadata.category === "note" && v.metadata.top_folder === "Clients" &&
+      v.metadata.platform === "drive" && v.metadata.document_date === 1750000000000),
+    JSON.stringify(up[0]?.metadata));
 }
 
 /* ---- alignment: the vector a chunk gets must be ITS OWN ---- */

@@ -125,7 +125,7 @@ command.
 
 ## For developers
 
-Architecture, testing, the storage design and the scaling ceiling are in
+Architecture, testing, the storage design and the retrieval measurement gates are in
 [docs/README-developer.md](docs/README-developer.md).
 
 ```bash

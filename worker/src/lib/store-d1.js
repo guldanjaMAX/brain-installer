@@ -48,6 +48,7 @@ const RRF_K = 60;
  * fits, and the readable chunk_uid remains the join key everywhere else.
  */
 export const VECTOR_ID_MAX_BYTES = 64;
+export const VECTOR_METADATA_MAX_BYTES = 64;
 
 export async function vectorIdFor(chunkUid) {
   const bytes = new TextEncoder().encode(chunkUid);
@@ -58,11 +59,26 @@ export async function vectorIdFor(chunkUid) {
   return `h:${hex.slice(0, 60)}`;
 }
 
-// Vectorize caps topK at 100, and only when no metadata or values are
-// returned; 50 otherwise. This is a hard platform limit that does NOT scale
-// with corpus size, so candidate depth shrinks as a fraction of the corpus as
-// the brain grows. It is the real ceiling on this design, well below the
-// advertised 20M vectors per index.
+/**
+ * Encode an exact-match metadata value without relying on Vectorize's silent
+ * 64-byte truncation. The same function is used when vectors are written and
+ * when a filter is queried, so long values remain exact rather than sharing a
+ * prefix with an unrelated value.
+ */
+export async function metadataTokenFor(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const text = String(value);
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.length <= VECTOR_METADATA_MAX_BYTES) return text;
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `h:${hex.slice(0, 60)}`;
+}
+
+// Vectorize caps topK at 100 when neither metadata nor values are returned, and
+// 50 otherwise. Metadata prefilters and D1 FTS5 keep this from being equivalent
+// to a corpus-size cutoff. The full eval set, not a guessed chunk threshold,
+// decides whether candidate depth is sufficient.
 const VECTOR_TOPK_MAX = 100;
 
 /**
@@ -92,13 +108,11 @@ export function fuseRRF(lists, { k = RRF_K } = {}) {
 /**
  * Translate the supported filters into a SQL fragment.
  *
- * `top_folder` and `platform` are NOT here. They exist in the Postgres schema
- * and have no equivalent column in D1, so they are refused by the caller rather
- * than dropped. Dropping a filter is worse than rejecting it: the answer comes
- * back looking narrowed when it never was.
+ * All public filters have real D1 columns. Dropping a filter is worse than
+ * rejecting it: the answer comes back looking narrowed when it never was.
  */
-export const D1_FILTERS = ["source", "client", "category", "from", "to"];
-export const D1_UNSUPPORTED = ["top_folder", "platform"];
+export const D1_FILTERS = ["source", "client", "category", "top_folder", "platform", "from", "to"];
+export const D1_UNSUPPORTED = [];
 
 export function filterSql(filters = {}, alias = "c", nextParam = 3) {
   const parts = [];
@@ -107,6 +121,8 @@ export function filterSql(filters = {}, alias = "c", nextParam = 3) {
   if (filters.source) add(`${alias}.source = ?N`, filters.source);
   if (filters.client) add(`${alias}.client = ?N`, filters.client);
   if (filters.category) add(`${alias}.category = ?N`, filters.category);
+  if (filters.top_folder) add(`${alias}.top_folder = ?N`, filters.top_folder);
+  if (filters.platform) add(`${alias}.platform = ?N`, filters.platform);
   // A date filter must not swallow undated rows silently, but it must not keep
   // them either: "since June" cannot be answered by a document with no date.
   // They are excluded, and the undated count is what the gap engine reports.
@@ -118,6 +134,42 @@ export function filterSql(filters = {}, alias = "c", nextParam = 3) {
 /** Which requested filters this backend cannot honour. */
 export function unsupportedFilters(filters = {}) {
   return D1_UNSUPPORTED.filter((k) => filters[k]);
+}
+
+const VECTOR_STRING_FILTERS = ["source", "client", "category", "top_folder", "platform"];
+
+/** Build the metadata stored with one vector. D1 remains the exact authority. */
+export async function vectorMetadataFor(row) {
+  const metadata = {};
+  for (const key of VECTOR_STRING_FILTERS) {
+    const token = await metadataTokenFor(row[key]);
+    if (token !== null) metadata[key] = token;
+  }
+  const date = Number(row.document_date);
+  if (row.document_date !== null && row.document_date !== undefined && Number.isFinite(date)) {
+    metadata.document_date = date;
+  }
+  return metadata;
+}
+
+/** Build the pre-filter Vectorize applies before selecting topK candidates. */
+export async function vectorFilterFor(filters = {}) {
+  const filter = {};
+  for (const key of VECTOR_STRING_FILTERS) {
+    const token = await metadataTokenFor(filters[key]);
+    if (token !== null) filter[key] = { $eq: token };
+  }
+  const range = {};
+  if (filters.from) {
+    const t = Date.parse(filters.from);
+    if (Number.isFinite(t)) range.$gte = t;
+  }
+  if (filters.to) {
+    const t = Date.parse(filters.to);
+    if (Number.isFinite(t)) range.$lte = t;
+  }
+  if (Object.keys(range).length) filter.document_date = range;
+  return filter;
 }
 
 /** Keyword search over D1's FTS5 index, ranked by bm25. */
@@ -176,7 +228,8 @@ export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
   const f = filterSql(filters, "c", 3);
   const sql = `
     SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
-           c.client, c.category, bm25(chunks_fts) AS score
+           c.client, c.category, c.top_folder, c.platform,
+           bm25(chunks_fts) AS score
     FROM chunks_fts
     JOIN chunks c ON c.id = chunks_fts.rowid
     WHERE chunks_fts MATCH ?1${f.clause}
@@ -190,23 +243,21 @@ export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
 /** Vector search over Vectorize, hydrated and filtered in D1. */
 export async function searchVector(env, embedding, { limit, filters = {} } = {}) {
   const topK = Math.min(limit, VECTOR_TOPK_MAX);
+  const vectorFilter = await vectorFilterFor(filters);
+  const hasFilter = Object.keys(vectorFilter).length > 0;
 
-  // Vectorize can only filter on indexed metadata, and only `source` is small
-  // and low-cardinality enough to live there safely. Everything else is applied
-  // during hydration. That costs recall — a filter narrower than the topK
-  // window can return almost nothing — so the topK is pushed to its maximum
-  // whenever a post-filter is in play, and a thin result is reported, not hidden.
-  const postFiltered = !!(filters.client || filters.category || filters.from || filters.to);
-  const effTopK = postFiltered ? VECTOR_TOPK_MAX : topK;
-
+  // Vectorize applies metadata filters BEFORE topK. D1 repeats the same filter
+  // during hydration as the exact authority and as protection against index
+  // drift. If an upgraded install is missing a metadata index, the fallback
+  // widens the candidate pool before D1 narrows it.
   const query = (withFilter) =>
     env.VECTORIZE.query(embedding, {
-      topK: effTopK,
+      topK: !withFilter && hasFilter ? VECTOR_TOPK_MAX : topK,
       returnValues: false,
       // Metadata is deliberately not returned. It halves topK from 100 to 50, and
       // everything needed is in D1 anyway, keyed by the same chunk_uid.
       returnMetadata: "none",
-      ...(withFilter && filters.source ? { filter: { source: { $eq: filters.source } } } : {}),
+      ...(withFilter && hasFilter ? { filter: vectorFilter } : {}),
     });
 
   let res;
@@ -242,7 +293,7 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
   const f = filterSql(filters, "c", resolved.length + 1);
   const { results } = await env.DB.prepare(
     `SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
-            c.client, c.category
+            c.client, c.category, c.top_folder, c.platform
      FROM chunks c WHERE c.chunk_uid IN (${placeholders})${f.clause}`
   )
     .bind(...resolved, ...f.params)
@@ -311,25 +362,87 @@ export async function upsertChunks(env, chunks) {
     c.vector_id = await vectorIdFor(c.chunk_uid);
     stmts.push(
       env.DB.prepare(
-        `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, vector_id)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+        `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
          ON CONFLICT(chunk_uid) DO UPDATE SET
            text = excluded.text, title = excluded.title,
            document_date = excluded.document_date,
            client = excluded.client, category = excluded.category,
+           top_folder = excluded.top_folder, platform = excluded.platform,
            vector_id = excluded.vector_id`
       ).bind(c.chunk_uid, c.doc_uid, c.chunk_ix, c.text, c.source, c.title ?? null,
-             c.document_date ?? null, c.client ?? null, c.category ?? null, c.vector_id)
+             c.document_date ?? null, c.client ?? null, c.category ?? null,
+             c.top_folder ?? null, c.platform ?? null, c.vector_id)
     );
     stmts.push(
       env.DB.prepare(
-        `INSERT INTO vector_outbox (chunk_uid, op, queued_at) VALUES (?1,'upsert',?2)
-         ON CONFLICT(chunk_uid) DO UPDATE SET op='upsert', queued_at=?2, attempts=0`
-      ).bind(c.chunk_uid, now)
+        `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at)
+         VALUES (?1,?2,'upsert',?3)
+         ON CONFLICT(chunk_uid) DO UPDATE SET
+           vector_id=excluded.vector_id, op='upsert', queued_at=?3,
+           attempts=0, last_error=NULL`
+      ).bind(c.chunk_uid, c.vector_id, now)
     );
   }
   await env.DB.batch(stmts);
   return { written: chunks.length, queued: chunks.length };
+}
+
+/**
+ * Queue every current vector for a document and remove its D1 chunks in one D1
+ * transaction. A following upsert for a retained chunk uid changes that queue
+ * row back to `upsert`; chunks removed by a shorter revision remain `delete`.
+ */
+export async function replaceDocumentChunks(env, docUid) {
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at, attempts, last_error)
+       SELECT chunk_uid, COALESCE(vector_id, chunk_uid), 'delete', ?2, 0, NULL
+       FROM chunks WHERE doc_uid = ?1
+       ON CONFLICT(chunk_uid) DO UPDATE SET
+         vector_id=excluded.vector_id, op='delete', queued_at=excluded.queued_at,
+         attempts=0, last_error=NULL`
+    ).bind(docUid, now),
+    env.DB.prepare("DELETE FROM chunks WHERE doc_uid = ?1").bind(docUid),
+  ]);
+}
+
+/** Vectorize caps a delete batch; stay well under it and chunk. */
+const DELETE_BATCH = 500;
+
+async function deleteQueuedVectors(env, rows) {
+  let deleted = 0;
+  for (let i = 0; i < rows.length; i += DELETE_BATCH) {
+    const slice = rows.slice(i, i + DELETE_BATCH);
+    try {
+      await env.VECTORIZE.deleteByIds(slice.map((r) => r.vector_id || r.chunk_uid));
+      deleted += slice.length;
+      // Only clear the exact delete operation we observed. If an ingest changed
+      // the row back to `upsert` while Vectorize was deleting, that upsert must
+      // survive so the current chunk is restored.
+      await env.DB.batch(slice.map((r) =>
+        env.DB.prepare(
+          `DELETE FROM vector_outbox
+           WHERE chunk_uid = ?1 AND op = 'delete'
+             AND COALESCE(vector_id, chunk_uid) = ?2 AND queued_at = ?3`
+        ).bind(r.chunk_uid, r.vector_id || r.chunk_uid, r.queued_at)
+      ));
+    } catch (e) {
+      const err = String(e.message || e).slice(0, 300);
+      await env.DB.batch(slice.map((r) =>
+        env.DB.prepare(
+          `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
+           WHERE chunk_uid = ?1 AND op = 'delete'`
+        ).bind(r.chunk_uid, err)
+      )).catch(() => {});
+      const e2 = new Error(`the vector index refused this delete batch: ${err}`);
+      e2.vectorDeleteFailed = true;
+      e2.deleted = deleted;
+      throw e2;
+    }
+  }
+  return deleted;
 }
 
 /**
@@ -341,18 +454,31 @@ export async function upsertChunks(env, chunks) {
  * broken. Draining separately makes the lag a visible queue instead.
  */
 export async function drainOutbox(env, { embed, embedBatch, batchSize = 100, embedGroup = 50 } = {}) {
+  // Delete first. Orphans still consume Vectorize candidate slots even though
+  // D1 hydration makes them unreachable, so leaving them behind damages recall.
+  const { results: deletePending } = await env.DB.prepare(
+    `SELECT chunk_uid, COALESCE(vector_id, chunk_uid) AS vector_id, queued_at
+     FROM vector_outbox WHERE op = 'delete' ORDER BY queued_at LIMIT ?1`
+  ).bind(batchSize).all();
+  const deleted = deletePending?.length ? await deleteQueuedVectors(env, deletePending) : 0;
+
   const { results: pending } = await env.DB.prepare(
-    `SELECT o.chunk_uid, c.text, c.source, c.doc_uid
+    `SELECT o.chunk_uid, o.queued_at, c.text, c.source, c.doc_uid, c.document_date,
+            c.client, c.category, c.top_folder, c.platform
      FROM vector_outbox o JOIN chunks c ON c.chunk_uid = o.chunk_uid
      WHERE o.op = 'upsert' ORDER BY o.queued_at LIMIT ?1`
   )
     .bind(batchSize)
     .all();
 
-  if (!pending?.length) return { drained: 0, remaining: 0 };
+  if (!pending?.length) {
+    const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+    return { drained: deleted, deleted, upserted: 0, failed: 0, remaining: Number(rest?.n || 0), errors: [] };
+  }
 
   const vectors = [];
   const idToChunk = new Map();
+  const chunkVersion = new Map();
   const poisoned = [];
 
   // Embed in groups when the caller can. One round trip per group instead of one
@@ -400,14 +526,11 @@ export async function drainOutbox(env, { embed, embedBatch, batchSize = 100, emb
     }
     const vid = await vectorIdFor(row.chunk_uid);
     idToChunk.set(vid, row.chunk_uid);
+    chunkVersion.set(row.chunk_uid, row.queued_at);
     vectors.push({
       id: vid,
       values,
-      // Metadata strings are INDEXED to 64 bytes and truncate silently, so two
-      // long client names sharing a prefix would become indistinguishable to a
-      // filter. Only short, low-cardinality values go here; everything else
-      // lives in D1.
-      metadata: { source: String(row.source).slice(0, 60) },
+      metadata: await vectorMetadataFor(row),
     });
   }
 
@@ -421,8 +544,9 @@ export async function drainOutbox(env, { embed, embedBatch, batchSize = 100, emb
       await env.DB.batch(
         vectors.map((v) =>
           env.DB.prepare(
-            "UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2 WHERE chunk_uid = ?1"
-          ).bind(idToChunk.get(v.id), err)
+            `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
+             WHERE chunk_uid = ?1 AND op = 'upsert' AND queued_at = ?3`
+          ).bind(idToChunk.get(v.id), err, chunkVersion.get(idToChunk.get(v.id)))
         )
       ).catch(() => {});
       const e2 = new Error(`the vector index refused this batch: ${err}`);
@@ -456,22 +580,27 @@ export async function drainOutbox(env, { embed, embedBatch, batchSize = 100, emb
   const landed = vectors.map((v) => idToChunk.get(v.id)).filter(Boolean);
   if (landed.length) {
     await env.DB.batch(
-      landed.map((cu) => env.DB.prepare("DELETE FROM vector_outbox WHERE chunk_uid = ?1").bind(cu))
+      landed.map((cu) => env.DB.prepare(
+        "DELETE FROM vector_outbox WHERE chunk_uid = ?1 AND op = 'upsert' AND queued_at = ?2"
+      ).bind(cu, chunkVersion.get(cu)))
     );
   }
   if (poisoned.length) {
     await env.DB.batch(
       poisoned.map((p) =>
         env.DB.prepare(
-          "UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2 WHERE chunk_uid = ?1"
-        ).bind(p.chunk_uid, p.error)
+          `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
+           WHERE chunk_uid = ?1 AND op = 'upsert' AND queued_at = ?3`
+        ).bind(p.chunk_uid, p.error, chunkVersion.get(p.chunk_uid))
       )
     ).catch(() => {});
   }
 
   const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
   return {
-    drained: landed.length,
+    drained: deleted + landed.length,
+    deleted,
+    upserted: landed.length,
     failed: poisoned.length,
     remaining: Number(rest?.n || 0),
     errors: poisoned.slice(0, 3).map((p) => p.error),
@@ -500,9 +629,6 @@ export async function drainOutbox(env, { embed, embedBatch, batchSize = 100, emb
  */
 /** Chunks past this are near the embedding model's 512-token ceiling and risk silent truncation. */
 const CHUNK_CHAR_WARN = 1800;
-/** Past this many chunks, recall degrades quietly rather than failing. */
-const CORPUS_COMFORT_CEILING = 100000;
-
 const q1 = async (env, sql, ...bind) => {
   const st = env.DB.prepare(sql);
   return await (bind.length ? st.bind(...bind) : st).first();
@@ -611,13 +737,18 @@ export async function diagnose(env, { sampleLimit = 10 } = {}) {
       if (Number.isFinite(v)) vectors = v;
     } catch { /* older binding without describe() */ }
 
-    const pending = Number((await q1(env, "SELECT count(*) n FROM vector_outbox"))?.n || 0);
-    const expected = totals.chunks - pending;
+    const queue = await q1(env,
+      `SELECT sum(CASE WHEN op = 'upsert' THEN 1 ELSE 0 END) upserts,
+              sum(CASE WHEN op = 'delete' THEN 1 ELSE 0 END) deletes
+       FROM vector_outbox`);
+    const pendingUpserts = Number(queue?.upserts || 0);
+    const pendingDeletes = Number(queue?.deletes || 0);
+    const expected = totals.chunks - pendingUpserts;
 
     if (vectors === null) {
       add({ id: "store_agreement", area: "integrity", severity: "info",
         title: "the vector count could not be read from Vectorize",
-        detail: `D1 holds ${totals.chunks} chunk(s) with ${pending} still queued, so ${expected} should be embedded. The vector store could not be asked how many it holds, so the two cannot be compared.`,
+        detail: `D1 holds ${totals.chunks} chunk(s) with ${pendingUpserts} upsert(s) and ${pendingDeletes} delete(s) queued, so ${expected} current chunk(s) should be embedded. The vector store could not be asked how many it holds, so the two cannot be compared.`,
         action: "Not a fault. This check needs a Vectorize binding that supports describe()." });
       return;
     }
@@ -632,7 +763,7 @@ export async function diagnose(env, { sampleLimit = 10 } = {}) {
     const missing = vectors < expected;
     add({ id: "store_agreement", area: "integrity", severity: "crit", count: drift,
       title: `the two stores disagree by ${drift} vector(s)`,
-      detail: `D1 says ${totals.chunks} chunk(s) with ${pending} queued, so ${expected} should be embedded. Vectorize holds ${vectors}. ` + (missing
+      detail: `D1 says ${totals.chunks} chunk(s) with ${pendingUpserts} upsert(s) and ${pendingDeletes} delete(s) queued, so ${expected} current chunk(s) should be embedded. Vectorize holds ${vectors}. ` + (missing
         ? "Vectors are MISSING: those chunks still answer keyword queries and are invisible to meaning-based search, which reads as poor retrieval rather than as a fault."
         : "There are MORE vectors than chunks: deleted documents likely left theirs behind, and they still compete for retrieval slots."),
       action: missing
@@ -641,15 +772,19 @@ export async function diagnose(env, { sampleLimit = 10 } = {}) {
   });
 
   await safe("backlog", async () => {
-    const row = await q1(env, "SELECT count(*) n, min(queued_at) oldest FROM vector_outbox");
+    const row = await q1(env,
+      `SELECT count(*) n, min(queued_at) oldest,
+              sum(CASE WHEN op = 'upsert' THEN 1 ELSE 0 END) upserts,
+              sum(CASE WHEN op = 'delete' THEN 1 ELSE 0 END) deletes
+       FROM vector_outbox`);
     const n = Number(row?.n || 0);
     if (!n) return;
     const mins = row?.oldest ? Math.floor((Date.now() - Number(row.oldest)) / 60000) : null;
     const stalled = mins !== null && mins > 30;
     add({ id: "backlog", area: "integrity", severity: stalled ? "crit" : "warn", count: n,
-      title: `${n} chunk(s) are waiting to be embedded${mins !== null ? `, oldest ${mins} min ago` : ""}`,
+      title: `${n} vector operation(s) are waiting (${Number(row?.upserts || 0)} upsert, ${Number(row?.deletes || 0)} delete)${mins !== null ? `, oldest ${mins} min ago` : ""}`,
       detail: stalled
-        ? "Older than 30 minutes means the drain is not running. Until it clears these are findable by keyword and invisible to meaning, and nothing else reports that."
+        ? "Older than 30 minutes means the drain is not running. Upserts remain keyword-only; deletes leave stale vectors competing for candidates."
         : "Normal right after a load.",
       action: "Clear it now with `brain drain <manifest>`." });
   });
@@ -660,8 +795,8 @@ export async function diagnose(env, { sampleLimit = 10 } = {}) {
     const rows = await qAll(env,
       "SELECT chunk_uid, attempts, last_error FROM vector_outbox WHERE attempts > 0 ORDER BY attempts DESC LIMIT ?1", sampleLimit);
     add({ id: "quarantined", area: "integrity", severity: "crit", count: n,
-      title: `${n} chunk(s) failed to embed and were set aside`,
-      detail: "These will never be searchable by meaning until the cause is fixed. The queue kept moving, which is exactly why nothing else reported it.",
+      title: `${n} vector operation(s) failed and were set aside`,
+      detail: "Upsert failures stay invisible to meaning search; delete failures leave stale vectors consuming candidates. Both remain queued for repair.",
       samples: rows.map((r) => `${r.chunk_uid}: ${String(r.last_error || "").slice(0, 90)}`),
       action: "Read the errors above. Once the cause is fixed, `brain reindex <manifest> --yes` re-queues them." });
   });
@@ -733,13 +868,6 @@ export async function diagnose(env, { sampleLimit = 10 } = {}) {
       title: `${groups}+ groups of identical chunk text`,
       detail: "Repeated headers, footers or boilerplate. Each copy is embedded and stored separately and can occupy a retrieval slot.",
       action: "Harmless at small scale. Worth trimming on a large corpus." });
-  });
-
-  await safe("scale", async () => {
-    if (totals.chunks > CORPUS_COMFORT_CEILING) add({ id: "scale", area: "efficiency", severity: "warn", count: totals.chunks,
-      title: `${totals.chunks} chunks is past the comfortable ceiling for this storage design`,
-      detail: `Past roughly ${CORPUS_COMFORT_CEILING} chunks recall degrades quietly rather than failing, which is easy to mistake for the product simply being poor.`,
-      action: "Narrow what is loaded, or plan a move to a larger backing store." });
   });
 
   const count = (s) => findings.filter((f) => f.severity === s).length;
@@ -881,8 +1009,8 @@ export async function reindex(env, { source = null, dryRun = true } = {}) {
   if (dryRun) return { chunks, queued: 0, already_queued: before, dry_run: true, source };
 
   await env.DB.prepare(
-    `INSERT OR IGNORE INTO vector_outbox (chunk_uid, op, queued_at, attempts, last_error)
-     SELECT c.chunk_uid, 'upsert', ?${source ? "2" : "1"}, 0, NULL
+    `INSERT OR REPLACE INTO vector_outbox (chunk_uid, vector_id, op, queued_at, attempts, last_error)
+     SELECT c.chunk_uid, COALESCE(c.vector_id, c.chunk_uid), 'upsert', ?${source ? "2" : "1"}, 0, NULL
      FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid ${where}`
   ).bind(...bind, Date.now()).run();
 
@@ -894,13 +1022,18 @@ export async function reindex(env, { source = null, dryRun = true } = {}) {
 
 export async function outboxDepth(env) {
   const row = await env.DB.prepare(
-    "SELECT count(*) AS n, min(queued_at) AS oldest FROM vector_outbox"
+    `SELECT count(*) AS n, min(queued_at) AS oldest,
+            sum(CASE WHEN op = 'upsert' THEN 1 ELSE 0 END) AS upserts,
+            sum(CASE WHEN op = 'delete' THEN 1 ELSE 0 END) AS deletes
+     FROM vector_outbox`
   ).first();
-  return { pending: Number(row?.n || 0), oldest_queued_at: row?.oldest ?? null };
+  return {
+    pending: Number(row?.n || 0),
+    upserts: Number(row?.upserts || 0),
+    deletes: Number(row?.deletes || 0),
+    oldest_queued_at: row?.oldest ?? null,
+  };
 }
-
-/** Vectorize caps a delete batch; stay well under it and chunk. */
-const DELETE_BATCH = 500;
 
 /**
  * Remove documents from both systems.
@@ -933,34 +1066,39 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
   // Delete by the id the vector was actually STORED under, which is the hash
   // when the readable id was too long. Deleting by chunk_uid alone would leave
   // those vectors orphaned and still competing for retrieval slots.
-  const vectorIds = (chunkRows || []).map((r) => r.vector_id || r.chunk_uid);
-
   if (dryRun) {
     return { documents: targets.length, chunks: chunkUids.length, vectors: chunkUids.length, dry_run: true, targets };
   }
 
   // D1 first. The FTS index follows via the delete trigger, and ON DELETE
   // CASCADE removes the chunks with their document.
+  const queuedAt = Date.now();
   await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at, attempts, last_error)
+       SELECT chunk_uid, COALESCE(vector_id, chunk_uid), 'delete', ?${targets.length + 1}, 0, NULL
+       FROM chunks WHERE doc_uid IN (${marks})
+       ON CONFLICT(chunk_uid) DO UPDATE SET
+         vector_id=excluded.vector_id, op='delete', queued_at=excluded.queued_at,
+         attempts=0, last_error=NULL`
+    ).bind(...targets, queuedAt),
     env.DB.prepare(`DELETE FROM chunks WHERE doc_uid IN (${marks})`).bind(...targets),
     env.DB.prepare(`DELETE FROM documents WHERE doc_uid IN (${marks})`).bind(...targets),
-    env.DB.prepare(`DELETE FROM vector_outbox WHERE chunk_uid IN (${chunkUids.map((_, i) => "?" + (i + 1)).join(",") || "NULL"})`)
-      .bind(...(chunkUids.length ? chunkUids : [])),
-  ].filter(Boolean));
+  ]);
 
   let vectors = 0;
   let vectorError = null;
-  for (let i = 0; i < vectorIds.length; i += DELETE_BATCH) {
-    const slice = vectorIds.slice(i, i + DELETE_BATCH);
-    try {
-      await env.VECTORIZE.deleteByIds(slice);
-      vectors += slice.length;
-    } catch (e) {
-      // Reported, never swallowed. The document is already unreachable, but a
-      // caller told "deleted" while vectors remain deserves to know.
-      vectorError = String(e.message || e).slice(0, 200);
-      break;
-    }
+  try {
+    vectors = await deleteQueuedVectors(env, (chunkRows || []).map((r) => ({
+      chunk_uid: r.chunk_uid,
+      vector_id: r.vector_id || r.chunk_uid,
+      queued_at: queuedAt,
+    })));
+  } catch (e) {
+    // The D1 delete is complete, so the content is unreachable. Keep the
+    // outbox rows for retry and report that physical vector cleanup is pending.
+    vectors = Number(e.deleted || 0);
+    vectorError = String(e.message || e).slice(0, 200);
   }
 
   // Derived, so the count cannot drift after a delete.
@@ -974,5 +1112,9 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
     ).bind(src).run().catch(() => {});
   }
 
-  return { documents: targets.length, chunks: chunkUids.length, vectors, dry_run: false, vector_error: vectorError, targets };
+  return {
+    documents: targets.length, chunks: chunkUids.length, vectors,
+    vector_cleanup_queued: Math.max(0, chunkUids.length - vectors),
+    dry_run: false, vector_error: vectorError, targets,
+  };
 }

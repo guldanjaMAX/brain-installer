@@ -1,16 +1,14 @@
 /**
  * store — one retrieval interface, two backends.
  *
- * The manifest picks. New installs get "d1", which keeps the entire brain
- * inside the single Cloudflare account the client already owns. "supabase" is
- * the upgrade, taken when a corpus outgrows the candidate depth Vectorize can
- * offer (roughly 250,000 chunks), and it is also what James's own brain runs
- * on today.
+ * The product backend is "d1", which keeps the entire brain inside the single
+ * Cloudflare account the client already owns. The Supabase adapter remains only
+ * as a migration source, comparison path and temporary rollback while James's
+ * existing corpus is moved onto the same architecture every client installs.
  *
  * The point of this file is that index.js should never know which. Every
- * difference between the two backends is absorbed here, so switching a client
- * from D1 to Postgres later is a manifest change and a data copy rather than a
- * rewrite of the endpoints.
+ * difference between the two backends is absorbed here, so migration comparison
+ * and temporary rollback do not require a rewrite of the endpoints.
  *
  * SHAPE CONTRACT, honoured by both backends:
  *
@@ -91,6 +89,8 @@ const d1Backend = {
         snippet: x.text,
         client: x.client ?? null,
         category: x.category ?? null,
+        top_folder: x.top_folder ?? null,
+        platform: x.platform ?? null,
         ts: x.document_date ? new Date(Number(x.document_date)).toISOString() : null,
         score: x.rrf_score,
       })),
@@ -120,12 +120,13 @@ const d1Backend = {
     await env.DB.prepare(
       `INSERT INTO documents (doc_uid, source, source_id, title, uri, document_date,
                               date_source, date_reliable, client, category,
-                              ingested_at, content_hash, meta)
-       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                              top_folder, platform, ingested_at, content_hash, meta)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
        ON CONFLICT(doc_uid) DO UPDATE SET
          title=excluded.title, document_date=excluded.document_date,
          date_source=excluded.date_source, date_reliable=excluded.date_reliable,
          client=excluded.client, category=excluded.category,
+         top_folder=excluded.top_folder, platform=excluded.platform,
          ingested_at=excluded.ingested_at, content_hash=excluded.content_hash,
          meta=excluded.meta`
     )
@@ -136,17 +137,21 @@ const d1Backend = {
         envelope.date_reliable ? 1 : 0,
         (envelope.metadata || {}).client_name || (envelope.metadata || {}).client || null,
         (envelope.metadata || {}).category || null,
+        (envelope.metadata || {}).top_folder || null,
+        (envelope.metadata || {}).platform || null,
         now, hash, JSON.stringify(envelope.metadata || {})
       )
       .run();
 
     // Replace rather than merge. A shorter revision must not leave the tail of
     // the previous version behind, answering questions from text that is gone.
-    await env.DB.prepare("DELETE FROM chunks WHERE doc_uid = ?1").bind(docUid).run();
+    await d1.replaceDocumentChunks(env, docUid);
 
     const md = envelope.metadata || {};
     const client = md.client_name || md.client || null;
     const category = md.category || null;
+    const topFolder = md.top_folder || null;
+    const platform = md.platform || null;
     const header = title ? `[${title}]` : "";
     const pieces = chunkText(content, { header });
     const chunks = pieces.map((text, i) => ({
@@ -159,6 +164,8 @@ const d1Backend = {
       document_date: Number.isFinite(docDate) ? docDate : null,
       client,
       category,
+      top_folder: topFolder,
+      platform,
     }));
 
     const w = await d1.upsertChunks(env, chunks);
@@ -232,6 +239,7 @@ const supabaseBackend = {
           title: r.title, snippet: String(r.content || "").slice(0, 900),
           ts: r.meeting_date || null, score: null,
           client: r.client_name || null, category: r.category || null,
+          top_folder: r.top_folder || null, platform: r.platform || null,
         })),
         degraded: "fts", ignored_filters: [],
       };
@@ -250,6 +258,7 @@ const supabaseBackend = {
         chunk_uid: r.ref_key, ref_key: r.ref_key, source: r.source, title: r.title,
         snippet: r.snippet, ts: r.ts || null, score: r.rrf_score,
         client: r.client || null, category: r.category || null,
+        top_folder: r.top_folder || null, platform: r.platform || null,
       })),
       degraded: null, ignored_filters: [],
     };

@@ -7,7 +7,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 /* A D1 env that records what SQL it was asked to run, so a filter that never
    reached the database is a visible failure rather than a silent one. */
 function mkEnv(rows, { vectorIds = [], vectorThrows = false, extra = {} } = {}) {
-  const seen = { sql: [], binds: [] };
+  const seen = { sql: [], binds: [], vectorQueries: [] };
   const env = {
     STORAGE: "d1",
     ADMIN_KEY: "k",
@@ -24,7 +24,11 @@ function mkEnv(rows, { vectorIds = [], vectorThrows = false, extra = {} } = {}) 
       batch: async () => {},
     },
     VECTORIZE: {
-      query: async () => { if (vectorThrows) throw new Error("no metadata index"); return { matches: vectorIds.map((id) => ({ id })) }; },
+      query: async (_embedding, options) => {
+        seen.vectorQueries.push(options);
+        if (vectorThrows) throw new Error("no metadata index");
+        return { matches: vectorIds.map((id) => ({ id })) };
+      },
       upsert: async () => {},
     },
     AI: { run: async () => ({ data: [[0.1, 0.2, 0.3]] }) },
@@ -36,6 +40,7 @@ function mkEnv(rows, { vectorIds = [], vectorThrows = false, extra = {} } = {}) 
 const ROW = {
   chunk_uid: "meeting:123#0", doc_uid: "meeting:123", text: "We agreed to defer the retainer.",
   source: "meeting", title: "Q3 sync", document_date: 1750000000000, client: "Acme", category: "meeting",
+  top_folder: "Clients", platform: "imessage",
 };
 const call = (env, path) => worker.fetch(new Request("https://b.example" + path, { headers: { "X-Admin-Key": "k" } }), env, { waitUntil() {}, passThroughOnException() {} });
 
@@ -69,20 +74,29 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   check("and its value is bound", !!bind && bind.includes(Date.parse("2025-01-01")), JSON.stringify(bind));
 }
 
-/* ---- a filter it CANNOT honour must be announced, never ignored ---- */
+/* ---- every public filter must narrow BOTH Vectorize and exact D1 hydration ---- */
 {
-  const { env } = mkEnv([ROW], { vectorIds: ["meeting:123#0"] });
-  const b = await (await call(env, "/api/rag/unified?q=x&platform=imessage")).json();
-  check("unsupported filter is reported", (b.ignored_filters || []).includes("platform"), JSON.stringify(b.ignored_filters));
+  const { env, seen } = mkEnv([ROW], { vectorIds: ["meeting:123#0"] });
+  const path = "/api/rag/unified?q=x&platform=imessage&top_folder=Clients&category=meeting&to=2025-12-31";
+  const b = await (await call(env, path)).json();
+  check("the D1 backend honors every public filter", (b.ignored_filters || []).length === 0, JSON.stringify(b.ignored_filters));
+  const query = seen.vectorQueries[0];
+  check("platform reaches Vectorize before topK", query.filter.platform.$eq === "imessage", JSON.stringify(query));
+  check("top_folder reaches Vectorize before topK", query.filter.top_folder.$eq === "Clients", JSON.stringify(query));
+  check("category reaches Vectorize before topK", query.filter.category.$eq === "meeting", JSON.stringify(query));
+  check("date reaches Vectorize as a numeric range", query.filter.document_date.$lte === Date.parse("2025-12-31"), JSON.stringify(query));
+
+  const hydration = seen.sql.find((s) => /FROM chunks c WHERE c\.chunk_uid IN/.test(s));
+  check("platform is re-applied in D1 hydration", /c\.platform = \?/.test(hydration), hydration);
+  check("top_folder is re-applied in D1 hydration", /c\.top_folder = \?/.test(hydration), hydration);
 
   const t = await (await call(env, "/api/rag/think?q=x&platform=imessage")).json();
   const g = (t.gaps || []).find((x) => x.type === "filter_not_applied");
-  check("think raises it as a gap", !!g, JSON.stringify(t.gaps));
-  check("and the gap is first, where it will be read", t.gaps[0].type === "filter_not_applied");
+  check("think does not claim a supported platform filter was ignored", !g, JSON.stringify(t.gaps));
 }
 {
   const { env } = mkEnv([ROW]);
-  check("supported filters are never flagged", unsupportedFilters({ client: "A", from: "2025-01-01" }).length === 0);
+  check("supported filters are never flagged", unsupportedFilters({ client: "A", top_folder: "Clients", platform: "imessage", from: "2025-01-01" }).length === 0);
 }
 
 /* ---- vector down is a degraded answer, not an empty corpus ---- */

@@ -292,7 +292,20 @@ function wranglerAvailable(accountId) {
  * provision can reach something that is not ours.
  */
 /**
- * Create the Vectorize metadata index on "source", and refuse to continue without it.
+ * Every filter that must narrow vector candidates before topK is listed here.
+ * Six of Vectorize's ten metadata-index slots are used by the product contract.
+ */
+export const VECTOR_METADATA_INDEXES = Object.freeze([
+  { propertyName: "source", indexType: "string" },
+  { propertyName: "client", indexType: "string" },
+  { propertyName: "category", indexType: "string" },
+  { propertyName: "top_folder", indexType: "string" },
+  { propertyName: "platform", indexType: "string" },
+  { propertyName: "document_date", indexType: "number" },
+]);
+
+/**
+ * Create one Vectorize metadata index and refuse to continue until it is active.
  *
  * Fatal on purpose. Measured against Vectorize on 2026-08-18: a vector written
  * BEFORE the metadata index exists is not filterable afterwards, even though it
@@ -301,25 +314,41 @@ function wranglerAvailable(accountId) {
  * returned by a filtered query. So there is no repair short of re-ingesting
  * everything, and a warning here buys a corpus that silently cannot be filtered.
  *
- * Injectable so the retry and the refusal are covered by a real test.
+ * The create API returns an asynchronous mutation id, so a successful POST is
+ * not proof that the index can filter yet. `exists` polls the list endpoint (or
+ * Wrangler) and closes that race before an immediate first ingest.
+ *
+ * Injectable so retries, activation polling and refusal are covered by a real
+ * test.
  */
-export async function ensureMetadataIndex({ create, attempts = 3, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = ok, onFatal = die }) {
+export async function ensureMetadataIndex({
+  propertyName = "source",
+  indexType = "string",
+  create,
+  exists,
+  attempts = 3,
+  verifyAttempts = 10,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  log = ok,
+  onFatal = die,
+}) {
+  let requested = false;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       await create();
-      log('metadata index on "source" created');
-      return true;
+      requested = true;
+      break;
     } catch (e) {
       const msg = e?.message || String(e);
       if (/already|exists|conflict/i.test(msg)) {
-        log('metadata index on "source" already present');
-        return true;
+        requested = true;
+        break;
       }
       if (attempt === attempts) {
         return onFatal(
-          `the metadata index on "source" could not be created: ${msg.slice(0, 120)}` + "\n" +
+          `the ${indexType} metadata index on "${propertyName}" could not be created: ${msg.slice(0, 120)}` + "\n" +
             "  This CANNOT be added later. Vectorize applies a metadata index only to" + "\n" +
-            "  vectors written after it exists, so continuing would leave source filtering" + "\n" +
+            `  vectors written after it exists, so continuing would leave ${propertyName} filtering` + "\n" +
             "  permanently broken for everything ingested from here on." + "\n" +
             "  Nothing has been ingested yet, so re-running `brain provision` costs nothing."
         );
@@ -327,6 +356,32 @@ export async function ensureMetadataIndex({ create, attempts = 3, sleep = (ms) =
       await sleep(3000);
     }
   }
+
+  if (!requested) return false;
+  if (!exists) {
+    log(`metadata index on "${propertyName}" requested`);
+    return true;
+  }
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= verifyAttempts; attempt++) {
+    try {
+      if (await exists()) {
+        log(`metadata index on "${propertyName}" active`);
+        return true;
+      }
+      lastError = `not visible after ${attempt} check(s)`;
+    } catch (e) {
+      lastError = e?.message || String(e);
+    }
+    if (attempt < verifyAttempts) await sleep(3000);
+  }
+
+  return onFatal(
+    `the metadata index on "${propertyName}" was requested but never became active: ${String(lastError || "unknown").slice(0, 120)}` + "\n" +
+      "  Provision will not ingest into an index whose filters are not ready." + "\n" +
+      "  Re-run `brain provision`; no corpus data has been written yet."
+  );
 }
 
 export function chooseDbName(cfg, slug) {
@@ -515,23 +570,50 @@ async function cmdProvision(manifestPath) {
         ok(`Vectorize "${idxName}" created via wrangler (768-dim, cosine)`);
       }
 
-      // A metadata index must exist BEFORE any vector is written; it does not
-      // apply retroactively. Creating it after ingest means source filtering
-      // silently matches nothing for everything already indexed.
-      await ensureMetadataIndex({
-        create: viaApi
-          ? () => cf(`/accounts/${acct.id}/vectorize/v2/indexes/${idxName}/metadata_index`, {
-              method: "POST",
-              body: { propertyName: "source", indexType: "string" },
-            })
-          : async () => {
-              const r = wrangler(
-                ["vectorize", "create-metadata-index", idxName, "--property-name=source", "--type=string"],
-                { accountId: acct.id }
-              );
-              if (!r.ok && !/already|exists/i.test(r.out)) throw new Error(r.out.slice(-200));
-            },
-      });
+      // Metadata indexes must be ACTIVE before any vector is written; they do
+      // not apply retroactively. Provision all public filter dimensions now.
+      for (const { propertyName, indexType } of VECTOR_METADATA_INDEXES) {
+        await ensureMetadataIndex({
+          propertyName,
+          indexType,
+          create: viaApi
+            ? () => cf(`/accounts/${acct.id}/vectorize/v2/indexes/${idxName}/metadata_index/create`, {
+                method: "POST",
+                body: { propertyName, indexType },
+              })
+            : async () => {
+                const r = wrangler(
+                  ["vectorize", "create-metadata-index", idxName, `--property-name=${propertyName}`, `--type=${indexType}`],
+                  { accountId: acct.id }
+                );
+                if (!r.ok && !/already|exists/i.test(r.out)) throw new Error(r.out.slice(-200));
+              },
+          exists: viaApi
+            ? async () => {
+                const found = await cf(`/accounts/${acct.id}/vectorize/v2/indexes/${idxName}/metadata_index/list`);
+                return (found?.metadataIndexes || []).some(
+                  (x) => x.propertyName === propertyName && String(x.indexType).toLowerCase() === indexType
+                );
+              }
+            : async () => {
+                const r = wrangler(
+                  ["vectorize", "list-metadata-index", idxName, "--json"],
+                  { accountId: acct.id }
+                );
+                if (!r.ok) throw new Error(r.out.slice(-200));
+                try {
+                  const parsed = JSON.parse(r.out);
+                  const rows = parsed?.metadataIndexes || parsed;
+                  if (Array.isArray(rows)) {
+                    return rows.some((x) =>
+                      x.propertyName === propertyName && String(x.indexType || x.type).toLowerCase() === indexType
+                    );
+                  }
+                } catch { /* fall through to the human-readable output */ }
+                return new RegExp(`\\b${propertyName.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\b`, "i").test(r.out);
+              },
+        });
+      }
 
       cfg.vectorize_index = idxName;
     } catch (e) {
@@ -540,8 +622,7 @@ async function cmdProvision(manifestPath) {
         `Vectorize could not be provisioned: ${e.message.slice(0, 140)}\n` +
           "  This is the storage backend, so the install cannot continue without it.\n" +
           VECTORIZE_REMEDY + "\n" +
-          "  To install against Postgres instead, set infrastructure.cloudflare.storage\n" +
-          '  to "supabase" in the manifest.'
+          "  Fix Cloudflare access and re-run provision. No corpus has been ingested."
       );
     }
   }
@@ -845,10 +926,9 @@ async function cmdHealth(manifestPath, { expectVersion = null } = {}) {
     if (docs.ok) {
       ok(`documents endpoint ${docs.status} ${dbody.slice(0, 160)}`);
 
-      // The one failure this install has that Postgres did not: text written to
-      // D1 whose vector never reached Vectorize. Both systems are up, every
-      // probe passes, and semantic search quietly answers from a subset. The
-      // backlog is the only place that shows.
+      // D1 and Vectorize cannot share a transaction. Both systems can be up
+      // while semantic search is behind or stale, so the operation backlog is
+      // part of health, not an implementation detail.
       try {
         const j = JSON.parse(dbody);
         const backlog = j.vector_backlog;
@@ -858,11 +938,12 @@ async function cmdHealth(manifestPath, { expectVersion = null } = {}) {
             : null;
           const stalled = oldest !== null && oldest > 30;
           (stalled ? warn : info)(
-            `${backlog.pending} chunk(s) awaiting embedding` +
+            `${backlog.pending} vector operation(s) pending` +
+              ` (${Number(backlog.upserts || 0)} upsert, ${Number(backlog.deletes || 0)} delete)` +
               (oldest !== null ? `, oldest queued ${oldest} min ago` : "") +
               (stalled
                 ? ".\n        Older than 30 minutes means the drain cron is NOT running. Those\n" +
-                  "        chunks are findable by keyword and invisible to semantic search.\n" +
+                  "        Upserts are keyword-only; deletes leave stale vectors competing.\n" +
                   "        Clear it now with:  brain drain <manifest>" + "\n" +
                   "        If it keeps returning, the drain cron is not firing: check the" + "\n" +
                   "        schedule on the worker in the Cloudflare dashboard."

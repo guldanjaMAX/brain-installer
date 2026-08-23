@@ -234,16 +234,19 @@ Read this before scoping an engagement.
 
 ---
 
-## Scaling ceiling
+## Scale is an evaluation gate, not a guessed cutoff
 
-Not the advertised limits. 20M vectors and 10GB of D1 are far past anything
-here. The real ceiling is **Vectorize's hard cap of 100 results per query**, and
-it does not grow with the corpus, so fusion ranks a thinner slice as the brain
-grows and recall decays quietly rather than breaking.
+The standard product backend is D1 plus Vectorize inside the client's
+Cloudflare account. Vectorize currently caps a query at 100 returned candidates
+when values and metadata are omitted. That is a candidate-depth constraint, not
+evidence for a 100k or 250k corpus-size cutoff.
 
-Comfortable to roughly 100k chunks. Plan the Postgres move at roughly 250k.
-`migrations/d1/0004_corpus.sql` already uses the Postgres column names and
-semantics, so that move is a data copy rather than a redesign.
+The retrieval path reduces the risk in three ways: metadata filters run before
+topK, D1 FTS5 supplies an independent keyword candidate list, and reciprocal
+rank fusion combines both lists. Full-corpus evaluation decides whether that is
+good enough. Do not move a client to another backend based on chunk count alone.
+Require a measured failure on the golden set, a diagnosed cause, and an approved
+architecture change.
 
 ---
 

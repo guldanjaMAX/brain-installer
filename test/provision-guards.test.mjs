@@ -4,7 +4,7 @@
 // ours, and both are tested here by CALLING the real functions, not by grepping
 // the source. A source assertion cannot tell a working guard from a deleted one.
 
-import { chooseDbName, assertAdoptable, ensureMetadataIndex } from "../brain.mjs";
+import { chooseDbName, assertAdoptable, ensureMetadataIndex, VECTOR_METADATA_INDEXES } from "../brain.mjs";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 200))); if (!c) fail++; };
@@ -56,6 +56,18 @@ const throws = async (fn) => { try { await fn(); return null; } catch (e) { retu
 {
   const noSleep = async () => {};
 
+  check("the full retrieval contract is provisioned before ingest",
+    JSON.stringify(VECTOR_METADATA_INDEXES) === JSON.stringify([
+      { propertyName: "source", indexType: "string" },
+      { propertyName: "client", indexType: "string" },
+      { propertyName: "category", indexType: "string" },
+      { propertyName: "top_folder", indexType: "string" },
+      { propertyName: "platform", indexType: "string" },
+      { propertyName: "document_date", indexType: "number" },
+    ]), JSON.stringify(VECTOR_METADATA_INDEXES));
+  check("the contract stays within Vectorize's ten-index limit", VECTOR_METADATA_INDEXES.length <= 10);
+  check("metadata index names are unique", new Set(VECTOR_METADATA_INDEXES.map((x) => x.propertyName)).size === VECTOR_METADATA_INDEXES.length);
+
   let created = 0;
   const okRes = await ensureMetadataIndex({ create: async () => { created++; }, sleep: noSleep, log: () => {} });
   check("a clean create succeeds on the first attempt", okRes === true && created === 1, `created=${created}`);
@@ -82,6 +94,22 @@ const throws = async (fn) => { try { await fn(); return null; } catch (e) { retu
     sleep: noSleep, log: () => {}, onFatal: (m) => { f2 = m; },
   });
   check("an already-present index is success, not a failure", already === true && f2 === null);
+
+  let polls = 0;
+  const activated = await ensureMetadataIndex({
+    propertyName: "platform", create: async () => {},
+    exists: async () => ++polls === 3, verifyAttempts: 3,
+    sleep: noSleep, log: () => {},
+  });
+  check("an asynchronous metadata index is polled until active", activated === true && polls === 3, `polls=${polls}`);
+
+  let inactiveFatal = null;
+  await ensureMetadataIndex({
+    propertyName: "document_date", indexType: "number", create: async () => {},
+    exists: async () => false, verifyAttempts: 2,
+    sleep: noSleep, log: () => {}, onFatal: (m) => { inactiveFatal = m; },
+  });
+  check("provision refuses an index that was requested but never active", /never became active/.test(inactiveFatal || ""), inactiveFatal);
 }
 
 /* ---- no copy of the code may send a client after a scope we have never proven ---- */

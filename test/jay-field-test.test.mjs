@@ -45,7 +45,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
         // first() is called both with and without bind() in this path, so the
         // mock has to answer either way.
         const shape = (b = []) => ({
-          all: async () => ({ results: rows }),
+          all: async () => ({ results: /WHERE op = 'delete'/.test(q) ? [] : rows }),
           first: async () => ({ n: 1 }),
           run: async () => ({}),
           _q: q, _b: b,
@@ -137,7 +137,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     DB: {
       prepare(q) {
         const shape = (b = []) => ({
-          all: async () => ({ results: [
+          all: async () => ({ results: /WHERE op = 'delete'/.test(q) ? [] : [
             // 97 bytes: exactly the shape that must be hashed
             { chunk_uid: "docs:Financial/2026/Q3 Statements/Wells Fargo Business Checking Statement 2026-07 Reconciled.md#0", text: "t", source: "docs", doc_uid: "d" },
           ] }),

@@ -60,8 +60,8 @@ const mkEnv = ({ chunks = 0, outbox = 0, inserted = 0 } = {}) => {
   const env = mkEnv({ chunks: 500, outbox: 0, inserted: 500 });
   const r = await reindex(env, { dryRun: false });
   check("armed, it queues every chunk", r.queued === 500, JSON.stringify(r));
-  check("via INSERT OR IGNORE, so a second run cannot double up",
-    env.sql.some((q) => /INSERT OR IGNORE INTO vector_outbox/i.test(q)), JSON.stringify(env.sql));
+  check("via INSERT OR REPLACE, so current D1 state wins over a stale delete operation",
+    env.sql.some((q) => /INSERT OR REPLACE INTO vector_outbox/i.test(q)), JSON.stringify(env.sql));
   check("and it re-queues as an upsert", env.sql.some((q) => /'upsert'/.test(q)));
 }
 

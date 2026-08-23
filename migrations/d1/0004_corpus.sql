@@ -11,12 +11,12 @@
 -- So text and keyword search live here in D1, and vectors live in Vectorize,
 -- both inside the client's own account.
 --
--- SHAPED FOR THE EXIT, DELIBERATELY
+-- SHAPED FOR PORTABILITY, DELIBERATELY
 --
--- Above roughly 250,000 chunks this design should hand off to Postgres and
--- pgvector. That migration is cheap only if the decision is made now, so these
--- tables use the names, columns and semantics the Postgres schema will use.
--- Moving becomes a data copy rather than a redesign.
+-- These tables use the names, columns and semantics shared by the product's
+-- retrieval contract. That keeps imports, exports and disaster recovery as a
+-- data copy rather than a redesign, without declaring an unmeasured corpus-size
+-- cutoff as an architectural limit.
 --
 -- The one rule that makes it work: chunk_uid is the ONLY join key that ever
 -- leaves this system. It is the Vectorize vector id, the D1 unique key, the

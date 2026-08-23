@@ -22,3 +22,7 @@ eval/baselines/
 # looked up. No secret value, but it is a targeting aid in a public repo, so the
 # tracked file is a template and the real one stays local.
 eval/eval.config.local.json
+
+# Temporary migration receipts name private source ids and the isolated target.
+# They contain no credentials, but they are operational state rather than code.
+.brain-migration-*.json

@@ -42,9 +42,9 @@ async function unifiedRetrieve(env, url, { matchCount, ftsCount }) {
   const q = url.searchParams.get("q");
   const rrfK = Math.min(Math.max(parseInt(url.searchParams.get("rrf_k")) || 60, 1), 1e3);
 
-  // Which store answers is a manifest decision, not a code path the routes know
-  // about. D1 plus Vectorize for a client's own Cloudflare account; Postgres
-  // once a corpus outgrows the candidate depth Vectorize can offer.
+  // Which store answers is isolated from the routes. D1 plus Vectorize is the
+  // standard product backend; the legacy adapter remains for migration checks
+  // and temporary rollback only.
   const r = await storeFor(env).search(env, {
     query: q,
     limit: matchCount,
