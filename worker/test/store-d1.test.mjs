@@ -64,6 +64,19 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("empty returns no results", r.results.length === 0);
 }
 
+/* ---- document dedupe happens before the public result limit ---- */
+{
+  const repeated = Array.from({ length: 10 }, (_, i) => ({
+    chunk_uid: `d1#${i}`, doc_uid: "d1", source_id: "d1", text: `repeat ${i}`, source: "drive",
+  }));
+  const distinct = { chunk_uid: "d2#0", doc_uid: "d2", source_id: "d2", text: "different", source: "drive" };
+  const env = {
+    DB: { prepare: () => ({ bind: () => ({ all: async () => ({ results: [...repeated, distinct] }) }) }) },
+  };
+  const r = await search(env, { query: "hello", embedding: null, limit: 2 });
+  check("repeat chunks cannot evict a different document before the limit", r.results.map((x) => x.doc_uid).join(",") === "d1,d2", JSON.stringify(r.results));
+}
+
 /* ---- vector hydration must preserve Vectorize's ordering ---- */
 {
   const env = {

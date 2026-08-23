@@ -340,8 +340,20 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
     { items: kw, weight: weights.keyword ?? 1.0 },
   ]);
 
+  // Retrieval ranks chunks, but the public result contract ranks documents.
+  // Collapse the wide fused pool BEFORE applying the caller's limit so a long
+  // file cannot consume several slots and evict a different document.
+  const seenDocuments = new Set();
+  const documents = [];
+  for (const row of fused) {
+    const key = row.doc_uid || `${row.source || ""}|${row.source_id || row.title || row.chunk_uid}`;
+    if (seenDocuments.has(key)) continue;
+    seenDocuments.add(key);
+    documents.push(row);
+  }
+
   return {
-    results: fused.slice(0, limit),
+    results: documents.slice(0, limit),
     degraded,
     ignored_filters: unsupportedFilters(filters),
     counts: { keyword: kw.length, vector: vec.length },
