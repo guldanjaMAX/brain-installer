@@ -1,5 +1,6 @@
 import {
-  joinOverlappingChunks, laneConfig, rowToEnvelope, runLane,
+  driveExactDuplicateSql, joinOverlappingChunks, laneConfig, resolveDrivePolicy,
+  rowToEnvelope, runLane,
 } from "../migration/supabase-import.mjs";
 
 let fail = 0, ran = 0;
@@ -31,8 +32,39 @@ const check = (name, condition, detail = "") => {
   check("Drive is bounded by a fixed high-water mark", /drive_file_id <= 'z'/.test(drive), drive);
   check("Drive excludes an entire file if any chunk is flagged", /HAVING NOT bool_or\(flagged\)/.test(drive), drive);
   check("Drive groups chunks into documents before target ingest", /GROUP BY drive_file_id/.test(drive), drive);
+  const excluded = laneConfig("drive", { excludedDriveFileIds: ["drive_file_123"] }).pageSql("a", "z", 10);
+  check("Drive applies exact per-install exclusions", /drive_file_id NOT IN \('drive_file_123'\)/.test(excluded), excluded);
   const messages = laneConfig("messages").pageSql("a", "z", 100);
   check("messages also use a high-water mark", /id::text <= 'z'/.test(messages), messages);
+}
+
+/* Exact-copy policy resolution is generic, deterministic and resumable. */
+{
+  const policy = {
+    config_hash: "policy-one",
+    dedupe_exact_content: true,
+    explicit_exclusions: [{ id: "explicit_file_123", reason: "reviewed extraction failure" }],
+  };
+  let duplicateSql = "";
+  const resolved = await resolveDrivePolicy({
+    policy,
+    queryFn: async (sql) => {
+      duplicateSql = sql;
+      return [{ drive_file_id: "duplicate_file_456", canonical_drive_file_id: "canonical_file_789" }];
+    },
+  });
+  check("Drive policy combines reviewed exclusions and exact duplicates",
+    resolved.summary.explicit === 1 && resolved.summary.exact_duplicates === 1 &&
+      resolved.excluded_drive_file_ids.join(",") === "duplicate_file_456,explicit_file_123", JSON.stringify(resolved));
+  check("duplicate discovery ignores an explicitly excluded file", duplicateSql.includes("'explicit_file_123'"), duplicateSql);
+  check("duplicate discovery strips the repeated path header", /split_part\(chunk_text/.test(driveExactDuplicateSql()), driveExactDuplicateSql().slice(0, 500));
+  check("a saved policy is reused without querying the changing source",
+    await resolveDrivePolicy({ policy, existing: resolved, queryFn: async () => { throw new Error("should not query"); } }) === resolved);
+  let changedPolicyRefused = false;
+  try {
+    await resolveDrivePolicy({ policy: { ...policy, config_hash: "policy-two" }, existing: resolved, queryFn: async () => [] });
+  } catch (error) { changedPolicyRefused = /changed after the lane started/.test(error.message); }
+  check("a changed policy cannot silently alter an in-progress lane", changedPolicyRefused);
 }
 
 /* Every source becomes the standard product document envelope. */

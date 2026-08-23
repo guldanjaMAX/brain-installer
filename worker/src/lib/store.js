@@ -39,8 +39,19 @@ export function backendOf(env) {
 
 /* ------------------------------------------------------------------ chunking */
 
-export const CHUNK_SIZE = 2000;
-export const CHUNK_OVERLAP = 500;
+// Keep the body below the embedding model's effective 512-token window even
+// after the title header is added. The previous 2000/500 geometry made 93% of
+// James's first real D1 corpus long enough to be truncated before embedding.
+export const CHUNK_SIZE = 1500;
+export const CHUNK_OVERLAP = 300;
+
+export function chunkGeometry(env = {}) {
+  const rawSize = Number.parseInt(env.CHUNK_SIZE, 10);
+  const rawOverlap = Number.parseInt(env.CHUNK_OVERLAP, 10);
+  const size = Number.isFinite(rawSize) ? Math.min(Math.max(rawSize, 256), 1800) : CHUNK_SIZE;
+  const overlap = Number.isFinite(rawOverlap) ? Math.min(Math.max(rawOverlap, 0), size - 1) : CHUNK_OVERLAP;
+  return { size, overlap };
+}
 
 /**
  * Sliding window, same geometry as the Drive indexer so a document chunked by
@@ -103,7 +114,11 @@ const d1Backend = {
   async ingest(env, envelope) {
     const { source_type, source_id, content, title } = envelope;
     const docUid = `${source_type}:${source_id}`;
-    const hash = await sha256Hex(content);
+    const geometry = chunkGeometry(env);
+    // Geometry is part of storage identity. A deploy that corrects chunk size
+    // must re-chunk unchanged documents on their next ingest instead of taking
+    // the content-only no-op path forever.
+    const hash = await sha256Hex(`chunk-v1:${geometry.size}:${geometry.overlap}\0${content}`);
 
     const prior = await env.DB.prepare("SELECT content_hash FROM documents WHERE doc_uid = ?1")
       .bind(docUid)
@@ -153,7 +168,7 @@ const d1Backend = {
     const topFolder = md.top_folder || null;
     const platform = md.platform || null;
     const header = title ? `[${title}]` : "";
-    const pieces = chunkText(content, { header });
+    const pieces = chunkText(content, { header, ...geometry });
     const chunks = pieces.map((text, i) => ({
       chunk_uid: `${docUid}#${i}`,
       doc_uid: docUid,

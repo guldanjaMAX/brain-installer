@@ -105,8 +105,8 @@
   "retrieval": {
     "embed_model": "@cf/baai/bge-base-en-v1.5",
     "embed_dimensions": 768,
-    "chunk_size": 2000,
-    "chunk_overlap": 500,
+    "chunk_size": 1500,
+    "chunk_overlap": 300,
     "default_result_limit": 8,
     "answer_model": "claude-sonnet-5",
     "rerank": false,

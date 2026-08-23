@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "dedupe_exact_content": true,
+  "exclude_drive_files": [
+    {
+      "id": "REPLACE_WITH_DRIVE_FILE_ID",
+      "reason": "Extraction was verified unusable; the source file remains untouched"
+    }
+  ]
+}

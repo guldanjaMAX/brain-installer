@@ -19,16 +19,30 @@ Dry-run one source page without touching Cloudflare:
 node migration/supabase-import.mjs --lane curated --dry-run --max-pages 1
 ```
 
+For Drive, copy `drive-policy.example.json` to a local ignored file and list
+only exact file ids whose extracted text has been reviewed and rejected. Setting
+`dedupe_exact_content` keeps one canonical Drive path for byte-identical
+extractions. It does not merge similar documents or remove the source files.
+
+```bash
+node migration/supabase-import.mjs --lane drive --dry-run --max-pages 1 \
+  --drive-policy .brain-migration-drive-policy.json
+```
+
 Run or resume a lane:
 
 ```bash
 node migration/supabase-import.mjs --lane curated --state .brain-migration-curated.json
 node migration/supabase-import.mjs --lane messages --state .brain-migration-messages.json
-node migration/supabase-import.mjs --lane drive --page-size 10 --state .brain-migration-drive.json
+node migration/supabase-import.mjs --lane drive --page-size 10 \
+  --drive-policy .brain-migration-drive-policy.json \
+  --state .brain-migration-drive.json
 ```
 
 The state file is written after every accepted batch. It records the fixed
-source high-water mark, cursor, receipts, counts, refusals, and failures. It
+source high-water mark, cursor, receipts, counts, refusals, failures, and the
+resolved Drive policy. Exact duplicate ids are resolved once and reused on
+resume, so a changing source cannot silently change the rules mid-run. It
 never stores either credential. A failed page does not advance, so rerunning
 retries only the failed documents while skipping accepted receipts.
 

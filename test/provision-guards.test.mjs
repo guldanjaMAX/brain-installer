@@ -129,6 +129,8 @@ const throws = async (fn) => { try { await fn(); return null; } catch (e) { retu
   check("the Vectorize remedy exists in exactly one place", (doctor.match(/export const VECTORIZE_REMEDY/g) || []).length === 1);
   check("and brain.mjs uses that constant rather than its own copy", /VECTORIZE_REMEDY/.test(brain));
   check("the token scope list is a shared constant too", /export const CF_TOKEN_SCOPES/.test(doctor));
+  check("deploy sends the manifest chunk size to every Worker", /name: "CHUNK_SIZE"[\s\S]{0,160}m\.retrieval\?\.chunk_size/.test(brain));
+  check("deploy sends the manifest overlap to every Worker", /name: "CHUNK_OVERLAP"[\s\S]{0,160}m\.retrieval\?\.chunk_overlap/.test(brain));
 }
 
 

@@ -15,13 +15,127 @@ import { batches, splitOversized } from "../ingest/run.mjs";
 
 const SOURCE_API = "https://api.supabase.com/v1";
 const LANES = new Set(["curated", "drive", "messages"]);
+const DRIVE_ID = /^[A-Za-z0-9_-]{8,200}$/;
 
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const cleanUrl = (value) => String(value || "").replace(/\/+$/, "");
 const sqlText = (value) => `'${String(value ?? "").replaceAll("'", "''")}'`;
 const safeLimit = (value, fallback) => Math.min(Math.max(Number.parseInt(value, 10) || fallback, 1), 500);
 
-export function laneConfig(lane) {
+const normalizeDriveIds = (values, label = "Drive exclusion") => {
+  const ids = [...new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean))].sort();
+  for (const id of ids) if (!DRIVE_ID.test(id)) throw new Error(`${label} has an invalid Drive file id: ${id.slice(0, 80)}`);
+  return ids;
+};
+
+const driveExclusionSql = (ids) => {
+  const normalized = normalizeDriveIds(ids);
+  return normalized.length ? ` AND drive_file_id NOT IN (${normalized.map(sqlText).join(", ")})` : "";
+};
+
+/** Read a non-secret, per-install migration policy. */
+export function loadDrivePolicy(path) {
+  if (!path) return null;
+  let raw;
+  try { raw = JSON.parse(readFileSync(resolve(path), "utf-8")); }
+  catch (error) { throw new Error(`could not read Drive migration policy ${path}: ${error?.message || error}`); }
+  if (!raw || raw.version !== 1) throw new Error("Drive migration policy must have version 1");
+  const explicit = Array.isArray(raw.exclude_drive_files) ? raw.exclude_drive_files : [];
+  const seen = new Set();
+  const explicitExclusions = explicit.map((entry, index) => {
+    if (!entry || typeof entry !== "object") throw new Error(`Drive migration policy exclusion ${index + 1} must be an object`);
+    const id = String(entry.id || "").trim();
+    if (!id) throw new Error(`Drive migration policy exclusion ${index + 1} needs a Drive file id`);
+    normalizeDriveIds([id], `Drive migration policy exclusion ${index + 1}`);
+    if (seen.has(id)) throw new Error(`Drive migration policy repeats file id ${id}`);
+    seen.add(id);
+    const reason = String(entry.reason || "").trim();
+    if (!reason) throw new Error(`Drive migration policy exclusion ${id} needs a reason`);
+    return { id, reason };
+  });
+  const dedupeExactContent = raw.dedupe_exact_content === true;
+  const configHash = sha256(JSON.stringify({
+    version: 1,
+    dedupe_exact_content: dedupeExactContent,
+    exclude_drive_file_ids: explicitExclusions.map((entry) => entry.id).sort(),
+  }));
+  return { version: 1, config_hash: configHash, dedupe_exact_content: dedupeExactContent, explicit_exclusions: explicitExclusions };
+}
+
+/**
+ * Exact-copy discovery is source-side and read-only. A repeated [path] header
+ * is removed before hashing so a copied file does not become "different" only
+ * because Drive exposes it under another folder. The shortest non-unzipped
+ * path is retained as the canonical citation.
+ */
+export function driveExactDuplicateSql(explicitExcludedIds = []) {
+  const exclusion = driveExclusionSql(explicitExcludedIds);
+  return `WITH eligible AS (
+            SELECT drive_file_id, min(drive_file_path) AS drive_file_path,
+                   count(*)::int AS source_chunks,
+                   md5(string_agg(
+                     CASE
+                       WHEN left(chunk_text, 1) = '[' AND split_part(chunk_text, chr(10), 1) LIKE '[%]'
+                         THEN substring(chunk_text FROM length(split_part(chunk_text, chr(10), 1)) + 2)
+                       ELSE chunk_text
+                     END,
+                     chr(30) ORDER BY coalesce(chunk_index, 0), id
+                   )) AS content_hash
+            FROM cocoindex.notes_rag_drive
+            WHERE true${exclusion}
+            GROUP BY drive_file_id
+            HAVING NOT bool_or(flagged)
+          ), ranked AS (
+            SELECT *,
+                   row_number() OVER (
+                     PARTITION BY content_hash
+                     ORDER BY CASE WHEN drive_file_path ILIKE '%/unzipped/%' THEN 1 ELSE 0 END,
+                              length(drive_file_path), drive_file_path, drive_file_id
+                   ) AS duplicate_rank,
+                   first_value(drive_file_id) OVER (
+                     PARTITION BY content_hash
+                     ORDER BY CASE WHEN drive_file_path ILIKE '%/unzipped/%' THEN 1 ELSE 0 END,
+                              length(drive_file_path), drive_file_path, drive_file_id
+                   ) AS canonical_drive_file_id
+            FROM eligible
+          )
+          SELECT drive_file_id, drive_file_path, source_chunks, content_hash, canonical_drive_file_id
+          FROM ranked WHERE duplicate_rank > 1
+          ORDER BY content_hash, drive_file_id`;
+}
+
+/** Resolve a stable effective policy once, then persist it in migration state. */
+export async function resolveDrivePolicy({ policy, queryFn, existing = null }) {
+  if (!policy) {
+    if (existing) throw new Error("this Drive migration state was created with a policy; pass the same --drive-policy file to resume");
+    return null;
+  }
+  if (existing) {
+    if (existing.config_hash !== policy.config_hash) {
+      throw new Error("Drive migration policy changed after the lane started; reset the lane or restore the original policy");
+    }
+    normalizeDriveIds(existing.excluded_drive_file_ids, "saved Drive migration policy");
+    return existing;
+  }
+
+  const explicitIds = normalizeDriveIds(policy.explicit_exclusions.map((entry) => entry.id));
+  const duplicateRows = policy.dedupe_exact_content ? await queryFn(driveExactDuplicateSql(explicitIds)) : [];
+  const duplicateIds = normalizeDriveIds(duplicateRows.map((row) => row.drive_file_id), "exact-duplicate query");
+  const effective = normalizeDriveIds([...explicitIds, ...duplicateIds]);
+  return {
+    version: 1,
+    config_hash: policy.config_hash,
+    excluded_drive_file_ids: effective,
+    summary: {
+      explicit: explicitIds.length,
+      exact_duplicates: duplicateIds.length,
+      total_excluded_files: effective.length,
+    },
+    resolved_at: new Date().toISOString(),
+  };
+}
+
+export function laneConfig(lane, { excludedDriveFileIds = [] } = {}) {
   if (!LANES.has(lane)) throw new Error(`unknown lane "${lane}"; use curated, drive or messages`);
 
   if (lane === "curated") return {
@@ -36,12 +150,14 @@ export function laneConfig(lane) {
     },
   };
 
-  if (lane === "drive") return {
+  if (lane === "drive") {
+    const exclusion = driveExclusionSql(excludedDriveFileIds);
+    return {
     defaultPageSize: 10,
     // A file with even one flagged chunk is excluded as a whole. Reconstructing
     // it without that chunk would create a document that never existed.
     highWaterSql: `SELECT max(drive_file_id) AS high_water FROM (
-                     SELECT drive_file_id FROM cocoindex.notes_rag_drive
+                     SELECT drive_file_id FROM cocoindex.notes_rag_drive WHERE true${exclusion}
                      GROUP BY drive_file_id HAVING NOT bool_or(flagged)
                    ) eligible`,
     pageSql(cursor, highWater, limit) {
@@ -55,12 +171,13 @@ export function laneConfig(lane) {
                      json_agg(json_build_object('id', id, 'chunk_index', coalesce(chunk_index, 0), 'text', chunk_text)
                               ORDER BY coalesce(chunk_index, 0), id) AS chunks
               FROM cocoindex.notes_rag_drive
-              WHERE drive_file_id > ${sqlText(cursor)} AND drive_file_id <= ${sqlText(highWater)}
+              WHERE drive_file_id > ${sqlText(cursor)} AND drive_file_id <= ${sqlText(highWater)}${exclusion}
               GROUP BY drive_file_id
               HAVING NOT bool_or(flagged)
               ORDER BY drive_file_id LIMIT ${safeLimit(limit, 10)}`;
     },
-  };
+    };
+  }
 
   return {
     defaultPageSize: 100,
@@ -285,9 +402,17 @@ export async function runLane({
   maxPages = Infinity,
   maxRows = Infinity,
   maxTargetChunks = Infinity,
+  migrationPolicy = null,
 }) {
-  const config = laneConfig(lane);
+  const config = laneConfig(lane, { excludedDriveFileIds: migrationPolicy?.excluded_drive_file_ids || [] });
   const laneState = state.lanes[lane] ||= freshLaneState();
+  if (laneState.migration_policy && !migrationPolicy) {
+    throw new Error("this lane was started with a migration policy; the same policy is required to resume");
+  }
+  if (migrationPolicy && laneState.migration_policy?.config_hash && laneState.migration_policy.config_hash !== migrationPolicy.config_hash) {
+    throw new Error("migration policy does not match the policy saved in this lane state");
+  }
+  if (migrationPolicy && !laneState.migration_policy) laneState.migration_policy = migrationPolicy;
   if (laneState.complete) return { lane, status: "complete", ...laneState };
 
   if (!laneState.high_water) {
@@ -436,11 +561,18 @@ async function main() {
   const statePath = resolve(flags.state || `.brain-migration-${lane}.json`);
   const state = loadMigrationState(statePath, { projectRef, targetUrl });
   if (flags["reset-lane"]) delete state.lanes[lane];
+  if (lane !== "drive" && flags["drive-policy"]) throw new Error("--drive-policy only applies to the drive lane");
+
+  const queryFn = (sql) => querySupabase({ projectRef, accessToken, sql });
+  const drivePolicy = lane === "drive" ? loadDrivePolicy(flags["drive-policy"]) : null;
+  const migrationPolicy = lane === "drive"
+    ? await resolveDrivePolicy({ policy: drivePolicy, queryFn, existing: state.lanes.drive?.migration_policy || null })
+    : null;
 
   const result = await runLane({
     lane,
     state,
-    queryFn: (sql) => querySupabase({ projectRef, accessToken, sql }),
+    queryFn,
     postFn: (items) => postTargetBatch({ targetUrl, adminKey, items }),
     saveFn: (next) => saveMigrationState(statePath, next),
     dryRun,
@@ -449,8 +581,15 @@ async function main() {
     maxPages: flags["max-pages"] ? Math.max(1, Number.parseInt(flags["max-pages"], 10)) : Infinity,
     maxRows: flags["max-rows"] ? Math.max(1, Number.parseInt(flags["max-rows"], 10)) : Infinity,
     maxTargetChunks: flags["max-target-chunks"] ? Math.max(1, Number.parseInt(flags["max-target-chunks"], 10)) : Infinity,
+    migrationPolicy,
   });
-  console.log(JSON.stringify({ ...result, done: undefined, failures: result.failures?.slice(-20) }, null, 2));
+  console.log(JSON.stringify({
+    ...result,
+    done: undefined,
+    migration_policy: undefined,
+    policy: result.migration_policy?.summary || null,
+    failures: result.failures?.slice(-20),
+  }, null, 2));
   if (result.status === "blocked") process.exitCode = 1;
 }
 

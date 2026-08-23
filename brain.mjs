@@ -694,6 +694,16 @@ async function cmdDeploy(manifestPath) {
       { type: "plain_text", name: "BRAIN_VERSION", text: PRODUCT_VERSION },
       {
         type: "plain_text",
+        name: "CHUNK_SIZE",
+        text: String(m.retrieval?.chunk_size ?? 1500),
+      },
+      {
+        type: "plain_text",
+        name: "CHUNK_OVERLAP",
+        text: String(m.retrieval?.chunk_overlap ?? 300),
+      },
+      {
+        type: "plain_text",
         name: "DAILY_LLM_CAP_USD",
         text: String(m.safety?.daily_llm_spend_cap_usd ?? 10),
       },

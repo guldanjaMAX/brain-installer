@@ -1,4 +1,4 @@
-import { backendOf, chunkText, storeFor, D1, SUPABASE } from "../src/lib/store.js";
+import { backendOf, chunkGeometry, chunkText, storeFor, CHUNK_SIZE, D1, SUPABASE } from "../src/lib/store.js";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + d)); if (!c) fail++; };
 
@@ -14,7 +14,7 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
 {
   const body = "x".repeat(5000);
   const c = chunkText(body);
-  check("chunks are capped at the window", c.every(p => p.length <= 2000), String(Math.max(...c.map(p=>p.length))));
+  check("chunks are capped at the embedding-safe window", c.every(p => p.length <= CHUNK_SIZE), String(Math.max(...c.map(p=>p.length))));
   // The properties that matter are coverage and overlap, not chunk count.
   // Nothing may fall between two windows, and consecutive windows must share
   // text or a sentence spanning a boundary is retrievable from neither.
@@ -38,6 +38,10 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
 
   // A pathological window must not loop forever.
   check("overlap >= size does not hang", chunkText("abcdefghij", { size: 4, overlap: 9 }).length > 0);
+
+  check("the default body stays below the diagnostic truncation threshold", CHUNK_SIZE < 1800, String(CHUNK_SIZE));
+  check("per-install chunk geometry is honored", JSON.stringify(chunkGeometry({ CHUNK_SIZE: "1200", CHUNK_OVERLAP: "240" })) === JSON.stringify({ size: 1200, overlap: 240 }));
+  check("unsafe manifest geometry is clamped", JSON.stringify(chunkGeometry({ CHUNK_SIZE: "9000", CHUNK_OVERLAP: "9000" })) === JSON.stringify({ size: 1800, overlap: 1799 }));
 }
 
 /* ---- the D1 backend honours the shape contract ---- */
