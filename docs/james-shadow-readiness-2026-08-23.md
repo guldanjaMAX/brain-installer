@@ -10,9 +10,29 @@ URL: `https://james-brain-shadow.james-d13.workers.dev`
 
 ## Decision
 
-The Cloudflare brain is ready for controlled integration testing. It is not yet ready for a silent production cutover of `notes.jamesguldan.com` because the Notes proxy still points at Supabase and no unattended incremental refresh is running for Drive or messages.
+The Cloudflare brain is live behind the production retrieval routes on `notes.jamesguldan.com`. Both `/api/rag/unified` and `/api/rag/think` now use the D1, Vectorize, and Workers AI install. The signed-in Search interface includes Answer and Sources modes, renders citations, and shows explicit coverage gaps.
 
-This is not a Cloudflare capability blocker. D1, Vectorize, Workers AI, Worker secrets, ingestion, retrieval, citations, refusal behavior, and source freshness accounting are all working in the shadow install.
+This is not a Cloudflare capability blocker. D1, Vectorize, Workers AI, Worker secrets, ingestion, retrieval, citations, refusal behavior, and source freshness accounting are all working in production retrieval. Supabase is not ready to be retired because unattended incremental refresh is not yet running for Drive or messages.
+
+## Production integration
+
+- Notes deployed SHA: `fb390cb418d2c7a921b382fd09c0ff947fc79f2e`
+- Notes branch: `codex/cloudflare-brain-proxy`
+- Brain branch: `codex/cloudflare-brain-phase2`
+- Production backend switch: `RAG_BACKEND=cloudflare`
+- Rollback: set the server-side `RAG_BACKEND` Worker secret to `supabase`
+- Live UI: `https://notes.jamesguldan.com/search`
+
+The Notes Worker holds a separate read-only Brain proxy key. That key can call only `/api/rag/unified` and `/api/rag/think`; it receives HTTP 401 on administrative routes. Notes cookies and Notes admin credentials are never forwarded to the Brain, and query-string credentials are stripped from proxied requests.
+
+Production verification passed:
+
+- authenticated positive query returned a Workers AI answer with an approved evidence gate and citations
+- the Series A subject-ownership trap returned the canonical refusal with zero citations
+- unauthenticated retrieval returned HTTP 401
+- a missing query returned HTTP 400
+- live Answer mode rendered clickable citation markers, three source cards, a coverage warning, and the Workers AI model label
+- the live Worker health SHA matches the committed deployment
 
 ## Live corpus
 
@@ -74,6 +94,7 @@ Safety behavior added and verified:
 
 - Brain admin credentials are accepted only through `X-Admin-Key`. Query-string admin credentials are refused.
 - The Brain admin key is stored in macOS Keychain under service `james-brain-shadow-admin-key`, account `james-main`.
+- The Notes read-only proxy key is stored in macOS Keychain under service `james-brain-shadow-notes-proxy-key`, account `james-main`.
 - The Cloudflare deployment token is stored in macOS Keychain under service `james-brain-shadow-cloudflare-api-token`, account `james-main`.
 - The scoped token expires 2026-09-30 and is limited to James's account with Workers AI Read, Vectorize Edit, D1 Edit, and Workers Scripts Edit.
 - The token was verified through the official API against the live Vectorize index.
@@ -84,19 +105,7 @@ Safety behavior added and verified:
 
 ## Remaining production gates
 
-### 1. Wire the Notes proxy to the Cloudflare brain
-
-`notes.jamesguldan.com` still uses the old Supabase-backed retrieval path. The cutover should happen behind one server-side proxy setting so the Brain admin key remains a Worker secret and never reaches browser JavaScript.
-
-Required proof:
-
-- authenticated Notes query reaches the Cloudflare `/api/rag/think` route
-- unauthenticated Notes query remains blocked
-- citations render correctly
-- timeout and refusal states are readable
-- rollback to the existing Supabase endpoint is one configuration change
-
-### 2. Run unattended incremental refresh
+### 1. Run unattended incremental refresh
 
 Drive and messages now have a daily freshness expectation, but no unattended connector is scheduled. The brain will correctly report them stale after 1.5 days if nothing updates them.
 
@@ -108,6 +117,8 @@ Required proof:
 - a new message appears after the high-water mark
 - failed sync state is visible in source freshness
 
+The product's Google Drive connector already implements a full first walk, incremental changes, edits, trash/deletion handling, and a persisted sync token. It needs a one-time OAuth connection to James's Google account before it can replace the migration snapshot. The product does not yet have an iMessage connector, so message freshness still needs a standard connector rather than a James-only bridge.
+
 ## Non-blocking cleanup
 
 - Diagnose reports 30 exact duplicate documents still stored more than once.
@@ -118,7 +129,6 @@ Required proof:
 
 ## Go or no-go
 
-- Cloudflare brain itself: **GO for integration testing**
-- Notes production endpoint switch today: **NO-GO until the proxy and incremental refresh are proven**
-- Supabase retirement: **NO-GO until the production switch has a rollback window and freshness has stayed healthy**
-
+- Cloudflare brain itself: **GO and live for production retrieval**
+- Notes production endpoint switch: **GO and live**
+- Supabase retirement: **NO-GO until unattended Drive and message refresh are proven and freshness stays healthy through a rollback window**
