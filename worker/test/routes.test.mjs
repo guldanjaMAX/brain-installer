@@ -52,13 +52,17 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
 
 /* ---- auth still gates everything but health ---- */
 {
-  const { env } = mkEnv([]);
+  const { env } = mkEnv([], { extra: { RAG_PROXY_KEY: "read-only" } });
   const open = await worker.fetch(new Request("https://b.example/health"), env, {});
   check("health is open", open.status === 200);
   const shut = await worker.fetch(new Request("https://b.example/api/rag/unified?q=x"), env, {});
   check("unified needs the admin key", shut.status === 401, String(shut.status));
   const querySecret = await worker.fetch(new Request("https://b.example/api/rag/unified?q=x&admin_key=k"), env, {});
   check("admin keys in query strings are refused", querySecret.status === 401, String(querySecret.status));
+  const readOnly = await worker.fetch(new Request("https://b.example/api/rag/unified?q=x", { headers: { "X-Admin-Key": "read-only" } }), env, {});
+  check("read-only proxy key can query retrieval", readOnly.status === 200, String(readOnly.status));
+  const readOnlyAdmin = await worker.fetch(new Request("https://b.example/api/admin/brain/documents", { headers: { "X-Admin-Key": "read-only" } }), env, {});
+  check("read-only proxy key cannot reach admin routes", readOnlyAdmin.status === 401, String(readOnlyAdmin.status));
 }
 
 /* ---- the D1 path answers, with the contract shape ---- */

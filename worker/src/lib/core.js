@@ -74,6 +74,20 @@ export function validateAdminKey(request, env) {
   return constantTimeEquals(key, env.ADMIN_KEY);
 }
 
+/**
+ * Accept the full admin key or the optional read-only proxy key.
+ *
+ * The proxy key is deliberately valid only on the two retrieval routes. A UI
+ * proxy can answer questions without holding a credential that can ingest,
+ * purge, reindex, drain, or inspect administrative state.
+ */
+export function validateReadKey(request, env) {
+  const key = request.headers.get("X-Admin-Key");
+  if (!key) return false;
+  if (env.ADMIN_KEY && constantTimeEquals(key, env.ADMIN_KEY)) return true;
+  return !!env.RAG_PROXY_KEY && constantTimeEquals(key, env.RAG_PROXY_KEY);
+}
+
 /* ----------------------------------------------------------------- llm */
 
 const CAP_TABLE = `CREATE TABLE IF NOT EXISTS llm_call_log (

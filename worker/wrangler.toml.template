@@ -25,6 +25,7 @@ database_id = "{{D1_ID}}"
 
 # Secrets, set with `wrangler secret put` and never written to this file:
 #   ADMIN_KEY
+#   RAG_PROXY_KEY                (optional, read-only retrieval proxy)
 #   ANTHROPIC_API_KEY            (optional nonstandard provider override)
 #   SUPABASE_URL
 #   SUPABASE_SERVICE_ROLE_KEY

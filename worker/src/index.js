@@ -17,7 +17,7 @@
  * entire users/sessions stack, which is the single largest simplification.
  */
 
-import { jsonResponse, cachedJson, validateAdminKey, callLLM } from "./lib/core.js";
+import { jsonResponse, cachedJson, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
 import { scan as scanSecrets } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
 import { drainOutbox, outboxDepth, forget, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
@@ -750,7 +750,10 @@ export default {
       });
     }
 
-    if (!validateAdminKey(request, env)) {
+    const readRoute =
+      request.method === "GET" &&
+      (path === "/api/rag/unified" || path === "/api/rag/think");
+    if (!(readRoute ? validateReadKey(request, env) : validateAdminKey(request, env))) {
       return jsonResponse({ error: "unauthorized" }, 401);
     }
 
