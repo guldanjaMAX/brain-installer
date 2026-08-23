@@ -39,7 +39,7 @@ function mkEnv(rows, { vectorIds = [], vectorThrows = false, extra = {} } = {}) 
 
 const ROW = {
   chunk_uid: "meeting:123#0", doc_uid: "meeting:123", text: "We agreed to defer the retainer.",
-  source: "meeting", title: "Q3 sync", document_date: 1750000000000, client: "Acme", category: "meeting",
+  source: "meeting", source_id: "123", uri: "meeting://123", title: "Q3 sync", document_date: 1750000000000, client: "Acme", category: "meeting",
   top_folder: "Clients", platform: "imessage",
 };
 const call = (env, path) => worker.fetch(new Request("https://b.example" + path, { headers: { "X-Admin-Key": "k" } }), env, { waitUntil() {}, passThroughOnException() {} });
@@ -61,6 +61,15 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   check("unified returns results from D1", r.status === 200 && b.results.length === 1, JSON.stringify(b).slice(0, 200));
   check("a hit carries its document date", b.results[0].ts === new Date(1750000000000).toISOString());
   check("and its client", b.results[0].client === "Acme");
+  check("a hit exposes stable document identity, not its chunk id", b.results[0].ref_key === "123" && b.results[0].chunk_uid === "meeting:123#0", JSON.stringify(b.results[0]));
+}
+
+/* Multiple matching chunks from one document consume one public result slot. */
+{
+  const second = { ...ROW, chunk_uid: "meeting:123#1", text: "The follow-up said the same thing." };
+  const { env } = mkEnv([ROW, second], { vectorIds: ["meeting:123#0", "meeting:123#1"] });
+  const b = await (await call(env, "/api/rag/unified?q=retainer&limit=5")).json();
+  check("one document cannot crowd out the result page with repeat chunks", b.results.length === 1, JSON.stringify(b.results));
 }
 
 /* ---- a filter must reach the database, not be dropped on the floor ---- */
@@ -86,7 +95,7 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   check("category reaches Vectorize before topK", query.filter.category.$eq === "meeting", JSON.stringify(query));
   check("date reaches Vectorize as a numeric range", query.filter.document_date.$lte === Date.parse("2025-12-31"), JSON.stringify(query));
 
-  const hydration = seen.sql.find((s) => /FROM chunks c WHERE c\.chunk_uid IN/.test(s));
+  const hydration = seen.sql.find((s) => /FROM chunks c JOIN documents d/.test(s) && /c\.chunk_uid IN/.test(s));
   check("platform is re-applied in D1 hydration", /c\.platform = \?/.test(hydration), hydration);
   check("top_folder is re-applied in D1 hydration", /c\.top_folder = \?/.test(hydration), hydration);
 

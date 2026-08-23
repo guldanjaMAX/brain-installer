@@ -92,19 +92,32 @@ const d1Backend = {
     }
     const r = await d1.search(env, { query, embedding, limit, filters, weights });
     return {
-      results: r.results.map((x) => ({
+      results: r.results.map((x) => {
+        const sourceId = x.source_id || (
+          x.doc_uid && x.source && x.doc_uid.startsWith(`${x.source}:`)
+            ? x.doc_uid.slice(x.source.length + 1)
+            : x.doc_uid || x.chunk_uid
+        );
+        return {
         chunk_uid: x.chunk_uid,
-        ref_key: x.chunk_uid,
+        doc_uid: x.doc_uid || null,
+        source_id: sourceId,
+        // Public identity is document-level. A chunk id changes when geometry
+        // changes and used to let one document consume most of a result page.
+        ref_key: sourceId,
+        drive_file_id: x.source === "drive" ? sourceId : null,
         source: x.source,
         title: x.title,
         snippet: x.text,
+        uri: x.uri || null,
         client: x.client ?? null,
         category: x.category ?? null,
         top_folder: x.top_folder ?? null,
         platform: x.platform ?? null,
         ts: x.document_date ? new Date(Number(x.document_date)).toISOString() : null,
         score: x.rrf_score,
-      })),
+      };
+      }),
       degraded: r.degraded,
       ignored_filters: r.ignored_filters,
       counts: r.counts,

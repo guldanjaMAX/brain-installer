@@ -51,7 +51,7 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
     VECTORIZE: { query: async () => ({ matches: [] }) },
     AI: { run: async () => ({ data: [[0.1, 0.2]] }) },
     DB: { prepare: () => ({ bind: () => ({ all: async () => ({ results: [
-      { chunk_uid: "curated:x#0", doc_uid: "curated:x", text: "body", source: "curated", title: "T", document_date: 1750000000000 },
+      { chunk_uid: "curated:x#0", doc_uid: "curated:x", source_id: "x", text: "body", source: "curated", title: "T", document_date: 1750000000000 },
     ] }), first: async () => null, run: async () => ({}) }) }), batch: async () => {} },
   };
   const s = storeFor(env);
@@ -60,6 +60,7 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
   check("search returns the contract shape",
     hit && "chunk_uid" in hit && "source" in hit && "title" in hit && "snippet" in hit && "ts" in hit,
     JSON.stringify(hit));
+  check("the public ref is document-stable", hit.ref_key === "x" && hit.chunk_uid === "curated:x#0", JSON.stringify(hit));
   check("ts is an ISO document date, not an mtime", typeof hit.ts === "string" && hit.ts.startsWith("2025-"), String(hit.ts));
 }
 

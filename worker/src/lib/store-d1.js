@@ -229,9 +229,11 @@ export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
   const sql = `
     SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
            c.client, c.category, c.top_folder, c.platform,
+           d.source_id, d.uri,
            bm25(chunks_fts) AS score
     FROM chunks_fts
     JOIN chunks c ON c.id = chunks_fts.rowid
+    JOIN documents d ON d.doc_uid = c.doc_uid
     WHERE chunks_fts MATCH ?1${f.clause}
     ORDER BY bm25(chunks_fts)
     LIMIT ?2`;
@@ -293,8 +295,10 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
   const f = filterSql(filters, "c", resolved.length + 1);
   const { results } = await env.DB.prepare(
     `SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
-            c.client, c.category, c.top_folder, c.platform
-     FROM chunks c WHERE c.chunk_uid IN (${placeholders})${f.clause}`
+            c.client, c.category, c.top_folder, c.platform,
+            d.source_id, d.uri
+     FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid
+     WHERE c.chunk_uid IN (${placeholders})${f.clause}`
   )
     .bind(...resolved, ...f.params)
     .all();

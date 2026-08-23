@@ -69,6 +69,12 @@ const check = (name, condition, detail = "") => {
 
 /* Every source becomes the standard product document envelope. */
 {
+  const prefixedCurated = rowToEnvelope("curated", {
+    cursor_id: "1", d1_key: "curated:meetings/2026-08-23_example.md", title: "Example", content: "meeting content",
+  });
+  check("legacy curated ids do not receive the source prefix twice",
+    prefixedCurated.source_id === "meetings/2026-08-23_example.md", JSON.stringify(prefixedCurated));
+
   const drive = rowToEnvelope("drive", {
     cursor_id: "f1", drive_file_id: "f1", drive_file_path: "Provider Records/Health.html",
     top_folder: "Provider Records", category: "medical", client_id: "James",

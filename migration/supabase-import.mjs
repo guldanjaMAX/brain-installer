@@ -231,9 +231,14 @@ const occurredAt = (value) => {
 
 export function rowToEnvelope(lane, row) {
   if (lane === "curated") {
+    const legacyId = String(row.d1_key || row.source_id || row.cursor_id);
+    // Some legacy rows stored the source namespace inside d1_key. The product
+    // adds the namespace when it creates doc_uid, so keeping both would produce
+    // citations such as curated:curated:meetings/... and break stable identity.
+    const sourceId = legacyId.startsWith("curated:") ? legacyId.slice("curated:".length) : legacyId;
     return {
       source_type: "curated",
-      source_id: String(row.d1_key || row.source_id || row.cursor_id),
+      source_id: sourceId,
       title: row.title || row.d1_key || "Curated record",
       content: String(row.content || ""),
       occurred_at: occurredAt(row.meeting_date),
