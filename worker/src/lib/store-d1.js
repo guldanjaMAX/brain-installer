@@ -412,8 +412,8 @@ export async function replaceDocumentChunks(env, docUid) {
   ]);
 }
 
-/** Vectorize caps a delete batch; stay well under it and chunk. */
-const DELETE_BATCH = 500;
+/** Vectorize and D1 both cap bulk operations; D1 allows 100 batch statements. */
+const DELETE_BATCH = 100;
 
 async function deleteQueuedVectors(env, rows) {
   let deleted = 0;

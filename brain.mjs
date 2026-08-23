@@ -1986,6 +1986,14 @@ async function purgeDocuments(base, adminKey, name) {
             "      The source has been left registered so it can be removed once this is fixed."
         );
       }
+      const queued = Number(body?.vector_cleanup_queued || 0);
+      if (queued > 0) {
+        warnings.push(
+          `${num(queued)} physical vector deletion(s) remain queued. The documents are unreachable, ` +
+          `but run \`brain drain <manifest>\` to reclaim the vector slots.`
+        );
+      }
+      if (body?.vector_error) warnings.push(`vector cleanup reported: ${String(body.vector_error).slice(0, 180)}`);
       return { channel: "worker route", removed, warnings };
     }
     // 404/405 means this worker has no such route, which is expected on an

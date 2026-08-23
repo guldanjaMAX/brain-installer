@@ -99,6 +99,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 {
   const docs = Array.from({ length: 205 }, (_, i) => ({ doc_uid: `drive:${i}` }));
   let maxBinds = 0;
+  let maxStatements = 0;
   const env = {
     DB: {
       prepare: (sql) => ({
@@ -119,6 +120,8 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
         },
       }),
       batch: async (statements) => {
+        maxStatements = Math.max(maxStatements, statements.length);
+        if (statements.length > 100) throw new Error("D1 batch statement limit exceeded");
         for (const statement of statements) maxBinds = Math.max(maxBinds, statement?._args?.length || 0);
       },
     },
@@ -127,6 +130,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   const removed = await forget(env, { source: "drive", dryRun: false });
   check("forget handles more than 100 documents", removed.documents === 205 && removed.vectors === 205, JSON.stringify(removed));
   check("forget never exceeds D1's bind ceiling", maxBinds <= 100, String(maxBinds));
+  check("vector cleanup never exceeds D1's batch-statement ceiling", maxStatements <= 100, String(maxStatements));
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nstore-d1: all ${ran} tests passed`);
