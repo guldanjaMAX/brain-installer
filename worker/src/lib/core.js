@@ -67,9 +67,9 @@ function constantTimeEquals(a, b) {
 }
 
 export function validateAdminKey(request, env) {
-  const key =
-    request.headers.get("X-Admin-Key") ||
-    new URL(request.url).searchParams.get("admin_key");
+  // Secrets belong in headers. Query-string credentials leak too easily into
+  // browser history, proxy/access logs, analytics, screenshots and referrers.
+  const key = request.headers.get("X-Admin-Key");
   if (!key || !env.ADMIN_KEY) return false;
   return constantTimeEquals(key, env.ADMIN_KEY);
 }

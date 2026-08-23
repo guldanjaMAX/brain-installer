@@ -51,6 +51,8 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   check("health is open", open.status === 200);
   const shut = await worker.fetch(new Request("https://b.example/api/rag/unified?q=x"), env, {});
   check("unified needs the admin key", shut.status === 401, String(shut.status));
+  const querySecret = await worker.fetch(new Request("https://b.example/api/rag/unified?q=x&admin_key=k"), env, {});
+  check("admin keys in query strings are refused", querySecret.status === 401, String(querySecret.status));
 }
 
 /* ---- the D1 path answers, with the contract shape ---- */
