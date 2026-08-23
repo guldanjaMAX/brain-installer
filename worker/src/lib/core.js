@@ -169,7 +169,12 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
         max_tokens: max_tokens || 1000,
         temperature: 0,
       });
-      const text = String(data?.response || "").trim();
+      const rawResponse = data?.response;
+      const text = typeof rawResponse === "string"
+        ? rawResponse.trim()
+        : rawResponse && typeof rawResponse === "object"
+          ? JSON.stringify(rawResponse)
+          : "";
       if (!text) throw new Error("Workers AI returned no answer text");
       const inTok = data?.usage?.prompt_tokens || data?.usage?.input_tokens || 0;
       const outTok = data?.usage?.completion_tokens || data?.usage?.output_tokens || 0;

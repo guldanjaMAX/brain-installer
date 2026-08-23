@@ -34,8 +34,8 @@ function mkEnv(rows, { vectorIds = [], vectorThrows = false, extra = {} } = {}) 
     AI: {
       run: async (model, input) => model.includes("bge-")
         ? ({ data: [[0.1, 0.2, 0.3]] })
-        : String(input?.messages?.[0]?.content || "").includes("strict evidence gate")
-          ? ({ response: '{"supported":true,"evidence":[1],"reason":"direct support"}', usage: { prompt_tokens: 100, completion_tokens: 12 } })
+        : String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+          ? ({ response: { supported: true, evidence: [1], reason: "direct support" }, usage: { prompt_tokens: 100, completion_tokens: 12 } })
           : ({ response: "The Cloudflare answer is grounded in the result [1].", usage: { prompt_tokens: 100, completion_tokens: 12 } }),
     },
     ...extra,
@@ -135,20 +135,21 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
         run: async (model, input) => {
           if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
           generations.push(input);
-          if (String(input?.messages?.[0]?.content || "").includes("strict evidence gate")) {
-            return { response: '{"supported":true,"evidence":[1],"reason":"direct support"}', usage: {} };
+          if (String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")) {
+            return { response: { supported: true, evidence: [1], reason: "direct support" }, usage: {} };
           }
-          return { response: "The documents do not actually answer the question.", usage: {} };
+          return { response: "The retainer was deferred [1].", usage: {} };
         },
       },
     },
   });
   await call(env, "/api/rag/think?q=What+is+our+parental+leave+policy");
   const generation = generations.find((input) => /second brain/.test(input?.messages?.[0]?.content || ""));
-  const gate = generations.find((input) => /strict evidence gate/.test(input?.messages?.[0]?.content || ""));
+  const gate = generations.find((input) => /verify a proposed answer/.test(input?.messages?.[0]?.content || ""));
   const system = generation?.messages?.find((message) => message.role === "system")?.content || "";
   check("both evidence gating and answer generation are deterministic", gate?.temperature === 0 && generation?.temperature === 0, JSON.stringify(generations));
-  check("the evidence gate requires every material part and exact subject", /every material part/.test(gate?.messages?.[0]?.content || ""), JSON.stringify(gate));
+  check("the evidence gate verifies exact factual claims and subject", /exact person, company, property/.test(gate?.messages?.[0]?.content || ""), JSON.stringify(gate));
+  check("the evidence gate receives the configured owner identity", /configured brain owner/.test(gate?.messages?.[0]?.content || ""), JSON.stringify(gate));
   check("the answer contract forbids cross-entity evidence transfer", /different entity or context/.test(system), system);
   check("ambiguous owner context requires an explicit evidence tie", /tie it to the brain owner/.test(system), system);
 }
@@ -159,17 +160,20 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
     vectorIds: [],
     extra: {
       AI: {
-        run: async (model) => {
+        run: async (model, input) => {
           if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
           modelCalls++;
-          return { response: '{"supported":false,"evidence":[],"reason":"different company"}', usage: {} };
+          return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+            ? { response: '{"supported":false,"evidence":[],"reason":"different company"}', usage: {} }
+            : { response: "The policy provides 24 weeks of leave [1].", usage: {} };
         },
       },
     },
   });
   const body = await (await call(env, "/api/rag/think?q=What+is+our+parental+leave+policy")).json();
-  check("unsupported evidence refuses before answer generation", modelCalls === 1 && body.answer === "The documents do not actually answer the question.", JSON.stringify(body));
+  check("unsupported evidence replaces the generated draft with a refusal", modelCalls === 2 && body.answer === "The documents do not actually answer the question.", JSON.stringify(body));
   check("unsupported candidates are not exposed as answer citations", body.citations?.length === 0, JSON.stringify(body.citations));
+  check("the refusal exposes its short support decision", body.evidence_gate?.supported === false && /different company/.test(body.evidence_gate?.reason || ""), JSON.stringify(body.evidence_gate));
 }
 
 /* ---- a missing metadata index must not take search down ---- */
