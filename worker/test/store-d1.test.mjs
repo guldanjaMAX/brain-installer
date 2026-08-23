@@ -1,4 +1,4 @@
-import { fuseRRF, search, upsertChunks, metadataTokenFor, vectorFilterFor } from "../src/lib/store-d1.js";
+import { forget, fuseRRF, search, upsertChunks, metadataTokenFor, vectorFilterFor } from "../src/lib/store-d1.js";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + d)); if (!c) fail++; };
 
@@ -93,6 +93,40 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("and a vector is queued", batched[1]._sql.includes("vector_outbox"));
   check("reports what it queued", out.queued === 1);
   check("empty input writes nothing", (await upsertChunks(env, [])).written === 0);
+}
+
+/* ---- source forget must stay below D1's 100-variable statement limit ---- */
+{
+  const docs = Array.from({ length: 205 }, (_, i) => ({ doc_uid: `drive:${i}` }));
+  let maxBinds = 0;
+  const env = {
+    DB: {
+      prepare: (sql) => ({
+        bind: (...args) => {
+          maxBinds = Math.max(maxBinds, args.length);
+          if (args.length > 100) throw new Error("D1 variable limit exceeded");
+          return {
+            _args: args,
+            all: async () => ({
+              results: /SELECT doc_uid FROM documents/.test(sql)
+                ? docs
+                : /SELECT chunk_uid, vector_id FROM chunks/.test(sql)
+                  ? args.map((id) => ({ chunk_uid: `${id}#0`, vector_id: `${id}#0` }))
+                  : [],
+            }),
+            run: async () => ({}),
+          };
+        },
+      }),
+      batch: async (statements) => {
+        for (const statement of statements) maxBinds = Math.max(maxBinds, statement?._args?.length || 0);
+      },
+    },
+    VECTORIZE: { deleteByIds: async () => {} },
+  };
+  const removed = await forget(env, { source: "drive", dryRun: false });
+  check("forget handles more than 100 documents", removed.documents === 205 && removed.vectors === 205, JSON.stringify(removed));
+  check("forget never exceeds D1's bind ceiling", maxBinds <= 100, String(maxBinds));
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nstore-d1: all ${ran} tests passed`);

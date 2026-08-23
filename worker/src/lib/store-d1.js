@@ -1062,10 +1062,20 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
   }
   if (!targets.length) return { documents: 0, chunks: 0, vectors: 0, dry_run: dryRun, targets: [] };
 
-  const marks = targets.map((_, i) => "?" + (i + 1)).join(",");
-  const { results: chunkRows } = await env.DB.prepare(
-    `SELECT chunk_uid, vector_id FROM chunks WHERE doc_uid IN (${marks})`
-  ).bind(...targets).all();
+  // D1 accepts at most 100 bound variables in one statement. Source-level
+  // forget routinely targets hundreds or thousands of documents, so every
+  // read and mutation is partitioned well below that ceiling.
+  const TARGET_BATCH = 50;
+  const groups = [];
+  for (let i = 0; i < targets.length; i += TARGET_BATCH) groups.push(targets.slice(i, i + TARGET_BATCH));
+  const chunkRows = [];
+  for (const group of groups) {
+    const marks = group.map((_, i) => "?" + (i + 1)).join(",");
+    const { results } = await env.DB.prepare(
+      `SELECT chunk_uid, vector_id FROM chunks WHERE doc_uid IN (${marks})`
+    ).bind(...group).all();
+    chunkRows.push(...(results || []));
+  }
   const chunkUids = (chunkRows || []).map((r) => r.chunk_uid);
   // Delete by the id the vector was actually STORED under, which is the hash
   // when the readable id was too long. Deleting by chunk_uid alone would leave
@@ -1077,18 +1087,21 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
   // D1 first. The FTS index follows via the delete trigger, and ON DELETE
   // CASCADE removes the chunks with their document.
   const queuedAt = Date.now();
-  await env.DB.batch([
-    env.DB.prepare(
-      `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at, attempts, last_error)
-       SELECT chunk_uid, COALESCE(vector_id, chunk_uid), 'delete', ?${targets.length + 1}, 0, NULL
-       FROM chunks WHERE doc_uid IN (${marks})
-       ON CONFLICT(chunk_uid) DO UPDATE SET
-         vector_id=excluded.vector_id, op='delete', queued_at=excluded.queued_at,
-         attempts=0, last_error=NULL`
-    ).bind(...targets, queuedAt),
-    env.DB.prepare(`DELETE FROM chunks WHERE doc_uid IN (${marks})`).bind(...targets),
-    env.DB.prepare(`DELETE FROM documents WHERE doc_uid IN (${marks})`).bind(...targets),
-  ]);
+  for (const group of groups) {
+    const marks = group.map((_, i) => "?" + (i + 1)).join(",");
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at, attempts, last_error)
+         SELECT chunk_uid, COALESCE(vector_id, chunk_uid), 'delete', ?${group.length + 1}, 0, NULL
+         FROM chunks WHERE doc_uid IN (${marks})
+         ON CONFLICT(chunk_uid) DO UPDATE SET
+           vector_id=excluded.vector_id, op='delete', queued_at=excluded.queued_at,
+           attempts=0, last_error=NULL`
+      ).bind(...group, queuedAt),
+      env.DB.prepare(`DELETE FROM chunks WHERE doc_uid IN (${marks})`).bind(...group),
+      env.DB.prepare(`DELETE FROM documents WHERE doc_uid IN (${marks})`).bind(...group),
+    ]);
+  }
 
   let vectors = 0;
   let vectorError = null;
