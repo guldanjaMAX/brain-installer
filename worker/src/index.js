@@ -363,6 +363,16 @@ async function handleThink(env, request) {
     });
     answer = (data?.content?.[0]?.text || "").trim() || null;
     model = data?.model || null;
+    if (answer) {
+      const headsUpAt = answer.search(/\n\s*Heads up:/i);
+      if (headsUpAt >= 0) {
+        const body = answer.slice(0, headsUpAt).trim();
+        const headsUp = answer.slice(headsUpAt).trim();
+        answer = /\b(?:not affected|does not affect|doesn't affect|no effect|not materially (?:affect|impact))\b/i.test(headsUp)
+          ? body
+          : `${body}\n\n${headsUp.replace(/\s*\[\d+\]/g, "")}`;
+      }
+    }
   } catch (e) {
     answerError = e.no_key
       ? "no LLM key configured"
@@ -401,6 +411,7 @@ async function handleThink(env, request) {
               `The configured brain owner is ${owner}.`,
               "Return only one JSON object: {\"supported\":true|false,\"evidence\":[1,2],\"reason\":\"short reason\"}.",
               "Set supported=true only if the cited documents explicitly support the proposed answer's factual claims for the exact person, company, property, agreement, policy or project in the question.",
+              "If supported=true, evidence must list every document number cited anywhere in the proposed answer. If any cited document does not support the claim next to its citation, set supported=false.",
               "A similar name, generic guidance, another entity's policy, another property's lease, a transaction, an account statement, or a draft does not establish the requested governing fact.",
               "When a question uses my, our, we, or an unnamed definite subject such as 'the term sheet', require the citation to explicitly connect that subject to the configured brain owner or to an organization, property, agreement, or project named in the question. First-person words inside an unrelated newsletter or third-party document refer to its author, not the brain owner.",
               "Example false: an answer gives our parental leave policy but cites another company's policy.",
@@ -425,6 +436,10 @@ async function handleThink(env, request) {
             reason: String(verdict?.reason || "").slice(0, 240) || undefined,
             ...(!verdict && raw ? { invalid_response: raw.replace(/\s+/g, " ").slice(0, 240) } : {}),
           };
+          if (evidenceGate.supported && allowed.size !== citedDocs.length) {
+            evidenceGate.supported = false;
+            evidenceGate.reason = "verifier did not approve every citation in the proposed answer";
+          }
           const asksForBindingAgreement = /\b(?:bound by|legally binding|executed agreement|signed agreement|governing agreement)\b/i.test(q);
           const allowedDocs = citedDocs.filter((doc) => allowed.has(doc.n));
           const onlyNonFinalLegalSources = asksForBindingAgreement && allowedDocs.length > 0 && allowedDocs.every((doc) =>

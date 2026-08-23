@@ -176,6 +176,27 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   check("the refusal exposes its short support decision", body.evidence_gate?.supported === false && /different company/.test(body.evidence_gate?.reason || ""), JSON.stringify(body.evidence_gate));
 }
 
+/* ---- a positive verdict must cover every citation in the draft ---- */
+{
+  const second = { ...ROW, chunk_uid: "meeting:456#0", doc_uid: "meeting:456", source_id: "456", title: "Other record", text: "An unrelated extra claim." };
+  const { env } = mkEnv([ROW, second], {
+    vectorIds: [],
+    extra: {
+      AI: {
+        run: async (model, input) => {
+          if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+            ? { response: { supported: true, evidence: [1], reason: "only the first citation is supported" }, usage: {} }
+            : { response: "The retainer was deferred [1]. An extra claim came from elsewhere [2].", usage: {} };
+        },
+      },
+    },
+  });
+  const body = await (await call(env, "/api/rag/think?q=What+happened+to+the+retainer%3F")).json();
+  check("a partial evidence approval fails closed", body.answer === "The documents do not answer the question." && body.evidence_gate?.supported === false, JSON.stringify(body));
+  check("the partial approval identifies the citation mismatch", /every citation/.test(body.evidence_gate?.reason || ""), JSON.stringify(body.evidence_gate));
+}
+
 /* ---- planning notes do not establish binding legal obligations ---- */
 {
   const rows = [{
