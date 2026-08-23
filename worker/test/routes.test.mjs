@@ -218,6 +218,32 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   check("the completeness refusal preserves the verifier reason", /deadline was silently omitted/.test(body.evidence_gate?.reason || ""), JSON.stringify(body.evidence_gate));
 }
 
+/* ---- ambiguous high-risk facts require a deterministic owner link ---- */
+{
+  const newsletter = { ...ROW, chunk_uid: "newsletter#0", doc_uid: "newsletter", source_id: "newsletter", source: "message", title: "Open Source CEO", text: "A third-party startup raised a Series A at a $150M valuation." };
+  const answerEnv = (row) => mkEnv([row], {
+    vectorIds: [],
+    extra: {
+      BRAIN_OWNER: "James Guldan",
+      AI: {
+        run: async (model, input) => {
+          if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+            ? { response: { supported: true, complete: true, evidence: [1], reason: "the valuation appears in the document" }, usage: {} }
+            : { response: "The Series A valuation was $150M [1].", usage: {} };
+        },
+      },
+    },
+  }).env;
+  const unrelated = await (await call(answerEnv(newsletter), "/api/rag/think?q=What+valuation+was+on+the+Series+A+term+sheet%3F")).json();
+  check("an unrelated newsletter cannot answer an unnamed term sheet question", unrelated.answer === "The documents do not answer the question." && unrelated.evidence_gate?.supported === false, JSON.stringify(unrelated));
+  check("the owner-link refusal states the structural reason", /no explicit link/.test(unrelated.evidence_gate?.reason || ""), JSON.stringify(unrelated.evidence_gate));
+
+  const owned = { ...newsletter, chunk_uid: "owned-term-sheet#0", doc_uid: "owned-term-sheet", source_id: "owned-term-sheet", title: "James's Series A Term Sheet", text: "James's Series A term sheet states a $150M valuation." };
+  const linked = await (await call(answerEnv(owned), "/api/rag/think?q=What+valuation+was+on+the+Series+A+term+sheet%3F")).json();
+  check("an explicitly owner-linked term sheet can still answer", linked.answer === "The Series A valuation was $150M [1]." && linked.evidence_gate?.supported === true, JSON.stringify(linked));
+}
+
 /* ---- planning notes do not establish binding legal obligations ---- */
 {
   const rows = [{

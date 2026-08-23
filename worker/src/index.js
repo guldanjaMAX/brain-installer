@@ -444,6 +444,21 @@ async function handleThink(env, request) {
           }
           const asksForBindingAgreement = /\b(?:bound by|legally binding|executed agreement|signed agreement|governing agreement)\b/i.test(q);
           const allowedDocs = citedDocs.filter((doc) => allowed.has(doc.n));
+          const asksOwnerSpecificHighRiskFact = /\b(?:term sheet|parental leave|jury duty|i-9|401\s*\(?k\)?|office lease|ownership agreements?|blood type|soc\s*2|security certification|tpt license|vat|gst)\b/i.test(q);
+          const ownerTokens = String(owner).toLowerCase().match(/[a-z0-9]+/g)?.filter((token) =>
+            !new Set(["the", "owner", "brain", "shadow", "company", "inc", "llc"]).has(token)
+          ) || [];
+          const ownerFirst = ownerTokens[0] || "";
+          const hasExplicitOwnerLink = allowedDocs.some((doc) => {
+            const raw = `${doc.title || ""} ${doc.snippet || ""} ${doc.ref || ""}`.toLowerCase();
+            const normalized = raw.replace(/[^a-z0-9]+/g, " ");
+            return (ownerTokens.length > 0 && ownerTokens.every((token) => normalized.includes(token))) ||
+              (ownerFirst && (raw.includes(`${ownerFirst}'s`) || raw.includes(`${ownerFirst}’s`)));
+          });
+          if (evidenceGate.supported && asksOwnerSpecificHighRiskFact && !hasExplicitOwnerLink) {
+            evidenceGate.supported = false;
+            evidenceGate.reason = "cited evidence has no explicit link to the configured brain owner";
+          }
           const onlyNonFinalLegalSources = asksForBindingAgreement && allowedDocs.length > 0 && allowedDocs.every((doc) =>
             /\b(?:interview|decisions? so far|planning|proposal|template|draft)\b/i.test(`${doc.title || ""} ${doc.snippet || ""}`)
           );
