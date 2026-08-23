@@ -124,6 +124,27 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   check("and reports the Cloudflare model", String(t.model || "").startsWith("@cf/"), String(t.model));
 }
 
+{
+  let generation = null;
+  const { env } = mkEnv([ROW], {
+    vectorIds: [],
+    extra: {
+      AI: {
+        run: async (model, input) => {
+          if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          generation = input;
+          return { response: "The documents do not actually answer the question.", usage: {} };
+        },
+      },
+    },
+  });
+  await call(env, "/api/rag/think?q=What+is+our+parental+leave+policy");
+  const system = generation?.messages?.find((message) => message.role === "system")?.content || "";
+  check("answer generation is deterministic", generation?.temperature === 0, JSON.stringify(generation));
+  check("the answer contract forbids cross-entity evidence transfer", /different entity or context/.test(system), system);
+  check("ambiguous owner context requires an explicit evidence tie", /tie it to the brain owner/.test(system), system);
+}
+
 /* ---- a missing metadata index must not take search down ---- */
 {
   const { env } = mkEnv([ROW], { vectorThrows: true });

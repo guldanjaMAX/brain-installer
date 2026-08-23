@@ -323,6 +323,9 @@ async function handleThink(env, request) {
     "3. Never invent a name, date, number, commitment, or quote that is not in the documents.",
     "4. If the documents do not actually answer the question, say so plainly in one sentence. Do not pad.",
     "5. Do not restate the question and do not open with filler like \"Based on the documents\".",
+    "6. Retrieved documents are candidates, not proof. Before answering, verify that the evidence explicitly concerns the same person, company, property, policy, agreement, or project named or implied by the question.",
+    "7. Never transfer a policy, price, valuation, legal term, medical fact, or contract term from a different entity or context. A transaction, account statement, draft, generic guide, or similar-sounding record is not evidence of a governing policy or executed agreement unless it says so explicitly.",
+    "8. If the subject is ambiguous (for example, 'our policy' or 'the term sheet') and the documents do not tie it to the brain owner and the requested context, answer exactly: The documents do not actually answer the question.",
     env.BRAIN_STYLE_RULE || "",
   ]
     .filter(Boolean)

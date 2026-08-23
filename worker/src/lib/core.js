@@ -167,7 +167,7 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
       const data = await env.AI.run(workersModel, {
         messages: [{ role: "system", content: system }, ...(messages || [])],
         max_tokens: max_tokens || 1000,
-        temperature: 0.2,
+        temperature: 0,
       });
       const text = String(data?.response || "").trim();
       if (!text) throw new Error("Workers AI returned no answer text");
