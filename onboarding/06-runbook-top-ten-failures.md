@@ -161,11 +161,10 @@ node brain.mjs verify <manifest>
 
 ---
 
-### 5. Every question 401s, or answers stop coming back, right after a deploy
+### 5. Every question 401s right after a deploy
 
-**You see:** searches that worked yesterday now return `unauthorized`, or they
-return sources with no written answer. The health check passes. The brain is up,
-it just cannot authenticate or cannot think.
+**You see:** searches that worked yesterday now return `unauthorized`. The
+health check passes. The brain is up, but it cannot authenticate.
 
 **Why:** the stored secrets were wiped by a deployment. Cloudflare erases every
 secret on deploy **unless the deployment explicitly says to keep them.**
@@ -177,7 +176,6 @@ breaks on first use.
 
 ```
 export ADMIN_KEY='...'
-export ANTHROPIC_API_KEY='...'
 node brain.mjs secrets <manifest>
 node brain.mjs health <manifest>
 ```
@@ -234,11 +232,13 @@ one. This is the failure that looks fine from every angle except the answers.
 
 **`no LLM key configured`**
 
-Your AI provider key is not set. Search does not need it, written answers do.
+The Worker is missing its Cloudflare AI binding. The standard install does not
+need an external provider key. Redeploy from the installer so the binding is
+restored:
 
 ```
-export ANTHROPIC_API_KEY='...'
-node brain.mjs secrets <manifest>
+node brain.mjs deploy <manifest>
+node brain.mjs health <manifest>
 ```
 
 **`daily LLM spend cap reached`**

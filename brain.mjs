@@ -709,6 +709,11 @@ async function cmdDeploy(manifestPath) {
       },
       {
         type: "plain_text",
+        name: "ANSWER_MODEL",
+        text: String(m.retrieval?.answer_model || "@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
+      },
+      {
+        type: "plain_text",
         name: "CREDENTIAL_SCANNER",
         text: m.safety?.credential_scanner?.enabled === false ? "off" : "on",
       },
@@ -778,9 +783,9 @@ async function cmdSecrets(manifestPath) {
   // What a D1 install actually reads. The worker embeds through the AI binding,
   // so there is no database credential to set: the brain's storage is D1 and
   // Vectorize inside the client's own account, reachable only by their worker.
-  const needed = ["ADMIN_KEY", "ANTHROPIC_API_KEY"];
+  const needed = ["ADMIN_KEY"];
   // Only for an install pointed at Postgres. Set when present, never demanded.
-  const optional = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"];
+  const optional = ["ANTHROPIC_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"];
   const provided = [...needed, ...optional].filter((n) => process.env[n]);
   const missing = needed.filter((n) => !process.env[n]);
 
@@ -814,16 +819,13 @@ async function cmdSecrets(manifestPath) {
     }
     ok(`secret ${name} set`);
   }
-  // ADMIN_KEY absent means every authenticated route stays shut; ANTHROPIC_API_KEY
-  // absent means search still works but nothing writes an answer. Both are worth
-  // naming precisely rather than as a bare list.
+  // ADMIN_KEY absent means every authenticated route stays shut. Answer
+  // synthesis needs no vendor secret: the standard install uses Workers AI.
   for (const name of missing) {
     warn(
       name === "ADMIN_KEY"
         ? "ADMIN_KEY was not set. Every route except /health will return 401 until it is."
-        : name === "ANTHROPIC_API_KEY"
-          ? "ANTHROPIC_API_KEY was not set. Search will return sources, but /think will return no written answer."
-          : `not set (absent from the environment): ${name}`
+        : `not set (absent from the environment): ${name}`
     );
   }
 }
@@ -3022,16 +3024,10 @@ async function cmdSetup(manifestPath) {
         "        automatically. Do not commit it and do not leave it in a synced folder."
     );
   }
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.log(
-      `\n    The brain writes its answers with Claude, on ${c.bold("your own")} API key, so the\n` +
-        "    cost and the data both stay yours. Get one at console.anthropic.com.\n" +
-        "    Leave this blank to skip: search still works, but you get sources with\n" +
-        "    no written answer.\n"
-    );
-    const k = await askSecret("Anthropic API key (hidden, not echoed)");
-    if (k) process.env.ANTHROPIC_API_KEY = k;
-  }
+  console.log(
+    `\n    Written answers use ${c.bold("Cloudflare Workers AI")} in the client's own account.\n` +
+      "    No Anthropic, OpenAI, Gemini, or Supabase credential is required.\n"
+  );
   await cmdSecrets(target);
   await cmdHealth(target);
 

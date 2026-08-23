@@ -74,7 +74,7 @@
     },
     "retrieval": {
       "type": "object",
-      "description": "chunk_size and chunk_overlap are deployed as Worker configuration. answer_model selects the client-owned synthesis model. Other fields remain descriptive until their runtime wiring is documented.",
+      "description": "chunk_size, chunk_overlap and answer_model are deployed as Worker configuration. The standard answer model runs through the client-owned Cloudflare Workers AI binding. Other fields remain descriptive until their runtime wiring is documented.",
       "properties": {
         "embed_model": { "const": "@cf/baai/bge-base-en-v1.5" },
         "embed_dimensions": { "const": 768 },

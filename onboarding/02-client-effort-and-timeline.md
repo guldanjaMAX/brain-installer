@@ -11,8 +11,7 @@ One page. Every single thing you have to do, how long it takes you, and what hap
 | Day | What you do | Your time | What it holds up |
 |---|---|---|---|
 | **Day 1** | Intake call with me | 45 min | Everything. Nothing starts before this |
-| **Day 2** | Create three accounts and grant access to your sources | 30 min | Everything after it. This is the gate |
-| **Day 2** | Add your own AI provider key (I send exact steps) | 10 min | Written answers. Search works without it, answers do not |
+| **Day 2** | Create the Cloudflare account and grant access to your sources | 30 min | Everything after it. This is the gate |
 | **Days 3 to 4** | Nothing | 0 | I build and deploy |
 | **Days 5 to 6** | Nothing. I may send one or two short questions | 5 min | I load your material, most valuable first |
 | **Day 7** | Nothing | 0 | I read the actual answers to your ten questions and fix what is wrong before you see any of it |
@@ -42,7 +41,7 @@ I am telling you this because late access is the single most common reason one o
 
 ---
 
-## The three accounts you create
+## The two Cloudflare requirements
 
 These are yours. I never own them, and that is the entire point: your material lives in infrastructure you control, and when the work is done my access is removed. I cannot hand over what I never held.
 
@@ -50,17 +49,18 @@ These are yours. I never own them, and that is the entire point: your material l
 |---|---|---|---|
 | 1 | **Cloudflare** | 10 min | The brain itself, its database, and its file storage. Free to create |
 | 2 | **Workers Paid, on that same Cloudflare account** | 2 min | 5 USD/month. Vectorize holds the search index and CANNOT be created on the free tier. See `08-provisioning-prerequisites.md` |
-| 3 | **Anthropic** (API key) | 10 min | The engine that writes answers. Billed on usage, capped by me |
-
-Plus one grant, not an account:
+Written answers run on Cloudflare Workers AI, so there is no second AI-provider
+account or credential. Plus one grant:
 
 | | What | Your time |
 |---|---|---|
-| 4 | **Read-only access** to the folders you named at intake | 10 min |
+| 3 | **Read-only access** to the folders you named at intake | 10 min |
 
 That access is genuinely read-only. It can look at documents. It cannot change, move, or delete anything.
 
-**Do all four in one sitting.** They take 40 minutes together and about three days apart, because each one you leave half done becomes a thing to re-find.
+**Do all three in one sitting.** They take about 25 minutes together and much
+longer when split across several days, because each unfinished item has to be
+found again.
 
 ---
 
@@ -119,7 +119,6 @@ Print this, or forward it to whoever is doing the setup.
 - [ ] Intake sheet returned, including all ten questions in section 6
 - [ ] Cloudflare account created, and I have been told which email it is under
 - [ ] Cloudflare account upgraded to Workers Paid (verify with `node brain.mjs doctor`, which actually checks it via Vectorize, NOT by asking)
-- [ ] Anthropic account created and a payment method added
 - [ ] Read-only access granted to the folders named at intake
 - [ ] Workspace or personal gmail.com question answered, and if personal, the publishing step scheduled
 - [ ] Anything from section 3 (what it must never see) confirmed in writing

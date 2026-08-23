@@ -59,7 +59,6 @@ node brain.mjs deploy     ./acme.manifest.json   # worker, bindings, drain cron
 # path below needs to make one by hand.
 # macOS/Linux:   export ADMIN_KEY="$(openssl rand -hex 24)"
 # PowerShell:    $env:ADMIN_KEY = -join ((1..48) | %% { '{0:x}' -f (Get-Random -Max 16) })
-export ANTHROPIC_API_KEY='...'
 node brain.mjs secrets    ./acme.manifest.json
 
 node brain.mjs health     ./acme.manifest.json   # prove it, including vector backlog

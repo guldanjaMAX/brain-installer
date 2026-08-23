@@ -20,30 +20,26 @@ At **[TIME] on [DATE]**, with you watching:
 | My Cloudflare API token for your account | Deleted | I can no longer see, deploy to, or delete anything in your Cloudflare account |
 | My access to your [Google Drive folders / source] | Removed by you | I can no longer read any of your source material |
 | Your admin key | Rotated by you, to a value I have never seen | I cannot query your brain, even at its public address |
-| Your database service key | Rotated by you | I cannot reach your indexed material directly, bypassing the brain |
-| Your AI provider key | Rotated by you | I cannot spend on your account |
 
-**Why the last two are on this list.** During the build I had to put those two keys into your worker, which means they passed through my hands. Any handoff that did not rotate them would be leaving you with two live credentials I had once held, while telling you I hold nothing. So they get rotated with the others, and this document lists all five rather than the three that are easy to point at.
+The Cloudflare and admin credentials used during the build are rotated or
+revoked at handoff. Written answers use the Cloudflare AI binding, so there is
+no separate model-provider key to transfer or revoke.
 
-Once those five are done I hold **no credential of any kind** to your infrastructure, your material, or your brain.
+Once those steps are done I hold **no credential of any kind** to your infrastructure, your material, or your brain.
 
 This is not a policy I am promising to follow. It is a fact about what keys exist. There is no support account, no vendor backdoor, and no copy of your data on any machine I control, because there never was one. Your material was read in your account, indexed into your account, and answered from your account.
 
 ### Verify it yourself, today
 
-Do not take my word for any of the above. All five are checkable in about five minutes:
+Do not take my word for any of the above. All three are checkable in about five minutes:
 
 1. **Cloudflare.** Log in, go to **My Profile, then API Tokens**. The token named `[TOKEN NAME]` should not be listed. If it is, delete it now and tell me.
 2. **Google.** Open the sharing settings on the folders you granted, or the service account list at [LOCATION]. My access should not appear.
 3. **Your admin key.** You rotated it during our session. I was not shown the new value and it exists only in your own store.
-4. **Your Anthropic API key.** console.anthropic.com, API Keys, revoke the one used during the install and issue a fresh one. Set the new value on the worker yourself with `node brain.mjs secrets <manifest>`, with the key in your own environment. There is no separate database key to rotate: the brain's storage is D1 and Vectorize inside your own Cloudflare account, reachable only by your worker.
-5. **Your AI provider key.** Anthropic console, revoke the key used during the build and issue a fresh one, then set it the same way.
+After all three, run `node brain.mjs test <manifest>` yourself. If the brain
+still answers, the remaining credentials and Cloudflare AI binding are working.
 
-Steps 4 and 5 must be done by you, not by me, or the rotation is meaningless.
-
-After all five, run `node brain.mjs test <manifest>` yourself. If the brain still answers, the new keys are in place and working. If it does not, one of them did not get set, and nothing is lost: re-run `secrets` and try again.
-
-If any of those five does not check out, that is a real problem and I want to hear about it the same day.
+If any of those three does not check out, that is a real problem and I want to hear about it the same day.
 
 ---
 
@@ -59,7 +55,7 @@ Everything. Here it is written down, because "you own it" is worthless if nobody
 | File storage | Cloudflare R2 bucket `[R2_BUCKET]` | Stored files |
 | Search index | Cloudflare Vectorize index `[VECTORIZE_INDEX]`, in YOUR account | The meaning of your material, as vectors |
 | Text and keywords | Cloudflare D1 database `[D1_NAME]`, in YOUR account | Your material itself, and the keyword index over it |
-| AI provider | Anthropic account [ANTHROPIC ACCOUNT] | Writes the answers. Your key, your bill, capped at $[CAP] per day |
+| Answer model | Cloudflare Workers AI in [ACCOUNT EMAIL] | Writes the answers in the same account, capped at $[CAP] per day |
 | Source access | [GOOGLE SERVICE ACCOUNT / OAUTH CLIENT] | Read-only access to your own folders |
 | Admin key | [WHERE YOU STORED IT] | The password to your brain. Treat it like one |
 | Your manifest | `[PATH / REPO]` | The one file that describes your install. Contains no secrets |
@@ -99,7 +95,7 @@ Then, from the installer folder:
 1. Run `node brain.mjs test <manifest>`.
 2. Read the failures and warnings at the bottom. The freshness line is the one to watch: a brain that quietly stops taking in new material still answers confidently, using old information.
 3. Run `node brain.mjs sources <manifest>` and check the last ingest date on each line.
-4. Check your Anthropic and Cloudflare bills against the numbers in section 2.
+4. Check your Cloudflare bill against the numbers in section 2.
 
 ### When something breaks
 
@@ -134,7 +130,6 @@ In this order:
 3. **Delete the file storage.** Cloudflare dashboard, R2, bucket `[R2_BUCKET]`, Delete.
 4. **Delete the brain.** Cloudflare dashboard, Workers and Pages, `[WORKER_NAME]`, Settings, Delete.
 5. **Revoke source access.** Remove [SERVICE ACCOUNT / OAUTH CLIENT] from the folders it could read, and delete it in the Google Cloud console.
-6. **Revoke the AI key.** Anthropic console, API keys, delete the key named [KEY NAME].
 
 **Then verify, and do not verify by visiting the URL.** A deleted worker can keep answering for a few seconds after it is gone, so a 200 response proves nothing in the first minute. Check the **list of workers in your account** instead. If `[WORKER_NAME]` is not in that list, it is gone.
 

@@ -22,14 +22,14 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   // without them, so they must never block one.
   check("Claude Code is never fatal", checkClaudeCode().status !== FAIL);
   check("Codex is never fatal", checkCodex().status !== FAIL);
-  check("a missing Anthropic key is a warning, not a blocker", checkAnthropicKey().status !== FAIL);
+  check("a missing Anthropic key is not a blocker", checkAnthropicKey().status !== FAIL);
   check("a missing Google connection is a warning", checkGoogleConnection().status !== FAIL);
 }
 {
   const k = process.env.ANTHROPIC_API_KEY;
   delete process.env.ANTHROPIC_API_KEY;
   const a = checkAnthropicKey();
-  check("without a key it warns and says what breaks", a.status === WARN && /NO written answer/.test(a.fix), a.fix);
+  check("without a key Workers AI remains the standard", a.status === OK && /Workers AI/.test(a.detail), a.detail);
   process.env.ANTHROPIC_API_KEY = "x";
   check("with a key it passes", checkAnthropicKey().status === OK);
   if (k) process.env.ANTHROPIC_API_KEY = k; else delete process.env.ANTHROPIC_API_KEY;

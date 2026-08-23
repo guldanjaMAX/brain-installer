@@ -16,9 +16,8 @@ account alone.
 | 1 | A Cloudflare account | 5 min | Everything lives here. Theirs, not ours |
 | 2 | **Workers Paid plan on it** | 2 min | 5 USD/month. **Vectorize cannot create an index on the free tier at all** |
 | 3 | An account-scoped, expiring API token | 5 min | One token drives every Cloudflare step |
-| 4 | An Anthropic API key | 5 min | The answers run on their key, so cost and data both stay theirs |
 
-Nothing else. No Supabase, no second vendor, no database password.
+Nothing else. No Supabase, no second AI vendor, no database password.
 
 ---
 

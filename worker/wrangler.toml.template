@@ -10,7 +10,7 @@ compatibility_date = "2026-01-01"
 BRAIN_NAME = "{{BRAIN_NAME}}"
 BRAIN_OWNER = "{{BRAIN_OWNER}}"
 BRAIN_VERSION = "{{BRAIN_VERSION}}"
-ANSWER_MODEL = "claude-sonnet-5"
+ANSWER_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 RERANK_MODEL = "claude-haiku-4-5-20251001"
 DAILY_LLM_CAP_USD = "{{DAILY_LLM_CAP_USD}}"
 CREDENTIAL_SCANNER = "on"
@@ -25,6 +25,6 @@ database_id = "{{D1_ID}}"
 
 # Secrets, set with `wrangler secret put` and never written to this file:
 #   ADMIN_KEY
-#   ANTHROPIC_API_KEY
+#   ANTHROPIC_API_KEY            (optional nonstandard provider override)
 #   SUPABASE_URL
 #   SUPABASE_SERVICE_ROLE_KEY

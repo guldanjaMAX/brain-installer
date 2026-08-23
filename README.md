@@ -27,7 +27,7 @@ brain doctor       # check your machine has everything it needs
 
 ## Set it up
 
-You need three things first. `brain doctor` checks all of them and tells you
+You need two things first. `brain doctor` checks all of them and tells you
 exactly what to do about anything missing.
 
 1. **A Cloudflare account on the Workers Paid plan.** 5 USD a month. The
@@ -36,8 +36,9 @@ exactly what to do about anything missing.
 2. **A Cloudflare API token**, created in your own account, with exactly four
    permissions: Workers Scripts Edit, D1 Edit, Vectorize Edit and Workers AI
    Read. The token can be limited to your account and given an expiry.
-3. **An Anthropic API key** from console.anthropic.com. Answers are written on
-   your key, so the cost and the data both stay yours.
+
+Written answers use Cloudflare Workers AI through the same account. There is no
+second AI-provider account or API key to create.
 
 Then:
 

@@ -31,7 +31,11 @@ function mkEnv(rows, { vectorIds = [], vectorThrows = false, extra = {} } = {}) 
       },
       upsert: async () => {},
     },
-    AI: { run: async () => ({ data: [[0.1, 0.2, 0.3]] }) },
+    AI: {
+      run: async (model) => model.includes("bge-")
+        ? ({ data: [[0.1, 0.2, 0.3]] })
+        : ({ response: "The Cloudflare answer is grounded in the result [1].", usage: { prompt_tokens: 100, completion_tokens: 12 } }),
+    },
     ...extra,
   };
   return { env, seen };
@@ -116,6 +120,8 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   const t = await (await call(env, "/api/rag/think?q=retainer")).json();
   check("vector outage surfaces as a gap", (t.gaps || []).some((g) => g.type === "vector_unavailable"), JSON.stringify(t.gaps));
   check("and results still come back", (t.results || []).length === 1);
+  check("Workers AI writes the cited answer without a vendor key", /Cloudflare answer/.test(t.answer || ""), JSON.stringify(t));
+  check("and reports the Cloudflare model", String(t.model || "").startsWith("@cf/"), String(t.model));
 }
 
 /* ---- a missing metadata index must not take search down ---- */

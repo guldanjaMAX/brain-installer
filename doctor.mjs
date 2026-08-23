@@ -272,12 +272,9 @@ export function checkCodex() {
 export function checkAnthropicKey() {
   if (process.env.ANTHROPIC_API_KEY) return check("Anthropic key", OK, "present in the environment");
   return check(
-    "Anthropic key",
-    WARN,
-    "not set",
-    "Search still works without it, but /think returns sources and NO written answer.\n" +
-      "  The client creates their own at console.anthropic.com so the cost and the data stay theirs:\n" +
-      "    export ANTHROPIC_API_KEY='...'"
+    "Answer model",
+    OK,
+    "Cloudflare Workers AI is the standard; no external model key is required"
   );
 }
 

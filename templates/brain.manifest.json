@@ -108,9 +108,9 @@
     "chunk_size": 1500,
     "chunk_overlap": 300,
     "default_result_limit": 8,
-    "answer_model": "claude-sonnet-5",
+    "answer_model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "rerank": false,
-    "_comment": "answer_model runs on the CLIENT's own API key, so cost and data both stay theirs."
+    "_comment": "answer_model runs through the CLIENT's own Cloudflare Workers AI binding, so no external model credential is required."
   },
   "safety": {
     "_comment": "Non-negotiable defaults. The scanner is what makes 'we store nothing dangerous' true rather than aspirational.",

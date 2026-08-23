@@ -152,7 +152,6 @@ Genuinely. What do you think it will fumble?
 |---|---|---|
 | This week | Return this document | 45 minutes |
 | Before we start | Create the Cloudflare account, grant access to the sources above | 30 minutes |
-| Before we start | Add your own AI provider key (I will send exact steps) | 10 minutes |
 | Build week | Nothing. I build | 0 |
 | Kickoff | 60 minutes together, looking at your own questions answered | 60 minutes |
 | A week later | 30 minutes, reviewing what it missed | 30 minutes |

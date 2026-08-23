@@ -142,7 +142,7 @@ async function logCall(env, { label, model, status, micros }) {
 
 export async function callLLM(env, { model, system, messages, max_tokens, label, timeoutMs }) {
   const apiKey = env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
+  if (!apiKey && !env.AI) {
     const e = new Error("no LLM key configured");
     e.no_key = true;
     throw e;
@@ -159,6 +159,40 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
     throw e;
   }
 
+  if (!apiKey) {
+    const workersModel = String(model || "").startsWith("@cf/")
+      ? model
+      : env.WORKERS_AI_ANSWER_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+    try {
+      const data = await env.AI.run(workersModel, {
+        messages: [{ role: "system", content: system }, ...(messages || [])],
+        max_tokens: max_tokens || 1000,
+        temperature: 0.2,
+      });
+      const text = String(data?.response || "").trim();
+      if (!text) throw new Error("Workers AI returned no answer text");
+      const inTok = data?.usage?.prompt_tokens || data?.usage?.input_tokens || 0;
+      const outTok = data?.usage?.completion_tokens || data?.usage?.output_tokens || 0;
+      // llama-3.3-70b-fp8-fast: $0.293/M input and $2.25/M output.
+      // Keep the estimate conservative enough for the guard to remain useful.
+      const micros = Math.ceil(inTok * 0.293 + outTok * 2.25);
+      capCache.micros += micros;
+      await logCall(env, { label, model: workersModel, status: "ok", micros });
+      return {
+        content: [{ type: "text", text }],
+        model: workersModel,
+        usage: data?.usage || {},
+        provider: "cloudflare-workers-ai",
+      };
+    } catch (error) {
+      await logCall(env, { label, model: workersModel, status: "error", micros: 0 });
+      throw new Error(`Workers AI: ${error?.message || error}`);
+    }
+  }
+
+  const anthropicModel = String(model || "").startsWith("@cf/")
+    ? env.ANTHROPIC_ANSWER_MODEL || "claude-sonnet-4-5"
+    : model;
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -166,7 +200,7 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
       "anthropic-version": "2023-06-01",
       "content-type": "application/json",
     },
-    body: JSON.stringify({ model, max_tokens: max_tokens || 1000, system, messages }),
+    body: JSON.stringify({ model: anthropicModel, max_tokens: max_tokens || 1000, system, messages }),
     signal: AbortSignal.timeout(timeoutMs || 45_000),
   });
 
@@ -182,6 +216,6 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
   const outTok = data?.usage?.output_tokens || 0;
   const micros = Math.round(inTok * 3 + outTok * 15);
   capCache.micros += micros;
-  await logCall(env, { label, model: data?.model || model, status: "ok", micros });
+  await logCall(env, { label, model: data?.model || anthropicModel, status: "ok", micros });
   return data;
 }
