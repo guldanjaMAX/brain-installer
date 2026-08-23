@@ -648,6 +648,48 @@ async function handleIngestBatch(env, request) {
   return jsonResponse({ ...tally, total: docs.length, results });
 }
 
+/** Record a completed bulk-load receipt against the authoritative D1 count. */
+async function handleSourceReceipt(env, request) {
+  if (backendOf(env) !== D1) return jsonResponse({ error: "source receipts apply to the d1 backend only" }, 400);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "invalid JSON body" }, 400);
+  }
+
+  const source = String(body?.source || "").trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(source)) {
+    return jsonResponse({ error: "source must contain only lowercase letters, numbers, underscores or hyphens" }, 400);
+  }
+  const kind = String(body?.kind || (source === "drive" ? "drive" : "upload")).trim().toLowerCase();
+  if (!new Set(["drive", "gmail", "calendar", "slack", "notion", "upload"]).has(kind)) {
+    return jsonResponse({ error: "unsupported source kind" }, 400);
+  }
+  const completedAt = body?.completed_at && Number.isFinite(Date.parse(body.completed_at))
+    ? new Date(body.completed_at).toISOString()
+    : new Date().toISOString();
+  const countRow = await env.DB.prepare("SELECT count(*) AS n FROM documents WHERE source = ?1").bind(source).first();
+  const documents = Number(countRow?.n || 0);
+  const detail = String(body?.detail || "bulk-load receipt").replace(/\s+/g, " ").slice(0, 500);
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO sources (name, kind, status, created_at, last_ingest_at, document_count, last_complete_sweep_at)
+       VALUES (?1,?2,'ready',?3,?3,?4,CASE WHEN ?5 = 1 THEN ?3 ELSE NULL END)
+       ON CONFLICT(name) DO UPDATE SET
+         kind=excluded.kind, status='ready', last_ingest_at=excluded.last_ingest_at,
+         document_count=excluded.document_count,
+         last_complete_sweep_at=CASE WHEN ?5 = 1 THEN excluded.last_ingest_at ELSE sources.last_complete_sweep_at END`
+    ).bind(source, kind, completedAt, documents, body?.complete_sweep === true ? 1 : 0),
+    env.DB.prepare(
+      "INSERT INTO source_events (source_name,event,at,documents,detail) VALUES (?1,'ingest',?2,?3,?4)"
+    ).bind(source, completedAt, documents, detail),
+  ]);
+
+  return jsonResponse({ source, kind, status: "ready", documents, completed_at: completedAt });
+}
+
 async function handleDocuments(env) {
   const { rows } = await storeFor(env).stats(env);
   const out = { backend: backendOf(env), rows: rows || [] };
@@ -696,6 +738,9 @@ export default {
       }
       if (path === "/api/admin/brain/ingest/batch" && request.method === "POST") {
         return await handleIngestBatch(env, request);
+      }
+      if (path === "/api/admin/brain/source-receipt" && request.method === "POST") {
+        return await handleSourceReceipt(env, request);
       }
       if (path === "/api/admin/brain/documents" && request.method === "GET") {
         return await handleDocuments(env);

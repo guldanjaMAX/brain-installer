@@ -357,6 +357,34 @@ export async function postTargetBatch({ targetUrl, adminKey, items, fetchImpl = 
   return body;
 }
 
+/** Close a completed migration lane with a source-registry receipt. */
+export async function postSourceReceipt({ targetUrl, adminKey, receipt, fetchImpl = fetch, timeoutMs = 30_000 }) {
+  if (!targetUrl) throw new Error("BRAIN_URL is missing");
+  if (!adminKey) throw new Error("ADMIN_KEY is missing");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetchImpl(`${cleanUrl(targetUrl)}/api/admin/brain/source-receipt`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify(receipt),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error(`source receipt timed out after ${timeoutMs}ms`);
+    throw new Error(`source receipt failed: ${error?.message || error}`);
+  } finally {
+    clearTimeout(timer);
+  }
+  const raw = await response.text();
+  let body;
+  try { body = JSON.parse(raw); } catch { throw new Error(`source receipt returned non-JSON (${response.status})`); }
+  if (!response.ok) throw new Error(`source receipt returned ${response.status}: ${body?.error || "unknown error"}`);
+  if (body?.status !== "ready") throw new Error("source receipt did not mark the source ready");
+  return body;
+}
+
 export function loadMigrationState(path, { projectRef, targetUrl } = {}) {
   let state = null;
   if (path && existsSync(path)) {
@@ -588,8 +616,27 @@ async function main() {
     maxTargetChunks: flags["max-target-chunks"] ? Math.max(1, Number.parseInt(flags["max-target-chunks"], 10)) : Infinity,
     migrationPolicy,
   });
+  let sourceReceipt = null;
+  if (!dryRun && result.status === "complete" && !state.lanes[lane]?.receipt_recorded_at) {
+    const source = lane === "messages" ? "message" : lane;
+    const completedAt = new Date().toISOString();
+    sourceReceipt = await postSourceReceipt({
+      targetUrl,
+      adminKey,
+      receipt: {
+        source,
+        kind: lane === "drive" ? "drive" : "upload",
+        completed_at: completedAt,
+        complete_sweep: lane === "drive",
+        detail: `Supabase migration complete; source_rows=${result.source_rows} refused=${result.refused} failed=${result.failed}`,
+      },
+    });
+    state.lanes[lane].receipt_recorded_at = completedAt;
+    saveMigrationState(statePath, state);
+  }
   console.log(JSON.stringify({
     ...result,
+    source_receipt: sourceReceipt,
     done: undefined,
     migration_policy: undefined,
     policy: result.migration_policy?.summary || null,

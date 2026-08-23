@@ -1,6 +1,6 @@
 import {
   driveExactDuplicateSql, joinOverlappingChunks, laneConfig, resolveDrivePolicy,
-  rowToEnvelope, runLane,
+  postSourceReceipt, rowToEnvelope, runLane,
 } from "../migration/supabase-import.mjs";
 
 let fail = 0, ran = 0;
@@ -127,6 +127,23 @@ const check = (name, condition, detail = "") => {
   check("a failed page blocks rather than skipping data", result.status === "blocked", JSON.stringify(result));
   check("the cursor did not advance", result.cursor === "", JSON.stringify(result));
   check("the failure is explicit and attributable", result.failures[0]?.source_id === "bad" && /target write failed/.test(result.failures[0]?.error), JSON.stringify(result.failures));
+}
+
+/* A completed lane can close the source registry through the admin API. */
+{
+  let seen = null;
+  const receipt = await postSourceReceipt({
+    targetUrl: "https://brain.example/",
+    adminKey: "test-admin-key",
+    receipt: { source: "message", kind: "upload", complete_sweep: false },
+    fetchImpl: async (url, options) => {
+      seen = { url, method: options.method, body: JSON.parse(options.body), authenticated: options.headers["X-Admin-Key"] === "test-admin-key" };
+      return new Response(JSON.stringify({ source: "message", status: "ready", documents: 12 }), { status: 200 });
+    },
+  });
+  check("a completed lane posts its source receipt", seen?.url.endsWith("/api/admin/brain/source-receipt") && seen?.method === "POST" && seen?.body.source === "message", JSON.stringify(seen));
+  check("the source receipt uses admin authentication", seen?.authenticated === true);
+  check("the source receipt must come back ready", receipt.status === "ready" && receipt.documents === 12, JSON.stringify(receipt));
 }
 
 console.log(`\nsupabase importer: ${ran - fail}/${ran} passed`);

@@ -274,6 +274,27 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   check("ingest refuses a live credential", r.status === 422, String(r.status));
 }
 
+/* ---- bulk imports close with a truthful source receipt ---- */
+{
+  const { env, seen } = mkEnv([]);
+  const response = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ source: "drive", kind: "drive", complete_sweep: true, detail: "migration complete" }),
+  }), env, {});
+  const body = await response.json();
+  check("a bulk importer can record its source receipt", response.status === 200 && body.source === "drive" && body.status === "ready", JSON.stringify(body));
+  check("the receipt uses the authoritative document count", seen.sql.some((sql) => /count\(\*\).*documents WHERE source/.test(sql)), JSON.stringify(seen.sql));
+  check("the receipt updates freshness and leaves an audit event", seen.sql.some((sql) => /INSERT INTO sources/.test(sql)) && seen.sql.some((sql) => /INSERT INTO source_events/.test(sql)), JSON.stringify(seen.sql));
+
+  const bad = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ source: "Drive %" }),
+  }), env, {});
+  check("an unsafe source receipt name is refused", bad.status === 400, String(bad.status));
+}
+
 /* ---- documents reports the backend and the vector backlog ---- */
 {
   const { env } = mkEnv([{ source_type: "meeting", total: 4, embedded: 4, last_ingest_at: 1750000000000 }]);
