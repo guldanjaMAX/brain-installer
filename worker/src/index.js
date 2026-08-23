@@ -368,7 +368,7 @@ async function handleThink(env, request) {
       if (headsUpAt >= 0) {
         const body = answer.slice(0, headsUpAt).trim();
         const headsUp = answer.slice(headsUpAt).trim();
-        answer = /\b(?:not affected|does not affect|doesn't affect|no effect|not materially (?:affect|impact))\b/i.test(headsUp)
+        answer = /\b(?:not affected|does not affect|doesn't affect|no effect|not materially (?:affect|impact)|but in this case)\b/i.test(headsUp)
           ? body
           : `${body}\n\n${headsUp.replace(/\s*\[\d+\]/g, "")}`;
       }
@@ -391,14 +391,14 @@ async function handleThink(env, request) {
     if (alreadyRefused) {
       answer = unsupportedAnswer;
       approvedDocs = [];
-      evidenceGate = { supported: false, evidence: [], reason: "answer model found no direct support" };
+      evidenceGate = { supported: false, complete: false, evidence: [], reason: "answer model found no direct support" };
     } else {
       const citedNumbers = new Set([...answer.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1])));
       const citedDocs = docs.filter((doc) => citedNumbers.has(doc.n));
       if (!citedDocs.length) {
         answer = unsupportedAnswer;
         approvedDocs = [];
-        evidenceGate = { supported: false, evidence: [], reason: "draft made claims without document citations" };
+        evidenceGate = { supported: false, complete: false, evidence: [], reason: "draft made claims without document citations" };
       } else {
         try {
           const check = await callLLM(env, {
@@ -409,8 +409,9 @@ async function handleThink(env, request) {
             system: [
               "You verify a proposed answer against its cited documents. You do not rewrite the answer.",
               `The configured brain owner is ${owner}.`,
-              "Return only one JSON object: {\"supported\":true|false,\"evidence\":[1,2],\"reason\":\"short reason\"}.",
+              "Return only one JSON object: {\"supported\":true|false,\"complete\":true|false,\"evidence\":[1,2],\"reason\":\"short reason\"}.",
               "Set supported=true only if the cited documents explicitly support the proposed answer's factual claims for the exact person, company, property, agreement, policy or project in the question.",
+              "Set complete=true only if the proposed answer addresses every material part of the question. A part counts as addressed when it is answered from evidence or the answer explicitly says the documents do not provide it. Silently omitting a requested part means complete=false.",
               "If supported=true, evidence must list every document number cited anywhere in the proposed answer. If any cited document does not support the claim next to its citation, set supported=false.",
               "A similar name, generic guidance, another entity's policy, another property's lease, a transaction, an account statement, or a draft does not establish the requested governing fact.",
               "When a question uses my, our, we, or an unnamed definite subject such as 'the term sheet', require the citation to explicitly connect that subject to the configured brain owner or to an organization, property, agreement, or project named in the question. First-person words inside an unrelated newsletter or third-party document refer to its author, not the brain owner.",
@@ -432,11 +433,12 @@ async function handleThink(env, request) {
             .filter((n) => citedDocs.some((doc) => doc.n === n)));
           evidenceGate = {
             supported: verdict?.supported === true || String(verdict?.supported).toLowerCase() === "true",
+            complete: verdict?.complete === true || String(verdict?.complete).toLowerCase() === "true",
             evidence: [...allowed],
             reason: String(verdict?.reason || "").slice(0, 240) || undefined,
             ...(!verdict && raw ? { invalid_response: raw.replace(/\s+/g, " ").slice(0, 240) } : {}),
           };
-          if (evidenceGate.supported && allowed.size !== citedDocs.length) {
+          if (evidenceGate.supported && evidenceGate.complete && allowed.size !== citedDocs.length) {
             evidenceGate.supported = false;
             evidenceGate.reason = "verifier did not approve every citation in the proposed answer";
           }
@@ -449,7 +451,7 @@ async function handleThink(env, request) {
             evidenceGate.supported = false;
             evidenceGate.reason = "only non-final planning material was cited for a binding legal claim";
           }
-          if (!evidenceGate.supported || !allowed.size) {
+          if (!evidenceGate.supported || !evidenceGate.complete || !allowed.size) {
             answer = unsupportedAnswer;
             approvedDocs = [];
           } else {
@@ -459,7 +461,7 @@ async function handleThink(env, request) {
           answer = null;
           answerError = e.llm_cap_exceeded ? "daily LLM spend cap reached" : "evidence gate could not verify support";
           approvedDocs = [];
-          evidenceGate = { supported: false, error: "verification unavailable" };
+          evidenceGate = { supported: false, complete: false, error: "verification unavailable" };
         }
       }
     }

@@ -35,7 +35,7 @@ function mkEnv(rows, { vectorIds = [], vectorThrows = false, extra = {} } = {}) 
       run: async (model, input) => model.includes("bge-")
         ? ({ data: [[0.1, 0.2, 0.3]] })
         : String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
-          ? ({ response: { supported: true, evidence: [1], reason: "direct support" }, usage: { prompt_tokens: 100, completion_tokens: 12 } })
+          ? ({ response: { supported: true, complete: true, evidence: [1], reason: "direct support" }, usage: { prompt_tokens: 100, completion_tokens: 12 } })
           : ({ response: "The Cloudflare answer is grounded in the result [1].", usage: { prompt_tokens: 100, completion_tokens: 12 } }),
     },
     ...extra,
@@ -136,7 +136,7 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
           if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
           generations.push(input);
           if (String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")) {
-            return { response: { supported: true, evidence: [1], reason: "direct support" }, usage: {} };
+            return { response: { supported: true, complete: true, evidence: [1], reason: "direct support" }, usage: {} };
           }
           return { response: "The retainer was deferred [1].", usage: {} };
         },
@@ -150,6 +150,7 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   check("both evidence gating and answer generation are deterministic", gate?.temperature === 0 && generation?.temperature === 0, JSON.stringify(generations));
   check("the evidence gate verifies exact factual claims and subject", /exact person, company, property/.test(gate?.messages?.[0]?.content || ""), JSON.stringify(gate));
   check("the evidence gate receives the configured owner identity", /configured brain owner/.test(gate?.messages?.[0]?.content || ""), JSON.stringify(gate));
+  check("the evidence gate requires every material part", /every material part/.test(gate?.messages?.[0]?.content || ""), JSON.stringify(gate));
   check("the answer contract forbids cross-entity evidence transfer", /different entity or context/.test(system), system);
   check("ambiguous owner context requires an explicit evidence tie", /tie it to the brain owner/.test(system), system);
 }
@@ -164,7 +165,7 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
           if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
           modelCalls++;
           return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
-            ? { response: '{"supported":false,"evidence":[],"reason":"different company"}', usage: {} }
+            ? { response: '{"supported":false,"complete":false,"evidence":[],"reason":"different company"}', usage: {} }
             : { response: "The policy provides 24 weeks of leave [1].", usage: {} };
         },
       },
@@ -186,7 +187,7 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
         run: async (model, input) => {
           if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
           return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
-            ? { response: { supported: true, evidence: [1], reason: "only the first citation is supported" }, usage: {} }
+            ? { response: { supported: true, complete: true, evidence: [1], reason: "only the first citation is supported" }, usage: {} }
             : { response: "The retainer was deferred [1]. An extra claim came from elsewhere [2].", usage: {} };
         },
       },
@@ -195,6 +196,26 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   const body = await (await call(env, "/api/rag/think?q=What+happened+to+the+retainer%3F")).json();
   check("a partial evidence approval fails closed", body.answer === "The documents do not answer the question." && body.evidence_gate?.supported === false, JSON.stringify(body));
   check("the partial approval identifies the citation mismatch", /every citation/.test(body.evidence_gate?.reason || ""), JSON.stringify(body.evidence_gate));
+}
+
+/* ---- every material part must be answered or explicitly called unknown ---- */
+{
+  const { env } = mkEnv([ROW], {
+    vectorIds: [],
+    extra: {
+      AI: {
+        run: async (model, input) => {
+          if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+            ? { response: { supported: true, complete: false, evidence: [1], reason: "the deadline was silently omitted" }, usage: {} }
+            : { response: "The amount was $5,000 [1].", usage: {} };
+        },
+      },
+    },
+  });
+  const body = await (await call(env, "/api/rag/think?q=What+were+the+amount+and+the+deadline%3F")).json();
+  check("an incomplete multi-part answer fails closed", body.answer === "The documents do not answer the question." && body.evidence_gate?.complete === false, JSON.stringify(body));
+  check("the completeness refusal preserves the verifier reason", /deadline was silently omitted/.test(body.evidence_gate?.reason || ""), JSON.stringify(body.evidence_gate));
 }
 
 /* ---- planning notes do not establish binding legal obligations ---- */
@@ -218,7 +239,7 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
         run: async (model, input) => {
           if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
           return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
-            ? { response: { supported: true, evidence: [1], reason: "the planning note says so" }, usage: {} }
+            ? { response: { supported: true, complete: true, evidence: [1], reason: "the planning note says so" }, usage: {} }
             : { response: "You are bound by a right of first refusal and drag along [1].", usage: {} };
         },
       },
