@@ -1726,6 +1726,14 @@ async function readSources(acctId, dbId) {
 
 const num = (n) => Number(n || 0).toLocaleString("en-US");
 
+/** The documents endpoint also exposes `total` for legacy chunk-oriented clients. */
+export function documentCountOf(row) {
+  if (!row) return undefined;
+  const value = row.documents ?? row.total;
+  const count = Number(value);
+  return Number.isFinite(count) ? count : undefined;
+}
+
 /**
  * Print how CURRENT each source is, as distinct from how big it is.
  *
@@ -1855,7 +1863,7 @@ async function cmdSources(manifestPath) {
       // which is always larger, and comparing against that showed drift on every
       // healthy install.
       const liveRow = live?.get(r.name);
-      const shown = liveRow?.documents ?? liveRow?.total;
+      const shown = documentCountOf(liveRow);
       const drift =
         shown !== undefined && Number(shown) !== Number(r.document_count)
           ? c.yellow(`  (store says ${num(shown)})`)
@@ -1883,7 +1891,7 @@ async function cmdSources(manifestPath) {
     const orphans = [...live.entries()].filter(([k]) => !rows.some((r) => r.name === k));
     if (orphans.length) {
       console.log(`\n  ${c.yellow("in the store but not registered")}, so \`brain forget\` cannot remove them:`);
-      for (const [k, v] of orphans) console.log(`    ${k.padEnd(16)} ${num(v.total).padStart(9)} documents`);
+      for (const [k, v] of orphans) console.log(`    ${k.padEnd(16)} ${num(documentCountOf(v)).padStart(9)} documents`);
     }
   }
 
@@ -2112,7 +2120,7 @@ async function cmdForget(manifestPath) {
   const base = await resolveBase(m, acct);
   const adminKey = resolveAdminKey(manifestPath);
   const live = await liveSourceCounts(base, adminKey);
-  const liveCount = live?.get(name)?.total;
+  const liveCount = documentCountOf(live?.get(name));
 
   // Print the damage BEFORE anything happens, every time, --yes or not.
   console.log(`\n  ${c.bold(`forget "${name}"`)} from ${m.client?.display_name || m.client?.slug || "this install"}\n`);
@@ -2167,7 +2175,7 @@ async function cmdForget(manifestPath) {
   // index with no name left to address them by, which is precisely what this
   // feature exists to prevent.
   const post = await liveSourceCounts(base, adminKey);
-  const stillThere = post?.get(name)?.total;
+  const stillThere = documentCountOf(post?.get(name));
   if (stillThere) {
     die(
       `${num(stillThere)} document(s) for "${name}" are STILL in the brain after the purge.\n` +

@@ -4,11 +4,14 @@
 // ours, and both are tested here by CALLING the real functions, not by grepping
 // the source. A source assertion cannot tell a working guard from a deleted one.
 
-import { chooseDbName, assertAdoptable, ensureMetadataIndex, VECTOR_METADATA_INDEXES } from "../brain.mjs";
+import { chooseDbName, assertAdoptable, documentCountOf, ensureMetadataIndex, VECTOR_METADATA_INDEXES } from "../brain.mjs";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 200))); if (!c) fail++; };
 const throws = async (fn) => { try { await fn(); return null; } catch (e) { return e.message || String(e); } };
+
+check("destructive previews report documents rather than chunks", documentCountOf({ documents: 981, chunks: 14753, total: 14753 }) === 981);
+check("older document receipts still have a count", documentCountOf({ total: 42 }) === 42);
 
 /* ---- the name must never be one that could belong to somebody else ---- */
 {
