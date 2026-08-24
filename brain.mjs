@@ -1701,6 +1701,100 @@ export function remoteFamilyOutcomes(plans, sentCounts, acceptedCounts) {
   };
 }
 
+// Load-time snapshot invariant: each WeakMap entry indexes only the legacy
+// per-part keys already present when this state object was loaded. Current
+// result failures use logical keys rather than synthetic part receipt keys. A
+// real local filename may resemble the suffix, but it is protected separately
+// and is intentionally not folded into this legacy snapshot during the run.
+// Indexing once avoids rescanning thousands of exclusions per accepted document.
+const SKIPPED_PART_INDEX = new WeakMap();
+
+function skippedPartIndexOf(state) {
+  const existing = SKIPPED_PART_INDEX.get(state);
+  if (existing?.source === state.skipped) return existing.byRoot;
+  const byRoot = new Map();
+  for (const skippedKey of Object.keys(state.skipped || {})) {
+    const match = skippedKey.match(/^(.*)#part[1-9]\d*of[1-9]\d*$/);
+    if (!match) continue;
+    const keys = byRoot.get(match[1]) || [];
+    keys.push(skippedKey);
+    byRoot.set(match[1], keys);
+  }
+  SKIPPED_PART_INDEX.set(state, { source: state.skipped, byRoot });
+  return byRoot;
+}
+
+/**
+ * Commit one logical document's accepted revision to resumable state.
+ *
+ * A refusal or extraction failure is current only until that same logical
+ * document is accepted later. Keep the transition here so local folders,
+ * Drive and Gmail cannot update `done` while leaving an old reason behind in
+ * `skipped`. Split families call this only after every part is accepted and
+ * family reconciliation succeeds.
+ *
+ * `skipKeys` contains exact receipt keys for the current revision. Older builds
+ * also wrote per-part failures, whose count may differ from the recovered
+ * revision. `legacyPartRoot` clears only the split suffix shape produced by this
+ * installer and may include both old platform-native and current POSIX roots.
+ * Local callers protect real candidate filenames that happen to use the same
+ * shape, so one recovery cannot erase another file's current failure.
+ */
+export function recordAcceptedDocumentState(state, {
+  stateKey, hash, skipKeys = [], legacyPartRoot = null, protectedSkipKeys = [],
+} = {}) {
+  const key = String(stateKey || "");
+  if (!key) throw new Error("accepted document state needs a logical state key");
+  if (!state.done || typeof state.done !== "object") state.done = {};
+  if (!state.skipped || typeof state.skipped !== "object") state.skipped = {};
+  state.done[key] = hash;
+  const exactSkipKeys = [key, ...(skipKeys || [])]
+    .filter((skipKey) => skipKey !== null && skipKey !== undefined && String(skipKey) !== "")
+    .map(String);
+  const legacyPartRoots = Array.isArray(legacyPartRoot) ? legacyPartRoot : [legacyPartRoot];
+  if (legacyPartRoots.some((root) => root !== null && root !== undefined && String(root) !== "")) {
+    const protectedKeys = protectedSkipKeys instanceof Set
+      ? protectedSkipKeys
+      : new Set([...(protectedSkipKeys || [])].map(String));
+    const partIndex = skippedPartIndexOf(state);
+    for (const root of legacyPartRoots) {
+      if (root === null || root === undefined || String(root) === "") continue;
+      for (const skippedKey of partIndex.get(String(root)) || []) {
+        if (!protectedKeys.has(skippedKey)) exactSkipKeys.push(skippedKey);
+      }
+    }
+  }
+  for (const skipKey of new Set(exactSkipKeys)) {
+    delete state.skipped[skipKey];
+  }
+  return state;
+}
+
+/** Add native and POSIX aliases to an existing local-path identity set. */
+export function addLocalPathAliases(target, records, field, pathSeparator = sep) {
+  if (!(target instanceof Set)) throw new Error("local path aliases need a Set target");
+  for (const record of records || []) {
+    const value = field ? record?.[field] : record;
+    if (value === null || value === undefined || String(value) === "") continue;
+    const raw = String(value);
+    const normalized = raw.split(pathSeparator).join("/");
+    target.add(normalized);
+    if (raw !== normalized) target.add(raw);
+  }
+  return target;
+}
+
+/** Record the current local skip under one portable key, retiring its old alias. */
+export function recordLocalSkippedDocumentState(state, { stateKey, nativePath, reason } = {}) {
+  const key = String(stateKey || "");
+  if (!key) throw new Error("skipped document state needs a logical state key");
+  if (!state.skipped || typeof state.skipped !== "object") state.skipped = {};
+  state.skipped[key] = String(reason || "skipped without a reason");
+  const alias = nativePath === null || nativePath === undefined ? "" : String(nativePath);
+  if (alias && alias !== key) delete state.skipped[alias];
+  return state;
+}
+
 export const sourceCursorCanAdvance = (tally) => Number(tally?.failed || 0) === 0;
 
 const INGEST_RESULT_STATUSES = new Set(["created", "updated", "unchanged", "refused", "failed"]);
@@ -2472,9 +2566,20 @@ async function cmdIngest(manifestPath) {
   if (!dry && scannerPolicyChanged && limitedMissesPrior) {
     die(
       "--limit cannot be used while previously-indexed files need a credential-scanner recheck.\n" +
-        "      Run without --limit so every prior document is rechecked before the new scanner is marked complete."
+      "      Run without --limit so every prior document is rechecked before the new scanner is marked complete."
     );
   }
+  // Scanner safety above needs only eligible, normalized candidates. After its
+  // decisions are fixed, reuse that same Set for recovery protection by adding
+  // native aliases and walk-skipped paths. A real file named like a split part
+  // must not lose its current skip when another document family recovers.
+  for (const file of files) {
+    const raw = String(file.rel);
+    const normalized = raw.split(sep).join("/");
+    if (raw !== normalized) candidateLocalKeys.add(raw);
+  }
+  addLocalPathAliases(candidateLocalKeys, walkSkips, "path");
+  const protectedLocalSkipKeys = candidateLocalKeys;
   const scannerRescanSkips = [];
   let unchanged = 0;
   let split = 0;
@@ -2487,20 +2592,31 @@ async function cmdIngest(manifestPath) {
   const prepareOne = async (f) => {
     const r = await prepare(f, { sourceName });
     if (r.note) notes.push({ path: f.rel, note: r.note });
-    const key = r.envelope ? r.envelope.source_id : f.rel;
+    const key = r.envelope ? r.envelope.source_id : String(f.rel).split(sep).join("/");
     if (!scannerPolicyChanged && r.hash && state.done[key] === r.hash) {
+      recordAcceptedDocumentState(state, {
+        stateKey: key,
+        hash: r.hash,
+        skipKeys: [r.envelope?.source_id, f.rel],
+        legacyPartRoot: [r.envelope?.source_id, f.rel],
+        protectedSkipKeys: protectedLocalSkipKeys,
+      });
       unchanged++;
       return { unchanged: true };
     }
     if (r.skip) {
-      state.skipped[r.skip.path] = r.skip.reason;
+      recordLocalSkippedDocumentState(state, {
+        stateKey: key, nativePath: f.rel, reason: r.skip.reason,
+      });
       if (scannerPolicyChanged && previouslyKnownKeys.has(key)) scannerRescanSkips.push(r.skip);
       return { skip: r.skip };
     }
     const refusal = credentialRefusalOf(r.envelope, scannerOn);
     if (refusal) {
       const skip = { path: f.rel, reason: refusal.reason };
-      state.skipped[f.rel] = refusal.reason;
+      recordLocalSkippedDocumentState(state, {
+        stateKey: key, nativePath: f.rel, reason: refusal.reason,
+      });
       intentionalRemovalKeys.add(key);
       return { skip };
     }
@@ -2517,6 +2633,8 @@ async function cmdIngest(manifestPath) {
         expectedParts: envelopes.length,
         base_doc_uid: `${sourceName}:${key}`,
         keep_doc_uids: envelopes.map((envelope) => `${sourceName}:${envelope.source_id}`),
+        skipKeys: [key, f.rel, ...envelopes.map((envelope) => envelope.source_id)],
+        legacyPartRoot: [key, f.rel],
       },
     };
   };
@@ -2619,7 +2737,9 @@ async function cmdIngest(manifestPath) {
       ...outcome.incomplete.map((plan) => ({ base_doc_uid: plan.base_doc_uid, keep_doc_uids: [] })),
     ];
     if (reconciliation.length) await reconcileDocumentFamilies({ families: reconciliation, base, adminKey });
-    for (const plan of outcome.completed) state.done[plan.stateKey] = plan.hash;
+    for (const plan of outcome.completed) {
+      recordAcceptedDocumentState(state, { ...plan, protectedSkipKeys: protectedLocalSkipKeys });
+    }
     for (const plan of outcome.incomplete) {
       delete state.done[plan.stateKey];
       const statuses = [...new Set(rejectedFamilyParts.get(plan.stateKey) || ["failed"])];
@@ -3110,7 +3230,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       const staleParts = await reconcileDocumentFamilies({ families: reconciliation, base, adminKey });
       if (staleParts) ok(`${staleParts} obsolete split-document part(s) removed`);
     }
-    for (const plan of outcome.completed) state.done[plan.stateKey] = plan.hash;
+    for (const plan of outcome.completed) recordAcceptedDocumentState(state, plan);
     for (const plan of outcome.incomplete) {
       delete state.done[plan.stateKey];
       const statuses = [...new Set(rejectedFamilyParts.get(plan.stateKey) || ["failed"])];
@@ -3238,6 +3358,9 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       // noticing a rename or ancestor-folder move through the resolved path.
       const listedVersion = drive.driveVersion(f, folder);
       if (!scannerPolicyChanged && state.done[key] === listedVersion) {
+        recordAcceptedDocumentState(state, {
+          stateKey: key, hash: listedVersion, skipKeys: [f.id], legacyPartRoot: f.id,
+        });
         unchanged++;
         return { unchanged: true };
       }
@@ -3263,6 +3386,8 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         expectedParts: envelopes.length,
         base_doc_uid: key,
         keep_doc_uids: envelopes.map((envelope) => `${envelope.source_type}:${envelope.source_id}`),
+        skipKeys: [key, ...envelopes.map((envelope) => envelope.source_id)],
+        legacyPartRoot: f.id,
       };
       if (scanned % 200 === 0) process.stdout.write(`\r  scanned ${scanned}...   `);
       return {
@@ -3345,6 +3470,9 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         return { skip: r.skip };
       }
       if (!scannerPolicyChanged && state.done[key] === r.version) {
+        recordAcceptedDocumentState(state, {
+          stateKey: key, hash: r.version, skipKeys: [id], legacyPartRoot: id,
+        });
         unchanged++;
         return { unchanged: true };
       }
@@ -3365,6 +3493,8 @@ async function cmdIngestRemote(m, manifestPath, flags) {
           expectedParts: envelopes.length,
           base_doc_uid: key,
           keep_doc_uids: envelopes.map((envelope) => `${envelope.source_type}:${envelope.source_id}`),
+          skipKeys: [key, ...envelopes.map((envelope) => envelope.source_id)],
+          legacyPartRoot: id,
         },
       };
     };
@@ -3520,12 +3650,19 @@ async function sendBatches({
       // double-prefixed document uid and an every-run resend loop.
       const base_id = item.stateKey || item.envelope.metadata?.part_of || r.source_id;
       if (["created", "updated", "unchanged"].includes(r.status)) {
-        if (!item.deferState) state.done[base_id] = item.hash;
+        if (!item.deferState) {
+          recordAcceptedDocumentState(state, {
+            stateKey: base_id,
+            hash: item.hash,
+            skipKeys: [r.source_id],
+            legacyPartRoot: item.envelope.metadata?.part_of || r.source_id,
+          });
+        }
         if (onAccepted) onAccepted(item, r);
       }
       else {
         const reason = r.status === "refused" ? `refused: carries ${(r.labels || []).join(", ")}` : `failed: ${r.error || "unknown"}`;
-        state.skipped[r.source_id] = reason;
+        state.skipped[base_id] = reason;
         skips.push({ path: r.source_id, reason });
       }
     }

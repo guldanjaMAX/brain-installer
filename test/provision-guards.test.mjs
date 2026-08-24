@@ -10,7 +10,7 @@ import {
   remoteFamilyOutcomes, assertDriveLimitSafe, assertRemoteLimitSafe, validateBatchReceipt, postSourceReceipt,
   validateForgetReceipt, assertNoPendingRemovals, credentialRefusalOf, drivePolicyFingerprint,
   driveSyncDecision, listStoredSourceFamilies, credentialScannerFingerprint, postSourceExpectation,
-  resolveAdminKey,
+  resolveAdminKey, recordAcceptedDocumentState, addLocalPathAliases, recordLocalSkippedDocumentState,
 } from "../brain.mjs";
 
 let fail = 0, ran = 0;
@@ -102,6 +102,99 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   outcome = remoteFamilyOutcomes(crossing, new Map([["drive:large", 3]]), new Map([["drive:large", 2]]));
   check("a sent family with a failed part remains retryable", outcome.completed.length === 0 && outcome.incomplete.length === 1,
     JSON.stringify(outcome));
+
+  const recovered = {
+    done: {},
+    skipped: {
+      "notes/safe-again.md": "refused: carries test credential",
+      "notes/safe-again.md#part2of3": "failed: old split receipt",
+      "notes/safe-again.md#part8of8": "file is currently too large during the walk",
+      "notes/safe-again.md#part9of9": "failed: current distinct local file",
+      "notes\\safe-again.md": "refused: old Windows path",
+      "notes\\safe-again.md#part2of4": "failed: old Windows split receipt",
+      "notes\\safe-again.md#part8of8": "file is currently too large during the walk",
+      "notes\\safe-again.md#part9of9": "failed: current distinct Windows file",
+      "drive:file-1": "refused: carries test credential",
+      "file-1": "failed: old single-part receipt",
+      "file-1#part2of3": "failed: old split receipt",
+      "gmail:message-1": "the message had no content",
+      "message-1": "failed: old single-part receipt",
+      "message-1#part2of3": "failed: old split receipt",
+      "drive:still-bad": "failed: current upstream failure",
+    },
+  };
+  const protectedLocalSkipKeys = new Set(["notes/safe-again.md#part9of9"]);
+  const reusedProtectionSet = addLocalPathAliases(protectedLocalSkipKeys, [
+    { rel: "notes\\safe-again.md#part9of9" },
+  ], "rel", "\\");
+  addLocalPathAliases(protectedLocalSkipKeys, [
+    { path: "notes\\safe-again.md#part8of8" },
+  ], "path", "\\");
+  check("local recovery reuses the candidate Set and protects walk-skipped split-shaped names",
+    reusedProtectionSet === protectedLocalSkipKeys &&
+      protectedLocalSkipKeys.has("notes/safe-again.md#part8of8") &&
+      protectedLocalSkipKeys.has("notes\\safe-again.md#part8of8"),
+    JSON.stringify([...protectedLocalSkipKeys]));
+  recordAcceptedDocumentState(recovered, {
+    stateKey: "notes/safe-again.md", hash: "local-v2", skipKeys: ["notes/safe-again.md", "notes\\safe-again.md"],
+    legacyPartRoot: ["notes/safe-again.md", "notes\\safe-again.md"],
+    protectedSkipKeys: protectedLocalSkipKeys,
+  });
+  recordAcceptedDocumentState(recovered, {
+    stateKey: "drive:file-1", hash: "drive-v2", skipKeys: ["file-1"], legacyPartRoot: "file-1",
+  });
+  recordAcceptedDocumentState(recovered, {
+    stateKey: "gmail:message-1", hash: "gmail-v2", skipKeys: ["message-1"], legacyPartRoot: "message-1",
+  });
+  check("a later accepted local document clears its stale refusal",
+    recovered.done["notes/safe-again.md"] === "local-v2" && !("notes/safe-again.md" in recovered.skipped) && !("notes/safe-again.md#part2of3" in recovered.skipped) && !("notes\\safe-again.md" in recovered.skipped) && !("notes\\safe-again.md#part2of4" in recovered.skipped), JSON.stringify(recovered));
+  check("a later accepted Drive document clears logical and legacy receipt skips",
+    recovered.done["drive:file-1"] === "drive-v2" && !("drive:file-1" in recovered.skipped) && !("file-1" in recovered.skipped) && !("file-1#part2of3" in recovered.skipped), JSON.stringify(recovered));
+  check("a later accepted Gmail document clears logical and legacy receipt skips",
+    recovered.done["gmail:message-1"] === "gmail-v2" && !("gmail:message-1" in recovered.skipped) && !("message-1" in recovered.skipped) && !("message-1#part2of3" in recovered.skipped), JSON.stringify(recovered));
+  check("recovery preserves a different document's current failure",
+    recovered.skipped["drive:still-bad"] === "failed: current upstream failure" && recovered.skipped["notes/safe-again.md#part9of9"] === "failed: current distinct local file" && recovered.skipped["notes\\safe-again.md#part9of9"] === "failed: current distinct Windows file" && recovered.skipped["notes/safe-again.md#part8of8"] === "file is currently too large during the walk" && recovered.skipped["notes\\safe-again.md#part8of8"] === "file is currently too large during the walk", JSON.stringify(recovered));
+
+  const windowsSkip = {
+    skipped: {
+      "notes\\later-safe.md": "stale native-path reason",
+      "notes/other.md": "current unrelated failure",
+    },
+  };
+  recordLocalSkippedDocumentState(windowsSkip, {
+    stateKey: "notes/later-safe.md",
+    nativePath: "notes\\later-safe.md",
+    reason: "current extraction failure",
+  });
+  check("a normalized Windows local skip retires its stale native-path alias",
+    windowsSkip.skipped["notes/later-safe.md"] === "current extraction failure" &&
+      !("notes\\later-safe.md" in windowsSkip.skipped) &&
+      windowsSkip.skipped["notes/other.md"] === "current unrelated failure",
+    JSON.stringify(windowsSkip));
+
+  const deferred = {
+    done: {},
+    skipped: {
+      "drive:large": "refused: carries test credential",
+      "large#part2of4": "failed: prior part receipt",
+      "drive:other": "failed: current upstream failure",
+    },
+  };
+  const deferredPlan = {
+    stateKey: "drive:large", hash: "large-v2", expectedParts: 3,
+    skipKeys: ["large#part1of3", "large#part2of3", "large#part3of3"],
+    legacyPartRoot: "large",
+  };
+  outcome = remoteFamilyOutcomes([deferredPlan], new Map([["drive:large", 2]]), new Map([["drive:large", 2]]));
+  for (const plan of outcome.completed) recordAcceptedDocumentState(deferred, plan);
+  check("a deferred split family keeps its current skip until every part lands",
+    deferred.skipped["drive:large"] && !("drive:large" in deferred.done), JSON.stringify(deferred));
+  outcome = remoteFamilyOutcomes([deferredPlan], new Map([["drive:large", 3]]), new Map([["drive:large", 3]]));
+  for (const plan of outcome.completed) recordAcceptedDocumentState(deferred, plan);
+  check("a fully accepted deferred split family clears its logical and part skips",
+    deferred.done["drive:large"] === "large-v2" && !("drive:large" in deferred.skipped) && !("large#part2of4" in deferred.skipped), JSON.stringify(deferred));
+  check("split-family recovery does not erase another family's failure",
+    deferred.skipped["drive:other"] === "failed: current upstream failure", JSON.stringify(deferred));
 
   check("a limited first Drive sync is safe as a preview",
     (await throws(() => assertDriveLimitSafe({ limit: 10, dryRun: true, incremental: false }))) === null);
