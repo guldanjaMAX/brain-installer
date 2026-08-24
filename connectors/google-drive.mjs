@@ -81,6 +81,7 @@ const errorMessage = (error) => {
 const PERMANENT_FILE_REASONS = new Set([
   "appNotAuthorizedToFile",
   "cannotDownloadFile",
+  "cannotExportFile",
   "exportSizeLimitExceeded",
   "fileNotDownloadable",
   "insufficientFilePermissions",

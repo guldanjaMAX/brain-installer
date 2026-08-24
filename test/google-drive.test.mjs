@@ -317,6 +317,14 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   check("a permanent per-file permission failure is a reasoned skip", !!r.skip && /could not be fetched/.test(r.skip.reason), r.skip?.reason);
 }
 {
+  const file = { id: "F5-export", name: "locked doc", mimeType: "application/vnd.google-apps.document", createdTime: "2026-01-01T00:00:00Z" };
+  const r = await toEnvelope(tok, file, {}, {
+    fetchImpl: async () => json({ error: { errors: [{ reason: "cannotExportFile" }], message: "This file cannot be exported by the user." } }, 403), sleep: async () => {},
+  });
+  check("a Google-native file the user cannot export is a reasoned per-file skip",
+    !!r.skip && /cannot be exported by the user/.test(r.skip.reason), r.skip?.reason);
+}
+{
   const file = { id: "F6", name: "temporary.pdf", mimeType: "application/pdf", size: "1000", createdTime: "2026-01-01T00:00:00Z" };
   let calls = 0, e = null;
   await toEnvelope(tok, file, {}, {
