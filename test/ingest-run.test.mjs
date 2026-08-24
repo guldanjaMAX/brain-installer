@@ -175,8 +175,15 @@ const one = (rel) => walk(root, {}).files.find((f) => f.rel.split(/[\\/]/).join(
   saveState(sp, { version: 1, done: { "a.md": "hash1" }, skipped: { "b.pdf": "no extractor" } });
   const s = loadState(sp);
   check("state round-trips", s.done["a.md"] === "hash1" && s.skipped["b.pdf"] === "no extractor", JSON.stringify(s));
-  check("state is owner-only", (statSync(sp).mode & 0o777) === 0o600, (statSync(sp).mode & 0o777).toString(8));
-  check("atomic save leaves no temporary state behind", !readdirSync(dirname(sp)).some((n) => n.startsWith("s.json.tmp-")));
+  const stateMode = statSync(sp).mode & 0o777;
+  const hasTemporaryState = readdirSync(dirname(sp)).some((n) => n.startsWith("s.json.tmp-"));
+  if (process.platform === "win32") {
+    check("Windows state round-trips atomically without POSIX mode bits",
+      s.done["a.md"] === "hash1" && !hasTemporaryState, `mode=${stateMode.toString(8)}`);
+  } else {
+    check("state is owner-only", stateMode === 0o600, stateMode.toString(8));
+  }
+  check("atomic save leaves no temporary state behind", !hasTemporaryState);
   writeFileSync(sp, "{ this is not json");
   check("a corrupt state file does not abort the load", loadState(sp).done && Object.keys(loadState(sp).done).length === 0);
 }
