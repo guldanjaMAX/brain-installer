@@ -23,10 +23,11 @@ try {
 const forbidden = files.filter((path) =>
   /(^|\/)(instances|eval\/baselines)(\/|$)/i.test(path) ||
   (/^eval\/golden\//i.test(path) && path !== "eval/golden/TEMPLATE.golden.json") ||
-  /james|readiness|\.brain-(?:migration|ingest)/i.test(path)
+  /james|readiness|\.brain-(?:migration|ingest|drive-live-fixture)|brain-support-|support-bundle/i.test(path)
 );
 const required = [
   "operations/drive-scheduler.mjs",
+  "support-journal.mjs",
   "connectors/keychain-write.exp",
   "docs/README-developer.md",
 ];

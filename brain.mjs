@@ -58,6 +58,13 @@ import { authorize, loadTokens, saveTokens, createTokenProvider, tokenStorageDes
 import { scan as scanSecrets, GATE_VERSION as CREDENTIAL_GATE_VERSION } from "./worker/src/lib/secret-scan.js";
 import { run } from "./doctor.mjs";
 import { runAll as doctorRunAll, summarize as doctorSummarize, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
+import {
+  clearSupportJournal,
+  exportSupportJournal,
+  previewSupportJournal,
+  recordSupportEvent,
+  supportJournalPaths,
+} from "./support-journal.mjs";
 
 // fileURLToPath, never `new URL(...).pathname`. The latter is percent-encoded,
 // so any install path containing a space resolves to a directory that does not
@@ -111,6 +118,74 @@ class Fatal extends Error {}
 const die = (s) => {
   throw new Fatal(s);
 };
+
+const SUPPORT_REMOTE_COMMANDS = new Set([
+  "deploy", "diagnose", "drain", "health", "migrate", "provision",
+  "reindex", "rollback", "secrets", "upgrade", "verify",
+]);
+let currentSupportCommand = "";
+
+function supportSourceForCommand(command = "") {
+  if (command === "schedule") return "scheduler";
+  if (command === "ingest") {
+    const index = process.argv.indexOf("--from");
+    const remote = index >= 0 ? process.argv[index + 1] : null;
+    if (["calendar", "drive", "gmail"].includes(remote)) return remote;
+    return "local";
+  }
+  if (SUPPORT_REMOTE_COMMANDS.has(command)) return "cloudflare";
+  return "installer";
+}
+
+/** Classify in memory; the raw message is never passed to the journal. */
+export function supportErrorCode(error, { command = "", unexpected = false } = {}) {
+  const message = String(error?.message || "");
+  if (/PDF.*tim(?:e|ed) out/i.test(message)) return "PDF_PROCESS_TIMEOUT";
+  if (/PDF.*process/i.test(message)) return "PDF_PROCESS_FAILED";
+  if (/timed out|ETIMEDOUT|ECONNRESET|EAI_AGAIN|ENOTFOUND/i.test(message)) return "NETWORK_UNREACHABLE";
+  if (/rate.?limit|\b429\b/i.test(message)) return "RATE_LIMITED";
+  if (/\b401\b|expired.*(?:auth|token)|reauthori[sz]/i.test(message)) return "AUTH_EXPIRED";
+  if (/\b403\b|forbidden|permission denied|not permitted/i.test(message)) return "REMOTE_PERMISSION_DENIED";
+  if (/admin key|credential.*(?:missing|required)|token is not set|sign.?in|required.*auth|Keychain.*(?:missing|empty)/i.test(message)) {
+    return "AUTH_REQUIRED";
+  }
+  if (/not found|\b404\b/i.test(message)) return "REMOTE_NOT_FOUND";
+  if (/extract/i.test(message)) return "EXTRACTION_FAILED";
+  if (/needs --|no such folder|could not read manifest|usage:|must be one of|invalid|does not match/i.test(message)) {
+    return "CONFIG_INVALID";
+  }
+  if (command === "ingest") return "INGEST_FAILED";
+  if (command === "health") return "HEALTH_CHECK_FAILED";
+  if (command === "drain") return "VECTOR_DRAIN_FAILED";
+  if (command === "migrate") return "MIGRATION_FAILED";
+  if (command === "upgrade") return "UPGRADE_FAILED";
+  if (command === "schedule") {
+    return process.argv.includes("--install") ? "SCHEDULE_INSTALL_FAILED" : "SCHEDULE_RUN_FAILED";
+  }
+  return unexpected ? "INTERNAL_ERROR" : "COMMAND_FAILED";
+}
+
+function recordSupportFailure(error, { unexpected = false } = {}) {
+  const command = currentSupportCommand;
+  if (!command || command === "support") return null;
+  try {
+    return recordSupportEvent({
+      command,
+      source: supportSourceForCommand(command),
+      errorCode: supportErrorCode(error, { command, unexpected }),
+      productRelativeLocation: unexpected ? "brain.mjs#crash" : "brain.mjs#fatal",
+    }).event_id;
+  } catch {
+    // Support capture must never replace or hide the actual command failure.
+    return null;
+  }
+}
+
+function printSupportReceipt(eventId, write = console.error) {
+  if (!eventId) return;
+  write(`  Private issue note ${eventId} was saved locally. Nothing was sent.`);
+  write("  Review the exact safe record with: brain support --preview");
+}
 
 function token() {
   const t = process.env.CLOUDFLARE_API_TOKEN;
@@ -1599,7 +1674,7 @@ function assertSourceName(name) {
  * `--report` is deliberately absent: a bare --report means "use the generated
  * filename", which is intended.
  */
-export const VALUE_FLAGS = new Set(["path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark"]);
+export const VALUE_FLAGS = new Set(["path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark", "export"]);
 
 /** Read an exact Drive-id exclusion list from either its portable shape or a migration receipt. */
 export function driveExclusionIdsOf(raw) {
@@ -1843,6 +1918,25 @@ export function recordLocalSkippedDocumentState(state, { stateKey, nativePath, r
 }
 
 export const sourceCursorCanAdvance = (tally) => Number(tally?.failed || 0) === 0;
+
+/**
+ * Turn a durable per-document failure receipt into a machine-visible failure.
+ *
+ * Callers invoke this only after saving resume state and closing the source
+ * receipt. Refusals and reasoned skips are deliberately not failures: they are
+ * accepted source-policy outcomes. A store result of `failed` is different. If
+ * it returned exit 0, launchd recorded a green scheduled run even though the
+ * source was left in error and its cursor was withheld for retry.
+ */
+export function assertNoIngestFailures(tally, { noun = "stored part" } = {}) {
+  const failed = Math.max(0, Math.trunc(Number(tally?.failed || 0)));
+  if (!failed) return true;
+  const label = failed === 1 ? noun : `${noun}s`;
+  die(
+    `${failed} ${label} failed, so this ingest is incomplete.\n` +
+      "      Progress was saved. Re-run the same command to retry only what did not finish."
+  );
+}
 
 const INGEST_RESULT_STATUSES = new Set(["created", "updated", "unchanged", "refused", "failed"]);
 
@@ -2843,12 +2937,14 @@ async function cmdIngest(manifestPath) {
     });
   }
 
-  ok(`${tally.created} created, ${tally.updated} updated, ${unchanged + tally.unchanged} unchanged`);
+  const summary = `${tally.created} created, ${tally.updated} updated, ${unchanged + tally.unchanged} unchanged`;
+  if (tally.failed) info(summary);
+  else ok(summary);
   if (tally.refused) warn(`${tally.refused} file(s) refused for carrying live credentials. They were NOT indexed.`);
-  if (tally.failed) warn(`${tally.failed} file(s) failed. Re-running will retry them.`);
   await reportSkips(skips);
 
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
+  assertNoIngestFailures(tally);
   await reportBacklog(manifestPath);
 }
 
@@ -3614,11 +3710,13 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   });
   runClosed = true;
 
-  ok(`${tally.created} created, ${tally.updated} updated, ${unchanged + tally.unchanged} unchanged`);
+  const summary = `${tally.created} created, ${tally.updated} updated, ${unchanged + tally.unchanged} unchanged`;
+  if (tally.failed) info(summary);
+  else ok(summary);
   if (tally.refused) warn(`${tally.refused} document(s) refused for carrying live credentials.`);
-  if (tally.failed) warn(`${tally.failed} failed. Re-running will retry them.`);
   await reportSkips(skips);
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
+  assertNoIngestFailures(tally);
   await reportBacklog(manifestPath);
   } catch (error) {
     // The cursor is deliberately outside this path: it is written only after
@@ -4288,6 +4386,7 @@ export function resolveAdminKey(manifestPath, {
  */
 function crash(err) {
   const msg = err && err.message ? err.message : String(err);
+  const supportEventId = recordSupportFailure(err, { unexpected: true });
   console.error(`\n${c.red("unexpected error")}  ${msg}`);
   console.error("  This is a bug in the installer, not something you did wrong.");
   console.error("  Every command here is safe to run again: nothing is left half-written that");
@@ -4297,6 +4396,7 @@ function crash(err) {
   } else {
     console.error(`\n  For the technical detail to send on: ${c.bold("BRAIN_DEBUG=1")} <the same command>`);
   }
+  printSupportReceipt(supportEventId, (line) => console.error(line));
   process.exit(1);
 }
 
@@ -4433,6 +4533,7 @@ const IS_MAIN = (() => {
 })();
 
 const [, , cmd, manifestPath] = process.argv;
+currentSupportCommand = String(cmd || "");
 /**
  * Drive the vector drain to completion instead of waiting for the cron.
  *
@@ -4561,6 +4662,14 @@ export function renderDiagnosis(r) {
  * finding something. A brain that declines a question it genuinely cannot answer
  * is the thing that makes the rest of its answers worth believing.
  */
+export function assertEvalSucceeded(result) {
+  if (result?.ok) return result;
+  die(
+    "evaluation did not complete successfully. The detailed output is above.\n" +
+      "      Nothing in the question set was changed; fix the reported cause and re-run it."
+  );
+}
+
 async function cmdEval(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
   const { m } = loadManifest(manifestPath);
@@ -4619,8 +4728,7 @@ async function cmdEval(manifestPath) {
 
   const r = run(process.execPath, args, { env: { ...process.env, BRAIN_ADMIN_KEY: adminKey }, timeout: 600_000 });
   process.stdout.write(r.out || "");
-  if (!r.ok) process.exitCode = 1;
-  return r;
+  return assertEvalSucceeded(r);
 }
 
 async function cmdDiagnose(manifestPath) {
@@ -4735,6 +4843,66 @@ async function cmdDrain(manifestPath) {
   return { drained, remaining };
 }
 
+function supportCommandOperation(label, operation) {
+  try {
+    return operation();
+  } catch (error) {
+    if (error instanceof Fatal) throw error;
+    const explained = ["SUPPORT_JOURNAL_UNSAFE_PATH", "SUPPORT_JOURNAL_EXISTS"].includes(error?.code) ||
+      error instanceof TypeError;
+    die(explained
+      ? `${String(error.message)} Nothing was uploaded or sent.`
+      : `the private issue journal could not ${label}. Nothing was uploaded or sent.`);
+  }
+}
+
+/** Inspect or export the private local failure journal. No network is used. */
+async function cmdSupport() {
+  const args = process.argv.slice(3);
+  const flags = parseFlags(args);
+  const positional = args.filter((value, index) =>
+    !value.startsWith("--") && !(index > 0 && args[index - 1] === "--export"));
+  if (positional.length) {
+    die("usage: brain support [--status|--preview|--export <file>|--clear --yes]");
+  }
+  const actions = ["preview", "export", "clear"].filter((name) => flags[name]);
+  if (actions.length > 1) die("choose only one of --preview, --export, or --clear");
+
+  if (flags.preview) {
+    // These are the exact canonical bytes export writes. Do not add a heading
+    // here: a user reviewing the payload must see precisely what could leave.
+    process.stdout.write(supportCommandOperation("be read", () => previewSupportJournal()));
+    return;
+  }
+
+  if (flags.export) {
+    const result = supportCommandOperation("be exported", () => exportSupportJournal(flags.export));
+    ok(`exported ${result.events} private issue note(s) to ${flags.export}`);
+    info("nothing was uploaded or sent");
+    return result;
+  }
+
+  if (flags.clear) {
+    if (!flags.yes) {
+      warn("nothing was cleared. Re-run with --clear --yes after reviewing --preview.");
+      return;
+    }
+    const cleared = supportCommandOperation("be cleared", () => clearSupportJournal());
+    ok(cleared ? "private issue journal cleared" : "private issue journal was already empty");
+    return;
+  }
+
+  const content = supportCommandOperation("be read", () => previewSupportJournal());
+  const events = content ? content.split("\n").length - 1 : 0;
+  const { eventsDir } = supportCommandOperation("be located", () => supportJournalPaths());
+  console.log(`\n  ${c.bold("private installer issue journal")}\n`);
+  console.log(`  ${events} sanitized issue note(s) stored locally`);
+  console.log(`  ${eventsDir}`);
+  console.log("  Nothing has been uploaded or sent.");
+  console.log("  Review exact shareable bytes: brain support --preview");
+  console.log("  Export for a private support issue: brain support --export <file>\n");
+}
+
 /** Install, inspect, or remove the standard per-client Drive scheduler. */
 async function cmdSchedule(manifestPath) {
   if (!manifestPath) {
@@ -4832,6 +5000,7 @@ const commands = {
   upgrade: cmdUpgrade,
   rollback: cmdRollback,
   schedule: cmdSchedule,
+  support: cmdSupport,
 };
 
 if (IS_MAIN && (!cmd || !commands[cmd])) {
@@ -4856,6 +5025,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain ingest     <manifest> --from drive  load from a connected remote source
     brain mcp-config <manifest>            config to connect the client's AI tools
     brain schedule   <manifest> --install  install unattended Drive refresh on macOS
+    brain support    [--preview|--export <file>]  inspect private local issue notes
 
   operate
     brain whatsnew   [manifest]            what changed in this version, and are you on it
@@ -4866,6 +5036,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain rollback   <manifest> <bookmark> restore a D1 snapshot (destructive)
     brain schedule   <manifest>            inspect unattended Drive refresh
     brain schedule   <manifest> --remove   remove it and preserve its logs
+    brain support    --clear --yes         clear private local issue notes
 
   brain ingest takes --source <name>, --limit <n>, --dry-run, and --reset. It is
   resumable: re-run the same command to continue an interrupted load.
@@ -4899,7 +5070,9 @@ if (IS_MAIN) {
       // addressed to the user; the exit code is the machine-readable part.
       // PowerShell wraps anything on stderr in a NativeCommandError block, which
       // makes a clear explanation look like the tool itself fell over.
+      const supportEventId = recordSupportFailure(e);
       console.log(`${c.red("fail")}  ${e.message}`);
+      printSupportReceipt(supportEventId, (line) => console.log(line));
       process.exit(1);
     }
     crash(e);

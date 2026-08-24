@@ -129,7 +129,8 @@
   "operations": {
     "_ingest_cron_comment": [
       "On macOS this installs as a per-user LaunchAgent and runs Google Drive",
-      "incrementally. The plist contains no credentials. Calendar times use",
+      "normally incrementally, with periodic and policy-triggered full comparisons.",
+      "The plist contains no credentials. Calendar times use",
       "the Mac's local timezone, which the installer compares with client.timezone.",
       "If this install keeps its admin key in macOS Keychain instead of an",
       "adjacent .brain-admin-key file, set admin_key_secret to the non-secret",

@@ -9,9 +9,10 @@ the brain, not for whoever built it: what changed for them, and what to check.
 **Google Drive can now stay current on its own on a Mac, using the same setup
 for every client.**
 
-- `brain schedule <manifest> --install` installs a per-user daily Drive refresh.
-  The schedule lives in the client manifest, and status shows whether it is
-  installed, running, out of date, or failing.
+- `brain schedule <manifest> --install` installs the per-user Drive refresh
+  declared by `operations.ingest_cron`, daily by default. Local status reports
+  installation, active runs, definition drift, and the last launchd exit.
+  `brain sources` reports Worker-side freshness.
 - Routine refresh has no Cloudflare deployment credential. Google OAuth uses
   macOS Keychain by default; the brain admin key uses Keychain when its manifest
   declares a locator, with an owner-only adjacent file as the standard fallback.
@@ -35,8 +36,21 @@ for every client.**
 - An interrupted database write stays retryable until its chunks are complete.
   A document cannot be marked unchanged merely because its row was written
   before a later chunk write failed.
-- Installing or removing the Mac scheduler now sets or clears the source's
-  freshness expectation through the authenticated brain data plane.
+- A successful Mac scheduler install sets the source freshness expectation.
+  Removal clears it when the Worker is reachable and warns when that remote
+  cleanup remains outstanding.
+- Recognized command failures now attempt to leave a private, sanitized local
+  issue note when its local journal is writable. Notes can be reviewed or
+  exported with `brain support`; nothing is sent automatically, and the journal
+  cannot store content, filenames, paths, account details, logs, stack traces,
+  or credentials.
+- A scheduled ingest now exits as failed when even one stored ingest part has a
+  true storage failure, after saving its retry state. Credential refusals remain
+  a successful safety outcome.
+- Scheduler logs are owner-only and cut back to a 5 MiB tail with two retained
+  histories after each lock-owning child exits. A currently running noisy
+  process can exceed that cap until it exits, and stale-run monitoring remains
+  the guard for a hung run.
 
 On macOS, Google credentials default to the login Keychain. Other platforms
 retain the atomic owner-only credential-file fallback. Windows and Linux still

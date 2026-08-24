@@ -54,7 +54,7 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 | Anything you excluded at intake | Excluded at the source. It is never read, not read and filtered |
 | Files whose names suggest credentials | Anything looking like a key file, an environment file, or a certificate is refused by name before it is opened |
 
-**How it stays current:** a full pass on a schedule, usually nightly. Re-running is safe: a document that has not changed since last time is skipped rather than duplicated.
+**How it stays current:** scheduled refreshes are normally incremental. A complete Drive comparison runs at least weekly and whenever source policy or folder changes require it. Re-running is safe: a document that has not changed since last time is skipped rather than duplicated.
 
 **When a file disappears from Drive**, the matching material is removed from your index. That removal is guarded: if the run could not see all of your Drive (a permissions blip, a network failure mid-walk), or if the removal would be unusually large, it **refuses to delete anything** and leaves the material in place for another day. A stale document costs nothing. A wrongly emptied index costs everything.
 

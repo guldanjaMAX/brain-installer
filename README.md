@@ -104,7 +104,7 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
   which takes about fifteen minutes.
 - **Google Drive can refresh itself on macOS.** Its schedule is declared in the
   manifest and installed as a per-user LaunchAgent. Windows and Linux still
-  require re-running the incremental load manually.
+  require manually re-running the Drive refresh.
 - **One key, all access.** Anyone with the admin key can ask anything. There are
   no per-person permissions yet.
 - **Slack, Notion and meeting transcripts** do not exist as connectors.
@@ -123,6 +123,19 @@ brain health ./brain.manifest.json    # what is wrong with the brain
 
 For technical detail on any error, put `BRAIN_DEBUG=1` in front of the same
 command.
+
+Recognized command failures attempt to leave a private, sanitized issue note on
+this machine whenever its local journal is writable. A note contains the
+installer version, command, platform, and a typed failure code. It never
+contains document text, filenames, paths, account IDs, URLs, questions, answers,
+logs, stack traces, or credentials, and it is never uploaded automatically.
+
+```bash
+brain support                                  # how many local notes exist
+brain support --preview                       # exact safe bytes, sends nothing
+brain support --export brain-support-review.jsonl
+brain support --clear --yes                    # remove the local journal
+```
 
 ---
 

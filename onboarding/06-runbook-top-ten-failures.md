@@ -287,6 +287,15 @@ node brain.mjs test <manifest>
 
 and confirm the freshness line returns to pass on the next scheduled run.
 
+For cause 3, inspect and reinstall the local schedule, then confirm the source
+freshness reported by the Worker:
+
+```
+node brain.mjs schedule <manifest> --status
+node brain.mjs schedule <manifest> --install
+node brain.mjs sources <manifest>
+```
+
 **This is the most dangerous failure in this document**, because it is the only one with no error message. A stale brain does not warn you mid-answer. It answers with old information in exactly the same confident voice. **The freshness line is the number to watch every month.**
 
 **Who:** you for the re-share, me for the Google publishing step if it is still within the engagement.
@@ -424,13 +433,22 @@ Not a failure. It is the feature. A tool that always produces something has taug
 
 ## What to send me when you need help
 
-There is no telemetry in your install. It reports nothing to me, ever, which means I cannot see your problem unless you show it to me. That is a real cost of your owning this outright, and it is the trade I would make again.
+There is no telemetry in your install. It reports nothing to me, ever. Recognized installer failures attempt to keep a small private issue journal on your own machine whenever its local storage is writable, so useful technical facts are less likely to be lost. The original failure is never hidden if the journal itself is unavailable. It stores only typed metadata such as installer version, operating system, command, and failure category. It does not store document contents, filenames, paths, account details, URLs, questions, answers, logs, stack traces, or credentials.
 
-So send:
+For an installer or scheduled-refresh problem, review the exact sanitized record first:
+
+```bash
+brain support --preview
+brain support --export brain-support-review.jsonl
+```
+
+The export sends nothing. Share it only after you have reviewed it.
+
+For an answer-quality problem, the journal deliberately knows nothing about what you asked. Send:
 
 1. The output of `node brain.mjs test <manifest>`, whole thing, including the passes.
 2. The exact question you asked, copied and pasted, not paraphrased.
 3. What came back.
 4. What you expected instead.
 
-Those four get most problems diagnosed in one reply instead of four.
+Those four get most answer problems diagnosed in one reply instead of four.

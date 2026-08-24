@@ -14,11 +14,21 @@
 
 import {
   chmodSync,
+  closeSync,
+  constants as fsConstants,
   existsSync,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  ftruncateSync,
+  lstatSync,
   mkdirSync,
+  openSync,
+  readSync,
   readFileSync,
   renameSync,
   unlinkSync,
+  writeSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -26,6 +36,7 @@ import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { recordSupportEvent } from "../support-journal.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_BRAIN_PATH = resolve(HERE, "..", "brain.mjs");
@@ -33,6 +44,17 @@ const DEFAULT_SCHEDULER_PATH = fileURLToPath(import.meta.url);
 const MAX_CALENDAR_INTERVALS = 512;
 const LOCKF_PATH = "/usr/bin/lockf";
 const LOCK_BUSY_EXIT = 75; // EX_TEMPFAIL from sysexits(3)
+
+/**
+ * Launchd appends to StandardOutPath and StandardErrorPath forever. Five MiB is
+ * enough to retain a long failure without allowing an unattended install to
+ * consume the owner's disk. Two exact history files keep a useful audit trail
+ * while making the upper bound obvious: after each retention pass, at most
+ * 15 MiB per stream, and normally less because the active file is truncated
+ * after a large run.
+ */
+export const DRIVE_LOG_MAX_BYTES = 5 * 1024 * 1024;
+export const DRIVE_LOG_HISTORY_FILES = 2;
 
 export const CLOUDFLARE_CREDENTIAL_ENV = Object.freeze([
   "CLOUDFLARE_API_TOKEN",
@@ -279,6 +301,334 @@ export function schedulerIdentity(manifestPath, options = {}) {
   };
 }
 
+function lstatIfPresent(path) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function currentUserId() {
+  return typeof process.getuid === "function" ? process.getuid() : null;
+}
+
+function assertCurrentUserOwner(st, path, description) {
+  const uid = currentUserId();
+  if (uid !== null && st.uid !== uid) {
+    throw new Error(`${description} is not owned by the current user: ${path}`);
+  }
+}
+
+function assertPrivateDirectory(path) {
+  if (!lstatIfPresent(path)) mkdirSync(path, { mode: 0o700 });
+  const st = lstatSync(path);
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new Error(`scheduler runtime path is not a private directory: ${path}`);
+  }
+  assertCurrentUserOwner(st, path, "scheduler runtime directory");
+  chmodSync(path, 0o700);
+}
+
+function assertHomeDirectory(path) {
+  if (!lstatIfPresent(path)) mkdirSync(path, { mode: 0o700 });
+  const st = lstatSync(path);
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new Error(`scheduler home path is not a real directory: ${path}`);
+  }
+  assertCurrentUserOwner(st, path, "scheduler home directory");
+}
+
+function noFollowFlag() {
+  // O_NOFOLLOW is available on the target platform (macOS). The lstat checks
+  // retain the same behavior on test platforms that do not expose the flag.
+  return fsConstants.O_NOFOLLOW || 0;
+}
+
+function assertRegularLogPath(path, { allowMissing = true } = {}) {
+  const st = lstatIfPresent(path);
+  if (!st) {
+    if (allowMissing) return null;
+    throw new Error(`scheduler log does not exist: ${path}`);
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error(`refusing to follow a symbolic link at scheduler log path: ${path}`);
+  }
+  if (!st.isFile()) {
+    throw new Error(`scheduler log path is not a regular file: ${path}`);
+  }
+  assertCurrentUserOwner(st, path, "scheduler log file");
+  if (currentUserId() !== null && st.nlink !== 1) {
+    throw new Error(`refusing a scheduler log path with multiple hard links: ${path}`);
+  }
+  return st;
+}
+
+function assertOpenedRegularLog(fd, path) {
+  const st = fstatSync(fd);
+  if (!st.isFile()) {
+    throw new Error(`scheduler log path is not a regular file: ${path}`);
+  }
+  assertCurrentUserOwner(st, path, "scheduler log file");
+  if (currentUserId() !== null && st.nlink !== 1) {
+    throw new Error(`refusing a scheduler log path with multiple hard links: ${path}`);
+  }
+  return st;
+}
+
+function assertRegularLockPath(path, { allowMissing = true } = {}) {
+  const st = lstatIfPresent(path);
+  if (!st) {
+    if (allowMissing) return null;
+    throw new Error(`scheduler lock does not exist: ${path}`);
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error(`refusing to follow a symbolic link at scheduler lock path: ${path}`);
+  }
+  if (!st.isFile()) {
+    throw new Error(`scheduler lock path is not a regular file: ${path}`);
+  }
+  assertCurrentUserOwner(st, path, "scheduler lock file");
+  if (currentUserId() !== null && st.nlink !== 1) {
+    throw new Error(`refusing a scheduler lock path with multiple hard links: ${path}`);
+  }
+  return st;
+}
+
+function preparePrivateLockFile(path) {
+  assertRegularLockPath(path);
+  let fd;
+  try {
+    fd = openSync(
+      path,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND | noFollowFlag(),
+      0o600
+    );
+    const st = fstatSync(fd);
+    if (!st.isFile()) {
+      throw new Error(`scheduler lock path is not a regular file: ${path}`);
+    }
+    assertCurrentUserOwner(st, path, "scheduler lock file");
+    if (currentUserId() !== null && st.nlink !== 1) {
+      throw new Error(`refusing a scheduler lock path with multiple hard links: ${path}`);
+    }
+    fchmodSync(fd, 0o600);
+  } catch (error) {
+    if (error?.code === "ELOOP") {
+      throw new Error(`refusing to follow a symbolic link at scheduler lock path: ${path}`);
+    }
+    throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function assertSchedulerLockDirectory(plan) {
+  const runtimeDir = dirname(plan.locksDir);
+  if (resolve(runtimeDir) !== resolve(plan.home, ".brain") ||
+      resolve(plan.locksDir) !== resolve(runtimeDir, "locks") ||
+      resolve(dirname(plan.lockPath)) !== resolve(plan.locksDir)) {
+    throw new Error("scheduler lock paths must stay inside the per-user .brain runtime directory");
+  }
+  assertHomeDirectory(plan.home);
+  assertPrivateDirectory(runtimeDir);
+  assertPrivateDirectory(plan.locksDir);
+}
+
+function openPrivateLog(path, flags) {
+  assertRegularLogPath(path);
+  let fd;
+  try {
+    fd = openSync(path, flags | noFollowFlag(), 0o600);
+  } catch (error) {
+    if (error?.code === "ELOOP") {
+      throw new Error(`refusing to follow a symbolic link at scheduler log path: ${path}`);
+    }
+    throw error;
+  }
+  try {
+    const st = assertOpenedRegularLog(fd, path);
+    fchmodSync(fd, 0o600);
+    return { fd, st };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function privateHistoryPaths(path, historyFiles) {
+  return Array.from({ length: historyFiles }, (_, index) => `${path}.${index + 1}`);
+}
+
+function renamePrivateLog(from, to) {
+  assertRegularLogPath(from, { allowMissing: false });
+  if (assertRegularLogPath(to)) {
+    throw new Error(`scheduler log rotation target unexpectedly exists: ${to}`);
+  }
+  renameSync(from, to);
+}
+
+function writePrivateSnapshot(path, bytes) {
+  const prior = assertRegularLogPath(path);
+  if (prior) unlinkSync(path);
+  let fd;
+  try {
+    fd = openSync(
+      path,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollowFlag(),
+      0o600
+    );
+    assertOpenedRegularLog(fd, path);
+    let written = 0;
+    while (written < bytes.length) {
+      const count = writeSync(fd, bytes, written, bytes.length - written);
+      if (!count) throw new Error(`scheduler log snapshot could not be written: ${path}`);
+      written += count;
+    }
+    fchmodSync(fd, 0o600);
+    fsyncSync(fd);
+  } catch (error) {
+    if (fd !== undefined) closeSync(fd);
+    fd = undefined;
+    if (assertRegularLogPath(path)) unlinkSync(path);
+    throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function trimPrivateLogTail(path, maxBytes) {
+  if (!assertRegularLogPath(path)) return null;
+  const opened = openPrivateLog(path, fsConstants.O_RDWR);
+  const { fd } = opened;
+  if (opened.st.size <= maxBytes) {
+    closeSync(fd);
+    return opened.st.size;
+  }
+  const bytes = Buffer.allocUnsafe(maxBytes);
+  let read = 0;
+  try {
+    assertOpenedRegularLog(fd, path);
+    while (read < maxBytes) {
+      const count = readSync(
+        fd,
+        bytes,
+        read,
+        maxBytes - read,
+        opened.st.size - maxBytes + read
+      );
+      if (!count) throw new Error(`scheduler history changed while it was being retained: ${path}`);
+      read += count;
+    }
+    assertOpenedRegularLog(fd, path);
+    ftruncateSync(fd, 0);
+    let written = 0;
+    while (written < bytes.length) {
+      const count = writeSync(fd, bytes, written, bytes.length - written, written);
+      if (!count) throw new Error(`scheduler history could not be retained: ${path}`);
+      written += count;
+    }
+    fchmodSync(fd, 0o600);
+    fsyncSync(fd);
+    return maxBytes;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function rotateOneSchedulerLog(path, { maxBytes, historyFiles }) {
+  const history = privateHistoryPaths(path, historyFiles);
+  for (const historyPath of history) {
+    trimPrivateLogTail(historyPath, maxBytes);
+  }
+
+  const opened = openPrivateLog(
+    path,
+    fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_APPEND
+  );
+  const { fd } = opened;
+  const beforeBytes = opened.st.size;
+  if (beforeBytes <= maxBytes) {
+    closeSync(fd);
+    return { path, rotated: false, beforeBytes, afterBytes: beforeBytes, history };
+  }
+
+  const keptBytes = Math.min(beforeBytes, maxBytes);
+  const snapshot = Buffer.allocUnsafe(keptBytes);
+  const offset = beforeBytes - keptBytes;
+  let read = 0;
+  try {
+    assertOpenedRegularLog(fd, path);
+    while (read < keptBytes) {
+      const count = readSync(fd, snapshot, read, keptBytes - read, offset + read);
+      if (!count) throw new Error(`scheduler log changed while it was being retained: ${path}`);
+      read += count;
+    }
+
+    // A fixed staging name is deliberate. It prevents a killed rotation from
+    // leaving an unbounded family of temp files. Only this exact path is ever
+    // removed; no directory scan or glob participates in retention.
+    const staged = `${path}.rotate.tmp`;
+    writePrivateSnapshot(staged, snapshot);
+    try {
+      const oldest = history.at(-1);
+      if (assertRegularLogPath(oldest)) unlinkSync(oldest);
+      for (let index = history.length - 2; index >= 0; index--) {
+        if (assertRegularLogPath(history[index])) {
+          renamePrivateLog(history[index], history[index + 1]);
+        }
+      }
+      renamePrivateLog(staged, history[0]);
+    } catch (error) {
+      // The staged path is ours and exact. If it was already renamed, it no
+      // longer exists; if history movement failed, remove only this one file.
+      if (assertRegularLogPath(staged)) unlinkSync(staged);
+      throw error;
+    }
+
+    // Launchd opens its log streams in append mode. Truncating the same regular
+    // file keeps the already-open descriptor valid, so the current scheduled
+    // process and its child continue in the bounded active file.
+    assertOpenedRegularLog(fd, path);
+    ftruncateSync(fd, 0);
+    fchmodSync(fd, 0o600);
+    fsyncSync(fd);
+    return { path, rotated: true, beforeBytes, afterBytes: 0, history };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Bound both scheduler streams without scanning the directory or following a
+ * link. Installation and removal call it while the service is stopped; a
+ * lock-owning scheduled run calls it after its ingest child exits.
+ */
+export function rotateDriveSchedulerLogs(plan, options = {}) {
+  const maxBytes = options.logMaxBytes ?? DRIVE_LOG_MAX_BYTES;
+  const historyFiles = options.logHistoryFiles ?? DRIVE_LOG_HISTORY_FILES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new Error("scheduler logMaxBytes must be a positive integer");
+  }
+  if (!Number.isSafeInteger(historyFiles) || historyFiles < 1 || historyFiles > 5) {
+    throw new Error("scheduler logHistoryFiles must be an integer from 1 to 5");
+  }
+  const runtimeDir = dirname(plan.logsDir);
+  if (resolve(runtimeDir) !== resolve(plan.home, ".brain") ||
+      resolve(plan.logsDir) !== resolve(runtimeDir, "logs") ||
+      resolve(dirname(plan.stdoutPath)) !== resolve(plan.logsDir) ||
+      resolve(dirname(plan.stderrPath)) !== resolve(plan.logsDir)) {
+    throw new Error("scheduler log paths must stay inside the per-user .brain runtime directory");
+  }
+  assertHomeDirectory(plan.home);
+  assertPrivateDirectory(runtimeDir);
+  assertPrivateDirectory(plan.logsDir);
+  return [plan.stdoutPath, plan.stderrPath].map((path) =>
+    rotateOneSchedulerLog(path, { maxBytes, historyFiles })
+  );
+}
+
 function buildDriveSchedulerReference(manifestPath, options = {}) {
   assertMac(options.platform);
   const identity = schedulerIdentity(manifestPath, options);
@@ -504,13 +854,7 @@ export function installDriveScheduler(manifestPath, options = {}) {
   const plan = buildDriveSchedulerPlan(manifestPath, options);
   const launchctl = options.launchctl || defaultLaunchctl;
   mkdirSync(dirname(plan.plistPath), { recursive: true, mode: 0o700 });
-  mkdirSync(plan.logsDir, { recursive: true, mode: 0o700 });
-  mkdirSync(plan.locksDir, { recursive: true, mode: 0o700 });
-  chmodSync(plan.logsDir, 0o700);
-  chmodSync(plan.locksDir, 0o700);
-  for (const logPath of [plan.stdoutPath, plan.stderrPath]) {
-    if (existsSync(logPath)) chmodSync(logPath, 0o600);
-  }
+  assertSchedulerLockDirectory(plan);
 
   const priorPlist = existsSync(plan.plistPath) ? readFileSync(plan.plistPath, "utf-8") : null;
   // Stage and chmod the complete definition before touching a working service.
@@ -532,6 +876,15 @@ export function installDriveScheduler(manifestPath, options = {}) {
   if (wasLoaded && parseLaunchctlStatus(priorStatus.stdout).running) {
     staged.discard();
     throw new Error("Drive ingest is currently running; wait for it to finish before replacing its scheduler");
+  }
+  try {
+    // Prepare and bound the exact files before launchd can open them. Check only
+    // after proving an existing job is idle, so a refused replacement does not
+    // truncate the log of a run that is still active.
+    rotateDriveSchedulerLogs(plan, options);
+  } catch (error) {
+    staged.discard();
+    throw error;
   }
   if (wasLoaded) {
     const stopped = launchctl(["bootout", plan.service]);
@@ -618,6 +971,9 @@ export function removeDriveScheduler(manifestPath, options = {}) {
     const stopped = launchctl(["bootout", plan.service]);
     if (stopped?.status !== 0) throw launchctlError("stopping the Drive scheduler", stopped);
   }
+  // The service is stopped, so cap its final output before preserving the
+  // audit trail. Histories stay beside the active logs and are never globbed.
+  const retained = rotateDriveSchedulerLogs(plan, options);
   const removed = existsSync(plan.plistPath);
   if (removed) unlinkSync(plan.plistPath);
   return {
@@ -625,7 +981,9 @@ export function removeDriveScheduler(manifestPath, options = {}) {
     installed: false,
     loaded: false,
     removed,
-    logsPreserved: [plan.stdoutPath, plan.stderrPath],
+    logsPreserved: retained.flatMap((entry) =>
+      [entry.path, ...entry.history].filter((path) => lstatIfPresent(path)?.isFile())
+    ),
   };
 }
 
@@ -700,10 +1058,8 @@ export function runDriveIngest(manifestPath, options = {}) {
   }
   const spawn = options.spawn || spawnSync;
   const startedAt = new Date().toISOString();
-  mkdirSync(plan.locksDir, { recursive: true, mode: 0o700 });
-  chmodSync(plan.locksDir, 0o700);
-  writeFileSync(plan.lockPath, "", { flag: "a", mode: 0o600 });
-  chmodSync(plan.lockPath, 0o600);
+  assertSchedulerLockDirectory(plan);
+  preparePrivateLockFile(plan.lockPath);
   const adminKey = resolveScheduledAdminKey(plan.manifest, {
     platform: options.platform,
     runSecurity: options.runSecurity,
@@ -725,8 +1081,13 @@ export function runDriveIngest(manifestPath, options = {}) {
   );
   if (result?.error) throw result.error;
   if (result?.status === LOCK_BUSY_EXIT) {
+    // Another process owns the ingest lock and is still writing these files.
+    // Leave its active logs untouched; that owner caps them when it exits.
     return { ...plan, status: "skipped", code: 0, reason: "Drive ingest is already running" };
   }
+  // The lock-holding child has exited, so no scheduled ingest is writing now.
+  // This catches a single unusually noisy parser or network failure immediately.
+  rotateDriveSchedulerLogs(plan, options);
   const code = Number.isInteger(result?.status) ? result.status : 1;
   return {
     ...plan,
@@ -767,6 +1128,33 @@ function cliSummary(result) {
   return summary;
 }
 
+/** Record wrapper failures that happen before the child brain CLI can run. */
+export function recordDriveSchedulerFailure(_error, { action = "run", journalOptions = {} } = {}) {
+  try {
+    const event = recordSupportEvent({
+      command: "schedule",
+      source: "scheduler",
+      errorCode: action === "install" ? "SCHEDULE_INSTALL_FAILED" : "SCHEDULE_RUN_FAILED",
+      productRelativeLocation: "operations/drive-scheduler.mjs#main",
+    }, journalOptions);
+    return event.event_id;
+  } catch {
+    // The journal must never hide or replace the scheduler's actual failure.
+    return null;
+  }
+}
+
+export function recordDriveSchedulerResult(result, options = {}) {
+  if (Number(result?.code || 0) === 0 && !result?.signal) return null;
+  return recordDriveSchedulerFailure(null, { action: "run", ...options });
+}
+
+function printDriveSchedulerSupportReceipt(eventId) {
+  if (!eventId) return;
+  console.error(`Private issue note ${eventId} was saved locally. Nothing was sent.`);
+  console.error("Review the exact safe record with: brain support --preview");
+}
+
 async function main(argv = process.argv.slice(2)) {
   const [command, manifestPath] = argv;
   if (!command || !manifestPath || !["install", "status", "remove", "run"].includes(command)) {
@@ -780,6 +1168,7 @@ async function main(argv = process.argv.slice(2)) {
     const result = runDriveIngest(manifestPath, options);
     const message = result.reason || `Drive ingest ${result.status}`;
     console.log(`[${new Date().toISOString()}] ${message}`);
+    printDriveSchedulerSupportReceipt(recordDriveSchedulerResult(result));
     return result.code;
   }
   const result = command === "install"
@@ -796,6 +1185,8 @@ const IS_MAIN = process.argv[1] && resolve(process.argv[1]) === DEFAULT_SCHEDULE
 if (IS_MAIN) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
     console.error(`Drive scheduler failed: ${error.message}`);
+    const eventId = recordDriveSchedulerFailure(error, { action: process.argv[2] });
+    printDriveSchedulerSupportReceipt(eventId);
     process.exitCode = 1;
   });
 }

@@ -10,8 +10,9 @@ upgrade rollback, and `brain setup` are verified end to end against real
 Cloudflare on macOS. Google Drive OAuth and a bounded real-account ingest have
 also been verified. The complete Drive baseline is the remaining production
 field gate for this release. Gmail uses the same tested cursor and storage
-pipeline but has not completed a real-account production run. **Nothing has run
-on Windows yet.** See "What is not built" before promising anything to anyone.
+pipeline but has not completed a real-account production run. The full suite and
+packed CLI pass on Windows in CI, but no real-account Windows install has been
+completed. See "What is not built" before promising anything to anyone.
 
 ---
 
@@ -247,12 +248,15 @@ node brain.mjs schedule ./acme.manifest.json --remove
 The public install command writes a per-user LaunchAgent under
 `~/Library/LaunchAgents` and sets the matching Drive freshness expectation on
 the Worker. Calling `operations/drive-scheduler.mjs` directly is an internal
-operation and does not set that remote expectation. The LaunchAgent runs
+operation and neither sets nor clears that remote expectation. A failed remote
+expectation write can leave the local LaunchAgent installed; re-running the
+public install safely completes both halves. The LaunchAgent runs
 `brain ingest <manifest> --from drive`, uses macOS's native per-client advisory
 lock to prevent two scheduler-launched syncs from overlapping, and writes
-separate stdout and stderr logs under `~/.brain/logs`. A manually started
-`brain ingest` does not participate in the scheduler lock, so do not start one
-while a scheduled run is active. Remove preserves the logs as an audit trail.
+separate stdout and stderr logs under `~/.brain/logs`. Manual `brain ingest`
+runs do not participate in this lock. Never start a manual run while the
+scheduler is active, or kickstart the scheduler while a manual run is active.
+Remove preserves the logs as an audit trail.
 LaunchAgent calendar times use the Mac's local timezone; status reports a
 mismatch with `client.timezone` instead of silently presenting the wrong
 schedule. Cron fields are numeric; month and weekday names are not accepted
@@ -292,6 +296,53 @@ current manifest and code paths, reports definition drift, and surfaces
 launchd's run count and last exit code. Windows and Linux schedulers are not
 built yet and fail with a platform-specific explanation rather than pretending
 the manifest schedule took effect.
+
+Scheduler stdout and stderr remain private mode `0600`. At install, after each
+lock-owning ingest child exits, and at removal, each stream is cut back to a
+5 MiB tail with two exact retained history files. A lock-contention skip does
+not rotate another writer's logs. A currently running noisy or hung process can
+exceed that cap until it exits, so stale-run monitoring still matters. Rotation
+refuses links, hard links, foreign-owned files, and paths outside the per-user
+`.brain` runtime.
+
+---
+
+## Private local issue journal
+
+Each recognized public CLI failure attempts to write one immutable,
+metadata-only event under `~/.brain/support/events/` when that private path is
+writable. Concurrent commands never rewrite one another's event files.
+Unknown commands and failures of the support command itself are not recorded,
+and journal failure never replaces the original error. This is local support
+evidence, not telemetry: no network call exists in the journal module, and
+nothing is sent automatically.
+
+```bash
+brain support
+brain support --preview
+brain support --export brain-support-review.jsonl
+brain support --clear --yes
+```
+
+The schema accepts only installer version, platform, architecture, Node major,
+command, connector class, typed error code, timestamp, random event ID, and an
+optional product-code fingerprint. It cannot accept raw errors, stacks, argv,
+environment values, paths, URLs, manifests, account or document IDs, filenames,
+queries, answers, indexed content, request bodies, response bodies, or logs.
+On POSIX, directories are `0700`, files are `0600`, and links, foreign
+ownership, and nonregular files are refused. Windows keeps the journal inside
+the current user profile and preserves the same schema and no-network boundary,
+but this release does not claim equivalent ACL, ownership, or hard-link
+enforcement there. Preview and export include only the newest 200 valid events,
+at most 30 days and 2 MiB, and they use the same canonical bytes. A partial or
+invalid event file is skipped rather than exported. Physical event-file cleanup
+is intentionally lazy, so use `brain support --clear --yes` after a case is
+resolved if local retention matters. Export refuses to overwrite an existing
+file.
+
+Cross-install collection is deliberately a later, opt-in feature. If built, it
+needs a separate write-only support credential and an exact payload preview. It
+must never reuse a brain admin key or a client's Cloudflare token.
 
 ---
 

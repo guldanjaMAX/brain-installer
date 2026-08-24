@@ -33,4 +33,8 @@ eval/eval.config.local.json
 # character classes intentionally match only the harness's validated hex id.
 .brain-drive-live-fixture-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].json
 .brain-drive-live-fixture-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].json.tmp-*
+
+# User-reviewed exports of the private local installer issue journal.
+brain-support-*.jsonl
+support-bundle*.json
 docs/*-readiness-*.md
