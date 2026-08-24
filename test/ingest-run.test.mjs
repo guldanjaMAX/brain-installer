@@ -1,5 +1,6 @@
 import { walk, prepare, batches, batchStream, splitOversized, loadState, saveState, MAX_FILE_BYTES, MAX_DOC_CHARS } from "../ingest/run.mjs";
 import { isBinaryFormat, supported } from "../ingest/extract.mjs";
+import { pdfPass } from "../ingest/formats.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -79,6 +80,23 @@ const one = (rel) => walk(root, {}).files.find((f) => f.rel.split(/[\\/]/).join(
   const r = await prepare(one("docs/report.pdf"), { sourceName: "docs" });
   check("a corrupt PDF is skipped with a legible reason", !!r.skip && /could not be opened|no text layer/.test(r.skip.reason), r.skip?.reason);
   check("and still returns a hash so a later run can detect the change", typeof r.hash === "string");
+}
+{
+  let receivedBytes = false;
+  let mergePages = false;
+  const malformed = await pdfPass(new Uint8Array([0x25, 0x50, 0x44, 0x46]), {
+    extractTextImpl: async (input, options) => {
+      receivedBytes = input instanceof Uint8Array;
+      mergePages = options?.mergePages === true;
+      const error = new Error("Bad (uncompressed) XRef entry: 24R");
+      error.name = "UnknownErrorException";
+      throw error;
+    },
+  });
+  check("a malformed PDF parser rejection becomes a reasoned file error",
+    malformed.text === null && /could not be opened/.test(malformed.error || ""), JSON.stringify(malformed));
+  check("PDF extraction gives unpdf owned bytes so its loading task is closed",
+    receivedBytes && mergePages, JSON.stringify({ receivedBytes, mergePages }));
 }
 {
   const r = await prepare(one("bin/logo.bin"), { sourceName: "docs" });

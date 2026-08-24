@@ -1644,6 +1644,53 @@ export function credentialScannerFingerprint(enabled = true, gateVersion = CREDE
   return createHash("sha256").update(JSON.stringify({ enabled: Boolean(enabled), gateVersion })).digest("hex");
 }
 
+/**
+ * Resume receipts for a scanner-policy migration.
+ *
+ * The final scanner fingerprint is deliberately committed only after the
+ * whole source sweep and its cleanup succeed. Without a separate in-progress
+ * receipt, that safety rule makes an interrupted first sweep re-download every
+ * document it already checked. Accepted revisions are safe to resume because
+ * they are recorded only after the Worker receipt and family reconciliation.
+ */
+export function ensureCredentialScannerProgress(state, fingerprint) {
+  if (!state || typeof state !== "object") throw new Error("credential scanner progress needs source state");
+  const value = String(fingerprint || "");
+  if (!value) throw new Error("credential scanner progress needs a fingerprint");
+  const current = state.credential_scanner_progress;
+  if (!current || current.fingerprint !== value || !current.accepted || typeof current.accepted !== "object") {
+    state.credential_scanner_progress = { fingerprint: value, accepted: {} };
+  }
+  return state.credential_scanner_progress;
+}
+
+export function recordCredentialScannerProgress(state, fingerprint, stateKey, version) {
+  const key = String(stateKey || "");
+  if (!key) throw new Error("credential scanner progress needs a document key");
+  const progress = ensureCredentialScannerProgress(state, fingerprint);
+  progress.accepted[key] = version;
+  return state;
+}
+
+export function hasCredentialScannerProgress(state, fingerprint, stateKey, version) {
+  const progress = state?.credential_scanner_progress;
+  const key = String(stateKey || "");
+  return Boolean(
+    key &&
+    progress?.fingerprint === String(fingerprint || "") &&
+    progress.accepted &&
+    Object.prototype.hasOwnProperty.call(progress.accepted, key) &&
+    progress.accepted[key] === version
+  );
+}
+
+export function commitCredentialScannerProgress(state, fingerprint) {
+  if (!state || typeof state !== "object") throw new Error("credential scanner commit needs source state");
+  state.credential_scanner_fingerprint = String(fingerprint || "");
+  delete state.credential_scanner_progress;
+  return state;
+}
+
 export function drivePolicyFingerprint(config = {}, scannerEnabled = true) {
   const normalized = {};
   for (const key of ["excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
@@ -3137,6 +3184,15 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     ? driveDecision.incremental
     : !flags.reset && !scannerPolicyChanged && Boolean(state.history_id);
   assertRemoteLimitSafe({ source: which === "drive" ? "Drive" : "Gmail", limit, dryRun: dry, incremental });
+  if (!dry && scannerPolicyChanged) {
+    ensureCredentialScannerProgress(state, scannerFingerprint);
+    saveState(statePath, state);
+  } else if (!dry && state.credential_scanner_progress) {
+    // A completed fingerprint is authoritative. Any leftover progress receipt
+    // is stale bookkeeping from an older build or interrupted cleanup.
+    delete state.credential_scanner_progress;
+    saveState(statePath, state);
+  }
   let lane = incremental ? "incremental" : "sweep";
   const runId = `sync_${randomBytes(16).toString("hex")}`;
   const runStartedAt = new Date().toISOString();
@@ -3230,7 +3286,12 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       const staleParts = await reconcileDocumentFamilies({ families: reconciliation, base, adminKey });
       if (staleParts) ok(`${staleParts} obsolete split-document part(s) removed`);
     }
-    for (const plan of outcome.completed) recordAcceptedDocumentState(state, plan);
+    for (const plan of outcome.completed) {
+      recordAcceptedDocumentState(state, plan);
+      if (scannerPolicyChanged) {
+        recordCredentialScannerProgress(state, scannerFingerprint, plan.stateKey, plan.hash);
+      }
+    }
     for (const plan of outcome.incomplete) {
       delete state.done[plan.stateKey];
       const statuses = [...new Set(rejectedFamilyParts.get(plan.stateKey) || ["failed"])];
@@ -3357,7 +3418,10 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       // sweep into cheap metadata verification for unchanged files while still
       // noticing a rename or ancestor-folder move through the resolved path.
       const listedVersion = drive.driveVersion(f, folder);
-      if (!scannerPolicyChanged && state.done[key] === listedVersion) {
+      const scannerResumeAccepted = hasCredentialScannerProgress(
+        state, scannerFingerprint, key, listedVersion
+      );
+      if ((!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === listedVersion) {
         recordAcceptedDocumentState(state, {
           stateKey: key, hash: listedVersion, skipKeys: [f.id], legacyPartRoot: f.id,
         });
@@ -3469,7 +3533,10 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         intentionalRemovalUids.push(key);
         return { skip: r.skip };
       }
-      if (!scannerPolicyChanged && state.done[key] === r.version) {
+      const scannerResumeAccepted = hasCredentialScannerProgress(
+        state, scannerFingerprint, key, r.version
+      );
+      if ((!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === r.version) {
         recordAcceptedDocumentState(state, {
           stateKey: key, hash: r.version, skipKeys: [id], legacyPartRoot: id,
         });
@@ -3527,6 +3594,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   if (pendingCursor && sourceCursorCanAdvance(tally)) {
     state[pendingCursor.key] = pendingCursor.value;
     Object.assign(state, pendingCursor.statePatch || {});
+    commitCredentialScannerProgress(state, scannerFingerprint);
     saveState(statePath, state);
   } else if (pendingCursor && tally.failed) {
     warn(`${tally.failed} document(s) failed, so the source cursor was NOT advanced; the next run will retry them`);

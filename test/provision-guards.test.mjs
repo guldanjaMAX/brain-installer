@@ -11,6 +11,8 @@ import {
   validateForgetReceipt, assertNoPendingRemovals, credentialRefusalOf, drivePolicyFingerprint,
   driveSyncDecision, listStoredSourceFamilies, credentialScannerFingerprint, postSourceExpectation,
   resolveAdminKey, recordAcceptedDocumentState, addLocalPathAliases, recordLocalSkippedDocumentState,
+  ensureCredentialScannerProgress, recordCredentialScannerProgress, hasCredentialScannerProgress,
+  commitCredentialScannerProgress,
 } from "../brain.mjs";
 
 let fail = 0, ran = 0;
@@ -63,6 +65,25 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     drivePolicyFingerprint(cfg, true) !== drivePolicyFingerprint(cfg, false));
   check("credential scanner version is a durable rescan marker",
     credentialScannerFingerprint(true, 2) !== credentialScannerFingerprint(true, 3));
+  const scannerV2 = credentialScannerFingerprint(true, 2);
+  const scannerV3 = credentialScannerFingerprint(true, 3);
+  const interruptedScanner = { done: { "drive:file": "revision-1" } };
+  ensureCredentialScannerProgress(interruptedScanner, scannerV2);
+  recordCredentialScannerProgress(interruptedScanner, scannerV2, "drive:file", "revision-1");
+  check("an interrupted scanner upgrade resumes only an exact accepted revision",
+    hasCredentialScannerProgress(interruptedScanner, scannerV2, "drive:file", "revision-1") &&
+      !hasCredentialScannerProgress(interruptedScanner, scannerV2, "drive:file", "revision-2"),
+    JSON.stringify(interruptedScanner));
+  ensureCredentialScannerProgress(interruptedScanner, scannerV3);
+  check("a different scanner fingerprint invalidates prior in-progress receipts",
+    !hasCredentialScannerProgress(interruptedScanner, scannerV2, "drive:file", "revision-1") &&
+      !hasCredentialScannerProgress(interruptedScanner, scannerV3, "drive:file", "revision-1"),
+    JSON.stringify(interruptedScanner));
+  recordCredentialScannerProgress(interruptedScanner, scannerV3, "drive:file", "revision-1");
+  commitCredentialScannerProgress(interruptedScanner, scannerV3);
+  check("scanner progress becomes authoritative only at the final commit",
+    interruptedScanner.credential_scanner_fingerprint === scannerV3 &&
+      !("credential_scanner_progress" in interruptedScanner), JSON.stringify(interruptedScanner));
   const freshDecision = driveSyncDecision({
     syncToken: "cursor", policyFingerprint, savedPolicyFingerprint: policyFingerprint,
     lastFullSweepAt: "2026-08-22T12:00:00.000Z", now: Date.parse("2026-08-23T12:00:00.000Z"),
@@ -535,6 +556,15 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
       /await consumeGroup\(group\)/.test(remote || "") &&
       !/const ready = \[\]/.test(remote || ""),
     String(remote).slice(0, 900));
+  check("remote scanner upgrades reuse only exact accepted progress receipts",
+    /hasCredentialScannerProgress\([\s\S]*state\.done\[key\] === listedVersion/.test(remote || "") &&
+      /recordCredentialScannerProgress\(state, scannerFingerprint, plan\.stateKey, plan\.hash\)/.test(remote || ""),
+    String(remote).slice(0, 2200));
+  const remoteCleanupConfirmed = String(remote).indexOf('assertNoPendingRemovals(vanished');
+  const remoteScannerCommitted = String(remote).indexOf('commitCredentialScannerProgress(state, scannerFingerprint)');
+  check("remote scanner progress commits only after full-sweep deletion is confirmed",
+    remoteCleanupConfirmed !== -1 && remoteScannerCommitted > remoteCleanupConfirmed,
+    `cleanup=${remoteCleanupConfirmed} commit=${remoteScannerCommitted}`);
   const versionCheck = String(remote).indexOf("state.done[key] === listedVersion");
   const driveDownload = String(remote).indexOf("drive.toEnvelope");
   check("a Drive sweep checks listing metadata before downloading bytes",

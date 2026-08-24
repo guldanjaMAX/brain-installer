@@ -20,7 +20,7 @@
  * between the two populations is an order of magnitude, not a judgement call.
  */
 
-import { extractText, getDocumentProxy } from "unpdf";
+import { extractText } from "unpdf";
 import { unzipSync, strFromU8 } from "fflate";
 import * as XLSX from "@e965/xlsx";
 import PostalMime from "postal-mime";
@@ -37,22 +37,22 @@ export const MIN_CHARS_PER_PAGE = 100;
 /**
  * Extract once. Separated so the caller can retry a suspicious result.
  */
-async function pdfPass(buf) {
-  let pdf;
+export async function pdfPass(buf, { extractTextImpl = extractText } = {}) {
   try {
-    pdf = await getDocumentProxy(new Uint8Array(buf));
+    // Give unpdf the bytes, not a caller-owned PDFDocumentProxy. Its byte-input
+    // path owns the complete PDF.js loading task and destroys it in `finally`.
+    // Keeping a proxy alive after text extraction let a malformed XRef reject
+    // from PDF.js later as an unhandled background task, aborting an otherwise
+    // resumable Drive sweep instead of becoming this file's reasoned skip.
+    const { text, totalPages } = await extractTextImpl(new Uint8Array(buf), { mergePages: true });
+    const body = (text || "").trim();
+    const perPage = totalPages ? body.length / totalPages : 0;
+    return { body, totalPages, perPage };
   } catch (e) {
     const name = e?.name || "";
     if (/Password/i.test(name)) return { text: null, error: "the PDF is password protected" };
     return { text: null, error: `the PDF could not be opened (${name || "unreadable"})` };
   }
-
-  const { text, totalPages } = await extractText(pdf, { mergePages: true });
-  const body = (text || "").trim();
-  const perPage = totalPages ? body.length / totalPages : 0;
-
-
-  return { body, totalPages, perPage };
 }
 
 /**
