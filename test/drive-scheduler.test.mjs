@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   buildDriveSchedulerPlan,
@@ -131,12 +131,12 @@ try {
       plan.expectedRefreshSeconds === 86_400, String(plan.expectedRefreshSeconds));
     check("the LaunchAgent invokes the reusable runner with absolute paths and a configuration binding",
       JSON.stringify(plan.programArguments.slice(0, 7)) === JSON.stringify([
-        "/opt/node/bin/node",
-        "/opt/brain installer/operations/drive-scheduler.mjs",
+        resolve("/opt/node/bin/node"),
+        resolve("/opt/brain installer/operations/drive-scheduler.mjs"),
         "run",
         manifestPath,
         "--brain",
-        "/opt/brain installer/brain.mjs",
+        resolve("/opt/brain installer/brain.mjs"),
         "--config-hash",
       ]) && plan.programArguments[7] === plan.configHash && /^[a-f0-9]{64}$/.test(plan.configHash),
       JSON.stringify(plan.programArguments));
@@ -217,7 +217,7 @@ try {
     check("scheduled run invokes brain ingest manifest --from drive",
       child.command === "/usr/bin/lockf" && JSON.stringify(child.args) === JSON.stringify([
         "-k", "-s", "-t", "0", result.lockPath,
-        "/opt/node/bin/node", "/opt/brain installer/brain.mjs", "ingest", manifestPath, "--from", "drive",
+        resolve("/opt/node/bin/node"), resolve("/opt/brain installer/brain.mjs"), "ingest", manifestPath, "--from", "drive",
       ]), JSON.stringify(child));
     check("Keychain admin key exists only in the ingest child's environment",
       child.options.env.ADMIN_KEY === "keychain-admin" && process.env.ADMIN_KEY !== "keychain-admin");
@@ -312,8 +312,13 @@ try {
       return args[0] === "print" ? { status: 1, stdout: "", stderr: "not found" } : { status: 0, stdout: "", stderr: "" };
     };
     const installed = installDriveScheduler(manifestPath, opts({ launchctl }));
-    check("install atomically writes a private LaunchAgent plist",
-      existsSync(installed.plistPath) && (statSync(installed.plistPath).mode & 0o777) === 0o600);
+    const plistExists = existsSync(installed.plistPath);
+    const plistMode = plistExists ? statSync(installed.plistPath).mode & 0o777 : null;
+    if (process.platform === "win32") {
+      check("install atomically writes the LaunchAgent plist on a Windows test host", plistExists);
+    } else {
+      check("install atomically writes a private LaunchAgent plist", plistExists && plistMode === 0o600, plistMode?.toString(8));
+    }
     check("install enables and bootstraps the user service",
       calls.some((x) => x[0] === "enable" && x[1] === installed.service) &&
       calls.some((x) => x[0] === "bootstrap" && x[1] === installed.domain && x[2] === installed.plistPath), JSON.stringify(calls));
