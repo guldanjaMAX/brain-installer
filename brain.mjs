@@ -4027,18 +4027,40 @@ async function wireAgents(m, manifestPath) {
 
 
 /**
- * The admin key, from the environment or from the file setup wrote.
+ * The admin key, from the environment, a declared Keychain item, or the file
+ * setup wrote.
  *
  * The env var wins so a rotation can be tested without touching the file. The
- * file is what makes tomorrow work: a client who ran `brain setup` never saw
- * the key and should never have needed to.
+ * durable Keychain or owner-only file lookup is what makes tomorrow work: a
+ * client who ran `brain setup` never saw the key and should never need to.
  */
-function resolveAdminKey(manifestPath) {
+export function resolveAdminKey(manifestPath, {
+  platform = process.platform,
+  read = (path) => readFileSync(path, "utf-8"),
+  exists = existsSync,
+  runSecurity = (args) => spawnSync("/usr/bin/security", args, {
+    encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 15_000,
+  }),
+} = {}) {
   if (process.env.ADMIN_KEY) return process.env.ADMIN_KEY;
   try {
+    const manifest = JSON.parse(read(manifestPath));
+    const reference = manifest?.operations?.admin_key_secret;
+    if (reference) {
+      if (platform !== "darwin") return undefined;
+      const match = String(reference).match(/^keychain:\/\/([^/]+)\/(.+)$/);
+      if (!match) return undefined;
+      const service = decodeURIComponent(match[1]);
+      const account = decodeURIComponent(match[2]);
+      if (!service || !account || /[?#]/.test(service) || /[?#]/.test(account)) return undefined;
+      const result = runSecurity(["find-generic-password", "-s", service, "-a", account, "-w"]);
+      if (result?.status !== 0) return undefined;
+      const key = String(result.stdout || "").replace(/[\r\n]+$/, "");
+      return key || undefined;
+    }
     const p = join(dirname(resolve(manifestPath)), ".brain-admin-key");
-    if (existsSync(p)) {
-      const k = readFileSync(p, "utf-8").trim();
+    if (exists(p)) {
+      const k = read(p).trim();
       if (k) return k;
     }
   } catch { /* fall through to the callers' own error text */ }

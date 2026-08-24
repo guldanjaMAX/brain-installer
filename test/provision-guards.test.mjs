@@ -10,11 +10,37 @@ import {
   remoteFamilyOutcomes, assertDriveLimitSafe, assertRemoteLimitSafe, validateBatchReceipt, postSourceReceipt,
   validateForgetReceipt, assertNoPendingRemovals, credentialRefusalOf, drivePolicyFingerprint,
   driveSyncDecision, listStoredSourceFamilies, credentialScannerFingerprint, postSourceExpectation,
+  resolveAdminKey,
 } from "../brain.mjs";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 200))); if (!c) fail++; };
 const throws = async (fn) => { try { await fn(); return null; } catch (e) { return e.message || String(e); } };
+
+{
+  const priorAdminKey = process.env.ADMIN_KEY;
+  delete process.env.ADMIN_KEY;
+  let securityArgs = null;
+  try {
+    const key = resolveAdminKey("/tmp/client.manifest.json", {
+      platform: "darwin",
+      read: () => JSON.stringify({ operations: { admin_key_secret: "keychain://brain-admin/owner" } }),
+      exists: () => false,
+      runSecurity: (args) => {
+        securityArgs = args;
+        return { status: 0, stdout: "local-test-value\n" };
+      },
+    });
+    check("ordinary commands resolve the manifest-declared admin key from Keychain",
+      key === "local-test-value" && securityArgs.join(" ") === "find-generic-password -s brain-admin -a owner -w",
+      JSON.stringify(securityArgs));
+    check("the Keychain value is never passed on the security command line",
+      !securityArgs.includes("local-test-value"), JSON.stringify(securityArgs));
+  } finally {
+    if (priorAdminKey === undefined) delete process.env.ADMIN_KEY;
+    else process.env.ADMIN_KEY = priorAdminKey;
+  }
+}
 
 check("destructive previews report documents rather than chunks", documentCountOf({ documents: 981, chunks: 14753, total: 14753 }) === 981);
 check("older document receipts still have a count", documentCountOf({ total: 42 }) === 42);
