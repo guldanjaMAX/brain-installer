@@ -7,6 +7,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { replaceDocumentChunks, upsertChunks, drainOutbox, forget, forgetFamilies } from "../worker/src/lib/store-d1.js";
 import { storeFor } from "../worker/src/lib/store.js";
 
@@ -19,7 +20,7 @@ const check = (name, condition, detail = "") => {
 
 function makeEnv({ deleteThrows = false } = {}) {
   const db = new DatabaseSync(":memory:");
-  const dir = new URL("../migrations/d1/", import.meta.url).pathname;
+  const dir = fileURLToPath(new URL("../migrations/d1/", import.meta.url));
   for (const file of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
     db.exec(readFileSync(join(dir, file), "utf-8"));
   }

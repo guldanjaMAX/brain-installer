@@ -19,12 +19,13 @@
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { searchKeyword } from "../worker/src/lib/store-d1.js";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 200))); if (!c) fail++; };
 
-const MIG = new URL("../migrations/d1/", import.meta.url).pathname;
+const MIG = fileURLToPath(new URL("../migrations/d1/", import.meta.url));
 
 function corpus(n) {
   const db = new DatabaseSync(":memory:");
