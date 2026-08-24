@@ -58,7 +58,7 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 
 **When a file disappears from Drive**, the matching material is removed from your index. That removal is guarded: if the run could not see all of your Drive (a permissions blip, a network failure mid-walk), or if the removal would be unusually large, it **refuses to delete anything** and leaves the material in place for another day. A stale document costs nothing. A wrongly emptied index costs everything.
 
-**One honest note about how this runs.** The Drive loader is a tool **I run**, not a button you click. It has run nightly in production for months against a corpus of several thousand documents, so it is proven rather than new. It is not yet packaged as a one-command connector inside your installer, which is why loading your material is something I do during the install rather than something you configure. If you take this over yourself later, that is the one piece where you would be running my script rather than your own command.
+**One honest note about how this runs.** Drive is a standard, packaged connector inside the installer, not a private script. You connect your own Google account once, load it with the normal ingest command, and on macOS the installer can schedule unattended refreshes. The Google sign-in still requires the account owner, and the packaged unattended scheduler is not built for Windows or Linux yet.
 
 ### Direct upload and API push
 

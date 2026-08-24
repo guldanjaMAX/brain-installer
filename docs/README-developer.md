@@ -235,21 +235,28 @@ like it was written this year, silently disabling staleness reporting. Drive's
 ### Unattended Drive refresh on macOS
 
 `operations.ingest_cron` is the standard source of truth for the Drive refresh
-schedule. The reusable scheduler supports install, status and remove:
+schedule. Use the public `brain schedule` command for install, status and
+remove:
 
 ```bash
-node operations/drive-scheduler.mjs install ./acme.manifest.json
-node operations/drive-scheduler.mjs status  ./acme.manifest.json
-node operations/drive-scheduler.mjs remove  ./acme.manifest.json
+node brain.mjs schedule ./acme.manifest.json --install
+node brain.mjs schedule ./acme.manifest.json --status
+node brain.mjs schedule ./acme.manifest.json --remove
 ```
 
-Install writes a per-user LaunchAgent under `~/Library/LaunchAgents`. It runs
-`brain ingest <manifest> --from drive`, uses macOS's native per-client advisory lock to prevent
-overlapping syncs, and writes separate stdout and stderr logs under
-`~/.brain/logs`. Remove preserves those logs as an audit trail. LaunchAgent
-calendar times use the Mac's local timezone; status reports a mismatch with
-`client.timezone` instead of silently presenting the wrong schedule. Cron fields
-are numeric; month and weekday names are not accepted today.
+The public install command writes a per-user LaunchAgent under
+`~/Library/LaunchAgents` and sets the matching Drive freshness expectation on
+the Worker. Calling `operations/drive-scheduler.mjs` directly is an internal
+operation and does not set that remote expectation. The LaunchAgent runs
+`brain ingest <manifest> --from drive`, uses macOS's native per-client advisory
+lock to prevent two scheduler-launched syncs from overlapping, and writes
+separate stdout and stderr logs under `~/.brain/logs`. A manually started
+`brain ingest` does not participate in the scheduler lock, so do not start one
+while a scheduled run is active. Remove preserves the logs as an audit trail.
+LaunchAgent calendar times use the Mac's local timezone; status reports a
+mismatch with `client.timezone` instead of silently presenting the wrong
+schedule. Cron fields are numeric; month and weekday names are not accepted
+today.
 
 `RunAtLoad` is deliberately false. A calendar firing missed while this Mac is
 asleep is coalesced by launchd and runs after wake. A firing missed while the
