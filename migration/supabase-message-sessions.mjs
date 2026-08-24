@@ -13,7 +13,7 @@ import { resolve } from "node:path";
 import { batches, splitOversized } from "../ingest/run.mjs";
 import { MessageSessionizer } from "../ingest/message-session.mjs";
 import { scan as scanSecrets } from "../worker/src/lib/secret-scan.js";
-import { postTargetBatch, querySupabase } from "./supabase-import.mjs";
+import { isDirectExecution, postTargetBatch, querySupabase } from "./supabase-import.mjs";
 
 const ELIGIBLE = "coalesce(m.flagged, false) = false AND m.body IS NOT NULL AND length(trim(m.body)) >= 4";
 const cleanUrl = (value) => String(value || "").replace(/\/+$/, "");
@@ -29,6 +29,10 @@ const rangeSql = ({ from = null, to = null } = {}) => [
   from ? `AND m.ts >= ${sqlText(from)}::timestamptz` : "",
   to ? `AND m.ts <= ${sqlText(to)}::timestamptz` : "",
 ].filter(Boolean).join("\n            ");
+
+export function isMessageMigrationDirectExecution(argvPath, options) {
+  return isDirectExecution(argvPath, import.meta.url, options);
+}
 
 export function messageHighWaterSql(scope = {}) {
   return `SELECT m.ts::text AS ts, m.id::text AS id
@@ -349,7 +353,7 @@ async function main() {
   }, null, 2));
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)) {
+if (isMessageMigrationDirectExecution(process.argv[1])) {
   main().catch((error) => {
     console.error(`message migration failed: ${error?.message || error}`);
     process.exitCode = 1;

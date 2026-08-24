@@ -1,5 +1,8 @@
 import { emailEnvelope, MessageSessionizer } from "../ingest/message-session.mjs";
-import { messageHighWaterSql, messagePageSql, sendMessageEnvelopes } from "../migration/supabase-message-sessions.mjs";
+import { win32 } from "node:path";
+import {
+  isMessageMigrationDirectExecution, messageHighWaterSql, messagePageSql, sendMessageEnvelopes,
+} from "../migration/supabase-message-sessions.mjs";
 
 let fail = 0, ran = 0;
 const check = (name, condition, detail = "") => {
@@ -7,6 +10,18 @@ const check = (name, condition, detail = "") => {
   console.log(`${condition ? "PASS" : "FAIL"}  ${name}${condition ? "" : `  ${String(detail).slice(0, 240)}`}`);
   if (!condition) fail++;
 };
+
+{
+  const script = "C:\\Program Files\\Brain Installer\\migration\\supabase-message-sessions.mjs";
+  const pathOptions = {
+    toNativePath: () => script,
+    resolvePath: win32.resolve,
+  };
+  check("message migration direct-entry detection uses a native Windows path",
+    isMessageMigrationDirectExecution(script, pathOptions));
+  check("message migration direct-entry detection rejects another Windows script",
+    !isMessageMigrationDirectExecution("C:\\Program Files\\Brain Installer\\migration\\other.mjs", pathOptions));
+}
 
 const row = (overrides = {}) => ({
   id: "m1", thread_id: "t1", platform: "imessage", thread_title: "Taylor",

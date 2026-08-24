@@ -1,7 +1,8 @@
 import {
   driveExactDuplicateSql, joinOverlappingChunks, laneConfig, resolveDrivePolicy,
-  postSourceReceipt, rowToEnvelope, runLane,
+  isSupabaseMigrationDirectExecution, postSourceReceipt, rowToEnvelope, runLane,
 } from "../migration/supabase-import.mjs";
+import { win32 } from "node:path";
 
 let fail = 0, ran = 0;
 const check = (name, condition, detail = "") => {
@@ -9,6 +10,18 @@ const check = (name, condition, detail = "") => {
   console.log((condition ? "PASS  " : "FAIL  ") + name + (condition ? "" : "  " + String(detail).slice(0, 220)));
   if (!condition) fail++;
 };
+
+{
+  const script = "C:\\Program Files\\Brain Installer\\migration\\supabase-import.mjs";
+  const pathOptions = {
+    toNativePath: () => script,
+    resolvePath: win32.resolve,
+  };
+  check("Supabase migration direct-entry detection uses a native Windows path",
+    isSupabaseMigrationDirectExecution(script, pathOptions));
+  check("Supabase migration direct-entry detection rejects another Windows script",
+    !isSupabaseMigrationDirectExecution("C:\\Program Files\\Brain Installer\\migration\\other.mjs", pathOptions));
+}
 
 /* Drive reconstruction removes the repeated header and exact 500-char overlap. */
 {

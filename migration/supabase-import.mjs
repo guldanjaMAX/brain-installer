@@ -11,6 +11,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { batches, splitOversized } from "../ingest/run.mjs";
 
 const SOURCE_API = "https://api.supabase.com/v1";
@@ -21,6 +22,17 @@ const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const cleanUrl = (value) => String(value || "").replace(/\/+$/, "");
 const sqlText = (value) => `'${String(value ?? "").replaceAll("'", "''")}'`;
 const safeLimit = (value, fallback) => Math.min(Math.max(Number.parseInt(value, 10) || fallback, 1), 500);
+
+export function isDirectExecution(argvPath, moduleUrl, {
+  toNativePath = fileURLToPath,
+  resolvePath = resolve,
+} = {}) {
+  return Boolean(argvPath && moduleUrl) && resolvePath(argvPath) === resolvePath(toNativePath(moduleUrl));
+}
+
+export function isSupabaseMigrationDirectExecution(argvPath, options) {
+  return isDirectExecution(argvPath, import.meta.url, options);
+}
 
 const normalizeDriveIds = (values, label = "Drive exclusion") => {
   const ids = [...new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean))].sort();
@@ -645,7 +657,7 @@ async function main() {
   if (result.status === "blocked") process.exitCode = 1;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)) {
+if (isSupabaseMigrationDirectExecution(process.argv[1])) {
   main().catch((error) => {
     console.error(`migration failed: ${error?.message || error}`);
     process.exitCode = 1;
