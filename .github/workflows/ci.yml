@@ -104,7 +104,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if tar -tzf "$TARBALL" | grep -Ei "golden|eval/"; then
+          contents=$(tar -tzf "$TARBALL")
+          private_paths=$(
+            {
+              printf '%s\n' "$contents" | grep -Ei '(^|/)instances(/|$)|(^|/)eval/baselines(/|$)|james|readiness|\.brain-(migration|ingest)' || true
+              printf '%s\n' "$contents" | grep -Ei '(^|/)eval/golden/' | grep -Ev '(^|/)eval/golden/TEMPLATE\.golden\.json$' || true
+            } | sort -u
+          )
+          if [ -n "$private_paths" ]; then
+            printf '%s\n' "$private_paths"
             echo "::error::private evaluation data is in the published package"
             exit 1
           fi
