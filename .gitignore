@@ -28,4 +28,9 @@ eval/eval.config.local.json
 # machine-local operational state and must never become a tracked artifact.
 .brain-ingest-*.json
 .brain-ingest-*.json.tmp-*
+
+# Live Drive lifecycle receipts contain the private remote file id. The eight
+# character classes intentionally match only the harness's validated hex id.
+.brain-drive-live-fixture-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].json
+.brain-drive-live-fixture-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].json.tmp-*
 docs/*-readiness-*.md
