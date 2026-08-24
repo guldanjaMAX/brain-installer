@@ -60,6 +60,14 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 
 **One honest note about how this runs.** Drive is a standard, packaged connector inside the installer, not a private script. You connect your own Google account once, load it with the normal ingest command, and on macOS the installer can schedule unattended refreshes. The Google sign-in still requires the account owner, and the packaged unattended scheduler is not built for Windows or Linux yet.
 
+### Gmail and email
+
+Built as a connector. Connect your Google account with the Gmail scope, then run the normal Gmail ingest command. Later runs are incremental through Gmail's history cursor, and bulk mail is excluded by default.
+
+**The honest production boundary:** the connector has passed the product test suite but has not yet completed a real-mailbox production run. The packaged unattended scheduler is currently Drive-only, so Gmail refresh is manual until that scheduler is extended. Treat Gmail as built but not yet production-proven.
+
+Shared mailboxes and group threads contain messages from people who never agreed to be indexed. Your material stays in your own accounts throughout, which handles most of the exposure, but a business indexing a shared inbox should have a written note about it. Cheap to write now, expensive to retrofit after an employee asks.
+
 ### Direct upload and API push
 
 Anything you can turn into text can be put into your brain directly, one document at a time or in bulk. This is the fallback for every source with no connector, and it always works.
@@ -101,14 +109,6 @@ Same publishing consideration as the rest of your Google connection: on Workspac
 ## Not built
 
 Named plainly, with what it would actually take, so you can plan around it rather than wait for it.
-
-### Gmail and email
-
-**Not built as a connector.** Email is one of the most valuable sources in most businesses and this is the most likely gap to matter to you.
-
-**In the meantime:** exported threads dropped into a Drive folder are read like any other document, and that covers most of the value for a specific project or client.
-
-**A note worth reading if you buy this for a team:** shared mailboxes and group threads contain messages from people who never agreed to be indexed. Your material stays in your own accounts throughout, which handles most of the exposure, but a business indexing a shared inbox should have a written note about it. Cheap to write now, expensive to retrofit after an employee asks.
 
 ### Slack
 
