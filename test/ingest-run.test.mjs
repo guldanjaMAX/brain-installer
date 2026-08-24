@@ -1,6 +1,6 @@
 import { walk, prepare, batches, batchStream, splitOversized, loadState, saveState, MAX_FILE_BYTES, MAX_DOC_CHARS } from "../ingest/run.mjs";
-import { isBinaryFormat, supported } from "../ingest/extract.mjs";
-import { pdfPass } from "../ingest/formats.mjs";
+import { extract, isBinaryFormat, register, supported } from "../ingest/extract.mjs";
+import { extractPdf, pdfPassIsolated } from "../ingest/formats.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -56,6 +56,28 @@ put("docs/report.pdf", "%PDF-1.4 not really");
 /* ---- prepare: every rejection carries a legible reason ---- */
 const one = (rel) => walk(root, {}).files.find((f) => f.rel.split(/[\\/]/).join("/") === rel);
 
+function textPdf() {
+  const stream = "BT\n/F1 12 Tf\n72 720 Td\n(Brain PDF child process works) Tj\nET\n";
+  const objects = [
+    "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+    "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+    "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    `4 0 obj\n<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}endstream\nendobj\n`,
+    "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+  ];
+  let pdf = "%PDF-1.4\n";
+  const offsets = [];
+  for (const object of objects) {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += object;
+  }
+  const xref = Buffer.byteLength(pdf);
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  pdf += offsets.map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("");
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(pdf);
+}
+
 {
   const r = await prepare(one("notes/2026-08-14 review.md"), { sourceName: "docs" });
   check("a good file becomes an envelope", !!r.envelope, JSON.stringify(r.skip));
@@ -70,6 +92,109 @@ const one = (rel) => walk(root, {}).files.find((f) => f.rel.split(/[\\/]/).join(
   check("a CSV is rendered header-aware, not as a bare grid", /Account: Checking/.test(r.envelope.content), r.envelope?.content);
 }
 {
+  const productionPdf = await pdfPassIsolated(textPdf(), { timeoutMs: 5_000 });
+  check("the packaged PDF child extracts a real text PDF",
+    productionPdf.body?.includes("Brain PDF child process works") && productionPdf.totalPages === 1,
+    JSON.stringify(productionPdf));
+
+  const previousSecret = process.env.BRAIN_PDF_TEST_SECRET;
+  process.env.BRAIN_PDF_TEST_SECRET = "must-not-reach-the-child";
+  let isolated;
+  try {
+    isolated = await pdfPassIsolated(new Uint8Array([1, 2, 3, 4]), {
+      childPath: new URL("./fixtures/pdf-success-child.mjs", import.meta.url),
+      timeoutMs: 2_000,
+    });
+  } finally {
+    if (previousSecret === undefined) delete process.env.BRAIN_PDF_TEST_SECRET;
+    else process.env.BRAIN_PDF_TEST_SECRET = previousSecret;
+  }
+  check("PDF bytes cross an isolated process without inherited secrets",
+    isolated.body === "isolated 4 bytes clean" && isolated.totalPages === 1, JSON.stringify(isolated));
+
+  const late = await pdfPassIsolated(new Uint8Array([1]), {
+    childPath: new URL("./fixtures/pdf-late-rejection-child.mjs", import.meta.url),
+    timeoutMs: 2_000,
+  });
+  check("a delayed PDF process rejection becomes a reasoned file error without killing ingest",
+    late.text === null && /could not be opened/.test(late.error || ""), JSON.stringify(late));
+
+  const falseSuccess = await pdfPassIsolated(new Uint8Array([1]), {
+    childPath: new URL("./fixtures/pdf-success-then-rejection-child.mjs", import.meta.url),
+    timeoutMs: 2_000,
+  });
+  check("a rejection after a staged PDF result overrides that false success",
+    falseSuccess.text === null && /could not be opened/.test(falseSuccess.error || ""), JSON.stringify(falseSuccess));
+
+  let invalidProtocolFatal = false;
+  try {
+    await pdfPassIsolated(new Uint8Array([1]), {
+      childPath: new URL("./fixtures/pdf-invalid-result-child.mjs", import.meta.url),
+      timeoutMs: 2_000,
+    });
+  } catch (error) {
+    invalidProtocolFatal = error?.fatal === true && error?.name === "ExtractorSystemError";
+  }
+  check("an invalid PDF process protocol aborts instead of omitting every PDF",
+    invalidProtocolFatal, String(invalidProtocolFatal));
+
+  let missingChildFatal = false;
+  try {
+    await pdfPassIsolated(new Uint8Array([1]), {
+      childPath: new URL("./fixtures/pdf-does-not-exist.mjs", import.meta.url),
+      timeoutMs: 2_000,
+    });
+  } catch (error) {
+    missingChildFatal = error?.fatal === true && error?.name === "ExtractorSystemError";
+  }
+  check("a missing PDF helper aborts instead of marking every PDF unreadable",
+    missingChildFatal, String(missingChildFatal));
+
+  register(".fataltest", () => {
+    const error = new Error("systemic extractor failure");
+    error.fatal = true;
+    throw error;
+  }, "fatal test");
+  let fatalEscapedExtract = false;
+  try {
+    await extract(new Uint8Array([1]), "system.fataltest");
+  } catch (error) {
+    fatalEscapedExtract = error?.fatal === true;
+  }
+  check("the generic extraction boundary preserves systemic fatal errors",
+    fatalEscapedExtract, String(fatalEscapedExtract));
+
+  let fatalEscapedPdf = false;
+  try {
+    await extractPdf(new Uint8Array([1]), {}, {
+      pdfPassImpl: async () => {
+        const error = new Error("PDF helper is unavailable");
+        error.fatal = true;
+        throw error;
+      },
+    });
+  } catch (error) {
+    fatalEscapedPdf = error?.fatal === true;
+  }
+  check("the registered PDF boundary preserves systemic fatal errors",
+    fatalEscapedPdf, String(fatalEscapedPdf));
+
+  const oversizedOutput = await pdfPassIsolated(new Uint8Array([1]), {
+    childPath: new URL("./fixtures/pdf-success-child.mjs", import.meta.url),
+    timeoutMs: 2_000,
+    maxOutputBytes: 8,
+  });
+  check("PDF process output is bounded before it can exhaust ingest memory",
+    oversizedOutput.text === null && /safe output limit/.test(oversizedOutput.error || ""), JSON.stringify(oversizedOutput));
+
+  const timedOut = await pdfPassIsolated(new Uint8Array([1]), {
+    childPath: new URL("./fixtures/pdf-hang-child.mjs", import.meta.url),
+    timeoutMs: 25,
+  });
+  check("a stuck PDF process times out as a reasoned file error",
+    timedOut.text === null && /timed out/.test(timedOut.error || ""), JSON.stringify(timedOut));
+}
+{
   const r = await prepare(one("bin/logo.bin"), { sourceName: "docs" });
   check("a binary file is skipped", !!r.skip && !r.envelope, JSON.stringify(r));
   check("and named as unsupported rather than failing the run", /no extractor/.test(r.skip.reason), r.skip.reason);
@@ -80,23 +205,6 @@ const one = (rel) => walk(root, {}).files.find((f) => f.rel.split(/[\\/]/).join(
   const r = await prepare(one("docs/report.pdf"), { sourceName: "docs" });
   check("a corrupt PDF is skipped with a legible reason", !!r.skip && /could not be opened|no text layer/.test(r.skip.reason), r.skip?.reason);
   check("and still returns a hash so a later run can detect the change", typeof r.hash === "string");
-}
-{
-  let receivedBytes = false;
-  let mergePages = false;
-  const malformed = await pdfPass(new Uint8Array([0x25, 0x50, 0x44, 0x46]), {
-    extractTextImpl: async (input, options) => {
-      receivedBytes = input instanceof Uint8Array;
-      mergePages = options?.mergePages === true;
-      const error = new Error("Bad (uncompressed) XRef entry: 24R");
-      error.name = "UnknownErrorException";
-      throw error;
-    },
-  });
-  check("a malformed PDF parser rejection becomes a reasoned file error",
-    malformed.text === null && /could not be opened/.test(malformed.error || ""), JSON.stringify(malformed));
-  check("PDF extraction gives unpdf owned bytes so its loading task is closed",
-    receivedBytes && mergePages, JSON.stringify({ receivedBytes, mergePages }));
 }
 {
   const r = await prepare(one("bin/logo.bin"), { sourceName: "docs" });

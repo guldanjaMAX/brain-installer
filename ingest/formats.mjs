@@ -20,7 +20,8 @@
  * between the two populations is an order of magnitude, not a judgement call.
  */
 
-import { extractText } from "unpdf";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { unzipSync, strFromU8 } from "fflate";
 import * as XLSX from "@e965/xlsx";
 import PostalMime from "postal-mime";
@@ -33,26 +34,175 @@ import { stripMarkup } from "./quality.mjs";
  * sparse document (a signature page, a cover sheet) is not misjudged.
  */
 export const MIN_CHARS_PER_PAGE = 100;
+export const PDF_PROCESS_TIMEOUT_MS = 120_000;
+export const PDF_PROCESS_MAX_OUTPUT_BYTES = 96 * 1024 * 1024;
+
+const PDF_CHILD_PATH = fileURLToPath(new URL("./pdf-child.mjs", import.meta.url));
+const PDF_HANDSHAKE_MAX_BYTES = 4_096;
+
+function pdfFailure(name = "unreadable") {
+  const safeName = typeof name === "string" && name ? name.slice(0, 80) : "unreadable";
+  if (/Password/i.test(safeName)) return { text: null, error: "the PDF is password protected" };
+  return { text: null, error: `the PDF could not be opened (${safeName})` };
+}
+
+function pdfResult(text, totalPages) {
+  const body = text.trim();
+  const perPage = totalPages ? body.length / totalPages : 0;
+  return { body, totalPages, perPage };
+}
+
+function pdfSystemFailure(reason) {
+  const error = new Error(`PDF parser is unavailable (${reason})`);
+  error.name = "ExtractorSystemError";
+  error.fatal = true;
+  return error;
+}
+
+function pdfChildEnvironment(source = process.env) {
+  const allowed = new Set([
+    "path", "systemroot", "windir", "comspec", "pathext",
+    "temp", "tmp", "tmpdir", "lang", "lc_all", "lc_ctype", "tz",
+  ]);
+  const clean = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value != null && allowed.has(key.toLowerCase())) clean[key] = value;
+  }
+  return clean;
+}
 
 /**
- * Extract once. Separated so the caller can retry a suspicious result.
+ * Parse one PDF outside the ingest process.
+ *
+ * A process is created per document on purpose. Reuse would let leaked PDF.js
+ * tasks accumulate again, and one malformed file could poison a later file.
+ * Bytes travel over stdin, parser output is bounded, and the child receives a
+ * small environment allowlist with no brain, Google, or Cloudflare credential.
  */
-export async function pdfPass(buf, { extractTextImpl = extractText } = {}) {
-  try {
-    // Give unpdf the bytes, not a caller-owned PDFDocumentProxy. Its byte-input
-    // path owns the complete PDF.js loading task and destroys it in `finally`.
-    // Keeping a proxy alive after text extraction let a malformed XRef reject
-    // from PDF.js later as an unhandled background task, aborting an otherwise
-    // resumable Drive sweep instead of becoming this file's reasoned skip.
-    const { text, totalPages } = await extractTextImpl(new Uint8Array(buf), { mergePages: true });
-    const body = (text || "").trim();
-    const perPage = totalPages ? body.length / totalPages : 0;
-    return { body, totalPages, perPage };
-  } catch (e) {
-    const name = e?.name || "";
-    if (/Password/i.test(name)) return { text: null, error: "the PDF is password protected" };
-    return { text: null, error: `the PDF could not be opened (${name || "unreadable"})` };
-  }
+export async function pdfPassIsolated(buf, {
+  childPath = PDF_CHILD_PATH,
+  timeoutMs = PDF_PROCESS_TIMEOUT_MS,
+  maxOutputBytes = PDF_PROCESS_MAX_OUTPUT_BYTES,
+} = {}) {
+  const bytes = Buffer.from(buf);
+  const scriptPath = childPath instanceof URL ? fileURLToPath(childPath) : childPath;
+
+  return await new Promise((resolve, reject) => {
+    let child;
+    let settled = false;
+    let timer;
+    let ready = false;
+    let handshake = Buffer.alloc(0);
+    let outputBytes = 0;
+    const output = [];
+
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
+    const finish = (result) => settle(resolve, result);
+    const failSystem = (reason) => {
+      child?.kill("SIGKILL");
+      settle(reject, pdfSystemFailure(reason));
+    };
+
+    const appendResult = (chunk) => {
+      if (!chunk.length || settled) return;
+      outputBytes += chunk.length;
+      if (outputBytes > maxOutputBytes) {
+        child.kill("SIGKILL");
+        finish({ text: null, error: "the PDF parser produced more text than the safe output limit" });
+        return;
+      }
+      output.push(chunk);
+    };
+
+    try {
+      child = spawn(process.execPath, [scriptPath], {
+        env: pdfChildEnvironment(),
+        stdio: ["pipe", "pipe", "ignore"],
+        windowsHide: true,
+      });
+    } catch (error) {
+      failSystem(error?.name || "could not start");
+      return;
+    }
+
+    child.once("error", (error) => {
+      if (ready) finish(pdfFailure(error?.name || "parser process failed"));
+      else failSystem(error?.name || "could not start");
+    });
+    child.stdin.on("error", () => {
+      // A parser that exits early closes stdin. Its exit and JSON result carry
+      // the useful classification; EPIPE must not become an installer crash.
+    });
+    child.stdout.on("data", (chunk) => {
+      if (settled) return;
+      if (ready) {
+        appendResult(chunk);
+        return;
+      }
+
+      handshake = Buffer.concat([handshake, chunk]);
+      const newline = handshake.indexOf(0x0a);
+      if (newline < 0) {
+        if (handshake.length > PDF_HANDSHAKE_MAX_BYTES) failSystem("invalid startup handshake");
+        return;
+      }
+
+      let hello;
+      try {
+        hello = JSON.parse(handshake.subarray(0, newline).toString("utf8"));
+      } catch {
+        failSystem("invalid startup handshake");
+        return;
+      }
+      if (hello?.type !== "ready" || hello?.version !== 1) {
+        failSystem("invalid startup handshake");
+        return;
+      }
+
+      ready = true;
+      const remainder = handshake.subarray(newline + 1);
+      handshake = Buffer.alloc(0);
+      appendResult(remainder);
+    });
+    child.once("close", (code) => {
+      if (settled) return;
+      if (!ready) {
+        failSystem("startup did not complete");
+        return;
+      }
+      let message;
+      try {
+        message = JSON.parse(Buffer.concat(output).toString("utf8"));
+      } catch {
+        if (code === 0) failSystem("invalid result protocol");
+        else finish(pdfFailure("parser process failed"));
+        return;
+      }
+      if (code !== 0 || message?.ok === false) {
+        finish(pdfFailure(message?.error_name || "parser process failed"));
+      } else if (message?.ok === true) {
+        if (typeof message.text !== "string" || !Number.isInteger(message.totalPages) || message.totalPages < 0) {
+          failSystem("invalid result protocol");
+        } else finish(pdfResult(message.text, message.totalPages));
+      } else failSystem("invalid result protocol");
+    });
+
+    timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      if (!ready) failSystem("startup timed out");
+      else finish({
+        text: null,
+        error: `the PDF parser timed out after ${Math.ceil(timeoutMs / 1000)} seconds`,
+      });
+    }, timeoutMs);
+    timer.unref?.();
+    child.stdin.end(bytes);
+  });
 }
 
 /**
@@ -73,11 +223,12 @@ export async function pdfPass(buf, { extractTextImpl = extractText } = {}) {
  * unreadable scans. One retry costs milliseconds on a file that is genuinely
  * empty and rescues one that was merely cold.
  */
-register(".pdf", async (buf, { reread } = {}) => {
+export async function extractPdf(buf, { reread } = {}, { pdfPassImpl = pdfPassIsolated } = {}) {
   let r;
   try {
-    r = await pdfPass(buf);
+    r = await pdfPassImpl(buf);
   } catch (e) {
+    if (e?.fatal === true) throw e;
     const name = e?.name || "";
     if (/Password/i.test(name)) return { text: null, error: "the PDF is password protected" };
     return { text: null, error: `the PDF could not be opened (${name || "unreadable"})` };
@@ -88,9 +239,10 @@ register(".pdf", async (buf, { reread } = {}) => {
     const fresh = await reread();
     if (fresh) {
       try {
-        const again = await pdfPass(fresh);
+        const again = await pdfPassImpl(fresh);
         if (again.body && again.body.length) r = again;
-      } catch {
+      } catch (e) {
+        if (e?.fatal === true) throw e;
         // Keep the first result; a retry that throws proves nothing new.
       }
     }
@@ -111,7 +263,9 @@ register(".pdf", async (buf, { reread } = {}) => {
     };
   }
   return { text: r.body };
-}, "pdf", { binary: true });
+}
+
+register(".pdf", extractPdf, "pdf", { binary: true });
 
 /* -------------------------------------------------------- ooxml (zip based) */
 

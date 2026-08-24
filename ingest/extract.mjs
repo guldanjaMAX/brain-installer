@@ -225,6 +225,10 @@ export async function extract(buf, name, opts = {}) {
     }
     return { text: out, how: entry.label };
   } catch (e) {
+    // A missing or broken format helper is systemic, not evidence that this one
+    // document is bad. Let the source run fail so its cursor stays retryable;
+    // otherwise every file of that format could be silently omitted at once.
+    if (e?.fatal === true) throw e;
     return { text: null, how: entry.label, error: String(e.message || e).slice(0, 200) };
   }
 }
