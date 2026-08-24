@@ -380,6 +380,9 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     check(`${name} resolves the account only as a fallback`,
       /m\.brain\?\.domain \? null : await resolveAccount\(m\)/.test(b));
   }
+  const health = bodyOf("cmdHealth");
+  check("domain-based health never dereferences a deliberately absent Cloudflare account",
+    /const sub = acct\s*\? await cf/.test(health || ""), String(health).slice(0, 900));
 
   const remote = bodyOf("cmdIngestRemote");
   const local = bodyOf("cmdIngest");

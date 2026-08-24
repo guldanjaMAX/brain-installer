@@ -862,7 +862,9 @@ async function cmdHealth(manifestPath, { expectVersion = null } = {}) {
   const acct = m.brain?.domain ? null : await resolveAccount(m);
   const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
 
-  const sub = await cf(`/accounts/${acct.id}/workers/subdomain`).catch(() => null);
+  const sub = acct
+    ? await cf(`/accounts/${acct.id}/workers/subdomain`).catch(() => null)
+    : null;
   const base = m.brain?.domain
     ? `https://${m.brain.domain}`
     : sub?.subdomain
