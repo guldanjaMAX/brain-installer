@@ -19,6 +19,7 @@ This is not a Cloudflare capability blocker. D1, Vectorize, Workers AI, Worker s
 - Notes deployed SHA: `fb390cb418d2c7a921b382fd09c0ff947fc79f2e`
 - Notes branch: `codex/cloudflare-brain-proxy`
 - Brain branch: `codex/cloudflare-brain-phase2`
+- Brain transition-safe Drive commit: `92bda5a`
 - Production backend switch: `RAG_BACKEND=cloudflare`
 - Rollback: set the server-side `RAG_BACKEND` Worker secret to `supabase`
 - Live UI: `https://notes.jamesguldan.com/search`
@@ -118,6 +119,18 @@ Required proof:
 - failed sync state is visible in source freshness
 
 The product's Google Drive connector already implements a full first walk, incremental changes, edits, trash/deletion handling, and a persisted sync token. It needs a one-time OAuth connection to James's Google account before it can replace the migration snapshot. The product does not yet have an iMessage connector, so message freshness still needs a standard connector rather than a James-only bridge.
+
+The pre-OAuth compatibility audit is complete and deployed:
+
+- live Drive envelopes use the same `drive:<file-id>` identity as the migrated corpus, so refresh updates rather than duplicates
+- the 2,009 reviewed migration exclusions remain enforced by the ordinary connector
+- Drive folder paths and top-folder filters survive edits and moves without erasing richer migrated client or category metadata
+- deletion removes both a one-document file and every oversized split part
+- changed split counts are reconciled only after all replacement parts are accepted
+- a document-level ingest failure does not advance the Drive change cursor
+- the full product test suite passes, and the live authenticated family-cleanup route passed a non-mutating probe
+
+Google Cloud Console then required James's passkey before OAuth client setup could continue. This is the only current Drive gate and requires a one-time local identity approval; it is not a Cloudflare, credential-design, or connector-capability blocker.
 
 ## Non-blocking cleanup
 
