@@ -189,7 +189,10 @@ function textPdf() {
 
   const timedOut = await pdfPassIsolated(new Uint8Array([1]), {
     childPath: new URL("./fixtures/pdf-hang-child.mjs", import.meta.url),
-    timeoutMs: 25,
+    // A cold Node process can take hundreds of milliseconds to start on CI,
+    // especially on Windows. Leave enough time for the ready handshake so
+    // this exercises a parser that hangs after startup, not a startup failure.
+    timeoutMs: 2_000,
   });
   check("a stuck PDF process times out as a reasoned file error",
     timedOut.text === null && /timed out/.test(timedOut.error || ""), JSON.stringify(timedOut));
