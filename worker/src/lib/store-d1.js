@@ -1208,8 +1208,6 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
   };
 }
 
-const likeLiteral = (value) => String(value).replace(/([\\%_])/g, "\\$1");
-
 /**
  * Return one uid per live logical source document in stable lexical pages.
  * Large connector documents are stored as several physical rows whose
@@ -1272,8 +1270,14 @@ export async function forgetFamilies(env, { families = [], dryRun = true } = {})
     const binds = [];
     for (const family of group) {
       const n = binds.length;
-      clauses.push(`(doc_uid = ?${n + 1} OR doc_uid LIKE ?${n + 2} ESCAPE '\\')`);
-      binds.push(family.base, `${likeLiteral(family.base)}#part%`);
+      // D1 rejects LIKE/GLOB patterns longer than 50 bytes. Drive ids routinely
+      // exceed that before the literal "#part" suffix is added, so a pattern
+      // query cannot be used here. Comparing the exact leading substring keeps
+      // %, _ and \\ literal and cannot include a similarly prefixed base id.
+      clauses.push(
+        `(doc_uid = ?${n + 1} OR substr(doc_uid, 1, length(?${n + 1} || '#part')) = ?${n + 1} || '#part')`
+      );
+      binds.push(family.base);
     }
     const { results } = await env.DB.prepare(
       `SELECT doc_uid FROM documents WHERE ${clauses.join(" OR ")}`

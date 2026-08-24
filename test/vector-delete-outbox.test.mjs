@@ -18,7 +18,7 @@ const check = (name, condition, detail = "") => {
   if (!condition) fail++;
 };
 
-function makeEnv({ deleteThrows = false } = {}) {
+function makeEnv({ deleteThrows = false, enforceD1PatternLimit = false } = {}) {
   const db = new DatabaseSync(":memory:");
   const dir = fileURLToPath(new URL("../migrations/d1/", import.meta.url));
   for (const file of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
@@ -30,7 +30,13 @@ function makeEnv({ deleteThrows = false } = {}) {
   const prepare = (sql) => {
     const shape = (params = []) => ({
       bind: (...next) => shape(next),
-      all: async () => ({ results: db.prepare(sql).all(...params) }),
+      all: async () => {
+        if (enforceD1PatternLimit && /\b(?:LIKE|GLOB)\b/i.test(sql) &&
+            params.some((value) => new TextEncoder().encode(String(value)).length > 50)) {
+          throw new Error("LIKE or GLOB pattern too complex");
+        }
+        return { results: db.prepare(sql).all(...params) };
+      },
       first: async () => db.prepare(sql).get(...params) ?? null,
       run: async () => db.prepare(sql).run(...params),
       _sql: sql,
@@ -161,6 +167,34 @@ const insertChunk = (db, uid, doc, ix, vectorId = uid) => db.prepare(
     families: [{ base_doc_uid: "drive:file", keep_doc_uids: [] }], dryRun: false,
   });
   check("a source deletion removes the whole split family", deleted.documents === 2 && db.prepare("SELECT count(*) n FROM documents WHERE doc_uid LIKE 'drive:file%'").get().n === 0, JSON.stringify(deleted));
+}
+
+/* Family matching does not depend on D1's 50-byte LIKE/GLOB pattern limit. */
+{
+  const { env, db } = makeEnv({ enforceD1PatternLimit: true });
+  const longBase = `drive:${"folder_%_\\\\quoted'segment/".repeat(3)}document`;
+  const keep = `${longBase}#part1of2`;
+  const stale = `${longBase}#part2of3`;
+  const prefixCollision = `${longBase}-copy#part1of1`;
+  const siblingCollision = `${longBase}2#part1of1`;
+  check("family regression uses a base id longer than D1's pattern limit",
+    new TextEncoder().encode(longBase).length > 50, String(new TextEncoder().encode(longBase).length));
+
+  for (const uid of [longBase, keep, stale, prefixCollision, siblingCollision, "drive:unrelated"]) {
+    insertDocument(db, uid);
+    insertChunk(db, `${uid}#0`, uid, 0);
+  }
+
+  const cleaned = await forgetFamilies(env, {
+    families: [{ base_doc_uid: longBase, keep_doc_uids: [keep] }],
+    dryRun: false,
+  });
+  const left = db.prepare("SELECT doc_uid FROM documents ORDER BY doc_uid").all().map((row) => row.doc_uid);
+  check("long special-character family ids clean without LIKE or GLOB",
+    cleaned.documents === 2 && !left.includes(longBase) && !left.includes(stale), JSON.stringify(cleaned));
+  check("family matching keeps the requested #part child", left.includes(keep), JSON.stringify(left));
+  check("family matching cannot delete similarly prefixed ids",
+    left.includes(prefixCollision) && left.includes(siblingCollision) && left.includes("drive:unrelated"), JSON.stringify(left));
 }
 
 /* A shorter document turns only its removed tail into a vector delete. */
