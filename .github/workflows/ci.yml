@@ -104,7 +104,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          contents=$(tar -tzf "$TARBALL")
+          tarball="$TARBALL"
+          if command -v cygpath >/dev/null 2>&1; then
+            tarball=$(cygpath -u "$tarball")
+          fi
+          contents=$(tar -tzf "$tarball")
           private_paths=$(
             {
               printf '%s\n' "$contents" | grep -Ei '(^|/)instances(/|$)|(^|/)eval/baselines(/|$)|james|readiness|\.brain-(migration|ingest)' || true
