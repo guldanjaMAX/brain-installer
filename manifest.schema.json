@@ -70,7 +70,22 @@
     },
     "corpora": {
       "type": "object",
-      "description": "NOT YET WIRED. No ingest connector ships today, so every field here is dead config. Filling it in does not cause anything to be ingested."
+      "description": "Source declarations. Google Drive policy is enforced by brain ingest --from drive. Other connector declarations may remain descriptive until their command is documented.",
+      "properties": {
+        "google_drive": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "exclude_paths": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "exclude_name_parts": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "exclude_file_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "exclude_file_ids_file": {
+              "type": ["string", "null"],
+              "description": "Optional local JSON exclusion list, resolved relative to the manifest. It may also be a completed Supabase migration receipt."
+            }
+          }
+        }
+      }
     },
     "retrieval": {
       "type": "object",
@@ -99,7 +114,7 @@
         "private_path_prefixes": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Enforced on LOCAL folder ingest only, per path segment, files and directories. NOT applied to the Drive or Gmail connectors yet: a _private folder in Drive is still ingested. State the limitation to the client."
+          "description": "Enforced per path segment on local-folder and Google Drive ingest. Gmail has no folder path and does not use this rule."
         },
         "daily_llm_spend_cap_usd": { "type": "number", "minimum": 0 }
       }

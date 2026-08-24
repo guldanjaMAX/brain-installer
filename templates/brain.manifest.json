@@ -76,10 +76,10 @@
     "_comment": "Which sources this install ingests. Each maps to a connector.",
     "google_drive": {
       "enabled": true,
-      "root_folder_ids": [],
-      "service_account_secret": "secret://GOOGLE_SERVICE_ACCOUNT",
       "exclude_paths": [],
-      "exclude_name_parts": []
+      "exclude_name_parts": [],
+      "exclude_file_ids": [],
+      "exclude_file_ids_file": null
     },
     "gmail": {
       "enabled": false,

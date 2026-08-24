@@ -25,6 +25,14 @@
       "project_ref": null
     }
   },
+  "corpora": {
+    "google_drive": {
+      "enabled": true,
+      "exclude_file_ids_file": "../.brain-migration-drive.json",
+      "exclude_paths": [],
+      "exclude_name_parts": []
+    }
+  },
   "retrieval": {
     "embed_model": "@cf/baai/bge-base-en-v1.5",
     "embed_dimensions": 768,

@@ -44,6 +44,8 @@ export const EXPORTS = {
 export const EXPORT_LIMIT = 10 * 1024 * 1024;
 export const DOWNLOAD_LIMIT = 8 * 1024 * 1024;
 
+const FOLDER_MIME = "application/vnd.google-apps.folder";
+
 const FIELDS =
   "nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, trashed, parents, webViewLink, md5Checksum)";
 
@@ -166,7 +168,7 @@ export async function listChanges(getAccessToken, pageToken, opts = {}) {
 /** Should this file be fetched at all? Decided before spending a request. */
 export function triage(file) {
   if (file.trashed) return { skip: "the file is in the trash" };
-  if (file.mimeType === "application/vnd.google-apps.folder") return { skip: null, folder: true };
+  if (file.mimeType === FOLDER_MIME) return { skip: null, folder: true };
   if (file.mimeType?.startsWith("application/vnd.google-apps.")) {
     const e = EXPORTS[file.mimeType];
     if (!e) return { skip: `Google ${file.mimeType.split(".").pop()} files cannot be exported as text` };
@@ -178,6 +180,78 @@ export function triage(file) {
     return { skip: `${(Number(file.size) / 1048576).toFixed(1)}MB, over the ${DOWNLOAD_LIMIT / 1048576}MB limit` };
   }
   return { download: true };
+}
+
+/**
+ * Keep the small amount of folder state needed to turn opaque parent ids into
+ * stable, human-readable paths. A full walk supplies every visible folder;
+ * incremental runs merge changed folders into the saved snapshot.
+ */
+export function updateFolderIndex(files, prior = {}) {
+  const out = { ...(prior || {}) };
+  for (const file of files || []) {
+    if (file?.mimeType !== FOLDER_MIME || !file.id) continue;
+    if (file.trashed) delete out[file.id];
+    else out[file.id] = {
+      name: String(file.name || "").trim(),
+      parents: Array.isArray(file.parents) ? file.parents.filter(Boolean).map(String) : [],
+    };
+  }
+  return out;
+}
+
+/** Folder path only, not the filename. Unknown roots are intentionally absent. */
+export function folderPathFor(file, folders = {}) {
+  const parts = [];
+  const seen = new Set();
+  let id = Array.isArray(file?.parents) ? file.parents[0] : null;
+  while (id && !seen.has(id)) {
+    seen.add(id);
+    const folder = folders[id];
+    if (!folder) break;
+    if (folder.name) parts.unshift(folder.name);
+    id = Array.isArray(folder.parents) ? folder.parents[0] : null;
+  }
+  return parts.join("/");
+}
+
+const pathSegments = (value) => String(value || "").replace(/\\/g, "/").split("/").map((x) => x.trim()).filter(Boolean);
+const normalPath = (value) => pathSegments(value).join("/").toLowerCase();
+
+/**
+ * Decide source-policy exclusions before downloading file bytes.
+ *
+ * Exact ids carry reviewed migration/dedupe decisions. Path rules are matched
+ * on segment boundaries so excluding `Legal/Sealed` cannot also exclude a
+ * sibling named `Legal/Sealed Notes`. Private prefixes match whole segments,
+ * the same contract used by local-folder ingest.
+ */
+export function exclusionReason(file, folderPath = "", {
+  excludeFileIds = [], excludePaths = [], excludeNameParts = [], privatePrefixes = [],
+} = {}) {
+  const ids = excludeFileIds instanceof Set ? excludeFileIds : new Set((excludeFileIds || []).map(String));
+  if (ids.has(String(file?.id || ""))) return "excluded by reviewed file-id policy";
+
+  const fullPath = [...pathSegments(folderPath), String(file?.name || "").trim()].filter(Boolean).join("/");
+  const normalized = normalPath(fullPath);
+  for (const configured of excludePaths || []) {
+    const prefix = normalPath(configured);
+    if (prefix && (normalized === prefix || normalized.startsWith(`${prefix}/`))) {
+      return `excluded path: ${configured}`;
+    }
+  }
+
+  const lowerName = String(file?.name || "").toLowerCase();
+  for (const part of excludeNameParts || []) {
+    if (String(part || "").trim() && lowerName.includes(String(part).toLowerCase())) {
+      return `excluded name part: ${part}`;
+    }
+  }
+
+  const privateSet = new Set((privatePrefixes || []).map((x) => String(x).toLowerCase()));
+  const privatePart = pathSegments(fullPath).find((part) => privateSet.has(part.toLowerCase()));
+  if (privatePart) return `private path segment: ${privatePart}`;
+  return null;
 }
 
 /** Fetch one file's bytes, exporting when it is a native Google type. */
@@ -238,12 +312,13 @@ export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYP
   const occurred = dd.value ?? (Number.isFinite(created) ? created : null);
 
   return {
-    // The Drive file id, not the name. Names are duplicated and renamed; the id
-    // is what makes a re-sync update rather than duplicate, and what lets a
-    // deletion later find its document.
+    // The bare Drive file id, not the name and not `drive:<id>`. The store owns
+    // namespacing and constructs `<source_type>:<source_id>` exactly once. This
+    // is also the identity used by the Supabase migration, so the first live
+    // sync updates that document instead of creating `drive:drive:<id>`.
     envelope: {
       source_type: sourceName,
-      source_id: `drive:${file.id}`,
+      source_id: String(file.id),
       title: file.name,
       content: got.text,
       occurred_at: occurred ? new Date(occurred).toISOString() : null,
@@ -251,11 +326,14 @@ export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYP
       date_reliable: dd.value ? dd.reliable : false,
       uri: file.webViewLink || null,
       metadata: {
-        category: sourceName,
         extracted_as: got.how,
         drive_id: file.id,
         mime: file.mimeType,
-        folder: folder || undefined,
+        platform: "drive",
+        // Null is deliberate for a root-level file: it clears a stale folder
+        // filter when a file is moved out of a subfolder.
+        top_folder: pathSegments(folder)[0] || null,
+        folder: folder || null,
         ...(got.note ? { extraction_note: got.note } : {}),
       },
     },

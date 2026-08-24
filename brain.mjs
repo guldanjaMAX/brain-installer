@@ -1598,6 +1598,50 @@ function assertSourceName(name) {
  */
 export const VALUE_FLAGS = new Set(["path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark"]);
 
+/** Read an exact Drive-id exclusion list from either its portable shape or a migration receipt. */
+export function driveExclusionIdsOf(raw) {
+  const values = Array.isArray(raw)
+    ? raw
+    : raw?.exclude_file_ids ||
+      raw?.excluded_drive_file_ids ||
+      raw?.lanes?.drive?.migration_policy?.excluded_drive_file_ids ||
+      [];
+  if (!Array.isArray(values)) throw new Error("the Drive exclusion file does not contain an array of file ids");
+  return [...new Set(values.map((x) => String(x || "").trim()).filter(Boolean))].sort();
+}
+
+/**
+ * The connector policy is install-owned manifest data. James's migration uses
+ * an ignored receipt file because thousands of opaque Drive ids do not belong
+ * in a public product manifest; new installs normally need no such file.
+ */
+export function driveConnectorConfig(m, manifestPath, read = (path) => readFileSync(path, "utf-8")) {
+  const declared = m?.corpora?.google_drive || {};
+  let fileIds = driveExclusionIdsOf(declared.exclude_file_ids || []);
+  if (declared.exclude_file_ids_file) {
+    const filePath = resolve(dirname(resolve(manifestPath)), String(declared.exclude_file_ids_file));
+    let parsed;
+    try {
+      parsed = JSON.parse(read(filePath));
+    } catch (error) {
+      throw new Error(`could not read Google Drive exclude_file_ids_file ${declared.exclude_file_ids_file}: ${error.message}`);
+    }
+    fileIds = [...new Set([...fileIds, ...driveExclusionIdsOf(parsed)])].sort();
+  }
+  return {
+    excludeFileIds: fileIds,
+    excludePaths: Array.isArray(declared.exclude_paths) ? declared.exclude_paths.map(String) : [],
+    excludeNameParts: Array.isArray(declared.exclude_name_parts) ? declared.exclude_name_parts.map(String) : [],
+    privatePrefixes: Array.isArray(m?.safety?.private_path_prefixes) ? m.safety.private_path_prefixes.map(String) : [],
+  };
+}
+
+export function completedDriveFamilyPlans(plans, acceptedCounts) {
+  return (plans || []).filter((plan) => acceptedCounts.get(plan.stateKey) === plan.expectedParts);
+}
+
+export const sourceCursorCanAdvance = (tally) => Number(tally?.failed || 0) === 0;
+
 /**
  * Refuse to write a secret somewhere it will be published or lost.
  *
@@ -2397,6 +2441,71 @@ async function recordSourceFinish(acctId, dbId, name, { documents, added, skippe
   ).catch(() => {});
 }
 
+/** Apply Drive deletions and policy exclusions in bounded, retryable groups. */
+async function applyDriveRemovals({ uids, base, adminKey, state, dryRun, label = "Drive deletion" }) {
+  const targets = [...new Set((uids || []).map(String).filter(Boolean))];
+  if (!targets.length) return { applied: 0, pending: 0 };
+  if (dryRun) {
+    warn(`${targets.length} file(s) ${label === "source policy" ? "match the exclusion policy and WOULD be removed from the brain" : "were deleted or trashed in Drive and WOULD be removed from the brain"}`);
+    return { applied: 0, pending: 0 };
+  }
+
+  let applied = 0;
+  let pending = 0;
+  // Bound the request and Worker CPU independently from D1's internal batches.
+  for (let i = 0; i < targets.length; i += 50) {
+    const group = targets.slice(i, i + 50);
+    const res = await http(`${base}/api/admin/brain/forget`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      // A Drive file may be stored as one document or as multiple oversized
+      // parts. Family deletion reaches both representations.
+      body: JSON.stringify({
+        families: group.map((baseDocUid) => ({ base_doc_uid: baseDocUid, keep_doc_uids: [] })),
+        confirm: true,
+      }),
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok || out.dry_run) {
+      state.removed = {
+        ...(state.removed || {}),
+        ...Object.fromEntries(group.map((uid) => [uid, new Date().toISOString()])),
+      };
+      pending += group.length;
+      continue;
+    }
+    for (const uid of group) {
+      delete state.done[uid];
+      if (state.removed) delete state.removed[uid];
+    }
+    applied += Number(out.documents || 0);
+  }
+  if (pending) warn(`${pending} ${label}(s) could not be applied and were recorded for the next run`);
+  return { applied, pending };
+}
+
+/** Remove obsolete oversized parts only after every replacement part landed. */
+async function reconcileDriveFamilies({ families, base, adminKey }) {
+  let removed = 0;
+  for (let i = 0; i < families.length; i += 50) {
+    const group = families.slice(i, i + 50);
+    const res = await http(`${base}/api/admin/brain/forget`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ families: group, confirm: true }),
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok || out.dry_run) {
+      die(
+        `Drive split-document cleanup failed (${res.status}). The sync cursor was not advanced.\n` +
+        "      Re-running the same ingest is safe and will retry the cleanup."
+      );
+    }
+    removed += Number(out.documents || 0);
+  }
+  return removed;
+}
+
 
 /**
  * Ingest from a connected remote source.
@@ -2431,9 +2540,20 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   // Held back until every batch has been accepted. See the note at its
   // assignment: advancing a sync cursor early loses documents silently.
   let pendingCursor = null;
+  const familyPlans = [];
+  const acceptedFamilyParts = new Map();
 
   if (which === "drive") {
     const drive = await import("./connectors/google-drive.mjs");
+    let sourcePolicy;
+    try {
+      sourcePolicy = driveConnectorConfig(m, manifestPath);
+    } catch (error) {
+      die(error.message);
+    }
+    if (sourcePolicy.excludeFileIds.length) info(`${sourcePolicy.excludeFileIds.length} reviewed Drive file-id exclusion(s) enforced`);
+    if (sourcePolicy.excludePaths.length) info(`${sourcePolicy.excludePaths.length} Drive path exclusion(s) enforced`);
+    if (sourcePolicy.privatePrefixes.length) info(`private path prefixes enforced in Drive: ${sourcePolicy.privatePrefixes.join(", ")}`);
     // Taken BEFORE the walk. Taken after, anything changed during the walk
     // would be missed forever, because the next run starts from a token that
     // already claims to include it.
@@ -2455,43 +2575,17 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       // answering from a document the client deleted in Drive is worse than one
       // that never had it: they believe it is gone.
       if (ch.removed.length) {
-        const uids = ch.removed.map((id) => `drive:${id}`);
-        if (flags["dry-run"]) {
-          warn(`${uids.length} file(s) were deleted or trashed in Drive and WOULD be removed from the brain`);
-        } else {
-          const res = await http(`${base}/api/admin/brain/forget`, {
-            method: "POST",
-            headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
-            body: JSON.stringify({ doc_uids: uids, confirm: true }),
-          });
-          const out = await res.json().catch(() => ({}));
-          if (!res.ok || out.dry_run) {
-            // Left in the state file so the next run retries rather than losing
-            // the fact that these should be gone.
-            state.removed = { ...(state.removed || {}), ...Object.fromEntries(uids.map((u) => [u, new Date().toISOString()])) };
-            warn(`${uids.length} Drive deletion(s) could NOT be applied (${res.status}). They are recorded in ${relative(process.cwd(), statePath)} and will be retried.`);
-          } else {
-            for (const u of uids) delete state.done[u];
-            if (state.removed) for (const u of uids) delete state.removed[u];
-            ok(`${out.documents || 0} document(s) removed to match Drive deletions`);
-          }
-        }
+        const uids = ch.removed.map((id) => `${sourceName}:${id}`);
+        const removed = await applyDriveRemovals({
+          uids, base, adminKey, state, dryRun: !!flags["dry-run"], label: "Drive deletion",
+        });
+        if (removed.applied) ok(`${removed.applied} document(s) removed to match Drive deletions`);
       }
       // Anything recorded as pending on an earlier run gets retried here.
       const pending = Object.keys(state.removed || {});
       if (pending.length && !flags["dry-run"]) {
-        const res = await http(`${base}/api/admin/brain/forget`, {
-          method: "POST",
-          headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
-          body: JSON.stringify({ doc_uids: pending, confirm: true }),
-        });
-        if (res.ok) {
-          const out = await res.json().catch(() => ({}));
-          if (!out.dry_run) {
-            for (const u of pending) { delete state.removed[u]; delete state.done[u]; }
-            ok(`${out.documents || 0} previously-pending deletion(s) applied`);
-          }
-        }
+        const retried = await applyDriveRemovals({ uids: pending, base, adminKey, state, dryRun: false, label: "pending Drive deletion" });
+        if (retried.applied) ok(`${retried.applied} previously-pending deletion(s) applied`);
       }
     } else {
       info("full walk of Drive");
@@ -2501,16 +2595,44 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       }
     }
 
+    // Resolve paths only after the complete page set has been seen. Drive does
+    // not return parents before children, and API order must not decide policy.
+    state.drive_folders = drive.updateFolderIndex(files, state.drive_folders || {});
+    const pathOf = (file) => drive.folderPathFor(file, state.drive_folders);
+    const excludedUids = [];
+
     for (const f of files.slice(0, limit)) {
       scanned++;
-      const key = `drive:${f.id}`;
-      const r = await drive.toEnvelope(getToken, f, { sourceName });
+      const key = `${sourceName}:${f.id}`;
+      const folder = pathOf(f);
+      const excluded = drive.exclusionReason(f, folder, sourcePolicy);
+      if (excluded) {
+        const displayPath = [folder, f.name].filter(Boolean).join("/");
+        const skip = { path: displayPath || f.name || f.id, id: f.id, reason: excluded };
+        skips.push(skip);
+        state.skipped[key] = excluded;
+        excludedUids.push(key);
+        continue;
+      }
+      const r = await drive.toEnvelope(getToken, f, { sourceName, pathOf });
       if (!r) continue;
       if (r.skip) { skips.push(r.skip); state.skipped[key] = r.skip.reason; continue; }
       if (state.done[key] === r.version) { unchanged++; continue; }
-      for (const envelope of splitOversized(r.envelope)) ready.push({ hash: r.version, envelope, rel: f.name });
+      const envelopes = splitOversized(r.envelope);
+      familyPlans.push({
+        stateKey: key,
+        hash: r.version,
+        expectedParts: envelopes.length,
+        base_doc_uid: key,
+        keep_doc_uids: envelopes.map((envelope) => `${envelope.source_type}:${envelope.source_id}`),
+      });
+      for (const envelope of envelopes) ready.push({ hash: r.version, envelope, rel: f.name, stateKey: key, deferState: true });
       if (scanned % 200 === 0) process.stdout.write(`\r  scanned ${scanned}...   `);
     }
+    const policyRemoved = await applyDriveRemovals({
+      uids: excludedUids, base, adminKey, state, dryRun: !!flags["dry-run"], label: "source policy",
+    });
+    if (policyRemoved.applied) ok(`${policyRemoved.applied} document(s) removed to enforce the Drive source policy`);
     // NOT saved yet. Advancing the cursor before the batches it covers have
     // been accepted means a mid-send failure permanently skips those documents:
     // the next run starts after them and no error is ever raised. It is written
@@ -2560,14 +2682,31 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   }
 
   if (dbId) await recordSourceStart(acct.id, dbId, sourceName, which);
-  const tally = await sendBatches({ base, adminKey, groups, state, statePath, skips });
+  const tally = await sendBatches({
+    base, adminKey, groups, state, statePath, skips,
+    onAccepted: which === "drive"
+      ? (item) => acceptedFamilyParts.set(item.stateKey, (acceptedFamilyParts.get(item.stateKey) || 0) + 1)
+      : null,
+  });
+
+  if (which === "drive") {
+    const completedPlans = completedDriveFamilyPlans(familyPlans, acceptedFamilyParts);
+    const completeFamilies = completedPlans
+      .map(({ base_doc_uid, keep_doc_uids }) => ({ base_doc_uid, keep_doc_uids }));
+    const staleParts = await reconcileDriveFamilies({ families: completeFamilies, base, adminKey });
+    for (const plan of completedPlans) state.done[plan.stateKey] = plan.hash;
+    saveState(statePath, state);
+    if (staleParts) ok(`${staleParts} obsolete split-document part(s) removed`);
+  }
 
   // Every batch landed, so it is now safe to say "we have everything up to
   // here". sendBatches dies rather than returning on a failure, so reaching
   // this line is the proof.
-  if (pendingCursor) {
+  if (pendingCursor && sourceCursorCanAdvance(tally)) {
     state[pendingCursor.key] = pendingCursor.value;
     saveState(statePath, state);
+  } else if (pendingCursor && tally.failed) {
+    warn(`${tally.failed} document(s) failed, so the source cursor was NOT advanced; the next run will retry them`);
   }
   if (dbId) {
     await recordSourceFinish(acct.id, dbId, sourceName, {
@@ -2587,7 +2726,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
 }
 
 /** POST every batch, recording progress after each so a stop is resumable. */
-async function sendBatches({ base, adminKey, groups, state, statePath, skips, quiet = false }) {
+async function sendBatches({ base, adminKey, groups, state, statePath, skips, quiet = false, onAccepted = null }) {
   // Loaded here rather than closed over: sendBatches is top-level and shared by
   // both ingest paths, so it cannot rely on a caller's destructured import.
   const { saveState } = await ingestLib();
@@ -2635,8 +2774,14 @@ async function sendBatches({ base, adminKey, groups, state, statePath, skips, qu
     for (const r of body.results || []) {
       const item = group.find((g) => g.envelope.source_id === r.source_id);
       if (!item) continue;
-      const base_id = item.envelope.metadata?.part_of || r.source_id;
-      if (["created", "updated", "unchanged"].includes(r.status)) state.done[base_id] = item.hash;
+      // Remote connectors can keep their progress key namespaced even though
+      // the ingest envelope carries the bare source id. That prevents both a
+      // double-prefixed document uid and an every-run resend loop.
+      const base_id = item.stateKey || item.envelope.metadata?.part_of || r.source_id;
+      if (["created", "updated", "unchanged"].includes(r.status)) {
+        if (!item.deferState) state.done[base_id] = item.hash;
+        if (onAccepted) onAccepted(item, r);
+      }
       else {
         const reason = r.status === "refused" ? `refused: carries ${(r.labels || []).join(", ")}` : `failed: ${r.error || "unknown"}`;
         state.skipped[r.source_id] = reason;

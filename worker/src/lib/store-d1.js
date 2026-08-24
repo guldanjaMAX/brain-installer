@@ -1147,3 +1147,42 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
     dry_run: false, vector_error: vectorError, targets,
   };
 }
+
+const likeLiteral = (value) => String(value).replace(/([\\%_])/g, "\\$1");
+
+/**
+ * Remove stale members of a split-document family after every replacement part
+ * has landed. This covers all three transitions: one-to-many, many-to-one and
+ * a changed part count. Exact keep ids make it impossible for cleanup to remove
+ * the new revision it is reconciling.
+ */
+export async function forgetFamilies(env, { families = [], dryRun = true } = {}) {
+  const normalized = [];
+  for (const family of families || []) {
+    const base = String(family?.base_doc_uid || "");
+    const keep = [...new Set((family?.keep_doc_uids || []).map(String))];
+    if (!base || keep.some((uid) => uid !== base && !uid.startsWith(`${base}#part`))) {
+      throw new Error("each document family needs a base_doc_uid and any keep_doc_uids must belong to it");
+    }
+    normalized.push({ base, keep });
+  }
+  if (!normalized.length) return { documents: 0, chunks: 0, vectors: 0, dry_run: dryRun, targets: [] };
+
+  const stale = [];
+  for (let i = 0; i < normalized.length; i += 25) {
+    const group = normalized.slice(i, i + 25);
+    const clauses = [];
+    const binds = [];
+    for (const family of group) {
+      const n = binds.length;
+      clauses.push(`(doc_uid = ?${n + 1} OR doc_uid LIKE ?${n + 2} ESCAPE '\\')`);
+      binds.push(family.base, `${likeLiteral(family.base)}#part%`);
+    }
+    const { results } = await env.DB.prepare(
+      `SELECT doc_uid FROM documents WHERE ${clauses.join(" OR ")}`
+    ).bind(...binds).all();
+    const keep = new Set(group.flatMap((family) => family.keep));
+    stale.push(...(results || []).map((row) => row.doc_uid).filter((uid) => !keep.has(uid)));
+  }
+  return forget(env, { docUids: [...new Set(stale)], dryRun });
+}

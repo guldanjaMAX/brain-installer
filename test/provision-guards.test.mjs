@@ -4,7 +4,10 @@
 // ours, and both are tested here by CALLING the real functions, not by grepping
 // the source. A source assertion cannot tell a working guard from a deleted one.
 
-import { chooseDbName, assertAdoptable, documentCountOf, ensureMetadataIndex, VECTOR_METADATA_INDEXES } from "../brain.mjs";
+import {
+  chooseDbName, assertAdoptable, documentCountOf, ensureMetadataIndex, VECTOR_METADATA_INDEXES,
+  driveExclusionIdsOf, driveConnectorConfig, completedDriveFamilyPlans, sourceCursorCanAdvance,
+} from "../brain.mjs";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 200))); if (!c) fail++; };
@@ -12,6 +15,29 @@ const throws = async (fn) => { try { await fn(); return null; } catch (e) { retu
 
 check("destructive previews report documents rather than chunks", documentCountOf({ documents: 981, chunks: 14753, total: 14753 }) === 981);
 check("older document receipts still have a count", documentCountOf({ total: 42 }) === 42);
+
+/* ---- Drive transition policy is portable but never silently optional ---- */
+{
+  const receipt = { lanes: { drive: { migration_policy: { excluded_drive_file_ids: ["dup-2", "bad-1", "dup-2"] } } } };
+  check("a migration receipt yields a unique exact Drive exclusion list",
+    driveExclusionIdsOf(receipt).join(",") === "bad-1,dup-2", JSON.stringify(driveExclusionIdsOf(receipt)));
+  const cfg = driveConnectorConfig({
+    corpora: { google_drive: { exclude_file_ids: ["inline-1"], exclude_file_ids_file: "receipt.json", exclude_paths: ["Legal/Sealed"] } },
+    safety: { private_path_prefixes: ["_private"] },
+  }, "/tmp/client/brain.manifest.json", () => JSON.stringify(receipt));
+  check("inline and receipt exclusions are combined", cfg.excludeFileIds.join(",") === "bad-1,dup-2,inline-1", JSON.stringify(cfg));
+  check("Drive receives path and private-prefix policy from the standard manifest",
+    cfg.excludePaths[0] === "Legal/Sealed" && cfg.privatePrefixes[0] === "_private", JSON.stringify(cfg));
+
+  const plans = [
+    { stateKey: "drive:a", expectedParts: 2 },
+    { stateKey: "drive:b", expectedParts: 1 },
+  ];
+  const complete = completedDriveFamilyPlans(plans, new Map([["drive:a", 1], ["drive:b", 1]]));
+  check("split-family cleanup waits for every replacement part", complete.length === 1 && complete[0].stateKey === "drive:b", JSON.stringify(complete));
+  check("a document-level failure keeps the source cursor retryable", sourceCursorCanAdvance({ failed: 1 }) === false);
+  check("a fully accepted batch may advance its source cursor", sourceCursorCanAdvance({ failed: 0 }) === true);
+}
 
 /* ---- the name must never be one that could belong to somebody else ---- */
 {

@@ -147,10 +147,11 @@ CSV and TSV are rendered row-wise as `Header: value` rather than as a bare grid,
 because `15234.11` on its own is unretrievable while `Balance: 15234.11` answers
 a question about a balance.
 
-**`safety.private_path_prefixes` is enforced on local folder ingest**, per path
-segment, on both files and directories. It is NOT yet applied to the Drive and
-Gmail connectors: a `_private` folder in Drive will still be ingested. Say so to
-a client rather than letting them assume.
+**`safety.private_path_prefixes` is enforced on local-folder and Google Drive
+ingest**, per path segment. Drive also enforces `corpora.google_drive` exact
+file-id, path-prefix and filename-part exclusions before downloading content.
+An excluded document already present in the brain is removed rather than left
+stranded. Gmail has no folder path and does not use these rules.
 
 Flags: `--dry-run`, `--source <name>`, `--limit <n>`, `--reset`.
 
@@ -206,6 +207,12 @@ deletion that cannot be applied is kept in the state file and retried on the
 following run rather than lost. **Gmail does not report deletions**, so a deleted
 message stays until the source is re-ingested with `--reset`.
 
+Oversized Drive documents are reconciled as a family. A revision that changes
+from one document to several parts, changes its part count, or becomes small
+again removes only the obsolete representation after every replacement part is
+accepted. A document-level failure leaves the Drive cursor unadvanced so the
+same change is retried instead of being acknowledged and lost.
+
 A Google Doc is exported as text, a Sheet as CSV, and a Google Form not at all.
 
 `modifiedTime` is deliberately **not** used as a document date. A sync or a
@@ -220,10 +227,11 @@ like it was written this year, silently disabling staleness reporting. Drive's
 Read this before scoping an engagement.
 
 - **No interface.** curl plus an admin key. A non-technical owner cannot use it.
-- **Much of the manifest is inert.** Everything under `corpora` and `operations`,
-  most of `retrieval`, `access.authorized_emails`, `kv_namespace` and `r2_bucket`
-  are read by nothing. `manifest.schema.json` marks each one NOT YET WIRED. Do
-  not tell a client they take effect.
+- **Some manifest declarations are still inert.** Google Drive source policy is
+  wired. Other undeveloped corpora, everything under `operations`, most of
+  `retrieval`, `access.authorized_emails`, `kv_namespace` and `r2_bucket` are
+  read by nothing. `manifest.schema.json` marks the important boundaries. Do not
+  tell a client an unwired declaration takes effect.
 
 ---
 

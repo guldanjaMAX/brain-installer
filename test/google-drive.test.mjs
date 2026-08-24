@@ -1,4 +1,7 @@
-import { api, listFiles, listChanges, startPageToken, triage, toEnvelope, DriveError, EXPORTS } from "../connectors/google-drive.mjs";
+import {
+  api, listFiles, listChanges, startPageToken, triage, toEnvelope, DriveError, EXPORTS,
+  updateFolderIndex, folderPathFor, exclusionReason,
+} from "../connectors/google-drive.mjs";
 import { buildAuthUrl, pkce, exchangeCode, createTokenProvider, redirectUri } from "../connectors/google-auth.mjs";
 
 let fail = 0, ran = 0;
@@ -123,17 +126,40 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
 
 /* ================= envelope ================= */
 {
+  const folders = updateFolderIndex([
+    { id: "root-child", name: "Provider Records", mimeType: "application/vnd.google-apps.folder", parents: ["unknown-root"] },
+    { id: "year", name: "2025", mimeType: "application/vnd.google-apps.folder", parents: ["root-child"] },
+  ]);
+  const file = { id: "F-path", name: "Visit.txt", parents: ["year"] };
+  check("folder paths are reconstructed after the unordered walk", folderPathFor(file, folders) === "Provider Records/2025", folderPathFor(file, folders));
+  check("an exact reviewed file id is excluded", /file-id policy/.test(exclusionReason({ id: "F1", name: "x.txt" }, "", { excludeFileIds: ["F1"] })));
+  check("path exclusions match segment boundaries", !!exclusionReason(file, "Legal/Sealed", { excludePaths: ["Legal/Sealed"] }));
+  check("path exclusions do not overmatch sibling names", exclusionReason(file, "Legal/Sealed Notes", { excludePaths: ["Legal/Sealed"] }) === null);
+  check("private prefixes apply to Drive path segments", /private path/.test(exclusionReason(file, "Clients/_private", { privatePrefixes: ["_private"] })));
+}
+{
   const file = { id: "F1", name: "2026-03-14 board notes.txt", mimeType: "text/plain", size: "400",
     createdTime: "2020-01-01T00:00:00Z", modifiedTime: "2026-08-17T00:00:00Z", md5Checksum: "abc", webViewLink: "https://drive/F1" };
   const body = "The board agreed to defer the retainer increase until the following quarter, pending the coverage review.";
   const r = await toEnvelope(tok, file, {}, { fetchImpl: async () => bytes(body), sleep: async () => {} });
   check("a text file becomes an envelope", !!r.envelope, JSON.stringify(r.skip));
-  check("the id is the Drive id, so a rename does not duplicate it", r.envelope.source_id === "drive:F1", r.envelope.source_id);
+  check("the envelope carries the bare Drive id", r.envelope.source_id === "F1", r.envelope.source_id);
+  check("the store namespaces that id exactly once, matching migration identity",
+    `${r.envelope.source_type}:${r.envelope.source_id}` === "drive:F1", `${r.envelope.source_type}:${r.envelope.source_id}`);
   // modifiedTime here is 2026; createdTime is 2020; the FILENAME says 2026-03-14.
   check("the filename date wins over Drive metadata", r.envelope.occurred_at.startsWith("2026-03-14"), r.envelope.occurred_at);
   check("and it records where the date came from", r.envelope.date_source === "filename");
   check("modifiedTime is used only as a change signal", r.version.includes("2026-08-17") && !r.envelope.occurred_at.includes("2026-08-17"));
   check("the web link is kept for citations", r.envelope.uri === "https://drive/F1");
+}
+{
+  const file = { id: "F-folder", name: "visit.txt", mimeType: "text/plain", size: "400",
+    createdTime: "2020-01-01T00:00:00Z", parents: ["medical"] };
+  const r = await toEnvelope(tok, file, { pathOf: () => "Provider Records/2025" }, {
+    fetchImpl: async () => bytes("A readable provider visit record with enough substance to pass the quality floor."), sleep: async () => {},
+  });
+  check("Drive envelopes preserve their folder for filtering", r.envelope.metadata.top_folder === "Provider Records", JSON.stringify(r.envelope.metadata));
+  check("Drive envelopes identify their platform", r.envelope.metadata.platform === "drive");
 }
 {
   // No filename date: createdTime is used, NOT modifiedTime. Storing modifiedTime

@@ -20,7 +20,7 @@
 import { jsonResponse, cachedJson, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
 import { scan as scanSecrets } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { drainOutbox, outboxDepth, forget, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import { drainOutbox, outboxDepth, forget, forgetFamilies, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 
 /* ------------------------------------------------------------ retrieval */
@@ -807,12 +807,23 @@ export default {
           return jsonResponse({ error: "invalid JSON body" }, 400);
         }
         const docUids = Array.isArray(body?.doc_uids) ? body.doc_uids.map(String) : [];
+        const families = Array.isArray(body?.families) ? body.families : [];
         const source = body?.source ? String(body.source) : null;
-        if (!docUids.length && !source) {
-          return jsonResponse({ error: "pass doc_uids: [...] or source: \"name\"" }, 400);
+        if (!docUids.length && !families.length && !source) {
+          return jsonResponse({ error: "pass doc_uids: [...], families: [...], or source: \"name\"" }, 400);
         }
         // Destructive and irreversible, so it must be asked for explicitly.
         const confirm = body?.confirm === true;
+        if (families.length) {
+          if (docUids.length || source || families.length > 50) {
+            return jsonResponse({ error: "families must be used alone and contain at most 50 entries" }, 400);
+          }
+          try {
+            return jsonResponse(await forgetFamilies(env, { families, dryRun: !confirm }));
+          } catch (error) {
+            return jsonResponse({ error: error.message }, 400);
+          }
+        }
         const r = await forget(env, { docUids, source, dryRun: !confirm });
         return jsonResponse(r);
       }

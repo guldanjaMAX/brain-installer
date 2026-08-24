@@ -127,22 +127,45 @@ const d1Backend = {
   async ingest(env, envelope) {
     const { source_type, source_id, content, title } = envelope;
     const docUid = `${source_type}:${source_id}`;
+    const md = envelope.metadata || {};
+    const owns = (key) => Object.prototype.hasOwnProperty.call(md, key);
+    const hasClient = owns("client_name") || owns("client");
+    const hasCategory = owns("category");
+    const hasTopFolder = owns("top_folder");
+    const hasPlatform = owns("platform");
+    const incomingClient = md.client_name || md.client || null;
+    const incomingCategory = md.category || null;
+    const incomingTopFolder = md.top_folder || null;
+    const incomingPlatform = md.platform || null;
+    const docDate = envelope.occurred_at ? Date.parse(envelope.occurred_at) : null;
     const geometry = chunkGeometry(env);
     // Geometry is part of storage identity. A deploy that corrects chunk size
     // must re-chunk unchanged documents on their next ingest instead of taking
     // the content-only no-op path forever.
     const hash = await sha256Hex(`chunk-v1:${geometry.size}:${geometry.overlap}\0${content}`);
 
-    const prior = await env.DB.prepare("SELECT content_hash FROM documents WHERE doc_uid = ?1")
+    const prior = await env.DB.prepare(
+      `SELECT content_hash, title, document_date, date_reliable, client, category, top_folder, platform
+       FROM documents WHERE doc_uid = ?1`
+    )
       .bind(docUid)
       .first();
-    // Identical content is a no-op, not a rewrite. Re-ingesting the whole
-    // corpus must be cheap or nobody will ever re-run it.
-    if (prior && prior.content_hash === hash) {
+    // Identical content AND filter identity is a no-op. Folder moves and title
+    // changes still have to rewrite chunks because both the embedded header and
+    // Vectorize metadata changed. Missing incoming metadata is not a request to
+    // erase a richer migration record.
+    const metadataChanged = prior && (
+      (title != null && title !== prior.title) ||
+      (envelope.date_reliable && Number.isFinite(docDate) && docDate !== prior.document_date) ||
+      (hasClient && incomingClient !== prior.client) ||
+      (hasCategory && incomingCategory !== prior.category) ||
+      (hasTopFolder && incomingTopFolder !== prior.top_folder) ||
+      (hasPlatform && incomingPlatform !== prior.platform)
+    );
+    if (prior && prior.content_hash === hash && !metadataChanged) {
       return { doc_uid: docUid, action: "unchanged", chunks: 0, queued: 0 };
     }
 
-    const docDate = envelope.occurred_at ? Date.parse(envelope.occurred_at) : null;
     const now = Date.now();
 
     await env.DB.prepare(
@@ -151,23 +174,30 @@ const d1Backend = {
                               top_folder, platform, ingested_at, content_hash, meta)
        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
        ON CONFLICT(doc_uid) DO UPDATE SET
-         title=excluded.title, document_date=excluded.document_date,
-         date_source=excluded.date_source, date_reliable=excluded.date_reliable,
-         client=excluded.client, category=excluded.category,
-         top_folder=excluded.top_folder, platform=excluded.platform,
+         title=COALESCE(excluded.title, documents.title),
+         uri=COALESCE(excluded.uri, documents.uri),
+         document_date=CASE
+           WHEN excluded.date_reliable = 1 OR documents.document_date IS NULL THEN excluded.document_date
+           ELSE documents.document_date END,
+         date_source=CASE
+           WHEN excluded.date_reliable = 1 OR documents.document_date IS NULL THEN excluded.date_source
+           ELSE documents.date_source END,
+         date_reliable=MAX(COALESCE(documents.date_reliable, 0), COALESCE(excluded.date_reliable, 0)),
+         client=CASE WHEN ?16 = 1 THEN excluded.client ELSE documents.client END,
+         category=CASE WHEN ?17 = 1 THEN excluded.category ELSE documents.category END,
+         top_folder=CASE WHEN ?18 = 1 THEN excluded.top_folder ELSE documents.top_folder END,
+         platform=CASE WHEN ?19 = 1 THEN excluded.platform ELSE documents.platform END,
          ingested_at=excluded.ingested_at, content_hash=excluded.content_hash,
-         meta=excluded.meta`
+         meta=json_patch(COALESCE(documents.meta, '{}'), excluded.meta)`
     )
       .bind(
         docUid, source_type, String(source_id), title ?? null, envelope.uri ?? null,
         Number.isFinite(docDate) ? docDate : null,
         envelope.date_source ?? (docDate ? "provided" : null),
         envelope.date_reliable ? 1 : 0,
-        (envelope.metadata || {}).client_name || (envelope.metadata || {}).client || null,
-        (envelope.metadata || {}).category || null,
-        (envelope.metadata || {}).top_folder || null,
-        (envelope.metadata || {}).platform || null,
-        now, hash, JSON.stringify(envelope.metadata || {})
+        incomingClient, incomingCategory, incomingTopFolder, incomingPlatform,
+        now, hash, JSON.stringify(md),
+        hasClient ? 1 : 0, hasCategory ? 1 : 0, hasTopFolder ? 1 : 0, hasPlatform ? 1 : 0
       )
       .run();
 
@@ -175,11 +205,16 @@ const d1Backend = {
     // the previous version behind, answering questions from text that is gone.
     await d1.replaceDocumentChunks(env, docUid);
 
-    const md = envelope.metadata || {};
-    const client = md.client_name || md.client || null;
-    const category = md.category || null;
-    const topFolder = md.top_folder || null;
-    const platform = md.platform || null;
+    // Use the merged document row for chunks too. Otherwise the document would
+    // preserve a migrated `medical` category while its replacement vectors
+    // silently lost that filter.
+    const merged = await env.DB.prepare(
+      "SELECT client, category, top_folder, platform FROM documents WHERE doc_uid = ?1"
+    ).bind(docUid).first();
+    const client = merged?.client || null;
+    const category = merged?.category || null;
+    const topFolder = merged?.top_folder || null;
+    const platform = merged?.platform || null;
     const header = title ? `[${title}]` : "";
     const pieces = chunkText(content, { header, ...geometry });
     const chunks = pieces.map((text, i) => ({

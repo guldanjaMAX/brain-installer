@@ -7,7 +7,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { replaceDocumentChunks, upsertChunks, drainOutbox, forget } from "../worker/src/lib/store-d1.js";
+import { replaceDocumentChunks, upsertChunks, drainOutbox, forget, forgetFamilies } from "../worker/src/lib/store-d1.js";
 import { storeFor } from "../worker/src/lib/store.js";
 
 let fail = 0, ran = 0;
@@ -75,7 +75,7 @@ function makeEnv({ deleteThrows = false } = {}) {
     occurred_at: "2025-08-20T12:00:00Z",
     metadata: {
       client_name: "James", category: "medical",
-      top_folder: "Provider Records", platform: "drive",
+      top_folder: "Provider Records", platform: "drive", migrated_from: "legacy-drive",
     },
   };
 
@@ -97,6 +97,31 @@ function makeEnv({ deleteThrows = false } = {}) {
   check("the removed tail is queued for Vectorize deletion", queuedDeletes === first.chunks - 1, `queued=${queuedDeletes} first=${first.chunks}`);
   await drainOutbox(env, { embed: async () => [0.2] });
   check("drain physically removes every old tail vector", deleted.length === first.chunks - 1, JSON.stringify(deleted));
+
+  const moved = await store.ingest(env, {
+    ...base,
+    content: "short replacement",
+    metadata: { top_folder: "Current Records", platform: "drive" },
+  });
+  check("a folder-only change is an update rather than a content no-op", moved.action === "updated", JSON.stringify(moved));
+  const movedDoc = db.prepare("SELECT client, category, top_folder, platform, meta FROM documents").get();
+  const movedChunk = db.prepare("SELECT client, category, top_folder, platform FROM chunks LIMIT 1").get();
+  check("partial connector metadata preserves richer migrated filters",
+    movedDoc.client === "James" && movedDoc.category === "medical" && movedDoc.top_folder === "Current Records",
+    JSON.stringify(movedDoc));
+  check("the merged filters reach replacement chunks and vectors",
+    movedChunk.client === "James" && movedChunk.category === "medical" && movedChunk.top_folder === "Current Records",
+    JSON.stringify(movedChunk));
+  check("unrelated migration provenance survives the metadata merge", JSON.parse(movedDoc.meta).migrated_from === "legacy-drive", movedDoc.meta);
+
+  const rootMove = await store.ingest(env, {
+    ...base,
+    content: "short replacement",
+    metadata: { top_folder: null, platform: "drive" },
+  });
+  check("moving a file to Drive root clears its stale folder filter",
+    rootMove.action === "updated" && db.prepare("SELECT top_folder FROM documents").get().top_folder === null,
+    JSON.stringify(rootMove));
 }
 
 const insertDocument = (db, uid, source = "drive") => db.prepare(
@@ -108,6 +133,34 @@ const insertChunk = (db, uid, doc, ix, vectorId = uid) => db.prepare(
   `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, vector_id)
    VALUES (?, ?, ?, ?, 'drive', ?)`
 ).run(uid, doc, ix, `old text ${ix}`, vectorId);
+
+/* Split-document reconciliation keeps the new shape and removes every old one. */
+{
+  const { env, db } = makeEnv();
+  for (const uid of [
+    "drive:file", "drive:file#part1of3", "drive:file#part2of3", "drive:file#part3of3",
+    "drive:file#part1of2", "drive:file#part2of2", "drive:other",
+  ]) {
+    insertDocument(db, uid);
+    insertChunk(db, `${uid}#0`, uid, 0);
+  }
+  const cleaned = await forgetFamilies(env, {
+    families: [{
+      base_doc_uid: "drive:file",
+      keep_doc_uids: ["drive:file#part1of2", "drive:file#part2of2"],
+    }],
+    dryRun: false,
+  });
+  const left = db.prepare("SELECT doc_uid FROM documents ORDER BY doc_uid").all().map((row) => row.doc_uid);
+  check("split-family cleanup removes the prior base and obsolete part count", cleaned.documents === 4, JSON.stringify(cleaned));
+  check("split-family cleanup keeps every new part and unrelated document",
+    left.join(",") === "drive:file#part1of2,drive:file#part2of2,drive:other", JSON.stringify(left));
+
+  const deleted = await forgetFamilies(env, {
+    families: [{ base_doc_uid: "drive:file", keep_doc_uids: [] }], dryRun: false,
+  });
+  check("a source deletion removes the whole split family", deleted.documents === 2 && db.prepare("SELECT count(*) n FROM documents WHERE doc_uid LIKE 'drive:file%'").get().n === 0, JSON.stringify(deleted));
+}
 
 /* A shorter document turns only its removed tail into a vector delete. */
 {

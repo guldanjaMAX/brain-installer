@@ -494,6 +494,16 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   check("individual documents can be removed by id", b.documents === 1, JSON.stringify(b));
 }
 {
+  const { env } = mkForgetEnv();
+  const r = await post(env, "/api/admin/brain/forget", {
+    families: [{ base_doc_uid: "drive:F1", keep_doc_uids: ["drive:F1#part1of2", "drive:F1#part2of2"] }],
+    confirm: true,
+  });
+  check("split-document families have an authenticated cleanup route", r.status === 200, String(r.status));
+  check("a family keep id outside its base is refused",
+    (await post(env, "/api/admin/brain/forget", { families: [{ base_doc_uid: "drive:F1", keep_doc_uids: ["drive:F2"] }] })).status === 400);
+}
+{
   // The document is already unreachable at this point; a caller told "deleted"
   // while vectors remain still deserves to know.
   const { env } = mkForgetEnv({ vectorThrows: true });
