@@ -54,7 +54,8 @@ async function ingestLib() {
     throw e;
   }
 }
-import { authorize, loadTokens, saveTokens, createTokenProvider, tokenPath, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
+import { authorize, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
+import { scan as scanSecrets, GATE_VERSION as CREDENTIAL_GATE_VERSION } from "./worker/src/lib/secret-scan.js";
 import { run } from "./doctor.mjs";
 import { runAll as doctorRunAll, summarize as doctorSummarize, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
 
@@ -1636,11 +1637,118 @@ export function driveConnectorConfig(m, manifestPath, read = (path) => readFileS
   };
 }
 
+/** Stable identity for the policy that decides which Drive files may be indexed. */
+export function credentialScannerFingerprint(enabled = true, gateVersion = CREDENTIAL_GATE_VERSION) {
+  return createHash("sha256").update(JSON.stringify({ enabled: Boolean(enabled), gateVersion })).digest("hex");
+}
+
+export function drivePolicyFingerprint(config = {}, scannerEnabled = true) {
+  const normalized = {};
+  for (const key of ["excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
+    normalized[key] = [...new Set((config[key] || []).map((value) => String(value)))].sort();
+  }
+  normalized.credentialScanner = credentialScannerFingerprint(scannerEnabled);
+  return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+
+export const DRIVE_FULL_SWEEP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Decide whether Drive's fast change feed is enough or a full truth sweep is due. */
+export function driveSyncDecision({
+  reset = false,
+  syncToken = null,
+  policyFingerprint = "",
+  savedPolicyFingerprint = "",
+  lastFullSweepAt = null,
+  now = Date.now(),
+  maxAgeMs = DRIVE_FULL_SWEEP_MAX_AGE_MS,
+} = {}) {
+  if (reset) return { incremental: false, reason: "reset requested" };
+  if (!syncToken) return { incremental: false, reason: "no saved change token" };
+  if (!policyFingerprint || policyFingerprint !== savedPolicyFingerprint) {
+    return { incremental: false, reason: "Drive source policy changed" };
+  }
+  const last = Date.parse(String(lastFullSweepAt || ""));
+  if (!Number.isFinite(last) || now - last >= maxAgeMs) {
+    return { incremental: false, reason: "the periodic full Drive comparison is due" };
+  }
+  return { incremental: true, reason: "saved change token is current" };
+}
+
 export function completedDriveFamilyPlans(plans, acceptedCounts) {
   return (plans || []).filter((plan) => acceptedCounts.get(plan.stateKey) === plan.expectedParts);
 }
 
+/**
+ * A streamed split document can cross a request boundary. It is settled only
+ * after every part has been sent, and complete only when every part has an
+ * accepted receipt. Callers may then save the version (and, for Drive, remove
+ * obsolete family members) without retaining the extracted corpus in memory.
+ */
+export function remoteFamilyOutcomes(plans, sentCounts, acceptedCounts) {
+  const settled = [...(plans || [])].filter(
+    (plan) => Number(sentCounts.get(plan.stateKey) || 0) >= plan.expectedParts
+  );
+  return {
+    completed: settled.filter(
+      (plan) => Number(acceptedCounts.get(plan.stateKey) || 0) === plan.expectedParts
+    ),
+    incomplete: settled.filter(
+      (plan) => Number(acceptedCounts.get(plan.stateKey) || 0) !== plan.expectedParts
+    ),
+  };
+}
+
 export const sourceCursorCanAdvance = (tally) => Number(tally?.failed || 0) === 0;
+
+const INGEST_RESULT_STATUSES = new Set(["created", "updated", "unchanged", "refused", "failed"]);
+
+/**
+ * Require one acknowledged result for every document sent in a batch.
+ *
+ * The top-level counters are informational. Cursor safety depends on the
+ * per-document receipt because a truncated response can otherwise say
+ * `failed: 0` while silently omitting a document that was never stored.
+ */
+export function validateBatchReceipt(body, group) {
+  if (!body || !Array.isArray(body.results)) {
+    throw new Error("the response has no per-document results array");
+  }
+  const expected = new Map();
+  for (const item of group || []) {
+    const sourceId = String(item?.envelope?.source_id || "");
+    if (!sourceId) throw new Error("a sent document has no source_id");
+    if (expected.has(sourceId)) throw new Error(`the request contains duplicate source_id ${sourceId}`);
+    expected.set(sourceId, item);
+  }
+
+  const received = new Set();
+  for (const result of body.results) {
+    const sourceId = String(result?.source_id || "");
+    if (!expected.has(sourceId)) throw new Error(`the response acknowledged an unknown source_id ${sourceId || "(empty)"}`);
+    if (received.has(sourceId)) throw new Error(`the response acknowledged source_id ${sourceId} more than once`);
+    if (!INGEST_RESULT_STATUSES.has(String(result?.status || ""))) {
+      throw new Error(`the response used an unknown status for source_id ${sourceId}`);
+    }
+    received.add(sourceId);
+  }
+  const missing = [...expected.keys()].filter((sourceId) => !received.has(sourceId));
+  if (missing.length) {
+    throw new Error(`${missing.length} sent document(s) were not acknowledged, including ${missing[0]}`);
+  }
+  return body.results;
+}
+
+/** Refuse a complete logical document before any size-based splitting. */
+export function credentialRefusalOf(envelope, enabled = true) {
+  if (!enabled || typeof envelope?.content !== "string") return null;
+  const result = scanSecrets(envelope.content);
+  if (!result.shouldRefuse) return null;
+  return {
+    reason: `refused: carries ${result.labels.join(", ")}`,
+    labels: result.labels,
+  };
+}
 
 /**
  * Refuse to write a secret somewhere it will be published or lost.
@@ -1801,7 +1909,8 @@ async function reportFreshness(m, acct, manifestPath) {
   const LABEL = {
     ok: () => c.green("current"),
     stale: (s) => c.red(`STALE, ${s.days_since_ingest}d since last read`),
-    broken: (s) => c.red(`BROKEN: ${s.reason}`),
+    broken: (s) => c.red(`BROKEN: ${s.reason || "the last sync failed"}`),
+    indexing: (s) => c.yellow(`indexing, ${s.hours_indexing ?? 0}h elapsed`),
     never_synced: () => c.red("never synced"),
     unscheduled: () => c.yellow("no refresh scheduled"),
     manual: (s) => c.dim(`manual, ${s.days_since_ingest ?? "?"}d since last load`),
@@ -2289,7 +2398,7 @@ async function cmdIngest(manifestPath) {
     );
   }
   if (!existsSync(root)) die(`no such folder: ${root}`);
-  const { walk, prepare, batchStream, loadState, saveState } = await ingestLib();
+  const { walk, prepare, batchStream, splitOversized, loadState, saveState } = await ingestLib();
 
   const sourceName = assertSourceName(flags.source === true ? null : flags.source || "upload");
   // A dry run sends nothing, so it must not demand credentials it will never
@@ -2305,16 +2414,30 @@ async function cmdIngest(manifestPath) {
   }
 
   const statePath = join(dirname(resolve(manifestPath)), `.brain-ingest-${sourceName}.json`);
-  const state = flags.reset ? { version: 1, done: {}, skipped: {} } : loadState(statePath);
+  const savedState = loadState(statePath);
+  const state = flags.reset
+    ? { version: 1, done: {}, skipped: {}, ...(savedState.removed ? { removed: savedState.removed } : {}) }
+    : savedState;
+  const previouslyKnownKeys = new Set(Object.keys(savedState.done || {}));
+  const scannerOn = m.safety?.credential_scanner?.enabled !== false;
+  const scannerFingerprint = credentialScannerFingerprint(scannerOn);
+  const scannerPolicyChanged = state.credential_scanner_fingerprint !== scannerFingerprint;
   const alreadyDone = Object.keys(state.done).length;
   if (alreadyDone && !flags.reset) info(`resuming: ${alreadyDone} file(s) already loaded`);
 
   const privatePrefixes = m.safety?.private_path_prefixes || [];
   info(`walking ${root}`);
-  const { files, skipped: walkSkips } = walk(root, { privatePrefixes });
+  const { files, skipped: walkSkips, complete: walkComplete } = walk(root, { privatePrefixes });
   info(`${files.length} candidate file(s), ${walkSkips.length} skipped during the walk`);
   if (privatePrefixes.length) {
     info(`private prefixes enforced: ${privatePrefixes.join(", ")}`);
+  }
+  if (!walkComplete) {
+    await reportSkips(walkSkips);
+    die(
+      "the folder could not be read completely, so nothing was sent and no prior document was removed.\n" +
+        "      Fix the reported permission or filesystem error, then re-run the same command."
+    );
   }
 
   const limited = flags.limit ? files.slice(0, parseInt(flags.limit, 10)) : files;
@@ -2322,6 +2445,35 @@ async function cmdIngest(manifestPath) {
 
   const skips = [...walkSkips];
   const notes = [];
+  const intentionalRemovalKeys = new Set();
+  const normalizedPrivatePaths = walkSkips
+    .filter((skip) => skip.reason === "matched a private path prefix from the manifest")
+    .map((skip) => String(skip.path).split(sep).join("/").replace(/^\.\//, "").replace(/\/$/, ""));
+  const privateRemovalKeys = [...previouslyKnownKeys].filter((key) => normalizedPrivatePaths.some(
+    (path) => key === path || key.startsWith(`${path}/`)
+  ));
+  const privateRemovalSet = new Set(privateRemovalKeys);
+  const candidateLocalKeys = new Set(files.map((file) => String(file.rel).split(sep).join("/")));
+  const missingScannerKeys = [...previouslyKnownKeys].filter(
+    (key) => !candidateLocalKeys.has(key) && !privateRemovalSet.has(key)
+  );
+  if (!dry && scannerPolicyChanged && missingScannerKeys.length) {
+    die(
+      `${missingScannerKeys.length} previously-indexed file(s) are not present under this folder, so the current scanner cannot recheck them safely.\n` +
+        "      Nothing was removed. Use the original source folder, or forget this source explicitly before replacing it."
+    );
+  }
+  const limitedLocalKeys = new Set(limited.map((file) => String(file.rel).split(sep).join("/")));
+  const limitedMissesPrior = [...previouslyKnownKeys].some(
+    (key) => candidateLocalKeys.has(key) && !privateRemovalSet.has(key) && !limitedLocalKeys.has(key)
+  );
+  if (!dry && scannerPolicyChanged && limitedMissesPrior) {
+    die(
+      "--limit cannot be used while previously-indexed files need a credential-scanner recheck.\n" +
+        "      Run without --limit so every prior document is rechecked before the new scanner is marked complete."
+    );
+  }
+  const scannerRescanSkips = [];
   let unchanged = 0;
   let split = 0;
   let scanned = 0;
@@ -2334,15 +2486,37 @@ async function cmdIngest(manifestPath) {
     const r = await prepare(f, { sourceName });
     if (r.note) notes.push({ path: f.rel, note: r.note });
     const key = r.envelope ? r.envelope.source_id : f.rel;
-    if (r.hash && state.done[key] === r.hash) {
+    if (!scannerPolicyChanged && r.hash && state.done[key] === r.hash) {
       unchanged++;
       return { unchanged: true };
     }
     if (r.skip) {
       state.skipped[r.skip.path] = r.skip.reason;
+      if (scannerPolicyChanged && previouslyKnownKeys.has(key)) scannerRescanSkips.push(r.skip);
       return { skip: r.skip };
     }
-    return { hash: r.hash, envelope: r.envelope, rel: f.rel };
+    const refusal = credentialRefusalOf(r.envelope, scannerOn);
+    if (refusal) {
+      const skip = { path: f.rel, reason: refusal.reason };
+      state.skipped[f.rel] = refusal.reason;
+      intentionalRemovalKeys.add(key);
+      return { skip };
+    }
+    const envelopes = splitOversized(r.envelope);
+    return {
+      hash: r.hash,
+      envelopes,
+      rel: f.rel,
+      stateKey: key,
+      deferState: true,
+      familyPlan: {
+        stateKey: key,
+        hash: r.hash,
+        expectedParts: envelopes.length,
+        base_doc_uid: `${sourceName}:${key}`,
+        keep_doc_uids: envelopes.map((envelope) => `${sourceName}:${envelope.source_id}`),
+      },
+    };
   };
 
   if (flags["dry-run"]) {
@@ -2357,6 +2531,10 @@ async function cmdIngest(manifestPath) {
       scanned += group.length;
     }
     process.stdout.write("\r");
+    await applyDriveRemovals({
+      uids: [...new Set([...privateRemovalKeys, ...intentionalRemovalKeys])].map((key) => `${sourceName}:${key}`),
+      base, adminKey, state, dryRun: true, label: "local source truth",
+    });
     info(`${scanned} document(s) would be sent; ${unchanged} unchanged; ${skips.length} skipped`);
     reportNotes(notes);
     console.log("");
@@ -2372,9 +2550,26 @@ async function cmdIngest(manifestPath) {
     return;
   }
 
-  if (dbId) await recordSourceStart(acct.id, dbId, sourceName, "upload");
+  const sourceRunId = dbId ? await recordSourceStart(acct.id, dbId, sourceName, "upload", "manual") : null;
+
+  const pendingLocalUids = Object.keys(state.removed || {});
+  if (pendingLocalUids.length) {
+    const retried = await applyDriveRemovals({
+      uids: pendingLocalUids, base, adminKey, state, dryRun: false, label: "pending local source removal",
+    });
+    saveState(statePath, state);
+    assertNoPendingRemovals(retried, "pending local source removal");
+    for (const uid of pendingLocalUids) {
+      if (uid.startsWith(`${sourceName}:`)) delete state.done[uid.slice(sourceName.length + 1)];
+    }
+    saveState(statePath, state);
+  }
 
   const tally = { created: 0, updated: 0, unchanged: 0, refused: 0, failed: 0 };
+  const familyPlans = new Map();
+  const sentFamilyParts = new Map();
+  const acceptedFamilyParts = new Map();
+  const rejectedFamilyParts = new Map();
   let batchNo = 0;
   for await (const group of batchStream(limited, prepareOne, {
     onSkip: (sk) => skips.push(sk),
@@ -2383,12 +2578,91 @@ async function cmdIngest(manifestPath) {
     },
   })) {
     batchNo++;
-    const t = await sendBatches({ base, adminKey, groups: [group], state, statePath, skips, quiet: true });
+    for (const item of group) if (item.familyPlan) familyPlans.set(item.familyPlan.stateKey, item.familyPlan);
+    let t;
+    try {
+      t = await sendBatches({
+        base, adminKey, groups: [group], state, statePath, skips, quiet: true,
+        onResult: (item, result) => {
+          const key = item.familyPlan?.stateKey;
+          if (!key) return;
+          if (["created", "updated", "unchanged"].includes(result.status)) {
+            acceptedFamilyParts.set(key, (acceptedFamilyParts.get(key) || 0) + 1);
+          } else {
+            const statuses = rejectedFamilyParts.get(key) || [];
+            statuses.push(result.status);
+            rejectedFamilyParts.set(key, statuses);
+          }
+        },
+      });
+    } catch (error) {
+      const touched = [...new Map(group.filter((item) => item.familyPlan)
+        .map((item) => [item.familyPlan.stateKey, item.familyPlan])).values()];
+      if (touched.length) {
+        await reconcileDocumentFamilies({
+          families: touched.map((plan) => ({ base_doc_uid: plan.base_doc_uid, keep_doc_uids: [] })),
+          base, adminKey,
+        });
+      }
+      throw error;
+    }
     for (const k of Object.keys(tally)) tally[k] += t[k] || 0;
+    for (const item of group) {
+      const key = item.familyPlan?.stateKey;
+      if (key) sentFamilyParts.set(key, (sentFamilyParts.get(key) || 0) + 1);
+    }
+    const outcome = remoteFamilyOutcomes(familyPlans.values(), sentFamilyParts, acceptedFamilyParts);
+    const reconciliation = [
+      ...outcome.completed.map((plan) => ({ base_doc_uid: plan.base_doc_uid, keep_doc_uids: plan.keep_doc_uids })),
+      ...outcome.incomplete.map((plan) => ({ base_doc_uid: plan.base_doc_uid, keep_doc_uids: [] })),
+    ];
+    if (reconciliation.length) await reconcileDocumentFamilies({ families: reconciliation, base, adminKey });
+    for (const plan of outcome.completed) state.done[plan.stateKey] = plan.hash;
+    for (const plan of outcome.incomplete) {
+      delete state.done[plan.stateKey];
+      const statuses = [...new Set(rejectedFamilyParts.get(plan.stateKey) || ["failed"])];
+      state.skipped[plan.stateKey] = `logical document was not indexed because part status was ${statuses.join(", ")}`;
+    }
+    for (const plan of [...outcome.completed, ...outcome.incomplete]) {
+      familyPlans.delete(plan.stateKey);
+      sentFamilyParts.delete(plan.stateKey);
+      acceptedFamilyParts.delete(plan.stateKey);
+      rejectedFamilyParts.delete(plan.stateKey);
+    }
+    if (outcome.completed.length || outcome.incomplete.length) saveState(statePath, state);
     process.stdout.write(`\r  batch ${batchNo}  loaded ${tally.created + tally.updated}  refused ${tally.refused}  failed ${tally.failed}   `);
   }
   process.stdout.write("\n");
   reportNotes(notes);
+
+  const localRemovalKeys = [...new Set([...privateRemovalKeys, ...intentionalRemovalKeys])];
+  const localRemoval = await applyDriveRemovals({
+    uids: localRemovalKeys.map((key) => `${sourceName}:${key}`),
+    base, adminKey, state, dryRun: false, label: "local source truth",
+  });
+  saveState(statePath, state);
+  assertNoPendingRemovals(localRemoval, "local source truth removal");
+  for (const key of localRemovalKeys) delete state.done[key];
+
+  if (scannerRescanSkips.length) {
+    saveState(statePath, state);
+    if (dbId) {
+      await recordSourceFinish(acct.id, dbId, sourceName, {
+        documents: Object.keys(state.done).length,
+        added: tally.created + tally.updated,
+        skipped: skips.length,
+        failed: scannerRescanSkips.length,
+        runId: sourceRunId,
+      });
+    }
+    die(
+      `${scannerRescanSkips.length} previously-indexed file(s) could not be rechecked by the current credential scanner.\n` +
+        "      Their prior revision was preserved, and the scanner upgrade was not marked complete. Fix the reported files and re-run."
+    );
+  }
+
+  state.credential_scanner_fingerprint = scannerFingerprint;
+  saveState(statePath, state);
 
   if (dbId) {
     await recordSourceFinish(acct.id, dbId, sourceName, {
@@ -2396,6 +2670,7 @@ async function cmdIngest(manifestPath) {
       added: tally.created + tally.updated,
       skipped: skips.length,
       failed: tally.failed,
+      runId: sourceRunId,
     });
   }
 
@@ -2410,14 +2685,27 @@ async function cmdIngest(manifestPath) {
 
 
 /** Mark a source as being loaded. Registers it on first run. */
-async function recordSourceStart(acctId, dbId, name, kind) {
+async function recordSourceStart(acctId, dbId, name, kind, lane = "manual") {
   const now = new Date().toISOString();
+  const startedAt = Date.parse(now);
+  const runId = `sync_${randomBytes(16).toString("hex")}`;
   await d1Query(
     acctId, dbId,
-    "INSERT INTO sources (name, kind, status, created_at) VALUES (?,?,'indexing',?) " +
-      "ON CONFLICT(name) DO UPDATE SET status='indexing'",
+    "INSERT INTO sources (name, kind, status, created_at, stale_reason) VALUES (?,?,'indexing',?,NULL) " +
+      "ON CONFLICT(name) DO UPDATE SET status='indexing', stale_reason=NULL",
     [name, kind, now]
   ).catch(() => {});
+  await d1Query(
+    acctId, dbId,
+    "UPDATE sync_runs SET finished_at=?, error=COALESCE(error,'superseded by a later sync attempt') WHERE source=? AND finished_at IS NULL",
+    [startedAt, name]
+  ).catch(() => {});
+  await d1Query(
+    acctId, dbId,
+    "INSERT INTO sync_runs (run_id,source,lane,started_at) VALUES (?,?,?,?)",
+    [runId, name, lane, startedAt]
+  ).catch(() => {});
+  return runId;
 }
 
 /**
@@ -2427,13 +2715,21 @@ async function recordSourceStart(acctId, dbId, name, kind) {
  * the authority, and `brain sources` prints both so drift is visible instead of
  * being quietly believed.
  */
-async function recordSourceFinish(acctId, dbId, name, { documents, added, skipped, failed }) {
+async function recordSourceFinish(acctId, dbId, name, { documents, added, skipped, failed, runId = null }) {
   const now = new Date().toISOString();
   await d1Query(
     acctId, dbId,
-    "UPDATE sources SET status=?, last_ingest_at=?, document_count=? WHERE name=?",
-    [failed ? "error" : "ready", now, documents, name]
+    "UPDATE sources SET status=?, last_ingest_at=CASE WHEN ?=0 THEN ? ELSE last_ingest_at END, " +
+      "document_count=?, stale_reason=CASE WHEN ?=0 THEN NULL ELSE ? END WHERE name=?",
+    [failed ? "error" : "ready", failed, now, documents, failed, failed ? `${failed} document(s) failed` : null, name]
   ).catch(() => {});
+  if (runId) {
+    await d1Query(
+      acctId, dbId,
+      "UPDATE sync_runs SET finished_at=?, walk_complete=?, docs_added=?, error=? WHERE run_id=?",
+      [Date.parse(now), failed ? 0 : 1, added, failed ? `${failed} document(s) failed` : null, runId]
+    ).catch(() => {});
+  }
   await d1Query(
     acctId, dbId,
     "INSERT INTO source_events (source_name, event, at, documents, detail) VALUES (?,'ingest',?,?,?)",
@@ -2441,12 +2737,100 @@ async function recordSourceFinish(acctId, dbId, name, { documents, added, skippe
   ).catch(() => {});
 }
 
+/** A destructive response is trusted only when it proves it is the forget API. */
+export function validateForgetReceipt(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new Error("the forget response is not a JSON object");
+  }
+  if (body.dry_run !== false) throw new Error("the forget response did not confirm a real deletion");
+  for (const field of ["documents", "chunks", "vectors"]) {
+    if (!Number.isFinite(Number(body[field])) || Number(body[field]) < 0) {
+      throw new Error(`the forget response has no valid ${field} count`);
+    }
+  }
+  if (!Array.isArray(body.targets)) throw new Error("the forget response has no targets array");
+  return body;
+}
+
+async function parseForgetResponse(res) {
+  const raw = await res.text();
+  let body = null;
+  try { body = JSON.parse(raw); } catch { /* validated below */ }
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${body?.error || raw.slice(0, 160) || "forget failed"}`);
+  try {
+    return validateForgetReceipt(body);
+  } catch (error) {
+    throw new Error(`${error.message}; received HTTP ${res.status}`);
+  }
+}
+
+export function assertNoPendingRemovals(result, label = "source deletion") {
+  if (Number(result?.pending || 0) > 0) {
+    throw new Error(
+      `${result.pending} ${label}(s) could not be confirmed. The source cursor was not advanced; re-run to retry them.`
+    );
+  }
+  return result;
+}
+
+/** Read every live logical document uid for one source from the data plane. */
+export async function listStoredSourceFamilies({ base, adminKey, source }) {
+  const normalizedSource = assertSourceName(source);
+  const families = new Set();
+  const seenCursors = new Set();
+  let cursor = "";
+  for (;;) {
+    if (seenCursors.has(cursor)) throw new Error("source-family inventory repeated a cursor");
+    seenCursors.add(cursor);
+    const query = new URLSearchParams({ source: normalizedSource, limit: "1000" });
+    if (cursor) query.set("cursor", cursor);
+    const res = await http(`${base}/api/admin/brain/source-families?${query}`, {
+      headers: { "X-Admin-Key": adminKey },
+    }, { what: "the source-family inventory" });
+    const raw = await res.text();
+    let body = null;
+    try { body = JSON.parse(raw); } catch { /* validated below */ }
+    if (!res.ok || !body || body.source !== normalizedSource || !Array.isArray(body.families)) {
+      throw new Error(
+        `source-family inventory was not accepted (${res.status}): ${body?.error || raw.slice(0, 160) || "invalid response"}`
+      );
+    }
+    if (body.families.length > 1000) {
+      throw new Error("source-family inventory exceeded its requested page size");
+    }
+    let previous = cursor;
+    for (const uid of body.families) {
+      if (typeof uid !== "string" || !uid.startsWith(`${normalizedSource}:`)) {
+        throw new Error("source-family inventory returned an invalid document uid");
+      }
+      if (uid <= previous) {
+        throw new Error("source-family inventory was not strictly ordered");
+      }
+      families.add(uid);
+      previous = uid;
+    }
+    if (body.next_cursor === null) return families;
+    if (typeof body.next_cursor !== "string" || !body.next_cursor.startsWith(`${normalizedSource}:`)) {
+      throw new Error("source-family inventory returned an invalid next cursor");
+    }
+    if (!body.families.length || body.next_cursor !== body.families[body.families.length - 1]) {
+      throw new Error("source-family inventory next cursor does not close its returned page");
+    }
+    cursor = body.next_cursor;
+  }
+}
+
 /** Apply Drive deletions and policy exclusions in bounded, retryable groups. */
 async function applyDriveRemovals({ uids, base, adminKey, state, dryRun, label = "Drive deletion" }) {
   const targets = [...new Set((uids || []).map(String).filter(Boolean))];
   if (!targets.length) return { applied: 0, pending: 0 };
   if (dryRun) {
-    warn(`${targets.length} file(s) ${label === "source policy" ? "match the exclusion policy and WOULD be removed from the brain" : "were deleted or trashed in Drive and WOULD be removed from the brain"}`);
+    const preview = label === "source policy"
+      ? "match the exclusion policy and WOULD be removed from the brain"
+      : label === "intentional source skip"
+        ? "are no longer eligible for indexing and WOULD be removed from the brain"
+        : "were removed at the source and WOULD be removed from the brain";
+    warn(`${targets.length} file(s) ${preview}`);
     return { applied: 0, pending: 0 };
   }
 
@@ -2465,8 +2849,10 @@ async function applyDriveRemovals({ uids, base, adminKey, state, dryRun, label =
         confirm: true,
       }),
     });
-    const out = await res.json().catch(() => ({}));
-    if (!res.ok || out.dry_run) {
+    let out;
+    try {
+      out = await parseForgetResponse(res);
+    } catch {
       state.removed = {
         ...(state.removed || {}),
         ...Object.fromEntries(group.map((uid) => [uid, new Date().toISOString()])),
@@ -2485,7 +2871,7 @@ async function applyDriveRemovals({ uids, base, adminKey, state, dryRun, label =
 }
 
 /** Remove obsolete oversized parts only after every replacement part landed. */
-async function reconcileDriveFamilies({ families, base, adminKey }) {
+async function reconcileDocumentFamilies({ families, base, adminKey }) {
   let removed = 0;
   for (let i = 0; i < families.length; i += 50) {
     const group = families.slice(i, i + 50);
@@ -2494,16 +2880,83 @@ async function reconcileDriveFamilies({ families, base, adminKey }) {
       headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
       body: JSON.stringify({ families: group, confirm: true }),
     });
-    const out = await res.json().catch(() => ({}));
-    if (!res.ok || out.dry_run) {
+    let out;
+    try {
+      out = await parseForgetResponse(res);
+    } catch (error) {
       die(
-        `Drive split-document cleanup failed (${res.status}). The sync cursor was not advanced.\n` +
+        `Drive split-document cleanup failed (${res.status}): ${error.message}. The sync cursor was not advanced.\n` +
         "      Re-running the same ingest is safe and will retry the cleanup."
       );
     }
     removed += Number(out.documents || 0);
   }
   return removed;
+}
+
+/**
+ * A limited Drive walk cannot save a source cursor safely. A full listing and
+ * listChanges() both return a cursor for the COMPLETE result window; slicing
+ * that result on the client and saving its cursor permanently skips everything
+ * beyond the slice. Previewing is safe because a dry run saves no cursor.
+ */
+export function assertRemoteLimitSafe({ source = "Drive", limit = Infinity, dryRun = false, incremental = false } = {}) {
+  if (Number.isFinite(limit) && !dryRun) {
+    die(
+      `--limit cannot be used on a real ${incremental ? "incremental" : "full"} ${source} sync. Google issues the next cursor` + "\n" +
+        "      or history marker for the complete result window, so saving it after a client-side limit would permanently" + "\n" +
+        "      skip every remaining file. Remove --limit for the real run. A limited --dry-run is safe."
+    );
+  }
+  return true;
+}
+
+export function assertDriveLimitSafe(options = {}) {
+  return assertRemoteLimitSafe({ source: "Drive", ...options });
+}
+
+/** Post one connector lifecycle receipt through the installed brain itself. */
+export async function postSourceReceipt(base, adminKey, receipt, request = http) {
+  const res = await request(`${base}/api/admin/brain/source-receipt`, {
+    method: "POST",
+    headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+    body: JSON.stringify(receipt),
+  }, { timeoutMs: 30_000, what: "the source freshness receipt" });
+  const raw = await res.text();
+  let body = null;
+  try { body = JSON.parse(raw); } catch { /* checked below */ }
+  const identityMatches = body?.source === receipt.source &&
+    (!receipt.run_id || body?.run_id === receipt.run_id);
+  if (!res.ok || !body || body.status !== receipt.status || !identityMatches) {
+    throw new Error(
+      `source freshness receipt was not accepted (${res.status}): ${body?.error || raw.slice(0, 160) || "invalid response"}`
+    );
+  }
+  return body;
+}
+
+/** Set or clear the freshness expectation owned by an installed scheduler. */
+export async function postSourceExpectation(base, adminKey, {
+  source,
+  kind = "drive",
+  expected_refresh_seconds,
+}, request = http) {
+  const normalizedSource = assertSourceName(source);
+  const res = await request(`${base}/api/admin/brain/source-expectation`, {
+    method: "POST",
+    headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+    body: JSON.stringify({ source: normalizedSource, kind, expected_refresh_seconds }),
+  }, { timeoutMs: 30_000, what: "the source freshness expectation" });
+  const raw = await res.text();
+  let body = null;
+  try { body = JSON.parse(raw); } catch { /* checked below */ }
+  if (!res.ok || !body || body.source !== normalizedSource ||
+      body.expected_refresh_seconds !== expected_refresh_seconds) {
+    throw new Error(
+      `source freshness expectation was not accepted (${res.status}): ${body?.error || raw.slice(0, 160) || "invalid response"}`
+    );
+  }
+  return body;
 }
 
 
@@ -2520,37 +2973,184 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     die(`--from ${which} is not a source. Available: drive, gmail.`);
   }
 
-  const sourceName = flags.source === true || !flags.source ? which : flags.source;
-  const acct = await resolveAccount(m);
-  const dbId = m.infrastructure?.cloudflare?.d1_database_id;
-  const base = await resolveBaseUrl(m, acct);
-  const adminKey = resolveAdminKey(manifestPath);
-  if (!adminKey && !flags["dry-run"]) die("no admin key found: not in the environment, and no .brain-admin-key file next to the manifest.");
+  const sourceName = assertSourceName(flags.source === true || !flags.source ? which : flags.source);
+  const dry = !!flags["dry-run"];
+  // A deployed connector talks to the brain's authenticated data-plane route.
+  // The Cloudflare control token is an install/deploy credential, not something
+  // a daily Drive or Gmail refresh should retain forever. A dry run talks only
+  // to Google, so it resolves neither Cloudflare nor the brain's admin secret.
+  const acct = dry ? null : m.brain?.domain ? null : await resolveAccount(m);
+  const base = dry ? null : await resolveBaseUrl(m, acct);
+  const adminKey = dry ? null : resolveAdminKey(manifestPath);
+  if (!adminKey && !dry) die("no admin key found: not in the environment, and no .brain-admin-key file next to the manifest.");
 
-  const { batches, splitOversized, loadState, saveState } = await ingestLib();
+  const { batchStream, splitOversized, loadState, saveState } = await ingestLib();
   const getToken = googleAuth(which === "gmail" ? "gmail" : "drive");
   const statePath = join(dirname(resolve(manifestPath)), `.brain-ingest-${sourceName}.json`);
   const state = flags.reset ? { version: 1, done: {}, skipped: {} } : loadState(statePath);
-  const limit = flags.limit ? parseInt(flags.limit, 10) : Infinity;
-
-  const ready = [];
-  const skips = [];
-  let unchanged = 0;
-  let scanned = 0;
-  // Held back until every batch has been accepted. See the note at its
-  // assignment: advancing a sync cursor early loses documents silently.
-  let pendingCursor = null;
-  const familyPlans = [];
-  const acceptedFamilyParts = new Map();
-
+  const scannerOn = m.safety?.credential_scanner?.enabled !== false;
+  const scannerFingerprint = credentialScannerFingerprint(scannerOn);
+  const scannerPolicyChanged = state.credential_scanner_fingerprint !== scannerFingerprint;
+  const limit = flags.limit ? Number(flags.limit) : Infinity;
+  if (flags.limit && (!Number.isInteger(limit) || limit < 1)) die("--limit must be a positive whole number.");
+  let sourcePolicy = null;
+  let policyFingerprint = null;
+  let driveDecision = null;
   if (which === "drive") {
-    const drive = await import("./connectors/google-drive.mjs");
-    let sourcePolicy;
     try {
       sourcePolicy = driveConnectorConfig(m, manifestPath);
     } catch (error) {
       die(error.message);
     }
+    policyFingerprint = drivePolicyFingerprint(sourcePolicy, scannerOn);
+    driveDecision = driveSyncDecision({
+      reset: !!flags.reset,
+      syncToken: state.sync_token,
+      policyFingerprint,
+      savedPolicyFingerprint: state.drive_policy_fingerprint,
+      lastFullSweepAt: state.drive_last_full_sweep_at,
+    });
+  }
+  let incremental = which === "drive"
+    ? driveDecision.incremental
+    : !flags.reset && !scannerPolicyChanged && Boolean(state.history_id);
+  assertRemoteLimitSafe({ source: which === "drive" ? "Drive" : "Gmail", limit, dryRun: dry, incremental });
+  let lane = incremental ? "incremental" : "sweep";
+  const runId = `sync_${randomBytes(16).toString("hex")}`;
+  const runStartedAt = new Date().toISOString();
+  let runOpened = false;
+  let runClosed = false;
+
+  const skips = [];
+  let unchanged = 0;
+  let scanned = 0;
+  let prepared = 0;
+  let batchNo = 0;
+  // Held back until every batch has been accepted. See the note at its
+  // assignment: advancing a sync cursor early loses documents silently.
+  let pendingCursor = null;
+  const familyPlans = new Map();
+  const sentFamilyParts = new Map();
+  const acceptedFamilyParts = new Map();
+  const rejectedFamilyParts = new Map();
+  const intentionalRemovalUids = [];
+  const tally = { created: 0, updated: 0, unchanged: 0, refused: 0, failed: 0 };
+
+  const addTally = (part) => {
+    for (const key of Object.keys(tally)) tally[key] += Number(part?.[key] || 0);
+  };
+
+  const flushIntentionalRemovals = async ({ strict = true } = {}) => {
+    const uids = intentionalRemovalUids.splice(0);
+    if (!uids.length) return { applied: 0, pending: 0 };
+    const result = await applyDriveRemovals({
+      uids, base, adminKey, state, dryRun: dry, label: "intentional source skip",
+    });
+    if (result.applied) ok(`${result.applied} previously-indexed document(s) removed because the source now skips them`);
+    if (!dry) saveState(statePath, state);
+    if (strict) assertNoPendingRemovals(result, "intentional source skip");
+    return result;
+  };
+
+  /**
+   * Send one bounded group and immediately make every fully accepted source
+   * document resumable. A split family may bridge two groups, so only its tiny
+   * plan and counters survive a yield; extracted strings do not.
+   */
+  const consumeGroup = async (group) => {
+    prepared += group.length;
+    batchNo++;
+    if (dry) return;
+
+    for (const item of group) {
+      if (item.familyPlan) familyPlans.set(item.familyPlan.stateKey, item.familyPlan);
+    }
+    let part;
+    try {
+      part = await sendBatches({
+        base, adminKey, groups: [group], state, statePath, skips, quiet: true,
+        onResult: (item, result) => {
+          if (!item.familyPlan) return;
+          const key = item.familyPlan.stateKey;
+          if (["created", "updated", "unchanged"].includes(result.status)) {
+            acceptedFamilyParts.set(key, (acceptedFamilyParts.get(key) || 0) + 1);
+          } else {
+            const statuses = rejectedFamilyParts.get(key) || [];
+            statuses.push(result.status);
+            rejectedFamilyParts.set(key, statuses);
+          }
+        },
+      });
+    } catch (error) {
+      const touched = [...new Map(group.filter((item) => item.familyPlan)
+        .map((item) => [item.familyPlan.stateKey, item.familyPlan])).values()];
+      if (touched.length) {
+        await reconcileDocumentFamilies({
+          families: touched.map((plan) => ({ base_doc_uid: plan.base_doc_uid, keep_doc_uids: [] })),
+          base, adminKey,
+        });
+      }
+      throw error;
+    }
+    addTally(part);
+    for (const item of group) {
+      if (!item.familyPlan) continue;
+      const key = item.familyPlan.stateKey;
+      sentFamilyParts.set(key, (sentFamilyParts.get(key) || 0) + 1);
+    }
+
+    const outcome = remoteFamilyOutcomes(familyPlans.values(), sentFamilyParts, acceptedFamilyParts);
+    const reconciliation = [
+      ...outcome.completed.map(({ base_doc_uid, keep_doc_uids }) => ({ base_doc_uid, keep_doc_uids })),
+      ...outcome.incomplete.map(({ base_doc_uid }) => ({ base_doc_uid, keep_doc_uids: [] })),
+    ];
+    if (reconciliation.length) {
+      const staleParts = await reconcileDocumentFamilies({ families: reconciliation, base, adminKey });
+      if (staleParts) ok(`${staleParts} obsolete split-document part(s) removed`);
+    }
+    for (const plan of outcome.completed) state.done[plan.stateKey] = plan.hash;
+    for (const plan of outcome.incomplete) {
+      delete state.done[plan.stateKey];
+      const statuses = [...new Set(rejectedFamilyParts.get(plan.stateKey) || ["failed"])];
+      state.skipped[plan.stateKey] = `logical document was not indexed because part status was ${statuses.join(", ")}`;
+    }
+    for (const plan of [...outcome.completed, ...outcome.incomplete]) {
+      familyPlans.delete(plan.stateKey);
+      sentFamilyParts.delete(plan.stateKey);
+      acceptedFamilyParts.delete(plan.stateKey);
+      rejectedFamilyParts.delete(plan.stateKey);
+    }
+    if (outcome.completed.length || outcome.incomplete.length) saveState(statePath, state);
+    process.stdout.write(
+      `\r  batch ${batchNo}  loaded ${tally.created + tally.updated}  refused ${tally.refused}  failed ${tally.failed}   `
+    );
+  };
+
+  try {
+  if (!dry) {
+    await postSourceReceipt(base, adminKey, {
+      source: sourceName, kind: which, status: "indexing", run_id: runId,
+      lane, started_at: runStartedAt, detail: `${which} ${lane} sync started`,
+    });
+    runOpened = true;
+
+    // A prior deletion or intentional-skip cleanup is part of source truth,
+    // regardless of whether the next run is Drive, Gmail, incremental, or a
+    // full sweep. Retry it before accepting a newer cursor.
+    const pending = Object.keys(state.removed || {});
+    if (pending.length) {
+      const retried = await applyDriveRemovals({
+        uids: pending, base, adminKey, state, dryRun: false, label: "pending source removal",
+      });
+      if (retried.applied) ok(`${retried.applied} previously-pending removal(s) applied`);
+      saveState(statePath, state);
+      assertNoPendingRemovals(retried, "pending source removal");
+    }
+  }
+
+  if (which === "drive") {
+    const drive = await import("./connectors/google-drive.mjs");
+    if (!incremental && state.sync_token) info(`${driveDecision.reason}; using a full Drive comparison`);
     if (sourcePolicy.excludeFileIds.length) info(`${sourcePolicy.excludeFileIds.length} reviewed Drive file-id exclusion(s) enforced`);
     if (sourcePolicy.excludePaths.length) info(`${sourcePolicy.excludePaths.length} Drive path exclusion(s) enforced`);
     if (sourcePolicy.privatePrefixes.length) info(`private path prefixes enforced in Drive: ${sourcePolicy.privatePrefixes.join(", ")}`);
@@ -2564,30 +3164,46 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       warn(`could not get a change token, so the next run will be a full walk: ${e.message.slice(0, 100)}`);
     }
 
-    const incremental = !flags.reset && state.sync_token;
     let files = [];
     if (incremental) {
       info("incremental sync from the saved change token");
-      const ch = await drive.listChanges(getToken, state.sync_token);
-      files = ch.changed;
-      nextSync = ch.nextToken || nextSync;
+      let ch = null;
+      try {
+        ch = await drive.listChanges(getToken, state.sync_token);
+      } catch (error) {
+        if (error?.status !== 410) throw error;
+        warn("the saved Drive change token is no longer usable, so this run is rebuilding source truth with a full comparison");
+        incremental = false;
+        lane = "sweep";
+      }
+      if (ch) {
+        files = ch.changed;
+        nextSync = ch.nextToken || nextSync;
       // Deletions are APPLIED, not merely recorded. A brain that keeps
       // answering from a document the client deleted in Drive is worse than one
       // that never had it: they believe it is gone.
-      if (ch.removed.length) {
+        if (ch.removed.length) {
         const uids = ch.removed.map((id) => `${sourceName}:${id}`);
         const removed = await applyDriveRemovals({
-          uids, base, adminKey, state, dryRun: !!flags["dry-run"], label: "Drive deletion",
+          uids, base, adminKey, state, dryRun: dry, label: "Drive deletion",
         });
         if (removed.applied) ok(`${removed.applied} document(s) removed to match Drive deletions`);
+        if (!dry) saveState(statePath, state);
+        assertNoPendingRemovals(removed, "Drive deletion");
+        }
+
+        // Drive emits the changed ancestor folder, not synthetic changes for
+        // all descendants. Expand now so a move under a private or excluded
+        // path cannot leave the subtree searchable until next week.
+        if (ch.changed.some((file) => file.mimeType === "application/vnd.google-apps.folder")) {
+          warn("a Drive folder changed, so this run is expanding to a full comparison of its descendants");
+          incremental = false;
+          lane = "sweep";
+          files = [];
+        }
       }
-      // Anything recorded as pending on an earlier run gets retried here.
-      const pending = Object.keys(state.removed || {});
-      if (pending.length && !flags["dry-run"]) {
-        const retried = await applyDriveRemovals({ uids: pending, base, adminKey, state, dryRun: false, label: "pending Drive deletion" });
-        if (retried.applied) ok(`${retried.applied} previously-pending deletion(s) applied`);
-      }
-    } else {
+    }
+    if (!incremental) {
       info("full walk of Drive");
       for await (const f of drive.listFiles(getToken)) {
         files.push(f);
@@ -2597,11 +3213,11 @@ async function cmdIngestRemote(m, manifestPath, flags) {
 
     // Resolve paths only after the complete page set has been seen. Drive does
     // not return parents before children, and API order must not decide policy.
-    state.drive_folders = drive.updateFolderIndex(files, state.drive_folders || {});
+    state.drive_folders = drive.updateFolderIndex(files, incremental ? (state.drive_folders || {}) : {});
     const pathOf = (file) => drive.folderPathFor(file, state.drive_folders);
     const excludedUids = [];
 
-    for (const f of files.slice(0, limit)) {
+    const prepareDrive = async (f) => {
       scanned++;
       const key = `${sourceName}:${f.id}`;
       const folder = pathOf(f);
@@ -2609,35 +3225,93 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       if (excluded) {
         const displayPath = [folder, f.name].filter(Boolean).join("/");
         const skip = { path: displayPath || f.name || f.id, id: f.id, reason: excluded };
-        skips.push(skip);
         state.skipped[key] = excluded;
         excludedUids.push(key);
-        continue;
+        return { skip };
       }
+
+      // The Drive listing already carries every field in driveVersion(). Check
+      // it before downloading or exporting bytes. This turns a periodic full
+      // sweep into cheap metadata verification for unchanged files while still
+      // noticing a rename or ancestor-folder move through the resolved path.
+      const listedVersion = drive.driveVersion(f, folder);
+      if (!scannerPolicyChanged && state.done[key] === listedVersion) {
+        unchanged++;
+        return { unchanged: true };
+      }
+
       const r = await drive.toEnvelope(getToken, f, { sourceName, pathOf });
-      if (!r) continue;
-      if (r.skip) { skips.push(r.skip); state.skipped[key] = r.skip.reason; continue; }
-      if (state.done[key] === r.version) { unchanged++; continue; }
+      if (!r) return null;
+      if (r.skip) {
+        state.skipped[key] = r.skip.reason;
+        intentionalRemovalUids.push(key);
+        return { skip: r.skip };
+      }
+      const refusal = credentialRefusalOf(r.envelope, scannerOn);
+      if (refusal) {
+        const skip = { path: r.envelope.title || f.name || f.id, id: f.id, reason: refusal.reason };
+        state.skipped[key] = refusal.reason;
+        intentionalRemovalUids.push(key);
+        return { skip };
+      }
       const envelopes = splitOversized(r.envelope);
-      familyPlans.push({
+      const familyPlan = {
         stateKey: key,
         hash: r.version,
         expectedParts: envelopes.length,
         base_doc_uid: key,
         keep_doc_uids: envelopes.map((envelope) => `${envelope.source_type}:${envelope.source_id}`),
-      });
-      for (const envelope of envelopes) ready.push({ hash: r.version, envelope, rel: f.name, stateKey: key, deferState: true });
+      };
       if (scanned % 200 === 0) process.stdout.write(`\r  scanned ${scanned}...   `);
+      return {
+        hash: r.version, envelopes, rel: f.name, stateKey: key,
+        deferState: true, familyPlan,
+      };
+    };
+
+    for await (const group of batchStream(files.slice(0, limit), prepareDrive, {
+      onSkip: (skip) => skips.push(skip),
+    })) {
+      await consumeGroup(group);
     }
     const policyRemoved = await applyDriveRemovals({
-      uids: excludedUids, base, adminKey, state, dryRun: !!flags["dry-run"], label: "source policy",
+      uids: excludedUids, base, adminKey, state, dryRun: dry, label: "source policy",
     });
     if (policyRemoved.applied) ok(`${policyRemoved.applied} document(s) removed to enforce the Drive source policy`);
+    if (!dry && excludedUids.length) saveState(statePath, state);
+    assertNoPendingRemovals(policyRemoved, "source policy removal");
+
+    // Change feeds tell us what Drive says changed. Only a complete listing can
+    // prove which previously-indexed files no longer exist or are no longer
+    // visible to this account. Compare logical family ids only after the walk
+    // and every ingest batch completed, then refuse to advance the cursor if
+    // any stale family cannot be removed.
+    if (!incremental && !dry) {
+      const seenUids = new Set(files.map((file) => `${sourceName}:${file.id}`));
+      const storedUids = await listStoredSourceFamilies({ base, adminKey, source: sourceName });
+      const vanishedUids = [...storedUids].filter((uid) => !seenUids.has(uid));
+      const vanished = await applyDriveRemovals({
+        uids: vanishedUids, base, adminKey, state, dryRun: false, label: "full-sweep source deletion",
+      });
+      if (vanished.applied) ok(`${vanished.applied} stale document(s) removed after the full Drive comparison`);
+      if (vanishedUids.length) saveState(statePath, state);
+      assertNoPendingRemovals(vanished, "full-sweep source deletion");
+    }
     // NOT saved yet. Advancing the cursor before the batches it covers have
     // been accepted means a mid-send failure permanently skips those documents:
     // the next run starts after them and no error is ever raised. It is written
     // only once every batch has landed.
-    pendingCursor = { key: "sync_token", value: nextSync };
+    pendingCursor = {
+      key: "sync_token",
+      value: nextSync,
+      statePatch: !incremental
+        ? {
+            drive_policy_fingerprint: policyFingerprint,
+            drive_last_full_sweep_at: new Date().toISOString(),
+            credential_scanner_fingerprint: scannerFingerprint,
+          }
+        : { credential_scanner_fingerprint: scannerFingerprint },
+    };
   } else {
     const gmail = await import("./connectors/gmail.mjs");
     let nextHistory = null;
@@ -2645,58 +3319,74 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       nextHistory = await gmail.currentHistoryId(getToken);
     } catch { /* a full list still works without it */ }
 
-    let ids = [];
-    if (!flags.reset && state.history_id) {
+    let ids;
+    if (incremental) {
       const h = await gmail.listHistory(getToken, state.history_id);
       if (h.expired) {
         warn("the saved Gmail history id is too old to answer from, so this is a full pass");
-        for await (const id of gmail.listMessages(getToken, { max: limit })) ids.push(id);
+        ids = gmail.listMessages(getToken, { max: limit });
       } else {
         info(`incremental: ${h.ids.length} new message(s)`);
-        ids = h.ids;
+        ids = h.ids.slice(0, limit);
       }
     } else {
-      for await (const id of gmail.listMessages(getToken, { max: limit })) ids.push(id);
+      ids = gmail.listMessages(getToken, { max: limit });
     }
 
-    for (const id of ids.slice(0, limit)) {
+    const prepareGmail = async (id) => {
       scanned++;
-      const key = `gmail:${id}`;
-      if (state.done[key]) { unchanged++; continue; }
+      const key = `${sourceName}:${id}`;
       const r = await gmail.toEnvelope(getToken, id, { sourceName });
-      if (r.skip) { skips.push(r.skip); state.skipped[key] = r.skip.reason; continue; }
-      for (const envelope of splitOversized(r.envelope)) ready.push({ hash: r.version, envelope, rel: id });
+      if (r.skip) {
+        state.skipped[key] = r.skip.reason;
+        intentionalRemovalUids.push(key);
+        return { skip: r.skip };
+      }
+      if (!scannerPolicyChanged && state.done[key] === r.version) {
+        unchanged++;
+        return { unchanged: true };
+      }
+      const refusal = credentialRefusalOf(r.envelope, scannerOn);
+      if (refusal) {
+        const skip = { path: r.envelope.title || id, id, reason: refusal.reason };
+        state.skipped[key] = refusal.reason;
+        intentionalRemovalUids.push(key);
+        return { skip };
+      }
+      const envelopes = splitOversized(r.envelope);
       if (scanned % 200 === 0) process.stdout.write(`\r  fetched ${scanned}...   `);
+      return {
+        hash: r.version, envelopes, rel: id, stateKey: key, deferState: true,
+        familyPlan: {
+          stateKey: key,
+          hash: r.version,
+          expectedParts: envelopes.length,
+          base_doc_uid: key,
+          keep_doc_uids: envelopes.map((envelope) => `${envelope.source_type}:${envelope.source_id}`),
+        },
+      };
+    };
+    for await (const group of batchStream(ids, prepareGmail, {
+      onSkip: (skip) => skips.push(skip),
+    })) {
+      await consumeGroup(group);
     }
-    pendingCursor = { key: "history_id", value: nextHistory || state.history_id };
+    pendingCursor = {
+      key: "history_id",
+      value: nextHistory || state.history_id,
+      statePatch: { credential_scanner_fingerprint: scannerFingerprint },
+    };
   }
   process.stdout.write("\r");
 
-  const groups = batches(ready);
-  info(`${scanned} scanned; ${ready.length} document(s) to send in ${groups.length} batch(es); ${unchanged} unchanged; ${skips.length} skipped`);
+  await flushIntentionalRemovals();
 
-  if (flags["dry-run"]) {
+  info(`${scanned} scanned; ${prepared} document(s) prepared in ${batchNo} batch(es); ${unchanged} unchanged; ${skips.length} skipped`);
+
+  if (dry) {
     ok("dry run, nothing was sent");
     await reportSkips(skips);
     return;
-  }
-
-  if (dbId) await recordSourceStart(acct.id, dbId, sourceName, which);
-  const tally = await sendBatches({
-    base, adminKey, groups, state, statePath, skips,
-    onAccepted: which === "drive"
-      ? (item) => acceptedFamilyParts.set(item.stateKey, (acceptedFamilyParts.get(item.stateKey) || 0) + 1)
-      : null,
-  });
-
-  if (which === "drive") {
-    const completedPlans = completedDriveFamilyPlans(familyPlans, acceptedFamilyParts);
-    const completeFamilies = completedPlans
-      .map(({ base_doc_uid, keep_doc_uids }) => ({ base_doc_uid, keep_doc_uids }));
-    const staleParts = await reconcileDriveFamilies({ families: completeFamilies, base, adminKey });
-    for (const plan of completedPlans) state.done[plan.stateKey] = plan.hash;
-    saveState(statePath, state);
-    if (staleParts) ok(`${staleParts} obsolete split-document part(s) removed`);
   }
 
   // Every batch landed, so it is now safe to say "we have everything up to
@@ -2704,18 +3394,25 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   // this line is the proof.
   if (pendingCursor && sourceCursorCanAdvance(tally)) {
     state[pendingCursor.key] = pendingCursor.value;
+    Object.assign(state, pendingCursor.statePatch || {});
     saveState(statePath, state);
   } else if (pendingCursor && tally.failed) {
     warn(`${tally.failed} document(s) failed, so the source cursor was NOT advanced; the next run will retry them`);
   }
-  if (dbId) {
-    await recordSourceFinish(acct.id, dbId, sourceName, {
-      documents: Object.keys(state.done).length,
-      added: tally.created + tally.updated,
-      skipped: skips.length,
-      failed: tally.failed,
-    });
-  }
+  const finalStatus = tally.failed ? "error" : "ready";
+  await postSourceReceipt(base, adminKey, {
+    source: sourceName, kind: which, status: finalStatus, run_id: runId,
+    lane, started_at: runStartedAt, completed_at: new Date().toISOString(),
+    complete_sweep: which === "drive" && !incremental,
+    walk_complete: tally.failed === 0,
+    files_seen: scanned,
+    docs_added: tally.created,
+    docs_updated: tally.updated,
+    docs_unchanged: unchanged + tally.unchanged,
+    detail: `${which} ${lane} sync ${finalStatus === "ready" ? "completed" : "completed with document failures"}; skipped=${skips.length}`,
+    ...(tally.failed ? { error: `${tally.failed} document(s) failed; the source cursor was not advanced` } : {}),
+  });
+  runClosed = true;
 
   ok(`${tally.created} created, ${tally.updated} updated, ${unchanged + tally.unchanged} unchanged`);
   if (tally.refused) warn(`${tally.refused} document(s) refused for carrying live credentials.`);
@@ -2723,10 +3420,41 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   await reportSkips(skips);
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
   await reportBacklog(manifestPath);
+  } catch (error) {
+    // The cursor is deliberately outside this path: it is written only after
+    // every batch and Drive family cleanup succeeds above. A thrown Drive/Gmail
+    // fetch therefore stays retryable and is also visible immediately instead
+    // of lingering as a green or anonymous `indexing` row.
+    if (intentionalRemovalUids.length && !dry) {
+      try {
+        await flushIntentionalRemovals({ strict: false });
+      } catch (cleanupError) {
+        warn(`the sync failed and source-skip cleanup could not finish: ${String(cleanupError?.message || cleanupError).slice(0, 160)}`);
+      }
+    }
+    if (runOpened && !runClosed) {
+      try {
+        await postSourceReceipt(base, adminKey, {
+          source: sourceName, kind: which, status: "error", run_id: runId,
+          lane, started_at: runStartedAt, completed_at: new Date().toISOString(),
+          walk_complete: false, files_seen: scanned,
+          error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
+          detail: `${which} ${lane} sync aborted before its cursor could advance`,
+        });
+        runClosed = true;
+      } catch (receiptError) {
+        warn(`the sync failed and its error receipt could not be recorded: ${String(receiptError?.message || receiptError).slice(0, 160)}`);
+      }
+    }
+    throw error;
+  }
 }
 
 /** POST every batch, recording progress after each so a stop is resumable. */
-async function sendBatches({ base, adminKey, groups, state, statePath, skips, quiet = false, onAccepted = null }) {
+async function sendBatches({
+  base, adminKey, groups, state, statePath, skips, quiet = false,
+  onAccepted = null, onResult = null,
+}) {
   // Loaded here rather than closed over: sendBatches is top-level and shared by
   // both ingest paths, so it cannot rely on a caller's destructured import.
   const { saveState } = await ingestLib();
@@ -2770,10 +3498,21 @@ async function sendBatches({ base, adminKey, groups, state, statePath, skips, qu
           "      Nothing was marked as loaded."
       );
     }
-    for (const k of Object.keys(tally)) tally[k] += body[k] || 0;
-    for (const r of body.results || []) {
-      const item = group.find((g) => g.envelope.source_id === r.source_id);
+    let results;
+    try {
+      results = validateBatchReceipt(body, group);
+    } catch (error) {
+      saveState(statePath, state);
+      die(
+        `batch ${n}/${groups.length} returned an incomplete ingest receipt: ${error.message}\n` +
+          "      Nothing missing was marked as loaded. Re-run the same command to retry it."
+      );
+    }
+    for (const r of results) {
+      tally[r.status]++;
+      const item = group.find((g) => String(g.envelope.source_id) === String(r.source_id));
       if (!item) continue;
+      if (onResult) onResult(item, r);
       // Remote connectors can keep their progress key namespaced even though
       // the ingest envelope carries the bare source id. That prevents both a
       // double-prefixed document uid and an every-run resend loop.
@@ -2841,7 +3580,7 @@ async function resolveBaseUrl(m, acct) {
  * brain connect google — the client authorises their OWN Google account.
  *
  * They register the OAuth client in their own Google Cloud project, and the
- * refresh token is written to their machine. We never see any of it. That is
+ * refresh token is stored securely on their machine. We never see any of it. That is
  * not only a custody preference: every Drive and Gmail read scope is RESTRICTED,
  * so one vendor-owned OAuth client serving many customers would require Google
  * verification plus a paid annual CASA security assessment.
@@ -2869,7 +3608,8 @@ async function cmdConnect(target) {
         "       gmail.com account choose External and then click PUBLISH APP, because an\n" +
         "       app left in Testing is issued refresh tokens that expire after 7 DAYS.\n" +
         "    4. Credentials, Create credentials, OAuth client ID, type Desktop app\n" +
-        `    5. Add the redirect URI: http://127.0.0.1:${flags.port || DEFAULT_PORT}\n\n` +
+        "       Desktop apps accept the local loopback callback automatically. Google Cloud\n" +
+        "       does not show or require a redirect-URI field for this client type.\n\n" +
         "  Then:\n" +
         "    export GOOGLE_CLIENT_ID='...'\n" +
         "    export GOOGLE_CLIENT_SECRET='...'\n" +
@@ -2895,7 +3635,7 @@ async function cmdConnect(target) {
     connected_at: new Date().toISOString(),
   };
   saveTokens(store);
-  ok(`connected. Token stored at ${tokenPath()} (mode 0600, on this machine only)`);
+  ok(`connected. Token stored in ${tokenStorageDescription()} (on this machine only)`);
   info(`now run: brain ingest <manifest> --from ${names[0]}`);
 }
 
@@ -3081,7 +3821,7 @@ async function cmdSetup(manifestPath) {
 
     const tmpl = JSON.parse(readFileSync(join(HERE, "templates", "brain.manifest.json"), "utf-8"));
     tmpl.client = { slug, display_name: display, primary_contact: "", timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
-    tmpl.brain = { version: tmpl.brain?.version || "0.1.0", worker_name: `${slug}-brain` };
+    tmpl.brain = { version: PRODUCT_VERSION, worker_name: `${slug}-brain` };
     const cf = tmpl.infrastructure.cloudflare;
     for (const k of ["d1_database_id", "vectorize_index", "kv_namespace_id"]) delete cf[k];
     delete cf.r2_bucket; // not wired to anything, so do not provision it
@@ -3485,7 +4225,7 @@ const [, , cmd, manifestPath] = process.argv;
 /** Chunks still awaiting embedding, or 0 if it cannot be determined. */
 async function backlogCount(manifestPath) {
   const { m } = loadManifest(manifestPath);
-  const acct = await resolveAccount(m);
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
   const base = await resolveBaseUrl(m, acct);
   const adminKey = resolveAdminKey(manifestPath);
   if (!adminKey) return 0;
@@ -3498,7 +4238,7 @@ async function backlogCount(manifestPath) {
 async function reportBacklog(manifestPath) {
   try {
     const { m } = loadManifest(manifestPath);
-    const acct = await resolveAccount(m);
+    const acct = m.brain?.domain ? null : await resolveAccount(m);
     const base = await resolveBaseUrl(m, acct);
     const adminKey = resolveAdminKey(manifestPath);
     if (!adminKey) return;
@@ -3766,6 +4506,79 @@ async function cmdDrain(manifestPath) {
   return { drained, remaining };
 }
 
+/** Install, inspect, or remove the standard per-client Drive scheduler. */
+async function cmdSchedule(manifestPath) {
+  if (!manifestPath) {
+    die("usage: brain schedule <manifest> [--install|--status|--remove]");
+  }
+  const flags = parseFlags(process.argv.slice(4));
+  const requested = ["install", "status", "remove"].filter((name) => flags[name]);
+  if (requested.length > 1) {
+    die("choose only one of --install, --status, or --remove");
+  }
+  const action = requested[0] || "status";
+  const { m } = loadManifest(manifestPath);
+  let dataPlane = null;
+  if (action === "install") {
+    const adminKey = resolveAdminKey(manifestPath);
+    if (!adminKey) {
+      die("no admin key found, so the Drive schedule cannot be reflected in source freshness.");
+    }
+    dataPlane = { base: await resolveBaseUrl(m, null), adminKey };
+  }
+  const {
+    installDriveScheduler,
+    statusDriveScheduler,
+    removeDriveScheduler,
+  } = await import("./operations/drive-scheduler.mjs");
+
+  const result = action === "install"
+    ? installDriveScheduler(manifestPath)
+    : action === "remove"
+      ? removeDriveScheduler(manifestPath)
+      : statusDriveScheduler(manifestPath);
+
+  for (const warning of result.warnings || []) warn(warning);
+  if (action === "install") {
+    await postSourceExpectation(dataPlane.base, dataPlane.adminKey, {
+      source: "drive", kind: "drive", expected_refresh_seconds: result.expectedRefreshSeconds,
+    });
+    ok(`Drive refresh installed for ${result.cron}`);
+    ok(`Drive freshness expectation set to ${result.expectedRefreshSeconds} seconds`);
+    info(`definition: ${result.plistPath}`);
+    info(`logs: ${result.stdoutPath} and ${result.stderrPath}`);
+    return result;
+  }
+  if (action === "remove") {
+    ok(result.removed || result.loaded ? "Drive refresh removed" : "Drive refresh was not installed");
+    try {
+      const adminKey = resolveAdminKey(manifestPath);
+      if (!adminKey) throw new Error("no admin key is available");
+      const base = await resolveBaseUrl(m, null);
+      await postSourceExpectation(base, adminKey, {
+        source: "drive", kind: "drive", expected_refresh_seconds: null,
+      });
+      ok("Drive freshness expectation cleared");
+    } catch (error) {
+      warn(`the local scheduler is removed, but its remote freshness expectation could not be cleared: ${String(error?.message || error).slice(0, 160)}`);
+    }
+    info(`logs preserved at ${result.stdoutPath} and ${result.stderrPath}`);
+    return result;
+  }
+
+  if (!result.installed) warn("Drive refresh is not installed on this Mac");
+  else if (!result.loaded) warn("Drive refresh has a definition but is not loaded by launchd");
+  else if (result.definitionDrift) warn("the installed Drive refresh does not match the current manifest; reinstall it");
+  else ok(`Drive refresh is installed for ${result.cron}`);
+  if (result.running) info(`a Drive sync is running as pid ${result.pid}`);
+  else if (result.lastRunSucceeded === false) warn(`the last scheduled run failed with exit code ${result.lastExitCode}`);
+  else if (result.lastRunSucceeded === true) ok(`the last scheduled run succeeded (${result.runs ?? 0} run(s) recorded)`);
+  if (result.scheduleError) warn(result.scheduleError);
+  info(`stdout: ${result.stdoutPath}`);
+  info(`stderr: ${result.stderrPath}`);
+  return result;
+}
+
 const commands = {
   setup: cmdSetup,
   doctor: cmdDoctor,
@@ -3789,6 +4602,7 @@ const commands = {
   eval: cmdEval,
   upgrade: cmdUpgrade,
   rollback: cmdRollback,
+  schedule: cmdSchedule,
 };
 
 if (IS_MAIN && (!cmd || !commands[cmd])) {
@@ -3812,6 +4626,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain ingest     <manifest> --path <dir>  load a folder into the brain
     brain ingest     <manifest> --from drive  load from a connected remote source
     brain mcp-config <manifest>            config to connect the client's AI tools
+    brain schedule   <manifest> --install  install unattended Drive refresh on macOS
 
   operate
     brain whatsnew   [manifest]            what changed in this version, and are you on it
@@ -3820,6 +4635,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain forget     <manifest>            remove one named source (destructive)
     brain upgrade    <manifest>            snapshot, migrate, deploy, verify
     brain rollback   <manifest> <bookmark> restore a D1 snapshot (destructive)
+    brain schedule   <manifest>            inspect unattended Drive refresh
+    brain schedule   <manifest> --remove   remove it and preserve its logs
 
   brain ingest takes --source <name>, --limit <n>, --dry-run, and --reset. It is
   resumable: re-run the same command to continue an interrupted load.
@@ -3830,7 +4647,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
   brain forget needs --source <name>, and --yes before it removes anything. Without
   --yes it prints exactly what would go and stops.
 
-  Requires CLOUDFLARE_API_TOKEN in the environment.
+  Provisioning and deployment require CLOUDFLARE_API_TOKEN. Routine source
+  refresh and health commands use the brain's domain and admin key instead.
 `);
   process.exit(cmd ? 1 : 0);
 }

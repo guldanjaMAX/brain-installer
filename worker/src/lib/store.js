@@ -168,6 +168,12 @@ const d1Backend = {
 
     const now = Date.now();
 
+    // `content_hash` is the commit marker for a complete document revision.
+    // Move it to a value that can never equal a real SHA-256 before touching the
+    // chunks, then commit the real hash only after every required write succeeds.
+    // This also covers metadata-only revisions: their content hash is unchanged,
+    // but their title/header and filter metadata still require rebuilt chunks.
+    const pendingHash = `pending:${hash}`;
     await env.DB.prepare(
       `INSERT INTO documents (doc_uid, source, source_id, title, uri, document_date,
                               date_source, date_reliable, client, category,
@@ -196,7 +202,7 @@ const d1Backend = {
         envelope.date_source ?? (docDate ? "provided" : null),
         envelope.date_reliable ? 1 : 0,
         incomingClient, incomingCategory, incomingTopFolder, incomingPlatform,
-        now, hash, JSON.stringify(md),
+        now, pendingHash, JSON.stringify(md),
         hasClient ? 1 : 0, hasCategory ? 1 : 0, hasTopFolder ? 1 : 0, hasPlatform ? 1 : 0
       )
       .run();
@@ -249,6 +255,13 @@ const d1Backend = {
       .bind(source_type, now)
       .run();
 
+    // Last write wins deliberately: only this turns the revision into an
+    // unchanged candidate on a later retry. Every operation needed for a usable
+    // document has completed before the marker advances.
+    await env.DB.prepare(
+      "UPDATE documents SET content_hash = ?2 WHERE doc_uid = ?1"
+    ).bind(docUid, hash).run();
+
     return {
       doc_uid: docUid,
       action: prior ? "updated" : "created",
@@ -261,6 +274,11 @@ const d1Backend = {
     const { results } = await env.DB.prepare(
       `SELECT s.source AS source_type, s.documents, s.chunks AS total,
               s.last_ingest_at,
+              (SELECT COUNT(DISTINCT COALESCE(
+                        CASE WHEN json_valid(d.meta) THEN json_extract(d.meta,'$.part_of') END,
+                        d.source_id
+                      ))
+                 FROM documents d WHERE d.source = s.source) AS logical_documents,
               s.chunks - COALESCE(o.pending, 0) AS embedded
        FROM corpus_stats s
        LEFT JOIN (SELECT c.source, count(*) AS pending
@@ -274,7 +292,9 @@ const d1Backend = {
         // to a document count sees permanent drift that is not real. A warning
         // that always fires is worse than no warning: it teaches people to
         // ignore the one time it means something.
-        documents: Number(r.documents || 0),
+        documents: Number(r.logical_documents || 0),
+        logical_documents: Number(r.logical_documents || 0),
+        stored_documents: Number(r.documents || 0),
         chunks: Number(r.total || 0),
         total: Number(r.total || 0),
         embedded: Number(r.embedded || 0),

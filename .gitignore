@@ -8,13 +8,10 @@ node_modules/
 # The template is tracked; real ones are not.
 manifests/
 *.manifest.local.json
+instances/*.manifest.json
 
-# James's OWN evaluation set and its baselines. It measures retrieval quality
-# against his real brain, so it names real clients, real prices, and his child's
-# school fee. It is already excluded from the published package by the allowlist
-# in package.json; keeping it out of git as well means the only copy lives on
-# his machine, which is the right default for that content even in a private
-# repo. Remove these two lines if the backup value ever outweighs that.
+# Real evaluation sets and baselines contain client-sensitive questions and
+# facts. The package ships only the blank template; filled sets stay local.
 eval/golden/
 eval/baselines/
 
@@ -26,3 +23,9 @@ eval/eval.config.local.json
 # Temporary migration receipts name private source ids and the isolated target.
 # They contain no credentials, but they are operational state rather than code.
 .brain-migration-*.json
+
+# Connector cursors and folder indexes contain private source IDs. They are
+# machine-local operational state and must never become a tracked artifact.
+.brain-ingest-*.json
+.brain-ingest-*.json.tmp-*
+docs/*-readiness-*.md

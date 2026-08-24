@@ -5,12 +5,13 @@ keyword search live in D1, vectors live in Vectorize, and the Worker fuses them.
 Nothing runs on our infrastructure, and nothing but a scoped token is held during
 the engagement.
 
-**Status: 0.1.0, pre-first-install.** Provisioning, retrieval, a resumable
-folder ingest with PDF and Office extraction, deletion, and the one-command
-`brain setup` are all verified end to end against real Cloudflare, on macOS.
-The Google Drive and Gmail connectors are complete and unit-tested but have not
-yet run against a real account. **Nothing has run on Windows yet.** See "What is
-not built" before promising anything to anyone.
+**Status: 0.1.9.** Provisioning, retrieval, resumable folder ingest, deletion,
+upgrade rollback, and `brain setup` are verified end to end against real
+Cloudflare on macOS. Google Drive OAuth and a bounded real-account ingest have
+also been verified. The complete Drive baseline is the remaining production
+field gate for this release. Gmail uses the same tested cursor and storage
+pipeline but has not completed a real-account production run. **Nothing has run
+on Windows yet.** See "What is not built" before promising anything to anyone.
 
 ---
 
@@ -189,8 +190,19 @@ Not only a custody preference: every Drive and Gmail read scope is *restricted*,
 so one vendor-owned OAuth client serving many customers would require Google
 verification plus a paid annual CASA security assessment. `brain connect google`
 prints the full console walkthrough when `GOOGLE_CLIENT_ID` is unset. The refresh
-token is written to `~/.brain/google-tokens.json` at mode 0600 and never
-transmitted.
+token is stored in the local macOS login Keychain by default and never
+transmitted. The Keychain item is deliberately identifiable as service
+`brain-installer.google-oauth`, account `local-google-connection`. Windows and
+Linux use an atomically replaced local file at `~/.brain/google-tokens.json`;
+macOS can explicitly select the same mode-0600 fallback with
+`BRAIN_GOOGLE_TOKEN_STORE=file`. A legacy macOS token file is deleted only after
+the full credential record has been written to Keychain and read back exactly.
+
+Choose OAuth client type **Desktop app**. Desktop clients accept the local
+loopback callback automatically. Google Cloud does not provide, or require, a
+field for manually adding `http://127.0.0.1:47811` as an authorised redirect
+URI. The connector sends that callback during sign-in and binds its temporary
+server to loopback only.
 
 **On a personal gmail.com account the consent screen must be PUBLISHED.** An app
 left in "Testing" is issued refresh tokens that expire after **seven days**, and
@@ -220,6 +232,60 @@ permission change rewrites it, and storing it once made 80% of a corpus look
 like it was written this year, silently disabling staleness reporting. Drive's
 `createdTime` is the fallback, and a date in the filename beats both.
 
+### Unattended Drive refresh on macOS
+
+`operations.ingest_cron` is the standard source of truth for the Drive refresh
+schedule. The reusable scheduler supports install, status and remove:
+
+```bash
+node operations/drive-scheduler.mjs install ./acme.manifest.json
+node operations/drive-scheduler.mjs status  ./acme.manifest.json
+node operations/drive-scheduler.mjs remove  ./acme.manifest.json
+```
+
+Install writes a per-user LaunchAgent under `~/Library/LaunchAgents`. It runs
+`brain ingest <manifest> --from drive`, uses macOS's native per-client advisory lock to prevent
+overlapping syncs, and writes separate stdout and stderr logs under
+`~/.brain/logs`. Remove preserves those logs as an audit trail. LaunchAgent
+calendar times use the Mac's local timezone; status reports a mismatch with
+`client.timezone` instead of silently presenting the wrong schedule. Cron fields
+are numeric; month and weekday names are not accepted today.
+
+`RunAtLoad` is deliberately false. A calendar firing missed while this Mac is
+asleep is coalesced by launchd and runs after wake. A firing missed while the
+Mac is powered off or the user is logged out is not caught up, so choose a
+schedule that overlaps the machine's normal logged-in hours.
+
+The plist contains paths, schedule data and a non-secret configuration hash
+only. Google credentials continue to come from the normal token store. The
+brain admin key uses the adjacent `.brain-admin-key` lookup unless the manifest
+declares a non-secret macOS Keychain locator. A direct manual run can use
+`ADMIN_KEY`, but LaunchAgents do not inherit Terminal exports:
+
+```json
+"operations": {
+  "ingest_cron": "0 9 * * *",
+  "admin_key_secret": "keychain://acme-brain-admin/owner",
+  "google_token_store": "auto"
+}
+```
+
+Only the service and account identifiers are stored. The scheduler reads the
+value at run time and places it only in the ingest child process. The installed
+configuration hash binds that Keychain locator and `brain.domain`; changing
+either in the manifest stops before Keychain access until the scheduler is
+reinstalled. The child receives a minimal allowlisted environment, so unrelated
+desktop credentials and all Cloudflare deployment credentials are absent.
+
+`google_token_store` persists the connection's storage choice because launchd
+does not inherit `BRAIN_GOOGLE_TOKEN_STORE=file` from the Terminal that ran
+OAuth. Use `auto` for the normal macOS Keychain default, or `file` only when that
+fallback was chosen deliberately. Status compares the installed plist with the
+current manifest and code paths, reports definition drift, and surfaces
+launchd's run count and last exit code. Windows and Linux schedulers are not
+built yet and fail with a platform-specific explanation rather than pretending
+the manifest schedule took effect.
+
 ---
 
 ## What is not built
@@ -227,11 +293,12 @@ like it was written this year, silently disabling staleness reporting. Drive's
 Read this before scoping an engagement.
 
 - **No interface.** curl plus an admin key. A non-technical owner cannot use it.
-- **Some manifest declarations are still inert.** Google Drive source policy is
-  wired. Other undeveloped corpora, everything under `operations`, most of
-  `retrieval`, `access.authorized_emails`, `kv_namespace` and `r2_bucket` are
-  read by nothing. `manifest.schema.json` marks the important boundaries. Do not
-  tell a client an unwired declaration takes effect.
+- **Some manifest declarations are still inert.** Google Drive source policy
+  and the macOS `operations.ingest_cron` scheduler are wired. Other undeveloped
+  corpora, health/report/webhook operations, most of `retrieval`,
+  `access.authorized_emails`, `kv_namespace` and `r2_bucket` are read by nothing.
+  `manifest.schema.json` marks the important boundaries. Do not tell a client an
+  unwired declaration takes effect.
 
 ---
 

@@ -13,6 +13,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 
 const NOW = Date.parse("2026-08-19T00:00:00Z");
 const daysAgo = (d) => new Date(NOW - d * 86400000).toISOString();
+const hoursAgo = (h) => NOW - h * 3600000;
 const mk = (rows) => ({ DB: { prepare: () => ({ all: async () => ({ results: rows }), bind() { return this; } }) } });
 const DAILY = 86400;
 
@@ -46,6 +47,47 @@ const DAILY = 86400;
   check("and names the cause verbatim, so it is actionable", /auth_expired/.test(g[0].detail), g[0].detail);
 }
 
+/* ---- connector-reported failure is broken immediately, schedule or not ---- */
+{
+  const rows = [{
+    name: "drive", kind: "drive", status: "error", last_ingest_at: daysAgo(0.1),
+    stale_reason: null, expected_refresh_seconds: null,
+  }];
+  const f = await freshnessReport(mk(rows), { now: NOW });
+  check("source status=error is surfaced as broken", f.sources[0]?.state === "broken", JSON.stringify(f));
+  check("a status-only error still has an actionable non-null reason",
+    /last sync reported an error/.test(f.sources[0]?.reason || ""), JSON.stringify(f.sources[0]));
+  check("the underlying source status is retained in the report",
+    f.sources[0]?.source_status === "error", JSON.stringify(f.sources[0]));
+  const g = await coverageGaps(mk(rows), { now: NOW });
+  check("a connector-reported error also qualifies retrieved answers",
+    g[0]?.type === "sync_broken" && /last sync reported an error/.test(g[0]?.detail || ""), JSON.stringify(g));
+}
+
+/* ---- a live run is distinct from a crashed or stuck run ---- */
+{
+  const active = {
+    name: "drive", kind: "drive", status: "indexing", indexing_started_at: hoursAgo(5),
+    last_ingest_at: daysAgo(1), expected_refresh_seconds: DAILY,
+  };
+  const atLimit = { ...active, name: "gmail", kind: "gmail", indexing_started_at: hoursAgo(6) };
+  const stuck = { ...active, name: "calendar", kind: "calendar", indexing_started_at: hoursAgo(6.01) };
+  const orphaned = { ...active, name: "drive-orphaned", indexing_started_at: null };
+  const f = await freshnessReport(mk([active, atLimit, stuck, orphaned]), { now: NOW });
+  const by = Object.fromEntries(f.sources.map((s) => [s.name, s]));
+  check("an indexing run younger than six hours remains in progress",
+    by.drive.state === "indexing" && by.drive.hours_indexing === 5, JSON.stringify(by.drive));
+  check("six hours exactly is not called stuck", by.gmail.state === "indexing", JSON.stringify(by.gmail));
+  check("an indexing run older than six hours is broken",
+    by.calendar.state === "broken" && /6 hour/.test(by.calendar.reason || ""), JSON.stringify(by.calendar));
+  check("an indexing row with no open run is treated as interrupted",
+    by["drive-orphaned"].state === "broken" && /no open sync run/.test(by["drive-orphaned"].reason || ""), JSON.stringify(by["drive-orphaned"]));
+
+  const g = await coverageGaps(mk([stuck]), { now: NOW });
+  check("a stuck run becomes a sync_broken answer gap",
+    g[0]?.type === "sync_broken" && /not completed/.test(g[0]?.detail || ""), JSON.stringify(g));
+}
+
 /* ---- never synced is distinct from stale ---- */
 {
   const g = await coverageGaps(mk([{ name: "drive", kind: "drive", last_ingest_at: null, expected_refresh_seconds: DAILY }]), { now: NOW });
@@ -73,9 +115,9 @@ const DAILY = 86400;
 /* ---- the report distinguishes what we can fix from what we cannot ---- */
 {
   const f = await freshnessReport(mk([
-    { name: "drive", kind: "drive", last_ingest_at: daysAgo(40), expected_refresh_seconds: DAILY, document_count: 900 },
-    { name: "documents", kind: "upload", last_ingest_at: daysAgo(400), document_count: 61 },
-    { name: "gmail", kind: "gmail", last_ingest_at: daysAgo(2), document_count: 10 },
+    { name: "drive", kind: "drive", status: "ready", last_ingest_at: daysAgo(40), expected_refresh_seconds: DAILY, document_count: 900 },
+    { name: "documents", kind: "upload", status: "ready", last_ingest_at: daysAgo(400), document_count: 61 },
+    { name: "gmail", kind: "gmail", status: "ready", last_ingest_at: daysAgo(2), document_count: 10 },
   ]), { now: NOW });
   const by = Object.fromEntries(f.sources.map((s) => [s.name, s]));
   check("an overdue connector reads stale", by.drive.state === "stale", JSON.stringify(by.drive));

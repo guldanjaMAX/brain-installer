@@ -47,18 +47,49 @@ export const DOWNLOAD_LIMIT = 8 * 1024 * 1024;
 const FOLDER_MIME = "application/vnd.google-apps.folder";
 
 const FIELDS =
-  "nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, trashed, parents, webViewLink, md5Checksum)";
+  "nextPageToken, incompleteSearch, files(id, name, mimeType, size, createdTime, modifiedTime, trashed, parents, webViewLink, md5Checksum)";
 
 /** Never worth fetching: they carry no text and cost a request each. */
 const SKIP_MIME = /^(image|video|audio)\//;
 
 export class DriveError extends Error {
-  constructor(message, status, reason) {
-    super(message);
+  constructor(message, status, reason, { retryable = false, cause } = {}) {
+    super(message, cause ? { cause } : undefined);
     this.name = "DriveError";
     this.status = status;
     this.reason = reason;
+    this.retryable = retryable;
   }
+}
+
+const retryDelay = (attempt) => Math.min(2 ** attempt * 1000, 32_000) + Math.random() * 1000;
+
+const errorMessage = (error) => {
+  const message = String(error?.message || error || "unknown error").trim();
+  return message || "unknown error";
+};
+
+/**
+ * Fetch failures that are about one particular file, rather than the health of
+ * the connector. These may be recorded as skips without making a completed
+ * changes page retry forever.
+ *
+ * Keep this list explicit. A broad `403 => skip` would turn a revoked token,
+ * disabled API or account-level policy failure into apparent success and let
+ * the changes cursor move past every affected file.
+ */
+const PERMANENT_FILE_REASONS = new Set([
+  "appNotAuthorizedToFile",
+  "cannotDownloadFile",
+  "exportSizeLimitExceeded",
+  "fileNotDownloadable",
+  "insufficientFilePermissions",
+]);
+
+export function isPermanentFileFailure(error) {
+  if (!(error instanceof DriveError)) return false;
+  if (error.status === 404) return true;
+  return PERMANENT_FILE_REASONS.has(String(error.reason || ""));
 }
 
 /**
@@ -68,28 +99,86 @@ export class DriveError extends Error {
  * for any other reason is a permission problem and must fail fast rather than
  * being retried into a long silence.
  */
-export async function api(getAccessToken, path, { search, raw = false, attempts = 5, fetchImpl = fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+export async function api(getAccessToken, path, {
+  search,
+  raw = false,
+  attempts = 5,
+  requestTimeoutMs = 60_000,
+  fetchImpl = fetch,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+} = {}) {
   let lastErr;
-  for (let i = 0; i < attempts; i++) {
-    const token = await getAccessToken({ force: i > 0 && lastErr?.status === 401 });
+  let forceRefresh = false;
+  let authRefreshAttempted = false;
+  const totalAttempts = Math.max(1, Number(attempts) || 1);
+  for (let i = 0; i < totalAttempts; i++) {
+    let token;
+    try {
+      token = await getAccessToken({ force: forceRefresh });
+      if (forceRefresh) {
+        authRefreshAttempted = true;
+        forceRefresh = false;
+      }
+    } catch (error) {
+      // invalid_grant and its equivalents require a person to reconnect. They
+      // are fatal immediately, while a transport/provider outage is retried and
+      // remains fatal after the retry budget. Neither is a document skip.
+      if (error?.needsReauth) throw error;
+      lastErr = new DriveError(
+        `access token could not be obtained: ${errorMessage(error)}`,
+        0,
+        "tokenRefreshError",
+        { retryable: true, cause: error },
+      );
+      if (i + 1 >= totalAttempts) throw lastErr;
+      await sleep(retryDelay(i));
+      continue;
+    }
+
     const url = new URL(path.startsWith("http") ? path : API + path);
     for (const [k, v] of Object.entries(search || {})) if (v != null) url.searchParams.set(k, String(v));
 
-    const res = await fetchImpl(url, { headers: { authorization: `Bearer ${token}` } });
-    if (res.ok) return raw ? new Uint8Array(await res.arrayBuffer()) : res.json();
+    let res;
+    try {
+      const signal = Number(requestTimeoutMs) > 0 && typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+        ? AbortSignal.timeout(Number(requestTimeoutMs))
+        : undefined;
+      res = await fetchImpl(url, { headers: { authorization: `Bearer ${token}` }, ...(signal ? { signal } : {}) });
+      if (res.ok) {
+        // Reading a response body can fail or hang independently of receiving
+        // its headers. Keep it inside the same retry boundary as fetch itself.
+        return raw ? new Uint8Array(await res.arrayBuffer()) : await res.json();
+      }
+    } catch (error) {
+      lastErr = new DriveError(
+        `Google API request or response failed: ${errorMessage(error)}`,
+        0,
+        "networkError",
+        { retryable: true, cause: error },
+      );
+      if (i + 1 >= totalAttempts) throw lastErr;
+      await sleep(retryDelay(i));
+      continue;
+    }
 
     const body = await res.json().catch(() => ({}));
     const reason = body?.error?.errors?.[0]?.reason || body?.error?.status || "";
+    // One 401 gets a forced access-token refresh. A second 401 is not a file
+    // quality problem; it is a broken connection and must abort the sync.
+    const retryAuth = res.status === 401 && !authRefreshAttempted;
     const retryable =
+      retryAuth ||
       res.status === 429 ||
       res.status >= 500 ||
       (res.status === 403 && /rateLimit|userRateLimit|quotaExceeded|backendError/i.test(reason));
 
-    lastErr = new DriveError(body?.error?.message || `HTTP ${res.status}`, res.status, reason);
+    lastErr = new DriveError(body?.error?.message || `HTTP ${res.status}`, res.status, reason, { retryable });
     if (!retryable) throw lastErr;
+    if (retryAuth) forceRefresh = true;
+    if (i + 1 >= totalAttempts) throw lastErr;
     // Exponential with jitter. Google's own guidance, and without the jitter a
     // large parallel walk re-collides on every retry.
-    await sleep(Math.min(2 ** i * 1000, 32_000) + Math.random() * 1000);
+    await sleep(retryDelay(i));
   }
   throw lastErr;
 }
@@ -113,6 +202,17 @@ export async function* listFiles(getAccessToken, { pageSize = 1000, query, opts 
       },
       ...opts,
     });
+    // With corpora=allDrives Google can answer 200 while explicitly admitting
+    // that some corpora were not searched. A full sweep uses absence as proof
+    // for deletion, so an incomplete page must abort before yielding even one
+    // file. The caller then withholds cleanup and its source cursor.
+    if (page.incompleteSearch === true) {
+      throw new DriveError(
+        "Google Drive reported an incomplete all-drives search; no full-sweep deletion was attempted",
+        200,
+        "incompleteSearch"
+      );
+    }
     for (const f of page.files || []) yield f;
     pageToken = page.nextPageToken;
   } while (pageToken);
@@ -219,6 +319,25 @@ const pathSegments = (value) => String(value || "").replace(/\\/g, "/").split("/
 const normalPath = (value) => pathSegments(value).join("/").toLowerCase();
 
 /**
+ * Everything that can change the stored document without changing its bytes.
+ *
+ * A Drive changes feed reports a moved parent folder, but it does not emit a
+ * change for every descendant. The periodic full sweep therefore has to notice
+ * that a child's resolved path changed even when its own modifiedTime and md5
+ * did not. Including the path also refreshes top_folder/private-path metadata
+ * after an ancestor rename or move.
+ */
+export function driveVersion(file, folderPath = "") {
+  return JSON.stringify([
+    String(file?.modifiedTime || ""),
+    String(file?.md5Checksum || file?.size || ""),
+    String(file?.name || ""),
+    String(file?.mimeType || ""),
+    pathSegments(folderPath).join("/"),
+  ]);
+}
+
+/**
  * Decide source-policy exclusions before downloading file bytes.
  *
  * Exact ids carry reviewed migration/dedupe decisions. Path rules are matched
@@ -248,8 +367,10 @@ export function exclusionReason(file, folderPath = "", {
     }
   }
 
-  const privateSet = new Set((privatePrefixes || []).map((x) => String(x).toLowerCase()));
-  const privatePart = pathSegments(fullPath).find((part) => privateSet.has(part.toLowerCase()));
+  const privateSet = [...new Set((privatePrefixes || []).map((x) => String(x).trim().toLowerCase()).filter(Boolean))];
+  const privatePart = pathSegments(fullPath).find((part) =>
+    privateSet.some((prefix) => part.toLowerCase().startsWith(prefix))
+  );
   if (privatePart) return `private path segment: ${privatePart}`;
   return null;
 }
@@ -288,6 +409,10 @@ export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYP
   try {
     buf = await fetchContent(getAccessToken, file, plan, opts);
   } catch (e) {
+    // Only a file-specific permanent condition is safe to forget. Network,
+    // server and auth failures must escape to the sync runner so it can record
+    // a failure and withhold the source cursor for a retry.
+    if (!isPermanentFileFailure(e)) throw e;
     return { skip: { path: file.name, id: file.id, reason: `could not be fetched: ${e.message.slice(0, 120)}` } };
   }
 
@@ -339,7 +464,7 @@ export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYP
     },
     // Drive's own change signal. Cheaper than hashing content we already have,
     // and it is what the changes feed reports against.
-    version: `${file.modifiedTime || ""}|${file.md5Checksum || file.size || ""}`,
+    version: driveVersion(file, folder),
     note: got.note || null,
   };
 }

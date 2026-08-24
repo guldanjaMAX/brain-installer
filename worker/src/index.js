@@ -20,7 +20,7 @@
 import { jsonResponse, cachedJson, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
 import { scan as scanSecrets } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { drainOutbox, outboxDepth, forget, forgetFamilies, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import { drainOutbox, outboxDepth, forget, forgetFamilies, listSourceFamilies, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 
 /* ------------------------------------------------------------ retrieval */
@@ -676,7 +676,36 @@ async function handleIngestBatch(env, request) {
   return jsonResponse({ ...tally, total: docs.length, results });
 }
 
-/** Record a completed bulk-load receipt against the authoritative D1 count. */
+const SOURCE_RECEIPT_STATUSES = new Set(["indexing", "ready", "error"]);
+const SOURCE_RUN_LANES = new Set(["incremental", "sweep", "manual"]);
+const SOURCE_KINDS = new Set(["drive", "gmail", "calendar", "slack", "notion", "upload"]);
+
+function receiptTimeMs(value, fallback = Date.now()) {
+  if (value === null || value === undefined || value === "") return fallback;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const receiptCount = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+};
+
+/**
+ * Record a connector lifecycle receipt against the authoritative D1 count.
+ *
+ * Omitting status retains the original completion-only contract (`ready`). A
+ * connector that wants truthful failure and stuck-run reporting sends:
+ *
+ *   indexing { run_id, lane, started_at }
+ *   ready    { run_id, completed_at, counters... }
+ *   error    { run_id, completed_at, error }
+ *
+ * This route is authenticated by the brain admin key, so an installed
+ * connector does not need a standing Cloudflare control-plane token merely to
+ * report its own progress.
+ */
 async function handleSourceReceipt(env, request) {
   if (backendOf(env) !== D1) return jsonResponse({ error: "source receipts apply to the d1 backend only" }, 400);
   let body;
@@ -691,31 +720,247 @@ async function handleSourceReceipt(env, request) {
     return jsonResponse({ error: "source must contain only lowercase letters, numbers, underscores or hyphens" }, 400);
   }
   const kind = String(body?.kind || (source === "drive" ? "drive" : "upload")).trim().toLowerCase();
-  if (!new Set(["drive", "gmail", "calendar", "slack", "notion", "upload"]).has(kind)) {
+  if (!SOURCE_KINDS.has(kind)) {
     return jsonResponse({ error: "unsupported source kind" }, 400);
   }
+  const status = String(body?.status || "ready").trim().toLowerCase();
+  if (!SOURCE_RECEIPT_STATUSES.has(status)) {
+    return jsonResponse({ error: "status must be indexing, ready, or error" }, 400);
+  }
+  const lane = String(body?.lane || "manual").trim().toLowerCase();
+  if (!SOURCE_RUN_LANES.has(lane)) {
+    return jsonResponse({ error: "lane must be incremental, sweep, or manual" }, 400);
+  }
+  const suppliedRunId = String(body?.run_id || "").trim();
+  const runId = suppliedRunId || (status === "indexing" ? crypto.randomUUID() : null);
+  if (runId && !/^[A-Za-z0-9_-]{1,128}$/.test(runId)) {
+    return jsonResponse({ error: "run_id must contain only letters, numbers, underscores, or hyphens" }, 400);
+  }
+
+  const detailDefault = status === "indexing" ? "sync started" : status === "error" ? "sync failed" : "bulk-load receipt";
+  const detail = String(body?.detail || detailDefault).replace(/\s+/g, " ").slice(0, 500);
+
+  if (status === "indexing") {
+    const startedMs = receiptTimeMs(body?.started_at);
+    const startedAt = new Date(startedMs).toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO sources (name,kind,status,created_at,stale_reason)
+         VALUES (?1,?2,'indexing',?3,NULL)
+         ON CONFLICT(name) DO UPDATE SET
+           kind=excluded.kind, status='indexing', stale_reason=NULL`
+      ).bind(source, kind, startedAt),
+      // A later attempt proves an older unfinished attempt is no longer live.
+      // Close it as superseded so it cannot poison freshness forever.
+      env.DB.prepare(
+        `UPDATE sync_runs
+            SET finished_at=?3, error=COALESCE(error,'superseded by a later sync attempt')
+          WHERE source=?1 AND finished_at IS NULL AND run_id<>?2`
+      ).bind(source, runId, startedMs),
+      env.DB.prepare(
+        `INSERT INTO sync_runs (run_id,source,lane,started_at)
+         VALUES (?1,?2,?3,?4)
+         ON CONFLICT(run_id) DO UPDATE SET
+           source=excluded.source, lane=excluded.lane, started_at=excluded.started_at,
+           finished_at=NULL, error=NULL`
+      ).bind(runId, source, lane, startedMs),
+      env.DB.prepare(
+        "INSERT INTO source_events (source_name,event,at,detail) VALUES (?1,'ingest',?2,?3)"
+      ).bind(source, startedAt, `status=indexing run_id=${runId} lane=${lane} ${detail}`.slice(0, 500)),
+    ]);
+    return jsonResponse({ source, kind, status, run_id: runId, lane, started_at: startedAt });
+  }
+
   const completedAt = body?.completed_at && Number.isFinite(Date.parse(body.completed_at))
     ? new Date(body.completed_at).toISOString()
     : new Date().toISOString();
-  const countRow = await env.DB.prepare("SELECT count(*) AS n FROM documents WHERE source = ?1").bind(source).first();
-  const documents = Number(countRow?.n || 0);
-  const detail = String(body?.detail || "bulk-load receipt").replace(/\s+/g, " ").slice(0, 500);
+  const completedMs = Date.parse(completedAt);
+  const startedMs = receiptTimeMs(body?.started_at, completedMs);
+  const countRow = await env.DB.prepare(
+    `SELECT COUNT(*) AS stored_documents,
+            COUNT(DISTINCT COALESCE(
+              CASE WHEN json_valid(meta) THEN json_extract(meta,'$.part_of') END,
+              source_id
+            )) AS logical_documents
+       FROM documents WHERE source = ?1`
+  ).bind(source).first();
+  // Split parts are physical documents in D1 but one source file. The source
+  // registry and connector state both count logical files, so comparing either
+  // of them to COUNT(*) produces permanent false drift on every large file.
+  const documents = Number(countRow?.logical_documents || 0);
+  const storedDocuments = Number(countRow?.stored_documents || 0);
+  const errorReason = status === "error"
+    ? String(body?.error || body?.reason || detail || "sync failed").replace(/\s+/g, " ").slice(0, 500)
+    : null;
+  const walkComplete = body?.walk_complete === true || (
+    status === "ready" && body?.walk_complete === undefined && body?.complete_sweep === true
+  );
+  const statements = [];
 
-  await env.DB.batch([
-    env.DB.prepare(
-      `INSERT INTO sources (name, kind, status, created_at, last_ingest_at, document_count, last_complete_sweep_at)
-       VALUES (?1,?2,'ready',?3,?3,?4,CASE WHEN ?5 = 1 THEN ?3 ELSE NULL END)
+  if (status === "ready") {
+    statements.push(env.DB.prepare(
+      `INSERT INTO sources (name, kind, status, created_at, last_ingest_at, document_count, last_complete_sweep_at, stale_reason)
+       VALUES (?1,?2,'ready',?3,?3,?4,CASE WHEN ?5 = 1 THEN ?3 ELSE NULL END,NULL)
        ON CONFLICT(name) DO UPDATE SET
          kind=excluded.kind, status='ready', last_ingest_at=excluded.last_ingest_at,
-         document_count=excluded.document_count,
+         document_count=excluded.document_count, stale_reason=NULL,
          last_complete_sweep_at=CASE WHEN ?5 = 1 THEN excluded.last_ingest_at ELSE sources.last_complete_sweep_at END`
-    ).bind(source, kind, completedAt, documents, body?.complete_sweep === true ? 1 : 0),
+    ).bind(source, kind, completedAt, documents, body?.complete_sweep === true ? 1 : 0));
+  } else {
+    // A failed attempt does not become the last successful ingest. Advancing
+    // last_ingest_at here would make a broken daily sync look current for the
+    // next day and a half.
+    statements.push(env.DB.prepare(
+      `INSERT INTO sources (name,kind,status,created_at,document_count,stale_reason)
+       VALUES (?1,?2,'error',?3,?4,?5)
+       ON CONFLICT(name) DO UPDATE SET
+         kind=excluded.kind, status='error', document_count=excluded.document_count,
+         stale_reason=excluded.stale_reason`
+    ).bind(source, kind, completedAt, documents, errorReason));
+  }
+
+  if (runId) {
+    statements.push(env.DB.prepare(
+      `INSERT INTO sync_runs
+         (run_id,source,lane,started_at,finished_at,walk_complete,files_seen,
+          docs_added,docs_updated,docs_unchanged,proposed_deletes,delete_action,refusal_reason,error)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+       ON CONFLICT(run_id) DO UPDATE SET
+         source=excluded.source, lane=excluded.lane, finished_at=excluded.finished_at,
+         walk_complete=excluded.walk_complete, files_seen=excluded.files_seen,
+         docs_added=excluded.docs_added, docs_updated=excluded.docs_updated,
+         docs_unchanged=excluded.docs_unchanged, proposed_deletes=excluded.proposed_deletes,
+         delete_action=excluded.delete_action, refusal_reason=excluded.refusal_reason,
+         error=excluded.error`
+    ).bind(
+      runId, source, lane, startedMs, completedMs,
+      walkComplete ? 1 : 0,
+      receiptCount(body?.files_seen), receiptCount(body?.docs_added),
+      receiptCount(body?.docs_updated), receiptCount(body?.docs_unchanged),
+      receiptCount(body?.proposed_deletes),
+      body?.delete_action ? String(body.delete_action).slice(0, 64) : null,
+      body?.refusal_reason ? String(body.refusal_reason).slice(0, 500) : null,
+      errorReason
+    ));
+  }
+  statements.push(env.DB.prepare(
+    "INSERT INTO source_events (source_name,event,at,documents,detail) VALUES (?1,?2,?3,?4,?5)"
+  ).bind(source, status === "error" ? "error" : "ingest", completedAt, documents,
+    `${detail}${runId ? ` run_id=${runId}` : ""}`.slice(0, 500)));
+
+  await env.DB.batch(statements);
+
+  return jsonResponse({
+    source, kind, status, documents, logical_documents: documents,
+    stored_documents: storedDocuments, completed_at: completedAt,
+    ...(runId ? { run_id: runId } : {}),
+    ...(errorReason ? { error: errorReason } : {}),
+  });
+}
+
+/**
+ * Set the operational refresh expectation without claiming that an ingest ran.
+ *
+ * Schedule installation and removal are configuration events, not source
+ * receipts. Keeping this separate means changing a schedule cannot advance
+ * last_ingest_at, turn an error green, or close an in-progress sync run.
+ */
+async function handleSourceExpectation(env, request) {
+  if (backendOf(env) !== D1) {
+    return jsonResponse({ error: "source expectations apply to the d1 backend only" }, 400);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "invalid JSON body" }, 400);
+  }
+
+  const source = String(body?.source || "").trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(source)) {
+    return jsonResponse({ error: "source must contain only lowercase letters, numbers, underscores or hyphens" }, 400);
+  }
+  const kind = String(body?.kind || "drive").trim().toLowerCase();
+  if (!SOURCE_KINDS.has(kind)) {
+    return jsonResponse({ error: "unsupported source kind" }, 400);
+  }
+  if (!body || !Object.hasOwn(body, "expected_refresh_seconds")) {
+    return jsonResponse({ error: "expected_refresh_seconds is required" }, 400);
+  }
+  const expected = body.expected_refresh_seconds;
+  if (expected !== null && (!Number.isSafeInteger(expected) || expected < 60)) {
+    return jsonResponse({ error: "expected_refresh_seconds must be null or an integer at least 60" }, 400);
+  }
+
+  const at = new Date().toISOString();
+  const detail = expected === null
+    ? "expected_refresh_seconds=off"
+    : `expected_refresh_seconds=${expected}`;
+  await env.DB.batch([
     env.DB.prepare(
-      "INSERT INTO source_events (source_name,event,at,documents,detail) VALUES (?1,'ingest',?2,?3,?4)"
-    ).bind(source, completedAt, documents, detail),
+      `INSERT INTO sources (name,kind,status,created_at,expected_refresh_seconds)
+       VALUES (?1,?2,'pending',?3,?4)
+       ON CONFLICT(name) DO UPDATE SET
+         kind=excluded.kind,
+         expected_refresh_seconds=excluded.expected_refresh_seconds`
+    ).bind(source, kind, at, expected),
+    env.DB.prepare(
+      "INSERT INTO source_events (source_name,event,at,detail) VALUES (?1,'schedule',?2,?3)"
+    ).bind(source, at, detail),
   ]);
 
-  return jsonResponse({ source, kind, status: "ready", documents, completed_at: completedAt });
+  return jsonResponse({ source, kind, expected_refresh_seconds: expected });
+}
+
+const SOURCE_FAMILY_DEFAULT_LIMIT = 500;
+const SOURCE_FAMILY_MAX_LIMIT = 1000;
+
+/**
+ * Page through the live logical document families for a source.
+ *
+ * The returned cursor is deliberately opaque to clients. Internally it is the
+ * last family uid in D1's lexical order, which makes a full sweep resumable
+ * without loading the installed corpus into connector memory.
+ */
+async function handleSourceFamilies(env, url) {
+  if (backendOf(env) !== D1) {
+    return jsonResponse({ error: "source families apply to the d1 backend only" }, 400);
+  }
+
+  if (url.searchParams.getAll("source").length !== 1) {
+    return jsonResponse({ error: "source is required exactly once" }, 400);
+  }
+  const source = String(url.searchParams.get("source") || "").trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(source)) {
+    return jsonResponse({ error: "source must contain only lowercase letters, numbers, underscores or hyphens" }, 400);
+  }
+
+  if (url.searchParams.getAll("limit").length > 1) {
+    return jsonResponse({ error: `limit must be an integer from 1 to ${SOURCE_FAMILY_MAX_LIMIT}` }, 400);
+  }
+  const limitText = url.searchParams.get("limit");
+  if (limitText !== null && !/^[1-9][0-9]{0,3}$/.test(limitText)) {
+    return jsonResponse({ error: `limit must be an integer from 1 to ${SOURCE_FAMILY_MAX_LIMIT}` }, 400);
+  }
+  const limit = limitText === null ? SOURCE_FAMILY_DEFAULT_LIMIT : Number(limitText);
+  if (limit > SOURCE_FAMILY_MAX_LIMIT) {
+    return jsonResponse({ error: `limit must be an integer from 1 to ${SOURCE_FAMILY_MAX_LIMIT}` }, 400);
+  }
+
+  if (url.searchParams.getAll("cursor").length > 1) {
+    return jsonResponse({ error: "cursor must be supplied at most once" }, 400);
+  }
+  const cursor = url.searchParams.get("cursor") || "";
+  const cursorBytes = new TextEncoder().encode(cursor).length;
+  if (cursor && (
+    cursorBytes > 2048 ||
+    /[\u0000-\u001f\u007f]/.test(cursor) ||
+    !cursor.startsWith(`${source}:`)
+  )) {
+    return jsonResponse({ error: "cursor is not valid for this source" }, 400);
+  }
+
+  return jsonResponse(await listSourceFamilies(env, { source, cursor, limit }));
 }
 
 async function handleDocuments(env) {
@@ -772,6 +1017,12 @@ export default {
       }
       if (path === "/api/admin/brain/source-receipt" && request.method === "POST") {
         return await handleSourceReceipt(env, request);
+      }
+      if (path === "/api/admin/brain/source-expectation" && request.method === "POST") {
+        return await handleSourceExpectation(env, request);
+      }
+      if (path === "/api/admin/brain/source-families" && request.method === "GET") {
+        return await handleSourceFamilies(env, url);
       }
       if (path === "/api/admin/brain/documents" && request.method === "GET") {
         return await handleDocuments(env);

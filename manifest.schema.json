@@ -121,7 +121,37 @@
     },
     "operations": {
       "type": "object",
-      "description": "NOT YET WIRED, all of it. No ingest cron, no health cron, no report email and no webhook are created by any command."
+      "description": "Machine-local unattended operations. ingest_cron is wired through the macOS Drive LaunchAgent scheduler. Health reports and webhooks remain descriptive until their commands are implemented.",
+      "properties": {
+        "ingest_cron": {
+          "type": "string",
+          "minLength": 9,
+          "description": "Numeric five-field cron schedule for unattended Google Drive ingest. Installed as a per-user macOS LaunchAgent; calendar times use the Mac's local timezone. brain.domain must also be set so refresh needs no Cloudflare deployment credential."
+        },
+        "admin_key_secret": {
+          "type": ["string", "null"],
+          "pattern": "^keychain://[^/]+/.+$",
+          "description": "Optional non-secret macOS Keychain locator, keychain://<service>/<account>, for the brain admin key used by unattended ingest. The secret value never enters the manifest or plist. If absent, the adjacent .brain-admin-key file is the durable LaunchAgent fallback; ADMIN_KEY applies only to a directly invoked runner because launchd does not inherit terminal exports."
+        },
+        "google_token_store": {
+          "enum": ["auto", "keychain", "file"],
+          "default": "auto",
+          "description": "Durable Google OAuth token-store choice for unattended ingest. auto uses macOS Keychain; file preserves an explicit BRAIN_GOOGLE_TOKEN_STORE=file connection choice across sparse LaunchAgent environments."
+        },
+        "health_cron": {
+          "type": "string",
+          "description": "NOT YET WIRED. No health scheduler is installed today."
+        },
+        "health_report_email": {
+          "type": "string",
+          "format": "email",
+          "description": "NOT YET WIRED. No report email is sent today."
+        },
+        "alert_webhook_secret": {
+          "type": "string",
+          "description": "NOT YET WIRED. No alert webhook is called today."
+        }
+      }
     },
     "testing": {
       "type": "object",

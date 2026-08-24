@@ -1,0 +1,38 @@
+#!/usr/bin/expect -f
+
+# `security add-generic-password -w` intentionally reads from a terminal. This
+# helper supplies that terminal while reading the credential from its own stdin.
+# log_user stays disabled so the password and prompt never reach stdout/stderr.
+set timeout 12
+log_user 0
+
+if {[gets stdin password] < 0 || [llength $argv] < 2} {
+  exit 90
+}
+
+spawn -noecho {*}$argv
+expect {
+  -exact "password data for new item: " { send -- "$password\r" }
+  eof {
+    set result [wait]
+    exit [lindex $result 3]
+  }
+  timeout {
+    exit 91
+  }
+}
+
+expect {
+  -exact "retype password for new item: " { send -- "$password\r" }
+  eof {
+    set result [wait]
+    exit [lindex $result 3]
+  }
+  timeout {
+    exit 91
+  }
+}
+
+expect eof
+set result [wait]
+exit [lindex $result 3]

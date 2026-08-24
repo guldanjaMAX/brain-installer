@@ -6,7 +6,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 
 /* A D1 env that records what SQL it was asked to run, so a filter that never
    reached the database is a visible failure rather than a silent one. */
-function mkEnv(rows, { vectorIds = [], vectorThrows = false, extra = {} } = {}) {
+function mkEnv(rows, { vectorIds = [], vectorThrows = false, countRow = null, extra = {} } = {}) {
   const seen = { sql: [], binds: [], vectorQueries: [] };
   const env = {
     STORAGE: "d1",
@@ -17,7 +17,9 @@ function mkEnv(rows, { vectorIds = [], vectorThrows = false, extra = {} } = {}) 
         return {
           bind(...b) { seen.binds.push(b); return this; },
           all: async () => ({ results: rows }),
-          first: async () => (/count\(\*\)/.test(sql) ? { n: 0 } : null),
+          first: async () => (/count\(\*\)/i.test(sql)
+            ? (countRow || { n: 0, stored_documents: 0, logical_documents: 0 })
+            : null),
           run: async () => ({}),
         };
       },
@@ -322,7 +324,8 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   }), env, {});
   const body = await response.json();
   check("a bulk importer can record its source receipt", response.status === 200 && body.source === "drive" && body.status === "ready", JSON.stringify(body));
-  check("the receipt uses the authoritative document count", seen.sql.some((sql) => /count\(\*\).*documents WHERE source/.test(sql)), JSON.stringify(seen.sql));
+  check("the receipt derives both logical files and stored split parts",
+    seen.sql.some((sql) => /COUNT\(DISTINCT[\s\S]*part_of[\s\S]*FROM documents WHERE source/i.test(sql)), JSON.stringify(seen.sql));
   check("the receipt updates freshness and leaves an audit event", seen.sql.some((sql) => /INSERT INTO sources/.test(sql)) && seen.sql.some((sql) => /INSERT INTO source_events/.test(sql)), JSON.stringify(seen.sql));
 
   const bad = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
@@ -333,11 +336,293 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   check("an unsafe source receipt name is refused", bad.status === 400, String(bad.status));
 }
 
+/* ---- connector receipts expose start, success, and failure without a CF token ---- */
+{
+  const { env, seen } = mkEnv([]);
+  const started = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({
+      source: "drive", kind: "drive", status: "indexing", run_id: "run_drive_1",
+      lane: "incremental", started_at: "2026-08-23T01:00:00.000Z",
+    }),
+  }), env, {});
+  const startBody = await started.json();
+  check("a connector can open an authenticated sync run",
+    started.status === 200 && startBody.status === "indexing" && startBody.run_id === "run_drive_1", JSON.stringify(startBody));
+  check("opening a run marks its source indexing",
+    seen.sql.some((sql) => /INSERT INTO sources[\s\S]*'indexing'/.test(sql)), JSON.stringify(seen.sql));
+  check("opening a run records its exact start in sync_runs",
+    seen.sql.some((sql) => /INSERT INTO sync_runs[\s\S]*started_at/.test(sql)), JSON.stringify(seen.sql));
+
+  const failed = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({
+      source: "drive", kind: "drive", status: "error", run_id: "run_drive_1",
+      lane: "incremental", error: "Drive API unavailable",
+    }),
+  }), env, {});
+  const failedBody = await failed.json();
+  check("a connector can close its run as failed",
+    failed.status === 200 && failedBody.status === "error" && /Drive API unavailable/.test(failedBody.error || ""), JSON.stringify(failedBody));
+  const errorSourceSql = seen.sql.find((sql) => /INSERT INTO sources[\s\S]*'error'/.test(sql));
+  check("a failed receipt does not advance last_ingest_at",
+    !!errorSourceSql && !/last_ingest_at/.test(errorSourceSql), errorSourceSql || JSON.stringify(seen.sql));
+  check("a failed receipt closes the sync run with its error",
+    seen.sql.some((sql) => /INSERT INTO sync_runs[\s\S]*finished_at[\s\S]*error/.test(sql)), JSON.stringify(seen.sql));
+
+  const generated = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ source: "gmail", kind: "gmail", status: "indexing", lane: "sweep" }),
+  }), env, {});
+  const generatedBody = await generated.json();
+  check("the Worker generates a safe run id when a connector omits one",
+    generated.status === 200 && /^[A-Za-z0-9_-]+$/.test(generatedBody.run_id || ""), JSON.stringify(generatedBody));
+
+  const invalid = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ source: "drive", status: "finished" }),
+  }), env, {});
+  check("an unknown connector lifecycle status is refused", invalid.status === 400, String(invalid.status));
+}
+
+/* ---- a failed sweep can never be recorded as a completed walk ---- */
+{
+  const { env, seen } = mkEnv([]);
+  const response = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({
+      source: "drive", kind: "drive", status: "error", run_id: "run_failed_sweep",
+      lane: "sweep", complete_sweep: true, walk_complete: false, error: "walk aborted",
+    }),
+  }), env, {});
+  const runBind = seen.binds.find((values) => values[0] === "run_failed_sweep" && values.length === 14);
+  check("an error receipt cannot turn complete_sweep into walk_complete",
+    response.status === 200 && runBind?.[5] === 0, JSON.stringify(runBind));
+}
+
+/* ---- source schedules configure freshness without pretending an ingest ran ---- */
+{
+  const { env, seen } = mkEnv([]);
+  const response = await worker.fetch(new Request("https://b.example/api/admin/brain/source-expectation", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ source: "drive", expected_refresh_seconds: 86_400 }),
+  }), env, {});
+  const body = await response.json();
+  check("a schedule can set its source freshness expectation through the data plane",
+    response.status === 200 && JSON.stringify(body) === JSON.stringify({
+      source: "drive", kind: "drive", expected_refresh_seconds: 86_400,
+    }), JSON.stringify(body));
+  const upsert = seen.sql.find((sql) => /INSERT INTO sources[\s\S]*expected_refresh_seconds/.test(sql));
+  const conflict = upsert?.split(/ON CONFLICT\(name\) DO UPDATE SET/i)[1] || "";
+  check("expectation upsert preserves an existing source status and last ingest",
+    /expected_refresh_seconds=excluded\.expected_refresh_seconds/.test(conflict) &&
+      !/\bstatus\s*=|last_ingest_at\s*=/.test(conflict), upsert);
+  check("expectation changes leave a source event",
+    seen.sql.some((sql) => /source_events[\s\S]*'schedule'/.test(sql)) &&
+      seen.binds.some((binds) => binds.includes("expected_refresh_seconds=86400")),
+    JSON.stringify({ sql: seen.sql, binds: seen.binds }));
+}
+{
+  const { env, seen } = mkEnv([]);
+  const response = await worker.fetch(new Request("https://b.example/api/admin/brain/source-expectation", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ source: "drive", kind: "drive", expected_refresh_seconds: null }),
+  }), env, {});
+  const body = await response.json();
+  check("removing a schedule clears the expectation explicitly",
+    response.status === 200 && body.expected_refresh_seconds === null &&
+      seen.binds.some((binds) => binds.includes(null)), JSON.stringify({ body, binds: seen.binds }));
+}
+{
+  const { env } = mkEnv([], { extra: { RAG_PROXY_KEY: "read-only" } });
+  const retrievalKey = await worker.fetch(new Request(
+    "https://b.example/api/admin/brain/source-expectation",
+    {
+      method: "POST",
+      headers: { "X-Admin-Key": "read-only", "content-type": "application/json" },
+      body: JSON.stringify({ source: "drive", expected_refresh_seconds: 86_400 }),
+    }
+  ), env, {});
+  check("the retrieval key cannot change a source expectation", retrievalKey.status === 401, String(retrievalKey.status));
+}
+{
+  const invalidBodies = [
+    { source: "drive" },
+    { source: "drive", expected_refresh_seconds: 59 },
+    { source: "drive", expected_refresh_seconds: 60.5 },
+    { source: "drive", expected_refresh_seconds: "86400" },
+    { source: "Drive %", expected_refresh_seconds: 86_400 },
+    { source: "drive", kind: "supabase", expected_refresh_seconds: 86_400 },
+  ];
+  const statuses = [];
+  for (const body of invalidBodies) {
+    const { env } = mkEnv([]);
+    const response = await worker.fetch(new Request("https://b.example/api/admin/brain/source-expectation", {
+      method: "POST",
+      headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }), env, {});
+    statuses.push(response.status);
+  }
+  check("invalid source expectations fail closed", statuses.every((status) => status === 400), JSON.stringify(statuses));
+
+  const supabase = { ...mkEnv([]).env, STORAGE: "supabase" };
+  const wrongBackend = await worker.fetch(new Request("https://b.example/api/admin/brain/source-expectation", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ source: "drive", expected_refresh_seconds: 86_400 }),
+  }), supabase, {});
+  check("source expectation is D1-only", wrongBackend.status === 400, String(wrongBackend.status));
+}
+
+/* A split file is one connector document even when it occupies several D1 rows. */
+{
+  const { env, seen } = mkEnv([], { countRow: { stored_documents: 3, logical_documents: 2 } });
+  const response = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ source: "drive", kind: "drive" }),
+  }), env, {});
+  const body = await response.json();
+  check("a receipt reports logical and physical document counts separately",
+    body.documents === 2 && body.logical_documents === 2 && body.stored_documents === 3, JSON.stringify(body));
+  const sourceBind = seen.binds.find((bind) => bind[0] === "drive" && bind[1] === "drive" && bind.length === 5);
+  check("the source registry stores the logical connector count", sourceBind?.[3] === 2, JSON.stringify(seen.binds));
+}
+
+/* ---- full-sweep reconciliation pages live logical document families ---- */
+function mkSourceFamilyEnv(documents, extra = {}) {
+  const seen = { sql: [], binds: [] };
+  const env = {
+    STORAGE: "d1", ADMIN_KEY: "k",
+    DB: {
+      prepare(sql) {
+        seen.sql.push(sql);
+        return {
+          bind(...binds) {
+            seen.binds.push(binds);
+            return {
+              all: async () => {
+                const [source, cursor, limit] = binds;
+                const familyUids = documents
+                  .filter((row) => row.source === source && row.deleted_at == null)
+                  .map((row) => {
+                    try {
+                      const partOf = JSON.parse(row.meta || "{}")?.part_of;
+                      return typeof partOf === "string" && partOf
+                        ? (partOf.startsWith(`${source}:`) ? partOf : `${source}:${partOf}`)
+                        : row.doc_uid;
+                    } catch {
+                      return row.doc_uid;
+                    }
+                  });
+                const page = [...new Set(familyUids)]
+                  .sort()
+                  .filter((uid) => uid > cursor)
+                  .slice(0, limit)
+                  .map((family_doc_uid) => ({ family_doc_uid }));
+                return { results: page };
+              },
+            };
+          },
+        };
+      },
+    },
+    ...extra,
+  };
+  return { env, seen };
+}
+
+{
+  const docs = [
+    { doc_uid: "drive:a", source: "drive", meta: "{}", deleted_at: null },
+    { doc_uid: "drive:b#part1of2", source: "drive", meta: '{"part_of":"b"}', deleted_at: null },
+    { doc_uid: "drive:b#part2of2", source: "drive", meta: '{"part_of":"b"}', deleted_at: null },
+    { doc_uid: "drive:c", source: "drive", meta: "{}", deleted_at: 1750000000000 },
+    { doc_uid: "drive:d", source: "drive", meta: "not-json", deleted_at: null },
+    { doc_uid: "drive:e#part1of1", source: "drive", meta: '{"part_of":"drive:e"}', deleted_at: null },
+    { doc_uid: "gmail:a", source: "gmail", meta: "{}", deleted_at: null },
+  ];
+  const { env, seen } = mkSourceFamilyEnv(docs);
+
+  const firstResponse = await call(env, "/api/admin/brain/source-families?source=drive&limit=2");
+  const first = await firstResponse.json();
+  check("source-family reconciliation is an authenticated D1 route",
+    firstResponse.status === 200 && first.source === "drive", JSON.stringify(first));
+  check("split parts collapse to one live logical family before pagination",
+    first.families.join(",") === "drive:a,drive:b", JSON.stringify(first));
+  check("a full page returns its last logical uid as an opaque continuation cursor",
+    first.next_cursor === "drive:b", JSON.stringify(first));
+
+  const secondResponse = await call(env,
+    `/api/admin/brain/source-families?source=drive&limit=2&cursor=${encodeURIComponent(first.next_cursor)}`);
+  const second = await secondResponse.json();
+  check("the next page neither repeats the boundary nor includes deleted or other-source rows",
+    secondResponse.status === 200 && second.families.join(",") === "drive:d,drive:e", JSON.stringify(second));
+  check("legacy already-prefixed part_of metadata is not prefixed a second time",
+    second.families.includes("drive:e") && !second.families.includes("drive:drive:e"), JSON.stringify(second));
+  check("the final reconciliation page has no continuation cursor",
+    second.next_cursor === null, JSON.stringify(second));
+
+  const sql = seen.sql.find((value) => /SELECT family_doc_uid/.test(value)) || "";
+  check("D1 collapses part_of families and excludes soft-deleted rows before the page limit",
+    /SELECT DISTINCT/.test(sql) && /part_of/.test(sql) && /deleted_at IS NULL/.test(sql), sql);
+  check("D1 applies the lexical cursor before ordering and fetching one lookahead row",
+    /family_doc_uid > \?2/.test(sql) && /ORDER BY family_doc_uid ASC/.test(sql) && seen.binds[0]?.[2] === 3,
+    `${sql} ${JSON.stringify(seen.binds[0])}`);
+
+  const unauthenticated = await worker.fetch(
+    new Request("https://b.example/api/admin/brain/source-families?source=drive"), env, {});
+  check("source-family enumeration refuses an unauthenticated caller", unauthenticated.status === 401, String(unauthenticated.status));
+
+  const readOnlyEnv = { ...env, RAG_PROXY_KEY: "read-only" };
+  const readOnly = await worker.fetch(new Request(
+    "https://b.example/api/admin/brain/source-families?source=drive",
+    { headers: { "X-Admin-Key": "read-only" } }
+  ), readOnlyEnv, {});
+  check("the read-only retrieval credential cannot enumerate source families", readOnly.status === 401, String(readOnly.status));
+}
+
+{
+  const { env, seen } = mkSourceFamilyEnv([]);
+  const responses = await Promise.all([
+    call(env, "/api/admin/brain/source-families"),
+    call(env, "/api/admin/brain/source-families?source=drive%20%25"),
+    call(env, "/api/admin/brain/source-families?source=drive&limit=0"),
+    call(env, "/api/admin/brain/source-families?source=drive&limit=1001"),
+    call(env, "/api/admin/brain/source-families?source=drive&limit=2.5"),
+    call(env, "/api/admin/brain/source-families?source=drive&cursor=gmail%3Aa"),
+    call(env, "/api/admin/brain/source-families?source=drive&source=gmail"),
+  ]);
+  check("source-family reconciliation validates source, limit, cursor and duplicate parameters",
+    responses.every((response) => response.status === 400), responses.map((response) => response.status).join(","));
+
+  const max = await call(env, "/api/admin/brain/source-families?source=drive&limit=1000");
+  check("the documented 1000-family page limit is accepted with one lookahead row",
+    max.status === 200 && seen.binds.at(-1)?.[2] === 1001, JSON.stringify(seen.binds.at(-1)));
+
+  const supabase = { ...env, STORAGE: "supabase" };
+  const wrongBackend = await call(supabase, "/api/admin/brain/source-families?source=drive");
+  check("source-family reconciliation refuses a non-D1 backend", wrongBackend.status === 400, String(wrongBackend.status));
+}
+
 /* ---- documents reports the backend and the vector backlog ---- */
 {
-  const { env } = mkEnv([{ source_type: "meeting", total: 4, embedded: 4, last_ingest_at: 1750000000000 }]);
+  const { env } = mkEnv([{
+    source_type: "meeting", documents: 3, logical_documents: 2,
+    total: 4, embedded: 4, last_ingest_at: 1750000000000,
+  }]);
   const b = await (await call(env, "/api/admin/brain/documents")).json();
   check("documents names the backend", b.backend === "d1", JSON.stringify(b));
+  check("documents separates source files from stored split parts",
+    b.rows[0]?.documents === 2 && b.rows[0]?.logical_documents === 2 && b.rows[0]?.stored_documents === 3, JSON.stringify(b.rows[0]));
   check("and reports vector backlog", b.vector_backlog && "pending" in b.vector_backlog, JSON.stringify(b.vector_backlog));
 }
 

@@ -11,6 +11,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { splitStatements } from "../brain.mjs";
+import worker from "../worker/src/index.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DIR = join(HERE, "..", "migrations", "d1");
@@ -99,6 +100,80 @@ check("vector_outbox retains vector_id after a chunk row is gone",
 
   db.exec("DELETE FROM chunks WHERE chunk_uid='m:1#0'");
   check("delete trigger removes it from the index", hit('"increased"').length === 0);
+}
+
+/* ---- source lifecycle SQL is executed, not merely inspected by a mock ---- */
+{
+  const d1 = {
+    prepare(sql) {
+      const statement = (params = []) => ({
+        bind: (...next) => statement(next),
+        first: async () => db.prepare(sql).get(...params) ?? null,
+        all: async () => ({ results: db.prepare(sql).all(...params) }),
+        run: async () => db.prepare(sql).run(...params),
+      });
+      return statement();
+    },
+    async batch(statements) {
+      db.exec("BEGIN");
+      try {
+        const results = [];
+        for (const statement of statements) results.push(await statement.run());
+        db.exec("COMMIT");
+        return results;
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+  const env = { STORAGE: "d1", ADMIN_KEY: "k", DB: d1 };
+  const post = (body) => worker.fetch(new Request("https://brain.example/api/admin/brain/source-receipt", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }), env, {});
+
+  const insertDoc = db.prepare(
+    `INSERT INTO documents (doc_uid,source,source_id,title,ingested_at,content_hash,meta)
+     VALUES (?,?,?,?,?,?,?)`
+  );
+  insertDoc.run("drive:big#part1of2", "drive", "big#part1of2", "Big 1", 1, "h1", JSON.stringify({ part_of: "big" }));
+  insertDoc.run("drive:big#part2of2", "drive", "big#part2of2", "Big 2", 1, "h2", JSON.stringify({ part_of: "big" }));
+  insertDoc.run("drive:small", "drive", "small", "Small", 1, "h3", "{}");
+
+  const oldStart = new Date(Date.now() - 7 * 3600000).toISOString();
+  const opened = await (await post({
+    source: "drive", kind: "drive", status: "indexing", run_id: "real_run_1",
+    lane: "sweep", started_at: oldStart,
+  })).json();
+  check("real SQLite accepts an indexing source receipt", opened.status === "indexing", JSON.stringify(opened));
+
+  const stuck = await (await worker.fetch(new Request("https://brain.example/api/admin/brain/freshness", {
+    headers: { "X-Admin-Key": "k" },
+  }), env, {})).json();
+  check("the real sync_runs join detects a seven-hour stuck run",
+    stuck.sources?.[0]?.state === "broken" && /7 hour/.test(stuck.sources[0].reason || ""), JSON.stringify(stuck));
+
+  const ready = await (await post({
+    source: "drive", kind: "drive", status: "ready", run_id: "real_run_1",
+    lane: "sweep", started_at: oldStart, complete_sweep: true,
+  })).json();
+  check("a real completion counts one split family as one logical document",
+    ready.documents === 2 && ready.stored_documents === 3, JSON.stringify(ready));
+  const successfulAt = db.prepare("SELECT last_ingest_at FROM sources WHERE name='drive'").get().last_ingest_at;
+
+  await post({ source: "drive", kind: "drive", status: "indexing", run_id: "real_run_2", lane: "incremental" });
+  const failed = await (await post({
+    source: "drive", kind: "drive", status: "error", run_id: "real_run_2",
+    lane: "incremental", error: "Drive API unavailable",
+  })).json();
+  const failedSource = db.prepare("SELECT status,last_ingest_at,stale_reason,document_count FROM sources WHERE name='drive'").get();
+  check("a real failed receipt is stored as an error without advancing last success",
+    failed.status === "error" && failedSource.status === "error" && failedSource.last_ingest_at === successfulAt,
+    JSON.stringify({ failed, failedSource, successfulAt }));
+  check("the real source registry keeps the logical count and failure reason",
+    failedSource.document_count === 2 && /Drive API unavailable/.test(failedSource.stale_reason || ""), JSON.stringify(failedSource));
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nmigrations: all ${ran} checks passed`);

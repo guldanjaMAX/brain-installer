@@ -4,6 +4,44 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.9
+
+**Google Drive can now stay current on its own on a Mac, using the same setup
+for every client.**
+
+- `brain schedule <manifest> --install` installs a per-user daily Drive refresh.
+  The schedule lives in the client manifest, and status shows whether it is
+  installed, running, out of date, or failing.
+- Routine refresh has no Cloudflare deployment credential. Google OAuth uses
+  macOS Keychain by default; the brain admin key uses Keychain when its manifest
+  declares a locator, with an owner-only adjacent file as the standard fallback.
+  The LaunchAgent definition contains no secrets and receives a minimal environment.
+- A first Drive load now streams bounded batches instead of keeping the corpus
+  in memory. Successful batches are resumable, and a failed file or API call
+  cannot advance the Drive cursor past material that was not safely stored.
+- Refresh health now distinguishes a live sync, a failed sync, and a run stuck
+  for more than six hours. Failed attempts do not overwrite the last successful
+  ingest time.
+- Large files remain one logical source document even when stored as several
+  physical parts. Edits clean up obsolete parts only after every replacement
+  part has landed.
+- Exclusions now remove material that was indexed before the rule existed.
+  Policy edits force a complete comparison, folder moves are re-evaluated with
+  their descendants, and a weekly full sweep catches deleted or inaccessible
+  files that no longer appear in the change feed.
+- A full Drive comparison refuses to delete from an incomplete Google listing.
+  Credential scanning runs on the complete logical file before splitting, and
+  a scanner upgrade rechecks unchanged files before it is marked complete.
+- An interrupted database write stays retryable until its chunks are complete.
+  A document cannot be marked unchanged merely because its row was written
+  before a later chunk write failed.
+- Installing or removing the Mac scheduler now sets or clears the source's
+  freshness expectation through the authenticated brain data plane.
+
+On macOS, Google credentials default to the login Keychain. Other platforms
+retain the atomic owner-only credential-file fallback. Windows and Linux still
+need a platform scheduler before unattended Drive refresh can be installed.
+
 ## 0.1.8
 
 **Keyword search gets roughly twice as fast on a large brain, and the gain grows

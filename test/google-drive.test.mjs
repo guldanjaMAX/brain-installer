@@ -1,6 +1,6 @@
 import {
   api, listFiles, listChanges, startPageToken, triage, toEnvelope, DriveError, EXPORTS,
-  updateFolderIndex, folderPathFor, exclusionReason,
+  updateFolderIndex, folderPathFor, exclusionReason, driveVersion,
 } from "../connectors/google-drive.mjs";
 import { buildAuthUrl, pkce, exchangeCode, createTokenProvider, redirectUri } from "../connectors/google-auth.mjs";
 
@@ -70,6 +70,107 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   await api(tok, "/files", { fetchImpl, sleep: async () => {} });
   check("5xx is retried", n === 2);
 }
+{
+  let n = 0;
+  const fetchImpl = async () => {
+    n++;
+    if (n < 3) throw new TypeError("temporary socket reset");
+    return json({ files: [] });
+  };
+  await api(tok, "/files", { fetchImpl, sleep: async () => {} });
+  check("network exceptions are retried", n === 3, String(n));
+}
+{
+  let n = 0, sawTimeoutSignal = false;
+  const body = await api(tok, "/files/x", {
+    raw: true,
+    fetchImpl: async (_url, init) => {
+      n++;
+      sawTimeoutSignal ||= !!init.signal;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        arrayBuffer: async () => {
+          if (n === 1) throw new TypeError("response stream reset");
+          return new TextEncoder().encode("complete").buffer;
+        },
+      };
+    },
+    sleep: async () => {},
+  });
+  check("response-body network failures are retried", n === 2 && new TextDecoder().decode(body) === "complete", String(n));
+  check("each Google request carries an unattended-run timeout", sawTimeoutSignal);
+}
+{
+  let n = 0, e = null;
+  await api(tok, "/files", {
+    attempts: 2,
+    fetchImpl: async () => { n++; throw new TypeError("host unavailable"); },
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("an exhausted network failure stays fatal", n === 2 && e instanceof DriveError && e.retryable === true && e.reason === "networkError", `${n} ${e?.reason}`);
+}
+{
+  const tokenCalls = [];
+  let requests = 0;
+  const getToken = async (opts) => { tokenCalls.push(opts); return opts.force ? "fresh" : "stale"; };
+  const result = await api(getToken, "/files", {
+    fetchImpl: async (_url, init) => {
+      requests++;
+      return init.headers.authorization === "Bearer stale"
+        ? json({ error: { message: "expired" } }, 401)
+        : json({ files: [] });
+    },
+    sleep: async () => {},
+  });
+  check("a 401 forces one access-token refresh", requests === 2 && tokenCalls[0].force === false && tokenCalls[1].force === true && !!result, JSON.stringify(tokenCalls));
+}
+{
+  let tokens = 0, requests = 0, e = null;
+  await api(async () => { tokens++; return "bad"; }, "/files", {
+    fetchImpl: async () => { requests++; return json({ error: { message: "still unauthorized" } }, 401); },
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("a second 401 is fatal instead of becoming a skip", tokens === 2 && requests === 2 && e instanceof DriveError && e.status === 401, `${tokens}/${requests} ${e?.status}`);
+}
+{
+  const tokenCalls = [];
+  let fresh = false, requests = 0;
+  await api(async ({ force }) => {
+    tokenCalls.push(force);
+    if (force) fresh = true;
+    return fresh ? "fresh" : "stale";
+  }, "/files", {
+    fetchImpl: async () => {
+      requests++;
+      if (requests === 1) return json({ error: { message: "expired" } }, 401);
+      if (requests === 2) return json({ error: { message: "temporary backend" } }, 503);
+      return json({ files: [] });
+    },
+    sleep: async () => {},
+  });
+  check("a refreshed token is not minted again for an unrelated 5xx retry",
+    tokenCalls.join(",") === "false,true,false", tokenCalls.join(","));
+}
+{
+  let tokenCalls = 0;
+  const getToken = async () => {
+    tokenCalls++;
+    if (tokenCalls < 3) throw new TypeError("token endpoint unavailable");
+    return "fresh";
+  };
+  await api(getToken, "/files", { fetchImpl: async () => json({ files: [] }), sleep: async () => {} });
+  check("transient token-provider failures are retried", tokenCalls === 3, String(tokenCalls));
+}
+{
+  let tokenCalls = 0, e = null;
+  const dead = Object.assign(new Error("reconnect required"), { needsReauth: true });
+  await api(async () => { tokenCalls++; throw dead; }, "/files", {
+    fetchImpl: async () => json({ files: [] }), sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("a revoked refresh token is immediately fatal", tokenCalls === 1 && e === dead, `${tokenCalls} ${e?.message}`);
+}
 
 /* ================= listing ================= */
 {
@@ -88,7 +189,23 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   check("shared drives are included", u.searchParams.get("includeItemsFromAllDrives") === "true" &&
     u.searchParams.get("supportsAllDrives") === "true" && u.searchParams.get("corpora") === "allDrives",
     u.search);
+  check("the all-drives walk requests Google's incomplete-search signal",
+    /incompleteSearch/.test(u.searchParams.get("fields") || ""), u.searchParams.get("fields"));
   check("trashed files are excluded by default", /trashed = false/.test(u.searchParams.get("q") || ""));
+}
+{
+  const yielded = [];
+  let error = null;
+  try {
+    for await (const file of listFiles(tok, {
+      opts: { fetchImpl: async () => json({ files: [{ id: "partial" }], incompleteSearch: true }), sleep: async () => {} },
+    })) yielded.push(file.id);
+  } catch (caught) {
+    error = caught;
+  }
+  check("an incomplete all-drives search aborts before absence can drive deletion",
+    yielded.length === 0 && error instanceof DriveError && error.reason === "incompleteSearch",
+    `${yielded.join(",")} ${error?.message || "no error"}`);
 }
 
 /* ================= changes feed ================= */
@@ -132,10 +249,17 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   ]);
   const file = { id: "F-path", name: "Visit.txt", parents: ["year"] };
   check("folder paths are reconstructed after the unordered walk", folderPathFor(file, folders) === "Provider Records/2025", folderPathFor(file, folders));
+  const beforeMove = driveVersion({ ...file, modifiedTime: "2026-08-23T00:00:00Z", md5Checksum: "same-bytes" }, "Provider Records/2025");
+  const afterMove = driveVersion({ ...file, modifiedTime: "2026-08-23T00:00:00Z", md5Checksum: "same-bytes" }, "Archive/Provider Records/2025");
+  check("an ancestor-folder move changes the stable Drive version", beforeMove !== afterMove, `${beforeMove} ${afterMove}`);
+  check("equivalent path separators do not cause a false version change",
+    driveVersion(file, " Provider Records\\2025/ ") === driveVersion(file, "Provider Records/2025"));
   check("an exact reviewed file id is excluded", /file-id policy/.test(exclusionReason({ id: "F1", name: "x.txt" }, "", { excludeFileIds: ["F1"] })));
   check("path exclusions match segment boundaries", !!exclusionReason(file, "Legal/Sealed", { excludePaths: ["Legal/Sealed"] }));
   check("path exclusions do not overmatch sibling names", exclusionReason(file, "Legal/Sealed Notes", { excludePaths: ["Legal/Sealed"] }) === null);
   check("private prefixes apply to Drive path segments", /private path/.test(exclusionReason(file, "Clients/_private", { privatePrefixes: ["_private"] })));
+  check("Drive private prefixes match the local walker's starts-with contract",
+    /private path/.test(exclusionReason(file, "Clients/_private-legal", { privatePrefixes: ["_private"] })));
 }
 {
   const file = { id: "F1", name: "2026-03-14 board notes.txt", mimeType: "text/plain", size: "400",
@@ -190,7 +314,36 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   const r = await toEnvelope(tok, file, {}, {
     fetchImpl: async () => json({ error: { errors: [{ reason: "insufficientFilePermissions" }], message: "no access" } }, 403), sleep: async () => {},
   });
-  check("a fetch failure is a reasoned skip, not a crash", !!r.skip && /could not be fetched/.test(r.skip.reason), r.skip?.reason);
+  check("a permanent per-file permission failure is a reasoned skip", !!r.skip && /could not be fetched/.test(r.skip.reason), r.skip?.reason);
+}
+{
+  const file = { id: "F6", name: "temporary.pdf", mimeType: "application/pdf", size: "1000", createdTime: "2026-01-01T00:00:00Z" };
+  let calls = 0, e = null;
+  await toEnvelope(tok, file, {}, {
+    attempts: 2,
+    fetchImpl: async () => { calls++; return json({ error: { message: "backend unavailable" } }, 503); },
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("an exhausted file 5xx is fatal so the source cursor cannot advance", calls === 2 && e instanceof DriveError && e.status === 503 && e.retryable === true, `${calls} ${e?.status}`);
+}
+{
+  const file = { id: "F7", name: "network.pdf", mimeType: "application/pdf", size: "1000", createdTime: "2026-01-01T00:00:00Z" };
+  let calls = 0, e = null;
+  await toEnvelope(tok, file, {}, {
+    attempts: 2,
+    fetchImpl: async () => { calls++; throw new TypeError("connection reset"); },
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("an exhausted file network error is fatal so the source cursor cannot advance", calls === 2 && e instanceof DriveError && e.reason === "networkError", `${calls} ${e?.reason}`);
+}
+{
+  const file = { id: "F8", name: "document.pdf", mimeType: "application/pdf", size: "1000", createdTime: "2026-01-01T00:00:00Z" };
+  let e = null;
+  await toEnvelope(tok, file, {}, {
+    fetchImpl: async () => json({ error: { errors: [{ reason: "accessNotConfigured" }], message: "Drive API disabled" } }, 403),
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("a connector-wide 403 is fatal rather than silently skipping every file", e instanceof DriveError && e.reason === "accessNotConfigured", e?.reason);
 }
 
 /* ================= gmail ================= */
@@ -234,12 +387,94 @@ const gm = await import("../connectors/gmail.mjs");
   // internalDate is a receipt time; unlike a file mtime nothing rewrites it.
   check("internalDate is the document date", r.envelope.occurred_at === new Date(1755172800000).toISOString(), r.envelope?.occurred_at);
   check("and it is marked reliable", r.envelope.date_reliable === true);
-  check("the id is stable and namespaced", r.envelope.source_id === "gmail:M1");
+  check("the envelope id is bare so the store namespaces Gmail exactly once", r.envelope.source_id === "M1");
   check("the thread is kept", r.envelope.metadata.thread_id === "T1");
 }
 {
   const r = await gm.toEnvelope(tok, "M2", {}, { fetchImpl: async () => json({ internalDate: "1" }), sleep: async () => {} });
   check("a message with no content is a reasoned skip", !!r.skip && /no content/.test(r.skip.reason), r.skip?.reason);
+}
+{
+  const r = await gm.toEnvelope(tok, "gone", {}, {
+    fetchImpl: async () => json({ error: { errors: [{ reason: "notFound" }], message: "Message not found" } }, 404),
+    sleep: async () => {},
+  });
+  check("a deleted message is the one fetch failure safe to skip", !!r.skip && r.skip.id === "gone" && /could not be fetched/.test(r.skip.reason), JSON.stringify(r));
+}
+{
+  let calls = 0, e = null;
+  await gm.toEnvelope(tok, "network", {}, {
+    attempts: 2,
+    fetchImpl: async () => { calls++; throw new TypeError("connection reset"); },
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("an exhausted Gmail network failure escapes instead of becoming a skip",
+    calls === 2 && e instanceof DriveError && e.reason === "networkError" && e.retryable === true,
+    `${calls} ${e?.reason}`);
+}
+{
+  let tokenCalls = 0, e = null;
+  await gm.toEnvelope(async () => { tokenCalls++; throw new TypeError("token endpoint unavailable"); }, "token-outage", {}, {
+    attempts: 2,
+    fetchImpl: async () => json({}),
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("an exhausted Gmail token-provider outage escapes instead of advancing history",
+    tokenCalls === 2 && e instanceof DriveError && e.reason === "tokenRefreshError" && e.retryable === true,
+    `${tokenCalls} ${e?.reason}`);
+}
+{
+  const dead = Object.assign(new Error("reconnect required"), { needsReauth: true });
+  let tokenCalls = 0, e = null;
+  await gm.toEnvelope(async () => { tokenCalls++; throw dead; }, "reauth", {}, {
+    fetchImpl: async () => json({}),
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("a Gmail reauthorization failure escapes immediately",
+    tokenCalls === 1 && e === dead,
+    `${tokenCalls} ${e?.message}`);
+}
+{
+  let tokenCalls = 0, requests = 0, e = null;
+  await gm.toEnvelope(async () => { tokenCalls++; return "bad"; }, "unauthorized", {}, {
+    fetchImpl: async () => { requests++; return json({ error: { message: "still unauthorized" } }, 401); },
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("a repeated Gmail 401 escapes after one forced token refresh",
+    tokenCalls === 2 && requests === 2 && e instanceof DriveError && e.status === 401,
+    `${tokenCalls}/${requests} ${e?.status}`);
+}
+{
+  let calls = 0, e = null;
+  await gm.toEnvelope(tok, "quota", {}, {
+    attempts: 2,
+    fetchImpl: async () => { calls++; return json({ error: { message: "Too many requests" } }, 429); },
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("an exhausted Gmail 429 escapes instead of becoming a skip",
+    calls === 2 && e instanceof DriveError && e.status === 429 && e.retryable === true,
+    `${calls} ${e?.status}`);
+}
+{
+  let calls = 0, e = null;
+  await gm.toEnvelope(tok, "backend", {}, {
+    attempts: 2,
+    fetchImpl: async () => { calls++; return json({ error: { message: "backend unavailable" } }, 503); },
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("an exhausted Gmail 5xx escapes instead of becoming a skip",
+    calls === 2 && e instanceof DriveError && e.status === 503 && e.retryable === true,
+    `${calls} ${e?.status}`);
+}
+{
+  let e = null;
+  await gm.toEnvelope(tok, "connector-off", {}, {
+    fetchImpl: async () => json({ error: { errors: [{ reason: "accessNotConfigured" }], message: "Gmail API disabled" } }, 403),
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("a connector-wide Gmail 403 is fatal rather than silently skipping every message",
+    e instanceof DriveError && e.status === 403 && e.reason === "accessNotConfigured",
+    `${e?.status} ${e?.reason}`);
 }
 {
   // A history id older than roughly a week is unanswerable. That is not an

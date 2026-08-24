@@ -19,7 +19,10 @@
  * is where it becomes true.
  */
 
-import { readFileSync, readdirSync, statSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import {
+  readFileSync, readdirSync, statSync, writeFileSync, existsSync, mkdirSync,
+  renameSync, chmodSync, rmSync,
+} from "node:fs";
 import { join, relative, sep, basename, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { extract, canExtract, extensionOf, isBinaryFormat } from "./extract.mjs";
@@ -50,6 +53,7 @@ export const MAX_FILE_BYTES = 8 * 1024 * 1024;
 export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES } = {}) {
   const files = [];
   const skipped = [];
+  let complete = true;
   const prefixes = privatePrefixes.map((p) => p.toLowerCase());
 
   const isPrivate = (rel) =>
@@ -63,6 +67,7 @@ export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES } =
       // A directory that cannot be listed is reported, never swallowed: a
       // permission error that silently truncates the walk looks like success.
       skipped.push({ path: dir, reason: `directory could not be read: ${e.code || e.message}` });
+      complete = false;
       return;
     }
     for (const e of entries) {
@@ -90,7 +95,11 @@ export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES } =
         continue;
       }
       let st;
-      try { st = statSync(full); } catch { continue; }
+      try { st = statSync(full); } catch (error) {
+        skipped.push({ path: rel, reason: `file metadata could not be read: ${error.code || error.message}` });
+        complete = false;
+        continue;
+      }
       if (st.size === 0) { skipped.push({ path: rel, reason: "file is empty" }); continue; }
       if (st.size > maxBytes) {
         skipped.push({ path: rel, reason: `file is ${(st.size / 1048576).toFixed(1)}MB, over the ${(maxBytes / 1048576).toFixed(0)}MB limit` });
@@ -101,7 +110,7 @@ export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES } =
   };
 
   visit(root);
-  return { files, skipped };
+  return { files, skipped, complete };
 }
 
 const sha = (b) => createHash("sha256").update(b).digest("hex");
@@ -274,7 +283,10 @@ export async function* batchStream(files, prepareOne, { maxDocs = 50, maxBytes =
   let bytes = 0;
   let scanned = 0;
 
-  for (const f of files) {
+  // `for await` also accepts ordinary arrays. Remote connectors can therefore
+  // feed a paginated async iterator without first collecting every Drive file
+  // or Gmail id, while the local walker keeps using the exact same path.
+  for await (const f of files) {
     scanned++;
     const r = await prepareOne(f);
     if (onProgress) onProgress(scanned, f);
@@ -285,14 +297,22 @@ export async function* batchStream(files, prepareOne, { maxDocs = 50, maxBytes =
     }
     if (r.unchanged) continue;
 
-    for (const envelope of splitOversized(r.envelope)) {
+    // A remote producer may need the split count before anything is sent so it
+    // can reconcile an old document family safely. Let it supply the one-file
+    // split rather than doing the same large string slicing twice.
+    const envelopes = r.envelopes || splitOversized(r.envelope);
+    const { envelope: _envelope, envelopes: _envelopes, unchanged: _unchanged, skip: _skip, ...context } = r;
+    for (const envelope of envelopes) {
       const n = envelopeBytes(envelope);
       if (cur.length && (cur.length >= maxDocs || bytes + n > maxBytes)) {
         yield cur;
         cur = [];
         bytes = 0;
       }
-      cur.push({ hash: r.hash, envelope, rel: r.rel });
+      // Preserve connector bookkeeping such as stateKey, deferState and the
+      // family plan. The previous fixed three-field wrapper silently discarded
+      // those fields, which made the streaming helper unsafe for remote resume.
+      cur.push({ ...context, envelope });
       bytes += n;
     }
   }
@@ -313,5 +333,19 @@ export function loadState(path) {
 
 export function saveState(path, state) {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(state, null, 2));
+  // The Drive state contains private file ids, names, folder paths and the
+  // incremental cursor. Keep it owner-only, and replace it atomically so a
+  // crash or laptop sleep cannot leave half-written JSON that silently forces
+  // the next run back to a full walk.
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+    renameSync(tmp, path);
+    // rename preserves the temp file's mode. chmod also repairs an older state
+    // file that may have been created by the pre-hardening implementation.
+    chmodSync(path, 0o600);
+  } catch (error) {
+    try { rmSync(tmp, { force: true }); } catch { /* original error wins */ }
+    throw error;
+  }
 }

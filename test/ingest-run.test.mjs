@@ -1,8 +1,8 @@
-import { walk, prepare, batches, splitOversized, loadState, saveState, MAX_FILE_BYTES, MAX_DOC_CHARS } from "../ingest/run.mjs";
+import { walk, prepare, batches, batchStream, splitOversized, loadState, saveState, MAX_FILE_BYTES, MAX_DOC_CHARS } from "../ingest/run.mjs";
 import { isBinaryFormat, supported } from "../ingest/extract.mjs";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 240))); if (!c) fail++; };
@@ -29,7 +29,7 @@ put("docs/report.pdf", "%PDF-1.4 not really");
 
 /* ---- the walk ---- */
 {
-  const { files, skipped } = walk(root, { privatePrefixes: ["_private", "Private"] });
+  const { files, skipped, complete } = walk(root, { privatePrefixes: ["_private", "Private"] });
   const rels = files.map((f) => f.rel.split(/[\\/]/).join("/"));
   check("finds ordinary documents", rels.includes("notes/2026-08-14 review.md") && rels.includes("notes/plain.txt"), rels.join(", "));
 
@@ -43,6 +43,7 @@ put("docs/report.pdf", "%PDF-1.4 not really");
   check("skips dot directories", !rels.some((r) => r.includes(".hidden/")));
   check("skips dot files", !rels.some((r) => r.endsWith(".hidden.md")));
   check("an empty file is skipped WITH a reason", skipped.some((s) => /empty/.test(s.reason)), JSON.stringify(skipped));
+  check("a fully readable folder walk is explicitly complete", complete === true, String(complete));
 }
 {
   const { files, skipped } = walk(root, { maxBytes: 10 });
@@ -138,6 +139,35 @@ const one = (rel) => walk(root, {}).files.find((f) => f.rel.split(/[\\/]/).join(
   check("and every part survives batching", grouped.flat().length === parts.length);
 }
 
+/* ---- streaming accepts remote iterators and preserves their resume context ---- */
+{
+  let produced = 0;
+  async function* remoteFiles() {
+    for (let i = 0; i < 6; i++) {
+      produced++;
+      yield { id: `r${i}` };
+    }
+  }
+  const stream = batchStream(remoteFiles(), async (file) => ({
+    hash: `v-${file.id}`,
+    rel: file.id,
+    stateKey: `drive:${file.id}`,
+    deferState: true,
+    familyPlan: { stateKey: `drive:${file.id}`, expectedParts: 1 },
+    envelope: { source_id: file.id, content: "bounded remote content" },
+  }), { maxDocs: 2, maxBytes: 1e9 });
+  const first = await stream.next();
+  check("the remote stream yields before consuming the whole source",
+    first.value.length === 2 && produced < 6, `batch=${first.value?.length} produced=${produced}`);
+  check("remote resume and family context survives streaming",
+    first.value[0].stateKey === "drive:r0" && first.value[0].deferState === true && first.value[0].familyPlan.expectedParts === 1,
+    JSON.stringify(first.value[0]));
+  const rest = [];
+  for await (const group of stream) rest.push(group);
+  check("the async source is consumed exactly once", produced === 6 && first.value.length + rest.flat().length === 6,
+    `produced=${produced} emitted=${first.value.length + rest.flat().length}`);
+}
+
 /* ---- state ---- */
 {
   const sp = join(root, "state", "s.json");
@@ -145,6 +175,8 @@ const one = (rel) => walk(root, {}).files.find((f) => f.rel.split(/[\\/]/).join(
   saveState(sp, { version: 1, done: { "a.md": "hash1" }, skipped: { "b.pdf": "no extractor" } });
   const s = loadState(sp);
   check("state round-trips", s.done["a.md"] === "hash1" && s.skipped["b.pdf"] === "no extractor", JSON.stringify(s));
+  check("state is owner-only", (statSync(sp).mode & 0o777) === 0o600, (statSync(sp).mode & 0o777).toString(8));
+  check("atomic save leaves no temporary state behind", !readdirSync(dirname(sp)).some((n) => n.startsWith("s.json.tmp-")));
   writeFileSync(sp, "{ this is not json");
   check("a corrupt state file does not abort the load", loadState(sp).done && Object.keys(loadState(sp).done).length === 0);
 }

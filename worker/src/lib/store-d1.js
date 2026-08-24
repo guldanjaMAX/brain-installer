@@ -913,14 +913,68 @@ export async function diagnose(env, { sampleLimit = 10 } = {}) {
  *    manual rather than broken. Calling it stale would be blaming the client for
  *    a limit of the architecture.
  */
+const INDEXING_STUCK_MS = 6 * 60 * 60 * 1000;
+
+function timestampMs(value) {
+  if (value === null || value === undefined || value === "") return NaN;
+  if (typeof value === "number") return Number.isFinite(value) ? value : NaN;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+/**
+ * The source row says what the connector last reported; sync_runs says whether
+ * an `indexing` report still belongs to a live attempt. Keeping this separate
+ * from schedule staleness matters: a failed hourly sync is broken immediately,
+ * not only after its freshness window expires, while a healthy six-minute run
+ * must not flash red just because it is currently in progress.
+ */
+function operationalFreshness(s, now) {
+  const status = String(s.status || "").toLowerCase();
+  const started = timestampMs(s.indexing_started_at);
+  const indexingMs = Number.isFinite(started) ? Math.max(0, now - started) : null;
+
+  if (s.stale_reason) {
+    return { state: "broken", reason: String(s.stale_reason), indexingMs };
+  }
+  if (status === "error") {
+    return { state: "broken", reason: "the last sync reported an error", indexingMs };
+  }
+  if (status !== "indexing") return { state: null, reason: null, indexingMs };
+
+  // New connector runs always open sync_runs through source-receipt. An
+  // indexing row without one is therefore an interrupted legacy/control-plane
+  // run, not evidence that work is still alive.
+  if (!Number.isFinite(started)) {
+    return {
+      state: "broken",
+      reason: "indexing is marked active but has no open sync run",
+      indexingMs: null,
+    };
+  }
+  if (indexingMs > INDEXING_STUCK_MS) {
+    const hours = Math.floor(indexingMs / 3600000);
+    return {
+      state: "broken",
+      reason: `indexing has not completed for ${hours} hour(s)`,
+      indexingMs,
+    };
+  }
+  return { state: "indexing", reason: null, indexingMs };
+}
+
+const sourceFreshnessSql = ({ ordered = false } = {}) => `
+  SELECT s.name, s.kind, s.status, s.last_ingest_at, s.last_complete_sweep_at,
+         s.expected_refresh_seconds, s.stale_reason, s.document_count,
+         (SELECT MIN(sr.started_at)
+            FROM sync_runs sr
+           WHERE sr.source = s.name AND sr.finished_at IS NULL) AS indexing_started_at
+    FROM sources s${ordered ? " ORDER BY s.name" : ""}`;
+
 export async function coverageGaps(env, { now = Date.now() } = {}) {
   let rows;
   try {
-    const r = await env.DB.prepare(
-      `SELECT name, kind, status, last_ingest_at, last_complete_sweep_at,
-              expected_refresh_seconds, stale_reason, document_count
-       FROM sources`
-    ).all();
+    const r = await env.DB.prepare(sourceFreshnessSql()).all();
     rows = r?.results || [];
   } catch {
     return []; // never fail an answer because the freshness check could not run
@@ -931,13 +985,14 @@ export async function coverageGaps(env, { now = Date.now() } = {}) {
     const last = s.last_ingest_at ? Date.parse(s.last_ingest_at) : NaN;
     const ageSec = Number.isFinite(last) ? Math.floor((now - last) / 1000) : null;
     const days = ageSec === null ? null : Math.floor(ageSec / 86400);
+    const operational = operationalFreshness(s, now);
 
-    if (s.stale_reason) {
+    if (operational.state === "broken") {
       gaps.push({
         type: "sync_broken",
         source: s.name,
         days_since_ingest: days,
-        detail: `The "${s.name}" source stopped updating${days === null ? "" : ` ${days} day(s) ago`}: ${s.stale_reason}. Anything added since is not in the brain.`,
+        detail: `The "${s.name}" source stopped updating${days === null ? "" : ` ${days} day(s) ago`}: ${operational.reason}. Anything added since is not in the brain.`,
       });
       continue;
     }
@@ -973,11 +1028,7 @@ export async function coverageGaps(env, { now = Date.now() } = {}) {
 export async function freshnessReport(env, { now = Date.now() } = {}) {
   let rows;
   try {
-    const r = await env.DB.prepare(
-      `SELECT name, kind, status, last_ingest_at, last_complete_sweep_at,
-              expected_refresh_seconds, stale_reason, document_count
-       FROM sources ORDER BY name`
-    ).all();
+    const r = await env.DB.prepare(sourceFreshnessSql({ ordered: true })).all();
     rows = r?.results || [];
   } catch {
     return { sources: [], unavailable: true };
@@ -990,18 +1041,27 @@ export async function freshnessReport(env, { now = Date.now() } = {}) {
       const days = Number.isFinite(last) ? Math.floor((now - last) / 86400000) : null;
       const expected = Number(s.expected_refresh_seconds) || null;
       const automatable = AUTOMATABLE.has(String(s.kind));
+      const operational = operationalFreshness(s, now);
       let state = "ok";
-      if (s.stale_reason) state = "broken";
+      let reason = operational.reason;
+      if (operational.state) state = operational.state;
       else if (!expected) state = automatable ? "unscheduled" : "manual";
       else if (!Number.isFinite(last)) state = "never_synced";
-      else if (days !== null && days * 86400 > expected * 1.5) state = "stale";
+      else if ((now - last) / 1000 > expected * 1.5) state = "stale";
       return {
         name: s.name, kind: s.kind, state,
+        source_status: String(s.status || "") || null,
         documents: Number(s.document_count || 0),
         days_since_ingest: days,
         expected_every_days: expected ? Math.max(1, Math.round(expected / 86400)) : null,
         last_complete_sweep_at: s.last_complete_sweep_at || null,
-        reason: s.stale_reason || null,
+        indexing_started_at: Number.isFinite(timestampMs(s.indexing_started_at))
+          ? new Date(timestampMs(s.indexing_started_at)).toISOString()
+          : null,
+        hours_indexing: operational.indexingMs === null
+          ? null
+          : Math.floor(operational.indexingMs / 3600000),
+        reason,
         automatable,
       };
     }),
@@ -1149,6 +1209,43 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
 }
 
 const likeLiteral = (value) => String(value).replace(/([\\%_])/g, "\\$1");
+
+/**
+ * Return one uid per live logical source document in stable lexical pages.
+ * Large connector documents are stored as several physical rows whose
+ * `meta.part_of` points at their base uid. The DISTINCT happens before the
+ * cursor and LIMIT so a split file occupies exactly one reconciliation slot.
+ */
+export async function listSourceFamilies(env, { source, cursor = "", limit = 500 } = {}) {
+  const { results } = await env.DB.prepare(
+    `SELECT family_doc_uid
+       FROM (
+         SELECT DISTINCT CASE
+           WHEN json_valid(meta)
+            AND json_type(meta,'$.part_of') = 'text'
+            AND length(json_extract(meta,'$.part_of')) > 0
+             THEN CASE
+               WHEN substr(json_extract(meta,'$.part_of'), 1, length(?1) + 1) = ?1 || ':'
+                 THEN json_extract(meta,'$.part_of')
+               ELSE ?1 || ':' || json_extract(meta,'$.part_of')
+             END
+           ELSE doc_uid
+         END AS family_doc_uid
+           FROM documents
+          WHERE source = ?1 AND deleted_at IS NULL
+       )
+      WHERE family_doc_uid > ?2
+      ORDER BY family_doc_uid ASC
+      LIMIT ?3`
+  ).bind(source, cursor, limit + 1).all();
+
+  const page = (results || []).slice(0, limit).map((row) => String(row.family_doc_uid));
+  return {
+    source,
+    families: page,
+    next_cursor: (results || []).length > limit ? page[page.length - 1] : null,
+  };
+}
 
 /**
  * Remove stale members of a split-document family after every replacement part

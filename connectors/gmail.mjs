@@ -99,12 +99,27 @@ export async function listHistory(getAccessToken, startHistoryId, opts = {}) {
   return { ids: [...added], expired: false, historyId: latest };
 }
 
+/**
+ * A messages.get 404 is about one message: it was deleted after Gmail returned
+ * its id, so retrying the same history window can never fetch it. Every other
+ * failure belongs to the connector, not the message. In particular, treating a
+ * broad 403 or an exhausted transient failure as a skip would let the caller
+ * advance its history cursor past mail it never read.
+ */
+export function isPermanentMessageFailure(error) {
+  return error instanceof DriveError && error.status === 404;
+}
+
 /** One message to one envelope, parsed by the same code that reads .eml files. */
 export async function toEnvelope(getAccessToken, id, { sourceName = SOURCE_TYPE } = {}, opts = {}) {
   let msg;
   try {
     msg = await api(getAccessToken, `/users/me/messages/${id}`, { search: { format: "raw" }, ...opts });
   } catch (e) {
+    // Only a message-specific permanent condition is safe to forget. Network,
+    // token, auth, quota, server and connector-wide permission failures must
+    // escape so the sync runner withholds the Gmail history cursor.
+    if (!isPermanentMessageFailure(e)) throw e;
     return { skip: { path: id, id, reason: `could not be fetched: ${e.message.slice(0, 120)}` } };
   }
   if (!msg?.raw) return { skip: { path: id, id, reason: "the message had no content" } };
@@ -124,7 +139,10 @@ export async function toEnvelope(getAccessToken, id, { sourceName = SOURCE_TYPE 
   return {
     envelope: {
       source_type: sourceName,
-      source_id: `gmail:${id}`,
+      // Bare connector identity. The store adds source_type exactly once;
+      // pre-prefixing here created gmail:gmail:<id> and made family deletion
+      // target a different document than the one actually stored.
+      source_id: id,
       title: subject.slice(0, 200),
       content: got.text,
       occurred_at: ts ? new Date(ts).toISOString() : null,

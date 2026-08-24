@@ -18,7 +18,7 @@
     "timezone": "America/Phoenix"
   },
   "brain": {
-    "version": "0.1.0",
+    "version": "0.1.9",
     "domain": "brain.acme.com",
     "worker_name": "acme-brain"
   },
@@ -127,7 +127,18 @@
     "daily_llm_spend_cap_usd": 10
   },
   "operations": {
+    "_ingest_cron_comment": [
+      "On macOS this installs as a per-user LaunchAgent and runs Google Drive",
+      "incrementally. The plist contains no credentials. Calendar times use",
+      "the Mac's local timezone, which the installer compares with client.timezone.",
+      "If this install keeps its admin key in macOS Keychain instead of an",
+      "adjacent .brain-admin-key file, set admin_key_secret to the non-secret",
+      "locator keychain://<service>/<account>. Never put the key itself here.",
+      "google_token_store persists auto, keychain or file for unattended runs."
+    ],
     "ingest_cron": "0 9 * * *",
+    "admin_key_secret": null,
+    "google_token_store": "auto",
     "health_cron": "0 13 * * *",
     "health_report_email": "owner@acme.com",
     "alert_webhook_secret": "secret://ALERT_WEBHOOK_URL"

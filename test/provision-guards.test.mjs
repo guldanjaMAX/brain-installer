@@ -7,6 +7,9 @@
 import {
   chooseDbName, assertAdoptable, documentCountOf, ensureMetadataIndex, VECTOR_METADATA_INDEXES,
   driveExclusionIdsOf, driveConnectorConfig, completedDriveFamilyPlans, sourceCursorCanAdvance,
+  remoteFamilyOutcomes, assertDriveLimitSafe, assertRemoteLimitSafe, validateBatchReceipt, postSourceReceipt,
+  validateForgetReceipt, assertNoPendingRemovals, credentialRefusalOf, drivePolicyFingerprint,
+  driveSyncDecision, listStoredSourceFamilies, credentialScannerFingerprint, postSourceExpectation,
 } from "../brain.mjs";
 
 let fail = 0, ran = 0;
@@ -29,6 +32,31 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   check("Drive receives path and private-prefix policy from the standard manifest",
     cfg.excludePaths[0] === "Legal/Sealed" && cfg.privatePrefixes[0] === "_private", JSON.stringify(cfg));
 
+  const policyFingerprint = drivePolicyFingerprint(cfg);
+  check("credential scanner mode is part of Drive policy identity",
+    drivePolicyFingerprint(cfg, true) !== drivePolicyFingerprint(cfg, false));
+  check("credential scanner version is a durable rescan marker",
+    credentialScannerFingerprint(true, 2) !== credentialScannerFingerprint(true, 3));
+  const freshDecision = driveSyncDecision({
+    syncToken: "cursor", policyFingerprint, savedPolicyFingerprint: policyFingerprint,
+    lastFullSweepAt: "2026-08-22T12:00:00.000Z", now: Date.parse("2026-08-23T12:00:00.000Z"),
+  });
+  check("a recent full sweep with unchanged policy may use the Drive change feed", freshDecision.incremental === true,
+    JSON.stringify(freshDecision));
+  check("a Drive policy change forces a complete comparison",
+    driveSyncDecision({ syncToken: "cursor", policyFingerprint, savedPolicyFingerprint: "old", lastFullSweepAt: "2026-08-23T00:00:00Z" }).incremental === false);
+  check("a weekly Drive truth sweep is forced even when the change token still exists",
+    driveSyncDecision({
+      syncToken: "cursor", policyFingerprint, savedPolicyFingerprint: policyFingerprint,
+      lastFullSweepAt: "2026-08-01T00:00:00Z", now: Date.parse("2026-08-23T00:00:00Z"),
+    }).incremental === false);
+
+  const boundarySecret = `sk-proj-${"A7".repeat(16)}`;
+  const logicalEnvelope = { content: `${"x".repeat(399_990)} ${boundarySecret}` };
+  const refusal = credentialRefusalOf(logicalEnvelope, true);
+  check("credential refusal scans the complete logical document before size splitting",
+    refusal?.labels?.includes("openai_api_key") && !refusal.reason.includes(boundarySecret), JSON.stringify(refusal));
+
   const plans = [
     { stateKey: "drive:a", expectedParts: 2 },
     { stateKey: "drive:b", expectedParts: 1 },
@@ -37,6 +65,134 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   check("split-family cleanup waits for every replacement part", complete.length === 1 && complete[0].stateKey === "drive:b", JSON.stringify(complete));
   check("a document-level failure keeps the source cursor retryable", sourceCursorCanAdvance({ failed: 1 }) === false);
   check("a fully accepted batch may advance its source cursor", sourceCursorCanAdvance({ failed: 0 }) === true);
+
+  const crossing = [{ stateKey: "drive:large", expectedParts: 3 }];
+  let outcome = remoteFamilyOutcomes(crossing, new Map([["drive:large", 2]]), new Map([["drive:large", 2]]));
+  check("a split family crossing batches remains pending", outcome.completed.length === 0 && outcome.incomplete.length === 0,
+    JSON.stringify(outcome));
+  outcome = remoteFamilyOutcomes(crossing, new Map([["drive:large", 3]]), new Map([["drive:large", 3]]));
+  check("a streamed family completes only after every part is accepted", outcome.completed.length === 1 && outcome.incomplete.length === 0,
+    JSON.stringify(outcome));
+  outcome = remoteFamilyOutcomes(crossing, new Map([["drive:large", 3]]), new Map([["drive:large", 2]]));
+  check("a sent family with a failed part remains retryable", outcome.completed.length === 0 && outcome.incomplete.length === 1,
+    JSON.stringify(outcome));
+
+  check("a limited first Drive sync is safe as a preview",
+    (await throws(() => assertDriveLimitSafe({ limit: 10, dryRun: true, incremental: false }))) === null);
+  const unsafeIncrementalLimit = await throws(() => assertDriveLimitSafe({ limit: 10, dryRun: false, incremental: true }));
+  check("a real limited incremental Drive sync is refused too",
+    /complete result window/.test(unsafeIncrementalLimit || ""), unsafeIncrementalLimit);
+  const unsafeLimit = await throws(() => assertDriveLimitSafe({ limit: 10, dryRun: false, incremental: false }));
+  check("a real limited first Drive walk is refused", /permanently/.test(unsafeLimit || ""), unsafeLimit);
+  const unsafeGmailLimit = await throws(() => assertRemoteLimitSafe({ source: "Gmail", limit: 10, dryRun: false, incremental: true }));
+  check("a real limited Gmail sync is refused before its history marker can skip messages",
+    /Gmail sync/.test(unsafeGmailLimit || "") && /history marker/.test(unsafeGmailLimit || ""), unsafeGmailLimit);
+
+  const group = [
+    { envelope: { source_id: "one" } },
+    { envelope: { source_id: "two" } },
+  ];
+  check("a complete per-document ingest receipt is accepted",
+    validateBatchReceipt({ results: [
+      { source_id: "one", status: "created" },
+      { source_id: "two", status: "unchanged" },
+    ] }, group).length === 2);
+  const missingReceipt = await throws(() => validateBatchReceipt({
+    failed: 0,
+    results: [{ source_id: "one", status: "created" }],
+  }, group));
+  check("a top-level zero-failure counter cannot hide an unacknowledged document",
+    /not acknowledged/.test(missingReceipt || ""), missingReceipt);
+  const falseSuccess = await throws(() => validateBatchReceipt({
+    failed: 0,
+    results: [
+      { source_id: "one", status: "created" },
+      { source_id: "two", status: "failed" },
+    ],
+  }, group));
+  check("an explicit failed result remains a valid receipt that the cursor tally can see", falseSuccess === null, falseSuccess);
+
+  check("a real forget receipt is accepted", validateForgetReceipt({
+    dry_run: false, documents: 1, chunks: 3, vectors: 3, targets: ["drive:one"],
+  }).documents === 1);
+  for (const [label, receipt] of [
+    ["HTML-shaped absence", null],
+    ["empty JSON", {}],
+    ["dry run", { dry_run: true, documents: 1, chunks: 1, vectors: 1, targets: [] }],
+    ["missing counts", { dry_run: false, targets: [] }],
+    ["missing targets", { dry_run: false, documents: 0, chunks: 0, vectors: 0 }],
+  ]) {
+    const invalid = await throws(() => validateForgetReceipt(receipt));
+    check(`${label} cannot masquerade as a confirmed deletion`, invalid !== null, invalid);
+  }
+  const pendingRemoval = await throws(() => assertNoPendingRemovals({ pending: 2 }, "test removal"));
+  check("an unconfirmed cleanup withholds the source cursor", /not advanced/.test(pendingRemoval || ""), pendingRemoval);
+}
+
+/* ---- full-sweep source inventory is authenticated, complete, and paged ---- */
+{
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), key: options?.headers?.["X-Admin-Key"] });
+    const cursor = new URL(String(url)).searchParams.get("cursor");
+    const body = cursor
+      ? { source: "drive", families: ["drive:c"], next_cursor: null }
+      : { source: "drive", families: ["drive:a", "drive:b"], next_cursor: "drive:b" };
+    return new Response(JSON.stringify(body), { status: 200 });
+  };
+  try {
+    const families = await listStoredSourceFamilies({ base: "https://brain.example", adminKey: "admin-only", source: "drive" });
+    check("a full source inventory follows every page", [...families].join(",") === "drive:a,drive:b,drive:c", [...families].join(","));
+    check("source inventory uses only the brain admin credential", calls.length === 2 && calls.every((call) => call.key === "admin-only"), JSON.stringify(calls));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+/* ---- connector lifecycle uses the brain admin route, not Cloudflare control ---- */
+{
+  let seen = null;
+  const request = async (url, options, policy) => {
+    seen = { url, options, policy, body: JSON.parse(options.body) };
+    return new Response(JSON.stringify({ source: "drive", status: "indexing", run_id: "run_1" }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  };
+  const out = await postSourceReceipt("https://brain.example", "admin-only", {
+    source: "drive", kind: "drive", status: "indexing", run_id: "run_1", lane: "incremental",
+  }, request);
+  check("source lifecycle posts to the authenticated Worker route",
+    seen?.url === "https://brain.example/api/admin/brain/source-receipt" && seen.options.headers["X-Admin-Key"] === "admin-only", JSON.stringify(seen));
+  check("source lifecycle never sends a Cloudflare bearer token",
+    !seen.options.headers.Authorization && out.run_id === "run_1", JSON.stringify(seen.options.headers));
+  check("source lifecycle uses a bounded request", seen.policy?.timeoutMs === 30000, JSON.stringify(seen.policy));
+
+  const bad = await throws(() => postSourceReceipt("https://brain.example", "k", { status: "ready" }, async () =>
+    new Response(JSON.stringify({ status: "error" }), { status: 200 })));
+  check("a mismatched lifecycle acknowledgement is not believed", /not accepted/.test(bad || ""), bad);
+  const wrongIdentity = await throws(() => postSourceReceipt("https://brain.example", "k", {
+    source: "drive", status: "ready", run_id: "run_expected",
+  }, async () => new Response(JSON.stringify({
+    source: "other", status: "ready", run_id: "run_other",
+  }), { status: 200 })));
+  check("a lifecycle acknowledgement for another source or run is not believed",
+    /not accepted/.test(wrongIdentity || ""), wrongIdentity);
+
+  const expectation = await postSourceExpectation("https://brain.example", "admin-only", {
+    source: "drive", kind: "drive", expected_refresh_seconds: 86_400,
+  }, async () => new Response(JSON.stringify({
+    source: "drive", kind: "drive", expected_refresh_seconds: 86_400,
+  }), { status: 200 }));
+  check("the scheduler can set its exact source freshness expectation",
+    expectation.expected_refresh_seconds === 86_400, JSON.stringify(expectation));
+  const wrongExpectation = await throws(() => postSourceExpectation("https://brain.example", "admin-only", {
+    source: "drive", kind: "drive", expected_refresh_seconds: null,
+  }, async () => new Response(JSON.stringify({
+    source: "drive", kind: "drive", expected_refresh_seconds: 86_400,
+  }), { status: 200 })));
+  check("a mismatched freshness acknowledgement is not believed",
+    /not accepted/.test(wrongExpectation || ""), wrongExpectation);
 }
 
 /* ---- the name must never be one that could belong to somebody else ---- */
@@ -214,7 +370,7 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     return src.slice(i, nxt === -1 ? src.length : nxt);
   };
 
-  for (const name of ["cmdEval", "cmdDiagnose", "cmdDrain", "cmdReindex", "cmdHealth"]) {
+  for (const name of ["cmdEval", "cmdDiagnose", "cmdDrain", "cmdReindex", "cmdHealth", "cmdIngestRemote"]) {
     const b = bodyOf(name);
     check(`${name} exists`, b !== null);
     if (!b) continue;
@@ -224,6 +380,44 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     check(`${name} resolves the account only as a fallback`,
       /m\.brain\?\.domain \? null : await resolveAccount\(m\)/.test(b));
   }
+
+  const remote = bodyOf("cmdIngestRemote");
+  const local = bodyOf("cmdIngest");
+  check("an incomplete local walk aborts before any source-truth cleanup",
+    /if \(!walkComplete\)[\s\S]*nothing was sent and no prior document was removed/.test(local || ""),
+    String(local).slice(0, 1200));
+  check("local cleanup is limited to explicit private policy and credential refusal",
+    /privateRemovalKeys/.test(local || "") && /intentionalRemovalKeys/.test(local || "") &&
+      !/vanishedLocalKeys/.test(local || ""), String(local).slice(0, 1800));
+  check("a limited local run cannot falsely commit a scanner migration",
+    /scannerPolicyChanged && limitedMissesPrior/.test(local || "") &&
+      /--limit cannot be used/.test(local || ""), String(local).slice(0, 1800));
+  const localCleanupConfirmed = String(local).indexOf('assertNoPendingRemovals(localRemoval');
+  const localScannerCommitted = String(local).indexOf('state.credential_scanner_fingerprint = scannerFingerprint');
+  check("local scanner policy commits only after confirmed refusal cleanup",
+    localCleanupConfirmed !== -1 && localScannerCommitted > localCleanupConfirmed,
+    `cleanup=${localCleanupConfirmed} commit=${localScannerCommitted}`);
+  check("remote ingest opens freshness through the Worker before reading Google",
+    /status: "indexing"/.test(remote || "") && /postSourceReceipt/.test(remote || ""), String(remote).slice(0, 200));
+  check("a thrown Drive or Gmail fetch posts an error receipt",
+    /catch \(error\)[\s\S]*status: "error"/.test(remote || ""), String(remote).slice(-500));
+  check("remote ingest no longer writes source state through Cloudflare D1 control APIs",
+    !/recordSource(?:Start|Finish)/.test(remote || ""), String(remote).slice(0, 200));
+  check("remote dry-run skips account, base URL, and admin-key resolution",
+    /const acct = dry \? null/.test(remote || "") &&
+      /const base = dry \? null/.test(remote || "") &&
+      /const adminKey = dry \? null/.test(remote || ""),
+    String(remote).slice(0, 900));
+  check("remote ingest streams bounded groups instead of retaining a ready corpus",
+    /for await \(const group of batchStream/.test(remote || "") &&
+      /await consumeGroup\(group\)/.test(remote || "") &&
+      !/const ready = \[\]/.test(remote || ""),
+    String(remote).slice(0, 900));
+  const versionCheck = String(remote).indexOf("state.done[key] === listedVersion");
+  const driveDownload = String(remote).indexOf("drive.toEnvelope");
+  check("a Drive sweep checks listing metadata before downloading bytes",
+    versionCheck !== -1 && driveDownload !== -1 && versionCheck < driveDownload,
+    `version=${versionCheck} download=${driveDownload}`);
 
   // And the ones that genuinely need Cloudflare should NOT have been changed.
   for (const name of ["cmdProvision", "cmdDeploy", "cmdMigrate"]) {

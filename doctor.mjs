@@ -18,8 +18,8 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { homedir, platform } from "node:os";
+import { platform } from "node:os";
+import { tokenStorageStatus } from "./connectors/google-auth.mjs";
 
 export const OK = "ok";
 export const WARN = "warn";
@@ -279,8 +279,16 @@ export function checkAnthropicKey() {
 }
 
 export function checkGoogleConnection() {
-  const p = join(homedir(), ".brain", "google-tokens.json");
-  if (existsSync(p)) return check("Google connection", OK, `token stored at ${p}`);
+  const stored = tokenStorageStatus();
+  if (stored.exists) return check("Google connection", OK, `token stored in ${stored.description}`);
+  if (stored.error) {
+    return check(
+      "Google connection",
+      WARN,
+      "credential storage could not be checked",
+      `${stored.error}\n  No credential value was read or printed.`
+    );
+  }
   return check(
     "Google connection",
     WARN,

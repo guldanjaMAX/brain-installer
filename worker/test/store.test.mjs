@@ -78,5 +78,113 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
   check("undated stays null", r.results[0].ts === null, String(r.results[0].ts));
 }
 
+/* ---- a failed revision cannot commit its hash before its chunks ---- */
+{
+  const rows = { document: null, chunks: new Map() };
+  let failAfterDocumentWrite = true;
+  let documentWrites = 0;
+  let batches = 0;
+
+  const execute = (sql, binds) => {
+    if (/INSERT INTO documents/i.test(sql)) {
+      documentWrites++;
+      const incoming = {
+        doc_uid: binds[0], source: binds[1], source_id: binds[2], title: binds[3],
+        uri: binds[4], document_date: binds[5], date_source: binds[6],
+        date_reliable: binds[7], client: binds[8], category: binds[9],
+        top_folder: binds[10], platform: binds[11], ingested_at: binds[12],
+        content_hash: binds[13], meta: binds[14],
+      };
+      rows.document = rows.document
+        ? { ...rows.document, ...incoming }
+        : incoming;
+    } else if (/UPDATE documents SET content_hash/i.test(sql)) {
+      rows.document.content_hash = binds[1];
+    } else if (/DELETE FROM chunks WHERE doc_uid/i.test(sql)) {
+      for (const [uid, chunk] of rows.chunks) if (chunk.doc_uid === binds[0]) rows.chunks.delete(uid);
+    } else if (/INSERT INTO chunks/i.test(sql)) {
+      rows.chunks.set(binds[0], { chunk_uid: binds[0], doc_uid: binds[1], text: binds[3] });
+    }
+  };
+
+  const env = {
+    STORAGE: "d1",
+    VECTORIZE: { deleteByIds: async () => {} },
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...binds) {
+            return {
+              sql, binds,
+              first: async () => {
+                if (/SELECT content_hash/i.test(sql)) return rows.document ? { ...rows.document } : null;
+                if (/SELECT client, category/i.test(sql)) return rows.document ? { ...rows.document } : null;
+                return null;
+              },
+              all: async () => ({ results: [] }),
+              run: async () => { execute(sql, binds); return {}; },
+            };
+          },
+        };
+      },
+      async batch(statements) {
+        batches++;
+        if (failAfterDocumentWrite) {
+          failAfterDocumentWrite = false;
+          throw new Error("simulated failure after document row write");
+        }
+        for (const statement of statements) execute(statement.sql, statement.binds);
+        return [];
+      },
+    },
+  };
+
+  const envelope = {
+    source_type: "drive", source_id: "retry-file", title: "Retry file",
+    content: "A complete document body that must be rebuilt after an interrupted write.",
+    metadata: { platform: "drive" },
+  };
+  let firstError = null;
+  try {
+    await storeFor(env).ingest(env, envelope);
+  } catch (error) {
+    firstError = error;
+  }
+  check("the simulated write fails only after the document row exists",
+    /simulated failure/.test(firstError?.message || "") && documentWrites === 1 && rows.document !== null,
+    `${firstError?.message || "no error"}; writes=${documentWrites}`);
+  check("an interrupted revision retains a non-committed hash",
+    rows.document.content_hash.startsWith("pending:") && rows.chunks.size === 0,
+    `${rows.document.content_hash}; chunks=${rows.chunks.size}`);
+
+  const repaired = await storeFor(env).ingest(env, envelope);
+  check("retry repairs chunks instead of returning unchanged",
+    repaired.action !== "unchanged" && repaired.chunks > 0 && rows.chunks.size === repaired.chunks,
+    `${JSON.stringify(repaired)}; stored=${rows.chunks.size}`);
+  check("the real content hash commits only after repair completes",
+    /^[a-f0-9]{64}$/.test(rows.document.content_hash), rows.document.content_hash);
+
+  const batchesAfterRepair = batches;
+  const stable = await storeFor(env).ingest(env, envelope);
+  check("a fully committed retry becomes unchanged normally",
+    stable.action === "unchanged" && batches === batchesAfterRepair, JSON.stringify(stable));
+
+  failAfterDocumentWrite = true;
+  const renamed = { ...envelope, title: "Renamed retry file" };
+  let renameError = null;
+  try {
+    await storeFor(env).ingest(env, renamed);
+  } catch (error) {
+    renameError = error;
+  }
+  check("a failed metadata-only revision also clears the commit marker",
+    /simulated failure/.test(renameError?.message || "") && rows.document.content_hash.startsWith("pending:"),
+    `${renameError?.message || "no error"}; ${rows.document.content_hash}`);
+  const renamedRepair = await storeFor(env).ingest(env, renamed);
+  check("retry rebuilds title-bearing chunks after a metadata-only failure",
+    renamedRepair.action === "updated" && [...rows.chunks.values()].every((chunk) => chunk.text.startsWith("[Renamed retry file]")),
+    JSON.stringify(renamedRepair));
+}
+
 console.log(fail ? `\n${fail} FAILURES` : `\nstore: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);
