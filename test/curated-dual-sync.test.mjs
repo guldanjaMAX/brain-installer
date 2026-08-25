@@ -336,6 +336,34 @@ try {
   assert.equal(contracts.legacy.origin, "https://legacy-contract.invalid");
   assert.equal(contracts.cloudflare.origin, "https://cloudflare-contract.invalid");
   assert.notEqual(contracts.legacy.backend, contracts.cloudflare.backend);
+  assert.match(contracts.legacy.manifestFingerprint, /^[0-9a-f]{64}$/);
+  assert.match(contracts.cloudflare.manifestFingerprint, /^[0-9a-f]{64}$/);
+
+  // A scheduler-bound manifest mismatch stops before Keychain, network, and
+  // ledger access. The expected value is a hash, never a copied locator.
+  let manifestKeyReads = 0;
+  let manifestNetwork = 0;
+  let manifestLedgerWrites = 0;
+  await assert.rejects(
+    () => runCuratedDualSync(plan(), {
+      mode: "audit",
+      planDirectory: sandbox,
+      expectedTargetFingerprints: {
+        legacy: contracts.legacy.manifestFingerprint,
+        cloudflare: "f".repeat(64),
+      },
+      runChild: () => {
+        manifestKeyReads++;
+        return { status: 0, stdout: Buffer.from("fixture-key\n"), stderr: Buffer.alloc(0) };
+      },
+      fetch: async () => { manifestNetwork++; return response(500, {}); },
+      writeLedger: () => { manifestLedgerWrites++; },
+    }),
+    /target manifest changed after the curated scheduler was prepared/,
+  );
+  assert.equal(manifestKeyReads, 0);
+  assert.equal(manifestNetwork, 0);
+  assert.equal(manifestLedgerWrites, 0);
 
   // The ledger may never alias any input or credential sidecar, even through
   // an absolute path. Every collision is refused before a writer is invoked.

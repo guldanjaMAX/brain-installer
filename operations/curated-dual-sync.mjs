@@ -168,6 +168,26 @@ function targetPlan(value, label, name) {
   });
 }
 
+function optionalSchedulerPlan(value) {
+  if (value === undefined || value === null) return null;
+  const scheduler = plainObject(value, "scheduler");
+  const slug = String(scheduler.slug ?? "");
+  if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(slug)) {
+    fail("scheduler.slug must be a lowercase installation label");
+  }
+  const cron = String(scheduler.cron ?? "").trim();
+  if (!cron || cron.length > 200 || PATH_CONTROL.test(cron)) {
+    fail("scheduler.cron must be a bounded cron expression");
+  }
+  const timezone = scheduler.timezone === undefined || scheduler.timezone === null
+    ? null
+    : String(scheduler.timezone);
+  if (timezone !== null && (!timezone || timezone.length > 100 || PATH_CONTROL.test(timezone))) {
+    fail("scheduler.timezone is invalid");
+  }
+  return Object.freeze({ slug, cron, timezone });
+}
+
 /** Validate a private plan without touching its corpus, credentials, or targets. */
 export function validateCuratedSyncPlan(input) {
   const plan = plainObject(input, "curated sync plan");
@@ -293,6 +313,7 @@ export function validateCuratedSyncPlan(input) {
     legacyTarget: targetPlan(plan.legacy_target, "legacy_target", "legacy"),
     cloudflareTarget: targetPlan(plan.cloudflare_target, "cloudflare_target", "cloudflare"),
     rawDrive,
+    scheduler: optionalSchedulerPlan(plan.scheduler),
     ledgerFile: safeInstancePath(
       plan.ledger_file ?? ".brain-curated-sync-ledger.json",
       "ledger_file",
@@ -331,6 +352,7 @@ export function loadCuratedSyncPlan(planPath, options = {}) {
         error?.message?.startsWith("raw_drive") ||
         error?.message?.startsWith("exclude_") ||
         error?.message?.startsWith("transforms") ||
+        error?.message?.startsWith("scheduler") ||
         error?.message?.startsWith("legacy_target") ||
         error?.message?.startsWith("cloudflare_target") ||
         error?.message?.startsWith("common_metadata")) {
@@ -705,7 +727,11 @@ function readTargetManifest(target, planDirectory) {
   const manifestPath = resolveFromPlan(planDirectory, target.manifest);
   let manifest;
   try {
-    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const snapshot = readStableRegularSource(manifestPath);
+    if (Buffer.byteLength(snapshot.body, "utf8") > MAX_PLAN_BYTES) {
+      fail("target manifest could not be read and validated");
+    }
+    manifest = JSON.parse(snapshot.body);
   } catch {
     fail("target manifest could not be read and validated");
   }
@@ -713,25 +739,24 @@ function readTargetManifest(target, planDirectory) {
   if (target.backend === TARGET_BACKENDS.cloudflare && manifest?.infrastructure?.cloudflare?.storage !== "d1") {
     fail("Cloudflare target manifest must declare d1 storage");
   }
-  return { manifestPath, manifest, baseUrl: `https://${domain}`, origin: `https://${domain}` };
+  return {
+    manifestPath,
+    manifest,
+    manifestFingerprint: sha256(`curated-sync-target-manifest-v1\0${canonical(manifest)}`),
+    baseUrl: `https://${domain}`,
+    origin: `https://${domain}`,
+  };
 }
 
-/** Read and validate target identities without touching an admin credential. */
-export function inspectCuratedTargetContracts(planInput, options = {}) {
-  const planDirectory = options.planDirectory ?? process.cwd();
-  const plan = planInput?.schemaVersion === CURATED_SYNC_PLAN_VERSION
-    ? planInput
-    : validateCuratedSyncPlan(planInput);
+function readCuratedTargetContracts(plan, planDirectory) {
   const targets = {};
   for (const name of TARGET_NAMES) {
     const target = name === "legacy" ? plan.legacyTarget : plan.cloudflareTarget;
     const descriptor = readTargetManifest(target, planDirectory);
     targets[name] = Object.freeze({
+      ...descriptor,
       name,
       backend: target.backend,
-      baseUrl: descriptor.baseUrl,
-      origin: descriptor.origin,
-      manifestPath: descriptor.manifestPath,
     });
   }
   if (targets.legacy.backend === targets.cloudflare.backend ||
@@ -741,8 +766,25 @@ export function inspectCuratedTargetContracts(planInput, options = {}) {
   return Object.freeze(targets);
 }
 
-async function defaultResolveTarget(target, planDirectory, options = {}, name) {
-  const { manifestPath, manifest, baseUrl, origin } = readTargetManifest(target, planDirectory);
+/** Read and validate target identities without touching an admin credential. */
+export function inspectCuratedTargetContracts(planInput, options = {}) {
+  const planDirectory = options.planDirectory ?? process.cwd();
+  const plan = planInput?.schemaVersion === CURATED_SYNC_PLAN_VERSION
+    ? planInput
+    : validateCuratedSyncPlan(planInput);
+  const inspected = readCuratedTargetContracts(plan, planDirectory);
+  return Object.freeze(Object.fromEntries(TARGET_NAMES.map((name) => [name, Object.freeze({
+    name,
+    backend: inspected[name].backend,
+    baseUrl: inspected[name].baseUrl,
+    origin: inspected[name].origin,
+    manifestPath: inspected[name].manifestPath,
+    manifestFingerprint: inspected[name].manifestFingerprint,
+  })])));
+}
+
+async function defaultResolveTarget(target, planDirectory, options = {}, name, inspected = null) {
+  const { manifestPath, manifest, baseUrl, origin } = inspected ?? readTargetManifest(target, planDirectory);
   const persistence = adminKeyPersistencePlan(manifestPath, manifest, options);
   const adminKey = readAdminKeyDurably(persistence, options);
   if (!adminKey) fail("target durable admin key is unavailable");
@@ -764,14 +806,24 @@ function validateResolvedTarget(name, target, resolved) {
   return Object.freeze({ ...resolved, name, backend, baseUrl: url.origin, origin: url.origin });
 }
 
-async function resolveRequiredTargets(prepared, options, mode) {
+async function resolveRequiredTargets(prepared, options, mode, inspectedTargets = null) {
   if (mode === "dry-run") return Object.freeze({});
   const resolver = options.resolveTarget ?? defaultResolveTarget;
   const names = mode === "sync" ? TARGET_NAMES : ["cloudflare"];
   const resolved = {};
   const candidates = await Promise.all(names.map(async (name) => {
     const target = name === "legacy" ? prepared.plan.legacyTarget : prepared.plan.cloudflareTarget;
-    try { return await resolver(target, prepared.planDirectory, options, name); } catch { return null; }
+    try {
+      return await resolver(
+        target,
+        prepared.planDirectory,
+        options,
+        name,
+        inspectedTargets?.[name] ?? null,
+      );
+    } catch {
+      return null;
+    }
   }));
   for (let index = 0; index < names.length; index++) {
     const name = names[index];
@@ -946,6 +998,20 @@ function rawDriveStatuses(prepared, mapped, live) {
     statuses.set(document.logicalFingerprint, status);
   }
   return statuses;
+}
+
+function assertExpectedTargetFingerprints(inspected, expected) {
+  if (expected === undefined || expected === null) return;
+  if (!expected || typeof expected !== "object" || Array.isArray(expected)) {
+    fail("expected target manifest fingerprints are invalid");
+  }
+  for (const name of TARGET_NAMES) {
+    const fingerprint = String(expected[name] ?? "");
+    if (!/^[0-9a-f]{64}$/.test(fingerprint) ||
+        inspected[name].manifestFingerprint !== fingerprint) {
+      fail("a target manifest changed after the curated scheduler was prepared");
+    }
+  }
 }
 
 function aggregateByRole(prepared, statuses, wanted) {
@@ -1165,16 +1231,15 @@ export async function runCuratedDualSync(planInput, options = {}) {
 
   // Production manifests are identity-only inspected before Keychain access.
   // Injected resolvers are validated from their returned backend and origin.
+  let inspectedTargets = null;
   if (mode !== "dry-run" && !options.resolveTarget) {
-    inspectCuratedTargetContracts(prepared.plan, {
-      ...options,
-      planDirectory: prepared.planDirectory,
-    });
+    inspectedTargets = readCuratedTargetContracts(prepared.plan, prepared.planDirectory);
+    assertExpectedTargetFingerprints(inspectedTargets, options.expectedTargetFingerprints);
   }
 
   let mapped = new Map();
   if (prepared.plan.rawDrive) mapped = driveFamiliesByLogicalDocument(prepared);
-  const resolvedTargets = await resolveRequiredTargets(prepared, options, mode);
+  const resolvedTargets = await resolveRequiredTargets(prepared, options, mode, inspectedTargets);
   const targetOptions = { ...options, resolvedTargets };
   let live = { ok: false, families: new Set() };
   if (mode !== "dry-run" && prepared.plan.rawDrive) {

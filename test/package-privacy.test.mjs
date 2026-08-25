@@ -91,6 +91,7 @@ const expected = [
   "operations/admin-key-file.mjs",
   "operations/admin-key-persistence.mjs",
   "operations/curated-dual-sync.mjs",
+  "operations/curated-sync-scheduler.mjs",
   "operations/drive-removal-plan.mjs",
   "operations/drive-scheduler.mjs",
   "operations/windows-dpapi.ps1",

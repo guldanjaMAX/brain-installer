@@ -353,8 +353,9 @@ a small Markdown collection that already has a live legacy ingest target. It is
 not part of a fresh install. A private mode-0600 sidecar plan names the exact
 expected files, their authoritative, superseded or plain role, their existing
 legacy identities, both target manifests, each target's fixed backend contract,
-and the private coverage-ledger destination. The plan and ledger are ignored by
-Git and never belong in the package. `legacy_target.backend` must be
+the private coverage-ledger destination, and an optional unattended scheduler
+slug, cron, and timezone. The plan and ledger are ignored by Git and never
+belong in the package. `legacy_target.backend` must be
 `legacy_notes_supabase`; `cloudflare_target.backend` must be `cloudflare_d1`.
 
 The operation has three explicit modes. `--dry-run` reads no credential and
@@ -376,7 +377,10 @@ fails. Finally, every source is reopened through a no-follow descriptor and its
 raw SHA-256 is compared with the first pass. All of these checks finish before
 an admin key can be read or a request can be made.
 
-Target resolution occurs once per required target. HTTPS origins are normalized,
+Each target manifest is read once through a stable no-follow descriptor before
+Keychain access. The same inspected object supplies the HTTPS origin, backend,
+and durable-key locator used by the request path, so a second path read cannot
+redirect a credential. HTTPS origins are normalized,
 legacy and Cloudflare must use distinct origins and backends, and every
 authenticated fetch uses manual redirect handling. A redirect is a target
 failure, never an invitation to forward a key. Cloudflare POST receipts must
@@ -418,13 +422,26 @@ during a read without changing source bytes. The collection is enumerated again
 after all reads. A cloud-sync replacement or an inventory change therefore
 stops the run before either target is contacted.
 
-This operation is not yet installed as a scheduler. Production rollout remains
-blocked on a private single-instance scheduler lock, a last-success freshness
-check, and bounded metadata-only support-journal events wired around this exact
-command. Reusing the Drive scheduler wrapper without a reviewed command and
-lock-identity contract could create overlapping medical syncs or misleading
-freshness, so those controls must be added and tested before any LaunchAgent is
-changed.
+`operations/curated-sync-scheduler.mjs` supplies the unattended execution rails
+for a reviewed plan. Its LaunchAgent definition contains only the plan locator
+and a configuration hash. That hash binds the normalized plan plus both complete
+target-manifest fingerprints, including domains and Keychain locators; changing
+any of them stops before Keychain access until the service is reviewed and
+reinstalled. `run` strips ambient credentials and invokes an
+`execute` child through a nonblocking native `lockf`; only that lock holder may
+open Keychain-backed target credentials. A complete dual-target confirmation
+atomically advances an owner-only aggregate freshness receipt. A normal child
+failure records one bounded local support-journal event in the child; an
+abnormal signal or pre-child wrapper failure is recorded by the parent. Neither
+receipt contains paths, source identities, document names, URLs, content, raw
+errors, or credentials.
+
+The scheduler wrapper and plist renderer do not silently install or replace a
+LaunchAgent. Production rollout still requires independent review, one
+supervised successful sync, a staged rollback-safe service replacement, and a
+fresh status read. The existing medical job must remain untouched until those
+checks pass; copying the Drive job's plist or command would use the wrong lock
+identity and could report false freshness.
 
 ---
 
