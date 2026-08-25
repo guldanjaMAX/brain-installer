@@ -314,7 +314,10 @@ function baseFields(q) {
   return {
     id: q.id,
     kind: q.kind,
-    query_kind: q.query_kind || q.kind,
+    // `kind` selects the executable evaluation path, so report and slice the
+    // same value. A second label must never make an answerable retrieval case
+    // look like an exercised refusal case.
+    query_kind: q.kind,
     risk: q.risk || "normal",
     domains: Array.isArray(q.domains) ? q.domains : q.domain ? [q.domain] : [],
     formats: Array.isArray(q.formats) ? q.formats : q.format ? [q.format] : [],
@@ -875,7 +878,7 @@ async function collectProvenance(client, base, suiteBytes, corpus) {
   return p;
 }
 
-function hardGateFailures(passes, k) {
+function hardGateFailures(passes, k, profile = "smoke") {
   const failures = [];
   for (let passIndex = 0; passIndex < passes.length; passIndex++) {
     const failuresBeforePass = failures.length;
@@ -897,7 +900,11 @@ function hardGateFailures(passes, k) {
         failures.push({ id: entry.id, scope: "case", pass, reason: "TRANSPORT_ERROR" });
         continue;
       }
-      if (entry.risk !== "critical") continue;
+      // The release profile requires an unanswerable slice. Every case in that
+      // required slice must therefore exercise and pass the refusal path,
+      // regardless of its risk label. Smoke preserves the existing behavior in
+      // which only critical case failures block the process.
+      if (entry.risk !== "critical" && !(profile === "release" && entry.kind === "unanswerable")) continue;
       if (entry.kind === "unanswerable") {
         if (entry.skipped) failures.push({ id: entry.id, scope: "case", pass, reason: "UNANSWERABLE_PROBE_SKIPPED" });
         else if (!entry.refusal || entry.refusal.inconclusive) {
@@ -1023,7 +1030,7 @@ async function main() {
         "                      Do this before believing a small win: retrieval is",
         "                      approximate, so identical runs differ.",
         "  --graph-boost       only if the target implements it; probed before use",
-        "  --no-think          skip the unanswerable probes (they cost LLM calls)",
+        "  --no-think          skip unanswerable probes in smoke only; release refuses this flag",
         "  --baseline <path>   compare against a saved run",
         "  --save <path>       write this run to disk",
         "  --artifacts <dir>   write run.json, failures.jsonl, coverage.csv and junit.xml",
@@ -1066,6 +1073,11 @@ async function main() {
   const profileCoverage = evaluateProfileCoverage(golden, profile);
   if (profileCoverage.failures.length > 0) {
     throw new Error(formatProfileFailures(profileCoverage));
+  }
+  if (profile === "release" && bools.has("no-think")) {
+    throw new Error(
+      "--no-think cannot be used with the release profile because every required unanswerable case must run",
+    );
   }
 
   const k = Number(flags.k || cfg.k || 5);
@@ -1256,7 +1268,7 @@ async function main() {
   const improvements = findImprovements(run, baseline, k);
   run.regression_count = regressions.length;
   run.regressions = regressions.map((entry) => ({ id: entry.id, repeat: entry.repeat || 1 }));
-  run.hard_gate_failures = hardGateFailures(passes, k);
+  run.hard_gate_failures = hardGateFailures(passes, k, profile);
   run.completed_at = new Date().toISOString();
 
   if (bools.has("json")) console.log(JSON.stringify(run, null, 2));

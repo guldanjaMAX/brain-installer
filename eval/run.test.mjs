@@ -136,6 +136,32 @@ async function runFixture({
   }
 }
 
+function releaseProfileFixture() {
+  const questions = Array.from({ length: 60 }, (_, index) => {
+    const unanswerable = index >= 55;
+    return {
+      id: `release-${index + 1}`,
+      kind: unanswerable ? "unanswerable" : "single",
+      risk: index < 5 ? "critical" : "normal",
+      domains: ["general"],
+      formats: ["text"],
+      question: `Synthetic release question ${index + 1}`,
+      expect: unanswerable ? [] : [{ any_of: ["curated:doc-a"] }],
+    };
+  });
+  return {
+    questions,
+    goldenFields: {
+      release_slices: {
+        risk: ["critical", "normal"],
+        domain: ["general"],
+        format: ["text"],
+        query_kind: ["single", "unanswerable"],
+      },
+    },
+  };
+}
+
 test("release profile rejects an undersized suite before credentials or network access", async () => {
   let requests = 0;
   const privateText = "PRIVATE question that must not be copied into release diagnostics";
@@ -161,28 +187,8 @@ test("release profile rejects an undersized suite before credentials or network 
 });
 
 test("release profile passes its exact aggregate coverage floor and records the profile", async () => {
-  const questions = Array.from({ length: 60 }, (_, index) => {
-    const unanswerable = index >= 55;
-    return {
-      id: `release-${index + 1}`,
-      kind: unanswerable ? "unanswerable" : "single",
-      risk: index < 5 ? "critical" : "normal",
-      domains: ["general"],
-      formats: ["text"],
-      question: `Synthetic release question ${index + 1}`,
-      expect: unanswerable ? [] : [{ any_of: ["curated:doc-a"] }],
-    };
-  });
   const result = await runFixture({
-    questions,
-    goldenFields: {
-      release_slices: {
-        risk: ["critical", "normal"],
-        domain: ["general"],
-        format: ["text"],
-        query_kind: ["single", "unanswerable"],
-      },
-    },
+    ...releaseProfileFixture(),
     args: ["--profile", "release"],
     artifacts: true,
   });
@@ -192,6 +198,33 @@ test("release profile passes its exact aggregate coverage floor and records the 
   assert.equal(result.runArtifact.suite.profile, "release");
   assert.equal(result.runArtifact.suite.profile_coverage.minimums.suite_cases, 60);
   assert.deepEqual(result.runArtifact.suite.profile_coverage.failures, []);
+});
+
+test("release refuses to skip its required normal-risk unanswerable cases", async () => {
+  let requests = 0;
+  const result = await runFixture({
+    ...releaseProfileFixture(),
+    args: ["--profile", "release", "--no-think"],
+    route: () => { requests++; return null; },
+  });
+
+  assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+  assert.equal(requests, 0, "an impossible release must fail before contacting the brain");
+  assert.match(result.stderr, /--no-think cannot be used with the release profile/);
+});
+
+test("a false answer in every required normal-risk unanswerable case blocks release", async () => {
+  const result = await runFixture({
+    ...releaseProfileFixture(),
+    args: ["--profile", "release"],
+    route: ({ url }) => url.pathname === "/api/rag/think"
+      ? { body: { answer: "The unsupported fact is definitely true.", gaps: ["missing"] } }
+      : null,
+  });
+
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /HARD GATE FAILURES \(5\)/);
+  assert.equal((result.stdout.match(/FALSE_ANSWER/g) || []).length >= 5, true);
 });
 
 test("the distributed runner records reproducible provenance and CI artifacts", async () => {

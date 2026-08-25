@@ -85,6 +85,23 @@ test("release requires an explicit coverage contract and all case labels", () =>
   ));
 });
 
+test("unanswerable coverage is derived from executable kind, not a conflicting query_kind label", () => {
+  const suite = releaseSuite();
+  for (const question of suite.questions.filter((entry) => entry.kind === "unanswerable")) {
+    question.kind = "single";
+    question.query_kind = "unanswerable";
+    question.expect = [{ source: "curated", doc: "Synthetic fixture" }];
+  }
+
+  const result = evaluateProfileCoverage(suite, "release");
+  assert.equal(result.observed.slices.query_kind.unanswerable ?? 0, 0);
+  assert.ok(result.failures.some((entry) =>
+    entry.code === "QUERY_KIND_MUST_MATCH_KIND" && entry.observed === 10));
+  assert.ok(result.failures.some((entry) =>
+    entry.code === "REQUIRED_SLICE_BELOW_MINIMUM" && entry.dimension === "query_kind" &&
+    entry.value === "unanswerable" && entry.observed === 0));
+});
+
 test("release coverage failures contain no private case text or source references", () => {
   const suite = releaseSuite();
   suite.questions.length = 1;

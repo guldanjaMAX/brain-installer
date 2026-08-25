@@ -138,8 +138,11 @@ meets all of these structural floors:
 
 Every label used by a case must be declared in `release_slices`. The gate emits
 aggregate counts only and runs before the admin key is read or a network call is
-made. After the floor passes, the existing v1 retrieval, refusal, provenance,
-regression, and critical-case gates run normally.
+made. Query-kind coverage is derived from the executable `kind`; when a legacy
+`query_kind` label is present it must match `kind`. After the floor passes, the
+existing v1 retrieval, provenance, regression, and critical-case gates run
+normally. Every release-profile unanswerable case must also run and pass its
+refusal check regardless of risk. `--no-think` is therefore smoke-only.
 
 This is v1 retrieval-suite release qualification, not full v2 certification.
 It does not prove that the declared slices cover every real corpus region, and

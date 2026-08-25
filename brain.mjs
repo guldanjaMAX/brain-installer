@@ -102,6 +102,7 @@ import {
   assertDriveRemovalPlanSafe,
   buildDriveRemovalPlan,
 } from "./operations/drive-removal-plan.mjs";
+import { evaluateProfileCoverage, formatProfileFailures } from "./eval/profile.mjs";
 export {
   DRIVE_REMOVAL_MAX_COUNT,
   DRIVE_REMOVAL_MAX_RATIO,
@@ -6791,6 +6792,26 @@ export function assertEvalSucceeded(result) {
   );
 }
 
+/**
+ * Prove the selected suite profile before resolving any account, URL, or key.
+ *
+ * The user-facing command otherwise has to resolve those remote and credential
+ * dependencies before it starts the child evaluator. A release suite that is
+ * structurally incapable of passing must stop before either path is touched.
+ */
+export function assertEvalProfilePreflight(goldenPath, requestedProfile = "smoke", options = {}) {
+  const read = options.read ?? ((path) => readFileSync(path, "utf8"));
+  let golden;
+  try {
+    golden = JSON.parse(String(read(goldenPath)));
+  } catch {
+    throw new Error("the evaluation set is not valid readable JSON; no credential or network path was used");
+  }
+  const result = evaluateProfileCoverage(golden, requestedProfile);
+  if (result.failures.length > 0) throw new Error(formatProfileFailures(result));
+  return result;
+}
+
 /** The eval child receives its one required key on stdin and no credentials in its environment. */
 export function evalChildEnvironment(environment = process.env) {
   return localToolEnvironment(environment, { BRAIN_ADMIN_KEY_STDIN: "1" });
@@ -6888,6 +6909,22 @@ async function cmdEval(manifestPath) {
         "  It has to be YOUR questions about YOUR documents. A generic test would" + "\n" +
         "  measure nothing about this brain."
     );
+  }
+
+  // This must stay ahead of account/base/admin-key resolution. Besides being
+  // faster, that ordering makes the documented pre-credential release gate a
+  // real product invariant rather than a property of the child runner alone.
+  try {
+    const preflight = assertEvalProfilePreflight(goldenPath, flags.profile && flags.profile !== true
+      ? String(flags.profile)
+      : "smoke");
+    if (preflight.profile === "release" && flags["no-think"]) {
+      throw new Error(
+        "--no-think cannot be used with the release profile because every required unanswerable case must run",
+      );
+    }
+  } catch (error) {
+    die(error?.message || "evaluation profile preflight failed");
   }
 
   // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker

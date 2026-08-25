@@ -553,8 +553,11 @@ not certification. `brain eval <manifest> --profile release` fails before
 reading the admin key or contacting the brain unless the private suite has at
 least 60 cases, explicit risk, domain, format, and query-kind declarations, and
 at least five cases in every declared slice. That is a v1 retrieval-suite
-coverage gate. Full answer, citation, corpus-completeness, authorization,
-confidence-bound, latency-budget, and cost certification remain v2 work.
+coverage gate. Query-kind coverage comes from executable `kind`, and every
+release unanswerable case must run and pass even when it is not marked critical.
+`--no-think` is smoke-only. Full answer, citation, corpus-completeness,
+authorization, confidence-bound, latency-budget, and cost certification remain
+v2 work.
 
 `test/migrations.test.mjs` applies every migration to a real SQLite database and
 asserts the FTS5 triggers actually keep the index in step. It exists because

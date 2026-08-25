@@ -18,10 +18,14 @@ const RELEASE_DIMENSIONS = Object.freeze(["risk", "domain", "format", "query_kin
 const LABEL = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 function labelsOf(question, dimension) {
-  if (dimension === "risk") return question.risk ? [question.risk] : [];
-  if (dimension === "domain") return Array.isArray(question.domains) ? question.domains : [];
-  if (dimension === "format") return Array.isArray(question.formats) ? question.formats : [];
-  const value = question.query_kind || question.kind;
+  if (dimension === "risk") return question?.risk ? [question.risk] : [];
+  if (dimension === "domain") return Array.isArray(question?.domains) ? question.domains : [];
+  if (dimension === "format") return Array.isArray(question?.formats) ? question.formats : [];
+  // `kind` controls which evaluator path actually runs. Derive query-kind
+  // coverage from that executable field rather than trusting a second label
+  // that could call an answerable retrieval case "unanswerable" without ever
+  // exercising the refusal path.
+  const value = question?.kind;
   return value ? [value] : [];
 }
 
@@ -128,6 +132,15 @@ export function evaluateProfileCoverage(golden, requestedProfile = "smoke") {
     }
   }
 
+  const queryKindMismatches = questions.filter((question) =>
+    question?.query_kind !== undefined && question.query_kind !== question.kind,
+  ).length;
+  if (queryKindMismatches > 0) {
+    failures.push(failure("QUERY_KIND_MUST_MATCH_KIND", {
+      observed: queryKindMismatches,
+    }));
+  }
+
   if (!requiredSlices.risk?.includes("critical")) {
     failures.push(failure("CRITICAL_RISK_SLICE_REQUIRED"));
   }
@@ -170,6 +183,9 @@ export function formatProfileFailures(result) {
     }
     if (entry.code === "CASES_OUTSIDE_REQUIRED_SLICES") {
       return `${entry.observed} ${entry.dimension} assignments are outside release_slices.${entry.dimension}`;
+    }
+    if (entry.code === "QUERY_KIND_MUST_MATCH_KIND") {
+      return `${entry.observed} cases have query_kind labels that do not match their executable kind`;
     }
     if (entry.code === "REQUIRED_SLICE_BELOW_MINIMUM") {
       return `${entry.dimension}:${entry.value} has ${entry.observed} cases; release requires at least ${entry.minimum}`;
