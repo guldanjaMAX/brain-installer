@@ -551,7 +551,11 @@ function rotateOneSchedulerLog(path, { maxBytes, historyFiles }) {
 
   const opened = openPrivateLog(
     path,
-    fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_APPEND
+    // This descriptor snapshots and truncates the active file; it never
+    // appends. Windows rejects ftruncate on an O_APPEND descriptor, while
+    // launchd's separate append-mode descriptor remains valid across this
+    // in-place truncation on macOS.
+    fsConstants.O_RDWR | fsConstants.O_CREAT
   );
   const { fd } = opened;
   const beforeBytes = opened.st.size;
