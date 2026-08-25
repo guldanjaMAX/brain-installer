@@ -25,8 +25,9 @@ refuse redirects.**
   Their sanitized artifacts report coverage without storing questions,
   answers, filenames, paths, or private identifiers.
 - Recovery field-drill tooling now orchestrates export, isolated D1 restore,
-  Vectorize rebuild, readback, health, and release evaluation behind five
-  explicit approvals. A disposable real-Cloudflare drill remains required
+  Vectorize rebuild, readback, health, and release evaluation behind six
+  explicit approvals, including the exact private evaluation suite. A
+  disposable real-Cloudflare drill remains required
   before calling production recovery verified.
 - Every packaged client that sends the Brain admin key now requires HTTPS
   outside loopback, refuses redirects, and verifies the final origin.

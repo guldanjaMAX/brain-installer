@@ -193,10 +193,12 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
 - **No OCR yet**, so scanned PDFs are reported rather than read.
 - **Outlook .msg and PST are not supported.** Export to .eml or .mbox and load
   the folder.
-- **Google Drive sync has passed a real-account field test.** Gmail is covered
-  by the same OAuth and cursor-safety test harness but has not yet completed a
-  real-account production run. Each client registers their own Google OAuth app,
-  which takes about fifteen minutes.
+- **Google Drive OAuth and resumable partial real-account ingest are verified.**
+  A complete no-limit first sweep and the live add, edit, refuse, recover,
+  trash, and incremental-refresh cycle remain field gates. Gmail is covered by
+  the same OAuth and cursor-safety test harness but has not yet completed a
+  real-account production run. Each client registers their own Google OAuth
+  app, which takes about fifteen minutes.
 - **Google Drive can refresh itself on macOS.** Its schedule is declared in the
   manifest and installed as a per-user LaunchAgent. Windows and Linux still
   require manually re-running the Drive refresh.
