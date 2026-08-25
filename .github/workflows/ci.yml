@@ -27,11 +27,16 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
         node: ['22', '24']
     steps:
-      - uses: actions/checkout@v4
+      # Pin third-party actions to reviewed commits. A mutable major tag can
+      # change underneath an otherwise identical installer release.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
+          # This job does not need shared dependency-cache state. Keeping the
+          # cache off also removes a cache-poisoning input from release CI.
+          package-manager-cache: false
 
       # --ignore-scripts is what the client is told to run, so CI runs the same
       # thing. If a dependency needs a postinstall script, better to find out
