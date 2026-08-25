@@ -226,7 +226,7 @@ It reads the backlog and tells you how long the oldest item has been waiting.
 **Fix, in order:**
 
 1. Empty the queue by hand right now, which is safe to run at any time:
-   `curl -X POST https://<your-brain>/api/admin/brain/drain -H "X-Admin-Key: $ADMIN_KEY"`
+   `node brain.mjs drain <manifest>`
 2. Then fix the cause, or it silently refills: redeploy with
    `node brain.mjs deploy`, which restores the schedule. Confirm it in the
    Cloudflare dashboard under the worker, Settings, Triggers, where a Cron
@@ -329,10 +329,11 @@ node brain.mjs sources <manifest>
 
 If the source you expected is missing, or its count is zero, or its status is still `pending`, the file never arrived. That is a loading problem, not a search problem, and no amount of rephrasing the question will fix it.
 
-For the raw numbers straight from the brain, bypassing the registry entirely:
+The same command cross-checks the registry against the authenticated live
+document store whenever the install's durable admin key is available:
 
 ```
-curl -s -H "X-Admin-Key: $ADMIN_KEY" https://<your brain>/api/admin/brain/documents
+node brain.mjs sources <manifest>
 ```
 
 **b. Is it still being processed?** The acceptance suite reports this as "embedding backlog". A backlog is normal for a few minutes after new material lands. A large one means processing is stuck, and the symptom you experience is exactly this: search does not find your document.

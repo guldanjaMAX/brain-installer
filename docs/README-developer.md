@@ -127,7 +127,7 @@ the most likely failure this design has and the least visible.
 
 ```bash
 node brain.mjs health <manifest>                     # reads the backlog
-curl -X POST "$BRAIN/api/admin/brain/drain" -H "X-Admin-Key: $ADMIN_KEY"
+node brain.mjs drain <manifest>                      # empties it safely now
 ```
 
 An oldest-queued timestamp over 30 minutes means the cron is not running.

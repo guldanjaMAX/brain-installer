@@ -175,8 +175,9 @@ node brain.mjs sources <manifest>
 
 One line per source: what it is, whether it is pending, loading, ready, or errored, how many documents it holds, and when it last took anything in. It is the only answer that cannot be out of date.
 
-For the raw numbers straight from the brain, bypassing that registry entirely:
+The same command also cross-checks the registry against the authenticated live
+document store whenever the install's durable admin key is available:
 
 ```
-curl -s -H "X-Admin-Key: $ADMIN_KEY" https://<your brain>/api/admin/brain/documents
+node brain.mjs sources <manifest>
 ```

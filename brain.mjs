@@ -3674,9 +3674,8 @@ async function purgeDocuments(base, adminKey, name) {
       if (body && body.dry_run === true) {
         die(
           "the worker ran a DRY RUN and removed nothing. This build of brain.mjs is older than\n" +
-            "      the worker it is talking to. Update it, or remove by hand with:\n" +
-            `        curl -X POST "$BRAIN/api/admin/brain/forget" -H "X-Admin-Key: $ADMIN_KEY" \\\n` +
-            `          -H 'content-type: application/json' -d '{"source":"${name}","confirm":true}'`
+            "      the worker it is talking to. Update the installer, then rerun the same\n" +
+            "      `brain forget` command. The raw credential-header workaround is intentionally disabled."
         );
       }
       if (removed === null) {
