@@ -39,6 +39,18 @@ const retiredKey = `retired-${"c".repeat(40)}`;
 const nativeFileOptions = process.platform === "win32"
   ? { username: process.env.USERNAME || process.env.USER }
   : {};
+const windowsRuntimeBasics = {
+  SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || process.env.WINDIR,
+  TEMP: process.env.TEMP,
+  TMP: process.env.TMP,
+  USERPROFILE: process.env.USERPROFILE,
+  HOMEDRIVE: process.env.HOMEDRIVE,
+  HOMEPATH: process.env.HOMEPATH,
+  APPDATA: process.env.APPDATA,
+  LOCALAPPDATA: process.env.LOCALAPPDATA,
+  USERDOMAIN: process.env.USERDOMAIN,
+  ComSpec: process.env.ComSpec,
+};
 
 function fixtureManifest(operations = { admin_key_secret: null }) {
   const value = JSON.parse(readFileSync(new URL("../templates/brain.manifest.json", import.meta.url), "utf8"));
@@ -310,17 +322,8 @@ try {
     HOME: sandbox,
     ...(process.platform === "win32"
       ? {
-          SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || process.env.WINDIR,
-          TEMP: process.env.TEMP,
-          TMP: process.env.TMP,
-          USERPROFILE: process.env.USERPROFILE,
-          HOMEDRIVE: process.env.HOMEDRIVE,
-          HOMEPATH: process.env.HOMEPATH,
-          APPDATA: process.env.APPDATA,
-          LOCALAPPDATA: process.env.LOCALAPPDATA,
+          ...windowsRuntimeBasics,
           USERNAME: nativeFileOptions.username,
-          USERDOMAIN: process.env.USERDOMAIN,
-          ComSpec: process.env.ComSpec,
         }
       : { USER: "fixture-user" }),
     BRAIN_MANIFEST: manifestPath,
@@ -384,7 +387,8 @@ try {
   const windowsRuntime = createBrainCredentialResolver({
     environment: {
       BRAIN_MANIFEST: windowsManifestPath,
-      USERNAME: "fixture-user",
+      ...windowsRuntimeBasics,
+      USERNAME: process.platform === "win32" ? nativeFileOptions.username : "fixture-user",
     },
     platform: "win32",
     durableOptions: {
