@@ -77,6 +77,28 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("repeat chunks cannot evict a different document before the limit", r.results.map((x) => x.doc_uid).join(",") === "d1,d2", JSON.stringify(r.results));
 }
 
+/* ---- exact copied documents collapse without erasing time or source context ---- */
+{
+  const same = [
+    { chunk_uid: "a#0", doc_uid: "a", source_id: "a", source: "drive", document_date: 100, content_hash: "same", text: "copy one" },
+    { chunk_uid: "b#0", doc_uid: "b", source_id: "b", source: "drive", document_date: 100, content_hash: "same", text: "copy two" },
+    { chunk_uid: "c#0", doc_uid: "c", source_id: "c", source: "drive", document_date: 200, content_hash: "same", text: "later record" },
+    { chunk_uid: "d#0", doc_uid: "d", source_id: "d", source: "curated", document_date: 100, content_hash: "same", text: "other connector" },
+  ];
+  const env = {
+    DB: { prepare: () => ({ bind: () => ({ all: async () => ({ results: same }) }) }) },
+  };
+  const r = await search(env, { query: "hello", embedding: null, limit: 10 });
+  check("same-source same-date exact copies collapse to one result",
+    r.results.filter((x) => x.source === "drive" && x.document_date === 100).length === 1,
+    JSON.stringify(r.results));
+  check("the same exact content remains distinct across dates and connectors",
+    r.results.length === 3 && r.results.some((x) => x.document_date === 200) && r.results.some((x) => x.source === "curated"),
+    JSON.stringify(r.results));
+  check("the internal content hash never enters the search response",
+    r.results.every((x) => !Object.hasOwn(x, "content_hash")), JSON.stringify(r.results));
+}
+
 /* ---- vector hydration must preserve Vectorize's ordering ---- */
 {
   const env = {

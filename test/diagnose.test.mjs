@@ -158,6 +158,22 @@ const find = (r, id) => (r.findings || []).find((f) => f.id === id);
   check("the same content stored twice is caught", f?.count === 1, JSON.stringify(f));
 }
 
+/* ---- duplicate document totals must never be capped by the sample limit ---- */
+{
+  const env = makeEnv({ vectorCount: 30 });
+  source(env._db, "documents");
+  for (let group = 0; group < 15; group++) {
+    for (let copy = 0; copy < 2; copy++) {
+      const id = `g${group}-copy${copy}`;
+      doc(env._db, id, { hash: `shared-${group}` });
+      chunk(env._db, `${id}#0`, id);
+    }
+  }
+  const f = find(await diagnose(env, { sampleLimit: 3 }), "duplicate_documents");
+  check("duplicate document count covers every group even with a small sample limit",
+    f?.count === 15 && /15 exact-content group/.test(f?.detail || ""), JSON.stringify(f));
+}
+
 /* ---- the spreadsheet that eats the corpus ---- */
 {
   const env = makeEnv({ vectorCount: 60 });
@@ -178,6 +194,24 @@ const find = (r, id) => (r.findings || []).find((f) => f.id === id);
   const f = find(await diagnose(env), "oversized_chunks");
   check("chunks past the embedding ceiling are caught", f?.count === 3, JSON.stringify(f));
   check("and the consequence is stated, not just the count", /never searchable by meaning/i.test(f?.detail || ""), f?.detail);
+}
+
+/* ---- duplicate chunk measurement is exact only inside its safe budget ---- */
+{
+  const env = makeEnv({ vectorCount: 24 });
+  source(env._db, "documents");
+  for (let i = 0; i < 24; i++) {
+    doc(env._db, `d${i}`);
+    chunk(env._db, `d${i}#0`, `d${i}`, `repeated-${i % 12}`);
+  }
+  const measured = find(await diagnose(env), "duplicate_chunks");
+  check("duplicate chunk groups are measured inside the safe scan budget",
+    measured?.count === 12 && measured?.observable !== false, JSON.stringify(measured));
+
+  const bounded = find(await diagnose(env, { duplicateChunkScanLimit: 10 }), "duplicate_chunks");
+  check("large-corpus duplicate chunk checks report not observable instead of a failed warning",
+    bounded?.severity === "info" && bounded?.observable === false && bounded?.area === "efficiency",
+    JSON.stringify(bounded));
 }
 
 /* ---- undated documents: warn only when it distorts recency ---- */

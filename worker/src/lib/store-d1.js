@@ -229,7 +229,7 @@ export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
   const sql = `
     SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
            c.client, c.category, c.top_folder, c.platform,
-           d.source_id, d.uri,
+           d.source_id, d.uri, d.content_hash,
            bm25(chunks_fts) AS score
     FROM chunks_fts
     JOIN chunks c ON c.id = chunks_fts.rowid
@@ -296,7 +296,7 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
   const { results } = await env.DB.prepare(
     `SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
             c.client, c.category, c.top_folder, c.platform,
-            d.source_id, d.uri
+            d.source_id, d.uri, d.content_hash
      FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid
      WHERE c.chunk_uid IN (${placeholders})${f.clause}`
   )
@@ -346,10 +346,20 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
   const seenDocuments = new Set();
   const documents = [];
   for (const row of fused) {
-    const key = row.doc_uid || `${row.source || ""}|${row.source_id || row.title || row.chunk_uid}`;
+    // Exact copies under different paths should not consume several public
+    // result slots. Preserve source and date because identical text can be a
+    // legitimate repeated record or message at a different time, and because
+    // a source filter must never be collapsed into evidence from another
+    // connector. Rows from an older schema still fall back to document identity.
+    const key = row.content_hash
+      ? `${row.source || ""}|${row.content_hash}|${row.document_date ?? "undated"}`
+      : row.doc_uid || `${row.source || ""}|${row.source_id || row.title || row.chunk_uid}`;
     if (seenDocuments.has(key)) continue;
     seenDocuments.add(key);
-    documents.push(row);
+    // content_hash is an internal dedupe key, not part of the authenticated
+    // search response contract or a stable source identifier for clients.
+    const { content_hash: _internalContentHash, ...publicRow } = row;
+    documents.push(publicRow);
   }
 
   return {
@@ -719,7 +729,10 @@ const qAll = async (env, sql, ...bind) => {
  * Every finding carries an action. A diagnostic that reports a number without
  * saying what to do about it has only relocated the problem.
  */
-export async function diagnose(env, { sampleLimit = 10 } = {}) {
+export async function diagnose(env, {
+  sampleLimit = 10,
+  duplicateChunkScanLimit = 100_000,
+} = {}) {
   const findings = [];
   const add = (f) => findings.push(f);
   const safe = async (id, fn) => {
@@ -881,14 +894,22 @@ export async function diagnose(env, { sampleLimit = 10 } = {}) {
   });
 
   await safe("duplicate_documents", async () => {
-    const rows = await qAll(env,
-      `SELECT content_hash, count(*) n FROM documents
-       WHERE deleted_at IS NULL AND content_hash IS NOT NULL AND content_hash != ''
-       GROUP BY content_hash HAVING count(*) > 1 ORDER BY n DESC LIMIT ?1`, sampleLimit);
-    const extra = rows.reduce((a, r) => a + (Number(r.n) - 1), 0);
+    // Sampling the largest groups made the displayed count look exact while it
+    // silently omitted every duplicate group below the sample limit. Aggregate
+    // the complete grouped result, and keep private identities out of the
+    // finding. This stays cheap because documents stores one content hash per
+    // document rather than full chunk bodies.
+    const summary = await q1(env,
+      `SELECT count(*) groups, COALESCE(sum(n - 1), 0) extra
+       FROM (
+         SELECT content_hash, count(*) n FROM documents
+         WHERE deleted_at IS NULL AND content_hash IS NOT NULL AND content_hash != ''
+         GROUP BY content_hash HAVING count(*) > 1
+       )`);
+    const extra = Number(summary?.extra || 0);
     if (extra) add({ id: "duplicate_documents", area: "integrity", severity: "warn", count: extra,
       title: `${extra} duplicate document(s) are stored more than once`,
-      detail: "Identical content under different paths. Each copy competes for the same retrieval slots, so one can push out a different and better source.",
+      detail: `${Number(summary?.groups || 0)} exact-content group(s) contain redundant documents under different identities. Each copy competes for the same retrieval slots, so one can push out a different and better source.`,
       action: "Usually one folder loaded twice under two source names. Check `brain sources`." });
   });
 
@@ -923,6 +944,19 @@ export async function diagnose(env, { sampleLimit = 10 } = {}) {
   });
 
   await safe("duplicate_chunks", async () => {
+    // Exact GROUP BY over every full chunk body exceeds D1's query budget on a
+    // large corpus. A timed-out diagnostic used to become a generic warning,
+    // which made a healthy large install look broken while proving nothing
+    // about duplicates. Stay explicit about the unavailable measurement until
+    // chunk text hashes make the check bounded and indexable.
+    if (totals.chunks > duplicateChunkScanLimit) {
+      add({ id: "duplicate_chunks", area: "efficiency", severity: "info",
+        observable: false,
+        title: "exact duplicate chunk measurement is not observable at this scale",
+        detail: `The exact full-text grouping check is bounded to ${duplicateChunkScanLimit} chunks, and this corpus has ${totals.chunks}. Running it here could exhaust D1's query budget without returning evidence.`,
+        action: "Use the duplicate-document result today. A future chunk text-hash migration will make this exact check scale safely." });
+      return;
+    }
     const rows = await qAll(env,
       "SELECT count(*) n FROM (SELECT text FROM chunks GROUP BY text HAVING count(*) > 1 LIMIT 5000)");
     const groups = Number(rows?.[0]?.n || 0);
