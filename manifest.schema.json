@@ -131,7 +131,7 @@
         "admin_key_secret": {
           "type": ["string", "null"],
           "pattern": "^keychain://[^/]+/.+$",
-          "description": "Optional non-secret macOS Keychain locator, keychain://<service>/<account>, for the brain admin key used by unattended ingest. The secret value never enters the manifest or plist. If absent, the adjacent .brain-admin-key file is the durable LaunchAgent fallback; ADMIN_KEY applies only to a directly invoked runner because launchd does not inherit terminal exports."
+          "description": "Optional non-secret macOS Keychain locator, keychain://<service>/<account>, for the brain admin key used by unattended ingest. Standard setup fills a deterministic locator automatically on macOS when no legacy adjacent .brain-admin-key exists. Windows keeps the adjacent key under DPAPI CurrentUser; Linux uses an owner-only adjacent file. brain secrets exactly verifies durable desired state before applying it to the Worker. A failed remote write can be retried with no ADMIN_KEY export. The secret value never enters the manifest or plist."
         },
         "google_token_store": {
           "enum": ["auto", "keychain", "file"],

@@ -76,17 +76,62 @@ const IS_WIN = platform() === "win32";
  */
 const NEEDS_SHELL = new Set(["npx", "npm", "claude", "codex", "wrangler"]);
 
+// Child CLIs do not need the desktop process's credentials. In particular,
+// doctor and wrangler used to inherit ADMIN_KEY plus every provider token just
+// to print a version or inspect Cloudflare login state. Keep only process/path
+// essentials and explicitly non-secret configuration needed cross-platform.
+const LOCAL_TOOL_ENV_ALLOWLIST = Object.freeze([
+  "PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+  "USER", "USERNAME", "LOGNAME",
+  "SystemRoot", "SYSTEMROOT", "WINDIR", "ComSpec", "COMSPEC", "PATHEXT",
+  "TEMP", "TMP", "TMPDIR", "LANG", "LANGUAGE", "SHELL", "TERM",
+  "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+  "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+  "NPM_CONFIG_CACHE", "npm_config_cache", "NPM_CONFIG_PREFIX", "npm_config_prefix",
+  "CLAUDE_CONFIG_DIR", "CODEX_HOME", "CLOUDFLARE_ACCOUNT_ID",
+]);
+
+/** Build a credential-scrubbed environment for a local CLI child. */
+export function localToolEnvironment(environment = process.env, overrides = {}) {
+  const clean = {};
+  for (const name of LOCAL_TOOL_ENV_ALLOWLIST) {
+    const value = environment?.[name];
+    if (typeof value === "string" && value) clean[name] = value;
+  }
+  for (const [name, value] of Object.entries(environment || {})) {
+    if (name.startsWith("LC_") && typeof value === "string" && value) clean[name] = value;
+  }
+  for (const [name, value] of Object.entries(overrides || {})) {
+    if (value === undefined) delete clean[name];
+    else clean[name] = String(value);
+  }
+  return clean;
+}
+
+/** Preserve a chosen/exported account id, but never an ambient API credential. */
+export function cloudflareCliEnvironment(accountId, environment = process.env) {
+  return localToolEnvironment(environment, accountId
+    ? { CLOUDFLARE_ACCOUNT_ID: accountId }
+    : {});
+}
+
 function quoteWin(a) {
   return /[\s"^&|<>()]/.test(a) ? `"${String(a).replace(/"/g, '\\"')}"` : a;
 }
 
-export function run(cmd, args = [], { timeout = 20_000, env } = {}) {
+export function run(cmd, args = [], {
+  timeout = 20_000,
+  env,
+  inheritEnv = true,
+  input,
+  maxBuffer,
+} = {}) {
   // Build the environment EXPLICITLY. spawnSync drops any key whose value is
   // undefined, so spreading `{CLOUDFLARE_ACCOUNT_ID: undefined}` over process.env
   // deletes a value the user deliberately exported. That is intended for the API
   // token and wrong for everything else, and the previous version could not tell
   // the two apart.
-  const finalEnv = { ...process.env };
+  const finalEnv = inheritEnv ? { ...process.env } : {};
   for (const [k, v] of Object.entries(env || {})) {
     if (v === undefined) delete finalEnv[k];
     else finalEnv[k] = String(v);
@@ -101,15 +146,27 @@ export function run(cmd, args = [], { timeout = 20_000, env } = {}) {
       timeout,
       shell: useShell,
       env: finalEnv,
+      input,
+      ...(maxBuffer === undefined ? {} : { maxBuffer }),
       windowsHide: true,
     });
+    const stdout = String(r.stdout || "");
+    const stderr = String(r.stderr || "");
     return {
       ok: r.status === 0,
-      out: `${r.stdout || ""}${r.stderr || ""}`,
+      out: `${stdout}${stderr}`,
+      stdout,
+      stderr,
       missing: r.error?.code === "ENOENT",
     };
   } catch (e) {
-    return { ok: false, out: String(e.message), missing: e.code === "ENOENT" };
+    return {
+      ok: false,
+      out: String(e.message),
+      stdout: "",
+      stderr: String(e.message),
+      missing: e.code === "ENOENT",
+    };
   }
 }
 
@@ -131,7 +188,11 @@ export function checkNode() {
 }
 
 export function checkWrangler() {
-  const r = run("npx", ["wrangler@4", "--version"], { timeout: 120_000 });
+  const r = run("npx", ["wrangler@4", "--version"], {
+    timeout: 120_000,
+    inheritEnv: false,
+    env: localToolEnvironment(),
+  });
   if (r.ok && /\d+\.\d+/.test(r.out)) {
     return check("wrangler", OK, (r.out.match(/\d+\.\d+\.\d+/) || ["present"])[0]);
   }
@@ -157,14 +218,16 @@ export function checkWrangler() {
  * set and would authenticate as the wrong identity.
  */
 function cfEnv(accountId) {
-  const env = { CLOUDFLARE_API_TOKEN: undefined };
-  if (accountId) env.CLOUDFLARE_ACCOUNT_ID = accountId;
-  return env;
+  return cloudflareCliEnvironment(accountId);
 }
 
 export function checkWranglerLogin(accountId) {
   const env = cfEnv(accountId);
-  const r = run("npx", ["wrangler@4", "whoami"], { timeout: 120_000, env });
+  const r = run("npx", ["wrangler@4", "whoami"], {
+    timeout: 120_000,
+    inheritEnv: false,
+    env,
+  });
   if (r.ok && /You are logged in|Account Name/i.test(r.out)) {
     const email = (r.out.match(/associated with the email ([^\s]+@[^\s]+?)[.\s]*$/im) || r.out.match(/([\w.+-]+@[\w-]+\.[\w.]+[\w])/) || [])[1];
     const accounts = (r.out.match(/│/g) || []).length;
@@ -216,7 +279,11 @@ export async function checkVectorizeApi(accountId) {
 
 export function checkVectorize(accountId) {
   const env = cfEnv(accountId);
-  const r = run("npx", ["wrangler@4", "vectorize", "list"], { timeout: 120_000, env });
+  const r = run("npx", ["wrangler@4", "vectorize", "list"], {
+    timeout: 120_000,
+    inheritEnv: false,
+    env,
+  });
   if (r.ok) {
     return check("Vectorize", OK, /haven't created any indexes/i.test(r.out) ? "reachable, no indexes yet" : "reachable");
   }
@@ -253,7 +320,11 @@ export function checkVectorize(accountId) {
 }
 
 export function checkClaudeCode() {
-  const r = run("claude", ["--version"], { timeout: 30_000 });
+  const r = run("claude", ["--version"], {
+    timeout: 30_000,
+    inheritEnv: false,
+    env: localToolEnvironment(),
+  });
   if (r.ok) return check("Claude Code", OK, (r.out.trim().split("\n")[0] || "present").slice(0, 40));
   return check(
     "Claude Code",
@@ -264,7 +335,11 @@ export function checkClaudeCode() {
 }
 
 export function checkCodex() {
-  const r = run("codex", ["--version"], { timeout: 30_000 });
+  const r = run("codex", ["--version"], {
+    timeout: 30_000,
+    inheritEnv: false,
+    env: localToolEnvironment(),
+  });
   if (r.ok) return check("Codex", OK, (r.out.trim().split("\n")[0] || "present").slice(0, 40));
   return check("Codex", WARN, "not found on PATH", "Optional. Install it if the client uses Codex; setup wires up whichever is present.");
 }
@@ -278,8 +353,19 @@ export function checkAnthropicKey() {
   );
 }
 
-export function checkGoogleConnection() {
-  const stored = tokenStorageStatus();
+export function checkGoogleConnection(storageStatus) {
+  const stored = storageStatus ?? tokenStorageStatus();
+  if (stored.exists && (stored.migrationPending || stored.backend === "legacy-file")) {
+    const windowsLegacy = stored.migrationPending === true || /Windows|DPAPI/i.test(stored.description || "");
+    return check(
+      "Google connection",
+      WARN,
+      `token still uses legacy plaintext storage in ${stored.description}`,
+      windowsLegacy
+        ? "The next Drive, Gmail, or Calendar use migrates a still-valid token to a DPAPI-encrypted file for this Windows user. If Google rejects the old token, reconnect with `brain connect google`."
+        : "The next Drive, Gmail, or Calendar use migrates a still-valid token to this Mac's login Keychain. If Google rejects the old token, reconnect with `brain connect google`."
+    );
+  }
   if (stored.exists) return check("Google connection", OK, `token stored in ${stored.description}`);
   if (stored.error) {
     return check(
@@ -336,7 +422,7 @@ export async function checkNetwork() {
 }
 
 /** Every check, in the order a person should fix them. */
-export async function runAll({ accountId, onResult } = {}) {
+export async function runAll({ accountId, onResult, googleStorageStatus } = {}) {
   const out = [];
   // Each result is handed to the caller the moment it exists, so a slow check
   // shows the ones before it rather than holding the whole report hostage.
@@ -352,7 +438,7 @@ export async function runAll({ accountId, onResult } = {}) {
   out.push(checkAnthropicKey());
   out.push(checkClaudeCode());
   out.push(checkCodex());
-  out.push(checkGoogleConnection());
+  out.push(checkGoogleConnection(googleStorageStatus));
   return out;
 }
 

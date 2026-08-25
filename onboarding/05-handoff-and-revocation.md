@@ -67,11 +67,13 @@ Everything. Here it is written down, because "you own it" is worthless if nobody
 
 ## 3. How to run it without me
 
-You need two things in your shell. Nothing else.
+Routine checks use the admin key from the manifest's durable local storage, so
+you do not need to copy it into your shell. Export a scoped Cloudflare token
+only for account-changing commands such as verify, provision, deploy, and
+secrets:
 
 ```
 export CLOUDFLARE_API_TOKEN='<a token you issue, for your own account>'
-export ADMIN_KEY='<your admin key>'
 ```
 
 Then, from the installer folder:
@@ -85,6 +87,19 @@ Then, from the installer folder:
 | See what version you are on, and the update history | `node brain.mjs status <manifest>` |
 | Reconnect your AI tools, or add a new machine | `node brain.mjs mcp-config <manifest>` |
 | Change a key or password | `node brain.mjs secrets <manifest>` |
+
+`brain secrets` is the exact admin-key rotation command. Only when you intend to
+rotate it, export the replacement as `ADMIN_KEY`, run that command once, and let
+it update the Worker plus the manifest's durable local storage. It reports
+success only after the local value reads back exactly and the Worker accepts
+it. If the remote update fails, rerun
+the same command without re-exporting the key; the verified durable copy is the
+retry source.
+
+Existing installer-owned Claude Code and Codex registrations are refreshed with
+the non-secret manifest locator during rotation. Claude Desktop is not changed
+automatically: replace its manual entry with the locator-only output from
+`brain mcp-config <manifest>`, then restart Claude Desktop.
 
 `test` is the one that matters. It runs five layers in order: is it reachable and locked down, is there anything in it and is it current, does a real question return real sources, does the credential protection actually refuse, and is the version and configuration right. It is read-only apart from one deliberate probe that must be refused.
 

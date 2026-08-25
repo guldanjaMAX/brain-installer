@@ -4,6 +4,37 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.10
+
+**Credentials now stay in the storage chosen by each install, and failures
+leave private issue notes that can be reviewed without exposing client data.**
+
+- Standard macOS setup declares and verifies a login Keychain location before
+  generating the brain admin key. Windows adjacent admin keys and Google OAuth
+  records use DPAPI CurrentUser encryption. Linux keeps owner-only local files.
+- `brain secrets` treats durable local storage as desired state, verifies it
+  before changing the Worker, and can safely retry an interrupted rotation.
+  Standard D1 and Workers AI installs ignore unrelated Supabase and Anthropic
+  credentials that happen to exist in the operator's shell. Setup, secrets,
+  and upgrade remove older provider-secret bindings that the manifest does not
+  allow, verify the removal, and leave every unrecognized secret name alone.
+- Claude Code and Codex registrations carry only the manifest location. Their
+  runtime resolves the current admin key from the install's declared durable
+  store, so a key rotation does not leave stale credentials in tool config.
+- Required health, verification, drain, reindex, report, deploy-schedule, and
+  secret failures now exit nonzero so automation cannot mistake them for a
+  successful install.
+- Recognized command failures attempt to leave one private, sanitized local
+  issue note. `brain support` previews, exports, or clears the bounded journal.
+  The installer does not upload it, and the schema cannot store content,
+  filenames, paths, account details, raw errors, logs, stack traces, or secrets.
+- Existing private installer directories are tightened automatically on POSIX.
+  Adjacent key writes refuse unsafe ownership, links, hard links, loose modes,
+  and any `.brain-admin-key` file already tracked by Git.
+- Google authentication helpers, scheduled Drive refresh, eval, Cloudflare
+  probes, and AI-tool registration children receive narrowly allowlisted
+  environments instead of inheriting unrelated desktop credentials.
+
 ## 0.1.9
 
 **Google Drive can now stay current on its own on a Mac, using the same setup

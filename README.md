@@ -49,7 +49,10 @@ brain setup
 It asks three short questions and does everything else itself: creates the
 database and search index in your account, deploys the worker, generates and
 saves your key, checks it is alive, and connects the brain to your Claude Code
-and Codex.
+and Codex. On macOS a standard setup declares and verifies a login-Keychain
+item before generating the key. Windows stores only DPAPI CurrentUser
+ciphertext; Linux uses an owner-only adjacent file. An existing legacy Mac
+`.brain-admin-key` remains authoritative instead of being silently moved.
 
 ---
 
@@ -119,7 +122,19 @@ cannot finish.
 ```bash
 brain doctor                          # what is wrong with this machine
 brain health ./brain.manifest.json    # what is wrong with the brain
+brain secrets ./brain.manifest.json   # exact durable ADMIN_KEY rotation command
 ```
+
+For an admin-key rotation, export the replacement as `ADMIN_KEY` and run
+`brain secrets`. After a read-only Cloudflare account check, it updates and
+verifies the manifest's declared Keychain item or adjacent protected file, then
+applies that durable desired value to the Worker. If the remote write fails,
+rerun the same command with no `ADMIN_KEY` export; the verified durable copy is
+reused. Standard macOS setup creates the non-secret Keychain locator
+automatically; it is not a credential and is safe to keep in the manifest.
+Setup, secrets, and upgrade also remove only the known Supabase or Anthropic
+Worker secrets that the manifest does not allow. Other secret names are left
+untouched, and every removal is read back from Cloudflare.
 
 For technical detail on any error, put `BRAIN_DEBUG=1` in front of the same
 command.
@@ -128,13 +143,24 @@ Recognized command failures attempt to leave a private, sanitized issue note on
 this machine whenever its local journal is writable. A note contains the
 installer version, command, platform, and a typed failure code. It never
 contains document text, filenames, paths, account IDs, URLs, questions, answers,
-logs, stack traces, or credentials, and it is never uploaded automatically.
+logs, stack traces, or credentials. The installer never uploads or sends these
+notes. An export written to a synced destination may be uploaded by that sync
+service.
+
+Preview and export contain only recent shareable notes: at most the newest 200
+valid events from the last 30 days, capped at 2 MiB. After a successful write,
+the installer makes a best-effort cleanup of complete private events outside
+those retention bounds. Fresh and concurrently written files are protected by
+a grace period. Partial or unsafe artifacts are not deleted automatically and
+may remain. Confirmed clear removes partial or invalid regular files after
+safety checks; links and special files are refused for manual review. Cleanup
+failure never replaces the command's original result.
 
 ```bash
-brain support                                  # how many local notes exist
-brain support --preview                       # exact safe bytes, sends nothing
-brain support --export brain-support-review.jsonl
-brain support --clear --yes                    # remove the local journal
+brain support                                  # recent shareable count and limits
+brain support --preview                       # exact bounded shareable bytes
+brain support --export brain-support-review.jsonl  # destination sync may upload
+brain support --clear --yes                    # clear the journal after safety checks
 ```
 
 ---

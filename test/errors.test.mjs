@@ -7,40 +7,103 @@
  */
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { writeFileSync, readFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { previewSupportJournal } from "../support-journal.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = join(HERE, "..", "brain.mjs");
-const INGEST_EXIT_FETCH = join(HERE, "fixtures", "ingest-exit-fetch.mjs");
-const ISOLATE_SUPPORT_ROOT = join(HERE, "fixtures", "isolate-support-root.mjs");
+const INGEST_EXIT_FETCH = pathToFileURL(join(HERE, "fixtures", "ingest-exit-fetch.mjs")).href;
+const ISOLATE_SUPPORT_ROOT = pathToFileURL(join(HERE, "fixtures", "isolate-support-root.mjs")).href;
+const UNEXPECTED_CRASH = pathToFileURL(join(HERE, "fixtures", "unexpected-crash.mjs")).href;
+const UNWRITABLE_SUPPORT = pathToFileURL(join(HERE, "fixtures", "unwritable-support.mjs")).href;
 let fail = 0, ran = 0;
+let observedConfigFingerprint = "";
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 260))); if (!c) fail++; };
 
 const strip = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, "");
-const journalEvents = (text) => String(text).trim()
-  ? String(text).trim().split("\n").map((line) => JSON.parse(line))
+const journalEvents = (text) => typeof text === "string" && text.trim()
+  ? text.trim().split("\n").map((line) => JSON.parse(line))
   : [];
 function readSupportJournal(userRoot) {
   const supportRoot = join(userRoot, ".brain", "support");
-  return existsSync(supportRoot) ? previewSupportJournal({ root: userRoot }) : "";
+  if (!existsSync(supportRoot)) return "";
+  try { return previewSupportJournal({ root: userRoot }); }
+  catch { return null; }
 }
 function cli(args, env = {}, options = {}) {
   const userRoot = options.userRoot || mkdtempSync(join(tmpdir(), "brain-support-cli-"));
   const e = { ...process.env, ...env };
   delete e.CLOUDFLARE_API_TOKEN;
   delete e.ADMIN_KEY;
+  delete e.BRAIN_DEBUG;
   e.BRAIN_TEST_USER_ROOT = userRoot;
+  const imports = [ISOLATE_SUPPORT_ROOT, ...(options.imports || [])];
+  const nodeArguments = imports.flatMap((specifier) => ["--import", specifier]);
   // Generous: on a cold machine the Cloudflare checks download wrangler before
   // they can answer, which is minutes, not seconds.
-  const r = spawnSync("node", ["--import", ISOLATE_SUPPORT_ROOT, CLI, ...args], {
+  const r = spawnSync("node", [...nodeArguments, CLI, ...args], {
     encoding: "utf-8", env: e, timeout: 300_000,
   });
   const journal = readSupportJournal(userRoot);
   if (!options.keepUserRoot) rmSync(userRoot, { recursive: true, force: true });
   return { code: r.status, out: strip(`${r.stdout || ""}${r.stderr || ""}`), journal, userRoot };
+}
+
+/* ---- an unexpected crash records exactly one sanitized internal note ---- */
+{
+  const rawSentinel = "RAW_UNEXPECTED_CRASH_SENTINEL";
+  const r = cli(["whatsnew"], {}, { imports: [UNEXPECTED_CRASH] });
+  const events = journalEvents(r.journal);
+  check("an unexpected command crash exits through the guarded failure path",
+    r.code === 1 && /unexpected error|This is a bug in the installer/.test(r.out), r.out.slice(0, 260));
+  check("an unexpected crash creates exactly one INTERNAL_ERROR issue note",
+    events.length === 1 && events[0]?.command === "whatsnew" && events[0]?.error_code === "INTERNAL_ERROR",
+    r.journal);
+  check("the unexpected crash note has a product call-site fingerprint and no raw error text",
+    /^loc_[0-9a-f]{24}$/.test(events[0]?.fingerprint || "") && !r.journal.includes(rawSentinel), r.journal);
+}
+
+/* ---- an unsafe journal never replaces the command's original failure ---- */
+{
+  const userRoot = mkdtempSync(join(tmpdir(), "brain-support-unsafe-"));
+  const brainRoot = join(userRoot, ".brain");
+  const unsafeSupportPath = join(brainRoot, "support");
+  const missingManifest = join(userRoot, "original-missing.manifest.json");
+  mkdirSync(brainRoot, { mode: 0o700 });
+  writeFileSync(unsafeSupportPath, "preserve unsafe journal path", { mode: 0o600 });
+  const r = cli(["status", missingManifest], {}, { userRoot, keepUserRoot: true });
+  check("an unsafe journal leaves the original command failure intact",
+    r.code === 1 && /original-missing\.manifest\.json/.test(r.out) && !/unexpected error/i.test(r.out), r.out);
+  check("an unsafe journal adds no misleading receipt and changes no unsafe path",
+    r.journal === null && !/Private issue note/.test(r.out) &&
+      readFileSync(unsafeSupportPath, "utf8") === "preserve unsafe journal path", r.out);
+  rmSync(userRoot, { recursive: true, force: true });
+}
+
+{
+  const userRoot = mkdtempSync(join(tmpdir(), "brain-support-unwritable-"));
+  const missingManifest = join(userRoot, "write-blocked.manifest.json");
+  const r = cli(["status", missingManifest], {}, {
+    userRoot,
+    keepUserRoot: true,
+    imports: [UNWRITABLE_SUPPORT],
+  });
+  check("an unwritable journal also leaves the original command failure intact",
+    r.code === 1 && /write-blocked\.manifest\.json/.test(r.out) && !/unexpected error/i.test(r.out) &&
+      !/Private issue note/.test(r.out) && r.journal === "", r.out);
+  rmSync(userRoot, { recursive: true, force: true });
 }
 
 function ingestExitCli(scenario) {
@@ -97,13 +160,16 @@ function ingestExitCli(scenario) {
   const directory = mkdtempSync(join(tmpdir(), "brain-err-"));
   const bad = join(directory, "nope.json");
   const r = cli(["status", bad]);
+  const events = journalEvents(r.journal);
+  observedConfigFingerprint = events[0]?.fingerprint || "";
   check("a missing manifest fails cleanly", r.code === 1);
   check("and shows no stack trace", !/\bat .*\.mjs:\d+/.test(r.out), r.out.slice(0, 200));
   check("and names the file it could not read", r.out.includes("nope.json"), r.out.slice(0, 160));
   check("the local issue note classifies the failure without copying its private path",
-    journalEvents(r.journal).length === 1 &&
-      journalEvents(r.journal)[0]?.command === "status" &&
-      journalEvents(r.journal)[0]?.error_code === "CONFIG_INVALID" &&
+    events.length === 1 &&
+      events[0]?.command === "status" &&
+      events[0]?.error_code === "CONFIG_INVALID" &&
+      /^loc_[0-9a-f]{24}$/.test(observedConfigFingerprint) &&
       !r.journal.includes("nope.json") && !r.journal.includes(directory), r.journal);
   rmSync(directory, { recursive: true, force: true });
 }
@@ -120,15 +186,19 @@ function ingestExitCli(scenario) {
 /* ---- expected failures explain themselves and stay quiet about internals ---- */
 {
   const r = cli(["verify", join(HERE, "..", "templates", "brain.manifest.json")]);
+  const events = journalEvents(r.journal);
   check("a missing token is an explained failure", r.code === 1 && /CLOUDFLARE_API_TOKEN/.test(r.out), r.out.slice(0, 160));
   check("and it says what to do about it", /export CLOUDFLARE_API_TOKEN/.test(r.out));
   // Fatal is anticipated, so it must NOT be dressed up as an installer bug.
   check("an anticipated failure is not reported as a bug", !/This is a bug in the installer/.test(r.out));
   check("anticipated auth failures create one private typed note and send no raw credential guidance",
-    journalEvents(r.journal).length === 1 &&
-      journalEvents(r.journal)[0]?.command === "verify" &&
-      journalEvents(r.journal)[0]?.error_code === "AUTH_REQUIRED" &&
-      !r.journal.includes("CLOUDFLARE_API_TOKEN") && /Nothing was sent/.test(r.out), r.journal);
+    events.length === 1 &&
+      events[0]?.command === "verify" &&
+      events[0]?.error_code === "AUTH_REQUIRED" &&
+      /^loc_[0-9a-f]{24}$/.test(events[0]?.fingerprint || "") &&
+      events[0]?.fingerprint !== observedConfigFingerprint &&
+      !r.journal.includes("CLOUDFLARE_API_TOKEN") &&
+      /did not upload or send this issue note/.test(r.out), r.journal);
 }
 {
   const r = cli(["ingest", join(HERE, "..", "templates", "brain.manifest.json"), "--path", "/definitely/not/here"]);
@@ -202,12 +272,36 @@ function ingestExitCli(scenario) {
   const preview = cli(["support", "--preview"], {}, { userRoot, keepUserRoot: true });
   check("support preview returns the exact canonical bytes recorded by the failed command",
     failed.code === 1 && preview.code === 0 && preview.out === failed.journal, preview.out);
+  if (process.platform !== "win32") {
+    const legacyDirectories = [
+      join(userRoot, ".brain"),
+      join(userRoot, ".brain", "support"),
+      join(userRoot, ".brain", "support", "events"),
+    ];
+    for (const directory of legacyDirectories) chmodSync(directory, 0o755);
+    const legacyPreview = cli(["support", "--preview"], {}, { userRoot, keepUserRoot: true });
+    check("support preview safely upgrades legacy installer directory modes",
+      legacyPreview.code === 0 && legacyPreview.out === failed.journal &&
+        legacyDirectories.every((directory) => (statSync(directory).mode & 0o777) === 0o700),
+      legacyPreview.out);
+  }
+
+  const status = cli(["support"], {}, { userRoot, keepUserRoot: true });
+  check("support status reports the bounded recent shareable count without exposing the home path",
+    status.code === 0 && /1 recent shareable issue note\(s\) available to preview or export/i.test(status.out) &&
+      /last 30 days, newest 200 notes, up to 2 MiB/i.test(status.out) &&
+      /safe expired and overflow notes are cleaned up after writes/i.test(status.out) &&
+      /fresh or concurrent files may remain until a later safe cleanup/i.test(status.out) &&
+      /links and special files are refused and require manual review/i.test(status.out) &&
+      !status.out.includes(userRoot) && !/stored locally/i.test(status.out), status.out);
 
   const exportPath = join(userRoot, "safe-support-export.jsonl");
   const exported = cli(["support", "--export", exportPath], {}, { userRoot, keepUserRoot: true });
-  check("support export writes the reviewed bytes and states that nothing was sent",
+  check("support export scopes its no-send claim to the installer and warns about destination sync",
     exported.code === 0 && readFileSync(exportPath, "utf-8") === failed.journal &&
-      /nothing was uploaded or sent/i.test(exported.out), exported.out);
+      /the installer did not upload or send this export/i.test(exported.out) &&
+      /a synced destination may upload it/i.test(exported.out) &&
+      !/nothing was uploaded or sent/i.test(exported.out), exported.out);
   const existingRefusal = cli(["support", "--export", exportPath], {}, { userRoot, keepUserRoot: true });
   check("support export refuses overwrite as an expected user-facing failure, not an installer bug",
     existingRefusal.code === 1 && /refusing to overwrite/i.test(existingRefusal.out) &&
@@ -218,9 +312,9 @@ function ingestExitCli(scenario) {
     ["support", "--export", join(userRoot, "missing-directory", "bundle.jsonl")],
     {}, { userRoot, keepUserRoot: true }
   );
-  check("a missing support export directory is an expected failure and sends nothing",
+  check("a missing support export directory is an expected failure and attributes no-send to the installer",
     missingDirectoryExport.code === 1 && /directory does not exist/i.test(missingDirectoryExport.out) &&
-      /Nothing was uploaded or sent/i.test(missingDirectoryExport.out) &&
+      /The installer did not upload or send anything/i.test(missingDirectoryExport.out) &&
       !/This is a bug in the installer|unexpected error/i.test(missingDirectoryExport.out),
     missingDirectoryExport.out);
   if (process.platform === "win32") {
@@ -270,6 +364,25 @@ function ingestExitCli(scenario) {
 {
   const mod = await import("../brain.mjs");
   check("brain.mjs imports without running the CLI", true);
+  const outsideRoot = mkdtempSync(join(tmpdir(), "brain-support-stack-"));
+  const outsideModule = join(outsideRoot, "private-caller.mjs");
+  writeFileSync(outsideModule, "export default true;\n");
+  const cliUrl = pathToFileURL(CLI).href;
+  const outsideUrl = pathToFileURL(outsideModule).href;
+  const syntheticStack = {
+    stack:
+      "Error: RAW_CALL_SITE_SENTINEL /private/outside/path\n" +
+      `    at outside (${outsideUrl}:7:3)\n` +
+      `    at die (${cliUrl}:144:9)\n` +
+      `    at cmdStatus (${cliUrl}:2345:11)`,
+  };
+  const safeLocation = mod.supportProductRelativeLocation(syntheticStack);
+  check("support call-site extraction skips outside and capture frames before validation",
+    safeLocation === "brain.mjs:2345" && !safeLocation.includes("RAW_CALL_SITE_SENTINEL") &&
+      !safeLocation.includes(outsideRoot), safeLocation);
+  check("an outside-only stack yields no fingerprint input",
+    mod.supportProductRelativeLocation({ stack: `Error: private\n    at outside (${outsideUrl}:7:3)` }) === null);
+  rmSync(outsideRoot, { recursive: true, force: true });
   check("PDF process timeouts keep their specific support category",
     mod.supportErrorCode(new Error("PDF process timed out"), { command: "ingest", unexpected: true }) ===
       "PDF_PROCESS_TIMEOUT");

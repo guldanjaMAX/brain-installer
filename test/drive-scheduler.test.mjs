@@ -14,7 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { previewSupportJournal } from "../support-journal.mjs";
+import { previewSupportJournal, recordSupportEvent } from "../support-journal.mjs";
 import {
   buildDriveSchedulerPlan,
   CLOUDFLARE_CREDENTIAL_ENV,
@@ -23,6 +23,7 @@ import {
   DRIVE_LOG_MAX_BYTES,
   expectedRefreshSecondsForCron,
   installDriveScheduler,
+  launchctlChildEnvironment,
   parseAdminKeySecretReference,
   recordDriveSchedulerFailure,
   recordDriveSchedulerResult,
@@ -191,14 +192,61 @@ try {
       journal.includes('"source":"scheduler"') &&
       journal.includes('"error_code":"SCHEDULE_RUN_FAILED"'));
     check("scheduler issue notes never copy raw errors", !journal.includes("malicious raw detail"), journal);
-    const failedResultEvent = recordDriveSchedulerResult(
+  }
+  {
+    const journalRoot = join(directory, "scheduled-child-failure-journal-root");
+    mkdirSync(journalRoot, { recursive: true });
+    recordSupportEvent({
+      command: "ingest",
+      source: "drive",
+      errorCode: "INGEST_FAILED",
+      productRelativeLocation: "brain.mjs#fatal",
+    }, { root: journalRoot });
+    const wrapperEvent = recordDriveSchedulerResult(
       { code: 1, signal: null }, { journalOptions: { root: journalRoot } }
+    );
+    const journal = previewSupportJournal({ root: journalRoot });
+    const records = journal.trim().split("\n").filter(Boolean);
+    check("one normal scheduled child failure creates exactly one child-owned issue note",
+      wrapperEvent === null && records.length === 1 &&
+      journal.includes('"command":"ingest"') && !journal.includes('"command":"schedule"'),
+      journal);
+  }
+  {
+    const journalRoot = join(directory, "scheduler-abnormal-failure-journal-root");
+    mkdirSync(journalRoot, { recursive: true });
+    const signaledResultEvent = recordDriveSchedulerResult(
+      { code: 1, signal: "SIGTERM" }, { journalOptions: { root: journalRoot } }
     );
     const successfulResultEvent = recordDriveSchedulerResult(
       { code: 0, signal: null }, { journalOptions: { root: journalRoot } }
     );
-    check("a nonzero scheduler child creates a wrapper note even if the child could not journal itself",
-      /^evt_[0-9a-f]{32}$/.test(failedResultEvent || "") && successfulResultEvent === null);
+    check("an abnormally signaled scheduler child creates one wrapper-owned issue note",
+      /^evt_[0-9a-f]{32}$/.test(signaledResultEvent || "") && successfulResultEvent === null &&
+      previewSupportJournal({ root: journalRoot }).trim().split("\n").filter(Boolean).length === 1);
+  }
+  {
+    const journalRoot = join(directory, "scheduler-spawn-failure-journal-root");
+    mkdirSync(journalRoot, { recursive: true });
+    let spawnError = null;
+    try {
+      runDriveIngest(manifestPath, opts({
+        env: { HOME: home },
+        runSecurity: () => ({ status: 0, stdout: "keychain-admin\n", stderr: "" }),
+        spawn: () => ({ status: null, signal: null, error: new Error("fixture spawn failure") }),
+      }));
+    } catch (caught) { spawnError = caught; }
+    const spawnFailureEvent = spawnError && recordDriveSchedulerFailure(spawnError, {
+      action: "run",
+      journalOptions: { root: journalRoot },
+    });
+    const journal = previewSupportJournal({ root: journalRoot });
+    check("a scheduler spawn failure remains captured by the wrapper catch path",
+      /fixture spawn failure/.test(spawnError?.message) &&
+      /^evt_[0-9a-f]{32}$/.test(spawnFailureEvent || "") &&
+      journal.trim().split("\n").filter(Boolean).length === 1 &&
+      journal.includes('"command":"schedule"') && !journal.includes("fixture spawn failure"),
+      journal);
   }
   {
     check("production scheduler log retention is capped at five MiB with two history files",
@@ -351,10 +399,26 @@ try {
       JSON.stringify(Object.keys(clean)));
   }
   {
+    const clean = launchctlChildEnvironment({
+      HOME: home,
+      PATH: "/usr/bin:/bin",
+      ADMIN_KEY: "admin-secret",
+      CLOUDFLARE_API_TOKEN: "deployment-secret",
+      OPENAI_API_KEY: "model-secret",
+      AWS_SECRET_ACCESS_KEY: "aws-secret",
+    });
+    check("launchctl service management inherits OS basics but no desktop credentials",
+      clean.HOME === home && clean.PATH === "/usr/bin:/bin" &&
+      clean.ADMIN_KEY === undefined && clean.CLOUDFLARE_API_TOKEN === undefined &&
+      clean.OPENAI_API_KEY === undefined && clean.AWS_SECRET_ACCESS_KEY === undefined,
+      JSON.stringify(Object.keys(clean)));
+  }
+  {
     let child = null;
+    let securityCalled = false;
     const result = runDriveIngest(manifestPath, opts({
       env: { HOME: home, CLOUDFLARE_API_TOKEN: "deployment-secret", ADMIN_KEY: "old-key" },
-      runSecurity: () => ({ status: 0, stdout: "keychain-admin\n", stderr: "" }),
+      runSecurity: () => { securityCalled = true; return { status: 0, stdout: "keychain-admin\n", stderr: "" }; },
       spawn: (command, args, options) => { child = { command, args, options }; return { status: 0 }; },
     }));
     check("scheduled run invokes brain ingest manifest --from drive",
@@ -362,8 +426,19 @@ try {
         "-k", "-s", "-t", "0", result.lockPath,
         resolve("/opt/node/bin/node"), resolve("/opt/brain installer/brain.mjs"), "ingest", manifestPath, "--from", "drive",
       ]), JSON.stringify(child));
-    check("Keychain admin key exists only in the ingest child's environment",
-      child.options.env.ADMIN_KEY === "keychain-admin" && process.env.ADMIN_KEY !== "keychain-admin");
+    const childMetadata = JSON.stringify({
+      command: child.command,
+      args: child.args,
+      env: child.options.env,
+      input: child.options.input,
+    });
+    check("the wrapper leaves the durable Keychain locator for the ingest child to resolve",
+      !securityCalled && JSON.parse(readFileSync(manifestPath, "utf8")).operations.admin_key_secret ===
+        "keychain://acme-brain-admin/owner");
+    check("no admin key enters lockf or node argv, environment, or stdin",
+      child.options.env.ADMIN_KEY === undefined && child.options.input === undefined &&
+      Array.isArray(child.options.stdio) && child.options.stdio[0] === "ignore" &&
+      !childMetadata.includes("old-key") && !childMetadata.includes("keychain-admin"), childMetadata);
     check("the deployment token is absent from that child", child.options.env.CLOUDFLARE_API_TOKEN === undefined);
     check("a successful child is reported complete through the native advisory lock", result.status === "complete");
   }
@@ -394,11 +469,12 @@ try {
     writeManifest({ ...baseManifest, operations: { ingest_cron: "0 9 * * *" } }, fallbackPath);
     let childEnv = null;
     runDriveIngest(fallbackPath, opts({
-      env: { HOME: home },
-      spawn: (_command, _args, options) => { childEnv = options.env; return { status: 0 }; },
+      env: { HOME: home, ADMIN_KEY: "ambient-only-must-not-cross" },
+      spawn: (_command, _args, options) => { childEnv = options; return { status: 0 }; },
     }));
-    check("without a Keychain reference, adjacent .brain-admin-key fallback remains available",
-      childEnv.ADMIN_KEY === undefined);
+    check("without a Keychain reference, the child must use an adjacent durable file, not an ambient-only key",
+      childEnv.env.ADMIN_KEY === undefined && childEnv.input === undefined &&
+      Array.isArray(childEnv.stdio) && childEnv.stdio[0] === "ignore");
   }
   {
     const fileTokensPath = join(directory, "file-token-mode", "brain.manifest.json");

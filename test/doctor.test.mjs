@@ -1,4 +1,5 @@
-import { run, checkNode, checkClaudeCode, checkCodex, checkAnthropicKey, checkGoogleConnection,
+import { run, localToolEnvironment, cloudflareCliEnvironment,
+         checkNode, checkClaudeCode, checkCodex, checkAnthropicKey, checkGoogleConnection,
          checkWranglerLogin, checkVectorize, checkVectorizeApi, CF_TOKEN_SCOPES,
          summarize, runAll, OK, WARN, FAIL } from "../doctor.mjs";
 let fail = 0, ran = 0;
@@ -6,7 +7,10 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 
 /* ---- every non-ok check MUST carry a fix. A failure without one is half a job. ---- */
 {
-  const all = await runAll({ accountId: "0000" });
+  const all = await runAll({
+    accountId: "0000",
+    googleStorageStatus: { exists: false, description: "fixture secure storage" },
+  });
   check("doctor runs every check without throwing", all.length >= 7, String(all.length));
   const bad = all.filter((x) => x.status !== OK && !x.fix);
   check("every non-ok check carries remediation text", bad.length === 0, JSON.stringify(bad.map((b) => b.name)));
@@ -23,7 +27,27 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("Claude Code is never fatal", checkClaudeCode().status !== FAIL);
   check("Codex is never fatal", checkCodex().status !== FAIL);
   check("a missing Anthropic key is not a blocker", checkAnthropicKey().status !== FAIL);
-  check("a missing Google connection is a warning", checkGoogleConnection().status !== FAIL);
+  check("a missing Google connection is a warning",
+    checkGoogleConnection({ exists: false, description: "fixture secure storage" }).status !== FAIL);
+  const migration = checkGoogleConnection({
+    exists: true,
+    backend: "legacy-file",
+    description: "fixture token file (legacy Windows plaintext file; DPAPI migration pending)",
+    encrypted: false,
+    migrationPending: true,
+  });
+  check("legacy Windows plaintext Google storage is not a false green",
+    migration.status === WARN && /plaintext/i.test(migration.detail), JSON.stringify(migration));
+  check("the warning explains automatic DPAPI migration on next connector use",
+    /next Drive, Gmail, or Calendar use migrates a still-valid token to a DPAPI-encrypted file/i.test(migration.fix) &&
+      /If Google rejects the old token, reconnect/i.test(migration.fix), migration.fix);
+  const macMigration = checkGoogleConnection({
+    exists: true,
+    backend: "legacy-file",
+    description: "fixture token file (will migrate to macOS Keychain on next use)",
+  });
+  check("legacy macOS plaintext Google storage is also not a false green",
+    macMigration.status === WARN && /login Keychain/i.test(macMigration.fix), JSON.stringify(macMigration));
 }
 {
   const k = process.env.ANTHROPIC_API_KEY;
@@ -78,6 +102,65 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 
 /* ---- environment handling. Each of these was a real defect. ---- */
 {
+  const ambient = {
+    PATH: process.env.PATH || "/usr/bin",
+    HOME: "/Users/fixture",
+    CLOUDFLARE_ACCOUNT_ID: "ambient-account",
+    ADMIN_KEY: "admin-secret",
+    BRAIN_KEY: "legacy-secret",
+    CLOUDFLARE_API_TOKEN: "cloudflare-secret",
+    OPENAI_API_KEY: "openai-secret",
+    ANTHROPIC_API_KEY: "anthropic-secret",
+    AWS_SECRET_ACCESS_KEY: "aws-secret",
+    NODE_OPTIONS: "--require=/tmp/untrusted.js",
+  };
+  const clean = localToolEnvironment(ambient);
+  check("local CLI children keep PATH and HOME", clean.PATH === ambient.PATH && clean.HOME === ambient.HOME);
+  check("local CLI children keep a non-secret exported Cloudflare account id",
+    clean.CLOUDFLARE_ACCOUNT_ID === "ambient-account");
+  check("local CLI children drop ambient admin and provider credentials",
+    !["ADMIN_KEY", "BRAIN_KEY", "CLOUDFLARE_API_TOKEN", "OPENAI_API_KEY",
+      "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY"].some((name) => Object.hasOwn(clean, name)),
+    JSON.stringify(Object.keys(clean)));
+  check("local CLI children drop ambient Node code-injection options",
+    !Object.hasOwn(clean, "NODE_OPTIONS"), JSON.stringify(Object.keys(clean)));
+
+  const cloudflare = cloudflareCliEnvironment("chosen-account", ambient);
+  check("Cloudflare CLI children receive the explicitly chosen account",
+    cloudflare.CLOUDFLARE_ACCOUNT_ID === "chosen-account");
+  check("Cloudflare CLI children never receive the ambient API token",
+    !Object.hasOwn(cloudflare, "CLOUDFLARE_API_TOKEN"));
+
+  const probe = run(process.execPath, ["-e", [
+    "console.log(JSON.stringify({",
+    "  path: !!process.env.PATH,",
+    "  admin: !!process.env.ADMIN_KEY,",
+    "  cf: !!process.env.CLOUDFLARE_API_TOKEN",
+    "}))",
+  ].join("\n")], { inheritEnv: false, env: clean });
+  const seen = JSON.parse(probe.out.trim());
+  check("the scrubbed environment is the environment the child actually sees",
+    seen.path === true && seen.admin === false && seen.cf === false, probe.out);
+
+  const stdinProbe = run(process.execPath, ["-e", [
+    "let input = '';",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', (chunk) => { input += chunk; });",
+    "process.stdin.on('end', () => console.log(JSON.stringify({",
+    "  marker: process.env.BRAIN_ADMIN_KEY_STDIN,",
+    "  envKey: !!process.env.BRAIN_ADMIN_KEY,",
+    "  input: input.trim() === 'fixture-admin-key'",
+    "})));",
+  ].join("\n")], {
+    inheritEnv: false,
+    env: localToolEnvironment(ambient, { BRAIN_ADMIN_KEY_STDIN: "1" }),
+    input: Buffer.from("fixture-admin-key\n", "utf8"),
+  });
+  const stdinSeen = JSON.parse(stdinProbe.out.trim());
+  check("run can pipe a required secret without putting it in the child environment",
+    stdinSeen.marker === "1" && stdinSeen.envKey === false && stdinSeen.input === true, stdinProbe.out);
+}
+{
   const show = (v, e) => run("node", ["-e", `console.log(process.env.${v} || "(absent)")`], { env: e }).out.trim();
 
   process.env.ZZ_USER_SET = "USERSET";
@@ -99,7 +182,10 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   const l = checkWranglerLogin(undefined);
   check("checking login without a manifest does not clobber the user's account id",
     process.env.CLOUDFLARE_ACCOUNT_ID === "USERSET" && !!l.status);
-  const probe = run("node", ["-e", "console.log(process.env.CLOUDFLARE_ACCOUNT_ID || '(absent)')"], { env: { CLOUDFLARE_API_TOKEN: undefined } });
+  const probe = run("node", ["-e", "console.log(process.env.CLOUDFLARE_ACCOUNT_ID || '(absent)')"], {
+    inheritEnv: false,
+    env: cloudflareCliEnvironment(undefined),
+  });
   check("and a child process still sees it", probe.out.trim() === "USERSET", probe.out.trim());
   delete process.env.CLOUDFLARE_ACCOUNT_ID;
 }

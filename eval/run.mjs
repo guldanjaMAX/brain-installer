@@ -26,6 +26,7 @@ import { dirname, resolve, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BrainClient } from "./brain-client.mjs";
+import { localToolEnvironment } from "../doctor.mjs";
 import {
   scoreQuestion,
   scoreRefusal,
@@ -117,15 +118,54 @@ function abs(p, relativeTo) {
  * shell, so a config file cannot smuggle in a command substitution.
  */
 const DEFAULT_KEY_ENV = "BRAIN_ADMIN_KEY";
+const ADMIN_KEY_STDIN_ENV = "BRAIN_ADMIN_KEY_STDIN";
+const MAX_ADMIN_KEY_STDIN_BYTES = 4096;
+
+async function readAdminKeyFromStdin(stream = process.stdin) {
+  const chunks = [];
+  let total = 0;
+  try {
+    for await (const chunk of stream) {
+      const bytes = Buffer.isBuffer(chunk)
+        ? Buffer.from(chunk)
+        : Buffer.from(String(chunk), "utf8");
+      total += bytes.length;
+      if (total > MAX_ADMIN_KEY_STDIN_BYTES) {
+        bytes.fill(0);
+        throw new Error("admin key on stdin is unexpectedly large");
+      }
+      chunks.push(bytes);
+    }
+    const combined = Buffer.concat(chunks, total);
+    try {
+      const key = combined.toString("utf8").trim();
+      if (!key) throw new Error("admin key on stdin was empty");
+      if (/[\0\r\n]/.test(key)) throw new Error("admin key on stdin must be one line");
+      return key;
+    } finally {
+      combined.fill(0);
+    }
+  } finally {
+    for (const chunk of chunks) chunk.fill(0);
+  }
+}
 
 async function resolveAdminKey(cfg) {
-  // The environment wins over the key command so a CI run, or an install with no
-  // macOS keychain, needs no config edit at all.
+  // `brain eval` uses a one-shot stdin pipe so its key is not exposed in argv or
+  // process metadata. The environment and command paths remain for people who
+  // run this harness directly or from CI.
+  if (process.env[ADMIN_KEY_STDIN_ENV] === "1") {
+    return readAdminKeyFromStdin();
+  }
   const envName = cfg.admin_key_env || DEFAULT_KEY_ENV;
   if (process.env[envName]) return process.env[envName].trim();
   if (Array.isArray(cfg.admin_key_command) && cfg.admin_key_command.length > 0) {
     const [cmd, ...args] = cfg.admin_key_command;
-    const { stdout } = await execFileAsync(cmd, args, { encoding: "utf8" });
+    const { stdout } = await execFileAsync(cmd, args, {
+      encoding: "utf8",
+      env: localToolEnvironment(),
+      windowsHide: true,
+    });
     return stdout.trim();
   }
   throw new Error(
@@ -297,7 +337,11 @@ async function collectProvenance(client, base) {
   } catch { /* provenance is best effort and must never fail a run */ }
   try {
     const { execFileSync } = await import("node:child_process");
-    p.git = execFileSync("git", ["rev-parse", "--short", "HEAD"], { encoding: "utf-8" }).trim();
+    p.git = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+      encoding: "utf-8",
+      env: localToolEnvironment(),
+      windowsHide: true,
+    }).trim();
   } catch { /* not a repo */ }
   return p;
 }

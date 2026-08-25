@@ -11,11 +11,14 @@ Written so you can fix it yourself. Every entry has what you see, why it happens
 
 ## Before anything else
 
-Two things need to be in your shell. Nothing else.
+The installer reads the brain admin key from its durable local storage. Do not
+copy `.brain-admin-key` into your shell. On Windows that file is a DPAPI
+CurrentUser ciphertext envelope, not the key itself. A Cloudflare token is
+needed only for account-changing commands such as verify, provision, deploy,
+and secrets.
 
 ```
 export CLOUDFLARE_API_TOKEN='<your token, for your own account>'
-export ADMIN_KEY="$(cat .brain-admin-key)"   # setup saved it next to your manifest
 ```
 
 **The one command that answers "is it broken":**
@@ -38,7 +41,7 @@ And the one that answers "what is actually in there, and is each part current":
 node brain.mjs sources <manifest>
 ```
 
-That prints one line per source with its status (pending, indexing, ready, or error), how many documents it holds, and when it last took anything in. When your admin key is in the shell it also cross-checks those counts against what your brain actually holds and flags any gap, because the registry's number is its last receipt and the brain is the authority. **A drift of thousands is the cheapest signal available that a load died halfway.**
+That prints one line per source with its status (pending, indexing, ready, or error), how many documents it holds, and when it last took anything in. When the durable admin key is available it also cross-checks those counts against what your brain actually holds and flags any gap, because the registry's number is its last receipt and the brain is the authority. **A drift of thousands is the cheapest signal available that a load died halfway.**
 
 ---
 
@@ -62,7 +65,7 @@ The credential protection is not running, and the test probe that should have be
 
 ### 1. Everything returns 401, right after setting up or changing a key
 
-**You see:** every request refused. `{"error":"unauthorized"}`. During a health check: `401 on attempt 1/5, waiting for secret propagation`.
+**You see:** every request refused. `{"error":"unauthorized"}`. During a health check: `401 on attempt 1/15, waiting for secret propagation`.
 
 **Why:** keys take a few seconds to reach every location that serves your brain. Measured on a real install: ready between 5 and 10 seconds. Running the key change and the check back to back is a race, and losing the race looks exactly like a wrong password.
 
@@ -72,15 +75,25 @@ The credential protection is not running, and the test probe that should have be
 node brain.mjs health <manifest>
 ```
 
-It already retries five times on your behalf, so if the first run reported the wait and then succeeded, nothing is wrong.
+It already retries fifteen times on your behalf, so if the first run reported the wait and then succeeded, nothing is wrong.
 
-**If it is still 401 after the retries:** the message says `still 401 after retries. Check that ADMIN_KEY here matches the deployed secret.` That is the real cause. The key in your shell is not the key on the server. Set both again:
+**If it is still 401 after the retries:** the message says `documents endpoint is still unauthorized after 15 attempts.` The durable local key does not match the deployed secret. If you deliberately know the replacement key, use the exact durable rotation command:
 
 ```
 export ADMIN_KEY='<the correct key>'
 node brain.mjs secrets <manifest>
 node brain.mjs health <manifest>
 ```
+
+`brain secrets` first verifies Cloudflare account access, then updates and reads
+back the manifest's declared Keychain item or adjacent protected file, and then
+applies that durable value to the Worker. It is the complete rotation command.
+Do not update the Worker secret separately in the dashboard.
+
+If the remote update fails, the new durable value stays as the desired state.
+Rerun `brain secrets <manifest>` with no `ADMIN_KEY` export and it will apply
+that same value again. If local persistence fails, the Worker was not changed.
+Never copy the Windows `.brain-admin-key` envelope into `ADMIN_KEY`.
 
 **Who:** you.
 
@@ -435,6 +448,10 @@ Not a failure. It is the feature. A tool that always produces something has taug
 
 There is no telemetry in your install. It reports nothing to me, ever. Recognized installer failures attempt to keep a small private issue journal on your own machine whenever its local storage is writable, so useful technical facts are less likely to be lost. The original failure is never hidden if the journal itself is unavailable. It stores only typed metadata such as installer version, operating system, command, and failure category. It does not store document contents, filenames, paths, account details, URLs, questions, answers, logs, stack traces, or credentials.
 
+After a successful note write, the installer makes a best-effort cleanup of
+safe expired and overflow notes. Fresh or concurrently written notes are left
+alone, and cleanup failure never changes the command's original result.
+
 For an installer or scheduled-refresh problem, review the exact sanitized record first:
 
 ```bash
@@ -442,7 +459,9 @@ brain support --preview
 brain support --export brain-support-review.jsonl
 ```
 
-The export sends nothing. Share it only after you have reviewed it.
+The installer does not upload or send the export. A sync service may upload it
+when the chosen destination is in a synced folder. Share it only after you have
+reviewed it.
 
 For an answer-quality problem, the journal deliberately knows nothing about what you asked. Send:
 

@@ -26,8 +26,16 @@ const forbidden = files.filter((path) =>
   /james|readiness|\.brain-(?:migration|ingest|drive-live-fixture)|brain-support-|support-bundle/i.test(path)
 );
 const required = [
+  "brain.mjs",
+  "components/brain-mcp.mjs",
+  "components/brain-mcp-runtime.mjs",
+  "connectors/google-auth.mjs",
+  "manifest.schema.json",
+  "operations/admin-key-file.mjs",
+  "operations/admin-key-persistence.mjs",
   "operations/drive-scheduler.mjs",
   "support-journal.mjs",
+  "templates/brain.manifest.json",
   "connectors/keychain-write.exp",
   "docs/README-developer.md",
 ];

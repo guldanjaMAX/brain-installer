@@ -9,25 +9,32 @@
  *
  * CONFIGURATION, in resolution order:
  *
- *   1. BRAIN_URL and BRAIN_KEY environment variables.
- *   2. A JSON config file at BRAIN_CONFIG, or ~/.brain/config.json:
+ *   1. BRAIN_URL, BRAIN_NAME, and an absolute BRAIN_MANIFEST locator. The
+ *      current key is read from that manifest's validated durable storage.
+ *   2. Legacy BRAIN_KEY or JSON config values, only when BRAIN_MANIFEST is
+ *      absent. New installer output never writes a literal key into MCP config.
+ *   3. A JSON config file at BRAIN_CONFIG, or ~/.brain/config.json:
  *        { "url": "https://brain.acme.com", "name": "acme",
  *          "key_env": "ACME_BRAIN_KEY",
  *          "key_keychain": { "account": "acme-brain", "service": "admin-key" } }
- *   3. macOS Keychain, when key_keychain is configured.
+ *   4. macOS Keychain, when legacy key_keychain is configured.
  *
  * Cross-platform matters: the first client install runs on Windows, where
  * there is no `security` binary. The Keychain path is a macOS convenience,
  * never a requirement, and the server fails with an instruction rather than a
  * stack trace when no credential resolves.
  *
- * Zero dependencies. Node 18+ (needs global fetch).
+ * Zero dependencies. Node 22+ (matches the installer runtime requirement).
  */
 
-import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { homedir, platform } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
+import { readAdminKeyFromKeychain } from "../operations/admin-key-persistence.mjs";
+import {
+  createBrainCredentialResolver,
+  fetchWithBrainCredential,
+} from "./brain-mcp-runtime.mjs";
 
 const SERVER_VERSION = "0.1.0";
 const DEFAULT_PROTOCOL = "2025-06-18";
@@ -65,40 +72,32 @@ if (!BASE) {
   process.exit(1);
 }
 
-let cachedKey = null;
-
-function credential() {
-  if (cachedKey) return cachedKey;
-
-  // 1. direct env var
+function legacyCredential() {
+  // Legacy only. A BRAIN_MANIFEST resolver always wins before this function is
+  // called, even if an old registration temporarily contains both forms.
   const direct = process.env.BRAIN_KEY;
-  if (direct) return (cachedKey = direct);
+  if (direct) return direct;
 
-  // 2. named env var from config
   if (CFG.key_env && process.env[CFG.key_env]) {
-    return (cachedKey = process.env[CFG.key_env]);
+    return process.env[CFG.key_env];
   }
 
-  // 3. macOS Keychain, when available. Never required.
-  if (CFG.key_keychain && platform() === "darwin") {
+  if (CFG.key_keychain && process.platform === "darwin") {
     const { account, service } = CFG.key_keychain;
-    const r = spawnSync(
-      "security",
-      ["find-generic-password", "-a", account, "-s", service, "-w"],
-      { encoding: "utf-8" }
+    const value = readAdminKeyFromKeychain(
+      { backend: "keychain", account, service },
+      { environment: process.env },
     );
-    if (r.status === 0 && r.stdout?.trim()) return (cachedKey = r.stdout.trim());
+    if (value) return value;
   }
 
-  throw new Error(
-    "no brain credential resolved. Set the BRAIN_KEY environment variable" +
-      (CFG.key_env ? ` (or ${CFG.key_env})` : "") +
-      (platform() === "darwin" && CFG.key_keychain
-        ? `, or store it in the Keychain as account="${CFG.key_keychain.account}" service="${CFG.key_keychain.service}"`
-        : "") +
-      "."
-  );
+  return null;
 }
+
+const CREDENTIALS = createBrainCredentialResolver({
+  environment: process.env,
+  legacyCredential,
+});
 
 /* ------------------------------------------------------------------ */
 /* http                                                                */
@@ -108,17 +107,16 @@ async function call(path, { method = "GET", body } = {}) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
   try {
-    const res = await fetch(BASE + path, {
+    const res = await fetchWithBrainCredential(fetch, BASE + path, {
       method,
       headers: {
-        "X-Admin-Key": credential(),
         "User-Agent": UA,
         ...(body ? { "Content-Type": "application/json" } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
       signal: ctl.signal,
-    });
-    const text = await res.text();
+    }, CREDENTIALS);
+    const text = CREDENTIALS.redact(await res.text());
     if (!res.ok) {
       const hint = text.includes("1010")
         ? " (a bot-protection rule rejected the request; the User-Agent header is the usual cause)"

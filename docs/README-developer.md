@@ -5,7 +5,7 @@ keyword search live in D1, vectors live in Vectorize, and the Worker fuses them.
 Nothing runs on our infrastructure, and nothing but a scoped token is held during
 the engagement.
 
-**Status: 0.1.9.** Provisioning, retrieval, resumable folder ingest, deletion,
+**Status: 0.1.10.** Provisioning, retrieval, resumable folder ingest, deletion,
 upgrade rollback, and `brain setup` are verified end to end against real
 Cloudflare on macOS. Google Drive OAuth and a bounded real-account ingest have
 also been verified. The complete Drive baseline is the remaining production
@@ -56,12 +56,23 @@ node brain.mjs deploy     ./acme.manifest.json   # worker, bindings, drain cron
 # has to exist. Deploying without secrets is safe, because the deploy carries
 # keep_bindings and later deploys preserve whatever is set here.
 #
-# `brain setup` generates the admin key itself and saves it to .brain-admin-key
-# next to the manifest; every later command reads it from there. Only the manual
-# path below needs to make one by hand.
+# `brain setup` generates the admin key itself. `brain secrets` is the one
+# durable rotation path for both setup and manual use: after read-only account
+# resolution, it updates and exactly verifies either operations.admin_key_secret's
+# macOS Keychain item or .brain-admin-key, then applies that desired value to the
+# Worker. Standard setup declares a deterministic Keychain locator automatically
+# on macOS unless an existing legacy adjacent key must be preserved. On Windows
+# the adjacent file contains DPAPI CurrentUser ciphertext, not the plaintext key,
+# and the current-user ACL must succeed before that replacement is committed.
+# Existing Windows plaintext key files remain readable until the next rotation.
+# Setup, secrets, and upgrade list Worker secret names and remove only the known
+# Supabase or Anthropic names disallowed by the manifest. Removal is read back;
+# every unrecognized secret name is preserved.
 # macOS/Linux:   export ADMIN_KEY="$(openssl rand -hex 24)"
 # PowerShell:    $env:ADMIN_KEY = -join ((1..48) | %% { '{0:x}' -f (Get-Random -Max 16) })
 node brain.mjs secrets    ./acme.manifest.json
+# If the remote write failed, rerun the same command with no ADMIN_KEY export.
+# The verified durable value is reused until the Worker converges.
 
 node brain.mjs health     ./acme.manifest.json   # prove it, including vector backlog
 
@@ -168,12 +179,14 @@ already work in, over MCP.
 node brain.mjs mcp-config ./acme.manifest.json
 ```
 
-**Pass credentials with `-e`, never as an environment prefix.** Verified against
-Claude Code 2.1.63 on 2026-08-17: `BRAIN_KEY=... claude mcp add ...` registers
-the server with an EMPTY environment. It appears in `claude mcp list`, connects,
-and then fails on the first question with no credential. `claude mcp get <name>`
-is the check that catches it, and `brain setup` runs that check rather than
-trusting the exit code.
+The generated registration carries only the URL, display name, executable path,
+and absolute manifest locator. The MCP process reads the current admin key from
+the manifest's validated durable Keychain or protected-file backend at runtime.
+`brain setup` reconciles installer-owned Claude Code and Codex registrations and
+accepts them only after an exact local readback. It never relies on a name-only
+listing or prints a stored legacy credential. Claude Desktop remains a manual
+config update; replace its entry with the locator-only JSON from `mcp-config`
+and restart it after a rotation.
 
 ---
 
@@ -193,11 +206,19 @@ verification plus a paid annual CASA security assessment. `brain connect google`
 prints the full console walkthrough when `GOOGLE_CLIENT_ID` is unset. The refresh
 token is stored in the local macOS login Keychain by default and never
 transmitted. The Keychain item is deliberately identifiable as service
-`brain-installer.google-oauth`, account `local-google-connection`. Windows and
-Linux use an atomically replaced local file at `~/.brain/google-tokens.json`;
-macOS can explicitly select the same mode-0600 fallback with
-`BRAIN_GOOGLE_TOKEN_STORE=file`. A legacy macOS token file is deleted only after
-the full credential record has been written to Keychain and read back exactly.
+`brain-installer.google-oauth`, account `local-google-connection`. Windows uses
+an atomically replaced, read-back-verified file at
+`~/.brain/google-tokens.json`, encrypted for the current Windows user with
+DPAPI. A legacy Windows plaintext file is migrated on its next successful read;
+the prior credential is retained or restored if encryption cannot be verified.
+Before that migration, `brain doctor` identifies the legacy plaintext state as
+pending migration instead of claiming the file is already DPAPI encrypted.
+Linux uses the same path as an owner-only mode-0600 file, and macOS can
+explicitly select that fallback with `BRAIN_GOOGLE_TOKEN_STORE=file`. A legacy
+macOS token file is deleted only after the full credential record has been
+written to Keychain and read back exactly. Browser, Keychain, Expect, ACL, and
+DPAPI helper processes receive a small allowlisted environment rather than the
+Terminal's ambient credentials.
 
 Choose OAuth client type **Desktop app**. Desktop clients accept the local
 loopback callback automatically. Google Cloud does not provide, or require, a
@@ -268,10 +289,11 @@ Mac is powered off or the user is logged out is not caught up, so choose a
 schedule that overlaps the machine's normal logged-in hours.
 
 The plist contains paths, schedule data and a non-secret configuration hash
-only. Google credentials continue to come from the normal token store. The
-brain admin key uses the adjacent `.brain-admin-key` lookup unless the manifest
-declares a non-secret macOS Keychain locator. A direct manual run can use
-`ADMIN_KEY`, but LaunchAgents do not inherit Terminal exports:
+only. Google credentials continue to come from the normal token store. Standard
+macOS setup declares a deterministic, non-secret Keychain locator for the brain
+admin key. A legacy adjacent `.brain-admin-key` is preserved rather than moved
+silently. A direct manual run can use `ADMIN_KEY`, but LaunchAgents do not
+inherit Terminal exports:
 
 ```json
 "operations": {
@@ -311,11 +333,13 @@ refuses links, hard links, foreign-owned files, and paths outside the per-user
 
 Each recognized public CLI failure attempts to write one immutable,
 metadata-only event under `~/.brain/support/events/` when that private path is
-writable. Concurrent commands never rewrite one another's event files.
+writable. Concurrent commands never rewrite one another's event files. After
+each successful write, best-effort retention may remove older complete event
+files, but it never changes the event that triggered cleanup.
 Unknown commands and failures of the support command itself are not recorded,
 and journal failure never replaces the original error. This is local support
 evidence, not telemetry: no network call exists in the journal module, and
-nothing is sent automatically.
+the installer does not upload or send journal data.
 
 ```bash
 brain support
@@ -326,19 +350,38 @@ brain support --clear --yes
 
 The schema accepts only installer version, platform, architecture, Node major,
 command, connector class, typed error code, timestamp, random event ID, and an
-optional product-code fingerprint. It cannot accept raw errors, stacks, argv,
-environment values, paths, URLs, manifests, account or document IDs, filenames,
-queries, answers, indexed content, request bodies, response bodies, or logs.
+optional product-code fingerprint. The fingerprint is derived only after an
+existing stack frame resolves inside the installed package and its sanitized
+product-relative module and line pass the strict location validator. Raw stack
+text and outside paths are never stored or hashed. The schema cannot accept raw
+errors, stacks, argv, environment values, paths, URLs, manifests, account or
+document IDs, filenames, queries, answers, indexed content, request bodies,
+response bodies, or logs.
 On POSIX, directories are `0700`, files are `0600`, and links, foreign
 ownership, and nonregular files are refused. Windows keeps the journal inside
 the current user profile and preserves the same schema and no-network boundary,
 but this release does not claim equivalent ACL, ownership, or hard-link
 enforcement there. Preview and export include only the newest 200 valid events,
-at most 30 days and 2 MiB, and they use the same canonical bytes. A partial or
-invalid event file is skipped rather than exported. Physical event-file cleanup
-is intentionally lazy, so use `brain support --clear --yes` after a case is
-resolved if local retention matters. Export refuses to overwrite an existing
-file.
+at most 30 days and 2 MiB, and they use the same canonical bytes. The default
+status reports the count in that recent shareable view, not the total number of
+physical event files, and it does not print the user-profile path. A partial or
+invalid event file is skipped rather than exported.
+
+Physical retention is automatic and best effort after a new event is durable.
+Cleanup considers only canonical event basenames and complete events that still
+have the same file identity observed during scanning. It never deletes the
+current event. A ten-minute freshness grace protects a process that is still
+closing or syncing its event, and partial events are never cleanup candidates.
+Concurrent cleaners choose the same oldest events and recheck identity before
+unlinking. A rapid burst can temporarily exceed the physical count until a
+later write runs after the grace period. Invalid or unsafe artifacts may remain
+outside automatic retention. `brain support --clear --yes` removes partial or
+invalid regular files only after the entire journal passes safety checks. It
+refuses links and special files for manual review. Any cleanup error is
+discarded so support housekeeping cannot replace the command's original
+failure. Export refuses to overwrite an existing file. The installer does not
+upload or send the export; a sync service may upload it when the chosen
+destination is in a synced folder.
 
 Cross-install collection is deliberately a later, opt-in feature. If built, it
 needs a separate write-only support credential and an exact payload preview. It
@@ -387,7 +430,7 @@ asserts the FTS5 triggers actually keep the index in step. It exists because
 migration 0004 once shipped broken: the SQL splitter shredded its trigger bodies,
 and the store tests use mocks, so no test had ever executed a migration file.
 
-**`eval/` is excluded from the published package on purpose.** It holds a golden
-question set built from the author's own brain, naming real clients and real
-figures. `package.json` uses an allowlist rather than a denylist so that cannot
-be re-included by accident.
+The published package includes the reviewed eval runtime, configuration, and
+blank golden-set template. Private baselines and client golden question files
+are excluded. `package.json` uses an allowlist rather than a denylist so private
+evaluation data cannot be included by accident.

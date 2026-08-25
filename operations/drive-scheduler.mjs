@@ -37,6 +37,12 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { recordSupportEvent } from "../support-journal.mjs";
+import {
+  parseAdminKeySecretReference,
+  readAdminKeyFromKeychain,
+} from "./admin-key-persistence.mjs";
+
+export { parseAdminKeySecretReference };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_BRAIN_PATH = resolve(HERE, "..", "brain.mjs");
@@ -802,11 +808,10 @@ function atomicWrite(path, text) {
 }
 
 function defaultLaunchctl(args) {
-  return spawnSync("/bin/launchctl", args, { encoding: "utf-8" });
-}
-
-function defaultSecurity(args) {
-  return spawnSync("/usr/bin/security", args, { encoding: "utf-8", timeout: 15_000, killSignal: "SIGKILL" });
+  return spawnSync("/bin/launchctl", args, {
+    encoding: "utf-8",
+    env: launchctlChildEnvironment(),
+  });
 }
 
 function launchctlError(action, result) {
@@ -1001,25 +1006,9 @@ export function safeIngestEnvironment(environment = process.env) {
   return clean;
 }
 
-/** Parse a non-secret Keychain locator kept in the client manifest. */
-export function parseAdminKeySecretReference(reference) {
-  const text = String(reference || "");
-  const match = text.match(/^keychain:\/\/([^/]+)\/(.+)$/);
-  if (!match) {
-    throw new Error("operations.admin_key_secret must use keychain://<service>/<account>");
-  }
-  let service;
-  let account;
-  try {
-    service = decodeURIComponent(match[1]);
-    account = decodeURIComponent(match[2]);
-  } catch {
-    throw new Error("operations.admin_key_secret contains invalid percent encoding");
-  }
-  if (!service || !account || /[?#]/.test(service) || /[?#]/.test(account)) {
-    throw new Error("operations.admin_key_secret must name a Keychain service and account without a query or fragment");
-  }
-  return { backend: "keychain", service, account };
+/** Service management needs the same OS basics as ingest, never desktop keys. */
+export function launchctlChildEnvironment(environment = process.env) {
+  return safeIngestEnvironment(environment);
 }
 
 /**
@@ -1033,19 +1022,20 @@ export function resolveScheduledAdminKey(manifest, options = {}) {
   if ((options.platform || process.platform) !== "darwin") {
     throw new Error("keychain:// admin key references require macOS");
   }
-  const { service, account } = parseAdminKeySecretReference(reference);
-  const runSecurity = options.runSecurity || defaultSecurity;
-  const result = runSecurity(["find-generic-password", "-s", service, "-a", account, "-w"]);
-  if (result?.status !== 0) {
-    if (result?.error?.code === "ETIMEDOUT") {
-      throw new Error("reading the scheduled admin key from macOS Keychain timed out after 15 seconds");
-    }
+  const locator = parseAdminKeySecretReference(reference);
+  const child = options.runChild ?? (options.runSecurity
+    ? (_command, args, childOptions) => options.runSecurity(args, childOptions)
+    : undefined);
+  const key = readAdminKeyFromKeychain(locator, {
+    ...(child ? { runChild: child } : {}),
+    environment: options.environment,
+    timeoutMs: options.timeoutMs,
+  });
+  if (!key) {
     throw new Error(
-      `could not read the scheduled admin key from macOS Keychain item ${service}/${account}; it may be missing or inaccessible`
+      `could not read the scheduled admin key from macOS Keychain item ${locator.service}/${locator.account}; it may be missing or inaccessible`
     );
   }
-  const key = String(result.stdout || "").replace(/[\r\n]+$/, "");
-  if (!key) throw new Error("the scheduled admin key Keychain item is empty");
   return key;
 }
 
@@ -1060,23 +1050,20 @@ export function runDriveIngest(manifestPath, options = {}) {
   const startedAt = new Date().toISOString();
   assertSchedulerLockDirectory(plan);
   preparePrivateLockFile(plan.lockPath);
-  const adminKey = resolveScheduledAdminKey(plan.manifest, {
-    platform: options.platform,
-    runSecurity: options.runSecurity,
-  });
   const sourceEnvironment = options.env || process.env;
   const childEnvironment = safeIngestEnvironment(sourceEnvironment);
   if (plan.googleTokenStore === "auto") delete childEnvironment.BRAIN_GOOGLE_TOKEN_STORE;
   else childEnvironment.BRAIN_GOOGLE_TOKEN_STORE = plan.googleTokenStore;
-  const childAdminKey = adminKey || sourceEnvironment.ADMIN_KEY;
-  if (childAdminKey) childEnvironment.ADMIN_KEY = childAdminKey;
   const result = spawn(
     LOCKF_PATH,
     ["-k", "-s", "-t", "0", plan.lockPath, plan.nodePath, plan.brainPath, "ingest", plan.path, "--from", "drive"],
     {
       cwd: dirname(plan.path),
       env: childEnvironment,
-      stdio: "inherit",
+      // The brain child resolves its manifest-declared Keychain, DPAPI, or
+      // owner-only file itself. Never duplicate the admin key into lockf/node
+      // process metadata, and never accept a pipe as an unattended key source.
+      stdio: ["ignore", "inherit", "inherit"],
     }
   );
   if (result?.error) throw result.error;
@@ -1145,13 +1132,17 @@ export function recordDriveSchedulerFailure(_error, { action = "run", journalOpt
 }
 
 export function recordDriveSchedulerResult(result, options = {}) {
-  if (Number(result?.code || 0) === 0 && !result?.signal) return null;
+  // A normal nonzero child exit is already journaled by brain.mjs. The wrapper
+  // owns only abnormal signal termination, where the child cannot reliably
+  // finish its own failure handler. Spawn and pre-child failures throw and are
+  // recorded by main's catch below.
+  if (!result?.signal) return null;
   return recordDriveSchedulerFailure(null, { action: "run", ...options });
 }
 
 function printDriveSchedulerSupportReceipt(eventId) {
   if (!eventId) return;
-  console.error(`Private issue note ${eventId} was saved locally. Nothing was sent.`);
+  console.error(`Private issue note ${eventId} was saved locally. The installer did not upload or send this issue note.`);
   console.error("Review the exact safe record with: brain support --preview");
 }
 

@@ -13,6 +13,7 @@ import {
   statSync,
   symlinkSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,6 +24,7 @@ import {
   SUPPORT_MAX_AGE_DAYS,
   SUPPORT_MAX_BYTES,
   SUPPORT_MAX_EVENTS,
+  SUPPORT_RETENTION_GRACE_MS,
   clearSupportJournal,
   exportSupportJournal,
   previewSupportEvent,
@@ -224,6 +226,33 @@ try {
   assert.throws(() => recordSupportEvent(eventInput, options(root)), /refusing to overwrite/);
   assert.equal(readFileSync(storedPath, "utf8"), onDisk);
 
+  // Existing releases created ~/.brain independently of the support journal,
+  // commonly with mode 0755. Preview must safely tighten an owned real
+  // directory instead of making support diagnostics unusable.
+  if (process.platform !== "win32") {
+    const legacyEmptyRoot = freshRoot("legacy-empty-brain-mode");
+    const legacyEmptyBrain = join(legacyEmptyRoot, ".brain");
+    mkdirSync(legacyEmptyBrain, { mode: 0o755 });
+    chmodSync(legacyEmptyBrain, 0o755);
+    assert.equal(previewSupportJournal(options(legacyEmptyRoot)), "");
+    assert.equal(statSync(legacyEmptyBrain).mode & 0o777, 0o700);
+
+    const legacyJournalRoot = freshRoot("legacy-journal-modes");
+    const legacyEvent = recordSupportEvent(
+      { command: "doctor", source: "local", errorCode: "CONFIG_INVALID" },
+      options(legacyJournalRoot, 9),
+    );
+    const legacyPaths = supportJournalPaths({ root: legacyJournalRoot });
+    for (const directory of [legacyPaths.brainRoot, legacyPaths.supportRoot, legacyPaths.eventsDir]) {
+      chmodSync(directory, 0o755);
+    }
+    const legacyPreview = previewSupportJournal(options(legacyJournalRoot, 10));
+    assert.equal(JSON.parse(legacyPreview).event_id, legacyEvent.event_id);
+    for (const directory of [legacyPaths.brainRoot, legacyPaths.supportRoot, legacyPaths.eventsDir]) {
+      assert.equal(statSync(directory).mode & 0o777, 0o700);
+    }
+  }
+
   const exported = join(sandbox, "support-export.jsonl");
   const canonicalPreview = previewSupportJournal(options(root));
   const exportResult = exportSupportJournal(exported, options(root));
@@ -268,8 +297,8 @@ try {
   assert.equal(repairedView.split("\n").filter(Boolean).length, 2);
   assert.equal(repairedView.includes(maliciousUuid), false);
 
-  // Preview/export are strictly bounded. Immutable physical retention is lazy,
-  // so recording never risks deleting an event another writer just created.
+  // Preview/export are strictly bounded. Physical retention runs only after a
+  // successful write and leaves fresh files alone during its concurrency grace.
   const pruneRoot = freshRoot("prune");
   recordSupportEvent(
     { command: "ingest", source: "drive", errorCode: "INGEST_FAILED" },
@@ -282,13 +311,81 @@ try {
     );
   }
   const prunePaths = supportJournalPaths({ root: pruneRoot });
-  assert.equal(readdirSync(prunePaths.eventsDir).length, SUPPORT_MAX_EVENTS + 18);
-  const prunedText = previewSupportJournal(options(pruneRoot, 1));
+  assert.equal(
+    readdirSync(prunePaths.eventsDir).length,
+    SUPPORT_MAX_EVENTS + 18,
+    "a rapid burst is not deleted while another writer may still be finishing",
+  );
+  const cleanupNow = new Date(fixedNow.getTime() + 60 * 60 * 1000);
+  const oldPhysicalTime = new Date(cleanupNow.getTime() - SUPPORT_RETENTION_GRACE_MS - 1000);
+  for (const name of readdirSync(prunePaths.eventsDir)) {
+    utimesSync(join(prunePaths.eventsDir, name), oldPhysicalTime, oldPhysicalTime);
+  }
+  recordSupportEvent(
+    { command: "ingest", source: "drive", errorCode: "INGEST_FAILED" },
+    {
+      ...options(pruneRoot, 251, cleanupNow),
+      retentionNowMs: cleanupNow.getTime(),
+    },
+  );
+  assert.equal(
+    readdirSync(prunePaths.eventsDir).length,
+    SUPPORT_MAX_EVENTS,
+    "a later write removes safe canonical expired and overflow event files",
+  );
+  assert.ok(
+    existsSync(join(prunePaths.eventsDir, `evt_${"fb".repeat(16)}.json`)),
+    "physical cleanup never removes the event that triggered it",
+  );
+  const prunedText = previewSupportJournal(options(pruneRoot, 1, cleanupNow));
   const pruned = prunedText.split("\n").filter(Boolean).map(JSON.parse);
   assert.equal(pruned.length, SUPPORT_MAX_EVENTS);
   assert.ok(Buffer.byteLength(prunedText) <= SUPPORT_MAX_BYTES);
   assert.ok(pruned.every((event) => Date.parse(event.timestamp) >= fixedNow.getTime() - SUPPORT_MAX_AGE_DAYS * 86_400_000));
   assert.equal(pruned.some((event) => event.event_id === `evt_${"fa".repeat(16)}`), false, "expired event is not exported");
+  const prunedExport = join(sandbox, "pruned-support-export.jsonl");
+  exportSupportJournal(prunedExport, options(pruneRoot, 1, cleanupNow));
+  assert.equal(readFileSync(prunedExport, "utf8"), prunedText, "bounded preview and export stay byte-identical");
+  assert.equal(
+    readdirSync(prunePaths.eventsDir).length,
+    SUPPORT_MAX_EVENTS,
+    "preview and export do not mutate the physically bounded event set",
+  );
+  assert.equal(clearSupportJournal({ root: pruneRoot }), true);
+  assert.equal(existsSync(prunePaths.supportRoot), false, "clear removes the retained physical journal");
+
+  // A valid-but-fresh overflow event and a partial concurrent write both stay
+  // untouched. Once a canonical overflow file is old enough, a later writer
+  // removes it without touching itself or the fresh neighbor.
+  const raceRoot = freshRoot("retention-race");
+  const raceStart = Date.now();
+  const raceOptions = (index, offset = 0) => ({
+    ...options(raceRoot, index, new Date(raceStart + offset)),
+    physicalMaxEvents: 1,
+    retentionNowMs: raceStart + offset,
+  });
+  const raceFirst = recordSupportEvent(
+    { command: "doctor", source: "local", errorCode: "INTERNAL_ERROR" },
+    raceOptions(1),
+  );
+  const raceSecond = recordSupportEvent(
+    { command: "doctor", source: "local", errorCode: "INTERNAL_ERROR" },
+    raceOptions(2, 1),
+  );
+  const racePaths = supportJournalPaths({ root: raceRoot });
+  assert.equal(readdirSync(racePaths.eventsDir).length, 2, "fresh overflow survives its grace period");
+  const partialName = `evt_${"04".repeat(16)}.json`;
+  writePrivate(join(racePaths.eventsDir, partialName), '{"unfinished":');
+  const agedRaceTime = new Date(raceStart - SUPPORT_RETENTION_GRACE_MS - 1000);
+  utimesSync(eventPath(racePaths, raceFirst), agedRaceTime, agedRaceTime);
+  const raceCurrent = recordSupportEvent(
+    { command: "health", source: "cloudflare", errorCode: "HEALTH_CHECK_FAILED" },
+    raceOptions(3, 2),
+  );
+  assert.equal(existsSync(eventPath(racePaths, raceFirst)), false, "safe old overflow is removed");
+  assert.equal(existsSync(eventPath(racePaths, raceSecond)), true, "fresh neighboring event is preserved");
+  assert.equal(existsSync(eventPath(racePaths, raceCurrent)), true, "current event is preserved");
+  assert.equal(existsSync(join(racePaths.eventsDir, partialName)), true, "a partial concurrent event is preserved");
 
   // This is the regression for the reproduced blocker: sixteen processes start
   // together, every successful return must correspond to one durable event.
@@ -335,9 +432,14 @@ try {
     linkSync(hardlinkPath, secondLink);
     assert.equal(lstatSync(hardlinkPath).nlink, 2);
     assert.throws(() => previewSupportJournal(options(hardlinkRoot, 1)), /hard links/);
-    recordSupportEvent(
+    const eventAfterUnsafeRetention = recordSupportEvent(
       { command: "health", source: "local", errorCode: "HEALTH_CHECK_FAILED" },
       options(hardlinkRoot, 2),
+    );
+    assert.equal(
+      existsSync(eventPath(supportJournalPaths({ root: hardlinkRoot }), eventAfterUnsafeRetention)),
+      true,
+      "retention refusal does not sacrifice the event that was just written",
     );
     assert.throws(() => clearSupportJournal({ root: hardlinkRoot }), /hard links/);
     unlinkSync(secondLink);

@@ -7,9 +7,10 @@
  * the stored schema. The only optional correlation value is derived from a
  * validated product-relative source location.
  *
- * Each event is an immutable private file. Writers never read, rewrite, lock,
- * or rename another writer's event, so concurrent commands cannot lose each
- * other's records and a crashed process cannot leave a stale lock.
+ * Each event is an immutable private file. Writers never rewrite, lock, or
+ * rename another writer's event. After a successful write, best-effort
+ * retention may remove only complete, private, older event files while fresh
+ * and concurrently written files are left alone.
  */
 
 import {
@@ -37,6 +38,7 @@ export const SUPPORT_SCHEMA_VERSION = 1;
 export const SUPPORT_MAX_EVENTS = 200;
 export const SUPPORT_MAX_AGE_DAYS = 30;
 export const SUPPORT_MAX_BYTES = 2 * 1024 * 1024;
+export const SUPPORT_RETENTION_GRACE_MS = 10 * 60 * 1000;
 
 export const SUPPORT_COMMANDS = Object.freeze([
   "auth",
@@ -289,8 +291,39 @@ function secureDirectory(path, label, expectedUid) {
       if (error?.code !== "EEXIST") throw error;
     }
   }
-  try { chmodSync(path, 0o700); } catch { /* Windows has no POSIX directory modes. */ }
-  verifyDirectory(path, label, { expectedUid, privateMode: true });
+  const before = lstatIfPresent(path);
+  verifyDirectory(path, label, { stat: before, expectedUid });
+  if (process.platform === "win32") {
+    // Windows has no POSIX directory modes. The real-directory checks still
+    // refuse links and special files before the journal uses this path.
+    return before;
+  }
+
+  let descriptor;
+  let secured;
+  try {
+    descriptor = openSync(
+      path,
+      fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY || 0) | (fsConstants.O_NOFOLLOW || 0),
+    );
+    const opened = fstatSync(descriptor);
+    verifyDirectory(path, label, { stat: opened, expectedUid });
+    if (!sameNodeIdentity(before, opened)) {
+      throw supportError(`${label} changed while its permissions were being secured`);
+    }
+    fchmodSync(descriptor, 0o700);
+    secured = fstatSync(descriptor);
+    verifyDirectory(path, label, { stat: secured, expectedUid, privateMode: true });
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+
+  const current = lstatIfPresent(path);
+  verifyDirectory(path, label, { stat: current, expectedUid, privateMode: true });
+  if (!sameNodeIdentity(secured, current)) {
+    throw supportError(`${label} changed while its permissions were being secured`);
+  }
+  return current;
 }
 
 function verifyFile(path, label, {
@@ -355,6 +388,17 @@ function parseCanonicalEvent(value) {
 
 function canonicalLine(event) {
   return `${JSON.stringify(event)}\n`;
+}
+
+function sameNodeIdentity(left, right) {
+  return Boolean(left && right) && left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameFileIdentity(left, right) {
+  return sameNodeIdentity(left, right) &&
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs &&
+    left.ctimeMs === right.ctimeMs;
 }
 
 function cleanupFailedExclusiveWrite(path, identity, expectedUid) {
@@ -478,6 +522,85 @@ function loadEvents(paths, expectedUid) {
   return events;
 }
 
+function physicalRetentionOptions(options, event) {
+  const maxEvents = options.physicalMaxEvents ?? SUPPORT_MAX_EVENTS;
+  const graceMs = options.retentionGraceMs ?? SUPPORT_RETENTION_GRACE_MS;
+  const nowMs = options.retentionNowMs ?? Date.parse(event.timestamp);
+  if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > SUPPORT_MAX_EVENTS) {
+    throw new TypeError("support journal physicalMaxEvents must be a positive bounded integer");
+  }
+  if (!Number.isSafeInteger(graceMs) || graceMs < 0 || graceMs > AGE_MS) {
+    throw new TypeError("support journal retentionGraceMs must be a bounded nonnegative integer");
+  }
+  if (!Number.isFinite(nowMs)) {
+    throw new TypeError("support journal retentionNowMs must be a finite timestamp");
+  }
+  return { maxEvents, graceMs, nowMs };
+}
+
+/**
+ * Remove only old canonical events after a new event is already durable.
+ *
+ * Cleanup deliberately ignores partial or invalid files. One of those may be
+ * a different process that has created its immutable name and is still
+ * writing. A freshness grace protects a complete writer that has not yet
+ * closed or synced its descriptor. The final identity check avoids unlinking
+ * a path that changed after the scan.
+ */
+function enforcePhysicalRetention(paths, expectedUid, currentEvent, options) {
+  const { maxEvents, graceMs, nowMs } = physicalRetentionOptions(options, currentEvent);
+  const eventsStat = lstatIfPresent(paths.eventsDir);
+  verifyDirectory(paths.eventsDir, "support journal events directory", {
+    stat: eventsStat,
+    expectedUid,
+    privateMode: true,
+  });
+
+  const candidates = [];
+  for (const name of readdirSync(paths.eventsDir)) {
+    const match = EVENT_FILE_RE.exec(name);
+    if (!match) continue;
+    const path = join(paths.eventsDir, name);
+    const before = lstatIfPresent(path);
+    if (!before) continue;
+    verifyFile(path, "support journal retention event", { stat: before, expectedUid });
+    const event = readImmutableEvent(path, match[1], expectedUid);
+    if (!event) continue;
+    const after = lstatIfPresent(path);
+    if (!after) continue;
+    verifyFile(path, "support journal retention event", { stat: after, expectedUid });
+    if (!sameFileIdentity(before, after)) continue;
+    candidates.push({ path, event, identity: after });
+  }
+
+  const ordered = candidates.sort((left, right) =>
+    left.event.timestamp.localeCompare(right.event.timestamp) ||
+    left.event.event_id.localeCompare(right.event.event_id));
+  const unexpired = ordered.filter((candidate) =>
+    Date.parse(candidate.event.timestamp) >= nowMs - AGE_MS);
+  const keepIds = new Set(unexpired.slice(-maxEvents).map((candidate) => candidate.event.event_id));
+
+  for (const candidate of ordered) {
+    if (candidate.event.event_id === currentEvent.event_id) continue;
+    const expired = Date.parse(candidate.event.timestamp) < nowMs - AGE_MS;
+    if (!expired && keepIds.has(candidate.event.event_id)) continue;
+    if (candidate.identity.mtimeMs >= nowMs - graceMs) continue;
+
+    const currentEventsDir = lstatIfPresent(paths.eventsDir);
+    verifyDirectory(paths.eventsDir, "support journal events directory", {
+      stat: currentEventsDir,
+      expectedUid,
+      privateMode: true,
+    });
+    if (!sameNodeIdentity(eventsStat, currentEventsDir)) return;
+    const current = lstatIfPresent(candidate.path);
+    if (!current) continue;
+    verifyFile(candidate.path, "support journal retention event", { stat: current, expectedUid });
+    if (!sameFileIdentity(candidate.identity, current)) continue;
+    unlinkSync(candidate.path);
+  }
+}
+
 function pruneEvents(events, now) {
   const newestAllowed = now.getTime() + 5 * 60 * 1000;
   const oldestAllowed = now.getTime() - AGE_MS;
@@ -507,13 +630,19 @@ function canonicalJournal(events) {
   return events.map(canonicalLine).join("");
 }
 
-/** Add one immutable event. No existing event file is read or changed. */
+/** Add one immutable event, then best-effort clean safe expired or overflow events. */
 export function recordSupportEvent(input, options = {}) {
   const expectedUid = ownershipUid(options);
   const paths = prepareSupportDirectory(options, expectedUid);
   const event = previewSupportEvent(input, options);
   const path = join(paths.eventsDir, `${event.event_id}.json`);
   exclusivePrivateWrite(path, canonicalLine(event), "support journal event", expectedUid);
+  try {
+    enforcePhysicalRetention(paths, expectedUid, event, options);
+  } catch {
+    // The new event and the command's original failure are already durable.
+    // Retention is housekeeping and must never hide either one.
+  }
   return event;
 }
 
@@ -524,18 +653,13 @@ function canonicalSupportJournal(options, expectedUid) {
   verifyDirectory(paths.userRoot, "support journal root", { stat: userRoot });
   const brain = lstatIfPresent(paths.brainRoot);
   if (!brain) return "";
-  verifyDirectory(paths.brainRoot, "support journal .brain directory", {
-    stat: brain,
-    expectedUid,
-    privateMode: true,
-  });
+  secureDirectory(paths.brainRoot, "support journal .brain directory", expectedUid);
   const support = lstatIfPresent(paths.supportRoot);
   if (!support) return "";
-  verifyDirectory(paths.supportRoot, "support journal directory", {
-    stat: support,
-    expectedUid,
-    privateMode: true,
-  });
+  secureDirectory(paths.supportRoot, "support journal directory", expectedUid);
+  if (lstatIfPresent(paths.eventsDir)) {
+    secureDirectory(paths.eventsDir, "support journal events directory", expectedUid);
+  }
   return canonicalJournal(pruneEvents(loadEvents(paths, expectedUid), nowDate(options)));
 }
 

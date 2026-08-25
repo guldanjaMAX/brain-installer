@@ -29,12 +29,14 @@ import { createServer } from "node:http";
 import { createHash, randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import {
-  readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync, renameSync,
-  unlinkSync, openSync, closeSync, fsyncSync,
+  chmodSync, closeSync, constants as fsConstants, existsSync, fchmodSync,
+  fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync,
+  readSync, renameSync, unlinkSync, writeSync,
 } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { TextDecoder } from "node:util";
 
 export const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 export const TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -53,6 +55,46 @@ export const SCOPES = {
  */
 export const DEFAULT_PORT = 47811;
 export const redirectUri = (port = DEFAULT_PORT) => `http://127.0.0.1:${port}`;
+
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const CHILD_ENV_BASICS = Object.freeze(["HOME", "USER", "LOGNAME", "TMPDIR"]);
+const BROWSER_ENV_BASICS = Object.freeze([
+  "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS",
+  "XDG_RUNTIME_DIR", "XDG_CURRENT_DESKTOP", "DESKTOP_SESSION",
+]);
+
+/**
+ * Return only the OS/session variables Google auth helper children need. In
+ * particular, no credential inherited by the desktop process reaches browser,
+ * Keychain, Expect, ACL, or DPAPI helpers.
+ */
+export function googleAuthChildEnvironment(
+  environment = process.env,
+  { platform = process.platform, browser = false } = {},
+) {
+  const clean = platform === "win32"
+    ? {}
+    : { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" };
+  for (const name of CHILD_ENV_BASICS) {
+    const value = environment?.[name];
+    if (typeof value === "string" && value) clean[name] = value;
+  }
+  if (platform === "win32") {
+    const systemRoot = environment?.SystemRoot || environment?.SYSTEMROOT || environment?.WINDIR;
+    if (typeof systemRoot === "string" && systemRoot) clean.SystemRoot = systemRoot;
+    for (const name of ["TEMP", "TMP"]) {
+      const value = environment?.[name];
+      if (typeof value === "string" && value) clean[name] = value;
+    }
+  }
+  if (browser) {
+    for (const name of BROWSER_ENV_BASICS) {
+      const value = environment?.[name];
+      if (typeof value === "string" && value) clean[name] = value;
+    }
+  }
+  return clean;
+}
 
 const b64url = (buf) => buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
@@ -80,11 +122,27 @@ export function buildAuthUrl({ clientId, scopes, challenge, state, port = DEFAUL
   return u.toString();
 }
 
-function openBrowser(url) {
-  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+export function openBrowser(url, options = {}) {
+  const platform = options.platform || process.platform;
+  const environment = options.environment || process.env;
+  const systemRoot = environment.SystemRoot || environment.SYSTEMROOT || environment.WINDIR;
+  const command = options.openCommand || (
+    platform === "darwin"
+      ? "/usr/bin/open"
+      : platform === "win32" && systemRoot
+        ? join(systemRoot, "explorer.exe")
+        : platform === "win32"
+          ? "explorer.exe"
+          : "/usr/bin/xdg-open"
+  );
   try {
-    spawn(cmd, args, { stdio: "ignore", detached: true }).unref();
+    (options.spawnChild || spawn)(command, [url], {
+      detached: true,
+      env: googleAuthChildEnvironment(environment, { platform, browser: true }),
+      shell: false,
+      stdio: "ignore",
+      windowsHide: true,
+    }).unref();
     return true;
   } catch {
     return false;
@@ -248,94 +306,683 @@ function parseStore(text, source, { strict = false } = {}) {
     const value = JSON.parse(text);
     if (!isRecord(value)) throw new Error("the stored value is not an object");
     return value;
-  } catch (error) {
-    if (!strict) return {};
-    throw new Error(`${source} does not contain a valid Google credential record`, { cause: error });
-  }
-}
-
-function readFileStore(path, { strict = false } = {}) {
-  if (!existsSync(path)) return null;
-  return parseStore(readFileSync(path, "utf-8"), path, { strict });
-}
-
-/** Write completely, fsync, then rename over the destination. */
-function writeFileStore(path, store) {
-  const directory = dirname(path);
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  try {
-    chmodSync(directory, 0o700);
   } catch {
-    // Windows does not expose POSIX modes. The directory remains in the user's
-    // profile and the write below still avoids partial credential files.
+    if (!strict) return {};
+    // JSON parser errors can include nearby source text. Never attach that
+    // error as a cause because the nearby text may be a token or client secret.
+    throw new Error(`${source} does not contain a valid Google credential record`);
   }
+}
 
-  const temporary = join(directory, `.${basename(path)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
-  let descriptor;
+const WINDOWS_DPAPI_HEADER = Buffer.from("BRAIN-GOOGLE-TOKENS-DPAPI-V1\n", "ascii");
+const MAX_TOKEN_STORE_BYTES = 2 * 1024 * 1024;
+const MAX_DPAPI_OUTPUT_BYTES = MAX_TOKEN_STORE_BYTES + 64 * 1024;
+
+const DPAPI_PROTECT_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Security
+$memory = New-Object System.IO.MemoryStream
+[byte[]]$plain = $null
+[byte[]]$protectedBytes = $null
+try {
+  [Console]::OpenStandardInput().CopyTo($memory)
+  $plain = $memory.ToArray()
+  $protectedBytes = [System.Security.Cryptography.ProtectedData]::Protect(
+    $plain,
+    $null,
+    [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+  )
+  $output = [Console]::OpenStandardOutput()
+  $output.Write($protectedBytes, 0, $protectedBytes.Length)
+  $output.Flush()
+} finally {
+  if ($null -ne $plain) { [Array]::Clear($plain, 0, $plain.Length) }
+  if ($null -ne $protectedBytes) { [Array]::Clear($protectedBytes, 0, $protectedBytes.Length) }
+  $memory.Dispose()
+}
+`;
+
+const DPAPI_UNPROTECT_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Security
+$memory = New-Object System.IO.MemoryStream
+[byte[]]$protectedBytes = $null
+[byte[]]$plain = $null
+try {
+  [Console]::OpenStandardInput().CopyTo($memory)
+  $protectedBytes = $memory.ToArray()
+  $plain = [System.Security.Cryptography.ProtectedData]::Unprotect(
+    $protectedBytes,
+    $null,
+    [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+  )
+  $output = [Console]::OpenStandardOutput()
+  $output.Write($plain, 0, $plain.Length)
+  $output.Flush()
+} finally {
+  if ($null -ne $protectedBytes) { [Array]::Clear($protectedBytes, 0, $protectedBytes.Length) }
+  if ($null -ne $plain) { [Array]::Clear($plain, 0, $plain.Length) }
+  $memory.Dispose()
+}
+`;
+
+function lstatIfPresent(path) {
   try {
-    descriptor = openSync(temporary, "wx", 0o600);
-    writeFileSync(descriptor, JSON.stringify(store, null, 2), "utf-8");
+    return lstatSync(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function sameFile(left, right) {
+  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);
+}
+
+function removeIfSame(path, identity) {
+  const current = lstatIfPresent(path);
+  if (!sameFile(current, identity)) return false;
+  try {
+    unlinkSync(path);
+    return lstatIfPresent(path) === null;
+  } catch {
+    return false;
+  }
+}
+
+function validateTokenDirectory(path, platform, options, { prepare = false } = {}) {
+  const directory = dirname(path);
+  if (prepare) mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const identity = lstatIfPresent(directory);
+  if (!identity || identity.isSymbolicLink() || !identity.isDirectory()) {
+    throw new Error("the Google token directory must be a real existing directory");
+  }
+  if (platform !== "win32") {
+    const getUid = options.getUid || process.getuid;
+    const expectedUid = typeof getUid === "function" ? getUid() : null;
+    if (expectedUid !== null && identity.uid !== expectedUid) {
+      throw new Error("the Google token directory must be owned by the current user");
+    }
+    if (prepare) {
+      try { chmodSync(directory, 0o700); } catch {
+        throw new Error("the Google token directory could not be restricted to the current user");
+      }
+    }
+  }
+  return identity;
+}
+
+function validateExistingTokenFile(path, platform, options) {
+  const identity = lstatIfPresent(path);
+  if (!identity) return null;
+  if (identity.isSymbolicLink() || !identity.isFile() || identity.nlink !== 1) {
+    throw new Error("the Google token file must be a private regular file with no links");
+  }
+  if (platform !== "win32") {
+    const getUid = options.getUid || process.getuid;
+    const expectedUid = typeof getUid === "function" ? getUid() : null;
+    if (expectedUid !== null && identity.uid !== expectedUid) {
+      throw new Error("the Google token file must be owned by the current user");
+    }
+    if ((identity.mode & 0o777) !== 0o600) {
+      throw new Error("the Google token file permissions must be exactly 0600");
+    }
+  }
+  return identity;
+}
+
+function childResultBuffer(value) {
+  if (Buffer.isBuffer(value)) return Buffer.from(value);
+  if (value === undefined || value === null) return Buffer.alloc(0);
+  return Buffer.from(String(value), "utf8");
+}
+
+function wipeChildResult(result) {
+  if (Buffer.isBuffer(result?.stdout)) result.stdout.fill(0);
+  if (Buffer.isBuffer(result?.stderr)) result.stderr.fill(0);
+}
+
+function windowsRuntime(options) {
+  const environment = options.environment || process.env;
+  const env = googleAuthChildEnvironment(environment, { platform: "win32" });
+  const systemRoot = env.SystemRoot;
+  if (!systemRoot && process.platform === "win32" && !options.runPowerShell) {
+    throw new Error("Windows could not locate its system PowerShell executable");
+  }
+  return {
+    command: options.powerShellPath || (systemRoot
+      ? join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+      : "powershell.exe"),
+    env,
+  };
+}
+
+function runWindowsDpapi(script, input, options, operation) {
+  const { command, env } = windowsRuntime(options);
+  const args = [
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+    "-Command", script,
+  ];
+  let result;
+  let stdout;
+  let stderr;
+  const failureMessage = operation === "protect"
+    ? "Windows could not protect the Google credential record with DPAPI"
+    : "Windows could not decrypt the Google credential record with DPAPI for the current user";
+  try {
+    result = (options.runPowerShell || spawnSync)(command, args, {
+      encoding: null,
+      env,
+      input,
+      maxBuffer: MAX_DPAPI_OUTPUT_BYTES,
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: options.timeoutMs || 15_000,
+      windowsHide: true,
+    });
+    stdout = childResultBuffer(result?.stdout);
+    stderr = childResultBuffer(result?.stderr);
+    if (result?.status !== 0 || result?.error || !stdout.length ||
+        stdout.length > MAX_DPAPI_OUTPUT_BYTES) {
+      throw new Error(failureMessage);
+    }
+    return Buffer.from(stdout);
+  } catch {
+    throw new Error(failureMessage);
+  } finally {
+    if (stdout) stdout.fill(0);
+    if (stderr) stderr.fill(0);
+    wipeChildResult(result);
+  }
+}
+
+function parseDpapiEnvelope(bytes) {
+  const body = bytes.subarray(WINDOWS_DPAPI_HEADER.length).toString("ascii");
+  if (!/^[A-Za-z0-9+/]+={0,2}\r?\n?$/.test(body)) {
+    throw new Error("the Windows Google token DPAPI envelope is malformed");
+  }
+  const encoded = body.replace(/\r?\n$/, "");
+  if (!encoded || encoded.length % 4 !== 0) {
+    throw new Error("the Windows Google token DPAPI envelope is malformed");
+  }
+  const protectedBytes = Buffer.from(encoded, "base64");
+  if (!protectedBytes.length || protectedBytes.toString("base64") !== encoded) {
+    protectedBytes.fill(0);
+    throw new Error("the Windows Google token DPAPI envelope is malformed");
+  }
+  return protectedBytes;
+}
+
+function protectWindowsPayload(payload, options) {
+  let protectedBytes;
+  try {
+    protectedBytes = runWindowsDpapi(DPAPI_PROTECT_SCRIPT, payload, options, "protect");
+    return Buffer.from(
+      `${WINDOWS_DPAPI_HEADER.toString("ascii")}${protectedBytes.toString("base64")}\n`,
+      "ascii",
+    );
+  } finally {
+    if (protectedBytes) protectedBytes.fill(0);
+  }
+}
+
+function decodeStoreBytes(bytes, path, options, { strict = true } = {}) {
+  const platform = options.platform || process.platform;
+  let payload;
+  let protectedBytes;
+  const encrypted = bytes.subarray(0, WINDOWS_DPAPI_HEADER.length).equals(WINDOWS_DPAPI_HEADER);
+  try {
+    if (encrypted) {
+      if (platform !== "win32") {
+        throw new Error("a Windows DPAPI Google token file can only be read by its Windows user");
+      }
+      protectedBytes = parseDpapiEnvelope(bytes);
+      payload = runWindowsDpapi(DPAPI_UNPROTECT_SCRIPT, protectedBytes, options, "unprotect");
+    } else {
+      payload = Buffer.from(bytes);
+    }
+    if (!payload.length || payload.length > MAX_TOKEN_STORE_BYTES) {
+      throw new Error("the Google token file is empty or oversized");
+    }
+    let text;
+    try { text = UTF8_DECODER.decode(payload); } catch {
+      throw new Error("the Google token file does not contain valid UTF-8 JSON");
+    }
+    const store = parseStore(text, path, { strict: strict || encrypted });
+    return { encrypted, payload: Buffer.from(payload), store };
+  } finally {
+    if (protectedBytes) protectedBytes.fill(0);
+    if (payload) payload.fill(0);
+  }
+}
+
+function readIdentityBytes(path, identity, options, phase) {
+  let descriptor;
+  let loaded;
+  try {
+    descriptor = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+    const current = fstatSync(descriptor);
+    if (!sameFile(current, identity) || !current.isFile() || current.nlink !== 1) {
+      throw new Error(`the Google token ${phase} identity changed before verification`);
+    }
+    try {
+      loaded = options.readFileForVerification
+        ? options.readFileForVerification(path, descriptor, phase)
+        : readFileSync(descriptor);
+    } catch {
+      throw new Error(`the Google token ${phase} payload could not be read safely`);
+    }
+    const bytes = Buffer.isBuffer(loaded)
+      ? Buffer.from(loaded)
+      : Buffer.from(String(loaded ?? ""), "utf8");
+    if (!bytes.length || bytes.length > MAX_DPAPI_OUTPUT_BYTES * 2) {
+      bytes.fill(0);
+      throw new Error(`the Google token ${phase} payload has an invalid size`);
+    }
+    return bytes;
+  } finally {
+    if (Buffer.isBuffer(loaded)) loaded.fill(0);
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* preserve the verification error */ }
+    }
+  }
+}
+
+function readFileStoreState(path, options = {}) {
+  if (!lstatIfPresent(path)) return null;
+  const platform = options.platform || process.platform;
+  validateTokenDirectory(path, platform, options);
+  const identity = validateExistingTokenFile(path, platform, options);
+  if (!identity) return null;
+  const bytes = readIdentityBytes(path, identity, options, "stored");
+  try {
+    const decoded = decodeStoreBytes(bytes, path, options, {
+      strict: options.strict === true || platform === "win32",
+    });
+    try {
+      return { encrypted: decoded.encrypted, store: decoded.store };
+    } finally {
+      decoded.payload.fill(0);
+    }
+  } finally {
+    bytes.fill(0);
+  }
+}
+
+function readFileStore(path, options = {}) {
+  return readFileStoreState(path, options)?.store ?? null;
+}
+
+function serializeStore(store) {
+  try {
+    const text = JSON.stringify(store, null, 2);
+    if (typeof text !== "string") throw new Error("not serializable");
+    const payload = Buffer.from(text, "utf8");
+    if (!payload.length || payload.length > MAX_TOKEN_STORE_BYTES) {
+      payload.fill(0);
+      throw new Error("invalid size");
+    }
+    return payload;
+  } catch {
+    throw new Error("the Google credential record could not be serialized safely");
+  }
+}
+
+function writeAll(descriptor, bytes) {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const written = writeSync(descriptor, bytes, offset, bytes.length - offset);
+    if (written <= 0) throw new Error("the Google token write made no progress");
+    offset += written;
+  }
+}
+
+function runWindowsAcl(path, options, label) {
+  const environment = options.environment || process.env;
+  const env = googleAuthChildEnvironment(environment, { platform: "win32" });
+  const username = options.username || environment.USERNAME || environment.USER;
+  if (typeof username !== "string" || !username.trim()) {
+    throw new Error(`Windows could not identify the current user for the Google token ${label}`);
+  }
+  const command = options.icaclsPath || (env.SystemRoot
+    ? join(env.SystemRoot, "System32", "icacls.exe")
+    : "icacls.exe");
+  const args = [path, "/inheritance:r", "/grant:r", `${username}:F`];
+  let result;
+  try {
+    result = (options.runAcl || spawnSync)(command, args, {
+      encoding: null,
+      env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: options.timeoutMs || 15_000,
+      windowsHide: true,
+    });
+    if (result?.status !== 0 || result?.error) {
+      throw new Error(`Windows could not restrict the Google token ${label} to the current user`);
+    }
+  } catch {
+    throw new Error(`Windows could not restrict the Google token ${label} to the current user`);
+  } finally {
+    wipeChildResult(result);
+  }
+}
+
+function createPrivatePayloadFile(path, bytes, platform, options, label) {
+  let descriptor;
+  let identity;
+  try {
+    descriptor = openSync(
+      path,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL |
+        (fsConstants.O_NOFOLLOW || 0),
+      0o600,
+    );
+    identity = fstatSync(descriptor);
+    if (!identity.isFile() || identity.nlink !== 1) {
+      throw new Error(`the Google token ${label} was not created as a private regular file`);
+    }
+    if (platform !== "win32") {
+      try {
+        (options.fchmodFile || fchmodSync)(descriptor, 0o600);
+      } catch {
+        throw new Error(`the Google token ${label} could not be restricted to the current user`);
+      }
+      const restricted = fstatSync(descriptor);
+      if (!sameFile(restricted, identity) || (restricted.mode & 0o777) !== 0o600) {
+        throw new Error(`the Google token ${label} was not restricted to the current user`);
+      }
+    }
+    fsyncSync(descriptor);
+
+    // The file is empty while its Windows DACL is replaced. Every byte written
+    // afterward is already DPAPI ciphertext, including rollback backups made
+    // while migrating a legacy plaintext record. Keep this exact handle open
+    // across icacls and recheck both it and the destination before any write.
+    if (platform === "win32") runWindowsAcl(path, options, label);
+
+    const secured = fstatSync(descriptor);
+    if (!sameFile(secured, identity) || !sameFile(lstatIfPresent(path), identity) ||
+        !secured.isFile() || secured.nlink !== 1) {
+      throw new Error(`the Google token ${label} identity changed before its payload was written`);
+    }
+    writeAll(descriptor, bytes);
     fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = undefined;
-    try {
-      chmodSync(temporary, 0o600);
-    } catch {
-      // See the Windows note above.
+    return identity;
+  } catch (error) {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* preserve the persistence error */ }
     }
-    renameSync(temporary, path);
+    if (identity) removeIfSame(path, identity);
+    throw error;
+  }
+}
+
+function hasWindowsDpapiHeader(path, identity) {
+  let descriptor;
+  const prefix = Buffer.alloc(WINDOWS_DPAPI_HEADER.length);
+  try {
+    descriptor = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+    const opened = fstatSync(descriptor);
+    if (!sameFile(opened, identity) || !opened.isFile() || opened.nlink !== 1) {
+      throw new Error("the Google token file identity changed while its format was checked");
+    }
+    let offset = 0;
+    while (offset < prefix.length) {
+      const count = readSync(descriptor, prefix, offset, prefix.length - offset, offset);
+      if (count === 0) break;
+      offset += count;
+    }
+    if (!sameFile(lstatIfPresent(path), identity)) {
+      throw new Error("the Google token file identity changed while its format was checked");
+    }
+    return offset === prefix.length && prefix.equals(WINDOWS_DPAPI_HEADER);
+  } finally {
+    prefix.fill(0);
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* preserve the format-check result */ }
+    }
+  }
+}
+
+function verifyFilePayload(path, identity, expectedPayload, options, phase) {
+  const bytes = readIdentityBytes(path, identity, options, phase);
+  try {
+    let decoded;
     try {
-      chmodSync(path, 0o600);
+      decoded = decodeStoreBytes(bytes, path, options, { strict: true });
     } catch {
-      // See the Windows note above.
+      throw new Error(`the Google token ${phase} payload could not be decoded and verified`);
     }
     try {
-      const directoryDescriptor = openSync(directory, "r");
-      try { fsyncSync(directoryDescriptor); } finally { closeSync(directoryDescriptor); }
-    } catch {
-      // Directory fsync is not available on every supported filesystem.
+      if (!decoded.payload.equals(expectedPayload)) {
+        throw new Error(`the Google token ${phase} payload did not read back exactly`);
+      }
+      return decoded.store;
+    } finally {
+      decoded.payload.fill(0);
     }
   } finally {
+    bytes.fill(0);
+  }
+}
+
+function directorySyncUnsupported(error, platform) {
+  if (["EINVAL", "ENOSYS", "ENOTSUP", "EOPNOTSUPP"].includes(error?.code)) return true;
+  return platform === "win32" &&
+    ["EACCES", "EBADF", "EISDIR", "EPERM"].includes(error?.code);
+}
+
+function syncTokenDirectory(path, platform, options, phase, required = true) {
+  let descriptor;
+  let failure;
+  try {
+    if (options.syncParentDirectory) {
+      options.syncParentDirectory(dirname(path), phase);
+    } else {
+      descriptor = openSync(dirname(path), fsConstants.O_RDONLY);
+      fsyncSync(descriptor);
+    }
+  } catch (error) {
+    failure = error;
+  } finally {
     if (descriptor !== undefined) {
-      try { closeSync(descriptor); } catch { /* already closed */ }
+      try { closeSync(descriptor); } catch (error) { failure ||= error; }
     }
-    if (existsSync(temporary)) {
-      try { unlinkSync(temporary); } catch { /* preserve the original error */ }
+  }
+  if (!failure) return true;
+  if (directorySyncUnsupported(failure, platform)) return false;
+  if (required) {
+    throw new Error(`the Google token ${phase} directory state could not be synchronized safely`);
+  }
+  return false;
+}
+
+/** Stage, verify, atomically replace, verify again, and roll back on failure. */
+function writeFileStore(path, store, options = {}) {
+  const platform = options.platform || process.platform;
+  validateTokenDirectory(path, platform, options, { prepare: true });
+  const prior = validateExistingTokenFile(path, platform, options);
+  const payload = serializeStore(store);
+  let encoded;
+  let suffix;
+  try {
+    encoded = platform === "win32"
+      ? protectWindowsPayload(payload, options)
+      : Buffer.from(payload);
+  } catch (error) {
+    payload.fill(0);
+    throw error;
+  }
+  try {
+    const entropy = (options.randomBytes || randomBytes)(8);
+    suffix = Buffer.from(entropy).toString("hex");
+    if (!/^[0-9a-f]{16}$/.test(suffix)) {
+      throw new Error("Google token staging entropy must contain exactly 8 bytes");
     }
+  } catch {
+    payload.fill(0);
+    if (encoded) encoded.fill(0);
+    throw new Error("Google token staging entropy could not be generated safely");
+  }
+  const directory = dirname(path);
+  const temporary = join(directory, `.${basename(path)}.${process.pid}.${suffix}.tmp`);
+  const backup = join(directory, `.${basename(path)}.${process.pid}.${suffix}.bak`);
+  const renameFile = options.renameFile || renameSync;
+  let stagedIdentity;
+  let backupIdentity;
+  let priorBytes;
+  let priorPayload;
+  let backupBytes;
+  let committed = false;
+  try {
+    stagedIdentity = createPrivatePayloadFile(
+      temporary, encoded, platform, options, "staging file",
+    );
+    verifyFilePayload(temporary, stagedIdentity, payload, options, "staged");
+
+    const currentPrior = lstatIfPresent(path);
+    if ((prior === null) !== (currentPrior === null) ||
+        (prior && !sameFile(prior, currentPrior))) {
+      throw new Error("the Google token destination changed while it was being prepared");
+    }
+
+    if (prior) {
+      priorBytes = readIdentityBytes(path, prior, options, "prior snapshot");
+      const priorDecoded = decodeStoreBytes(priorBytes, path, options, { strict: true });
+      priorPayload = priorDecoded.payload;
+      backupBytes = platform === "win32"
+        ? (priorDecoded.encrypted ? Buffer.from(priorBytes) : protectWindowsPayload(priorPayload, options))
+        : Buffer.from(priorBytes);
+      backupIdentity = createPrivatePayloadFile(
+        backup, backupBytes, platform, options, "rollback backup",
+      );
+      verifyFilePayload(backup, backupIdentity, priorPayload, options, "rollback backup");
+    }
+
+    const finalPrior = lstatIfPresent(path);
+    if ((prior === null) !== (finalPrior === null) ||
+        (prior && !sameFile(prior, finalPrior))) {
+      throw new Error("the Google token destination changed before replacement");
+    }
+    syncTokenDirectory(path, platform, options, "prepared");
+    try { renameFile(temporary, path); } catch {
+      throw new Error("the Google token replacement could not be committed");
+    }
+    committed = true;
+    const verified = verifyFilePayload(path, stagedIdentity, payload, options, "persisted");
+    syncTokenDirectory(path, platform, options, "persisted");
+
+    if (backupIdentity) {
+      if (!removeIfSame(backup, backupIdentity)) {
+        throw new Error("the Google token rollback backup could not be removed safely");
+      }
+      backupIdentity = undefined;
+      syncTokenDirectory(path, platform, options, "backup cleanup", false);
+    }
+    return verified;
+  } catch (error) {
+    if (!committed) {
+      if (stagedIdentity) removeIfSame(temporary, stagedIdentity);
+      if (backupIdentity) removeIfSame(backup, backupIdentity);
+      throw error;
+    }
+
+    let restored = false;
+    if (prior && backupIdentity && priorPayload) {
+      try {
+        if (!sameFile(lstatIfPresent(path), stagedIdentity) ||
+            !sameFile(lstatIfPresent(backup), backupIdentity)) {
+          throw new Error("transaction identities changed");
+        }
+        renameFile(backup, path);
+        const restoredIdentity = lstatIfPresent(path);
+        if (!sameFile(restoredIdentity, backupIdentity)) {
+          throw new Error("rollback identity did not become durable");
+        }
+        verifyFilePayload(path, restoredIdentity, priorPayload, options, "rollback");
+        backupIdentity = undefined;
+        syncTokenDirectory(path, platform, options, "rollback");
+        restored = true;
+      } catch {
+        restored = false;
+      }
+    } else if (!prior) {
+      restored = removeIfSame(path, stagedIdentity) && lstatIfPresent(path) === null;
+      if (restored) {
+        try { syncTokenDirectory(path, platform, options, "absence rollback"); }
+        catch { restored = false; }
+      }
+    }
+    throw new Error(
+      restored
+        ? prior
+          ? "the Google token replacement was not verified; the prior credential record was restored and verified"
+          : "the Google token replacement was not verified; no token destination was left behind"
+        : "the Google token replacement was not verified and rollback could not be verified; a protected transaction artifact was retained",
+    );
+  } finally {
+    payload.fill(0);
+    encoded.fill(0);
+    if (priorBytes) priorBytes.fill(0);
+    if (priorPayload) priorPayload.fill(0);
+    if (backupBytes) backupBytes.fill(0);
   }
 }
 
 function security(options, args, input) {
   const runSecurity = options.runSecurity || ((securityArgs, runOptions) =>
     spawnSync(options.securityPath || "/usr/bin/security", securityArgs, runOptions));
-  return runSecurity(args, {
-    encoding: "utf-8",
-    input,
-    timeout: options.timeoutMs || 15_000,
-    maxBuffer: 2 * 1024 * 1024,
-  });
+  const platform = options.platform || process.platform;
+  const environment = options.environment || process.env;
+  try {
+    return runSecurity(args, {
+      encoding: "utf-8",
+      env: googleAuthChildEnvironment(environment, { platform }),
+      input,
+      maxBuffer: 2 * 1024 * 1024,
+      shell: false,
+      stdio: input === undefined ? ["ignore", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
+      timeout: options.timeoutMs || 15_000,
+      windowsHide: true,
+    });
+  } catch {
+    return { status: 1, stdout: "", stderr: "" };
+  }
 }
 
 function securityPasswordWrite(options, args, payload) {
   // Injected runners keep the storage contract independently testable without
   // touching a developer's real Keychain.
-  if (options.runSecurity) return security(options, args, `${payload}\n`);
+  if (options.runSecurity && !options.runExpect) return security(options, args, `${payload}\n`);
 
   // `security ... -w` reads from /dev/tty, not a normal stdin pipe. Expect gives
   // it that terminal while the helper disables all transcript output. This
   // avoids the insecure alternative of putting the credential in `security`'s
   // argv, where another process could read it with `ps`.
   const helper = options.expectScriptPath || join(dirname(fileURLToPath(import.meta.url)), "keychain-write.exp");
-  return spawnSync(options.expectPath || "/usr/bin/expect", [
-    helper,
-    options.securityPath || "/usr/bin/security",
-    ...args,
-  ], {
-    encoding: "utf-8",
-    input: `${payload}\n`,
-    timeout: options.timeoutMs || 15_000,
-    maxBuffer: 2 * 1024 * 1024,
-  });
+  const platform = options.platform || process.platform;
+  const environment = options.environment || process.env;
+  try {
+    return (options.runExpect || spawnSync)(options.expectPath || "/usr/bin/expect", [
+      helper,
+      options.securityPath || "/usr/bin/security",
+      ...args,
+    ], {
+      encoding: "utf-8",
+      env: googleAuthChildEnvironment(environment, { platform }),
+      input: `${payload}\n`,
+      maxBuffer: 2 * 1024 * 1024,
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: options.timeoutMs || 15_000,
+      windowsHide: true,
+    });
+  } catch {
+    return { status: 1, stdout: "", stderr: "" };
+  }
 }
 
 const keychainNotFound = (result) =>
@@ -501,14 +1148,15 @@ function writeKeychainStore(options = {}, store) {
 
 function removeMatchingLegacyFile(options, store) {
   const path = filePath(options);
-  const legacy = readFileStore(path, { strict: true });
+  const legacy = readFileStore(path, { ...options, strict: true });
   if (legacy && JSON.stringify(legacy) === JSON.stringify(store)) unlinkSync(path);
 }
 
 /**
  * Tokens live on the CLIENT's machine and never transit us. macOS uses the
- * login Keychain by default. Other platforms, and macOS users who explicitly
- * set BRAIN_GOOGLE_TOKEN_STORE=file, use an atomic mode-0600 file.
+ * login Keychain by default. Windows uses a DPAPI CurrentUser encrypted file.
+ * Linux, and macOS users who explicitly set BRAIN_GOOGLE_TOKEN_STORE=file, use
+ * an atomic mode-0600 plaintext file.
  *
  * The record also holds the client id and secret because unattended syncs need
  * them to refresh. The file fallback directory remains on the ingest walker's
@@ -518,7 +1166,7 @@ export function saveTokens(store, value) {
   if (!isRecord(store)) throw new Error("Google token store must be an object");
   const options = storageOptions(value);
   if (storageBackend(options) === "file") {
-    writeFileStore(filePath(options), store);
+    writeFileStore(filePath(options), store, options);
     return;
   }
   writeKeychainStore(options, store);
@@ -527,7 +1175,19 @@ export function saveTokens(store, value) {
 
 export function loadTokens(value) {
   const options = storageOptions(value);
-  if (storageBackend(options) === "file") return readFileStore(filePath(options)) || {};
+  if (storageBackend(options) === "file") {
+    const platform = options.platform || process.platform;
+    const path = filePath(options);
+    const state = readFileStoreState(path, { ...options, strict: platform === "win32" });
+    if (!state) return {};
+    if (platform === "win32" && !state.encrypted) {
+      // A pre-DPAPI Windows file remains readable, but never remains plaintext
+      // after a successful use. The transactional writer retains or restores
+      // its credential record if encryption cannot be verified.
+      return writeFileStore(path, state.store, options);
+    }
+    return state.store;
+  }
 
   const path = filePath(options);
   let stored;
@@ -549,17 +1209,54 @@ export function loadTokens(value) {
 /** Human-readable storage location for CLI success and support messages. */
 export function tokenStorageDescription(value) {
   const options = storageOptions(value);
-  if (storageBackend(options) === "file") return `${filePath(options)} (atomic mode 0600 file)`;
+  if (storageBackend(options) === "file") {
+    return (options.platform || process.platform) === "win32"
+      ? `${filePath(options)} (Windows DPAPI CurrentUser encrypted file)`
+      : `${filePath(options)} (atomic mode 0600 file)`;
+  }
   return `macOS Keychain (service "${options.keychainService || GOOGLE_KEYCHAIN_SERVICE}", account "${options.keychainAccount || GOOGLE_KEYCHAIN_ACCOUNT}")`;
 }
 
-/** Existence-only probe for doctor. It never asks Keychain to reveal a secret. */
+/**
+ * Metadata-only probe for doctor. It never asks Keychain or DPAPI to reveal a
+ * secret; on Windows it reads only the fixed envelope-header width.
+ */
 export function tokenStorageStatus(value) {
   const options = storageOptions(value);
   const backend = storageBackend(options);
   if (backend === "file") {
     const path = filePath(options);
-    return { exists: existsSync(path), backend, description: tokenStorageDescription(options) };
+    const platform = options.platform || process.platform;
+    try {
+      const present = lstatIfPresent(path);
+      if (!present) {
+        return { exists: false, backend, description: tokenStorageDescription(options) };
+      }
+      validateTokenDirectory(path, platform, options);
+      const identity = validateExistingTokenFile(path, platform, options);
+      if (platform !== "win32" || hasWindowsDpapiHeader(path, identity)) {
+        return {
+          exists: true,
+          backend,
+          description: tokenStorageDescription(options),
+          ...(platform === "win32" ? { encrypted: true, migrationPending: false } : {}),
+        };
+      }
+      return {
+        exists: true,
+        backend: "legacy-file",
+        description: `${path} (legacy Windows plaintext file; DPAPI migration pending)`,
+        encrypted: false,
+        migrationPending: true,
+      };
+    } catch (error) {
+      return {
+        exists: false,
+        backend,
+        description: tokenStorageDescription(options),
+        error: error.message,
+      };
+    }
   }
   try {
     if (readKeychainStore(options, { metadataOnly: true })) {

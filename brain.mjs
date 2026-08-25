@@ -5,7 +5,7 @@
  *   brain verify      <manifest>   check the token and resolve the account
  *   brain provision   <manifest>   create D1 (and R2/KV), write IDs back
  *   brain deploy      <manifest>   upload the worker with its bindings
- *   brain secrets     <manifest>   set worker secrets interactively
+ *   brain secrets     <manifest>   set secrets and persist ADMIN_KEY rotation
  *   brain health      <manifest>   prove the install actually works
  *
  * DESIGN RULES
@@ -29,8 +29,25 @@
  * command-line argument where `ps` could read it.
  */
 
-import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, chmodSync, realpathSync, copyFileSync} from "node:fs";
-import { join, dirname, relative, resolve, sep } from "node:path";
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  copyFileSync,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { basename, isAbsolute, join, dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -56,15 +73,26 @@ async function ingestLib() {
 }
 import { authorize, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
 import { scan as scanSecrets, GATE_VERSION as CREDENTIAL_GATE_VERSION } from "./worker/src/lib/secret-scan.js";
-import { run } from "./doctor.mjs";
+import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mjs";
 import { runAll as doctorRunAll, summarize as doctorSummarize, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
 import {
+  SUPPORT_MAX_AGE_DAYS,
+  SUPPORT_MAX_BYTES,
+  SUPPORT_MAX_EVENTS,
   clearSupportJournal,
   exportSupportJournal,
   previewSupportJournal,
+  productRelativeFingerprint,
   recordSupportEvent,
-  supportJournalPaths,
 } from "./support-journal.mjs";
+import { readAdminKeyFile, validateAdminKeyValue } from "./operations/admin-key-file.mjs";
+import {
+  adminKeyPersistencePlan,
+  parseAdminKeySecretReference,
+  persistAdminKeyDurably,
+  readAdminKeyDurably,
+  readAdminKeyFromKeychain,
+} from "./operations/admin-key-persistence.mjs";
 
 // fileURLToPath, never `new URL(...).pathname`. The latter is percent-encoded,
 // so any install path containing a space resolves to a directory that does not
@@ -165,16 +193,80 @@ export function supportErrorCode(error, { command = "", unexpected = false } = {
   return unexpected ? "INTERNAL_ERROR" : "COMMAND_FAILED";
 }
 
+const SUPPORT_STACK_SKIP_FUNCTIONS = new Set(["crash", "die", "recordSupportFailure"]);
+
+function supportStackFrame(line) {
+  const text = String(line || "").trim();
+  if (!text.startsWith("at ")) return null;
+  const body = text.slice(3).trim();
+  let functionName = "";
+  let location = body;
+  if (body.endsWith(")")) {
+    const open = body.lastIndexOf(" (");
+    if (open > 0) {
+      functionName = body.slice(0, open).replace(/^async\s+/, "").replace(/^new\s+/, "").trim();
+      location = body.slice(open + 2, -1);
+    }
+  }
+  const match = /^(.*):([1-9]\d{0,5}):\d{1,6}$/.exec(location);
+  if (!match || match[1].length > 4096) return null;
+  const leafFunction = functionName.split(".").at(-1);
+  return { path: match[1], line: Number(match[2]), functionName: leafFunction };
+}
+
+/**
+ * Find the first useful product frame without persisting or hashing raw stack
+ * text. Outside paths and unsupported package files are rejected before the
+ * sanitized product-relative location reaches the fingerprint validator.
+ */
+export function supportProductRelativeLocation(error, options = {}) {
+  let stack;
+  try { stack = typeof error?.stack === "string" ? error.stack : ""; }
+  catch { return null; }
+  if (!stack) return null;
+
+  const resolveRealPath = options.realpath ?? realpathSync;
+  const inspectFile = options.stat ?? statSync;
+  let packageRoot;
+  try { packageRoot = resolveRealPath(options.packageRoot ?? HERE); }
+  catch { return null; }
+
+  for (const line of stack.split("\n").slice(1, 65)) {
+    const frame = supportStackFrame(line);
+    if (!frame || SUPPORT_STACK_SKIP_FUNCTIONS.has(frame.functionName)) continue;
+    let candidate = frame.path;
+    try {
+      if (candidate.startsWith("file://")) candidate = fileURLToPath(candidate);
+      else if (!isAbsolute(candidate)) continue;
+      const realCandidate = resolveRealPath(candidate);
+      if (!inspectFile(realCandidate).isFile()) continue;
+      const productPath = relative(packageRoot, realCandidate);
+      if (!productPath || productPath === ".." || productPath.startsWith(`..${sep}`) || isAbsolute(productPath)) {
+        continue;
+      }
+      const normalized = productPath.split(sep).join("/");
+      const location = `${normalized}:${frame.line}`;
+      productRelativeFingerprint(location);
+      return location;
+    } catch {
+      // A raw outside path or unsupported package frame is never fingerprinted.
+    }
+  }
+  return null;
+}
+
 function recordSupportFailure(error, { unexpected = false } = {}) {
   const command = currentSupportCommand;
   if (!command || command === "support") return null;
   try {
-    return recordSupportEvent({
+    const productRelativeLocation = supportProductRelativeLocation(error);
+    const input = {
       command,
       source: supportSourceForCommand(command),
       errorCode: supportErrorCode(error, { command, unexpected }),
-      productRelativeLocation: unexpected ? "brain.mjs#crash" : "brain.mjs#fatal",
-    }).event_id;
+      ...(productRelativeLocation ? { productRelativeLocation } : {}),
+    };
+    return recordSupportEvent(input).event_id;
   } catch {
     // Support capture must never replace or hide the actual command failure.
     return null;
@@ -183,7 +275,7 @@ function recordSupportFailure(error, { unexpected = false } = {}) {
 
 function printSupportReceipt(eventId, write = console.error) {
   if (!eventId) return;
-  write(`  Private issue note ${eventId} was saved locally. Nothing was sent.`);
+  write(`  Private issue note ${eventId} was saved locally. The installer did not upload or send this issue note.`);
   write("  Review the exact safe record with: brain support --preview");
 }
 
@@ -294,7 +386,11 @@ async function cmdVerify(manifestPath) {
     await cf(`/accounts/${acct.id}/d1/database`);
     ok("D1 is reachable");
   } catch (e) {
-    warn(`D1 not reachable, the token may lack D1 scope: ${e.message.slice(0, 120)}`);
+    die(
+      "D1 is not reachable, so the required database cannot be verified." + "\n" +
+        "      Confirm that the token has D1 access, then re-run `brain verify`." + "\n" +
+        `      detail: ${e.message.slice(0, 120)}`
+    );
   }
 
   try {
@@ -341,9 +437,12 @@ function wrangler(args, { accountId } = {}) {
   // CVE-2024-27980. The previous raw spawnSync returned ENOENT there, which
   // made provision report "wrangler: not logged in" to a client whose doctor
   // had verified the login moments earlier.
-  const env = { CLOUDFLARE_API_TOKEN: undefined };
-  if (accountId) env.CLOUDFLARE_ACCOUNT_ID = accountId;
-  const r = run("npx", ["wrangler@4", ...args], { timeout: 180_000, env });
+  const env = cloudflareCliEnvironment(accountId);
+  const r = run("npx", ["wrangler@4", ...args], {
+    timeout: 180_000,
+    inheritEnv: false,
+    env,
+  });
   return { ok: r.ok, out: r.out, status: r.ok ? 0 : 1 };
 }
 
@@ -723,7 +822,13 @@ function collectWorkerFiles(root) {
   return out;
 }
 
-async function cmdDeploy(manifestPath) {
+/** Whether a failed workers.dev enable call still leaves a usable public route. */
+export function workersDevRouteDisposition({ customDomain = null, workersDevEnabled = false } = {}) {
+  if (workersDevEnabled) return "ready";
+  return customDomain ? "optional" : "required";
+}
+
+export async function cmdDeploy(manifestPath) {
   const { m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
   const cfg = m.infrastructure.cloudflare;
@@ -819,14 +924,37 @@ async function cmdDeploy(manifestPath) {
 
   // A deploy that is not verified is a belief. Enable the workers.dev route so
   // there is always a URL to prove it against, even before a custom domain.
+  const workersDevPath = `/accounts/${acct.id}/workers/scripts/${scriptName}/subdomain`;
   try {
-    await cf(`/accounts/${acct.id}/workers/scripts/${scriptName}/subdomain`, {
+    await cf(workersDevPath, {
       method: "POST",
       body: { enabled: true },
     });
     ok("workers.dev route enabled");
   } catch (e) {
-    warn(`could not enable the workers.dev route: ${e.message.slice(0, 120)}`);
+    // A failed write can mean the route was already enabled or that this token
+    // lacks only route-edit permission. Read the actual state before deciding
+    // whether deploy is incomplete.
+    const currentRoute = await cf(workersDevPath).catch(() => null);
+    const disposition = workersDevRouteDisposition({
+      customDomain: m.brain?.domain,
+      workersDevEnabled: currentRoute?.enabled === true,
+    });
+    if (disposition === "ready") {
+      ok("workers.dev route already enabled");
+    } else if (disposition === "optional") {
+      warn(
+        `could not enable the optional workers.dev route: ${e.message.slice(0, 120)}\n` +
+          `        The configured route https://${m.brain.domain} remains the install URL.`
+      );
+    } else {
+      die(
+        `could not enable or verify a workers.dev route: ${e.message.slice(0, 120)}\n` +
+          "  The Worker code was uploaded, but this manifest has no custom domain, so there\n" +
+          "  is no usable URL to test or hand to the client. Fix Workers route access and\n" +
+          "  re-run `brain deploy`; the upload is safe to repeat."
+      );
+    }
   }
 
   // The cron that drains the vector outbox. Without it the D1 install writes
@@ -841,43 +969,205 @@ async function cmdDeploy(manifestPath) {
       });
       ok(`vector drain scheduled (${schedule})`);
     } catch (e) {
-      warn(
+      die(
         `could not set the drain cron: ${e.message.slice(0, 120)}\n` +
-          "        Ingested text will be keyword-searchable but NOT semantically\n" +
-          "        searchable until this is set. Check it with `brain health`."
+          "  The Worker code was uploaded, but a D1 install without this required schedule\n" +
+          "  accumulates text that is keyword-searchable and NOT semantically searchable.\n" +
+          "  Fix Worker schedule access and re-run `brain deploy`; the upload is safe to repeat."
       );
     }
   }
   info("next: brain secrets <manifest>, then brain health <manifest>");
 }
 
-async function cmdSecrets(manifestPath) {
+export const WORKER_PROVIDER_SECRET_NAMES = Object.freeze([
+  "ANTHROPIC_API_KEY",
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
+]);
+
+export function optionalWorkerSecretNames(m) {
+  // Never harvest unrelated credentials merely because they happen to be in
+  // the operator's shell. A standard D1 + Workers AI install needs only its
+  // ADMIN_KEY. Supabase credentials are eligible only when the manifest
+  // explicitly selects that backend. Anthropic is eligible only when the
+  // manifest explicitly selects a non-Cloudflare answer model or reranking.
+  const storage = m.infrastructure?.cloudflare?.storage || "d1";
+  const answerModel = String(
+    m.retrieval?.answer_model || "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+  );
+  return Object.freeze([
+    ...(storage === "supabase" ? ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"] : []),
+    ...(m.retrieval?.rerank === true || !answerModel.startsWith("@cf/")
+      ? ["ANTHROPIC_API_KEY"]
+      : []),
+  ]);
+}
+
+async function reconcileWorkerProviderSecrets(m, acct, scriptName, optional) {
+  const path = `/accounts/${acct.id}/workers/scripts/${scriptName}/secrets`;
+  let current;
+  try {
+    current = await cf(path);
+  } catch {
+    die(
+      "the Worker's existing secret names could not be inspected, so provider-secret reconciliation stopped.\n" +
+        "  Nothing was removed. Fix Workers Scripts access and rerun `brain secrets`."
+    );
+  }
+  if (!Array.isArray(current) || current.some((binding) =>
+    !binding || typeof binding !== "object" || typeof binding.name !== "string")) {
+    die("Cloudflare returned an invalid Worker secret inventory. Nothing was removed.");
+  }
+  const allowed = new Set(optional);
+  const present = new Set(current.map((binding) => binding.name));
+  const unwanted = WORKER_PROVIDER_SECRET_NAMES.filter((name) =>
+    present.has(name) && !allowed.has(name));
+  if (!unwanted.length) return;
+
+  for (const name of unwanted) {
+    try {
+      await cf(`${path}/${encodeURIComponent(name)}`, { method: "DELETE" });
+    } catch {
+      die(
+        `the unexpected Worker secret ${name} could not be removed. ` +
+          "Rerun `brain secrets`; no unrecognized secret names were touched."
+      );
+    }
+  }
+
+  let verified;
+  try {
+    verified = await cf(path);
+  } catch {
+    die(
+      "the provider-secret cleanup could not be read back from Cloudflare. " +
+        "Rerun `brain secrets` before treating this install as reconciled."
+    );
+  }
+  const remaining = new Set(Array.isArray(verified)
+    ? verified.map((binding) => binding?.name).filter((name) => typeof name === "string")
+    : []);
+  const failed = unwanted.filter((name) => remaining.has(name));
+  if (!Array.isArray(verified) || failed.length) {
+    die(
+      "Cloudflare did not verify removal of every unexpected provider secret. " +
+        "Rerun `brain secrets` before treating this install as reconciled."
+    );
+  }
+  for (const name of unwanted) ok(`removed unexpected Worker secret ${name}`);
+}
+
+export async function cmdSecrets(manifestPath, options = {}) {
   const { m } = loadManifest(manifestPath);
-  const acct = await resolveAccount(m);
   const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
 
   // What a D1 install actually reads. The worker embeds through the AI binding,
   // so there is no database credential to set: the brain's storage is D1 and
   // Vectorize inside the client's own account, reachable only by their worker.
   const needed = ["ADMIN_KEY"];
-  // Only for an install pointed at Postgres. Set when present, never demanded.
-  const optional = ["ANTHROPIC_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"];
-  const provided = [...needed, ...optional].filter((n) => process.env[n]);
-  const missing = needed.filter((n) => !process.env[n]);
+  const optional = optionalWorkerSecretNames(m);
+  const explicitAdminKey = Object.hasOwn(options, "explicitAdminKey")
+    ? options.explicitAdminKey
+    : (process.env.ADMIN_KEY || null);
+  const persistenceOptions = {
+    platform: options.platform ?? process.platform,
+    username: options.username ?? process.env.USERNAME ?? process.env.USER,
+    ...(options.persistenceOptions || {}),
+  };
+
+  // The durable copy is desired state. An explicit rotation is persisted and
+  // read back first, so a crash or ambiguous remote failure can be retried from
+  // that exact value without reconstructing it from a lost shell.
+  let adminKeyPlan;
+  let adminKey = null;
+  let adminReceipt = null;
+  try {
+    const plan = options.adminKeyPersistencePlan ?? adminKeyPersistencePlan;
+    adminKeyPlan = plan(manifestPath, m, persistenceOptions);
+    if (adminKeyPlan.backend === "file" && explicitAdminKey) {
+      const inspectKeyDir = options.assertKeyDirSafe ?? assertKeyDirSafe;
+      inspectKeyDir(dirname(adminKeyPlan.path));
+    }
+  } catch (error) {
+    die(`ADMIN_KEY durable-storage preflight failed: ${String(error?.message || error)}`);
+  }
+
+  if (explicitAdminKey) {
+    adminKey = explicitAdminKey;
+  } else {
+    try {
+      const readDurable = options.readAdminKeyDurably ?? readAdminKeyDurably;
+      adminKey = await readDurable(adminKeyPlan, persistenceOptions);
+      if (adminKey) adminReceipt = Object.freeze({ ...adminKeyPlan, verified: true, reused: true });
+    } catch {
+      die(
+        "the durable ADMIN_KEY could not be read and verified. Fix its declared local storage,\n" +
+          "  then rerun `brain secrets <manifest>`."
+      );
+    }
+  }
+
+  const provided = [
+    ...(adminKey ? needed : []),
+    ...optional.filter((name) => process.env[name]),
+  ];
+  const missing = adminKey ? [] : needed;
 
   if (!provided.length) {
     die(
-      "no secrets found in the environment. Export the ones you want to set, then re-run:\n" +
+      "no ADMIN_KEY was found in the environment or durable storage. Export it, then re-run:\n" +
         needed.map((n) => `        export ${n}='...'`).join("\n") +
-        "\n      They are read from the environment, never from a file and never from argv."
+        "\n      `brain secrets` will persist and verify it before updating the Worker."
     );
   }
 
+  const acct = await resolveAccount(m);
+
+  // A crash between staging and replacement can leave the key module's exact
+  // temporary or rollback basename behind. Put every private key basename in
+  // .gitignore before an adjacent-file write starts, not after it succeeds.
+  // Reused legacy files receive the same tracked-file check so an already
+  // committed plaintext key is never silently reapplied. The Worker account
+  // lookup above is read-only, so an ignore failure cannot follow a mutation.
+  if (adminKeyPlan?.backend === "file") {
+    try {
+      const ignorePrivateKey = options.gitignoreTheKey ?? gitignoreTheKey;
+      ignorePrivateKey(dirname(adminKeyPlan.path));
+    } catch (error) {
+      const remedy = /already tracked by Git/i.test(String(error?.message || ""))
+        ? "The adjacent .brain-admin-key is already tracked by Git. Remove it from the Git index, then rerun."
+        : "Fix .gitignore permissions or the local Git repository, then rerun.";
+      die(
+        "refusing to write the adjacent ADMIN_KEY because Git safety could not be verified or the install's .gitignore could not be updated. " +
+          `The durable key and Worker secret were not changed. ${remedy}`
+      );
+    }
+  }
+
+  if (explicitAdminKey) {
+    try {
+      const persist = options.persistAdminKeyDurably ?? persistAdminKeyDurably;
+      adminReceipt = await persist(adminKeyPlan, explicitAdminKey, persistenceOptions);
+    } catch {
+      const destination = adminKeyPlan?.backend === "keychain"
+        ? "the manifest-declared macOS Keychain item"
+        : "the adjacent protected admin-key file";
+      die(
+        `ADMIN_KEY was not changed on the remote Worker because ${destination} could not be updated and verified.\n` +
+          "  Fix the local storage problem and rerun `brain secrets <manifest>`."
+      );
+    }
+  }
+
+  await reconcileWorkerProviderSecrets(m, acct, scriptName, optional);
+
   for (const name of provided) {
+    const value = name === "ADMIN_KEY" ? adminKey : process.env[name];
     try {
       await cf(`/accounts/${acct.id}/workers/scripts/${scriptName}/secrets`, {
         method: "PUT",
-        body: { name, text: process.env[name], type: "secret_text" },
+        body: { name, text: value, type: "secret_text" },
       });
     } catch (e) {
       // A secret is set ON a script, so the script has to exist. The raw 404
@@ -888,22 +1178,79 @@ async function cmdSecrets(manifestPath) {
           `the worker "${scriptName}" has not been deployed yet, so there is nothing to set secrets on.\n` +
             "  Run `brain deploy <manifest>` first, then `brain secrets`. Deploying without\n" +
             "  secrets is safe: the deploy carries keep_bindings, so setting them afterwards\n" +
-            "  sticks and later deploys preserve them."
+            "  sticks and later deploys preserve them. The durable ADMIN_KEY was kept for that retry."
+        );
+      }
+      if (name === "ADMIN_KEY") {
+        die(
+          "the durable ADMIN_KEY is verified, but its Worker update did not complete.\n" +
+            "  The durable value was kept as desired state. Rerun `brain secrets <manifest>`;\n" +
+            "  ADMIN_KEY does not need to remain in this shell for the retry."
         );
       }
       throw e;
     }
+    if (name === "ADMIN_KEY") {
+      if (adminReceipt.backend === "file") {
+        ok(`secret ADMIN_KEY set from the verified durable copy at ${relative(process.cwd(), adminReceipt.path)}`);
+        warn(
+          `SECRET: ${relative(process.cwd(), adminReceipt.path)}\n` +
+            "        This key reads the entire brain. Commands load it automatically.\n" +
+            "        Do not commit it and do not leave it in a synced folder."
+        );
+      } else {
+        ok(
+          `secret ADMIN_KEY set from the verified macOS Keychain copy ` +
+            `(service ${adminReceipt.service}, account ${adminReceipt.account})`
+        );
+        info("the declared Keychain item is authoritative; no adjacent .brain-admin-key copy was written");
+      }
+
+      // Standalone rotation updates only registrations the owner already chose.
+      // Setup performs the full add path later. Imported unit tests stay inert
+      // unless they inject this seam, so fixtures can never touch real configs.
+      const reconcile = Object.hasOwn(options, "reconcileExistingAgents")
+        ? options.reconcileExistingAgents
+        : (IS_MAIN ? wireAgents : null);
+      if (reconcile) {
+        let reconciliation;
+        try {
+          reconciliation = await reconcile(m, manifestPath, {
+            ...(options.agentOptions || {}),
+            account: acct,
+            existingOnly: true,
+          });
+        } catch {
+          reconciliation = { wired: [], failures: ["agent-reconciliation"] };
+        }
+        const failures = Array.isArray(reconciliation) ? [] : (reconciliation?.failures || []);
+        if (failures.length) {
+          die(
+            "the durable and Worker admin key were updated, but an existing AI tool registration\n" +
+              "  could not be replaced and verified safely. Run `brain setup <manifest>` to repair\n" +
+              "  the chosen registration; do not copy the key into a command."
+          );
+        }
+      }
+      info(
+        "If Claude Desktop has a manual entry for this brain, replace it with the locator-only\n" +
+          "        output from `brain mcp-config <manifest>`, then restart Claude Desktop."
+      );
+      continue;
+    }
     ok(`secret ${name} set`);
   }
-  // ADMIN_KEY absent means every authenticated route stays shut. Answer
-  // synthesis needs no vendor secret: the standard install uses Workers AI.
-  for (const name of missing) {
-    warn(
-      name === "ADMIN_KEY"
-        ? "ADMIN_KEY was not set. Every route except /health will return 401 until it is."
-        : `not set (absent from the environment): ${name}`
+  // ADMIN_KEY absent means every authenticated route stays shut. Optional
+  // Postgres or model secrets may have been written successfully, but that is
+  // not a usable install and must not turn the command green.
+  if (missing.includes("ADMIN_KEY")) {
+    die(
+      "ADMIN_KEY remains absent. Any optional secrets above were saved, but every route\n" +
+        "  except /health will return 401. Set ADMIN_KEY and re-run `brain secrets`;\n" +
+        "  successfully written optional secrets do not need to be removed first."
     );
   }
+  return Object.freeze({ adminKey: adminReceipt });
 }
 
 /**
@@ -928,7 +1275,7 @@ export function healthProbeVerdict({ ok, body, expectVersion = null, attempt = 1
   return attempt < attempts ? "retry" : "fail";
 }
 
-async function cmdHealth(manifestPath, { expectVersion = null } = {}) {
+async function cmdHealth(manifestPath, { expectVersion = null, durableAdminKeyOnly = false } = {}) {
   const { m } = loadManifest(manifestPath);
   // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker
   // over plain HTTPS with the admin key, so it must keep working after our token
@@ -993,10 +1340,12 @@ async function cmdHealth(manifestPath, { expectVersion = null } = {}) {
   if (!res.ok) die(`/health returned ${res.status} after ${healthAttempts} attempts: ${body.slice(0, 200)}`);
   ok(`/health ${res.status} ${body.slice(0, 160)}`);
 
-  const key = resolveAdminKey(manifestPath);
+  const key = resolveAdminKey(manifestPath, { ignoreEnvironment: durableAdminKeyOnly });
   if (!key) {
-    warn("ADMIN_KEY not in the environment, so authenticated routes were not probed.");
-    return;
+    die(
+      "no admin key is available, so health cannot prove the authenticated documents endpoint." + "\n" +
+        "      Set ADMIN_KEY or configure the manifest's durable admin-key storage, then re-run `brain health`."
+    );
   }
 
   // Secrets take a few seconds to reach every edge location. Running `secrets`
@@ -1012,36 +1361,84 @@ async function cmdHealth(manifestPath, { expectVersion = null } = {}) {
     });
     const dbody = await docs.text();
     if (docs.ok) {
-      ok(`documents endpoint ${docs.status} ${dbody.slice(0, 160)}`);
+      let inventory;
+      try {
+        inventory = JSON.parse(dbody);
+      } catch {
+        die(
+          `documents endpoint ${docs.status} did not return JSON, so authenticated access was not proven.` + "\n" +
+            "      Re-run `brain health`; if this repeats, the configured domain is not serving this brain."
+        );
+      }
+      if (!inventory || typeof inventory !== "object" ||
+          typeof inventory.backend !== "string" || !inventory.backend ||
+          !Array.isArray(inventory.rows)) {
+        die(
+          `documents endpoint ${docs.status} returned an invalid inventory, so authenticated access was not proven.` + "\n" +
+            "      Re-run `brain health`; if this repeats, the deployed Worker and installer do not match."
+        );
+      }
+      const actualBackend = inventory.backend.trim().toLowerCase();
+      if (!["d1", "supabase"].includes(actualBackend)) {
+        die(
+          "the authenticated documents endpoint returned an unsupported storage backend." + "\n" +
+            "      Health cannot pass because the deployed Worker and installer do not match."
+        );
+      }
+      // D1 is the schema and deploy default. An omitted storage field must not
+      // make health accept an old Supabase Worker at the configured URL.
+      const expectedBackend = String(m.infrastructure?.cloudflare?.storage || "d1").trim().toLowerCase();
+      if (actualBackend !== expectedBackend) {
+        die(
+          "the authenticated documents endpoint is serving a different storage backend than this manifest." + "\n" +
+            "      Health cannot pass because this URL may point at an old or misbound brain."
+        );
+      }
+      ok(`documents endpoint ${docs.status}; authenticated inventory confirmed`);
 
       // D1 and Vectorize cannot share a transaction. Both systems can be up
       // while semantic search is behind or stale, so the operation backlog is
-      // part of health, not an implementation detail.
-      try {
-        const j = JSON.parse(dbody);
-        const backlog = j.vector_backlog;
-        if (backlog && Number(backlog.pending) > 0) {
-          const oldest = backlog.oldest_queued_at
-            ? Math.floor((Date.now() - Number(backlog.oldest_queued_at)) / 60000)
-            : null;
-          const stalled = oldest !== null && oldest > 30;
-          (stalled ? warn : info)(
-            `${backlog.pending} vector operation(s) pending` +
-              ` (${Number(backlog.upserts || 0)} upsert, ${Number(backlog.deletes || 0)} delete)` +
-              (oldest !== null ? `, oldest queued ${oldest} min ago` : "") +
-              (stalled
-                ? ".\n        Older than 30 minutes means the drain cron is NOT running. Those\n" +
-                  "        Upserts are keyword-only; deletes leave stale vectors competing.\n" +
-                  "        Clear it now with:  brain drain <manifest>" + "\n" +
-                  "        If it keeps returning, the drain cron is not firing: check the" + "\n" +
-                  "        schedule on the worker in the Cloudflare dashboard."
-                : " (the drain cron will clear these).")
+      // part of health, not an implementation detail. A 200 with an error or
+      // malformed backlog is a failed health check, never proof of zero work.
+      if (actualBackend === "d1") {
+        const backlog = inventory.vector_backlog;
+        const validCount = (value) => Number.isSafeInteger(value) && value >= 0;
+        if (!backlog || typeof backlog !== "object" || Array.isArray(backlog) ||
+            Object.prototype.hasOwnProperty.call(backlog, "error") ||
+            !validCount(backlog.pending) || !validCount(backlog.upserts) ||
+            !validCount(backlog.deletes) || backlog.upserts + backlog.deletes !== backlog.pending) {
+          die(
+            "the documents endpoint could not prove a valid D1 vector backlog." + "\n" +
+              "      Health cannot pass because semantic indexing may be stalled or incomplete."
           );
-        } else if (backlog) {
+        }
+        if (backlog.pending > 0) {
+          const queuedAt = backlog.oldest_queued_at;
+          if (!Number.isSafeInteger(queuedAt) || queuedAt < 0) {
+            die(
+              "the documents endpoint reported queued vector work without a valid oldest timestamp." + "\n" +
+                "      Health cannot determine whether semantic indexing is stalled."
+            );
+          }
+          const oldest = Math.max(0, Math.floor((Date.now() - queuedAt) / 60000));
+          if (oldest > 30) {
+            die(
+              `${backlog.pending} vector operation(s) are stalled` +
+                ` (${backlog.upserts} upsert, ${backlog.deletes} delete), oldest queued ${oldest} min ago.` + "\n" +
+                "      Older than 30 minutes means the drain cron is not keeping up. Upserts are" + "\n" +
+                "      keyword-only; deletes leave stale vectors competing. Clear it now with:" + "\n" +
+                "      brain drain <manifest>" + "\n" +
+                "      If it returns, inspect the Worker schedule in the Cloudflare dashboard."
+            );
+          }
+          info(
+            `${backlog.pending} vector operation(s) pending` +
+              ` (${backlog.upserts} upsert, ${backlog.deletes} delete)` +
+              `, oldest queued ${oldest} min ago (the drain cron will clear these).`
+          );
+        } else {
           ok("vector index is caught up with the text");
         }
-      } catch {
-        // A body that will not parse is not a health failure on its own.
       }
       return;
     }
@@ -1050,12 +1447,19 @@ async function cmdHealth(manifestPath, { expectVersion = null } = {}) {
       await new Promise((r) => setTimeout(r, 4000));
       continue;
     }
-    warn(`documents endpoint ${docs.status}: ${dbody.slice(0, 200)}`);
     if (docs.status === 401) {
-      warn("still 401 after retries. Check that ADMIN_KEY here matches the deployed secret.");
+      die(
+        `documents endpoint is still unauthorized after ${attempts} attempts.` + "\n" +
+          "      Health cannot pass until the local admin key matches the deployed secret."
+      );
     }
-    return;
+    die(
+      `documents endpoint ${docs.status}, so authenticated access was not proven.` + "\n" +
+        "      Fix the endpoint and re-run `brain health`."
+    );
   }
+
+  die("authenticated documents access could not be proven after all health attempts.");
 }
 
 /* ---------------------------------------------------------- migrations */
@@ -1303,13 +1707,20 @@ async function cmdStatus(manifestPath) {
  * potential data loss. So this captures the bookmark, prints it, and stops.
  * Recovery is one explicit command away and stays a human decision.
  */
-async function cmdUpgrade(manifestPath) {
+export async function cmdUpgrade(manifestPath, options = {}) {
   const { m } = loadManifest(manifestPath);
-  const acct = await resolveAccount(m);
+  const resolveUpgradeAccount = options.resolveAccount ?? resolveAccount;
+  const queryDatabase = options.d1Query ?? d1Query;
+  const callCloudflare = options.cf ?? cf;
+  const migrate = options.cmdMigrate ?? cmdMigrate;
+  const deploy = options.cmdDeploy ?? cmdDeploy;
+  const reconcileProviders = options.reconcileWorkerProviderSecrets ?? reconcileWorkerProviderSecrets;
+  const verifyHealth = options.cmdHealth ?? cmdHealth;
+  const acct = await resolveUpgradeAccount(m);
   const dbId = m.infrastructure?.cloudflare?.d1_database_id;
   if (!dbId) die("no d1_database_id in the manifest. Run `brain provision` first.");
 
-  const before = await d1Query(acct.id, dbId, "SELECT * FROM install_state WHERE id = 1").catch(
+  const before = await queryDatabase(acct.id, dbId, "SELECT * FROM install_state WHERE id = 1").catch(
     () => null
   );
   const fromVersion = before?.results?.[0]?.product_version || "unknown";
@@ -1319,7 +1730,7 @@ async function cmdUpgrade(manifestPath) {
   // Snapshot first. A bookmark taken after a migration is worthless.
   let bookmark = null;
   try {
-    const bm = await cf(`/accounts/${acct.id}/d1/database/${dbId}/time_travel/bookmark`);
+    const bm = await callCloudflare(`/accounts/${acct.id}/d1/database/${dbId}/time_travel/bookmark`);
     bookmark = bm?.bookmark || null;
     ok(`snapshot bookmark ${bookmark}`);
   } catch (e) {
@@ -1329,7 +1740,7 @@ async function cmdUpgrade(manifestPath) {
   const startedAt = new Date().toISOString();
   const logRun = async (status, detail) => {
     try {
-      await d1Query(
+      await queryDatabase(
         acct.id,
         dbId,
         `INSERT INTO upgrade_runs (started_at, finished_at, from_version, to_version, status, d1_bookmark, detail)
@@ -1344,8 +1755,15 @@ async function cmdUpgrade(manifestPath) {
   info(`upgrading ${fromVersion} -> ${toVersion}`);
 
   try {
-    await cmdMigrate(manifestPath);
-    await cmdDeploy(manifestPath);
+    await migrate(manifestPath);
+    await deploy(manifestPath);
+    const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
+    await reconcileProviders(
+      m,
+      acct,
+      scriptName,
+      optionalWorkerSecretNames(m),
+    );
   } catch (e) {
     await logRun("failed", e.message.slice(0, 400));
     die(
@@ -1365,13 +1783,13 @@ async function cmdUpgrade(manifestPath) {
   // from the worker being REPLACED, printed its old version, and declared the
   // new one verified.
   try {
-    await cmdHealth(manifestPath, { expectVersion: toVersion });
+    await verifyHealth(manifestPath, { expectVersion: toVersion });
   } catch (e) {
     await logRun("failed", `verification: ${e.message}`.slice(0, 400));
     die(`upgrade deployed but verification failed: ${e.message}`);
   }
 
-  await d1Query(
+  await queryDatabase(
     acct.id,
     dbId,
     "UPDATE install_state SET last_upgraded_at = ?, product_version = ? WHERE id = 1",
@@ -1405,7 +1823,14 @@ async function cmdRollback(manifestPath, bookmarkArg) {
 
 /* ------------------------------------------------------------ acceptance */
 
-async function cmdTest(manifestPath) {
+/** A report is still a failed acceptance run even when its HTML was preserved. */
+export function reportAcceptanceFailure(data = {}) {
+  if (data?.acceptanceError) return { kind: "error", failed: Number(data?.acceptance?.counts?.fail || 0) };
+  const failed = Number(data?.acceptance?.counts?.fail || 0);
+  return failed > 0 ? { kind: "failed", failed } : null;
+}
+
+export async function cmdTest(manifestPath) {
   const { m } = loadManifest(manifestPath);
   const key = resolveAdminKey(manifestPath);
   if (!key) die("no admin key found: not in the environment, and no .brain-admin-key file next to the manifest.");
@@ -1478,6 +1903,16 @@ async function cmdTest(manifestPath) {
         `  ${acc.counts.pass} passed, ${acc.counts.fail} failed, ${acc.counts.warn} warnings`
       );
     }
+    const reportFailure = reportAcceptanceFailure(data);
+    if (reportFailure?.kind === "error") {
+      die("report was written, but the acceptance checks did not complete. The report records where they stopped.");
+    }
+    if (reportFailure) {
+      die(
+        `report was written, but acceptance FAILED with ${reportFailure.failed} ` +
+          `${reportFailure.failed === 1 ? "check" : "checks"} failing.`
+      );
+    }
     return;
   }
 
@@ -1527,13 +1962,54 @@ async function cmdTest(manifestPath) {
  * terminal, is the highest perceived-value second in the whole engagement.
  * Before that it is a system they were shown; after it, it is a thing they own.
  *
- * The admin key is printed here on purpose: it is THEIR key, for THEIR brain,
- * on their machine. Refusing to show it would be security theatre that just
- * makes them go dig it out of a dashboard.
+ * The config contains only a URL, display name, executable path, and absolute
+ * manifest locator. brain-mcp reads the current key from the same validated
+ * durable storage as every installer command, so rotation never requires a
+ * credential in terminal output, shell history, argv, or an MCP config file.
  */
-async function cmdMcpConfig(manifestPath) {
+export function mcpRegistrationDescriptor(manifest, manifestPath, {
+  baseUrl,
+  serverPath = join(HERE, "components", "brain-mcp.mjs"),
+  nodePath = process.execPath,
+} = {}) {
+  const name = manifest?.client?.slug || "brain";
+  const base = String(baseUrl || "").replace(/\/+$/, "");
+  if (!base) throw new TypeError("a brain URL is required for MCP registration");
+  const absoluteManifest = resolve(manifestPath);
+  const absoluteServer = resolve(serverPath);
+  const absoluteNode = resolve(nodePath);
+  for (const [label, value] of [
+    ["name", name],
+    ["URL", base],
+    ["manifest path", absoluteManifest],
+    ["server path", absoluteServer],
+    ["Node path", absoluteNode],
+  ]) {
+    if (typeof value !== "string" || !value || /[\0-\x1f\x7f]/.test(value)) {
+      throw new TypeError(`the MCP ${label} contains an unsafe control character`);
+    }
+  }
+  return Object.freeze({
+    name,
+    type: "stdio",
+    // GUI-launched AI tools do not reliably inherit the terminal's PATH. The
+    // exact interpreter running setup is a testable executable, not a guess.
+    command: absoluteNode,
+    args: Object.freeze([absoluteServer]),
+    env: Object.freeze({
+      BRAIN_URL: base,
+      BRAIN_NAME: name,
+      BRAIN_MANIFEST: absoluteManifest,
+    }),
+  });
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
+export async function cmdMcpConfig(manifestPath) {
   const { m } = loadManifest(manifestPath);
-  const key = resolveAdminKey(manifestPath);
 
   let base = m.brain?.domain ? `https://${m.brain.domain}` : null;
   if (!base) {
@@ -1544,20 +2020,31 @@ async function cmdMcpConfig(manifestPath) {
   }
   if (!base) die("could not determine a URL for this install.");
 
-  const name = m.client?.slug || "brain";
+  try {
+    const persistenceOptions = {
+      platform: process.platform,
+      username: process.env.USERNAME ?? process.env.USER,
+      environment: process.env,
+    };
+    const plan = adminKeyPersistencePlan(manifestPath, m, persistenceOptions);
+    if (!readAdminKeyDurably(plan, persistenceOptions)) throw new Error("missing durable key");
+  } catch {
+    die(
+      "the durable ADMIN_KEY could not be read and verified, so a working MCP locator cannot be generated.\n" +
+        "  Fix its declared local storage, then rerun `brain mcp-config <manifest>`."
+    );
+  }
+
+  const descriptor = mcpRegistrationDescriptor(m, manifestPath, { baseUrl: base });
+  const { name, command, args, env } = descriptor;
   const owner = m.client?.display_name || "the owner";
-  const serverPath = join(HERE, "components", "brain-mcp.mjs");
 
   const block = {
     mcpServers: {
       [name]: {
-        command: "node",
-        args: [serverPath],
-        env: {
-          BRAIN_URL: base,
-          BRAIN_NAME: name,
-          BRAIN_KEY: key || "<your admin key>",
-        },
+        command,
+        args,
+        env,
       },
     },
   };
@@ -1565,20 +2052,18 @@ async function cmdMcpConfig(manifestPath) {
   console.log(`\n${c.bold(`Connect ${owner}'s brain to your AI tools`)}\n`);
   console.log(`Your brain lives at ${c.bold(base)}\n`);
 
-  // -e per variable. An env prefix like `BRAIN_KEY=... claude mcp add ...` is
-  // silently DISCARDED: the server registers with an empty environment and fails
-  // on the first question. Verified against Claude Code 2.1.63 on 2026-08-17.
-  console.log(`${c.bold("Claude Code")} — run this once, then it works in every folder:\n`);
+  console.log(`${c.bold("Claude Code")}: run this once, then it works in every folder:\n`);
   console.log(
-    `  claude mcp add --scope user ${name} \\\n` +
-      `    -e BRAIN_URL=${base} \\\n` +
-      `    -e BRAIN_NAME=${name} \\\n` +
-      `    -e BRAIN_KEY=${key || "<your admin key>"} \\\n` +
-      `    -- node ${JSON.stringify(serverPath)}\n`
+    `  claude mcp add --scope user ${shellQuote(name)} \\\n` +
+      Object.entries(env).map(([key, value]) => `    -e ${shellQuote(`${key}=${value}`)} \\\n`).join("") +
+      `    -- ${shellQuote(command)} ${args.map(shellQuote).join(" ")}\n`
   );
-  console.log(`  Confirm the credentials landed: claude mcp get ${name}\n`);
+  console.log(
+    "  If this name already exists, run brain setup to reconcile it safely. Do not use\n" +
+      "  a config-display command on an older entry because it may print the retired key.\n"
+  );
 
-  console.log(`${c.bold("Claude Desktop")} — add this to your config file:\n`);
+  console.log(`${c.bold("Claude Desktop")}: add this to your config file:\n`);
   console.log(
     JSON.stringify(block, null, 2)
       .split("\n")
@@ -1592,24 +2077,26 @@ async function cmdMcpConfig(manifestPath) {
   // Codex. Verified against `codex mcp add --help` on 2026-08-17: the form is
   // `codex mcp add <NAME> --env K=V -- <COMMAND>...`, and the `--` separator is
   // REQUIRED or the launch command is parsed as codex's own flags.
-  console.log(`${c.bold("Codex")} — run this once:\n`);
+  console.log(`${c.bold("Codex")}: run this once:\n`);
   console.log(
-    `  codex mcp add ${name} \\\n` +
-      `    --env BRAIN_URL=${base} \\\n` +
-      `    --env BRAIN_NAME=${name} \\\n` +
-      `    --env BRAIN_KEY=${key || "<your admin key>"} \\\n` +
-      `    -- node ${JSON.stringify(serverPath)}\n`
+    `  codex mcp add ${shellQuote(name)} \\\n` +
+      Object.entries(env).map(([key, value]) => `    --env ${shellQuote(`${key}=${value}`)} \\\n`).join("") +
+      `    -- ${shellQuote(command)} ${args.map(shellQuote).join(" ")}\n`
   );
-  console.log(`  Confirm with: codex mcp list\n`);
+  console.log(`  Confirm with: codex mcp get ${shellQuote(name)}\n`);
   console.log(`  Or write it into ~/.codex/config.toml by hand:\n`);
   console.log(
     `  [mcp_servers.${name}]\n` +
-      `  command = "node"\n` +
-      `  args = [${JSON.stringify(serverPath)}]\n\n` +
+      `  command = ${JSON.stringify(command)}\n` +
+      `  args = [${args.map(JSON.stringify).join(", ")}]\n\n` +
       `  [mcp_servers.${name}.env]\n` +
-      `  BRAIN_URL = ${JSON.stringify(base)}\n` +
-      `  BRAIN_NAME = ${JSON.stringify(name)}\n` +
-      `  BRAIN_KEY = ${JSON.stringify(key || "<your admin key>")}\n`
+      Object.entries(env).map(([key, value]) => `  ${key} = ${JSON.stringify(value)}\n`).join("")
+  );
+
+  console.log(
+    `${c.bold("After an admin-key rotation")}: replace any older manual MCP entry with this\n` +
+      "  locator-only version and restart the AI tool. Setup refreshes Claude Code and\n" +
+      "  Codex registrations automatically. Claude Desktop remains a manual config update.\n"
   );
 
   console.log(`${c.bold("Then try asking it")}:\n`);
@@ -1624,9 +2111,6 @@ async function cmdMcpConfig(manifestPath) {
   }
   console.log("");
 
-  if (!key) {
-    warn("ADMIN_KEY was not in the environment, so the config above has a placeholder.");
-  }
 }
 
 /* ----------------------------------------------------------- sources */
@@ -2018,17 +2502,123 @@ export function assertKeyDirSafe(dir) {
   }
 }
 
-/** Defuse the likeliest accident: committing the key. */
+/** Basenames used by the durable key writer, including its crash residue. */
+export const ADMIN_KEY_GITIGNORE_RULES = Object.freeze([
+  ".brain-admin-key",
+  "..brain-admin-key.[0-9]*.[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].tmp",
+  "..brain-admin-key.[0-9]*.[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].bak",
+]);
+
+/** Defuse the likeliest accident: committing the key or crash residue. */
 function gitignoreTheKey(dir) {
-  let d = dir;
-  for (let i = 0; i < 8; i++) {
+  let d = resolve(dir);
+  while (true) {
     if (existsSync(join(d, ".git"))) {
-      const gi = join(dir, ".gitignore");
-      const cur = existsSync(gi) ? readFileSync(gi, "utf-8") : "";
-      if (!/^\.brain-admin-key\s*$/m.test(cur)) {
-        writeFileSync(gi, (cur && !cur.endsWith("\n") ? cur + "\n" : cur) + ".brain-admin-key\n");
+      const keyPath = relative(d, join(dir, ".brain-admin-key")).split(sep).join("/");
+      if (!keyPath || keyPath === ".." || keyPath.startsWith("../")) {
+        throw new Error("the adjacent admin-key path is outside the detected Git repository");
       }
-      warn(`the admin key is inside a git repository. Added it to ${relative(process.cwd(), gi)}.`);
+      const tracked = spawnSync(
+        "git",
+        ["-C", d, "ls-files", "--error-unmatch", "--", keyPath],
+        {
+          encoding: "utf8",
+          env: localToolEnvironment(process.env),
+          timeout: 5_000,
+          windowsHide: true,
+        },
+      );
+      if (tracked.error || (tracked.status !== 0 && tracked.status !== 1)) {
+        throw new Error("the install's Git index could not be checked before writing the admin key");
+      }
+      if (tracked.status === 0) {
+        throw new Error(
+          "the adjacent .brain-admin-key is already tracked by Git; remove it from the index before rotating",
+        );
+      }
+      const gi = join(dir, ".gitignore");
+      const inspect = () => {
+        let identity;
+        try { identity = lstatSync(gi); }
+        catch (error) {
+          if (error?.code === "ENOENT") return null;
+          throw error;
+        }
+        if (!identity.isFile() || identity.isSymbolicLink() || identity.nlink !== 1 ||
+            identity.size > 16 * 1024 * 1024 ||
+            (typeof process.getuid === "function" && identity.uid !== process.getuid())) {
+          throw new Error("the install .gitignore is not a safe owner-controlled regular file");
+        }
+        return identity;
+      };
+      let identity = inspect();
+      let fd;
+      let cur = "";
+      let missing;
+      let addition;
+      try {
+        if (identity) {
+          fd = openSync(
+            gi,
+            fsConstants.O_RDWR | fsConstants.O_APPEND | (fsConstants.O_NOFOLLOW || 0),
+          );
+          const opened = fstatSync(fd);
+          if (opened.dev !== identity.dev || opened.ino !== identity.ino ||
+              opened.size !== identity.size || opened.nlink !== 1) {
+            throw new Error("the install .gitignore changed while it was being inspected");
+          }
+          cur = readFileSync(fd, "utf8");
+        }
+        const lines = new Set(cur.split(/\r?\n/));
+        missing = ADMIN_KEY_GITIGNORE_RULES.filter((rule) => !lines.has(rule));
+        if (missing.length) {
+          addition = Buffer.from(
+            `${cur && !cur.endsWith("\n") ? "\n" : ""}${missing.join("\n")}\n`,
+            "utf8",
+          );
+          if (!identity) {
+            fd = openSync(
+              gi,
+              fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL |
+                (fsConstants.O_NOFOLLOW || 0),
+              0o644,
+            );
+            identity = fstatSync(fd);
+          }
+          let offset = 0;
+          while (offset < addition.length) {
+            const written = writeSync(fd, addition, offset, addition.length - offset);
+            if (written <= 0) throw new Error("the install .gitignore append made no progress");
+            offset += written;
+          }
+          fsyncSync(fd);
+        }
+      } finally {
+        if (addition) addition.fill(0);
+        if (fd !== undefined) closeSync(fd);
+      }
+      if (missing.length) {
+        const current = inspect();
+        if (!current || !identity || current.dev !== identity.dev || current.ino !== identity.ino) {
+          throw new Error("the install .gitignore changed before its key rules were verified");
+        }
+        let verifyFd;
+        let verified;
+        try {
+          verifyFd = openSync(gi, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+          const opened = fstatSync(verifyFd);
+          if (opened.dev !== current.dev || opened.ino !== current.ino || opened.nlink !== 1) {
+            throw new Error("the install .gitignore changed during key-rule verification");
+          }
+          verified = readFileSync(verifyFd, "utf8").split(/\r?\n/);
+        } finally {
+          if (verifyFd !== undefined) closeSync(verifyFd);
+        }
+        if (missing.some((rule) => !verified.includes(rule))) {
+          throw new Error("the install .gitignore key rules did not verify exactly");
+        }
+        warn("the admin key is inside a git repository. Added its private basenames to the install's .gitignore.");
+      }
       return;
     }
     const up = dirname(d);
@@ -4080,6 +4670,151 @@ async function askSecret(question) {
   return done ? "" : String(value || "").trim();
 }
 
+/** Deterministic, non-secret Keychain locator for a standard macOS setup. */
+export function standardMacAdminKeyReference(manifestPath, manifest) {
+  const slug = String(manifest?.client?.slug || "brain")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64) || "brain";
+  const accountId = String(manifest?.infrastructure?.cloudflare?.account_id || "").trim();
+  const identity = /^[0-9a-f]{32}$/i.test(accountId)
+    ? accountId.toLowerCase()
+    : createHash("sha256").update(resolve(manifestPath)).digest("hex").slice(0, 16);
+  return `keychain://${encodeURIComponent(`${slug}-brain-admin`)}/${encodeURIComponent(`owner-${identity}`)}`;
+}
+
+/**
+ * Make native secure storage the standard on macOS without silently moving a
+ * legacy adjacent key. An explicit locator always wins. Any existing adjacent
+ * destination, including an unsafe link, remains on the legacy path so its
+ * normal validator can stop rather than routing around it.
+ */
+export function configureStandardAdminKeyStorage(manifestPath, manifest, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const current = manifest?.operations?.admin_key_secret;
+  if (platform !== "darwin" || (current !== null && current !== undefined)) {
+    return Object.freeze({ changed: false, reference: current ?? null });
+  }
+
+  const directory = dirname(resolve(manifestPath));
+  const adjacent = join(directory, ".brain-admin-key");
+  const inspect = options.lstat ?? lstatSync;
+  try {
+    inspect(adjacent);
+    return Object.freeze({ changed: false, reference: null, legacyAdjacent: true });
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw new Error("setup could not safely inspect the legacy adjacent admin-key destination");
+    }
+  }
+
+  // A rollback backup means an interrupted legacy transaction may contain the
+  // only working key. Do not route around it into a new Keychain item.
+  let names;
+  try {
+    names = (options.readDirectory ?? readdirSync)(directory);
+  } catch {
+    throw new Error("setup could not inspect the admin-key directory for legacy recovery state");
+  }
+  if (names.some((name) => /^\.\.brain-admin-key\.\d+\.[0-9a-f]{16}\.bak$/.test(String(name)))) {
+    return Object.freeze({ changed: false, reference: null, legacyRollback: true });
+  }
+
+  const reference = standardMacAdminKeyReference(manifestPath, manifest);
+  manifest.operations = { ...(manifest.operations || {}), admin_key_secret: reference };
+  const save = options.saveManifest ?? saveManifest;
+  save(manifestPath, manifest);
+  return Object.freeze({ changed: true, reference });
+}
+
+/**
+ * Resolve setup's ADMIN_KEY before setup performs any Cloudflare write.
+ *
+ * Null is the durable readers' explicit "not found" result. Every other bad
+ * result is treated as unreadable state and stops setup rather than silently
+ * inventing a replacement key that would disagree with an earlier install.
+ */
+export async function prepareSetupAdminKey(manifestPath, manifest, options = {}) {
+  const persistenceOptions = {
+    platform: options.platform ?? process.platform,
+    username: options.username ?? process.env.USERNAME ?? process.env.USER,
+    ...(options.persistenceOptions || {}),
+  };
+
+  let plan;
+  try {
+    const makePlan = options.adminKeyPersistencePlan ?? adminKeyPersistencePlan;
+    plan = makePlan(manifestPath, manifest, persistenceOptions);
+  } catch {
+    die(
+      "setup could not verify the declared durable ADMIN_KEY storage. " +
+        "No Cloudflare changes were made. Fix the local key storage and rerun setup."
+    );
+  }
+
+  const explicitAdminKey = Object.hasOwn(options, "explicitAdminKey")
+    ? options.explicitAdminKey
+    : (process.env.ADMIN_KEY || null);
+  if (explicitAdminKey !== null) {
+    try {
+      validateAdminKeyValue(explicitAdminKey);
+    } catch {
+      die(
+        "the ADMIN_KEY in this shell is not a valid HTTP-header-safe key. " +
+          "No Cloudflare changes were made. Replace it or unset it, then rerun setup."
+      );
+    }
+    return Object.freeze({ value: explicitAdminKey, source: "environment", plan });
+  }
+
+  let durable;
+  try {
+    const readDurable = options.readAdminKeyDurably ?? readAdminKeyDurably;
+    durable = await readDurable(plan, persistenceOptions);
+  } catch {
+    die(
+      "the durable ADMIN_KEY exists but could not be read and verified. " +
+        "No Cloudflare changes were made. Fix the local key storage and rerun setup."
+    );
+  }
+
+  if (durable !== null) {
+    try {
+      validateAdminKeyValue(durable);
+    } catch {
+      die(
+        "the durable ADMIN_KEY exists but could not be read and verified. " +
+          "No Cloudflare changes were made. Fix the local key storage and rerun setup."
+      );
+    }
+    return Object.freeze({ value: durable, source: "durable", plan });
+  }
+
+  let generated;
+  let generatedCopy;
+  try {
+    const generate = options.randomBytes ?? randomBytes;
+    generated = generate(24);
+    if (!(generated instanceof Uint8Array) || generated.byteLength !== 24) {
+      throw new Error("invalid secure-random result");
+    }
+    generatedCopy = Buffer.from(generated);
+    const value = generatedCopy.toString("hex");
+    validateAdminKeyValue(value);
+    return Object.freeze({
+      value,
+      source: "generated",
+      plan,
+    });
+  } catch {
+    die("setup could not generate its ADMIN_KEY. No Cloudflare changes were made; rerun setup.");
+  } finally {
+    if (generatedCopy) generatedCopy.fill(0);
+    if (generated?.fill) generated.fill(0);
+  }
+}
+
 /**
  * brain setup — nothing to a working brain, in one command.
  *
@@ -4091,13 +4826,15 @@ async function askSecret(question) {
  * Every step is idempotent and the manifest is written after each, so an
  * interrupted setup is resumed by re-running the same command.
  */
-async function cmdSetup(manifestPath) {
+export async function cmdSetup(manifestPath, options = {}) {
   const flags = parseFlags(process.argv.slice(3));
+  const prompt = options.ask ?? ask;
   console.log(`\n  ${c.bold("brain setup")}  ${c.dim("nothing to a working brain")}\n`);
 
   /* --- 1. preflight, because everything below assumes it --- */
   console.log(`  ${c.bold("Step 1 of 6")}  checking this machine\n`);
-  const checks = await doctorRunAll({ accountId: undefined });
+  const runDoctorChecks = options.doctorRunAll ?? doctorRunAll;
+  const checks = await runDoctorChecks({ accountId: undefined });
   for (const x of checks) {
     const mark = x.status === D_OK ? c.green("ok  ") : x.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
     console.log(`    ${mark}  ${x.name}  ${c.dim(x.detail)}`);
@@ -4118,8 +4855,8 @@ async function cmdSetup(manifestPath) {
     ok(`resuming from ${relative(process.cwd(), target)}`);
   } else {
     console.log(`\n  ${c.bold("Step 2 of 6")}  about this install\n`);
-    const display = await ask("What is this brain for? (a person or a company)", "My Brain");
-    const slug = (await ask(
+    const display = await prompt("What is this brain for? (a person or a company)", "My Brain");
+    const slug = (await prompt(
       "Short name, lowercase, no spaces (names the worker and the database)",
       display.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 30) || "brain"
     )).toLowerCase();
@@ -4151,7 +4888,7 @@ async function cmdSetup(manifestPath) {
       // NO DEFAULT when the login can see more than one account. Offering the
       // first one means a person pressing enter provisions a brain into someone
       // else's business, and the resources look identical afterwards.
-      cf.account_id = await ask("Cloudflare account id", ids.length === 1 ? ids[0] : "");
+      cf.account_id = await prompt("Cloudflare account id", ids.length === 1 ? ids[0] : "");
       if (!cf.account_id && ids.length > 1) {
         closePrompts();
         die("no account id given, and this login can see several. Re-run and name the one you mean.");
@@ -4167,78 +4904,88 @@ async function cmdSetup(manifestPath) {
     ok(`wrote ${relative(process.cwd(), target)}`);
   }
 
+  try {
+    const configureStorage = options.configureStandardAdminKeyStorage ?? configureStandardAdminKeyStorage;
+    const storage = configureStorage(target, m, options);
+    if (storage?.changed) ok("admin key will be kept in this Mac's login Keychain");
+  } catch {
+    closePrompts();
+    die(
+      "setup could not configure native admin-key storage. No Cloudflare changes were made. " +
+        "Fix the manifest directory and rerun setup."
+    );
+  }
+
+  // Validate an explicit shell key, or resolve an absent one, before any remote
+  // step. On a resumed install durable storage is authoritative. Only an exact
+  // "missing" result may create a value; invalid or unreadable state stops here.
+  const prepareAdminKey = options.prepareSetupAdminKey ?? prepareSetupAdminKey;
+  const preparedAdminKey = await prepareAdminKey(target, m, options);
+
   /* --- 3. the install sequence, in the ONLY order that works --- */
   console.log(`\n  ${c.bold("Step 3 of 6")}  creating the brain in your Cloudflare account\n`);
-  await cmdVerify(target);
-  await cmdProvision(target);
-  await cmdMigrate(target);
-  await cmdDeploy(target);
+  await (options.cmdVerify ?? cmdVerify)(target);
+  await (options.cmdProvision ?? cmdProvision)(target);
+  await (options.cmdMigrate ?? cmdMigrate)(target);
+  await (options.cmdDeploy ?? cmdDeploy)(target);
 
   /* --- 4. secrets, AFTER deploy --- */
   console.log(`\n  ${c.bold("Step 4 of 6")}  keys\n`);
-  if (!process.env.ADMIN_KEY) {
-    // Generated, never asked for. It protects this brain and nothing else, so
-    // there is no reason to make a person invent or manage one.
-    // randomBytes, not Math.random. This key is the only thing between the open
-    // internet and the client's entire corpus, and the previous version derived
-    // it from a timestamp, Math.random and the pid, all of which are low-entropy
-    // and partly guessable by anyone who knows roughly when the install ran.
-    process.env.ADMIN_KEY = randomBytes(24).toString("hex");
+  if (preparedAdminKey?.source === "generated") {
+    // Generated, never asked for. It protects this brain and nothing else.
+    // randomBytes, not Math.random: this is the only key guarding the corpus.
     ok("generated an admin key for this brain");
-  }
-  {
-    // PERSIST it, or the client is locked out of their own brain tomorrow. The
-    // first version generated the key inside this process, pushed it to the
-    // worker and into the MCP registrations, and exited. Nothing on disk held
-    // it, so `brain ingest` and `brain test` died the next morning asking for a
-    // key the client had never seen.
-    const keyDir = dirname(resolve(target));
-    assertKeyDirSafe(keyDir);
-    const keyPath = join(keyDir, ".brain-admin-key");
-    // mode on the WRITE, so the file never exists as 0644 even briefly.
-    writeFileSync(keyPath, process.env.ADMIN_KEY + "\n", { mode: 0o600 });
-    if (process.platform === "win32") {
-      // chmodSync on Windows only toggles the read-only bit and does not throw,
-      // so the POSIX call above is silently a no-op on the one platform this
-      // finding came from. Restrict the ACL properly instead.
-      const who = process.env.USERNAME || process.env.USER;
-      const r = who ? run("icacls", [keyPath, "/inheritance:r", "/grant:r", `${who}:F`]) : { ok: false };
-      if (!r.ok) warn(`could not restrict permissions on ${keyPath}. Check who can read it.`);
-    } else {
-      try { chmodSync(keyPath, 0o600); } catch { /* best effort */ }
-    }
-    gitignoreTheKey(keyDir);
-    warn(
-      `SECRET: ${relative(process.cwd(), keyPath)}` + "\n" +
-        "        This key reads the entire brain. Commands pick it up from there" + "\n" +
-        "        automatically. Do not commit it and do not leave it in a synced folder."
-    );
+  } else if (preparedAdminKey?.source === "durable") {
+    ok("reusing this brain's verified durable admin key");
   }
   console.log(
     `\n    Written answers use ${c.bold("Cloudflare Workers AI")} in the client's own account.\n` +
       "    No Anthropic, OpenAI, Gemini, or Supabase credential is required.\n"
   );
-  await cmdSecrets(target);
-  await cmdHealth(target);
+  // Setup owns one full reconciliation in Step 5. Suppress cmdSecrets' normal
+  // existing-only rotation hook here so a stale entry cannot abort before the
+  // full add-or-repair path gets its turn.
+  await (options.cmdSecrets ?? cmdSecrets)(target, {
+    reconcileExistingAgents: false,
+    explicitAdminKey: preparedAdminKey.value,
+  });
+  // Prove that Step 4 actually committed durable desired state. A shell key is
+  // still preserved for the caller, but setup health must not depend on it.
+  await (options.cmdHealth ?? cmdHealth)(target, { durableAdminKeyOnly: true });
 
   /* --- 5. wire it into the tools people actually use --- */
   console.log(`\n  ${c.bold("Step 5 of 6")}  connecting it to your AI tools\n`);
-  const wired = await wireAgents(m, target);
+  const connectAgents = options.wireAgents ?? wireAgents;
+  const wiring = await connectAgents(m, target, {
+    ...(options.agentOptions || {}),
+    existingOnly: false,
+  });
+  const wired = Array.isArray(wiring) ? wiring : (wiring?.wired || []);
+  const wiringFailures = Array.isArray(wiring) ? [] : (wiring?.failures || []);
+  if (wiringFailures.length) {
+    die(
+      "setup could not verify the AI tool registration exactly. The brain and durable key are ready,\n" +
+        "  but setup will not claim the connection works. Rerun setup or use `brain mcp-config <manifest>`;\n" +
+        "  no credential needs to be copied into a command."
+    );
+  }
 
   /* --- 6. the first thing worth looking at --- */
   console.log(`\n  ${c.bold("Step 6 of 6")}  loading something in\n`);
-  const folder = flags.path || (await ask("A folder to load now (blank to skip)", ""));
+  const folder = flags.path || (await prompt("A folder to load now (blank to skip)", ""));
   if (folder && existsSync(folder)) {
     process.argv = [process.argv[0], process.argv[1], "ingest", target, "--path", folder, "--source", "documents"];
     await cmdIngest(target);
   } else if (folder) {
-    warn(`no such folder: ${folder}. Load one later with: brain ingest ${relative(process.cwd(), target)} --path <dir>`);
+    closePrompts();
+    die(`no such folder: ${folder}. Nothing was loaded. Fix the path and re-run setup.`);
   } else {
     info(`load one later with: brain ingest ${relative(process.cwd(), target)} --path <dir>`);
   }
 
   closePrompts();
-  const outstanding = await backlogCount(target).catch(() => 0);
+  const countBacklog = options.backlogCount ?? backlogCount;
+  const outstanding = await countBacklog(target).catch(() => 0);
   console.log(`\n  ${c.green(c.bold("Your brain is live."))}\n`);
   if (outstanding > 0) {
     console.log(
@@ -4254,78 +5001,696 @@ async function cmdSetup(manifestPath) {
   }
 }
 
+const AGENT_ENV_ALLOWLIST = Object.freeze([
+  "PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+  "USER", "USERNAME", "LOGNAME", "SystemRoot", "ComSpec", "PATHEXT",
+  "TEMP", "TMP", "TMPDIR", "LANG", "SHELL", "TERM",
+  "CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME",
+]);
+
+/** Only nonsecret process essentials may reach agent configuration CLIs. */
+export function agentCliEnvironment(environment = process.env) {
+  const clean = {};
+  for (const name of AGENT_ENV_ALLOWLIST) {
+    const value = environment?.[name];
+    if (typeof value === "string" && value) clean[name] = value;
+  }
+  for (const [name, value] of Object.entries(environment || {})) {
+    if (name.startsWith("LC_") && typeof value === "string" && value) clean[name] = value;
+  }
+  return clean;
+}
+
+function runAgentCli(runner, environment, command, args) {
+  return runner(command, args, {
+    inheritEnv: false,
+    env: agentCliEnvironment(environment),
+  });
+}
+
+function sameStringMap(left, right) {
+  if (!left || typeof left !== "object" || Array.isArray(left)) return false;
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  return leftKeys.length === rightKeys.length &&
+    leftKeys.every((key, index) => key === rightKeys[index] && left[key] === right[key]);
+}
+
+function normalizedRegistration(entry, name = null) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  const transport = entry.transport && typeof entry.transport === "object"
+    ? entry.transport
+    : entry;
+  return {
+    name: entry.name || name,
+    enabled: entry.enabled,
+    type: transport.type || "stdio",
+    command: transport.command,
+    args: Array.isArray(transport.args) ? [...transport.args] : [],
+    env: transport.env && typeof transport.env === "object" && !Array.isArray(transport.env)
+      ? { ...transport.env }
+      : {},
+    envVars: Array.isArray(transport.env_vars) ? [...transport.env_vars] : [],
+    cwd: transport.cwd ?? null,
+  };
+}
+
+export function mcpRegistrationIsExact(entry, desired) {
+  const actual = normalizedRegistration(entry, desired.name);
+  return Boolean(actual) &&
+    actual.name === desired.name &&
+    actual.enabled !== false &&
+    actual.type === "stdio" &&
+    actual.command === desired.command &&
+    actual.args.length === desired.args.length &&
+    actual.args.every((value, index) => value === desired.args[index]) &&
+    actual.envVars.length === 0 &&
+    actual.cwd === null &&
+    sameStringMap(actual.env, desired.env) &&
+    !Object.hasOwn(actual.env, "BRAIN_KEY") &&
+    !Object.hasOwn(actual.env, "ADMIN_KEY");
+}
+
+/** Refuse to replace an unrelated MCP server that happens to share the slug. */
+export function mcpRegistrationIsInstallerOwned(entry, desired) {
+  const actual = normalizedRegistration(entry, desired.name);
+  const samePath = (left, right) => {
+    if (typeof left !== "string" || typeof right !== "string") return false;
+    const a = resolve(left);
+    const b = resolve(right);
+    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  };
+  const sameManifest = typeof actual?.env?.BRAIN_MANIFEST === "string" &&
+    samePath(actual.env.BRAIN_MANIFEST, desired.env.BRAIN_MANIFEST);
+  const transitionName = CLAUDE_LEGACY_KEY_NAMES.find((key) =>
+    Object.hasOwn(actual?.env || {}, key));
+  const envKeys = Object.keys(actual?.env || {}).sort();
+  const safeTransition = transitionName === "BRAIN_KEY" ||
+    (transitionName && /^x+$/.test(actual.env[transitionName] || ""));
+  const manifestOwned = sameManifest && (
+    sameStringMap(actual.env, desired.env) ||
+    (safeTransition && sameStringMap(actual.env, {
+      ...desired.env,
+      [transitionName]: actual.env[transitionName],
+    }))
+  );
+  const exactLegacyTarget = transitionName &&
+    !Object.hasOwn(actual?.env || {}, "BRAIN_MANIFEST") &&
+    envKeys.length === 3 &&
+    envKeys.includes("BRAIN_URL") && envKeys.includes("BRAIN_NAME") && envKeys.includes(transitionName) &&
+    actual?.env?.BRAIN_URL === desired.env.BRAIN_URL &&
+    actual?.env?.BRAIN_NAME === desired.name &&
+    (transitionName === "BRAIN_KEY" || /^x+$/.test(actual.env[transitionName] || ""));
+  const installerNode = actual?.command === "node" || samePath(actual?.command, desired.command);
+  return Boolean(actual) &&
+    actual.name === desired.name &&
+    actual.type === "stdio" &&
+    installerNode &&
+    actual.args.length === 1 &&
+    basename(String(actual.args[0])) === "brain-mcp.mjs" &&
+    samePath(actual.args[0], desired.args[0]) &&
+    actual.envVars.length === 0 &&
+    actual.cwd === null &&
+    actual.env.BRAIN_NAME === desired.name &&
+    actual.env.BRAIN_URL === desired.env.BRAIN_URL &&
+    (manifestOwned || exactLegacyTarget);
+}
+
 /**
- * Register the brain with whichever agent tools are actually installed.
- *
- * Registering is not the same as working, so each one is checked afterwards by
- * listing what the tool now knows about. A registration that silently did not
- * take means the client opens Claude Code and their brain is simply not there,
- * which is the failure worth catching here rather than tomorrow.
+ * Launch the exact locator-only descriptor and complete one offline MCP
+ * initialize exchange. This catches a missing Node executable, import failure,
+ * broken server syntax, or incompatible stdio framing before setup says wired.
  */
-async function wireAgents(m, manifestPath) {
-  const name = m.client?.slug || "brain";
-  const scriptName = m.brain?.worker_name || `${name}-brain`;
-  const acct = await resolveAccount(m).catch(() => null);
-  const base = await resolveBaseUrl(m, acct).catch(() => null);
-  const key = resolveAdminKey(manifestPath);
-  const serverPath = join(HERE, "components", "brain-mcp.mjs");
+export function verifyMcpRuntime(desired, options = {}) {
+  if (!desired || desired.type !== "stdio" || !isAbsolute(desired.command) ||
+      !Array.isArray(desired.args) || !desired.args.length) return false;
+  const spawn = options.spawn ?? spawnSync;
+  const environment = localToolEnvironment(options.environment ?? process.env, desired.env);
+  const request = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "brain-installer", version: PRODUCT_VERSION } },
+  }) + "\n";
+  let result;
+  try {
+    result = spawn(desired.command, desired.args, {
+      encoding: "utf8",
+      env: environment,
+      input: request,
+      maxBuffer: 1024 * 1024,
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: options.timeoutMs ?? 15_000,
+      windowsHide: true,
+    });
+  } catch {
+    return false;
+  }
+  if (result?.error || result?.status !== 0) return false;
+  try {
+    const replies = String(result.stdout || "").split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    const reply = replies.find((value) => value?.id === 1);
+    return reply?.jsonrpc === "2.0" && reply?.result?.serverInfo?.name === desired.env.BRAIN_NAME &&
+      typeof reply.result.serverInfo.version === "string";
+  } catch {
+    return false;
+  }
+}
+
+const CLAUDE_LEGACY_KEY_NAMES = Object.freeze(
+  Array.from({ length: "BRAIN_KEY".length + 1 }, (_, length) =>
+    "REDACTED_".slice(0, length) + "BRAIN_KEY".slice(length)),
+);
+
+function sameOpenedFile(before, opened) {
+  return before.isFile() && opened.isFile() && before.dev === opened.dev &&
+    before.ino === opened.ino && before.uid === opened.uid && before.gid === opened.gid &&
+    before.mode === opened.mode && before.size === opened.size &&
+    before.nlink === 1 && opened.nlink === 1;
+}
+
+function jsonStringEnd(source, start) {
+  if (source[start] !== '"') throw new Error("expected a JSON string");
+  for (let index = start + 1; index < source.length; index++) {
+    if (source[index] === "\\") {
+      index++;
+      continue;
+    }
+    if (source[index] === '"') return index + 1;
+  }
+  throw new Error("unterminated JSON string");
+}
+
+function jsonCompositeEnd(source, start) {
+  if (source[start] !== "{" && source[start] !== "[") {
+    throw new Error("expected a JSON object or array");
+  }
+  const stack = [];
+  for (let index = start; index < source.length; index++) {
+    const character = source[index];
+    if (character === '"') {
+      index = jsonStringEnd(source, index) - 1;
+      continue;
+    }
+    if (character === "{" || character === "[") stack.push(character);
+    else if (character === "}" || character === "]") {
+      const expected = character === "}" ? "{" : "[";
+      if (stack.pop() !== expected) throw new Error("mismatched JSON container");
+      if (!stack.length) return index + 1;
+    }
+  }
+  throw new Error("unterminated JSON container");
+}
+
+/** Find object-valued JSON properties without reserializing credential bytes. */
+function jsonObjectPropertyRanges(source, propertyName) {
+  const ranges = [];
+  for (let index = 0; index < source.length;) {
+    if (source[index] !== '"') {
+      index++;
+      continue;
+    }
+    const tokenEnd = jsonStringEnd(source, index);
+    let decoded;
+    try { decoded = JSON.parse(source.slice(index, tokenEnd)); }
+    catch { throw new Error("invalid JSON string token"); }
+    let cursor = tokenEnd;
+    while (/\s/.test(source[cursor] || "")) cursor++;
+    if (decoded !== propertyName || source[cursor] !== ":") {
+      index = tokenEnd;
+      continue;
+    }
+    cursor++;
+    while (/\s/.test(source[cursor] || "")) cursor++;
+    if (source[cursor] !== "{") {
+      index = tokenEnd;
+      continue;
+    }
+    const end = jsonCompositeEnd(source, cursor);
+    ranges.push({ start: cursor, end, value: JSON.parse(source.slice(cursor, end)) });
+    index = tokenEnd;
+  }
+  return ranges;
+}
+
+/**
+ * Remove a retired literal from one exact installer-owned Claude entry before
+ * Claude's own writer makes a config backup. The overwrite is same-inode and
+ * same-length: value bytes first, then the field name, with an fsync after each
+ * phase. Every partial prefix remains valid JSON and is recognized on rerun.
+ */
+function neutralizeClaudeLegacyKey(desired, before) {
+  const entry = normalizedRegistration(before.entry, desired.name);
+  const field = CLAUDE_LEGACY_KEY_NAMES.find((name) => Object.hasOwn(entry?.env || {}, name));
+  if (!field || field === "REDACTED_") return;
+  if (!mcpRegistrationIsInstallerOwned(before.entry, desired)) {
+    throw new Error("not an installer-owned Claude registration");
+  }
+  const value = entry.env[field];
+  if (typeof value !== "string" || !value || !/^[\x20-\x7e]+$/.test(value) || /["\\]/.test(value)) {
+    throw new Error("the legacy Claude credential is not safe for in-place neutralization");
+  }
+
+  const raw = readFileSync(before.path, "utf8");
+  const serverRanges = jsonObjectPropertyRanges(raw, "mcpServers");
+  if (serverRanges.length !== 1) {
+    throw new Error("the Claude MCP configuration location is ambiguous");
+  }
+  const serverRange = serverRanges[0];
+  const targetRanges = jsonObjectPropertyRanges(
+    raw.slice(serverRange.start, serverRange.end),
+    desired.name,
+  );
+  if (targetRanges.length !== 1 ||
+      JSON.stringify(targetRanges[0].value) !== JSON.stringify(before.entry)) {
+    throw new Error("the legacy Claude registration location is ambiguous");
+  }
+  const targetStart = serverRange.start + targetRanges[0].start;
+  const targetRaw = raw.slice(targetStart, serverRange.start + targetRanges[0].end);
+  const namesPattern = CLAUDE_LEGACY_KEY_NAMES.join("|");
+  const propertyPattern = new RegExp(`"(${namesPattern})"\\s*:\\s*"([^"\\\\]*)"`, "g");
+  const matches = [...targetRaw.matchAll(propertyPattern)];
+  if (matches.length !== 1 || matches[0][1] !== field || matches[0][2] !== value) {
+    throw new Error("the legacy Claude credential location is ambiguous");
+  }
+  const match = matches[0];
+  const fieldCharacterOffset = targetStart + match.index + match[0].indexOf(field);
+  const valueToken = `"${value}"`;
+  const valueCharacterOffset = targetStart + match.index + match[0].lastIndexOf(valueToken) + 1;
+  // RegExp and String offsets count UTF-16 code units, while positional file
+  // writes count bytes. A display name or path containing non-ASCII text before
+  // this entry would otherwise shift both writes and corrupt Claude's config.
+  const fieldOffset = Buffer.byteLength(raw.slice(0, fieldCharacterOffset), "utf8");
+  const valueOffset = Buffer.byteLength(raw.slice(0, valueCharacterOffset), "utf8");
+  const beforeStat = lstatSync(before.path);
+  const flags = fsConstants.O_RDWR | (fsConstants.O_NOFOLLOW || 0);
+  const fd = openSync(before.path, flags);
+  try {
+    const openedStat = fstatSync(fd);
+    if (!sameOpenedFile(beforeStat, openedStat) || readFileSync(fd, "utf8") !== raw) {
+      throw new Error("Claude configuration changed during reconciliation");
+    }
+    const neutralValue = Buffer.from("x".repeat(Buffer.byteLength(value)), "ascii");
+    if (writeSync(fd, neutralValue, 0, neutralValue.length, valueOffset) !== neutralValue.length) {
+      throw new Error("short Claude credential neutralization write");
+    }
+    fsyncSync(fd);
+
+    const neutralField = Buffer.from("REDACTED_", "ascii");
+    if (writeSync(fd, neutralField, 0, neutralField.length, fieldOffset) !== neutralField.length) {
+      throw new Error("short Claude credential field neutralization write");
+    }
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+
+  const verified = JSON.parse(readFileSync(before.path, "utf8"));
+  const current = verified?.mcpServers?.[desired.name];
+  if (!current || Object.hasOwn(current.env || {}, "BRAIN_KEY") ||
+      current.env?.REDACTED_ !== "x".repeat(value.length)) {
+    throw new Error("Claude credential neutralization did not verify");
+  }
+}
+
+function claudeUserConfigPath(environment, explicitPath) {
+  if (explicitPath) return resolve(explicitPath);
+  const root = environment?.CLAUDE_CONFIG_DIR || environment?.HOME ||
+    environment?.USERPROFILE || homedir();
+  return resolve(root, ".claude.json");
+}
+
+function readClaudeRegistration(desired, options) {
+  const path = claudeUserConfigPath(options.environment, options.claudeConfigPath);
+  if (!existsSync(path)) return { path, entry: null };
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 16 * 1024 * 1024) {
+      throw new Error("unsafe Claude config");
+    }
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+      throw new Error("foreign Claude config");
+    }
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("invalid Claude config");
+    }
+    const servers = parsed.mcpServers;
+    if (servers !== undefined && (!servers || typeof servers !== "object" || Array.isArray(servers))) {
+      throw new Error("invalid Claude MCP config");
+    }
+    return { path, entry: servers?.[desired.name] ?? null };
+  } catch {
+    throw new Error("Claude Code's user configuration could not be read safely");
+  }
+}
+
+function claudeAddArgs(desired, { json = false } = {}) {
+  if (json) {
+    return [
+      "mcp", "add-json", "--scope", "user", desired.name,
+      JSON.stringify({
+        type: "stdio",
+        command: desired.command,
+        args: desired.args,
+        env: desired.env,
+      }),
+    ];
+  }
+  const args = ["mcp", "add", "--scope", "user", desired.name];
+  for (const [key, value] of Object.entries(desired.env)) args.push("-e", `${key}=${value}`);
+  args.push("--", desired.command, ...desired.args);
+  return args;
+}
+
+function reconcileClaudeRegistration(desired, options) {
+  const runner = options.runCommand;
+  const before = readClaudeRegistration(desired, options);
+  if (!before.entry && options.existingOnly) return { status: "skipped" };
+  if (before.entry && mcpRegistrationIsExact(before.entry, desired)) return { status: "verified" };
+  if (before.entry && !mcpRegistrationIsInstallerOwned(before.entry, desired)) {
+    return { status: "failed", reason: "name-collision" };
+  }
+
+  if (before.entry) {
+    neutralizeClaudeLegacyKey(desired, before);
+    runAgentCli(runner, options.environment, "claude", [
+      "mcp", "remove", "--scope", "user", desired.name,
+    ]);
+    const removed = readClaudeRegistration(desired, options);
+    if (removed.entry) return { status: "failed", reason: "remove-failed" };
+  }
+
+  runAgentCli(runner, options.environment, "claude", claudeAddArgs(desired));
+  let after = readClaudeRegistration(desired, options);
+  if (mcpRegistrationIsExact(after.entry, desired)) {
+    return { status: before.entry ? "updated" : "added" };
+  }
+
+  // A second secret-free CLI path recovers from a version-specific add parser
+  // failure. Never reconstruct a removed legacy entry containing a literal key.
+  if (after.entry && mcpRegistrationIsInstallerOwned(after.entry, desired)) {
+    runAgentCli(runner, options.environment, "claude", [
+      "mcp", "remove", "--scope", "user", desired.name,
+    ]);
+    after = readClaudeRegistration(desired, options);
+  }
+  if (!after.entry) {
+    runAgentCli(runner, options.environment, "claude", claudeAddArgs(desired, { json: true }));
+    after = readClaudeRegistration(desired, options);
+    if (mcpRegistrationIsExact(after.entry, desired)) {
+      return { status: before.entry ? "updated" : "added" };
+    }
+  }
+
+  // If a partial installer-owned entry was created, remove only that entry.
+  // An unrelated concurrent replacement is preserved untouched.
+  if (after.entry && mcpRegistrationIsInstallerOwned(after.entry, desired)) {
+    runAgentCli(runner, options.environment, "claude", [
+      "mcp", "remove", "--scope", "user", desired.name,
+    ]);
+  }
+  const final = readClaudeRegistration(desired, options);
+  return {
+    status: "failed",
+    reason: final.entry ? "verification-mismatch" : "registration-absent",
+  };
+}
+
+function verifyCodexRegistrationRedacted(desired, options) {
+  const result = runAgentCli(options.runCommand, options.environment, "codex", [
+    "mcp", "get", desired.name,
+  ]);
+  if (!result.ok) return false;
+  const output = String(result.stdout || result.out || "");
+  const envLine = output.match(/^\s*env:\s*(.*?)\s*$/m)?.[1] || "";
+  const envNames = envLine === "-" ? [] : envLine.split(/,\s*/).map((item) => {
+    const match = item.match(/^([A-Za-z_][A-Za-z0-9_]*)=\*+$/);
+    return match?.[1] || null;
+  });
+  return output.split(/\r?\n/)[0]?.trim() === desired.name &&
+    output.includes(`command: ${desired.command}`) &&
+    envNames.every(Boolean) &&
+    envNames.sort().join("\0") === Object.keys(desired.env).sort().join("\0") &&
+    !envNames.includes("BRAIN_KEY") && !envNames.includes("ADMIN_KEY");
+}
+
+function codexUserConfigPath(environment, explicitPath) {
+  if (explicitPath) return resolve(explicitPath);
+  const root = environment?.CODEX_HOME || join(
+    environment?.HOME || environment?.USERPROFILE || homedir(),
+    ".codex",
+  );
+  return resolve(root, "config.toml");
+}
+
+function parseCanonicalTomlValue(source) {
+  const raw = String(source).trim();
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  // Codex writes strings and string arrays using JSON-compatible TOML basic
+  // syntax. Unsupported hand-written TOML fails closed as a name collision.
+  return JSON.parse(raw);
+}
+
+function readCodexRegistration(desired, options) {
+  const path = codexUserConfigPath(options.environment, options.codexConfigPath);
+  if (!existsSync(path)) return { path, entry: null };
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 16 * 1024 * 1024) {
+      throw new Error("unsafe Codex config");
+    }
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+      throw new Error("foreign Codex config");
+    }
+    const mainName = `mcp_servers.${desired.name}`;
+    const envName = `${mainName}.env`;
+    const main = {};
+    const env = {};
+    let section = null;
+    let foundMain = false;
+    let foundEnv = false;
+    for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+      const header = line.match(/^\s*\[([^\]]+)]\s*(?:#.*)?$/);
+      if (header) {
+        section = header[1];
+        if (section === mainName) {
+          if (foundMain) throw new Error("duplicate Codex MCP table");
+          foundMain = true;
+        } else if (section === envName) {
+          if (foundEnv) throw new Error("duplicate Codex MCP env table");
+          foundEnv = true;
+        }
+        continue;
+      }
+      if (section !== mainName && section !== envName) continue;
+      if (!line.trim() || /^\s*#/.test(line)) continue;
+      const assignment = line.match(/^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(.+?)\s*$/);
+      if (!assignment) throw new Error("unsupported Codex MCP TOML");
+      const target = section === envName ? env : main;
+      if (Object.hasOwn(target, assignment[1])) throw new Error("duplicate Codex MCP value");
+      target[assignment[1]] = parseCanonicalTomlValue(assignment[2]);
+    }
+    if (!foundMain) return { path, entry: null };
+    return {
+      path,
+      entry: {
+        name: desired.name,
+        enabled: main.enabled,
+        type: "stdio",
+        command: main.command,
+        args: Array.isArray(main.args) ? main.args : [],
+        env,
+        env_vars: Array.isArray(main.env_vars) ? main.env_vars : [],
+        cwd: main.cwd ?? null,
+      },
+    };
+  } catch {
+    throw new Error("Codex's user configuration could not be read safely");
+  }
+}
+
+function codexAddArgs(desired) {
+  const args = ["mcp", "add", desired.name];
+  for (const [key, value] of Object.entries(desired.env)) args.push("--env", `${key}=${value}`);
+  args.push("--", desired.command, ...desired.args);
+  return args;
+}
+
+function reconcileCodexRegistration(desired, options) {
+  const before = readCodexRegistration(desired, options);
+  if (!before.entry && options.existingOnly) return { status: "skipped" };
+  if (before.entry && mcpRegistrationIsExact(before.entry, desired)) {
+    const visible = verifyCodexRegistrationRedacted(desired, options);
+    const confirmed = readCodexRegistration(desired, options);
+    return visible && mcpRegistrationIsExact(confirmed.entry, desired)
+      ? { status: "verified" }
+      : { status: "failed", reason: "verification-mismatch" };
+  }
+  if (before.entry && !mcpRegistrationIsInstallerOwned(before.entry, desired)) {
+    return { status: "failed", reason: "name-collision" };
+  }
+
+  runAgentCli(options.runCommand, options.environment, "codex", codexAddArgs(desired));
+  const localAfter = readCodexRegistration(desired, options);
+  if (!mcpRegistrationIsExact(localAfter.entry, desired)) {
+    return { status: "failed", reason: "verification-mismatch" };
+  }
+  // The human readback redacts env values. Exact values come from a second
+  // strict read of Codex's source-of-truth config, so no legacy key can enter a
+  // child stdout pipe and no name-only output can make this pass.
+  const visible = verifyCodexRegistrationRedacted(desired, options);
+  const after = readCodexRegistration(desired, options);
+  if (visible && mcpRegistrationIsExact(after.entry, desired)) {
+    return { status: before.entry ? "updated" : "added" };
+  }
+  return { status: "failed", reason: "verification-mismatch" };
+}
+
+/**
+ * Register or reconcile the brain with installed CLI agents.
+ *
+ * Every success is an exact readback of command, args, and the three nonsecret
+ * environment values. No name-only or add-exit-code shortcut is accepted.
+ */
+export async function wireAgents(m, manifestPath, options = {}) {
+  const environment = options.environment ?? process.env;
+  const runner = options.runCommand ?? run;
+  const existingOnly = options.existingOnly === true;
+  const failures = [];
   const wired = [];
-  if (!base || !key) {
-    warn("could not determine the brain URL or admin key, so the AI tools were not wired up");
-    return wired;
-  }
+  const skipped = [];
+  const name = m?.client?.slug || "brain";
+  const claudeInstalled = runAgentCli(runner, environment, "claude", ["--version"]).ok;
+  const codexInstalled = runAgentCli(runner, environment, "codex", ["--version"]).ok;
 
-  const env = { BRAIN_URL: base, BRAIN_NAME: name, BRAIN_KEY: key };
-
-  if (run("claude", ["--version"]).ok) {
-    // --scope user so it works in every folder, not just the one they happen to
-    // be standing in during the install.
-    // -e for EVERY variable. Verified 2026-08-17 against Claude Code 2.1.63:
-    // ambient environment on the `claude mcp add` process is DISCARDED, and the
-    // server is written with an empty env block. It registers, it appears in
-    // `claude mcp list`, and it fails on the client's first question with no
-    // credential. Registration is not the same as working.
-    const claudeArgs = ["mcp", "add", "--scope", "user", name];
-    for (const [k, v] of Object.entries(env)) claudeArgs.push("-e", `${k}=${v}`);
-    claudeArgs.push("--", "node", serverPath);
-    const r = run("claude", claudeArgs);
-    // Check the CREDENTIAL landed, not just the name. A registration with an
-    // empty env is the exact failure this is guarding against.
-    const got = run("claude", ["mcp", "get", name]);
-    if (got.ok && got.out.includes("BRAIN_URL=")) {
-      ok(`Claude Code: "${name}" registered with credentials`);
-      wired.push("Claude Code");
-    } else if (r.ok || got.ok) {
-      warn(
-        `Claude Code registered "${name}" but WITHOUT credentials, so it will fail on the first question.\n` +
-          `        Remove it and re-add by hand:\n` +
-          `          claude mcp remove --scope user ${name}\n` +
-          `          claude mcp add --scope user ${name} -e BRAIN_URL=${base} -e BRAIN_NAME=${name} -e BRAIN_KEY=<key> -- node ${JSON.stringify(serverPath)}`
-      );
-    } else {
-      warn(`Claude Code registration did not take: ${r.out.slice(-160)}`);
-    }
-  } else {
+  if (!claudeInstalled) {
     info("Claude Code is not installed, skipping");
+    skipped.push("Claude Code");
   }
-
-  if (run("codex", ["--version"]).ok) {
-    const args = ["mcp", "add", name];
-    for (const [k, v] of Object.entries(env)) args.push("--env", `${k}=${v}`);
-    args.push("--", "node", serverPath);
-    const r = run("codex", args);
-    const listed = run("codex", ["mcp", "list"]);
-    if (r.ok || new RegExp(`\\b${name}\\b`).test(listed.out)) {
-      ok(`Codex: "${name}" registered`);
-      wired.push("Codex");
-    } else {
-      warn(`Codex registration did not take: ${r.out.slice(-160)}`);
-    }
-  } else {
+  if (!codexInstalled) {
     info("Codex is not installed, skipping");
+    skipped.push("Codex");
+  }
+  if (!claudeInstalled && !codexInstalled) return { wired, failures, skipped };
+
+  // A standalone rotation must not need another network lookup when the owner
+  // has not chosen either registration. Inspect only local state first, and
+  // resolve the URL/key only when there is an existing target to reconcile.
+  if (existingOnly) {
+    let anyExisting = false;
+    if (claudeInstalled) {
+      try {
+        const current = readClaudeRegistration({ name }, {
+          environment,
+          claudeConfigPath: options.claudeConfigPath,
+        });
+        anyExisting ||= Boolean(current.entry);
+        if (!current.entry) skipped.push("Claude Code");
+      } catch {
+        failures.push("Claude Code");
+      }
+    }
+    if (codexInstalled) {
+      try {
+        const current = readCodexRegistration({ name }, {
+          environment,
+          codexConfigPath: options.codexConfigPath,
+        });
+        anyExisting ||= Boolean(current.entry);
+        if (!current.entry) skipped.push("Codex");
+      } catch {
+        failures.push("Codex");
+      }
+    }
+    if (failures.length || !anyExisting) return { wired, failures, skipped };
   }
 
-  return wired;
+  let base = options.baseUrl || null;
+  if (!base) {
+    const acct = options.account || await resolveAccount(m).catch(() => null);
+    base = await resolveBaseUrl(m, acct).catch(() => null);
+  }
+  if (!base) {
+    warn("could not determine the brain URL, so AI tool registrations were not changed");
+    return { wired, failures: ["url"], skipped: [] };
+  }
+
+  try {
+    const persistenceOptions = {
+      platform: options.platform ?? process.platform,
+      username: options.username ?? environment.USERNAME ?? environment.USER,
+      environment,
+      ...(options.persistenceOptions || {}),
+    };
+    const makePlan = options.adminKeyPersistencePlan ?? adminKeyPersistencePlan;
+    const readDurable = options.readAdminKeyDurably ?? readAdminKeyDurably;
+    const plan = makePlan(manifestPath, m, persistenceOptions);
+    if (!readDurable(plan, persistenceOptions)) throw new Error("missing durable key");
+  } catch {
+    warn("the durable admin key could not be verified, so AI tool registrations were not changed");
+    return { wired, failures: ["durable-key"], skipped: [] };
+  }
+
+  const desired = mcpRegistrationDescriptor(m, manifestPath, {
+    baseUrl: base,
+    serverPath: options.serverPath,
+    nodePath: options.nodePath,
+  });
+  const verifyRuntime = options.verifyMcpRuntime ?? verifyMcpRuntime;
+  if (!verifyRuntime(desired, { environment, ...(options.runtimeOptions || {}) })) {
+    warn(
+      "the MCP server did not complete its local initialize handshake, so no AI tool registration was changed"
+    );
+    return { wired, failures: ["MCP runtime"], skipped };
+  }
+  const reconcileOptions = {
+    environment,
+    existingOnly,
+    runCommand: runner,
+    claudeConfigPath: options.claudeConfigPath,
+    codexConfigPath: options.codexConfigPath,
+  };
+  if (claudeInstalled) {
+    let result;
+    try {
+      result = reconcileClaudeRegistration(desired, reconcileOptions);
+    } catch {
+      result = { status: "failed", reason: "unsafe-config" };
+    }
+    if (["verified", "updated", "added"].includes(result.status)) {
+      ok(`Claude Code: "${desired.name}" registered with a durable credential locator`);
+      wired.push("Claude Code");
+    } else if (result.status === "skipped") {
+      skipped.push("Claude Code");
+    } else {
+      warn(
+        `Claude Code's "${desired.name}" registration could not be reconciled safely. ` +
+          "No literal credential was written; rerun setup or use brain mcp-config."
+      );
+      failures.push("Claude Code");
+    }
+  }
+
+  if (codexInstalled) {
+    const result = reconcileCodexRegistration(desired, reconcileOptions);
+    if (["verified", "updated", "added"].includes(result.status)) {
+      ok(`Codex: "${desired.name}" registered with a durable credential locator`);
+      wired.push("Codex");
+    } else if (result.status === "skipped") {
+      skipped.push("Codex");
+    } else {
+      warn(
+        `Codex's "${desired.name}" registration could not be verified exactly. ` +
+          "No literal credential was written; rerun setup or use brain mcp-config."
+      );
+      failures.push("Codex");
+    }
+  }
+
+  return { wired, failures, skipped };
 }
 
 
@@ -4341,29 +5706,31 @@ export function resolveAdminKey(manifestPath, {
   platform = process.platform,
   read = (path) => readFileSync(path, "utf-8"),
   exists = existsSync,
-  runSecurity = (args) => spawnSync("/usr/bin/security", args, {
-    encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 15_000,
-  }),
+  readAdminKey = readAdminKeyFile,
+  runPowerShell,
+  runSecurity,
+  runChild,
+  environment = process.env,
+  ignoreEnvironment = false,
 } = {}) {
-  if (process.env.ADMIN_KEY) return process.env.ADMIN_KEY;
+  if (!ignoreEnvironment && environment?.ADMIN_KEY) return environment.ADMIN_KEY;
   try {
     const manifest = JSON.parse(read(manifestPath));
     const reference = manifest?.operations?.admin_key_secret;
     if (reference) {
       if (platform !== "darwin") return undefined;
-      const match = String(reference).match(/^keychain:\/\/([^/]+)\/(.+)$/);
-      if (!match) return undefined;
-      const service = decodeURIComponent(match[1]);
-      const account = decodeURIComponent(match[2]);
-      if (!service || !account || /[?#]/.test(service) || /[?#]/.test(account)) return undefined;
-      const result = runSecurity(["find-generic-password", "-s", service, "-a", account, "-w"]);
-      if (result?.status !== 0) return undefined;
-      const key = String(result.stdout || "").replace(/[\r\n]+$/, "");
-      return key || undefined;
+      const locator = parseAdminKeySecretReference(reference);
+      const child = runChild ?? (runSecurity
+        ? (_command, args, childOptions) => runSecurity(args, childOptions)
+        : undefined);
+      return readAdminKeyFromKeychain(locator, {
+        ...(child ? { runChild: child } : {}),
+        environment,
+      }) || undefined;
     }
     const p = join(dirname(resolve(manifestPath)), ".brain-admin-key");
     if (exists(p)) {
-      const k = read(p).trim();
+      const k = readAdminKey(p, { platform, runPowerShell });
       if (k) return k;
     }
   } catch { /* fall through to the callers' own error text */ }
@@ -4670,6 +6037,11 @@ export function assertEvalSucceeded(result) {
   );
 }
 
+/** The eval child receives its one required key on stdin and no credentials in its environment. */
+export function evalChildEnvironment(environment = process.env) {
+  return localToolEnvironment(environment, { BRAIN_ADMIN_KEY_STDIN: "1" });
+}
+
 async function cmdEval(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
   const { m } = loadManifest(manifestPath);
@@ -4726,7 +6098,18 @@ async function cmdEval(manifestPath) {
   }
   for (const f of ["rerank", "no-think", "json"]) if (flags[f]) args.push(`--${f}`);
 
-  const r = run(process.execPath, args, { env: { ...process.env, BRAIN_ADMIN_KEY: adminKey }, timeout: 600_000 });
+  const keyInput = Buffer.from(`${adminKey}\n`, "utf8");
+  let r;
+  try {
+    r = run(process.execPath, args, {
+      env: evalChildEnvironment(),
+      inheritEnv: false,
+      input: keyInput,
+      timeout: 600_000,
+    });
+  } finally {
+    keyInput.fill(0);
+  }
   process.stdout.write(r.out || "");
   return assertEvalSucceeded(r);
 }
@@ -4751,6 +6134,73 @@ async function cmdDiagnose(manifestPath) {
   return r;
 }
 
+function nonNegativeReceiptCount(body, field, label) {
+  const value = body?.[field];
+  if (!Number.isSafeInteger(value) || value < 0) {
+    die(`${label} did not include a valid non-negative whole-number ${field} count. Nothing was declared complete.`);
+  }
+  return value;
+}
+
+/** Accept only the exact reindex receipt shape the installed Worker promises. */
+export function validateReindexReceipt(body, { confirm = false, source = null } = {}) {
+  const phase = confirm ? "confirmation" : "preview";
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    die(`reindex returned HTTP success but no valid ${phase} receipt. Nothing was treated as queued.`);
+  }
+  const chunks = nonNegativeReceiptCount(body, "chunks", `the reindex ${phase} receipt`);
+  const queued = nonNegativeReceiptCount(body, "queued", `the reindex ${phase} receipt`);
+  const alreadyQueued = nonNegativeReceiptCount(body, "already_queued", `the reindex ${phase} receipt`);
+  if (body.dry_run !== !confirm) {
+    die(`the reindex ${phase} receipt did not confirm ${confirm ? "a real queue write" : "a dry run"}. Nothing was treated as queued.`);
+  }
+  if (body.source !== source) {
+    die(`the reindex ${phase} receipt did not match the requested source. Nothing was treated as queued.`);
+  }
+  if (!confirm) {
+    if (queued !== 0) {
+      die("the reindex preview claimed that it changed the queue. Refusing to treat that response as a safe dry run.");
+    }
+    return body;
+  }
+
+  const pending = nonNegativeReceiptCount(body, "pending", "the reindex confirmation receipt");
+  if (pending !== alreadyQueued + queued) {
+    die("the reindex confirmation counts do not reconcile. Nothing was treated as fully queued.");
+  }
+  if (chunks > 0 && pending === 0) {
+    die("the reindex confirmation reported chunks to rebuild but no pending vector work. Nothing was treated as fully queued.");
+  }
+  return body;
+}
+
+/** A drain response is success only when both progress counts are explicit. */
+export function validateDrainReceipt(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    die("drain returned HTTP success but no valid receipt. The vector index was not declared complete.");
+  }
+  const drained = nonNegativeReceiptCount(body, "drained", "the drain receipt");
+  const remaining = nonNegativeReceiptCount(body, "remaining", "the drain receipt");
+  if (remaining > 0 && drained === 0) {
+    die(
+      `the drain stopped making progress with ${remaining} vector operation(s) still queued.\n` +
+        "      The vector index is incomplete. `brain health` will show the stalled backlog."
+    );
+  }
+  return { drained, remaining };
+}
+
+/** Refuse a green exit when the bounded drain loop ends with work outstanding. */
+export function assertDrainComplete({ remaining, rounds, maxRounds = 400 }) {
+  if (remaining !== 0) {
+    die(
+      `the drain reached its ${maxRounds}-round safety limit with ${remaining} vector operation(s) still queued.\n` +
+        "      Completed chunks are safe, but the vector index is still incomplete. Re-run `brain drain` to continue."
+    );
+  }
+  return { remaining, rounds };
+}
+
 async function cmdReindex(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
   const { m } = loadManifest(manifestPath);
@@ -4770,8 +6220,11 @@ async function cmdReindex(manifestPath) {
       headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
       body: JSON.stringify({ source, confirm }),
     }, { timeoutMs: 120_000, what: "the reindex" });
-    if (!res.ok) die(`reindex failed (${res.status}): ${(await res.text()).slice(0, 200)}`);
-    return res.json();
+    const raw = await res.text();
+    if (!res.ok) die(`reindex failed (${res.status}): ${raw.slice(0, 200)}`);
+    let body = null;
+    try { body = JSON.parse(raw); } catch { /* validated below */ }
+    return validateReindexReceipt(body, { confirm, source });
   };
 
   const plan = await call(false);
@@ -4812,7 +6265,10 @@ async function cmdDrain(manifestPath) {
   const started = Date.now();
   let drained = 0;
   let remaining = null;
-  for (let round = 1; round <= 400; round++) {
+  let rounds = 0;
+  const maxRounds = 400;
+  for (let round = 1; round <= maxRounds; round++) {
+    rounds = round;
     const res = await retryTransient(() => http(`${base}/api/admin/brain/drain`, {
       method: "POST",
       headers: { "X-Admin-Key": adminKey },
@@ -4822,10 +6278,13 @@ async function cmdDrain(manifestPath) {
         `Retrying ${attempt}/${attempts - 1}; completed chunks are already safe.`
       ),
     });
-    if (!res.ok) die(`drain failed (${res.status}): ${(await res.text()).slice(0, 200)}`);
-    const j = await res.json().catch(() => ({}));
-    drained += Number(j.drained || 0);
-    remaining = Number(j.remaining || 0);
+    const raw = await res.text();
+    if (!res.ok) die(`drain failed (${res.status}): ${raw.slice(0, 200)}`);
+    let body = null;
+    try { body = JSON.parse(raw); } catch { /* validated below */ }
+    const receipt = validateDrainReceipt(body);
+    drained += receipt.drained;
+    remaining = receipt.remaining;
     const mins = (Date.now() - started) / 60000;
     const rate = mins > 0.05 ? Math.round(drained / mins) : null;
     info(
@@ -4833,13 +6292,10 @@ async function cmdDrain(manifestPath) {
         (rate ? `, ~${rate}/min` : "") +
         (rate && remaining ? `, about ${Math.max(1, Math.ceil(remaining / rate))} min left` : "")
     );
-    if (!remaining) break;
-    if (!j.drained) {
-      warn("the drain stopped making progress. `brain health` will show why.");
-      break;
-    }
+    if (remaining === 0) break;
   }
-  if (remaining === 0) ok(`vector index is caught up (${drained} embedded)`);
+  assertDrainComplete({ remaining, rounds, maxRounds });
+  ok(`vector index is caught up (${drained} embedded)`);
   return { drained, remaining };
 }
 
@@ -4851,8 +6307,8 @@ function supportCommandOperation(label, operation) {
     const explained = ["SUPPORT_JOURNAL_UNSAFE_PATH", "SUPPORT_JOURNAL_EXISTS"].includes(error?.code) ||
       error instanceof TypeError;
     die(explained
-      ? `${String(error.message)} Nothing was uploaded or sent.`
-      : `the private issue journal could not ${label}. Nothing was uploaded or sent.`);
+      ? `${String(error.message)} The installer did not upload or send anything.`
+      : `the private issue journal could not ${label}. The installer did not upload or send anything.`);
   }
 }
 
@@ -4878,7 +6334,7 @@ async function cmdSupport() {
   if (flags.export) {
     const result = supportCommandOperation("be exported", () => exportSupportJournal(flags.export));
     ok(`exported ${result.events} private issue note(s) to ${flags.export}`);
-    info("nothing was uploaded or sent");
+    info("the installer did not upload or send this export; a synced destination may upload it");
     return result;
   }
 
@@ -4894,11 +6350,14 @@ async function cmdSupport() {
 
   const content = supportCommandOperation("be read", () => previewSupportJournal());
   const events = content ? content.split("\n").length - 1 : 0;
-  const { eventsDir } = supportCommandOperation("be located", () => supportJournalPaths());
+  const maxMiB = SUPPORT_MAX_BYTES / (1024 * 1024);
   console.log(`\n  ${c.bold("private installer issue journal")}\n`);
-  console.log(`  ${events} sanitized issue note(s) stored locally`);
-  console.log(`  ${eventsDir}`);
-  console.log("  Nothing has been uploaded or sent.");
+  console.log(`  ${events} recent shareable issue note(s) available to preview or export`);
+  console.log(`  Shareable view: last ${SUPPORT_MAX_AGE_DAYS} days, newest ${SUPPORT_MAX_EVENTS} notes, up to ${maxMiB} MiB.`);
+  console.log("  Safe expired and overflow notes are cleaned up after writes.");
+  console.log("  Fresh or concurrent files may remain until a later safe cleanup.");
+  console.log("  Links and special files are refused and require manual review.");
+  console.log("  The installer has not uploaded or sent these notes.");
   console.log("  Review exact shareable bytes: brain support --preview");
   console.log("  Export for a private support issue: brain support --export <file>\n");
 }
@@ -5011,7 +6470,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain doctor     [manifest]            check this machine has everything it needs
     brain verify     <manifest>            check the token and resolve the account
     brain provision  <manifest>            create D1 (and R2), write IDs back
-    brain secrets    <manifest>            set worker secrets from the environment
+    brain secrets    <manifest>            set secrets and durably rotate ADMIN_KEY
     brain migrate    <manifest>            apply pending schema migrations
     brain deploy     <manifest>            upload the worker with its bindings
     brain health     <manifest>            prove the install actually works
