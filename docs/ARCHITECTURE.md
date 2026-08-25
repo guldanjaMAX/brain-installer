@@ -192,6 +192,15 @@ early as the backend supports. Reciprocal rank fusion combines the rankings.
 Optional reranking may reorder a bounded candidate set when explicitly enabled.
 Scaffolding files are demoted rather than silently removed.
 
+Retrieval first collapses multiple chunks from one document. It also collapses
+same-source, same-date documents with the same canonical content hash before the
+public result limit, so copied files cannot occupy several evidence slots. The
+source and date remain part of the key because identical text can be a valid
+record at a different time or in a different connector. The internal content
+hash is removed from the response. This is retrieval protection, not physical
+deduplication: source lifecycle rows remain intact until an alias-aware storage
+plan can preserve update and deletion semantics.
+
 `/api/rag/unified` returns ranked evidence. It has no universal relevance floor,
 so a result list by itself is not proof that the corpus answers the question.
 `/api/rag/think` is the owner-facing answer path: it generates an answer from

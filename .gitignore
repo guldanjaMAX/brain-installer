@@ -38,6 +38,13 @@ eval/eval.config.local.json
 .brain-curated-sync-*.json
 .brain-curated-sync-*.json.tmp-*
 
+# Verified-recovery control files and D1 SQL exports are private instance state.
+# The SQL artifact contains the full durable corpus and is never support data.
+.brain-recovery-*.json
+.brain-recovery-*.json.tmp-*
+.brain-recovery-*.sql
+.brain-recovery-*.sql.tmp-*
+
 # Adjacent fallback admin-key files contain the Brain's live authentication
 # secret. Atomic writes briefly create the matching residue beside them.
 .brain-admin-key

@@ -81,6 +81,9 @@ for (const table of ["documents", "chunks"]) {
 for (const index of ["idx_chunks_category", "idx_chunks_top_folder", "idx_chunks_platform"]) {
   check(`${index} exists`, names.has(index), "filtered hydration would otherwise scan the chunk table");
 }
+check("idx_documents_live_content_hash exists",
+  names.has("idx_documents_live_content_hash"),
+  "exact duplicate diagnosis would otherwise group an unindexed document table");
 check("vector_outbox retains vector_id after a chunk row is gone",
   new Set(db.prepare("PRAGMA table_info(vector_outbox)").all().map((r) => r.name)).has("vector_id"));
 

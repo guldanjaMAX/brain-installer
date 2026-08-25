@@ -910,7 +910,7 @@ export async function diagnose(env, {
     if (extra) add({ id: "duplicate_documents", area: "integrity", severity: "warn", count: extra,
       title: `${extra} duplicate document(s) are stored more than once`,
       detail: `${Number(summary?.groups || 0)} exact-content group(s) contain redundant documents under different identities. Each copy competes for the same retrieval slots, so one can push out a different and better source.`,
-      action: "Usually one folder loaded twice under two source names. Check `brain sources`." });
+      action: "Do not delete them blindly. Review their source and path aliases first. Retrieval collapses safe same-source, same-date copies, but physical cleanup needs to preserve update, deletion, and citation identity." });
   });
 
   /* ---------------- EFFICIENCY: is it stored well ---------------- */

@@ -53,6 +53,7 @@ const expected = [
   "docs/COMPETITIVE-BENCHMARK.md",
   "docs/ENGINEERING-STANDARDS.md",
   "docs/EVALUATION.md",
+  "docs/RECOVERY.md",
   "docs/LEGACY-SUPABASE-EXIT.md",
   "docs/README-developer.md",
   "docs/decisions/000-template.md",
@@ -85,6 +86,7 @@ const expected = [
   "migrations/d1/0006_freshness.sql",
   "migrations/d1/0007_filter_metadata.sql",
   "migrations/d1/0008_vector_delete_outbox.sql",
+  "migrations/d1/0009_document_content_hash_index.sql",
   "onboarding/01-intake-RUNBOOK.md",
   "onboarding/01-intake-questionnaire.md",
   "onboarding/02-client-effort-and-timeline.md",
@@ -100,6 +102,7 @@ const expected = [
   "operations/curated-sync-scheduler.mjs",
   "operations/drive-removal-plan.mjs",
   "operations/drive-scheduler.mjs",
+  "operations/verified-recovery.mjs",
   "operations/windows-dpapi.ps1",
   "operations/windows-dpapi-bridge.mjs",
   "operations/windows-dpapi.cs",
@@ -137,6 +140,10 @@ const requiredGitIgnored = [
   ".brain-curated-sync-plan.json",
   ".brain-curated-sync-ledger.json",
   ".brain-curated-sync-ledger.json.tmp-deadbeef",
+  ".brain-recovery-plan.json",
+  ".brain-recovery-state.json",
+  ".brain-recovery-state.json.tmp-deadbeef",
+  ".brain-recovery-export.sql",
 ];
 const gitIgnoreFailures = requiredGitIgnored.filter((path) =>
   spawnSync("git", ["check-ignore", "--quiet", "--no-index", path], {
