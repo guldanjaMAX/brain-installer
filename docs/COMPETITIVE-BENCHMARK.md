@@ -1,6 +1,6 @@
 # Competitive benchmark
 
-**Reviewed:** 2026-08-24  
+**Reviewed:** 2026-08-25
 **Scope:** Installable and managed personal or organizational knowledge-base RAG systems.
 
 This is a product benchmark, not a feature shopping list. A capability belongs in
@@ -29,7 +29,9 @@ Official Cloudflare references: [AutoRAG REST migration](https://developers.clou
 
 | Category | Representative systems | What they do better today | Product response |
 |---|---|---|---|
-| Managed RAG | Cloudflare AI Search, Vectara, Pinecone Assistant | Managed indexing jobs, retrieval tuning, metadata filters, reranking, query visibility, and grounded-answer features | Run a shadow benchmark. Adopt only where quality, lifecycle safety, cost, and ownership are at least as good. |
+| Managed RAG | Cloudflare AI Search, Vectara, Pinecone Assistant, Amazon Bedrock Knowledge Bases, Azure AI Search | Managed indexing jobs, retrieval tuning, metadata filters, reranking, query visibility, grounded-answer features, and first-party evaluation workflows | Run a shadow benchmark. Adopt only where quality, lifecycle safety, cost, and ownership are at least as good. |
+| Document understanding | Google Document AI, Pinecone multimodal parsing | OCR, page layout, tables, images, and annotated extraction evaluation | Benchmark extraction separately from retrieval. Keep source-page canaries so a polished answer cannot hide a missing field or page. |
+| Advanced ranking | Elastic, Azure AI Search | Semantic ranking, learning-to-rank options, hybrid candidate fusion, and relevance-debugging tools | Compare with pooled private relevance judgments before adding another production search dependency. |
 | Turnkey and self-hosted assistants | Open WebUI, AnythingLLM, Khoj | User interface, multi-user controls, broad model support, OCR options, agentic file browsing, incremental source sync, and exports | Keep the installer backend-focused, but match their install clarity, corpus visibility, and permission safety. |
 | Obsidian-native tools | Copilot for Obsidian, Smart Connections, Khoj | Automatic vault indexing, clickable note navigation, local embeddings, and related-note discovery | Preserve Obsidian usability through MCP and links without making a desktop plugin the canonical store. |
 | RAG frameworks and evaluation platforms | LlamaIndex, LangSmith, Phoenix, Ragas, DeepEval | Pipeline caching, document management, datasets, experiments, traces, human review, production feedback, and component-level evaluation | Build a small native evaluation contract and allow optional export to standard observability tools. |
@@ -46,6 +48,11 @@ Selected official references:
   [reranking](https://docs.vectara.com/docs/search-and-retrieval/reranking), and
   [observability](https://docs.vectara.com/docs/observability)
 - [Pinecone Assistant workflow and evaluation](https://docs.pinecone.io/guides/assistant/overview)
+- [Amazon Bedrock RAG evaluation](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base-evaluation-create-randg.html)
+- [Azure AI Search relevance pipeline](https://learn.microsoft.com/en-us/azure/search/search-relevance-overview)
+- [Google Document AI evaluation](https://docs.cloud.google.com/document-ai/docs/evaluate) and
+  [layout parsing](https://docs.cloud.google.com/document-ai/docs/layout-parse-chunk)
+- [Elastic ranking](https://www.elastic.co/docs/solutions/search/ranking)
 - [Open WebUI Knowledge](https://docs.openwebui.com/features/workspace/knowledge/)
 - [AnythingLLM product and architecture](https://github.com/mintplex-labs/anything-llm)
 - [Khoj sources and interfaces](https://docs.khoj.dev/features/all-features/)
@@ -91,11 +98,13 @@ parts that make an install supportable, recoverable, and safe to reproduce.
 | Priority | Gap | Required outcome |
 |---|---|---|
 | P0 | Evaluation depth | Separate ingestion, retrieval, generation, citation, refusal, security, latency, and cost failures. Add Precision@K, NDCG, answer correctness and completeness, claim faithfulness, citation precision and recall, refusal calibration, and slice-level reports. |
+| P0 | Relevance judgments and statistics | Pool the union of top results from every compared retrieval variant, add private graded qrels and hard negatives, then calculate standard Precision, Recall, MAP and nDCG with explicit confidence methods. Repeated calls are not independent questions. |
 | P0 | Corpus coverage ledger | A private report must reconcile every expected source item into indexed, skipped, refused, failed, quarantined, deleted, stale, or awaiting-vector state and give a corrective action. |
 | P0 for shared installs | Permissions | Replace shared all-access credentials with authenticated users and pre-retrieval document or corpus authorization. Add negative tests proving that an unauthorized result never reaches retrieval or generation. |
 | P0 | Verified recovery | Automate a canonical D1 export, protected retention, restore into a clean target, Vectorize rebuild, and post-restore evaluation. A backup is not proven until restore succeeds. |
 | P0 | Executable configuration documentation | Every operational manifest field needs an implementation status, enforcing component, and test identifier. CI must reject a field that appears active but has no consuming code. |
 | P1 | Query observability and feedback | Add local, privacy-controlled stage traces with configuration, filters, candidate scores, timings, model versions, and result identities. Let a user mark an answer helpful or wrong and promote a reviewed failure into the golden set. |
+| P1 | Multi-turn memory evaluation | Add follow-up resolution, temporal update, correction, cross-session reasoning, abstention, and leakage cases. Single-question retrieval cannot certify a conversational brain. |
 | P1 | Retrieval feature lab | Measure Cloudflare reranking, query rewriting, recency or priority boosting, diversity, thresholds, and candidate depth as named variants. Never change the default on intuition alone. |
 | P1 | OCR and connector breadth | Add OCR and table or image extraction plus a standard connector contract for inventory, cursor, fetch, transform, checksum, delete, retry, quarantine, and reconciliation. Priority missing sources are live message refresh, Slack, Notion, and meeting transcripts. |
 | P2 | Graph or multi-hop retrieval | Add only if chronology, relationship, or corpus-wide synthesis slices fail under well-tuned hybrid retrieval. Include incremental update and deletion tests before release. |
@@ -110,6 +119,14 @@ baseline regression detection, and a named release profile that enforces a
 query-kind slice. That release profile is a structural retrieval-suite gate,
 not full answer, citation, corpus-completeness, or security certification.
 Extend it rather than replacing it with a judge-only score.
+
+The current evidence-slot precision and nDCG describe how densely the top results
+satisfy the case's required slots. They are not yet standard pooled-relevance
+metrics because an unlisted but genuinely relevant document can receive grade
+zero. Preserve those slot metrics, label them accurately, and add human-reviewed
+pooled qrels for backend or retrieval-variant comparisons. See
+[NIST relevance judgment pooling](https://trec.nist.gov/data/reljudge_eng.html)
+and [trec_eval](https://github.com/usnistgov/trec_eval).
 
 A complete case should record:
 

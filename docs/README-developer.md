@@ -14,6 +14,11 @@ pipeline but has not completed a real-account production run. The full suite and
 packed CLI pass on Windows in CI, but no real-account Windows install has been
 completed. See "What is not built" before promising anything to anyone.
 
+Engineering changes follow [the code, test, documentation, and tracking
+standard](./ENGINEERING-STANDARDS.md). Architecturally significant choices are
+recorded in [append-only decision records](./decisions/README.md), beginning
+with the [Cloudflare-native install decision](./decisions/001-cloudflare-native-standard.md).
+
 ---
 
 ## Requirements
