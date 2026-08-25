@@ -1,14 +1,18 @@
 import {
   chmodSync,
+  closeSync,
+  constants as fsConstants,
   existsSync,
   lstatSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   rmSync,
   statSync,
   symlinkSync,
+  writeSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -300,6 +304,29 @@ try {
       statSync(`${plan.stdoutPath}.1`).size === maxBytes &&
       statSync(`${plan.stdoutPath}.2`).size === maxBytes &&
       !existsSync(`${plan.stdoutPath}.3`));
+  }
+  {
+    if (process.platform === "win32") {
+      check("an already-open launchd stream survives in-place rotation on its target platform", true);
+    } else {
+      const liveHome = join(directory, "retention-live-descriptor-home");
+      const plan = buildDriveSchedulerPlan(manifestPath, opts({ home: liveHome }));
+      mkdirSync(plan.logsDir, { recursive: true });
+      const maxBytes = 64;
+      const original = Buffer.from("old-stream:" + "L".repeat(96));
+      const afterRotation = Buffer.from("new-stream-data\n");
+      writeFileSync(plan.stdoutPath, original, { mode: 0o600 });
+      const launchdDescriptor = openSync(plan.stdoutPath, fsConstants.O_WRONLY | fsConstants.O_APPEND);
+      try {
+        rotateDriveSchedulerLogs(plan, { logMaxBytes: maxBytes, logHistoryFiles: 2 });
+        writeSync(launchdDescriptor, afterRotation);
+      } finally {
+        closeSync(launchdDescriptor);
+      }
+      check("an already-open launchd append stream survives in-place rotation",
+        readFileSync(`${plan.stdoutPath}.1`).equals(original.subarray(original.length - maxBytes)) &&
+        readFileSync(plan.stdoutPath).equals(afterRotation));
+    }
   }
   {
     if (process.platform === "win32") {
