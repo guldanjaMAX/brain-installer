@@ -209,7 +209,9 @@ try {
   assert.equal(Object.hasOwn(busySpawn.options.env, "CLOUDFLARE_API_TOKEN"), false);
   assert.equal(busySpawn.options.stdio[0], "ignore");
   assert.equal(Number.isInteger(busySpawn.options.stdio[3]), true);
-  assert.equal(statSync(plan.lockPath).mode & 0o777, 0o600);
+  if (process.platform !== "win32") {
+    assert.equal(statSync(plan.lockPath).mode & 0o777, 0o600);
+  }
 
   if (process.platform === "darwin") {
     const holderReady = join(sandbox, "lock-holder-ready");
@@ -406,7 +408,9 @@ try {
   assert.equal(executed.receipt.target_coverage.cloudflare, 1);
   assert.equal(executed.receipt.target_coverage.legacy, 1);
   assert.equal(executed.receipt.historical_raw_drive.deletion_eligible, false);
-  assert.equal(statSync(plan.freshnessPath).mode & 0o777, 0o600);
+  if (process.platform !== "win32") {
+    assert.equal(statSync(plan.freshnessPath).mode & 0o777, 0o600);
+  }
   const receiptText = readFileSync(plan.freshnessPath, "utf8");
   for (const forbidden of ["fixture.md", "fixture-source-id", "legacy.manifest", "cloudflare.manifest"]) {
     assert.equal(receiptText.includes(forbidden), false, `freshness omitted ${forbidden}`);
