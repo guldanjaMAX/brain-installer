@@ -5,11 +5,12 @@ keyword search live in D1, vectors live in Vectorize, and the Worker fuses them.
 Nothing runs on our infrastructure, and nothing but a scoped token is held during
 the engagement.
 
-**Status: 0.1.12.** Provisioning, retrieval, resumable folder ingest, deletion,
+**Status: 0.1.13.** Provisioning, retrieval, resumable folder ingest, deletion,
 upgrade rollback, and `brain setup` are verified end to end against real
 Cloudflare on macOS. Google Drive OAuth and a bounded real-account ingest have
-also been verified. The complete Drive baseline is the remaining production
-field gate for this release. Gmail uses the same tested cursor and storage
+also been verified. The complete Drive baseline and the recovery adapter's
+disposable real-Cloudflare drill are the remaining production field gates for
+this release. Gmail uses the same tested cursor and storage
 pipeline but has not completed a real-account production run. The full suite and
 packed CLI pass on Windows in CI, but no real-account Windows install has been
 completed. See "What is not built" before promising anything to anyone.

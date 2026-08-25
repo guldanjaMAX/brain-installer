@@ -4,6 +4,31 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.13
+
+**Repeated evidence no longer crowds out real results, migrations resume
+safely, recovery drills fail closed, and authenticated Brain requests now
+refuse redirects.**
+
+- Exact copies collapse only during retrieval when their source, date, and
+  content match. Stored documents remain untouched, so the behavior is
+  reversible and source evidence is preserved.
+- Resumable message migration freezes its source boundary, records exact batch
+  receipts, locks concurrent runs, and refuses an ambiguous owner label or
+  timezone before creating a new checkpoint.
+- Private corpus contracts and deterministic answer canaries now test promised
+  source-family coverage, literal values, numbers, dates, and inline citations.
+  Their sanitized artifacts report coverage without storing questions,
+  answers, filenames, paths, or private identifiers.
+- Recovery field-drill tooling now orchestrates export, isolated D1 restore,
+  Vectorize rebuild, readback, health, and release evaluation behind five
+  explicit approvals. A disposable real-Cloudflare drill remains required
+  before calling production recovery verified.
+- Every packaged client that sends the Brain admin key now requires HTTPS
+  outside loopback, refuses redirects, and verifies the final origin.
+- Release automation pins third-party GitHub Actions to reviewed commit hashes,
+  and package tests inspect the real tarball for private material.
+
 ## 0.1.12
 
 **Large imports are faster, concurrent updates fail closed, and release checks

@@ -19,14 +19,14 @@ asset and installs into a folder owned by your user account, so it needs no Git,
 Mac or Linux:
 
 ```bash
-npm install --global --ignore-scripts --no-audit --no-fund --prefix "$HOME/.financial-brain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.12/brain-installer-0.1.12.tgz"
+npm install --global --ignore-scripts --no-audit --no-fund --prefix "$HOME/.financial-brain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.13/brain-installer-0.1.13.tgz"
 export PATH="$HOME/.financial-brain/bin:$PATH"
 ```
 
 Windows PowerShell:
 
 ```powershell
-npm.cmd install --global --ignore-scripts --no-audit --no-fund --prefix "$env:LOCALAPPDATA\FinancialBrain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.12/brain-installer-0.1.12.tgz"
+npm.cmd install --global --ignore-scripts --no-audit --no-fund --prefix "$env:LOCALAPPDATA\FinancialBrain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.13/brain-installer-0.1.13.tgz"
 $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
 ```
 
