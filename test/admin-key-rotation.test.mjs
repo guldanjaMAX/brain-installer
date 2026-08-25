@@ -323,7 +323,7 @@ try {
   assert.equal(keychainReceipt.replaced, true);
   assert.equal(keychain.stored, replacementKey);
   const writeCall = keychain.calls.find((call) => call.command.endsWith("/expect"));
-  assert.ok(writeCall.args[0].endsWith("/connectors/keychain-write.exp"));
+  assert.ok(writeCall.args[0].replaceAll("\\", "/").endsWith("/connectors/keychain-write.exp"));
   assert.equal(writeCall.args.at(-1), "-w");
   assert.equal(writeCall.input.toString("utf8"), `${replacementKey}\n`);
   for (const call of keychain.calls) {
