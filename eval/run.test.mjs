@@ -227,6 +227,167 @@ test("a false answer in every required normal-risk unanswerable case blocks rele
   assert.equal((result.stdout.match(/FALSE_ANSWER/g) || []).length >= 5, true);
 });
 
+test("an answerable case executes deterministic claims and citation resolution without storing content artifacts", async () => {
+  let thinkCalls = 0;
+  const result = await runFixture({
+    questions: [{
+      id: "critical-answer",
+      kind: "single",
+      risk: "critical",
+      domains: ["general"],
+      formats: ["text"],
+      question: "What are the synthetic policy code and approved limit?",
+      expect: [{
+        slot_id: "policy",
+        doc: "Synthetic Policy Record",
+        any_of: ["curated:doc-a"],
+      }],
+      answer_expect: {
+        claim_boundary: "sentence",
+        claims: [
+          {
+            claim_id: "policy-code",
+            contains_any: ["the policy code is AX-17"],
+            evidence_slot_ids: ["policy"],
+          },
+          {
+            claim_id: "approved-limit",
+            exact_value: {
+              type: "number", canonical: 1250, normalization: "numeric", tolerance: 0,
+            },
+            evidence_slot_ids: ["policy"],
+          },
+        ],
+      },
+    }],
+    artifacts: true,
+    save: true,
+    route: ({ url }) => {
+      if (url.pathname !== "/api/rag/think") return null;
+      thinkCalls++;
+      return {
+        body: {
+          answer: "The policy code is ax-17 [1]. The approved limit is $1,250.00 [1].",
+          citations: [{ n: 1, source: "curated", ref: "doc-a", title: "Synthetic Policy Record" }],
+          gaps: [],
+        },
+      };
+    },
+  });
+
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(thinkCalls, 1);
+  assert.deepEqual(result.runArtifact.metrics.deterministic_answer, {
+    total: 1,
+    conclusive: 1,
+    passed: 1,
+    required_claims: 2,
+    matched_claims: 2,
+    cited_claims: 2,
+    resolved_claims: 2,
+  });
+  assert.equal(result.runArtifact.cases[0].deterministic_answer.pass, true);
+  assert.equal(result.savedRun.questions[0].answer.pass, true);
+  const shareable = `${JSON.stringify(result.runArtifact)}\n${result.failuresArtifact}\n${result.junitArtifact}`;
+  assert.doesNotMatch(shareable, /AX-17|1,250|Synthetic Policy Record|What are the synthetic policy/);
+  assert.match(result.stdout, /no semantic judge or faithfulness claim/);
+});
+
+test("a critical answer with a citation to the wrong source fails the gate", async () => {
+  const result = await runFixture({
+    questions: [{
+      id: "critical-citation",
+      kind: "single",
+      risk: "critical",
+      question: "What is the synthetic policy code?",
+      expect: [{ slot_id: "policy", any_of: ["curated:doc-a"] }],
+      answer_expect: {
+        claim_boundary: "sentence",
+        claims: [{
+          claim_id: "policy-code",
+          contains_any: ["the policy code is AX-17"],
+          evidence_slot_ids: ["policy"],
+        }],
+      },
+    }],
+    artifacts: true,
+    route: ({ url }) => url.pathname === "/api/rag/think"
+      ? {
+          body: {
+            answer: "The policy code is AX-17 [1].",
+            citations: [{ n: 1, source: "curated", ref: "different-policy" }],
+          },
+        }
+      : null,
+  });
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /CITATION_UNRESOLVABLE/);
+  assert.equal(result.runArtifact.cases[0].deterministic_answer.pass, false);
+  assert.deepEqual(result.runArtifact.cases[0].deterministic_answer.failure_codes, ["CITATION_UNRESOLVABLE"]);
+});
+
+test("critical declared answer checks cannot be silently skipped in smoke", async () => {
+  const result = await runFixture({
+    questions: [{
+      id: "critical-answer-skip",
+      kind: "single",
+      risk: "critical",
+      question: "What is the synthetic policy code?",
+      expect: [{ slot_id: "policy", any_of: ["curated:doc-a"] }],
+      answer_expect: {
+        claim_boundary: "sentence",
+        claims: [{
+          claim_id: "policy-code",
+          contains_any: ["the policy code is AX-17"],
+          evidence_slot_ids: ["policy"],
+        }],
+      },
+    }],
+    args: ["--no-think"],
+  });
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /ANSWER_PROBE_SKIPPED/);
+});
+
+test("legacy answerable v1 cases remain retrieval-only unless answer_expect is declared", async () => {
+  let thinkCalls = 0;
+  const result = await runFixture({
+    questions: [{
+      id: "legacy-answerable", kind: "single", risk: "critical",
+      question: "Which fixture is present?", expect: [{ any_of: ["curated:doc-a"] }],
+    }],
+    route: ({ url }) => {
+      if (url.pathname === "/api/rag/think") thinkCalls++;
+      return null;
+    },
+  });
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(thinkCalls, 0);
+});
+
+test("malformed deterministic answer contracts fail before any credentialed request", async () => {
+  let requests = 0;
+  const result = await runFixture({
+    questions: [{
+      id: "invalid-answer-contract", kind: "single", risk: "critical",
+      question: "What is the synthetic policy code?",
+      expect: [{ any_of: ["curated:doc-a"] }],
+      answer_expect: {
+        claim_boundary: "sentence",
+        claims: [{
+          claim_id: "policy-code",
+          contains_any: ["the policy code is AX-17"],
+          evidence_slot_ids: ["missing-slot"],
+        }],
+      },
+    }],
+    route: () => { requests++; return null; },
+  });
+  assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+  assert.equal(requests, 0);
+  assert.match(result.stderr, /must name unique existing evidence_slot_ids/);
+});
+
 test("the distributed runner records reproducible provenance and CI artifacts", async () => {
   const key = "fixture-eval-admin-key";
   const server = createServer((request, response) => {

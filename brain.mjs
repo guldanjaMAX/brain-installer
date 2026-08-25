@@ -6942,7 +6942,7 @@ async function cmdEval(manifestPath) {
     const preflight = assertEvalProfilePreflight(goldenPath, requestedProfile);
     if (preflight.profile === "release" && flags["no-think"]) {
       throw new Error(
-        "--no-think cannot be used with the release profile because every required unanswerable case must run",
+        "--no-think cannot be used with the release profile because every refusal and declared answer canary must run",
       );
     }
   } catch (error) {

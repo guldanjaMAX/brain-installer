@@ -34,6 +34,7 @@ import { localToolEnvironment } from "../doctor.mjs";
 import {
   scoreQuestion,
   scoreRefusal,
+  scoreDeterministicAnswer,
   aggregate,
   dedupeByDocument,
   findRegressions,
@@ -277,25 +278,27 @@ async function runOne(client, q, opts) {
     }
   }
 
+  const retrievalStarted = performance.now();
+  let row;
   try {
     const results = await client.retrieve(q.question, opts);
     const raw = scoreQuestion(q, results);
     const byDoc = scoreQuestion(q, dedupeByDocument(results));
     const quality = retrievalQuality(q, results, [1, opts.k, 10]);
-    return {
+    row = {
       ...baseFields(q),
       ...raw,
       byDocument: { slots: byDoc.slots, satisfiedAt: byDoc.satisfiedAt },
       quality,
       diagnosis: diagnoseRetrieval(q, raw, opts.k),
-      latency_ms: Math.round(performance.now() - started),
+      retrieval_latency_ms: Math.round(performance.now() - retrievalStarted),
       returned: results.length,
       distinct: dedupeByDocument(results).length,
       top: results.slice(0, 3).map(documentKeyOf),
     };
   } catch (e) {
     const failed = scoreQuestion(q, []);
-    return {
+    row = {
       ...baseFields(q),
       ...failed,
       quality: retrievalQuality(q, [], [1, opts.k, 10]),
@@ -305,6 +308,43 @@ async function runOne(client, q, opts) {
         inspect: "brain health, authentication, network path, and retrieval endpoint",
       },
       error: e.message,
+      retrieval_latency_ms: Math.round(performance.now() - retrievalStarted),
+    };
+  }
+
+  // Old v1 suites remain retrieval-only. `/think` is called for an answerable
+  // case only when that case opts into the deterministic answer contract, so
+  // existing cost, latency, and baseline behavior do not change silently.
+  if (!q.answer_expect) {
+    return { ...row, latency_ms: Math.round(performance.now() - started) };
+  }
+  if (opts.skipThink) {
+    return {
+      ...row,
+      answer: null,
+      answer_required_claims: q.answer_expect.claims.length,
+      answer_skipped: "think probe disabled",
+      latency_ms: Math.round(performance.now() - started),
+    };
+  }
+
+  const answerStarted = performance.now();
+  try {
+    const body = await client.think(q.question, { limit: opts.limit });
+    return {
+      ...row,
+      answer: scoreDeterministicAnswer(q, body),
+      answer_required_claims: q.answer_expect.claims.length,
+      answer_latency_ms: Math.round(performance.now() - answerStarted),
+      latency_ms: Math.round(performance.now() - started),
+    };
+  } catch (e) {
+    return {
+      ...row,
+      answer: null,
+      answer_required_claims: q.answer_expect.claims.length,
+      answer_error: e.message,
+      answer_latency_ms: Math.round(performance.now() - answerStarted),
       latency_ms: Math.round(performance.now() - started),
     };
   }
@@ -335,6 +375,30 @@ function percentile(values, p) {
 function performanceSummary(scored) {
   const values = scored.map((row) => Number(row.latency_ms)).filter(Number.isFinite);
   return { n: values.length, p50_ms: percentile(values, 0.5), p95_ms: percentile(values, 0.95) };
+}
+
+function answerPerformanceSummary(scored) {
+  const values = scored.map((row) => Number(row.answer_latency_ms)).filter(Number.isFinite);
+  return { n: values.length, p50_ms: percentile(values, 0.5), p95_ms: percentile(values, 0.95) };
+}
+
+function deterministicAnswerSummary(scored) {
+  const rows = scored.filter((row) => Object.hasOwn(row, "answer"));
+  const conclusive = rows.filter((row) => row.answer && !row.answer.inconclusive);
+  const sum = (field) => rows.reduce((total, row) => total + Number(
+    field === "required_claims"
+      ? row.answer?.required_claims ?? row.answer_required_claims ?? 0
+      : row.answer?.[field] || 0,
+  ), 0);
+  return {
+    total: rows.length,
+    conclusive: conclusive.length,
+    passed: rows.filter((row) => row.answer?.pass === true).length,
+    required_claims: sum("required_claims"),
+    matched_claims: sum("matched_claims"),
+    cited_claims: sum("cited_claims"),
+    resolved_claims: sum("resolved_claims"),
+  };
 }
 
 function sliceSummary(scored, k) {
@@ -373,6 +437,7 @@ const xmlEscape = (value) => String(value ?? "")
   .replaceAll("'", "&apos;");
 
 function sanitizedCase(entry, k) {
+  const hasAnswerCheck = Object.hasOwn(entry, "answer");
   return {
     case_id: opaqueExecutionId(entry.id, executionNumber(entry)),
     repeat: executionNumber(entry),
@@ -381,11 +446,15 @@ function sanitizedCase(entry, k) {
     domains: entry.domains,
     formats: entry.formats,
     query_kind: entry.query_kind,
-    status: entry.error
+    status: entry.error || entry.answer_error
       ? "error"
       : entry.kind === "unanswerable"
         ? entry.refusal?.pass === true ? "pass" : entry.refusal?.inconclusive ? "inconclusive" : "fail"
-        : rankOf(entry) <= k ? "pass" : "fail",
+        : rankOf(entry) > k
+          ? "fail"
+          : hasAnswerCheck
+            ? entry.answer?.pass === true ? "pass" : entry.answer?.inconclusive || entry.answer_skipped ? "inconclusive" : "fail"
+            : "pass",
     satisfied_at: Number.isFinite(entry.satisfiedAt) ? entry.satisfiedAt : null,
     first_relevant_at: Number.isFinite(entry.firstRelevantAt) ? entry.firstRelevantAt : null,
     latency_ms: Number.isFinite(entry.latency_ms) ? entry.latency_ms : null,
@@ -394,6 +463,29 @@ function sanitizedCase(entry, k) {
     quality: entry.quality?.[k] || null,
     refusal: entry.kind === "unanswerable" && entry.refusal
       ? { pass: entry.refusal.pass, inconclusive: entry.refusal.inconclusive, gaps: entry.refusal.gaps }
+      : null,
+    deterministic_answer: hasAnswerCheck
+      ? entry.answer
+        ? {
+            pass: entry.answer.pass,
+            inconclusive: entry.answer.inconclusive,
+            claim_boundary: entry.answer.claim_boundary,
+            required_claims: entry.answer.required_claims,
+            matched_claims: entry.answer.matched_claims,
+            cited_claims: entry.answer.cited_claims,
+            resolved_claims: entry.answer.resolved_claims,
+            failure_codes: entry.answer.failures,
+          }
+        : {
+            pass: false,
+            inconclusive: true,
+            claim_boundary: "sentence",
+            required_claims: entry.answer_required_claims,
+            matched_claims: null,
+            cited_claims: null,
+            resolved_claims: null,
+            failure_codes: [entry.answer_error ? "ANSWER_TRANSPORT_ERROR" : "ANSWER_PROBE_SKIPPED"],
+          }
       : null,
     diagnosis_code: entry.diagnosis?.primary || null,
   };
@@ -436,7 +528,9 @@ function sanitizedRunArtifact(run, k) {
       evidence_at_k: run.quality,
       evidence_at_10: run.quality_at_10,
       refusal: run.refusals,
+      deterministic_answer: run.deterministic_answers,
       latency: run.performance,
+      answer_latency: run.answer_performance,
     },
     slices: run.slices,
     hard_gates: { passed: gateFailures.length === 0, failures: gateFailures },
@@ -470,7 +564,8 @@ async function writeArtifacts(directory, run, k) {
     risk: entry.risk,
     domains: entry.domains,
     formats: entry.formats,
-    diagnosis_code: entry.hard_gate_reason || entry.diagnosis_code || (entry.kind === "unanswerable"
+    diagnosis_code: entry.hard_gate_reason || entry.deterministic_answer?.failure_codes?.[0] ||
+      entry.diagnosis_code || (entry.kind === "unanswerable"
       ? "FALSE_ANSWER"
       : "EVALUATION_FAILURE"),
   }, jsonReplacer));
@@ -502,7 +597,8 @@ async function writeArtifacts(directory, run, k) {
   ]);
   const testCases = artifact.cases.map((entry) => {
     const failureCode = failuresById.get(entry.case_id)?.hard_gate_reason ||
-      (artifact.regressions.includes(entry.case_id) ? "REGRESSION" : entry.diagnosis_code) ||
+      (artifact.regressions.includes(entry.case_id) ? "REGRESSION" :
+        entry.deterministic_answer?.failure_codes?.[0] || entry.diagnosis_code) ||
       (entry.kind === "unanswerable" ? "FALSE_ANSWER" : "EVALUATION_FAILURE");
     const failure = releaseFailureIds.has(entry.case_id)
       ? `<failure message="${xmlEscape(failureCode)}"/>`
@@ -533,7 +629,7 @@ const rank = (r) => (Number.isFinite(r) ? `#${r}` : "miss");
 
 function report(run, regressions, improvements, k) {
   const L = [];
-  const { scored, agg, aggByDoc, refusals, variant } = run;
+  const { scored, agg, aggByDoc, refusals, deterministic_answers: answers, variant } = run;
 
   L.push("");
   L.push(`  brain      ${run.base}`);
@@ -565,6 +661,18 @@ function report(run, regressions, improvements, k) {
       `  honest refusal  ${refusals.conclusive === 0 ? "n/a" : pct(refusals.passed / refusals.conclusive)}` +
         `  (${refusals.passed}/${refusals.conclusive} unanswerable questions declined)`
     );
+  }
+  if (answers.total > 0) {
+    L.push(
+      `  deterministic answers  ${answers.conclusive === 0 ? "n/a" : pct(answers.passed / answers.conclusive)}` +
+        `  (${answers.passed}/${answers.conclusive} answer checks passed)`,
+    );
+    L.push(
+      `    atomic claims ${answers.matched_claims}/${answers.required_claims} matched; ` +
+        `${answers.cited_claims}/${answers.required_claims} cited; ` +
+        `${answers.resolved_claims}/${answers.required_claims} citations resolved`,
+    );
+    L.push("    boundary: literal phrase or typed value within one sentence; no semantic judge or faithfulness claim");
   }
   L.push("");
 
@@ -599,12 +707,26 @@ function report(run, regressions, improvements, k) {
       continue;
     }
     const hit = s.satisfiedAt <= k;
+    const answerLabel = !Object.hasOwn(s, "answer")
+      ? ""
+      : s.answer?.pass
+        ? "  answer PASS"
+        : s.answer_skipped
+          ? "  answer SKIP"
+          : s.answer?.inconclusive
+            ? "  answer INCONCLUSIVE"
+            : "  answer FAIL";
     L.push(
       `    ${hit ? "PASS" : "FAIL"}  ${s.id}${repeatLabel}  ${trunc(s.question, 58)}` +
-        `  ${rank(s.satisfiedAt)}${s.byDocument && s.byDocument.satisfiedAt !== s.satisfiedAt ? ` (${rank(s.byDocument.satisfiedAt)} by doc)` : ""}`
+        `  ${rank(s.satisfiedAt)}${s.byDocument && s.byDocument.satisfiedAt !== s.satisfiedAt ? ` (${rank(s.byDocument.satisfiedAt)} by doc)` : ""}` +
+        answerLabel
     );
     if (s.error) L.push(`          error: ${s.error}`);
-    else if (!hit) {
+    if (s.answer_error) L.push("          deterministic answer request failed");
+    else if (s.answer && !s.answer.pass) {
+      L.push(`          answer check: ${s.answer.failures.join(", ")}`);
+    }
+    if (!s.error && !hit) {
       for (const slot of s.slots) {
         L.push(`          ${rank(slot.rank).padEnd(5)} needs: ${trunc(slot.doc, 76)}`);
       }
@@ -900,6 +1022,26 @@ function hardGateFailures(passes, k, profile = "smoke") {
         failures.push({ id: entry.id, scope: "case", pass, reason: "TRANSPORT_ERROR" });
         continue;
       }
+      const hasAnswerCheck = Object.hasOwn(entry, "answer");
+      if (entry.answer_error) {
+        // A declared answer check that never reached a response is no score,
+        // regardless of risk. Treating provider or route failure as a normal
+        // answer miss would produce a deceptively clean release result.
+        failures.push({ id: entry.id, scope: "case", pass, reason: "ANSWER_TRANSPORT_ERROR" });
+      } else if (hasAnswerCheck && (entry.risk === "critical" || profile === "release")) {
+        if (entry.answer_skipped) {
+          failures.push({ id: entry.id, scope: "case", pass, reason: "ANSWER_PROBE_SKIPPED" });
+        } else if (!entry.answer || entry.answer.inconclusive) {
+          failures.push({ id: entry.id, scope: "case", pass, reason: "ANSWER_RESULT_INCONCLUSIVE" });
+        } else if (entry.answer.pass !== true) {
+          failures.push({
+            id: entry.id,
+            scope: "case",
+            pass,
+            reason: entry.answer.failures?.[0] || "DETERMINISTIC_ANSWER_FAILED",
+          });
+        }
+      }
       // The release profile requires an unanswerable slice. Every case in that
       // required slice must therefore exercise and pass the refusal path,
       // regardless of its risk label. Smoke preserves the existing behavior in
@@ -1030,7 +1172,7 @@ async function main() {
         "                      Do this before believing a small win: retrieval is",
         "                      approximate, so identical runs differ.",
         "  --graph-boost       only if the target implements it; probed before use",
-        "  --no-think          skip unanswerable probes in smoke only; release refuses this flag",
+        "  --no-think          skip refusal and answer canaries in smoke only; critical skips still fail",
         "  --baseline <path>   compare against a saved run",
         "  --save <path>       write this run to disk",
         "  --artifacts <dir>   write run.json, failures.jsonl, coverage.csv and junit.xml",
@@ -1076,7 +1218,7 @@ async function main() {
   }
   if (profile === "release" && bools.has("no-think")) {
     throw new Error(
-      "--no-think cannot be used with the release profile because every required unanswerable case must run",
+      "--no-think cannot be used with the release profile because every refusal and declared answer canary must run",
     );
   }
 
@@ -1178,9 +1320,9 @@ async function main() {
 
   // A transport failure partway through is not a retrieval result. Saying so is
   // the difference between a bad number and no number. Every repeat matters.
-  const errored = scored.filter((s) => s.error).length;
+  const errored = scored.filter((s) => s.error || s.answer_error).length;
   if (errored > 0 && errored === scored.length) {
-    throw new Error(`every request failed in transport. First error: ${scored[0].error}`);
+    throw new Error(`every scored case had a transport failure. First error: ${scored[0].error || scored[0].answer_error}`);
   }
   if (errored > 0) {
     console.error(`  warning: ${errored} of ${scored.length} requests errored; the run cannot pass.`);
@@ -1201,6 +1343,7 @@ async function main() {
     conclusive: conclusive.length,
     passed: conclusive.filter((s) => s.refusal.pass).length,
   };
+  const deterministicAnswers = deterministicAnswerSummary(scored);
 
   // What this harness can and cannot resolve, measured rather than assumed.
   let noise = null;
@@ -1253,7 +1396,9 @@ async function main() {
     quality_at_10: qualityAt10,
     slices: sliceSummary(retrieval, k),
     performance: performanceSummary(scored),
+    answer_performance: answerPerformanceSummary(scored),
     refusals,
+    deterministic_answers: deterministicAnswers,
     questions: scored,
     scored,
   };
@@ -1292,6 +1437,97 @@ async function main() {
   return regressions.length > 0 || run.hard_gate_failures.length > 0 ? 1 : 0;
 }
 
+const GOLDEN_LABEL = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+function validateAnswerExpectation(q, path, slotIds) {
+  const expectation = q.answer_expect;
+  if (expectation === undefined) return;
+  if (q.kind === "unanswerable") {
+    throw new Error(`${path}: ${q.id} is unanswerable and cannot declare answer_expect`);
+  }
+  if (!expectation || typeof expectation !== "object" || Array.isArray(expectation)) {
+    throw new Error(`${path}: ${q.id} answer_expect must be an object`);
+  }
+  const extraExpectationFields = Object.keys(expectation)
+    .filter((field) => !new Set(["claim_boundary", "claims"]).has(field));
+  if (extraExpectationFields.length > 0) {
+    throw new Error(`${path}: ${q.id} answer_expect has unknown fields`);
+  }
+  if (expectation.claim_boundary !== "sentence") {
+    throw new Error(`${path}: ${q.id} answer_expect.claim_boundary must be sentence`);
+  }
+  if (!Array.isArray(expectation.claims) || expectation.claims.length === 0) {
+    throw new Error(`${path}: ${q.id} answer_expect.claims must contain at least one required claim`);
+  }
+
+  const claimIds = new Set();
+  for (const claim of expectation.claims) {
+    if (!claim || typeof claim !== "object" || Array.isArray(claim)) {
+      throw new Error(`${path}: ${q.id} answer claims must be objects`);
+    }
+    const extraClaimFields = Object.keys(claim).filter((field) =>
+      !new Set(["claim_id", "contains_any", "exact_value", "evidence_slot_ids"]).has(field));
+    if (extraClaimFields.length > 0) {
+      throw new Error(`${path}: ${q.id} answer claim has unknown fields`);
+    }
+    if (!GOLDEN_LABEL.test(String(claim.claim_id || "")) || claimIds.has(claim.claim_id)) {
+      throw new Error(`${path}: ${q.id} answer claim_id values must be unique lowercase labels`);
+    }
+    claimIds.add(claim.claim_id);
+    if (!Array.isArray(claim.evidence_slot_ids) || claim.evidence_slot_ids.length === 0 ||
+        new Set(claim.evidence_slot_ids).size !== claim.evidence_slot_ids.length ||
+        claim.evidence_slot_ids.some((id) => !slotIds.has(id))) {
+      throw new Error(`${path}: ${q.id} claim ${claim.claim_id} must name unique existing evidence_slot_ids`);
+    }
+
+    const hasPhrases = claim.contains_any !== undefined;
+    const hasExactValue = claim.exact_value !== undefined;
+    if (hasPhrases === hasExactValue) {
+      throw new Error(`${path}: ${q.id} claim ${claim.claim_id} must declare exactly one of contains_any or exact_value`);
+    }
+    if (hasPhrases) {
+      if (!Array.isArray(claim.contains_any) || claim.contains_any.length === 0 ||
+          claim.contains_any.length > 10 ||
+          claim.contains_any.some((phrase) => typeof phrase !== "string" || !phrase.trim() ||
+            phrase.length > 500 || /\[\d+\]/.test(phrase))) {
+        throw new Error(`${path}: ${q.id} claim ${claim.claim_id} contains_any must be 1 to 10 citation-free phrases`);
+      }
+      continue;
+    }
+
+    const exact = claim.exact_value;
+    if (!exact || typeof exact !== "object" || Array.isArray(exact)) {
+      throw new Error(`${path}: ${q.id} claim ${claim.claim_id} exact_value must be an object`);
+    }
+    const exactFields = Object.keys(exact);
+    if (exactFields.some((field) => !new Set(["type", "canonical", "normalization", "tolerance"]).has(field)) ||
+        !["type", "canonical", "normalization", "tolerance"].every((field) => exactFields.includes(field))) {
+      throw new Error(`${path}: ${q.id} claim ${claim.claim_id} exact_value fields are invalid`);
+    }
+    if (exact.type === "number") {
+      if (exact.normalization !== "numeric" || typeof exact.canonical !== "number" ||
+          !Number.isFinite(exact.canonical) || typeof exact.tolerance !== "number" ||
+          !Number.isFinite(exact.tolerance) || exact.tolerance < 0) {
+        throw new Error(`${path}: ${q.id} numeric exact_value requires a finite canonical, numeric normalization, and non-negative tolerance`);
+      }
+    } else if (exact.type === "string") {
+      if (!["none", "casefold_whitespace"].includes(exact.normalization) ||
+          typeof exact.canonical !== "string" || !exact.canonical || exact.tolerance !== null) {
+        throw new Error(`${path}: ${q.id} string exact_value requires a string canonical, supported normalization, and null tolerance`);
+      }
+    } else if (exact.type === "date") {
+      const parsedDate = Date.parse(`${exact.canonical}T00:00:00Z`);
+      if (exact.normalization !== "iso_date" || typeof exact.canonical !== "string" ||
+          !/^\d{4}-\d{2}-\d{2}$/.test(exact.canonical) || exact.tolerance !== null ||
+          !Number.isFinite(parsedDate) || new Date(parsedDate).toISOString().slice(0, 10) !== exact.canonical) {
+        throw new Error(`${path}: ${q.id} date exact_value requires a valid ISO date and null tolerance`);
+      }
+    } else {
+      throw new Error(`${path}: ${q.id} exact_value type must be string, number, or date in the deterministic v1 scorer`);
+    }
+  }
+}
+
 function validateGolden(golden, path) {
   const schemaVersion = Number(golden.schema_version ?? 1);
   if (schemaVersion !== 1) {
@@ -1322,10 +1558,12 @@ function validateGolden(golden, path) {
     const expect = q.expect || [];
     if (q.kind === "unanswerable") {
       if (expect.length > 0) throw new Error(`${path}: ${q.id} is unanswerable but names expected documents`);
+      validateAnswerExpectation(q, path, new Set());
       continue;
     }
     if (expect.length === 0) throw new Error(`${path}: ${q.id} expects nothing and is not marked unanswerable`);
     const sharedGroups = new Map();
+    const slotIds = new Set();
     for (const slot of expect) {
       const hasReferences = Array.isArray(slot.any_of) && slot.any_of.length > 0;
       if (!hasReferences && !String(slot.doc || "").trim()) {
@@ -1336,6 +1574,13 @@ function validateGolden(golden, path) {
       }
       if (!hasReferences && !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(String(slot.source || ""))) {
         throw new Error(`${path}: ${q.id} title-only evidence must name its source`);
+      }
+      if (slot.slot_id !== undefined) {
+        if (q.answer_expect !== undefined &&
+            (!GOLDEN_LABEL.test(String(slot.slot_id)) || slotIds.has(slot.slot_id))) {
+          throw new Error(`${path}: ${q.id} slot_id values must be unique lowercase labels`);
+        }
+        slotIds.add(slot.slot_id);
       }
       if (slot.shared_result_group !== undefined) {
         const group = String(slot.shared_result_group);
@@ -1350,6 +1595,7 @@ function validateGolden(golden, path) {
         throw new Error(`${path}: ${q.id} shared_result_group ${group} must be used by at least two slots`);
       }
     }
+    validateAnswerExpectation(q, path, slotIds);
   }
 }
 

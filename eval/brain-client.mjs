@@ -103,7 +103,7 @@ export class BrainClient {
     return Array.isArray(response?.results) ? response.results : [];
   }
 
-  /** Cited answer plus the gap list. Used only for the unanswerable questions. */
+  /** Cited answer plus gaps. Used for refusals and opt-in deterministic answer checks. */
   async think(question, { limit = 8 } = {}) {
     return this.#post("/api/rag/think", { q: question, limit });
   }

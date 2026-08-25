@@ -48,6 +48,17 @@ test("smoke remains a diagnostic profile for a small valid suite", () => {
   assert.deepEqual(result.failures, []);
 });
 
+test("smoke rejects an empty suite in the pre-credential aggregate gate", () => {
+  const result = evaluateProfileCoverage({ questions: [] }, "smoke");
+  assert.deepEqual(result.failures, [{
+    code: "SUITE_BELOW_MINIMUM",
+    observed: 0,
+    minimum: 1,
+  }]);
+  assert.match(formatProfileFailures(result), /smoke profile coverage gate failed before retrieval/);
+  assert.match(formatProfileFailures(result), /smoke requires at least 1/);
+});
+
 test("release accepts the exact suite and required-slice coverage floor", () => {
   const result = evaluateProfileCoverage(releaseSuite(), "release");
   assert.deepEqual(result.failures, []);

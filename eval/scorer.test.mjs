@@ -18,6 +18,7 @@ import {
   dedupeByDocument,
   scoreQuestion,
   scoreRefusal,
+  scoreDeterministicAnswer,
   looksLikeRefusal,
   aggregate,
   retrievalQuality,
@@ -315,6 +316,155 @@ test("a clean refusal may offer a bounded next step", () => {
   assert.equal(scoreRefusal({ answer, gaps: [] }).pass, true);
 });
 
+/* ------------------------------------------------ deterministic answers */
+
+const answerQuestion = (claim) => ({
+  expect: [
+    { slot_id: "policy", doc: "Policy", any_of: ["curated:policy-a"] },
+    { slot_id: "amount", doc: "Approval", any_of: ["drive:FILE-A"] },
+  ],
+  answer_expect: {
+    claim_boundary: "sentence",
+    claims: [claim],
+  },
+});
+
+test("a required literal claim passes only with an inline resolvable citation", () => {
+  const question = answerQuestion({
+    claim_id: "policy-code",
+    contains_any: ["the policy code is AX-17"],
+    evidence_slot_ids: ["policy"],
+  });
+  const scored = scoreDeterministicAnswer(question, {
+    answer: "The policy code is ax-17 [2].",
+    citations: [{ n: 2, source: "curated", ref: "policy-a", title: "Policy" }],
+  });
+  assert.equal(scored.pass, true);
+  assert.equal(scored.matched_claims, 1);
+  assert.equal(scored.cited_claims, 1);
+  assert.equal(scored.resolved_claims, 1);
+  assert.equal(scored.claim_boundary, "sentence");
+});
+
+test("a citation in another sentence does not attach itself to the claim", () => {
+  const question = answerQuestion({
+    claim_id: "policy-code",
+    contains_any: ["the policy code is AX-17"],
+    evidence_slot_ids: ["policy"],
+  });
+  const scored = scoreDeterministicAnswer(question, {
+    answer: "The policy code is AX-17. A different observation appears here [1].",
+    citations: [{ n: 1, source: "curated", ref: "policy-a", title: "Policy" }],
+  });
+  assert.equal(scored.pass, false);
+  assert.deepEqual(scored.failures, ["CITATION_MISSING"]);
+});
+
+test("a typed numeric exact value normalizes separators and resolves a Drive reference", () => {
+  const question = answerQuestion({
+    claim_id: "approved-limit",
+    exact_value: {
+      type: "number", canonical: 1250, normalization: "numeric", tolerance: 0,
+    },
+    evidence_slot_ids: ["amount"],
+  });
+  const scored = scoreDeterministicAnswer(question, {
+    answer: "The approved limit is $1,250.00 [3].",
+    citations: [{ n: 3, source: "drive", ref: "FILE-A", title: "Folder/Approval.pdf" }],
+  });
+  assert.equal(scored.pass, true);
+  assert.equal(scored.claims[0].citation_resolved, true);
+});
+
+test("typed string and ISO-date exact values use only their declared normalization", () => {
+  const stringScore = scoreDeterministicAnswer(answerQuestion({
+    claim_id: "record-code",
+    exact_value: {
+      type: "string", canonical: "AX  17", normalization: "casefold_whitespace", tolerance: null,
+    },
+    evidence_slot_ids: ["policy"],
+  }), {
+    answer: "The record code is ax 17 [1].",
+    citations: [{ n: 1, source: "curated", ref: "policy-a" }],
+  });
+  assert.equal(stringScore.pass, true);
+
+  const dateScore = scoreDeterministicAnswer(answerQuestion({
+    claim_id: "effective-date",
+    exact_value: {
+      type: "date", canonical: "2026-08-25", normalization: "iso_date", tolerance: null,
+    },
+    evidence_slot_ids: ["policy"],
+  }), {
+    answer: "The effective date is 2026-08-25 [1].",
+    citations: [{ n: 1, source: "curated", ref: "policy-a" }],
+  });
+  assert.equal(dateScore.pass, true);
+});
+
+test("a citation number cannot masquerade as the expected numeric value", () => {
+  const question = answerQuestion({
+    claim_id: "approved-limit",
+    exact_value: {
+      type: "number", canonical: 1, normalization: "numeric", tolerance: 0,
+    },
+    evidence_slot_ids: ["amount"],
+  });
+  const scored = scoreDeterministicAnswer(question, {
+    answer: "The approved limit is not stated [1].",
+    citations: [{ n: 1, source: "drive", ref: "FILE-A" }],
+  });
+  assert.equal(scored.pass, false);
+  assert.deepEqual(scored.failures, ["CLAIM_MISSING"]);
+});
+
+test("a number embedded in an alphanumeric code is not an exact numeric value", () => {
+  const question = answerQuestion({
+    claim_id: "approved-limit",
+    exact_value: {
+      type: "number", canonical: 17, normalization: "numeric", tolerance: 0,
+    },
+    evidence_slot_ids: ["amount"],
+  });
+  const scored = scoreDeterministicAnswer(question, {
+    answer: "The record code is AX-17 [1].",
+    citations: [{ n: 1, source: "drive", ref: "FILE-A" }],
+  });
+  assert.equal(scored.pass, false);
+  assert.deepEqual(scored.failures, ["CLAIM_MISSING"]);
+});
+
+test("a present citation to the wrong source is unresolved, not accepted by number alone", () => {
+  const question = answerQuestion({
+    claim_id: "policy-code",
+    contains_any: ["the policy code is AX-17"],
+    evidence_slot_ids: ["policy"],
+  });
+  const scored = scoreDeterministicAnswer(question, {
+    answer: "The policy code is AX-17 [1].",
+    citations: [{ n: 1, source: "curated", ref: "different-policy", title: "Policy" }],
+  });
+  assert.equal(scored.pass, false);
+  assert.equal(scored.claims[0].citation_present, true);
+  assert.equal(scored.claims[0].citation_resolved, false);
+  assert.deepEqual(scored.failures, ["CITATION_UNRESOLVABLE"]);
+});
+
+test("no generated answer is inconclusive and retains no raw response content", () => {
+  const question = answerQuestion({
+    claim_id: "policy-code",
+    contains_any: ["the policy code is AX-17"],
+    evidence_slot_ids: ["policy"],
+  });
+  const scored = scoreDeterministicAnswer(question, {
+    answer: null,
+    answer_error: "synthetic provider detail that must not be copied",
+  });
+  assert.equal(scored.pass, false);
+  assert.equal(scored.inconclusive, true);
+  assert.doesNotMatch(JSON.stringify(scored), /synthetic provider detail/);
+});
+
 /* ------------------------------------------------------- baseline diffing */
 
 test("a question falling out of the top k is reported as a regression", () => {
@@ -351,6 +501,22 @@ test("an unanswerable question that starts answering is a regression", () => {
   const regs = findRegressions(current, baseline, 5);
   assert.equal(regs.length, 1);
   assert.equal(regs[0].to, "answered anyway");
+});
+
+test("a deterministic answer that stops passing is a regression", () => {
+  const baseline = {
+    questions: [{ id: "a1", kind: "single", scorable: true, satisfiedAt: 1, answer: { pass: true } }],
+  };
+  const current = {
+    questions: [{
+      id: "a1", kind: "single", question: "?", scorable: true, satisfiedAt: 1,
+      answer: { pass: false, failures: ["CLAIM_MISSING"] },
+    }],
+  };
+  const regressions = findRegressions(current, baseline, 5);
+  assert.equal(regressions.length, 1);
+  assert.equal(regressions[0].from, "deterministic answer passed");
+  assert.equal(regressions[0].to, "deterministic answer failed");
 });
 
 test("skipping a previously passing unanswerable repeat is a regression", () => {

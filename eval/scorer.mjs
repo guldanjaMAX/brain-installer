@@ -80,7 +80,7 @@ export function dedupeByDocument(results) {
  * Rank (1 based) of the first result matching any acceptable reference for a
  * slot, or Infinity when the slot never appears.
  */
-function resultMatchesSlot(slot, result) {
+export function resultMatchesSlot(slot, result) {
   const raw = slot.any_of || [];
   const accept = new Set(raw);
   const expectedTitle = String(slot.doc || "").trim();
@@ -300,6 +300,192 @@ export function scoreRefusal(thinkResponse) {
   };
 }
 
+/* ------------------------------------------------ deterministic answers */
+
+const CITATION_MARKER_RE = /\[(\d+)\]/g;
+const NUMERIC_VALUE_RE = /(?<![\p{L}\p{N}_+\.\-])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\p{L}\p{N}_\.\-])/gu;
+
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Locate a deterministic claim matcher without pretending to understand
+ * paraphrases. `contains_any` is case-insensitive and whitespace-flexible;
+ * exact values use only the normalization explicitly declared in the suite.
+ */
+function locateClaimMatch(answer, claim) {
+  if (Array.isArray(claim?.contains_any)) {
+    for (const phrase of claim.contains_any) {
+      const pattern = String(phrase).trim().split(/\s+/).map(escapeRegex).join("\\s+");
+      const match = new RegExp(pattern, "iu").exec(answer);
+      if (match) return { start: match.index, end: match.index + match[0].length };
+    }
+    return null;
+  }
+
+  const exact = claim?.exact_value;
+  if (!exact) return null;
+  if (exact.normalization === "numeric") {
+    const expected = Number(exact.canonical);
+    const tolerance = Number(exact.tolerance ?? 0);
+    for (const match of answer.matchAll(NUMERIC_VALUE_RE)) {
+      const observed = Number(match[0].replaceAll(",", ""));
+      if (Number.isFinite(observed) && Math.abs(observed - expected) <= tolerance) {
+        return { start: match.index, end: match.index + match[0].length };
+      }
+    }
+    return null;
+  }
+
+  const canonical = String(exact.canonical);
+  if (exact.normalization === "casefold_whitespace") {
+    const pattern = canonical.trim().split(/\s+/).map(escapeRegex).join("\\s+");
+    const match = new RegExp(pattern, "iu").exec(answer);
+    return match ? { start: match.index, end: match.index + match[0].length } : null;
+  }
+  if (exact.normalization === "iso_date") {
+    const match = new RegExp(`(?<!\\d)${escapeRegex(canonical)}(?!\\d)`, "u").exec(answer);
+    return match ? { start: match.index, end: match.index + match[0].length } : null;
+  }
+  const index = answer.indexOf(canonical);
+  return index >= 0 ? { start: index, end: index + canonical.length } : null;
+}
+
+/**
+ * Return the sentence-like boundary that owns a matched atomic claim.
+ * Citations outside this boundary do not count for the claim. This is a
+ * deliberately narrow syntactic rule, not a semantic support judgment.
+ */
+function claimBoundary(answer, match) {
+  const breaks = /[.!?;](?:\s+|$)|\n+/gu;
+  let start = 0;
+  let end = answer.length;
+  for (const boundary of answer.matchAll(breaks)) {
+    const boundaryStart = boundary.index;
+    const boundaryEnd = boundary.index + boundary[0].length;
+    if (boundaryEnd <= match.start) {
+      start = boundaryEnd;
+      continue;
+    }
+    if (boundaryStart >= match.end) {
+      end = boundaryStart;
+      break;
+    }
+  }
+  return answer.slice(start, end);
+}
+
+function citationResult(citation) {
+  const source = String(citation?.source || "");
+  const ref = citation?.ref == null ? null : String(citation.ref);
+  return {
+    source,
+    title: citation?.title == null ? null : String(citation.title),
+    ref_key: ref,
+    drive_file_id: source === "drive" ? ref : null,
+  };
+}
+
+/**
+ * Score only the deterministic answer contract declared by `answer_expect`.
+ *
+ * This proves literal atomic-claim or typed exact-value presence plus an inline
+ * citation resolving to an allowed evidence slot. It does not score additional
+ * generated claims, semantic paraphrases, citation support, or faithfulness.
+ * Those remain explicitly outside this judge-free v1 slice.
+ */
+export function scoreDeterministicAnswer(question, thinkResponse) {
+  const expectation = question?.answer_expect;
+  if (!expectation) return null;
+  const answer = typeof thinkResponse?.answer === "string" ? thinkResponse.answer.trim() : "";
+  const claims = Array.isArray(expectation.claims) ? expectation.claims : [];
+  if (!answer) {
+    return {
+      pass: false,
+      inconclusive: true,
+      claim_boundary: "sentence",
+      required_claims: claims.length,
+      matched_claims: 0,
+      cited_claims: 0,
+      resolved_claims: 0,
+      false_refusal: false,
+      failures: ["ANSWER_NOT_PRODUCED"],
+      claims: claims.map((claim) => ({
+        claim_id: claim.claim_id,
+        matched: false,
+        citation_present: false,
+        citation_resolved: false,
+        failure: "ANSWER_NOT_PRODUCED",
+      })),
+    };
+  }
+
+  // Citation numbers are metadata, not answer values. Preserve byte-for-byte
+  // positions while hiding the markers from claim matching so an expected
+  // numeric value of 1 cannot pass merely because the answer contains `[1]`.
+  const answerForMatching = answer.replace(/\[\d+\]/g, (marker) => " ".repeat(marker.length));
+
+  const citationsByNumber = new Map();
+  const ambiguousNumbers = new Set();
+  for (const citation of Array.isArray(thinkResponse?.citations) ? thinkResponse.citations : []) {
+    const number = Number(citation?.n);
+    if (!Number.isSafeInteger(number) || number < 1) continue;
+    if (citationsByNumber.has(number)) ambiguousNumbers.add(number);
+    else citationsByNumber.set(number, citation);
+  }
+  for (const number of ambiguousNumbers) citationsByNumber.delete(number);
+
+  const slotsById = new Map((question.expect || []).map((slot) => [slot.slot_id, slot]));
+  const scoredClaims = claims.map((claim) => {
+    const match = locateClaimMatch(answerForMatching, claim);
+    if (!match) {
+      return {
+        claim_id: claim.claim_id,
+        matched: false,
+        citation_present: false,
+        citation_resolved: false,
+        failure: "CLAIM_MISSING",
+      };
+    }
+    const boundary = claimBoundary(answer, match);
+    const citationNumbers = [...boundary.matchAll(CITATION_MARKER_RE)]
+      .map((entry) => Number(entry[1]));
+    const expectedSlots = (claim.evidence_slot_ids || []).map((id) => slotsById.get(id)).filter(Boolean);
+    const resolved = citationNumbers.some((number) => {
+      const citation = citationsByNumber.get(number);
+      return citation && expectedSlots.some((slot) => resultMatchesSlot(slot, citationResult(citation)));
+    });
+    return {
+      claim_id: claim.claim_id,
+      matched: true,
+      citation_present: citationNumbers.length > 0,
+      citation_resolved: !!resolved,
+      failure: citationNumbers.length === 0
+        ? "CITATION_MISSING"
+        : resolved
+          ? null
+          : "CITATION_UNRESOLVABLE",
+    };
+  });
+
+  const falseRefusal = looksLikeRefusal(answer);
+  const failures = [
+    ...(falseRefusal ? ["ANSWER_REFUSED"] : []),
+    ...scoredClaims.map((claim) => claim.failure).filter(Boolean),
+  ].filter((value, index, all) => all.indexOf(value) === index);
+  return {
+    pass: failures.length === 0,
+    inconclusive: false,
+    claim_boundary: "sentence",
+    required_claims: scoredClaims.length,
+    matched_claims: scoredClaims.filter((claim) => claim.matched).length,
+    cited_claims: scoredClaims.filter((claim) => claim.citation_present).length,
+    resolved_claims: scoredClaims.filter((claim) => claim.citation_resolved).length,
+    false_refusal: falseRefusal,
+    failures,
+    claims: scoredClaims,
+  };
+}
+
 /** Legacy `recall` field (question pass@k), first-relevant MRR, and pass list. */
 export function aggregate(scored, ks = [1, 5]) {
   const scorable = scored.filter((s) => s.scorable);
@@ -488,6 +674,20 @@ export function findRegressions(current, baseline, k = 5) {
         from: `rank ${wasRank}`,
         to: Number.isFinite(nowRank) ? `rank ${nowRank}` : "not in results",
       });
+      continue;
+    }
+    if (was.answer?.pass === true && q.answer?.pass !== true) {
+      out.push({
+        id: q.id,
+        repeat: Number(q.repeat || 1),
+        question: q.question,
+        from: "deterministic answer passed",
+        to: q.answer_skipped
+          ? "answer not evaluated"
+          : q.answer?.inconclusive
+            ? "answer inconclusive"
+            : "deterministic answer failed",
+      });
     }
   }
   return out;
@@ -521,6 +721,16 @@ export function findImprovements(current, baseline, k = 5) {
         question: q.question,
         from: Number.isFinite(wasRank) ? `rank ${wasRank}` : "not in results",
         to: `rank ${nowRank}`,
+      });
+      continue;
+    }
+    if (was.answer && was.answer.pass !== true && q.answer?.pass === true) {
+      out.push({
+        id: q.id,
+        repeat: Number(q.repeat || 1),
+        question: q.question,
+        from: "deterministic answer failed",
+        to: "deterministic answer passed",
       });
     }
   }

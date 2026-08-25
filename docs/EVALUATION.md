@@ -6,9 +6,12 @@ refuses unsupported questions, and does not cross an ownership boundary. It is
 designed for one shared installer and many isolated, private installations.
 
 This document contains both the shipped v1 behavior and the v2 specification.
-The current `eval/run.mjs` harness implements retrieval and refusal checks plus
-two named profiles: diagnostic `smoke` and a deterministic `release` suite
-coverage gate. The v2 schemas do not by themselves enable the remaining
+The current `eval/run.mjs` harness implements retrieval and refusal checks,
+opt-in deterministic answer canaries, and two named profiles: diagnostic
+`smoke` and a deterministic `release` suite coverage gate. The answer canary
+proves only a literal atomic phrase or typed value inside one sentence, plus an
+inline citation that resolves to an allowed v1 evidence slot. It is not a
+semantic judge. The v2 schemas do not by themselves enable the remaining
 commands, metrics, inventory readback, answer judging, or reports described
 here. Each rollout step below must be implemented and tested before its
 corresponding claim is made.
@@ -118,10 +121,12 @@ field must never imply that provenance was successfully collected.
 ### `brain eval <manifest> --profile smoke`
 
 This is the shipped default. It runs the current deterministic retrieval and
-refusal harness against any non-empty valid v1 suite. Use it while writing a
-suite and after setup, ingest, sync, or a retrieval change. A smoke pass is a
-diagnostic result. It is not release certification, even when every small-set
-case passes.
+refusal harness against any non-empty valid v1 suite. Answerable cases with an
+`answer_expect` contract also call `/think` and run the deterministic answer
+canary. Cases without that optional field remain retrieval-only, preserving v1
+cost and baseline behavior. Use smoke while writing a suite and after setup,
+ingest, sync, or a retrieval change. A smoke pass is a diagnostic result. It is
+not release certification, even when every small-set case passes.
 
 ### `brain eval <manifest> --profile release`
 
@@ -142,13 +147,19 @@ made. Query-kind coverage is derived from the executable `kind`; when a legacy
 `query_kind` label is present it must match `kind`. After the floor passes, the
 existing v1 retrieval, provenance, regression, and critical-case gates run
 normally. Every release-profile unanswerable case must also run and pass its
-refusal check regardless of risk. `--no-think` is therefore smoke-only.
+refusal check regardless of risk. Every declared deterministic answer canary in
+a release case must also run and pass. `--no-think` is therefore smoke-only. In
+smoke, skipping a critical refusal or deterministic answer canary still blocks
+a green result.
 
 This is v1 retrieval-suite release qualification, not full v2 certification.
 It does not prove that the declared slices cover every real corpus region, and
-it does not yet gate answer claims, citations, complete source inventory,
-document-level authorization, confidence bounds, latency budgets, or cost.
-Those claims remain blocked until their executable v2 contracts ship.
+it does not require answer-canary coverage across the suite. The shipped canary
+does not judge paraphrases, additional produced claims, semantic support,
+faithfulness, citation support at the span level, or complete source inventory.
+Document-level authorization, confidence bounds, latency budgets, and cost also
+remain outside this gate. Those claims remain blocked until their executable v2
+contracts ship.
 
 ### Future: `brain eval deep`
 
@@ -197,6 +208,62 @@ For query `q`, cutoff `k`, rank `i`, and relevance grade `rel(i)` from 0 to 3:
 Multi-source cases report both partial slot recall and complete evidence. A
 question that found one half of its required evidence is not counted as fully
 answerable.
+
+### Shipped deterministic answer canary
+
+An answerable v1 question may opt in with `answer_expect`. Each expected
+evidence slot used by a claim needs a unique `slot_id`. Every declared claim is
+required and must choose exactly one deterministic matcher:
+
+- `contains_any`: one of 1 to 10 literal phrases, matched case-insensitively
+  with flexible whitespace; or
+- `exact_value`: a string, finite number, or ISO date with its declared
+  normalization and tolerance.
+
+The fixed `claim_boundary` is `sentence`. A claim passes only when the phrase or
+value appears inside a sentence that also contains an inline `[n]` marker, and
+the response citation numbered `n` resolves to one of the claim's named v1
+evidence slots. Citation numbers by themselves do not pass. Duplicate citation
+numbers are unresolved, citations in another sentence do not attach to the
+claim, and a missing answer is inconclusive.
+
+```json
+{
+  "expect": [
+    {
+      "slot_id": "policy-record",
+      "any_of": ["curated:synthetic-policy"]
+    }
+  ],
+  "answer_expect": {
+    "claim_boundary": "sentence",
+    "claims": [
+      {
+        "claim_id": "policy-code",
+        "contains_any": ["the policy code is AX-17"],
+        "evidence_slot_ids": ["policy-record"]
+      },
+      {
+        "claim_id": "approved-limit",
+        "exact_value": {
+          "type": "number",
+          "canonical": 1250,
+          "normalization": "numeric",
+          "tolerance": 0
+        },
+        "evidence_slot_ids": ["policy-record"]
+      }
+    ]
+  }
+}
+```
+
+This is a deterministic canary, not general answer correctness. It does not
+inspect extra factual claims, infer semantic paraphrases, see the private prompt
+context, or prove that a resolved citation actually supports the sentence.
+Those measurements still require trace evidence or reviewed judging. Use this
+contract for short, low-ambiguity facts whose literal phrase or typed value is
+meaningful. Do not label its pass rate as claim correctness or faithfulness.
 
 For atomic answer claims:
 
@@ -280,8 +347,9 @@ missing?" is "not knowable from the index alone."
 These are strong starting targets. An installation may raise them. Lowering a
 gate requires a versioned policy decision backed by evidence.
 
-Except for the current v1 critical retrieval and refusal gates, the targets in
-this section are specification until their scorers, policies, and tests ship.
+Except for the current v1 critical retrieval and refusal gates and any explicitly
+declared deterministic answer canaries, the targets in this section are
+specification until their scorers, policies, and tests ship.
 
 Hard gates are not averaged away:
 
@@ -364,7 +432,9 @@ The current retrieval harness produces an internal v1 artifact set:
 
 - `run.json`: sanitized retrieval metrics, opaque case IDs, provenance hashes,
   the named profile and aggregate profile-coverage evidence, and hard-gate
-  results;
+  results. Declared answer canaries add aggregate counts and case-level booleans
+  and failure codes, never expected phrases, values, answers, or citation
+  identities;
 - `failures.jsonl`: sanitized case failures and diagnosis codes;
 - `coverage.csv`: case counts and metrics by slice;
 - `junit.xml`: release-gate integration for CI.
@@ -390,9 +460,9 @@ raw error, stack, trace, prompt, or credential.
 ### Batch 1: executable contracts and deterministic retrieval
 
 The v1 runtime now covers the deterministic retrieval metrics, privacy-safe
-artifacts, critical-case gates, and named structural release-profile floor. It
-does not validate or execute the complete v2 suite, policy, corpus, or artifact
-contracts below.
+artifacts, critical-case gates, named structural release-profile floor, and the
+opt-in deterministic answer canary above. It does not validate or execute the
+complete v2 suite, policy, corpus, or artifact contracts below.
 
 1. Validate suite, gate-policy, and run-artifact schemas.
 2. Preserve v1 scorer behavior with compatibility fixtures.
@@ -413,8 +483,9 @@ The first gate should be deterministic and incapable of exporting private data.
    policy states, content hashes, extraction status, and vector-outbox state.
 2. Reconcile that snapshot with the private corpus contract.
 3. Trace retrieval and context-assembly stages with content capture disabled.
-4. Add normalized exact-value, atomic claim, citation support, and citation
-   resolution scoring.
+4. Extend the shipped literal/exact-value and citation-identity canary with
+   observable context evidence, semantic claim review, citation support, and
+   current-version or span resolution.
 5. Add earliest-stage diagnosis and the private explain command.
 
 ### Batch 3: lifecycle and adversarial validation

@@ -53,8 +53,10 @@
     "query_kind label. Every release unanswerable case must run and refuse",
     "correctly regardless of risk, so --no-think is smoke-only.",
     "This v1 release gate proves suite coverage plus the existing retrieval and",
-    "refusal checks. It does not yet certify answer claims, citations, complete",
-    "source inventory, or document-level authorization.",
+    "refusal checks. For a short, important fact, answer_expect can also require",
+    "a literal phrase or typed value plus an inline citation to the named source.",
+    "That deterministic canary does not judge paraphrases, extra claims, semantic",
+    "citation support, faithfulness, complete inventory, or authorization.",
     "Measure how much it varies between runs with:  brain eval <manifest> --repeat 3"
   ],
 
@@ -66,13 +68,25 @@
       "domains": ["replace-with-domain"],
       "formats": ["replace-with-format"],
       "_comment": "single = one document answers it. Replace this whole entry.",
+      "_answer_check_comment": "This first entry shows the optional deterministic answer canary. Replace its phrase and IDs, or remove answer_expect to keep the case retrieval-only.",
       "question": "REPLACE. Something specific you decided, that lives in exactly one document.",
       "expect": [
         {
+          "slot_id": "decision-source",
           "doc": "The title of the document that should answer it",
           "any_of": ["drive_path:Folder/The exact document title.pdf"]
         }
-      ]
+      ],
+      "answer_expect": {
+        "claim_boundary": "sentence",
+        "claims": [
+          {
+            "claim_id": "replace-with-atomic-claim",
+            "contains_any": ["REPLACE. A short literal phrase the answer must contain"],
+            "evidence_slot_ids": ["decision-source"]
+          }
+        ]
+      }
     },
     {
       "id": "q02",

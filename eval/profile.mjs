@@ -56,13 +56,19 @@ export function evaluateProfileCoverage(golden, requestedProfile = "smoke") {
 
   const questions = Array.isArray(golden?.questions) ? golden.questions : [];
   if (profile === "smoke") {
+    const minimums = { suite_cases: 1 };
     return {
       profile,
       scope: "diagnostic-smoke",
-      minimums: { suite_cases: 1 },
+      minimums,
       observed: { suite_cases: questions.length },
       required_slices: {},
-      failures: [],
+      failures: questions.length >= minimums.suite_cases
+        ? []
+        : [failure("SUITE_BELOW_MINIMUM", {
+            observed: questions.length,
+            minimum: minimums.suite_cases,
+          })],
     };
   }
 
@@ -164,7 +170,7 @@ export function evaluateProfileCoverage(golden, requestedProfile = "smoke") {
 export function formatProfileFailures(result) {
   const lines = result.failures.map((entry) => {
     if (entry.code === "SUITE_BELOW_MINIMUM") {
-      return `suite has ${entry.observed} cases; release requires at least ${entry.minimum}`;
+      return `suite has ${entry.observed} cases; ${result.profile} requires at least ${entry.minimum}`;
     }
     if (entry.code === "RELEASE_SLICES_REQUIRED") {
       return "release_slices must declare risk, domain, format, and query_kind coverage";
@@ -201,5 +207,5 @@ export function formatProfileFailures(result) {
     }
     return entry.code;
   });
-  return `release profile coverage gate failed before retrieval:\n  - ${lines.join("\n  - ")}`;
+  return `${result.profile} profile coverage gate failed before retrieval:\n  - ${lines.join("\n  - ")}`;
 }

@@ -61,7 +61,12 @@ try {
   const isolateSupport = fileURLToPath(new URL("./fixtures/isolate-support-root.mjs", import.meta.url));
   const isolatedUserRoot = join(sandbox, "isolated-user-root");
   mkdirSync(isolatedUserRoot, { mode: 0o700 });
-  const runReleasePreflight = (manifestPath, goldenPath = destination, extraArgs = []) => {
+  const runProfilePreflight = (
+    manifestPath,
+    goldenPath = destination,
+    extraArgs = [],
+    profile = "release",
+  ) => {
     const environment = {
       ...process.env,
       BRAIN_TEST_USER_ROOT: isolatedUserRoot,
@@ -75,7 +80,7 @@ try {
       "--import", pathToFileURL(isolateSupport).href,
       cli, "eval", manifestPath,
       "--golden", goldenPath,
-      "--profile", "release",
+      "--profile", profile,
       ...extraArgs,
     ], { encoding: "utf8", env: environment, timeout: 10_000 });
   };
@@ -87,7 +92,7 @@ try {
     infrastructure: { cloudflare: { account_id: "fixture-account" } },
     operations: { admin_key_secret: null },
   }));
-  const beforeAccount = runReleasePreflight(noDomainManifest);
+  const beforeAccount = runProfilePreflight(noDomainManifest);
   const accountOutput = `${beforeAccount.stdout || ""}${beforeAccount.stderr || ""}`;
   assert.equal(beforeAccount.status, 1, accountOutput);
   assert.match(accountOutput, /release profile coverage gate failed before retrieval/);
@@ -99,11 +104,20 @@ try {
     brain: { domain: "brain.fixture.invalid", worker_name: "fixture-brain" },
     operations: { admin_key_secret: null },
   }));
-  const beforeAdminKey = runReleasePreflight(domainManifest);
+  const beforeAdminKey = runProfilePreflight(domainManifest);
   const keyOutput = `${beforeAdminKey.stdout || ""}${beforeAdminKey.stderr || ""}`;
   assert.equal(beforeAdminKey.status, 1, keyOutput);
   assert.match(keyOutput, /release profile coverage gate failed before retrieval/);
   assert.doesNotMatch(keyOutput, /no admin key found|set ADMIN_KEY|Keychain/);
+
+  const emptySmokePath = join(sandbox, "empty-smoke.golden.json");
+  writeFileSync(emptySmokePath, JSON.stringify({ schema_version: 1, questions: [] }));
+  const emptySmoke = runProfilePreflight(domainManifest, emptySmokePath, [], "smoke");
+  const emptySmokeOutput = `${emptySmoke.stdout || ""}${emptySmoke.stderr || ""}`;
+  assert.equal(emptySmoke.status, 1, emptySmokeOutput);
+  assert.match(emptySmokeOutput, /smoke profile coverage gate failed before retrieval/);
+  assert.match(emptySmokeOutput, /suite has 0 cases; smoke requires at least 1/);
+  assert.doesNotMatch(emptySmokeOutput, /no admin key found|set ADMIN_KEY|Keychain/);
 
   const fullReleasePath = join(sandbox, "full-release.golden.json");
   const fullReleaseQuestions = Array.from({ length: 60 }, (_, index) => ({
@@ -125,7 +139,7 @@ try {
     },
     questions: fullReleaseQuestions,
   }));
-  const skipBeforeAdminKey = runReleasePreflight(domainManifest, fullReleasePath, ["--no-think"]);
+  const skipBeforeAdminKey = runProfilePreflight(domainManifest, fullReleasePath, ["--no-think"]);
   const skipOutput = `${skipBeforeAdminKey.stdout || ""}${skipBeforeAdminKey.stderr || ""}`;
   assert.equal(skipBeforeAdminKey.status, 1, skipOutput);
   assert.match(skipOutput, /--no-think cannot be used with the release profile/);

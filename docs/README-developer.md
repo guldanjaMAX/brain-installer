@@ -583,9 +583,14 @@ least 60 cases, explicit risk, domain, format, and query-kind declarations, and
 at least five cases in every declared slice. That is a v1 retrieval-suite
 coverage gate. Query-kind coverage comes from executable `kind`, and every
 release unanswerable case must run and pass even when it is not marked critical.
-`--no-think` is smoke-only. Full answer, citation, corpus-completeness,
-authorization, confidence-bound, latency-budget, and cost certification remain
-v2 work.
+Answerable v1 cases may opt into a deterministic `/think` canary through
+`answer_expect`: a literal phrase or typed value must appear inside one sentence
+with an inline citation resolving to an allowed evidence slot. Every declared
+release canary and every critical smoke canary must run and pass. Existing v1
+cases remain retrieval-only. `--no-think` is smoke-only. General answer
+correctness, additional-claim and faithfulness review, citation support,
+corpus-completeness, authorization, confidence-bound, latency-budget, and cost
+certification remain v2 work.
 
 `test/migrations.test.mjs` applies every migration to a real SQLite database and
 asserts the FTS5 triggers actually keep the index in step. It exists because
@@ -599,5 +604,7 @@ evaluation data cannot be included by accident.
 
 `brain eval --artifacts <new-directory>` writes a sanitized internal v1 report
 set with opaque case IDs. The directory and files are owner-only, are never
-overwritten, and are never uploaded. It is intentionally not labeled as the v2
-run-artifact schema described in `docs/EVALUATION.md`.
+overwritten, and are never uploaded. Deterministic answer results contain only
+counts, booleans, and typed failure codes, never expected phrases, values,
+answers, citation identities, or source titles. It is intentionally not labeled
+as the v2 run-artifact schema described in `docs/EVALUATION.md`.
