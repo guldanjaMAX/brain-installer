@@ -321,12 +321,19 @@ const MAX_DPAPI_OUTPUT_BYTES = MAX_TOKEN_STORE_BYTES + 64 * 1024;
 const DPAPI_PROTECT_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security
-$memory = New-Object System.IO.MemoryStream
+[int]$expectedLength = __BRAIN_INPUT_LENGTH__
 [byte[]]$plain = $null
 [byte[]]$protectedBytes = $null
 try {
-  [Console]::OpenStandardInput().CopyTo($memory)
-  $plain = $memory.ToArray()
+  if ($expectedLength -lt 1) { throw 'DPAPI input length is invalid' }
+  $inputStream = [Console]::OpenStandardInput()
+  $plain = New-Object byte[] $expectedLength
+  $offset = 0
+  while ($offset -lt $expectedLength) {
+    $read = $inputStream.Read($plain, $offset, $expectedLength - $offset)
+    if ($read -le 0) { throw 'DPAPI input ended before the declared length' }
+    $offset += $read
+  }
   $protectedBytes = [System.Security.Cryptography.ProtectedData]::Protect(
     $plain,
     $null,
@@ -338,19 +345,25 @@ try {
 } finally {
   if ($null -ne $plain) { [Array]::Clear($plain, 0, $plain.Length) }
   if ($null -ne $protectedBytes) { [Array]::Clear($protectedBytes, 0, $protectedBytes.Length) }
-  $memory.Dispose()
 }
 `;
 
 const DPAPI_UNPROTECT_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security
-$memory = New-Object System.IO.MemoryStream
+[int]$expectedLength = __BRAIN_INPUT_LENGTH__
 [byte[]]$protectedBytes = $null
 [byte[]]$plain = $null
 try {
-  [Console]::OpenStandardInput().CopyTo($memory)
-  $protectedBytes = $memory.ToArray()
+  if ($expectedLength -lt 1) { throw 'DPAPI input length is invalid' }
+  $inputStream = [Console]::OpenStandardInput()
+  $protectedBytes = New-Object byte[] $expectedLength
+  $offset = 0
+  while ($offset -lt $expectedLength) {
+    $read = $inputStream.Read($protectedBytes, $offset, $expectedLength - $offset)
+    if ($read -le 0) { throw 'DPAPI input ended before the declared length' }
+    $offset += $read
+  }
   $plain = [System.Security.Cryptography.ProtectedData]::Unprotect(
     $protectedBytes,
     $null,
@@ -362,7 +375,6 @@ try {
 } finally {
   if ($null -ne $protectedBytes) { [Array]::Clear($protectedBytes, 0, $protectedBytes.Length) }
   if ($null -ne $plain) { [Array]::Clear($plain, 0, $plain.Length) }
-  $memory.Dispose()
 }
 `;
 
@@ -459,9 +471,16 @@ function windowsRuntime(options) {
 
 function runWindowsDpapi(script, input, options, operation) {
   const { command, env } = windowsRuntime(options);
+  if (!Buffer.isBuffer(input) || input.length < 1 || input.length > MAX_DPAPI_OUTPUT_BYTES) {
+    throw new Error("Windows DPAPI received an invalid Google credential payload size");
+  }
+  const commandScript = script.replace("__BRAIN_INPUT_LENGTH__", String(input.length));
+  if (commandScript === script || commandScript.includes("__BRAIN_INPUT_LENGTH__")) {
+    throw new Error("Windows DPAPI input framing could not be prepared safely");
+  }
   const args = [
     "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-    "-Command", script,
+    "-Command", commandScript,
   ];
   let result;
   let stdout;
@@ -477,7 +496,7 @@ function runWindowsDpapi(script, input, options, operation) {
       maxBuffer: MAX_DPAPI_OUTPUT_BYTES,
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      timeout: options.timeoutMs || 15_000,
+      timeout: options.timeoutMs || 30_000,
       windowsHide: true,
     });
     stdout = childResultBuffer(result?.stdout);

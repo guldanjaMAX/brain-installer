@@ -37,6 +37,9 @@ const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-admin-key-
 const currentKey = `current-${"a".repeat(40)}`;
 const replacementKey = `replacement-$& []{}-key-${"b".repeat(30)}`;
 const priorKey = `prior-${"c".repeat(42)}`;
+const nativeFileOptions = process.platform === "win32"
+  ? { username: process.env.USERNAME || process.env.USER }
+  : {};
 
 function manifest(operations = undefined) {
   return {
@@ -212,13 +215,13 @@ try {
   const adjacentDir = join(sandbox, "adjacent");
   mkdirSync(adjacentDir, { mode: 0o700 });
   const adjacentManifest = writeManifest(adjacentDir, manifest());
-  const adjacentPlan = adminKeyPersistencePlan(adjacentManifest, manifest());
+  const adjacentPlan = adminKeyPersistencePlan(adjacentManifest, manifest(), nativeFileOptions);
   assert.equal(adjacentPlan.backend, "file");
-  const adjacentReceipt = persistAdminKeyDurably(adjacentPlan, currentKey);
+  const adjacentReceipt = persistAdminKeyDurably(adjacentPlan, currentKey, nativeFileOptions);
   assert.equal(adjacentReceipt.replaced, false);
-  assert.equal(readAdminKeyFile(adjacentPlan.path), currentKey);
-  assert.equal(persistAdminKeyDurably(adjacentPlan, replacementKey).replaced, true);
-  assert.equal(readAdminKeyFile(adjacentPlan.path), replacementKey);
+  assert.equal(readAdminKeyFile(adjacentPlan.path, nativeFileOptions), currentKey);
+  assert.equal(persistAdminKeyDurably(adjacentPlan, replacementKey, nativeFileOptions).replaced, true);
+  assert.equal(readAdminKeyFile(adjacentPlan.path, nativeFileOptions), replacementKey);
 
   assert.throws(
     () => adminKeyPersistencePlan(adjacentManifest, manifest({ admin_key_secret: "secret://wrong/value" })),
@@ -536,11 +539,12 @@ try {
   const setupReuseDir = join(sandbox, "setup-reuse");
   mkdirSync(setupReuseDir, { mode: 0o700 });
   const setupReuseManifest = writeManifest(setupReuseDir, manifest());
-  const setupReusePlan = adminKeyPersistencePlan(setupReuseManifest, manifest());
-  persistAdminKeyDurably(setupReusePlan, replacementKey);
+  const setupReusePlan = adminKeyPersistencePlan(setupReuseManifest, manifest(), nativeFileOptions);
+  persistAdminKeyDurably(setupReusePlan, replacementKey, nativeFileOptions);
   let generatedForReuse = 0;
   const reusedSetupKey = await prepareSetupAdminKey(setupReuseManifest, manifest(), {
     explicitAdminKey: null,
+    persistenceOptions: nativeFileOptions,
     randomBytes() {
       generatedForReuse++;
       return Buffer.alloc(24, 0xaa);

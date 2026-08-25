@@ -69,11 +69,13 @@ function fakeDpapi() {
       const script = String(args.at(-1) || "");
       const protect = script.includes("]::Protect(");
       const unprotect = script.includes("]::Unprotect(");
+      const framed = script.includes(`[int]$expectedLength = ${input.length}`) &&
+        !script.includes("__BRAIN_INPUT_LENGTH__");
       calls.push({
         args: [...args], command, env: { ...options.env }, input,
         protect, unprotect,
       });
-      if (protect === unprotect) {
+      if (protect === unprotect || !framed) {
         return { status: 1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
       }
       if (protect) {

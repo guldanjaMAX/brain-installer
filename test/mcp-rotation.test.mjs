@@ -36,6 +36,9 @@ const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-mcp-rotati
 const currentKey = `current-${"a".repeat(40)}`;
 const replacementKey = `replacement-${"b".repeat(40)}`;
 const retiredKey = `retired-${"c".repeat(40)}`;
+const nativeFileOptions = process.platform === "win32"
+  ? { username: process.env.USERNAME || process.env.USER }
+  : {};
 
 function fixtureManifest(operations = { admin_key_secret: null }) {
   const value = JSON.parse(readFileSync(new URL("../templates/brain.manifest.json", import.meta.url), "utf8"));
@@ -54,8 +57,8 @@ function writeManifest(directory, value = fixtureManifest()) {
 }
 
 function persistFixtureKey(manifestPath, manifest, value) {
-  const plan = adminKeyPersistencePlan(manifestPath, manifest);
-  persistAdminKeyDurably(plan, value);
+  const plan = adminKeyPersistencePlan(manifestPath, manifest, nativeFileOptions);
+  persistAdminKeyDurably(plan, value, nativeFileOptions);
   return plan;
 }
 
@@ -292,6 +295,7 @@ try {
     environment: {
       PATH: process.env.PATH || "/usr/bin:/bin",
       HOME: sandbox,
+      USERNAME: process.env.USERNAME || process.env.USER || "fixture-user",
       ADMIN_KEY: replacementKey,
       CLOUDFLARE_API_TOKEN: "deployment-secret",
       OPENAI_API_KEY: "openai-fixture-secret",
@@ -307,7 +311,7 @@ try {
   };
   const runtime = createBrainCredentialResolver({ environment: runtimeEnvironment });
   assert.equal(runtime.get(), currentKey, "BRAIN_MANIFEST is authoritative over a legacy key");
-  persistAdminKeyDurably(plan, replacementKey);
+  persistAdminKeyDurably(plan, replacementKey, nativeFileOptions);
   const attempted = [];
   const response = await fetchWithBrainCredential(async (_url, options) => {
     const key = new Headers(options.headers).get("X-Admin-Key");

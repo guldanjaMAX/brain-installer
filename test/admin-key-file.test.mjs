@@ -48,6 +48,8 @@ function fakeDpapi(pairs) {
       const script = String(args.at(-1) || "");
       const protect = script.includes("]::Protect(");
       const unprotect = script.includes("]::Unprotect(");
+      const framed = script.includes(`[int]$expectedLength = ${input.length}`) &&
+        !script.includes("__BRAIN_INPUT_LENGTH__");
       calls.push({
         args: [...args],
         command,
@@ -56,7 +58,9 @@ function fakeDpapi(pairs) {
         protect,
         unprotect,
       });
-      if (protect === unprotect) return { status: 1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+      if (protect === unprotect || !framed) {
+        return { status: 1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+      }
       const pair = protect
         ? pairs.find((candidate) => input.equals(Buffer.from(candidate.secret, "utf8")))
         : pairs.find((candidate) => input.equals(candidate.cipher));
