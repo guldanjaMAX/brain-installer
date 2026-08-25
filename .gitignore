@@ -27,6 +27,7 @@ eval/eval.config.local.json
 # Temporary migration receipts name private source ids and the isolated target.
 # They contain no credentials, but they are operational state rather than code.
 .brain-migration-*.json
+.brain-migration-*.json.tmp-*
 
 # Connector cursors and folder indexes contain private source IDs. They are
 # machine-local operational state and must never become a tracked artifact.

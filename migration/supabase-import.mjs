@@ -9,14 +9,17 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { batches, splitOversized } from "../ingest/run.mjs";
+import { readProtectedStateJson, saveProtectedStateJson } from "./state-file.mjs";
 
 const SOURCE_API = "https://api.supabase.com/v1";
 const LANES = new Set(["curated", "drive", "messages"]);
 const DRIVE_ID = /^[A-Za-z0-9_-]{8,200}$/;
+export const SOURCE_RESPONSE_MAX_BYTES = 32 * 1024 * 1024;
+export const TARGET_RESPONSE_MAX_BYTES = 2 * 1024 * 1024;
 
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const cleanUrl = (value) => String(value || "").replace(/\/+$/, "");
@@ -313,107 +316,219 @@ export function rowToEnvelope(lane, row) {
   };
 }
 
-export async function querySupabase({ projectRef, accessToken, sql, fetchImpl = fetch, timeoutMs = 120_000 }) {
+const assertExactResponseUrl = (response, expected, label) => {
+  if (response?.redirected) throw new Error(`${label} redirected; refusing to forward credentials`);
+  if (!response?.url) return; // Injected test responses may not expose a final URL.
+  let final;
+  try { final = new URL(response.url); }
+  catch { throw new Error(`${label} returned an invalid final URL`); }
+  if (final.href !== expected.href) throw new Error(`${label} changed origin or path`);
+};
+
+export async function readBoundedResponseText(response, {
+  maxBytes,
+  label = "migration response",
+} = {}) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error(`${label} has an invalid size limit`);
+  const declared = Number.parseInt(response?.headers?.get?.("content-length") || "", 10);
+  if (Number.isFinite(declared) && declared > maxBytes) throw new Error(`${label} exceeds its size limit`);
+
+  if (!response?.body || typeof response.body.getReader !== "function") {
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > maxBytes) throw new Error(`${label} exceeds its size limit`);
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value?.byteLength || 0;
+      if (bytes > maxBytes) {
+        try { await reader.cancel(); } catch { /* the size refusal is primary */ }
+        throw new Error(`${label} exceeds its size limit`);
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+export function assertTargetReceiptIdentity(items, body) {
+  if (!Array.isArray(body?.results) || body.results.length !== items.length) {
+    throw new Error(`target receipt has ${body?.results?.length ?? 0} slots for ${items.length} documents`);
+  }
+  for (let index = 0; index < items.length; index++) {
+    const envelope = items[index]?.envelope;
+    const slot = body.results[index];
+    if (String(slot?.source_id ?? "") !== String(envelope?.source_id ?? "") ||
+        String(slot?.source_type ?? "") !== String(envelope?.source_type ?? "")) {
+      throw new Error(`target receipt identity mismatch at slot ${index + 1}`);
+    }
+  }
+  return body;
+}
+
+export async function querySupabase({
+  projectRef, accessToken, sql, fetchImpl = fetch, timeoutMs = 120_000,
+  maxResponseBytes = SOURCE_RESPONSE_MAX_BYTES,
+}) {
   if (!projectRef || !/^[a-z0-9]{20}$/.test(projectRef)) throw new Error("SUPABASE_PROJECT_REF is missing or invalid");
   if (!accessToken) throw new Error("SUPABASE_ACCESS_TOKEN is missing");
+  const endpoint = new URL(`${SOURCE_API}/projects/${projectRef}/database/query`);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let response;
+  let raw;
   try {
-    response = await fetchImpl(`${SOURCE_API}/projects/${projectRef}/database/query`, {
+    response = await fetchImpl(endpoint.href, {
       method: "POST",
       headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ query: sql }),
       signal: controller.signal,
+      redirect: "error",
     });
+    assertExactResponseUrl(response, endpoint, "Supabase source query");
+    raw = await readBoundedResponseText(response, { maxBytes: maxResponseBytes, label: "Supabase source response" });
   } catch (error) {
     if (error?.name === "AbortError") throw new Error(`Supabase source query timed out after ${timeoutMs}ms`);
     throw new Error(`Supabase source query failed: ${error?.message || error}`);
   } finally {
     clearTimeout(timer);
   }
-  const raw = await response.text();
-  if (!response.ok) throw new Error(`Supabase source query returned ${response.status}: ${raw.slice(0, 300)}`);
+  if (!response.ok) throw new Error(`Supabase source query returned ${response.status}`);
   let rows;
   try { rows = JSON.parse(raw); } catch { throw new Error("Supabase source query returned non-JSON"); }
   if (!Array.isArray(rows)) throw new Error("Supabase source query did not return rows");
   return rows;
 }
 
-export async function postTargetBatch({ targetUrl, adminKey, items, fetchImpl = fetch, timeoutMs = 180_000 }) {
+export async function postTargetBatch({
+  targetUrl, adminKey, items, fetchImpl = fetch, timeoutMs = 180_000,
+  maxResponseBytes = TARGET_RESPONSE_MAX_BYTES,
+}) {
   if (!targetUrl) throw new Error("BRAIN_URL is missing");
   if (!adminKey) throw new Error("ADMIN_KEY is missing");
+  const endpoint = new URL(`${cleanUrl(targetUrl)}/api/admin/brain/ingest/batch`);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let response;
+  let raw;
   try {
-    response = await fetchImpl(`${cleanUrl(targetUrl)}/api/admin/brain/ingest/batch`, {
+    response = await fetchImpl(endpoint.href, {
       method: "POST",
       headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
       body: JSON.stringify({ docs: items.map((item) => item.envelope) }),
       signal: controller.signal,
+      redirect: "error",
     });
+    assertExactResponseUrl(response, endpoint, "target ingest");
+    raw = await readBoundedResponseText(response, { maxBytes: maxResponseBytes, label: "target ingest response" });
   } catch (error) {
     if (error?.name === "AbortError") throw new Error(`target ingest timed out after ${timeoutMs}ms`);
     throw new Error(`target ingest failed: ${error?.message || error}`);
   } finally {
     clearTimeout(timer);
   }
-  const raw = await response.text();
   let body;
   try { body = JSON.parse(raw); } catch { throw new Error(`target ingest returned non-JSON (${response.status})`); }
-  if (!response.ok) throw new Error(`target ingest returned ${response.status}: ${body?.error || "unknown error"}`);
-  if (!Array.isArray(body.results) || body.results.length !== items.length) {
-    throw new Error(`target receipt has ${body.results?.length ?? 0} slots for ${items.length} documents`);
+  if (!response.ok) throw new Error(`target ingest returned ${response.status}`);
+  return assertTargetReceiptIdentity(items, body);
+}
+
+/** Read the target's aggregate D1 and Vectorize state without mutating it. */
+export async function getTargetInventory({
+  targetUrl, adminKey, fetchImpl = fetch, timeoutMs = 30_000,
+  maxResponseBytes = TARGET_RESPONSE_MAX_BYTES,
+}) {
+  if (!targetUrl) throw new Error("BRAIN_URL is missing");
+  if (!adminKey) throw new Error("ADMIN_KEY is missing");
+  const endpoint = new URL(`${cleanUrl(targetUrl)}/api/admin/brain/documents`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  let raw;
+  try {
+    response = await fetchImpl(endpoint.href, {
+      method: "GET",
+      headers: { "X-Admin-Key": adminKey },
+      signal: controller.signal,
+      redirect: "error",
+    });
+    assertExactResponseUrl(response, endpoint, "target inventory");
+    raw = await readBoundedResponseText(response, { maxBytes: maxResponseBytes, label: "target inventory response" });
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error(`target inventory timed out after ${timeoutMs}ms`);
+    throw new Error(`target inventory failed: ${error?.message || error}`);
+  } finally {
+    clearTimeout(timer);
   }
+  let body;
+  try { body = JSON.parse(raw); } catch { throw new Error(`target inventory returned non-JSON (${response.status})`); }
+  if (!response.ok) throw new Error(`target inventory returned ${response.status}`);
+  if (!body || !Array.isArray(body.rows)) throw new Error("target inventory returned an invalid aggregate shape");
   return body;
 }
 
 /** Close a completed migration lane with a source-registry receipt. */
-export async function postSourceReceipt({ targetUrl, adminKey, receipt, fetchImpl = fetch, timeoutMs = 30_000 }) {
+export async function postSourceReceipt({
+  targetUrl, adminKey, receipt, fetchImpl = fetch, timeoutMs = 30_000,
+  maxResponseBytes = TARGET_RESPONSE_MAX_BYTES,
+}) {
   if (!targetUrl) throw new Error("BRAIN_URL is missing");
   if (!adminKey) throw new Error("ADMIN_KEY is missing");
+  const endpoint = new URL(`${cleanUrl(targetUrl)}/api/admin/brain/source-receipt`);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let response;
+  let raw;
   try {
-    response = await fetchImpl(`${cleanUrl(targetUrl)}/api/admin/brain/source-receipt`, {
+    response = await fetchImpl(endpoint.href, {
       method: "POST",
       headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
       body: JSON.stringify(receipt),
       signal: controller.signal,
+      redirect: "error",
     });
+    assertExactResponseUrl(response, endpoint, "source receipt");
+    raw = await readBoundedResponseText(response, { maxBytes: maxResponseBytes, label: "source receipt response" });
   } catch (error) {
     if (error?.name === "AbortError") throw new Error(`source receipt timed out after ${timeoutMs}ms`);
     throw new Error(`source receipt failed: ${error?.message || error}`);
   } finally {
     clearTimeout(timer);
   }
-  const raw = await response.text();
   let body;
   try { body = JSON.parse(raw); } catch { throw new Error(`source receipt returned non-JSON (${response.status})`); }
-  if (!response.ok) throw new Error(`source receipt returned ${response.status}: ${body?.error || "unknown error"}`);
+  if (!response.ok) throw new Error(`source receipt returned ${response.status}`);
   if (body?.status !== "ready") throw new Error("source receipt did not mark the source ready");
+  if (body?.source !== receipt?.source) throw new Error("source receipt returned the wrong source identity");
+  if (receipt?.run_id && body?.run_id !== receipt.run_id) {
+    throw new Error("source receipt returned the wrong run identity");
+  }
   return body;
 }
 
 export function loadMigrationState(path, { projectRef, targetUrl } = {}) {
-  let state = null;
-  if (path && existsSync(path)) {
-    try { state = JSON.parse(readFileSync(path, "utf-8")); } catch { throw new Error(`migration state is not valid JSON: ${path}`); }
-  }
+  let state = path ? readProtectedStateJson(path, { label: "migration checkpoint", allowMissing: true }) : null;
   state ||= { version: 1, project_ref: projectRef, target_url: cleanUrl(targetUrl), lanes: {} };
   if (state.version !== 1) throw new Error(`unsupported migration state version ${state.version}`);
   if (projectRef && state.project_ref && state.project_ref !== projectRef) throw new Error("state belongs to a different Supabase project");
   if (targetUrl && state.target_url && state.target_url !== cleanUrl(targetUrl)) throw new Error("state belongs to a different target brain");
+  if (!state.project_ref && projectRef) state.project_ref = projectRef;
+  if (!state.target_url && targetUrl) state.target_url = cleanUrl(targetUrl);
   return state;
 }
 
 export function saveMigrationState(path, state) {
-  const absolute = resolve(path);
-  const temporary = `${absolute}.tmp`;
-  writeFileSync(temporary, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
-  renameSync(temporary, absolute);
+  saveProtectedStateJson(path, state, { label: "migration checkpoint" });
 }
 
 const failure = (laneState, item, status, error) => {
@@ -524,6 +639,7 @@ export async function runLane({
       let receipt;
       try {
         receipt = await postFn(group);
+        assertTargetReceiptIdentity(group, receipt);
       } catch (error) {
         for (const item of group) failure(laneState, item, "request_failed", error?.message || error);
         laneState.failed += group.length;

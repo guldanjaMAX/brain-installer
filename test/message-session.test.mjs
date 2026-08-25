@@ -1,7 +1,8 @@
-import { emailEnvelope, MessageSessionizer } from "../ingest/message-session.mjs";
+import { emailEnvelope, MessageSessionizer, messageRowDisposition } from "../ingest/message-session.mjs";
 import { win32 } from "node:path";
 import {
-  isMessageMigrationDirectExecution, messageHighWaterSql, messagePageSql, sendMessageEnvelopes,
+  isMessageMigrationDirectExecution, messageExpectedCountSql, messageHighWaterSql,
+  messagePageSql, sendMessageEnvelopes,
 } from "../migration/supabase-message-sessions.mjs";
 
 let fail = 0, ran = 0;
@@ -65,6 +66,17 @@ const row = (overrides = {}) => ({
 }
 
 {
+  const utc = new MessageSessionizer({ groupingTimezone: "UTC" });
+  utc.push(row({ ts: "2026-01-01T23:50:00Z" }));
+  const utcClosed = utc.push(row({ id: "m2", ts: "2026-01-02T00:10:00Z", body: "After UTC midnight" }));
+  const mountain = new MessageSessionizer({ groupingTimezone: "America/Denver" });
+  mountain.push(row({ ts: "2026-01-01T23:50:00Z" }));
+  const mountainClosed = mountain.push(row({ id: "m2", ts: "2026-01-02T00:10:00Z", body: "Same local day" }));
+  check("the pinned grouping timezone controls the conversation day boundary",
+    utcClosed.length === 1 && mountainClosed.length === 0 && mountain.finish()[0].metadata.message_count === 2);
+}
+
+{
   const s = new MessageSessionizer({ maxChars: 12 });
   s.push(row({ body: "12345678" }));
   const closed = s.push(row({ id: "m2", ts: "2026-08-23T10:01:00Z", body: "abcdefgh" }));
@@ -87,12 +99,22 @@ const row = (overrides = {}) => ({
   check("the fixed high-water mark bounds a live source", /\(m\.ts, m\.id::text\) <=/.test(sql) && /ORDER BY m\.ts DESC, m\.id DESC/.test(messageHighWaterSql()));
   check("a recent-first scope is explicit in both source queries", /m\.ts >=/.test(sql) && /m\.ts >=/.test(messageHighWaterSql({ from: "2026-01-01T00:00:00.000Z" })));
   check("sender, direction and thread context are read from the normalized source", /m\.direction/.test(sql) && /sender_name/.test(sql) && /messaging\.threads/.test(sql));
+  check("the high-water query freezes the eligible row count in the same source snapshot",
+    /count\(\*\) OVER\(\)::text AS eligible_rows/.test(messageHighWaterSql()));
+  check("a resumed legacy checkpoint can recalculate the count below its saved high-water mark",
+    /count\(\*\)::text AS eligible_rows/.test(messageExpectedCountSql({ ts: "2026-12-31T00:00:00Z", id: "z" })));
+  check("every returned source row has an explicit represented or skipped disposition",
+    messageRowDisposition(row()) === "represented" &&
+    messageRowDisposition(row({ platform: "unsupported" })) === "unsupported_platform" &&
+    messageRowDisposition(row({ body: "[image]" })) === "media_marker");
 }
 
 {
   const envelope = emailEnvelope(row({ id: "e2", platform: "email", body: "Body" }));
   const receipt = await sendMessageEnvelopes([envelope], async (items) => ({
-    results: items.map(() => ({ status: "created", chunks: 2 })),
+    results: items.map(({ envelope: item }) => ({
+      source_id: item.source_id, source_type: item.source_type, status: "created", chunks: 2,
+    })),
   }));
   check("message migration accounts for target receipts", receipt.created === 1 && receipt.target_chunks === 2, JSON.stringify(receipt));
 }
@@ -100,11 +122,15 @@ const row = (overrides = {}) => ({
 {
   let calls = 0;
   const envelope = emailEnvelope(row({ id: "network-retry", platform: "email", body: "Body" }));
-  const receipt = await sendMessageEnvelopes([envelope], async () => {
+  const receipt = await sendMessageEnvelopes([envelope], async (items) => {
     calls++;
+    const identity = {
+      source_id: items[0].envelope.source_id,
+      source_type: items[0].envelope.source_type,
+    };
     return calls === 1
-      ? { results: [{ status: "failed", error: "D1_ERROR: Network connection lost." }] }
-      : { results: [{ status: "unchanged", chunks: 2 }] };
+      ? { results: [{ ...identity, status: "failed", error: "D1_ERROR: Network connection lost." }] }
+      : { results: [{ ...identity, status: "unchanged", chunks: 2 }] };
   }, { delayMs: 1, sleep: async () => {} });
   check("a transient D1 receipt is retried idempotently", calls === 2 && receipt.unchanged === 1, JSON.stringify({ calls, receipt }));
 }
@@ -113,14 +139,19 @@ const row = (overrides = {}) => ({
   let calls = 0, error = null;
   const envelope = emailEnvelope(row({ id: "permanent-failure", platform: "email", body: "Body" }));
   try {
-    await sendMessageEnvelopes([envelope], async () => {
+    await sendMessageEnvelopes([envelope], async (items) => {
       calls++;
-      return { results: [{ status: "failed", error: "D1 constraint violation" }] };
+      return { results: [{
+        source_id: items[0].envelope.source_id,
+        source_type: items[0].envelope.source_type,
+        status: "failed",
+        error: "D1 constraint violation",
+      }] };
     }, { delayMs: 1, sleep: async () => {} });
   } catch (caught) {
     error = caught;
   }
-  check("a permanent D1 failure is not retried", calls === 1 && /constraint violation/.test(error?.message || ""), JSON.stringify({ calls, error: error?.message }));
+  check("a permanent D1 failure is not retried", calls === 1 && /rejected receipt slot/.test(error?.message || ""), JSON.stringify({ calls, error: error?.message }));
 }
 
 {

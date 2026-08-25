@@ -8,14 +8,31 @@
  */
 
 const HOUR_MS = 60 * 60 * 1000;
-const CHAT_PLATFORMS = new Set(["imessage", "sms", "whatsapp", "fb_messenger"]);
+export const MESSAGE_CHAT_PLATFORMS = Object.freeze(["imessage", "sms", "whatsapp", "fb_messenger"]);
+const CHAT_PLATFORMS = new Set(MESSAGE_CHAT_PLATFORMS);
+export const MESSAGE_SESSION_DEFAULTS = Object.freeze({
+  maxGapMs: 6 * HOUR_MS,
+  maxChars: 18_000,
+  maxMessages: 50,
+});
 
 const clean = (value) => String(value || "").replace(/\r\n/g, "\n").trim();
 const iso = (value) => {
   const date = new Date(value);
   return Number.isFinite(date.getTime()) ? date.toISOString() : null;
 };
-const dayOf = (value) => iso(value)?.slice(0, 10) || null;
+const dayOf = (value, timeZone = "UTC") => {
+  const normalized = iso(value);
+  if (!normalized) return null;
+  const parts = new Intl.DateTimeFormat("en", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(normalized));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+};
 const platformLabel = (value) => ({
   imessage: "iMessage",
   sms: "SMS",
@@ -119,7 +136,7 @@ export function sessionEnvelope(session) {
   };
 }
 
-const newSession = (row, ownerLabel) => {
+const newSession = (row, ownerLabel, groupingTimezone) => {
   const id = rowId(row);
   const body = rowBody(row);
   const ts = rowTime(row);
@@ -129,7 +146,7 @@ const newSession = (row, ownerLabel) => {
     thread_id: String(row.thread_id || "unknown"),
     thread_title: clean(row.thread_title),
     category: clean(row.category) || "message",
-    day: dayOf(ts),
+    day: dayOf(ts, groupingTimezone),
     first_id: id,
     last_id: id,
     first_ts: ts,
@@ -158,19 +175,45 @@ const validChatRow = (row) => {
   return CHAT_PLATFORMS.has(platform) && !!rowId(row) && !!rowTime(row) && !!rowBody(row) && !isMediaMarkerOnly(rowBody(row));
 };
 
+/**
+ * Classify every source row before sessionization so completion accounting can
+ * prove that nothing disappeared merely because `push()` returned no closed
+ * document. A supported chat row normally stays pending, which is different
+ * from an unsupported or malformed row being skipped.
+ */
+export function messageRowDisposition(row) {
+  if (!rowId(row)) return "invalid_identity";
+  if (!rowTime(row)) return "invalid_time";
+  const body = rowBody(row);
+  if (!body) return "empty_content";
+  if (isMediaMarkerOnly(body)) return "media_marker";
+  const platform = String(row.platform || "").toLowerCase();
+  if (platform === "email" || CHAT_PLATFORMS.has(platform)) return "represented";
+  return "unsupported_platform";
+}
+
 export class MessageSessionizer {
   constructor({
     ownerLabel = "Owner",
-    maxGapMs = 6 * HOUR_MS,
-    maxChars = 18_000,
-    maxMessages = 50,
+    maxGapMs = MESSAGE_SESSION_DEFAULTS.maxGapMs,
+    maxChars = MESSAGE_SESSION_DEFAULTS.maxChars,
+    maxMessages = MESSAGE_SESSION_DEFAULTS.maxMessages,
+    groupingTimezone = "UTC",
     active = [],
   } = {}) {
     this.ownerLabel = ownerLabel;
     this.maxGapMs = maxGapMs;
     this.maxChars = maxChars;
     this.maxMessages = maxMessages;
-    this.active = new Map((active || []).map((session) => [`${session.platform}:${session.thread_id}`, session]));
+    // Intl validates IANA names and canonicalizes aliases once at startup.
+    this.groupingTimezone = new Intl.DateTimeFormat("en", {
+      timeZone: groupingTimezone,
+    }).resolvedOptions().timeZone;
+    // A migration attempt may mutate sessions before a target request fails.
+    // Keep the durable checkpoint objects isolated so the caller can retry the
+    // same in-memory state without accidentally advancing uncommitted work.
+    const restored = structuredClone(active || []);
+    this.active = new Map(restored.map((session) => [`${session.platform}:${session.thread_id}`, session]));
   }
 
   /** Add one globally chronological row and return any documents it closes. */
@@ -180,7 +223,7 @@ export class MessageSessionizer {
     if (!ts || !rowId(row) || !rowBody(row) || isMediaMarkerOnly(rowBody(row))) return out;
 
     const now = Date.parse(ts);
-    const day = dayOf(ts);
+    const day = dayOf(ts, this.groupingTimezone);
     for (const [key, session] of this.active) {
       const expired = day !== session.day || now - Date.parse(session.last_ts) > this.maxGapMs;
       if (expired) {
@@ -207,7 +250,7 @@ export class MessageSessionizer {
       session = null;
     }
     if (!session) {
-      this.active.set(key, newSession(row, this.ownerLabel));
+      this.active.set(key, newSession(row, this.ownerLabel, this.groupingTimezone));
     } else {
       appendSession(session, row, this.ownerLabel);
     }
@@ -221,7 +264,6 @@ export class MessageSessionizer {
   }
 
   snapshot() {
-    return [...this.active.values()];
+    return structuredClone([...this.active.values()]);
   }
 }
-

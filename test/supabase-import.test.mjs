@@ -116,7 +116,9 @@ const check = (name, condition, detail = "") => {
   const queryFn = async (sql) => /max\(id\)/.test(sql) ? [{ high_water: "1" }] : pageCalls++ === 0 ? page : [];
   const postFn = async (items) => {
     posts++;
-    return { results: items.map(() => ({ status: "created", chunks: 2 })) };
+    return { results: items.map(({ envelope }) => ({
+      source_id: envelope.source_id, source_type: envelope.source_type, status: "created", chunks: 2,
+    })) };
   };
   const first = await runLane({ lane: "curated", state, queryFn, postFn, saveFn: () => { saves++; } });
   check("a successful lane completes", first.status === "complete", JSON.stringify(first));
@@ -134,7 +136,12 @@ const check = (name, condition, detail = "") => {
     : [{ cursor_id: "2", d1_key: "bad", title: "Bad", category: "note", content: "content" }];
   const result = await runLane({
     lane: "curated", state, queryFn,
-    postFn: async () => ({ results: [{ status: "failed", error: "target write failed" }] }),
+    postFn: async (items) => ({ results: [{
+      source_id: items[0].envelope.source_id,
+      source_type: items[0].envelope.source_type,
+      status: "failed",
+      error: "target write failed",
+    }] }),
     saveFn: () => {}, maxPages: 1,
   });
   check("a failed page blocks rather than skipping data", result.status === "blocked", JSON.stringify(result));
