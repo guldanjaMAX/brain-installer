@@ -24,6 +24,9 @@ report success.**
   parts and refused legacy copies, recounts live physical documents, and checks
   the frozen source again immediately before every completion path. A backfilled
   historical row blocks completion instead of being silently missed.
+- A recorded message replay is sealed. Re-running it cannot reconcile away
+  newer delta documents, and crash recovery validates saved completion
+  accounting before any target cleanup.
 
 ## 0.1.13
 

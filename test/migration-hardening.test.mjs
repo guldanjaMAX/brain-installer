@@ -963,6 +963,118 @@ await check("complete-state recovery rechecks for backfills after target reconci
   assert.equal(liveRows.length, 3);
 });
 
+await check("a recorded completion is sealed before any source or target operation", async () => {
+  const rows = syntheticRows(3);
+  const state = freshState();
+  const target = targetStore();
+  await runMessageMigration({
+    state,
+    queryFn: sourceFor(rows),
+    postFn: target.post,
+    reconcileFn: target.reconcile,
+    listTargetFamiliesFn: target.list,
+    ownerLabel: "Fixture Owner",
+    groupingTimezone: "UTC",
+    sourceBoundary: sourceBoundaryFor(rows),
+  });
+  state.message_sessions.target_readback = verifyMessageTargetInventory(state.message_sessions, {
+    backend: "d1",
+    rows: [{
+      source_type: "message",
+      stored_documents: state.message_sessions.target_documents,
+      logical_documents: state.message_sessions.accepted_family_hashes.length,
+      document_counts_exact: true,
+    }],
+    vector_backlog: { pending: 0 },
+  });
+  state.message_sessions.receipt_recorded_at = "2026-08-25T00:00:00.000Z";
+  target.documents.set("message:newer-delta", JSON.stringify({
+    source_type: "message", source_id: "newer-delta", metadata: {}, content: "newer fixture",
+  }));
+  const before = canonicalDocuments(target.documents);
+  const calls = { query: 0, post: 0, reconcile: 0, list: 0, save: 0 };
+  const result = await runMessageMigration({
+    state,
+    queryFn: async () => { calls.query++; throw new Error("sealed replay queried its source"); },
+    postFn: async () => { calls.post++; throw new Error("sealed replay posted a document"); },
+    reconcileFn: async () => { calls.reconcile++; throw new Error("sealed replay reconciled target families"); },
+    listTargetFamiliesFn: async () => { calls.list++; throw new Error("sealed replay listed target families"); },
+    saveFn: () => { calls.save++; throw new Error("sealed replay saved its checkpoint"); },
+  });
+  assert.equal(result.status, "complete");
+  assert.equal(result.sealed_noop, true);
+  assert.deepEqual(calls, { query: 0, post: 0, reconcile: 0, list: 0, save: 0 });
+  assert.deepEqual(canonicalDocuments(target.documents), before);
+});
+
+await check("corrupt completed accounting fails before target reconciliation", async () => {
+  const rows = syntheticRows(2);
+  const state = freshState();
+  const target = targetStore();
+  await runMessageMigration({
+    state,
+    queryFn: sourceFor(rows),
+    postFn: target.post,
+    reconcileFn: target.reconcile,
+    listTargetFamiliesFn: target.list,
+    ownerLabel: "Fixture Owner",
+    groupingTimezone: "UTC",
+    sourceBoundary: sourceBoundaryFor(rows),
+  });
+  state.message_sessions.represented_source_messages++;
+  let reconciliations = 0;
+  let inventories = 0;
+  let saves = 0;
+  await assert.rejects(() => runMessageMigration({
+    state,
+    queryFn: sourceFor(rows),
+    postFn: target.post,
+    reconcileFn: async (plans) => {
+      reconciliations++;
+      return target.reconcile(plans);
+    },
+    listTargetFamiliesFn: async () => {
+      inventories++;
+      return target.list();
+    },
+    saveFn: () => { saves++; },
+  }), /saved completion accounting|source classifications do not balance/);
+  assert.equal(reconciliations, 0);
+  assert.equal(inventories, 0);
+  assert.equal(saves, 0);
+});
+
+await check("a sealed completion rejects corrupt saved target readback without operations", async () => {
+  const state = freshState();
+  await runMessageMigration({
+    state,
+    queryFn: async () => [],
+    postFn: async () => ({ results: [] }),
+    ...EMPTY_TARGET,
+    ownerLabel: "Fixture Owner",
+    groupingTimezone: "UTC",
+    sourceBoundary: EMPTY_SOURCE_BOUNDARY,
+  });
+  state.message_sessions.target_readback = {
+    backend: "d1",
+    stored_documents: 999,
+    logical_documents: 999,
+    vector_backlog: 0,
+    verified_at: "2026-08-25T00:00:00.000Z",
+  };
+  state.message_sessions.receipt_recorded_at = "2026-08-25T00:01:00.000Z";
+  const calls = { query: 0, post: 0, reconcile: 0, list: 0, save: 0 };
+  await assert.rejects(() => runMessageMigration({
+    state,
+    queryFn: async () => { calls.query++; return []; },
+    postFn: async () => { calls.post++; return { results: [] }; },
+    reconcileFn: async () => { calls.reconcile++; return { families: 0 }; },
+    listTargetFamiliesFn: async () => { calls.list++; return []; },
+    saveFn: () => { calls.save++; },
+  }), /recorded completion is not retrieval-ready/);
+  assert.deepEqual(calls, { query: 0, post: 0, reconcile: 0, list: 0, save: 0 });
+});
+
 await check("completion receipts are available only after aggregate accounting verifies", async () => {
   const state = freshState();
   await runMessageMigration({

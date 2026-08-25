@@ -646,6 +646,27 @@ export function verifyMessageAccounting(lane) {
   };
 }
 
+function verifySavedCompletionAccounting(lane, { receiptRecorded = false } = {}) {
+  if (!lane?.complete || !lane?.accounting) {
+    throw new Error("message migration saved completion accounting is missing");
+  }
+  const verified = verifyMessageAccounting(lane);
+  if (JSON.stringify(lane.accounting) !== JSON.stringify(verified)) {
+    throw new Error("message migration saved completion accounting does not match its counters");
+  }
+  if (receiptRecorded) {
+    const readback = lane.target_readback;
+    if (!Number.isFinite(Date.parse(String(lane.receipt_recorded_at || ""))) ||
+        !readback || readback.backend !== "d1" || readback.vector_backlog !== 0 ||
+        readback.stored_documents !== lane.target_documents ||
+        readback.logical_documents !== lane.accepted_family_hashes.length ||
+        !Number.isFinite(Date.parse(String(readback.verified_at || "")))) {
+      throw new Error("message migration recorded completion is not retrieval-ready");
+    }
+  }
+  return verified;
+}
+
 export function messageCompletionReceipt(lane, completedAt = new Date().toISOString()) {
   if (!lane?.complete || !lane?.accounting) throw new Error("message migration is not accounting-verified complete");
   if (!lane?.target_readback || lane.target_readback.vector_backlog !== 0) {
@@ -902,6 +923,21 @@ export async function runMessageMigration({
     boundaryChanged = true;
   }
 
+  // A recorded source receipt seals this finite high-water replay. Re-entering
+  // exact reconciliation later could mistake documents from a newer delta run
+  // for extras and delete them. Validate the saved proof, then return without
+  // a source query, target inventory call, write, deletion, or checkpoint save.
+  if (lane.receipt_recorded_at) {
+    verifySavedCompletionAccounting(lane, { receiptRecorded: true });
+    return {
+      status: dryRun ? "dry_run" : "complete",
+      run_rows: 0,
+      run_pages: 0,
+      sealed_noop: true,
+      ...lane,
+    };
+  }
+
   // This source-only check runs on every invocation and before any target
   // mutation. It prevents an empty, truncated, or replaced project from using
   // old target rows as evidence that the replay succeeded.
@@ -928,6 +964,10 @@ export async function runMessageMigration({
   if (boundaryChanged && !dryRun) saveFn(workingState);
 
   if (lane.complete) {
+    // Crash recovery may resume after complete=true but before target readback
+    // and receipt persistence. Prove the saved accounting before a target
+    // listing or exact-reconciliation deletion can occur.
+    verifySavedCompletionAccounting(lane);
     if (!dryRun) {
       lane.target_reconciliation = await reconcileMessageTargetFamilies(lane, {
         listFn: listTargetFamiliesFn,
