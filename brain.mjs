@@ -2717,6 +2717,16 @@ export async function cmdUpgrade(manifestPath, options = {}) {
           persistDomain: false,
           pauseVectorDrainForUpgrade: false,
         }));
+        // Cloudflare can keep routing this client to the paused compatibility
+        // deployment for a few seconds after the active upload succeeds. Prove
+        // the exact active mode is serving before the first corpus mutation;
+        // otherwise convergence can fail on the old Worker's intentional 503.
+        await runStage("active vector-drain health verification", () =>
+          verifyHealth(executionPin.target, {
+            expectVersion: toVersion,
+            expectDrainMode: "active",
+            reachOnly: true,
+          }));
       } else {
         await runStage("migration", () => migrate(executionPin.target));
         await runStage("deployment", () => deploy(executionPin.target, { persistDomain: false }));

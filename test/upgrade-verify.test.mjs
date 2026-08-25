@@ -110,6 +110,33 @@ const manifestFixture = (version = "0.1.9") => ({
       attempt: 6,
       attempts: 6,
     }) === "fail");
+  check("a paused compatibility Worker is retried while active mode propagates",
+    V({
+      ok: true,
+      body: cutoverBody("0.1.14", "paused-for-upgrade"),
+      expectVersion: "0.1.14",
+      expectDrainMode: "active",
+      attempt: 1,
+      attempts: 6,
+    }) === "retry");
+  check("a compatibility Worker still paused after the retry budget fails closed",
+    V({
+      ok: true,
+      body: cutoverBody("0.1.14", "paused-for-upgrade"),
+      expectVersion: "0.1.14",
+      expectDrainMode: "active",
+      attempt: 6,
+      attempts: 6,
+    }) === "fail");
+  check("active mode is accepted only with the leased writer protocol",
+    V({
+      ok: true,
+      body: cutoverBody("0.1.14", "active"),
+      expectVersion: "0.1.14",
+      expectDrainMode: "active",
+      attempt: 2,
+      attempts: 6,
+    }) === "accept");
   check("the rolling-upgrade grace is never shorter than one supported writer lease",
     VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS >= DRAIN_LEASE_TTL_MS,
     `${VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS} < ${DRAIN_LEASE_TTL_MS}`);
@@ -361,11 +388,18 @@ const manifestFixture = (version = "0.1.9") => ({
       },
       cmdHealth: async (path, options) => {
         executionPaths.add(path);
-        events.push(options.expectDrainMode === "paused-for-upgrade" ? "health-paused" : "health-active");
+        events.push(options.expectDrainMode === "paused-for-upgrade"
+          ? "health-paused"
+          : options.reachOnly
+            ? "health-active-cutover"
+            : "health-active-final");
         check("upgrade health requires the running package version", options.expectVersion === "0.1.14");
         if (options.expectDrainMode === "paused-for-upgrade") {
           check("the compatibility health probe is paused-mode and reach-only",
             options.reachOnly === true, JSON.stringify(options));
+        } else if (options.reachOnly) {
+          check("the cutover health probe proves active mode before convergence",
+            options.expectDrainMode === "active", JSON.stringify(options));
         } else {
           check("the final health probe proves vector draining is active",
             options.expectDrainMode === "active", JSON.stringify(options));
@@ -383,8 +417,8 @@ const manifestFixture = (version = "0.1.9") => ({
       },
     });
     check(
-      "upgrade reconciles provider secrets after deploy and before health",
-      events.join(",") === "state,bookmark,deploy-paused,health-paused,quiescence,migrate,deploy-active,reconcile,drain,health-active,test,version,readback,manifest,log",
+      "upgrade proves active propagation before secret reconciliation and vector convergence",
+      events.join(",") === "state,bookmark,deploy-paused,health-paused,quiescence,migrate,deploy-active,health-active-cutover,reconcile,drain,health-active-final,test,version,readback,manifest,log",
       events.join(","),
     );
     check("every remote lifecycle stage revalidates the token account", accountChecks >= 10, String(accountChecks));
@@ -576,7 +610,11 @@ const manifestFixture = (version = "0.1.9") => ({
           }
         },
         cmdHealth: async (_path, options) => {
-          events.push(options.reachOnly ? "health-paused" : "health-active");
+          const mode = options.expectDrainMode === "paused-for-upgrade" ? "paused" : "active";
+          events.push(`health-${mode}${options.reachOnly ? "-reach" : "-full"}`);
+          if (failureStage === "active-health" && mode === "active" && options.reachOnly) {
+            throw new Error("synthetic paused deployment still serving");
+          }
         },
         waitForVectorDrainQuiescence: async () => { events.push("wait"); },
         cmdMigrate: async (_path, options) => {
@@ -599,7 +637,7 @@ const manifestFixture = (version = "0.1.9") => ({
 
   const migrationFailure = await runFailure("migration");
   check("migration failure leaves the compatibility Worker paused and versions uncommitted",
-    migrationFailure.events.join(",") === "deploy-paused,health-paused,wait,migrate-true" &&
+    migrationFailure.events.join(",") === "deploy-paused,health-paused-reach,wait,migrate-true" &&
       migrationFailure.versionWrites === 0 && migrationFailure.manifestWrites === 0 &&
       migrationFailure.manifestVersion === "0.1.9" &&
       /migration-bookmark/.test(migrationFailure.error?.message || "") &&
@@ -608,17 +646,27 @@ const manifestFixture = (version = "0.1.9") => ({
 
   const deployFailure = await runFailure("active-deploy");
   check("an ambiguous final upload stops before health, acceptance, and version commits",
-    deployFailure.events.join(",") === "deploy-paused,health-paused,wait,migrate-true,deploy-active" &&
+    deployFailure.events.join(",") === "deploy-paused,health-paused-reach,wait,migrate-true,deploy-active" &&
       deployFailure.versionWrites === 0 && deployFailure.manifestWrites === 0 &&
       deployFailure.manifestVersion === "0.1.9" &&
       /active-deploy-bookmark/.test(deployFailure.error?.message || "") &&
       /active vector-drain deployment/.test(deployFailure.error?.message || ""),
     JSON.stringify({ ...deployFailure, error: deployFailure.error?.message }));
 
+  const activeHealthFailure = await runFailure("active-health");
+  check("a still-paused deployment stops before reconciliation, convergence, and version commits",
+    activeHealthFailure.events.join(",") ===
+      "deploy-paused,health-paused-reach,wait,migrate-true,deploy-active,health-active-reach" &&
+      activeHealthFailure.versionWrites === 0 && activeHealthFailure.manifestWrites === 0 &&
+      activeHealthFailure.manifestVersion === "0.1.9" &&
+      /active vector-drain health verification/.test(activeHealthFailure.error?.message || "") &&
+      /active-health-bookmark/.test(activeHealthFailure.error?.message || ""),
+    JSON.stringify({ ...activeHealthFailure, error: activeHealthFailure.error?.message }));
+
   const convergenceFailure = await runFailure("convergence");
   check("an incomplete projection bootstrap blocks health, acceptance, and every version commit",
     convergenceFailure.events.join(",") ===
-      "deploy-paused,health-paused,wait,migrate-true,deploy-active,reconcile,converge" &&
+      "deploy-paused,health-paused-reach,wait,migrate-true,deploy-active,health-active-reach,reconcile,converge" &&
       convergenceFailure.versionWrites === 0 && convergenceFailure.manifestWrites === 0 &&
       convergenceFailure.manifestVersion === "0.1.9" &&
       /vector projection convergence/.test(convergenceFailure.error?.message || "") &&
