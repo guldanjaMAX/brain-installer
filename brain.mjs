@@ -100,6 +100,7 @@ import {
 import {
   DRIVE_REMOVAL_MAX_COUNT,
   DRIVE_REMOVAL_MAX_RATIO,
+  DriveRemovalReviewRequired,
   assertDriveRemovalPlanSafe,
   buildDriveRemovalPlan,
 } from "./operations/drive-removal-plan.mjs";
@@ -116,6 +117,7 @@ import {
 export {
   DRIVE_REMOVAL_MAX_COUNT,
   DRIVE_REMOVAL_MAX_RATIO,
+  DriveRemovalReviewRequired,
   assertDriveRemovalPlanSafe,
   buildDriveRemovalPlan,
 };
@@ -193,6 +195,7 @@ function supportSourceForCommand(command = "") {
 
 /** Classify in memory; the raw message is never passed to the journal. */
 export function supportErrorCode(error, { command = "", unexpected = false } = {}) {
+  if (error instanceof DriveRemovalReviewRequired) return "SAFETY_REVIEW_REQUIRED";
   const message = String(error?.message || "");
   if (/PDF.*tim(?:e|ed) out/i.test(message)) return "PDF_PROCESS_TIMEOUT";
   if (/PDF.*process/i.test(message)) return "PDF_PROCESS_FAILED";
@@ -7538,16 +7541,18 @@ if (IS_MAIN) {
 
   commands[cmd](manifestPath).catch((e) => {
     // Fatal is a failure this code ANTICIPATED and already explained: a missing
-    // token, a free-tier account, a typo'd source name. Its message is the whole
-    // point, so print it plainly. Anything else is a bug, and crash() says so
-    // rather than dressing it up as the client's problem.
-    if (e instanceof Fatal) {
+    // token, a free-tier account, a typo'd source name. A Drive removal review
+    // is an intentional safety stop with the same no-crash treatment and a
+    // clearer label. Anything else is a bug, and crash() says so.
+    const reviewRequired = e instanceof DriveRemovalReviewRequired;
+    if (e instanceof Fatal || reviewRequired) {
       // stdout, not stderr. This message is anticipated, already formatted, and
       // addressed to the user; the exit code is the machine-readable part.
       // PowerShell wraps anything on stderr in a NativeCommandError block, which
       // makes a clear explanation look like the tool itself fell over.
       const supportEventId = recordSupportFailure(e);
-      console.log(`${c.red("fail")}  ${e.message}`);
+      const label = reviewRequired ? c.yellow("review required") : c.red("fail");
+      console.log(`${label}  ${e.message}`);
       printSupportReceipt(supportEventId, (line) => console.log(line));
       process.exit(1);
     }

@@ -150,6 +150,20 @@ try {
   exportSupportJournal(fallbackExport, options(fallbackRoot));
   assert.equal(readFileSync(fallbackExport, "utf8"), fallbackPreview);
 
+  const safetyStop = previewSupportEvent({
+    command: "ingest",
+    source: "drive",
+    errorCode: "SAFETY_REVIEW_REQUIRED",
+    message: malicious,
+    removalFingerprint: malicious,
+    documentIds: [malicious],
+  }, options(sandbox, 9));
+  assert.equal(safetyStop.error_code, "SAFETY_REVIEW_REQUIRED");
+  assert.equal(JSON.stringify(safetyStop).includes("THIS_MUST_NEVER_APPEAR"), false);
+  assert.equal(Object.hasOwn(safetyStop, "message"), false);
+  assert.equal(Object.hasOwn(safetyStop, "removalFingerprint"), false);
+  assert.equal(Object.hasOwn(safetyStop, "documentIds"), false);
+
   const root = freshRoot("privacy");
   const eventInput = {
     command: "ingest",

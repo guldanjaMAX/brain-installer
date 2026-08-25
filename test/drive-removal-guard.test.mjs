@@ -20,6 +20,7 @@ import {
   remoteFamilySettlement,
   VALUE_FLAGS,
 } from "../brain.mjs";
+import { previewSupportJournal } from "../support-journal.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = join(HERE, "..", "brain.mjs");
@@ -374,7 +375,21 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     const stopped = run();
     assert.equal(stopped.code, 1, safeDiagnostic(stopped.output));
     assertNoFamilyLeak(stopped.output);
+    assert.match(stopped.output, /review required/i);
+    assert.doesNotMatch(stopped.output, /unexpected error|This is a bug in the installer/i);
     const initialApproval = approvalFrom(stopped.output);
+    const supportBytes = previewSupportJournal({ root: userRoot });
+    const supportEvents = supportBytes.trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(supportEvents.length, 1, supportBytes);
+    assert.equal(supportEvents[0].command, "ingest");
+    assert.equal(supportEvents[0].source, "drive");
+    assert.equal(supportEvents[0].error_code, "SAFETY_REVIEW_REQUIRED");
+    assert.deepEqual(Object.keys(supportEvents[0]), [
+      "schema_version", "event_id", "timestamp", "product_version", "platform",
+      "arch", "node_major", "command", "source", "error_code", "fingerprint",
+    ]);
+    assertNoFamilyLeak(supportBytes);
+    assert.equal(supportBytes.includes(initialApproval), false, "support note retained the removal approval fingerprint");
     assertCursorWithheld();
     let evidence = readEvidence();
     assert.equal(evidence.forgetRequests, 0, "an unapproved plan reached the forget route");

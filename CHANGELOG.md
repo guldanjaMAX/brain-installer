@@ -39,6 +39,9 @@ refuse redirects.**
 - Credential help uses hidden prompts, durable per-install storage, or an
   approved secret manager. Public instructions no longer teach owners to paste
   administrative keys or Cloudflare tokens into shell commands.
+- An oversized Drive cleanup now says `review required` instead of reporting an
+  installer bug. It still removes nothing and withholds the Drive cursor until
+  the owner approves the exact aggregate plan.
 - Release automation pins third-party GitHub Actions to reviewed commit hashes,
   and package tests inspect the real tarball for private material.
 

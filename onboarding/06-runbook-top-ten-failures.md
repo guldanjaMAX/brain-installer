@@ -441,7 +441,20 @@ A bad import being one command instead of a support call is the reason you can a
 
 ---
 
-## Two things that look like failures and are not
+## Things that look like failures and are not
+
+### Drive cleanup says `review required`
+
+This is an intentional safety stop, not an installer crash. The proposed Drive
+cleanup crossed 100 documents or 10% of the stored Drive corpus. Nothing in the
+plan was removed, and the Drive cursor was not advanced.
+
+Review the aggregate reason counts in the message. If the change is expected,
+rerun with the exact `--approve-removals <fingerprint>` value it printed. If the
+change is surprising, do not approve it. Check the Drive connection and source
+policy, then rerun so a fresh source comparison produces a new plan. The local
+issue note records only `SAFETY_REVIEW_REQUIRED`; it does not retain the
+fingerprint, document identifiers, filenames, or message text.
 
 ### `refused: content carries live credential(s)`
 

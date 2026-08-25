@@ -7,6 +7,15 @@ import { createHash } from "node:crypto";
 export const DRIVE_REMOVAL_MAX_COUNT = 100;
 export const DRIVE_REMOVAL_MAX_RATIO = 0.10;
 
+/** A deliberate owner-review boundary, not an installer crash. */
+export class DriveRemovalReviewRequired extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "DriveRemovalReviewRequired";
+    this.code = "SAFETY_REVIEW_REQUIRED";
+  }
+}
+
 const CATEGORY_INPUTS = Object.freeze([
   ["source_policy", "policyCandidates"],
   ["source_deleted", "vanishedCandidates"],
@@ -91,7 +100,7 @@ export function assertDriveRemovalPlanSafe(plan, approval) {
   if (!plan.tooLarge || approval === plan.fingerprint) return plan;
 
   const percent = (Number(plan.ratio || 0) * 100).toFixed(1);
-  throw new Error(
+  throw new DriveRemovalReviewRequired(
     `Drive cleanup would remove ${plan.total} of ${plan.stored} stored documents (${percent}%).\n` +
       `      Aggregate reasons: source policy ${plan.counts.source_policy}; source deletion ${plan.counts.source_deleted}; intentional skip ${plan.counts.intentional_skip}.\n` +
       "      Nothing in this removal plan was removed. The source cursor was not advanced.\n" +
