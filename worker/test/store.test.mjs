@@ -86,6 +86,7 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
   let batches = 0;
 
   const execute = (sql, binds) => {
+    let changes = 0;
     if (/INSERT INTO documents/i.test(sql)) {
       documentWrites++;
       const incoming = {
@@ -98,13 +99,19 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
       rows.document = rows.document
         ? { ...rows.document, ...incoming }
         : incoming;
+      changes = 1;
     } else if (/UPDATE documents SET content_hash/i.test(sql)) {
-      rows.document.content_hash = binds[1];
+      if (rows.document?.content_hash === binds[2]) {
+        rows.document.content_hash = binds[1];
+        changes = 1;
+      }
     } else if (/DELETE FROM chunks WHERE doc_uid/i.test(sql)) {
       for (const [uid, chunk] of rows.chunks) if (chunk.doc_uid === binds[0]) rows.chunks.delete(uid);
     } else if (/INSERT INTO chunks/i.test(sql)) {
       rows.chunks.set(binds[0], { chunk_uid: binds[0], doc_uid: binds[1], text: binds[3] });
+      changes = 1;
     }
+    return { changes };
   };
 
   const env = {
@@ -122,7 +129,10 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
                 return null;
               },
               all: async () => ({ results: [] }),
-              run: async () => { execute(sql, binds); return {}; },
+              run: async () => {
+                const result = execute(sql, binds);
+                return { success: true, meta: { changes: result.changes } };
+              },
             };
           },
         };
@@ -133,8 +143,10 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
           failAfterDocumentWrite = false;
           throw new Error("simulated failure after document row write");
         }
-        for (const statement of statements) execute(statement.sql, statement.binds);
-        return [];
+        return statements.map((statement) => {
+          const result = execute(statement.sql, statement.binds);
+          return { success: true, meta: { changes: result.changes } };
+        });
       },
     },
   };

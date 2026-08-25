@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { splitStatements } from "../brain.mjs";
 import worker from "../worker/src/index.js";
+import { storeFor } from "../worker/src/lib/store.js";
+import { replaceDocumentChunks, upsertChunks } from "../worker/src/lib/store-d1.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationDir = join(here, "..", "migrations", "d1");
@@ -31,7 +33,11 @@ function prepared(sql, params = []) {
     bind: (...next) => prepared(sql, next),
     all: async () => { metrics.remote_calls++; return execute(sql, params, "all"); },
     first: async () => { metrics.remote_calls++; return execute(sql, params, "first"); },
-    run: async () => { metrics.remote_calls++; return execute(sql, params, "run"); },
+    run: async () => {
+      metrics.remote_calls++;
+      const result = execute(sql, params, "run");
+      return { success: true, results: [], meta: { changes: Number(result.changes || 0) } };
+    },
   };
 }
 
@@ -151,5 +157,85 @@ assert.deepEqual(duplicate.results.map((row) => row.status), ["created", "update
 assert.equal(metrics.stats_scans - scansBeforeDuplicate, 2);
 assert.match(sqlite.prepare("SELECT content_hash FROM documents WHERE doc_uid = 'message:duplicate'").get().content_hash, /^[a-f0-9]{64}$/);
 assert.match(sqlite.prepare("SELECT text FROM chunks WHERE doc_uid = 'message:duplicate'").get().text, /second revision/);
+
+// Two requests can have identical content hashes while changing title and
+// filter metadata. Stage both from the same prior snapshot, then prove in both
+// finalizer orders that only the revision owning the current unique marker can
+// report success. The stale finalizer must fail even after it reads the same
+// final content hash written by the winner.
+const store = storeFor(env);
+async function stageMetadataRace(sourceId) {
+  const content = "Synthetic shared content whose metadata revisions differ.";
+  const alpha = {
+    ...envelope(sourceId, content),
+    title: "Synthetic alpha title",
+    metadata: { category: "alpha", platform: "synthetic" },
+  };
+  const beta = {
+    ...envelope(sourceId, content),
+    title: "Synthetic beta title",
+    metadata: { category: "beta", platform: "synthetic" },
+  };
+  const [alphaPreflight] = await store.preflightIngestBatch(env, [alpha]);
+  const [betaPreflight] = await store.preflightIngestBatch(env, [beta]);
+  const alphaStaged = await store.ingest(env, alpha, { deferFinalize: true, prepared: alphaPreflight.prepared });
+  const betaStaged = await store.ingest(env, beta, { deferFinalize: true, prepared: betaPreflight.prepared });
+  assert.equal(alphaStaged.deferred_revision.hash, betaStaged.deferred_revision.hash);
+  assert.notEqual(alphaStaged.deferred_revision.pending_marker, betaStaged.deferred_revision.pending_marker);
+
+  // A stale request may still reach its delete/upsert steps after the newer
+  // request has taken marker ownership. Those writes must be conditional too,
+  // or the eventual CAS winner could commit someone else's chunks.
+  const docUid = `message:${sourceId}`;
+  await replaceDocumentChunks(env, docUid, {
+    expectedContentHash: alphaStaged.deferred_revision.pending_marker,
+  });
+  await upsertChunks(env, [{
+    chunk_uid: `${docUid}#0`,
+    doc_uid: docUid,
+    chunk_ix: 0,
+    text: "[Synthetic alpha title]\n\nSynthetic stale write.",
+    source: "message",
+    title: "Synthetic alpha title",
+    category: "alpha",
+    platform: "synthetic",
+  }], { expectedContentHash: alphaStaged.deferred_revision.pending_marker });
+  const guarded = sqlite.prepare("SELECT title, category FROM chunks WHERE doc_uid = ?").get(docUid);
+  assert.equal(guarded.title, "Synthetic beta title");
+  assert.equal(guarded.category, "beta");
+  return { alpha: alphaStaged.deferred_revision, beta: betaStaged.deferred_revision };
+}
+
+{
+  const race = await stageMetadataRace("race-stale-first");
+  const stale = await store.finalizeIngestBatch(env, [race.alpha]);
+  const winner = await store.finalizeIngestBatch(env, [race.beta]);
+  assert.equal(stale[0].ok, false);
+  assert.equal(winner[0].ok, true);
+}
+
+{
+  const race = await stageMetadataRace("race-winner-first");
+  const winner = await store.finalizeIngestBatch(env, [race.beta]);
+  const stale = await store.finalizeIngestBatch(env, [race.alpha]);
+  assert.equal(winner[0].ok, true);
+  assert.equal(stale[0].ok, false);
+}
+
+for (const sourceId of ["race-stale-first", "race-winner-first"]) {
+  const docUid = `message:${sourceId}`;
+  const document = sqlite.prepare(
+    "SELECT title, category, content_hash FROM documents WHERE doc_uid = ?"
+  ).get(docUid);
+  const chunk = sqlite.prepare(
+    "SELECT title, category, text FROM chunks WHERE doc_uid = ?"
+  ).get(docUid);
+  assert.equal(document.title, "Synthetic beta title");
+  assert.equal(document.category, "beta");
+  assert.match(document.content_hash, /^[a-f0-9]{64}$/);
+  assert.equal(chunk.title, "Synthetic beta title");
+  assert.equal(chunk.category, "beta");
+  assert.match(chunk.text, /^\[Synthetic beta title\]/);
+}
 
 console.log("d1-batch-ingest: real SQLite integration and performance structure passed");

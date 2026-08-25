@@ -684,6 +684,7 @@ function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocU
   const calls = { remote: 0, stats_scans: 0, stats_attempts: 0, finalizer_batches: 0 };
   const control = { explodeOn, finalizeFailSource, failChunkDocUid, preflightFail };
   const execute = (sql, b) => {
+    let changes = 0;
     if (/INSERT INTO documents/.test(sql)) {
       if (control.explodeOn && String(b[2]) === control.explodeOn) throw new Error("D1 write failed");
       const prior = documents.get(b[0]) || {};
@@ -694,14 +695,18 @@ function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocU
         content_hash: b[13],
       });
       written.push(String(b[2]));
+      changes = 1;
     } else if (/UPDATE documents SET content_hash/.test(sql)) {
       const row = documents.get(b[0]);
-      if (row && (!/content_hash IN/.test(sql) || row.content_hash === b[1] || row.content_hash === b[2])) {
+      if (row && row.content_hash === b[2]) {
         row.content_hash = b[1];
+        changes = 1;
       }
     } else if (/INSERT INTO corpus_stats/.test(sql)) {
       calls.stats_scans++;
+      changes = 1;
     }
+    return { changes };
   };
   const env = {
     STORAGE: "d1", ADMIN_KEY: "k",
@@ -725,7 +730,11 @@ function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocU
             if (/SELECT client, category/.test(sql)) return documents.get(b[0]) || null;
             return null;
           },
-          run: async () => { calls.remote++; execute(sql, b); return {}; },
+          run: async () => {
+            calls.remote++;
+            const result = execute(sql, b);
+            return { success: true, meta: { changes: result.changes } };
+          },
         }),
       }),
       batch: async (statements) => {
@@ -746,8 +755,10 @@ function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocU
         if (control.failChunkDocUid && statements.some((statement) =>
           /INSERT INTO chunks/.test(statement.sql) && statement.binds[1] === control.failChunkDocUid
         )) throw new Error("simulated chunk batch failure");
-        for (const statement of statements) execute(statement.sql, statement.binds);
-        return statements.map(() => ({}));
+        return statements.map((statement) => {
+          const result = execute(statement.sql, statement.binds);
+          return { success: true, meta: { changes: result.changes } };
+        });
       },
     },
   };

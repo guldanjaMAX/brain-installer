@@ -367,38 +367,65 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
  * exists in D1 without a vector is findable by keyword and repairable. A vector
  * with no D1 row is an orphan that returns an id pointing at nothing.
  */
-export async function upsertChunks(env, chunks) {
+export async function upsertChunks(env, chunks, { expectedContentHash = null } = {}) {
   if (!chunks.length) return { written: 0, queued: 0 };
   const now = Date.now();
+  const guarded = typeof expectedContentHash === "string" && expectedContentHash.length > 0;
 
   const stmts = [];
   for (const c of chunks) {
     // Computed at write time so a search hit can be resolved back to its chunk
     // even when the id had to be hashed to fit Vectorize's 64-byte ceiling.
     c.vector_id = await vectorIdFor(c.chunk_uid);
-    stmts.push(
-      env.DB.prepare(
-        `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-         ON CONFLICT(chunk_uid) DO UPDATE SET
-           text = excluded.text, title = excluded.title,
-           document_date = excluded.document_date,
-           client = excluded.client, category = excluded.category,
-           top_folder = excluded.top_folder, platform = excluded.platform,
-           vector_id = excluded.vector_id`
-      ).bind(c.chunk_uid, c.doc_uid, c.chunk_ix, c.text, c.source, c.title ?? null,
-             c.document_date ?? null, c.client ?? null, c.category ?? null,
-             c.top_folder ?? null, c.platform ?? null, c.vector_id)
+    const chunkStatement = env.DB.prepare(
+      guarded
+        ? `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id)
+           SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12
+           WHERE EXISTS (
+             SELECT 1 FROM documents WHERE doc_uid = ?2 AND content_hash = ?13
+           )
+           ON CONFLICT(chunk_uid) DO UPDATE SET
+             text = excluded.text, title = excluded.title,
+             document_date = excluded.document_date,
+             client = excluded.client, category = excluded.category,
+             top_folder = excluded.top_folder, platform = excluded.platform,
+             vector_id = excluded.vector_id`
+        : `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+           ON CONFLICT(chunk_uid) DO UPDATE SET
+             text = excluded.text, title = excluded.title,
+             document_date = excluded.document_date,
+             client = excluded.client, category = excluded.category,
+             top_folder = excluded.top_folder, platform = excluded.platform,
+             vector_id = excluded.vector_id`
+    ).bind(
+      c.chunk_uid, c.doc_uid, c.chunk_ix, c.text, c.source, c.title ?? null,
+      c.document_date ?? null, c.client ?? null, c.category ?? null,
+      c.top_folder ?? null, c.platform ?? null, c.vector_id,
+      ...(guarded ? [expectedContentHash] : [])
     );
-    stmts.push(
-      env.DB.prepare(
-        `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at)
-         VALUES (?1,?2,'upsert',?3)
-         ON CONFLICT(chunk_uid) DO UPDATE SET
-           vector_id=excluded.vector_id, op='upsert', queued_at=?3,
-           attempts=0, last_error=NULL`
-      ).bind(c.chunk_uid, c.vector_id, now)
+    stmts.push(chunkStatement);
+
+    const outboxStatement = env.DB.prepare(
+      guarded
+        ? `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at)
+           SELECT ?1,?2,'upsert',?3
+           WHERE EXISTS (
+             SELECT 1 FROM documents WHERE doc_uid = ?4 AND content_hash = ?5
+           )
+           ON CONFLICT(chunk_uid) DO UPDATE SET
+             vector_id=excluded.vector_id, op='upsert', queued_at=?3,
+             attempts=0, last_error=NULL`
+        : `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at)
+           VALUES (?1,?2,'upsert',?3)
+           ON CONFLICT(chunk_uid) DO UPDATE SET
+             vector_id=excluded.vector_id, op='upsert', queued_at=?3,
+             attempts=0, last_error=NULL`
+    ).bind(
+      c.chunk_uid, c.vector_id, now,
+      ...(guarded ? [c.doc_uid, expectedContentHash] : [])
     );
+    stmts.push(outboxStatement);
   }
   await env.DB.batch(stmts);
   return { written: chunks.length, queued: chunks.length };
@@ -409,18 +436,37 @@ export async function upsertChunks(env, chunks) {
  * transaction. A following upsert for a retained chunk uid changes that queue
  * row back to `upsert`; chunks removed by a shorter revision remain `delete`.
  */
-export async function replaceDocumentChunks(env, docUid) {
+export async function replaceDocumentChunks(env, docUid, { expectedContentHash = null } = {}) {
   const now = Date.now();
+  const guarded = typeof expectedContentHash === "string" && expectedContentHash.length > 0;
   await env.DB.batch([
     env.DB.prepare(
-      `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at, attempts, last_error)
-       SELECT chunk_uid, COALESCE(vector_id, chunk_uid), 'delete', ?2, 0, NULL
-       FROM chunks WHERE doc_uid = ?1
-       ON CONFLICT(chunk_uid) DO UPDATE SET
-         vector_id=excluded.vector_id, op='delete', queued_at=excluded.queued_at,
-         attempts=0, last_error=NULL`
-    ).bind(docUid, now),
-    env.DB.prepare("DELETE FROM chunks WHERE doc_uid = ?1").bind(docUid),
+      guarded
+        ? `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at, attempts, last_error)
+           SELECT chunk_uid, COALESCE(vector_id, chunk_uid), 'delete', ?2, 0, NULL
+           FROM chunks
+           WHERE doc_uid = ?1
+             AND EXISTS (
+               SELECT 1 FROM documents WHERE doc_uid = ?1 AND content_hash = ?3
+             )
+           ON CONFLICT(chunk_uid) DO UPDATE SET
+             vector_id=excluded.vector_id, op='delete', queued_at=excluded.queued_at,
+             attempts=0, last_error=NULL`
+        : `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at, attempts, last_error)
+           SELECT chunk_uid, COALESCE(vector_id, chunk_uid), 'delete', ?2, 0, NULL
+           FROM chunks WHERE doc_uid = ?1
+           ON CONFLICT(chunk_uid) DO UPDATE SET
+             vector_id=excluded.vector_id, op='delete', queued_at=excluded.queued_at,
+             attempts=0, last_error=NULL`
+    ).bind(docUid, now, ...(guarded ? [expectedContentHash] : [])),
+    env.DB.prepare(
+      guarded
+        ? `DELETE FROM chunks WHERE doc_uid = ?1
+           AND EXISTS (
+             SELECT 1 FROM documents WHERE doc_uid = ?1 AND content_hash = ?2
+           )`
+        : "DELETE FROM chunks WHERE doc_uid = ?1"
+    ).bind(docUid, ...(guarded ? [expectedContentHash] : [])),
   ]);
 }
 

@@ -38,7 +38,10 @@ function makeEnv({ deleteThrows = false, enforceD1PatternLimit = false } = {}) {
         return { results: db.prepare(sql).all(...params) };
       },
       first: async () => db.prepare(sql).get(...params) ?? null,
-      run: async () => db.prepare(sql).run(...params),
+      run: async () => {
+        const result = db.prepare(sql).run(...params);
+        return { success: true, results: [], meta: { changes: Number(result.changes || 0) } };
+      },
       _sql: sql,
       _params: params,
     });
@@ -51,8 +54,12 @@ function makeEnv({ deleteThrows = false, enforceD1PatternLimit = false } = {}) {
       batch: async (statements) => {
         db.exec("BEGIN");
         try {
-          for (const statement of statements) db.prepare(statement._sql).run(...statement._params);
+          const results = statements.map((statement) => {
+            const result = db.prepare(statement._sql).run(...statement._params);
+            return { success: true, results: [], meta: { changes: Number(result.changes || 0) } };
+          });
           db.exec("COMMIT");
+          return results;
         } catch (e) {
           db.exec("ROLLBACK");
           throw e;

@@ -1,4 +1,4 @@
-import { forget, fuseRRF, search, upsertChunks, metadataTokenFor, vectorFilterFor } from "../src/lib/store-d1.js";
+import { forget, fuseRRF, search, upsertChunks, replaceDocumentChunks, metadataTokenFor, vectorFilterFor } from "../src/lib/store-d1.js";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + d)); if (!c) fail++; };
 
@@ -106,6 +106,30 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("and a vector is queued", batched[1]._sql.includes("vector_outbox"));
   check("reports what it queued", out.queued === 1);
   check("empty input writes nothing", (await upsertChunks(env, [])).written === 0);
+}
+
+/* ---- stale revisions cannot delete or replace a newer revision's chunks ---- */
+{
+  const batched = [];
+  const env = {
+    DB: {
+      prepare: (sql) => ({ bind: (...args) => ({ sql, args }) }),
+      batch: async (statements) => { batched.push(statements); return statements.map(() => ({})); },
+    },
+  };
+  const marker = `pending:${"a".repeat(64)}:${"b".repeat(32)}`;
+  await replaceDocumentChunks(env, "message:guarded", { expectedContentHash: marker });
+  await upsertChunks(env, [{
+    chunk_uid: "message:guarded#0", doc_uid: "message:guarded", chunk_ix: 0,
+    text: "synthetic", source: "message",
+  }], { expectedContentHash: marker });
+  const statements = batched.flat();
+  check("guarded replacement conditions both deletion statements on marker ownership",
+    statements.slice(0, 2).every((statement) => /content_hash\s*=/.test(statement.sql) && statement.args.includes(marker)),
+    statements.slice(0, 2).map((statement) => statement.sql).join("\n"));
+  check("guarded chunk and outbox writes require the same marker",
+    statements.slice(2).every((statement) => /content_hash\s*=/.test(statement.sql) && statement.args.includes(marker)),
+    statements.slice(2).map((statement) => statement.sql).join("\n"));
 }
 
 /* ---- source forget must stay below D1's 100-variable statement limit ---- */

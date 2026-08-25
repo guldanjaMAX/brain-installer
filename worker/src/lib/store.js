@@ -133,6 +133,13 @@ function d1MetadataChanged(prior, prepared) {
   );
 }
 
+function pendingRevisionMarker(hash) {
+  const nonce = new Uint8Array(16);
+  crypto.getRandomValues(nonce);
+  const revision = [...nonce].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `pending:${hash}:${revision}`;
+}
+
 /* ---------------------------------------------------------------- D1 backend */
 
 const d1Backend = {
@@ -211,7 +218,12 @@ const d1Backend = {
     // chunks, then commit the real hash only after every required write succeeds.
     // This also covers metadata-only revisions: their content hash is unchanged,
     // but their title/header and filter metadata still require rebuilt chunks.
-    const pendingHash = `pending:${hash}`;
+    // A content-derived pending marker is not enough. Two concurrent requests
+    // can carry identical text but different title/filter metadata. If they
+    // share `pending:<content-hash>`, both finalizers can claim the same marker
+    // even though only one revision's metadata and chunks survived. The random
+    // suffix makes ownership of the commit marker revision-specific.
+    const pendingHash = pendingRevisionMarker(hash);
     await env.DB.prepare(
       `INSERT INTO documents (doc_uid, source, source_id, title, uri, document_date,
                               date_source, date_reliable, client, category,
@@ -247,14 +259,18 @@ const d1Backend = {
 
     // Replace rather than merge. A shorter revision must not leave the tail of
     // the previous version behind, answering questions from text that is gone.
-    await d1.replaceDocumentChunks(env, docUid);
+    await d1.replaceDocumentChunks(env, docUid, { expectedContentHash: pendingHash });
 
     // Use the merged document row for chunks too. Otherwise the document would
     // preserve a migrated `medical` category while its replacement vectors
     // silently lost that filter.
     const merged = await env.DB.prepare(
-      "SELECT client, category, top_folder, platform FROM documents WHERE doc_uid = ?1"
-    ).bind(docUid).first();
+      `SELECT client, category, top_folder, platform FROM documents
+       WHERE doc_uid = ?1 AND content_hash = ?2`
+    ).bind(docUid, pendingHash).first();
+    if (!merged) {
+      throw new Error("ingest revision was superseded before chunk write; retry this document");
+    }
     const client = merged?.client || null;
     const category = merged?.category || null;
     const topFolder = merged?.top_folder || null;
@@ -275,7 +291,7 @@ const d1Backend = {
       platform,
     }));
 
-    const w = await d1.upsertChunks(env, chunks);
+    const w = await d1.upsertChunks(env, chunks, { expectedContentHash: pendingHash });
 
     const out = {
       doc_uid: docUid,
@@ -286,12 +302,18 @@ const d1Backend = {
 
     if (deferFinalize) {
       // A batch may defer only the two source-wide/final writes. The document
-      // remains `pending:<hash>` until corpus statistics and every revision
-      // marker for its source commit together. A crash or rejected batch is
-      // therefore still retryable through the ordinary idempotent ingest path.
+      // remains under its unique `pending:<hash>:<revision>` marker until its
+      // source statistics and revision markers commit together. A crash or
+      // rejected batch is still retryable through the ordinary ingest path.
       return {
         ...out,
-        deferred_revision: { doc_uid: docUid, source: source_type, hash, ingested_at: now },
+        deferred_revision: {
+          doc_uid: docUid,
+          source: source_type,
+          hash,
+          pending_marker: pendingHash,
+          ingested_at: now,
+        },
       };
     }
 
@@ -311,12 +333,16 @@ const d1Backend = {
       .bind(source_type, now)
       .run();
 
-    // Last write wins deliberately: only this turns the revision into an
-    // unchanged candidate on a later retry. Every operation needed for a usable
-    // document has completed before the marker advances.
-    await env.DB.prepare(
-      "UPDATE documents SET content_hash = ?2 WHERE doc_uid = ?1"
-    ).bind(docUid, hash).run();
+    // Only this request's unique marker may commit. A merely matching final
+    // content hash is ambiguous because a same-content concurrent revision may
+    // have written different title or filter metadata under that hash.
+    const committed = await env.DB.prepare(
+      `UPDATE documents SET content_hash = ?2
+       WHERE doc_uid = ?1 AND content_hash = ?3`
+    ).bind(docUid, hash, pendingHash).run();
+    if (Number(committed?.meta?.changes) !== 1) {
+      throw new Error("ingest revision was superseded before commit; retry this document");
+    }
 
     return out;
   },
@@ -359,8 +385,9 @@ const d1Backend = {
    * Each source is finalized independently. D1 executes its statistics refresh
    * and revision-marker updates as one transaction. If it fails, those
    * documents keep their pending hashes and are safe to retry, while another
-   * source in the same request can still succeed. Exact readback prevents a
-   * concurrent newer revision from being reported as this request's success.
+   * source in the same request can still succeed. The exact CAS statement must
+   * report one changed row; final-hash readback alone is never proof because a
+   * same-content revision can carry different metadata.
    */
   async finalizeIngestBatch(env, revisions) {
     const outcomes = revisions.map(() => ({ ok: false, error: "ingest finalization failed; retry this document" }));
@@ -368,7 +395,12 @@ const d1Backend = {
 
     for (let index = 0; index < revisions.length; index++) {
       const revision = revisions[index];
-      if (!revision?.doc_uid || !revision?.source || !/^[a-f0-9]{64}$/.test(revision.hash || "")) continue;
+      const hashIsValid = /^[a-f0-9]{64}$/.test(revision?.hash || "");
+      const markerPrefix = hashIsValid ? `pending:${revision.hash}:` : "";
+      const markerIsValid = typeof revision?.pending_marker === "string" &&
+        revision.pending_marker.startsWith(markerPrefix) &&
+        /^[a-f0-9]{32}$/.test(revision.pending_marker.slice(markerPrefix.length));
+      if (!revision?.doc_uid || !revision?.source || !hashIsValid || !markerIsValid) continue;
       const group = bySource.get(revision.source) || [];
       group.push({ ...revision, index });
       bySource.set(revision.source, group);
@@ -379,7 +411,7 @@ const d1Backend = {
       try {
         // At most 50 documents enter the route, so this remains below D1's
         // 100-statement batch ceiling even with the one source-stat statement.
-        await env.DB.batch([
+        const batchResults = await env.DB.batch([
           env.DB.prepare(
             `INSERT INTO corpus_stats (source, documents, chunks, last_ingest_at)
              SELECT ?1, COUNT(DISTINCT doc_uid), COUNT(*), ?2 FROM chunks WHERE source = ?1
@@ -390,17 +422,22 @@ const d1Backend = {
           ).bind(source, lastIngestAt),
           ...group.map((revision) => env.DB.prepare(
             `UPDATE documents SET content_hash = ?2
-             WHERE doc_uid = ?1 AND content_hash IN (?2, ?3)`
-          ).bind(revision.doc_uid, revision.hash, `pending:${revision.hash}`)),
+             WHERE doc_uid = ?1 AND content_hash = ?3`
+          ).bind(revision.doc_uid, revision.hash, revision.pending_marker)),
         ]);
+        if (!Array.isArray(batchResults) || batchResults.length !== group.length + 1) {
+          throw new Error("D1 batch finalization returned an incomplete result set");
+        }
 
         const placeholders = group.map((_, index) => `?${index + 1}`).join(",");
         const { results } = await env.DB.prepare(
           `SELECT doc_uid, content_hash FROM documents WHERE doc_uid IN (${placeholders})`
         ).bind(...group.map((revision) => revision.doc_uid)).all();
         const committed = new Map((results || []).map((row) => [row.doc_uid, row.content_hash]));
-        for (const revision of group) {
-          outcomes[revision.index] = committed.get(revision.doc_uid) === revision.hash
+        for (let groupIndex = 0; groupIndex < group.length; groupIndex++) {
+          const revision = group[groupIndex];
+          const changedThisMarker = Number(batchResults[groupIndex + 1]?.meta?.changes) === 1;
+          outcomes[revision.index] = changedThisMarker && committed.get(revision.doc_uid) === revision.hash
             ? { ok: true }
             : { ok: false, error: "ingest revision could not be verified; retry this document" };
         }
