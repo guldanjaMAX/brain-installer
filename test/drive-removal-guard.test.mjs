@@ -444,7 +444,8 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
 
 /* CLI wiring keeps the aggregate approval guard ahead of every planned deletion. */
 assert.ok(VALUE_FLAGS.has("approve-removals"), "a bare --approve-removals must be rejected as a missing value");
-const source = readFileSync(new URL("../brain.mjs", import.meta.url), "utf8");
+const source = readFileSync(new URL("../brain.mjs", import.meta.url), "utf8")
+  .replace(/\r\n?/g, "\n");
 const remoteStart = source.indexOf("async function cmdIngestRemote(");
 const remoteEnd = source.indexOf("\nasync function ", remoteStart + 1);
 assert.notEqual(remoteStart, -1, "cmdIngestRemote must exist");
