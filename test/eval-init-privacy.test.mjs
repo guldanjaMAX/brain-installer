@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { evalChildArguments, writePrivateEvalTemplate } from "../brain.mjs";
 
 const sandbox = mkdtempSync(join(tmpdir(), "brain-eval-init-"));
@@ -70,7 +70,9 @@ try {
     delete environment.CLOUDFLARE_API_TOKEN;
     delete environment.BRAIN_DEBUG;
     return spawnSync(process.execPath, [
-      "--import", isolateSupport,
+      // Node treats a bare Windows drive path as a URL scheme for --import.
+      // A file URL keeps this isolation hook portable across every CI runner.
+      "--import", pathToFileURL(isolateSupport).href,
       cli, "eval", manifestPath,
       "--golden", goldenPath,
       "--profile", "release",
