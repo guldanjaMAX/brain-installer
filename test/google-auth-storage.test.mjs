@@ -160,7 +160,7 @@ try {
   /* ================= atomic file fallback ================= */
   {
     const path = join(directory, "file", "google-tokens.json");
-    saveTokens(record, { backend: "file", path });
+    saveTokens(record, { backend: "file", platform: "linux", path });
     check("file fallback round-trips the complete credential record",
       JSON.stringify(loadTokens({ backend: "file", path })) === JSON.stringify(record));
     if (process.platform !== "win32") {
@@ -178,7 +178,7 @@ try {
 
   if (process.platform !== "win32") {
     const path = join(directory, "permissive-file", "google-tokens.json");
-    saveTokens(record, { backend: "file", path });
+    saveTokens(record, { backend: "file", platform: "linux", path });
     const original = readFileSync(path);
     chmodSync(path, 0o644);
     let loadError;
