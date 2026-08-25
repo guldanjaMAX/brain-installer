@@ -676,16 +676,28 @@ async function handleIngestBatch(env, request) {
 
   const store = storeFor(env);
   const scannerOn = env.CREDENTIAL_SCANNER !== "off";
-  const results = [];
+  const results = new Array(docs.length);
   const tally = { created: 0, updated: 0, unchanged: 0, refused: 0, failed: 0 };
+  const staged = [];
+  const eligible = [];
+  const canOptimizeD1 = backendOf(env) === D1 &&
+    typeof store.preflightIngestBatch === "function" &&
+    typeof store.finalizeIngestBatch === "function";
 
-  for (const envelope of docs) {
+  // Repeated identities need the ordinary per-document finalization order. If
+  // the second revision failed after the first was staged, a delayed commit of
+  // the first hash could otherwise make the failed newer revision look
+  // complete. Large message and email migrations use distinct source ids, so
+  // this safety fallback does not dilute the high-volume path it protects.
+  const identityCounts = new Map();
+  for (let inputIndex = 0; inputIndex < docs.length; inputIndex++) {
+    const envelope = docs[inputIndex];
     const ref = envelope && envelope.source_id != null ? String(envelope.source_id) : null;
     const slot = { source_id: ref, source_type: envelope?.source_type ?? null };
 
     if (!envelope?.source_type || envelope.source_id == null || typeof envelope.content !== "string") {
       tally.failed++;
-      results.push({ ...slot, status: "failed", error: "source_type, source_id and content (string) are required" });
+      results[inputIndex] = { ...slot, status: "failed", error: "source_type, source_id and content (string) are required" };
       continue;
     }
 
@@ -695,19 +707,87 @@ async function handleIngestBatch(env, request) {
         tally.refused++;
         // Named, never quoted. The refusal has to be actionable without becoming
         // its own copy of the credential.
-        results.push({ ...slot, status: "refused", labels: secrets.labels });
+        results[inputIndex] = { ...slot, status: "refused", labels: secrets.labels };
         continue;
       }
     }
 
+    const docUid = `${envelope.source_type}:${envelope.source_id}`;
+    eligible.push({ inputIndex, envelope, slot, docUid });
+    if (canOptimizeD1) identityCounts.set(docUid, (identityCounts.get(docUid) || 0) + 1);
+  }
+
+  // Most full-corpus safety rescans are unchanged. Read every unique prior row
+  // in one D1 round trip so 50 no-ops do not become 50 sequential edge calls.
+  // A failed preflight is only a performance miss: the ordinary per-document
+  // reads below remain the correctness fallback.
+  const preflightByInput = new Map();
+  if (canOptimizeD1) {
+    const unique = eligible.filter((item) => identityCounts.get(item.docUid) === 1);
+    if (unique.length) {
+      try {
+        const preflight = await store.preflightIngestBatch(env, unique.map((item) => item.envelope));
+        if (Array.isArray(preflight) && preflight.length === unique.length) {
+          unique.forEach((item, index) => preflightByInput.set(item.inputIndex, preflight[index]));
+        }
+      } catch {
+        // Fall through to the original one-document read path without exposing
+        // a database error that may contain a source identifier.
+      }
+    }
+  }
+
+  for (const { inputIndex, envelope, slot, docUid } of eligible) {
+    const preflight = preflightByInput.get(inputIndex);
+    if (preflight?.unchanged) {
+      tally.unchanged++;
+      results[inputIndex] = {
+        ...slot,
+        status: "unchanged",
+        chunks: 0,
+        doc_uid: preflight.doc_uid,
+      };
+      continue;
+    }
+
     try {
-      const out = await store.ingest(env, envelope);
+      const deferFinalize = canOptimizeD1 && identityCounts.get(docUid) === 1;
+      const out = await store.ingest(env, envelope, { deferFinalize, prepared: preflight?.prepared || null });
       const action = out.action || "created";
-      if (tally[action] !== undefined) tally[action]++;
-      results.push({ ...slot, status: action, chunks: out.chunks ?? null, doc_uid: out.doc_uid ?? out.brain_doc_id ?? null });
+      results[inputIndex] = { ...slot, status: action, chunks: out.chunks ?? null, doc_uid: out.doc_uid ?? out.brain_doc_id ?? null };
+      if (out.deferred_revision) {
+        staged.push({ resultIndex: inputIndex, action, revision: out.deferred_revision });
+      } else if (tally[action] !== undefined) {
+        tally[action]++;
+      }
     } catch (e) {
       tally.failed++;
-      results.push({ ...slot, status: "failed", error: String(e.message || e).slice(0, 300) });
+      results[inputIndex] = { ...slot, status: "failed", error: String(e.message || e).slice(0, 300) };
+    }
+  }
+
+  if (staged.length) {
+    let finalized = null;
+    try {
+      finalized = await store.finalizeIngestBatch(env, staged.map((item) => item.revision));
+    } catch {
+      // Every staged document still has a pending marker and is retryable.
+    }
+    for (let index = 0; index < staged.length; index++) {
+      const item = staged[index];
+      const outcome = finalized?.[index];
+      if (outcome?.ok) {
+        if (tally[item.action] !== undefined) tally[item.action]++;
+        continue;
+      }
+      tally.failed++;
+      const prior = results[item.resultIndex];
+      results[item.resultIndex] = {
+        source_id: prior.source_id,
+        source_type: prior.source_type,
+        status: "failed",
+        error: outcome?.error || "ingest finalization failed; retry this document",
+      };
     }
   }
 

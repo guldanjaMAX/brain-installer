@@ -120,6 +120,15 @@ resumable. A failure stays retryable. Drive policy changes and periodic full
 sweeps compare source truth with stored families so excluded, deleted, moved,
 or no-longer-accessible files can be removed safely.
 
+The authenticated HTTP batch route preserves one receipt per input document.
+For D1 it reads prior rows for unique document identities in one batch preflight,
+so an unchanged 50-document safety rescan is one database round trip rather than
+50 sequential reads. Changed documents still enter the normal pending-hash
+write path. Their revision markers and one derived statistics refresh commit
+together per touched source, followed by exact readback. Repeated identities in
+one request deliberately use the original sequential path because revision
+order is part of their correctness contract.
+
 Drive removal candidates from policy, source deletion, and intentional quality
 skips are intersected with the current stored-family inventory and approved as
 one deterministic plan. Crossing either the 100-document limit or the 10%

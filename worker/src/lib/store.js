@@ -80,6 +80,59 @@ async function sha256Hex(s) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+async function prepareD1Envelope(env, envelope) {
+  const { source_type, source_id, content, title } = envelope;
+  const docUid = `${source_type}:${source_id}`;
+  const md = envelope.metadata || {};
+  const owns = (key) => Object.prototype.hasOwnProperty.call(md, key);
+  const hasClient = owns("client_name") || owns("client");
+  const hasCategory = owns("category");
+  const hasTopFolder = owns("top_folder");
+  const hasPlatform = owns("platform");
+  const incomingClient = md.client_name || md.client || null;
+  const incomingCategory = md.category || null;
+  const incomingTopFolder = md.top_folder || null;
+  const incomingPlatform = md.platform || null;
+  const docDate = envelope.occurred_at ? Date.parse(envelope.occurred_at) : null;
+  const geometry = chunkGeometry(env);
+  // Geometry is part of storage identity. A deploy that corrects chunk size
+  // must re-chunk unchanged documents on their next ingest instead of taking
+  // the content-only no-op path forever.
+  const hash = await sha256Hex(`chunk-v1:${geometry.size}:${geometry.overlap}\0${content}`);
+  return {
+    envelope,
+    source_type,
+    source_id,
+    content,
+    title,
+    docUid,
+    md,
+    hasClient,
+    hasCategory,
+    hasTopFolder,
+    hasPlatform,
+    incomingClient,
+    incomingCategory,
+    incomingTopFolder,
+    incomingPlatform,
+    docDate,
+    geometry,
+    hash,
+  };
+}
+
+function d1MetadataChanged(prior, prepared) {
+  if (!prior) return false;
+  return (
+    (prepared.title != null && prepared.title !== prior.title) ||
+    (prepared.envelope.date_reliable && Number.isFinite(prepared.docDate) && prepared.docDate !== prior.document_date) ||
+    (prepared.hasClient && prepared.incomingClient !== prior.client) ||
+    (prepared.hasCategory && prepared.incomingCategory !== prior.category) ||
+    (prepared.hasTopFolder && prepared.incomingTopFolder !== prior.top_folder) ||
+    (prepared.hasPlatform && prepared.incomingPlatform !== prior.platform)
+  );
+}
+
 /* ---------------------------------------------------------------- D1 backend */
 
 const d1Backend = {
@@ -124,44 +177,29 @@ const d1Backend = {
     };
   },
 
-  async ingest(env, envelope) {
-    const { source_type, source_id, content, title } = envelope;
-    const docUid = `${source_type}:${source_id}`;
-    const md = envelope.metadata || {};
-    const owns = (key) => Object.prototype.hasOwnProperty.call(md, key);
-    const hasClient = owns("client_name") || owns("client");
-    const hasCategory = owns("category");
-    const hasTopFolder = owns("top_folder");
-    const hasPlatform = owns("platform");
-    const incomingClient = md.client_name || md.client || null;
-    const incomingCategory = md.category || null;
-    const incomingTopFolder = md.top_folder || null;
-    const incomingPlatform = md.platform || null;
-    const docDate = envelope.occurred_at ? Date.parse(envelope.occurred_at) : null;
-    const geometry = chunkGeometry(env);
-    // Geometry is part of storage identity. A deploy that corrects chunk size
-    // must re-chunk unchanged documents on their next ingest instead of taking
-    // the content-only no-op path forever.
-    const hash = await sha256Hex(`chunk-v1:${geometry.size}:${geometry.overlap}\0${content}`);
+  async ingest(env, envelope, { deferFinalize = false, prepared = null } = {}) {
+    // A prepared state is accepted only for the same in-memory envelope object.
+    // That keeps this internal optimization from becoming a way to pair one
+    // document's hash or prior row with another document's content.
+    const input = prepared?.envelope === envelope ? prepared : await prepareD1Envelope(env, envelope);
+    const {
+      source_type, source_id, content, title, docUid, md,
+      hasClient, hasCategory, hasTopFolder, hasPlatform,
+      incomingClient, incomingCategory, incomingTopFolder, incomingPlatform,
+      docDate, geometry, hash,
+    } = input;
 
-    const prior = await env.DB.prepare(
-      `SELECT content_hash, title, document_date, date_reliable, client, category, top_folder, platform
-       FROM documents WHERE doc_uid = ?1`
-    )
-      .bind(docUid)
-      .first();
+    const prior = Object.prototype.hasOwnProperty.call(input, "prior")
+      ? input.prior
+      : await env.DB.prepare(
+        `SELECT content_hash, title, document_date, date_reliable, client, category, top_folder, platform
+         FROM documents WHERE doc_uid = ?1`
+      ).bind(docUid).first();
     // Identical content AND filter identity is a no-op. Folder moves and title
     // changes still have to rewrite chunks because both the embedded header and
     // Vectorize metadata changed. Missing incoming metadata is not a request to
     // erase a richer migration record.
-    const metadataChanged = prior && (
-      (title != null && title !== prior.title) ||
-      (envelope.date_reliable && Number.isFinite(docDate) && docDate !== prior.document_date) ||
-      (hasClient && incomingClient !== prior.client) ||
-      (hasCategory && incomingCategory !== prior.category) ||
-      (hasTopFolder && incomingTopFolder !== prior.top_folder) ||
-      (hasPlatform && incomingPlatform !== prior.platform)
-    );
+    const metadataChanged = d1MetadataChanged(prior, input);
     if (prior && prior.content_hash === hash && !metadataChanged) {
       return { doc_uid: docUid, action: "unchanged", chunks: 0, queued: 0 };
     }
@@ -239,6 +277,24 @@ const d1Backend = {
 
     const w = await d1.upsertChunks(env, chunks);
 
+    const out = {
+      doc_uid: docUid,
+      action: prior ? "updated" : "created",
+      chunks: chunks.length,
+      queued: w.queued,
+    };
+
+    if (deferFinalize) {
+      // A batch may defer only the two source-wide/final writes. The document
+      // remains `pending:<hash>` until corpus statistics and every revision
+      // marker for its source commit together. A crash or rejected batch is
+      // therefore still retryable through the ordinary idempotent ingest path.
+      return {
+        ...out,
+        deferred_revision: { doc_uid: docUid, source: source_type, hash, ingested_at: now },
+      };
+    }
+
     // DERIVED, not incremented. The previous version added the new chunk count
     // to the running total, but a re-ingest DELETEs the old chunks first, so
     // every update inflated the number. This is the one figure a client is told
@@ -262,12 +318,100 @@ const d1Backend = {
       "UPDATE documents SET content_hash = ?2 WHERE doc_uid = ?1"
     ).bind(docUid, hash).run();
 
-    return {
-      doc_uid: docUid,
-      action: prior ? "updated" : "created",
-      chunks: chunks.length,
-      queued: w.queued,
-    };
+    return out;
+  },
+
+  /**
+   * Read the prior rows for a unique-document HTTP batch in one D1 round trip.
+   * Hashing and metadata comparison are byte-for-byte the same helpers used by
+   * single ingest. Changed documents carry the prepared prior into `ingest`;
+   * unchanged documents need no write at all.
+   */
+  async preflightIngestBatch(env, envelopes) {
+    if (!envelopes.length) return [];
+    const prepared = await Promise.all(envelopes.map((envelope) => prepareD1Envelope(env, envelope)));
+    const priorResults = await env.DB.batch(prepared.map((input) => env.DB.prepare(
+      `SELECT content_hash, title, document_date, date_reliable, client, category, top_folder, platform
+       FROM documents WHERE doc_uid = ?1`
+    ).bind(input.docUid)));
+
+    if (!Array.isArray(priorResults) || priorResults.length !== prepared.length) {
+      throw new Error("D1 batch preflight returned an incomplete result set");
+    }
+
+    return prepared.map((input, index) => {
+      const rows = priorResults[index]?.results;
+      if (!Array.isArray(rows)) throw new Error("D1 batch preflight returned an invalid row set");
+      const prior = rows[0] || null;
+      const state = { ...input, prior };
+      return {
+        unchanged: Boolean(prior && prior.content_hash === input.hash && !d1MetadataChanged(prior, input)),
+        doc_uid: input.docUid,
+        prepared: state,
+      };
+    });
+  },
+
+  /**
+   * Finish changed documents from one HTTP batch with one corpus scan per
+   * touched source, rather than one full-source COUNT for every small message.
+   *
+   * Each source is finalized independently. D1 executes its statistics refresh
+   * and revision-marker updates as one transaction. If it fails, those
+   * documents keep their pending hashes and are safe to retry, while another
+   * source in the same request can still succeed. Exact readback prevents a
+   * concurrent newer revision from being reported as this request's success.
+   */
+  async finalizeIngestBatch(env, revisions) {
+    const outcomes = revisions.map(() => ({ ok: false, error: "ingest finalization failed; retry this document" }));
+    const bySource = new Map();
+
+    for (let index = 0; index < revisions.length; index++) {
+      const revision = revisions[index];
+      if (!revision?.doc_uid || !revision?.source || !/^[a-f0-9]{64}$/.test(revision.hash || "")) continue;
+      const group = bySource.get(revision.source) || [];
+      group.push({ ...revision, index });
+      bySource.set(revision.source, group);
+    }
+
+    for (const [source, group] of bySource) {
+      const lastIngestAt = Math.max(...group.map((revision) => Number(revision.ingested_at) || 0));
+      try {
+        // At most 50 documents enter the route, so this remains below D1's
+        // 100-statement batch ceiling even with the one source-stat statement.
+        await env.DB.batch([
+          env.DB.prepare(
+            `INSERT INTO corpus_stats (source, documents, chunks, last_ingest_at)
+             SELECT ?1, COUNT(DISTINCT doc_uid), COUNT(*), ?2 FROM chunks WHERE source = ?1
+             ON CONFLICT(source) DO UPDATE SET
+               documents = excluded.documents,
+               chunks = excluded.chunks,
+               last_ingest_at = MAX(COALESCE(corpus_stats.last_ingest_at, 0), excluded.last_ingest_at)`
+          ).bind(source, lastIngestAt),
+          ...group.map((revision) => env.DB.prepare(
+            `UPDATE documents SET content_hash = ?2
+             WHERE doc_uid = ?1 AND content_hash IN (?2, ?3)`
+          ).bind(revision.doc_uid, revision.hash, `pending:${revision.hash}`)),
+        ]);
+
+        const placeholders = group.map((_, index) => `?${index + 1}`).join(",");
+        const { results } = await env.DB.prepare(
+          `SELECT doc_uid, content_hash FROM documents WHERE doc_uid IN (${placeholders})`
+        ).bind(...group.map((revision) => revision.doc_uid)).all();
+        const committed = new Map((results || []).map((row) => [row.doc_uid, row.content_hash]));
+        for (const revision of group) {
+          outcomes[revision.index] = committed.get(revision.doc_uid) === revision.hash
+            ? { ok: true }
+            : { ok: false, error: "ingest revision could not be verified; retry this document" };
+        }
+      } catch {
+        // Do not quote D1 errors into a per-document receipt. Some platform
+        // errors include bound values; the retry instruction is sufficient and
+        // keeps source identifiers or content out of the response.
+      }
+    }
+
+    return outcomes;
   },
 
   async stats(env) {

@@ -678,8 +678,31 @@ function mkSourceFamilyEnv(documents, extra = {}) {
 
 // A batch env whose ingest can be made to explode on a chosen document, so the
 // partial-failure path is exercised rather than assumed.
-function mkBatchEnv({ explodeOn = null } = {}) {
+function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocUid = null, preflightFail = false } = {}) {
   const written = [];
+  const documents = new Map();
+  const calls = { remote: 0, stats_scans: 0, stats_attempts: 0, finalizer_batches: 0 };
+  const control = { explodeOn, finalizeFailSource, failChunkDocUid, preflightFail };
+  const execute = (sql, b) => {
+    if (/INSERT INTO documents/.test(sql)) {
+      if (control.explodeOn && String(b[2]) === control.explodeOn) throw new Error("D1 write failed");
+      const prior = documents.get(b[0]) || {};
+      documents.set(b[0], {
+        ...prior,
+        doc_uid: b[0], source: b[1], source_id: b[2], title: b[3],
+        client: b[8], category: b[9], top_folder: b[10], platform: b[11],
+        content_hash: b[13],
+      });
+      written.push(String(b[2]));
+    } else if (/UPDATE documents SET content_hash/.test(sql)) {
+      const row = documents.get(b[0]);
+      if (row && (!/content_hash IN/.test(sql) || row.content_hash === b[1] || row.content_hash === b[2])) {
+        row.content_hash = b[1];
+      }
+    } else if (/INSERT INTO corpus_stats/.test(sql)) {
+      calls.stats_scans++;
+    }
+  };
   const env = {
     STORAGE: "d1", ADMIN_KEY: "k",
     VECTORIZE: { query: async () => ({ matches: [] }), upsert: async () => {} },
@@ -687,21 +710,48 @@ function mkBatchEnv({ explodeOn = null } = {}) {
     DB: {
       prepare: (sql) => ({
         bind: (...b) => ({
-          all: async () => ({ results: [] }),
-          first: async () => null,
-          run: async () => {
-            if (/INSERT INTO documents/.test(sql)) {
-              if (explodeOn && String(b[2]) === explodeOn) throw new Error("D1 write failed");
-              written.push(String(b[2]));
-            }
-            return {};
+          sql, binds: b,
+          all: async () => ({
+            results: (() => {
+              calls.remote++;
+              return /SELECT doc_uid, content_hash FROM documents/.test(sql)
+                ? b.map((docUid) => documents.get(docUid)).filter(Boolean)
+                : [];
+            })(),
+          }),
+          first: async () => {
+            calls.remote++;
+            if (/SELECT content_hash, title/.test(sql)) return documents.get(b[0]) || null;
+            if (/SELECT client, category/.test(sql)) return documents.get(b[0]) || null;
+            return null;
           },
+          run: async () => { calls.remote++; execute(sql, b); return {}; },
         }),
       }),
-      batch: async () => {},
+      batch: async (statements) => {
+        calls.remote++;
+        if (statements.every((statement) => /SELECT content_hash, title/.test(statement.sql))) {
+          if (control.preflightFail) throw new Error("simulated preflight failure");
+          return statements.map((statement) => {
+            const row = documents.get(statement.binds[0]);
+            return { results: row ? [{ ...row }] : [] };
+          });
+        }
+        const stats = statements.find((statement) => /INSERT INTO corpus_stats/.test(statement.sql));
+        if (stats) {
+          calls.stats_attempts++;
+          calls.finalizer_batches++;
+          if (control.finalizeFailSource === stats.binds[0]) throw new Error("simulated source finalization failure");
+        }
+        if (control.failChunkDocUid && statements.some((statement) =>
+          /INSERT INTO chunks/.test(statement.sql) && statement.binds[1] === control.failChunkDocUid
+        )) throw new Error("simulated chunk batch failure");
+        for (const statement of statements) execute(statement.sql, statement.binds);
+        return statements.map(() => ({}));
+      },
     },
   };
-  return { env, written };
+  return { env, written, documents, calls, control };
 }
 const post = (env, path, body) =>
   worker.fetch(new Request("https://b.example" + path, {
@@ -779,6 +829,122 @@ const doc = (id, content = "some ordinary meeting content about the retainer") =
   })).json();
   check("invalid documents are counted as failures", b.failed === 2 && b.created === 1, JSON.stringify(b).slice(0, 250));
   check("and every input has a result slot", b.results.length === 3);
+}
+
+/* The large-message path must stay O(documents) in D1 calls and O(sources) in
+   full corpus scans. At v0.1.11 the same synthetic request made seven remote D1
+   calls per document, including 50 repeated full-source COUNT queries. */
+{
+  const { env, calls } = mkBatchEnv();
+  const docs = Array.from({ length: 50 }, (_, index) => doc(`message-${index}`));
+  const first = await (await post(env, "/api/admin/brain/ingest/batch", { docs })).json();
+  const legacyCalls = docs.length * 7;
+  check("a maximum one-source batch keeps every per-document receipt",
+    first.created === 50 && first.results.length === 50 && first.results.every((row) => row.doc_uid), JSON.stringify(first).slice(0, 200));
+  check("50 small documents recompute source statistics once, not 50 times",
+    calls.stats_scans === 1 && calls.finalizer_batches === 1, JSON.stringify(calls));
+  check("the batch uses 203 D1 calls instead of the v0.1.11 structure's 350",
+    calls.remote === 203 && calls.remote < legacyCalls, `${calls.remote} vs ${legacyCalls}`);
+
+  const beforeRetry = { ...calls };
+  const retry = await (await post(env, "/api/admin/brain/ingest/batch", { docs })).json();
+  check("a committed batch is idempotent on retry",
+    retry.unchanged === 50 && retry.created === 0 && retry.failed === 0, JSON.stringify(retry).slice(0, 200));
+  check("unchanged retries perform only identity reads and no corpus scan",
+    calls.remote - beforeRetry.remote === 1 && calls.stats_scans === beforeRetry.stats_scans,
+    JSON.stringify({ beforeRetry, after: calls }));
+}
+
+/* One preflight can safely classify no-op, update, and create receipts without
+   changing their input order or bypassing finalization for the changed rows. */
+{
+  const { env, calls } = mkBatchEnv();
+  const seed = [doc("steady"), doc("changing")];
+  await post(env, "/api/admin/brain/ingest/batch", { docs: seed });
+  const scansBefore = calls.stats_scans;
+  const body = await (await post(env, "/api/admin/brain/ingest/batch", {
+    docs: [seed[0], doc("changing", "a changed but still ordinary document body"), doc("new")],
+  })).json();
+  check("one batch can mix unchanged, updated, and created receipts in order",
+    body.unchanged === 1 && body.updated === 1 && body.created === 1 &&
+      body.results.map((row) => row.status).join(",") === "unchanged,updated,created",
+    JSON.stringify(body));
+  check("a mixed changed/no-op batch still scans its source only once",
+    calls.stats_scans - scansBefore === 1, JSON.stringify(calls));
+}
+
+/* Preflight is an optimization, not a new availability dependency. */
+{
+  const { env, calls } = mkBatchEnv({ preflightFail: true });
+  const body = await (await post(env, "/api/admin/brain/ingest/batch", { docs: [doc("a"), doc("b")] })).json();
+  check("a failed batch preflight falls back to ordinary per-document reads",
+    body.created === 2 && body.failed === 0, JSON.stringify(body));
+  check("the fallback preserves one source-level finalization",
+    calls.stats_scans === 1 && calls.finalizer_batches === 1, JSON.stringify(calls));
+}
+
+/* Statistics and commit markers are finalized independently per touched source,
+   so one mixed-source failure cannot turn another source into collateral loss. */
+{
+  const { env, documents, calls, control } = mkBatchEnv({ finalizeFailSource: "meeting" });
+  const docs = [
+    doc("m1"), doc("m2"),
+    { ...doc("e1"), source_type: "email" },
+    { ...doc("e2"), source_type: "email" },
+  ];
+  const first = await (await post(env, "/api/admin/brain/ingest/batch", { docs })).json();
+  check("a source-level finalization failure is isolated",
+    first.created === 2 && first.failed === 2 && first.results.filter((row) => row.status === "failed").every((row) => row.source_type === "meeting"),
+    JSON.stringify(first));
+  check("the failed source stays pending while the other source commits",
+    String(documents.get("meeting:m1")?.content_hash).startsWith("pending:") &&
+      /^[a-f0-9]{64}$/.test(documents.get("email:e1")?.content_hash || ""),
+    "revision markers did not preserve the source boundary");
+  check("mixed-source batching attempts one statistics refresh per source",
+    calls.stats_attempts === 2 && calls.stats_scans === 1, JSON.stringify(calls));
+
+  control.finalizeFailSource = null;
+  const retry = await (await post(env, "/api/admin/brain/ingest/batch", { docs })).json();
+  check("retry repairs only the pending source and leaves committed documents unchanged",
+    retry.updated === 2 && retry.unchanged === 2 && retry.failed === 0, JSON.stringify(retry));
+  check("the repaired source receives committed hashes",
+    /^[a-f0-9]{64}$/.test(documents.get("meeting:m1")?.content_hash || ""));
+}
+
+/* A failure after the pending marker but before chunk completion must not be
+   hidden by finalizing another successful document from the same source. */
+{
+  const failedUid = "meeting:middle";
+  const { env, documents, control } = mkBatchEnv({ failChunkDocUid: failedUid });
+  const docs = [doc("first"), doc("middle"), doc("last")];
+  const first = await (await post(env, "/api/admin/brain/ingest/batch", { docs })).json();
+  check("a chunk-stage failure keeps its own receipt failed and its neighbors committed",
+    first.created === 2 && first.failed === 1 && first.results.find((row) => row.source_id === "middle")?.status === "failed",
+    JSON.stringify(first));
+  check("the failed revision's content hash remains pending",
+    String(documents.get(failedUid)?.content_hash).startsWith("pending:"), documents.get(failedUid)?.content_hash || "missing");
+  check("successful neighbors still commit their exact revision markers",
+    /^[a-f0-9]{64}$/.test(documents.get("meeting:first")?.content_hash || "") &&
+      /^[a-f0-9]{64}$/.test(documents.get("meeting:last")?.content_hash || ""));
+
+  control.failChunkDocUid = null;
+  const retry = await (await post(env, "/api/admin/brain/ingest/batch", { docs })).json();
+  check("retry repairs the interrupted revision without rewriting its neighbors",
+    retry.updated === 1 && retry.unchanged === 2 && retry.failed === 0, JSON.stringify(retry));
+}
+
+/* Duplicate identities deliberately use the original sequential path. */
+{
+  const { env, documents, calls } = mkBatchEnv();
+  const first = doc("same", "first ordinary revision");
+  const second = doc("same", "second ordinary revision");
+  const body = await (await post(env, "/api/admin/brain/ingest/batch", { docs: [first, second] })).json();
+  check("two revisions of one identity preserve sequential created-then-updated receipts",
+    body.created === 1 && body.updated === 1 && body.results.map((row) => row.status).join(",") === "created,updated", JSON.stringify(body));
+  check("duplicate identities never use delayed source finalization",
+    calls.finalizer_batches === 0 && calls.stats_scans === 2, JSON.stringify(calls));
+  check("the final duplicate revision is committed rather than left pending",
+    /^[a-f0-9]{64}$/.test(documents.get("meeting:same")?.content_hash || ""));
 }
 
 /* ================= forget ================= */
