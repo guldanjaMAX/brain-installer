@@ -204,7 +204,14 @@ export function buildCuratedSchedulerPlan(planPath, options = {}) {
     fail("curated sync scheduling is currently implemented with macOS LaunchAgents");
   }
   const absolutePlan = resolve(planPath || "");
-  const loaded = loadCuratedSyncPlan(absolutePlan, options);
+  // `options.platform` models the LaunchAgent target in deterministic tests.
+  // File ownership and mode checks must follow the host that actually read
+  // the plan, otherwise a Windows runner simulating macOS applies POSIX mode
+  // bits that Windows cannot represent.
+  const loaded = loadCuratedSyncPlan(absolutePlan, {
+    ...options,
+    platform: process.platform,
+  });
   const scheduler = loaded.plan.scheduler;
   if (!scheduler) fail("curated sync plan needs a scheduler declaration before unattended use");
   const uid = options.uid ?? currentUid();
