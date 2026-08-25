@@ -587,10 +587,29 @@ Answerable v1 cases may opt into a deterministic `/think` canary through
 `answer_expect`: a literal phrase or typed value must appear inside one sentence
 with an inline citation resolving to an allowed evidence slot. Every declared
 release canary and every critical smoke canary must run and pass. Existing v1
-cases remain retrieval-only. `--no-think` is smoke-only. General answer
-correctness, additional-claim and faithfulness review, citation support,
-corpus-completeness, authorization, confidence-bound, latency-budget, and cost
-certification remain v2 work.
+cases remain retrieval-only. `--no-think` is smoke-only.
+
+An install may add a private corpus completeness gate:
+
+```bash
+brain eval <manifest> --corpus-contract ./brain.corpus-contract.json
+```
+
+The mode-0600 contract is validated twice before credential use and is bound to
+the manifest `client.slug`. A complete contract and complete per-connector
+snapshots reconcile every expected logical source family against the
+authenticated read-only D1 family inventory. Eligible sources must exist;
+excluded, quarantined, and tombstoned sources must not; and unknown indexed
+families fail. Aggregate slice counts and stage-specific codes enter the normal
+JSON, JSONL, CSV, and JUnit artifacts. Private locators, source identities,
+document names, content hashes, versions, and content never do.
+
+This shipped gate proves logical source-family presence and expected policy
+absence only. D1's current family observation does not expose content-version,
+extraction, connector-failure, or per-family vector evidence, so those stages
+remain explicitly not observable. General answer correctness, additional-claim
+and faithfulness review, semantic citation support, authorization,
+confidence-bound, latency-budget, and cost certification remain v2 work.
 
 `test/migrations.test.mjs` applies every migration to a real SQLite database and
 asserts the FTS5 triggers actually keep the index in step. It exists because

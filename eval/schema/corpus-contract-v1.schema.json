@@ -52,6 +52,25 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "inventory_complete": {
+            "const": true
+          }
+        },
+        "required": [
+          "inventory_complete"
+        ]
+      },
+      "then": {
+        "required": [
+          "inventory_hash"
+        ]
+      }
+    }
+  ],
   "$defs": {
     "slug": {
       "type": "string",
@@ -89,7 +108,27 @@
         "policy_hash": {
           "$ref": "#/$defs/hash"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "complete": {
+                "const": true
+              }
+            },
+            "required": [
+              "complete"
+            ]
+          },
+          "then": {
+            "required": [
+              "cursor_hash",
+              "policy_hash"
+            ]
+          }
+        }
+      ]
     },
     "source": {
       "type": "object",
@@ -126,6 +165,12 @@
           ]
         },
         "canonical_locator": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "index_source_id": {
+          "description": "Optional private source identity used by the Brain index. When absent, canonical_locator is used for v1 compatibility.",
           "type": "string",
           "minLength": 1,
           "maxLength": 4096
@@ -167,7 +212,8 @@
         "mime_type": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 255
+          "maxLength": 255,
+          "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$"
         },
         "extraction_mode": {
           "enum": [
@@ -297,6 +343,7 @@
           "connector": "synthetic",
           "locator_kind": "synthetic_fixture",
           "canonical_locator": "fixtures/synthetic/policy.txt",
+          "index_source_id": "synthetic-policy-document",
           "domains": [
             "sample-records"
           ],

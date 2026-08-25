@@ -7,14 +7,17 @@ designed for one shared installer and many isolated, private installations.
 
 This document contains both the shipped v1 behavior and the v2 specification.
 The current `eval/run.mjs` harness implements retrieval and refusal checks,
-opt-in deterministic answer canaries, and two named profiles: diagnostic
-`smoke` and a deterministic `release` suite coverage gate. The answer canary
+opt-in deterministic answer canaries, an optional deterministic corpus
+inventory reconciliation, and two named profiles: diagnostic `smoke` and a
+deterministic `release` suite coverage gate. The answer canary
 proves only a literal atomic phrase or typed value inside one sentence, plus an
 inline citation that resolves to an allowed v1 evidence slot. It is not a
-semantic judge. The v2 schemas do not by themselves enable the remaining
-commands, metrics, inventory readback, answer judging, or reports described
-here. Each rollout step below must be implemented and tested before its
-corresponding claim is made.
+semantic judge. The corpus reconciliation proves only logical source-family
+presence and expected policy absence against the authenticated D1 inventory.
+The v2 schemas do not by themselves enable the remaining commands, metrics,
+content-version readback, answer judging, or reports described here. Each
+rollout step below must be implemented and tested before its corresponding
+claim is made.
 
 ## Product and instance boundary
 
@@ -99,6 +102,55 @@ Each expected source reconciles to exactly one observed state:
 An index row with no matching expected source is `unknown`. Every exclusion,
 quarantine, failure, and tombstone retains a typed reason.
 
+The executable v1 subset is opt-in:
+
+```bash
+brain eval ./brain.manifest.json \
+  --corpus-contract ./brain.corpus-contract.json
+```
+
+The contract file is private instance material. On POSIX it must be an
+owner-owned, single-link regular file with mode `0600` or stricter. The parent
+CLI and child evaluator both validate it before the admin key is read or a
+network path is opened. Validation rejects unknown fields, duplicate stable
+source labels, duplicate index-family mappings, missing connector snapshots,
+incomplete proof hashes, future capture times, and an `installation_ref` that
+does not equal the manifest's `client.slug`.
+
+For each contract source, `index_source_id` names the private bare identity used
+by the Brain index. Older v1 contracts without that optional field use
+`canonical_locator`, preserving the original schema behavior. The evaluator
+prefixes that value with `connector` when needed, then reconciles it against the
+authenticated, paginated `/api/admin/brain/source-families` observation. An
+`eligible` source must be present. An `excluded`, `quarantined`, or `tombstoned`
+source must be absent. Every observed family not in the complete independent
+contract is unknown.
+
+The gate reports aggregate counts for connector, domain, priority, MIME format,
+extraction mode, sensitivity, and expected policy state. Its typed failures are:
+
+| Stage | Failure code |
+|---|---|
+| Contract preflight | `CORPUS_INVENTORY_INCOMPLETE` |
+| Connector snapshot | `CONNECTOR_SNAPSHOT_INCOMPLETE` |
+| Source inventory | `SOURCE_NOT_INDEXED`, `UNKNOWN_INDEX_SOURCE`, `SOURCE_INVENTORY_INVALID`, `SOURCE_INVENTORY_NOT_OBSERVABLE` |
+| Policy state | `EXCLUDED_SOURCE_INDEXED`, `QUARANTINED_SOURCE_INDEXED`, `TOMBSTONED_SOURCE_INDEXED` |
+
+Supplying the contract makes every one of those failures blocking in both smoke
+and release profiles. Omitting it preserves v1 retrieval behavior. Shareable
+artifacts contain only counts, declared slice labels, hashes, and these typed
+codes. They never contain the canonical locator, index source identity, stable
+source ID, source version, filename, path, document title, or content.
+
+The claim boundary is deliberate. The existing read-only family endpoint proves
+logical presence and expected absence. It does not return content hashes,
+connector failure receipts, extraction output, or tombstone history. Therefore
+content-version equality remains `not_observable` even though the private
+contract records `content_hash` and `source_version`. A green reconciliation is
+not OCR quality, extraction accuracy, or answer accuracy certification. It also
+depends on the owner or connector producing a truthful, complete independent
+contract; the evaluator does not discover missing source systems by itself.
+
 ### Gate policy
 
 `eval/schema/gate-policy-v1.schema.json` separates policy from measurement. It
@@ -153,13 +205,15 @@ smoke, skipping a critical refusal or deterministic answer canary still blocks
 a green result.
 
 This is v1 retrieval-suite release qualification, not full v2 certification.
-It does not prove that the declared slices cover every real corpus region, and
-it does not require answer-canary coverage across the suite. The shipped canary
-does not judge paraphrases, additional produced claims, semantic support,
-faithfulness, citation support at the span level, or complete source inventory.
-Document-level authorization, confidence bounds, latency budgets, and cost also
-remain outside this gate. Those claims remain blocked until their executable v2
-contracts ship.
+Without a supplied corpus contract it does not prove that the declared slices
+cover every real corpus region. With a supplied complete contract, logical
+source-family presence and policy absence become blocking, but content-version
+and extraction equality remain not observable. The release profile does not
+require answer-canary coverage across the suite. The shipped canary does not
+judge paraphrases, additional produced claims, semantic support, faithfulness,
+or citation support at the span level. Document-level authorization, confidence
+bounds, latency budgets, and cost also remain outside this gate. Those claims
+remain blocked until their executable v2 contracts ship.
 
 ### Future: `brain eval deep`
 
@@ -434,9 +488,13 @@ The current retrieval harness produces an internal v1 artifact set:
   the named profile and aggregate profile-coverage evidence, and hard-gate
   results. Declared answer canaries add aggregate counts and case-level booleans
   and failure codes, never expected phrases, values, answers, or citation
-  identities;
+  identities. A supplied corpus contract adds only aggregate reconciliation
+  totals, declared slice labels, contract hashes, and typed failure codes;
 - `failures.jsonl`: sanitized case failures and diagnosis codes;
 - `coverage.csv`: case counts and metrics by slice;
+- `corpus-coverage.csv`: written only when a corpus contract is supplied, with
+  expected, indexed, accounted, missing, and policy-leak counts by declared
+  slice;
 - `junit.xml`: release-gate integration for CI.
 
 These files are created in a new owner-only directory, each file is owner-only,
@@ -460,9 +518,10 @@ raw error, stack, trace, prompt, or credential.
 ### Batch 1: executable contracts and deterministic retrieval
 
 The v1 runtime now covers the deterministic retrieval metrics, privacy-safe
-artifacts, critical-case gates, named structural release-profile floor, and the
-opt-in deterministic answer canary above. It does not validate or execute the
-complete v2 suite, policy, corpus, or artifact contracts below.
+artifacts, critical-case gates, named structural release-profile floor, the
+opt-in deterministic answer canary, and the aggregate logical-family corpus
+reconciliation above. It does not validate or execute the complete v2 suite,
+policy, content-version corpus, or artifact contracts below.
 
 1. Validate suite, gate-policy, and run-artifact schemas.
 2. Preserve v1 scorer behavior with compatibility fixtures.
@@ -479,9 +538,11 @@ The first gate should be deterministic and incapable of exporting private data.
 
 ### Batch 2: source, extraction, context, claim, and citation evidence
 
-1. Add a read-only evaluation snapshot returning opaque source and version IDs,
-   policy states, content hashes, extraction status, and vector-outbox state.
-2. Reconcile that snapshot with the private corpus contract.
+1. Extend the shipped read-only logical-family observation with opaque source
+   version IDs, policy receipts, content hashes, extraction status, and
+   per-family vector-outbox state.
+2. Extend the shipped private-contract reconciliation from logical presence and
+   expected absence to those richer stage observations.
 3. Trace retrieval and context-assembly stages with content capture disabled.
 4. Extend the shipped literal/exact-value and citation-identity canary with
    observable context evidence, semantic claim review, citation support, and

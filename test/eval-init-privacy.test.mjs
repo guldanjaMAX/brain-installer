@@ -119,6 +119,45 @@ try {
   assert.match(emptySmokeOutput, /suite has 0 cases; smoke requires at least 1/);
   assert.doesNotMatch(emptySmokeOutput, /no admin key found|set ADMIN_KEY|Keychain/);
 
+  const incompleteContractPath = join(sandbox, "brain.corpus-contract.json");
+  writeFileSync(incompleteContractPath, JSON.stringify({
+    schema_version: 1,
+    contract_id: "fixture-corpus",
+    contract_version: "1",
+    installation_ref: "fixture",
+    captured_at: "2026-08-25T00:00:00.000Z",
+    inventory_complete: false,
+    connector_snapshots: [{
+      connector: "curated",
+      observed_at: "2026-08-25T00:00:00.000Z",
+      complete: false,
+    }],
+    sources: [],
+  }), { mode: 0o600 });
+  const corpusBeforeAdminKey = runProfilePreflight(
+    domainManifest,
+    destination,
+    ["--corpus-contract", incompleteContractPath],
+    "smoke",
+  );
+  const corpusOutput = `${corpusBeforeAdminKey.stdout || ""}${corpusBeforeAdminKey.stderr || ""}`;
+  assert.equal(corpusBeforeAdminKey.status, 1, corpusOutput);
+  assert.match(corpusOutput, /CORPUS_INVENTORY_INCOMPLETE \(1\)/);
+  assert.match(corpusOutput, /CONNECTOR_SNAPSHOT_INCOMPLETE \(1\)/);
+  assert.doesNotMatch(corpusOutput, /no admin key found|set ADMIN_KEY|Keychain/);
+  assert.doesNotMatch(corpusOutput, /brain\.corpus-contract\.json|fixture-corpus/);
+
+  const forwardedCorpusArgs = evalChildArguments(
+    "https://brain.fixture.invalid",
+    destination,
+    "smoke",
+    { "corpus-contract": incompleteContractPath },
+    { installationRef: "fixture" },
+  );
+  assert.deepEqual(forwardedCorpusArgs.slice(-4), [
+    "--corpus-contract", incompleteContractPath, "--installation-ref", "fixture",
+  ]);
+
   const fullReleasePath = join(sandbox, "full-release.golden.json");
   const fullReleaseQuestions = Array.from({ length: 60 }, (_, index) => ({
     id: `release-${index + 1}`,

@@ -273,6 +273,17 @@ questions the corpus genuinely cannot answer. Retrieval is scored with recall at
 fixed depth and MRR, raw and deduplicated by document. Repeated runs measure
 variance before a small score change is treated as real.
 
+An optional private corpus contract supplies the independent expected-source
+boundary that search cannot infer from itself. Before credential use, the
+evaluator validates a stable owner-only file, its complete connector snapshots,
+and its binding to the manifest client slug. During the normal read-only corpus
+bracket it compares each expected logical family with the authenticated D1
+family inventory. Results retain only aggregate counts, declared slice labels,
+hashes, and typed stage codes. Private paths, source identities, document names,
+versions, and content never enter shareable artifacts. This proves logical
+presence and expected policy absence. Content-version and extraction equality
+remain not observable until a richer read-only snapshot exists.
+
 ## Where to make common changes
 
 | Change | Update together |

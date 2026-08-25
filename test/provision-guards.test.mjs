@@ -20,7 +20,10 @@ let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 200))); if (!c) fail++; };
 const throws = async (fn) => { try { await fn(); return null; } catch (e) { return e.message || String(e); } };
 
-for (const flag of ["golden", "profile", "k", "repeat", "baseline", "save", "artifacts"]) {
+for (const flag of [
+  "golden", "profile", "k", "repeat", "baseline", "save", "artifacts",
+  "corpus-contract",
+]) {
   check(`eval value flag --${flag} cannot silently become boolean true`, VALUE_FLAGS.has(flag));
 }
 
@@ -541,7 +544,7 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     ? null
     : src.slice(evalArgumentsStart, evalArgumentsEnd === -1 ? evalArgumentsStart + 1800 : evalArgumentsEnd);
   check("brain eval forwards the named profile to the shipped evaluator",
-    /evalChildArguments\(base, goldenPath, requestedProfile, flags\)/.test(evalCommand || "") &&
+    /evalChildArguments\([\s\S]*base,[\s\S]*goldenPath,[\s\S]*requestedProfile,/.test(evalCommand || "") &&
       /"--profile", requestedProfile/.test(evalArguments || ""),
     `${String(evalCommand).slice(-700)}\n${String(evalArguments).slice(0, 700)}`);
   check("brain eval forwards graph-boost to the shipped evaluator",

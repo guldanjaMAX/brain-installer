@@ -30,6 +30,14 @@ import { fileURLToPath } from "node:url";
 
 import { BrainClient } from "./brain-client.mjs";
 import { evaluateProfileCoverage, formatProfileFailures } from "./profile.mjs";
+import {
+  corpusCompletenessHardGates,
+  corpusContractReadiness,
+  corpusReconciliationUnavailable,
+  createCorpusReconciliationCollector,
+  formatCorpusReadinessFailure,
+  loadCorpusContract,
+} from "./corpus-contract.mjs";
 import { localToolEnvironment } from "../doctor.mjs";
 import {
   scoreQuestion,
@@ -118,7 +126,10 @@ async function writePrivateNewFile(path, content) {
 
 /* ------------------------------------------------------------------ config */
 
-const VALUE_FLAGS = new Set(["config", "golden", "base", "profile", "limit", "k", "baseline", "save", "repeat", "artifacts"]);
+const VALUE_FLAGS = new Set([
+  "config", "golden", "base", "profile", "limit", "k", "baseline", "save",
+  "repeat", "artifacts", "corpus-contract", "installation-ref",
+]);
 const BOOL_FLAGS = new Set(["rerank", "graph-boost", "no-think", "json", "help"]);
 
 /**
@@ -491,6 +502,52 @@ function sanitizedCase(entry, k) {
   };
 }
 
+function sanitizedCorpusCompleteness(result) {
+  if (!result) return null;
+  const numeric = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const slices = {};
+  for (const [dimension, values] of Object.entries(result.slices || {})) {
+    slices[dimension] = {};
+    for (const [label, row] of Object.entries(values || {})) {
+      slices[dimension][label] = {
+        expected: numeric(row.expected),
+        indexed: numeric(row.indexed),
+        accounted: numeric(row.accounted),
+        missing: numeric(row.missing),
+        policy_leaks: numeric(row.policy_leaks),
+        pass: row.pass === true,
+      };
+    }
+  }
+  return {
+    schema_version: 1,
+    status: ["pass", "fail", "not_observable"].includes(result.status)
+      ? result.status
+      : "not_observable",
+    claim_boundary: "logical-source-family-presence-and-policy-absence",
+    contract_hash: /^sha256:[a-f0-9]{64}$/.test(result.contract_hash || "")
+      ? result.contract_hash
+      : null,
+    inventory_hash: /^sha256:[a-f0-9]{64}$/.test(result.inventory_hash || "")
+      ? result.inventory_hash
+      : null,
+    totals: Object.fromEntries([
+      "expected", "observed", "indexed_expected", "accounted", "missing",
+      "policy_leaks", "unknown",
+    ].map((field) => [field, numeric(result.totals?.[field])])),
+    slices,
+    failures: (result.failures || []).map((failure) => ({
+      stage: String(failure.stage || "source_inventory"),
+      code: String(failure.code || "SOURCE_INVENTORY_NOT_OBSERVABLE"),
+      count: numeric(failure.count),
+    })),
+    content_version: {
+      status: "not_observable",
+      reason: "CONTENT_HASH_OBSERVATION_UNAVAILABLE",
+    },
+  };
+}
+
 function sanitizedRunArtifact(run, k) {
   const gateFailures = (run.hard_gate_failures || []).map((failure) => ({
     case_id: opaqueExecutionId(failure.id, failure.pass || 1),
@@ -521,6 +578,9 @@ function sanitizedRunArtifact(run, k) {
         : null,
     },
     corpus: run.provenance.corpus,
+    ...(run.corpus_completeness
+      ? { corpus_completeness: sanitizedCorpusCompleteness(run.corpus_completeness) }
+      : {}),
     configuration: { ...run.variant, k: run.k, repeat: run.repeat },
     metrics: {
       question_pass_at_k: run.agg.recall[k],
@@ -591,6 +651,25 @@ async function writeArtifacts(directory, run, k) {
     `${coverage.map((row) => row.map(csvCell).join(",")).join("\n")}\n`,
   );
 
+  if (artifact.corpus_completeness) {
+    const corpusCoverage = [[
+      "dimension", "value", "expected", "indexed", "accounted", "missing",
+      "policy_leaks", "pass",
+    ]];
+    for (const [dimension, values] of Object.entries(artifact.corpus_completeness.slices || {})) {
+      for (const [value, metrics] of Object.entries(values || {})) {
+        corpusCoverage.push([
+          dimension, value, metrics.expected, metrics.indexed, metrics.accounted,
+          metrics.missing, metrics.policy_leaks, metrics.pass,
+        ]);
+      }
+    }
+    await writePrivateNewFile(
+      resolve(privateDirectory, "corpus-coverage.csv"),
+      `${corpusCoverage.map((row) => row.map(csvCell).join(",")).join("\n")}\n`,
+    );
+  }
+
   const releaseFailureIds = new Set([
     ...artifact.hard_gates.failures.map((entry) => entry.case_id),
     ...artifact.regressions,
@@ -636,6 +715,19 @@ function report(run, regressions, improvements, k) {
   L.push(`  golden     ${run.goldenLabel}  (${agg.n} scored, ${refusals.total} unanswerable)`);
   L.push(`  profile    ${run.profile}${run.profile === "release" ? " (v1 retrieval-suite coverage floor passed)" : " (diagnostic; not certification)"}`);
   L.push(`  variant    limit=${variant.limit} rerank=${variant.rerank} graph_boost=${variant.graphBoost}`);
+  if (run.corpus_completeness) {
+    const completeness = run.corpus_completeness;
+    const totals = completeness.totals || {};
+    L.push(
+      `  corpus     ${String(completeness.status).toUpperCase()}  ` +
+        `${totals.accounted ?? "?"}/${totals.expected ?? "?"} expected sources accounted; ` +
+        `${totals.unknown ?? "?"} unknown indexed`,
+    );
+    for (const failure of completeness.failures || []) {
+      L.push(`             ${failure.code} (${failure.count}) at ${failure.stage}`);
+    }
+    L.push("             proves logical-family presence and expected absence only; content-version matching is not yet observable");
+  }
   L.push("");
   L.push(`  QUESTION PASS@${k}   ${pct(agg.recall[k])}   <- all required evidence found`);
   if (run.noise) {
@@ -862,7 +954,7 @@ async function authenticatedCorpusGet(client, path) {
   throw lastError || new Error("corpus inventory endpoint failed");
 }
 
-async function fingerprintSourceFamilies(client, row) {
+async function fingerprintSourceFamilies(client, row, observeFamily = null) {
   const source = row.source_type;
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(source)) {
     throw new Error("inventory source label cannot be paged safely");
@@ -897,6 +989,7 @@ async function fingerprintSourceFamilies(client, row) {
       hasher.update(":");
       hasher.update(bytes);
       hasher.update("\n");
+      if (observeFamily) observeFamily(source, family);
       count++;
       if (count > row.documents) {
         throw new Error("source-family inventory exceeded the declared document count");
@@ -916,16 +1009,23 @@ async function fingerprintSourceFamilies(client, row) {
   return { source_type: source, families: count, family_hash: `sha256:${hasher.digest("hex")}` };
 }
 
-async function collectCorpusSnapshot(client) {
+async function collectCorpusSnapshot(client, contractBundle = null) {
   try {
     const inventory = canonicalInventory(await client.documents());
     const familyFingerprints = [];
+    const reconciliation = contractBundle
+      ? createCorpusReconciliationCollector(contractBundle)
+      : null;
     for (const row of inventory.rows) {
-      familyFingerprints.push(await fingerprintSourceFamilies(client, row));
+      familyFingerprints.push(await fingerprintSourceFamilies(
+        client,
+        row,
+        reconciliation ? (source, family) => reconciliation.observe(source, family) : null,
+      ));
     }
     const sum = (field) => inventory.rows.reduce((total, row) => total + row[field], 0);
     const fingerprintMaterial = { inventory, family_fingerprints: familyFingerprints };
-    return {
+    const snapshot = {
       status: "observed",
       documents: sum("documents"),
       chunks: sum("chunks"),
@@ -935,8 +1035,19 @@ async function collectCorpusSnapshot(client) {
       snapshot_hash: hashLabel(JSON.stringify(fingerprintMaterial)),
       fingerprint_basis: "logical-family-identities-source-versions-and-index-state",
     };
-  } catch {
-    return { status: "not_observable", reason: "CONTENT_FINGERPRINT_UNAVAILABLE" };
+    if (reconciliation) snapshot.completeness = reconciliation.finish();
+    return snapshot;
+  } catch (error) {
+    const unavailable = { status: "not_observable", reason: "CONTENT_FINGERPRINT_UNAVAILABLE" };
+    if (contractBundle) {
+      unavailable.completeness = corpusReconciliationUnavailable(
+        contractBundle,
+        error?.code === "SOURCE_INVENTORY_INVALID"
+          ? "SOURCE_INVENTORY_INVALID"
+          : "SOURCE_INVENTORY_NOT_OBSERVABLE",
+      );
+    }
+    return unavailable;
   }
 }
 
@@ -1137,6 +1248,11 @@ function assertBaselineCompatible(run, baseline) {
   for (const [label, before, after] of pairs) {
     if (before && after && before !== after) mismatches.push(label);
   }
+  const baselineContract = baseline.corpus_completeness?.contract_hash || null;
+  const currentContract = run.corpus_completeness?.contract_hash || null;
+  if (baselineContract !== currentContract && (baselineContract || currentContract)) {
+    mismatches.push("corpus contract");
+  }
   if (mismatches.length) {
     throw new Error(`baseline is not comparable: ${mismatches.join(", ")} changed`);
   }
@@ -1164,6 +1280,8 @@ async function main() {
         "  --config <path>     config file (default eval/eval.config.json)",
         "  --golden <path>     golden set JSON, overrides the config",
         "  --base <url>        brain base URL, overrides the config",
+        "  --corpus-contract <path>  private source-inventory contract; enables completeness gates",
+        "  --installation-ref <slug> manifest binding required with --corpus-contract",
         "  --profile <name>    smoke (default) or release suite-coverage gate",
         "  --limit <n>         results requested per question (default/minimum 10 for nDCG@10)",
         "  --k <n>             evidence cutoff for question pass and quality metrics (default 5)",
@@ -1175,7 +1293,7 @@ async function main() {
         "  --no-think          skip refusal and answer canaries in smoke only; critical skips still fail",
         "  --baseline <path>   compare against a saved run",
         "  --save <path>       write this run to disk",
-        "  --artifacts <dir>   write run.json, failures.jsonl, coverage.csv and junit.xml",
+        "  --artifacts <dir>   write aggregate JSON, JSONL, CSV and JUnit evidence",
         "  --json              print the raw run object instead of the report",
         "",
         "exit 1 on a regression, any transport error, or any case/suite hard-gate failure.",
@@ -1220,6 +1338,27 @@ async function main() {
     throw new Error(
       "--no-think cannot be used with the release profile because every refusal and declared answer canary must run",
     );
+  }
+
+  // Corpus contracts are private instance material. Validate their file,
+  // schema, source-to-connector topology, and manifest binding before the admin
+  // key is read. An incomplete connector snapshot cannot become a passing
+  // percentage merely because the indexed subset looks healthy.
+  const configuredContract = flags["corpus-contract"] || cfg.corpus_contract || null;
+  let corpusContractBundle = null;
+  if (configuredContract) {
+    const installationRef = flags["installation-ref"] || cfg.installation_ref || null;
+    if (!installationRef) {
+      throw new Error(
+        "--installation-ref (or config installation_ref) is required with a corpus contract so it cannot be applied to another install",
+      );
+    }
+    const contractPath = flags["corpus-contract"]
+      ? abs(configuredContract, process.cwd())
+      : abs(configuredContract, dirname(configPath));
+    corpusContractBundle = await loadCorpusContract(contractPath, { installationRef });
+    const readiness = corpusContractReadiness(corpusContractBundle.contract);
+    if (readiness.status !== "ready") throw new Error(formatCorpusReadinessFailure(readiness));
   }
 
   const k = Number(flags.k || cfg.k || 5);
@@ -1298,7 +1437,7 @@ async function main() {
   // The same document and index state must surround the measured calls. Counts
   // alone are insufficient: a file can be replaced without changing a count.
   const runStartedAt = new Date().toISOString();
-  const corpusBefore = await collectCorpusSnapshot(client);
+  const corpusBefore = await collectCorpusSnapshot(client, corpusContractBundle);
   const passes = [];
   for (let i = 0; i < repeat; i++) {
     if (repeat > 1) console.error(`  pass ${i + 1} of ${repeat}...`);
@@ -1309,7 +1448,12 @@ async function main() {
     );
     passes.push(passRows.map((entry) => ({ ...entry, repeat: i + 1 })));
   }
-  const corpus = closeCorpusBracket(corpusBefore, await collectCorpusSnapshot(client));
+  const bracketedCorpus = closeCorpusBracket(
+    corpusBefore,
+    await collectCorpusSnapshot(client, corpusContractBundle),
+  );
+  const corpusCompleteness = bracketedCorpus.completeness || null;
+  const { completeness: _privateCompleteness, ...corpus } = bracketedCorpus;
   if (flags.save && corpus.status !== "observed") {
     throw new Error("cannot save a baseline because a bracketed corpus content fingerprint is not observable");
   }
@@ -1381,6 +1525,7 @@ async function main() {
     // Provenance. Without it a baseline is a number with no idea what produced
     // it, and six months later nobody can say whether two are comparable.
     provenance: await collectProvenance(client, base, goldenBytes, corpus),
+    ...(corpusCompleteness ? { corpus_completeness: corpusCompleteness } : {}),
     noise,
     goldenLabel: `${golden.install || "unnamed"} (${golden.questions.length} questions)`,
     suite_question_count: golden.questions.length,
@@ -1413,7 +1558,10 @@ async function main() {
   const improvements = findImprovements(run, baseline, k);
   run.regression_count = regressions.length;
   run.regressions = regressions.map((entry) => ({ id: entry.id, repeat: entry.repeat || 1 }));
-  run.hard_gate_failures = hardGateFailures(passes, k, profile);
+  run.hard_gate_failures = [
+    ...hardGateFailures(passes, k, profile),
+    ...corpusCompletenessHardGates(corpusCompleteness),
+  ];
   run.completed_at = new Date().toISOString();
 
   if (bools.has("json")) console.log(JSON.stringify(run, null, 2));

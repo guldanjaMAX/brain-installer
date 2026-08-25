@@ -103,6 +103,11 @@ import {
   buildDriveRemovalPlan,
 } from "./operations/drive-removal-plan.mjs";
 import { evaluateProfileCoverage, formatProfileFailures } from "./eval/profile.mjs";
+import {
+  corpusContractReadiness,
+  formatCorpusReadinessFailure,
+  loadCorpusContract,
+} from "./eval/corpus-contract.mjs";
 export {
   DRIVE_REMOVAL_MAX_COUNT,
   DRIVE_REMOVAL_MAX_RATIO,
@@ -2848,7 +2853,8 @@ function assertSourceName(name) {
  */
 export const VALUE_FLAGS = new Set([
   "path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark", "export",
-  "golden", "profile", "k", "repeat", "baseline", "save", "artifacts", "approve-removals",
+  "golden", "profile", "k", "repeat", "baseline", "save", "artifacts",
+  "corpus-contract", "approve-removals",
 ]);
 
 /** Read an exact Drive-id exclusion list from either its portable shape or a migration receipt. */
@@ -6818,7 +6824,7 @@ export function evalChildEnvironment(environment = process.env) {
 }
 
 /** Build the evaluator command line with an explicit profile every time. */
-export function evalChildArguments(base, goldenPath, requestedProfile, flags = {}) {
+export function evalChildArguments(base, goldenPath, requestedProfile, flags = {}, context = {}) {
   const args = [
     join(HERE, "eval", "run.mjs"),
     "--base", base,
@@ -6830,6 +6836,13 @@ export function evalChildArguments(base, goldenPath, requestedProfile, flags = {
   }
   for (const f of ["rerank", "graph-boost", "no-think", "json"]) {
     if (flags[f]) args.push(`--${f}`);
+  }
+  if (flags["corpus-contract"] && flags["corpus-contract"] !== true) {
+    if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(String(context.installationRef || ""))) {
+      throw new Error("a manifest installation reference is required with --corpus-contract");
+    }
+    args.push("--corpus-contract", String(flags["corpus-contract"]));
+    args.push("--installation-ref", String(context.installationRef));
   }
   return args;
 }
@@ -6949,6 +6962,27 @@ async function cmdEval(manifestPath) {
     die(error?.message || "evaluation profile preflight failed");
   }
 
+  let corpusContractPath = null;
+  if (flags["corpus-contract"]) {
+    if (flags["corpus-contract"] === true) {
+      die("--corpus-contract needs the path to a private corpus contract");
+    }
+    const installationRef = String(m.client?.slug || "");
+    if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(installationRef)) {
+      die("the manifest needs a valid client.slug before a corpus contract can be bound to this install");
+    }
+    corpusContractPath = resolve(String(flags["corpus-contract"]));
+    try {
+      const bundle = await loadCorpusContract(corpusContractPath, {
+        installationRef,
+      });
+      const readiness = corpusContractReadiness(bundle.contract);
+      if (readiness.status !== "ready") throw new Error(formatCorpusReadinessFailure(readiness));
+    } catch (error) {
+      die(error?.message || "corpus contract preflight failed");
+    }
+  }
+
   // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker
   // over plain HTTPS with the admin key, so it must keep working after our token
   // is revoked at handoff. A command that proves the brain works, but only while
@@ -6958,7 +6992,13 @@ async function cmdEval(manifestPath) {
   const adminKey = resolveAdminKey(manifestPath);
   if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
 
-  const args = evalChildArguments(base, goldenPath, requestedProfile, flags);
+  const args = evalChildArguments(
+    base,
+    goldenPath,
+    requestedProfile,
+    corpusContractPath ? { ...flags, "corpus-contract": corpusContractPath } : flags,
+    { installationRef: m.client?.slug || null },
+  );
 
   const keyInput = Buffer.from(`${adminKey}\n`, "utf8");
   let r;
@@ -7389,7 +7429,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain drain      <manifest>            finish the vector embedding now, with a live ETA
     brain reindex    <manifest>            rebuild the vector index from D1, no source files needed
     brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
-    brain eval       <manifest>            score the brain on YOUR questions (--init to start one)
+    brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail  authorise the client's own Google account
     brain ingest     <manifest> --path <dir>  load a folder into the brain

@@ -61,6 +61,7 @@ const expected = [
   "docs/decisions/README.md",
   "doctor.mjs",
   "eval/brain-client.mjs",
+  "eval/corpus-contract.mjs",
   "eval/eval.config.json",
   "eval/golden/TEMPLATE.golden.json",
   "eval/profile.mjs",
@@ -145,6 +146,7 @@ const requiredGitIgnored = [
   ".brain-recovery-state.json",
   ".brain-recovery-state.json.tmp-deadbeef",
   ".brain-recovery-export.sql",
+  "brain.corpus-contract.json",
 ];
 const gitIgnoreFailures = requiredGitIgnored.filter((path) =>
   spawnSync("git", ["check-ignore", "--quiet", "--no-index", path], {

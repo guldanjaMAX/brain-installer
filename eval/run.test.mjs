@@ -31,7 +31,8 @@ function run(command, args, options) {
 }
 
 async function runFixture({
-  questions, goldenFields = {}, args = [], route = null, artifacts = false, baseline = undefined, save = false,
+  questions, goldenFields = {}, args = [], route = null, artifacts = false,
+  baseline = undefined, save = false, corpusContract = null,
 }) {
   const root = mkdtempSync(join(tmpdir(), "brain-eval-case-"));
   const key = "fixture-private-key";
@@ -107,11 +108,16 @@ async function runFixture({
     const artifactPath = join(root, "artifacts");
     const baselinePath = join(root, "baseline.json");
     const savedPath = join(root, "saved-run.json");
+    const corpusContractPath = join(root, "brain.corpus-contract.json");
     if (baseline !== undefined) writeFileSync(baselinePath, JSON.stringify(baseline));
+    if (corpusContract) writeFileSync(corpusContractPath, JSON.stringify(corpusContract), { mode: 0o600 });
     const result = await run(process.execPath, [
       fileURLToPath(new URL("./run.mjs", import.meta.url)),
       "--base", `http://127.0.0.1:${address.port}`,
       "--golden", golden,
+      ...(corpusContract
+        ? ["--corpus-contract", corpusContractPath, "--installation-ref", "private-owner"]
+        : []),
       ...args,
       ...(baseline !== undefined ? ["--baseline", baselinePath] : []),
       ...(save ? ["--save", savedPath] : []),
@@ -127,6 +133,9 @@ async function runFixture({
         : null,
       junitArtifact: existsSync(join(artifactPath, "junit.xml"))
         ? readFileSync(join(artifactPath, "junit.xml"), "utf8")
+        : null,
+      corpusCoverageArtifact: existsSync(join(artifactPath, "corpus-coverage.csv"))
+        ? readFileSync(join(artifactPath, "corpus-coverage.csv"), "utf8")
         : null,
       savedRun: existsSync(savedPath) ? JSON.parse(readFileSync(savedPath, "utf8")) : null,
     };
@@ -161,6 +170,145 @@ function releaseProfileFixture() {
     },
   };
 }
+
+function corpusContractFixture({ missing = false, incomplete = false } = {}) {
+  const h = (character) => `sha256:${character.repeat(64)}`;
+  return {
+    schema_version: 1,
+    contract_id: "fixture-corpus",
+    contract_version: "1",
+    installation_ref: "private-owner",
+    captured_at: "2026-08-25T00:00:00.000Z",
+    inventory_complete: !incomplete,
+    ...(!incomplete ? { inventory_hash: h("a") } : {}),
+    connector_snapshots: [{
+      connector: "curated",
+      observed_at: "2026-08-25T00:00:00.000Z",
+      complete: !incomplete,
+      ...(!incomplete ? { cursor_hash: h("b"), policy_hash: h("c") } : {}),
+    }],
+    sources: [
+      {
+        source_id: "private-expected-source",
+        connector: "curated",
+        locator_kind: "source_native_id",
+        canonical_locator: "Private/Owner/Expected Record.pdf",
+        index_source_id: missing ? "missing-private-id" : "doc-a",
+        domains: ["records"],
+        owner_scope: ["owner"],
+        sensitivity: "restricted",
+        expected_status: "eligible",
+        mime_type: "application/pdf",
+        extraction_mode: "native_text",
+        page_count: 1,
+        content_hash: h("d"),
+        source_version: "private-version",
+        priority: "critical",
+        required_fields: [],
+      },
+      ...(missing ? [{
+        source_id: "private-excluded-source",
+        connector: "curated",
+        locator_kind: "source_native_id",
+        canonical_locator: "Private/Owner/Excluded Record.pdf",
+        index_source_id: "doc-a",
+        domains: ["records"],
+        owner_scope: ["owner"],
+        sensitivity: "restricted",
+        expected_status: "excluded",
+        status_reason_code: "owner-policy",
+        mime_type: "application/pdf",
+        extraction_mode: "none",
+        page_count: 1,
+        content_hash: h("e"),
+        priority: "high",
+        required_fields: [],
+      }] : []),
+    ],
+  };
+}
+
+test("an optional private corpus contract adds deterministic aggregate completeness gates", async () => {
+  const result = await runFixture({
+    questions: [{
+      id: "corpus-pass",
+      kind: "single",
+      risk: "critical",
+      domains: ["records"],
+      formats: ["pdf"],
+      question: "Which fixture is present?",
+      expect: [{ any_of: ["curated:doc-a"] }],
+    }],
+    corpusContract: corpusContractFixture(),
+    artifacts: true,
+  });
+
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /corpus\s+PASS\s+1\/1 expected sources accounted/);
+  assert.deepEqual(result.runArtifact.corpus_completeness.totals, {
+    expected: 1,
+    observed: 1,
+    indexed_expected: 1,
+    accounted: 1,
+    missing: 0,
+    policy_leaks: 0,
+    unknown: 0,
+  });
+  assert.equal(result.runArtifact.corpus_completeness.slices.domain.records.pass, true);
+  assert.match(result.corpusCoverageArtifact, /domain,records,1,1,1,0,0,true/);
+  assert.equal(result.runArtifact.corpus_completeness.content_version.reason,
+    "CONTENT_HASH_OBSERVATION_UNAVAILABLE");
+  const shareable = `${JSON.stringify(result.runArtifact)}\n${result.failuresArtifact}\n${result.junitArtifact}\n${result.corpusCoverageArtifact}`;
+  for (const privateValue of [
+    "Expected Record", "private-expected-source", "private-version", "doc-a",
+  ]) {
+    assert.doesNotMatch(shareable, new RegExp(privateValue, "i"));
+  }
+});
+
+test("corpus inventory mismatches fail with stage codes and no private source identity", async () => {
+  const result = await runFixture({
+    questions: [{
+      id: "corpus-fail",
+      kind: "single",
+      risk: "critical",
+      question: "Which fixture is present?",
+      expect: [{ any_of: ["curated:doc-a"] }],
+    }],
+    corpusContract: corpusContractFixture({ missing: true }),
+    artifacts: true,
+  });
+
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /SOURCE_NOT_INDEXED \(1\) at source_inventory/);
+  assert.match(result.stdout, /EXCLUDED_SOURCE_INDEXED \(1\) at policy_state/);
+  const reasons = result.runArtifact.hard_gates.failures.map((failure) => failure.reason);
+  assert.ok(reasons.includes("SOURCE_NOT_INDEXED"));
+  assert.ok(reasons.includes("EXCLUDED_SOURCE_INDEXED"));
+  const shareable = `${JSON.stringify(result.runArtifact)}\n${result.failuresArtifact}\n${result.junitArtifact}\n${result.corpusCoverageArtifact}`;
+  assert.doesNotMatch(shareable, /missing-private-id|Excluded Record|private-excluded-source|doc-a/i);
+});
+
+test("an incomplete corpus contract stops before credentials or network", async () => {
+  let requests = 0;
+  const result = await runFixture({
+    questions: [{
+      id: "corpus-preflight",
+      kind: "single",
+      risk: "critical",
+      question: "Which fixture is present?",
+      expect: [{ any_of: ["curated:doc-a"] }],
+    }],
+    corpusContract: corpusContractFixture({ incomplete: true }),
+    route: () => { requests++; return null; },
+  });
+
+  assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+  assert.equal(requests, 0);
+  assert.match(result.stderr, /CORPUS_INVENTORY_INCOMPLETE \(1\)/);
+  assert.match(result.stderr, /CONNECTOR_SNAPSHOT_INCOMPLETE \(1\)/);
+  assert.doesNotMatch(result.stderr, /Expected Record|private-expected-source|doc-a/);
+});
 
 test("release profile rejects an undersized suite before credentials or network access", async () => {
   let requests = 0;
@@ -466,6 +614,8 @@ test("the distributed runner records reproducible provenance and CI artifacts", 
     for (const file of ["run.json", "failures.jsonl", "coverage.csv", "junit.xml"]) {
       assert.equal(existsSync(join(artifacts, file)), true, `${file} was not written`);
     }
+    assert.equal(existsSync(join(artifacts, "corpus-coverage.csv")), false,
+      "legacy runs must not gain a corpus artifact without an explicit contract");
     const runArtifact = JSON.parse(readFileSync(join(artifacts, "run.json"), "utf8"));
     assert.equal(runArtifact.schema_version, 1);
     assert.equal(runArtifact.artifact_kind, "brain-retrieval-eval");

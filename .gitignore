@@ -18,6 +18,9 @@ eval/baselines/
 # The shipped evaluator creates this beside each manifest. It contains the
 # owner's real questions, expected claims, and source identities.
 brain.golden.json
+# Independent source inventories contain private paths, connector identities,
+# and content hashes. Only the generic schema and evaluator ship.
+*.corpus-contract.json
 
 # A real eval config names a real brain's hostname and how its admin key is
 # looked up. No secret value, but it is a targeting aid in a public repo, so the
