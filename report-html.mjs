@@ -39,6 +39,7 @@
  */
 
 import { Acceptance } from "./acceptance.mjs";
+import { fetchBrainWithAdminKey } from "./components/brain-http.mjs";
 
 /* ------------------------------------------------------------- escaping */
 
@@ -1017,9 +1018,12 @@ export async function collectReportData({
 
   let corpus = null;
   try {
-    const res = await fetchImpl(`${root}/api/admin/brain/documents`, {
-      headers: { "X-Admin-Key": adminKey },
-    });
+    const res = await fetchBrainWithAdminKey(
+      fetchImpl,
+      `${root}/api/admin/brain/documents`,
+      {},
+      () => adminKey,
+    );
     if (res.ok) corpus = await res.json();
   } catch {
     // A missing corpus summary is reported as a blank section, never as a
@@ -1028,11 +1032,11 @@ export async function collectReportData({
 
   const askOne = async (question) => {
     try {
-      const res = await fetchImpl(`${root}/api/rag/think`, {
+      const res = await fetchBrainWithAdminKey(fetchImpl, `${root}/api/rag/think`, {
         method: "POST",
-        headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ q: question, limit: answerLimit }),
-      });
+      }, () => adminKey);
       const text = await res.text();
       let json = null;
       try {

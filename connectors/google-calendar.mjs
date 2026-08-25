@@ -87,6 +87,8 @@
  * records. It is supported, it is fingerprinted, and it will force a resync.
  */
 
+import { fetchBrainWithAdminKey } from "../components/brain-http.mjs";
+
 /* --------------------------------------------------------------- constants */
 
 export const CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events.readonly";
@@ -1175,11 +1177,11 @@ export async function ingestEnvelopes({ baseUrl, adminKey, envelopes, fetchImpl 
   for (const envelope of envelopes) {
     let res;
     try {
-      res = await fetchImpl(`${baseUrl.replace(/\/$/, "")}/api/admin/brain/ingest`, {
+      res = await fetchBrainWithAdminKey(fetchImpl, `${baseUrl.replace(/\/$/, "")}/api/admin/brain/ingest`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-admin-key": adminKey },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify(envelope),
-      });
+      }, () => adminKey);
     } catch (e) {
       out.errors.push({ source_id: envelope.source_id, error: e.message });
       continue;

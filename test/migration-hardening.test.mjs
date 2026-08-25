@@ -109,7 +109,16 @@ await check("source, target, and completion calls refuse automatic redirects", a
     adminKey: "fixture",
     items: [item()],
     fetchImpl: async () => response("{}", { url: "https://other.example/api/admin/brain/ingest/batch" }),
-  }), /changed origin or path/);
+  }), /different origin|changed origin or path/);
+
+  let insecureTargetCalls = 0;
+  await assert.rejects(() => postTargetBatch({
+    targetUrl: "http://brain.example",
+    adminKey: "fixture",
+    items: [item()],
+    fetchImpl: async () => { insecureTargetCalls++; return response("{}"); },
+  }), /HTTPS.*loopback/i);
+  assert.equal(insecureTargetCalls, 0, "migration refuses insecure target before fetch");
 });
 
 await check("migration responses are bounded before JSON parsing", async () => {

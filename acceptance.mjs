@@ -32,6 +32,8 @@
  * loudly and the content it wrote is reported for removal.
  */
 
+import { fetchBrainWithAdminKey } from "./components/brain-http.mjs";
+
 const PASS = "pass";
 const FAIL = "fail";
 const WARN = "warn";
@@ -89,14 +91,16 @@ export class Acceptance {
   }
 
   async request(path, { auth = true, method = "GET", body } = {}) {
-    const res = await this.fetch(this.base + path, {
+    const init = {
       method,
       headers: {
-        ...(auth ? { "X-Admin-Key": this.key } : {}),
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    };
+    const res = auth
+      ? await fetchBrainWithAdminKey(this.fetch, this.base + path, init, () => this.key)
+      : await this.fetch(this.base + path, init);
     const text = await res.text();
     let json = null;
     try {
@@ -147,11 +151,11 @@ export class Acceptance {
       `HTTP ${noKey.status}${noKey.status !== 401 ? " — THE BRAIN IS ANSWERING WITHOUT A KEY" : ""}`
     );
 
-    const badKey = await this.fetch(`${this.base}/api/rag/unified`, {
+    const badKey = await fetchBrainWithAdminKey(this.fetch, `${this.base}/api/rag/unified`, {
       method: "POST",
-      headers: { "X-Admin-Key": "definitely-not-the-key", "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ q: "test" }),
-    });
+    }, () => "definitely-not-the-key");
     this.record(
       t,
       "wrong key is refused",
@@ -304,16 +308,16 @@ export class Acceptance {
     // CONFIRMED tier fires.
     const canary = "cfut_" + "Kd9Xm2Pq7Rv4Tz8Ly6Wn3Bc5Hj1Gs0Ae4Uf7Yx2Mq";
     const sourceId = "acceptance/credential-gate-probe";
-    const res = await this.fetch(`${this.base}/api/admin/brain/ingest`, {
+    const res = await fetchBrainWithAdminKey(this.fetch, `${this.base}/api/admin/brain/ingest`, {
       method: "POST",
-      headers: { "X-Admin-Key": this.key, "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         source_type: "curated",
         source_id: sourceId,
         title: "acceptance probe",
         content: `Acceptance probe. Deploy with CLOUDFLARE_API_TOKEN=${canary} and it works.`,
       }),
-    });
+    }, () => this.key);
     const text = await res.text();
 
     const gate = credentialGateRefusalVerdict({ status: res.status, text });

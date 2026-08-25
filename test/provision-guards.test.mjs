@@ -294,7 +294,7 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     const requestBody = JSON.parse(String(options?.body || "{}"));
     calls.push({
       url: String(url),
-      key: options?.headers?.["X-Admin-Key"],
+      key: new Headers(options?.headers || {}).get("X-Admin-Key"),
       method: options?.method,
       redirect: options?.redirect,
       body: requestBody,

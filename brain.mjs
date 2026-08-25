@@ -89,6 +89,7 @@ import {
   recordSupportEvent,
 } from "./support-journal.mjs";
 import { readAdminKeyFile, validateAdminKeyValue } from "./operations/admin-key-file.mjs";
+import { guardBrainAdminFetch } from "./components/brain-http.mjs";
 import {
   adminKeyPersistencePlan,
   parseAdminKeySecretReference,
@@ -6552,7 +6553,10 @@ async function http(url, opts = {}, { timeoutMs = HTTP_TIMEOUT_MS, what = "the r
     host = new URL(String(url)).host;
   } catch { /* a relative or odd URL still deserves a real error below */ }
   try {
-    return await fetch(url, { ...opts, signal: AbortSignal.timeout(timeoutMs) });
+    return await guardBrainAdminFetch(fetch, url, {
+      ...opts,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
   } catch (e) {
     const name = e?.name || "";
     if (name === "TimeoutError" || name === "AbortError") {

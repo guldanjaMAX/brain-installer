@@ -18,6 +18,7 @@
  */
 
 import { Acceptance } from "./acceptance.mjs";
+import { fetchBrainWithAdminKey } from "./components/brain-http.mjs";
 
 const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
 const num = (n) => Number(n || 0).toLocaleString("en-US");
@@ -51,9 +52,12 @@ export async function buildReport({ base, adminKey, manifest, installState, upgr
     installState,
   });
 
-  const docsRes = await fetch(`${base}/api/admin/brain/documents`, {
-    headers: { "X-Admin-Key": adminKey },
-  });
+  const docsRes = await fetchBrainWithAdminKey(
+    fetch,
+    `${base}/api/admin/brain/documents`,
+    {},
+    () => adminKey,
+  );
   const docs = docsRes.ok ? await docsRes.json() : { rows: [] };
   const rows = docs.rows || [];
   const total = rows.reduce((a, r) => a + Number(r.total || 0), 0);

@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { fetchBrainWithAdminKey } from "../components/brain-http.mjs";
 import { batches, splitOversized } from "../ingest/envelope-batching.mjs";
 import { readProtectedStateJson, saveProtectedStateJson } from "./state-file.mjs";
 
@@ -422,13 +423,12 @@ export async function postTargetBatch({
   let response;
   let raw;
   try {
-    response = await fetchImpl(endpoint.href, {
+    response = await fetchBrainWithAdminKey(fetchImpl, endpoint.href, {
       method: "POST",
-      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ docs: items.map((item) => item.envelope) }),
       signal: controller.signal,
-      redirect: "error",
-    });
+    }, () => adminKey);
     assertExactResponseUrl(response, endpoint, "target ingest");
     raw = await readBoundedResponseText(response, { maxBytes: maxResponseBytes, label: "target ingest response" });
   } catch (error) {
@@ -456,12 +456,10 @@ export async function getTargetInventory({
   let response;
   let raw;
   try {
-    response = await fetchImpl(endpoint.href, {
+    response = await fetchBrainWithAdminKey(fetchImpl, endpoint.href, {
       method: "GET",
-      headers: { "X-Admin-Key": adminKey },
       signal: controller.signal,
-      redirect: "error",
-    });
+    }, () => adminKey);
     assertExactResponseUrl(response, endpoint, "target inventory");
     raw = await readBoundedResponseText(response, { maxBytes: maxResponseBytes, label: "target inventory response" });
   } catch (error) {
@@ -490,13 +488,12 @@ export async function postSourceReceipt({
   let response;
   let raw;
   try {
-    response = await fetchImpl(endpoint.href, {
+    response = await fetchBrainWithAdminKey(fetchImpl, endpoint.href, {
       method: "POST",
-      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(receipt),
       signal: controller.signal,
-      redirect: "error",
-    });
+    }, () => adminKey);
     assertExactResponseUrl(response, endpoint, "source receipt");
     raw = await readBoundedResponseText(response, { maxBytes: maxResponseBytes, label: "source receipt response" });
   } catch (error) {

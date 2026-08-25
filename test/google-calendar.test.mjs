@@ -859,7 +859,12 @@ section("posting envelopes at the brain");
 {
   const seen = [];
   const impl = async (url, init) => {
-    seen.push({ url, body: JSON.parse(init.body), key: init.headers["x-admin-key"] });
+    seen.push({
+      url,
+      body: JSON.parse(init.body),
+      key: new Headers(init.headers).get("x-admin-key"),
+      redirect: init.redirect,
+    });
     const n = seen.length;
     if (n === 2) return mkRes({ status: 422, body: { error: "refused", labels: ["anthropic_key"], detail: "Rotate them." } });
     return mkRes({ status: 200, body: { brain_doc_id: n, action: n === 3 ? "unchanged" : "created", embedded: true } });
@@ -869,6 +874,7 @@ section("posting envelopes at the brain");
 
   check("it posts to the ingest route", seen[0].url === "https://brain.acme.com/api/admin/brain/ingest", seen[0].url);
   check("it sends the admin key", seen[0].key === "k");
+  check("it refuses redirects before posting the admin key", seen[0].redirect === "error");
   check("a 422 refusal does NOT abort the batch", seen.length === 3, String(seen.length));
   check("the refusal is reported with its labels", out.refused.length === 1 && out.refused[0].labels[0] === "anthropic_key");
   check("created and unchanged are counted separately", out.created === 1 && out.unchanged === 1, JSON.stringify(out));

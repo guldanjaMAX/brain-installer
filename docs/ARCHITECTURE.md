@@ -218,6 +218,13 @@ owner-only Linux files. AI-tool registrations carry the manifest locator and
 resolve the current key when the MCP process starts, so rotation does not leave
 stale copied credentials.
 
+Every shipped client request carrying `X-Admin-Key` requires HTTPS, except for
+an explicit loopback test URL, and refuses redirects before sending the header.
+The client also rejects a response whose final origin differs from the reviewed
+request origin. This is a shared transport invariant because Node preserves
+custom headers across a cross-origin redirect even though it strips the standard
+`Authorization` header.
+
 Google OAuth uses Keychain by default on macOS and a protected file under
 `~/.brain/` on other supported paths. Scheduler logs and locks also live under
 the private per-user `.brain` directory. These files are runtime evidence, not

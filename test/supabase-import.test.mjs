@@ -157,7 +157,12 @@ const check = (name, condition, detail = "") => {
     adminKey: "test-admin-key",
     receipt: { source: "message", kind: "upload", complete_sweep: false },
     fetchImpl: async (url, options) => {
-      seen = { url, method: options.method, body: JSON.parse(options.body), authenticated: options.headers["X-Admin-Key"] === "test-admin-key" };
+      seen = {
+        url,
+        method: options.method,
+        body: JSON.parse(options.body),
+        authenticated: new Headers(options.headers).get("X-Admin-Key") === "test-admin-key",
+      };
       return new Response(JSON.stringify({ source: "message", status: "ready", documents: 12 }), { status: 200 });
     },
   });

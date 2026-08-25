@@ -12,6 +12,7 @@ import {
   adminKeyPersistencePlan,
   readAdminKeyDurably,
 } from "../operations/admin-key-persistence.mjs";
+import { fetchBrainWithAdminKey } from "./brain-http.mjs";
 
 const DURABLE_CREDENTIAL_ERROR =
   "the durable brain credential could not be read and verified. Run `brain secrets <manifest>` and restart the AI tool if this continues.";
@@ -103,9 +104,7 @@ export async function fetchWithBrainCredential(fetchImpl, url, requestOptions, r
   if (!resolver?.get) throw new TypeError("a brain credential resolver is required");
 
   const attempt = () => {
-    const headers = new Headers(requestOptions?.headers || {});
-    headers.set("X-Admin-Key", resolver.get());
-    return fetchImpl(url, { ...(requestOptions || {}), headers });
+    return fetchBrainWithAdminKey(fetchImpl, url, requestOptions, () => resolver.get());
   };
 
   let response = await attempt();

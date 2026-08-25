@@ -425,7 +425,9 @@ function ingestExitCli(scenario) {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(CLI, "utf-8");
   const bare = (src.match(/await fetch\(/g) || []).length;
-  check("no bare fetch remains outside the http() wrapper", bare === 1, `${bare} found`);
+  check("no bare fetch remains outside the http() wrapper", bare === 0, `${bare} found`);
+  check("the wrapper routes admin requests through the exact-origin guard",
+    /await guardBrainAdminFetch\(fetch, url/.test(src));
   check("the wrapper sets a timeout", /AbortSignal\.timeout/.test(src));
   for (const sig of ["timed out after", "could not be resolved", "connection to"]) {
     check(`network failures are translated: "${sig}"`, src.includes(sig));

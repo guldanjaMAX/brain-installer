@@ -44,6 +44,7 @@ const expected = [
   "brain.mjs",
   "components/brain-mcp.mjs",
   "components/brain-mcp-runtime.mjs",
+  "components/brain-http.mjs",
   "connectors/gmail.mjs",
   "connectors/google-auth.mjs",
   "connectors/google-calendar.mjs",

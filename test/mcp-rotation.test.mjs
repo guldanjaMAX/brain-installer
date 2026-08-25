@@ -334,6 +334,7 @@ try {
   persistAdminKeyDurably(plan, replacementKey, nativeFileOptions);
   const attempted = [];
   const response = await fetchWithBrainCredential(async (_url, options) => {
+    assert.equal(options.redirect, "error", "MCP admin requests refuse redirects");
     const key = new Headers(options.headers).get("X-Admin-Key");
     attempted.push(key);
     return attempted.length === 1
@@ -343,6 +344,25 @@ try {
   assert.equal(response.status, 200);
   assert.deepEqual(attempted, [currentKey, replacementKey], "401 reloads durable desired state once");
   assert.doesNotMatch(runtime.redact(`${currentKey} ${replacementKey}`), new RegExp(`${currentKey}|${replacementKey}`));
+
+  let insecureReads = 0;
+  let insecureRequests = 0;
+  const insecureResolver = {
+    durable: true,
+    get() { insecureReads++; return replacementKey; },
+    clear() {},
+  };
+  await assert.rejects(
+    fetchWithBrainCredential(
+      async () => { insecureRequests++; return new Response("unexpected"); },
+      "http://brain.example.invalid/api/admin/brain/documents",
+      {},
+      insecureResolver,
+    ),
+    /HTTPS.*loopback/i,
+  );
+  assert.equal(insecureReads, 0, "an insecure MCP URL is refused before durable-key access");
+  assert.equal(insecureRequests, 0, "an insecure MCP URL is refused before fetch");
 
   /* Shared Keychain reader is used without secret argv or inherited credentials. */
   const keychainDir = join(sandbox, "keychain runtime");

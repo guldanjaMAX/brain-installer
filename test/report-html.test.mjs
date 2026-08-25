@@ -474,7 +474,7 @@ const reply = (status, body) => ({
 const privateQueryCalls = [];
 const fetchStub = async (url, init = {}) => {
   const u = new URL(url);
-  const key = (init.headers || {})["X-Admin-Key"];
+  const key = new Headers(init.headers || {}).get("X-Admin-Key");
   const authed = key === "the-real-key";
 
   if (u.pathname === "/health") return reply(200, { ok: true, version: "0.2.0" });
@@ -518,7 +518,8 @@ check("collect asks every probe question", collected.seedAnswers.length === 2);
 check("collect asks the predicted misses too", collected.expectedToFail.length === 1);
 check("report and acceptance questions use private JSON POST bodies",
   privateQueryCalls.length > 0 && privateQueryCalls.every((call) =>
-    call.init.method === "POST" && call.url.search === "" && typeof call.body.q === "string"),
+    call.init.method === "POST" && call.init.redirect === "error" &&
+      call.url.search === "" && typeof call.body.q === "string"),
   JSON.stringify(privateQueryCalls.map((call) => ({ method: call.init.method, search: call.url.search, body: call.body }))));
 check("collect normalises a trailing slash on the base", collected.base === "https://brain.acme.com");
 check("collect keeps citations from think", collected.seedAnswers[0].citations.length === 1);
