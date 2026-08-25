@@ -39,6 +39,12 @@ jobs:
       - name: install
         run: npm ci --ignore-scripts
 
+      # Fixed bytes only. This isolates Windows profile, stdin framing, and
+      # DPAPI availability without ever putting a credential in CI output.
+      - name: Windows DPAPI stage probe
+        if: runner.os == 'Windows'
+        run: node test/fixtures/windows-dpapi-probe.mjs
+
       - name: unit and integration suite
         run: npm test
 
