@@ -15,11 +15,9 @@ The installer reads the brain admin key from its durable local storage. Do not
 copy `.brain-admin-key` into your shell. On Windows that file is a DPAPI
 CurrentUser ciphertext envelope, not the key itself. A Cloudflare token is
 needed only for account-changing commands such as verify, provision, deploy,
-and secrets.
-
-```
-export CLOUDFLARE_API_TOKEN='<your token, for your own account>'
-```
+and secrets. The supported `brain setup` and `brain update` paths ask for it in
+a hidden terminal prompt. Low-level automation must inject it through an
+approved secret manager. Never paste a token or key into a shell command.
 
 **The one command that answers "is it broken":**
 
@@ -77,23 +75,24 @@ node brain.mjs health <manifest>
 
 It already retries fifteen times on your behalf, so if the first run reported the wait and then succeeded, nothing is wrong.
 
-**If it is still 401 after the retries:** the message says `documents endpoint is still unauthorized after 15 attempts.` The durable local key does not match the deployed secret. If you deliberately know the replacement key, use the exact durable rotation command:
+**If it is still 401 after the retries:** the message says `documents endpoint is still unauthorized after 15 attempts.` The durable local key does not match the deployed secret. Reapply the reviewed durable value through the supported setup path:
 
 ```
-export ADMIN_KEY='<the correct key>'
-node brain.mjs secrets <manifest>
-node brain.mjs health <manifest>
+brain setup <manifest>
+brain health <manifest>
 ```
 
-`brain secrets` first verifies Cloudflare account access, then updates and reads
-back the manifest's declared Keychain item or adjacent protected file, and then
-applies that durable value to the Worker. It is the complete rotation command.
-Do not update the Worker secret separately in the dashboard.
+`brain setup` prompts for the Cloudflare token without echo, reuses the
+manifest's verified durable admin key, and applies that durable value to the
+Worker. Do not update the Worker secret separately in the dashboard.
 
-If the remote update fails, the new durable value stays as the desired state.
-Rerun `brain secrets <manifest>` with no `ADMIN_KEY` export and it will apply
-that same value again. If local persistence fails, the Worker was not changed.
-Never copy the Windows `.brain-admin-key` envelope into `ADMIN_KEY`.
+If the remote update fails, the durable value stays as the desired state.
+Rerun `brain setup <manifest>` and it will apply that same durable value again.
+If the intended replacement is not already in durable storage, stop and use the
+installer/operator's approved no-history credential launcher with `brain
+secrets`; that command does not provide a safe prompt for a new admin-key value.
+If local persistence fails, the Worker was not changed. Never copy the Windows
+`.brain-admin-key` envelope into another credential field.
 
 **Who:** you.
 
@@ -140,10 +139,10 @@ this token can see more than one account and the manifest does not say which:
 
 **Fix:** issue a token from the correct account, or, if the account ID in the manifest is genuinely wrong, correct that instead.
 
-```
-export CLOUDFLARE_API_TOKEN='<token from the right account>'
-node brain.mjs verify <manifest>
-```
+Run `brain setup <manifest>` or `brain update <manifest>` in an interactive
+terminal and enter the replacement token at the hidden prompt. If you need the
+low-level `verify` command by itself, use an approved secret-manager-backed
+launcher; never paste the token into a shell command.
 
 **Never fix this by deleting the account line from the manifest.** That does not solve the mismatch, it removes the guard that caught it.
 
@@ -185,13 +184,17 @@ secret on deploy **unless the deployment explicitly says to keep them.**
 usually does not, and it fails silently: the worker deploys perfectly and then
 breaks on first use.
 
-**Fix:** put them back.
+**Fix:** reapply the verified durable key through the supported setup path.
 
 ```
-export ADMIN_KEY='...'
-node brain.mjs secrets <manifest>
-node brain.mjs health <manifest>
+brain setup <manifest>
+brain health <manifest>
 ```
+
+Setup prompts for the Cloudflare token without echo and reuses the durable
+admin key. If that durable copy is missing or is not the intended value, stop
+and use the installer/operator's approved no-history credential launcher with
+`brain secrets`; never paste the admin key into a shell command.
 
 **Prevention:** deploy with `node brain.mjs deploy`. That is what it is for.
 

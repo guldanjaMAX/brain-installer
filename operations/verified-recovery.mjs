@@ -689,7 +689,15 @@ export async function runVerifiedRecovery(planInput, stateInput, adapters, optio
   if (typeof options.revalidateManifests !== "function") {
     fail("verified recovery needs manifest revalidation for every remaining stage");
   }
+  if (options.afterStageCheckpoint !== undefined &&
+      typeof options.afterStageCheckpoint !== "function") {
+    fail("verified recovery after-stage checkpoint hook must be a function");
+  }
+  if (options.afterStageCheckpoint && typeof options.persistState !== "function") {
+    fail("verified recovery after-stage checkpoint hook requires durable state persistence");
+  }
   const persist = options.persistState ?? (async () => {});
+  const afterStageCheckpoint = options.afterStageCheckpoint ?? null;
   const clock = options.clock ?? (() => new Date());
   while (state.current_stage) {
     const stage = state.current_stage;
@@ -720,6 +728,11 @@ export async function runVerifiedRecovery(planInput, stateInput, adapters, optio
         state,
       });
     }
+    // This hook is deliberately outside the adapter failure boundary. The
+    // completed-stage state has already been durably persisted, so a supervised
+    // drill can stop here without falsely marking the next untouched stage as
+    // failed. Re-running from that checkpoint never repeats `stage`.
+    if (afterStageCheckpoint) await afterStageCheckpoint(stage);
   }
   return Object.freeze({ ok: true, state });
 }

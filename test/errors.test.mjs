@@ -13,6 +13,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
@@ -23,7 +24,34 @@ import { tmpdir } from "node:os";
 import { previewSupportJournal } from "../support-journal.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const CLI = join(HERE, "..", "brain.mjs");
+const ROOT = join(HERE, "..");
+const CLI = join(ROOT, "brain.mjs");
+function filesBelow(directory, suffix) {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) return filesBelow(path, suffix);
+    return entry.isFile() && entry.name.endsWith(suffix) ? [path] : [];
+  });
+}
+const PUBLIC_MARKDOWN_GUIDANCE = [
+  join(ROOT, "README.md"),
+  join(ROOT, "CHANGELOG.md"),
+  ...filesBelow(join(ROOT, "docs"), ".md").filter((path) => !/-readiness-/.test(path)),
+  ...filesBelow(join(ROOT, "onboarding"), ".md"),
+  // The migration tool is private to the transition and not in npm, but its
+  // operator instructions are still public guidance in this repository.
+  join(ROOT, "migration", "README.md"),
+];
+const PUBLIC_CLI_GUIDANCE = [
+  ...["acceptance.mjs", "brain.mjs", "doctor.mjs", "report-html.mjs", "report.mjs", "support-journal.mjs"]
+    .map((name) => join(ROOT, name)),
+  ...["components", "connectors", "eval", "ingest", "operations"]
+    .flatMap((directory) => filesBelow(join(ROOT, directory), ".mjs"))
+    .filter((path) => !/\.test\.mjs$/.test(path)),
+];
+const PUBLIC_SECRET_GUIDANCE = [
+  ...new Set([...PUBLIC_MARKDOWN_GUIDANCE, ...PUBLIC_CLI_GUIDANCE]),
+];
 const INGEST_EXIT_FETCH = pathToFileURL(join(HERE, "fixtures", "ingest-exit-fetch.mjs")).href;
 const ISOLATE_SUPPORT_ROOT = pathToFileURL(join(HERE, "fixtures", "isolate-support-root.mjs")).href;
 const UNEXPECTED_CRASH = pathToFileURL(join(HERE, "fixtures", "unexpected-crash.mjs")).href;
@@ -188,7 +216,9 @@ function ingestExitCli(scenario) {
   const r = cli(["verify", join(HERE, "..", "templates", "brain.manifest.json")]);
   const events = journalEvents(r.journal);
   check("a missing token is an explained failure", r.code === 1 && /CLOUDFLARE_API_TOKEN/.test(r.out), r.out.slice(0, 160));
-  check("and it says what to do about it", /export CLOUDFLARE_API_TOKEN/.test(r.out));
+  check("and it gives a safe next step instead of a shell-history command",
+    /brain setup.*brain update.*hidden token entry/is.test(r.out) &&
+      !/export\s+CLOUDFLARE_API_TOKEN|CLOUDFLARE_API_TOKEN\s*=\s*['\"]/i.test(r.out), r.out.slice(0, 400));
   // Fatal is anticipated, so it must NOT be dressed up as an installer bug.
   check("an anticipated failure is not reported as a bug", !/This is a bug in the installer/.test(r.out));
   check("anticipated auth failures create one private typed note and send no raw credential guidance",
@@ -199,6 +229,28 @@ function ingestExitCli(scenario) {
       events[0]?.fingerprint !== observedConfigFingerprint &&
       !r.journal.includes("CLOUDFLARE_API_TOKEN") &&
       /did not upload or send this issue note/.test(r.out), r.journal);
+}
+
+/* ---- public remediation must never teach people to paste a secret ---- */
+{
+  const secretNames = "(?:CLOUDFLARE_API_TOKEN|ADMIN_KEY|SUPABASE_ACCESS_TOKEN|SUPABASE_SERVICE_ROLE_KEY|GOOGLE_CLIENT_SECRET)";
+  const pasteable = new RegExp(
+    `(?:export\\s+${secretNames}\\b|\\$env:${secretNames}\\s*=|(?:^|[\\s;])${secretNames}\\s*=\\s*['\"<])`,
+    "gmi",
+  );
+  const unsafeNarrative = [
+    /\bexport\s+the\s+replacement\s+as\s+`?(?:ADMIN_KEY|CLOUDFLARE_API_TOKEN)\b/gmi,
+    /\btoken\s+arrives\b/gmi,
+    /\bleave\s+(?:the\s+)?api\s+token\s+exported\b/gmi,
+    /\bsend\s+(?:it|the\s+(?:api\s+)?token)\s+(?:to\s+(?:me|us|support)|(?:over|through)\s+\[?agreed\s+channel\]?)/gmi,
+  ];
+  const offenders = PUBLIC_SECRET_GUIDANCE.flatMap((path) => {
+    const source = readFileSync(path, "utf8");
+    return [pasteable, ...unsafeNarrative].flatMap((pattern) =>
+      [...source.matchAll(pattern)].map((match) => `${path}:${match[0].trim()}`));
+  });
+  check("public guidance and CLI contain no pasteable assignment or credential-transport instruction",
+    offenders.length === 0, offenders.join(" | "));
 }
 {
   const r = cli(["ingest", join(HERE, "..", "templates", "brain.manifest.json"), "--path", "/definitely/not/here"]);

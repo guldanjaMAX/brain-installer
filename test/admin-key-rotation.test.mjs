@@ -317,11 +317,16 @@ try {
   try {
     const waitState = new Int32Array(new SharedArrayBuffer(4));
     const evalServerDeadline = Date.now() + 5_000;
-    while (!existsSync(evalServerPortFile) && Date.now() < evalServerDeadline) {
+    // A port file can become visible between its create and write syscalls.
+    // Wait for the complete numeric receipt so a fast filesystem cannot turn
+    // this credential test into a flaky request to `127.0.0.1:`.
+    let evalServerPort = "";
+    while (Date.now() < evalServerDeadline) {
+      try { evalServerPort = readFileSync(evalServerPortFile, "utf8").trim(); } catch { /* not ready */ }
+      if (/^[1-9]\d{0,4}$/.test(evalServerPort) && Number(evalServerPort) <= 65535) break;
       Atomics.wait(waitState, 0, 0, 10);
     }
-    assert.equal(existsSync(evalServerPortFile), true, "loopback eval fixture did not start");
-    const evalServerPort = readFileSync(evalServerPortFile, "utf8").trim();
+    assert.match(evalServerPort, /^[1-9]\d{0,4}$/, "loopback eval fixture did not publish a port");
     evalResult = spawnSync(process.execPath, [
       fileURLToPath(new URL("../eval/run.mjs", import.meta.url)),
       "--base", `http://127.0.0.1:${evalServerPort}`,
@@ -899,7 +904,7 @@ try {
     "a retained desired-state file is ignored even when its first remote PUT fails",
   );
   assert.match(remoteFailure.message, /durable value was kept as desired state/i);
-  assert.match(remoteFailure.message, /does not need to remain in this shell/i);
+  assert.match(remoteFailure.message, /no credential re-entry is needed/i);
   assert.equal(remoteFailure.message.includes(replacementKey), false);
 
   const retryEvents = [];
@@ -936,6 +941,7 @@ try {
     env: {},
   }, () => cmdSetup(setupReuseManifest, {
     doctorRunAll: async () => [],
+    rememberInstalledManifest: () => ({}),
     prepareSetupAdminKey: async () => ({
       source: "durable",
       value: replacementKey,

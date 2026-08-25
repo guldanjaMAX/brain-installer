@@ -247,7 +247,13 @@ export function checkWranglerLogin(accountId) {
 export async function checkVectorizeApi(accountId, cloudflareToken = process.env.CLOUDFLARE_API_TOKEN) {
   const token = cloudflareToken;
   if (!token) {
-    return check("Vectorize", WARN, "not checked: Cloudflare token is missing", "Set CLOUDFLARE_API_TOKEN and re-run.");
+    return check(
+      "Vectorize",
+      WARN,
+      "not checked: Cloudflare token is missing",
+      "Run `brain setup` or `brain update` in an interactive terminal for hidden token entry. " +
+        "Low-level automation must inject it through an approved secret manager, never a pasted shell command.",
+    );
   }
   if (!accountId) {
     return check(
@@ -399,7 +405,8 @@ export function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_TOKEN)
       `  Scopes: ${CF_TOKEN_SCOPES.join(", ")}.
 ` +
       "  Set \'Expires on\' to tomorrow. Nothing here needs to outlive the install.\n" +
-      "  Then: export CLOUDFLARE_API_TOKEN=\'...\'\n" +
+      "  Then run `brain setup` or `brain update` in an interactive terminal; it asks for the token without echo.\n" +
+      "  Low-level automation must inject it through an approved secret manager, never a pasted shell command.\n" +
       VECTORIZE_REMEDY
   );
 }

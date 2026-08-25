@@ -56,33 +56,46 @@ Create Token, Custom token, with exactly these permissions:
 
 Set an expiry. Nothing here needs to outlive the engagement.
 
+Keep the value in the account owner's password manager. Do not email it,
+message it, or put it in a shared terminal. The account owner enters it only at
+the hidden prompt in `brain setup` or `brain update`. Low-level automation must
+use an approved no-history secret-manager launcher.
+
 Vectorize Edit was verified end to end on 2026-08-23: the account-scoped token
 created the 768-dimensional index and all six metadata indexes through the API.
 
-`brain verify <manifest>` probes all five and names whichever is missing, so run
-it the moment the token arrives rather than at the start of the session.
+The guided setup and update paths probe every required permission and name
+whichever is missing before making account changes. Run the appropriate path as
+soon as the account owner has created the token, not at the start of a support
+session.
 
 ### Compatibility fallback
 
-If an older token cannot reach Vectorize, the account owner can temporarily run:
+If an older token cannot reach Vectorize, create a correctly scoped replacement
+and enter it at the hidden `brain setup` or `brain update` prompt. Do not leave
+the old value in a shell environment.
+
+For a temporary compatibility test of an older account, the account owner can
+instead run:
 
 ```bash
 npx wrangler@4 login
 ```
 
-They approve in their own browser and leave the API token exported. Provision
-uses this session only for Vectorize. New installs should fix the token scope
-instead so every client follows the same token-only path.
+They approve in their own browser. Provision uses that local OAuth session only
+for Vectorize. New installs should fix the scoped token and use hidden prompt
+entry so every client follows the same supported path.
 
 ---
 
 ## Verify before you start
 
-```bash
-node brain.mjs verify <manifest>
-```
+Run `node brain.mjs setup <manifest>` for a new install or
+`node brain.mjs update <manifest>` for an existing install. Enter the scoped
+token only when the hidden prompt asks for it.
 
-Expect five green lines: account resolved, R2, D1, Workers, Vectorize. A
+The preflight should show five green lines: account resolved, R2, D1, Workers,
+Vectorize. A
 warning on R2 is survivable and the brain runs without it. **A warning on
 Vectorize is not** — it means the install would come up keyword-only, which
 looks healthy and answers badly, and that is far worse than failing loudly.

@@ -152,8 +152,35 @@ node operations/cloudflare-recovery-adapter.mjs run \
   --approve-disposable-target <target-resource-fingerprint> \
   --approve-target-execution <target-execution-fingerprint> \
   --approve-source-export-blocking <source-export-fingerprint> \
-  --approve-wrapper <wrapper-fingerprint>
+  --approve-wrapper <wrapper-fingerprint> \
+  --stop-after-stage restore_d1
 ```
+
+`--stop-after-stage` is an optional supervised drill control. Its only accepted
+values are `export_d1`, `restore_d1`, and `rebuild_vectorize`. The field gate
+still requires all five approvals and completes all verification leading to the
+named stage. It then persists that stage's completed evidence, releases the
+field-gate lock, reports only the fixed code
+`RECOVERY_FIELD_GATE_INTENTIONAL_INTERRUPTION`, and exits nonzero. Re-run the
+identical approved command to continue. Because the named stage is already in
+the durable completed prefix, the rerun does not execute its external effect or
+stop there again. Omitting the option runs every remaining stage normally.
+
+One disposable target can exercise all three checkpoint boundaries in order:
+
+1. Run with `--stop-after-stage export_d1` and require the intentional nonzero
+   exit. Confirm status now names `verify_export`.
+2. Re-run with `--stop-after-stage restore_d1`. It resumes after the export,
+   completes the verified import, then stops. Confirm status names `verify_d1`.
+3. Re-run with `--stop-after-stage rebuild_vectorize`. It resumes after the
+   import, completes the vector rebuild, then stops. Confirm status names
+   `verify_health`.
+4. Re-run that exact third command. The rebuild is already checkpointed, so the
+   run continues through health and release evaluation without rebuilding it.
+
+Changing only this stop boundary does not authorize another resource or write.
+The same manifests, target execution claim, wrapper, plan, and five approval
+fingerprints remain mandatory on every invocation.
 
 The adapter reopens and fingerprints the wrapper, manifests, golden set, and
 artifact directory before and after every stage. Wrangler receives a narrow
@@ -177,7 +204,7 @@ Passing deterministic tests is not a production recovery claim. The remaining
 live release gate is to provision the disposable resources out of band, refresh
 the manual no-route/no-custom-domain review and pinned version claim, pause
 source writes for the approved export window, and complete one full run. That
-run must include an intentionally interrupted retry at each mutating stage,
+run must exercise the three deterministic post-checkpoint stops above,
 followed by independent Cloudflare confirmation that source resources and
 production routes did not change. Disposal of the test resources is a separate
 operator action; this adapter has no destroy command.

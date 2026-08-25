@@ -1,6 +1,6 @@
 import { run, localToolEnvironment, cloudflareCliEnvironment,
          checkNode, checkClaudeCode, checkCodex, checkAnthropicKey, checkGoogleConnection,
-         checkWranglerLogin, checkVectorize, checkVectorizeApi, CF_TOKEN_SCOPES,
+         checkWranglerLogin, checkVectorize, checkVectorizeApi, checkCfToken, CF_TOKEN_SCOPES,
          summarize, runAll, OK, WARN, FAIL } from "../doctor.mjs";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
@@ -74,6 +74,13 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   delete process.env.CLOUDFLARE_API_TOKEN;
   const v = await checkVectorizeApi("0000");
   check("a missing token skips the API probe with a useful warning", v.status === WARN && /token is missing/.test(v.detail), JSON.stringify(v));
+  check("the missing-token remedy uses hidden entry rather than shell history",
+    /brain setup.*brain update.*hidden token entry/is.test(v.fix) &&
+      !/export\s+CLOUDFLARE_API_TOKEN|CLOUDFLARE_API_TOKEN\s*=\s*['\"]/i.test(v.fix), v.fix);
+  const tokenCheck = checkCfToken();
+  check("doctor's required-token fix never prints a pasteable token command",
+    tokenCheck.status === FAIL && /without echo|secret manager/i.test(tokenCheck.fix) &&
+      !/export\s+CLOUDFLARE_API_TOKEN|CLOUDFLARE_API_TOKEN\s*=\s*['\"]/i.test(tokenCheck.fix), tokenCheck.fix);
   if (saved) process.env.CLOUDFLARE_API_TOKEN = saved;
 }
 {

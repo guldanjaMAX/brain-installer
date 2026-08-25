@@ -16,6 +16,10 @@ refuse redirects.**
 - Resumable message migration freezes its source boundary, records exact batch
   receipts, locks concurrent runs, and refuses an ambiguous owner label or
   timezone before creating a new checkpoint.
+- Setup remembers only the owner-private manifest location, so future
+  `brain update` runs work after Terminal is reopened and from any folder. An
+  older or custom install remembers its location only after a successful
+  verified upgrade, and unsafe saved pointers fail closed.
 - Private corpus contracts and deterministic answer canaries now test promised
   source-family coverage, literal values, numbers, dates, and inline citations.
   Their sanitized artifacts report coverage without storing questions,
@@ -26,6 +30,9 @@ refuse redirects.**
   before calling production recovery verified.
 - Every packaged client that sends the Brain admin key now requires HTTPS
   outside loopback, refuses redirects, and verifies the final origin.
+- Credential help uses hidden prompts, durable per-install storage, or an
+  approved secret manager. Public instructions no longer teach owners to paste
+  administrative keys or Cloudflare tokens into shell commands.
 - Release automation pins third-party GitHub Actions to reviewed commit hashes,
   and package tests inspect the real tarball for private material.
 

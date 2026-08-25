@@ -68,13 +68,11 @@ Everything. Here it is written down, because "you own it" is worthless if nobody
 ## 3. How to run it without me
 
 Routine checks use the admin key from the manifest's durable local storage, so
-you do not need to copy it into your shell. Export a scoped Cloudflare token
-only for account-changing commands such as verify, provision, deploy, and
-secrets:
-
-```
-export CLOUDFLARE_API_TOKEN='<a token you issue, for your own account>'
-```
+you do not need to copy it into your shell. For account-changing work, run the
+supported `brain setup` or `brain update` path in an interactive terminal and
+enter the scoped Cloudflare token at its hidden prompt. Low-level automation
+must inject that token through an approved secret manager. Never paste a token
+into a shell command or leave it in shell history.
 
 Then, from the installer folder:
 
@@ -88,13 +86,13 @@ Then, from the installer folder:
 | Reconnect your AI tools, or add a new machine | `node brain.mjs mcp-config <manifest>` |
 | Change a key or password | `node brain.mjs secrets <manifest>` |
 
-`brain secrets` is the exact admin-key rotation command. Only when you intend to
-rotate it, export the replacement as `ADMIN_KEY`, run that command once, and let
-it update the Worker plus the manifest's durable local storage. It reports
-success only after the local value reads back exactly and the Worker accepts
-it. If the remote update fails, rerun
-the same command without re-exporting the key; the verified durable copy is the
-retry source.
+`brain secrets` is the exact admin-key rotation command. It normally reads the
+existing value from the manifest's durable local storage. A deliberate new
+replacement must be supplied through the installer/operator's approved
+no-history credential launcher; never paste it into a shell command. The
+command reports success only after the durable local value reads back exactly
+and the Worker accepts it. If the remote update fails, rerun the same command
+without supplying the key again; the verified durable copy is the retry source.
 
 Existing installer-owned Claude Code and Codex registrations are refreshed with
 the non-secret manifest locator during rotation. Claude Desktop is not changed
@@ -118,7 +116,14 @@ Use the runbook you were given: `06-runbook-top-ten-failures.md`. It covers the 
 
 ### If you want me back in
 
-Issue a fresh scoped Cloudflare API token, send it to me over [AGREED CHANNEL], and **delete it when the work is done.** That is the cost of the custody model and I would rather it be slightly inconvenient than have a standing key to your business sitting in my password manager for years.
+Issue a fresh scoped Cloudflare API token. At the start of the supported work,
+you enter it yourself at the hidden `brain setup` or `brain update` prompt. For
+low-level automation, your approved secret manager must launch the process and
+inject the token without exposing it in a command, log, or shell history. Do
+not send the credential to me or put it in a shared channel. **Delete it when
+the work is done.** That is the cost of the custody model and I would rather it
+be slightly inconvenient than have a standing key to your business sitting in
+my password manager for years.
 
 ---
 

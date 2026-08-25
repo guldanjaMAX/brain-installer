@@ -302,6 +302,84 @@ try {
   );
   assert.equal(unvalidatedAdapterCalls, 0);
 
+  const checkpointCalls = [];
+  const checkpointHooks = [];
+  let checkpointedState = initialState;
+  const stopAfterRestore = async (stage) => {
+    checkpointHooks.push(stage);
+    if (stage === "restore_d1") {
+      assert.equal(checkpointedState.completed.at(-1)?.id, "restore_d1");
+      assert.equal(checkpointedState.current_stage, "verify_d1");
+      assert.equal(checkpointedState.stage_status, "pending");
+      throw new Error("intentional fixture checkpoint");
+    }
+  };
+  await assert.rejects(
+    runVerifiedRecovery(
+      initialized.plan,
+      initialState,
+      goodAdapters(checkpointCalls),
+      {
+        clock: clock(Date.parse("2026-08-25T11:30:00.000Z")),
+        revalidateManifests: async () => true,
+        persistState: async (state) => { checkpointedState = state; },
+        afterStageCheckpoint: stopAfterRestore,
+      },
+    ),
+    /intentional fixture checkpoint/,
+  );
+  assert.deepEqual(checkpointCalls, [
+    "export_d1", "verify_export", "prove_target_clean", "restore_d1",
+  ]);
+  assert.deepEqual(checkpointHooks, checkpointCalls);
+  assert.equal(checkpointedState.status, "running");
+  assert.equal(checkpointedState.current_stage, "verify_d1");
+  assert.equal(checkpointedState.stage_status, "pending");
+  assert.equal(checkpointedState.failure, null);
+  assert.deepEqual(
+    checkpointedState.completed.map((entry) => entry.id),
+    checkpointCalls,
+  );
+
+  const checkpointResumeCalls = [];
+  const checkpointResumed = await runVerifiedRecovery(
+    initialized.plan,
+    checkpointedState,
+    goodAdapters(checkpointResumeCalls),
+    {
+      clock: clock(Date.parse("2026-08-25T11:45:00.000Z")),
+      revalidateManifests: async () => true,
+      persistState: async (state) => { checkpointedState = state; },
+      // Keeping the identical hook proves an already-checkpointed stage cannot
+      // trigger again or repeat its external effect.
+      afterStageCheckpoint: stopAfterRestore,
+    },
+  );
+  assert.equal(checkpointResumed.ok, true);
+  assert.deepEqual(checkpointResumeCalls, [
+    "verify_d1", "rebuild_vectorize", "verify_health", "verify_eval",
+  ]);
+  assert.equal(checkpointedState.status, "complete");
+
+  await assert.rejects(
+    runVerifiedRecovery(
+      initialized.plan,
+      initialState,
+      goodAdapters([]),
+      { revalidateManifests: async () => true, afterStageCheckpoint: "restore_d1" },
+    ),
+    /after-stage checkpoint hook must be a function/,
+  );
+  await assert.rejects(
+    runVerifiedRecovery(
+      initialized.plan,
+      initialState,
+      goodAdapters([]),
+      { revalidateManifests: async () => true, afterStageCheckpoint: async () => {} },
+    ),
+    /after-stage checkpoint hook requires durable state persistence/,
+  );
+
   const calls = [];
   let lastPersisted = initialState;
   const completed = await runVerifiedRecovery(

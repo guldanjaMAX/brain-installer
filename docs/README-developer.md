@@ -53,7 +53,8 @@ available individually:
 
 ```bash
 cp templates/brain.manifest.json ./acme.manifest.json   # then edit it
-export CLOUDFLARE_API_TOKEN='...'            # automation only; interactive setup prompts securely
+# Low-level automation must inject the scoped Cloudflare token through an
+# approved secret-manager-backed launcher. Never paste it into a shell command.
 
 node brain.mjs verify     ./acme.manifest.json   # token, account, every service
 node brain.mjs provision  ./acme.manifest.json   # D1 + Vectorize, writes IDs back
@@ -76,10 +77,11 @@ node brain.mjs deploy     ./acme.manifest.json   # worker, bindings, drain cron
 # Setup, secrets, and upgrade list Worker secret names and remove only the known
 # Supabase or Anthropic names disallowed by the manifest. Removal is read back;
 # every unrecognized secret name is preserved.
-# macOS/Linux:   export ADMIN_KEY="$(openssl rand -hex 24)"
-# PowerShell:    $env:ADMIN_KEY = -join ((1..48) | %% { '{0:x}' -f (Get-Random -Max 16) })
+# Beginner installs use `brain setup`, which generates and persists this key.
+# A deliberate operator rotation must inject the replacement through an
+# approved no-history credential launcher.
 node brain.mjs secrets    ./acme.manifest.json
-# If the remote write failed, rerun the same command with no ADMIN_KEY export.
+# If the remote write failed, rerun the same command with no credential entry.
 # The verified durable value is reused until the Worker converges.
 
 node brain.mjs health     ./acme.manifest.json   # prove it, including vector backlog

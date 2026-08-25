@@ -49,6 +49,7 @@ import {
   readAdminKeyFromKeychain,
 } from "./admin-key-persistence.mjs";
 import {
+  VERIFIED_RECOVERY_STAGES,
   inspectVerifiedRecoveryManifestBindings,
   loadVerifiedRecoveryPlan,
   loadVerifiedRecoveryState,
@@ -72,6 +73,19 @@ const MAX_EVAL_TIMEOUT_MS = 30 * 60 * 1000;
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const DISPOSABLE_WORKER_RE = /(?:^|-)recovery-gate-([a-z0-9]{8,24})$/;
+
+/**
+ * Checkpoint boundaries available to a supervised live drill. Read-only stages
+ * are intentionally absent: stopping there adds no recovery evidence, while
+ * accepting arbitrary names would make an operator think a drill ran when it
+ * did not.
+ */
+export const RECOVERY_FIELD_GATE_STOP_STAGES = Object.freeze(
+  VERIFIED_RECOVERY_STAGES
+    .filter((stage) => stage.effect !== "read_only")
+    .map((stage) => stage.id),
+);
+const RECOVERY_FIELD_GATE_STOP_STAGE_SET = new Set(RECOVERY_FIELD_GATE_STOP_STAGES);
 
 /**
  * D1 full export currently refuses FTS5 virtual tables. These are the durable
@@ -175,6 +189,14 @@ function recoveryError(code) {
 
 function refuse(code) {
   throw recoveryError(code);
+}
+
+function normalizeStopAfterStage(value) {
+  if (value === undefined) return null;
+  if (typeof value !== "string" || !RECOVERY_FIELD_GATE_STOP_STAGE_SET.has(value)) {
+    refuse("RECOVERY_FIELD_GATE_STOP_STAGE_INVALID");
+  }
+  return value;
 }
 
 function sha256(value) {
@@ -1683,6 +1705,7 @@ export function previewCloudflareRecoveryFieldGate(configInput, dependencies = {
 /** Execute or resume the approved disposable field gate. */
 export async function runCloudflareRecoveryFieldGate(configInput, dependencies = {}) {
   const config = normalizeFieldGateConfig(configInput);
+  const stopAfterStage = normalizeStopAfterStage(configInput.stopAfterStage);
   const plan = loadVerifiedRecoveryPlan(config.planPath);
   const state = loadVerifiedRecoveryState(config.statePath, plan);
   if (configInput.approvePlan !== plan.plan_fingerprint ||
@@ -1713,6 +1736,13 @@ export async function runCloudflareRecoveryFieldGate(configInput, dependencies =
         return gate.revalidate();
       },
       persistState: async (next) => writeVerifiedRecoveryState(config.statePath, next, plan),
+      ...(stopAfterStage ? {
+        afterStageCheckpoint: async (stage) => {
+          if (stage === stopAfterStage) {
+            refuse("RECOVERY_FIELD_GATE_INTENTIONAL_INTERRUPTION");
+          }
+        },
+      } : {}),
       ...(dependencies.clock ? { clock: dependencies.clock } : {}),
     });
   } finally {
@@ -1726,6 +1756,7 @@ const CLI_VALUE_FLAGS = Object.freeze(new Set([
   "source-manifest", "target-manifest", "plan", "state", "artifact-directory",
   "wrangler-wrapper", "golden", "approve-plan", "approve-disposable-target",
   "approve-target-execution", "approve-source-export-blocking", "approve-wrapper",
+  "stop-after-stage",
 ]));
 
 export function parseCloudflareRecoveryCliArguments(argv) {
@@ -1752,10 +1783,17 @@ export function parseCloudflareRecoveryCliArguments(argv) {
       "approve-source-export-blocking", "approve-wrapper",
     ] : []),
   ];
+  const allowed = [
+    ...required,
+    ...(command === "run" ? ["stop-after-stage"] : []),
+  ];
   if (argv.length % 2 !== 1 || required.some((key) => !Object.hasOwn(values, key)) ||
-      Object.keys(values).some((key) => !required.includes(key))) {
+      Object.keys(values).some((key) => !allowed.includes(key))) {
     refuse("RECOVERY_FIELD_GATE_ARGUMENTS_INVALID");
   }
+  const stopAfterStage = command === "run"
+    ? normalizeStopAfterStage(values["stop-after-stage"])
+    : null;
   return Object.freeze({
     command,
     sourceManifestPath: values["source-manifest"],
@@ -1771,13 +1809,14 @@ export function parseCloudflareRecoveryCliArguments(argv) {
       approveTargetExecution: values["approve-target-execution"],
       approveSourceExportBlocking: values["approve-source-export-blocking"],
       approveWrapper: values["approve-wrapper"],
+      ...(stopAfterStage ? { stopAfterStage } : {}),
     } : {}),
   });
 }
 
 function printUsage() {
   console.log("usage: node operations/cloudflare-recovery-adapter.mjs preview --source-manifest <file> --target-manifest <file> --plan <file> --state <file> --artifact-directory <private-dir> --wrangler-wrapper <owner-only-wrapper> --golden <private-release-suite>");
-  console.log("       node operations/cloudflare-recovery-adapter.mjs run <same flags> --approve-plan <fingerprint> --approve-disposable-target <fingerprint> --approve-target-execution <fingerprint> --approve-source-export-blocking <fingerprint> --approve-wrapper <fingerprint>");
+  console.log("       node operations/cloudflare-recovery-adapter.mjs run <same flags> --approve-plan <fingerprint> --approve-disposable-target <fingerprint> --approve-target-execution <fingerprint> --approve-source-export-blocking <fingerprint> --approve-wrapper <fingerprint> [--stop-after-stage <export_d1|restore_d1|rebuild_vectorize>]");
 }
 
 async function main(argv = process.argv.slice(2)) {

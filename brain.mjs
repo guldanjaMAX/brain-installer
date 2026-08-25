@@ -103,6 +103,10 @@ import {
   assertDriveRemovalPlanSafe,
   buildDriveRemovalPlan,
 } from "./operations/drive-removal-plan.mjs";
+import {
+  discoverInstalledManifest,
+  rememberInstalledManifest,
+} from "./operations/installed-manifest.mjs";
 import { evaluateProfileCoverage, formatProfileFailures } from "./eval/profile.mjs";
 import {
   corpusContractReadiness,
@@ -327,7 +331,8 @@ export function readHiddenCloudflareToken({ input = process.stdin, output = proc
   if (!input?.isTTY || !output?.isTTY || typeof input.setRawMode !== "function") {
     return Promise.reject(new Error(
       "no Cloudflare token is available and this terminal cannot prompt securely. " +
-      "Set CLOUDFLARE_API_TOKEN in this terminal and rerun the command.",
+      "Rerun from an interactive terminal for hidden entry. For automation, inject " +
+      "CLOUDFLARE_API_TOKEN through an approved secret manager; never paste it into a shell command.",
     ));
   }
   return new Promise((resolveToken, rejectToken) => {
@@ -416,9 +421,9 @@ function token() {
   if (!t) {
     die(
       "CLOUDFLARE_API_TOKEN is not set.\n" +
-        "      Export the scoped token the client issued:\n" +
-        "        export CLOUDFLARE_API_TOKEN='...'\n" +
-        "      It is deliberately not read from the manifest, so it never lands in a file."
+        "      Run `brain setup` or `brain update` in an interactive terminal for hidden token entry.\n" +
+        "      Low-level automation must inject it through an approved secret manager; never paste it\n" +
+        "      into a shell command. It is deliberately not read from the manifest."
     );
   }
   return t;
@@ -1340,9 +1345,10 @@ export async function cmdSecrets(manifestPath, options = {}) {
 
   if (!provided.length) {
     die(
-      "no ADMIN_KEY was found in the environment or durable storage. Export it, then re-run:\n" +
-        needed.map((n) => `        export ${n}='...'`).join("\n") +
-        "\n      `brain secrets` will persist and verify it before updating the Worker."
+      "no ADMIN_KEY was found in durable storage. Run `brain setup <manifest>` to generate,\n" +
+        "      persist, and verify one. A deliberate manual replacement must be injected by an\n" +
+        "      approved no-history credential launcher before `brain secrets`; never paste the key\n" +
+        "      into a shell command."
     );
   }
 
@@ -1409,7 +1415,7 @@ export async function cmdSecrets(manifestPath, options = {}) {
         die(
           "the durable ADMIN_KEY is verified, but its Worker update did not complete.\n" +
             "  The durable value was kept as desired state. Rerun `brain secrets <manifest>`;\n" +
-            "  ADMIN_KEY does not need to remain in this shell for the retry."
+            "  No credential re-entry is needed for the retry."
         );
       }
       throw e;
@@ -1470,7 +1476,7 @@ export async function cmdSecrets(manifestPath, options = {}) {
   if (missing.includes("ADMIN_KEY")) {
     die(
       "ADMIN_KEY remains absent. Any optional secrets above were saved, but every route\n" +
-        "  except /health will return 401. Set ADMIN_KEY and re-run `brain secrets`;\n" +
+        "  except /health will return 401. Run `brain setup <manifest>` to generate and persist it;\n" +
         "  successfully written optional secrets do not need to be removed first."
     );
   }
@@ -1568,7 +1574,8 @@ async function cmdHealth(manifestPath, { expectVersion = null, durableAdminKeyOn
   if (!key) {
     die(
       "no admin key is available, so health cannot prove the authenticated documents endpoint." + "\n" +
-        "      Set ADMIN_KEY or configure the manifest's durable admin-key storage, then re-run `brain health`."
+        "      Run `brain setup <manifest>` or repair the manifest's declared durable admin-key storage,\n" +
+        "      then re-run `brain health`. Do not paste the key into a shell command."
     );
   }
 
@@ -3585,9 +3592,9 @@ async function cmdSources(manifestPath) {
 
   if (!live) {
     console.log(
-      `\n  ${c.dim("counts above are the registry's own last receipt. Set ADMIN_KEY in the")}`
+      `\n  ${c.dim("counts above are the registry's own last receipt. Repair the manifest's durable")}`
     );
-    console.log(`  ${c.dim("environment to cross-check them against what the brain actually holds.")}`);
+    console.log(`  ${c.dim("admin-key storage to cross-check them against what the brain actually holds.")}`);
   } else {
     // Everything ingested before this feature existed, or by a path that never
     // registered itself, lands here. It is the honest version of the listing:
@@ -3723,10 +3730,9 @@ async function purgeDocuments(base, adminKey, name) {
   if (!url || !key) {
     die(
       `no way to reach the document store, so nothing was removed.\n` +
-        `      Either deploy a worker that serves POST /api/admin/brain/forget, or export the\n` +
-        `      store credentials for a one-off direct removal:\n` +
-        `        export SUPABASE_URL='...'\n` +
-        `        export SUPABASE_SERVICE_ROLE_KEY='...'\n` +
+        `      Deploy a worker that serves POST /api/admin/brain/forget. The legacy direct fallback\n` +
+        `      requires a Supabase service-role key supplied by an approved secret manager; this CLI\n` +
+        `      will not show a pasteable shell command for that high-privilege credential.\n` +
         `      The registry row was left in place on purpose: removing it while the documents\n` +
         `      survive would leave them in the brain with no name left to remove them by.`
     );
@@ -3960,7 +3966,10 @@ async function cmdIngest(manifestPath) {
   const base = dry ? null : await resolveBaseUrl(m, acct);
   const adminKey = dry ? null : resolveAdminKey(manifestPath);
   if (!adminKey && !flags["dry-run"]) {
-    die("no admin key found: not in the environment, and no .brain-admin-key file next to the manifest. Export ADMIN_KEY or re-run `brain setup`.");
+    die(
+      "no durable admin key was found. Re-run `brain setup <manifest>` to generate and persist one; " +
+        "do not paste the key into a shell command."
+    );
   }
 
   const statePath = join(dirname(resolve(manifestPath)), `.brain-ingest-${sourceName}.json`);
@@ -5313,10 +5322,9 @@ async function cmdConnect(target) {
         "    4. Credentials, Create credentials, OAuth client ID, type Desktop app\n" +
         "       Desktop apps accept the local loopback callback automatically. Google Cloud\n" +
         "       does not show or require a redirect-URI field for this client type.\n\n" +
-        "  Then:\n" +
-        "    export GOOGLE_CLIENT_ID='...'\n" +
-        "    export GOOGLE_CLIENT_SECRET='...'\n" +
-        "    node brain.mjs connect google --scopes drive,gmail"
+        "  Supply the public client ID through your approved local launcher. If Google issued a\n" +
+        "  client secret, inject it through an approved secret manager; never paste it into a shell\n" +
+        "  command. Then run: brain connect google --scopes drive,gmail"
     );
   }
 
@@ -5750,6 +5758,20 @@ export async function cmdSetup(manifestPath, options = {}) {
     die(`no such folder: ${folder}. Nothing was loaded. Fix the path and re-run setup.`);
   } else {
     info(`load one later with: brain ingest ${shownTarget} --path <dir>`);
+  }
+
+  // Setup is the one moment the installer knows the durable manifest location
+  // with certainty. Save only that location, never a credential, so a later
+  // `brain update` can start from any folder after Terminal is reopened.
+  try {
+    const rememberManifest = options.rememberInstalledManifest ?? rememberInstalledManifest;
+    rememberManifest(target, options.installedManifestOptions || {});
+  } catch (error) {
+    closePrompts();
+    die(
+      "this Brain is ready, but this computer could not safely remember where its manifest is. " +
+        "No Cloudflare work needs to be undone. Rerun setup with the same manifest path."
+    );
   }
 
   closePrompts();
@@ -7001,7 +7023,7 @@ async function cmdEval(manifestPath) {
   const acct = m.brain?.domain ? null : await resolveAccount(m);
   const base = await resolveBaseUrl(m, acct);
   const adminKey = resolveAdminKey(manifestPath);
-  if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
+  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
 
   const args = evalChildArguments(
     base,
@@ -7036,7 +7058,7 @@ async function cmdDiagnose(manifestPath) {
   const acct = m.brain?.domain ? null : await resolveAccount(m);
   const base = await resolveBaseUrl(m, acct);
   const adminKey = resolveAdminKey(manifestPath);
-  if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
+  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
 
   const res = await http(`${base}/api/admin/brain/diagnose`, { headers: { "X-Admin-Key": adminKey } },
     { timeoutMs: 120_000, what: "the diagnostic" });
@@ -7124,7 +7146,7 @@ async function cmdReindex(manifestPath) {
   const acct = m.brain?.domain ? null : await resolveAccount(m);
   const base = await resolveBaseUrl(m, acct);
   const adminKey = resolveAdminKey(manifestPath);
-  if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
+  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
   const source = flags.source && flags.source !== true ? assertSourceName(flags.source) : null;
 
   const call = async (confirm) => {
@@ -7173,7 +7195,7 @@ async function cmdDrain(manifestPath) {
   const acct = m.brain?.domain ? null : await resolveAccount(m);
   const base = await resolveBaseUrl(m, acct);
   const adminKey = resolveAdminKey(manifestPath);
-  if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
+  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
 
   const started = Date.now();
   let drained = 0;
@@ -7358,16 +7380,46 @@ async function cmdUpgradeInteractive(manifestPath) {
 
 /** Beginner update path: verify custody first, then run the fully gated upgrade. */
 export async function cmdUpdate(manifestPath, options = {}) {
-  const target = manifestPath || "./brain.manifest.json";
-  if (!existsSync(target)) {
-    die(`no manifest found at ${target}. Run this command from the brain folder or name the manifest path.`);
+  let installed;
+  try {
+    const discoverManifest = options.discoverInstalledManifest ?? discoverInstalledManifest;
+    installed = discoverManifest(manifestPath, options.installedManifestOptions || {});
+  } catch (error) {
+    die(
+      `${String(error?.message || error)}. ` +
+        "Run brain update <full path to brain.manifest.json> once to repair the saved location."
+    );
   }
-  const pin = pinUpdateManifest(target);
+  if (!installed) {
+    die(
+      "no installed Brain was found. Run brain update <full path to brain.manifest.json> once; " +
+        "future updates will work from any folder."
+    );
+  }
+  const pin = pinUpdateManifest(installed.path);
   return withCloudflareToken(async () => {
     revalidateUpdateManifest(pin, "update verification");
-    await (options.cmdVerify ?? cmdVerify)(target);
+    await (options.cmdVerify ?? cmdVerify)(pin.target);
     revalidateUpdateManifest(pin, "update verification");
-    return (options.cmdUpgrade ?? cmdUpgrade)(target, options.upgradeOptions || {});
+    const upgradeResult = await (options.cmdUpgrade ?? cmdUpgrade)(
+      pin.target,
+      options.upgradeOptions || {},
+    );
+    if (installed.source !== "remembered") {
+      try {
+        const rememberManifest = options.rememberInstalledManifest ?? rememberInstalledManifest;
+        rememberManifest(pin.target, {
+          ...(options.installedManifestOptions || {}),
+          repairUnsafePointer: installed.source === "explicit",
+        });
+      } catch (error) {
+        die(
+          "the Brain update is verified, but this computer could not safely remember the manifest location. " +
+            "No update work needs to be undone. Fix the local install folder and rerun the same full-path command."
+        );
+      }
+    }
+    return upgradeResult;
   }, options);
 }
 

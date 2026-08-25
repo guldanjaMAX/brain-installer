@@ -12,8 +12,11 @@
 // it worse than no check: it converts an unknown into a false assurance.
 
 import {
+  chmodSync,
   existsSync,
   linkSync,
+  lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -22,8 +25,10 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   cloudflareTokenAvailable,
   cmdRollback,
@@ -35,6 +40,11 @@ import {
   healthProbeVerdict,
 } from "../brain.mjs";
 import { Acceptance, credentialGateRefusalVerdict } from "../acceptance.mjs";
+import {
+  installedManifestPointerPath,
+  readInstalledManifest,
+  rememberInstalledManifest,
+} from "../operations/installed-manifest.mjs";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 200))); if (!c) fail++; };
@@ -659,9 +669,32 @@ const manifestFixture = (version = "0.1.9") => ({
     delete process.env.CLOUDFLARE_API_TOKEN;
     const manifestPath = join(sandbox, "brain.manifest.json");
     writeFileSync(manifestPath, JSON.stringify(manifestFixture()));
+    const installedManifestOptions = {
+      home: sandbox,
+      stateDirectory: join(sandbox, "installed-state"),
+    };
     process.chdir(sandbox);
+    let failedVerifyError = null;
+    let failedVerifyUpgrade = 0;
+    try {
+      await cmdUpdate(undefined, {
+        installedManifestOptions,
+        readCloudflareToken: async () => Buffer.from("f".repeat(24), "ascii"),
+        cmdVerify: async () => { throw new Error("fixture custody refusal"); },
+        cmdUpgrade: async () => { failedVerifyUpgrade++; },
+      });
+    } catch (caught) { failedVerifyError = caught; }
+    check(
+      "a failed custody check does not remember the wrong manifest",
+      /fixture custody refusal/.test(failedVerifyError?.message || "") &&
+        !existsSync(installedManifestPointerPath(installedManifestOptions)) &&
+        failedVerifyUpgrade === 0 && !cloudflareTokenAvailable(),
+      failedVerifyError?.message,
+    );
+
     const events = [];
     await cmdUpdate(undefined, {
+      installedManifestOptions,
       readCloudflareToken: async () => Buffer.from("x".repeat(24), "ascii"),
       cmdVerify: async (path) => {
         events.push(`verify:${path}`);
@@ -673,11 +706,180 @@ const manifestFixture = (version = "0.1.9") => ({
       },
     });
     check(
-      "brain update defaults to the local manifest and verifies before upgrade",
-      events.join(",") === "verify:./brain.manifest.json,upgrade:./brain.manifest.json",
+      "brain update discovers the local manifest once and verifies before upgrade",
+      events.join(",") === `verify:${manifestPath},upgrade:${manifestPath}`,
       events.join(","),
     );
+    check(
+      "the first update remembers the canonical manifest without storing credentials",
+      readInstalledManifest(installedManifestOptions) === manifestPath &&
+        Object.keys(JSON.parse(readFileSync(installedManifestPointerPath(installedManifestOptions), "utf8")))
+          .sort().join(",") === "manifest_path,schema_version",
+    );
+    const durabilityStateDirectory = join(sandbox, "durability-order-state");
+    let synchronizedAfterRename = false;
+    const durabilityOptions = {
+      home: sandbox,
+      stateDirectory: durabilityStateDirectory,
+      syncStateDirectory: (directory, phase) => {
+        const pointerPath = installedManifestPointerPath({ stateDirectory: directory });
+        synchronizedAfterRename = phase === "persisted" && existsSync(pointerPath) &&
+          JSON.parse(readFileSync(pointerPath, "utf8")).manifest_path === manifestPath;
+      },
+    };
+    rememberInstalledManifest(manifestPath, durabilityOptions);
+    check(
+      "the pointer durability barrier runs after the atomic rename",
+      synchronizedAfterRename && readInstalledManifest(durabilityOptions) === manifestPath,
+    );
+
+    const failingDurabilityState = join(sandbox, "durability-failure-state");
+    let durabilityError = null;
+    try {
+      rememberInstalledManifest(manifestPath, {
+        home: sandbox,
+        stateDirectory: failingDurabilityState,
+        syncStateDirectory: () => {
+          throw Object.assign(new Error("synthetic private filesystem detail"), { code: "EIO" });
+        },
+      });
+    } catch (caught) { durabilityError = caught; }
+    check(
+      "an unexpected directory durability failure is never reported as success",
+      durabilityError?.code === "INSTALLED_MANIFEST_STATE_DURABILITY" &&
+        !String(durabilityError?.message || durabilityError).includes("synthetic private filesystem detail") &&
+        !readdirSync(failingDurabilityState).some((name) => name.endsWith(".tmp")),
+      durabilityError?.message,
+    );
+    const windowsFallbackOptions = {
+      home: sandbox,
+      platform: "win32",
+      stateDirectory: join(sandbox, "windows-directory-sync-fallback"),
+      syncStateDirectory: () => {
+        throw Object.assign(new Error("synthetic unsupported directory handle"), { code: "EINVAL" });
+      },
+    };
+    rememberInstalledManifest(manifestPath, windowsFallbackOptions);
+    check(
+      "Windows directory-fsync limitations fall back to a verified final-file flush",
+      readInstalledManifest(windowsFallbackOptions) === manifestPath,
+    );
+    if (process.platform !== "win32") {
+      check(
+        "the remembered location is private",
+        (lstatSync(installedManifestPointerPath(installedManifestOptions)).mode & 0o777) === 0o600 &&
+          (lstatSync(installedManifestOptions.stateDirectory).mode & 0o777) === 0o700,
+      );
+    }
     check("the prompted Cloudflare token is gone after update", !cloudflareTokenAvailable());
+
+    const unrelatedManifest = join(sandbox, "unrelated.manifest.json");
+    writeFileSync(unrelatedManifest, "{}\n");
+    let unrelatedError = null;
+    let unrelatedVerify = 0;
+    try {
+      await cmdUpdate(unrelatedManifest, {
+        installedManifestOptions,
+        readCloudflareToken: async () => Buffer.from("q".repeat(24), "ascii"),
+        cmdVerify: async () => { unrelatedVerify++; },
+      });
+    } catch (caught) { unrelatedError = caught; }
+    check(
+      "an unrelated JSON object is not remembered when upgrade preflight rejects it",
+      unrelatedVerify === 1 &&
+        /no d1_database_id in the manifest/i.test(unrelatedError?.message || "") &&
+        readInstalledManifest(installedManifestOptions) === manifestPath &&
+        !cloudflareTokenAvailable(),
+      unrelatedError?.message,
+    );
+
+    const freshDirectory = join(sandbox, "a completely different folder");
+    mkdirSync(freshDirectory);
+    process.chdir(freshDirectory);
+    const reopenedEvents = [];
+    await cmdUpdate(undefined, {
+      installedManifestOptions,
+      readCloudflareToken: async () => Buffer.from("r".repeat(24), "ascii"),
+      cmdVerify: async (path) => reopenedEvents.push(`verify:${path}`),
+      cmdUpgrade: async (path) => reopenedEvents.push(`upgrade:${path}`),
+    });
+    check(
+      "after Terminal is reopened, brain update works from an unrelated folder",
+      reopenedEvents.join(",") === `verify:${manifestPath},upgrade:${manifestPath}`,
+      reopenedEvents.join(","),
+    );
+    check("the reopened update also clears its prompted token", !cloudflareTokenAvailable());
+    process.chdir(sandbox);
+
+    if (process.platform !== "win32") {
+      const pointerPath = installedManifestPointerPath(installedManifestOptions);
+      chmodSync(pointerPath, 0o644);
+      let unsafeError = null;
+      let unsafePrompts = 0;
+      let unsafeVerify = 0;
+      try {
+        await cmdUpdate(undefined, {
+          installedManifestOptions,
+          readCloudflareToken: async () => {
+            unsafePrompts++;
+            return Buffer.from("u".repeat(24), "ascii");
+          },
+          cmdVerify: async () => { unsafeVerify++; },
+        });
+      } catch (caught) { unsafeError = caught; }
+      check(
+        "an unsafe saved location fails closed before token entry or Cloudflare work",
+        /saved Brain location is not private/i.test(unsafeError?.message || "") &&
+          unsafePrompts === 0 && unsafeVerify === 0 && !cloudflareTokenAvailable(),
+        unsafeError?.message,
+      );
+      await cmdUpdate(manifestPath, {
+        installedManifestOptions,
+        readCloudflareToken: async () => Buffer.from("m".repeat(24), "ascii"),
+        cmdVerify: async () => {},
+        cmdUpgrade: async () => {},
+      });
+      check(
+        "one custody-verified explicit update repairs an unsafe pointer mode",
+        readInstalledManifest(installedManifestOptions) === manifestPath &&
+          (lstatSync(pointerPath).mode & 0o777) === 0o600,
+      );
+
+      const symlinkTarget = join(sandbox, "pointer-symlink-target");
+      const symlinkTargetBytes = "do not change this target\n";
+      writeFileSync(symlinkTarget, symlinkTargetBytes, { mode: 0o600 });
+      rmSync(pointerPath);
+      symlinkSync(symlinkTarget, pointerPath);
+      await cmdUpdate(manifestPath, {
+        installedManifestOptions,
+        readCloudflareToken: async () => Buffer.from("s".repeat(24), "ascii"),
+        cmdVerify: async () => {},
+        cmdUpgrade: async () => {},
+      });
+      check(
+        "explicit repair replaces a pointer symlink without touching its target",
+        readFileSync(symlinkTarget, "utf8") === symlinkTargetBytes &&
+          lstatSync(pointerPath).isFile() && !lstatSync(pointerPath).isSymbolicLink() &&
+          readInstalledManifest(installedManifestOptions) === manifestPath,
+      );
+    }
+
+    const staleManifest = join(sandbox, "old-brain.manifest.json");
+    writeFileSync(staleManifest, JSON.stringify(manifestFixture()));
+    rememberInstalledManifest(staleManifest, installedManifestOptions);
+    rmSync(staleManifest);
+    await cmdUpdate(manifestPath, {
+      installedManifestOptions,
+      readCloudflareToken: async () => Buffer.from("p".repeat(24), "ascii"),
+      cmdVerify: async () => {},
+      cmdUpgrade: async () => {},
+    });
+    check(
+      "one explicit full-path update repairs a stale saved location",
+      readInstalledManifest(installedManifestOptions) === manifestPath,
+      readInstalledManifest(installedManifestOptions),
+    );
+    check("the repair update clears its prompted token", !cloudflareTokenAvailable());
 
     let rollbackCalled = 0;
     let rollbackTokenPrompts = 0;
@@ -712,6 +914,7 @@ const manifestFixture = (version = "0.1.9") => ({
     let driftError = null;
     try {
       await cmdUpdate("./brain.manifest.json", {
+        installedManifestOptions,
         readCloudflareToken: async () => Buffer.from("z".repeat(24), "ascii"),
         cmdVerify: async () => {
           writeFileSync(manifestPath, JSON.stringify(manifestFixture("0.1.8")));
@@ -729,6 +932,153 @@ const manifestFixture = (version = "0.1.9") => ({
     process.chdir(priorDirectory);
     if (priorToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN;
     else process.env.CLOUDFLARE_API_TOKEN = priorToken;
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+}
+
+/* ---- the packed user-prefix launcher rediscovers setup state in a fresh process ---- */
+{
+  const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-installed-update-")));
+  try {
+    const root = fileURLToPath(new URL("../", import.meta.url));
+    const packDirectory = join(sandbox, "pack");
+    const fakeHome = join(sandbox, "home");
+    const fakeLocalAppData = join(sandbox, "local-app-data");
+    const prefix = process.platform === "win32"
+      ? join(fakeLocalAppData, "FinancialBrain")
+      : join(fakeHome, ".financial-brain");
+    const firstDirectory = join(sandbox, "first shell");
+    const reopenedDirectory = join(sandbox, "reopened somewhere else");
+    const reinstalledDirectory = join(sandbox, "reopened after reinstall");
+    mkdirSync(packDirectory, { recursive: true });
+    mkdirSync(fakeHome, { recursive: true });
+    mkdirSync(fakeLocalAppData, { recursive: true });
+    mkdirSync(firstDirectory, { recursive: true });
+    mkdirSync(reopenedDirectory, { recursive: true });
+    mkdirSync(reinstalledDirectory, { recursive: true });
+
+    const pack = spawnSync("npm", [
+      "pack", "--json", "--ignore-scripts", "--pack-destination", packDirectory,
+    ], {
+      cwd: root,
+      encoding: "utf8",
+      shell: process.platform === "win32",
+      timeout: 60_000,
+    });
+    let archive = null;
+    try { archive = JSON.parse(pack.stdout)?.[0]?.filename || null; } catch { /* fixed check below */ }
+    check(
+      "the rediscovery acceptance test can build the real release package",
+      pack.status === 0 && Boolean(archive),
+      pack.stderr || pack.stdout,
+    );
+
+    if (pack.status === 0 && archive) {
+      const installPacked = (cwd) => spawnSync("npm", [
+          "install", "--global", "--ignore-scripts", "--no-audit", "--no-fund",
+          "--prefix", prefix, join(packDirectory, archive),
+        ], {
+          cwd,
+          encoding: "utf8",
+          shell: process.platform === "win32",
+          timeout: 60_000,
+        });
+      const install = installPacked(firstDirectory);
+      check(
+        "the real package installs into a user-owned prefix without sudo",
+        install.status === 0,
+        install.stderr || install.stdout,
+      );
+
+      if (install.status === 0) {
+        const installedRoot = process.platform === "win32"
+          ? join(prefix, "node_modules", "brain-installer")
+          : join(prefix, "lib", "node_modules", "brain-installer");
+        const installedModule = join(installedRoot, "operations", "installed-manifest.mjs");
+        const installedLauncher = process.platform === "win32"
+          ? join(prefix, "brain.cmd")
+          : join(prefix, "bin", "brain");
+        const manifestPath = join(sandbox, "Financial Brain", "brain.manifest.json");
+        mkdirSync(join(sandbox, "Financial Brain"), { recursive: true });
+        writeFileSync(manifestPath, JSON.stringify(manifestFixture()));
+        const isolatedEnvironment = {
+          PATH: process.env.PATH || "",
+          HOME: fakeHome,
+          USERPROFILE: fakeHome,
+          LOCALAPPDATA: fakeLocalAppData,
+          NO_COLOR: "1",
+          ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+          ...(process.env.WINDIR ? { WINDIR: process.env.WINDIR } : {}),
+        };
+        const setupReceipt = spawnSync(process.execPath, [
+          "--input-type=module",
+          "--eval",
+          "const {pathToFileURL}=await import('node:url');" +
+            "const installed=await import(pathToFileURL(process.env.INSTALLED_MODULE).href);" +
+            "installed.rememberInstalledManifest(process.env.INSTALLED_MANIFEST);",
+        ], {
+          cwd: firstDirectory,
+          encoding: "utf8",
+          env: {
+            ...isolatedEnvironment,
+            INSTALLED_MODULE: installedModule,
+            INSTALLED_MANIFEST: manifestPath,
+          },
+          timeout: 30_000,
+        });
+        check(
+          "a successful setup process can persist discovery state from the packed module",
+          setupReceipt.status === 0,
+          setupReceipt.stderr || setupReceipt.stdout,
+        );
+
+        const reopened = setupReceipt.status === 0
+          ? spawnSync(installedLauncher, ["update"], {
+              cwd: reopenedDirectory,
+              encoding: "utf8",
+              env: isolatedEnvironment,
+              shell: process.platform === "win32",
+              timeout: 30_000,
+            })
+          : { status: null, stdout: "", stderr: "setup receipt failed" };
+        const reopenedOutput = `${reopened.stdout || ""}\n${reopened.stderr || ""}`;
+        check(
+          "the installed launcher rediscovers the manifest after Terminal reopens anywhere",
+          reopened.status !== 0 &&
+            /terminal cannot prompt securely/i.test(reopenedOutput) &&
+            !/no installed Brain was found|no manifest found/i.test(reopenedOutput),
+          reopenedOutput,
+        );
+
+        const reinstall = setupReceipt.status === 0
+          ? installPacked(reopenedDirectory)
+          : { status: null, stdout: "", stderr: "setup receipt failed" };
+        check(
+          "the same packed release reinstalls into the same user prefix",
+          reinstall.status === 0,
+          reinstall.stderr || reinstall.stdout,
+        );
+
+        const afterReinstall = reinstall.status === 0
+          ? spawnSync(installedLauncher, ["update"], {
+              cwd: reinstalledDirectory,
+              encoding: "utf8",
+              env: isolatedEnvironment,
+              shell: process.platform === "win32",
+              timeout: 30_000,
+            })
+          : { status: null, stdout: "", stderr: "second package install failed" };
+        const afterReinstallOutput = `${afterReinstall.stdout || ""}\n${afterReinstall.stderr || ""}`;
+        check(
+          "the reinstalled launcher keeps the remembered manifest in a fresh process and folder",
+          afterReinstall.status !== 0 &&
+            /terminal cannot prompt securely/i.test(afterReinstallOutput) &&
+            !/no installed Brain was found|no manifest found/i.test(afterReinstallOutput),
+          afterReinstallOutput,
+        );
+      }
+    }
+  } finally {
     rmSync(sandbox, { recursive: true, force: true });
   }
 }

@@ -20,6 +20,7 @@ Mac or Linux:
 
 ```bash
 npm install --global --ignore-scripts --no-audit --no-fund --prefix "$HOME/.financial-brain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.13/brain-installer-0.1.13.tgz"
+# Optional: makes the shorter `brain` examples work in this Terminal window.
 export PATH="$HOME/.financial-brain/bin:$PATH"
 ```
 
@@ -27,16 +28,29 @@ Windows PowerShell:
 
 ```powershell
 npm.cmd install --global --ignore-scripts --no-audit --no-fund --prefix "$env:LOCALAPPDATA\FinancialBrain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.13/brain-installer-0.1.13.tgz"
+# Optional: makes the shorter `brain` examples work in this PowerShell window.
 $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
 ```
+
+The full command path below is deliberate. It keeps working after Terminal is
+closed, without `sudo`, administrator access, or a shell-profile change.
 
 Setup and updates ask for the scoped Cloudflare token
 inside a hidden terminal prompt. The token exists only for that command and is
 never written to a file, command argument, log, or issue note.
 
+Mac or Linux:
+
 ```bash
-brain whatsnew     # what this version does, and whether you are on it
-brain doctor       # check your machine has everything it needs
+"$HOME/.financial-brain/bin/brain" whatsnew
+"$HOME/.financial-brain/bin/brain" doctor
+```
+
+Windows PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\FinancialBrain\brain.cmd" whatsnew
+& "$env:LOCALAPPDATA\FinancialBrain\brain.cmd" doctor
 ```
 
 ---
@@ -57,10 +71,19 @@ exactly what to do about anything missing.
 Written answers use Cloudflare Workers AI through the same account. There is no
 second AI-provider account or API key to create.
 
-Then:
+Then run the command for your computer. Setup creates the `Financial Brain`
+folder if it does not exist and remembers this manifest location for updates.
+
+Mac or Linux:
 
 ```bash
-brain setup
+"$HOME/.financial-brain/bin/brain" setup "$HOME/Financial Brain/brain.manifest.json"
+```
+
+Windows PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\FinancialBrain\brain.cmd" setup "$HOME\Financial Brain\brain.manifest.json"
 ```
 
 It asks three short questions and does everything else itself: creates the
@@ -73,10 +96,33 @@ ciphertext; Linux uses an owner-only adjacent file. An existing legacy Mac
 
 ## Update it
 
-First install the exact release named on `financialbrain.ai/update`, then run:
+First install the exact release named on `financialbrain.ai/update`. Then run
+the update command from any folder. It uses the manifest location saved by
+setup, even after Terminal has been closed and reopened.
+
+Mac or Linux:
 
 ```bash
-brain update
+"$HOME/.financial-brain/bin/brain" update
+```
+
+Windows PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\FinancialBrain\brain.cmd" update
+```
+
+If this Brain was installed before manifest remembering existed, name the full
+manifest path once. Every later update can use the no-manifest command above:
+
+```bash
+"$HOME/.financial-brain/bin/brain" update "$HOME/Financial Brain/brain.manifest.json"
+```
+
+On Windows, use:
+
+```powershell
+& "$env:LOCALAPPDATA\FinancialBrain\brain.cmd" update "$HOME\Financial Brain\brain.manifest.json"
 ```
 
 The update verifies the Cloudflare account, requires a D1 restore bookmark,
@@ -171,12 +217,14 @@ brain health ./brain.manifest.json    # what is wrong with the brain
 brain secrets ./brain.manifest.json   # exact durable ADMIN_KEY rotation command
 ```
 
-For an admin-key rotation, export the replacement as `ADMIN_KEY` and run
-`brain secrets`. After a read-only Cloudflare account check, it updates and
-verifies the manifest's declared Keychain item or adjacent protected file, then
-applies that durable desired value to the Worker. If the remote write fails,
-rerun the same command with no `ADMIN_KEY` export; the verified durable copy is
-reused. Standard macOS setup creates the non-secret Keychain locator
+For an admin-key rotation, use an approved no-history credential launcher to
+provide the replacement only to `brain secrets`. Never paste or export the
+replacement in a shell command. After a read-only Cloudflare account check, the
+command updates and verifies the manifest's declared Keychain item or adjacent
+protected file, then applies that durable desired value to the Worker. If the
+remote write fails, rerun the same command without supplying the replacement
+again; the verified durable copy is reused. Standard macOS setup creates the
+non-secret Keychain locator
 automatically; it is not a credential and is safe to keep in the manifest.
 Setup, secrets, and upgrade also remove only the known Supabase or Anthropic
 Worker secrets that the manifest does not allow. Other secret names are left

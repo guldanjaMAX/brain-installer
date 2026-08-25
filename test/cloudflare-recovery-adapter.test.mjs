@@ -21,6 +21,7 @@ import {
   CloudflareRecoveryAdapterError,
   RECOVERY_DURABLE_TABLES,
   RECOVERY_EXPORT_TABLES,
+  RECOVERY_FIELD_GATE_STOP_STAGES,
   createCloudflareRecoveryFieldGateAdapters,
   parseCloudflareRecoveryCliArguments,
   previewCloudflareRecoveryFieldGate,
@@ -29,6 +30,7 @@ import {
 } from "../operations/cloudflare-recovery-adapter.mjs";
 import {
   initializeVerifiedRecovery,
+  loadVerifiedRecoveryState,
 } from "../operations/verified-recovery.mjs";
 
 const sandbox = mkdtempSync(join(tmpdir(), "brain-cloudflare-recovery-adapter-"));
@@ -488,6 +490,9 @@ try {
     initialized.plan.source_resource_fingerprint,
   );
   assert.match(preview.wrapper_approval_fingerprint, /^[0-9a-f]{64}$/);
+  assert.deepEqual(RECOVERY_FIELD_GATE_STOP_STAGES, [
+    "export_d1", "restore_d1", "rebuild_vectorize",
+  ]);
   const approvedAdapterConfig = Object.freeze({
     ...baseConfig,
     plan: initialized.plan,
@@ -512,6 +517,58 @@ try {
     "--wrangler-wrapper", wrapperPath,
     "--golden", goldenPath,
   ]).command, "preview");
+  const parsedStop = parseCloudflareRecoveryCliArguments([
+    "run",
+    "--source-manifest", sourceManifestPath,
+    "--target-manifest", targetManifestPath,
+    "--plan", planPath,
+    "--state", statePath,
+    "--artifact-directory", artifactDirectory,
+    "--wrangler-wrapper", wrapperPath,
+    "--golden", goldenPath,
+    "--approve-plan", initialized.plan.plan_fingerprint,
+    "--approve-disposable-target", initialized.plan.target_resource_fingerprint,
+    "--approve-target-execution", preview.target_execution_approval_fingerprint,
+    "--approve-source-export-blocking", preview.source_export_blocking_approval_fingerprint,
+    "--approve-wrapper", preview.wrapper_approval_fingerprint,
+    "--stop-after-stage", "restore_d1",
+  ]);
+  assert.equal(parsedStop.stopAfterStage, "restore_d1");
+  assert.throws(
+    () => parseCloudflareRecoveryCliArguments([
+      "preview",
+      "--source-manifest", sourceManifestPath,
+      "--target-manifest", targetManifestPath,
+      "--plan", planPath,
+      "--state", statePath,
+      "--artifact-directory", artifactDirectory,
+      "--wrangler-wrapper", wrapperPath,
+      "--golden", goldenPath,
+      "--stop-after-stage", "restore_d1",
+    ]),
+    (error) => error.code === "RECOVERY_FIELD_GATE_ARGUMENTS_INVALID",
+  );
+  assert.throws(
+    () => parseCloudflareRecoveryCliArguments([
+      ...[
+        "run",
+        "--source-manifest", sourceManifestPath,
+        "--target-manifest", targetManifestPath,
+        "--plan", planPath,
+        "--state", statePath,
+        "--artifact-directory", artifactDirectory,
+        "--wrangler-wrapper", wrapperPath,
+        "--golden", goldenPath,
+        "--approve-plan", initialized.plan.plan_fingerprint,
+        "--approve-disposable-target", initialized.plan.target_resource_fingerprint,
+        "--approve-target-execution", preview.target_execution_approval_fingerprint,
+        "--approve-source-export-blocking", preview.source_export_blocking_approval_fingerprint,
+        "--approve-wrapper", preview.wrapper_approval_fingerprint,
+      ],
+      "--stop-after-stage", "verify_health",
+    ]),
+    (error) => error.code === "RECOVERY_FIELD_GATE_STOP_STAGE_INVALID",
+  );
   assert.throws(
     () => parseCloudflareRecoveryCliArguments(["run", "--plan", planPath, "--plan", planPath]),
     /RECOVERY_FIELD_GATE_ARGUMENTS_INVALID/,
@@ -549,6 +606,7 @@ try {
       ...baseConfig,
       approvePlan: "0".repeat(64),
       approveDisposableTarget: initialized.plan.target_resource_fingerprint,
+      stopAfterStage: "restore_d1",
     }, unusedHarness.dependencies),
     (error) => error instanceof CloudflareRecoveryAdapterError &&
       error.code === "RECOVERY_FIELD_GATE_APPROVAL_MISMATCH",
@@ -571,6 +629,82 @@ try {
     (error) => error.code === "RECOVERY_FIELD_GATE_APPROVAL_MISMATCH",
   );
   assert.equal(directBypassHarness.wranglerCalls.length, 0);
+
+  const invalidStopHarness = providerHarness();
+  await assert.rejects(
+    runCloudflareRecoveryFieldGate({
+      ...baseConfig,
+      approvePlan: initialized.plan.plan_fingerprint,
+      approveDisposableTarget: initialized.plan.target_resource_fingerprint,
+      approveTargetExecution: preview.target_execution_approval_fingerprint,
+      approveSourceExportBlocking: preview.source_export_blocking_approval_fingerprint,
+      approveWrapper: preview.wrapper_approval_fingerprint,
+      stopAfterStage: "verify_health",
+    }, invalidStopHarness.dependencies),
+    (error) => error.code === "RECOVERY_FIELD_GATE_STOP_STAGE_INVALID",
+  );
+  assert.equal(invalidStopHarness.wranglerCalls.length, 0);
+  assert.equal(invalidStopHarness.adminReads, 0);
+
+  const drillPlanPath = join(sandbox, ".brain-recovery-drill-plan.json");
+  const drillStatePath = join(sandbox, ".brain-recovery-drill-state.json");
+  const drillArtifactDirectory = join(sandbox, "private-drill-artifacts");
+  mkdirSync(drillArtifactDirectory, { mode: 0o700 });
+  if (process.platform !== "win32") chmodSync(drillArtifactDirectory, 0o700);
+  const drillInitialized = initializeVerifiedRecovery(
+    sourceManifestPath,
+    targetManifestPath,
+    drillPlanPath,
+    drillStatePath,
+    { now: new Date("2026-08-25T12:30:00.000Z") },
+  );
+  const drillConfig = {
+    ...baseConfig,
+    planPath: drillPlanPath,
+    statePath: drillStatePath,
+    artifactDirectory: drillArtifactDirectory,
+  };
+  const drillPreview = previewCloudflareRecoveryFieldGate(drillConfig, { platform: "darwin" });
+  const approvedDrillConfig = Object.freeze({
+    ...drillConfig,
+    approvePlan: drillInitialized.plan.plan_fingerprint,
+    approveDisposableTarget: drillInitialized.plan.target_resource_fingerprint,
+    approveTargetExecution: drillPreview.target_execution_approval_fingerprint,
+    approveSourceExportBlocking: drillPreview.source_export_blocking_approval_fingerprint,
+    approveWrapper: drillPreview.wrapper_approval_fingerprint,
+    stopAfterStage: "restore_d1",
+  });
+  const drillHarness = providerHarness();
+  await assert.rejects(
+    runCloudflareRecoveryFieldGate(approvedDrillConfig, drillHarness.dependencies),
+    (error) => error instanceof CloudflareRecoveryAdapterError &&
+      error.code === "RECOVERY_FIELD_GATE_INTENTIONAL_INTERRUPTION",
+  );
+  const drillCheckpoint = loadVerifiedRecoveryState(
+    drillStatePath,
+    drillInitialized.plan,
+  );
+  assert.equal(drillCheckpoint.status, "running");
+  assert.equal(drillCheckpoint.current_stage, "verify_d1");
+  assert.equal(drillCheckpoint.stage_status, "pending");
+  assert.equal(drillCheckpoint.failure, null);
+  assert.deepEqual(
+    drillCheckpoint.completed.map((entry) => entry.id),
+    ["export_d1", "verify_export", "prove_target_clean", "restore_d1"],
+  );
+  assert.equal(drillHarness.importCalls, 1);
+  assert.equal(drillHarness.evalCalls, 0);
+  assert.equal(existsSync(join(drillArtifactDirectory, ".brain-recovery-field-gate.lock")), false);
+
+  const resumedDrill = await runCloudflareRecoveryFieldGate(
+    approvedDrillConfig,
+    drillHarness.dependencies,
+  );
+  assert.equal(resumedDrill.ok, true);
+  assert.equal(resumedDrill.status.status, "complete");
+  assert.equal(drillHarness.importCalls, 1);
+  assert.equal(drillHarness.evalCalls, 1);
+  assert.equal(existsSync(join(drillArtifactDirectory, ".brain-recovery-field-gate.lock")), false);
 
   const harness = providerHarness();
   const completed = await runCloudflareRecoveryFieldGate({

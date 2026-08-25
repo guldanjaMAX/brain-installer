@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import {
   mkdtempSync,
+  lstatSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -12,6 +14,10 @@ import {
   cmdSetup,
   persistWorkersDevDomain,
 } from "../brain.mjs";
+import {
+  installedManifestPointerPath,
+  readInstalledManifest,
+} from "../operations/installed-manifest.mjs";
 
 const oneAccount = { id: "a".repeat(32), name: "Owner account" };
 
@@ -56,6 +62,10 @@ try {
   assert.equal(JSON.parse(readFileSync(domainManifest, "utf8")).brain.domain, domain);
 
   const target = join(sandbox, "Financial Brain", "brain.manifest.json");
+  const installedManifestOptions = {
+    home: sandbox,
+    stateDirectory: join(sandbox, "installed-state"),
+  };
   const events = [];
   const key = `fixture-${"k".repeat(40)}`;
   const prompt = async (question, fallback) => {
@@ -99,14 +109,18 @@ try {
       return { wired: [], failures: [], skipped: [] };
     },
     backlogCount: async () => 0,
+    installedManifestOptions,
   });
   assert.deepEqual(events, ["verify", "provision", "migrate", "deploy", "secrets", "health", "wire"]);
   const saved = JSON.parse(readFileSync(target, "utf8"));
   assert.equal(saved.infrastructure.cloudflare.account_id, oneAccount.id);
   assert.equal(saved.brain.domain, "clean-brain.owner-subdomain.workers.dev");
+  assert.equal(readInstalledManifest(installedManifestOptions), realpathSync.native(target));
   if (process.platform !== "win32") {
-    const { mode } = (await import("node:fs")).lstatSync(target);
+    const { mode } = lstatSync(target);
     assert.equal(mode & 0o777, 0o600);
+    assert.equal(lstatSync(installedManifestPointerPath(installedManifestOptions)).mode & 0o777, 0o600);
+    assert.equal(lstatSync(installedManifestOptions.stateDirectory).mode & 0o777, 0o700);
   }
   console.log("clean setup path: all focused tests passed");
 } finally {

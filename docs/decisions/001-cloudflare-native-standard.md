@@ -53,8 +53,9 @@ The executable retirement sequence is defined in the
 
 ## Verification
 
-- Immutable installer release, CI, real-account field rehearsal, and signed
-  checksums.
+- Immutable GitHub installer release, CI, real-account field rehearsal, and an
+  independent download whose SHA-256 must match GitHub's immutable asset digest
+  before the public install and update pages can be published.
 - Exact-version health, D1/FTS/Vectorize agreement, zero outbox backlog, and
   negative authentication tests.
 - Private source reconciliation and reviewed evaluation slices for every

@@ -4,14 +4,17 @@ This directory is temporary migration tooling. It is not a second product
 backend. The source database is read-only and every target write uses the same
 document ingest endpoint as Drive, Gmail, and folder connectors.
 
-Required runtime variables:
+This is operator-only tooling. Run every command below through an approved
+no-history secret-manager launcher. The launcher must expose these names only
+to the migration child process:
 
-```bash
-export SUPABASE_ACCESS_TOKEN='...'
-export SUPABASE_PROJECT_REF='...'
-export BRAIN_URL='https://isolated-target.example.com'
-export ADMIN_KEY='...'
-```
+- `SUPABASE_ACCESS_TOKEN`: secret source credential.
+- `ADMIN_KEY`: secret target credential.
+- `SUPABASE_PROJECT_REF`: non-secret source project locator.
+- `BRAIN_URL`: non-secret isolated-target URL.
+
+Never paste, export, email, or message either credential. Keep both values out
+of command arguments, shell history, logs, checkpoints, and shared terminals.
 
 Dry-run one source page without touching Cloudflare:
 
