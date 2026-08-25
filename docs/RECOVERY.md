@@ -83,6 +83,9 @@ recreates the derived FTS index through those migrations and triggers. The
 rebuilt; source verification therefore also requires that queue to be empty.
 Any unknown durable table, migration mismatch, schema mismatch, FTS integrity
 failure, aggregate mismatch, or durable-data hash mismatch stops the run.
+Migration checksums bind the exact reviewed SQL bytes. Schema comparison then
+canonicalizes SQL comments and whitespace because D1 removes non-semantic
+comments from `sqlite_schema` while local SQLite preserves them.
 
 Cloudflare's remote D1 export takes a blocking lock. Run the source export only
 in an approved maintenance window with source ingest and writes paused. The

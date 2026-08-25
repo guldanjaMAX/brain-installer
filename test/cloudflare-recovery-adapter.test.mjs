@@ -1083,6 +1083,16 @@ try {
     assert.equal(local.document_count, 6000);
     assert.equal(local.chunk_count, 0);
     assert.equal(local.fts_count, 0);
+
+    // D1 removes full-line SQL comments from sqlite_schema. The exact migration
+    // checksums remain separately pinned, so schema comparison must treat only
+    // those non-semantic comments and whitespace as equivalent.
+    const commentlessArtifact = join(sandbox, ".brain-recovery-commentless-verifier.sql");
+    const commentlessSchema = schemaSql.replace(/^[ \t]*--[^\r\n]*(?:\r?\n|$)/gm, "");
+    writeFileSync(commentlessArtifact, `${commentlessSchema}\n${receipts}\n`, { mode: 0o600 });
+    chmodSync(commentlessArtifact, 0o600);
+    const commentless = await verifyRecoverySqlArtifact(commentlessArtifact);
+    assert.equal(commentless.schema_fingerprint, local.schema_fingerprint);
   }
 
   console.log("PASS  Cloudflare recovery adapter is disposable-only, credential-safe, redirect-safe, and resumable");

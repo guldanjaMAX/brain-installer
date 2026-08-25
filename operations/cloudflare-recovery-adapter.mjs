@@ -616,6 +616,73 @@ function validateMigrationContract(rows) {
   return Object.freeze(selected);
 }
 
+/**
+ * Compare executable SQLite schema rather than provider-specific formatting.
+ *
+ * D1 removes SQL comments before storing CREATE statements in sqlite_schema,
+ * while local SQLite preserves them. Migration checksums still bind the exact
+ * reviewed files; this normalization only prevents non-semantic comments and
+ * whitespace from making the independently restored schema look different.
+ */
+function canonicalSchemaSql(value) {
+  let output = "";
+  let quote = null;
+  let pendingSpace = false;
+  for (let index = 0; index < value.length; index++) {
+    const character = value[index];
+    const next = value[index + 1];
+    if (quote) {
+      output += character;
+      if (quote === "]") {
+        if (character === "]") quote = null;
+      } else if (character === quote) {
+        if (next === quote) {
+          output += next;
+          index++;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      if (pendingSpace && output) output += " ";
+      pendingSpace = false;
+      quote = character;
+      output += character;
+      continue;
+    }
+    if (character === "[") {
+      if (pendingSpace && output) output += " ";
+      pendingSpace = false;
+      quote = "]";
+      output += character;
+      continue;
+    }
+    if (character === "-" && next === "-") {
+      index += 2;
+      while (index < value.length && value[index] !== "\n" && value[index] !== "\r") index++;
+      pendingSpace = true;
+      continue;
+    }
+    if (character === "/" && next === "*") {
+      index += 2;
+      while (index < value.length && !(value[index] === "*" && value[index + 1] === "/")) index++;
+      if (index < value.length) index++;
+      pendingSpace = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      pendingSpace = true;
+      continue;
+    }
+    if (pendingSpace && output) output += " ";
+    pendingSpace = false;
+    output += character;
+  }
+  return output.trim();
+}
+
 function normalizeSchemaRows(rows) {
   if (!Array.isArray(rows)) refuse("RECOVERY_SCHEMA_CONTRACT_INVALID");
   const normalized = rows.map((row) => {
@@ -629,7 +696,7 @@ function normalizeSchemaRows(rows) {
       type: exactString(row?.type, "RECOVERY_SCHEMA_CONTRACT_INVALID"),
       name: exactString(row?.name, "RECOVERY_SCHEMA_CONTRACT_INVALID"),
       tbl_name: exactString(row?.tbl_name, "RECOVERY_SCHEMA_CONTRACT_INVALID"),
-      sql,
+      sql: sql === null ? null : canonicalSchemaSql(sql),
     };
   });
   const sorted = [...normalized].sort((a, b) =>
