@@ -934,6 +934,7 @@ try {
 
   /* A complete standard setup reaches the truthful final receipt offline. */
   const successfulSetupEvents = [];
+  let successfulSetupKeyCommitted = false;
   const successfulSetup = await isolatedRuntime({
     fetchImpl: async () => {
       throw new Error("successful setup fixture must remain offline");
@@ -941,6 +942,7 @@ try {
     env: {},
   }, () => cmdSetup(setupReuseManifest, {
     doctorRunAll: async () => [],
+    setupWorkerScriptExists: async () => false,
     rememberInstalledManifest: () => ({}),
     prepareSetupAdminKey: async () => ({
       source: "durable",
@@ -955,6 +957,13 @@ try {
       successfulSetupEvents.push("secrets");
       assert.equal(options.reconcileExistingAgents, false);
       assert.equal(options.explicitAdminKey, replacementKey);
+      successfulSetupKeyCommitted = true;
+    },
+    cmdDrain: async (path) => {
+      assert.equal(path, setupReuseManifest);
+      assert.equal(successfulSetupKeyCommitted, true, "setup must persist its key before authenticated drain");
+      assert.equal(process.env.ADMIN_KEY, undefined);
+      successfulSetupEvents.push("drain");
     },
     cmdHealth: async (_path, options) => {
       successfulSetupEvents.push("health");
@@ -977,7 +986,7 @@ try {
     },
   }));
   assert.deepEqual(successfulSetupEvents, [
-    "verify", "provision", "migrate", "deploy", "secrets", "health", "wire", "prompt", "backlog",
+    "verify", "provision", "migrate", "deploy", "secrets", "drain", "health", "wire", "prompt", "backlog",
   ]);
   assert.match(successfulSetup.output, /Step 6 of 6[\s\S]*Your brain is live/i);
   assert.match(successfulSetup.output, /connected to: Codex/i);
@@ -986,6 +995,7 @@ try {
 
   /* Setup has one full reconciliation owner and stops before source ingest. */
   const setupWiringEvents = [];
+  let setupWiringKeyCommitted = false;
   let setupWiringFailure;
   try {
     await isolatedRuntime({
@@ -995,6 +1005,7 @@ try {
       env: {},
     }, () => cmdSetup(setupReuseManifest, {
       doctorRunAll: async () => [],
+      setupWorkerScriptExists: async () => false,
       prepareSetupAdminKey: async () => ({
         source: "durable",
         value: replacementKey,
@@ -1021,6 +1032,13 @@ try {
         assert.equal(options.reconcileExistingAgents, false);
         assert.equal(options.explicitAdminKey, replacementKey);
         assert.equal(process.env.ADMIN_KEY, undefined);
+        setupWiringKeyCommitted = true;
+      },
+      cmdDrain: async (path) => {
+        setupWiringEvents.push("drain");
+        assert.equal(path, setupReuseManifest);
+        assert.equal(setupWiringKeyCommitted, true, "setup must persist its key before authenticated drain");
+        assert.equal(process.env.ADMIN_KEY, undefined);
       },
       cmdHealth: async (_path, options) => {
         setupWiringEvents.push("health");
@@ -1039,7 +1057,7 @@ try {
   assert.ok(setupWiringFailure);
   assert.match(setupWiringFailure.message, /could not verify the AI tool registration exactly/i);
   assert.deepEqual(setupWiringEvents, [
-    "verify", "provision", "migrate", "deploy", "secrets", "health", "wire",
+    "verify", "provision", "migrate", "deploy", "secrets", "drain", "health", "wire",
   ]);
   assert.doesNotMatch(setupWiringFailure.capturedOutput, /Step 6 of 6|loading something in/i);
 
@@ -1049,6 +1067,7 @@ try {
   const standardSetupValue = manifest({ admin_key_secret: null });
   standardSetupValue.infrastructure.cloudflare.account_id = "e".repeat(32);
   const standardSetupManifest = writeManifest(standardSetupDir, standardSetupValue);
+  let standardSetupKeyCommitted = false;
   let standardSetupFailure;
   try {
     await isolatedRuntime({
@@ -1057,6 +1076,7 @@ try {
     }, () => cmdSetup(standardSetupManifest, {
       platform: "darwin",
       doctorRunAll: async () => [],
+      setupWorkerScriptExists: async () => false,
       prepareSetupAdminKey: async (_path, preparedManifest) => {
         const saved = JSON.parse(readFileSync(standardSetupManifest, "utf8"));
         assert.match(preparedManifest.operations.admin_key_secret, /^keychain:\/\//);
@@ -1074,6 +1094,12 @@ try {
       cmdDeploy: async () => {},
       cmdSecrets: async (_path, options) => {
         assert.equal(options.explicitAdminKey, replacementKey);
+        assert.equal(process.env.ADMIN_KEY, undefined);
+        standardSetupKeyCommitted = true;
+      },
+      cmdDrain: async (path) => {
+        assert.equal(path, standardSetupManifest);
+        assert.equal(standardSetupKeyCommitted, true, "setup must persist its key before authenticated drain");
         assert.equal(process.env.ADMIN_KEY, undefined);
       },
       cmdHealth: async (_path, options) => {
@@ -1094,6 +1120,7 @@ try {
 
   /* Setup never consumes or clears an ADMIN_KEY the user exported. */
   let explicitSetupFailure;
+  let explicitSetupKeyCommitted = false;
   try {
     await isolatedRuntime({
       fetchImpl: async () => {
@@ -1104,6 +1131,7 @@ try {
       try {
         await cmdSetup(setupReuseManifest, {
           doctorRunAll: async () => [],
+          setupWorkerScriptExists: async () => false,
           prepareSetupAdminKey: async () => ({
             source: "environment",
             value: currentKey,
@@ -1116,6 +1144,12 @@ try {
           cmdSecrets: async (_path, options) => {
             assert.equal(process.env.ADMIN_KEY, currentKey);
             assert.equal(options.explicitAdminKey, currentKey);
+            explicitSetupKeyCommitted = true;
+          },
+          cmdDrain: async (path) => {
+            assert.equal(path, setupReuseManifest);
+            assert.equal(explicitSetupKeyCommitted, true, "setup must set the Worker key before authenticated drain");
+            assert.equal(process.env.ADMIN_KEY, currentKey);
           },
           cmdHealth: async (_path, options) => {
             assert.equal(process.env.ADMIN_KEY, currentKey);

@@ -63,8 +63,10 @@ owner's Cloudflare Worker
 - D1 is the durable authority for documents, chunks, source lifecycle,
   migrations, keyword search, and the vector outbox.
 - Vectorize is a rebuildable semantic projection. A green Worker is not proof
-  that semantic search is complete, so health and release checks must require a
-  zero vector backlog.
+  that semantic search is complete, and an empty queue alone is not proof that
+  an accepted asynchronous mutation is query-visible. Health and release checks
+  require exact `vector_readiness`: zero pending/submitted work, a processed
+  provider fence, and equal D1/Vectorize counts.
 - The Worker fuses Vectorize and D1 FTS candidates and produces cited answers.
 - The manifest is the only intended per-install product configuration. Source
   selections, credentials, resume state, private evaluations, and Cloudflare
@@ -73,13 +75,65 @@ owner's Cloudflare Worker
   retrieval, ingest, health, evaluation, drain, and reindex use the deployed
   Brain and its separately stored admin key.
 
-Version 0.1.14 strengthens current-status retrieval so stale records and
+The 0.1.14 candidate strengthens current-status retrieval so stale records and
 transaction-system evidence cannot silently establish a current client
 relationship. It also makes full message replay exact and fail-closed across
-high-water snapshots, reconciliation, crash recovery, and live inventory
+high-water snapshots, reconciliation, crash recovery, and target inventory
 verification. Version 0.1.13 established the duplicate collapsing, durable
 installed-manifest pointer, guarded recovery, and release-safety foundations.
 `CHANGELOG.md` is the authoritative owner-facing list.
+
+Three append-only migrations make the D1-to-Vectorize protocol durable:
+
+- `0010` replaces millisecond timestamps as revision identity with a monotonic
+  install-state generation. Every cleanup and failure update uses generation,
+  operation, and vector identity as its compare-and-swap token.
+- `0011` adds the opaque, expiring exclusive drain lease. Cron and manual drain
+  cannot overlap, forget is enqueue-only, and only the matching owner can
+  release a lease.
+- `0012` stores asynchronous Vectorize mutation receipts on both the outbox row
+  and a global projection fence. A provider watermark plus exact-generation
+  `getByIds` readback must confirm the change before the row leaves the queue.
+  Existing corpora start `bootstrap_required`; a durable high-water and 99-row
+  cursor rebuild the projection without materializing a corpus-sized queue.
+
+`brain update` deploys a paused compatibility Worker and verifies its exact
+version/writer mode, waits one complete supported lease window, runs these
+migrations, deploys active mode, and verifies active mode again. This closes the
+rolling interval in which an older Worker could write without the lease. The
+migration runner is restart-safe after every independently committed statement.
+Paused mode is a complete corpus-write barrier: ingest, batch ingest, source
+receipts/expectations, forget, reindex, manual drain, and cron drain all stop
+before D1 or provider access. After active deploy, update and resumed setup run
+the bounded drain to exact visibility before health or acceptance can pass.
+
+A setup interrupted after D1 commits an early migration statement can leave an
+`install_state` table without its singleton or migration receipt. A rerun with
+no exact manifest Worker must not infer quiescence, because a renamed Worker can
+still share the D1 binding. Setup makes zero further D1 mutations and directs
+the owner through `brain update <manifest>` for the verified paused-writer
+cutover, followed by `brain setup <manifest>`. The migration runner resumes the
+committed prefix; setup then persists the admin key and completes convergence.
+
+The normal maximum 50-document, one-chunk batch uses 53 D1 binding round trips,
+but Cloudflare bills/counts its 352 SQL statements. The Worker reserves a
+conservative worst-case statement cost before any write and refuses requests
+above its internal 900-query budget, leaving headroom below Cloudflare's
+documented 1,000-query invocation limit. The separate 100-statement value in
+the store is only our internal transaction slice, not a Cloudflare platform
+ceiling.
+
+All-history Supabase message replay is source/operator migration tooling, not an
+installed owner command. The `migration/` directory is intentionally absent
+from the package allowlist. An authorized operator runs it from a reviewed
+source checkout against a protected checkpoint. Its final readback requires
+exact D1 document/family counts and `vector_readiness` before it records a
+completion receipt.
+
+Do not describe 0.1.14 as live or recovery-verified merely because these files
+or deterministic tests exist. The exact candidate still requires its disposable
+provider field gate, recovery drill evidence, six-job CI matrix, immutable
+release artifact verification, and each install's private release evaluation.
 
 The code line is not a release merely because `package.json` says `0.1.14`. A
 release exists only when its exact reviewed commit is tagged, all six CI jobs
@@ -250,14 +304,16 @@ brain status <manifest>
 brain sources <manifest>
 ```
 
-`brain update` obtains a D1 restore bookmark before mutation, applies pending
-migrations, deploys the exact Worker version, reconciles only known obsolete
-provider secrets, runs exact-version health and the full acceptance suite,
-commits version state to D1, reads it back, and only then advances the local
-manifest. A failed update does not report or record the new version as live.
+`brain update` obtains a D1 restore bookmark before mutation. For the D1 vector
+writer protocol it deploys and verifies paused mode, waits one lease window,
+applies pending migrations, deploys and verifies active mode, reconciles only
+known obsolete provider secrets, runs exact-version health and the full
+acceptance suite, commits version state to D1, reads it back, and only then
+advances the local manifest. A failed update does not report or record the new
+version as live.
 
-After a successful update, require zero failed health checks and zero pending
-vector work. Run the install's private release evaluation for any release that
+After a successful update, require zero failed health checks and exact vector
+readiness, not merely an empty queue. Run the install's private release evaluation for any release that
 changes extraction, chunking, indexing, ranking, answer generation, source
 lifecycle, or authorization. Keep the private suite and artifacts outside the
 repository.
@@ -286,6 +342,9 @@ bookmark, and it does not restore Vectorize. After reviewing the exact target:
 
 ```bash
 brain rollback <manifest> <bookmark> --yes
+# Worker intentionally remains paused here.
+# Recreate and rebind a clean Vectorize index plus every metadata index under
+# the supervised recovery procedure before continuing.
 brain reindex <manifest> --yes
 brain drain <manifest>
 brain health <manifest>
@@ -295,10 +354,27 @@ brain test <manifest>
 Do not return the Brain to normal use until D1, FTS, Vectorize, version health,
 and the install's required evaluation agree again.
 
+That direct reindex repairs missing/current vectors only. If the restored D1
+bookmark predates Vectorize writes, provider-only IDs can remain and reindex
+cannot enumerate them. Recreate and rebind the exact Vectorize index under the
+reviewed recovery procedure, recreate all metadata indexes, then reindex and
+require exact count/readiness before returning the Brain to use.
+
+Rollback first deploys and verifies the same complete write barrier, waits one
+old-invocation window, restores D1, then clears any restored lease/mutation
+receipt and records an exact bootstrap high-water. It deliberately does not
+return active mode: a clean Vectorize replacement/rebind is required because
+provider-only post-bookmark ids cannot be enumerated by reindex. A bookmark from
+before schema 12 also fails closed with the Worker paused; forward-migrate the
+restored schema as part of the supervised recovery, then recreate/rebind a
+clean Vectorize index before reindexing. Forward migration and reindex alone do
+not remove provider-only vectors written after the restored bookmark.
+
 A bookmark rollback is not disaster-recovery proof. Full recovery means an
-isolated D1 export and restore, FTS recreation, Vectorize rebuild, zero backlog,
-health, and the same private release evaluation. Follow `docs/RECOVERY.md` and
-use disposable resources. Never improvise that drill against a live target.
+isolated D1 export and restore, FTS recreation, a visibility-confirmed Vectorize
+rebuild with exact count agreement, health, and the same private release
+evaluation. Follow `docs/RECOVERY.md` and use disposable resources. Never
+improvise that drill against a live target.
 
 ## Credential boundaries
 

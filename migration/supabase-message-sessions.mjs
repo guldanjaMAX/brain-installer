@@ -656,8 +656,12 @@ function verifySavedCompletionAccounting(lane, { receiptRecorded = false } = {})
   }
   if (receiptRecorded) {
     const readback = lane.target_readback;
+    const readiness = readback?.vector_readiness;
     if (!Number.isFinite(Date.parse(String(lane.receipt_recorded_at || ""))) ||
         !readback || readback.backend !== "d1" || readback.vector_backlog !== 0 ||
+        readiness?.ready !== true || readiness.pending !== 0 || readiness.submitted !== 0 ||
+        !Number.isSafeInteger(readiness.expected_vectors) || readiness.expected_vectors < 0 ||
+        readiness.actual_vectors !== readiness.expected_vectors ||
         readback.stored_documents !== lane.target_documents ||
         readback.logical_documents !== lane.accepted_family_hashes.length ||
         !Number.isFinite(Date.parse(String(readback.verified_at || "")))) {
@@ -669,7 +673,11 @@ function verifySavedCompletionAccounting(lane, { receiptRecorded = false } = {})
 
 export function messageCompletionReceipt(lane, completedAt = new Date().toISOString()) {
   if (!lane?.complete || !lane?.accounting) throw new Error("message migration is not accounting-verified complete");
-  if (!lane?.target_readback || lane.target_readback.vector_backlog !== 0) {
+  const readiness = lane?.target_readback?.vector_readiness;
+  if (!lane?.target_readback || lane.target_readback.vector_backlog !== 0 ||
+      readiness?.ready !== true || readiness.pending !== 0 || readiness.submitted !== 0 ||
+      !Number.isSafeInteger(readiness.expected_vectors) || readiness.expected_vectors < 0 ||
+      readiness.actual_vectors !== readiness.expected_vectors) {
     throw new Error("message migration target readback is not retrieval-ready");
   }
   if (!/^[a-f0-9]{64}$/.test(String(lane.config_fingerprint || ""))) {
@@ -720,6 +728,30 @@ export function verifyMessageTargetInventory(lane, inventory) {
   if (pending > 0) {
     throw new Error(`message migration data is durable but ${pending} vector operations are still pending`);
   }
+  const readiness = inventory?.vector_readiness;
+  const readinessPending = Number(readiness?.pending);
+  const submitted = Number(readiness?.submitted);
+  const expectedVectors = Number(readiness?.expected_vectors);
+  const actualVectors = Number(readiness?.actual_vectors);
+  if (!readiness || !Number.isSafeInteger(readinessPending) || readinessPending < 0 ||
+      !Number.isSafeInteger(submitted) || submitted < 0 ||
+      !Number.isSafeInteger(expectedVectors) || expectedVectors < 0 ||
+      !Number.isSafeInteger(actualVectors) || actualVectors < 0) {
+    throw new Error("message migration target readback has no valid exact vector readiness");
+  }
+  if (readinessPending !== pending) {
+    throw new Error("message migration target readback vector backlog and readiness disagree");
+  }
+  if (readiness.ready !== true || readinessPending !== 0 || submitted !== 0 ||
+      actualVectors !== expectedVectors) {
+    const reason = typeof readiness.reason === "string" && readiness.reason
+      ? ` (${readiness.reason})`
+      : "";
+    const action = typeof readiness.action === "string" && readiness.action
+      ? `; ${readiness.action}`
+      : "; run brain drain, then brain diagnose if visibility does not converge";
+    throw new Error(`message migration vector index is not query-ready${reason}${action}`);
+  }
   const messageRow = inventory.rows.find((row) => row?.source_type === "message");
   if (messageRow && messageRow.document_counts_exact !== true) {
     throw new Error("message migration target readback is not based on exact live document counts");
@@ -743,6 +775,13 @@ export function verifyMessageTargetInventory(lane, inventory) {
     stored_documents: stored,
     logical_documents: logical,
     vector_backlog: 0,
+    vector_readiness: {
+      ready: true,
+      pending: 0,
+      submitted: 0,
+      expected_vectors: expectedVectors,
+      actual_vectors: actualVectors,
+    },
     verified_at: new Date().toISOString(),
   };
 }
@@ -1233,7 +1272,7 @@ async function main() {
     would_create_parts: result.would_create_parts,
     refusal_labels: refusalLabelCounts(result.refusals),
     accounting_verified: Boolean(result.accounting),
-    retrieval_ready: state.message_sessions.target_readback?.vector_backlog === 0,
+    retrieval_ready: state.message_sessions.target_readback?.vector_readiness?.ready === true,
     source_receipt: sourceReceipt ? { source: sourceReceipt.source, status: sourceReceipt.status } : null,
   }, null, 2));
 }

@@ -26,6 +26,11 @@ function makeEnv({ vectorCount = null } = {}) {
   for (const f of readdirSync(MIG).filter((f) => f.endsWith(".sql")).sort()) {
     db.exec(readFileSync(join(MIG, f), "utf-8"));
   }
+  db.prepare(
+    `INSERT INTO install_state
+       (id, client_slug, product_version, schema_version, gate_version, installed_at, ring)
+     VALUES (1, 'fixture', '0.0.0', 11, 0, '2026-01-01T00:00:00Z', 'test')`
+  ).run();
   const env = {
     _db: db,
     DB: {

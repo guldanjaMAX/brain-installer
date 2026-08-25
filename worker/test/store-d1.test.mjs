@@ -1,7 +1,7 @@
 import {
   D1_QUERY_BIND_LIMIT, RETRIEVAL_CANDIDATE_DEPTH, collapseRankedDocuments, forget,
   fuseRRF, search, searchVector, upsertChunks, replaceDocumentChunks,
-  metadataTokenFor, vectorFilterFor,
+  canStageDocumentRevision, stageDocumentRevision, metadataTokenFor, vectorFilterFor,
 } from "../src/lib/store-d1.js";
 import {
   currentEvidenceCandidates, hasExplicitCurrentIntent, matchesEntityAnchors,
@@ -106,8 +106,27 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 /* ---- genuinely empty is distinguishable from degraded ---- */
 {
   const env = {
-    DB: { prepare: () => ({ bind: () => ({ all: async () => ({ results: [] }) }) }) },
-    VECTORIZE: { query: async () => ({ matches: [] }) },
+    DB: {
+      prepare: (sql) => /vector_projection_mutation_id AS mutation_id/.test(sql)
+        ? ({ first: async () => ({
+          schema_version: 12,
+          mutation_id: null,
+          mutation_submitted_at: null,
+          projection_status: "verified",
+          bootstrap_epoch: 0,
+          bootstrap_cursor: null,
+          bootstrap_high_water: null,
+          expected_vectors: 0,
+          pending: 0,
+          submitted: 0,
+          oldest_queued_at: null,
+        }) })
+        : ({ bind: () => ({ all: async () => ({ results: [] }) }) }),
+    },
+    VECTORIZE: {
+      query: async () => ({ matches: [] }),
+      describe: async () => ({ vectorCount: 0, processedUpToMutation: null }),
+    },
   };
   const r = await search(env, { query: "nothing", embedding: [0.1], limit: 5 });
   check("empty corpus is not marked degraded", r.degraded === null, String(r.degraded));
@@ -653,6 +672,29 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("empty input writes nothing", (await upsertChunks(env, [])).written === 0);
 }
 
+/* ---- large chunk sets preserve recovery across our internal transaction slices ---- */
+{
+  const batches = [];
+  const env = {
+    DB: {
+      prepare: (sql) => ({ bind: (...args) => ({ sql, args }) }),
+      batch: async (statements) => { batches.push(statements); return statements.map(() => ({})); },
+    },
+  };
+  const chunks = Array.from({ length: 51 }, (_, index) => ({
+    chunk_uid: `message:large#${index}`, doc_uid: "message:large", chunk_ix: index,
+    text: `synthetic ${index}`, source: "message",
+  }));
+  const out = await upsertChunks(env, chunks, {
+    expectedContentHash: `pending:${"a".repeat(64)}:${"b".repeat(32)}`,
+  });
+  check("a 51-chunk write is sliced into 100 and 2 statements",
+    batches.map((batch) => batch.length).join(",") === "100,2", JSON.stringify(batches.map((batch) => batch.length)));
+  check("large chunk writes stay inside the internal transaction slice",
+    Math.max(...batches.map((batch) => batch.length)) <= 100);
+  check("sliced chunk writes preserve exact queue accounting", out.written === 51 && out.queued === 51);
+}
+
 /* ---- stale revisions cannot delete or replace a newer revision's chunks ---- */
 {
   const batched = [];
@@ -677,11 +719,64 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     statements.slice(2).map((statement) => statement.sql).join("\n"));
 }
 
+/* ---- bounded atomic staging saves calls without coupling documents ---- */
+{
+  const batches = [];
+  let forceUnverifiedChunk = false;
+  const env = {
+    DB: {
+      prepare: (sql) => ({ bind: (...args) => ({ _sql: sql, _args: args }) }),
+      batch: async (statements) => {
+        batches.push(statements);
+        return statements.map((_, index) => ({
+          meta: { changes: forceUnverifiedChunk && index === 3 ? 0 : 1 },
+        }));
+      },
+    },
+  };
+  const marker = `pending:${"c".repeat(64)}:${"d".repeat(32)}`;
+  const chunk = {
+    chunk_uid: "message:atomic#0", doc_uid: "message:atomic", chunk_ix: 0,
+    text: "synthetic", source: "message", title: "Synthetic",
+  };
+  const staged = await stageDocumentRevision(env, {
+    documentStatement: { _sql: "INSERT INTO documents", _args: [] },
+    docUid: "message:atomic",
+    chunks: [chunk],
+    expectedContentHash: marker,
+  });
+  check("one-chunk atomic staging uses one five-statement D1 transaction",
+    batches.length === 1 && batches[0].length === 5, JSON.stringify(batches.map((batch) => batch.length)));
+  check("every derived atomic-stage write is marker guarded",
+    batches[0].slice(1).every((statement) => statement._sql.includes("content_hash") && statement._args.includes(marker)),
+    batches[0].slice(1).map((statement) => statement._sql).join("\n"));
+  check("atomic chunks inherit the merged durable filter metadata",
+    /documents\.client/.test(batches[0][3]._sql) && /documents\.platform/.test(batches[0][3]._sql), batches[0][3]._sql);
+  check("atomic staging reports its exact durable and queued rows", staged.written === 1 && staged.queued === 1);
+  check("the atomic-stage bound accepts 48 chunks and refuses 49",
+    canStageDocumentRevision(48) && !canStageDocumentRevision(49));
+
+  forceUnverifiedChunk = true;
+  let failedClosed = false;
+  try {
+    await stageDocumentRevision(env, {
+      documentStatement: { _sql: "INSERT INTO documents", _args: [] },
+      docUid: "message:atomic-unverified",
+      chunks: [{ ...chunk, chunk_uid: "message:atomic-unverified#0", doc_uid: "message:atomic-unverified" }],
+      expectedContentHash: marker,
+    });
+  } catch {
+    failedClosed = true;
+  }
+  check("a guarded atomic write with no changed row cannot receive success", failedClosed);
+}
+
 /* ---- source forget must stay below D1's 100-variable statement limit ---- */
 {
   const docs = Array.from({ length: 205 }, (_, i) => ({ doc_uid: `drive:${i}` }));
   let maxBinds = 0;
   let maxStatements = 0;
+  let vectorDeleteCalls = 0;
   const env = {
     DB: {
       prepare: (sql) => ({
@@ -695,6 +790,12 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
                 ? docs
                 : /SELECT chunk_uid, vector_id FROM chunks/.test(sql)
                   ? args.map((id) => ({ chunk_uid: `${id}#0`, vector_id: `${id}#0` }))
+                  : /FROM vector_outbox/.test(sql)
+                    ? args.map((id, index) => ({
+                      chunk_uid: id,
+                      vector_id: id,
+                      generation: index + 1,
+                    }))
                   : [],
             }),
             run: async () => ({}),
@@ -703,16 +804,19 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
       }),
       batch: async (statements) => {
         maxStatements = Math.max(maxStatements, statements.length);
-        if (statements.length > 100) throw new Error("D1 batch statement limit exceeded");
+        if (statements.length > 100) throw new Error("internal transaction slice exceeded");
         for (const statement of statements) maxBinds = Math.max(maxBinds, statement?._args?.length || 0);
       },
     },
-    VECTORIZE: { deleteByIds: async () => {} },
+    VECTORIZE: { deleteByIds: async () => { vectorDeleteCalls++; } },
   };
   const removed = await forget(env, { source: "drive", dryRun: false });
-  check("forget handles more than 100 documents", removed.documents === 205 && removed.vectors === 205, JSON.stringify(removed));
+  check("forget handles more than 100 documents",
+    removed.documents === 205 && removed.vectors === 0 && removed.vector_cleanup_queued === 205,
+    JSON.stringify(removed));
+  check("forget leaves physical cleanup to the sole leased Vectorize writer", vectorDeleteCalls === 0, String(vectorDeleteCalls));
   check("forget never exceeds D1's bind ceiling", maxBinds <= 100, String(maxBinds));
-  check("vector cleanup never exceeds D1's batch-statement ceiling", maxStatements <= 100, String(maxStatements));
+  check("vector cleanup stays inside the conservative transaction slice", maxStatements <= 100, String(maxStatements));
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nstore-d1: all ${ran} tests passed`);

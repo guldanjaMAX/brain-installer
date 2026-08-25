@@ -754,8 +754,12 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   // And the ones that genuinely need Cloudflare should NOT have been changed.
   for (const name of ["cmdProvision", "cmdDeploy", "cmdMigrate"]) {
     const b = bodyOf(name);
+    const resolvesCloudflare = name === "cmdMigrate"
+      ? /const resolveMigrateAccount = options\.resolveAccount \?\? resolveAccount;/.test(b || "") &&
+        /const acct = await resolveMigrateAccount\(m\);/.test(b || "")
+      : /const acct = await resolveAccount\(m\);/.test(b || "");
     check(`${name} still requires Cloudflare, as it must`,
-      b !== null && /const acct = await resolveAccount\(m\);/.test(b));
+      b !== null && resolvesCloudflare);
   }
 }
 

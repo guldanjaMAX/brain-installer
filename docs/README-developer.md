@@ -95,22 +95,35 @@ node brain.mjs test       ./acme.manifest.json   # full acceptance suite
 ```
 
 The supported beginner update is `brain update [manifest]`. It verifies the
-account, requires a pre-change D1 bookmark, migrates, deploys, reconciles
-allowed Worker secrets, requires exact-version health plus the full acceptance
-suite, commits and reads back D1 version state, then atomically commits and
-reads back the local manifest version. The older `brain upgrade` command uses
-the same engine and cannot bypass those gates. Neither path restores D1
-automatically because that would discard writes made after the bookmark.
+account, requires a pre-change D1 bookmark, deploys and verifies a paused
+compatibility Worker, waits the declared 20-minute old-invocation window,
+migrates, deploys active mode, resumes any durable 99-row vector bootstrap,
+reconciles allowed Worker secrets, requires exact-version health plus the full acceptance suite, commits and reads back D1
+version state, then atomically commits and reads back the local manifest
+version. Paused mode rejects every corpus and source mutation before D1 access.
+The older `brain upgrade` command uses the same engine and cannot
+bypass those gates. Neither path restores D1 automatically because that would
+discard writes made after the bookmark. Direct `brain migrate` refuses a live
+D1 install when the pending writer-protocol migrations require this cutover.
 
 Always `--dry-run` first. It walks, extracts and judges every file without
 sending anything, and prints what would be skipped and why. On a real corpus
 that list is the useful part: it is where you find out that 12,000 PDFs are not
 supported yet, before rather than after.
 
-`verify`, `provision` and `migrate` are all safe to re-run. Provision adopts
-existing resources rather than duplicating them, and **refuses** to adopt a
-Vectorize index with the wrong dimensions or metric rather than silently writing
-vectors that would be rejected or mis-ranked.
+`verify` and `provision` are safe to re-run. Migration execution itself is
+restart-safe after every independently committed statement, but a live D1
+install must use `brain update` whenever the pending migration changes the
+Vectorize writer protocol. Provision adopts existing resources rather than
+duplicating them, and **refuses** to adopt a Vectorize index with the wrong
+dimensions or metric rather than silently writing vectors that would be
+rejected or mis-ranked.
+
+If a first setup stopped after creating part of the migration schema but before
+its receipt/seed, rerun setup remains fail-closed. With no exact manifest Worker
+it cannot distinguish that partial setup from a renamed live writer. It changes
+no more D1 state and instructs the owner to run `brain update <manifest>` for
+the verified paused-writer cutover, then rerun `brain setup <manifest>`.
 
 Verified recovery uses the provider-neutral state machine in
 `operations/verified-recovery.mjs` and the disposable-only Cloudflare adapter in

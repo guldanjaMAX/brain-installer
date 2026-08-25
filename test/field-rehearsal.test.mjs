@@ -33,9 +33,9 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 /* ---- one bad chunk must not strand the queue behind it ---- */
 {
   const rows = [
-    { chunk_uid: "a#0", text: "fine", source: "s", doc_uid: "a" },
-    { chunk_uid: "poison#0", text: "BAD", source: "s", doc_uid: "poison" },
-    { chunk_uid: "b#0", text: "also fine", source: "s", doc_uid: "b" },
+    { chunk_uid: "a#0", text: "fine", source: "s", doc_uid: "a", generation: 1 },
+    { chunk_uid: "poison#0", text: "BAD", source: "s", doc_uid: "poison", generation: 2 },
+    { chunk_uid: "b#0", text: "also fine", source: "s", doc_uid: "b", generation: 3 },
   ];
   const updates = [];
   const deleted = [];
@@ -45,9 +45,12 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
         // first() is called both with and without bind() in this path, so the
         // mock has to answer either way.
         const shape = (b = []) => ({
-          all: async () => ({ results: /WHERE op = 'delete'/.test(q) ? [] : rows }),
+          all: async () => ({ results:
+            /submitted_mutation_id IS NOT NULL/.test(q) || /WHERE op = 'delete'/.test(q) ? [] : rows }),
           first: async () => ({ n: 1 }),
-          run: async () => ({}),
+          run: async () => /UPDATE install_state/.test(q)
+            ? ({ meta: { changes: 1 } })
+            : ({}),
           _q: q, _b: b,
         });
         const o = shape();
@@ -59,17 +62,21 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
           if (/DELETE FROM vector_outbox/.test(s._q)) deleted.push(s._b[0]);
           if (/UPDATE vector_outbox/.test(s._q)) updates.push(s._b[0]);
         }
+        // D1 batch returns one receipt per statement. The production drain
+        // refuses an accepted provider write unless both its durable vector-id
+        // remap and its per-row submission CAS have unambiguous receipts.
+        return stmts.map(() => ({ meta: { changes: 1 } }));
       },
     },
-    VECTORIZE: { upsert: async () => {} },
+    VECTORIZE: { upsert: async () => ({ mutationId: "fixture-poison-isolation" }) },
   };
   const r = await drainOutbox(env, {
     embed: async (t) => { if (t === "BAD") throw new Error("Workers AI returned no embedding"); return [0.1]; },
   });
-  check("the good chunks still drain past a poisoned one", r.drained === 2, JSON.stringify(r));
+  check("the good chunks still submit past a poisoned one", r.submitted === 2, JSON.stringify(r));
   check("the bad one is counted, not swallowed", r.failed === 1, JSON.stringify(r));
   check("and its error is reported", (r.errors || []).some((e) => /no embedding/.test(e)), JSON.stringify(r.errors));
-  check("only the good ones are removed from the queue", deleted.length === 2 && !deleted.includes("poison#0"), JSON.stringify(deleted));
+  check("accepted rows stay queued until their exact generation is visible", deleted.length === 0, JSON.stringify(deleted));
   check("the bad one records an attempt so it is bounded, not invisible", updates.includes("poison#0"), JSON.stringify(updates));
 }
 
@@ -138,12 +145,17 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     DB: {
       prepare(q) {
         const shape = (b = []) => ({
-          all: async () => ({ results: /WHERE op = 'delete'/.test(q) ? [] : [
+          all: async () => ({ results:
+            /submitted_mutation_id IS NOT NULL/.test(q) || /WHERE op = 'delete'/.test(q) ? [] : [
             // 97 bytes: exactly the shape that must be hashed
-            { chunk_uid: "docs:Financial/2026/Q3 Statements/Wells Fargo Business Checking Statement 2026-07 Reconciled.md#0", text: "t", source: "docs", doc_uid: "d" },
+            { chunk_uid: "docs:Financial/2026/Q3 Statements/Wells Fargo Business Checking Statement 2026-07 Reconciled.md#0", text: "t", source: "docs", doc_uid: "d", generation: 1 },
           ] }),
-          first: async () => ({ n: 0 }),
-          run: async () => ({}),
+          // The accepted row remains in the outbox until a later invocation
+          // proves provider visibility, so the durable depth is still one.
+          first: async () => ({ n: 1 }),
+          run: async () => /UPDATE install_state/.test(q)
+            ? ({ meta: { changes: 1 } })
+            : ({}),
           _q: q, _b: b,
         });
         const o = shape();
@@ -154,9 +166,13 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
         for (const st of stmts) {
           if (/UPDATE chunks SET vector_id/.test(st._q)) stored.push(st._b);
         }
+        return stmts.map(() => ({ meta: { changes: 1 } }));
       },
     },
-    VECTORIZE: { upsert: async (v) => { stored.push(["__upserted__", v[0].id]); } },
+    VECTORIZE: { upsert: async (v) => {
+      stored.push(["__upserted__", v[0].id]);
+      return { mutationId: "fixture-legacy-remap" };
+    } },
   };
   const r = await drainOutbox(env, { embed: async () => [0.1] });
   const upserted = stored.find((x) => x[0] === "__upserted__");
@@ -164,7 +180,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   const written = stored.find((x) => x[0] !== "__upserted__" && String(x[1] || "").startsWith("h:"));
   check("and the drain writes that id BACK to the chunk row", !!written,
     "without this the chunk embeds and is then unreachable by meaning, keyword-only and silent");
-  check("the drain still reports success", r.drained === 1, JSON.stringify(r));
+  check("the drain reports durable submission pending visibility", r.submitted === 1 && r.waiting === 1, JSON.stringify(r));
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nfield-rehearsal: all ${ran} tests passed`);

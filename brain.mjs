@@ -1102,6 +1102,9 @@ export async function cmdDeploy(manifestPath, options = {}) {
       { type: "plain_text", name: "BRAIN_NAME", text: m.client?.slug || "brain" },
       { type: "plain_text", name: "BRAIN_OWNER", text: m.client?.display_name || "the owner" },
       { type: "plain_text", name: "BRAIN_VERSION", text: PRODUCT_VERSION },
+      ...(options.pauseVectorDrainForUpgrade === true
+        ? [{ type: "plain_text", name: "VECTOR_DRAIN_MODE", text: "paused-for-upgrade" }]
+        : []),
       {
         type: "plain_text",
         name: "CHUNK_SIZE",
@@ -1502,18 +1505,58 @@ export async function cmdSecrets(manifestPath, options = {}) {
  *
  * Returns "accept" | "retry" | "fail".
  */
-export function healthProbeVerdict({ ok, body, expectVersion = null, attempt = 1, attempts = 6 }) {
+export function healthProbeVerdict({
+  ok,
+  body,
+  expectVersion = null,
+  expectDrainMode = null,
+  attempt = 1,
+  attempts = 6,
+}) {
   if (ok) {
-    if (!expectVersion) return "accept";
-    let live = null;
-    try { live = JSON.parse(body)?.version || null; } catch { /* not JSON */ }
-    if (live === expectVersion) return "accept";
+    if (!expectVersion && !expectDrainMode) return "accept";
+    let parsed = null;
+    try { parsed = JSON.parse(body); } catch { /* not JSON */ }
+    const versionMatches = !expectVersion || parsed?.version === expectVersion;
+    const drainModeMatches = !expectDrainMode || (
+      parsed?.vector_writer_protocol === "lease-v1" &&
+      parsed?.vector_drain_mode === expectDrainMode
+    );
+    if (versionMatches && drainModeMatches) return "accept";
     return attempt < attempts ? "retry" : "fail";
   }
   return attempt < attempts ? "retry" : "fail";
 }
 
-async function cmdHealth(manifestPath, { expectVersion = null, durableAdminKeyOnly = false } = {}) {
+/**
+ * Give count mismatches a direction-aware recovery. Missing provider rows can
+ * be rebuilt from D1. Excess provider-only rows cannot: their ids no longer
+ * exist in D1, so a reindex has nothing it can enumerate and delete.
+ */
+function vectorCountMismatchFailure(expected, actual, { prefix = "" } = {}) {
+  const header = `${prefix}Vectorize holds ${actual} vector(s), but D1 requires ${expected}.`;
+  if (actual < expected) {
+    return header + "\n" +
+      "      Semantic search is missing vectors. Diagnose and rebuild the missing projection:" + "\n" +
+      "      brain diagnose <manifest>" + "\n" +
+      "      brain reindex <manifest> --yes";
+  }
+  if (actual > expected) {
+    return header + "\n" +
+      "      Vectorize contains provider-only excess vectors that reindex cannot enumerate or remove." + "\n" +
+      "      Do not treat this brain as healthy. Use supervised recovery to recreate/rebind a clean" + "\n" +
+      "      Vectorize index and every metadata index, then reindex, drain, health-check, and test.";
+  }
+  return header + "\n" +
+    "      The count receipt contradicts its mismatch reason. Run `brain diagnose <manifest>` and keep this brain out of service.";
+}
+
+async function cmdHealth(manifestPath, {
+  expectVersion = null,
+  expectDrainMode = null,
+  durableAdminKeyOnly = false,
+  reachOnly = false,
+} = {}) {
   const { m } = loadManifest(manifestPath);
   // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker
   // over plain HTTPS with the admin key, so it must keep working after our token
@@ -1550,20 +1593,36 @@ async function cmdHealth(manifestPath, { expectVersion = null, durableAdminKeyOn
     // 200 verifies the build that was just replaced and reports it as success.
     // Found in the field on a real upgrade: the probe read 0.1.1 and the tool
     // said "now at 0.1.2". A genuinely broken deploy would pass this green.
-    const verdict = healthProbeVerdict({ ok: res.ok, body, expectVersion, attempt: i, attempts: healthAttempts });
+    const verdict = healthProbeVerdict({
+      ok: res.ok,
+      body,
+      expectVersion,
+      expectDrainMode,
+      attempt: i,
+      attempts: healthAttempts,
+    });
     if (verdict === "accept") break;
 
-    if (res.ok && expectVersion) {
+    if (res.ok && (expectVersion || expectDrainMode)) {
       let live = null;
-      try { live = JSON.parse(body)?.version || null; } catch { /* not JSON */ }
+      let liveDrainMode = null;
+      try {
+        const parsed = JSON.parse(body);
+        live = parsed?.version || null;
+        liveDrainMode = parsed?.vector_drain_mode || null;
+      } catch { /* not JSON */ }
       if (verdict === "retry") {
-        info(`/health is still answering ${live || "an unknown version"}, waiting for ${expectVersion} to take over`);
+        const expectation = [
+          expectVersion ? `version ${expectVersion}` : null,
+          expectDrainMode ? `vector drain mode ${expectDrainMode}` : null,
+        ].filter(Boolean).join(" and ");
+        info(`/health is still answering ${live || "an unknown version"}/${liveDrainMode || "unknown drain mode"}, waiting for ${expectation}`);
         await new Promise((r) => setTimeout(r, 5000));
         continue;
       }
       die(
-        `the deploy is not live. /health still reports ${live || "no version"} after ${healthAttempts} attempts,` + "\n" +
-          `  but ${expectVersion} was just deployed.` + "\n" +
+        `the deploy is not live. /health still reports ${live || "no version"}/${liveDrainMode || "no drain mode"} after ${healthAttempts} attempts,` + "\n" +
+          `  but ${expectVersion || "the expected version"}/${expectDrainMode || "the expected drain mode"} was just deployed.` + "\n" +
           "  The upgrade is NOT verified. Re-run it, and if this repeats the worker is" + "\n" +
           "  not being replaced: check the script name in the manifest against Cloudflare."
       );
@@ -1577,6 +1636,7 @@ async function cmdHealth(manifestPath, { expectVersion = null, durableAdminKeyOn
   }
   if (!res.ok) die(`/health returned ${res.status} after ${healthAttempts} attempts: ${body.slice(0, 200)}`);
   ok(`/health ${res.status} ${body.slice(0, 160)}`);
+  if (reachOnly) return;
 
   const key = resolveAdminKey(manifestPath, { ignoreEnvironment: durableAdminKeyOnly });
   if (!key) {
@@ -1645,10 +1705,24 @@ async function cmdHealth(manifestPath, { expectVersion = null, durableAdminKeyOn
         if (!backlog || typeof backlog !== "object" || Array.isArray(backlog) ||
             Object.prototype.hasOwnProperty.call(backlog, "error") ||
             !validCount(backlog.pending) || !validCount(backlog.upserts) ||
-            !validCount(backlog.deletes) || backlog.upserts + backlog.deletes !== backlog.pending) {
+            !validCount(backlog.deletes) || !validCount(backlog.submitted) ||
+            backlog.upserts + backlog.deletes !== backlog.pending ||
+            backlog.submitted > backlog.pending) {
           die(
             "the documents endpoint could not prove a valid D1 vector backlog." + "\n" +
               "      Health cannot pass because semantic indexing may be stalled or incomplete."
+          );
+        }
+        const readiness = inventory.vector_readiness;
+        if (!readiness || typeof readiness !== "object" || Array.isArray(readiness) ||
+            Object.prototype.hasOwnProperty.call(readiness, "error") ||
+            typeof readiness.ready !== "boolean" || !validCount(readiness.expected_vectors) ||
+            !validCount(readiness.actual_vectors) || !validCount(readiness.pending) ||
+            !validCount(readiness.submitted) || readiness.pending !== backlog.pending ||
+            readiness.submitted !== backlog.submitted || readiness.submitted > readiness.pending) {
+          die(
+            "the documents endpoint could not prove Vectorize query readiness." + "\n" +
+              "      Health cannot pass from queue depth alone because Vectorize mutations are asynchronous."
           );
         }
         if (backlog.pending > 0) {
@@ -1663,21 +1737,33 @@ async function cmdHealth(manifestPath, { expectVersion = null, durableAdminKeyOn
           if (oldest > 30) {
             die(
               `${backlog.pending} vector operation(s) are stalled` +
-                ` (${backlog.upserts} upsert, ${backlog.deletes} delete), oldest queued ${oldest} min ago.` + "\n" +
+                ` (${backlog.upserts} upsert, ${backlog.deletes} delete, ${backlog.submitted} accepted), oldest queued ${oldest} min ago.` + "\n" +
                 "      Older than 30 minutes means the drain cron is not keeping up. Upserts are" + "\n" +
                 "      keyword-only; deletes leave stale vectors competing. Clear it now with:" + "\n" +
                 "      brain drain <manifest>" + "\n" +
                 "      If it returns, inspect the Worker schedule in the Cloudflare dashboard."
             );
           }
-          info(
-            `${backlog.pending} vector operation(s) pending` +
-              ` (${backlog.upserts} upsert, ${backlog.deletes} delete)` +
-              `, oldest queued ${oldest} min ago (the drain cron will clear these).`
+          die(
+            `${backlog.pending} vector operation(s) are not query-visible yet` +
+              ` (${backlog.submitted} accepted by Vectorize), oldest queued ${oldest} min ago.` + "\n" +
+              "      Provider acceptance is not completion. Finish and confirm visibility with:" + "\n" +
+              "      brain drain <manifest>"
           );
-        } else {
-          ok("vector index is caught up with the text");
         }
+        if (!readiness.ready || readiness.actual_vectors !== readiness.expected_vectors) {
+          if (readiness.reason === "vector_count_mismatch") {
+            die(vectorCountMismatchFailure(
+              readiness.expected_vectors,
+              readiness.actual_vectors,
+            ));
+          }
+          die(
+            "Vectorize has accepted work that is not query-visible yet." + "\n" +
+              "      Re-run `brain drain <manifest>`; it waits without paying to re-embed accepted rows."
+          );
+        }
+        ok(`vector index is query-ready (${readiness.actual_vectors} confirmed vector(s))`);
       }
       return;
     }
@@ -1857,24 +1943,97 @@ export function splitStatements(sql) {
   return out.map((s) => s.trim()).filter(Boolean);
 }
 
-async function appliedVersions(acctId, dbId) {
+function addedColumnDescriptor(statement) {
+  const match = String(statement).match(
+    /^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)([\s\S]*)$/i,
+  );
+  if (!match) return null;
+  const tail = match[4] || "";
+  const defaultMatch = tail.match(/\bDEFAULT\s+([^\s,;]+)/i);
+  return {
+    table: match[1],
+    column: match[2],
+    type: match[3].toUpperCase(),
+    notNull: /\bNOT\s+NULL\b/i.test(tail),
+    defaultValue: defaultMatch ? defaultMatch[1] : null,
+  };
+}
+
+function normalizedSqlDefault(value) {
+  if (value === null || value === undefined) return null;
+  let text = String(value).trim();
+  while (text.startsWith("(") && text.endsWith(")")) {
+    text = text.slice(1, -1).trim();
+  }
+  return text;
+}
+
+/**
+ * Apply per-statement D1 migrations so a process restart can safely resume.
+ *
+ * D1's REST query endpoint commits each statement independently. An ADD COLUMN
+ * can therefore succeed even when the command dies before schema_migrations is
+ * updated. SQLite has no portable ADD COLUMN IF NOT EXISTS syntax, so the
+ * runner proves the existing column's complete declared contract before
+ * treating that exact statement as already applied. All other statements in
+ * restart-sensitive migrations must themselves be idempotent.
+ */
+export async function runRestartSafeMigrationStatements(
+  statements,
+  queryStatement,
+  { afterStatement = null } = {},
+) {
+  if (!Array.isArray(statements) || typeof queryStatement !== "function") {
+    throw new Error("migration statement runner received invalid input");
+  }
+  for (let index = 0; index < statements.length; index++) {
+    const statement = statements[index];
+    const descriptor = addedColumnDescriptor(statement);
+    let skipped = false;
+    if (descriptor) {
+      const inspected = await queryStatement(`PRAGMA table_info(${descriptor.table})`);
+      if (!inspected || !Array.isArray(inspected.results)) {
+        throw new Error(`migration could not inspect ${descriptor.table}.${descriptor.column}`);
+      }
+      const existing = inspected.results.find((row) => row?.name === descriptor.column);
+      if (existing) {
+        const compatible = String(existing.type || "").toUpperCase() === descriptor.type &&
+          Number(existing.notnull || 0) === Number(descriptor.notNull) &&
+          normalizedSqlDefault(existing.dflt_value) === normalizedSqlDefault(descriptor.defaultValue);
+        if (!compatible) {
+          throw new Error(
+            `migration column ${descriptor.table}.${descriptor.column} already exists with an incompatible schema`,
+          );
+        }
+        skipped = true;
+      }
+    }
+    if (!skipped) await queryStatement(statement);
+    if (afterStatement) await afterStatement({ index, statement, skipped });
+  }
+}
+
+async function appliedVersions(acctId, dbId, queryDatabase = d1Query) {
   try {
-    const r = await d1Query(acctId, dbId, "SELECT version, checksum, name FROM schema_migrations");
+    const r = await queryDatabase(acctId, dbId, "SELECT version, checksum, name FROM schema_migrations");
     return r?.results || [];
   } catch {
     return []; // table does not exist yet, so nothing is applied
   }
 }
 
-async function cmdMigrate(manifestPath, { silent = false } = {}) {
+export async function cmdMigrate(manifestPath, options = {}) {
+  const { silent = false } = options;
+  const resolveMigrateAccount = options.resolveAccount ?? resolveAccount;
+  const queryDatabase = options.d1Query ?? d1Query;
   const { m } = loadManifest(manifestPath);
-  const acct = await resolveAccount(m);
+  const acct = await resolveMigrateAccount(m);
   const dbId = m.infrastructure?.cloudflare?.d1_database_id;
   if (!dbId) die("no d1_database_id in the manifest. Run `brain provision` first.");
 
   const all = loadMigrations();
   if (!all.length) die("no migrations found.");
-  const applied = await appliedVersions(acct.id, dbId);
+  const applied = await appliedVersions(acct.id, dbId, queryDatabase);
   const appliedMap = new Map(applied.map((a) => [a.version, a]));
 
   // A migration whose content changed after being applied is a hard stop.
@@ -1895,15 +2054,67 @@ async function cmdMigrate(manifestPath, { silent = false } = {}) {
   const pending = all.filter((mig) => !appliedMap.has(mig.version));
   if (!pending.length) {
     if (!silent) ok(`schema up to date (${all.length} migration(s) applied)`);
-    return { applied: 0, schemaVersion: Math.max(...all.map((x) => x.version)) };
+  }
+
+  // 0010-0012 change the protocol used by every Vectorize writer. A public
+  // `brain migrate` against an already-running pre-lease Worker would recreate
+  // the rolling race that update's paused compatibility deployment prevents.
+  // The private option is passed only by the verified setup/update cutover; it
+  // is intentionally not a CLI flag.
+  if ((m.infrastructure?.cloudflare?.storage || "d1") === "d1" &&
+      pending.some((migration) => [10, 11, 12].includes(migration.version)) &&
+      options.vectorDrainQuiesced !== true) {
+    let installTable;
+    try {
+      installTable = await queryDatabase(
+        acct.id,
+        dbId,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'install_state'",
+      );
+    } catch {
+      die("migration could not verify whether this brain is already live. Nothing was migrated.");
+    }
+    if (!installTable || !Array.isArray(installTable.results) || installTable.results.length > 1) {
+      die("migration received an ambiguous install-state inventory. Nothing was migrated.");
+    }
+    if (installTable.results.length === 1) {
+      // Absence of the singleton row is not freshness proof. A legacy or
+      // interrupted install can have a live pre-lease Worker and the table but
+      // no id=1 seed. Only a database with no install_state table at all is
+      // eligible for the direct fresh-install path; every other prefix must use
+      // setup/update's paused-worker quiescence protocol.
+      die(
+        "this existing brain needs the verified vector-writer cutover before migrations 0010-0012.\n" +
+          "      Run `brain update` instead; direct migrate was stopped before changing D1.",
+      );
+    }
+    let inventory;
+    try {
+      inventory = await queryDatabase(
+        acct.id,
+        dbId,
+        `SELECT COUNT(*) AS user_table_count FROM sqlite_master
+          WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> '_cf_KV'`,
+      );
+    } catch {
+      die("migration could not prove that this database is a fresh empty resource. Nothing was migrated.");
+    }
+    if (!inventory || !Array.isArray(inventory.results) || inventory.results.length !== 1 ||
+        Number(inventory.results[0]?.user_table_count) !== 0) {
+      die(
+        "this database is not provably fresh, so migrations 0010-0012 require the verified writer cutover.\n" +
+          "      Run `brain update` instead; direct migrate was stopped before changing D1.",
+      );
+    }
   }
 
   for (const mig of pending) {
     if (!silent) info(`applying ${mig.name}`);
-    for (const stmt of splitStatements(mig.sql)) {
-      await d1Query(acct.id, dbId, stmt);
-    }
-    await d1Query(
+    await runRestartSafeMigrationStatements(
+      splitStatements(mig.sql),
+      (statement) => queryDatabase(acct.id, dbId, statement),
+    );
+    await queryDatabase(
       acct.id,
       dbId,
       "INSERT INTO schema_migrations (version, name, applied_at, checksum) VALUES (?,?,?,?)",
@@ -1921,11 +2132,20 @@ async function cmdMigrate(manifestPath, { silent = false } = {}) {
   // database must not already claim the new version. Only `upgrade` advances
   // it, and only after verification passes.
   const now = new Date().toISOString();
-  await d1Query(
+  await queryDatabase(
     acct.id,
     dbId,
-    `INSERT INTO install_state (id, client_slug, product_version, schema_version, gate_version, installed_at, ring)
-     VALUES (1,?,?,?,?,?,?)
+    `INSERT INTO install_state
+       (id, client_slug, product_version, schema_version, gate_version, installed_at, ring,
+        vector_projection_status, vector_projection_bootstrap_epoch,
+        vector_projection_bootstrap_cursor, vector_projection_bootstrap_high_water)
+     VALUES (
+       1,?,?,?,?,?,?,
+       CASE WHEN EXISTS (SELECT 1 FROM chunks) THEN 'bootstrap_required' ELSE 'verified' END,
+       CASE WHEN EXISTS (SELECT 1 FROM chunks) THEN 1 ELSE 0 END,
+       NULL,
+       (SELECT MAX(chunk_uid) FROM chunks)
+     )
      ON CONFLICT(id) DO UPDATE SET
        client_slug = excluded.client_slug,
        schema_version = excluded.schema_version,
@@ -2249,6 +2469,13 @@ function installStateRow(response) {
   return response.results[0];
 }
 
+// Twenty minutes is the declared maximum supported old HTTP/cron drain
+// invocation. A paused compatibility deployment plus this full grace period is
+// the verified boundary after which no pre-lease Worker can still be writing
+// Vectorize during the schema cutover. The matching new lease TTL is a drift
+// check, not the reason an old Worker is assumed to honor a lease it never had.
+export const VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS = 20 * 60 * 1000;
+
 export async function cmdUpgrade(manifestPath, options = {}) {
   const resolveUpgradeAccount = options.resolveAccount ?? resolveAccount;
   const queryDatabase = options.d1Query ?? d1Query;
@@ -2256,9 +2483,12 @@ export async function cmdUpgrade(manifestPath, options = {}) {
   const migrate = options.cmdMigrate ?? cmdMigrate;
   const deploy = options.cmdDeploy ?? cmdDeploy;
   const reconcileProviders = options.reconcileWorkerProviderSecrets ?? reconcileWorkerProviderSecrets;
+  const drainProjection = options.cmdDrain ?? cmdDrain;
   const verifyHealth = options.cmdHealth ?? cmdHealth;
   const verifyAcceptance = options.cmdTest ?? cmdTest;
   const commitVersion = options.commitManifestVersion ?? commitManifestVersion;
+  const waitForVectorDrainQuiescence = options.waitForVectorDrainQuiescence ??
+    ((milliseconds) => new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds)));
   let originalPin = pinUpdateManifest(manifestPath);
   const executionPin = writePinnedExecutionManifest(originalPin);
   try {
@@ -2333,6 +2563,8 @@ export async function cmdUpgrade(manifestPath, options = {}) {
 
     // The version being upgraded TO is the code in the client's hands right now.
     const toVersion = PRODUCT_VERSION;
+    const usesD1VectorOutbox =
+      (initialManifest.infrastructure?.cloudflare?.storage || "d1") === "d1";
     const stateVersion = before ? before.product_version : null;
     const manifestVersion = initialManifest.brain?.version || null;
     if (before && (typeof stateVersion !== "string" || !stateVersion)) {
@@ -2406,19 +2638,59 @@ export async function cmdUpgrade(manifestPath, options = {}) {
     };
 
     try {
-      await runStage("migration", () => migrate(executionPin.target));
       // The execution manifest is fingerprint-pinned across every remote
       // stage. Legacy manifests have no domain, and a normal deploy persists
       // the workers.dev hostname. Suppress that one local write during update:
       // health can resolve the hostname read-only, while the pinned artifact
       // must remain byte-identical until the verified version commit.
-      await runStage("deployment", () => deploy(executionPin.target, { persistDomain: false }));
+      //
+      // Deploy the lease-aware code PAUSED before changing the schema. An old
+      // Worker ignores the new lease columns, so migration-first would create a
+      // rolling window where it can still write Vectorize concurrently. Exact
+      // paused-mode health proves the compatibility build has taken over; a
+      // full invocation grace then lets every already-started old drain finish.
+      if (usesD1VectorOutbox) {
+        await runStage("paused vector-drain deployment", () => deploy(executionPin.target, {
+          persistDomain: false,
+          pauseVectorDrainForUpgrade: true,
+        }));
+        await runStage("paused vector-drain health verification", () =>
+          verifyHealth(executionPin.target, {
+            expectVersion: toVersion,
+            expectDrainMode: "paused-for-upgrade",
+            reachOnly: true,
+          }));
+        await runStage("vector-drain quiescence", () =>
+          waitForVectorDrainQuiescence(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS));
+        await runStage("migration", () => migrate(executionPin.target, {
+          vectorDrainQuiesced: true,
+        }));
+        await runStage("active vector-drain deployment", () => deploy(executionPin.target, {
+          persistDomain: false,
+          pauseVectorDrainForUpgrade: false,
+        }));
+      } else {
+        await runStage("migration", () => migrate(executionPin.target));
+        await runStage("deployment", () => deploy(executionPin.target, { persistDomain: false }));
+      }
       await runStage("provider-secret reconciliation", ({ manifest, account }) => {
         const scriptName = manifest.brain?.worker_name || `${manifest.client?.slug || "client"}-brain`;
         return reconcileProviders(manifest, account, scriptName, optionalWorkerSecretNames(manifest));
       });
+      if (usesD1VectorOutbox) {
+        // Schema 0012 marks every legacy corpus unverified. The active leased
+        // drain advances a durable 99-row high-water cursor, exact-confirms
+        // each async Vectorize page, and resumes safely if update is rerun.
+        // Health and acceptance remain unreachable until that full projection
+        // has a verified receipt.
+        await runStage("vector projection convergence", () =>
+          drainProjection(executionPin.target));
+      }
       await runStage("exact-version health verification", () =>
-        verifyHealth(executionPin.target, { expectVersion: toVersion }));
+        verifyHealth(executionPin.target, {
+          expectVersion: toVersion,
+          expectDrainMode: usesD1VectorOutbox ? "active" : null,
+        }));
       await runStage("full acceptance test", () =>
         verifyAcceptance(executionPin.target, { expectVersion: toVersion }));
       await runStage("D1 version commit", () => queryDatabase(
@@ -2459,7 +2731,8 @@ export async function cmdUpgrade(manifestPath, options = {}) {
         `update stopped during ${stage}: ${error.message}\n` +
           `      D1 recovery bookmark: ${bookmark}\n` +
           "      Do not restore it as the first response. A D1 restore discards newer writes and\n" +
-          "      does not restore Vectorize, so it requires a reviewed recovery and reindex.\n" +
+          "      does not restore Vectorize. A restore requires reviewed clean-index recreation/rebind\n" +
+          "      before reindex because provider-only excess vectors cannot be enumerated from D1.\n" +
           "      Safe default: fix the reported issue and run brain update again.",
       );
     }
@@ -2482,7 +2755,7 @@ function rollbackLocalPreflight(manifestPath, bookmarkArg) {
 function printRollbackPreview({ bookmark, databaseId }) {
   warn("rollback preview only: nothing was changed.");
   warn("a D1 restore is DESTRUCTIVE: everything written after this bookmark would be lost.");
-  warn("this restores D1 only. It does not restore Vectorize; a full brain reindex is required afterward.");
+  warn("this restores D1 only. It does not restore Vectorize; provider-only excess vectors can require supervised index recreation before reindex.");
   info(`database ${databaseId}, bookmark ${bookmark}`);
   info("After reviewing this recovery, re-run the same command with --yes to perform it.");
   return { confirmed: false, restored: false, databaseId, bookmark };
@@ -2496,6 +2769,10 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
   const resolveRollbackAccount = options.resolveAccount ?? resolveAccount;
   const callCloudflare = options.cf ?? cf;
   const queryDatabase = options.d1Query ?? d1Query;
+  const deployRollbackWorker = options.cmdDeploy ?? cmdDeploy;
+  const verifyRollbackHealth = options.cmdHealth ?? cmdHealth;
+  const waitForVectorDrainQuiescence = options.waitForVectorDrainQuiescence ??
+    ((milliseconds) => new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds)));
   const acct = await resolveRollbackAccount(m);
   if (!acct?.id || (declaredAccountId && declaredAccountId !== acct.id)) {
     die("rollback stopped because the token account does not match the pinned manifest.");
@@ -2505,11 +2782,94 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
   warn("restoring this D1 bookmark is DESTRUCTIVE: everything written since is lost.");
   warn("this restores D1 only. Vectorize must be rebuilt before semantic retrieval is trustworthy.");
   info(`database ${dbId}, bookmark ${bookmark}`);
+  const usesD1VectorOutbox = (m.infrastructure?.cloudflare?.storage || "d1") === "d1";
+  if (usesD1VectorOutbox) {
+    // Time travel restores the lease and mutation-fence rows too. Quiesce every
+    // old writer before restoring them, or an already-started mutation can land
+    // after the restore with no surviving receipt. Keep the Worker paused until
+    // the restored corpus has been durably marked for a new bootstrap epoch.
+    await deployRollbackWorker(pin.target, {
+      persistDomain: false,
+      pauseVectorDrainForUpgrade: true,
+    });
+    revalidateUpdateManifest(pin, "rollback paused vector-drain deployment");
+    await verifyRollbackHealth(pin.target, {
+      expectVersion: PRODUCT_VERSION,
+      expectDrainMode: "paused-for-upgrade",
+      reachOnly: true,
+    });
+    revalidateUpdateManifest(pin, "rollback paused vector-drain health verification");
+    await waitForVectorDrainQuiescence(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS);
+    revalidateUpdateManifest(pin, "rollback vector-drain quiescence");
+  }
   await callCloudflare(`/accounts/${acct.id}/d1/database/${dbId}/time_travel/restore?bookmark=${encodeURIComponent(bookmark)}`, {
     method: "POST",
   });
   revalidateUpdateManifest(pin, "rollback restore");
   ok("D1 restored");
+  if (usesD1VectorOutbox) {
+    try {
+      await queryDatabase(
+        acct.id,
+        dbId,
+        `UPDATE install_state
+            SET vector_drain_lease_owner = NULL,
+                vector_drain_lease_expires_at = NULL,
+                vector_projection_status = CASE
+                  WHEN EXISTS (SELECT 1 FROM chunks) THEN 'bootstrap_required' ELSE 'verified' END,
+                vector_projection_bootstrap_epoch = vector_projection_bootstrap_epoch + 1,
+                vector_projection_bootstrap_cursor = NULL,
+                vector_projection_bootstrap_high_water = (SELECT MAX(chunk_uid) FROM chunks),
+                vector_projection_mutation_id = NULL,
+                vector_projection_submitted_at = NULL
+          WHERE id = 1 AND schema_version >= 12`,
+      );
+      await queryDatabase(
+        acct.id,
+        dbId,
+        `UPDATE vector_outbox
+            SET submitted_mutation_id = NULL, submitted_at = NULL
+          WHERE submitted_mutation_id IS NOT NULL OR submitted_at IS NOT NULL`,
+      );
+      const receipt = await queryDatabase(
+        acct.id,
+        dbId,
+        `SELECT vector_projection_status AS status,
+                vector_drain_lease_owner AS lease_owner,
+                vector_drain_lease_expires_at AS lease_expires_at,
+                vector_projection_mutation_id AS mutation_id,
+                vector_projection_submitted_at AS mutation_submitted_at,
+                vector_projection_bootstrap_cursor AS cursor,
+                vector_projection_bootstrap_high_water AS high_water,
+                (SELECT MAX(chunk_uid) FROM chunks) AS chunk_high_water,
+                (SELECT COUNT(*) FROM vector_outbox
+                  WHERE submitted_mutation_id IS NOT NULL OR submitted_at IS NOT NULL) AS submitted_rows
+           FROM install_state WHERE id = 1`,
+      );
+      if (!receipt || !Array.isArray(receipt.results) || receipt.results.length !== 1 ||
+          !["bootstrap_required", "verified"].includes(receipt.results[0]?.status) ||
+          receipt.results[0]?.lease_owner !== null ||
+          receipt.results[0]?.lease_expires_at !== null ||
+          receipt.results[0]?.mutation_id !== null ||
+          receipt.results[0]?.mutation_submitted_at !== null ||
+          receipt.results[0]?.cursor !== null ||
+          Number(receipt.results[0]?.submitted_rows) !== 0 ||
+          receipt.results[0]?.high_water !== receipt.results[0]?.chunk_high_water) {
+        throw new Error("projection invalidation did not read back");
+      }
+    } catch {
+      die(
+        "D1 was restored, but the semantic projection could not be marked unverified.\n" +
+          "      The compatibility Worker remains paused; do not return this brain to use.\n" +
+          "      Run `brain update` to forward-migrate the restored schema. Then use supervised recovery\n" +
+          "      to recreate/rebind a clean Vectorize index and every metadata index before reindex, drain, health, and test.",
+      );
+    }
+    // D1 time travel cannot enumerate Vectorize ids written after the bookmark.
+    // Reindex can upsert current chunks, but it cannot remove those provider-only
+    // orphans. Keep the complete corpus-write barrier live until a supervised
+    // recovery creates/rebinds a clean index and rebuilds exact readiness.
+  }
   // A rolled-back run must never become the baseline for the next upgrade.
   const marked = await queryDatabase(
     acct.id,
@@ -2521,8 +2881,14 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
   } else {
     warn("D1 was restored, but its upgrade-history marker could not be updated. Record this recovery manually.");
   }
-  warn("semantic retrieval is not repaired yet. Run brain reindex <manifest> before returning this brain to use.");
-  return { confirmed: true, restored: true, databaseId: dbId, bookmark };
+  warn("the Worker remains paused. Recreate/rebind a clean Vectorize index with every metadata index under supervised recovery, then reindex, drain, health-check, and test before active use.");
+  return {
+    confirmed: true,
+    restored: true,
+    databaseId: dbId,
+    bookmark,
+    requiresVectorizeRecreation: usesD1VectorOutbox,
+  };
 }
 
 /* ------------------------------------------------------------ acceptance */
@@ -5682,6 +6048,49 @@ export async function prepareSetupAdminKey(manifestPath, manifest, options = {})
   }
 }
 
+/** Read whether setup is resuming over an already deployed Worker. */
+export async function setupWorkerScriptExists(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const resolveSetupAccount = options.resolveAccount ?? resolveAccount;
+  const callCloudflare = options.cf ?? cf;
+  const account = await resolveSetupAccount(m);
+  const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
+  let scripts;
+  try {
+    scripts = await callCloudflare(`/accounts/${account.id}/workers/scripts`);
+  } catch {
+    die("setup could not prove whether an older Worker is still running. Nothing was migrated.");
+  }
+  if (!Array.isArray(scripts) || scripts.some((row) =>
+    !row || typeof row !== "object" || typeof row.id !== "string" || !row.id)) {
+    die("setup received an ambiguous Worker inventory. Nothing was migrated.");
+  }
+  return scripts.some((row) => row.id === scriptName);
+}
+
+/** Capture the same required pre-migration recovery point used by update. */
+export async function captureSetupD1Bookmark(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const resolveSetupAccount = options.resolveAccount ?? resolveAccount;
+  const callCloudflare = options.cf ?? cf;
+  const account = await resolveSetupAccount(m);
+  const databaseId = m.infrastructure?.cloudflare?.d1_database_id;
+  if (!databaseId) die("setup cannot capture a recovery bookmark without a pinned D1 database id.");
+  let bookmark;
+  try {
+    const response = await callCloudflare(
+      `/accounts/${account.id}/d1/database/${databaseId}/time_travel/bookmark`,
+    );
+    bookmark = response?.bookmark;
+  } catch {
+    die("setup stopped because the required D1 recovery bookmark could not be captured. Nothing was migrated.");
+  }
+  if (!validD1Bookmark(bookmark)) {
+    die("setup stopped because Cloudflare returned no valid D1 recovery bookmark. Nothing was migrated.");
+  }
+  return bookmark;
+}
+
 /**
  * brain setup — nothing to a working brain, in one command.
  *
@@ -5775,8 +6184,125 @@ export async function cmdSetup(manifestPath, options = {}) {
   console.log(`\n  ${c.bold("Step 3 of 6")}  creating the brain in your Cloudflare account\n`);
   await (options.cmdVerify ?? cmdVerify)(target);
   await (options.cmdProvision ?? cmdProvision)(target);
-  await (options.cmdMigrate ?? cmdMigrate)(target);
-  await (options.cmdDeploy ?? cmdDeploy)(target);
+  const migrateSetup = options.cmdMigrate ?? cmdMigrate;
+  const deploySetup = options.cmdDeploy ?? cmdDeploy;
+  const healthSetup = options.cmdHealth ?? cmdHealth;
+  const drainSetup = options.cmdDrain ?? cmdDrain;
+  const detectExistingWorker = options.setupWorkerScriptExists ?? setupWorkerScriptExists;
+  // Pin the post-provision manifest before asking whether its exact Worker
+  // exists. The inventory decision, bookmark, paused Worker, migration, and
+  // active Worker must all name one immutable account/database/script tuple.
+  // A user edit during the grace window stops before migration instead of
+  // pairing one database with another database's recovery bookmark.
+  const setupOriginalPin = pinUpdateManifest(target);
+  let setupExecutionPin = writePinnedExecutionManifest(setupOriginalPin);
+  const runPinnedSetupStage = async (stage, action) => {
+    revalidateUpdateManifest(setupOriginalPin, stage);
+    revalidateUpdateManifest(setupExecutionPin, stage);
+    const result = await action(setupExecutionPin.target);
+    revalidateUpdateManifest(setupOriginalPin, stage);
+    revalidateUpdateManifest(setupExecutionPin, stage);
+    return result;
+  };
+  let workerAlreadyExisted;
+  try {
+    workerAlreadyExisted = await runPinnedSetupStage(
+      "setup Worker inventory",
+      (pinnedPath) => detectExistingWorker(pinnedPath),
+    );
+    if (workerAlreadyExisted &&
+        (setupExecutionPin.manifest.infrastructure?.cloudflare?.storage || "d1") === "d1") {
+      // A resumed setup can encounter a Worker deployed by an older package.
+      // Quiesce it with the same compatibility protocol as `brain update`
+      // before any new lease columns are applied.
+      const captureBookmark = options.captureSetupD1Bookmark ?? captureSetupD1Bookmark;
+      let bookmark = null;
+      try {
+        bookmark = await runPinnedSetupStage(
+          "setup D1 bookmark capture",
+          (pinnedPath) => captureBookmark(pinnedPath),
+        );
+        await runPinnedSetupStage(
+          "setup paused vector-drain deployment",
+          (pinnedPath) => deploySetup(pinnedPath, {
+            persistDomain: false,
+            pauseVectorDrainForUpgrade: true,
+          }),
+        );
+        await runPinnedSetupStage(
+          "setup paused vector-drain health verification",
+          (pinnedPath) => healthSetup(pinnedPath, {
+            expectVersion: PRODUCT_VERSION,
+            expectDrainMode: "paused-for-upgrade",
+            reachOnly: true,
+          }),
+        );
+        const waitForVectorDrainQuiescence = options.waitForVectorDrainQuiescence ??
+          ((milliseconds) => new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds)));
+        await runPinnedSetupStage(
+          "setup vector-drain quiescence",
+          () => waitForVectorDrainQuiescence(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS),
+        );
+        await runPinnedSetupStage(
+          "setup migration",
+          (pinnedPath) => migrateSetup(pinnedPath, { vectorDrainQuiesced: true }),
+        );
+        await runPinnedSetupStage(
+          "setup active vector-drain deployment",
+          (pinnedPath) => deploySetup(pinnedPath, {
+            persistDomain: false,
+            pauseVectorDrainForUpgrade: false,
+          }),
+        );
+        await runPinnedSetupStage(
+          "setup active vector-drain health verification",
+          (pinnedPath) => healthSetup(pinnedPath, {
+            expectVersion: PRODUCT_VERSION,
+            expectDrainMode: "active",
+            reachOnly: true,
+          }),
+        );
+      } catch (error) {
+        const recovery = bookmark ? `\n      D1 recovery bookmark: ${bookmark}` : "";
+        die(
+          `resumed setup stopped during the verified vector-writer cutover: ${error.message}${recovery}\n` +
+            "      Fix the reported issue and rerun setup; do not restore a bookmark as the first response.",
+        );
+      }
+    }
+  } finally {
+    removePinnedExecutionManifest(setupExecutionPin);
+    setupExecutionPin = null;
+  }
+  if (!workerAlreadyExisted ||
+      (setupOriginalPin.manifest.infrastructure?.cloudflare?.storage || "d1") !== "d1") {
+    // Do not claim quiescence merely because one manifest script name was not
+    // found. A genuinely fresh D1 has no install_state row and migrates normally;
+    // a renamed live brain hits cmdMigrate's zero-mutation guard.
+    try {
+      await migrateSetup(target);
+    } catch (error) {
+      const message = String(error?.message || error);
+      const needsVerifiedCutover =
+        (setupOriginalPin.manifest.infrastructure?.cloudflare?.storage || "d1") === "d1" &&
+        /verified (?:vector-)?writer cutover|verified vector-writer cutover|not provably fresh/i.test(message);
+      if (needsVerifiedCutover) {
+        die(
+          "setup found D1 state that cannot be proven to be a brand-new empty database. Nothing was migrated.\n" +
+            "      This can happen when a first setup stopped after only part of a migration, or when another Worker name still uses this D1.\n" +
+            `      Run \`brain update ${shownTarget}\` to establish the verified paused-writer cutover, then rerun \`brain setup ${shownTarget}\`.`,
+        );
+      }
+      throw error;
+    }
+    await deploySetup(target);
+  } else if (!setupOriginalPin.manifest.brain?.domain) {
+    // The compatibility deploys use the immutable execution copy and suppress
+    // local writes. A rare legacy manifest with no saved route gets one final
+    // ordinary active deploy solely to persist its token-free URL.
+    revalidateUpdateManifest(setupOriginalPin, "setup domain persistence");
+    await deploySetup(target, { pauseVectorDrainForUpgrade: false });
+  }
   // Provision and deploy write resource IDs and the token-free live address.
   // Everything below must use the committed manifest, not setup's old template.
   m = loadManifest(target).m;
@@ -5801,9 +6327,22 @@ export async function cmdSetup(manifestPath, options = {}) {
     reconcileExistingAgents: false,
     explicitAdminKey: preparedAdminKey.value,
   });
+  if ((m.infrastructure?.cloudflare?.storage || "d1") === "d1") {
+    // Schema 0012 deliberately marks an existing Vectorize projection as
+    // unverified instead of trusting equal row counts. The durable admin key
+    // must exist before this HTTPS-only command can resume the bounded,
+    // cursor-backed bootstrap. If setup is interrupted, rerunning it continues
+    // from D1 rather than rebuilding an invocation-local queue.
+    await drainSetup(target);
+  }
   // Prove that Step 4 actually committed durable desired state. A shell key is
   // still preserved for the caller, but setup health must not depend on it.
-  await (options.cmdHealth ?? cmdHealth)(target, { durableAdminKeyOnly: true });
+  await healthSetup(target, {
+    durableAdminKeyOnly: true,
+    expectVersion: PRODUCT_VERSION,
+    expectDrainMode:
+      (m.infrastructure?.cloudflare?.storage || "d1") === "d1" ? "active" : null,
+  });
 
   /* --- 5. wire it into the tools people actually use --- */
   console.log(`\n  ${c.bold("Step 5 of 6")}  connecting it to your AI tools\n`);
@@ -6910,11 +7449,24 @@ async function reportBacklog(manifestPath) {
     const res = await http(`${base}/api/admin/brain/documents`, { headers: { "X-Admin-Key": adminKey } },
       { timeoutMs: 30_000, what: "the backlog check" });
     if (!res.ok) return;
-    const pending = Number((await res.json())?.vector_backlog?.pending || 0);
-    if (!pending) { ok("the vector index is already caught up: semantic search is live now"); return; }
+    const body = await res.json();
+    const pending = Number(body?.vector_backlog?.pending || 0);
+    const readiness = body?.vector_readiness;
+    if (!pending && readiness?.ready === true &&
+        readiness.actual_vectors === readiness.expected_vectors) {
+      ok("the vector index is query-ready: semantic search is live now");
+      return;
+    }
     const rel = relative(process.cwd(), manifestPath || "./brain.manifest.json");
+    if (!pending) {
+      warn(
+        "Vectorize has not proven the same query-visible corpus as D1." + "\n" +
+          `        Verify it now:  brain health ${rel}`
+      );
+      return;
+    }
     warn(
-      `${pending} chunk(s) are queued for embedding. Until they drain they are findable` + "\n" +
+      `${pending} chunk(s) are queued or awaiting visibility. Until confirmed they are findable` + "\n" +
         "        by keyword and INVISIBLE to meaning-based search, and nothing else reports that." + "\n" +
         `        Finish it now instead of waiting for the cron:  brain drain ${rel}`
     );
@@ -7277,7 +7829,15 @@ export function validateReindexReceipt(body, { confirm = false, source = null } 
   if (pending !== alreadyQueued + queued) {
     die("the reindex confirmation counts do not reconcile. Nothing was treated as fully queued.");
   }
-  if (chunks > 0 && pending === 0) {
+  const bootstrapRequired = body.bootstrap_required === true;
+  if (bootstrapRequired && source !== null) {
+    die("the reindex confirmation tried to start a whole-corpus bootstrap for one source.");
+  }
+  if (bootstrapRequired) {
+    const epoch = nonNegativeReceiptCount(body, "bootstrap_epoch", "the reindex bootstrap receipt");
+    if (epoch < 1) die("the reindex bootstrap receipt did not include a valid durable epoch.");
+  }
+  if (chunks > 0 && pending === 0 && !bootstrapRequired) {
     die("the reindex confirmation reported chunks to rebuild but no pending vector work. Nothing was treated as fully queued.");
   }
   return body;
@@ -7289,14 +7849,44 @@ export function validateDrainReceipt(body) {
     die("drain returned HTTP success but no valid receipt. The vector index was not declared complete.");
   }
   const drained = nonNegativeReceiptCount(body, "drained", "the drain receipt");
+  const submitted = nonNegativeReceiptCount(body, "submitted", "the drain receipt");
+  const waiting = nonNegativeReceiptCount(body, "waiting", "the drain receipt");
   const remaining = nonNegativeReceiptCount(body, "remaining", "the drain receipt");
-  if (remaining > 0 && drained === 0) {
+  if (typeof body.vector_ready !== "boolean") {
+    die("the drain receipt did not prove Vectorize query readiness. Nothing was declared complete.");
+  }
+  // submitted and drained are cumulative progress within this HTTP call. A
+  // fast provider can accept and confirm the same mutation before the Worker
+  // returns, so submitted may legitimately exceed the final queue depth.
+  // waiting is the current unconfirmed subset and must reconcile to remaining.
+  if (waiting > remaining) {
+    die("the drain receipt counts do not reconcile. The vector index was not declared complete.");
+  }
+  if (remaining === 0 && waiting !== 0) {
+    die("the drain receipt claimed waiting work after the queue was empty. The vector index was not declared complete.");
+  }
+  if (remaining > 0 && body.vector_ready) {
+    die("the drain receipt claimed query readiness with vector work still outstanding. Nothing was declared complete.");
+  }
+  if (remaining === 0 && !body.vector_ready) {
+    if (body.readiness_reason === "vector_count_mismatch" &&
+        Number.isSafeInteger(body.expected_vectors) && Number.isSafeInteger(body.actual_vectors)) {
+      die(vectorCountMismatchFailure(body.expected_vectors, body.actual_vectors, {
+        prefix: "the outbox is empty, but ",
+      }));
+    }
     die(
-      `the drain stopped making progress with ${remaining} vector operation(s) still queued.\n` +
-        "      The vector index is incomplete. `brain health` will show the stalled backlog."
+      "the outbox is empty, but Vectorize has not confirmed query visibility.\n" +
+        "      Wait briefly and re-run `brain drain <manifest>`; if it persists, run `brain diagnose <manifest>`."
     );
   }
-  return { drained, remaining };
+  if (remaining > 0 && drained === 0 && submitted === 0 && waiting === 0) {
+    die(
+      `the drain stopped making progress with ${remaining} vector operation(s) still queued.\n` +
+        "      The vector index is incomplete. Run `brain diagnose <manifest>` for the exact retry reason."
+    );
+  }
+  return { drained, submitted, waiting, remaining, vector_ready: body.vector_ready };
 }
 
 /** Refuse a green exit when the bounded drain loop ends with work outstanding. */
@@ -7360,7 +7950,26 @@ async function cmdReindex(manifestPath) {
   return cmdDrain(manifestPath);
 }
 
-async function cmdDrain(manifestPath) {
+export const MANUAL_DRAIN_MAX_MS = 20 * 60 * 1000;
+
+/** Validate the lease-busy retry contract without exposing its owner token. */
+export function validateDrainBusyReceipt(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body) || body.busy !== true) {
+    die("the drain conflict did not include a valid busy receipt. Nothing was declared complete.");
+  }
+  const remaining = nonNegativeReceiptCount(body, "remaining", "the drain busy receipt");
+  const retryAfterSeconds = nonNegativeReceiptCount(
+    body,
+    "retry_after_seconds",
+    "the drain busy receipt",
+  );
+  if (retryAfterSeconds < 1 || retryAfterSeconds > Math.ceil(MANUAL_DRAIN_MAX_MS / 1_000)) {
+    die("the drain busy receipt included an unsafe retry delay. Nothing was declared complete.");
+  }
+  return { remaining, retryAfterSeconds };
+}
+
+async function cmdDrain(manifestPath, options = {}) {
   const { m } = loadManifest(manifestPath);
   // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker
   // over plain HTTPS with the admin key, so it must keep working after our token
@@ -7371,17 +7980,30 @@ async function cmdDrain(manifestPath) {
   const adminKey = resolveAdminKey(manifestPath);
   if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
 
-  const started = Date.now();
+  const now = typeof options.now === "function" ? options.now : Date.now;
+  const wait = options.sleep ?? ((milliseconds) =>
+    new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds)));
+  const callHttp = options.http ?? http;
+  const maxDurationMs = Number.isSafeInteger(options.maxDurationMs)
+    ? Math.min(MANUAL_DRAIN_MAX_MS, Math.max(1_000, options.maxDurationMs))
+    : MANUAL_DRAIN_MAX_MS;
+  const started = now();
+  const deadline = started + maxDurationMs;
   let drained = 0;
+  let submitted = 0;
   let remaining = null;
   let rounds = 0;
   const maxRounds = 400;
   for (let round = 1; round <= maxRounds; round++) {
+    if (now() >= deadline) break;
     rounds = round;
-    const res = await retryTransient(() => http(`${base}/api/admin/brain/drain`, {
+    const res = await retryTransient(() => callHttp(`${base}/api/admin/brain/drain`, {
       method: "POST",
       headers: { "X-Admin-Key": adminKey },
-    }, { timeoutMs: 180_000, what: "the drain" }), {
+    }, {
+      timeoutMs: Math.max(1_000, Math.min(180_000, deadline - now())),
+      what: "the drain",
+    }), {
       shouldRetry: (error) => error?.retryable === true,
       onRetry: (error, attempt, attempts) => info(
         `the drain request hit a network error (${String(error?.message || error).split("\n", 1)[0]}). ` +
@@ -7389,24 +8011,49 @@ async function cmdDrain(manifestPath) {
       ),
     });
     const raw = await res.text();
-    if (!res.ok) die(`drain failed (${res.status}): ${raw.slice(0, 200)}`);
     let body = null;
     try { body = JSON.parse(raw); } catch { /* validated below */ }
+    if (res.status === 409) {
+      const busy = validateDrainBusyReceipt(body);
+      remaining = busy.remaining;
+      const delayMs = Math.min(busy.retryAfterSeconds * 1_000, Math.max(0, deadline - now()));
+      if (delayMs <= 0) break;
+      info(`another vector drain is finishing; retrying in ${Math.ceil(delayMs / 1_000)} second(s)`);
+      await wait(delayMs);
+      continue;
+    }
+    if (!res.ok) die(`drain failed (${res.status}): ${raw.slice(0, 200)}`);
     const receipt = validateDrainReceipt(body);
     drained += receipt.drained;
+    submitted += receipt.submitted;
     remaining = receipt.remaining;
-    const mins = (Date.now() - started) / 60000;
+    const mins = (now() - started) / 60000;
     const rate = mins > 0.05 ? Math.round(drained / mins) : null;
     info(
-      `${drained} embedded, ${remaining} to go` +
+      `${drained} query-visible, ${submitted} accepted, ${remaining} to go` +
         (rate ? `, ~${rate}/min` : "") +
         (rate && remaining ? `, about ${Math.max(1, Math.ceil(remaining / rate))} min left` : "")
     );
     if (remaining === 0) break;
+    if (receipt.waiting > 0) {
+      // Vectorize V2 processes changesets asynchronously. Poll slowly enough to
+      // remain Free-plan friendly, but keep the existing 400-round/20-minute
+      // upper bound so a provider stall never hangs an installer indefinitely.
+      const delayMs = Math.min(3_000, Math.max(0, deadline - now()));
+      if (delayMs <= 0) break;
+      await wait(delayMs);
+    }
+  }
+  if (remaining !== 0 && now() >= deadline) {
+    die(
+      `the drain reached its ${Math.ceil(maxDurationMs / 60_000)}-minute wall-clock safety limit with ` +
+        `${remaining ?? "unknown"} vector operation(s) still queued.\n` +
+        "      Completed chunks are safe. Re-run `brain drain` to resume from the durable queue.",
+    );
   }
   assertDrainComplete({ remaining, rounds, maxRounds });
-  ok(`vector index is caught up (${drained} embedded)`);
-  return { drained, remaining };
+  ok(`vector index is query-ready (${drained} confirmed)`);
+  return { drained, submitted, remaining };
 }
 
 function supportCommandOperation(label, operation) {

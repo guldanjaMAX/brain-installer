@@ -115,7 +115,8 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
  * reindex safely resumable without weakening the documents/chunks proof.
  */
 export const RECOVERY_EXPORT_TABLES = Object.freeze(
-  RECOVERY_DURABLE_TABLES.filter((table) => table !== "vector_outbox"),
+  RECOVERY_DURABLE_TABLES.filter((table) =>
+    table !== "vector_outbox" && table !== "install_state"),
 );
 
 const SAFE_WRANGLER_PREFIXES = Object.freeze([
@@ -153,6 +154,24 @@ const OUTBOX_SQL =
   "SELECT COUNT(*) AS pending_outbox, " +
   "COALESCE(SUM(CASE WHEN attempts > 0 AND last_error IS NOT NULL THEN 1 ELSE 0 END),0) AS failed_vectors " +
   "FROM vector_outbox";
+const INSTALL_STATE_BASE_COLUMNS = Object.freeze([
+  "id", "client_slug", "product_version", "schema_version", "gate_version",
+  "installed_at", "last_upgraded_at", "ring", "notes",
+]);
+const INSTALL_STATE_LEASE_COLUMNS = Object.freeze([
+  "vector_drain_lease_owner", "vector_drain_lease_expires_at",
+]);
+const INSTALL_STATE_PROJECTION_COLUMNS = Object.freeze([
+  "vector_projection_mutation_id", "vector_projection_submitted_at",
+  "vector_projection_status", "vector_projection_bootstrap_epoch",
+  "vector_projection_bootstrap_cursor", "vector_projection_bootstrap_high_water",
+]);
+const INSTALL_STATE_NULL_NORMALIZED_COLUMNS = Object.freeze([
+  ...INSTALL_STATE_LEASE_COLUMNS,
+  "vector_projection_mutation_id", "vector_projection_submitted_at",
+  "vector_projection_bootstrap_cursor",
+]);
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 12;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -168,6 +187,14 @@ const AGGREGATE_FIELDS = Object.freeze([
   ["documents_text_bytes", "SELECT COALESCE(SUM(length(COALESCE(title,''))+length(COALESCE(uri,''))+length(COALESCE(meta,''))+length(content_hash)),0) FROM documents"],
   ["chunks_id_max", "SELECT COALESCE(MAX(id),0) FROM chunks"],
   ["chunks_text_bytes", "SELECT COALESCE(SUM(length(text)+length(chunk_uid)),0) FROM chunks"],
+  // Drain leases and Vectorize mutation fences belong to one live derived
+  // index, not the durable corpus. Snapshot comparison always observes their
+  // normalized recovery value. Literals also keep older migration prefixes
+  // queryable without referencing columns they do not have.
+  ["vector_drain_lease_owner_present", "SELECT 0"],
+  ["vector_drain_lease_expiry_present", "SELECT 0"],
+  ["vector_projection_mutation_present", "SELECT 0"],
+  ["vector_projection_submission_present", "SELECT 0"],
 ]);
 
 const AGGREGATE_SQL = `SELECT ${AGGREGATE_FIELDS.map(
@@ -313,6 +340,35 @@ function hashStableArtifact(path, maxBytes) {
       refuse("RECOVERY_EXPORT_ARTIFACT_CHANGED");
     }
     return Object.freeze({ artifact_sha256: hasher.digest("hex"), artifact_bytes: bytes });
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+/** Hash a canonical normalized prefix followed by one stable Wrangler export. */
+function hashNormalizedDataExport(prefix, path, maxBytes) {
+  if (!Buffer.isBuffer(prefix)) refuse("RECOVERY_EXPORT_ASSEMBLY_FAILED");
+  const checked = assertArtifactFile(path, { maxBytes, allowEmpty: true });
+  if (prefix.length + checked.info.size > maxBytes) refuse("RECOVERY_EXPORT_ARTIFACT_TOO_LARGE");
+  let descriptor;
+  try {
+    descriptor = openSync(checked.path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+    const opened = fstatSync(descriptor);
+    if (!sameFile(checked.info, opened)) refuse("RECOVERY_EXPORT_ARTIFACT_CHANGED");
+    const hasher = createHash("sha256").update(prefix);
+    const block = Buffer.allocUnsafe(1024 * 1024);
+    for (;;) {
+      const read = readSync(descriptor, block, 0, block.length, null);
+      if (!read) break;
+      hasher.update(block.subarray(0, read));
+    }
+    block.fill(0);
+    const afterDescriptor = fstatSync(descriptor);
+    const afterPath = lstatSync(checked.path);
+    if (!sameFile(opened, afterDescriptor) || !sameFile(opened, afterPath)) {
+      refuse("RECOVERY_EXPORT_ARTIFACT_CHANGED");
+    }
+    return hasher.digest("hex");
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
   }
@@ -614,6 +670,90 @@ function validateMigrationContract(rows) {
     selected.push(local);
   }
   return Object.freeze(selected);
+}
+
+function expectedInstallStateColumns(migrations) {
+  const latest = migrations.at(-1)?.version || 0;
+  return Object.freeze([
+    ...INSTALL_STATE_BASE_COLUMNS,
+    ...(latest >= 10 ? ["outbox_generation"] : []),
+    ...(latest >= 11 ? INSTALL_STATE_LEASE_COLUMNS : []),
+    ...(latest >= 12 ? INSTALL_STATE_PROJECTION_COLUMNS : []),
+  ]);
+}
+
+function recoverySqlLiteral(value) {
+  if (value === null) return "NULL";
+  if (typeof value === "number" && Number.isSafeInteger(value)) return String(value);
+  if (typeof value === "string" && value.length <= 1024 * 1024 && !value.includes("\0")) {
+    return `'${value.replaceAll("'", "''")}'`;
+  }
+  refuse("RECOVERY_INSTALL_STATE_INVALID");
+}
+
+/**
+ * Serialize the singleton install row without ever selecting live derived-index
+ * coordination state.
+ *
+ * Wrangler's table export has no column projection. Exporting install_state
+ * directly would therefore persist an opaque invocation owner or a source
+ * Vectorize changeset in a resumable artifact. Read the reviewed schema first,
+ * project ephemeral fields to SQL NULL, and build one bounded INSERT. Older
+ * prefix schemas use the same path without referencing absent columns.
+ */
+export async function normalizedInstallStateExport(binding, migrations, readRows) {
+  const expectedColumns = expectedInstallStateColumns(migrations);
+  const schema = await readRows(binding, "PRAGMA table_info(install_state)");
+  if (!Array.isArray(schema) || schema.length !== expectedColumns.length) {
+    refuse("RECOVERY_INSTALL_STATE_INVALID");
+  }
+  const ordered = [...schema].sort((left, right) => Number(left?.cid) - Number(right?.cid));
+  if (ordered.some((column, index) =>
+    !column || column.name !== expectedColumns[index] ||
+    !["INTEGER", "TEXT"].includes(String(column.type || "").toUpperCase()))) {
+    refuse("RECOVERY_INSTALL_STATE_INVALID");
+  }
+  const recoveryValue = (name, row = null) => {
+    if (INSTALL_STATE_NULL_NORMALIZED_COLUMNS.includes(name)) return null;
+    return row?.[name];
+  };
+  const projection = expectedColumns.map((name) => {
+    if (name === "vector_projection_status") {
+      return `CASE WHEN EXISTS (SELECT 1 FROM chunks) THEN 'bootstrap_required' ELSE 'verified' END AS ${quoteIdentifier(name)}`;
+    }
+    if (name === "vector_projection_bootstrap_epoch") {
+      return `CASE WHEN EXISTS (SELECT 1 FROM chunks) THEN 1 ELSE 0 END AS ${quoteIdentifier(name)}`;
+    }
+    if (name === "vector_projection_bootstrap_high_water") {
+      return `(SELECT MAX(chunk_uid) FROM chunks) AS ${quoteIdentifier(name)}`;
+    }
+    const normalized = recoveryValue(name);
+    if (normalized === null) return `NULL AS ${quoteIdentifier(name)}`;
+    if (normalized !== undefined) {
+      return `${recoverySqlLiteral(normalized)} AS ${quoteIdentifier(name)}`;
+    }
+    return quoteIdentifier(name);
+  });
+  const rows = await readRows(
+    binding,
+    `SELECT ${projection.join(",")} FROM install_state ORDER BY id`,
+  );
+  if (!Array.isArray(rows) || rows.length !== 1) refuse("RECOVERY_INSTALL_STATE_INVALID");
+  const row = rows[0];
+  const hasCorpus = row?.vector_projection_bootstrap_high_water !== null;
+  if (!row || typeof row !== "object" || Array.isArray(row) || Number(row.id) !== 1 ||
+      expectedColumns.some((name) => !Object.hasOwn(row, name)) ||
+      expectedColumns.some((name) =>
+        recoveryValue(name, row) !== row[name]) ||
+      (expectedColumns.includes("vector_projection_status") &&
+        (row.vector_projection_status !== (hasCorpus ? "bootstrap_required" : "verified") ||
+         Number(row.vector_projection_bootstrap_epoch) !== (hasCorpus ? 1 : 0)))) {
+    refuse("RECOVERY_INSTALL_STATE_INVALID");
+  }
+  const columns = expectedColumns.map(quoteIdentifier).join(",");
+  const values = expectedColumns.map((name) =>
+    recoverySqlLiteral(recoveryValue(name, row))).join(",");
+  return Buffer.from(`INSERT INTO "install_state" (${columns}) VALUES (${values});\n`, "utf8");
 }
 
 /**
@@ -1053,30 +1193,44 @@ async function exactFetch(fetchImpl, base, path, options = {}, timeoutMs = 180_0
   return response;
 }
 
-function validateReindexReceipt(body, confirm) {
-  if (!body || typeof body !== "object" || Array.isArray(body) || body.source !== null ||
-      body.dry_run !== !confirm) refuse("RECOVERY_REINDEX_RECEIPT_INVALID");
-  const chunks = nonNegativeInteger(body.chunks, "RECOVERY_REINDEX_RECEIPT_INVALID");
-  const queued = nonNegativeInteger(body.queued, "RECOVERY_REINDEX_RECEIPT_INVALID");
-  const alreadyQueued = nonNegativeInteger(body.already_queued, "RECOVERY_REINDEX_RECEIPT_INVALID");
-  if (!confirm && queued !== 0) refuse("RECOVERY_REINDEX_RECEIPT_INVALID");
-  if (confirm) {
-    const pending = nonNegativeInteger(body.pending, "RECOVERY_REINDEX_RECEIPT_INVALID");
-    if (pending !== queued + alreadyQueued || (chunks > 0 && pending === 0)) {
-      refuse("RECOVERY_REINDEX_RECEIPT_INVALID");
-    }
-  }
-  return Object.freeze({ chunks, queued, alreadyQueued });
-}
-
 function validateDrainReceipt(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     refuse("RECOVERY_DRAIN_RECEIPT_INVALID");
   }
   const drained = nonNegativeInteger(body.drained, "RECOVERY_DRAIN_RECEIPT_INVALID");
+  const submitted = nonNegativeInteger(body.submitted, "RECOVERY_DRAIN_RECEIPT_INVALID");
+  const waiting = nonNegativeInteger(body.waiting, "RECOVERY_DRAIN_RECEIPT_INVALID");
   const remaining = nonNegativeInteger(body.remaining, "RECOVERY_DRAIN_RECEIPT_INVALID");
-  if (remaining > 0 && drained === 0) refuse("RECOVERY_DRAIN_STALLED");
-  return Object.freeze({ drained, remaining });
+  if (typeof body.vector_ready !== "boolean" || waiting > remaining ||
+      (remaining === 0 && waiting !== 0) || (remaining > 0 && body.vector_ready)) {
+    refuse("RECOVERY_DRAIN_RECEIPT_INVALID");
+  }
+  if (remaining === 0 && !body.vector_ready) refuse("RECOVERY_VECTORIZE_NOT_READY");
+  if (remaining > 0 && drained === 0 && submitted === 0 && waiting === 0) {
+    refuse("RECOVERY_DRAIN_STALLED");
+  }
+  return Object.freeze({ drained, submitted, waiting, remaining, vectorReady: body.vector_ready });
+}
+
+function validateExactVectorInventory(inventory, expectedVectors, code = "RECOVERY_HEALTH_FAILED") {
+  if (!inventory || typeof inventory !== "object" || Array.isArray(inventory) ||
+      inventory.backend !== "d1" || !Array.isArray(inventory.rows)) refuse(code);
+  const backlog = inventory.vector_backlog;
+  const readiness = inventory.vector_readiness;
+  if (!backlog || typeof backlog !== "object" || Array.isArray(backlog) ||
+      !readiness || typeof readiness !== "object" || Array.isArray(readiness) ||
+      Object.hasOwn(backlog, "error") || Object.hasOwn(readiness, "error")) refuse(code);
+  const pending = nonNegativeInteger(backlog.pending, code);
+  const submitted = nonNegativeInteger(backlog.submitted, code);
+  const readinessPending = nonNegativeInteger(readiness.pending, code);
+  const readinessSubmitted = nonNegativeInteger(readiness.submitted, code);
+  const expected = nonNegativeInteger(readiness.expected_vectors, code);
+  const actual = nonNegativeInteger(readiness.actual_vectors, code);
+  if (readiness.ready !== true || pending !== 0 || submitted !== 0 ||
+      readinessPending !== 0 || readinessSubmitted !== 0 ||
+      pending !== readinessPending || submitted !== readinessSubmitted ||
+      expected !== expectedVectors || actual !== expectedVectors) refuse(code);
+  return Object.freeze({ expectedVectors: expected, actualVectors: actual });
 }
 
 function evalChildEnvironment(environment = process.env) {
@@ -1309,6 +1463,21 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     return validateMigrationContract(rows);
   }
 
+  async function requireCurrentVectorProtocol(
+    binding,
+    code = "RECOVERY_TARGET_UPGRADE_REQUIRED",
+  ) {
+    const migrations = await remoteMigrationContract(binding);
+    if (migrations.at(-1)?.version !== RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION) {
+      // The current Worker drains only the schema-12 generation, lease, and
+      // async-visibility protocol. A historical exact-prefix artifact remains
+      // inspectable offline, but the field runner has no implicit live-upgrade
+      // authority and therefore stops before export, restore, or provider I/O.
+      refuse(code);
+    }
+    return migrations;
+  }
+
   async function remoteDatabaseSnapshot(binding, { verifyFtsIntegrity = false } = {}) {
     const quickRows = await d1Rows(binding, QUICK_CHECK_SQL);
     const quick = quickRows?.[0];
@@ -1351,15 +1520,23 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
   async function remoteDataFingerprint(binding) {
     const path = join(pins.artifacts.path, ".brain-recovery-export.sql.tmp-readback");
     removeKnownPartial(path, pins.artifacts.path);
+    let normalizedInstallState = null;
     try {
+      const migrations = await remoteMigrationContract(binding);
+      normalizedInstallState = await normalizedInstallStateExport(binding, migrations, d1Rows);
       await wrangler(binding, [
         "d1", "export", binding.databaseName,
         "--remote", "--no-schema", "--output", path,
         ...RECOVERY_EXPORT_TABLES.flatMap((table) => ["--table", table]),
       ]);
       if (process.platform !== "win32") chmodSync(path, 0o600);
-      return hashStableArtifact(path, plan.artifact.max_single_import_bytes).artifact_sha256;
+      return hashNormalizedDataExport(
+        normalizedInstallState,
+        path,
+        plan.artifact.max_single_import_bytes,
+      );
     } finally {
+      if (normalizedInstallState) normalizedInstallState.fill(0);
       removeKnownPartial(path, pins.artifacts.path);
     }
   }
@@ -1387,7 +1564,13 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     return context.completed?.find((entry) => entry.id === stage)?.evidence ?? null;
   }
 
-  function combineExport(migrations, dataPartial, combinedPartial, dataFingerprint) {
+  function combineExport(
+    migrations,
+    normalizedInstallState,
+    dataPartial,
+    combinedPartial,
+    dataFingerprint,
+  ) {
     let output;
     let input;
     try {
@@ -1408,6 +1591,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         writeSync(output, bytes);
         bytes.fill(0);
       }
+      writeSync(output, normalizedInstallState);
       const checkedData = assertArtifactFile(dataPartial, {
         maxBytes: plan.artifact.max_single_import_bytes,
         allowEmpty: true,
@@ -1415,7 +1599,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       input = openSync(dataPartial, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
       const openedData = fstatSync(input);
       if (!sameFile(checkedData.info, openedData)) refuse("RECOVERY_EXPORT_ARTIFACT_CHANGED");
-      const copiedDataHash = createHash("sha256");
+      const copiedDataHash = createHash("sha256").update(normalizedInstallState);
       const block = Buffer.allocUnsafe(1024 * 1024);
       for (;;) {
         const read = readSync(input, block, 0, block.length, null);
@@ -1467,7 +1651,10 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     export_d1: async (context) => {
       assertContext(context, "export_d1");
       await assertExactCloudflareResources(pins.binding.source, "source");
-      const migrations = await remoteMigrationContract(pins.binding.source);
+      const migrations = await requireCurrentVectorProtocol(
+        pins.binding.source,
+        "RECOVERY_SOURCE_UPGRADE_REQUIRED",
+      );
       assertExpectedTables(await d1Rows(pins.binding.source, TABLE_INVENTORY_SQL));
       const dataPartial = join(pins.artifacts.path, ".brain-recovery-export.sql.tmp-data");
       const combinedPartial = join(pins.artifacts.path, ".brain-recovery-export.sql.tmp-combined");
@@ -1478,7 +1665,13 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         pins.artifacts.path,
         plan.artifact.max_single_import_bytes,
       )) return artifactEvidence();
+      let normalizedInstallState = null;
       try {
+        normalizedInstallState = await normalizedInstallStateExport(
+          pins.binding.source,
+          migrations,
+          d1Rows,
+        );
         await wrangler(pins.binding.source, [
           "d1", "export", pins.binding.source.databaseName,
           "--remote", "--no-schema", "--output", dataPartial,
@@ -1486,11 +1679,18 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         ]);
         if (process.platform !== "win32") chmodSync(dataPartial, 0o600);
         assertArtifactFile(dataPartial, { maxBytes: plan.artifact.max_single_import_bytes, allowEmpty: true });
-        const dataFingerprint = hashStableArtifact(
+        const dataFingerprint = hashNormalizedDataExport(
+          normalizedInstallState,
           dataPartial,
           plan.artifact.max_single_import_bytes,
-        ).artifact_sha256;
-        combineExport(migrations, dataPartial, combinedPartial, dataFingerprint);
+        );
+        combineExport(
+          migrations,
+          normalizedInstallState,
+          dataPartial,
+          combinedPartial,
+          dataFingerprint,
+        );
         const combined = assertArtifactFile(combinedPartial, {
           maxBytes: plan.artifact.max_single_import_bytes,
         });
@@ -1505,6 +1705,8 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         try { removeKnownPartial(dataPartial, pins.artifacts.path); } catch { /* original fixed failure wins */ }
         try { removeKnownPartial(combinedPartial, pins.artifacts.path); } catch { /* original fixed failure wins */ }
         throw error;
+      } finally {
+        if (normalizedInstallState) normalizedInstallState.fill(0);
       }
     },
 
@@ -1586,12 +1788,17 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
 
     verify_d1: async (context) => {
       assertContext(context, "verify_d1");
+      await requireCurrentVectorProtocol(pins.binding.target);
       const restored = await targetDatabaseSnapshot();
       return restored;
     },
 
     rebuild_vectorize: async (context) => {
       assertContext(context, "rebuild_vectorize");
+      // Recheck on every resumed rebuild. An old journal checkpoint or an
+      // out-of-band target replacement must never route schema-prefix data to
+      // the current drain endpoint.
+      await requireCurrentVectorProtocol(pins.binding.target);
       const restored = completedEvidence(context, "verify_d1");
       assertSameRecoveryCorpus(
         await targetDatabaseSnapshot(),
@@ -1609,24 +1816,38 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         refuse("RECOVERY_VECTORIZE_TARGET_AMBIGUOUS");
       }
 
-      await withTargetKey(async (key) => {
-        const preview = validateReindexReceipt(
-          await postAdmin("/api/admin/brain/reindex", key, { source: null, confirm: false }),
-          false,
-        );
-        if (preview.chunks !== restored.chunk_count) refuse("RECOVERY_REINDEX_RECEIPT_INVALID");
-        if (preview.chunks > 0) {
-          const confirmed = validateReindexReceipt(
-            await postAdmin("/api/admin/brain/reindex", key, { source: null, confirm: true }),
-            true,
-          );
-          if (confirmed.chunks !== restored.chunk_count) refuse("RECOVERY_REINDEX_RECEIPT_INVALID");
-        }
+      const visibility = await withTargetKey(async (key) => {
+        // The verified artifact already normalizes a nonempty corpus to one
+        // bootstrap epoch with its exact SQL high-water. Never call reindex
+        // here: resetting the epoch on a stage retry would discard committed
+        // cursor progress and make a large restore restart from page one.
+        let settled = false;
         for (let round = 0; round < 400; round++) {
           const receipt = validateDrainReceipt(await postAdmin("/api/admin/brain/drain", key));
-          if (receipt.remaining === 0) return;
+          if (receipt.remaining === 0) {
+            settled = true;
+            break;
+          }
+          if (receipt.waiting > 0) await sleep(3_000);
         }
-        refuse("RECOVERY_DRAIN_LIMIT_REACHED");
+        if (!settled) refuse("RECOVERY_DRAIN_LIMIT_REACHED");
+
+        // An accepted Vectorize mutation is not necessarily query-visible.
+        // The Worker is the only surface that can combine its processed fence,
+        // exact getByIds confirmations, D1 queue, and provider count. Require
+        // that receipt before the recovery stage can checkpoint success.
+        const inventoryResponse = await exactFetch(
+          fetchImpl,
+          dataPlaneBase(pins.binding.target),
+          "/api/admin/brain/documents",
+          { method: "GET", headers: { "X-Admin-Key": key } },
+        );
+        if (!inventoryResponse.ok) refuse("RECOVERY_VECTORIZE_NOT_READY");
+        return validateExactVectorInventory(
+          await boundedJsonResponse(inventoryResponse),
+          restored.chunk_count,
+          "RECOVERY_VECTORIZE_NOT_READY",
+        );
       });
 
       const outbox = await targetOutbox();
@@ -1657,6 +1878,11 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
           health?.brain !== pins.binding.target.clientSlug) {
         refuse("RECOVERY_HEALTH_IDENTITY_MISMATCH");
       }
+      const rebuilt = completedEvidence(context, "rebuild_vectorize");
+      const expectedVectors = nonNegativeInteger(
+        rebuilt?.chunk_count,
+        "RECOVERY_HEALTH_FAILED",
+      );
       await withTargetKey(async (key) => {
         const inventoryResponse = await exactFetch(fetchImpl, base, "/api/admin/brain/documents", {
           method: "GET",
@@ -1664,11 +1890,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         });
         if (!inventoryResponse.ok) refuse("RECOVERY_HEALTH_FAILED");
         const inventory = await boundedJsonResponse(inventoryResponse);
-        const backlog = inventory?.vector_backlog;
-        if (inventory?.backend !== "d1" || !Array.isArray(inventory?.rows) ||
-            !backlog || nonNegativeInteger(backlog.pending, "RECOVERY_HEALTH_FAILED") !== 0) {
-          refuse("RECOVERY_HEALTH_FAILED");
-        }
+        validateExactVectorInventory(inventory, expectedVectors, "RECOVERY_HEALTH_FAILED");
         const noKey = await exactFetch(fetchImpl, base, "/api/rag/unified", {
           method: "POST",
           headers: { "Content-Type": "application/json" },

@@ -6,7 +6,14 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 
 /* A D1 env that records what SQL it was asked to run, so a filter that never
    reached the database is a visible failure rather than a silent one. */
-function mkEnv(rows, { vectorIds = [], vectorThrows = false, countRow = null, extra = {} } = {}) {
+function mkEnv(rows, {
+  vectorIds = [],
+  vectorThrows = false,
+  countRow = null,
+  outboxRow = null,
+  readinessRow = null,
+  extra = {},
+} = {}) {
   const seen = { sql: [], binds: [], vectorQueries: [] };
   const env = {
     STORAGE: "d1",
@@ -17,9 +24,31 @@ function mkEnv(rows, { vectorIds = [], vectorThrows = false, countRow = null, ex
         return {
           bind(...b) { seen.binds.push(b); return this; },
           all: async () => ({ results: rows }),
-          first: async () => (/count\(\*\)/i.test(sql)
-            ? (countRow || { n: 0, stored_documents: 0, logical_documents: 0 })
-            : null),
+          first: async () => {
+            if (/vector_projection_mutation_id AS mutation_id/.test(sql)) {
+              return readinessRow || {
+                schema_version: 12,
+                mutation_id: null,
+                mutation_submitted_at: null,
+                projection_status: "verified",
+                bootstrap_epoch: 0,
+                bootstrap_cursor: null,
+                bootstrap_high_water: null,
+                expected_vectors: vectorIds.length,
+                pending: 0,
+                submitted: 0,
+                oldest_queued_at: null,
+              };
+            }
+            if (/FROM vector_outbox/.test(sql) && /submitted_mutation_id/.test(sql)) {
+              return outboxRow || {
+                n: 0, oldest: null, upserts: 0, deletes: 0, submitted: 0,
+              };
+            }
+            return /count\(\*\)/i.test(sql)
+              ? (countRow || { n: 0, stored_documents: 0, logical_documents: 0 })
+              : null;
+          },
           run: async () => ({}),
         };
       },
@@ -32,6 +61,7 @@ function mkEnv(rows, { vectorIds = [], vectorThrows = false, countRow = null, ex
         return { matches: vectorIds.map((id) => ({ id })) };
       },
       upsert: async () => {},
+      describe: async () => ({ vectorCount: vectorIds.length, processedUpToMutation: null }),
     },
     AI: {
       run: async (model, input) => model.includes("bge-")
@@ -201,6 +231,44 @@ const call = (env, path) => {
   check("and results still come back", (t.results || []).length === 1);
   check("Workers AI writes the cited answer without a vendor key", /Cloudflare answer/.test(t.answer || ""), JSON.stringify(t));
   check("and reports the Cloudflare model", String(t.model || "").startsWith("@cf/"), String(t.model));
+}
+
+/* A partially populated vector index is also degraded. A non-empty semantic
+   page can otherwise hide that newly accepted context is still missing. */
+{
+  const newer = {
+    ...ROW,
+    chunk_uid: "message:new-context#0",
+    doc_uid: "message:new-context",
+    source_id: "new-context",
+    text: "Newly accepted context not visible in Vectorize yet.",
+  };
+  const { env } = mkEnv([ROW, newer], {
+    vectorIds: ["meeting:123#0"],
+    outboxRow: { n: 1, oldest: 100, upserts: 1, deletes: 0, submitted: 1 },
+    readinessRow: {
+      schema_version: 12,
+      mutation_id: "fixture-partial-projection",
+      mutation_submitted_at: 100,
+      projection_status: "pending",
+      bootstrap_epoch: 0,
+      bootstrap_cursor: null,
+      bootstrap_high_water: null,
+      expected_vectors: 2,
+      pending: 1,
+      submitted: 1,
+      oldest_queued_at: 100,
+    },
+  });
+  const unified = await (await call(env, "/api/rag/unified?q=context&limit=5")).json();
+  check("non-empty Vectorize results still disclose a partial async projection",
+    unified.degraded === "vector" && unified.results.length > 0,
+    JSON.stringify(unified));
+  const think = await (await call(env, "/api/rag/think?q=context&limit=5")).json();
+  check("think warns that partial projection can miss paraphrased current context",
+    think.degraded === "vector" && (think.gaps || []).some((gap) =>
+      gap.type === "vector_unavailable" && /not fully query-ready/.test(gap.detail || "")),
+    JSON.stringify(think.gaps));
 }
 
 {
@@ -1077,6 +1145,10 @@ function mkSourceFamilyEnv(documents, extra = {}) {
   check("documents separates source files from stored split parts",
     b.rows[0]?.documents === 2 && b.rows[0]?.logical_documents === 2 && b.rows[0]?.stored_documents === 3, JSON.stringify(b.rows[0]));
   check("and reports vector backlog", b.vector_backlog && "pending" in b.vector_backlog, JSON.stringify(b.vector_backlog));
+  check("and reports exact query-visible vector readiness",
+    b.vector_readiness?.ready === true && b.vector_readiness.expected_vectors === 0 &&
+      b.vector_readiness.actual_vectors === 0,
+    JSON.stringify(b.vector_readiness));
   check("private aggregate inventory responses cannot be cached",
     /no-store/.test(documentsResponse.headers.get("cache-control") || ""),
     documentsResponse.headers.get("cache-control") || "missing");
@@ -1090,6 +1162,37 @@ function mkSourceFamilyEnv(documents, extra = {}) {
     `${failedDocuments.status} ${failedDocuments.headers.get("cache-control") || "missing"}`);
 }
 
+{
+  const { env } = mkEnv([], {
+    outboxRow: { n: 1, oldest: 100, upserts: 1, deletes: 0, submitted: 1 },
+    readinessRow: {
+      schema_version: 12,
+      mutation_id: "fixture-accepted-not-visible",
+      mutation_submitted_at: 100,
+      projection_status: "pending",
+      bootstrap_epoch: 0,
+      bootstrap_cursor: null,
+      bootstrap_high_water: null,
+      expected_vectors: 1,
+      pending: 1,
+      submitted: 1,
+      oldest_queued_at: 100,
+    },
+    extra: {
+      VECTORIZE: {
+        describe: async () => ({ vectorCount: 0, processedUpToMutation: null }),
+      },
+    },
+  });
+  const body = await (await call(env, "/api/admin/brain/documents")).json();
+  check("documents cannot false-green an accepted mutation before query visibility",
+    body.vector_backlog?.pending === 1 && body.vector_backlog?.submitted === 1 &&
+      body.vector_readiness?.ready === false &&
+      body.vector_readiness?.reason === "accepted_mutation_processing" &&
+      body.vector_readiness?.expected_vectors === 1 && body.vector_readiness?.actual_vectors === 0,
+    JSON.stringify(body));
+}
+
 /* ================= batch ingest ================= */
 
 // A batch env whose ingest can be made to explode on a chosen document, so the
@@ -1098,7 +1201,13 @@ function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocU
   const written = [];
   const storedTexts = [];
   const documents = new Map();
-  const calls = { remote: 0, stats_scans: 0, stats_attempts: 0, finalizer_batches: 0 };
+  const calls = {
+    remote: 0,
+    submitted_statements: 0,
+    stats_scans: 0,
+    stats_attempts: 0,
+    finalizer_batches: 0,
+  };
   const control = { explodeOn, finalizeFailSource, failChunkDocUid, preflightFail };
   const execute = (sql, b) => {
     let changes = 0;
@@ -1116,6 +1225,11 @@ function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocU
       changes = 1;
     } else if (/INSERT INTO chunks/.test(sql)) {
       storedTexts.push(String(b[3] || ""));
+      changes = 1;
+    } else if (/INSERT INTO vector_outbox/.test(sql)) {
+      // A guarded upsert that follows the document marker inside the same D1
+      // transaction must report one changed queue row. Replacement deletes may
+      // also use this shape; their count is not part of receipt verification.
       changes = 1;
     } else if (/UPDATE documents SET content_hash/.test(sql)) {
       const row = documents.get(b[0]);
@@ -1144,6 +1258,7 @@ function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocU
           all: async () => ({
             results: (() => {
               calls.remote++;
+              calls.submitted_statements++;
               return /SELECT doc_uid, content_hash FROM documents/.test(sql)
                 ? b.map((docUid) => documents.get(docUid)).filter(Boolean)
                 : [];
@@ -1151,12 +1266,14 @@ function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocU
           }),
           first: async () => {
             calls.remote++;
+            calls.submitted_statements++;
             if (/SELECT content_hash, title/.test(sql)) return documents.get(b[0]) || null;
             if (/SELECT client, category/.test(sql)) return documents.get(b[0]) || null;
             return null;
           },
           run: async () => {
             calls.remote++;
+            calls.submitted_statements++;
             const result = execute(sql, b);
             return { success: true, meta: { changes: result.changes } };
           },
@@ -1164,6 +1281,7 @@ function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocU
       }),
       batch: async (statements) => {
         calls.remote++;
+        calls.submitted_statements += statements.length;
         if (statements.every((statement) => /SELECT content_hash, title/.test(statement.sql))) {
           if (control.preflightFail) throw new Error("simulated preflight failure");
           return statements.map((statement) => {
@@ -1416,6 +1534,26 @@ const doc = (id, content = "some ordinary meeting content about the retainer") =
   check("a malformed body is a 400", (await post(env, "/api/admin/brain/ingest/batch", { nope: 1 })).status === 400);
 }
 
+/* The byte cap alone is insufficient. At default geometry this 900KB body is
+   roughly 750 chunks and would submit well over D1's 1,000-query invocation
+   ceiling. It must stop before even the read-only preflight. */
+{
+  const { env, written, calls } = mkBatchEnv();
+  const response = await post(env, "/api/admin/brain/ingest/batch", {
+    docs: [doc("over-query-budget", "x".repeat(900_000))],
+  });
+  const body = await response.json();
+  check("a 900KB multi-chunk request is refused by the pre-write D1 budget",
+    response.status === 413 && body.estimated_statements > body.max_statements,
+    JSON.stringify(body));
+  check("the query-budget refusal performs zero D1 calls, statements, or writes",
+    calls.remote === 0 && calls.submitted_statements === 0 && written.length === 0,
+    JSON.stringify(calls));
+  check("the budget refusal gives bounded segmentation guidance",
+    body.detail?.includes("fewer or smaller") && body.detail?.includes("Nothing was written"),
+    JSON.stringify(body));
+}
+
 /* A document missing required fields is reported, not silently skipped. */
 {
   const { env } = mkBatchEnv();
@@ -1438,8 +1576,10 @@ const doc = (id, content = "some ordinary meeting content about the retainer") =
     first.created === 50 && first.results.length === 50 && first.results.every((row) => row.doc_uid), JSON.stringify(first).slice(0, 200));
   check("50 small documents recompute source statistics once, not 50 times",
     calls.stats_scans === 1 && calls.finalizer_batches === 1, JSON.stringify(calls));
-  check("the batch uses 203 D1 calls instead of the v0.1.11 structure's 350",
-    calls.remote === 203 && calls.remote < legacyCalls, `${calls.remote} vs ${legacyCalls}`);
+  check("the atomic per-document stage cuts a 50-document batch to 53 D1 calls",
+    calls.remote === 53 && calls.remote < legacyCalls, `${calls.remote} vs ${legacyCalls}`);
+  check("the same request submits 352 paid D1 statements, not 53 queries",
+    calls.submitted_statements === 352, JSON.stringify(calls));
 
   const beforeRetry = { ...calls };
   const retry = await (await post(env, "/api/admin/brain/ingest/batch", { docs })).json();
@@ -1506,8 +1646,8 @@ const doc = (id, content = "some ordinary meeting content about the retainer") =
     /^[a-f0-9]{64}$/.test(documents.get("meeting:m1")?.content_hash || ""));
 }
 
-/* A failure after the pending marker but before chunk completion must not be
-   hidden by finalizing another successful document from the same source. */
+/* A small-document stage is one isolated D1 transaction. A chunk failure rolls
+   back that document completely and cannot be hidden by successful neighbors. */
 {
   const failedUid = "meeting:middle";
   const { env, documents, control } = mkBatchEnv({ failChunkDocUid: failedUid });
@@ -1516,16 +1656,35 @@ const doc = (id, content = "some ordinary meeting content about the retainer") =
   check("a chunk-stage failure keeps its own receipt failed and its neighbors committed",
     first.created === 2 && first.failed === 1 && first.results.find((row) => row.source_id === "middle")?.status === "failed",
     JSON.stringify(first));
-  check("the failed revision's content hash remains pending",
-    String(documents.get(failedUid)?.content_hash).startsWith("pending:"), documents.get(failedUid)?.content_hash || "missing");
+  check("the failed atomic stage leaves no partial document revision",
+    !documents.has(failedUid), documents.get(failedUid)?.content_hash || "missing");
   check("successful neighbors still commit their exact revision markers",
     /^[a-f0-9]{64}$/.test(documents.get("meeting:first")?.content_hash || "") &&
       /^[a-f0-9]{64}$/.test(documents.get("meeting:last")?.content_hash || ""));
 
   control.failChunkDocUid = null;
   const retry = await (await post(env, "/api/admin/brain/ingest/batch", { docs })).json();
-  check("retry repairs the interrupted revision without rewriting its neighbors",
-    retry.updated === 1 && retry.unchanged === 2 && retry.failed === 0, JSON.stringify(retry));
+  check("retry creates the rolled-back revision without rewriting its neighbors",
+    retry.created === 1 && retry.unchanged === 2 && retry.failed === 0, JSON.stringify(retry));
+}
+
+/* A document just above our 100-statement atomic-stage slice retains the
+   proven resumable path. If its chunk batch fails after the marker write, the
+   pending revision remains visible and a retry repairs it. */
+{
+  const failedUid = "meeting:large-interrupted";
+  const { env, documents, control } = mkBatchEnv({ failChunkDocUid: failedUid });
+  const large = doc("large-interrupted", "x".repeat(58_500)); // 49 chunks: 101 atomic-stage statements.
+  const first = await (await post(env, "/api/admin/brain/ingest/batch", { docs: [large] })).json();
+  check("an over-slice document remains a retryable per-document failure",
+    first.failed === 1 && first.results[0]?.source_id === "large-interrupted", JSON.stringify(first));
+  check("the large-document fallback preserves its pending revision",
+    String(documents.get(failedUid)?.content_hash).startsWith("pending:"), documents.get(failedUid)?.content_hash || "missing");
+
+  control.failChunkDocUid = null;
+  const repaired = await (await post(env, "/api/admin/brain/ingest/batch", { docs: [large] })).json();
+  check("retry repairs the fallback revision through its original path",
+    repaired.updated === 1 && repaired.failed === 0, JSON.stringify(repaired));
 }
 
 /* Duplicate identities deliberately use the original sequential path. */
@@ -1563,6 +1722,10 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
                 ? [{ doc_uid: "meeting:1" }, { doc_uid: "meeting:2" }]
                 : /FROM chunks WHERE doc_uid/.test(q)
                   ? [{ chunk_uid: "meeting:1#0" }, { chunk_uid: "meeting:1#1" }, { chunk_uid: "meeting:2#0" }]
+                  : /FROM vector_outbox/.test(q)
+                    ? b.map((chunkUid, index) => ({
+                      chunk_uid: chunkUid, vector_id: chunkUid, generation: index + 1,
+                    }))
                   : [],
             }),
             first: async () => null,
@@ -1589,7 +1752,9 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   const { env, deleted, sql } = mkForgetEnv();
   const b = await (await post(env, "/api/admin/brain/forget", { source: "meeting", confirm: true })).json();
   check("confirm actually deletes", b.dry_run === false && b.documents === 2, JSON.stringify(b));
-  check("every vector is removed too", deleted.length === 3, JSON.stringify(deleted));
+  check("physical vector cleanup is queued for the one leased writer",
+    deleted.length === 0 && b.vectors === 0 && b.vector_cleanup_queued === 3,
+    JSON.stringify({ body: b, deleted }));
   check("and D1 rows go first, so a crash leaves it unreachable rather than half-visible",
     sql.some((q) => /BATCH/.test(q)), JSON.stringify(sql));
 }
@@ -1609,11 +1774,12 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
     (await post(env, "/api/admin/brain/forget", { families: [{ base_doc_uid: "drive:F1", keep_doc_uids: ["drive:F2"] }] })).status === 400);
 }
 {
-  // The document is already unreachable at this point; a caller told "deleted"
-  // while vectors remain still deserves to know.
+  // Provider availability cannot make forget partially execute. Content is
+  // already unreachable in D1 and the leased drain owns physical cleanup.
   const { env } = mkForgetEnv({ vectorThrows: true });
   const b = await (await post(env, "/api/admin/brain/forget", { source: "meeting", confirm: true })).json();
-  check("a vector-delete failure is REPORTED, not swallowed", !!b.vector_error, JSON.stringify(b));
+  check("enqueue-only forget does not call an unavailable vector provider",
+    b.vector_error === null && b.vector_cleanup_queued === 3, JSON.stringify(b));
   check("and the D1 delete still counted", b.documents === 2);
 }
 {
@@ -1627,6 +1793,131 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   const { env } = mkForgetEnv();
   const r = await worker.fetch(new Request("https://b.example/api/admin/brain/forget", { method: "POST", body: "{}" }), env, {});
   check("forget is behind the admin key", r.status === 401, String(r.status));
+}
+
+/* A paused compatibility deployment is a complete corpus-write barrier, not
+   merely a drain pause. This protects every independently committed migration
+   statement and D1 time-travel restore from concurrent request mutations. */
+{
+  let forbiddenCalls = 0;
+  const forbid = () => { forbiddenCalls++; throw new Error("paused drain touched a provider"); };
+  const env = {
+    STORAGE: "d1",
+    ADMIN_KEY: "k",
+    BRAIN_VERSION: "fixture-version",
+    VECTOR_DRAIN_MODE: "paused-for-upgrade",
+    DB: { prepare: forbid, batch: forbid },
+    AI: { run: forbid },
+    VECTORIZE: { upsert: forbid, deleteByIds: forbid },
+  };
+  const health = await (await worker.fetch(new Request("https://b.example/health"), env, {})).json();
+  check("paused compatibility health proves the leased writer protocol and mode",
+    health.version === "fixture-version" && health.vector_writer_protocol === "lease-v1" &&
+      health.vector_drain_mode === "paused-for-upgrade", JSON.stringify(health));
+
+  const manual = await post(env, "/api/admin/brain/drain", {});
+  const manualBody = await manual.json();
+  check("a manual drain fails closed while an upgrade cutover is paused",
+    manual.status === 503 && manualBody.paused === true, JSON.stringify(manualBody));
+
+  const pausedMutations = [
+    ["/api/admin/brain/ingest", { source_type: "drive", source_id: "one", content: "fixture" }],
+    ["/api/admin/brain/ingest/batch", { documents: [] }],
+    ["/api/admin/brain/source-receipt", { source: "drive", status: "ready" }],
+    ["/api/admin/brain/source-expectation", { source: "drive", expected_interval_hours: 24 }],
+    ["/api/admin/brain/forget", { source: "drive", confirm: true }],
+    ["/api/admin/brain/reindex", { confirm: true }],
+  ];
+  let everyMutationPaused = true;
+  const pauseDetails = [];
+  for (const [path, body] of pausedMutations) {
+    const response = await post(env, path, body);
+    const receipt = await response.json();
+    pauseDetails.push({ path, status: response.status, receipt });
+    if (response.status !== 503 || receipt.paused !== true) everyMutationPaused = false;
+  }
+  check("paused mode rejects every corpus, outbox, and source mutation route",
+    everyMutationPaused, JSON.stringify(pauseDetails));
+
+  let readOnlyD1Calls = 0;
+  const readOnlyEnv = {
+    ...env,
+    DB: {
+      prepare() {
+        const statement = {
+          bind: () => statement,
+          all: async () => { readOnlyD1Calls++; return { results: [] }; },
+        };
+        return statement;
+      },
+    },
+  };
+  const sourceFamilies = await post(readOnlyEnv, "/api/admin/brain/source-families", {
+    source: "drive",
+  });
+  check("paused mode keeps authenticated read-only source-family inventory available",
+    sourceFamilies.status === 200 && readOnlyD1Calls === 1,
+    `${sourceFamilies.status}/${readOnlyD1Calls}`);
+
+  let scheduledPromise = null;
+  await worker.scheduled({}, env, {
+    waitUntil(promise) { scheduledPromise = promise; },
+  });
+  await scheduledPromise;
+  check("paused requests and scheduled drains perform zero mutation D1, AI, or Vectorize calls",
+    forbiddenCalls === 0, String(forbiddenCalls));
+}
+
+{
+  let attemptedOwner = null;
+  let vectorWrites = 0;
+  let outboxMutations = 0;
+  const observedLogs = [];
+  const env = {
+    STORAGE: "d1",
+    ADMIN_KEY: "k",
+    AI: { run: async () => { throw new Error("busy drain reached embedding"); } },
+    VECTORIZE: { upsert: async () => { vectorWrites++; } },
+    DB: {
+      prepare(q) {
+        const shape = (b = []) => ({
+          bind: (...next) => shape(next),
+          run: async () => {
+            if (/SET vector_drain_lease_owner = \?1/.test(q)) attemptedOwner = b[0];
+            return { meta: { changes: 0 } };
+          },
+          first: async () => {
+            if (/CASE WHEN vector_drain_lease_owner IS NULL/.test(q)) {
+              return { held: 1, schema_ready: 1, expires_at: Date.now() + 60_000 };
+            }
+            if (/count\(\*\).*vector_outbox/i.test(q)) return { n: 7 };
+            return null;
+          },
+          all: async () => ({ results: [] }),
+        });
+        return shape();
+      },
+      batch: async () => { outboxMutations++; },
+    },
+  };
+  const originalLog = console.log;
+  try {
+    console.log = (...args) => observedLogs.push(args.map(String).join(" "));
+    const response = await post(env, "/api/admin/brain/drain", {});
+    const raw = await response.text();
+    const body = JSON.parse(raw);
+    check("a busy manual drain returns an explicit fail-closed conflict",
+      response.status === 409 && body.busy === true && body.remaining === 7,
+      raw);
+    check("the busy conflict performs no embedding, vector write, or outbox mutation",
+      vectorWrites === 0 && outboxMutations === 0, JSON.stringify({ vectorWrites, outboxMutations }));
+    check("the busy response and logs never expose either lease owner token",
+      typeof attemptedOwner === "string" && !raw.includes(attemptedOwner) &&
+        !observedLogs.join("\n").includes(attemptedOwner) &&
+        !raw.includes("vector_drain_lease_owner"), raw);
+  } finally {
+    console.log = originalLog;
+  }
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nroutes: all ${ran} tests passed`);

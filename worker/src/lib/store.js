@@ -45,6 +45,11 @@ export function backendOf(env) {
 // The first large field D1 corpus was long enough to be truncated before embedding.
 export const CHUNK_SIZE = 1500;
 export const CHUNK_OVERLAP = 300;
+// Cloudflare's paid Workers limit counts every statement submitted through a
+// D1 batch, not merely one service-binding round trip. Leave ten percent of the
+// 1,000-query invocation limit for platform/runtime evolution rather than
+// discovering the cap after half a request has durable pending revisions.
+export const D1_INGEST_STATEMENT_BUDGET = 900;
 
 export function chunkGeometry(env = {}) {
   const rawSize = Number.parseInt(env.CHUNK_SIZE, 10);
@@ -52,6 +57,30 @@ export function chunkGeometry(env = {}) {
   const size = Number.isFinite(rawSize) ? Math.min(Math.max(rawSize, 256), 1800) : CHUNK_SIZE;
   const overlap = Number.isFinite(rawOverlap) ? Math.min(Math.max(rawOverlap, 0), size - 1) : CHUNK_OVERLAP;
   return { size, overlap };
+}
+
+function conservativeChunkCount(content, geometry) {
+  const body = String(content || "");
+  if (!body.trim()) return 0;
+  if (body.length <= geometry.size) return 1;
+  return 1 + Math.ceil((body.length - geometry.size) / (geometry.size - geometry.overlap));
+}
+
+/**
+ * Bound one HTTP batch before its first D1 statement.
+ *
+ * This intentionally assumes every document changed, every unique-document
+ * preflight failed after consuming its reads, every source needs its own stats
+ * refresh/readback, and every document needs the larger resumable stage. The
+ * estimate is therefore above the normal path (50 one-chunk messages submit
+ * 352 statements but reserve 550) while still accepting that replay shape.
+ */
+export function estimateD1IngestStatements(env, envelopes) {
+  const geometry = chunkGeometry(env);
+  return (envelopes || []).reduce((total, envelope) => {
+    const chunks = conservativeChunkCount(envelope?.content, geometry);
+    return total + 9 + (chunks * 2);
+  }, 0);
 }
 
 /**
@@ -318,6 +347,13 @@ function sourceStatsCommitStatement(env, source, revisions) {
 /* ---------------------------------------------------------------- D1 backend */
 
 const d1Backend = {
+  estimateIngestBatchStatements(env, envelopes) {
+    return {
+      estimated_statements: estimateD1IngestStatements(env, envelopes),
+      max_statements: D1_INGEST_STATEMENT_BUDGET,
+    };
+  },
+
   async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60 }) {
     let embedding = null;
     try {
@@ -403,7 +439,7 @@ const d1Backend = {
     // even though only one revision's metadata and chunks survived. The random
     // suffix makes ownership of the commit marker revision-specific.
     const pendingHash = pendingRevisionMarker(hash);
-    await env.DB.prepare(
+    const documentStatement = env.DB.prepare(
       `INSERT INTO documents (doc_uid, source, source_id, title, uri, document_date,
                               date_source, date_reliable, client, category,
                               top_folder, platform, ingested_at, content_hash, meta)
@@ -441,30 +477,11 @@ const d1Backend = {
         persisted.writeHasPlatform ? 1 : 0,
         persisted.forceDateSourceSafety ? 1 : 0,
         persisted.replaceMeta ? 1 : 0
-      )
-      .run();
+      );
 
-    // Replace rather than merge. A shorter revision must not leave the tail of
-    // the previous version behind, answering questions from text that is gone.
-    await d1.replaceDocumentChunks(env, docUid, { expectedContentHash: pendingHash });
-
-    // Use the merged document row for chunks too. Otherwise the document would
-    // preserve a migrated `medical` category while its replacement vectors
-    // silently lost that filter.
-    const merged = await env.DB.prepare(
-      `SELECT client, category, top_folder, platform FROM documents
-       WHERE doc_uid = ?1 AND content_hash = ?2`
-    ).bind(docUid, pendingHash).first();
-    if (!merged) {
-      throw new Error("ingest revision was superseded before chunk write; retry this document");
-    }
-    const client = merged?.client || null;
-    const category = merged?.category || null;
-    const topFolder = merged?.top_folder || null;
-    const platform = merged?.platform || null;
     const header = title ? `[${title}]` : "";
     const pieces = chunkText(content, { header, ...geometry });
-    const chunks = pieces.map((text, i) => ({
+    const baseChunks = pieces.map((text, i) => ({
       chunk_uid: `${docUid}#${i}`,
       doc_uid: docUid,
       chunk_ix: i,
@@ -472,13 +489,51 @@ const d1Backend = {
       source: source_type,
       title: title ?? null,
       document_date: Number.isFinite(docDate) ? docDate : null,
-      client,
-      category,
-      top_folder: topFolder,
-      platform,
     }));
 
-    const w = await d1.upsertChunks(env, chunks, { expectedContentHash: pendingHash });
+    let chunks = baseChunks;
+    let w;
+    if (deferFinalize && d1.canStageDocumentRevision(baseChunks.length)) {
+      // Small changed documents are the dominant email/message migration case.
+      // Stage one document per D1 transaction so a bad row cannot roll back a
+      // neighbour. Chunk INSERT ... SELECT statements read the just-merged
+      // document metadata inside that transaction, preserving rich migrated
+      // filters without the previous extra service-binding read.
+      w = await d1.stageDocumentRevision(env, {
+        documentStatement,
+        docUid,
+        chunks: baseChunks,
+        expectedContentHash: pendingHash,
+      });
+    } else {
+      // Larger documents cannot fit their chunk and outbox statements under
+      // our conservative 100-statement transaction slice. Keep the original
+      // resumable sequence rather than couple its fate to another file.
+      await documentStatement.run();
+
+      // Replace rather than merge. A shorter revision must not leave the tail
+      // of the previous version behind, answering from text that is gone.
+      await d1.replaceDocumentChunks(env, docUid, { expectedContentHash: pendingHash });
+
+      // Use the merged document row for chunks too. Otherwise the document
+      // could preserve a migrated `medical` category while its replacement
+      // vectors silently lost that filter.
+      const merged = await env.DB.prepare(
+        `SELECT client, category, top_folder, platform FROM documents
+         WHERE doc_uid = ?1 AND content_hash = ?2`
+      ).bind(docUid, pendingHash).first();
+      if (!merged) {
+        throw new Error("ingest revision was superseded before chunk write; retry this document");
+      }
+      chunks = baseChunks.map((chunk) => ({
+        ...chunk,
+        client: merged.client || null,
+        category: merged.category || null,
+        top_folder: merged.top_folder || null,
+        platform: merged.platform || null,
+      }));
+      w = await d1.upsertChunks(env, chunks, { expectedContentHash: pendingHash });
+    }
 
     const out = {
       doc_uid: docUid,

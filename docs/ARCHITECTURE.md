@@ -79,8 +79,11 @@ live path.
 1. Run local preflight checks.
 2. Create or resume the manifest, declare durable admin-key storage, and
    prepare the exact desired key before remote changes.
-3. Verify the scoped token and account, provision D1 and Vectorize, apply
-   migrations, then deploy the Worker.
+3. Verify the scoped token and account, then provision D1 and Vectorize. A new
+   install with no existing Worker can migrate and deploy directly. A resumed
+   D1 install with an existing Worker first captures a required bookmark,
+   deploys and verifies the paused compatibility Worker, waits the declared
+   20-minute old-invocation window, migrates, and deploys active mode.
 4. Persist and read back the admin key, set Worker secrets, and verify health.
 5. Register locator-only MCP entries for supported AI tools.
 6. Optionally ingest the first folder and report the vector backlog.
@@ -91,11 +94,17 @@ version, not merely any HTTP 200, because the previous Worker can remain visible
 briefly during propagation.
 
 Provisioning adopts only resources whose identity and stored install state prove
-they belong to this client. Migrations are checksum-protected and append-only.
-Upgrade bookmarks D1, migrates, deploys, reconciles allowed provider secrets,
-waits for the new version, and records success. Rollback is explicit and does
-not pretend Vectorize is transactionally restored with D1; reindex is the repair
-path for a derived index.
+they belong to this client. Migrations are checksum-protected, append-only, and
+restart-safe after every independently committed statement. A D1 upgrade
+captures a required bookmark, deploys and verifies the paused compatibility
+Worker, waits the same old-invocation window, migrates, deploys active mode,
+reconciles allowed provider secrets, waits for the new version, and records
+success. Direct `brain migrate` refuses a live D1 install that needs the writer
+protocol migrations because it cannot prove that older Worker invocations are
+quiescent. Rollback is explicit and does not pretend Vectorize is
+transactionally restored with D1. It leaves the Worker paused until supervised
+recovery recreates/rebinds a clean Vectorize index, because reindex cannot
+enumerate provider-only post-bookmark ids.
 
 Verified recovery keeps orchestration provider-neutral and places all live
 Cloudflare access behind a separate disposable-only adapter. The adapter binds
@@ -107,7 +116,15 @@ private release golden SHA-256 across every supervised stop and resume. D1
 remains the durable authority. FTS and Vectorize are rebuilt derived state.
 Recovery control files contain
 fingerprints and bounded evidence only; the owner-only SQL export is the sole
-recovery artifact that contains corpus data.
+recovery artifact that contains corpus data. The Vectorize drain owner and
+expiry are invocation-local coordination, not recoverable state. Recovery
+therefore excludes `install_state` from the raw provider export, recreates its
+reviewed singleton row with lease and mutation fields forced to SQL `NULL`, a
+corpus-derived bootstrap status/epoch, and the exact `MAX(chunk_uid)` high-water,
+then hashes that normalized row with the remaining durable data. Exact older
+migration prefixes remain inspectable by the offline verifier only. The field
+recovery runner requires schema 12 on both source and restored target before it
+can export or invoke the current drain protocol.
 
 ## Ingest lifecycle
 
@@ -135,17 +152,34 @@ or no-longer-accessible files can be removed safely.
 The authenticated HTTP batch route preserves one receipt per input document.
 For D1 it reads prior rows for unique document identities in one batch preflight,
 so an unchanged 50-document safety rescan is one database round trip rather than
-50 sequential reads. Changed documents still enter the normal pending-hash
-write path. Each attempt owns a revision-unique marker, and its chunk deletes,
-chunk writes, outbox writes, and final commit are conditional on still owning
-that marker. The exact compare-and-swap and one derived statistics refresh
-commit together per touched source, followed by exact readback. The refresh
-derives freshness only from markers that still belong to that transaction, so
-an all-stale finalizer leaves counts and `last_ingest_at` unchanged. The same
-atomic rule covers ordinary one-document ingest. A final content hash by itself
-is not proof because same-content revisions can carry different metadata.
-Repeated identities in one request deliberately use the original sequential
-path because revision order is part of their correctness contract.
+50 sequential reads. Each changed attempt owns a revision-unique pending marker.
+When one document's complete stage fits our conservative 100-statement
+transaction slice, its document row, old-vector queue, chunk replacement, and
+new outbox rows commit in one
+document-isolated transaction. Documents are deliberately not combined, so one
+bad row cannot roll back a neighbor. A larger document retains the resumable
+multi-call stage, slices derived writes to the same internal bound, and
+keeps its pending-marker recovery path.
+
+Binding round trips and paid D1 queries are different units. The normal maximum
+50-document, one-chunk message request uses 53 binding round trips but submits
+352 SQL statements. Before its first D1 read, the Worker reserves a deliberately
+pessimistic statement cost for every eligible document and refuses a request
+above 900 statements, leaving margin below Cloudflare's 1,000-query invocation
+ceiling. A byte-valid request can therefore still receive a pre-write 413 with
+guidance to send fewer or smaller documents; it never discovers that ceiling
+after creating partial pending revisions.
+
+Every chunk delete, chunk write, outbox write, and final commit is conditional
+on still owning the exact marker. The compare-and-swap and one derived
+statistics refresh commit together per touched source, followed by exact
+readback. The refresh derives freshness only from markers that still belong to
+that transaction, so an all-stale finalizer leaves counts and `last_ingest_at`
+unchanged. The same atomic rule covers ordinary one-document ingest. A final
+content hash by itself is not proof because same-content revisions can carry
+different metadata. Repeated identities in one request deliberately use the
+original sequential path because revision order is part of their correctness
+contract.
 
 Drive removal candidates from policy, source deletion, and intentional quality
 skips are intersected with the current stored-family inventory and approved as
@@ -184,17 +218,61 @@ operation. The Worker's cron, or `brain drain`, embeds queued text with the
 declared Cloudflare Workers AI model and applies vector upserts or deletes.
 Failed work remains queued.
 
+`queued_at` measures backlog age and may legitimately repeat within one
+millisecond. It is not a revision identity. D1 assigns every enqueue a strictly
+increasing `generation` from the durable install-state clock. Drain cleanup and
+failure bookkeeping compare that generation, operation, and vector identity,
+so a drain holding an older snapshot cannot clear or mutate a newly requeued
+row even when both rows share the same timestamp.
+
+Vectorize itself has no conditional write, so generation-CAS alone cannot make
+two simultaneous drains safe: an older invocation could land last after a newer
+one. Every manual or scheduled drain therefore claims one opaque, expiring D1
+lease for its complete bounded invocation. A second drain receives a busy
+response without reading or exposing the owner token and performs no embedding,
+Vectorize write, or outbox acknowledgement. Normal completion and exceptions
+release only the matching owner; an abruptly terminated Worker recovers when
+the bounded lease expires.
+
+The source-forget path is enqueue-only: it deletes authoritative D1 content and
+queues vector deletes, but never writes Vectorize directly. This makes the
+leased drain the only Vectorize writer. Each drain also maintains a conservative
+900-query internal budget, including lease operations, worst-case hashed-ID
+remaps, cleanup, failure bookkeeping, and final depth. `maxBatches` is a latency
+preference, not permission to cross that budget; a drain stops cleanly with
+remaining work queued and always reserves its lease-release query.
+
+Vectorize V2 accepts a mutation before that mutation is query-visible. A drain
+therefore has two durable phases. First it records the provider mutation ID on
+the exact outbox generation and on the singleton projection fence, leaving the
+row queued. A later leased drain waits for the provider's processed watermark,
+then uses `getByIds` to prove the exact generation for an upsert or exact absence
+for a delete. Only that confirmation deletes the outbox row. A processed receipt
+whose vector is missing or stale is requeued with an explicit failure instead
+of being counted as embedded.
+
+Readiness is similarly exact: D1 chunk count, outbox depth, submitted depth,
+the provider watermark, and Vectorize count must all agree. The documents
+inventory exposes this as `vector_readiness`; `brain health`, `brain test`, the
+message-migration completion receipt, and every semantic answer fail or mark
+degradation until it is true. This prevents a non-empty but partially updated
+Vectorize result page from looking like complete semantic retrieval.
+
 This creates a deliberate temporary state:
 
 - keyword search can find a new chunk immediately;
-- semantic search cannot find it until its outbox entry drains;
-- `/health` can be green while semantic coverage is incomplete;
-- `brain health`, `brain diagnose`, and backlog reporting must therefore expose
-  pending and stalled vector work.
+- semantic search cannot find it until its outbox entry is visibility-confirmed;
+- the public `/health` route remains a reach/version probe, not a corpus claim;
+- `brain health`, `brain test`, message replay, retrieval responses, and backlog
+  reporting require or disclose exact projection readiness.
 
-`brain reindex` rebuilds Vectorize from D1 when metadata indexes, rollbacks, or
-drift make the derived index untrustworthy. It does not need the original source
-files.
+`brain reindex` rebuilds missing/current Vectorize entries from D1 when metadata
+indexes or drift make the derived index untrustworthy. It cannot remove unknown
+provider-only ids, so rollback/excess recovery first requires a clean supervised
+index replacement and rebind. Reindex does not need the original source files.
+Whole-corpus rebuilds record one durable epoch and advance in 99-chunk pages.
+Re-running reindex while that epoch is in progress resumes its cursor instead
+of resetting completed pages.
 
 ## Retrieval and answer flow
 

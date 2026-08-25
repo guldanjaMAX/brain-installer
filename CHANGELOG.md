@@ -27,6 +27,37 @@ report success.**
 - A recorded message replay is sealed. Re-running it cannot reconcile away
   newer delta documents, and crash recovery validates saved completion
   accounting before any target cleanup.
+- D1 vector work now has a monotonic generation, an exclusive expiring writer
+  lease, and durable asynchronous mutation receipts. Cron, manual drain, and
+  forget cannot race an older Vectorize write into a newer state.
+- Provider acceptance is no longer reported as semantic completion. Drain
+  confirms the processed mutation and exact vector generation or deletion
+  before clearing its outbox row. Health, acceptance, message replay, and live
+  retrieval all disclose or fail on a partial projection, even when Vectorize
+  already returns some candidates.
+- D1 batch ingest now uses 53 binding round trips for the normal maximum
+  50-document, one-chunk request while preserving one receipt and isolated
+  failure per document. Its 352 SQL statements are counted separately, and a
+  conservative pre-write query budget refuses oversized multi-chunk requests
+  before they can create partial no-progress revisions.
+- Updates deploy a verified full corpus-write barrier, wait for older
+  invocations, apply restart-safe migrations, deploy and verify active mode,
+  then resume the bounded legacy-vector bootstrap before exact health and
+  acceptance. Recovery exports normalize
+  invocation-local lease and projection fields instead of persisting them as
+  corpus state.
+- A setup interrupted during its first migration now stops before another D1
+  write when database freshness cannot be proven. It prints the verified
+  paused-writer update and setup-rerun commands instead of guessing that no
+  renamed Worker can still use the database.
+- A D1 rollback deliberately leaves the Worker paused. Provider-only vectors
+  written after the bookmark cannot be enumerated by reindex, so supervised
+  recovery must recreate/rebind a clean Vectorize index and all metadata
+  indexes before reindex, drain, health, and test can return the Brain to use.
+
+After updating, run `brain health <manifest>` and `brain test <manifest>`. Both
+must report the semantic index query-ready with zero pending/submitted vector
+work and exact expected/actual vector counts before you rely on Brain answers.
 
 ## 0.1.13
 

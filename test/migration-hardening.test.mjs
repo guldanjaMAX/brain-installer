@@ -55,6 +55,17 @@ const item = (sourceId = "synthetic-one") => ({
   },
 });
 
+const readyVectorInventory = (expectedVectors = 0) => ({
+  vector_backlog: { pending: 0 },
+  vector_readiness: {
+    ready: true,
+    pending: 0,
+    submitted: 0,
+    expected_vectors: expectedVectors,
+    actual_vectors: expectedVectors,
+  },
+});
+
 await check("source, target, and completion calls refuse automatic redirects", async () => {
   const seen = [];
   const projectRef = "abcdefghijklmnopqrst";
@@ -83,7 +94,7 @@ await check("source, target, and completion calls refuse automatic redirects", a
     adminKey: "fixture",
     fetchImpl: async (url, options) => {
       seen.push({ url, redirect: options.redirect });
-      return response(JSON.stringify({ backend: "d1", rows: [], vector_backlog: { pending: 0 } }), { url });
+      return response(JSON.stringify({ backend: "d1", rows: [], ...readyVectorInventory() }), { url });
     },
   });
   await postSourceReceipt({
@@ -985,7 +996,7 @@ await check("a recorded completion is sealed before any source or target operati
       logical_documents: state.message_sessions.accepted_family_hashes.length,
       document_counts_exact: true,
     }],
-    vector_backlog: { pending: 0 },
+    ...readyVectorInventory(state.message_sessions.target_documents),
   });
   state.message_sessions.receipt_recorded_at = "2026-08-25T00:00:00.000Z";
   target.documents.set("message:newer-delta", JSON.stringify({
@@ -1060,6 +1071,13 @@ await check("a sealed completion rejects corrupt saved target readback without o
     stored_documents: 999,
     logical_documents: 999,
     vector_backlog: 0,
+    vector_readiness: {
+      ready: true,
+      pending: 0,
+      submitted: 0,
+      expected_vectors: 999,
+      actual_vectors: 999,
+    },
     verified_at: "2026-08-25T00:00:00.000Z",
   };
   state.message_sessions.receipt_recorded_at = "2026-08-25T00:01:00.000Z";
@@ -1089,7 +1107,7 @@ await check("completion receipts are available only after aggregate accounting v
   state.message_sessions.target_readback = verifyMessageTargetInventory(state.message_sessions, {
     backend: "d1",
     rows: [],
-    vector_backlog: { pending: 0 },
+    ...readyVectorInventory(),
   });
   const receipt = messageCompletionReceipt(state.message_sessions, "2026-01-01T00:00:00Z");
   assert.equal(receipt.source, "message");
@@ -1117,10 +1135,39 @@ await check("completion waits for exact D1 visibility and an empty vector outbox
   });
   assert.throws(() => verifyMessageTargetInventory(state.message_sessions, {
     backend: "d1", rows: [], vector_backlog: { pending: 3 },
+    vector_readiness: {
+      ready: false, pending: 3, submitted: 0, expected_vectors: 0, actual_vectors: 0,
+    },
   }), /3 vector operations are still pending/);
   assert.throws(() => verifyMessageTargetInventory(state.message_sessions, {
-    backend: "supabase", rows: [], vector_backlog: { pending: 0 },
+    backend: "supabase", rows: [], ...readyVectorInventory(),
   }), /expected D1 backend/);
+
+  assert.throws(() => verifyMessageTargetInventory(state.message_sessions, {
+    backend: "d1", rows: [], vector_backlog: { pending: 0 },
+  }), /no valid exact vector readiness/);
+  assert.throws(() => verifyMessageTargetInventory(state.message_sessions, {
+    backend: "d1",
+    rows: [],
+    vector_backlog: { pending: 0 },
+    vector_readiness: {
+      ready: false,
+      pending: 0,
+      submitted: 0,
+      expected_vectors: 1,
+      actual_vectors: 0,
+      reason: "vector_count_mismatch",
+      action: "run brain diagnose",
+    },
+  }), /not query-ready \(vector_count_mismatch\); run brain diagnose/);
+  assert.throws(() => verifyMessageTargetInventory(state.message_sessions, {
+    backend: "d1",
+    rows: [],
+    vector_backlog: { pending: 0 },
+    vector_readiness: {
+      ready: true, pending: 0, submitted: 0, expected_vectors: 2, actual_vectors: 1,
+    },
+  }), /not query-ready/);
 
   const lane = structuredClone(state.message_sessions);
   lane.target_documents = 2;
@@ -1129,12 +1176,12 @@ await check("completion waits for exact D1 visibility and an empty vector outbox
   assert.throws(() => verifyMessageTargetInventory(lane, {
     backend: "d1",
     rows: [{ source_type: "message", stored_documents: 1, document_counts_exact: true }],
-    vector_backlog: { pending: 0 },
+    ...readyVectorInventory(1),
   }), /does not exactly match accepted physical documents/);
   assert.throws(() => verifyMessageTargetInventory(lane, {
     backend: "d1",
     rows: [{ source_type: "message", stored_documents: 2, logical_documents: 0 }],
-    vector_backlog: { pending: 0 },
+    ...readyVectorInventory(2),
   }), /not based on exact live document counts/);
 });
 

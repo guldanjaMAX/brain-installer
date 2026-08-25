@@ -14,9 +14,15 @@ const sqlite = new DatabaseSync(":memory:");
 for (const file of readdirSync(migrationDir).filter((name) => name.endsWith(".sql")).sort()) {
   for (const sql of splitStatements(readFileSync(join(migrationDir, file), "utf8"))) sqlite.exec(sql);
 }
+sqlite.prepare(
+  `INSERT INTO install_state
+     (id, client_slug, product_version, schema_version, gate_version, installed_at, ring)
+   VALUES (1, 'fixture', '0.0.0', 11, 0, '2026-01-01T00:00:00Z', 'test')`
+).run();
 
 const metrics = {
   remote_calls: 0,
+  submitted_statements: 0,
   stats_scans: 0,
   max_batch_statements: 0,
   max_statement_binds: 0,
@@ -28,6 +34,7 @@ const control = {
 };
 
 function execute(sql, params, mode) {
+  metrics.submitted_statements++;
   if (/INSERT INTO corpus_stats/.test(sql)) metrics.stats_scans++;
   const statement = sqlite.prepare(sql);
   if (mode === "all") return { results: statement.all(...params) };
@@ -127,7 +134,8 @@ const first = await post(fifty);
 assert.equal(first.created, 50);
 assert.equal(first.failed, 0);
 assert.equal(first.results.length, 50);
-assert.equal(metrics.remote_calls, 203);
+assert.equal(metrics.remote_calls, 53);
+assert.equal(metrics.submitted_statements, 352);
 assert.equal(metrics.stats_scans, 1);
 assert.equal(metrics.max_batch_statements, 51);
 assert.ok(metrics.max_statement_binds <= 100);
@@ -141,6 +149,30 @@ assert.deepEqual({ ...sqlite.prepare(
 assert.deepEqual({ ...sqlite.prepare(
   "SELECT documents, chunks FROM corpus_stats WHERE source = 'message'"
 ).get() }, { documents: 50, chunks: 50 });
+
+// A shorter atomic revision must convert retained chunk ids back to upserts
+// while leaving every removed tail vector queued for deletion.
+const longAtomic = envelope("atomic-shorter", "x".repeat(3_500));
+const longAtomicReceipt = await post([longAtomic]);
+assert.equal(longAtomicReceipt.created, 1);
+assert.equal(longAtomicReceipt.results[0].chunks, 3);
+const shortAtomicReceipt = await post([
+  envelope("atomic-shorter", "Synthetic shorter replacement."),
+]);
+assert.equal(shortAtomicReceipt.updated, 1);
+assert.equal(shortAtomicReceipt.results[0].chunks, 1);
+assert.deepEqual(sqlite.prepare(
+  `SELECT chunk_uid, op FROM vector_outbox
+   WHERE chunk_uid LIKE 'message:atomic-shorter#%'
+   ORDER BY chunk_uid`
+).all().map((row) => ({ ...row })), [
+  { chunk_uid: "message:atomic-shorter#0", op: "upsert" },
+  { chunk_uid: "message:atomic-shorter#1", op: "delete" },
+  { chunk_uid: "message:atomic-shorter#2", op: "delete" },
+]);
+assert.equal(sqlite.prepare(
+  "SELECT COUNT(*) AS n FROM chunks WHERE doc_uid = 'message:atomic-shorter'"
+).get().n, 1);
 
 // The scale-critical rescan is one read-only D1 batch and no writes.
 const beforeRetry = { ...metrics };
@@ -162,19 +194,41 @@ assert.deepEqual(mixed.results.map((row) => row.status), ["unchanged", "updated"
 assert.equal(metrics.stats_scans - scansBeforeMix, 1);
 assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM documents WHERE content_hash LIKE 'pending:%'").get().n, 0);
 
-// A chunk-stage failure leaves that revision pending, yet does not stop its
-// successful same-source neighbor from committing. The next retry repairs it.
+// A small-document chunk-stage failure rolls back that document's isolated D1
+// transaction, yet does not stop its successful same-source neighbor. The next
+// retry creates only the missing revision.
 control.fail_chunk_doc_uid = "message:interrupted";
 const interrupted = await post([envelope("neighbor"), envelope("interrupted")]);
 assert.equal(interrupted.created, 1);
 assert.equal(interrupted.failed, 1);
-assert.match(sqlite.prepare("SELECT content_hash FROM documents WHERE doc_uid = ?").get("message:interrupted").content_hash, /^pending:/);
+assert.equal(sqlite.prepare("SELECT content_hash FROM documents WHERE doc_uid = ?").get("message:interrupted"), undefined);
 assert.match(sqlite.prepare("SELECT content_hash FROM documents WHERE doc_uid = ?").get("message:neighbor").content_hash, /^[a-f0-9]{64}$/);
 control.fail_chunk_doc_uid = null;
 const repaired = await post([envelope("neighbor"), envelope("interrupted")]);
 assert.equal(repaired.unchanged, 1);
-assert.equal(repaired.updated, 1);
+assert.equal(repaired.created, 1);
 assert.equal(repaired.failed, 0);
+
+// At 63 chunks, the full atomic stage would need 129 statements. The route
+// therefore keeps the established resumable sequence and slices its derived
+// writes into 100 and 26 statements. A failure leaves its unique pending
+// marker, and retry commits that exact document.
+const largeBody = "x".repeat(75_000);
+control.fail_chunk_doc_uid = "message:large-interrupted";
+const largeInterrupted = await post([envelope("large-interrupted", largeBody)]);
+assert.equal(largeInterrupted.failed, 1);
+assert.match(sqlite.prepare(
+  "SELECT content_hash FROM documents WHERE doc_uid = ?"
+).get("message:large-interrupted").content_hash, /^pending:/);
+assert.ok(metrics.max_batch_statements <= 100);
+control.fail_chunk_doc_uid = null;
+const largeRepaired = await post([envelope("large-interrupted", largeBody)]);
+assert.equal(largeRepaired.updated, 1);
+assert.equal(largeRepaired.failed, 0);
+assert.equal(sqlite.prepare(
+  "SELECT COUNT(*) AS n FROM chunks WHERE doc_uid = ?"
+).get("message:large-interrupted").n, 63);
+assert.ok(metrics.max_batch_statements <= 100);
 
 // Duplicate identities stay sequential, so the second revision is the durable
 // one and each receipt preserves the original created-then-updated contract.

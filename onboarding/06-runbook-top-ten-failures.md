@@ -409,15 +409,19 @@ node brain.mjs rollback <manifest> <bookmark>
 ```
 
 The preview changes nothing and names the exact D1 database and bookmark. It also
-warns that Vectorize is not restored and must be rebuilt. If that reviewed
-target is correct, perform the restore explicitly:
+warns that Vectorize is not restored. If that reviewed target is correct,
+perform the D1 restore explicitly:
 
 ```
 node brain.mjs rollback <manifest> <bookmark> --yes
-node brain.mjs reindex <manifest> --yes
 ```
 
-**Restoring is destructive and irreversible.** Everything written since that snapshot is lost. It is deliberately not automatic, because doing it unattended against your only copy trades a broken update for possible data loss. Prefer fixing forward. Use the snapshot when fixing forward is not available, and do not return the brain to use until the reindex completes.
+The Worker remains paused after restore. Reindex alone cannot enumerate vectors
+written after the D1 bookmark. Under supervised recovery, create and bind a
+clean Vectorize index, recreate every metadata index, then run reindex, drain,
+health, and test to exact readiness before returning active mode.
+
+**Restoring is destructive and irreversible.** Everything written since that snapshot is lost. It is deliberately not automatic, because doing it unattended against your only copy trades a broken update for possible data loss. Prefer fixing forward. Use the snapshot when fixing forward is not available, and do not return the brain to use until the supervised rebuild completes.
 
 **Who:** me, during the engagement. After handoff, the commands above are complete and the snapshot ID is printed at the time of failure. Keep it.
 

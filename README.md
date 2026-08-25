@@ -57,8 +57,10 @@ Windows PowerShell:
 
 ## Set it up
 
-You need two things first. `brain doctor` checks all of them and tells you
-exactly what to do about anything missing.
+You need two things first. `brain doctor` checks the technical access and tells
+you what to do about anything missing. Cloudflare does not expose the account's
+plan through the scoped install token, so you must confirm **Workers and Pages,
+Plans: Paid** in the dashboard yourself before a production install.
 
 1. **A Cloudflare account on the Workers Paid plan.** 5 USD a month minimum.
    Cloudflare now lets Free accounts create the meaning-search index, but Free
@@ -94,6 +96,13 @@ item before generating the key. Windows stores only DPAPI CurrentUser
 ciphertext; Linux uses an owner-only adjacent file. An existing legacy Mac
 `.brain-admin-key` remains authoritative instead of being silently moved.
 
+If a first setup is interrupted after D1 commits only part of a migration, the
+next setup does not guess that the database is unused. It stops before another
+write and prints two exact commands: run `brain update <manifest>` to establish
+the verified paused-writer boundary, then rerun `brain setup <manifest>`. If the
+update later stops because setup has not saved its admin key yet, still rerun
+setup as instructed; the migration boundary is already safe and resumable.
+
 ## Update it
 
 First install the exact release named on `financialbrain.ai/update`. Then run
@@ -126,11 +135,13 @@ On Windows, use:
 ```
 
 The update verifies the Cloudflare account, requires a D1 restore bookmark,
-applies migrations, deploys the Worker, runs exact-version health and the full
-acceptance suite, reads the committed version back from D1, and only then
-updates the local manifest. A failed update keeps the bookmark and tells you
-the safe rerun path. It never restores automatically because restoring would
-discard newer writes.
+deploys and verifies a temporary paused Worker, waits for older Worker requests
+to finish, applies migrations, deploys active mode, resumes any bounded vector
+bootstrap, runs exact-version health and the full acceptance suite, reads the
+committed version back from D1, and only then updates the local manifest. Paused
+mode rejects every corpus/source write, not only vector drain. A failed update
+keeps the bookmark and tells you the safe rerun path. It never restores
+automatically because restoring would discard newer writes.
 
 ---
 

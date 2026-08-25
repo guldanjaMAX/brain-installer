@@ -196,6 +196,42 @@ export class Acceptance {
       `${unembedded} document(s) awaiting embedding`
     );
 
+    // D1 is the product default everywhere else (setup, update, and health).
+    // Do not let an endpoint choose its own expected backend here: a misbound
+    // Supabase Worker could otherwise make a manifest with omitted storage
+    // silently skip every exact Vectorize readiness check.
+    const expectedBackend = String(
+      this.m.infrastructure?.cloudflare?.storage || "d1",
+    ).trim().toLowerCase();
+    const actualBackend = String(docs.json?.backend || "").trim().toLowerCase();
+    this.record(
+      t,
+      "storage backend matches manifest",
+      actualBackend === expectedBackend ? PASS : FAIL,
+      `expected ${expectedBackend || "an explicit backend"}, received ${actualBackend || "none"}`,
+    );
+    if (expectedBackend === "d1") {
+      const readiness = docs.json?.vector_readiness;
+      const valid = readiness && typeof readiness === "object" && !Array.isArray(readiness) &&
+        !Object.hasOwn(readiness, "error") && typeof readiness.ready === "boolean" &&
+        Number.isSafeInteger(readiness.expected_vectors) && readiness.expected_vectors >= 0 &&
+        Number.isSafeInteger(readiness.actual_vectors) && readiness.actual_vectors >= 0 &&
+        Number.isSafeInteger(readiness.pending) && readiness.pending >= 0 &&
+        Number.isSafeInteger(readiness.submitted) && readiness.submitted >= 0 &&
+        readiness.submitted <= readiness.pending;
+      const ready = valid && readiness.ready === true && readiness.pending === 0 &&
+        readiness.submitted === 0 && readiness.actual_vectors === readiness.expected_vectors;
+      this.record(
+        t,
+        "semantic index is query-ready",
+        ready ? PASS : FAIL,
+        valid
+          ? `${readiness.actual_vectors}/${readiness.expected_vectors} vector(s), ${readiness.pending} operation(s) pending` +
+            (ready ? "" : `; ${readiness.action || "run brain drain, then brain diagnose"}`)
+          : "the Worker did not provide a valid Vectorize visibility receipt",
+      );
+    }
+
     const freshest = rows
       .map((r) => (r.last_ingested ? Date.parse(r.last_ingested) : NaN))
       .filter(Number.isFinite)
@@ -230,10 +266,12 @@ export class Acceptance {
     }
 
     let answered = 0;
+    let vectorDegraded = 0;
     for (const q of probes) {
       const r = await this.post("/api/rag/unified", { q, limit: 5, rerank: 0 });
       const n = r.json?.results?.length || 0;
       if (n > 0) answered++;
+      if (r.json?.degraded === "vector") vectorDegraded++;
       this.record(
         t,
         `probe: ${q.slice(0, 48)}`,
@@ -247,12 +285,28 @@ export class Acceptance {
       answered === probes.length ? PASS : answered > 0 ? WARN : FAIL,
       `${answered}/${probes.length} probes returned sources`
     );
+    this.record(
+      t,
+      "semantic retrieval is active",
+      vectorDegraded === 0 ? PASS : FAIL,
+      vectorDegraded === 0
+        ? "no probe degraded to keyword-only retrieval"
+        : `${vectorDegraded}/${probes.length} probe(s) were keyword-only because Vectorize returned no candidates`,
+    );
 
     // `think` must degrade rather than 500. This is the path most likely to
     // break quietly, because it only fails when the LLM key, the spend cap or
     // the model name is wrong, none of which show up until someone asks a
     // question.
     const think = await this.post("/api/rag/think", { q: probes[0], limit: 5 });
+    if (think.json?.degraded === "vector") {
+      this.record(
+        t,
+        "think uses semantic retrieval",
+        FAIL,
+        "the answer path degraded to keyword-only retrieval",
+      );
+    }
     if (!think.ok) {
       this.record(t, "think endpoint", FAIL, `HTTP ${think.status}`);
     } else if (think.json?.answer) {

@@ -34,11 +34,13 @@ import {
   cmdRollback,
   cmdRollbackInteractive,
   cmdUpdate,
-  cmdUpgrade,
+  cmdUpgrade as cmdUpgradeWithRealQuiescence,
   commitManifestVersion,
   compareSemver,
   healthProbeVerdict,
+  VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS,
 } from "../brain.mjs";
+import { DRAIN_LEASE_TTL_MS } from "../worker/src/lib/store-d1.js";
 import { Acceptance, credentialGateRefusalVerdict } from "../acceptance.mjs";
 import {
   installedManifestPointerPath,
@@ -46,11 +48,29 @@ import {
   rememberInstalledManifest,
 } from "../operations/installed-manifest.mjs";
 
+// Production waits the full cutover grace. Unit tests inject a zero-time
+// waiter while still asserting the exact duration requested by cmdUpgrade.
+const cmdUpgrade = (manifestPath, options = {}) => cmdUpgradeWithRealQuiescence(
+  manifestPath,
+  {
+    waitForVectorDrainQuiescence: async () => {},
+    cmdDrain: async () => {},
+    ...options,
+  },
+);
+
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 200))); if (!c) fail++; };
 
 const V = (o) => healthProbeVerdict(o);
 const body = (v) => JSON.stringify({ ok: true, brain: "x", version: v });
+const cutoverBody = (v, mode, protocol = "lease-v1") => JSON.stringify({
+  ok: true,
+  brain: "x",
+  version: v,
+  vector_writer_protocol: protocol,
+  vector_drain_mode: mode,
+});
 const manifestFixture = (version = "0.1.9") => ({
   client: { slug: "fixture" },
   brain: { worker_name: "fixture-brain", version },
@@ -71,6 +91,30 @@ const manifestFixture = (version = "0.1.9") => ({
   check("it retries instead, because propagation is normal", v === "retry", `got ${v}`);
 }
 
+{
+  check("paused cutover health requires the expected mode and leased writer protocol",
+    V({
+      ok: true,
+      body: cutoverBody("0.1.14", "paused-for-upgrade"),
+      expectVersion: "0.1.14",
+      expectDrainMode: "paused-for-upgrade",
+      attempt: 1,
+      attempts: 6,
+    }) === "accept");
+  check("version-only old health cannot masquerade as a paused compatibility worker",
+    V({
+      ok: true,
+      body: body("0.1.14"),
+      expectVersion: "0.1.14",
+      expectDrainMode: "paused-for-upgrade",
+      attempt: 6,
+      attempts: 6,
+    }) === "fail");
+  check("the rolling-upgrade grace is never shorter than one supported writer lease",
+    VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS >= DRAIN_LEASE_TTL_MS,
+    `${VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS} < ${DRAIN_LEASE_TTL_MS}`);
+}
+
 /* ---- full acceptance independently enforces the deployed version ---- */
 {
   const suite = new Acceptance({
@@ -87,6 +131,101 @@ const manifestFixture = (version = "0.1.9") => ({
   check("the full acceptance suite rejects an old Worker version",
     suite.results[0]?.status === "fail" && /expected version 0\.1\.14/.test(suite.results[0]?.detail || ""),
     JSON.stringify(suite.results));
+}
+
+/* ---- provider acceptance is not semantic visibility ---- */
+{
+  const inventory = (readiness) => ({
+    backend: "d1",
+    rows: [{ source_type: "message", total: 1, embedded: 1, last_ingested: new Date().toISOString() }],
+    vector_backlog: { pending: readiness.pending, submitted: readiness.submitted },
+    vector_readiness: readiness,
+  });
+  const lagged = new Acceptance({
+    base: "https://fixture.invalid",
+    adminKey: "fixture-admin-key",
+    manifest: manifestFixture("0.1.14"),
+    fetchImpl: async () => new Response(JSON.stringify(inventory({
+      ready: false,
+      reason: "accepted_mutation_processing",
+      expected_vectors: 1,
+      actual_vectors: 0,
+      pending: 1,
+      submitted: 1,
+      action: "Run brain drain",
+    })), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  await lagged.tierData();
+  const laggedGate = lagged.results.find((result) => result.name === "semantic index is query-ready");
+  check("full acceptance fails while an accepted vector is not query-visible",
+    laggedGate?.status === "fail" && /0\/1 vector/.test(laggedGate.detail || ""),
+    JSON.stringify(lagged.results));
+
+  const converged = new Acceptance({
+    base: "https://fixture.invalid",
+    adminKey: "fixture-admin-key",
+    manifest: manifestFixture("0.1.14"),
+    fetchImpl: async () => new Response(JSON.stringify(inventory({
+      ready: true,
+      reason: null,
+      expected_vectors: 1,
+      actual_vectors: 1,
+      pending: 0,
+      submitted: 0,
+      action: null,
+    })), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  await converged.tierData();
+  check("full acceptance passes exact vector visibility after convergence",
+    converged.results.find((result) => result.name === "semantic index is query-ready")?.status === "pass",
+    JSON.stringify(converged.results));
+
+  const omittedStorage = manifestFixture("0.1.14");
+  delete omittedStorage.infrastructure.cloudflare.storage;
+  const misbound = new Acceptance({
+    base: "https://fixture.invalid",
+    adminKey: "fixture-admin-key",
+    manifest: omittedStorage,
+    fetchImpl: async () => new Response(JSON.stringify({
+      backend: "supabase",
+      rows: inventory({
+        ready: true,
+        expected_vectors: 1,
+        actual_vectors: 1,
+        pending: 0,
+        submitted: 0,
+      }).rows,
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  await misbound.tierData();
+  check("omitted manifest storage still requires D1 and refuses a Supabase-bound Worker",
+    misbound.results.some((result) =>
+      result.name === "storage backend matches manifest" && result.status === "fail" &&
+      /expected d1, received supabase/.test(result.detail || "")),
+    JSON.stringify(misbound.results));
+}
+
+{
+  const degraded = new Acceptance({
+    base: "https://fixture.invalid",
+    adminKey: "fixture-admin-key",
+    manifest: manifestFixture("0.1.14"),
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(String(init?.body || "{}"));
+      return new Response(JSON.stringify({
+        results: [{ title: "keyword-only fixture" }],
+        degraded: "vector",
+        answer: "Keyword-only fixture [1]",
+        gaps: [],
+        q: body.q,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  await degraded.tierRetrieval(["fixture query"]);
+  check("full acceptance cannot pass keyword-only fallback as semantic retrieval",
+    degraded.results.some((result) => result.name === "semantic retrieval is active" && result.status === "fail") &&
+      degraded.results.some((result) => result.name === "think uses semantic retrieval" && result.status === "fail"),
+    JSON.stringify(degraded.results));
 }
 
 /* ---- it must eventually give up rather than pass ---- */
@@ -159,10 +298,15 @@ const manifestFixture = (version = "0.1.9") => ({
         events.push("bookmark");
         return { bookmark: "fixture-bookmark" };
       },
-      cmdMigrate: async (path) => { executionPaths.add(path); events.push("migrate"); },
+      cmdMigrate: async (path, options) => {
+        executionPaths.add(path);
+        events.push("migrate");
+        check("only the verified cutover authorizes live writer migrations",
+          options?.vectorDrainQuiesced === true, JSON.stringify(options));
+      },
       cmdDeploy: async (path, options) => {
         executionPaths.add(path);
-        events.push("deploy");
+        events.push(options?.pauseVectorDrainForUpgrade ? "deploy-paused" : "deploy-active");
         // Model cmdDeploy's legacy no-domain behavior. Without the explicit
         // update override this write changes the pinned execution artifact and
         // the next lifecycle revalidation fails after a live deployment.
@@ -174,16 +318,32 @@ const manifestFixture = (version = "0.1.9") => ({
         check("legacy update deploy cannot persist into the pinned manifest",
           options?.persistDomain === false, JSON.stringify(options));
       },
+      waitForVectorDrainQuiescence: async (milliseconds) => {
+        events.push("quiescence");
+        check("upgrade waits one complete supported drain window",
+          milliseconds === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS, String(milliseconds));
+      },
       reconcileWorkerProviderSecrets: async (_manifest, account, scriptName, allowed) => {
         events.push("reconcile");
         check("upgrade reconciliation uses the resolved account", account.id === "fixture-account");
         check("upgrade reconciliation targets only this worker", scriptName === "fixture-brain");
         check("standard D1 upgrade allows no provider secrets", Array.isArray(allowed) && allowed.length === 0);
       },
+      cmdDrain: async (path) => {
+        executionPaths.add(path);
+        events.push("drain");
+      },
       cmdHealth: async (path, options) => {
         executionPaths.add(path);
-        events.push("health");
+        events.push(options.expectDrainMode === "paused-for-upgrade" ? "health-paused" : "health-active");
         check("upgrade health requires the running package version", options.expectVersion === "0.1.14");
+        if (options.expectDrainMode === "paused-for-upgrade") {
+          check("the compatibility health probe is paused-mode and reach-only",
+            options.reachOnly === true, JSON.stringify(options));
+        } else {
+          check("the final health probe proves vector draining is active",
+            options.expectDrainMode === "active", JSON.stringify(options));
+        }
       },
       cmdTest: async (path, options) => {
         executionPaths.add(path);
@@ -198,7 +358,7 @@ const manifestFixture = (version = "0.1.9") => ({
     });
     check(
       "upgrade reconciles provider secrets after deploy and before health",
-      events.join(",") === "state,bookmark,migrate,deploy,reconcile,health,test,version,readback,manifest,log",
+      events.join(",") === "state,bookmark,deploy-paused,health-paused,quiescence,migrate,deploy-active,reconcile,drain,health-active,test,version,readback,manifest,log",
       events.join(","),
     );
     check("every remote lifecycle stage revalidates the token account", accountChecks >= 10, String(accountChecks));
@@ -211,6 +371,67 @@ const manifestFixture = (version = "0.1.9") => ({
       "the private execution manifest is removed after success",
       !readdirSync(sandbox).some((name) => name.includes(".brain-update-")),
     );
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+}
+
+/* ---- a legacy non-D1 install has no D1 outbox writer to quiesce ---- */
+{
+  const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-upgrade-non-d1-")));
+  try {
+    const manifestPath = join(sandbox, "brain.manifest.json");
+    const value = manifestFixture();
+    value.infrastructure.cloudflare.storage = "supabase";
+    writeFileSync(manifestPath, JSON.stringify(value));
+    const events = [];
+    let d1Version = "0.1.9";
+    await cmdUpgrade(manifestPath, {
+      resolveAccount: async () => ({ id: "fixture-account" }),
+      d1Query: async (_account, _database, sql) => {
+        if (/sqlite_master/i.test(sql)) return { results: [{ name: "install_state" }] };
+        if (/SELECT \* FROM install_state/i.test(sql)) {
+          events.push("state");
+          return { results: [{ client_slug: "fixture", product_version: d1Version }] };
+        }
+        if (/UPDATE install_state/i.test(sql)) {
+          events.push("version");
+          d1Version = "0.1.14";
+        }
+        if (/SELECT product_version/i.test(sql)) {
+          events.push("readback");
+          return { results: [{ product_version: d1Version }] };
+        }
+        if (/INSERT INTO upgrade_runs/i.test(sql)) events.push("log");
+        return { results: [] };
+      },
+      cf: async () => { events.push("bookmark"); return { bookmark: "non-d1-bookmark" }; },
+      cmdMigrate: async (_path, options) => {
+        events.push("migrate");
+        check("non-D1 migration does not claim a vector-writer cutover",
+          options?.vectorDrainQuiesced !== true, JSON.stringify(options));
+      },
+      cmdDeploy: async (_path, options) => {
+        events.push("deploy");
+        check("non-D1 upgrade uses one ordinary deployment",
+          options?.pauseVectorDrainForUpgrade === undefined, JSON.stringify(options));
+      },
+      waitForVectorDrainQuiescence: async () => { events.push("unexpected-wait"); },
+      reconcileWorkerProviderSecrets: async () => { events.push("reconcile"); },
+      cmdHealth: async (_path, options) => {
+        events.push("health");
+        check("non-D1 final health has no D1 drain-mode requirement",
+          options.expectDrainMode === null, JSON.stringify(options));
+      },
+      cmdTest: async () => { events.push("test"); },
+      commitManifestVersion: (path, version) => {
+        events.push("manifest");
+        return commitManifestVersion(path, version);
+      },
+    });
+    check("non-D1 upgrade skips the compatibility pause and grace",
+      events.join(",") === "state,bookmark,migrate,deploy,reconcile,health,test,version,readback,manifest,log",
+      events.join(","));
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
   }
@@ -287,6 +508,86 @@ const manifestFixture = (version = "0.1.9") => ({
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
   }
+}
+
+/* ---- cutover failures stay fail-closed and never advance versions ---- */
+{
+  const runFailure = async (failureStage) => {
+    const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), `brain-cutover-${failureStage}-`)));
+    const manifestPath = join(sandbox, "brain.manifest.json");
+    writeFileSync(manifestPath, JSON.stringify(manifestFixture()));
+    const events = [];
+    let versionWrites = 0;
+    let manifestWrites = 0;
+    let error = null;
+    try {
+      await cmdUpgrade(manifestPath, {
+        resolveAccount: async () => ({ id: "fixture-account" }),
+        d1Query: async (_account, _database, sql) => {
+          if (/sqlite_master/i.test(sql)) return { results: [{ name: "install_state" }] };
+          if (/SELECT \* FROM install_state/i.test(sql)) {
+            return { results: [{ client_slug: "fixture", product_version: "0.1.9" }] };
+          }
+          if (/UPDATE install_state/i.test(sql)) versionWrites++;
+          return { results: [] };
+        },
+        cf: async () => ({ bookmark: `${failureStage}-bookmark` }),
+        cmdDeploy: async (_path, options) => {
+          const mode = options.pauseVectorDrainForUpgrade ? "paused" : "active";
+          events.push(`deploy-${mode}`);
+          if (failureStage === "active-deploy" && mode === "active") {
+            throw new Error("synthetic final upload ambiguity");
+          }
+        },
+        cmdHealth: async (_path, options) => {
+          events.push(options.reachOnly ? "health-paused" : "health-active");
+        },
+        waitForVectorDrainQuiescence: async () => { events.push("wait"); },
+        cmdMigrate: async (_path, options) => {
+          events.push(`migrate-${options?.vectorDrainQuiesced === true}`);
+          if (failureStage === "migration") throw new Error("synthetic migration failure");
+        },
+        reconcileWorkerProviderSecrets: async () => { events.push("reconcile"); },
+        cmdDrain: async () => {
+          events.push("converge");
+          if (failureStage === "convergence") throw new Error("synthetic bootstrap deadline");
+        },
+        cmdTest: async () => { events.push("acceptance"); },
+        commitManifestVersion: () => { manifestWrites++; },
+      });
+    } catch (caught) { error = caught; }
+    const manifestVersion = JSON.parse(readFileSync(manifestPath, "utf8")).brain.version;
+    rmSync(sandbox, { recursive: true, force: true });
+    return { events, error, versionWrites, manifestWrites, manifestVersion };
+  };
+
+  const migrationFailure = await runFailure("migration");
+  check("migration failure leaves the compatibility Worker paused and versions uncommitted",
+    migrationFailure.events.join(",") === "deploy-paused,health-paused,wait,migrate-true" &&
+      migrationFailure.versionWrites === 0 && migrationFailure.manifestWrites === 0 &&
+      migrationFailure.manifestVersion === "0.1.9" &&
+      /migration-bookmark/.test(migrationFailure.error?.message || "") &&
+      /run brain update again/i.test(migrationFailure.error?.message || ""),
+    JSON.stringify({ ...migrationFailure, error: migrationFailure.error?.message }));
+
+  const deployFailure = await runFailure("active-deploy");
+  check("an ambiguous final upload stops before health, acceptance, and version commits",
+    deployFailure.events.join(",") === "deploy-paused,health-paused,wait,migrate-true,deploy-active" &&
+      deployFailure.versionWrites === 0 && deployFailure.manifestWrites === 0 &&
+      deployFailure.manifestVersion === "0.1.9" &&
+      /active-deploy-bookmark/.test(deployFailure.error?.message || "") &&
+      /active vector-drain deployment/.test(deployFailure.error?.message || ""),
+    JSON.stringify({ ...deployFailure, error: deployFailure.error?.message }));
+
+  const convergenceFailure = await runFailure("convergence");
+  check("an incomplete projection bootstrap blocks health, acceptance, and every version commit",
+    convergenceFailure.events.join(",") ===
+      "deploy-paused,health-paused,wait,migrate-true,deploy-active,reconcile,converge" &&
+      convergenceFailure.versionWrites === 0 && convergenceFailure.manifestWrites === 0 &&
+      convergenceFailure.manifestVersion === "0.1.9" &&
+      /vector projection convergence/.test(convergenceFailure.error?.message || "") &&
+      /convergence-bookmark/.test(convergenceFailure.error?.message || ""),
+    JSON.stringify({ ...convergenceFailure, error: convergenceFailure.error?.message }));
 }
 
 /* ---- manifest version commit is atomic and verified ---- */
@@ -500,11 +801,12 @@ const manifestFixture = (version = "0.1.9") => ({
           writeFileSync(manifestPath, JSON.stringify(manifestFixture("0.1.8")));
         },
         cmdDeploy: async () => { deployed++; },
+        cmdHealth: async () => {},
       });
     } catch (caught) { error = caught; }
     check(
       "a manifest fingerprint change stops before the next remote stage",
-      /manifest changed during migration/.test(error?.message || "") && deployed === 0,
+      /manifest changed during migration/.test(error?.message || "") && deployed === 1,
       error?.message,
     );
     check(
@@ -534,11 +836,12 @@ const manifestFixture = (version = "0.1.9") => ({
         cf: async () => ({ bookmark: "account-bookmark" }),
         cmdMigrate: async () => { resolvedAccount = "other-account"; },
         cmdDeploy: async () => { secondDeploy++; },
+        cmdHealth: async () => {},
       });
     } catch (caught) { accountError = caught; }
     check(
       "a changed token account stops before the next remote stage",
-      /account identity changed during deployment/.test(accountError?.message || "") && secondDeploy === 0,
+      /account identity changed during active vector-drain deployment/.test(accountError?.message || "") && secondDeploy === 1,
       accountError?.message,
     );
   } finally {
@@ -570,10 +873,11 @@ const manifestFixture = (version = "0.1.9") => ({
     }
     const rendered = output.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
     check(
-      "direct rollback without --yes is a D1-only destructive preview with a required reindex",
+      "direct rollback preview requires supervised clean-index recovery before reindex",
       preview?.confirmed === false && preview?.restored === false &&
         /nothing was changed/i.test(rendered) && /D1 restore is DESTRUCTIVE/i.test(rendered) &&
-        /does not restore Vectorize/i.test(rendered) && /reindex/i.test(rendered) && /--yes/.test(rendered),
+        /does not restore Vectorize/i.test(rendered) && /supervised index recreation before reindex/i.test(rendered) &&
+        /--yes/.test(rendered),
       rendered,
     );
     check(
@@ -602,6 +906,24 @@ const manifestFixture = (version = "0.1.9") => ({
     const restored = await cmdRollback(manifestPath, "fixture-bookmark", {
       confirmed: true,
       resolveAccount: async () => { actions.push("account"); return { id: "fixture-account" }; },
+      cmdDeploy: async (_path, options) => {
+        actions.push(options.pauseVectorDrainForUpgrade ? "deploy-paused" : "deploy-active");
+        check("rollback deploys only explicit paused or active writer mode",
+          options.persistDomain === false && typeof options.pauseVectorDrainForUpgrade === "boolean",
+          JSON.stringify(options));
+      },
+      cmdHealth: async (_path, options) => {
+        actions.push(options.expectDrainMode === "paused-for-upgrade" ? "health-paused" : "health-active");
+        check("rollback proves exact paused writer mode before restore",
+          options.expectVersion === "0.1.14" && options.reachOnly === true &&
+            options.expectDrainMode === "paused-for-upgrade",
+          JSON.stringify(options));
+      },
+      waitForVectorDrainQuiescence: async (milliseconds) => {
+        actions.push("quiesce");
+        check("rollback waits one full old-writer window before D1 time travel",
+          milliseconds === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS, String(milliseconds));
+      },
       cf: async (path, request) => {
         actions.push("restore");
         check(
@@ -612,15 +934,73 @@ const manifestFixture = (version = "0.1.9") => ({
         );
       },
       d1Query: async (_account, _database, sql) => {
+        if (/UPDATE install_state/.test(sql)) {
+          actions.push("invalidate");
+          check("rollback clears restored lease ownership before supervised recovery",
+            /vector_drain_lease_owner\s*=\s*NULL/.test(sql) &&
+              /vector_drain_lease_expires_at\s*=\s*NULL/.test(sql), sql);
+          return { results: [], meta: { changes: 1 } };
+        }
+        if (/UPDATE vector_outbox/.test(sql)) {
+          actions.push("reset-receipts");
+          return { results: [], meta: { changes: 1 } };
+        }
+        if (/SELECT vector_projection_status/.test(sql)) {
+          actions.push("readback");
+          return { results: [{
+            status: "bootstrap_required",
+            lease_owner: null,
+            lease_expires_at: null,
+            mutation_id: null,
+            mutation_submitted_at: null,
+            cursor: null,
+            high_water: "fixture#9",
+            chunk_high_water: "fixture#9",
+            submitted_rows: 0,
+          }] };
+        }
         actions.push("history");
         check("confirmed rollback marks its history as rolled back", /status = 'rolled_back'/.test(sql), sql);
+        return { results: [] };
       },
     });
     check(
       "explicit confirmation is the only path that performs the restore",
       restored?.confirmed === true && restored?.restored === true &&
-        actions.join(",") === "account,restore,history",
+        restored?.requiresVectorizeRecreation === true &&
+        actions.join(",") === "account,deploy-paused,health-paused,quiesce,restore,invalidate,reset-receipts,readback,history",
       actions.join(","),
+    );
+    check("rollback never reactivates a Worker against an orphaned provider index",
+      !actions.includes("deploy-active") && !actions.includes("health-active"), actions.join(","));
+
+    const prefixActions = [];
+    let prefixRollbackError = null;
+    try {
+      await cmdRollback(manifestPath, "fixture-bookmark", {
+        confirmed: true,
+        resolveAccount: async () => ({ id: "fixture-account" }),
+        cmdDeploy: async (_path, options) => {
+          prefixActions.push(options.pauseVectorDrainForUpgrade ? "deploy-paused" : "DEPLOY-ACTIVE");
+        },
+        cmdHealth: async (_path, options) => {
+          prefixActions.push(`health:${options.expectDrainMode}`);
+        },
+        waitForVectorDrainQuiescence: async () => { prefixActions.push("quiesce"); },
+        cf: async () => { prefixActions.push("restore-prefix"); },
+        d1Query: async () => {
+          prefixActions.push("schema12-invalidate");
+          throw new Error("no such column: vector_projection_status");
+        },
+      });
+    } catch (caught) { prefixRollbackError = caught; }
+    check(
+      "a pre-schema12 bookmark fails closed after restore with the Worker still paused",
+      /Worker remains paused.*brain update.*forward-migrate/is.test(prefixRollbackError?.message || "") &&
+        prefixActions.join(",") ===
+          "deploy-paused,health:paused-for-upgrade,quiesce,restore-prefix,schema12-invalidate" &&
+        !prefixActions.includes("DEPLOY-ACTIVE"),
+      `${prefixRollbackError?.message}; ${prefixActions.join(",")}`,
     );
 
     let ownershipError = null;

@@ -15,8 +15,13 @@ const mkEnv = (rows, upserted, deleted = [], updates = []) => ({
   DB: {
     prepare(q) {
       const shape = (b = []) => ({
-        all: async () => ({ results: /WHERE op = 'delete'/.test(q) ? [] : rows }), first: async () => ({ n: 1 }),
-        run: async () => ({}), _q: q, _b: b,
+        all: async () => ({ results:
+          /submitted_mutation_id IS NOT NULL/.test(q) || /WHERE op = 'delete'/.test(q) ? [] : rows }),
+        first: async () => ({ n: 1 }),
+        run: async () => /UPDATE install_state/.test(q)
+          ? ({ meta: { changes: 1 } })
+          : ({}),
+        _q: q, _b: b,
       });
       const o = shape(); o.bind = (...b) => shape(b); return o;
     },
@@ -25,15 +30,16 @@ const mkEnv = (rows, upserted, deleted = [], updates = []) => ({
         if (/DELETE FROM vector_outbox/.test(s._q)) deleted.push(s._b[0]);
         if (/UPDATE vector_outbox/.test(s._q)) updates.push(s._b[0]);
       }
+      return stmts.map(() => ({ meta: { changes: 1 } }));
     },
   },
-  VECTORIZE: { upsert: async (v) => { upserted.push(...v); } },
+  VECTORIZE: { upsert: async (v) => { upserted.push(...v); return { mutationId: "fixture-throughput" }; } },
 });
 
 const rows = (n) => Array.from({ length: n }, (_, i) => ({
   chunk_uid: `c${i}#0`, text: `text ${i}`, source: "s", doc_uid: `c${i}`,
   client: "Acme", category: "note", top_folder: "Clients", platform: "drive",
-  document_date: 1750000000000,
+  document_date: 1750000000000, generation: i + 1,
 }));
 
 /* ---- the round trips actually collapse ---- */
@@ -45,7 +51,8 @@ const rows = (n) => Array.from({ length: n }, (_, i) => ({
     embedGroup: 50,
   });
   check("100 chunks embed in 2 calls, not 100", batchCalls === 2 && singleCalls === 0, `batch=${batchCalls} single=${singleCalls}`);
-  check("and all 100 are drained", r.drained === 100, JSON.stringify(r));
+  check("and all 100 are durably submitted for later visibility confirmation",
+    r.submitted === 100 && r.drained === 0 && r.waiting === 100, JSON.stringify(r));
   check("every vector carries the full pre-filter metadata contract",
     up.every((v) => v.metadata.source === "s" && v.metadata.client === "Acme" &&
       v.metadata.category === "note" && v.metadata.top_folder === "Clients" &&
@@ -77,7 +84,7 @@ const rows = (n) => Array.from({ length: n }, (_, i) => ({
   });
   check("a short batch response is rejected, not misaligned", up.every((v, i) => v.values[0] === i),
     JSON.stringify(up.map((v) => v.values[0])));
-  check("and every chunk still drains via the per-item fallback", r.drained === 4, JSON.stringify(r));
+  check("and every chunk still submits via the per-item fallback", r.submitted === 4, JSON.stringify(r));
 }
 
 /* ---- poison isolation survives batching ---- */
@@ -92,16 +99,17 @@ const rows = (n) => Array.from({ length: n }, (_, i) => ({
     embedBatch: async (texts) => { if (texts.includes("BAD")) throw new Error("group failed"); return texts.map(() => [0.1]); },
     embedGroup: 50,
   });
-  check("a failed group does NOT poison its innocent members", r.drained === 2, JSON.stringify(r));
+  check("a failed group does NOT poison its innocent members", r.submitted === 2, JSON.stringify(r));
   check("only the genuinely bad chunk is quarantined", r.failed === 1 && upd.includes("poison#0"), JSON.stringify(upd));
-  check("and the good ones leave the queue", del.length === 2 && !del.includes("poison#0"), JSON.stringify(del));
+  check("and accepted rows stay queued until their exact generation is visible",
+    del.length === 0 && upd.includes("ok1#0") && upd.includes("ok2#0"), JSON.stringify({ del, upd }));
 }
 
 /* ---- without embedBatch, behaviour is exactly as before ---- */
 {
   const up = []; let single = 0;
   const r = await drainOutbox(mkEnv(rows(3), up), { embed: async () => { single++; return [0.1]; } });
-  check("a caller that passes no embedBatch still works", r.drained === 3 && single === 3, `single=${single}`);
+  check("a caller that passes no embedBatch still works", r.submitted === 3 && single === 3, `single=${single}`);
 }
 
 console.log(`\ndrain throughput: ${ran - fail}/${ran} passed`);

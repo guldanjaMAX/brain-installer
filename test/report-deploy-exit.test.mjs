@@ -84,6 +84,7 @@ async function isolatedRuntime({ fetchImpl, env = {}, argv = null }, fn) {
 
 function cloudflareHarness({ routePost = "ok", routeEnabled = true, schedule = "ok" } = {}) {
   const calls = [];
+  const workerMetadata = [];
   const fetchImpl = async (url, options = {}) => {
     const path = new URL(String(url)).pathname;
     const method = options.method || "GET";
@@ -92,6 +93,8 @@ function cloudflareHarness({ routePost = "ok", routeEnabled = true, schedule = "
       return apiResponse([{ id: "fixture-account", name: "Fixture account" }]);
     }
     if (path.endsWith("/workers/scripts/fixture-brain") && method === "PUT") {
+      const rawMetadata = await options.body?.get?.("metadata")?.text?.();
+      workerMetadata.push(JSON.parse(rawMetadata));
       return apiResponse({});
     }
     if (path.endsWith("/workers/scripts/fixture-brain/subdomain") && method === "POST") {
@@ -118,7 +121,7 @@ function cloudflareHarness({ routePost = "ok", routeEnabled = true, schedule = "
     }
     throw new Error(`offline fixture has no response for ${method} ${path}`);
   };
-  return { fetchImpl, calls };
+  return { fetchImpl, calls, workerMetadata };
 }
 
 try {
@@ -203,6 +206,26 @@ try {
     env: { CLOUDFLARE_API_TOKEN: "fixture-cloudflare-value" },
   }, () => cmdDeploy(customRouteManifest));
   assert.equal(customRouteHarness.calls.some((call) => call.path.endsWith("/schedules")), true);
+
+  const cutoverDeployHarness = cloudflareHarness();
+  await isolatedRuntime({
+    fetchImpl: cutoverDeployHarness.fetchImpl,
+    env: { CLOUDFLARE_API_TOKEN: "fixture-cloudflare-value" },
+  }, async () => {
+    await cmdDeploy(customRouteManifest, { pauseVectorDrainForUpgrade: true });
+    await cmdDeploy(customRouteManifest, { pauseVectorDrainForUpgrade: false });
+  });
+  const pauseBindings = cutoverDeployHarness.workerMetadata[0].bindings;
+  const activeBindings = cutoverDeployHarness.workerMetadata[1].bindings;
+  assert.deepEqual(
+    pauseBindings.filter((binding) => binding.name === "VECTOR_DRAIN_MODE"),
+    [{ type: "plain_text", name: "VECTOR_DRAIN_MODE", text: "paused-for-upgrade" }],
+  );
+  assert.equal(
+    activeBindings.some((binding) => binding.name === "VECTOR_DRAIN_MODE"),
+    false,
+    "the active deploy removes the temporary compatibility binding",
+  );
 
   /* ---------------- D1 semantic drain scheduling is a required deploy step */
   const drainFailureHarness = cloudflareHarness({ schedule: "fail" });

@@ -1,4 +1,7 @@
-import { backendOf, chunkGeometry, chunkText, storeFor, CHUNK_SIZE, D1, SUPABASE } from "../src/lib/store.js";
+import {
+  backendOf, chunkGeometry, chunkText, estimateD1IngestStatements, storeFor,
+  CHUNK_SIZE, D1, D1_INGEST_STATEMENT_BUDGET, SUPABASE,
+} from "../src/lib/store.js";
 import { sanitizeEnvelope } from "../src/lib/secret-scan.js";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + d)); if (!c) fail++; };
@@ -43,6 +46,26 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
   check("the default body stays below the diagnostic truncation threshold", CHUNK_SIZE < 1800, String(CHUNK_SIZE));
   check("per-install chunk geometry is honored", JSON.stringify(chunkGeometry({ CHUNK_SIZE: "1200", CHUNK_OVERLAP: "240" })) === JSON.stringify({ size: 1200, overlap: 240 }));
   check("unsafe manifest geometry is clamped", JSON.stringify(chunkGeometry({ CHUNK_SIZE: "9000", CHUNK_OVERLAP: "9000" })) === JSON.stringify({ size: 1800, overlap: 1799 }));
+}
+
+/* ---- D1 request budgeting happens before the first database statement ---- */
+{
+  const messages = Array.from({ length: 50 }, (_, index) => ({
+    source_type: "message", source_id: `m-${index}`, content: "ordinary one-chunk message",
+  }));
+  const messageEstimate = estimateD1IngestStatements({}, messages);
+  check("the conservative budget preserves the 50-message replay shape",
+    messageEstimate === 550 && messageEstimate <= D1_INGEST_STATEMENT_BUDGET,
+    `${messageEstimate}/${D1_INGEST_STATEMENT_BUDGET}`);
+  const wideEstimate = estimateD1IngestStatements({}, [{ content: "x".repeat(900_000) }]);
+  check("a byte-valid 900KB document exceeds the pre-write statement budget",
+    wideEstimate > D1_INGEST_STATEMENT_BUDGET, `${wideEstimate}/${D1_INGEST_STATEMENT_BUDGET}`);
+  const pathological = estimateD1IngestStatements(
+    { CHUNK_SIZE: "1800", CHUNK_OVERLAP: "1799" },
+    [{ content: "x".repeat(5_000) }],
+  );
+  check("the budget uses deployed chunk geometry rather than default assumptions",
+    pathological > D1_INGEST_STATEMENT_BUDGET, String(pathological));
 }
 
 /* ---- the D1 backend honours the shape contract ---- */

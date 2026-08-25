@@ -69,7 +69,11 @@ if (SCENARIO) {
         return json({
           backend: "d1",
           rows: [],
-          vector_backlog: { pending: 1, upserts: 1, deletes: 0 },
+          vector_backlog: { pending: 1, upserts: 1, deletes: 0, submitted: 0 },
+          vector_readiness: {
+            ready: false, reason: "vector_work_queued",
+            expected_vectors: 1, actual_vectors: 0, pending: 1, submitted: 0,
+          },
         });
       }
       if (SCENARIO === "health-backlog-stalled") {
@@ -80,7 +84,51 @@ if (SCENARIO) {
             pending: 1,
             upserts: 1,
             deletes: 0,
+            submitted: 0,
             oldest_queued_at: Date.now() - 31 * 60 * 1000,
+          },
+          vector_readiness: {
+            ready: false, reason: "vector_work_queued",
+            expected_vectors: 1, actual_vectors: 0, pending: 1, submitted: 0,
+          },
+        });
+      }
+      if (SCENARIO === "health-vector-processing") {
+        return json({
+          backend: "d1",
+          rows: [],
+          vector_backlog: {
+            pending: 1,
+            upserts: 1,
+            deletes: 0,
+            submitted: 1,
+            oldest_queued_at: Date.now() - 1_000,
+          },
+          vector_readiness: {
+            ready: false, reason: "accepted_mutation_processing",
+            expected_vectors: 1, actual_vectors: 0, pending: 1, submitted: 1,
+          },
+        });
+      }
+      if (SCENARIO === "health-vector-count-mismatch") {
+        return json({
+          backend: "d1",
+          rows: [],
+          vector_backlog: { pending: 0, upserts: 0, deletes: 0, submitted: 0 },
+          vector_readiness: {
+            ready: false, reason: "vector_count_mismatch",
+            expected_vectors: 10, actual_vectors: 0, pending: 0, submitted: 0,
+          },
+        });
+      }
+      if (SCENARIO === "health-vector-count-excess") {
+        return json({
+          backend: "d1",
+          rows: [],
+          vector_backlog: { pending: 0, upserts: 0, deletes: 0, submitted: 0 },
+          vector_readiness: {
+            ready: false, reason: "vector_count_mismatch",
+            expected_vectors: 10, actual_vectors: 13, pending: 0, submitted: 0,
           },
         });
       }
@@ -99,7 +147,11 @@ if (SCENARIO) {
       return json({
         backend: "d1",
         rows: [],
-        vector_backlog: { pending: 0, upserts: 0, deletes: 0 },
+        vector_backlog: { pending: 0, upserts: 0, deletes: 0, submitted: 0 },
+        vector_readiness: {
+          ready: true, reason: null,
+          expected_vectors: 0, actual_vectors: 0, pending: 0, submitted: 0,
+        },
       });
     }
 
@@ -205,13 +257,13 @@ if (SCENARIO) {
   const healthy = runScenario("health-ok", "health", { adminKey: true });
   check("health still succeeds after authenticated documents are proven",
     healthy.code === 0 && /documents endpoint 200/.test(healthy.output) &&
-      /vector index is caught up/.test(healthy.output), healthy.output);
+      /vector index is query-ready/.test(healthy.output), healthy.output);
 
   for (const scenario of ["health-backlog-error", "health-backlog-missing", "health-backlog-malformed"]) {
     const invalidBacklog = runScenario(scenario, "health", { adminKey: true });
     check(`${scenario} exits nonzero instead of claiming semantic indexing is healthy`,
       invalidBacklog.code === 1 && /could not prove a valid D1 vector backlog/is.test(invalidBacklog.output) &&
-        !/vector index is caught up/.test(invalidBacklog.output), invalidBacklog.output);
+        !/vector index is query-ready/.test(invalidBacklog.output), invalidBacklog.output);
   }
 
   const missingOldest = runScenario("health-backlog-oldest-missing", "health", { adminKey: true });
@@ -223,6 +275,25 @@ if (SCENARIO) {
   check("health exits nonzero when the vector queue is older than the allowed drain window",
     stalled.code === 1 && /vector operation\(s\) are stalled.*oldest queued/is.test(stalled.output) &&
       !/vector index is caught up/.test(stalled.output), stalled.output);
+
+  const processing = runScenario("health-vector-processing", "health", { adminKey: true });
+  check("health cannot green an accepted mutation before query visibility",
+    processing.code === 1 && /not query-visible yet.*accepted by Vectorize/is.test(processing.output) &&
+      /brain drain/.test(processing.output) && !/vector index is query-ready/.test(processing.output),
+    processing.output);
+
+  const countMismatch = runScenario("health-vector-count-mismatch", "health", { adminKey: true });
+  check("health rejects an empty queue when Vectorize is still missing vectors",
+    countMismatch.code === 1 && /Vectorize holds 0 vector\(s\), but D1 requires 10/is.test(countMismatch.output) &&
+      /brain diagnose/.test(countMismatch.output) && /brain reindex/.test(countMismatch.output),
+    countMismatch.output);
+
+  const countExcess = runScenario("health-vector-count-excess", "health", { adminKey: true });
+  check("health does not claim reindex alone can remove provider-only excess vectors",
+    countExcess.code === 1 && /Vectorize holds 13 vector\(s\), but D1 requires 10/is.test(countExcess.output) &&
+      /provider-only excess vectors.*reindex cannot enumerate or remove/is.test(countExcess.output) &&
+      /supervised recovery.*recreate\/rebind a clean/is.test(countExcess.output),
+    countExcess.output);
 
   const mismatch = runScenario("health-backend-mismatch", "health", { adminKey: true });
   check("health rejects a valid endpoint serving a backend different from the manifest",

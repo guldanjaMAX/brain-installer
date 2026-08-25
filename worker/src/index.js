@@ -25,7 +25,7 @@ import {
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { drainOutbox, outboxDepth, forget, forgetFamilies, listSourceFamilies, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import { drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 
@@ -461,7 +461,7 @@ async function handleThink(env, request) {
   if (degraded === "vector") {
     gaps.unshift({
       type: "vector_unavailable",
-      detail: "The vector index did not answer, so these results are keyword matches only. Anything phrased differently from the question was not found.",
+      detail: "The vector index is not fully query-ready. Keyword evidence remains available, but new or differently phrased evidence may be missing until `brain drain` confirms the complete projection.",
     });
   }
   const docs = results.slice(0, 12).map((r, i) => ({
@@ -926,6 +926,24 @@ async function handleIngestBatch(env, request) {
     if (canOptimizeD1) identityCounts.set(docUid, (identityCounts.get(docUid) || 0) + 1);
   }
 
+  // A D1 batch is one network round trip but still consumes one paid query per
+  // submitted SQL statement. Refuse an over-budget request before preflight or
+  // any pending marker is written. Otherwise a 900KB request can hit the
+  // Worker's per-invocation ceiling halfway through staging and fail forever at
+  // the same resume boundary. The estimate is deliberately pessimistic; the
+  // ordinary 50-message replay shape remains comfortably below it.
+  if (backendOf(env) === D1 && typeof store.estimateIngestBatchStatements === "function") {
+    const budget = store.estimateIngestBatchStatements(env, eligible.map((item) => item.envelope));
+    if (budget.estimated_statements > budget.max_statements) {
+      return jsonResponse({
+        error: "batch exceeds the safe D1 statement budget",
+        estimated_statements: budget.estimated_statements,
+        max_statements: budget.max_statements,
+        detail: "Send fewer or smaller documents in each call. Nothing was written.",
+      }, 413);
+    }
+  }
+
   // Most full-corpus safety rescans are unchanged. Read every unique prior row
   // in one D1 round trip so 50 no-ops do not become 50 sequential edge calls.
   // A failed preflight is only a performance miss: the ordinary per-document
@@ -1322,11 +1340,40 @@ async function handleDocuments(env) {
     } catch (e) {
       out.vector_backlog = { error: e.message };
     }
+    // Queue depth proves work is durable; readiness proves accepted async
+    // mutations are actually visible to Vectorize queries. Both are required.
+    try {
+      out.vector_readiness = await vectorReadiness(env);
+    } catch (e) {
+      out.vector_readiness = { ready: false, error: e.message };
+    }
   }
   return jsonResponse(out);
 }
 
 /* -------------------------------------------------------------- router */
+
+// The compatibility Worker is a whole-corpus write barrier, not merely a
+// paused cron. Migrations 0010-0012 replace outbox coordination in several
+// independently committed statements, and D1 time-travel rollback replaces
+// the database underneath the Worker. Any concurrent corpus/source mutation
+// could otherwise receive generation 0, corrupt the visibility fence, or be
+// silently lost by restore. Read-only retrieval and source-family inventory
+// remain available while setup/update waits out every older invocation.
+const PAUSED_CORPUS_MUTATION_PATHS = new Set([
+  "/api/admin/brain/ingest",
+  "/api/admin/brain/ingest/batch",
+  "/api/admin/brain/source-receipt",
+  "/api/admin/brain/source-expectation",
+  "/api/admin/brain/forget",
+  "/api/admin/brain/reindex",
+  "/api/admin/brain/drain",
+]);
+
+function corpusWritesPaused(env, path, method) {
+  return env.VECTOR_DRAIN_MODE === "paused-for-upgrade" &&
+    method === "POST" && PAUSED_CORPUS_MUTATION_PATHS.has(path);
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -1338,6 +1385,10 @@ export default {
         ok: true,
         brain: env.BRAIN_NAME || "brain",
         version: env.BRAIN_VERSION || "0.1.0",
+        vector_writer_protocol: "lease-v1",
+        vector_drain_mode: env.VECTOR_DRAIN_MODE === "paused-for-upgrade"
+          ? "paused-for-upgrade"
+          : "active",
         ts: new Date().toISOString(),
       });
     }
@@ -1348,6 +1399,12 @@ export default {
     }
 
     try {
+      if (corpusWritesPaused(env, path, request.method)) {
+        return jsonResponse({
+          error: "brain corpus writes are paused for a verified upgrade or rollback",
+          paused: true,
+        }, 503);
+      }
       if (readRoute && request.method === "GET") {
         return privateNoStore(jsonResponse({
           error: "Private questions must be sent as a JSON POST body, never in the URL",
@@ -1440,20 +1497,47 @@ export default {
       if (path === "/api/admin/brain/reindex" && request.method === "POST") {
         if (backendOf(env) !== D1) return jsonResponse({ error: "reindex applies to the d1 backend only" }, 400);
         const body = await request.json().catch(() => ({}));
-        const r = await reindex(env, { source: body.source || null, dryRun: body.confirm !== true });
+        const r = await reindex(env, {
+          source: body.source || null,
+          dryRun: body.confirm !== true,
+          bootstrap: body.bootstrap === true,
+        });
         return jsonResponse(r);
       }
       if (path === "/api/admin/brain/drain" && request.method === "POST") {
         if (backendOf(env) !== D1) return jsonResponse({ error: "drain applies to the d1 backend only" }, 400);
-        let total = 0;
-        let remaining = 0;
-        for (let i = 0; i < 10; i++) {
-          const r = await drainOutbox(env, { embed: (text) => embedText(env, text), embedBatch: (texts) => embedTexts(env, texts) });
-          total += r.drained;
-          remaining = r.remaining;
-          if (!r.drained || !r.remaining) break;
+        const r = await drainOutbox(env, {
+          embed: (text) => embedText(env, text),
+          embedBatch: (texts) => embedTexts(env, texts),
+          maxBatches: 10,
+        });
+        if (r.paused) {
+          return jsonResponse({
+            error: "vector drain is paused for a verified upgrade",
+            paused: true,
+          }, 503);
         }
-        return jsonResponse({ drained: total, remaining });
+        if (r.busy) {
+          // The lease owner is intentionally absent. Its opaque CAS token is an
+          // internal coordination secret, not a diagnostic or API value.
+          return jsonResponse({
+            error: "another vector drain is already in progress",
+            busy: true,
+            remaining: r.remaining,
+            retry_after_seconds: r.retry_after_seconds,
+          }, 409);
+        }
+        const readiness = await vectorReadiness(env);
+        return jsonResponse({
+          drained: r.drained,
+          submitted: r.submitted,
+          waiting: r.waiting,
+          remaining: r.remaining,
+          vector_ready: readiness.ready,
+          readiness_reason: readiness.reason,
+          expected_vectors: readiness.expected_vectors,
+          actual_vectors: readiness.actual_vectors,
+        });
       }
       return jsonResponse({ error: "not found" }, 404);
     } catch (e) {
@@ -1479,15 +1563,14 @@ export default {
     if (backendOf(env) !== D1) return;
     ctx.waitUntil(
       (async () => {
-        let total = 0;
         // Bounded, because a Worker invocation has a wall clock and an unbounded
         // loop on a large backfill would be killed mid-batch every time.
-        for (let i = 0; i < 10; i++) {
-          const r = await drainOutbox(env, { embed: (text) => embedText(env, text), embedBatch: (texts) => embedTexts(env, texts) });
-          total += r.drained;
-          if (!r.drained || !r.remaining) break;
-        }
-        if (total) console.log(`vector outbox: drained ${total}`);
+        const r = await drainOutbox(env, {
+          embed: (text) => embedText(env, text),
+          embedBatch: (texts) => embedTexts(env, texts),
+          maxBatches: 10,
+        });
+        if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
       })()
     );
   },

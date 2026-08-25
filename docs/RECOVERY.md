@@ -46,9 +46,12 @@ The reviewed order is fixed:
 5. Export the restored durable tables back from D1 and require integrity,
    schema, aggregate counts, and the exact data SHA-256 to match the source
    artifact.
-6. Run the existing full reindex path and drain until every D1 chunk has one
-   vector, the outbox is empty, and no vector failed.
-7. Run post-restore health with zero failures and zero vector backlog.
+6. Drain the normalized durable bootstrap in bounded 99-chunk pages until every
+   D1 chunk has one query-visible vector, the provider mutation fence is
+   processed, the outbox and submitted counts are zero, and no vector failed.
+   A retry resumes the saved epoch/cursor and never calls reindex to reset it.
+7. Run post-restore health with zero failures and exact `vector_readiness`:
+   `ready=true`, zero pending/submitted work, and equal D1/Vectorize counts.
 8. Run the release evaluation profile with zero critical failures and zero
    unauthorized retrievals.
 
@@ -114,6 +117,18 @@ Before preview, prepare all of these locally and out of band:
   directory that reads its Cloudflare token from Keychain at execution time;
 - an owner-only directory for the SQL artifact and a complete private release
   evaluation golden set.
+
+The SQL artifact never carries live derived-index coordination. The adapter
+exports the reviewed `install_state` row separately from the raw provider tables
+and forces the ephemeral drain lease owner/expiry and projection mutation
+ID/submission time to `NULL`. For a nonempty corpus it records
+`bootstrap_required`, epoch 1, a null cursor, and the exact SQL
+`MAX(chunk_uid)` high-water. The normalized row is then hashed together with the
+remaining durable table export, so a retry cannot reuse a recovery artifact
+poisoned by an invocation-local lease or mutation fence. Older exact migration
+prefixes remain offline-inspectable, but the live field runner refuses a source
+or restored target below schema 12 because it cannot safely use the current
+lease and visibility protocol without an explicit upgrade.
 
 The preview is local only. It reads and fingerprints those files but does not
 invoke Wrangler, read Keychain, or call either Brain:

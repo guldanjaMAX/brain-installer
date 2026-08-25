@@ -94,6 +94,10 @@ export async function metadataTokenFor(value) {
 // decides whether candidate depth is sufficient.
 const VECTOR_TOPK_MAX = 100;
 export const D1_QUERY_BIND_LIMIT = 100;
+// Keep one transaction reviewable and bounded independently of the documented
+// 1,000-query invocation limit. This is our conservative internal slice, not a
+// claimed D1 per-batch platform ceiling. Each chunk needs two statements.
+export const D1_TRANSACTION_SLICE_STATEMENTS = 100;
 // Ranking prefixes must not change because one route asked for 8 results and
 // another asked for 12. Both retrieval systems always contribute the same
 // bounded candidate depth; `limit` is applied only after fusion.
@@ -274,6 +278,13 @@ export async function vectorMetadataFor(row) {
   if (row.document_date !== null && row.document_date !== undefined && Number.isFinite(date)) {
     metadata.document_date = date;
   }
+  // Not indexed and never used as a public filter. This is the durable receipt
+  // that distinguishes an old vector with the same id from the exact outbox
+  // generation just accepted by Vectorize's asynchronous mutation API.
+  const generation = Number(row.generation);
+  if (Number.isSafeInteger(generation) && generation > 0) {
+    metadata.outbox_generation = String(generation);
+  }
   return metadata;
 }
 
@@ -452,18 +463,28 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
   const pool = RETRIEVAL_CANDIDATE_DEPTH;
   const fusionK = Math.min(Math.max(Number(rrfK) || RRF_K, 1), 1e3);
 
-  const [kw, vec] = await Promise.all([
+  const [kw, vec, projection] = await Promise.all([
     searchKeyword(env, query, { limit: pool, filters }).catch(() => []),
     embedding
       ? searchVector(env, embedding, { limit: pool, filters }).catch(() => [])
       : Promise.resolve([]),
+    // Vectorize may return some old/current candidates while a newer accepted
+    // changeset is still processing. Non-empty semantic results therefore do
+    // not prove the complete D1 corpus is query-visible. Reuse the exact
+    // readiness contract that gates health and acceptance so every answer
+    // advertises partial projection instead of looking fully healthy.
+    embedding
+      ? vectorReadiness(env).catch(() => ({ ready: false }))
+      : Promise.resolve(null),
   ]);
 
   // Both empty is a real answer (nothing matched). Only ONE empty when both
   // were attempted means a subsystem is down, and a caller that cannot tell
   // those apart will report a degraded brain as an empty one.
   const degraded =
-    embedding && vec.length === 0 && kw.length > 0
+    embedding && projection?.ready !== true
+      ? "vector"
+      : embedding && vec.length === 0 && kw.length > 0
       ? "vector"
       : !embedding
         ? "no-embedding"
@@ -656,7 +677,120 @@ export async function upsertChunks(env, chunks, { expectedContentHash = null } =
     );
     stmts.push(outboxStatement);
   }
-  await env.DB.batch(stmts);
+  // A split document can still contain more than 50 chunks. Keep each internal
+  // transaction in a conservative 100-statement slice; the pending marker makes
+  // an interrupted later slice recoverable on ordinary retry.
+  for (let start = 0; start < stmts.length; start += D1_TRANSACTION_SLICE_STATEMENTS) {
+    await env.DB.batch(stmts.slice(start, start + D1_TRANSACTION_SLICE_STATEMENTS));
+  }
+  return { written: chunks.length, queued: chunks.length };
+}
+
+/**
+ * A small changed document can stage its complete pending revision in one D1
+ * transaction instead of four service-binding round trips. The three fixed
+ * statements are the document upsert plus the old-vector queue and chunk
+ * delete; every new chunk adds its durable row and outbox row.
+ *
+ * Larger documents stay on the original resumable path. The 100-statement
+ * boundary is our conservative internal transaction slice, distinct from
+ * Cloudflare's documented 1,000-query invocation limit. Keeping the fallback
+ * means an installer never rejects a valid document merely to gain throughput.
+ */
+export function canStageDocumentRevision(chunkCount) {
+  return Number.isSafeInteger(chunkCount) &&
+    chunkCount >= 0 &&
+    3 + (chunkCount * 2) <= D1_TRANSACTION_SLICE_STATEMENTS;
+}
+
+/**
+ * Atomically stage one document revision under its unique pending marker.
+ *
+ * The caller deliberately invokes this once per document. Combining multiple
+ * documents into one transaction would save more round trips, but one poison
+ * row would then roll back unrelated documents and destroy the batch route's
+ * per-document failure-isolation contract.
+ */
+export async function stageDocumentRevision(env, {
+  documentStatement,
+  docUid,
+  chunks,
+  expectedContentHash,
+}) {
+  if (!documentStatement || typeof docUid !== "string" || !docUid ||
+      typeof expectedContentHash !== "string" || !expectedContentHash ||
+      !Array.isArray(chunks) || !canStageDocumentRevision(chunks.length)) {
+    throw new Error("document revision is not eligible for atomic D1 staging");
+  }
+
+  const queuedAt = Date.now();
+  const statements = [
+    documentStatement,
+    env.DB.prepare(
+      `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at, attempts, last_error)
+       SELECT chunk_uid, COALESCE(vector_id, chunk_uid), 'delete', ?2, 0, NULL
+       FROM chunks
+       WHERE doc_uid = ?1
+         AND EXISTS (
+           SELECT 1 FROM documents WHERE doc_uid = ?1 AND content_hash = ?3
+         )
+       ON CONFLICT(chunk_uid) DO UPDATE SET
+         vector_id=excluded.vector_id, op='delete', queued_at=excluded.queued_at,
+         attempts=0, last_error=NULL`
+    ).bind(docUid, queuedAt, expectedContentHash),
+    env.DB.prepare(
+      `DELETE FROM chunks WHERE doc_uid = ?1
+       AND EXISTS (
+         SELECT 1 FROM documents WHERE doc_uid = ?1 AND content_hash = ?2
+       )`
+    ).bind(docUid, expectedContentHash),
+  ];
+
+  const requiredWriteIndexes = [0];
+  for (const chunk of chunks) {
+    chunk.vector_id = await vectorIdFor(chunk.chunk_uid);
+    requiredWriteIndexes.push(statements.length);
+    statements.push(env.DB.prepare(
+      `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id)
+       SELECT ?1,?2,?3,?4,?5,?6,?7,
+              documents.client, documents.category, documents.top_folder, documents.platform, ?8
+       FROM documents
+       WHERE documents.doc_uid = ?2 AND documents.content_hash = ?9
+       ON CONFLICT(chunk_uid) DO UPDATE SET
+         text = excluded.text, title = excluded.title,
+         document_date = excluded.document_date,
+         client = excluded.client, category = excluded.category,
+         top_folder = excluded.top_folder, platform = excluded.platform,
+         vector_id = excluded.vector_id`
+    ).bind(
+      chunk.chunk_uid, chunk.doc_uid, chunk.chunk_ix, chunk.text, chunk.source,
+      chunk.title ?? null, chunk.document_date ?? null, chunk.vector_id,
+      expectedContentHash
+    ));
+
+    requiredWriteIndexes.push(statements.length);
+    statements.push(env.DB.prepare(
+      `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at)
+       SELECT ?1,?2,'upsert',?3
+       WHERE EXISTS (
+         SELECT 1 FROM documents WHERE doc_uid = ?4 AND content_hash = ?5
+       )
+       ON CONFLICT(chunk_uid) DO UPDATE SET
+         vector_id=excluded.vector_id, op='upsert', queued_at=?3,
+         attempts=0, last_error=NULL`
+    ).bind(chunk.chunk_uid, chunk.vector_id, queuedAt, chunk.doc_uid, expectedContentHash));
+  }
+
+  const results = await env.DB.batch(statements);
+  if (!Array.isArray(results) || results.length !== statements.length) {
+    throw new Error("atomic D1 staging returned an incomplete result set");
+  }
+  if (requiredWriteIndexes.some((index) => Number(results[index]?.meta?.changes) !== 1)) {
+    // A zero-row guarded write means this revision did not own its marker. The
+    // pending state remains retryable and must not receive a successful receipt.
+    throw new Error("atomic D1 staging could not verify revision ownership");
+  }
+
   return { written: chunks.length, queued: chunks.length };
 }
 
@@ -699,41 +833,416 @@ export async function replaceDocumentChunks(env, docUid, { expectedContentHash =
   ]);
 }
 
-/** Vectorize and D1 both cap bulk operations; D1 allows 100 batch statements. */
+/** Keep Vectorize deletion and its D1 CAS cleanup in conservative 100-row slices. */
 const DELETE_BATCH = 100;
 
-async function deleteQueuedVectors(env, rows) {
-  let deleted = 0;
-  for (let i = 0; i < rows.length; i += DELETE_BATCH) {
-    const slice = rows.slice(i, i + DELETE_BATCH);
-    try {
-      await env.VECTORIZE.deleteByIds(slice.map((r) => r.vector_id || r.chunk_uid));
-      deleted += slice.length;
-      // Only clear the exact delete operation we observed. If an ingest changed
-      // the row back to `upsert` while Vectorize was deleting, that upsert must
-      // survive so the current chunk is restored.
-      await env.DB.batch(slice.map((r) =>
-        env.DB.prepare(
-          `DELETE FROM vector_outbox
-           WHERE chunk_uid = ?1 AND op = 'delete'
-             AND COALESCE(vector_id, chunk_uid) = ?2 AND queued_at = ?3`
-        ).bind(r.chunk_uid, r.vector_id || r.chunk_uid, r.queued_at)
-      ));
-    } catch (e) {
-      const err = String(e.message || e).slice(0, 300);
-      await env.DB.batch(slice.map((r) =>
-        env.DB.prepare(
-          `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
-           WHERE chunk_uid = ?1 AND op = 'delete'`
-        ).bind(r.chunk_uid, err)
-      )).catch(() => {});
-      const e2 = new Error(`the vector index refused this delete batch: ${err}`);
-      e2.vectorDeleteFailed = true;
-      e2.deleted = deleted;
-      throw e2;
+// The HTTP drain has a 180-second client deadline and both HTTP and cron paths
+// are capped at ten 100-row batches. Twenty minutes is deliberately longer
+// than one supported invocation while still making an abruptly terminated
+// owner self-heal without operator access. This is a safety lease, not a lock
+// that can remain held forever.
+export const DRAIN_LEASE_TTL_MS = 20 * 60 * 1000;
+
+// Cloudflare counts every statement submitted through D1, including each
+// statement inside DB.batch(), toward the documented 1,000-query Worker
+// invocation limit. Keep the drain below a stricter internal budget so its
+// compare-and-swap lease release always has reserved headroom.
+export const DRAIN_D1_QUERY_BUDGET = 900;
+const DRAIN_LEASE_ACQUIRE_QUERIES = 1;
+const DRAIN_LEASE_RELEASE_QUERIES = 1;
+const DRAIN_PROJECTION_VERIFY_QUERIES = 1;
+const DRAIN_INITIAL_DEPTH_QUERIES = 1;
+const DRAIN_BATCH_SIZE_MAX = 100;
+
+// One two-phase slice either submits or confirms. The largest path is an upsert
+// submission: queue/fence/delete/upsert reads plus the durable fence, final
+// depth, one submission receipt per row, and one legacy hashed-id remap per row.
+// Confirmation needs only one CAS statement per row. Reserving this bound before
+// provider work keeps the lease release inside the invocation budget.
+export function drainBatchQueryUpperBound(batchSize = DRAIN_BATCH_SIZE_MAX) {
+  const bounded = Number.isInteger(batchSize)
+    ? Math.min(DRAIN_BATCH_SIZE_MAX, Math.max(1, batchSize))
+    : DRAIN_BATCH_SIZE_MAX;
+  // +1 renews and re-proves the owner immediately before the one possible
+  // provider mutation in this slice. Five more cover the bounded legacy
+  // bootstrap status/page/transaction/depth path when a confirmation empties
+  // the current page.
+  return 12 + (2 * bounded);
+}
+
+const drainLeaseChanges = (result) => Number(
+  result?.meta?.changes ?? result?.changes ?? 0
+);
+
+/**
+ * Atomically claim the one Vectorize-writer lease for this brain.
+ *
+ * The opaque owner is returned only to the in-memory caller so release can use
+ * compare-and-swap. Busy receipts deliberately contain only aggregate timing;
+ * neither an API response nor a log ever needs the owner token.
+ */
+export async function acquireDrainLease(env, {
+  ownerToken = crypto.randomUUID(),
+  now = Date.now(),
+  ttlMs = DRAIN_LEASE_TTL_MS,
+} = {}) {
+  if (typeof ownerToken !== "string" || !ownerToken || ownerToken.length > 200) {
+    throw new Error("vector drain lease owner is invalid");
+  }
+  if (!Number.isSafeInteger(now) || !Number.isSafeInteger(ttlMs) || ttlMs < 1_000 ||
+      ttlMs > DRAIN_LEASE_TTL_MS) {
+    throw new Error("vector drain lease timing is invalid");
+  }
+  const expiresAt = now + ttlMs;
+  if (!Number.isSafeInteger(expiresAt)) {
+    throw new Error("vector drain lease expiry is invalid");
+  }
+
+  let claimed;
+  try {
+    claimed = await env.DB.prepare(
+      `UPDATE install_state
+       SET vector_drain_lease_owner = ?1,
+           vector_drain_lease_expires_at = ?2
+       WHERE id = 1
+         AND schema_version >= 12
+         AND (vector_drain_lease_owner IS NULL
+              OR vector_drain_lease_expires_at IS NULL
+              OR vector_drain_lease_expires_at <= ?3)`
+    ).bind(ownerToken, expiresAt, now).run();
+  } catch {
+    throw new Error("vector drain lease could not be acquired");
+  }
+  if (drainLeaseChanges(claimed) === 1) {
+    return { acquired: true, ownerToken, expiresAt };
+  }
+
+  // Do not read or return the current owner's token. The aggregate held/expiry
+  // state is enough to distinguish a legitimate busy lease from a missing or
+  // malformed install row, which must fail closed rather than start a drain.
+  let state;
+  try {
+    state = await env.DB.prepare(
+      `SELECT CASE WHEN vector_drain_lease_owner IS NULL THEN 0 ELSE 1 END AS held,
+              CASE WHEN schema_version >= 12 THEN 1 ELSE 0 END AS schema_ready,
+              vector_drain_lease_expires_at AS expires_at
+       FROM install_state WHERE id = 1`
+    ).first();
+  } catch {
+    throw new Error("vector drain lease state could not be verified");
+  }
+  if (!state || Number(state.schema_ready) !== 1 || Number(state.held) !== 1) {
+    throw new Error("vector drain lease state is unavailable");
+  }
+  const observedExpiry = Number(state.expires_at);
+  const retryAfterMs = Number.isSafeInteger(observedExpiry)
+    ? Math.max(1_000, Math.min(DRAIN_LEASE_TTL_MS, observedExpiry - now))
+    : DRAIN_LEASE_TTL_MS;
+  return {
+    acquired: false,
+    retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1_000)),
+  };
+}
+
+/** Release only the lease still owned by this invocation. */
+export async function releaseDrainLease(env, ownerToken) {
+  if (typeof ownerToken !== "string" || !ownerToken) return false;
+  let released;
+  try {
+    released = await env.DB.prepare(
+      `UPDATE install_state
+       SET vector_drain_lease_owner = NULL,
+           vector_drain_lease_expires_at = NULL
+       WHERE id = 1 AND vector_drain_lease_owner = ?1`
+    ).bind(ownerToken).run();
+  } catch {
+    throw new Error("vector drain lease could not be released; it will expire automatically");
+  }
+  return drainLeaseChanges(released) === 1;
+}
+
+/** Renew and prove the same lease immediately before a Vectorize mutation. */
+export async function renewDrainLease(env, ownerToken, {
+  now = Date.now(),
+  ttlMs = DRAIN_LEASE_TTL_MS,
+} = {}) {
+  if (typeof ownerToken !== "string" || !ownerToken || !Number.isSafeInteger(now) ||
+      !Number.isSafeInteger(ttlMs) || ttlMs < 1_000 || ttlMs > DRAIN_LEASE_TTL_MS) {
+    throw new Error("vector drain lease renewal input is invalid");
+  }
+  const expiresAt = now + ttlMs;
+  if (!Number.isSafeInteger(expiresAt)) throw new Error("vector drain lease renewal expiry is invalid");
+  let renewed;
+  try {
+    renewed = await env.DB.prepare(
+      `UPDATE install_state
+          SET vector_drain_lease_expires_at = ?3
+        WHERE id = 1 AND schema_version >= 12
+          AND vector_drain_lease_owner = ?1
+          AND vector_drain_lease_expires_at > ?2`
+    ).bind(ownerToken, now, expiresAt).run();
+  } catch {
+    throw new Error("vector drain lease could not be renewed before provider write");
+  }
+  if (drainLeaseChanges(renewed) !== 1) {
+    throw new Error("vector drain lease ownership or expiry was lost before provider write");
+  }
+  return { expiresAt };
+}
+
+const VECTOR_MUTATION_ID_MAX_CHARS = 200;
+
+function acceptedMutationId(receipt) {
+  const id = receipt?.mutationId;
+  if (typeof id !== "string" || !id || id.length > VECTOR_MUTATION_ID_MAX_CHARS ||
+      /[\u0000-\u001f\u007f]/.test(id)) {
+    throw new Error("Vectorize did not return a valid asynchronous mutation receipt");
+  }
+  return id;
+}
+
+/** Store the provider receipt before any affected outbox row can be confirmed. */
+async function recordSubmittedMutation(env, rows, op, receipt, submittedAt = Date.now()) {
+  const mutationId = acceptedMutationId(receipt);
+  if (!Number.isSafeInteger(submittedAt) || submittedAt < 0) {
+    throw new Error("the vector mutation submission time is invalid");
+  }
+  const fence = await env.DB.prepare(
+    `UPDATE install_state
+        SET vector_projection_mutation_id = ?1,
+            vector_projection_submitted_at = ?2
+      WHERE id = 1 AND schema_version >= 12`
+  ).bind(mutationId, submittedAt).run();
+  if (drainLeaseChanges(fence) !== 1) {
+    throw new Error("the vector mutation receipt could not be recorded durably");
+  }
+
+  if (rows.length) {
+    if (op === "upsert") {
+      // Do this for every accepted upsert, including a legacy short id whose
+      // chunks.vector_id is NULL. The receipt below is conditional on this
+      // exact durable hydration mapping.
+      const remaps = rows;
+      if (remaps.length) {
+        // Persist the actual hashed provider id before the accepted row receipt.
+        // If this batch fails, the global fence remains durable and the outbox
+        // generation stays unsubmitted/retryable; it can never false-green.
+        const remapChanges = await env.DB.batch(remaps.map((row) => env.DB.prepare(
+          `UPDATE chunks SET vector_id = ?2
+            WHERE chunk_uid = ?1
+              AND EXISTS (
+                SELECT 1 FROM vector_outbox
+                 WHERE chunk_uid = ?1 AND op = 'upsert' AND generation = ?3
+              )`
+        ).bind(row.chunk_uid, row.vector_id, row.generation)));
+        if (!Array.isArray(remapChanges) || remapChanges.length !== remaps.length) {
+          throw new Error("the accepted vector id remap could not be recorded");
+        }
+      }
+    }
+    const statements = rows.map((row) => op === "delete"
+      ? env.DB.prepare(
+        `UPDATE vector_outbox
+              SET submitted_mutation_id = ?4, submitted_at = ?5, last_error = NULL
+            WHERE chunk_uid = ?1 AND op = 'delete'
+              AND COALESCE(vector_id, chunk_uid) = ?2 AND generation = ?3`
+      ).bind(row.chunk_uid, row.vector_id || row.chunk_uid, row.generation, mutationId, submittedAt)
+      : env.DB.prepare(
+          `UPDATE vector_outbox
+              SET submitted_mutation_id = ?3, submitted_at = ?4, last_error = NULL
+            WHERE chunk_uid = ?1 AND op = 'upsert' AND generation = ?2
+              AND EXISTS (
+                SELECT 1 FROM chunks
+                 WHERE chunk_uid = ?1 AND vector_id = ?5
+              )`
+        ).bind(row.chunk_uid, row.generation, mutationId, submittedAt, row.vector_id));
+    const changes = await env.DB.batch(statements);
+    if (!Array.isArray(changes) || changes.length !== rows.length) {
+      throw new Error("the vector mutation row receipts were ambiguous");
+    }
+    return {
+      mutationId,
+      submitted: changes.reduce((total, result) =>
+        total + Number(drainLeaseChanges(result) === 1), 0),
+    };
+  }
+  return { mutationId, submitted: 0 };
+}
+
+async function projectionFenceState(env) {
+  const state = await env.DB.prepare(
+    `SELECT vector_projection_mutation_id AS mutation_id,
+            vector_projection_submitted_at AS submitted_at
+       FROM install_state WHERE id = 1 AND schema_version >= 12`
+  ).first();
+  if (!state) throw new Error("vector visibility receipt state is unavailable");
+  if (state.mutation_id === null || state.mutation_id === undefined || state.mutation_id === "") {
+    return { mutationId: null, submittedAt: null };
+  }
+  const mutationId = String(state.mutation_id);
+  const submittedAt = Number(state.submitted_at);
+  if (!mutationId || mutationId.length > VECTOR_MUTATION_ID_MAX_CHARS ||
+      /[\u0000-\u001f\u007f]/.test(mutationId) || !Number.isSafeInteger(submittedAt) || submittedAt < 0) {
+    throw new Error("vector visibility receipt state is invalid");
+  }
+  return { mutationId, submittedAt };
+}
+
+async function projectionFenceProcessed(env, fence) {
+  if (!fence?.mutationId) return true;
+  const info = await env.VECTORIZE.describe();
+  const processed = info?.processedUpToMutation;
+  // A brand-new index legitimately reports no processed watermark while its
+  // first accepted changeset is still pending. That is "not yet", not a
+  // malformed response. Other shapes still fail closed.
+  if (processed === null || processed === undefined || processed === "") return false;
+  if (typeof processed !== "string" && typeof processed !== "number") {
+    throw new Error("Vectorize did not expose its processed mutation watermark");
+  }
+  return String(processed) === fence.mutationId;
+}
+
+/** Mark the full projection verified only across one exact, empty-queue cut. */
+async function markProjectionVerifiedIfExact(env) {
+  const description = await env.VECTORIZE.describe();
+  const vectorCount = Number(
+    description?.vectorCount ?? description?.vectorsCount ?? description?.count,
+  );
+  if (!Number.isSafeInteger(vectorCount) || vectorCount < 0) return false;
+  const fence = await projectionFenceState(env);
+  const processed = fence.mutationId === null
+    ? true
+    : String(description?.processedUpToMutation ?? "") === fence.mutationId;
+  if (!processed) return false;
+  const result = await env.DB.prepare(
+    `UPDATE install_state
+        SET vector_projection_status = 'verified'
+      WHERE id = 1 AND schema_version >= 12
+        AND vector_projection_status = 'pending'
+        AND (vector_projection_bootstrap_high_water IS NULL OR
+             vector_projection_bootstrap_cursor = vector_projection_bootstrap_high_water)
+        AND COALESCE(vector_projection_mutation_id, '') = ?1
+        AND NOT EXISTS (SELECT 1 FROM vector_outbox)
+        AND (SELECT count(*) FROM chunks) = ?2`
+  ).bind(fence.mutationId || "", vectorCount).run();
+  return drainLeaseChanges(result) === 1;
+}
+
+/**
+ * Confirm provider-visible effects for one previously accepted changeset.
+ *
+ * The processed watermark is an ordering fence for deletes and for generations
+ * replaced while an older mutation was in flight. getByIds then proves the
+ * exact upsert generation, rather than accepting an old vector with the same id.
+ */
+async function confirmSubmittedVectors(env, rows) {
+  if (!rows.length) return { confirmed: 0, confirmedDeletes: 0, confirmedUpserts: 0, retrying: 0, waiting: 0 };
+  const fence = await projectionFenceState(env);
+  if (!await projectionFenceProcessed(env, fence)) {
+    return { confirmed: 0, confirmedDeletes: 0, confirmedUpserts: 0, retrying: 0, waiting: rows.length };
+  }
+
+  // A legacy/bootstrap outbox row may still carry the long chunk_uid even
+  // though this Worker deterministically hashed it for Vectorize. Do not trust
+  // that stale upsert field for visibility or CAS. Deletes must keep using the
+  // exact historical stored id because their chunk row may already be gone.
+  rows = await Promise.all(rows.map(async (row) => ({
+    ...row,
+    provider_vector_id: row.op === "upsert"
+      ? await vectorIdFor(row.chunk_uid)
+      : row.vector_id || row.chunk_uid,
+  })));
+  const ids = [...new Set(rows.map((row) => row.provider_vector_id))];
+  let visible;
+  try {
+    visible = await env.VECTORIZE.getByIds(ids);
+  } catch (error) {
+    throw new Error(`the vector index could not verify accepted changes: ${String(error?.message || error).slice(0, 240)}`);
+  }
+  if (!Array.isArray(visible)) {
+    throw new Error("the vector index returned an invalid visibility receipt");
+  }
+  const byId = new Map(visible.map((vector) => [vector?.id, vector]));
+  let confirmed = [];
+  let retrying = [];
+  for (const row of rows) {
+    const vectorId = row.provider_vector_id;
+    const vector = byId.get(vectorId);
+    const exactGeneration = String(vector?.metadata?.outbox_generation ?? "") === String(row.generation);
+    if ((row.op === "delete" && !vector) || (row.op === "upsert" && exactGeneration)) {
+      confirmed.push(row);
+    } else {
+      retrying.push(row);
     }
   }
-  return deleted;
+
+  if (confirmed.length) {
+    const changes = await env.DB.batch(confirmed.map((row) => row.op === "delete"
+      ? env.DB.prepare(
+        `DELETE FROM vector_outbox
+          WHERE chunk_uid = ?1 AND op = 'delete'
+            AND COALESCE(vector_id, chunk_uid) = ?2 AND generation = ?3
+            AND submitted_mutation_id = ?4`
+      ).bind(row.chunk_uid, row.provider_vector_id, row.generation, row.submitted_mutation_id)
+      : env.DB.prepare(
+        `DELETE FROM vector_outbox
+          WHERE chunk_uid = ?1 AND op = 'upsert' AND generation = ?2
+            AND submitted_mutation_id = ?3`
+      ).bind(row.chunk_uid, row.generation, row.submitted_mutation_id)));
+    if (!Array.isArray(changes) || changes.length !== confirmed.length) {
+      throw new Error("the vector confirmation receipts were ambiguous");
+    }
+    confirmed = confirmed.filter((_, index) => drainLeaseChanges(changes[index]) === 1);
+  }
+  if (retrying.length) {
+    const detail = "accepted Vectorize mutation was processed but the exact vector state was not query-visible; retrying";
+    const changes = await env.DB.batch(retrying.map((row) => row.op === "delete"
+      ? env.DB.prepare(
+        `UPDATE vector_outbox
+            SET submitted_mutation_id = NULL, submitted_at = NULL,
+                attempts = attempts + 1, last_error = ?5
+          WHERE chunk_uid = ?1 AND op = 'delete'
+            AND COALESCE(vector_id, chunk_uid) = ?2 AND generation = ?3
+            AND submitted_mutation_id = ?4`
+      ).bind(row.chunk_uid, row.provider_vector_id, row.generation, row.submitted_mutation_id, detail)
+      : env.DB.prepare(
+        `UPDATE vector_outbox
+            SET submitted_mutation_id = NULL, submitted_at = NULL,
+                attempts = attempts + 1, last_error = ?4
+          WHERE chunk_uid = ?1 AND op = 'upsert' AND generation = ?2
+            AND submitted_mutation_id = ?3`
+      ).bind(row.chunk_uid, row.generation, row.submitted_mutation_id, detail)));
+    if (!Array.isArray(changes) || changes.length !== retrying.length) {
+      throw new Error("the vector retry receipts were ambiguous");
+    }
+    retrying = retrying.filter((_, index) => drainLeaseChanges(changes[index]) === 1);
+  }
+  return {
+    confirmed: confirmed.length,
+    confirmedDeletes: confirmed.filter((row) => row.op === "delete").length,
+    confirmedUpserts: confirmed.filter((row) => row.op === "upsert").length,
+    retrying: retrying.length,
+    waiting: 0,
+  };
+}
+
+async function submitQueuedDeletes(env, rows, lease) {
+  if (!rows.length) return 0;
+  try {
+    await renewDrainLease(env, lease.ownerToken, { now: lease.now() });
+    const receipt = await env.VECTORIZE.deleteByIds(rows.map((row) => row.vector_id || row.chunk_uid));
+    return (await recordSubmittedMutation(env, rows, "delete", receipt)).submitted;
+  } catch (error) {
+    const detail = String(error?.message || error).slice(0, 300);
+    await env.DB.batch(rows.map((row) => env.DB.prepare(
+      `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
+        WHERE chunk_uid = ?1 AND op = 'delete'
+          AND COALESCE(vector_id, chunk_uid) = ?3 AND generation = ?4`
+    ).bind(row.chunk_uid, detail, row.vector_id || row.chunk_uid, row.generation))).catch(() => {});
+    const wrapped = new Error(`the vector index could not durably accept this delete batch: ${detail}`);
+    wrapped.vectorDeleteFailed = true;
+    throw wrapped;
+  }
 }
 
 /**
@@ -744,32 +1253,96 @@ async function deleteQueuedVectors(env, rows) {
  * pretending the write completed inline would make read-after-write look
  * broken. Draining separately makes the lag a visible queue instead.
  */
-export async function drainOutbox(env, { embed, embedBatch, batchSize = 100, embedGroup = 50 } = {}) {
+async function drainOutboxBatch(env, {
+  embed,
+  embedBatch,
+  batchSize = 100,
+  embedGroup = 50,
+  lease,
+} = {}) {
+  // First finish the second phase of accepted asynchronous mutations. A newer
+  // enqueue clears its submitted receipt through the generation trigger, so a
+  // stale confirmation can never acknowledge the newer operation.
+  const { results: submittedRows } = await env.DB.prepare(
+    `SELECT o.chunk_uid, COALESCE(o.vector_id, c.vector_id, o.chunk_uid) AS vector_id,
+            o.op, o.queued_at, o.generation, o.submitted_mutation_id, o.submitted_at
+       FROM vector_outbox o LEFT JOIN chunks c ON c.chunk_uid = o.chunk_uid
+      WHERE o.submitted_mutation_id IS NOT NULL
+      ORDER BY o.queued_at LIMIT ?1`
+  ).bind(batchSize).all();
+  if (submittedRows?.length) {
+    const confirmed = await confirmSubmittedVectors(env, submittedRows);
+    const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+    return {
+      drained: confirmed.confirmed,
+      deleted: confirmed.confirmedDeletes,
+      upserted: confirmed.confirmedUpserts,
+      submitted: 0,
+      waiting: confirmed.waiting,
+      failed: confirmed.retrying,
+      remaining: Number(rest?.n || 0),
+      errors: confirmed.retrying ? ["accepted vector state was not visible and was re-queued"] : [],
+    };
+  }
+
+  // An accepted mutation can lose its per-row marker if a newer ingest replaces
+  // every affected generation. The global fence must still process before any
+  // newer provider write is accepted, or the older result could land last.
+  const fence = await projectionFenceState(env);
+  if (!await projectionFenceProcessed(env, fence)) {
+    const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+    const remaining = Number(rest?.n || 0);
+    return {
+      drained: 0, deleted: 0, upserted: 0, submitted: 0,
+      waiting: remaining, failed: 0, remaining, errors: [],
+    };
+  }
+
   // Delete first. Orphans still consume Vectorize candidate slots even though
   // D1 hydration makes them unreachable, so leaving them behind damages recall.
   const { results: deletePending } = await env.DB.prepare(
-    `SELECT chunk_uid, COALESCE(vector_id, chunk_uid) AS vector_id, queued_at
-     FROM vector_outbox WHERE op = 'delete' ORDER BY queued_at LIMIT ?1`
+    `SELECT chunk_uid, COALESCE(vector_id, chunk_uid) AS vector_id, queued_at, generation
+       FROM vector_outbox
+      WHERE op = 'delete' AND submitted_mutation_id IS NULL
+      ORDER BY queued_at LIMIT ?1`
   ).bind(batchSize).all();
-  const deleted = deletePending?.length ? await deleteQueuedVectors(env, deletePending) : 0;
+  if (deletePending?.length) {
+    const submitted = await submitQueuedDeletes(env, deletePending, lease);
+    const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+    return {
+      drained: 0, deleted: 0, upserted: 0, submitted, waiting: submitted,
+      failed: 0, remaining: Number(rest?.n || 0), errors: [],
+    };
+  }
 
   const { results: pending } = await env.DB.prepare(
-    `SELECT o.chunk_uid, o.queued_at, c.text, c.source, c.doc_uid, c.document_date,
+    `SELECT o.chunk_uid, o.queued_at, o.generation,
+            c.text, c.source, c.doc_uid, c.document_date,
             c.client, c.category, c.top_folder, c.platform
      FROM vector_outbox o JOIN chunks c ON c.chunk_uid = o.chunk_uid
-     WHERE o.op = 'upsert' ORDER BY o.queued_at LIMIT ?1`
+     WHERE o.op = 'upsert' AND o.submitted_mutation_id IS NULL
+     ORDER BY o.queued_at LIMIT ?1`
   )
     .bind(batchSize)
     .all();
 
   if (!pending?.length) {
     const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
-    return { drained: deleted, deleted, upserted: 0, failed: 0, remaining: Number(rest?.n || 0), errors: [] };
+    return {
+      drained: 0, deleted: 0, upserted: 0, submitted: 0, waiting: 0,
+      failed: 0, remaining: Number(rest?.n || 0), errors: [],
+    };
   }
 
   const vectors = [];
   const idToChunk = new Map();
-  const chunkVersion = new Map();
+  // Capture every selected token before embedding starts. A poison row can
+  // fail before it becomes a vector, but its failure receipt still needs the
+  // exact generation CAS. Building this map only after a successful embed
+  // would silently leave those rows at attempts=0 forever.
+  const chunkGeneration = new Map(
+    pending.map((row) => [row.chunk_uid, row.generation])
+  );
   const poisoned = [];
 
   // Embed in groups when the caller can. One round trip per group instead of one
@@ -817,7 +1390,6 @@ export async function drainOutbox(env, { embed, embedBatch, batchSize = 100, emb
     }
     const vid = await vectorIdFor(row.chunk_uid);
     idToChunk.set(vid, row.chunk_uid);
-    chunkVersion.set(row.chunk_uid, row.queued_at);
     vectors.push({
       id: vid,
       values,
@@ -825,77 +1397,200 @@ export async function drainOutbox(env, { embed, embedBatch, batchSize = 100, emb
     });
   }
 
+  let submitted = 0;
   if (vectors.length) {
     try {
-      await env.VECTORIZE.upsert(vectors);
+      await renewDrainLease(env, lease.ownerToken, { now: lease.now() });
+      const receipt = await env.VECTORIZE.upsert(vectors);
+      const submittedRows = vectors.map((vector) => ({
+        chunk_uid: idToChunk.get(vector.id),
+        generation: chunkGeneration.get(idToChunk.get(vector.id)),
+        vector_id: vector.id,
+      }));
+      submitted = (await recordSubmittedMutation(env, submittedRows, "upsert", receipt)).submitted;
     } catch (e) {
-      // The whole batch failed. Leave every row queued so nothing is lost, and
-      // surface the reason rather than letting the backlog silently plateau.
+      // Acceptance and its D1 receipt are one phase. If either fails, leave the
+      // row queued so a later idempotent upsert creates a newer ordering fence.
       const err = String(e.message || e).slice(0, 300);
       await env.DB.batch(
         vectors.map((v) =>
           env.DB.prepare(
             `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
-             WHERE chunk_uid = ?1 AND op = 'upsert' AND queued_at = ?3`
-          ).bind(idToChunk.get(v.id), err, chunkVersion.get(idToChunk.get(v.id)))
+             WHERE chunk_uid = ?1 AND op = 'upsert' AND generation = ?3`
+          ).bind(idToChunk.get(v.id), err, chunkGeneration.get(idToChunk.get(v.id)))
         )
       ).catch(() => {});
-      const e2 = new Error(`the vector index refused this batch: ${err}`);
+      const e2 = new Error(`the vector index could not durably accept this batch: ${err}`);
       e2.vectorUpsertFailed = true;
       throw e2;
     }
   }
 
-  // Record the id each chunk was ACTUALLY stored under, at drain time.
-  //
-  // upsertChunks writes this at ingest, which covers anything loaded on a fixed
-  // build. It does NOT cover rows already queued by an older build: those drain
-  // fine, embed fine, and are then unreachable, because search resolves a hashed
-  // id back through this column and finds nothing. The chunk is silently
-  // keyword-only. Found by replaying a real 0.1.0 install through the upgrade
-  // rather than trusting a fresh install to represent it.
-  const remap = vectors
-    .map((v) => [idToChunk.get(v.id), v.id])
-    .filter(([cu, vid]) => cu && vid !== cu);
-  if (remap.length) {
-    await env.DB.batch(
-      remap.map(([cu, vid]) =>
-        env.DB.prepare("UPDATE chunks SET vector_id = ?2 WHERE chunk_uid = ?1").bind(cu, vid)
-      )
-    ).catch(() => {});
-  }
-
-  // Only rows that actually made it are cleared. A poisoned row stays queued
-  // with its attempt count and error recorded, so it is visible and bounded
-  // rather than an invisible permanent stall.
-  const landed = vectors.map((v) => idToChunk.get(v.id)).filter(Boolean);
-  if (landed.length) {
-    await env.DB.batch(
-      landed.map((cu) => env.DB.prepare(
-        "DELETE FROM vector_outbox WHERE chunk_uid = ?1 AND op = 'upsert' AND queued_at = ?2"
-      ).bind(cu, chunkVersion.get(cu)))
-    );
-  }
+  // A poisoned row never entered the accepted mutation and stays fresh in the
+  // queue. Accepted rows also stay queued, now in submitted state, until a later
+  // invocation observes the exact generation through getByIds().
   if (poisoned.length) {
     await env.DB.batch(
       poisoned.map((p) =>
         env.DB.prepare(
           `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
-           WHERE chunk_uid = ?1 AND op = 'upsert' AND queued_at = ?3`
-        ).bind(p.chunk_uid, p.error, chunkVersion.get(p.chunk_uid))
+           WHERE chunk_uid = ?1 AND op = 'upsert' AND generation = ?3`
+        ).bind(p.chunk_uid, p.error, chunkGeneration.get(p.chunk_uid))
       )
     ).catch(() => {});
   }
 
   const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
   return {
-    drained: deleted + landed.length,
-    deleted,
-    upserted: landed.length,
+    drained: 0,
+    deleted: 0,
+    upserted: 0,
+    submitted,
+    waiting: submitted,
     failed: poisoned.length,
     remaining: Number(rest?.n || 0),
     errors: poisoned.slice(0, 3).map((p) => p.error),
   };
+}
+
+/**
+ * Drain one bounded invocation under an exclusive D1-backed Vectorize lease.
+ *
+ * HTTP and cron entrypoints may request up to ten batches, but maxBatches is a
+ * latency preference only: the internal query budget can stop the invocation
+ * sooner. The lease spans every batch actually attempted, so another cron or
+ * manual request can neither read nor write Vectorize until this owner releases
+ * it. If the owner disappears, the migration's timestamp makes the lease
+ * reclaimable without deleting or acknowledging any outbox row.
+ */
+export async function drainOutbox(env, options = {}) {
+  // Upgrade cutovers deploy this exact code in a paused mode before changing
+  // the lease schema. Return before even acquiring D1 state so the paused
+  // Worker is a provable zero-writer compatibility bridge for old installs.
+  if (env?.VECTOR_DRAIN_MODE === "paused-for-upgrade") {
+    return {
+      drained: 0, deleted: 0, upserted: 0, submitted: 0, waiting: 0, failed: 0,
+      remaining: 0, errors: [], busy: false, paused: true,
+    };
+  }
+  const rawMaxBatches = Number(options.maxBatches ?? 1);
+  const maxBatches = Number.isInteger(rawMaxBatches)
+    ? Math.min(10, Math.max(1, rawMaxBatches))
+    : 1;
+  const rawBatchSize = Number(options.batchSize ?? DRAIN_BATCH_SIZE_MAX);
+  const batchSize = Number.isInteger(rawBatchSize)
+    ? Math.min(DRAIN_BATCH_SIZE_MAX, Math.max(1, rawBatchSize))
+    : DRAIN_BATCH_SIZE_MAX;
+  const now = typeof options.now === "function" ? options.now : Date.now;
+  const maxInvocationMs = Number.isSafeInteger(options.maxInvocationMs)
+    ? Math.min(DRAIN_LEASE_TTL_MS - 60_000, Math.max(1_000, options.maxInvocationMs))
+    : 10 * 60 * 1_000;
+  const startedAt = now();
+  const lease = await acquireDrainLease(env, { now: startedAt });
+  if (!lease.acquired) {
+    let rest;
+    try {
+      rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+    } catch {
+      throw new Error("vector drain is busy and its remaining backlog could not be verified");
+    }
+    return {
+      drained: 0,
+      deleted: 0,
+      upserted: 0,
+      submitted: 0,
+      waiting: 0,
+      failed: 0,
+      remaining: Number(rest?.n || 0),
+      errors: [],
+      busy: true,
+      retry_after_seconds: lease.retryAfterSeconds,
+    };
+  }
+
+  const initialDepth = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+  const initialRemaining = Number(initialDepth?.n);
+  if (!Number.isSafeInteger(initialRemaining) || initialRemaining < 0) {
+    try { await releaseDrainLease(env, lease.ownerToken); } catch { /* expiry remains the fallback */ }
+    throw new Error("vector drain initial backlog is invalid");
+  }
+  let result = {
+    drained: 0, deleted: 0, upserted: 0, submitted: 0, waiting: 0, failed: 0,
+    remaining: initialRemaining, errors: [], busy: false,
+  };
+  let operationError = null;
+  let reservedQueries = DRAIN_LEASE_ACQUIRE_QUERIES + DRAIN_LEASE_RELEASE_QUERIES +
+    DRAIN_PROJECTION_VERIFY_QUERIES + DRAIN_INITIAL_DEPTH_QUERIES;
+  const batchQueryUpperBound = drainBatchQueryUpperBound(batchSize);
+  try {
+    for (let batch = 0; batch < maxBatches; batch++) {
+      if (now() - startedAt >= maxInvocationMs) break;
+      // Never begin provider work unless every possible D1 receipt/remap for
+      // that batch fits alongside the already-reserved lease release. This
+      // prevents a Vectorize write from landing only to hit D1's invocation
+      // query limit before its durable acknowledgement can be recorded.
+      if (reservedQueries + batchQueryUpperBound > DRAIN_D1_QUERY_BUDGET) break;
+      reservedQueries += batchQueryUpperBound;
+      const part = await drainOutboxBatch(env, {
+        ...options,
+        batchSize,
+        lease: { ownerToken: lease.ownerToken, now },
+      });
+      result.drained += Number(part.drained || 0);
+      result.deleted += Number(part.deleted || 0);
+      result.upserted += Number(part.upserted || 0);
+      result.submitted += Number(part.submitted || 0);
+      result.waiting = Number(part.waiting || 0);
+      result.failed += Number(part.failed || 0);
+      result.remaining = Number(part.remaining || 0);
+      result.errors.push(...(part.errors || []).slice(0, Math.max(0, 3 - result.errors.length)));
+      if (result.remaining === 0) {
+        const bootstrap = await bootstrapVectorProjectionPage(env, { now: now() });
+        result.remaining = bootstrap.pending;
+        if (bootstrap.pending > 0) {
+          result.waiting = 0;
+          continue;
+        }
+      }
+      // One immediate confirmation check is useful when a small changeset has
+      // already become visible. Once that check reports waiting, stop rather
+      // than spinning inside one Worker invocation. A later manual/cron call
+      // confirms it without another embedding bill.
+      if (!result.remaining) break;
+      if (part.waiting && !part.submitted) break;
+      if (!part.drained && !part.submitted) break;
+    }
+  } catch (error) {
+    operationError = error;
+  }
+
+  if (!operationError && result.remaining === 0) {
+    try {
+      result.projection_verified = await markProjectionVerifiedIfExact(env);
+    } catch (error) {
+      operationError = error;
+    }
+  }
+
+  let released = false;
+  let releaseError = null;
+  try {
+    released = await releaseDrainLease(env, lease.ownerToken);
+    if (!released) {
+      releaseError = new Error("vector drain lease ownership was lost before release");
+    }
+  } catch (error) {
+    releaseError = error;
+  }
+
+  if (operationError) {
+    if (releaseError && operationError && typeof operationError === "object") {
+      operationError.leaseReleaseFailed = true;
+    }
+    throw operationError;
+  }
+  if (releaseError) throw releaseError;
+  return result;
 }
 
 /** How far the vector index is behind the text. Surfaced by health and report. */
@@ -1062,7 +1757,7 @@ export async function diagnose(env, {
         : "There are MORE vectors than chunks: deleted documents likely left theirs behind, and they still compete for retrieval slots."),
       action: missing
         ? "Run `brain reindex <manifest> --yes`. It rebuilds the index from D1 and needs no source files."
-        : "Run `brain reindex <manifest> --yes`, then re-check. Persistent excess means deletions are not reaching Vectorize." });
+        : "Reindex cannot enumerate unknown provider-only IDs. Use a reviewed recovery to recreate and rebind this brain's Vectorize index with all metadata indexes, then run `brain reindex <manifest> --yes` and verify exact readiness." });
   });
 
   await safe("backlog", async () => {
@@ -1367,7 +2062,189 @@ export async function freshnessReport(env, { now = Date.now() } = {}) {
   };
 }
 
-export async function reindex(env, { source = null, dryRun = true } = {}) {
+// Ninety-nine ids plus the queued_at value exactly fit the installer's shared
+// 100-bind D1 ceiling. Keep this independent from the drain's 100-row batch.
+export const VECTOR_BOOTSTRAP_PAGE_SIZE = 99;
+
+/**
+ * Advance one crash-resumable legacy projection page.
+ *
+ * The migration only records a high-water mark. Each call enqueues at most 99
+ * rows in one INSERT..SELECT and advances the epoch-bound cursor in the same
+ * D1 transaction. Callers must drain the current page to exact visibility
+ * before asking for another, which caps bootstrap queue growth and makes a
+ * 736k-chunk upgrade resumable without one trigger-amplified migration.
+ */
+export async function bootstrapVectorProjectionPage(env, {
+  pageSize = VECTOR_BOOTSTRAP_PAGE_SIZE,
+  now = Date.now(),
+} = {}) {
+  const limit = Number.isInteger(pageSize)
+    ? Math.min(VECTOR_BOOTSTRAP_PAGE_SIZE, Math.max(1, pageSize))
+    : VECTOR_BOOTSTRAP_PAGE_SIZE;
+  if (!Number.isSafeInteger(now) || now < 0) throw new Error("vector bootstrap time is invalid");
+
+  const state = await env.DB.prepare(
+    `SELECT vector_projection_status AS status,
+            vector_projection_bootstrap_epoch AS epoch,
+            vector_projection_bootstrap_cursor AS cursor,
+            vector_projection_bootstrap_high_water AS high_water,
+            (SELECT count(*) FROM chunks) AS chunks,
+            (SELECT count(*) FROM vector_outbox) AS pending
+       FROM install_state WHERE id = 1 AND schema_version >= 12`
+  ).first();
+  if (!state || !["verified", "pending", "bootstrap_required"].includes(String(state.status))) {
+    throw new Error("vector bootstrap state is unavailable");
+  }
+  const epoch = Number(state.epoch);
+  const chunks = Number(state.chunks);
+  const pending = Number(state.pending);
+  if (![epoch, chunks, pending].every((value) => Number.isSafeInteger(value) && value >= 0)) {
+    throw new Error("vector bootstrap counts are invalid");
+  }
+  if (state.status !== "bootstrap_required") {
+    return {
+      bootstrap: true,
+      complete: true,
+      chunks,
+      page_chunks: 0,
+      queued: 0,
+      already_queued: pending,
+      pending,
+      epoch,
+    };
+  }
+  if (pending > 0) {
+    return {
+      bootstrap: true,
+      complete: false,
+      blocked_on_drain: true,
+      chunks,
+      page_chunks: 0,
+      queued: 0,
+      already_queued: pending,
+      pending,
+      epoch,
+    };
+  }
+
+  const cursor = state.cursor === null || state.cursor === undefined ? "" : String(state.cursor);
+  const highWater = state.high_water === null || state.high_water === undefined
+    ? ""
+    : String(state.high_water);
+  if (chunks > 0 && !highWater) {
+    throw new Error("vector bootstrap cursor is invalid");
+  }
+  const { results: candidates } = await env.DB.prepare(
+    `SELECT chunk_uid FROM chunks
+      WHERE chunk_uid > ?1 AND chunk_uid <= ?2
+      ORDER BY chunk_uid LIMIT ?3`
+  ).bind(cursor, highWater, limit + 1).all();
+  if (!Array.isArray(candidates)) throw new Error("vector bootstrap page is invalid");
+  const page = candidates.slice(0, limit);
+  const hasMore = candidates.length > limit;
+  const nextCursor = hasMore ? String(page.at(-1)?.chunk_uid || "") : highWater;
+  if (page.length && !nextCursor) throw new Error("vector bootstrap page cursor is invalid");
+  const nextStatus = hasMore ? "bootstrap_required" : "pending";
+
+  const statements = [];
+  if (page.length) {
+    const pageIds = page.map((row) => String(row?.chunk_uid || ""));
+    if (pageIds.some((id) => !id)) {
+      throw new Error("vector bootstrap page identity is invalid");
+    }
+    const placeholders = pageIds.map((_, index) => `?${index + 1}`).join(",");
+    statements.push(env.DB.prepare(
+      `INSERT INTO vector_outbox
+         (chunk_uid, vector_id, op, queued_at, attempts, last_error)
+       SELECT c.chunk_uid, COALESCE(c.vector_id, c.chunk_uid), 'upsert', ?${pageIds.length + 1}, 0, NULL
+         FROM chunks c
+        WHERE c.chunk_uid IN (${placeholders})
+       ON CONFLICT(chunk_uid) DO UPDATE SET
+         vector_id=excluded.vector_id, op='upsert', queued_at=excluded.queued_at,
+         attempts=0, last_error=NULL`
+    ).bind(...pageIds, now));
+  }
+  statements.push(env.DB.prepare(
+    `UPDATE install_state
+        SET vector_projection_status = ?5,
+            vector_projection_bootstrap_cursor = ?4
+      WHERE id = 1 AND schema_version >= 12
+        AND vector_projection_status = 'bootstrap_required'
+        AND vector_projection_bootstrap_epoch = ?1
+        AND COALESCE(vector_projection_bootstrap_cursor, '') = ?2
+        AND COALESCE(vector_projection_bootstrap_high_water, '') = ?3`
+  ).bind(epoch, cursor, highWater, nextCursor, nextStatus));
+  const results = await env.DB.batch(statements);
+  if (!Array.isArray(results) || results.length !== statements.length ||
+      drainLeaseChanges(results.at(-1)) !== 1) {
+    throw new Error("vector bootstrap epoch changed; retry from durable state");
+  }
+  const after = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+  const afterPending = Number(after?.n);
+  if (!Number.isSafeInteger(afterPending) || afterPending < 0) {
+    throw new Error("vector bootstrap outbox receipt is invalid");
+  }
+  return {
+    bootstrap: true,
+    complete: !hasMore,
+    blocked_on_drain: false,
+    chunks,
+    page_chunks: page.length,
+    queued: afterPending,
+    already_queued: 0,
+    pending: afterPending,
+    epoch,
+  };
+}
+
+/** Start a whole-corpus bootstrap, or resume the current durable epoch. */
+export async function resetVectorProjectionBootstrap(env) {
+  const result = await env.DB.prepare(
+    `UPDATE install_state
+        SET vector_projection_status = CASE
+              WHEN EXISTS (SELECT 1 FROM chunks) THEN 'bootstrap_required' ELSE 'verified' END,
+            vector_projection_bootstrap_epoch = vector_projection_bootstrap_epoch + 1,
+            vector_projection_bootstrap_cursor = NULL,
+            vector_projection_bootstrap_high_water = (SELECT MAX(chunk_uid) FROM chunks)
+      WHERE id = 1 AND schema_version >= 12
+        AND vector_projection_status <> 'bootstrap_required'`
+  ).run();
+  const reset = drainLeaseChanges(result);
+  if (![0, 1].includes(reset)) {
+    throw new Error("the vector bootstrap could not be reset durably");
+  }
+  const state = await env.DB.prepare(
+    `SELECT vector_projection_status AS status,
+            vector_projection_bootstrap_epoch AS epoch,
+            vector_projection_bootstrap_cursor AS cursor,
+            vector_projection_bootstrap_high_water AS high_water,
+            (SELECT count(*) FROM chunks) AS chunks,
+            (SELECT count(*) FROM vector_outbox) AS pending
+       FROM install_state WHERE id = 1`
+  ).first();
+  const chunks = Number(state?.chunks);
+  const pending = Number(state?.pending);
+  const epoch = Number(state?.epoch);
+  if (![chunks, pending, epoch].every((value) => Number.isSafeInteger(value) && value >= 0) ||
+      !["verified", "bootstrap_required"].includes(String(state?.status)) ||
+      (chunks > 0 && state?.status === "bootstrap_required" && state?.high_water === null)) {
+    throw new Error("the vector bootstrap reset receipt is invalid");
+  }
+  return {
+    chunks,
+    pending,
+    epoch,
+    bootstrapRequired: state.status === "bootstrap_required",
+    resumed: reset === 0,
+  };
+}
+
+export async function reindex(env, { source = null, dryRun = true, bootstrap = false } = {}) {
+  if (bootstrap) {
+    if (source || dryRun) throw new Error("vector bootstrap requires a confirmed whole-corpus request");
+    return bootstrapVectorProjectionPage(env);
+  }
   const where = source ? "WHERE d.source = ?1" : "";
   const bind = source ? [source] : [];
 
@@ -1382,6 +2259,21 @@ export async function reindex(env, { source = null, dryRun = true } = {}) {
   const before = Number(beforeRow?.n || 0);
 
   if (dryRun) return { chunks, queued: 0, already_queued: before, dry_run: true, source };
+
+  if (!source) {
+    const reset = await resetVectorProjectionBootstrap(env);
+    return {
+      chunks,
+      queued: 0,
+      already_queued: before,
+      pending: reset.pending,
+      bootstrap_required: reset.bootstrapRequired,
+      bootstrap_epoch: reset.epoch,
+      bootstrap_resumed: reset.resumed,
+      dry_run: false,
+      source,
+    };
+  }
 
   await env.DB.prepare(
     `INSERT OR REPLACE INTO vector_outbox (chunk_uid, vector_id, op, queued_at, attempts, last_error)
@@ -1399,19 +2291,133 @@ export async function outboxDepth(env) {
   const row = await env.DB.prepare(
     `SELECT count(*) AS n, min(queued_at) AS oldest,
             sum(CASE WHEN op = 'upsert' THEN 1 ELSE 0 END) AS upserts,
-            sum(CASE WHEN op = 'delete' THEN 1 ELSE 0 END) AS deletes
+            sum(CASE WHEN op = 'delete' THEN 1 ELSE 0 END) AS deletes,
+            sum(CASE WHEN submitted_mutation_id IS NOT NULL THEN 1 ELSE 0 END) AS submitted
      FROM vector_outbox`
   ).first();
   return {
     pending: Number(row?.n || 0),
     upserts: Number(row?.upserts || 0),
     deletes: Number(row?.deletes || 0),
+    submitted: Number(row?.submitted || 0),
     oldest_queued_at: row?.oldest ?? null,
   };
 }
 
 /**
- * Remove documents from both systems.
+ * Exact semantic-projection readiness, not provider reachability.
+ *
+ * Read Vectorize first and D1 second. If ingest or a drain advances D1 between
+ * those observations, the newer queue/fence makes this fail closed. A write
+ * that starts after the D1 read simply starts after this point-in-time check.
+ */
+export async function vectorReadiness(env) {
+  let description;
+  try {
+    description = await env.VECTORIZE.describe();
+  } catch (error) {
+    throw new Error(`the vector index could not report readiness: ${String(error?.message || error).slice(0, 240)}`);
+  }
+  const vectorCount = Number(
+    description?.vectorCount ?? description?.vectorsCount ?? description?.count,
+  );
+  if (!Number.isSafeInteger(vectorCount) || vectorCount < 0) {
+    throw new Error("the vector index returned an invalid vector count");
+  }
+
+  const state = await env.DB.prepare(
+    `SELECT schema_version,
+            vector_projection_mutation_id AS mutation_id,
+            vector_projection_submitted_at AS mutation_submitted_at,
+            vector_projection_status AS projection_status,
+            vector_projection_bootstrap_epoch AS bootstrap_epoch,
+            vector_projection_bootstrap_cursor AS bootstrap_cursor,
+            vector_projection_bootstrap_high_water AS bootstrap_high_water,
+            (SELECT count(*) FROM chunks) AS expected_vectors,
+            (SELECT count(*) FROM vector_outbox) AS pending,
+            (SELECT count(*) FROM vector_outbox
+              WHERE submitted_mutation_id IS NOT NULL) AS submitted,
+            (SELECT min(queued_at) FROM vector_outbox) AS oldest_queued_at
+       FROM install_state WHERE id = 1`
+  ).first();
+  if (!state || Number(state.schema_version) < 12) {
+    throw new Error("the vector visibility receipt schema is not active");
+  }
+  const expected = Number(state.expected_vectors);
+  const pending = Number(state.pending);
+  const submitted = Number(state.submitted);
+  if (![expected, pending, submitted].every((value) => Number.isSafeInteger(value) && value >= 0) ||
+      submitted > pending) {
+    throw new Error("the vector readiness counts are invalid");
+  }
+
+  const mutationId = state.mutation_id === null || state.mutation_id === undefined || state.mutation_id === ""
+    ? null
+    : String(state.mutation_id);
+  let mutationProcessed = mutationId === null;
+  if (mutationId !== null) {
+    const processed = description?.processedUpToMutation;
+    if (processed === null || processed === undefined || processed === "") {
+      mutationProcessed = false;
+    } else if (typeof processed !== "string" && typeof processed !== "number") {
+      throw new Error("the vector index did not expose its processed mutation watermark");
+    } else {
+      mutationProcessed = String(processed) === mutationId;
+    }
+  }
+
+  const countsMatch = vectorCount === expected;
+  const status = String(state.projection_status || "");
+  const bootstrapEpoch = Number(state.bootstrap_epoch);
+  if (!["verified", "pending", "bootstrap_required"].includes(status) ||
+      !Number.isSafeInteger(bootstrapEpoch) || bootstrapEpoch < 0) {
+    throw new Error("the vector projection verification state is invalid");
+  }
+  const ready = pending === 0 && mutationProcessed && countsMatch &&
+    (expected === 0 || status === "verified");
+  let reason = null;
+  let action = null;
+  if (!ready) {
+    if (status === "bootstrap_required") {
+      reason = "projection_bootstrap_required";
+      action = "Run `brain update <manifest>` to resume the bounded legacy vector bootstrap.";
+    } else if (pending > 0) {
+      reason = submitted > 0 && !mutationProcessed
+        ? "accepted_mutation_processing"
+        : submitted > 0
+          ? "accepted_mutation_needs_confirmation"
+          : "vector_work_queued";
+      action = "Run `brain drain <manifest>`; it confirms provider visibility without re-embedding accepted rows.";
+    } else if (!mutationProcessed) {
+      reason = "accepted_mutation_processing";
+      action = "Wait for Vectorize processing, then run `brain drain <manifest>` again.";
+    } else if (!countsMatch) {
+      reason = "vector_count_mismatch";
+      action = vectorCount < expected
+        ? "Run `brain diagnose <manifest>`, then `brain reindex <manifest> --yes` to rebuild missing vectors."
+        : "Vectorize has provider-only vectors that reindex cannot enumerate. Use a reviewed recovery to recreate/rebind the index and metadata indexes, then reindex and verify exact readiness.";
+    } else {
+      reason = "projection_unverified";
+      action = "Run `brain drain <manifest>` to finish the exact vector verification receipt.";
+    }
+  }
+  return {
+    ready,
+    reason,
+    expected_vectors: expected,
+    actual_vectors: vectorCount,
+    pending,
+    submitted,
+    oldest_queued_at: state.oldest_queued_at ?? null,
+    mutation_submitted_at: state.mutation_submitted_at ?? null,
+    projection_status: status,
+    bootstrap_epoch: bootstrapEpoch,
+    action,
+  };
+}
+
+/**
+ * Remove documents from D1 and durably queue their Vectorize cleanup.
  *
  * ORDER MATTERS, AND IT IS THE OPPOSITE OF THE INSERT ORDER.
  *
@@ -1423,7 +2429,8 @@ export async function outboxDepth(env) {
  * keyword search, and any vector still in Vectorize returns an id that hydration
  * cannot resolve, which searchVector already drops. A crash between the two
  * therefore leaves the document unreachable by BOTH paths, which is the safe
- * way to fail. Vectors are then removed to reclaim the space.
+ * way to fail. The exclusive leased drain later removes the vectors to reclaim
+ * the space.
  */
 export async function forget(env, { docUids = [], source = null, dryRun = true } = {}) {
   let targets = docUids;
@@ -1435,7 +2442,7 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
 
   // D1 accepts at most 100 bound variables in one statement. Source-level
   // forget routinely targets hundreds or thousands of documents, so every
-  // read and mutation is partitioned well below that ceiling.
+  // read and mutation is partitioned below that separate bind-parameter limit.
   const TARGET_BATCH = 50;
   const groups = [];
   for (let i = 0; i < targets.length; i += TARGET_BATCH) groups.push(targets.slice(i, i + TARGET_BATCH));
@@ -1474,20 +2481,13 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
     ]);
   }
 
-  let vectors = 0;
-  let vectorError = null;
-  try {
-    vectors = await deleteQueuedVectors(env, (chunkRows || []).map((r) => ({
-      chunk_uid: r.chunk_uid,
-      vector_id: r.vector_id || r.chunk_uid,
-      queued_at: queuedAt,
-    })));
-  } catch (e) {
-    // The D1 delete is complete, so the content is unreachable. Keep the
-    // outbox rows for retry and report that physical vector cleanup is pending.
-    vectors = Number(e.deleted || 0);
-    vectorError = String(e.message || e).slice(0, 200);
-  }
+  // Physical vector deletion is deliberately enqueue-only here. `drainOutbox`
+  // is the sole Vectorize writer and owns the exclusive D1 lease; letting
+  // forget write Vectorize directly would let a stale in-flight upsert land
+  // after this delete. D1 hydration already makes the removed content
+  // unreachable, while the durable delete rows make space reclamation
+  // retryable after crashes or a busy drain.
+  const vectors = 0;
 
   // Derived, so the count cannot drift after a delete.
   const sources = source ? [source] : [...new Set(targets.map((t) => String(t).split(":")[0]))];
@@ -1502,8 +2502,8 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
 
   return {
     documents: targets.length, chunks: chunkUids.length, vectors,
-    vector_cleanup_queued: Math.max(0, chunkUids.length - vectors),
-    dry_run: false, vector_error: vectorError, targets,
+    vector_cleanup_queued: chunkUids.length,
+    dry_run: false, vector_error: null, targets,
   };
 }
 

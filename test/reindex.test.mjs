@@ -15,6 +15,9 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 const mkEnv = ({ chunks = 0, outbox = 0, inserted = 0 } = {}) => {
   const sql = [];
   let outboxNow = outbox;
+  let bootstrapStatus = "verified";
+  let bootstrapEpoch = 0;
+  const bootstrapHighWater = chunks > 0 ? "fixture:high-water#0" : null;
   return {
     sql,
     DB: {
@@ -24,10 +27,31 @@ const mkEnv = ({ chunks = 0, outbox = 0, inserted = 0 } = {}) => {
           bind: (...bb) => shape(bb),
           first: async () => {
             if (/FROM chunks c JOIN documents/.test(q)) return { n: chunks };
+            if (/vector_projection_bootstrap_epoch AS epoch/.test(q)) {
+              return {
+                status: bootstrapStatus,
+                epoch: bootstrapEpoch,
+                cursor: null,
+                high_water: bootstrapHighWater,
+                chunks,
+                pending: outboxNow,
+              };
+            }
             if (/FROM vector_outbox/.test(q)) return { n: outboxNow };
             return {};
           },
-          run: async () => { outboxNow += inserted; return {}; },
+          run: async () => {
+            if (/UPDATE install_state/.test(q)) {
+              if (bootstrapStatus === "bootstrap_required") {
+                return { meta: { changes: 0 } };
+              }
+              bootstrapStatus = chunks > 0 ? "bootstrap_required" : "verified";
+              bootstrapEpoch += 1;
+              return { meta: { changes: 1 } };
+            }
+            outboxNow += inserted;
+            return { meta: { changes: inserted } };
+          },
           all: async () => ({ results: [] }),
         });
         return shape();
@@ -40,8 +64,10 @@ const mkEnv = ({ chunks = 0, outbox = 0, inserted = 0 } = {}) => {
 {
   const env = mkEnv({ chunks: 500, outbox: 0, inserted: 500 });
   await reindex(env, { dryRun: false });
-  const destructive = env.sql.filter((q) => /\b(DELETE|DROP|TRUNCATE|UPDATE)\b/i.test(q));
-  check("reindex issues NO destructive statement", destructive.length === 0, JSON.stringify(destructive));
+  const destructive = env.sql.filter((q) =>
+    /\b(?:DELETE|DROP|TRUNCATE)\b/i.test(q) ||
+    /\bUPDATE\s+(?:documents|chunks|vector_outbox)\b/i.test(q));
+  check("reindex issues no destructive corpus or queue statement", destructive.length === 0, JSON.stringify(destructive));
   check("and does not touch documents or chunks except to read them",
     env.sql.every((q) => !/INSERT INTO (documents|chunks)|DELETE FROM (documents|chunks)/i.test(q)), JSON.stringify(env.sql));
 }
@@ -55,22 +81,28 @@ const mkEnv = ({ chunks = 0, outbox = 0, inserted = 0 } = {}) => {
   check("and queues nothing", r.queued === 0 && !env.sql.some((q) => /INSERT/i.test(q)), JSON.stringify(env.sql));
 }
 
-/* ---- armed, it queues every chunk ---- */
+/* ---- armed, whole-corpus work starts one durable bounded bootstrap ---- */
 {
   const env = mkEnv({ chunks: 500, outbox: 0, inserted: 500 });
   const r = await reindex(env, { dryRun: false });
-  check("armed, it queues every chunk", r.queued === 500, JSON.stringify(r));
-  check("via INSERT OR REPLACE, so current D1 state wins over a stale delete operation",
-    env.sql.some((q) => /INSERT OR REPLACE INTO vector_outbox/i.test(q)), JSON.stringify(env.sql));
-  check("and it re-queues as an upsert", env.sql.some((q) => /'upsert'/.test(q)));
+  check("armed, it records a durable bootstrap instead of materializing 500 queue rows",
+    r.queued === 0 && r.pending === 0 && r.bootstrap_required === true && r.bootstrap_epoch === 1,
+    JSON.stringify(r));
+  check("whole-corpus reindex performs no corpus-sized outbox insert",
+    !env.sql.some((q) => /INSERT (?:OR REPLACE )?INTO vector_outbox/i.test(q)), JSON.stringify(env.sql));
 }
 
-/* ---- running it twice is safe ---- */
+/* ---- running it twice resumes the same epoch and existing queue ---- */
 {
   const env = mkEnv({ chunks: 500, outbox: 500, inserted: 0 });
-  const r = await reindex(env, { dryRun: false });
-  check("a second run adds nothing new", r.queued === 0, JSON.stringify(r));
-  check("and says how many were already waiting", r.already_queued === 500, JSON.stringify(r));
+  const first = await reindex(env, { dryRun: false });
+  const second = await reindex(env, { dryRun: false });
+  check("a second run preserves the durable bootstrap epoch",
+    first.bootstrap_epoch === 1 && second.bootstrap_epoch === 1 && second.bootstrap_resumed === true,
+    JSON.stringify({ first, second }));
+  check("and preserves the already waiting queue instead of duplicating it",
+    second.queued === 0 && second.already_queued === 500 && second.pending === 500,
+    JSON.stringify(second));
 }
 
 /* ---- scoped to one source ---- */
@@ -79,6 +111,9 @@ const mkEnv = ({ chunks = 0, outbox = 0, inserted = 0 } = {}) => {
   const r = await reindex(env, { source: "documents", dryRun: false });
   check("a source filter reaches the SQL", env.sql.some((q) => /WHERE d\.source = \?/.test(q)), JSON.stringify(env.sql));
   check("and is reported back", r.source === "documents", JSON.stringify(r));
+  check("scoped repair still queues current D1 state as upserts",
+    r.queued === 40 && env.sql.some((q) => /INSERT OR REPLACE INTO vector_outbox/i.test(q)) &&
+      env.sql.some((q) => /'upsert'/.test(q)), JSON.stringify({ receipt: r, sql: env.sql }));
 }
 
 /* ---- an empty brain is not an error ---- */
