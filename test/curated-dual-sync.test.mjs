@@ -2,12 +2,17 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   rmSync,
   statSync,
   utimesSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,6 +21,7 @@ import {
   buildCuratedCoverageLedger,
   loadCuratedSyncPlan,
   prepareCuratedCorpus,
+  readStableRegularSource,
   runCuratedDualSync,
   validateCuratedSyncPlan,
   writeCuratedCoverageLedger,
@@ -118,12 +124,17 @@ try {
   const stableMtime = new Date(2026, 0, 2, 12, 0, 0);
   utimesSync(join(corpus, "alpha.md"), stableMtime, stableMtime);
 
+  const md5 = (path) => createHash("md5").update(readFileSync(path)).digest("hex");
+  const alphaRawMd5 = md5(join(corpus, "alpha.md"));
+  const betaWrongMd5 = "0".repeat(32);
+  const gammaSizeOnly = String(statSync(join(corpus, "nested", "gamma.markdown")).size);
+
   writeFileSync(stateFile, JSON.stringify({
     version: 6,
     done: {
-      "drive:fixture-alpha": JSON.stringify(["revision", "hash", "alpha.md", "text/markdown", "Fixture"]),
-      "drive:fixture-beta": JSON.stringify(["revision", "hash", "beta.md", "text/markdown", "Fixture/nested"]),
-      "drive:fixture-gamma": JSON.stringify(["revision", "hash", "gamma.markdown", "text/markdown", "Fixture/nested"]),
+      "drive:fixture-alpha": JSON.stringify(["revision", alphaRawMd5, "alpha.md", "text/markdown", "Fixture"]),
+      "drive:fixture-beta": JSON.stringify(["revision", betaWrongMd5, "beta.md", "text/markdown", "Fixture/nested"]),
+      "drive:fixture-gamma": JSON.stringify(["revision", gammaSizeOnly, "gamma.markdown", "text/markdown", "Fixture/nested"]),
     },
   }), { mode: 0o600 });
 
@@ -140,10 +151,76 @@ try {
   assert.equal(gamma.legacyEnvelope.title, "gamma");
   assert.equal(alpha.cloudflareEnvelope.source_type, "curated");
   assert.equal(alpha.cloudflareEnvelope.source_id, "brain:custom:fixture-alpha-id");
+  assert.equal(alpha.rawMd5, alphaRawMd5);
   assert.equal(
     alpha.legacyEnvelope.metadata.content_hash,
     createHash("sha256").update(alpha.legacyEnvelope.content).digest("hex").slice(0, 16),
   );
+
+  // The source bytes come from a no-follow descriptor and must remain the same
+  // inode, size and timestamps through the read and final path verification.
+  let openedFlags = 0;
+  const stableRead = readStableRegularSource(join(corpus, "alpha.md"), {
+    openSource(path, flags) {
+      openedFlags = flags;
+      return openSync(path, flags);
+    },
+  });
+  assert.equal(stableRead.rawMd5, alphaRawMd5);
+  if (fsConstants.O_NOFOLLOW) {
+    assert.equal((openedFlags & fsConstants.O_NOFOLLOW) === fsConstants.O_NOFOLLOW, true);
+  }
+
+  let fstatCalls = 0;
+  let changedError;
+  try {
+    readStableRegularSource(join(corpus, "alpha.md"), {
+      fstatSource(descriptor, options) {
+        const info = fstatSync(descriptor, options);
+        fstatCalls++;
+        if (fstatCalls === 1) return info;
+        return {
+          ...info,
+          isFile: () => true,
+          mtimeNs: info.mtimeNs + 1n,
+        };
+      },
+    });
+  } catch (error) { changedError = error; }
+  assert.match(changedError?.message || "", /changed while being read/);
+  assert.equal(changedError.message.includes("alpha.md"), false);
+
+  let replacedError;
+  try {
+    readStableRegularSource(join(corpus, "alpha.md"), {
+      lstatSource(path, options) {
+        const info = lstatSync(path, options);
+        return { ...info, isFile: () => true, isSymbolicLink: () => false, ino: info.ino + 1n };
+      },
+    });
+  } catch (error) { replacedError = error; }
+  assert.match(replacedError?.message || "", /changed while being read/);
+  assert.equal(replacedError.message.includes("alpha.md"), false);
+
+  const racedPath = join(corpus, "late-arrival.md");
+  let injectedArrival = false;
+  let inventoryRaceError;
+  try {
+    prepareCuratedCorpus(checked, {
+      planDirectory: sandbox,
+      readStableSource(path, options) {
+        const snapshot = readStableRegularSource(path, options);
+        if (!injectedArrival) {
+          injectedArrival = true;
+          writeFileSync(racedPath, "# Late fixture\n", { mode: 0o600 });
+        }
+        return snapshot;
+      },
+    });
+  } catch (error) { inventoryRaceError = error; }
+  assert.match(inventoryRaceError?.message || "", /inventory changed while the snapshot was being built/);
+  assert.equal(inventoryRaceError.message.includes("late-arrival"), false);
+  unlinkSync(racedPath);
 
   // A scheduled mount that enumerates no files must fail before either target
   // resolver, the network, or the ledger writer can be reached.
@@ -192,7 +269,7 @@ try {
     writeLedger: (_path, value) => { dryLedger = value; },
   });
   assert.equal(dry.ok, true);
-  assert.equal(dry.rawDriveDuplicates.total, 0);
+  assert.equal(dry.rawDriveChecksumDuplicates.total, 0);
   assert.equal(dryLedger.documents.every((document) => document.targets.legacy === "not_attempted"), true);
 
   // Read-only audit pages through the authenticated Cloudflare family list and
@@ -220,7 +297,7 @@ try {
       }
       return response(200, {
         source: "drive",
-        families: ["drive:fixture-beta"],
+          families: ["drive:fixture-beta", "drive:fixture-gamma"],
         next_cursor: null,
       });
     },
@@ -228,11 +305,23 @@ try {
   });
   assert.equal(audit.ok, true);
   assert.equal(auditCalls.length, 2);
-  assert.deepEqual(audit.rawDriveDuplicates, {
-    total: 2,
+  assert.deepEqual(audit.rawDriveChecksumDuplicates, {
+    total: 1,
     authoritative: 1,
+    superseded: 0,
+    plain: 0,
+  });
+  assert.deepEqual(audit.rawDriveChecksumMismatches, {
+    total: 1,
+    authoritative: 0,
     superseded: 1,
     plain: 0,
+  });
+  assert.deepEqual(audit.rawDrivePresenceUnverified, {
+    total: 1,
+    authoritative: 0,
+    superseded: 0,
+    plain: 1,
   });
   const auditText = JSON.stringify(auditLedger);
   for (const privateFixture of [
@@ -357,7 +446,7 @@ try {
   const observations = {
     legacy: allStatus(prepared, "confirmed"),
     cloudflare: allStatus(prepared, "confirmed"),
-    rawDrive: allStatus(prepared, "duplicate_confirmed"),
+    rawDrive: allStatus(prepared, "checksum_confirmed_duplicate"),
   };
   const stableLedger = buildCuratedCoverageLedger(prepared, observations);
   const firstWrite = writeCuratedCoverageLedger(ledgerFile, stableLedger, {

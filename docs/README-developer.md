@@ -374,11 +374,22 @@ target receipt is complete, so rerunning is the recovery path.
 
 The atomically replaced owner-only ledger contains salted logical fingerprints,
 content SHA-256 values, roles, bounded target receipt states and aggregate raw
-Drive duplicate counts. It contains no filenames, paths, source IDs, URLs,
-document content or credentials. Raw Drive duplicates are matched internally
-from the private Drive resume state to the authenticated Cloudflare
-source-family inventory; only role-level counts and opaque document
+Drive checksum findings. It contains no filenames, paths, source IDs, URLs,
+document content or credentials. The operation calls a raw Drive family a
+checksum-confirmed duplicate only when the family is live and Drive's stored
+MD5 matches the exact local bytes read. A driveVersion value that is merely a
+file size, or has no checksum, is reported as unverified presence. A different
+MD5 is reported as a mismatch. Only role-level counts and opaque document
 fingerprints leave that comparison.
+
+Each Markdown revision is opened with the operating system's no-follow flag,
+read from that descriptor, and checked with descriptor metadata before and
+after the read. The path must still name the same regular, current-user-owned
+file with the same device, inode, size and source modification time. File
+Provider change time is not revision identity because hydration can update it
+during a read without changing source bytes. The collection is enumerated again
+after all reads. A cloud-sync replacement or an inventory change therefore
+stops the run before either target is contacted.
 
 ---
 

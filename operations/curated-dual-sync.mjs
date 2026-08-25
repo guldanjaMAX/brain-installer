@@ -18,6 +18,7 @@ import {
   constants as fsConstants,
   closeSync,
   existsSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -38,7 +39,7 @@ import {
 } from "./admin-key-persistence.mjs";
 
 export const CURATED_SYNC_PLAN_VERSION = 1;
-export const CURATED_SYNC_LEDGER_VERSION = 1;
+export const CURATED_SYNC_LEDGER_VERSION = 2;
 export const CURATED_SYNC_ROLES = Object.freeze([
   "authoritative",
   "superseded",
@@ -62,6 +63,15 @@ const STATUS_VALUES = new Set([
   "http_error",
   "invalid_receipt",
   "oversized",
+]);
+const RAW_DRIVE_STATUS_VALUES = new Set([
+  "not_configured",
+  "state_unmapped",
+  "not_verified",
+  "not_present",
+  "presence_unverified",
+  "checksum_mismatch",
+  "checksum_confirmed_duplicate",
 ]);
 
 function sha256(value) {
@@ -363,6 +373,81 @@ function localDate(value) {
   return `${year}-${month}-${day}`;
 }
 
+function sameStableFile(left, right) {
+  // File Provider may legitimately update ctime while hydrating bytes for a
+  // read, even though inode, size, and source mtime stay fixed. The latter are
+  // the source-revision identity; including ctime makes healthy cloud files
+  // fail the stability gate merely because they were opened.
+  return ["dev", "ino", "size", "mtimeNs"].every((field) =>
+    left?.[field] !== undefined && left[field] === right?.[field]);
+}
+
+function assertRegularOwner(info, options = {}) {
+  if (!info?.isFile?.()) fail("curated corpus inventory contains a nonregular file");
+  const platform = options.platform ?? process.platform;
+  const currentUid = options.currentUid ?? (
+    typeof process.getuid === "function" ? process.getuid() : null
+  );
+  if (platform !== "win32" && currentUid !== null && BigInt(info.uid) !== BigInt(currentUid)) {
+    fail("curated corpus document is not owned by the current user");
+  }
+}
+
+/**
+ * Read one stable source revision through a no-follow descriptor.
+ *
+ * Cloud-sync clients commonly replace a file while updating it. Path-based
+ * lstat followed by readFile can therefore validate one inode and read another.
+ * Opening first with O_NOFOLLOW, comparing descriptor metadata before and after
+ * the read, and proving the path still names that descriptor closes that
+ * window. The returned MD5 is over the exact bytes read, before UTF-8 decoding.
+ */
+export function readStableRegularSource(path, options = {}) {
+  const openSource = options.openSource ?? openSync;
+  const fstatSource = options.fstatSource ?? fstatSync;
+  const readSource = options.readSource ?? readFileSync;
+  const lstatSource = options.lstatSource ?? lstatSync;
+  const closeSource = options.closeSource ?? closeSync;
+  const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0);
+  let descriptor;
+  let bytes;
+  try {
+    descriptor = openSource(path, flags);
+    const before = fstatSource(descriptor, { bigint: true });
+    assertRegularOwner(before, options);
+    bytes = readSource(descriptor);
+    if (!Buffer.isBuffer(bytes)) bytes = Buffer.from(bytes);
+    const after = fstatSource(descriptor, { bigint: true });
+    assertRegularOwner(after, options);
+    let pathAfter;
+    try {
+      pathAfter = lstatSource(path, { bigint: true });
+    } catch {
+      fail("curated corpus document changed while being read");
+    }
+    assertRegularOwner(pathAfter, options);
+    if (
+      pathAfter.isSymbolicLink?.() || !sameStableFile(before, after) ||
+      !sameStableFile(after, pathAfter) || BigInt(bytes.length) !== after.size
+    ) {
+      fail("curated corpus document changed while being read");
+    }
+    return Object.freeze({
+      body: bytes.toString("utf8"),
+      rawMd5: createHash("md5").update(bytes).digest("hex"),
+      stats: after,
+    });
+  } catch (error) {
+    if (error?.message?.startsWith("curated corpus")) throw error;
+    fail("curated corpus document could not be read through a stable descriptor");
+  } finally {
+    if (descriptor !== undefined) {
+      try { closeSource(descriptor); } catch { /* the read result is already bounded */ }
+    }
+    if (Buffer.isBuffer(bytes)) bytes.fill(0);
+  }
+}
+
 function markdownTitle(relativePath, body) {
   for (const line of body.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -406,7 +491,8 @@ function planSetMismatch(found, planned) {
  * This is the sole function allowed to read source content. It finishes before
  * callers may resolve credentials, which is the fail-closed scheduler gate.
  */
-export function prepareCuratedCorpus(planInput, { planDirectory = process.cwd() } = {}) {
+export function prepareCuratedCorpus(planInput, options = {}) {
+  const planDirectory = options.planDirectory ?? process.cwd();
   const plan = planInput?.schemaVersion === CURATED_SYNC_PLAN_VERSION
     ? planInput
     : validateCuratedSyncPlan(planInput);
@@ -432,17 +518,10 @@ export function prepareCuratedCorpus(planInput, { planDirectory = process.cwd() 
   const documents = plan.documents.map((document) => {
     const absolute = resolve(root, ...document.relativePath.split("/"));
     if (relative(root, absolute).startsWith("..")) fail("curated corpus inventory escaped its root");
-    let body;
-    let info;
-    try {
-      info = lstatSync(absolute);
-      if (!info.isFile() || info.isSymbolicLink()) fail("curated corpus inventory contains a nonregular file");
-      body = readFileSync(absolute, "utf8");
-    } catch (error) {
-      if (error?.message?.startsWith("curated corpus")) throw error;
-      fail("curated corpus document could not be read");
-    }
-    const modifiedDate = localDate(info.mtimeMs);
+    const snapshotReader = options.readStableSource ?? readStableRegularSource;
+    const snapshot = snapshotReader(absolute, options);
+    const body = snapshot.body;
+    const modifiedDate = localDate(Number(snapshot.stats.mtimeMs));
     const transform = plan.transforms[document.role];
     const prefixContext = {
       modifiedDate,
@@ -476,11 +555,21 @@ export function prepareCuratedCorpus(planInput, { planDirectory = process.cwd() 
       relativePath: document.relativePath,
       role: document.role,
       contentHash,
+      rawMd5: snapshot.rawMd5,
       logicalFingerprint,
       legacyEnvelope: Object.freeze(legacyEnvelope),
       cloudflareEnvelope: Object.freeze(cloudflareEnvelope),
     });
   });
+
+  // A folder update can add or replace another planned file while this loop is
+  // reading. Re-enumeration proves the collection boundary stayed exact for the
+  // duration of the snapshot rather than trusting only the initial walk.
+  const after = enumerateMarkdown(root, plan.excludedDirectories);
+  const afterMismatch = planSetMismatch(after, found);
+  if (after.length !== found.length || afterMismatch.missing || afterMismatch.unexpected) {
+    fail("curated corpus inventory changed while the snapshot was being built");
+  }
 
   documents.sort((left, right) => left.logicalFingerprint.localeCompare(right.logicalFingerprint));
   return Object.freeze({ plan, planDirectory, root, documents: Object.freeze(documents) });
@@ -520,7 +609,11 @@ function driveFamiliesByLogicalDocument(prepared) {
       : (path ? `${path}/${name}` : name);
     if (!key) continue;
     if (!byMatch.has(key)) byMatch.set(key, []);
-    byMatch.get(key).push(family);
+    const signal = Array.isArray(version) ? String(version[1] ?? "") : "";
+    byMatch.get(key).push({
+      family,
+      driveMd5: /^[0-9a-f]{32}$/i.test(signal) ? signal.toLowerCase() : null,
+    });
   }
   const mapped = new Map();
   let missing = 0;
@@ -528,9 +621,11 @@ function driveFamiliesByLogicalDocument(prepared) {
     const key = prepared.plan.rawDrive.match === "basename"
       ? basename(document.relativePath)
       : (prefix ? `${prefix}/${document.relativePath}` : document.relativePath);
-    const families = byMatch.get(key) || [];
-    if (!families.length) missing++;
-    mapped.set(document.logicalFingerprint, [...new Set(families)].sort());
+    const candidates = byMatch.get(key) || [];
+    if (!candidates.length) missing++;
+    const unique = [...new Map(candidates.map((candidate) => [candidate.family, candidate])).values()]
+      .sort((left, right) => left.family.localeCompare(right.family));
+    mapped.set(document.logicalFingerprint, unique);
   }
   if (missing && prepared.plan.rawDrive.requireStateMatch) {
     fail(`raw Drive state is missing ${missing} curated inventory matches`);
@@ -707,9 +802,19 @@ function rawDriveStatuses(prepared, mapped, live) {
     if (prepared.plan.rawDrive) {
       if (!candidates.length) status = "state_unmapped";
       else if (!live.ok) status = "not_verified";
-      else status = candidates.some((family) => live.families.has(family))
-        ? "duplicate_confirmed"
-        : "not_present";
+      else {
+        const present = candidates.filter((candidate) => live.families.has(candidate.family));
+        if (!present.length) status = "not_present";
+        else if (present.some((candidate) => candidate.driveMd5 === document.rawMd5)) {
+          status = "checksum_confirmed_duplicate";
+        } else if (present.some((candidate) => candidate.driveMd5 === null)) {
+          // driveVersion falls back to size when Drive provides no MD5. Same
+          // path and size are presence evidence, never byte-equality evidence.
+          status = "presence_unverified";
+        } else {
+          status = "checksum_mismatch";
+        }
+      }
     }
     statuses.set(document.logicalFingerprint, status);
   }
@@ -738,15 +843,19 @@ export function buildCuratedCoverageLedger(prepared, observations = {}) {
   const documents = prepared.documents.map((document) => {
     const legacyStatus = legacy.get(document.logicalFingerprint) ?? "not_attempted";
     const cloudflareStatus = cloudflare.get(document.logicalFingerprint) ?? "not_attempted";
+    const rawDriveStatus = rawDrive.get(document.logicalFingerprint) ?? "not_configured";
     if (!STATUS_VALUES.has(legacyStatus) || !STATUS_VALUES.has(cloudflareStatus)) {
       fail("target observation contains an invalid status");
+    }
+    if (!RAW_DRIVE_STATUS_VALUES.has(rawDriveStatus)) {
+      fail("raw Drive observation contains an invalid status");
     }
     return {
       logical_fingerprint: document.logicalFingerprint,
       content_sha256: document.contentHash,
       role: document.role,
       targets: { cloudflare: cloudflareStatus, legacy: legacyStatus },
-      raw_drive: rawDrive.get(document.logicalFingerprint) ?? "not_configured",
+      raw_drive: rawDriveStatus,
     };
   });
   documents.sort((left, right) => left.logical_fingerprint.localeCompare(right.logical_fingerprint));
@@ -764,7 +873,13 @@ export function buildCuratedCoverageLedger(prepared, observations = {}) {
       cloudflare_confirmed: aggregateByRole(prepared, cloudflare, "confirmed"),
       legacy_confirmed: aggregateByRole(prepared, legacy, "confirmed"),
     },
-    raw_drive_duplicates: aggregateByRole(prepared, rawDrive, "duplicate_confirmed"),
+    raw_drive_checksum_duplicates: aggregateByRole(
+      prepared,
+      rawDrive,
+      "checksum_confirmed_duplicate",
+    ),
+    raw_drive_presence_unverified: aggregateByRole(prepared, rawDrive, "presence_unverified"),
+    raw_drive_checksum_mismatches: aggregateByRole(prepared, rawDrive, "checksum_mismatch"),
     documents,
   };
 }
@@ -836,6 +951,7 @@ export async function runCuratedDualSync(planInput, options = {}) {
     fail("curated sync mode must be dry-run, audit, or sync");
   }
   const prepared = prepareCuratedCorpus(planInput, {
+    ...options,
     planDirectory: options.planDirectory ?? process.cwd(),
   });
 
@@ -879,7 +995,9 @@ export async function runCuratedDualSync(planInput, options = {}) {
     count: prepared.documents.length,
     roles: { ...prepared.plan.expectedRoles },
     corpusFingerprint: ledger.corpus_fingerprint,
-    rawDriveDuplicates: ledger.raw_drive_duplicates,
+    rawDriveChecksumDuplicates: ledger.raw_drive_checksum_duplicates,
+    rawDrivePresenceUnverified: ledger.raw_drive_presence_unverified,
+    rawDriveChecksumMismatches: ledger.raw_drive_checksum_mismatches,
     targetCoverage: ledger.target_coverage,
     actions: {
       legacy: legacyResult.actions,
@@ -936,7 +1054,9 @@ async function main(argv = process.argv.slice(2)) {
       `${report.roles.plain} plain`,
     );
     console.log(
-      `raw Drive duplicates: ${report.rawDriveDuplicates.total}; ` +
+      `checksum-confirmed raw Drive duplicates: ${report.rawDriveChecksumDuplicates.total}; ` +
+      `unverified presence: ${report.rawDrivePresenceUnverified.total}; ` +
+      `checksum mismatches: ${report.rawDriveChecksumMismatches.total}; ` +
       `coverage ledger ${report.ok ? "updated" : "updated with incomplete receipts"}`,
     );
     return report.ok ? 0 : 1;
