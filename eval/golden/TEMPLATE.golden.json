@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "install": "REPLACE-WITH-your-name",
+  "brain_label": "REPLACE-WITH-a-short-label",
+  "created": "REPLACE-WITH-the-date",
+  "built_by": "the person who owns this brain",
+
+  "_how_to_read_this": [
+    "This is the acceptance test for YOUR brain. It is not a benchmark and it is",
+    "not comparable to anyone else's, because it is built from your documents and",
+    "your questions.",
+    "",
+    "HOW TO WRITE IT, and the order matters:",
+    "",
+    "1. Write the questions FIRST, from memory, without looking at your files.",
+    "   A question written while reading a document borrows that document's",
+    "   wording, and the brain then finds it by matching words rather than",
+    "   meaning. That flatters the score and teaches you nothing.",
+    "",
+    "2. THEN go find which document should answer each one, and put its title in",
+    "   'expect'. If you cannot find one, the question is unanswerable, which is",
+    "   useful, see below.",
+    "",
+    "3. Include 4 or 5 questions you KNOW the brain cannot answer. Mark them",
+    "   kind: 'unanswerable' with an empty expect. These are the most valuable",
+    "   entries in the file. A brain that answers them anyway is confabulating,",
+    "   and you want to know that before you trust it with something that",
+    "   matters. Pick things genuinely absent: a policy you have never written,",
+    "   a deal that never happened.",
+    "",
+    "20 to 30 questions is a useful smoke set. A release set should grow to 60",
+    "to 80 reviewed questions, then roughly 120 as real failures are added.",
+    "",
+    "Tag every question by risk, domain, and source format. Without those tags",
+    "an overall score cannot prove that medical, legal, tax, credit, OCR, or",
+    "another important slice actually works. A critical retrieval miss fails",
+    "the run even when the overall average looks healthy.",
+    "",
+    "Run it with:  brain eval <manifest>",
+    "Measure how much it varies between runs with:  brain eval <manifest> --repeat 3"
+  ],
+
+  "questions": [
+    {
+      "id": "q01",
+      "kind": "single",
+      "risk": "critical",
+      "domains": ["replace-with-domain"],
+      "formats": ["replace-with-format"],
+      "_comment": "single = one document answers it. Replace this whole entry.",
+      "question": "REPLACE. Something specific you decided, that lives in exactly one document.",
+      "expect": [
+        {
+          "doc": "The title of the document that should answer it",
+          "any_of": ["drive_path:Folder/The exact document title.pdf"]
+        }
+      ]
+    },
+    {
+      "id": "q02",
+      "kind": "multi",
+      "risk": "normal",
+      "domains": ["replace-with-domain"],
+      "formats": ["replace-with-format"],
+      "_comment": "multi = needs two or more documents together. Slots require distinct documents by default. Only give slots the same shared_result_group when one document is deliberately allowed to satisfy all of them.",
+      "question": "REPLACE. Something that requires pulling two separate things together.",
+      "expect": [
+        { "source": "drive", "doc": "First document" },
+        { "source": "drive", "doc": "Second document" }
+      ]
+    },
+    {
+      "id": "q03",
+      "kind": "temporal",
+      "risk": "normal",
+      "domains": ["replace-with-domain"],
+      "formats": ["replace-with-format"],
+      "_comment": "temporal = the answer depends on WHEN. These catch a brain that ignores dates.",
+      "question": "REPLACE. Something like: what did we decide about X back in March?",
+      "expect": [{ "source": "drive", "doc": "The document from that period" }]
+    },
+    {
+      "id": "q04",
+      "kind": "person",
+      "risk": "normal",
+      "domains": ["replace-with-domain"],
+      "formats": ["replace-with-format"],
+      "_comment": "person = about a specific human. These catch a brain that confuses similar names.",
+      "question": "REPLACE. Something like: who is X and what do they handle for us?",
+      "expect": [{ "source": "drive", "doc": "The document that covers them" }]
+    },
+    {
+      "id": "q05",
+      "kind": "unanswerable",
+      "risk": "critical",
+      "domains": ["general"],
+      "formats": ["negative"],
+      "_comment": "THE IMPORTANT ONES. Verify it is genuinely absent before adding it.",
+      "question": "REPLACE. Something you are certain is nowhere in your documents.",
+      "expect": [],
+      "why": "State how you know it is absent. The correct behaviour is for the brain to say it does not know."
+    }
+  ]
+}

@@ -2,7 +2,7 @@
 // that refuses real secrets cannot be tested without secret-shaped inputs.
 // Verified against the live keychain 2026-08-18: zero matches.
 
-import { scan, redact, CONFIRMED, SUSPECTED, CLEAN } from "../src/lib/secret-scan.js";
+import { scan, scanEnvelope, redact, CONFIRMED, SUSPECTED, CLEAN, GATE_VERSION } from "../src/lib/secret-scan.js";
 let fail = 0;
 const chk = (n, c, d = "") => { console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + d)); if (!c) fail++; };
 
@@ -50,5 +50,14 @@ chk("preview never leaks", !JSON.stringify(scan(s).findings).includes("a1b2c3d4e
 chk("empty", scan("").verdict === CLEAN);
 chk("null", scan(null).verdict === CLEAN);
 
-console.log(fail ? `\n${fail} FAILURES` : "\nsecret-scan v2 (js): all tests passed");
+const envelopeSecret = `sk-proj-${"A7".repeat(16)}`;
+chk("envelope title is scanned",
+  scanEnvelope({ content: "ordinary prose", title: `credentials ${envelopeSecret}` }).shouldRefuse);
+chk("envelope path metadata is scanned",
+  scanEnvelope({ content: "ordinary prose", metadata: { folder: `Imports/${envelopeSecret}/Notes` } }).shouldRefuse);
+chk("envelope fields are never concatenated into a synthetic credential",
+  scanEnvelope({ title: "sk-proj-", content: "A7".repeat(16) }).verdict === CLEAN);
+chk("envelope scope change advances the durable gate version", GATE_VERSION === 3, String(GATE_VERSION));
+
+console.log(fail ? `\n${fail} FAILURES` : "\nsecret-scan v3 (js): all tests passed");
 process.exit(fail ? 1 : 0);

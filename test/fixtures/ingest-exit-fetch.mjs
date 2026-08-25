@@ -104,7 +104,11 @@ globalThis.fetch = async (input, options = {}) => {
 
   if (url.hostname === "fixture.invalid" && url.pathname === "/api/admin/brain/source-receipt") {
     const receipt = JSON.parse(String(options.body || "{}"));
-    if (receipt.status === "error") console.log("TEST_REMOTE_ERROR_RECEIPT_RECORDED");
+    if (receipt.status === "error") {
+      console.log(scenario.startsWith("drive")
+        ? "TEST_REMOTE_ERROR_RECEIPT_RECORDED"
+        : "TEST_LOCAL_ERROR_RECEIPT_RECORDED");
+    }
     return json({ source: receipt.source, status: receipt.status, run_id: receipt.run_id });
   }
 

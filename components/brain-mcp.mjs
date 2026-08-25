@@ -135,15 +135,6 @@ async function call(path, { method = "GET", body } = {}) {
   }
 }
 
-const qs = (params) => {
-  const p = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== "") p.set(k, String(v));
-  }
-  const s = p.toString();
-  return s ? `?${s}` : "";
-};
-
 /* ------------------------------------------------------------------ */
 /* the remember contract                                               */
 /* ------------------------------------------------------------------ */
@@ -294,9 +285,10 @@ const TOOLS = [
 async function runTool(name, args = {}) {
   switch (name) {
     case "brain_think": {
-      const d = await call(
-        "/api/rag/think" + qs({ q: args.q, limit: args.limit ?? 8, source: args.source })
-      );
+      const d = await call("/api/rag/think", {
+        method: "POST",
+        body: { q: args.q, limit: args.limit ?? 8, source: args.source },
+      });
       const out = {
         answer: d.answer ?? null,
         answer_error: d.answer_error ?? undefined,
@@ -317,10 +309,15 @@ async function runTool(name, args = {}) {
       return out;
     }
     case "brain_search": {
-      const d = await call(
-        "/api/rag/unified" +
-          qs({ q: args.q, limit: args.limit ?? 10, source: args.source, category: args.category })
-      );
+      const d = await call("/api/rag/unified", {
+        method: "POST",
+        body: {
+          q: args.q,
+          limit: args.limit ?? 10,
+          source: args.source,
+          category: args.category,
+        },
+      });
       const rows = d.results ?? [];
       return {
         count: rows.length,

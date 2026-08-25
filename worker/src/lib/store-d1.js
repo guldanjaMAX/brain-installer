@@ -214,7 +214,7 @@ export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
   //   selective single term                 0.2 ms
   //   the question OR'd as-is            2,034 ms
   //   the same question, stopwords gone  1,046 ms
-  // At Jay's 1,000 chunks the difference is invisible, which is why this
+  // At roughly 1,000 chunks the difference is invisible, which is why this
   // shipped. It grows with the corpus and reads as "retrieval feels slow"
   // rather than as a fault.
   const content = raw.filter((t) => !FTS_STOPWORDS.has(t.toLowerCase()));

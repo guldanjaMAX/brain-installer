@@ -41,6 +41,7 @@ export const SUPPORT_MAX_BYTES = 2 * 1024 * 1024;
 export const SUPPORT_RETENTION_GRACE_MS = 10 * 60 * 1000;
 
 export const SUPPORT_COMMANDS = Object.freeze([
+  "ask",
   "auth",
   "connect",
   "diagnose",
@@ -64,6 +65,7 @@ export const SUPPORT_COMMANDS = Object.freeze([
   "status",
   "support",
   "test",
+  "update",
   "upgrade",
   "verify",
   "whatsnew",

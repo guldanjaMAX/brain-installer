@@ -1,0 +1,327 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brain-installer.invalid/schema/corpus-contract-v1.schema.json",
+  "title": "Brain corpus contract v1",
+  "description": "The private, independent source inventory used to distinguish absent sources from ingest, extraction, retrieval, and generation failures.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "contract_version",
+    "installation_ref",
+    "captured_at",
+    "inventory_complete",
+    "connector_snapshots",
+    "sources"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "contract_id": {
+      "$ref": "#/$defs/slug"
+    },
+    "contract_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "installation_ref": {
+      "$ref": "#/$defs/slug"
+    },
+    "captured_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "inventory_complete": {
+      "type": "boolean"
+    },
+    "inventory_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "connector_snapshots": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/connectorSnapshot"
+      }
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    }
+  },
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "connectorSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connector",
+        "observed_at",
+        "complete"
+      ],
+      "properties": {
+        "connector": {
+          "$ref": "#/$defs/slug"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "cursor_hash": {
+          "$ref": "#/$defs/hash"
+        },
+        "policy_hash": {
+          "$ref": "#/$defs/hash"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_id",
+        "connector",
+        "locator_kind",
+        "canonical_locator",
+        "domains",
+        "owner_scope",
+        "sensitivity",
+        "expected_status",
+        "mime_type",
+        "extraction_mode",
+        "content_hash",
+        "priority",
+        "required_fields"
+      ],
+      "properties": {
+        "source_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "connector": {
+          "$ref": "#/$defs/slug"
+        },
+        "locator_kind": {
+          "enum": [
+            "local_path",
+            "drive_file_id",
+            "gmail_message_id",
+            "source_native_id",
+            "synthetic_fixture"
+          ]
+        },
+        "canonical_locator": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "domains": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        },
+        "owner_scope": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        },
+        "sensitivity": {
+          "enum": [
+            "public",
+            "internal",
+            "restricted",
+            "highly_restricted"
+          ]
+        },
+        "expected_status": {
+          "enum": [
+            "eligible",
+            "excluded",
+            "quarantined",
+            "tombstoned"
+          ]
+        },
+        "status_reason_code": {
+          "$ref": "#/$defs/slug"
+        },
+        "mime_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "extraction_mode": {
+          "enum": [
+            "native_text",
+            "structured",
+            "ocr",
+            "image_unsupported",
+            "binary_unsupported",
+            "none"
+          ]
+        },
+        "page_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "content_hash": {
+          "$ref": "#/$defs/hash"
+        },
+        "source_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "modified_at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effective_from": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effective_to": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "priority": {
+          "enum": [
+            "critical",
+            "high",
+            "normal"
+          ]
+        },
+        "required_fields": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        },
+        "expected_case_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "expected_status": {
+                "type": "string",
+                "enum": [
+                  "excluded",
+                  "quarantined",
+                  "tombstoned"
+                ]
+              }
+            },
+            "required": [
+              "expected_status"
+            ]
+          },
+          "then": {
+            "required": [
+              "status_reason_code"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "examples": [
+    {
+      "schema_version": 1,
+      "contract_id": "synthetic-corpus",
+      "contract_version": "1",
+      "installation_ref": "sample-install",
+      "captured_at": "2026-01-01T00:00:00Z",
+      "inventory_complete": true,
+      "inventory_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "connector_snapshots": [
+        {
+          "connector": "synthetic",
+          "observed_at": "2026-01-01T00:00:00Z",
+          "complete": true,
+          "cursor_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "policy_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+        }
+      ],
+      "sources": [
+        {
+          "source_id": "synthetic-policy-document",
+          "connector": "synthetic",
+          "locator_kind": "synthetic_fixture",
+          "canonical_locator": "fixtures/synthetic/policy.txt",
+          "domains": [
+            "sample-records"
+          ],
+          "owner_scope": [
+            "sample-owner"
+          ],
+          "sensitivity": "public",
+          "expected_status": "eligible",
+          "mime_type": "text/plain",
+          "extraction_mode": "native_text",
+          "page_count": null,
+          "content_hash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+          "source_version": "version-1",
+          "modified_at": "2026-01-01T00:00:00Z",
+          "effective_from": null,
+          "effective_to": null,
+          "priority": "normal",
+          "required_fields": [
+            "policy-code"
+          ],
+          "expected_case_ids": [
+            "sample-policy-001"
+          ]
+        }
+      ]
+    }
+  ]
+}

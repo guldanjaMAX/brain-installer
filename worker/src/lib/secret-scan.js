@@ -1,5 +1,5 @@
 /**
- * secret-scan v2 — credential detection for the ingest endpoint.
+ * secret-scan v3 — credential detection for the ingest endpoint.
  *
  * Port of ~/CocoIndex/secret_scan.py v2. The two must stay in step: the
  * indexer and this Worker are two doors into the same index, and a gate on one
@@ -31,7 +31,10 @@
 export const CONFIRMED = "confirmed";
 export const SUSPECTED = "suspected";
 export const CLEAN = "clean";
-export const GATE_VERSION = 2;
+// v3 scans every string in the ingest envelope separately. That scope change
+// must advance the durable fingerprint so previously accepted titles and path
+// metadata are reconsidered by the next source sweep.
+export const GATE_VERSION = 3;
 
 // Anchors that respect the token alphabet rather than JS's word definition. A
 // trailing \b cannot fire after '-', which made Google keys ending in '-'
@@ -297,6 +300,60 @@ export function scan(text) {
     findings,
     shouldRefuse: hasConfirmed,
     shouldFlag: true,
+  };
+}
+
+/**
+ * Scan every human-authored string that can feed chunking or searchable
+ * document metadata.
+ *
+ * Content is not the only searchable text. The D1 store prepends `title` to
+ * every chunk, while connector paths and other human-readable metadata are
+ * retained with the document. Walking `content`, `title`, `uri`, and the full
+ * nested `metadata` value keeps both ingest doors on the same policy as those
+ * fields evolve. Transport identity fields stay outside this pass: batch
+ * receipts must echo `source_id` exactly so clients can resume safely, and
+ * connector-generated ids are not embedded document text.
+ *
+ * Values are scanned SEPARATELY. Joining adjacent fields could manufacture a
+ * provider-shaped token from a prefix in a title and a suffix in content that
+ * never existed in any source field.
+ */
+export function scanEnvelope(envelope) {
+  const empty = { verdict: CLEAN, labels: [], findings: [], shouldRefuse: false, shouldFlag: false };
+  if (!envelope || typeof envelope !== "object") return empty;
+
+  const labels = new Set();
+  const findings = [];
+  let shouldRefuse = false;
+  let shouldFlag = false;
+  const seen = new Set();
+
+  const visit = (value) => {
+    if (typeof value === "string") {
+      const result = scan(value);
+      for (const label of result.labels) labels.add(label);
+      findings.push(...result.findings);
+      shouldRefuse ||= result.shouldRefuse;
+      shouldFlag ||= result.shouldFlag;
+      return;
+    }
+    if (!value || typeof value !== "object" || seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    for (const item of Object.values(value)) visit(item);
+  };
+
+  for (const value of [envelope.content, envelope.title, envelope.uri, envelope.metadata]) visit(value);
+  return {
+    verdict: shouldRefuse ? CONFIRMED : shouldFlag ? SUSPECTED : CLEAN,
+    labels: [...labels],
+    findings,
+    shouldRefuse,
+    shouldFlag,
   };
 }
 

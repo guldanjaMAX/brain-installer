@@ -275,15 +275,22 @@ try {
       id: "q1",
       kind: "single",
       question: "Which fixture document should be returned?",
-      expect: [{ doc: "Fixture", any_of: ["fixture-document"] }],
+      expect: [{ doc: "Fixture", any_of: ["curated:fixture-document"] }],
     }],
   }));
   const evalInput = Buffer.from(`${replacementKey}\n`, "utf8");
+  const evalFixtureResponse = encodeURIComponent(JSON.stringify({
+    results: [{
+      source: "curated",
+      ref_key: "fixture-document",
+      title: "Fixture",
+    }],
+  }));
   let evalResult;
   try {
     evalResult = spawnSync(process.execPath, [
       fileURLToPath(new URL("../eval/run.mjs", import.meta.url)),
-      "--base", "data:application/json,%7B%22results%22%3A%5B%5D%7D#fixture",
+      "--base", `data:application/json,${evalFixtureResponse}#fixture`,
       "--golden", evalGoldenPath,
       "--no-think",
     ], {

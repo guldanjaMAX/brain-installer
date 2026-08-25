@@ -1,0 +1,423 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brain-installer.invalid/schema/gate-policy-v1.schema.json",
+  "title": "Brain evaluation gate policy v1",
+  "description": "Versioned release thresholds and statistical comparison rules. The policy contains no corpus content.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "policy_id",
+    "policy_version",
+    "cutoffs",
+    "statistics",
+    "regression",
+    "slice_requirements",
+    "gates"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "policy_id": {
+      "$ref": "#/$defs/slug"
+    },
+    "policy_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "cutoffs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1000
+      }
+    },
+    "statistics": {
+      "$ref": "#/$defs/statistics"
+    },
+    "regression": {
+      "$ref": "#/$defs/regression"
+    },
+    "slice_requirements": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/sliceRequirement"
+      }
+    },
+    "gates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/gate"
+      }
+    }
+  },
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "statistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "confidence_level",
+        "comparison_method",
+        "bootstrap_resamples",
+        "stratify_by",
+        "multiple_comparisons",
+        "critical_repeats"
+      ],
+      "properties": {
+        "confidence_level": {
+          "type": "number",
+          "exclusiveMinimum": 0.5,
+          "exclusiveMaximum": 1
+        },
+        "comparison_method": {
+          "enum": [
+            "paired_stratified_bootstrap",
+            "paired_permutation"
+          ]
+        },
+        "bootstrap_resamples": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 1000000
+        },
+        "stratify_by": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "risk",
+              "domain",
+              "format",
+              "query_kind",
+              "connector",
+              "owner_scope"
+            ]
+          }
+        },
+        "multiple_comparisons": {
+          "enum": [
+            "holm",
+            "none"
+          ]
+        },
+        "critical_repeats": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        }
+      }
+    },
+    "regression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "critical_case_regressions_maximum",
+        "aggregate_relative_regression_maximum",
+        "latency_relative_regression_maximum",
+        "cost_relative_regression_maximum"
+      ],
+      "properties": {
+        "critical_case_regressions_maximum": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "aggregate_relative_regression_maximum": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "latency_relative_regression_maximum": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 10
+        },
+        "cost_relative_regression_maximum": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 10
+        }
+      }
+    },
+    "sliceRequirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dimension",
+        "minimum_reviewed_cases",
+        "on_insufficient_coverage"
+      ],
+      "properties": {
+        "dimension": {
+          "enum": [
+            "risk",
+            "domain",
+            "format",
+            "query_kind",
+            "connector",
+            "owner_scope"
+          ]
+        },
+        "values": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        },
+        "minimum_reviewed_cases": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "on_insufficient_coverage": {
+          "enum": [
+            "block",
+            "warn"
+          ]
+        }
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gate_id",
+        "metric",
+        "operator",
+        "threshold",
+        "confidence_bound",
+        "severity",
+        "scope"
+      ],
+      "properties": {
+        "gate_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "metric": {
+          "$ref": "#/$defs/metricName"
+        },
+        "operator": {
+          "enum": [
+            "gte",
+            "lte",
+            "eq"
+          ]
+        },
+        "threshold": {
+          "type": "number"
+        },
+        "cutoff": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "confidence_bound": {
+          "enum": [
+            "point",
+            "lower_95",
+            "upper_95"
+          ]
+        },
+        "minimum_sample_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "severity": {
+          "enum": [
+            "block",
+            "warn"
+          ]
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "risks": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "critical",
+              "high",
+              "normal"
+            ]
+          }
+        },
+        "domains": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        },
+        "formats": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        },
+        "query_kinds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "single",
+              "multi",
+              "temporal",
+              "aggregate",
+              "conflict",
+              "unanswerable",
+              "entity_attribution",
+              "ocr_text",
+              "ocr_table",
+              "typo",
+              "adversarial"
+            ]
+          }
+        },
+        "connectors": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        },
+        "owner_scopes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        }
+      }
+    },
+    "metricName": {
+      "enum": [
+        "source_accounting_fraction",
+        "unknown_index_rows",
+        "excluded_sources_indexed",
+        "unresolved_critical_sources",
+        "exact_value_accuracy",
+        "evidence_slot_recall_at_k",
+        "complete_evidence_at_k",
+        "precision_at_k",
+        "recall_at_k",
+        "ndcg_at_k",
+        "mrr",
+        "duplicate_waste_at_k",
+        "claim_correctness",
+        "claim_completeness",
+        "claim_f1",
+        "faithfulness",
+        "citation_precision",
+        "citation_recall",
+        "citation_resolvability",
+        "abstention_recall",
+        "false_answer_rate",
+        "false_refusal_rate",
+        "unauthorized_retrieval_count",
+        "canary_emission_count",
+        "entity_misattribution_rate",
+        "stale_exposure_rate",
+        "current_evidence_at_k",
+        "correct_as_of_rate",
+        "lifecycle_pass_rate",
+        "retrieval_latency_p95_ms",
+        "answer_latency_p95_ms",
+        "cost_per_query_usd",
+        "error_rate",
+        "rank_flip_rate"
+      ]
+    }
+  },
+  "examples": [
+    {
+      "schema_version": 1,
+      "policy_id": "synthetic-release-policy",
+      "policy_version": "1",
+      "cutoffs": [
+        1,
+        5,
+        10
+      ],
+      "statistics": {
+        "confidence_level": 0.95,
+        "comparison_method": "paired_stratified_bootstrap",
+        "bootstrap_resamples": 10000,
+        "stratify_by": [
+          "risk",
+          "domain"
+        ],
+        "multiple_comparisons": "holm",
+        "critical_repeats": 3
+      },
+      "regression": {
+        "critical_case_regressions_maximum": 0,
+        "aggregate_relative_regression_maximum": 0,
+        "latency_relative_regression_maximum": 0.2,
+        "cost_relative_regression_maximum": 0.2
+      },
+      "slice_requirements": [
+        {
+          "dimension": "domain",
+          "minimum_reviewed_cases": 20,
+          "on_insufficient_coverage": "block"
+        }
+      ],
+      "gates": [
+        {
+          "gate_id": "critical-complete-evidence-at-five",
+          "metric": "complete_evidence_at_k",
+          "operator": "gte",
+          "threshold": 1,
+          "cutoff": 5,
+          "confidence_bound": "point",
+          "minimum_sample_size": 1,
+          "severity": "block",
+          "scope": {
+            "risks": [
+              "critical"
+            ]
+          }
+        },
+        {
+          "gate_id": "overall-evidence-recall-at-five",
+          "metric": "evidence_slot_recall_at_k",
+          "operator": "gte",
+          "threshold": 0.9,
+          "cutoff": 5,
+          "confidence_bound": "lower_95",
+          "minimum_sample_size": 60,
+          "severity": "block",
+          "scope": {}
+        },
+        {
+          "gate_id": "no-canary-emission",
+          "metric": "canary_emission_count",
+          "operator": "eq",
+          "threshold": 0,
+          "confidence_bound": "point",
+          "minimum_sample_size": 1,
+          "severity": "block",
+          "scope": {}
+        }
+      ]
+    }
+  ]
+}

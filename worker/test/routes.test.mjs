@@ -50,19 +50,46 @@ const ROW = {
   source: "meeting", source_id: "123", uri: "meeting://123", title: "Q3 sync", document_date: 1750000000000, client: "Acme", category: "meeting",
   top_folder: "Clients", platform: "imessage",
 };
-const call = (env, path) => worker.fetch(new Request("https://b.example" + path, { headers: { "X-Admin-Key": "k" } }), env, { waitUntil() {}, passThroughOnException() {} });
+const call = (env, path) => {
+  const url = new URL("https://b.example" + path);
+  const isRag = url.pathname === "/api/rag/unified" || url.pathname === "/api/rag/think";
+  const init = { headers: { "X-Admin-Key": "k" } };
+  if (isRag) {
+    const body = Object.fromEntries(url.searchParams);
+    url.search = "";
+    init.method = "POST";
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  return worker.fetch(new Request(url, init), env, { waitUntil() {}, passThroughOnException() {} });
+};
 
 /* ---- auth still gates everything but health ---- */
 {
   const { env } = mkEnv([], { extra: { RAG_PROXY_KEY: "read-only" } });
   const open = await worker.fetch(new Request("https://b.example/health"), env, {});
   check("health is open", open.status === 200);
-  const shut = await worker.fetch(new Request("https://b.example/api/rag/unified?q=x"), env, {});
+  const shut = await worker.fetch(new Request("https://b.example/api/rag/unified", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ q: "x" }),
+  }), env, {});
   check("unified needs the admin key", shut.status === 401, String(shut.status));
-  const querySecret = await worker.fetch(new Request("https://b.example/api/rag/unified?q=x&admin_key=k"), env, {});
+  const querySecret = await worker.fetch(new Request("https://b.example/api/rag/unified?admin_key=k", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ q: "x" }),
+  }), env, {});
   check("admin keys in query strings are refused", querySecret.status === 401, String(querySecret.status));
-  const readOnly = await worker.fetch(new Request("https://b.example/api/rag/unified?q=x", { headers: { "X-Admin-Key": "read-only" } }), env, {});
+  const readOnly = await worker.fetch(new Request("https://b.example/api/rag/unified", {
+    method: "POST",
+    headers: { "X-Admin-Key": "read-only", "Content-Type": "application/json" },
+    body: JSON.stringify({ q: "x" }),
+  }), env, {});
   check("read-only proxy key can query retrieval", readOnly.status === 200, String(readOnly.status));
+  check("private retrieval responses cannot be cached",
+    /private/.test(readOnly.headers.get("cache-control") || "") && /no-store/.test(readOnly.headers.get("cache-control") || ""),
+    readOnly.headers.get("cache-control") || "missing");
+  const leakedGet = await worker.fetch(new Request("https://b.example/api/rag/unified?q=private-question", {
+    headers: { "X-Admin-Key": "read-only" },
+  }), env, {});
+  check("question-bearing GET retrieval is refused", leakedGet.status === 405, String(leakedGet.status));
   const readOnlyAdmin = await worker.fetch(new Request("https://b.example/api/admin/brain/documents", { headers: { "X-Admin-Key": "read-only" } }), env, {});
   check("read-only proxy key cannot reach admin routes", readOnlyAdmin.status === 401, String(readOnlyAdmin.status));
 }
@@ -73,6 +100,7 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
   const r = await call(env, "/api/rag/unified?q=retainer&limit=5");
   const b = await r.json();
   check("unified returns results from D1", r.status === 200 && b.results.length === 1, JSON.stringify(b).slice(0, 200));
+  check("private questions are not echoed in retrieval responses", !("query" in b), JSON.stringify(b));
   check("a hit carries its document date", b.results[0].ts === new Date(1750000000000).toISOString());
   check("and its client", b.results[0].client === "Acme");
   check("a hit exposes stable document identity, not its chunk id", b.results[0].ref_key === "123" && b.results[0].chunk_uid === "meeting:123#0", JSON.stringify(b.results[0]));
@@ -312,6 +340,26 @@ const call = (env, path) => worker.fetch(new Request("https://b.example" + path,
     body: JSON.stringify({ source_type: "note", source_id: "1", content: "key sk-ant-api03-" + "A".repeat(95) }),
   }), env, {});
   check("ingest refuses a live credential", r.status === 422, String(r.status));
+}
+
+{
+  const { env } = mkEnv([]);
+  const secret = `sk-proj-${"A7".repeat(16)}`;
+  const titleResponse = await worker.fetch(new Request("https://b.example/api/admin/brain/ingest", {
+    method: "POST", headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ source_type: "note", source_id: "title-only", title: `Credentials ${secret}`, content: "ordinary prose" }),
+  }), env, {});
+  const titleBody = await titleResponse.text();
+  check("worker ingest refuses a credential in an embedded title",
+    titleResponse.status === 422 && !titleBody.includes(secret), `${titleResponse.status} ${titleBody}`);
+
+  const pathResponse = await worker.fetch(new Request("https://b.example/api/admin/brain/ingest", {
+    method: "POST", headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ source_type: "note", source_id: "path-only", content: "ordinary prose", metadata: { folder: `Imports/${secret}/Notes` } }),
+  }), env, {});
+  const pathBody = await pathResponse.text();
+  check("worker ingest refuses a credential in connector path metadata",
+    pathResponse.status === 422 && !pathBody.includes(secret), `${pathResponse.status} ${pathBody}`);
 }
 
 /* ---- bulk imports close with a truthful source receipt ---- */
@@ -694,6 +742,17 @@ const doc = (id, content = "some ordinary meeting content about the retainer") =
   const ref = b.results.find((x) => x.source_id === "bad");
   check("the refusal names the credential type", ref && ref.labels && ref.labels.length, JSON.stringify(ref));
   check("but never echoes the secret back", !JSON.stringify(b).includes("A".repeat(20)), "SECRET ECHOED IN RESPONSE");
+}
+
+{
+  const { env, written } = mkBatchEnv();
+  const secret = `sk-proj-${"A7".repeat(16)}`;
+  const pathOnly = { ...doc("path-secret"), metadata: { folder: `Imports/${secret}/Notes` } };
+  const b = await (await post(env, "/api/admin/brain/ingest/batch", { docs: [doc("safe"), pathOnly] })).json();
+  check("batch ingest applies the envelope gate to path metadata",
+    b.created === 1 && b.refused === 1 && !written.includes("path-secret"), JSON.stringify(b).slice(0, 250));
+  check("batch metadata refusal never echoes the credential",
+    !JSON.stringify(b).includes(secret), "SECRET ECHOED IN RESPONSE");
 }
 
 /* Caps: a Worker killed mid-batch looks exactly like data loss. */

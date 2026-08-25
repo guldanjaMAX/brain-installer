@@ -39,8 +39,9 @@ jobs:
       - name: install
         run: npm ci --ignore-scripts
 
-      # Fixed bytes only. This isolates Windows profile, stdin framing, and
-      # DPAPI availability without ever putting a credential in CI output.
+      # Fixed bytes only. This isolates the built-in C# compiler, private helper
+      # staging, Windows profile, stdin framing, and DPAPI availability without
+      # ever putting a credential in CI output.
       - name: Windows DPAPI stage probe
         if: runner.os == 'Windows'
         run: node test/fixtures/windows-dpapi-probe.mjs
@@ -102,6 +103,35 @@ jobs:
           out=$("$bin")
           echo "$out"
           echo "$out" | grep -q "brain setup" || { echo "::error::installed bin ran but printed nothing"; exit 1; }
+
+      # The public guide uses a user-owned prefix. That avoids sudo/EACCES on
+      # Mac and Linux and keeps Windows inside the current profile. Exercise
+      # that exact shape as well as the traditional global install above.
+      - name: packed tarball installs in a user-owned prefix
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/financial-brain-cli"
+          npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$TARBALL"
+          if [ -x "$prefix/bin/brain" ]; then bin="$prefix/bin/brain";
+          elif [ -f "$prefix/brain.cmd" ]; then bin="$prefix/brain.cmd";
+          else echo "::error::no user-prefix brain bin found"; exit 1; fi
+          out=$("$bin")
+          echo "$out"
+          echo "$out" | grep -q "brain setup" || { echo "::error::user-prefix bin did not run"; exit 1; }
+
+      # PowerShell can block npm.ps1/npx.ps1 under its default execution
+      # policy. The website therefore uses the .cmd shims explicitly on
+      # Windows, and CI must prove that exact beginner path.
+      - name: Windows PowerShell user-prefix command works
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP 'financial-brain-powershell'
+          npm.cmd install --global --prefix $prefix --ignore-scripts --no-audit --no-fund $env:TARBALL
+          $out = & (Join-Path $prefix 'brain.cmd') | Out-String
+          $out
+          if ($out -notmatch 'brain setup') { throw 'PowerShell user-prefix bin did not run' }
 
       # An install must never carry the author's own client data. package.json
       # uses an allowlist; this fails loudly if a future edit turns it into a

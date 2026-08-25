@@ -12,11 +12,27 @@ questions from any folder on your machine.
 
 ## Install it
 
+The guided path is at `financialbrain.ai/install`. It uses one immutable release
+asset and installs into a folder owned by your user account, so it needs no Git,
+`sudo`, or administrator access.
+
+Mac or Linux:
+
 ```bash
-npm install -g github:guldanjaMAX/brain-installer
+npm install --global --ignore-scripts --no-audit --no-fund --prefix "$HOME/.financial-brain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.10/brain-installer-0.1.10.tgz"
+export PATH="$HOME/.financial-brain/bin:$PATH"
 ```
 
-That is the whole install. To update later, run the same command again.
+Windows PowerShell:
+
+```powershell
+npm.cmd install --global --ignore-scripts --no-audit --no-fund --prefix "$env:LOCALAPPDATA\FinancialBrain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.10/brain-installer-0.1.10.tgz"
+$env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
+```
+
+Setup and updates ask for the scoped Cloudflare token
+inside a hidden terminal prompt. The token exists only for that command and is
+never written to a file, command argument, log, or issue note.
 
 ```bash
 brain whatsnew     # what this version does, and whether you are on it
@@ -54,6 +70,21 @@ item before generating the key. Windows stores only DPAPI CurrentUser
 ciphertext; Linux uses an owner-only adjacent file. An existing legacy Mac
 `.brain-admin-key` remains authoritative instead of being silently moved.
 
+## Update it
+
+First install the exact release named on `financialbrain.ai/update`, then run:
+
+```bash
+brain update
+```
+
+The update verifies the Cloudflare account, requires a D1 restore bookmark,
+applies migrations, deploys the Worker, runs exact-version health and the full
+acceptance suite, reads the committed version back from D1, and only then
+updates the local manifest. A failed update keeps the bookmark and tells you
+the safe rerun path. It never restores automatically because restoring would
+discard newer writes.
+
 ---
 
 ## Load your documents
@@ -69,9 +100,15 @@ brain will not know.
 Then drop `--dry-run` to load it for real. Large loads are resumable: if it is
 interrupted, run the same command again and it continues from where it stopped.
 
-Restart Claude Code, then ask it something only your documents could answer.
-Then ask it something they definitely do not cover, and watch it say so. The
-second answer matters as much as the first.
+Ask directly in the terminal, even if you do not have Claude Code or Codex:
+
+```bash
+brain ask ./brain.manifest.json
+```
+
+The command prompts for the question so it does not enter your shell history.
+Ask something only your documents could answer, then something they definitely
+do not cover. The second answer matters as much as the first.
 
 ---
 

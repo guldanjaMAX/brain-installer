@@ -1,12 +1,11 @@
 /**
- * CI-only round-trip probe for the shipped Windows DPAPI helper.
+ * CI-only round-trip probe for the shipped compiled Windows DPAPI helper.
  *
  * It uses four fixed bytes, never a credential, and prints only a whitelisted
  * result. Raw ciphertext, plaintext, and child diagnostics are wiped.
  */
 
 import { spawnSync } from "node:child_process";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 if (process.platform !== "win32") process.exit(0);
@@ -25,15 +24,13 @@ for (const name of [
   if (process.env[name]) environment[name] = process.env[name];
 }
 
-const command = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-const helper = fileURLToPath(new URL("../../operations/windows-dpapi.ps1", import.meta.url));
 const bridge = fileURLToPath(new URL("../../operations/windows-dpapi-bridge.mjs", import.meta.url));
+const source = fileURLToPath(new URL("../../operations/windows-dpapi.cs", import.meta.url));
 
 function invoke(operation, input) {
   return spawnSync(process.execPath, [
     bridge,
-    "--powershell", command,
-    "--helper", helper,
+    "--source", source,
     "--operation", operation,
     "--length", String(input.length),
     "--max", "65536",

@@ -24,25 +24,27 @@
  * adopts them rather than creating duplicates. An installer you are afraid to
  * re-run is an installer you will not use.
  *
- * The token is read from the CLOUDFLARE_API_TOKEN environment variable only.
- * It is never written to the manifest, never logged, and never passed as a
- * command-line argument where `ps` could read it.
+ * The token is read from CLOUDFLARE_API_TOKEN for automation or from a hidden,
+ * command-scoped terminal prompt for setup/update. It is never written to the
+ * manifest, logged, or passed as a command-line argument where `ps` could read it.
  */
 
 import {
   chmodSync,
   closeSync,
   constants as fsConstants,
-  copyFileSync,
   existsSync,
   fstatSync,
   fsyncSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -50,6 +52,7 @@ import { homedir } from "node:os";
 import { basename, isAbsolute, join, dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 // The ingest pipeline is loaded LAZILY, inside the commands that use it. It
@@ -72,7 +75,7 @@ async function ingestLib() {
   }
 }
 import { authorize, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
-import { scan as scanSecrets, GATE_VERSION as CREDENTIAL_GATE_VERSION } from "./worker/src/lib/secret-scan.js";
+import { scanEnvelope as scanEnvelopeSecrets, GATE_VERSION as CREDENTIAL_GATE_VERSION } from "./worker/src/lib/secret-scan.js";
 import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mjs";
 import { runAll as doctorRunAll, summarize as doctorSummarize, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
 import {
@@ -149,7 +152,7 @@ const die = (s) => {
 
 const SUPPORT_REMOTE_COMMANDS = new Set([
   "deploy", "diagnose", "drain", "health", "migrate", "provision",
-  "reindex", "rollback", "secrets", "upgrade", "verify",
+  "reindex", "rollback", "secrets", "update", "upgrade", "verify",
 ]);
 let currentSupportCommand = "";
 
@@ -186,7 +189,7 @@ export function supportErrorCode(error, { command = "", unexpected = false } = {
   if (command === "health") return "HEALTH_CHECK_FAILED";
   if (command === "drain") return "VECTOR_DRAIN_FAILED";
   if (command === "migrate") return "MIGRATION_FAILED";
-  if (command === "upgrade") return "UPGRADE_FAILED";
+  if (command === "upgrade" || command === "update") return "UPGRADE_FAILED";
   if (command === "schedule") {
     return process.argv.includes("--install") ? "SCHEDULE_INSTALL_FAILED" : "SCHEDULE_RUN_FAILED";
   }
@@ -279,8 +282,118 @@ function printSupportReceipt(eventId, write = console.error) {
   write("  Review the exact safe record with: brain support --preview");
 }
 
+const cloudflareTokenSession = new AsyncLocalStorage();
+
+function activeCloudflareToken() {
+  if (process.env.CLOUDFLARE_API_TOKEN) return process.env.CLOUDFLARE_API_TOKEN;
+  const scoped = cloudflareTokenSession.getStore();
+  return scoped ? scoped.toString("ascii") : null;
+}
+
+export function cloudflareTokenAvailable() {
+  return Boolean(process.env.CLOUDFLARE_API_TOKEN || cloudflareTokenSession.getStore());
+}
+
+function validateCloudflareTokenBytes(value) {
+  const bytes = Buffer.isBuffer(value) ? Buffer.from(value) : Buffer.from(String(value || ""), "ascii");
+  if (bytes.length < 20 || bytes.length > 512 || [...bytes].some((byte) => byte < 0x21 || byte > 0x7e)) {
+    bytes.fill(0);
+    throw new Error("the Cloudflare token must be 20 to 512 printable characters with no spaces");
+  }
+  return bytes;
+}
+
+/** Read a token from a real terminal with echo disabled and restore it on every exit path. */
+export function readHiddenCloudflareToken({ input = process.stdin, output = process.stderr } = {}) {
+  if (!input?.isTTY || !output?.isTTY || typeof input.setRawMode !== "function") {
+    return Promise.reject(new Error(
+      "no Cloudflare token is available and this terminal cannot prompt securely. " +
+      "Set CLOUDFLARE_API_TOKEN in this terminal and rerun the command.",
+    ));
+  }
+  return new Promise((resolveToken, rejectToken) => {
+    const bytes = Buffer.alloc(512);
+    let length = 0;
+    let settled = false;
+    const wasRaw = Boolean(input.isRaw);
+    const wasPaused = typeof input.isPaused === "function" ? input.isPaused() : false;
+    const cleanup = () => {
+      input.removeListener("data", onData);
+      input.removeListener("end", onEnd);
+      input.removeListener("error", onError);
+      try { input.setRawMode(wasRaw); } catch { /* original result wins */ }
+      if (wasPaused && typeof input.pause === "function") input.pause();
+      output.write("\n");
+    };
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) {
+        bytes.fill(0);
+        rejectToken(error);
+        return;
+      }
+      try {
+        const result = validateCloudflareTokenBytes(bytes.subarray(0, length));
+        bytes.fill(0);
+        resolveToken(result);
+      } catch (validationError) {
+        bytes.fill(0);
+        rejectToken(validationError);
+      }
+    };
+    const onData = (chunk) => {
+      const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      for (const byte of incoming) {
+        if (byte === 0x03) return finish(new Error("Cloudflare token entry was cancelled"));
+        if (byte === 0x0d || byte === 0x0a) return finish();
+        if (byte === 0x08 || byte === 0x7f) {
+          if (length > 0) bytes[--length] = 0;
+          continue;
+        }
+        if (byte < 0x21 || byte > 0x7e || length >= bytes.length) {
+          return finish(new Error("the Cloudflare token contains an unsupported character or is too long"));
+        }
+        bytes[length++] = byte;
+      }
+    };
+    const onEnd = () => finish(new Error("terminal input ended before a Cloudflare token was entered"));
+    const onError = () => finish(new Error("terminal input failed while reading the Cloudflare token"));
+    output.write("  Cloudflare token (hidden): ");
+    input.on("data", onData);
+    input.once("end", onEnd);
+    input.once("error", onError);
+    try {
+      input.setRawMode(true);
+      input.resume();
+    } catch {
+      finish(new Error("this terminal could not disable echo for Cloudflare token entry"));
+    }
+  });
+}
+
+export async function withCloudflareToken(action, options = {}) {
+  if (cloudflareTokenAvailable()) return action();
+  const prompt = options.readCloudflareToken ?? readHiddenCloudflareToken;
+  const prompted = await prompt();
+  let entered;
+  try {
+    entered = validateCloudflareTokenBytes(prompted);
+  } finally {
+    if (Buffer.isBuffer(prompted)) prompted.fill(0);
+  }
+  return cloudflareTokenSession.run(entered, async () => {
+    try {
+      return await action();
+    } finally {
+      entered.fill(0);
+    }
+  });
+}
+
 function token() {
-  const t = process.env.CLOUDFLARE_API_TOKEN;
+  const t = activeCloudflareToken();
   if (!t) {
     die(
       "CLOUDFLARE_API_TOKEN is not set.\n" +
@@ -328,6 +441,47 @@ function saveManifest(path, m) {
   writeFileSync(path, JSON.stringify(m, null, 2) + "\n");
 }
 
+function commandPath(value) {
+  const text = String(value).replace(/[\r\n"]/g, "");
+  return /^[a-z0-9_./:\\-]+$/i.test(text) ? text : `"${text}"`;
+}
+
+/** Create a new manifest and its private install folder without following a link. */
+function createSetupManifest(path, m) {
+  const parent = dirname(resolve(path));
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const parentIdentity = lstatSync(parent);
+  if (!parentIdentity.isDirectory() || parentIdentity.isSymbolicLink()) {
+    die("the Brain folder must be a real directory, not a link.");
+  }
+  let descriptor = null;
+  let created = false;
+  try {
+    descriptor = openSync(
+      path,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL |
+        (fsConstants.O_NOFOLLOW || 0),
+      0o600,
+    );
+    created = true;
+    writeFileSync(descriptor, JSON.stringify(m, null, 2) + "\n");
+    fsyncSync(descriptor);
+    if (process.platform !== "win32") chmodSync(path, 0o600);
+  } catch (error) {
+    if (descriptor !== null) {
+      try { closeSync(descriptor); } catch { /* cleanup below */ }
+      descriptor = null;
+    }
+    if (created) {
+      try { unlinkSync(path); } catch { /* preserve the original failure */ }
+    }
+    if (error?.code === "EEXIST") die("the Brain manifest appeared while setup was starting. Rerun setup to resume it.");
+    throw error;
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
+}
+
 /**
  * Resolve the account from the token itself.
  *
@@ -360,6 +514,30 @@ async function resolveAccount(m) {
     );
   }
   return accounts[0];
+}
+
+/** Pick a fresh install's account from the hidden scoped token, never Wrangler. */
+export async function chooseSetupAccount(prompt, options = {}) {
+  const listAccounts = options.listAccounts ?? (() => cf("/accounts"));
+  const accounts = await listAccounts();
+  if (!Array.isArray(accounts) || accounts.some((account) =>
+    !account || typeof account.id !== "string" || typeof account.name !== "string")) {
+    die("Cloudflare returned an invalid account list. Nothing was created.");
+  }
+  if (!accounts.length) die("this token cannot see any Cloudflare account.");
+  if (accounts.length === 1) return accounts[0];
+
+  console.log(`\n  ${c.yellow("This permission pass can see several Cloudflare accounts.")}`);
+  console.log(`  ${c.dim("Pick carefully: this creates real resources in whichever one you name.")}\n`);
+  for (const account of accounts) console.log(`    ${account.id}  ${account.name}`);
+  console.log("");
+  const chosenId = String(await prompt("Cloudflare account id", "")).trim();
+  const chosen = accounts.find((account) => account.id === chosenId);
+  if (!chosen) {
+    closePrompts();
+    die("that account id is not one this permission pass can see. Nothing was created.");
+  }
+  return chosen;
 }
 
 /* ------------------------------------------------------------- commands */
@@ -828,7 +1006,26 @@ export function workersDevRouteDisposition({ customDomain = null, workersDevEnab
   return customDomain ? "optional" : "required";
 }
 
-export async function cmdDeploy(manifestPath) {
+/** Save the verified workers.dev hostname so routine commands need no API token. */
+export async function persistWorkersDevDomain(manifestPath, m, acct, scriptName, options = {}) {
+  if (m.brain?.domain) return m.brain.domain;
+  const readSubdomain = options.readSubdomain ??
+    (() => cf(`/accounts/${acct.id}/workers/subdomain`));
+  const sub = await readSubdomain().catch(() => null);
+  const label = typeof sub?.subdomain === "string" ? sub.subdomain.trim() : "";
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label)) {
+    die(
+      "the workers.dev route is enabled, but Cloudflare did not return a usable account subdomain.\n" +
+        "  The Worker is deployed, but its token-free URL cannot be saved. Rerun deploy after\n" +
+        "  the Workers subdomain is visible in Cloudflare."
+    );
+  }
+  m.brain = { ...(m.brain || {}), domain: `${scriptName}.${label}.workers.dev` };
+  saveManifest(manifestPath, m);
+  return m.brain.domain;
+}
+
+export async function cmdDeploy(manifestPath, options = {}) {
   const { m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
   const cfg = m.infrastructure.cloudflare;
@@ -955,6 +1152,14 @@ export async function cmdDeploy(manifestPath) {
           "  re-run `brain deploy`; the upload is safe to repeat."
       );
     }
+  }
+
+  // Routine ingest, drain, health, diagnose, and evaluation must keep working
+  // after the one-day Cloudflare control token is revoked. Persist the verified
+  // workers.dev hostname once, instead of looking it up again on every command.
+  if (!m.brain?.domain && options.persistDomain !== false) {
+    const domain = await persistWorkersDevDomain(manifestPath, m, acct, scriptName);
+    ok(`saved the live address https://${domain}`);
   }
 
   // The cron that drains the vector outbox. Without it the D1 install writes
@@ -1462,6 +1667,58 @@ async function cmdHealth(manifestPath, { expectVersion = null, durableAdminKeyOn
   die("authenticated documents access could not be proven after all health attempts.");
 }
 
+/** Ask one private question without requiring Claude Code, Codex, or a token. */
+export async function cmdAsk(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const prompt = options.ask ?? ask;
+  const question = String(await prompt("What do you want to know?", "")).trim();
+  closePrompts();
+  if (!question) die("no question entered. Run the command again when you are ready.");
+
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = options.adminKey ?? resolveAdminKey(manifestPath);
+  if (!adminKey) {
+    die("no admin key found: re-run `brain setup` so this Brain can be opened safely.");
+  }
+
+  const request = options.http ?? http;
+  const response = await request(
+    `${base}/api/rag/think`,
+    {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ q: question, limit: 8 }),
+    },
+    { timeoutMs: 90_000, what: "the answer" },
+  );
+  const raw = await response.text();
+  let body;
+  try { body = JSON.parse(raw); } catch { /* validated below */ }
+  if (!response.ok || !body || typeof body !== "object") {
+    die(`the Brain could not answer (HTTP ${response.status}). Run \`brain support --preview\` for the safe issue note.`);
+  }
+
+  const answer = typeof body.answer === "string" && body.answer.trim()
+    ? body.answer.trim()
+    : "The documents do not answer the question.";
+  console.log(`\n${answer}\n`);
+  if (body.answer_error) warn(`answer generation reported: ${String(body.answer_error).slice(0, 160)}`);
+  if (body.degraded) warn(`search is degraded: ${String(body.degraded).slice(0, 80)}`);
+  const citations = Array.isArray(body.citations) ? body.citations : [];
+  if (citations.length) {
+    console.log(`  ${c.bold("Sources")}`);
+    for (const citation of citations) {
+      const number = Number.isInteger(citation?.n) ? `[${citation.n}]` : "[ ]";
+      const title = String(citation?.title || "Untitled").replace(/\s+/g, " ").slice(0, 140);
+      const source = String(citation?.source || "source").replace(/\s+/g, " ").slice(0, 40);
+      console.log(`  ${number} ${title} (${source})`);
+    }
+    console.log("");
+  }
+  return body;
+}
+
 /* ---------------------------------------------------------- migrations */
 
 
@@ -1705,10 +1962,260 @@ async function cmdStatus(manifestPath) {
  * restore is itself destructive and irreversible, and running one unattended
  * against a client's only copy of their data trades a broken deploy for
  * potential data loss. So this captures the bookmark, prints it, and stops.
- * Recovery is one explicit command away and stays a human decision.
+ * A restore stays a reviewed decision because D1 recovery also requires a
+ * Vectorize rebuild before semantic retrieval is trustworthy again.
  */
+export function commitManifestVersion(manifestPath, version) {
+  const pin = pinUpdateManifest(manifestPath);
+  const target = pin.target;
+  const before = pin.stat;
+  const raw = pin.raw;
+  const manifest = JSON.parse(raw);
+  manifest.brain = { ...(manifest.brain || {}), version };
+  const output = Buffer.from(JSON.stringify(manifest, null, 2) + "\n", "utf8");
+  const temporary = join(
+    dirname(target),
+    `.${basename(target)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
+  );
+  let fd;
+  try {
+    fd = openSync(
+      temporary,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW || 0),
+      before.mode & 0o777,
+    );
+    if (writeSync(fd, output, 0, output.length, 0) !== output.length) {
+      throw new Error("the manifest version write was incomplete");
+    }
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    revalidateUpdateManifest(pin, "local manifest version commit");
+    renameSync(temporary, target);
+    const verifiedPin = pinUpdateManifest(target);
+    const verified = verifiedPin.manifest;
+    if (verified?.brain?.version !== version) {
+      throw new Error("the manifest version did not verify after its atomic write");
+    }
+    return verified;
+  } finally {
+    output.fill(0);
+    if (fd !== undefined) closeSync(fd);
+    if (existsSync(temporary)) unlinkSync(temporary);
+  }
+}
+
+function validD1Bookmark(value) {
+  return typeof value === "string" && value.length >= 1 && value.length <= 1024 &&
+    !/[\0-\x1f\x7f]/.test(value);
+}
+
+function parseSemver(value) {
+  const source = String(value || "");
+  if (!source || source.length > 128) throw new Error("not a bounded semantic version");
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(
+    source,
+  );
+  if (!match) throw new Error("not a semantic version");
+  const prerelease = match[4] ? match[4].split(".") : [];
+  for (const identifier of prerelease) {
+    if (/^\d+$/.test(identifier) && identifier.length > 1 && identifier.startsWith("0")) {
+      throw new Error("numeric prerelease identifiers cannot have leading zeroes");
+    }
+  }
+  return {
+    core: [BigInt(match[1]), BigInt(match[2]), BigInt(match[3])],
+    prerelease,
+  };
+}
+
+/** Compare two strict semantic versions without adding a release-time dependency. */
+export function compareSemver(left, right) {
+  const a = parseSemver(left);
+  const b = parseSemver(right);
+  for (let index = 0; index < a.core.length; index++) {
+    if (a.core[index] !== b.core[index]) return a.core[index] < b.core[index] ? -1 : 1;
+  }
+  if (!a.prerelease.length && !b.prerelease.length) return 0;
+  if (!a.prerelease.length) return 1;
+  if (!b.prerelease.length) return -1;
+  const length = Math.max(a.prerelease.length, b.prerelease.length);
+  for (let index = 0; index < length; index++) {
+    const av = a.prerelease[index];
+    const bv = b.prerelease[index];
+    if (av === undefined) return -1;
+    if (bv === undefined) return 1;
+    if (av === bv) continue;
+    const an = /^\d+$/.test(av);
+    const bn = /^\d+$/.test(bv);
+    if (an && bn) return BigInt(av) < BigInt(bv) ? -1 : 1;
+    if (an !== bn) return an ? -1 : 1;
+    return av < bv ? -1 : 1;
+  }
+  return 0;
+}
+
+function sameUpgradeManifestStat(left, right) {
+  return sameOpenedFile(left, right) &&
+    left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+
+/**
+ * Open, identify, and hash the manifest without following a link.
+ *
+ * Lifecycle subcommands reopen the manifest, so an update must establish one
+ * immutable identity before any Cloudflare mutation and reject any later swap.
+ */
+export function pinUpdateManifest(manifestPath) {
+  if (!manifestPath) throw new Error("an update manifest path is required");
+  const lexicalTarget = resolve(manifestPath);
+  let descriptor;
+  try {
+    const lexicalBefore = lstatSync(lexicalTarget);
+    if (!lexicalBefore.isFile() || lexicalBefore.isSymbolicLink() || lexicalBefore.nlink !== 1) {
+      throw new Error("the update manifest must be one regular file, not a link");
+    }
+    // Resolve the parent only after refusing a file-level link. Lifecycle
+    // subcommands receive this canonical path, so swapping a symlinked parent
+    // directory cannot redirect a later stage after its fingerprint check.
+    const target = join(realpathSync.native(dirname(lexicalTarget)), basename(lexicalTarget));
+    const before = lstatSync(target);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+      throw new Error("the update manifest must be one regular file, not a link");
+    }
+    if (before.dev !== lexicalBefore.dev || before.ino !== lexicalBefore.ino) {
+      throw new Error("the update manifest path changed while its directory was resolved");
+    }
+    descriptor = openSync(target, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+    const opened = fstatSync(descriptor);
+    if (!sameUpgradeManifestStat(before, opened)) {
+      throw new Error("the update manifest changed while it was being opened");
+    }
+    const raw = readFileSync(descriptor, "utf8");
+    const afterRead = fstatSync(descriptor);
+    const afterPath = lstatSync(target);
+    if (!sameUpgradeManifestStat(opened, afterRead) || !sameUpgradeManifestStat(opened, afterPath)) {
+      throw new Error("the update manifest changed while it was being read");
+    }
+    const manifest = JSON.parse(raw);
+    if (!manifest || Array.isArray(manifest) || typeof manifest !== "object") {
+      throw new Error("the update manifest must contain one JSON object");
+    }
+    return Object.freeze({
+      target,
+      raw,
+      fingerprint: createHash("sha256").update(raw).digest("hex"),
+      stat: opened,
+      manifest,
+    });
+  } catch (error) {
+    throw new Error(`update manifest safety check failed: ${String(error?.message || error)}`);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function revalidateUpdateManifest(pin, stage) {
+  let current;
+  try {
+    current = pinUpdateManifest(pin.target);
+  } catch {
+    throw new Error(`the update manifest could not be revalidated during ${stage}`);
+  }
+  if (
+    current.fingerprint !== pin.fingerprint ||
+    !sameUpgradeManifestStat(pin.stat, current.stat)
+  ) {
+    throw new Error(`the update manifest changed during ${stage}; no later stage was run`);
+  }
+  return current;
+}
+
+function writePinnedExecutionManifest(pin) {
+  const path = join(
+    dirname(pin.target),
+    `.${basename(pin.target)}.brain-update-${process.pid}-${randomBytes(8).toString("hex")}.tmp`,
+  );
+  const bytes = Buffer.from(pin.raw, "utf8");
+  let descriptor;
+  let createdStat = null;
+  let completed = false;
+  try {
+    descriptor = openSync(
+      path,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW || 0),
+      0o600,
+    );
+    createdStat = fstatSync(descriptor);
+    if (writeSync(descriptor, bytes, 0, bytes.length, 0) !== bytes.length) {
+      throw new Error("the pinned execution manifest write was incomplete");
+    }
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    const executionPin = pinUpdateManifest(path);
+    if (executionPin.fingerprint !== pin.fingerprint) {
+      throw new Error("the pinned execution manifest did not verify");
+    }
+    completed = true;
+    return executionPin;
+  } finally {
+    bytes.fill(0);
+    if (descriptor !== undefined) closeSync(descriptor);
+    if (!completed && createdStat) {
+      try {
+        const current = lstatSync(path);
+        if (current.dev === createdStat.dev && current.ino === createdStat.ino && current.nlink === 1) {
+          unlinkSync(path);
+        }
+      } catch {
+        // The caller's safety failure remains primary, and a replaced random
+        // path is never removed as if it were still ours.
+      }
+    }
+  }
+}
+
+function removePinnedExecutionManifest(pin) {
+  try {
+    const current = lstatSync(pin.target);
+    if (current.dev === pin.stat.dev && current.ino === pin.stat.ino && current.nlink === 1) {
+      unlinkSync(pin.target);
+    }
+  } catch {
+    // Cleanup cannot replace the update's real result. A replaced path is left
+    // untouched rather than deleting something we did not create.
+  }
+}
+
+function cloudflareIdentity(manifest) {
+  const cfg = manifest?.infrastructure?.cloudflare;
+  const databaseId = cfg?.d1_database_id;
+  if (typeof databaseId !== "string" || !databaseId || /^REQUIRED/i.test(databaseId)) {
+    throw new Error("no d1_database_id in the manifest. Run `brain provision` first.");
+  }
+  const declaredAccountId = cfg?.account_id;
+  return {
+    databaseId,
+    declaredAccountId:
+      typeof declaredAccountId === "string" && declaredAccountId && !/^REQUIRED/i.test(declaredAccountId)
+        ? declaredAccountId
+        : null,
+  };
+}
+
+function installStateRow(response) {
+  if (!response || !Array.isArray(response.results)) {
+    throw new Error("D1 returned an invalid install-state response");
+  }
+  if (response.results.length === 0) return null;
+  if (response.results.length !== 1 || !response.results[0] || typeof response.results[0] !== "object") {
+    throw new Error("D1 returned an ambiguous install-state response");
+  }
+  return response.results[0];
+}
+
 export async function cmdUpgrade(manifestPath, options = {}) {
-  const { m } = loadManifest(manifestPath);
   const resolveUpgradeAccount = options.resolveAccount ?? resolveAccount;
   const queryDatabase = options.d1Query ?? d1Query;
   const callCloudflare = options.cf ?? cf;
@@ -1716,109 +2223,272 @@ export async function cmdUpgrade(manifestPath, options = {}) {
   const deploy = options.cmdDeploy ?? cmdDeploy;
   const reconcileProviders = options.reconcileWorkerProviderSecrets ?? reconcileWorkerProviderSecrets;
   const verifyHealth = options.cmdHealth ?? cmdHealth;
-  const acct = await resolveUpgradeAccount(m);
-  const dbId = m.infrastructure?.cloudflare?.d1_database_id;
-  if (!dbId) die("no d1_database_id in the manifest. Run `brain provision` first.");
-
-  const before = await queryDatabase(acct.id, dbId, "SELECT * FROM install_state WHERE id = 1").catch(
-    () => null
-  );
-  const fromVersion = before?.results?.[0]?.product_version || "unknown";
-  // The version being upgraded TO is the code in the client's hands right now.
-  const toVersion = PRODUCT_VERSION;
-
-  // Snapshot first. A bookmark taken after a migration is worthless.
-  let bookmark = null;
+  const verifyAcceptance = options.cmdTest ?? cmdTest;
+  const commitVersion = options.commitManifestVersion ?? commitManifestVersion;
+  let originalPin = pinUpdateManifest(manifestPath);
+  const executionPin = writePinnedExecutionManifest(originalPin);
   try {
-    const bm = await callCloudflare(`/accounts/${acct.id}/d1/database/${dbId}/time_travel/bookmark`);
-    bookmark = bm?.bookmark || null;
-    ok(`snapshot bookmark ${bookmark}`);
-  } catch (e) {
-    warn(`could not capture a D1 bookmark, continuing without a restore point: ${e.message.slice(0, 100)}`);
-  }
+    const initialManifest = executionPin.manifest;
+    const identity = cloudflareIdentity(initialManifest);
+    let acct = await resolveUpgradeAccount(initialManifest);
+    if (!acct?.id) die("update stopped because the Cloudflare account identity could not be resolved. Nothing was changed.");
+    if (identity.declaredAccountId && identity.declaredAccountId !== acct.id) {
+      die("update stopped because the token account does not match the pinned manifest. Nothing was changed.");
+    }
+    revalidateUpdateManifest(originalPin, "account preflight");
+    revalidateUpdateManifest(executionPin, "account preflight");
 
-  const startedAt = new Date().toISOString();
-  const logRun = async (status, detail) => {
+    const accountId = acct.id;
+    const dbId = identity.databaseId;
+    const assertStageContext = async (stage) => {
+      const original = revalidateUpdateManifest(originalPin, stage);
+      const execution = revalidateUpdateManifest(executionPin, stage);
+      const currentIdentity = cloudflareIdentity(original.manifest);
+      const executionIdentity = cloudflareIdentity(execution.manifest);
+      if (currentIdentity.databaseId !== dbId || executionIdentity.databaseId !== dbId) {
+        throw new Error(`the D1 database identity changed during ${stage}`);
+      }
+      const currentAccount = await resolveUpgradeAccount(execution.manifest);
+      if (!currentAccount?.id || currentAccount.id !== accountId) {
+        throw new Error(`the Cloudflare account identity changed during ${stage}`);
+      }
+      revalidateUpdateManifest(originalPin, stage);
+      revalidateUpdateManifest(executionPin, stage);
+      acct = currentAccount;
+      return { manifest: execution.manifest, account: currentAccount };
+    };
+    const assertStageFiles = (stage) => {
+      revalidateUpdateManifest(originalPin, stage);
+      revalidateUpdateManifest(executionPin, stage);
+    };
+
+    await assertStageContext("install-state preflight");
+    let tableResponse;
     try {
-      await queryDatabase(
-        acct.id,
+      tableResponse = await queryDatabase(
+        accountId,
         dbId,
-        `INSERT INTO upgrade_runs (started_at, finished_at, from_version, to_version, status, d1_bookmark, detail)
-         VALUES (?,?,?,?,?,?,?)`,
-        [startedAt, new Date().toISOString(), fromVersion, toVersion, status, bookmark, detail || null]
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'install_state'",
       );
     } catch {
-      /* the run log must never be the reason an upgrade fails */
+      die("update stopped because D1 install state could not be read. Nothing was changed.");
     }
-  };
+    assertStageFiles("install-state preflight");
+    if (!tableResponse || !Array.isArray(tableResponse.results) ||
+        tableResponse.results.some((row) => row?.name !== "install_state")) {
+      die("update stopped because D1 install state was unreadable or ambiguous. Nothing was changed.");
+    }
+    let before = null;
+    if (tableResponse.results.length > 0) {
+      let stateResponse;
+      try {
+        stateResponse = await queryDatabase(accountId, dbId, "SELECT * FROM install_state WHERE id = 1");
+      } catch {
+        die("update stopped because D1 install state could not be read. Nothing was changed.");
+      }
+      assertStageFiles("install-state preflight");
+      try {
+        before = installStateRow(stateResponse);
+      } catch {
+        die("update stopped because D1 install state was unreadable or ambiguous. Nothing was changed.");
+      }
+    }
+    if (before && initialManifest.client?.slug && before.client_slug && before.client_slug !== initialManifest.client.slug) {
+      die("update stopped because this D1 database belongs to a different brain. Nothing was changed.");
+    }
 
-  info(`upgrading ${fromVersion} -> ${toVersion}`);
+    // The version being upgraded TO is the code in the client's hands right now.
+    const toVersion = PRODUCT_VERSION;
+    const stateVersion = before ? before.product_version : null;
+    const manifestVersion = initialManifest.brain?.version || null;
+    if (before && (typeof stateVersion !== "string" || !stateVersion)) {
+      die("update stopped because D1 install state has no valid product version. Nothing was changed.");
+    }
+    if (manifestVersion !== null && typeof manifestVersion !== "string") {
+      die("update stopped because the manifest product version is invalid. Nothing was changed.");
+    }
+    const recordedVersions = [...new Set([stateVersion, manifestVersion].filter(Boolean))];
+    let newestRecordedVersion = null;
+    try {
+      parseSemver(toVersion);
+      for (const recordedVersion of recordedVersions) {
+        parseSemver(recordedVersion);
+        if (!newestRecordedVersion || compareSemver(recordedVersion, newestRecordedVersion) > 0) {
+          newestRecordedVersion = recordedVersion;
+        }
+        const direction = compareSemver(recordedVersion, toVersion);
+        if (direction > 0) {
+          die(
+            `update refused to downgrade this brain from ${recordedVersion} to ${toVersion}. Nothing was changed.\n` +
+              "      Install that version or a newer release, then run brain update again.",
+          );
+        }
+      }
+    } catch (error) {
+      if (error instanceof Fatal) throw error;
+      die("update stopped because the recorded product version is not valid semantic version data. Nothing was changed.");
+    }
+    const fromVersion = stateVersion || newestRecordedVersion || "legacy-unrecorded";
+    if (!before) info("legacy install_state is absent; migrations will create it after the safety snapshot");
 
-  try {
-    await migrate(manifestPath);
-    await deploy(manifestPath);
-    const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
-    await reconcileProviders(
-      m,
-      acct,
-      scriptName,
-      optionalWorkerSecretNames(m),
-    );
-  } catch (e) {
-    await logRun("failed", e.message.slice(0, 400));
-    die(
-      `upgrade failed: ${e.message}\n` +
-        (bookmark
-          ? `      A restore point was captured BEFORE any change:\n` +
-            `        brain rollback ${manifestPath} ${bookmark}\n` +
-            `      Rollback is not automatic on purpose: a restore is destructive and\n` +
-            `      unattended data loss is worse than a broken deploy.`
-          : "      No restore point was captured.")
-    );
+    // Snapshot first. A bookmark taken after a migration is worthless.
+    await assertStageContext("D1 bookmark capture");
+    let bookmark = null;
+    try {
+      const bm = await callCloudflare(`/accounts/${accountId}/d1/database/${dbId}/time_travel/bookmark`);
+      bookmark = bm?.bookmark;
+      if (!validD1Bookmark(bookmark)) throw new Error("Cloudflare returned no valid bookmark");
+      assertStageFiles("D1 bookmark capture");
+      ok("required D1 restore bookmark captured");
+    } catch {
+      die("update stopped because a required D1 restore bookmark could not be captured. Nothing was changed.");
+    }
+
+    const startedAt = new Date().toISOString();
+    const logRun = async (status, detail, { required = false } = {}) => {
+      try {
+        await queryDatabase(
+          accountId,
+          dbId,
+          `INSERT INTO upgrade_runs (started_at, finished_at, from_version, to_version, status, d1_bookmark, detail)
+           VALUES (?,?,?,?,?,?,?)`,
+          [startedAt, new Date().toISOString(), fromVersion, toVersion, status, bookmark, detail || null],
+        );
+        return true;
+      } catch (error) {
+        if (required) throw new Error("the verified update could not be recorded in upgrade history", { cause: error });
+        return false;
+      }
+    };
+
+    info(`upgrading ${fromVersion} -> ${toVersion}`);
+    let stage = "migration";
+    const runStage = async (name, action) => {
+      stage = name;
+      const context = await assertStageContext(name);
+      const result = await action(context);
+      assertStageFiles(name);
+      return result;
+    };
+
+    try {
+      await runStage("migration", () => migrate(executionPin.target));
+      // The execution manifest is fingerprint-pinned across every remote
+      // stage. Legacy manifests have no domain, and a normal deploy persists
+      // the workers.dev hostname. Suppress that one local write during update:
+      // health can resolve the hostname read-only, while the pinned artifact
+      // must remain byte-identical until the verified version commit.
+      await runStage("deployment", () => deploy(executionPin.target, { persistDomain: false }));
+      await runStage("provider-secret reconciliation", ({ manifest, account }) => {
+        const scriptName = manifest.brain?.worker_name || `${manifest.client?.slug || "client"}-brain`;
+        return reconcileProviders(manifest, account, scriptName, optionalWorkerSecretNames(manifest));
+      });
+      await runStage("exact-version health verification", () =>
+        verifyHealth(executionPin.target, { expectVersion: toVersion }));
+      await runStage("full acceptance test", () =>
+        verifyAcceptance(executionPin.target, { expectVersion: toVersion }));
+      await runStage("D1 version commit", () => queryDatabase(
+        accountId,
+        dbId,
+        "UPDATE install_state SET last_upgraded_at = ?, product_version = ? WHERE id = 1",
+        [new Date().toISOString(), toVersion],
+      ));
+      const committed = await runStage("D1 version readback", () => queryDatabase(
+        accountId,
+        dbId,
+        "SELECT product_version FROM install_state WHERE id = 1",
+      ));
+      if (committed?.results?.[0]?.product_version !== toVersion) {
+        throw new Error("D1 did not read back the package version that was written");
+      }
+
+      stage = "local manifest version commit";
+      await assertStageContext(stage);
+      const expectedManifest = JSON.parse(originalPin.raw);
+      expectedManifest.brain = { ...(expectedManifest.brain || {}), version: toVersion };
+      commitVersion(originalPin.target, toVersion);
+      const advancedPin = pinUpdateManifest(originalPin.target);
+      if (JSON.stringify(advancedPin.manifest) !== JSON.stringify(expectedManifest)) {
+        throw new Error("the local manifest changed beyond its verified version field");
+      }
+      const advancedIdentity = cloudflareIdentity(advancedPin.manifest);
+      if (advancedIdentity.databaseId !== dbId) {
+        throw new Error("the local manifest database identity changed during version commit");
+      }
+      originalPin = advancedPin;
+      await assertStageContext(stage);
+
+      await runStage("verified history commit", () => logRun("verified", null, { required: true }));
+    } catch (error) {
+      await logRun("failed", `stage:${stage}`);
+      die(
+        `update stopped during ${stage}: ${error.message}\n` +
+          `      D1 recovery bookmark: ${bookmark}\n` +
+          "      Do not restore it as the first response. A D1 restore discards newer writes and\n" +
+          "      does not restore Vectorize, so it requires a reviewed recovery and reindex.\n" +
+          "      Safe default: fix the reported issue and run brain update again.",
+      );
+    }
+    ok(`upgrade verified, now at ${toVersion}`);
+  } finally {
+    removePinnedExecutionManifest(executionPin);
   }
-
-  // Verify. An upgrade that is not verified is a belief.
-  //
-  // expectVersion is the whole point: without it this probed /health, got a 200
-  // from the worker being REPLACED, printed its old version, and declared the
-  // new one verified.
-  try {
-    await verifyHealth(manifestPath, { expectVersion: toVersion });
-  } catch (e) {
-    await logRun("failed", `verification: ${e.message}`.slice(0, 400));
-    die(`upgrade deployed but verification failed: ${e.message}`);
-  }
-
-  await queryDatabase(
-    acct.id,
-    dbId,
-    "UPDATE install_state SET last_upgraded_at = ?, product_version = ? WHERE id = 1",
-    [new Date().toISOString(), toVersion]
-  ).catch(() => {});
-  await logRun("verified", null);
-  ok(`upgrade verified, now at ${toVersion}`);
 }
 
-async function cmdRollback(manifestPath, bookmarkArg) {
-  const { m } = loadManifest(manifestPath);
-  const acct = await resolveAccount(m);
-  const dbId = m.infrastructure?.cloudflare?.d1_database_id;
-  const bookmark = bookmarkArg || process.argv[4];
-  if (!bookmark) die("usage: brain rollback <manifest> <bookmark>");
+function rollbackLocalPreflight(manifestPath, bookmarkArg) {
+  const bookmark = bookmarkArg;
+  if (!bookmark) die("usage: brain rollback <manifest> <bookmark> [--yes]");
+  if (!validD1Bookmark(bookmark)) die("the D1 bookmark is invalid; nothing was changed.");
+  const pin = pinUpdateManifest(manifestPath);
+  const m = pin.manifest;
+  const { databaseId, declaredAccountId } = cloudflareIdentity(m);
+  return { bookmark, pin, m, databaseId, declaredAccountId };
+}
 
-  warn("restoring a D1 bookmark is DESTRUCTIVE: everything written since is lost.");
+function printRollbackPreview({ bookmark, databaseId }) {
+  warn("rollback preview only: nothing was changed.");
+  warn("a D1 restore is DESTRUCTIVE: everything written after this bookmark would be lost.");
+  warn("this restores D1 only. It does not restore Vectorize; a full brain reindex is required afterward.");
+  info(`database ${databaseId}, bookmark ${bookmark}`);
+  info("After reviewing this recovery, re-run the same command with --yes to perform it.");
+  return { confirmed: false, restored: false, databaseId, bookmark };
+}
+
+export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
+  const preflight = rollbackLocalPreflight(manifestPath, bookmarkArg);
+  if (options.confirmed !== true) return printRollbackPreview(preflight);
+
+  const { bookmark, pin, m, databaseId: dbId, declaredAccountId } = preflight;
+  const resolveRollbackAccount = options.resolveAccount ?? resolveAccount;
+  const callCloudflare = options.cf ?? cf;
+  const queryDatabase = options.d1Query ?? d1Query;
+  const acct = await resolveRollbackAccount(m);
+  if (!acct?.id || (declaredAccountId && declaredAccountId !== acct.id)) {
+    die("rollback stopped because the token account does not match the pinned manifest.");
+  }
+  revalidateUpdateManifest(pin, "rollback preflight");
+
+  warn("restoring this D1 bookmark is DESTRUCTIVE: everything written since is lost.");
+  warn("this restores D1 only. Vectorize must be rebuilt before semantic retrieval is trustworthy.");
   info(`database ${dbId}, bookmark ${bookmark}`);
-  await cf(`/accounts/${acct.id}/d1/database/${dbId}/time_travel/restore?bookmark=${encodeURIComponent(bookmark)}`, {
+  await callCloudflare(`/accounts/${acct.id}/d1/database/${dbId}/time_travel/restore?bookmark=${encodeURIComponent(bookmark)}`, {
     method: "POST",
   });
-  ok("restored");
+  revalidateUpdateManifest(pin, "rollback restore");
+  ok("D1 restored");
   // A rolled-back run must never become the baseline for the next upgrade.
-  await d1Query(
+  const marked = await queryDatabase(
     acct.id,
     dbId,
-    "UPDATE upgrade_runs SET status = 'rolled_back' WHERE id = (SELECT MAX(id) FROM upgrade_runs)"
-  ).catch(() => {});
-  info("the most recent upgrade run is marked rolled_back so it cannot become the next baseline.");
+    "UPDATE upgrade_runs SET status = 'rolled_back' WHERE id = (SELECT MAX(id) FROM upgrade_runs)",
+  ).then(() => true, () => false);
+  if (marked) {
+    info("the most recent upgrade run is marked rolled_back so it cannot become the next baseline.");
+  } else {
+    warn("D1 was restored, but its upgrade-history marker could not be updated. Record this recovery manually.");
+  }
+  warn("semantic retrieval is not repaired yet. Run brain reindex <manifest> before returning this brain to use.");
+  return { confirmed: true, restored: true, databaseId: dbId, bookmark };
 }
 
 /* ------------------------------------------------------------ acceptance */
@@ -1830,7 +2500,7 @@ export function reportAcceptanceFailure(data = {}) {
   return failed > 0 ? { kind: "failed", failed } : null;
 }
 
-export async function cmdTest(manifestPath) {
+export async function cmdTest(manifestPath, options = {}) {
   const { m } = loadManifest(manifestPath);
   const key = resolveAdminKey(manifestPath);
   if (!key) die("no admin key found: not in the environment, and no .brain-admin-key file next to the manifest.");
@@ -1849,7 +2519,7 @@ export async function cmdTest(manifestPath) {
   // with nothing but the admin key. Cloudflare buys exactly one thing, the
   // install_state row behind tier 5, and its absence degrades that tier to
   // skip rather than failing the run.
-  const haveCfToken = Boolean(process.env.CLOUDFLARE_API_TOKEN);
+  const haveCfToken = cloudflareTokenAvailable();
   if (!base || (haveCfToken && m.infrastructure?.cloudflare?.d1_database_id)) {
     if (!base && !haveCfToken) {
       die(
@@ -1917,7 +2587,12 @@ export async function cmdTest(manifestPath) {
   }
 
   const { Acceptance } = await import("./acceptance.mjs");
-  const suite = new Acceptance({ base, adminKey: key, manifest: m });
+  const suite = new Acceptance({
+    base,
+    adminKey: key,
+    manifest: m,
+    expectVersion: options.expectVersion || null,
+  });
   info(`acceptance suite against ${base}`);
   const out = await suite.run({
     probes: m.testing?.probe_questions || [],
@@ -2158,7 +2833,10 @@ function assertSourceName(name) {
  * `--report` is deliberately absent: a bare --report means "use the generated
  * filename", which is intended.
  */
-export const VALUE_FLAGS = new Set(["path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark", "export"]);
+export const VALUE_FLAGS = new Set([
+  "path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark", "export",
+  "golden", "k", "repeat", "baseline", "save", "artifacts",
+]);
 
 /** Read an exact Drive-id exclusion list from either its portable shape or a migration receipt. */
 export function driveExclusionIdsOf(raw) {
@@ -2173,9 +2851,9 @@ export function driveExclusionIdsOf(raw) {
 }
 
 /**
- * The connector policy is install-owned manifest data. James's migration uses
- * an ignored receipt file because thousands of opaque Drive ids do not belong
- * in a public product manifest; new installs normally need no such file.
+ * The connector policy is install-owned manifest data. A large migration can
+ * use an ignored receipt file because thousands of opaque Drive ids do not
+ * belong in a public product manifest; new installs normally need no such file.
  */
 export function driveConnectorConfig(m, manifestPath, read = (path) => readFileSync(path, "utf-8")) {
   const declared = m?.corpora?.google_drive || {};
@@ -2463,7 +3141,7 @@ export function validateBatchReceipt(body, group) {
 /** Refuse a complete logical document before any size-based splitting. */
 export function credentialRefusalOf(envelope, enabled = true) {
   if (!enabled || typeof envelope?.content !== "string") return null;
-  const result = scanSecrets(envelope.content);
+  const result = scanEnvelopeSecrets(envelope);
   if (!result.shouldRefuse) return null;
   return {
     reason: `refused: carries ${result.labels.join(", ")}`,
@@ -3232,8 +3910,7 @@ async function cmdIngest(manifestPath) {
   // use. Requiring a Cloudflare token to preview what WOULD be loaded turns the
   // safest command in the tool into one of the hardest to reach.
   const dry = !!flags["dry-run"];
-  const acct = dry ? null : await resolveAccount(m);
-  const dbId = m.infrastructure?.cloudflare?.d1_database_id;
+  const acct = dry ? null : m.brain?.domain ? null : await resolveAccount(m);
   const base = dry ? null : await resolveBaseUrl(m, acct);
   const adminKey = dry ? null : resolveAdminKey(manifestPath);
   if (!adminKey && !flags["dry-run"]) {
@@ -3401,7 +4078,24 @@ async function cmdIngest(manifestPath) {
     return;
   }
 
-  const sourceRunId = dbId ? await recordSourceStart(acct.id, dbId, sourceName, "upload", "manual") : null;
+  // Routine ingest is a data-plane operation. Once setup has saved the live
+  // Worker URL, recording source health must use the brain admin key instead
+  // of silently requiring a standing Cloudflare control-plane token.
+  const sourceRunId = `sync_${randomBytes(16).toString("hex")}`;
+  const sourceRunStartedAt = new Date().toISOString();
+  let sourceRunClosed = false;
+  const tally = { created: 0, updated: 0, unchanged: 0, refused: 0, failed: 0 };
+  await postSourceReceipt(base, adminKey, {
+    source: sourceName,
+    kind: "upload",
+    status: "indexing",
+    run_id: sourceRunId,
+    lane: "manual",
+    started_at: sourceRunStartedAt,
+    detail: "local folder ingest started",
+  });
+
+  try {
 
   const pendingLocalUids = Object.keys(state.removed || {});
   if (pendingLocalUids.length) {
@@ -3416,7 +4110,6 @@ async function cmdIngest(manifestPath) {
     saveState(statePath, state);
   }
 
-  const tally = { created: 0, updated: 0, unchanged: 0, refused: 0, failed: 0 };
   const familyPlans = new Map();
   const sentFamilyParts = new Map();
   const acceptedFamilyParts = new Map();
@@ -3425,6 +4118,7 @@ async function cmdIngest(manifestPath) {
   for await (const group of batchStream(limited, prepareOne, {
     onSkip: (sk) => skips.push(sk),
     onProgress: (n) => {
+      scanned = n;
       if (n % 100 === 0) process.stdout.write(`\r  scanned ${n}/${limited.length}, sent ${tally.created + tally.updated}   `);
     },
   })) {
@@ -3499,15 +4193,23 @@ async function cmdIngest(manifestPath) {
 
   if (scannerRescanSkips.length) {
     saveState(statePath, state);
-    if (dbId) {
-      await recordSourceFinish(acct.id, dbId, sourceName, {
-        documents: Object.keys(state.done).length,
-        added: tally.created + tally.updated,
-        skipped: skips.length,
-        failed: scannerRescanSkips.length,
-        runId: sourceRunId,
-      });
-    }
+    await postSourceReceipt(base, adminKey, {
+      source: sourceName,
+      kind: "upload",
+      status: "error",
+      run_id: sourceRunId,
+      lane: "manual",
+      started_at: sourceRunStartedAt,
+      completed_at: new Date().toISOString(),
+      walk_complete: false,
+      files_seen: scanned,
+      docs_added: tally.created,
+      docs_updated: tally.updated,
+      docs_unchanged: unchanged + tally.unchanged,
+      error: `${scannerRescanSkips.length} previously-indexed file(s) could not be rechecked by the current credential scanner`,
+      detail: `local folder ingest stopped during credential recheck; skipped=${skips.length}`,
+    });
+    sourceRunClosed = true;
     die(
       `${scannerRescanSkips.length} previously-indexed file(s) could not be rechecked by the current credential scanner.\n` +
         "      Their prior revision was preserved, and the scanner upgrade was not marked complete. Fix the reported files and re-run."
@@ -3517,15 +4219,24 @@ async function cmdIngest(manifestPath) {
   state.credential_scanner_fingerprint = scannerFingerprint;
   saveState(statePath, state);
 
-  if (dbId) {
-    await recordSourceFinish(acct.id, dbId, sourceName, {
-      documents: Object.keys(state.done).length,
-      added: tally.created + tally.updated,
-      skipped: skips.length,
-      failed: tally.failed,
-      runId: sourceRunId,
-    });
-  }
+  const finalStatus = tally.failed ? "error" : "ready";
+  await postSourceReceipt(base, adminKey, {
+    source: sourceName,
+    kind: "upload",
+    status: finalStatus,
+    run_id: sourceRunId,
+    lane: "manual",
+    started_at: sourceRunStartedAt,
+    completed_at: new Date().toISOString(),
+    walk_complete: tally.failed === 0,
+    files_seen: scanned,
+    docs_added: tally.created,
+    docs_updated: tally.updated,
+    docs_unchanged: unchanged + tally.unchanged,
+    detail: `local folder ingest ${finalStatus === "ready" ? "completed" : "completed with document failures"}; skipped=${skips.length}`,
+    ...(tally.failed ? { error: `${tally.failed} document(s) failed` } : {}),
+  });
+  sourceRunClosed = true;
 
   const summary = `${tally.created} created, ${tally.updated} updated, ${unchanged + tally.unchanged} unchanged`;
   if (tally.failed) info(summary);
@@ -3536,60 +4247,36 @@ async function cmdIngest(manifestPath) {
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
   assertNoIngestFailures(tally);
   await reportBacklog(manifestPath);
-}
-
-
-/** Mark a source as being loaded. Registers it on first run. */
-async function recordSourceStart(acctId, dbId, name, kind, lane = "manual") {
-  const now = new Date().toISOString();
-  const startedAt = Date.parse(now);
-  const runId = `sync_${randomBytes(16).toString("hex")}`;
-  await d1Query(
-    acctId, dbId,
-    "INSERT INTO sources (name, kind, status, created_at, stale_reason) VALUES (?,?,'indexing',?,NULL) " +
-      "ON CONFLICT(name) DO UPDATE SET status='indexing', stale_reason=NULL",
-    [name, kind, now]
-  ).catch(() => {});
-  await d1Query(
-    acctId, dbId,
-    "UPDATE sync_runs SET finished_at=?, error=COALESCE(error,'superseded by a later sync attempt') WHERE source=? AND finished_at IS NULL",
-    [startedAt, name]
-  ).catch(() => {});
-  await d1Query(
-    acctId, dbId,
-    "INSERT INTO sync_runs (run_id,source,lane,started_at) VALUES (?,?,?,?)",
-    [runId, name, lane, startedAt]
-  ).catch(() => {});
-  return runId;
-}
-
-/**
- * Close out a load.
- *
- * `document_count` is written as a RECEIPT, not as the authority — the store is
- * the authority, and `brain sources` prints both so drift is visible instead of
- * being quietly believed.
- */
-async function recordSourceFinish(acctId, dbId, name, { documents, added, skipped, failed, runId = null }) {
-  const now = new Date().toISOString();
-  await d1Query(
-    acctId, dbId,
-    "UPDATE sources SET status=?, last_ingest_at=CASE WHEN ?=0 THEN ? ELSE last_ingest_at END, " +
-      "document_count=?, stale_reason=CASE WHEN ?=0 THEN NULL ELSE ? END WHERE name=?",
-    [failed ? "error" : "ready", failed, now, documents, failed, failed ? `${failed} document(s) failed` : null, name]
-  ).catch(() => {});
-  if (runId) {
-    await d1Query(
-      acctId, dbId,
-      "UPDATE sync_runs SET finished_at=?, walk_complete=?, docs_added=?, error=? WHERE run_id=?",
-      [Date.parse(now), failed ? 0 : 1, added, failed ? `${failed} document(s) failed` : null, runId]
-    ).catch(() => {});
+  } catch (error) {
+    // Do not leave a source looking perpetually "indexing" when extraction,
+    // transport, reconciliation, or the final acceptance check aborts. The
+    // original failure remains authoritative even if this best-effort receipt
+    // cannot be written.
+    if (!sourceRunClosed) {
+      try {
+        await postSourceReceipt(base, adminKey, {
+          source: sourceName,
+          kind: "upload",
+          status: "error",
+          run_id: sourceRunId,
+          lane: "manual",
+          started_at: sourceRunStartedAt,
+          completed_at: new Date().toISOString(),
+          walk_complete: false,
+          files_seen: scanned,
+          docs_added: tally.created,
+          docs_updated: tally.updated,
+          docs_unchanged: unchanged + tally.unchanged,
+          error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
+          detail: "local folder ingest aborted before completion",
+        });
+        sourceRunClosed = true;
+      } catch (receiptError) {
+        warn(`the ingest failed and its error receipt could not be recorded: ${String(receiptError?.message || receiptError).slice(0, 160)}`);
+      }
+    }
+    throw error;
   }
-  await d1Query(
-    acctId, dbId,
-    "INSERT INTO source_events (source_name, event, at, documents, detail) VALUES (?,'ingest',?,?,?)",
-    [name, now, added, `skipped=${skipped} failed=${failed}`]
-  ).catch(() => {});
 }
 
 /** A destructive response is trusted only when it proves it is the forget API. */
@@ -4646,30 +5333,6 @@ async function ask(question, fallback = "") {
   return (String(value || "").trim()) || fallback;
 }
 
-/**
- * Ask for a secret without echoing it.
- *
- * Not theatre. A key typed as a command argument lands in shell history and in
- * screenshare scrollback, and setup runs live with someone watching. On a pipe
- * there is nothing to hide from, so it reads the line plainly rather than
- * pretending.
- */
-async function askSecret(question) {
-  if (!process.stdin.isTTY) return ask(question);
-  const lines = prompts();
-  process.stdout.write(`  ${question}: `);
-  const mute = () => {
-    process.stdout.clearLine(0);
-    process.stdout.cursorTo(0);
-    process.stdout.write(`  ${question}: `);
-  };
-  process.stdin.on("data", mute);
-  const { value, done } = await lines.next();
-  process.stdin.removeListener("data", mute);
-  process.stdout.write("\n");
-  return done ? "" : String(value || "").trim();
-}
-
 /** Deterministic, non-secret Keychain locator for a standard macOS setup. */
 export function standardMacAdminKeyReference(manifestPath, manifest) {
   const slug = String(manifest?.client?.slug || "brain")
@@ -4834,7 +5497,10 @@ export async function cmdSetup(manifestPath, options = {}) {
   /* --- 1. preflight, because everything below assumes it --- */
   console.log(`  ${c.bold("Step 1 of 6")}  checking this machine\n`);
   const runDoctorChecks = options.doctorRunAll ?? doctorRunAll;
-  const checks = await runDoctorChecks({ accountId: undefined });
+  const checks = await runDoctorChecks({
+    accountId: undefined,
+    cloudflareToken: activeCloudflareToken(),
+  });
   for (const x of checks) {
     const mark = x.status === D_OK ? c.green("ok  ") : x.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
     console.log(`    ${mark}  ${x.name}  ${c.dim(x.detail)}`);
@@ -4849,6 +5515,7 @@ export async function cmdSetup(manifestPath, options = {}) {
 
   /* --- 2. the manifest, asked for once --- */
   const target = manifestPath || flags.manifest || "./brain.manifest.json";
+  const shownTarget = commandPath(relative(process.cwd(), target));
   let m;
   if (existsSync(target)) {
     m = loadManifest(target).m;
@@ -4871,35 +5538,13 @@ export async function cmdSetup(manifestPath, options = {}) {
     cf.storage = "d1";
     delete tmpl.infrastructure.supabase;
 
-    // Resolved from the wrangler session rather than asked for: people paste the
-    // wrong id, and the session already knows which account it is.
-    const who = wrangler(["whoami"], { accountId: undefined });
-    const ids = [...(who.out.matchAll(/\b([0-9a-f]{32})\b/g) || [])].map((x) => x[1]);
-    if (ids.length === 1) {
-      cf.account_id = ids[0];
-      ok(`Cloudflare account ${ids[0]}`);
-    } else {
-      if (ids.length > 1) {
-        console.log(`\n  ${c.yellow("This login can see several Cloudflare accounts.")}`);
-        console.log(`  ${c.dim("Pick carefully: this creates real resources in whichever one you name.")}\n`);
-        for (const id of [...new Set(ids)]) console.log(`    ${id}`);
-        console.log("");
-      }
-      // NO DEFAULT when the login can see more than one account. Offering the
-      // first one means a person pressing enter provisions a brain into someone
-      // else's business, and the resources look identical afterwards.
-      cf.account_id = await prompt("Cloudflare account id", ids.length === 1 ? ids[0] : "");
-      if (!cf.account_id && ids.length > 1) {
-        closePrompts();
-        die("no account id given, and this login can see several. Re-run and name the one you mean.");
-      }
-    }
-      if (!cf.account_id) {
-      closePrompts();
-      die("a Cloudflare account id is required.");
-    }
+    const account = await chooseSetupAccount(prompt, {
+      listAccounts: options.listCloudflareAccounts,
+    });
+    cf.account_id = account.id;
+    ok(`Cloudflare account "${account.name}" (${account.id})`);
 
-    writeFileSync(target, JSON.stringify(tmpl, null, 2) + "\n");
+    createSetupManifest(target, tmpl);
     m = tmpl;
     ok(`wrote ${relative(process.cwd(), target)}`);
   }
@@ -4928,6 +5573,9 @@ export async function cmdSetup(manifestPath, options = {}) {
   await (options.cmdProvision ?? cmdProvision)(target);
   await (options.cmdMigrate ?? cmdMigrate)(target);
   await (options.cmdDeploy ?? cmdDeploy)(target);
+  // Provision and deploy write resource IDs and the token-free live address.
+  // Everything below must use the committed manifest, not setup's old template.
+  m = loadManifest(target).m;
 
   /* --- 4. secrets, AFTER deploy --- */
   console.log(`\n  ${c.bold("Step 4 of 6")}  keys\n`);
@@ -4980,7 +5628,7 @@ export async function cmdSetup(manifestPath, options = {}) {
     closePrompts();
     die(`no such folder: ${folder}. Nothing was loaded. Fix the path and re-run setup.`);
   } else {
-    info(`load one later with: brain ingest ${relative(process.cwd(), target)} --path <dir>`);
+    info(`load one later with: brain ingest ${shownTarget} --path <dir>`);
   }
 
   closePrompts();
@@ -4990,14 +5638,15 @@ export async function cmdSetup(manifestPath, options = {}) {
   if (outstanding > 0) {
     console.log(
       `  ${c.yellow("Keyword search works now.")} ${outstanding} chunk(s) are still embedding, so\n` +
-        `  meaning-based search is incomplete until they finish. Run:\n    brain drain ${relative(process.cwd(), target)}\n`
+        `  meaning-based search is incomplete until they finish. Run:\n    brain drain ${shownTarget}\n`
     );
   }
+  console.log(`  Ask it directly with: brain ask ${shownTarget}`);
   if (wired.length) {
     console.log(`  It is connected to: ${wired.join(", ")}.`);
     console.log(`  ${c.dim("Restart them, then ask a question about your own material.")}\n`);
   } else {
-    console.log(`  Connect it to Claude Code or Codex with:\n    node brain.mjs mcp-config ${relative(process.cwd(), target)}\n`);
+    console.log(`  Optional: connect it to Claude Code or Codex with:\n    brain mcp-config ${shownTarget}\n`);
   }
 }
 
@@ -5914,10 +6563,9 @@ currentSupportCommand = String(cmd || "");
 /**
  * Say what is actually outstanding after an ingest, rather than "a few minutes".
  *
- * Jay measured the real figure on a 2 MB folder: 1,001 chunks, ~50 minutes, and
- * a message promising minutes. Understating this is a first-impression risk on
- * the highest-stakes interaction of the engagement, so the number is read from
- * the install rather than guessed at.
+ * A real 2 MB field corpus produced 1,001 chunks and took about 50 minutes after
+ * a message had promised minutes. Understating this is a first-impression risk,
+ * so the number is read from the install rather than guessed at.
  */
 /** Chunks still awaiting embedding, or 0 if it cannot be determined. */
 async function backlogCount(manifestPath) {
@@ -6042,6 +6690,55 @@ export function evalChildEnvironment(environment = process.env) {
   return localToolEnvironment(environment, { BRAIN_ADMIN_KEY_STDIN: "1" });
 }
 
+/** Create the owner's private eval set once, without links or broad file modes. */
+export function writePrivateEvalTemplate(destination, options = {}) {
+  if (options.force) {
+    throw new Error(
+      "--force is not supported for private evaluation sets. Rename the existing file first so no questions are overwritten.",
+    );
+  }
+  const path = resolve(destination);
+  const parent = dirname(path);
+  const parentIdentity = lstatSync(parent);
+  if (!parentIdentity.isDirectory() || parentIdentity.isSymbolicLink()) {
+    throw new Error("the evaluation-set directory must be a real directory, not a link");
+  }
+  const template = readFileSync(join(HERE, "eval", "golden", "TEMPLATE.golden.json"));
+  let descriptor = null;
+  let created = false;
+  try {
+    descriptor = openSync(
+      path,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL |
+        (fsConstants.O_NOFOLLOW || 0),
+      0o600,
+    );
+    created = true;
+    const identity = fstatSync(descriptor);
+    if (!identity.isFile() || identity.nlink !== 1) {
+      throw new Error("the evaluation-set destination is not a private regular file");
+    }
+    writeFileSync(descriptor, template);
+    fsyncSync(descriptor);
+    if (process.platform !== "win32") chmodSync(path, 0o600);
+  } catch (error) {
+    if (descriptor !== null) {
+      try { closeSync(descriptor); } catch { /* best effort cleanup below */ }
+      descriptor = null;
+    }
+    if (created) {
+      try { unlinkSync(path); } catch { /* never hide the original failure */ }
+    }
+    if (error?.code === "EEXIST") {
+      throw new Error("the private evaluation set already exists; rename it before creating another");
+    }
+    throw error;
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
+  return path;
+}
+
 async function cmdEval(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
   const { m } = loadManifest(manifestPath);
@@ -6051,13 +6748,17 @@ async function cmdEval(manifestPath) {
     : join(dir, "brain.golden.json");
 
   if (flags.init) {
-    if (existsSync(goldenPath) && !flags.force) {
+    if (existsSync(goldenPath)) {
       die(
         `${relative(process.cwd(), goldenPath)} already exists.` + "\n" +
-          "  Edit it, or pass --force to overwrite it with a fresh template."
+          "  It contains private questions, so the evaluator never overwrites it. Rename it first if you want a fresh template."
       );
     }
-    copyFileSync(join(HERE, "eval", "golden", "TEMPLATE.golden.json"), goldenPath);
+    try {
+      writePrivateEvalTemplate(goldenPath, { force: !!flags.force });
+    } catch (error) {
+      die(`could not create the private evaluation set safely: ${error.message}`);
+    }
     ok(`wrote ${relative(process.cwd(), goldenPath)}`);
     console.log(
       "\n  Fill it in, and do it in this order, because the order is what makes the\n" +
@@ -6093,10 +6794,10 @@ async function cmdEval(manifestPath) {
   if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
 
   const args = [join(HERE, "eval", "run.mjs"), "--base", base, "--golden", goldenPath];
-  for (const f of ["limit", "k", "repeat", "baseline", "save"]) {
+  for (const f of ["limit", "k", "repeat", "baseline", "save", "artifacts"]) {
     if (flags[f] && flags[f] !== true) args.push(`--${f}`, String(flags[f]));
   }
-  for (const f of ["rerank", "no-think", "json"]) if (flags[f]) args.push(`--${f}`);
+  for (const f of ["rerank", "graph-boost", "no-think", "json"]) if (flags[f]) args.push(`--${f}`);
 
   const keyInput = Buffer.from(`${adminKey}\n`, "utf8");
   let r;
@@ -6435,8 +7136,56 @@ async function cmdSchedule(manifestPath) {
   return result;
 }
 
+async function cmdSetupInteractive(manifestPath) {
+  return withCloudflareToken(() => cmdSetup(manifestPath));
+}
+
+async function cmdUpgradeInteractive(manifestPath) {
+  return withCloudflareToken(() => cmdUpgrade(manifestPath));
+}
+
+/** Beginner update path: verify custody first, then run the fully gated upgrade. */
+export async function cmdUpdate(manifestPath, options = {}) {
+  const target = manifestPath || "./brain.manifest.json";
+  if (!existsSync(target)) {
+    die(`no manifest found at ${target}. Run this command from the brain folder or name the manifest path.`);
+  }
+  const pin = pinUpdateManifest(target);
+  return withCloudflareToken(async () => {
+    revalidateUpdateManifest(pin, "update verification");
+    await (options.cmdVerify ?? cmdVerify)(target);
+    revalidateUpdateManifest(pin, "update verification");
+    return (options.cmdUpgrade ?? cmdUpgrade)(target, options.upgradeOptions || {});
+  }, options);
+}
+
+export async function cmdRollbackInteractive(manifestPath, bookmarkArg, options = {}) {
+  const preflight = rollbackLocalPreflight(manifestPath, bookmarkArg);
+  if (options.confirmed !== true) return printRollbackPreview(preflight);
+  return withCloudflareToken(
+    () => (options.cmdRollback ?? cmdRollback)(manifestPath, bookmarkArg, {
+      ...(options.rollbackOptions || {}),
+      confirmed: true,
+    }),
+    options,
+  );
+}
+
+async function dispatchRollback(manifestPath) {
+  const args = process.argv.slice(4);
+  const bookmark = args[0];
+  const trailing = args.slice(1);
+  const flags = parseFlags(trailing);
+  const unknown = Object.keys(flags).filter((name) => name !== "yes");
+  if (trailing.some((value) => !value.startsWith("--")) || unknown.length) {
+    die("usage: brain rollback <manifest> <bookmark> [--yes]");
+  }
+  return cmdRollbackInteractive(manifestPath, bookmark, { confirmed: flags.yes === true });
+}
+
 const commands = {
-  setup: cmdSetup,
+  setup: cmdSetupInteractive,
+  ask: cmdAsk,
   doctor: cmdDoctor,
   whatsnew: cmdWhatsnew,
   verify: cmdVerify,
@@ -6456,8 +7205,9 @@ const commands = {
   reindex: cmdReindex,
   diagnose: cmdDiagnose,
   eval: cmdEval,
-  upgrade: cmdUpgrade,
-  rollback: cmdRollback,
+  update: cmdUpdate,
+  upgrade: cmdUpgradeInteractive,
+  rollback: dispatchRollback,
   schedule: cmdSchedule,
   support: cmdSupport,
 };
@@ -6467,6 +7217,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
 
   install
     brain setup      [manifest]            nothing to a working brain, one command
+    brain ask        <manifest>            ask a private question in this terminal
     brain doctor     [manifest]            check this machine has everything it needs
     brain verify     <manifest>            check the token and resolve the account
     brain provision  <manifest>            create D1 (and R2), write IDs back
@@ -6487,12 +7238,13 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain support    [--preview|--export <file>]  inspect private local issue notes
 
   operate
+    brain update     [manifest]            one safe update: snapshot, test, verify
     brain whatsnew   [manifest]            what changed in this version, and are you on it
     brain status     <manifest>            versions, pending migrations, upgrade history
     brain sources    <manifest>            named ingest sources, counts, last ingest
     brain forget     <manifest>            remove one named source (destructive)
     brain upgrade    <manifest>            snapshot, migrate, deploy, verify
-    brain rollback   <manifest> <bookmark> restore a D1 snapshot (destructive)
+    brain rollback   <manifest> <bookmark> preview D1-only restore (--yes performs it)
     brain schedule   <manifest>            inspect unattended Drive refresh
     brain schedule   <manifest> --remove   remove it and preserve its logs
     brain support    --clear --yes         clear private local issue notes

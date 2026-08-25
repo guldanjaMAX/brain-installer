@@ -1,9 +1,9 @@
 /**
  * brain-client — the only thing in eval/ that touches the network.
  *
- * Every request is a GET. The eval must never be able to change a brain it is
- * measuring, because the moment it can, a bad run stops being a bad number and
- * starts being an incident in a client's account.
+ * Every endpoint is read-only. Private questions use POST bodies so they never
+ * enter URLs, while corpus inventory remains GET. The eval must never be able
+ * to change a brain it is measuring.
  *
  * Two details that are load bearing rather than decorative:
  *
@@ -30,14 +30,20 @@ export class BrainClient {
     this.fetch = fetchImpl;
   }
 
-  async #get(path) {
+  async #request(path, { method = "GET", body } = {}) {
     let lastErr;
     for (let attempt = 0; attempt <= this.retries; attempt++) {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
       try {
         const res = await this.fetch(this.base + path, {
-          headers: { "X-Admin-Key": this.key, "User-Agent": BROWSER_UA },
+          method,
+          headers: {
+            "X-Admin-Key": this.key,
+            "User-Agent": BROWSER_UA,
+            ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
           signal: ctrl.signal,
         });
         const text = await res.text();
@@ -49,7 +55,9 @@ export class BrainClient {
             await sleep(400 * (attempt + 1));
             continue;
           }
-          throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+          const error = new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+          error.retryable = false;
+          throw error;
         }
         try {
           return JSON.parse(text);
@@ -59,6 +67,7 @@ export class BrainClient {
       } catch (e) {
         lastErr = e;
         if (e.name === "AbortError") lastErr = new Error(`timed out after ${this.timeoutMs}ms`);
+        if (e.retryable === false) throw e;
         if (attempt === this.retries) break;
         await sleep(400 * (attempt + 1));
       } finally {
@@ -66,6 +75,14 @@ export class BrainClient {
       }
     }
     throw lastErr;
+  }
+
+  async #get(path) {
+    return this.#request(path);
+  }
+
+  async #post(path, body) {
+    return this.#request(path, { method: "POST", body });
   }
 
   /**
@@ -76,38 +93,42 @@ export class BrainClient {
    * with different settings without it being obvious.
    */
   async retrieve(question, { limit = 10, rerank = false, graphBoost = false } = {}) {
-    const qs = new URLSearchParams({
+    const body = {
       q: question,
-      limit: String(limit),
-      rerank: rerank ? "1" : "0",
-      graph_boost: graphBoost ? "1" : "0",
-      // Bust the edge cache on every request.
-      //
-      // Both brains cache this endpoint for 120 seconds, keyed by URL. Without
-      // this, --repeat re-read ONE cached response N times and reported a noise
-      // floor of 0.0, which is what a cache looks like and not what the system
-      // does. Verified 2026-08-22: with the cache busted and the reranker on,
-      // 3 of 4 identical requests returned a different ranking. The reranker is
-      // an LLM and is not deterministic; the cache was hiding that completely.
-      _cb: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-    });
-    const body = await this.#get(`/api/rag/unified?${qs}`);
-    return Array.isArray(body?.results) ? body.results : [];
+      limit,
+      rerank: rerank ? 1 : 0,
+      graph_boost: graphBoost ? 1 : 0,
+    };
+    const response = await this.#post("/api/rag/unified", body);
+    return Array.isArray(response?.results) ? response.results : [];
   }
 
   /** Cited answer plus the gap list. Used only for the unanswerable questions. */
   async think(question, { limit = 8 } = {}) {
-    const qs = new URLSearchParams({
-      q: question,
-      limit: String(limit),
-      _cb: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-    });
-    return this.#get(`/api/rag/think?${qs}`);
+    return this.#post("/api/rag/think", { q: question, limit });
+  }
+
+  /** Authenticated corpus inventory used to make saved baselines reproducible. */
+  async documents() {
+    return this.#get(`/api/admin/brain/documents?_cb=${Date.now()}`);
   }
 
   async health() {
-    const res = await this.fetch(`${this.base}/health`, { headers: { "User-Agent": BROWSER_UA } });
-    return { status: res.status, ok: res.ok };
+    const res = await this.fetch(`${this.base}/health?_cb=${Date.now()}`, {
+      headers: { "User-Agent": BROWSER_UA },
+    });
+    let body = null;
+    try {
+      body = await res.json();
+    } catch {
+      // Reachability is still useful when an older Worker does not return JSON.
+    }
+    return {
+      status: res.status,
+      ok: res.ok,
+      version: body?.version ?? null,
+      brain: body?.brain ?? null,
+    };
   }
 }
 

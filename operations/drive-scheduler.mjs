@@ -2,7 +2,7 @@
 /**
  * Unattended Google Drive ingest for macOS.
  *
- * A LaunchAgent is machine-local product infrastructure, not a James-specific
+ * A LaunchAgent is machine-local product infrastructure, not an instance-specific
  * artifact. Its label and paths are derived from the client slug, while the
  * schedule comes from operations.ingest_cron in that client's manifest.
  *

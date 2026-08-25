@@ -5,7 +5,7 @@ Template. Fill every bracket before sending. Delivered at the end of the kickoff
 ---
 
 **To:** [CLIENT NAME]
-**From:** James Guldan, Align Growth LLC
+**From:** [IMPLEMENTATION OWNER / ORGANIZATION]
 **Date:** [DATE]
 **Subject:** Your brain is yours. Here is what was removed, what you own, and how to run it without me.
 
@@ -182,6 +182,6 @@ That was the point of building it this way.
 
 [SIGNATURE]
 
-James Guldan
-Align Growth LLC
-james@jamesguldan.com
+[IMPLEMENTATION OWNER]
+[IMPLEMENTATION ORGANIZATION]
+[SUPPORT EMAIL]

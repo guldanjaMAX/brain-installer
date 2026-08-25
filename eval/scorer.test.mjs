@@ -20,6 +20,9 @@ import {
   scoreRefusal,
   looksLikeRefusal,
   aggregate,
+  retrievalQuality,
+  aggregateQuality,
+  diagnoseRetrieval,
   findRegressions,
   findImprovements,
   rankOf,
@@ -89,6 +92,22 @@ test("a drive slot can be written as a path instead of a file id", () => {
   assert.equal(scoreQuestion(q, [drive("WHATEVER", "Career/Resume.pdf")]).satisfiedAt, 1);
 });
 
+test("a slot with no any_of references can match an exact document title", () => {
+  const q = { expect: [{ source: "drive", doc: "Career/Resume.pdf" }] };
+  assert.equal(scoreQuestion(q, [drive("WHATEVER", "Career/Resume.pdf")]).satisfiedAt, 1);
+  assert.equal(scoreQuestion(q, [drive("WHATEVER", "Career/Other.pdf")]).satisfiedAt, Infinity);
+});
+
+test("source-scoped matching rejects a same-title or same-key result from another source", () => {
+  const titleOnly = { expect: [{ source: "drive", doc: "Shared title" }] };
+  const stableKey = { expect: [{ doc: "Expected", any_of: ["curated:same-key"] }] };
+  assert.equal(
+    scoreQuestion(titleOnly, [{ source: "curated", title: "Shared title", ref_key: "x" }]).satisfiedAt,
+    Infinity,
+  );
+  assert.equal(scoreQuestion(stableKey, [{ source: "message", ref_key: "same-key" }]).satisfiedAt, Infinity);
+});
+
 test("a two document question is satisfied at the rank of the SECOND one", () => {
   const q = {
     expect: [
@@ -99,6 +118,51 @@ test("a two document question is satisfied at the rank of the SECOND one", () =>
   const s = scoreQuestion(q, [curated("a"), curated("x"), curated("b")]);
   assert.equal(s.satisfiedAt, 3, "half the evidence is not an answer");
   assert.deepEqual(s.slots.map((x) => x.rank), [1, 3]);
+});
+
+test("one broad result cannot satisfy two required evidence slots", () => {
+  const q = {
+    expect: [
+      { doc: "first", any_of: ["curated:shared", "curated:first-copy"] },
+      { doc: "second", any_of: ["curated:shared", "curated:second-copy"] },
+    ],
+  };
+  const oneResult = scoreQuestion(q, [curated("shared")]);
+  assert.equal(oneResult.satisfiedAt, Infinity);
+  assert.equal(oneResult.slots.filter((slot) => Number.isFinite(slot.rank)).length, 1);
+
+  const twoDocuments = scoreQuestion(q, [curated("shared"), curated("second-copy")]);
+  assert.equal(twoDocuments.satisfiedAt, 2);
+  assert.deepEqual(twoDocuments.slots.map((slot) => slot.rank), [1, 2]);
+});
+
+test("evidence assignment uses maximum matching instead of a greedy false miss", () => {
+  const q = {
+    expect: [
+      { doc: "broad", any_of: ["curated:a", "curated:b"] },
+      { doc: "narrow", any_of: ["curated:a"] },
+    ],
+  };
+  const scored = scoreQuestion(q, [curated("a"), curated("b")]);
+  assert.equal(scored.satisfiedAt, 2);
+  assert.deepEqual(scored.slots.map((slot) => slot.rank), [2, 1]);
+});
+
+test("shared_result_group is the explicit way for one document to satisfy several slots", () => {
+  const q = {
+    expect: [
+      { doc: "claim one", any_of: ["curated:shared"], shared_result_group: "same-policy" },
+      { doc: "claim two", any_of: ["curated:shared"], shared_result_group: "same-policy" },
+    ],
+  };
+  const scored = scoreQuestion(q, [curated("shared")]);
+  assert.equal(scored.satisfiedAt, 1);
+  assert.deepEqual(scored.slots.map((slot) => slot.rank), [1, 1]);
+  const quality = retrievalQuality(q, [curated("shared")], [1]);
+  assert.equal(quality[1].complete_evidence, true);
+  assert.equal(quality[1].slot_recall, 1);
+  assert.equal(quality[1].precision, 1);
+  assert.equal(quality[1].ndcg, 1, "a deliberately shared document is one ideal relevance unit");
 });
 
 test("a missing slot makes the whole question unsatisfied even if the other is rank 1", () => {
@@ -150,6 +214,47 @@ test("aggregating nothing yields zeros rather than dividing by zero", () => {
   assert.equal(a.recall[5], 0);
 });
 
+test("retrieval quality reports partial multi-evidence coverage and graded rank", () => {
+  const q = {
+    expect: [
+      { doc: "a", any_of: ["curated:a"], relevance_grade: 3 },
+      { doc: "b", any_of: ["curated:b"], relevance_grade: 2 },
+    ],
+  };
+  const quality = retrievalQuality(q, [curated("a"), curated("noise"), curated("a")], [1, 3]);
+  assert.equal(quality[1].slot_recall, 0.5);
+  assert.equal(quality[1].complete_evidence, false);
+  assert.equal(quality[1].precision, 1);
+  assert.equal(quality[3].slot_recall, 0.5);
+  assert.ok(Math.abs(quality[3].duplicate_waste - 1 / 3) < 1e-12);
+  assert.equal(quality[3].precision, 1 / 3, "repeat chunks of one source do not earn relevance twice");
+  assert.ok(quality[3].ndcg > 0 && quality[3].ndcg < 1);
+});
+
+test("quality aggregation keeps complete evidence separate from average slot recall", () => {
+  const summary = aggregateQuality([
+    { quality: { 5: { slot_recall: 1, complete_evidence: true, precision: 0.4, ndcg: 1, duplicate_waste: 0 } } },
+    { quality: { 5: { slot_recall: 0.5, complete_evidence: false, precision: 0.2, ndcg: 0.5, duplicate_waste: 0.4 } } },
+  ], 5);
+  assert.equal(summary.slot_recall, 0.75);
+  assert.equal(summary.complete_evidence, 0.5);
+  assert.ok(Math.abs(summary.precision - 0.3) < 1e-12);
+  assert.ok(Math.abs(summary.duplicate_waste - 0.2) < 1e-12);
+});
+
+test("a retrieval miss names observable and not-yet-observable stages honestly", () => {
+  const scored = scoreQuestion(
+    { expect: [{ doc: "expected", any_of: ["curated:expected"] }] },
+    [curated("other")],
+  );
+  const diagnosis = diagnoseRetrieval({}, scored, 5);
+  assert.equal(diagnosis.primary, "NOT_OBSERVABLE_AT_STAGE");
+  assert.equal(diagnosis.stage, "source_inventory");
+  assert.equal(diagnosis.missing[0].document, "expected");
+  assert.equal(diagnosis.missing[0].observed_rank, Infinity);
+  assert.equal(diagnosis.downstream[0].diagnosis, "RETRIEVAL_RANK_MISS");
+});
+
 /* ---------------------------------------------------------------- refusal */
 
 test("common ways of saying I do not know all register as refusals", () => {
@@ -170,6 +275,7 @@ test("a confident fabrication is not mistaken for a refusal", () => {
     "The parental leave policy provides twelve weeks at full pay [1].",
     "The Series A closed at a 40 million dollar post money valuation.",
     "We match 4 percent of employee contributions.",
+    "There is no doubt the fictional event happened on Tuesday.",
   ]) {
     assert.ok(!looksLikeRefusal(s), `should NOT be a refusal: ${s}`);
   }
@@ -185,6 +291,28 @@ test("gaps alone do not earn a pass, because the sentence is what a client reads
   const r = scoreRefusal({ answer: "The policy grants twelve weeks [1].", gaps: [{ type: "thin_coverage" }] });
   assert.equal(r.pass, false);
   assert.equal(r.gaps, 1);
+});
+
+test("refusal language cannot mask an affirmative claim", () => {
+  for (const answer of [
+    "The documents do not contain that policy, but employees receive twelve weeks of paid leave.",
+    "There is no record of the transaction. It closed for 40 million dollars on Tuesday.",
+    "I cannot determine the rate from the sources; the company match is definitely four percent.",
+    "The documents do not contain that policy and the benefit lasts twelve weeks.",
+    "There is no record of the transaction: it closed on Tuesday.",
+    "Nothing was found in the corpus — the payment was 40 million dollars.",
+  ]) {
+    assert.equal(looksLikeRefusal(answer), false, answer);
+    const scored = scoreRefusal({ answer, gaps: [{ type: "missing" }] });
+    assert.equal(scored.pass, false, answer);
+    assert.match(scored.detail, /affirmative claim/, answer);
+  }
+});
+
+test("a clean refusal may offer a bounded next step", () => {
+  const answer = "The documents do not contain that policy. If you share the agreement, I can check it.";
+  assert.equal(looksLikeRefusal(answer), true);
+  assert.equal(scoreRefusal({ answer, gaps: [] }).pass, true);
 });
 
 /* ------------------------------------------------------- baseline diffing */
@@ -223,6 +351,40 @@ test("an unanswerable question that starts answering is a regression", () => {
   const regs = findRegressions(current, baseline, 5);
   assert.equal(regs.length, 1);
   assert.equal(regs[0].to, "answered anyway");
+});
+
+test("skipping a previously passing unanswerable repeat is a regression", () => {
+  const baseline = {
+    questions: [{ id: "u1", repeat: 2, kind: "unanswerable", refusal: { pass: true } }],
+  };
+  const current = {
+    questions: [{
+      id: "u1", repeat: 2, kind: "unanswerable", question: "?", refusal: null,
+      skipped: "think probe disabled",
+    }],
+  };
+  const regressions = findRegressions(current, baseline, 5);
+  assert.equal(regressions.length, 1);
+  assert.equal(regressions[0].repeat, 2);
+  assert.equal(regressions[0].to, "not evaluated");
+});
+
+test("a regression in a later repeat is compared instead of being discarded", () => {
+  const baseline = {
+    questions: [
+      { id: "q1", repeat: 1, scorable: true, satisfiedAt: 1 },
+      { id: "q1", repeat: 2, scorable: true, satisfiedAt: 2 },
+    ],
+  };
+  const current = {
+    questions: [
+      { id: "q1", repeat: 1, question: "?", scorable: true, satisfiedAt: 1 },
+      { id: "q1", repeat: 2, question: "?", scorable: true, satisfiedAt: Infinity },
+    ],
+  };
+  const regressions = findRegressions(current, baseline, 5);
+  assert.equal(regressions.length, 1);
+  assert.equal(regressions[0].repeat, 2);
 });
 
 test("a new question with no baseline entry is not counted either way", () => {

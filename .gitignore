@@ -12,8 +12,12 @@ instances/*.manifest.json
 
 # Real evaluation sets and baselines contain client-sensitive questions and
 # facts. The package ships only the blank template; filled sets stay local.
-eval/golden/
+eval/golden/*
+!eval/golden/TEMPLATE.golden.json
 eval/baselines/
+# The shipped evaluator creates this beside each manifest. It contains the
+# owner's real questions, expected claims, and source identities.
+brain.golden.json
 
 # A real eval config names a real brain's hostname and how its admin key is
 # looked up. No secret value, but it is a targeting aid in a public repo, so the
@@ -28,6 +32,11 @@ eval/eval.config.local.json
 # machine-local operational state and must never become a tracked artifact.
 .brain-ingest-*.json
 .brain-ingest-*.json.tmp-*
+
+# Adjacent fallback admin-key files contain the Brain's live authentication
+# secret. Atomic writes briefly create the matching residue beside them.
+.brain-admin-key
+.brain-admin-key.tmp-*
 
 # Live Drive lifecycle receipts contain the private remote file id. The eight
 # character classes intentionally match only the harness's validated hex id.

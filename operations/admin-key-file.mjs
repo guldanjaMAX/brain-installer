@@ -40,6 +40,7 @@ const WINDOWS_RUNTIME_ENV = Object.freeze([
 ]);
 const WINDOWS_DPAPI_HELPER = fileURLToPath(new URL("./windows-dpapi.ps1", import.meta.url));
 const WINDOWS_DPAPI_BRIDGE = fileURLToPath(new URL("./windows-dpapi-bridge.mjs", import.meta.url));
+const WINDOWS_DPAPI_SOURCE = fileURLToPath(new URL("./windows-dpapi.cs", import.meta.url));
 
 function lstatIfPresent(path) {
   try {
@@ -201,13 +202,13 @@ function windowsPowerShellRuntime(environment = process.env) {
     // A real Windows process should always have SystemRoot; refusing to inherit
     // PATH here is safer than forwarding a possibly secret-bearing environment.
     if (process.platform === "win32") {
-      throw new Error("Windows could not locate its system PowerShell executable");
+      throw new Error("Windows could not locate its system runtime directory");
     }
     return { command: "powershell.exe", env: {} };
   }
   const env = { SystemRoot: systemRoot };
   // DPAPI CurrentUser depends on the loaded Windows profile. Keep only the
-  // profile/runtime locators PowerShell and DPAPI need, never the caller's
+  // profile/runtime locators the Windows helpers and DPAPI need, never the caller's
   // credential-bearing environment.
   for (const name of WINDOWS_RUNTIME_ENV) {
     if (typeof environment[name] === "string" && environment[name]) env[name] = environment[name];
@@ -232,17 +233,16 @@ function runWindowsDpapi(input, options, operation, secretForMetadataCheck = nul
     "-Operation", operation,
     "-ExpectedLength", String(input.length),
   ];
-  // Node's synchronous Windows child path can leave PowerShell's stdin unread.
-  // Tests inject the PowerShell runner directly; production uses a fixed Node
-  // bridge whose asynchronous pipe reliably closes stdin after the exact bytes.
+  // Tests inject the legacy PowerShell runner directly. Production asks a
+  // fixed Node bridge to compile the fixed C# helper before it reads any secret,
+  // then uses an ordinary asynchronous pipe for the exact bytes.
   const runner = options.runPowerShell ?? spawnSync;
   const runnerCommand = options.runPowerShell ? command : process.execPath;
   const runnerArgs = options.runPowerShell
     ? powerShellArgs
     : [
         WINDOWS_DPAPI_BRIDGE,
-        "--powershell", command,
-        "--helper", WINDOWS_DPAPI_HELPER,
+        "--source", WINDOWS_DPAPI_SOURCE,
         "--operation", operation,
         "--length", String(input.length),
         "--max", String(MAX_ADMIN_KEY_FILE_BYTES),
@@ -251,7 +251,7 @@ function runWindowsDpapi(input, options, operation, secretForMetadataCheck = nul
     const metadata = [runnerCommand, ...runnerArgs, ...Object.entries(env).flat()].join("\0");
     const encodedSecret = Buffer.from(secretForMetadataCheck, "utf8").toString("base64");
     if (metadata.includes(secretForMetadataCheck) || metadata.includes(encodedSecret)) {
-      throw new Error("Windows refused to expose the admin key in PowerShell process metadata");
+      throw new Error("Windows refused to expose the admin key in DPAPI process metadata");
     }
   }
   const result = runner(runnerCommand, runnerArgs, {

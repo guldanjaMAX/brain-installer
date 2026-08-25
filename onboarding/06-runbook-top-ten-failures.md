@@ -377,7 +377,7 @@ node brain.mjs migrate <manifest>
 ```
 fail  upgrade failed: <reason>
       A restore point was captured BEFORE any change:
-        node brain.mjs rollback <manifest> <bookmark>
+        D1 recovery bookmark: <bookmark>
 ```
 
 **Why:** anything can fail mid-update. What matters is what the system did about it. A snapshot was taken **before** anything was touched, the failure was recorded, and **the recorded version was not advanced**, so your install correctly still reports the version it is actually running rather than the one it tried to become.
@@ -398,13 +398,22 @@ That prints your current version and the recent update history, including the fa
 node brain.mjs upgrade <manifest>
 ```
 
-3. **Only if step 2 cannot work**, restore the snapshot:
+3. **Only if step 2 cannot work**, preview the snapshot restore:
 
 ```
 node brain.mjs rollback <manifest> <bookmark>
 ```
 
-**Restoring is destructive and irreversible.** Everything written since that snapshot is lost. It is deliberately not automatic, because doing it unattended against your only copy trades a broken update for possible data loss. Prefer fixing forward. Use the snapshot when fixing forward is not available.
+The preview changes nothing and names the exact D1 database and bookmark. It also
+warns that Vectorize is not restored and must be rebuilt. If that reviewed
+target is correct, perform the restore explicitly:
+
+```
+node brain.mjs rollback <manifest> <bookmark> --yes
+node brain.mjs reindex <manifest> --yes
+```
+
+**Restoring is destructive and irreversible.** Everything written since that snapshot is lost. It is deliberately not automatic, because doing it unattended against your only copy trades a broken update for possible data loss. Prefer fixing forward. Use the snapshot when fixing forward is not available, and do not return the brain to use until the reindex completes.
 
 **Who:** me, during the engagement. After handoff, the commands above are complete and the snapshot ID is printed at the time of failure. Keep it.
 

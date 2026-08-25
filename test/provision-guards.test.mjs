@@ -13,11 +13,16 @@ import {
   resolveAdminKey, recordAcceptedDocumentState, addLocalPathAliases, recordLocalSkippedDocumentState,
   ensureCredentialScannerProgress, recordCredentialScannerProgress, hasCredentialScannerProgress,
   commitCredentialScannerProgress,
+  VALUE_FLAGS,
 } from "../brain.mjs";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 200))); if (!c) fail++; };
 const throws = async (fn) => { try { await fn(); return null; } catch (e) { return e.message || String(e); } };
+
+for (const flag of ["golden", "k", "repeat", "baseline", "save", "artifacts"]) {
+  check(`eval value flag --${flag} cannot silently become boolean true`, VALUE_FLAGS.has(flag));
+}
 
 {
   const priorAdminKey = process.env.ADMIN_KEY;
@@ -103,6 +108,15 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   const refusal = credentialRefusalOf(logicalEnvelope, true);
   check("credential refusal scans the complete logical document before size splitting",
     refusal?.labels?.includes("openai_api_key") && !refusal.reason.includes(boundarySecret), JSON.stringify(refusal));
+  const titleRefusal = credentialRefusalOf({ content: "ordinary prose", title: `Credentials ${boundarySecret}` }, true);
+  check("client preflight scans embedded document titles",
+    titleRefusal?.labels?.includes("openai_api_key") && !titleRefusal.reason.includes(boundarySecret), JSON.stringify(titleRefusal));
+  const pathRefusal = credentialRefusalOf({
+    content: "ordinary prose",
+    metadata: { folder: `Imports/${boundarySecret}/Notes` },
+  }, true);
+  check("client preflight scans connector path metadata",
+    pathRefusal?.labels?.includes("openai_api_key") && !pathRefusal.reason.includes(boundarySecret), JSON.stringify(pathRefusal));
 
   const plans = [
     { stateKey: "drive:a", expectedParts: 2 },
@@ -510,7 +524,7 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     return src.slice(i, nxt === -1 ? src.length : nxt);
   };
 
-  for (const name of ["cmdEval", "cmdDiagnose", "cmdDrain", "cmdReindex", "cmdHealth", "cmdIngestRemote"]) {
+  for (const name of ["cmdEval", "cmdDiagnose", "cmdDrain", "cmdReindex", "cmdHealth", "cmdIngest", "cmdIngestRemote"]) {
     const b = bodyOf(name);
     check(`${name} exists`, b !== null);
     if (!b) continue;
@@ -520,6 +534,10 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     check(`${name} resolves the account only as a fallback`,
       /m\.brain\?\.domain \? null : await resolveAccount\(m\)/.test(b));
   }
+  const evalCommand = bodyOf("cmdEval");
+  check("brain eval forwards graph-boost to the shipped evaluator",
+    /\["rerank", "graph-boost", "no-think", "json"\]/.test(evalCommand || ""),
+    String(evalCommand).slice(-900));
   const health = bodyOf("cmdHealth");
   check("domain-based health never dereferences a deliberately absent Cloudflare account",
     /const sub = acct\s*\? await cf/.test(health || ""), String(health).slice(0, 900));

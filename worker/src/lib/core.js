@@ -1,7 +1,7 @@
 // core.js — HTTP helpers, auth, and the LLM call with its spend cap.
 //
 // Extracted from a single-tenant worker and genericized. Every
-// James-specific value is now read from env.
+// Instance-specific values are now read from env.
 
 /* ---------------------------------------------------------------- http */
 
@@ -10,47 +10,6 @@ export function jsonResponse(data, status = 200) {
     status,
     headers: { "Content-Type": "application/json" },
   });
-}
-
-/**
- * Edge-cache a JSON producer.
- *
- * This is load-bearing for cost, not a nicety: the retrieval RPC scans the
- * whole corpus and runs several seconds cold, so an uncached duplicate query
- * is a real bill. `?nocache` bypasses.
- */
-export async function cachedJson(request, env, ctx, ttlSeconds, producer) {
-  const url = new URL(request.url);
-  if (url.searchParams.has("nocache")) return producer();
-  if (!ctx || typeof caches === "undefined" || !caches.default) return producer();
-
-  const cacheKey = new Request(url.toString(), { method: "GET" });
-  const cache = caches.default;
-  try {
-    const hit = await cache.match(cacheKey);
-    if (hit) {
-      const h = new Headers(hit.headers);
-      h.set("x-cache", "HIT");
-      return new Response(hit.body, { status: hit.status, headers: h });
-    }
-  } catch {
-    /* cache miss is not an error */
-  }
-  const fresh = await producer();
-  if (fresh && fresh.status >= 200 && fresh.status < 300) {
-    try {
-      const cloned = fresh.clone();
-      const h = new Headers(cloned.headers);
-      h.set("Cache-Control", `public, max-age=${ttlSeconds}`);
-      h.set("x-cache", "MISS");
-      const cacheable = new Response(cloned.body, { status: cloned.status, headers: h });
-      ctx.waitUntil(cache.put(cacheKey, cacheable.clone()));
-      return cacheable;
-    } catch {
-      /* fall through to uncached */
-    }
-  }
-  return fresh;
 }
 
 /* ---------------------------------------------------------------- auth */

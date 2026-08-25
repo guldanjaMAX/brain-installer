@@ -471,6 +471,7 @@ const reply = (status, body) => ({
   json: async () => body,
 });
 
+const privateQueryCalls = [];
 const fetchStub = async (url, init = {}) => {
   const u = new URL(url);
   const key = (init.headers || {})["X-Admin-Key"];
@@ -479,11 +480,20 @@ const fetchStub = async (url, init = {}) => {
   if (u.pathname === "/health") return reply(200, { ok: true, version: "0.2.0" });
   if (!authed) return reply(401, { error: "unauthorized" });
   if (u.pathname === "/api/admin/brain/documents") return reply(200, cleanCorpus);
-  if (u.pathname === "/api/admin/brain/ingest") return reply(422, { error: "refused: cloudflare_token" });
-  if (u.pathname === "/api/rag/unified") return reply(200, { results: [{ title: "a doc", ts: "2026-07-01T00:00:00Z", source: "drive" }] });
+  if (u.pathname === "/api/admin/brain/ingest") {
+    return reply(422, {
+      error: "refused: content carries live credential(s)",
+      labels: ["cloudflare_token_new", "env_assignment"],
+      detail: "Rotate them, strip them from the source, then re-ingest. Nothing was written.",
+    });
+  }
+  if (u.pathname === "/api/rag/unified") {
+    privateQueryCalls.push({ url: u, init, body: JSON.parse(init.body || "{}") });
+    return reply(200, { results: [{ title: "a doc", ts: "2026-07-01T00:00:00Z", source: "drive" }] });
+  }
   if (u.pathname === "/api/rag/think") {
+    privateQueryCalls.push({ url: u, init, body: JSON.parse(init.body || "{}") });
     return reply(200, {
-      query: u.searchParams.get("q"),
       answer: "They were let go after two missed windows [1].",
       gaps: [{ type: "thin_coverage", detail: "Only 2 sources matched." }],
       citations: [{ n: 1, title: "Vendor review call", source: "meeting", ref: "m/1", ts: "2026-03-04T00:00:00Z" }],
@@ -506,6 +516,10 @@ check("collect reports the suite as passing on a healthy stub", collected.accept
   JSON.stringify(collected.acceptance.counts));
 check("collect asks every probe question", collected.seedAnswers.length === 2);
 check("collect asks the predicted misses too", collected.expectedToFail.length === 1);
+check("report and acceptance questions use private JSON POST bodies",
+  privateQueryCalls.length > 0 && privateQueryCalls.every((call) =>
+    call.init.method === "POST" && call.url.search === "" && typeof call.body.q === "string"),
+  JSON.stringify(privateQueryCalls.map((call) => ({ method: call.init.method, search: call.url.search, body: call.body }))));
 check("collect normalises a trailing slash on the base", collected.base === "https://brain.acme.com");
 check("collect keeps citations from think", collected.seedAnswers[0].citations.length === 1);
 

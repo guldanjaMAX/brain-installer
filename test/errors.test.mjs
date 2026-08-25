@@ -137,8 +137,8 @@ function ingestExitCli(scenario) {
     BRAIN_INGEST_EXIT_TEST: scenario,
     BRAIN_INGEST_EXIT_USER_ROOT: userRoot,
     ADMIN_KEY: "fixture-admin",
-    CLOUDFLARE_API_TOKEN: "fixture-cloudflare",
   };
+  delete env.CLOUDFLARE_API_TOKEN;
   delete env.BRAIN_DEBUG;
   const args = scenario.startsWith("drive")
     ? ["ingest", manifest, "--from", "drive"]

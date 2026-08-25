@@ -7,7 +7,7 @@ import { relative, sep } from "node:path";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 200))); if (!c) fail++; };
 
-/* ---- Jay's blocker 1: vector ids must fit, always ---- */
+/* ---- field blocker 1: vector ids must fit, always ---- */
 {
   const short = "meeting:123#0";
   check("a short id is passed through unchanged", (await vectorIdFor(short)) === short);
@@ -20,7 +20,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("hashing is stable across runs", (await vectorIdFor(real)) === id);
   check("different chunks get different ids", (await vectorIdFor(real)) !== (await vectorIdFor(real.replace("#12", "#13"))));
 
-  // The exact case Jay hit: 67 bytes, just over.
+  // The exact field case was 67 bytes, just over.
   const border = "drive:" + "x".repeat(58) + "#1";
   check("a just-over-the-line id is hashed, not sent raw",
     new TextEncoder().encode(await vectorIdFor(border)).length <= VECTOR_ID_MAX_BYTES);
@@ -73,7 +73,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("the bad one records an attempt so it is bounded, not invisible", updates.includes("poison#0"), JSON.stringify(updates));
 }
 
-/* ---- Jay's blocker 2: module specifiers are URLs, not paths ---- */
+/* ---- field blocker 2: module specifiers are URLs, not paths ---- */
 {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../brain.mjs", import.meta.url), "utf-8");
@@ -85,7 +85,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 }
 
 /* ---- the credential gate was wrong in BOTH directions ----
-   Found when Jay quoted a line of our own source in his bug report and the
+   Found when a field report quoted a line of our own source and the
    scanner refused the report. Worse than the false positive: it ACCEPTED a real
    hex admin key, because a bare hex value is allowlisted as a probable git SHA
    unless the surrounding text is recognised as secret context, and the list did
@@ -122,7 +122,8 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../brain.mjs", import.meta.url), "utf-8");
   const body = src.slice(src.indexOf("async function cmdIngest(manifestPath)"));
-  check("dry-run skips account resolution", /const acct = dry \? null : await resolveAccount/.test(body));
+  check("dry-run and a saved domain skip account resolution",
+    /const acct = dry \? null : m\.brain\?\.domain \? null : await resolveAccount/.test(body));
   check("dry-run skips the admin key", /const adminKey = dry \? null : resolveAdminKey/.test(body));
 }
 
@@ -166,5 +167,5 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("the drain still reports success", r.drained === 1, JSON.stringify(r));
 }
 
-console.log(fail ? `\n${fail} FAILURES` : `\njay-field-test: all ${ran} tests passed`);
+console.log(fail ? `\n${fail} FAILURES` : `\nfield-rehearsal: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);

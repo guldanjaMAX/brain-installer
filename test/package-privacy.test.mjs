@@ -1,8 +1,17 @@
 import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const packageJson = JSON.parse(readFileSync(resolve(ROOT, "package.json"), "utf8"));
+const lock = JSON.parse(readFileSync(resolve(ROOT, "package-lock.json"), "utf8"));
+const reviewedBundles = new Map([
+  ["@e965/xlsx", "0.20.3"],
+  ["fflate", "0.8.3"],
+  ["postal-mime", "3.0.0"],
+  ["unpdf", "1.8.1"],
+]);
 const packed = spawnSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
   cwd: ROOT,
   encoding: "utf-8",
@@ -25,23 +34,125 @@ const forbidden = files.filter((path) =>
   (/^eval\/golden\//i.test(path) && path !== "eval/golden/TEMPLATE.golden.json") ||
   /james|readiness|\.brain-(?:migration|ingest|drive-live-fixture)|brain-support-|support-bundle/i.test(path)
 );
-const required = [
+// Exact package inventory. package.json must use directory entries for npm's
+// packer, but this test is the real allowlist: adding any file under one of
+// those directories fails until a reviewer names it here deliberately.
+const expected = [
+  "CHANGELOG.md",
+  "README.md",
+  "acceptance.mjs",
   "brain.mjs",
   "components/brain-mcp.mjs",
   "components/brain-mcp-runtime.mjs",
+  "connectors/gmail.mjs",
   "connectors/google-auth.mjs",
+  "connectors/google-calendar.mjs",
+  "connectors/google-drive.mjs",
+  "connectors/keychain-write.exp",
+  "docs/ARCHITECTURE.md",
+  "docs/COMPETITIVE-BENCHMARK.md",
+  "docs/EVALUATION.md",
+  "docs/README-developer.md",
+  "doctor.mjs",
+  "eval/brain-client.mjs",
+  "eval/eval.config.json",
+  "eval/golden/TEMPLATE.golden.json",
+  "eval/run.mjs",
+  "eval/schema/corpus-contract-v1.schema.json",
+  "eval/schema/eval-suite-v2.schema.json",
+  "eval/schema/gate-policy-v1.schema.json",
+  "eval/schema/run-artifact-v2.schema.json",
+  "eval/scorer.mjs",
+  "ingest/doc-date.mjs",
+  "ingest/extract.mjs",
+  "ingest/formats.mjs",
+  "ingest/message-session.mjs",
+  "ingest/pdf-child.mjs",
+  "ingest/quality.mjs",
+  "ingest/run.mjs",
   "manifest.schema.json",
+  "migrations/d1/0001_install_state.sql",
+  "migrations/d1/0002_llm_call_log.sql",
+  "migrations/d1/0003_sources.sql",
+  "migrations/d1/0004_corpus.sql",
+  "migrations/d1/0005_vector_id.sql",
+  "migrations/d1/0006_freshness.sql",
+  "migrations/d1/0007_filter_metadata.sql",
+  "migrations/d1/0008_vector_delete_outbox.sql",
+  "onboarding/01-intake-RUNBOOK.md",
+  "onboarding/01-intake-questionnaire.md",
+  "onboarding/02-client-effort-and-timeline.md",
+  "onboarding/03-kickoff-and-checkins.md",
+  "onboarding/04-what-it-can-and-cannot-answer.md",
+  "onboarding/05-handoff-and-revocation.md",
+  "onboarding/06-runbook-top-ten-failures.md",
+  "onboarding/07-ingest-source-matrix.md",
+  "onboarding/08-provisioning-prerequisites.md",
   "operations/admin-key-file.mjs",
   "operations/admin-key-persistence.mjs",
   "operations/drive-scheduler.mjs",
+  "operations/windows-dpapi.ps1",
+  "operations/windows-dpapi-bridge.mjs",
+  "operations/windows-dpapi.cs",
+  "package.json",
+  "report-html.mjs",
+  "report.mjs",
   "support-journal.mjs",
   "templates/brain.manifest.json",
-  "connectors/keychain-write.exp",
-  "docs/README-developer.md",
+  "worker/src/index.js",
+  "worker/src/lib/core.js",
+  "worker/src/lib/secret-scan.js",
+  "worker/src/lib/store-d1.js",
+  "worker/src/lib/store.js",
+  "worker/src/lib/supabase.js",
 ];
-const missing = required.filter((path) => !files.includes(path));
+const allowed = new Set(expected);
+const missing = expected.filter((path) => !files.includes(path));
+const bundledPathAllowed = (path) => [...reviewedBundles.keys()].some(
+  (name) => path.startsWith(`node_modules/${name}/`),
+);
+const unexpected = files.filter((path) => !allowed.has(path) && !bundledPathAllowed(path));
+const bundledConfig = Array.isArray(packageJson.bundleDependencies)
+  ? [...packageJson.bundleDependencies].sort()
+  : [];
+const expectedBundles = [...reviewedBundles.keys()].sort();
+const bundleConfigMismatch = JSON.stringify(bundledConfig) !== JSON.stringify(expectedBundles);
+const dependencyMismatch = [...reviewedBundles].filter(([name, version]) =>
+  packageJson.dependencies?.[name] !== version ||
+  lock.packages?.[`node_modules/${name}`]?.version !== version ||
+  !files.includes(`node_modules/${name}/package.json`)
+);
+const requiredGitIgnored = [
+  ".brain-admin-key",
+  ".brain-admin-key.tmp-deadbeef",
+];
+const gitIgnoreFailures = requiredGitIgnored.filter((path) =>
+  spawnSync("git", ["check-ignore", "--quiet", "--no-index", path], {
+    cwd: ROOT,
+    encoding: "utf-8",
+  }).status !== 0
+);
+// These are source-instance identities, not product concepts. Scan only the
+// package's own reviewed files so a bundled dependency cannot create noise.
+// Report the file and rule, never the matched text itself.
+const privateIdentityRules = [
+  ["owner first name", /\bJames(?:'s)?\b/i],
+  ["owner surname", /\bGuldan(?:'s)?\b/i],
+  ["owner organization", /\bAlign Growth(?: LLC)?\b/i],
+  ["owner organization short name", /\bAlign\b/],
+  ["owner email", /\bjames@jamesguldan\.com\b/i],
+  ["collaborator first name", /\bJay(?:'s)?\b/i],
+  ["collaborator surname", /\bBhakta(?:'s)?\b/i],
+];
+const privateTextMatches = expected.flatMap((path) => {
+  const text = readFileSync(resolve(ROOT, path), "utf8");
+  return privateIdentityRules
+    .filter(([, pattern]) => pattern.test(text))
+    .map(([label]) => `${path} (${label})`);
+});
 
-if (packed.status !== 0 || !files.length || forbidden.length || missing.length) {
+if (packed.status !== 0 || !files.length || forbidden.length || missing.length || unexpected.length ||
+    bundleConfigMismatch || dependencyMismatch.length || gitIgnoreFailures.length || privateTextMatches.length) {
   console.error("FAIL  published package privacy allowlist");
   if (packed.status !== 0) {
     console.error(
@@ -51,6 +162,17 @@ if (packed.status !== 0 || !files.length || forbidden.length || missing.length) 
   if (!files.length) console.error("npm returned no packlist");
   if (forbidden.length) console.error(`private paths would ship: ${forbidden.join(", ")}`);
   if (missing.length) console.error(`required product paths are missing: ${missing.join(", ")}`);
+  if (unexpected.length) console.error(`unreviewed package files would ship: ${unexpected.join(", ")}`);
+  if (bundleConfigMismatch) console.error("bundleDependencies does not match the reviewed dependency set");
+  if (dependencyMismatch.length) {
+    console.error(`bundled dependency version or package mismatch: ${dependencyMismatch.map(([name]) => name).join(", ")}`);
+  }
+  if (gitIgnoreFailures.length) {
+    console.error(`private admin-key paths are not ignored by Git: ${gitIgnoreFailures.join(", ")}`);
+  }
+  if (privateTextMatches.length) {
+    console.error(`source-instance identity appears in packaged product text: ${privateTextMatches.join(", ")}`);
+  }
   process.exit(1);
 }
 

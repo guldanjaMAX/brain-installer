@@ -3,7 +3,7 @@
  *
  * The product backend is "d1", which keeps the entire brain inside the single
  * Cloudflare account the client already owns. The Supabase adapter remains only
- * as a migration source, comparison path and temporary rollback while James's
+ * as a migration source, comparison path and temporary rollback while an
  * existing corpus is moved onto the same architecture every client installs.
  *
  * The point of this file is that index.js should never know which. Every
@@ -41,7 +41,7 @@ export function backendOf(env) {
 
 // Keep the body below the embedding model's effective 512-token window even
 // after the title header is added. The previous 2000/500 geometry made 93% of
-// James's first real D1 corpus long enough to be truncated before embedding.
+// The first large field D1 corpus was long enough to be truncated before embedding.
 export const CHUNK_SIZE = 1500;
 export const CHUNK_OVERLAP = 300;
 

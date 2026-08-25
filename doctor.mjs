@@ -243,8 +243,8 @@ export function checkWranglerLogin(accountId) {
   );
 }
 
-export async function checkVectorizeApi(accountId) {
-  const token = process.env.CLOUDFLARE_API_TOKEN;
+export async function checkVectorizeApi(accountId, cloudflareToken = process.env.CLOUDFLARE_API_TOKEN) {
+  const token = cloudflareToken;
   if (!token) {
     return check("Vectorize", WARN, "not checked: Cloudflare token is missing", "Set CLOUDFLARE_API_TOKEN and re-run.");
   }
@@ -387,8 +387,8 @@ export function checkGoogleConnection(storageStatus) {
  * The scoped API token drives every Cloudflare step. Wrangler login is only a
  * fallback for an older or incorrectly scoped token.
  */
-export function checkCfToken() {
-  if (process.env.CLOUDFLARE_API_TOKEN) return check("Cloudflare token", OK, "present in the environment");
+export function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_TOKEN) {
+  if (cloudflareToken) return check("Cloudflare token", OK, "available for this command");
   return check(
     "Cloudflare token",
     FAIL,
@@ -396,7 +396,7 @@ export function checkCfToken() {
     "Create one in the CLIENT's account: dash.cloudflare.com > My Profile > API Tokens.\n" +
       `  Scopes: ${CF_TOKEN_SCOPES.join(", ")}.
 ` +
-      "  Set \'Expires on\' to 7 days. Nothing here needs to outlive the install.\n" +
+      "  Set \'Expires on\' to tomorrow. Nothing here needs to outlive the install.\n" +
       "  Then: export CLOUDFLARE_API_TOKEN=\'...\'\n" +
       VECTORIZE_REMEDY
   );
@@ -422,7 +422,7 @@ export async function checkNetwork() {
 }
 
 /** Every check, in the order a person should fix them. */
-export async function runAll({ accountId, onResult, googleStorageStatus } = {}) {
+export async function runAll({ accountId, onResult, googleStorageStatus, cloudflareToken } = {}) {
   const out = [];
   // Each result is handed to the caller the moment it exists, so a slow check
   // shows the ones before it rather than holding the whole report hostage.
@@ -433,8 +433,8 @@ export async function runAll({ accountId, onResult, googleStorageStatus } = {}) 
   };
   push(checkNode());
   push(await checkNetwork());
-  out.push(checkCfToken());
-  out.push(await checkVectorizeApi(accountId));
+  out.push(checkCfToken(cloudflareToken));
+  out.push(await checkVectorizeApi(accountId, cloudflareToken));
   out.push(checkAnthropicKey());
   out.push(checkClaudeCode());
   out.push(checkCodex());

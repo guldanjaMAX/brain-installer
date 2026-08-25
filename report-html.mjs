@@ -5,7 +5,7 @@
  *
  * This is four things at once, which is why it gets the care it gets.
  *
- *   As a GATE it is what James reads at T-2 before anything ships. Not the
+ *   As a GATE it is what the operator reads at T-2 before anything ships. Not the
  *   pass/fail line: the actual answers to the client's actual questions.
  *   A green suite over answers nobody read is a green suite over nothing.
  *
@@ -1028,10 +1028,11 @@ export async function collectReportData({
 
   const askOne = async (question) => {
     try {
-      const res = await fetchImpl(
-        `${root}/api/rag/think?q=${encodeURIComponent(question)}&limit=${answerLimit}`,
-        { headers: { "X-Admin-Key": adminKey } }
-      );
+      const res = await fetchImpl(`${root}/api/rag/think`, {
+        method: "POST",
+        headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+        body: JSON.stringify({ q: question, limit: answerLimit }),
+      });
       const text = await res.text();
       let json = null;
       try {

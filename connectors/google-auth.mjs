@@ -324,6 +324,7 @@ const MAX_TOKEN_STORE_BYTES = 2 * 1024 * 1024;
 const MAX_DPAPI_OUTPUT_BYTES = MAX_TOKEN_STORE_BYTES + 64 * 1024;
 const WINDOWS_DPAPI_HELPER = fileURLToPath(new URL("../operations/windows-dpapi.ps1", import.meta.url));
 const WINDOWS_DPAPI_BRIDGE = fileURLToPath(new URL("../operations/windows-dpapi-bridge.mjs", import.meta.url));
+const WINDOWS_DPAPI_SOURCE = fileURLToPath(new URL("../operations/windows-dpapi.cs", import.meta.url));
 
 function lstatIfPresent(path) {
   try {
@@ -406,7 +407,7 @@ function windowsRuntime(options) {
   const env = googleAuthChildEnvironment(environment, { platform: "win32" });
   const systemRoot = env.SystemRoot;
   if (!systemRoot && process.platform === "win32" && !options.runPowerShell) {
-    throw new Error("Windows could not locate its system PowerShell executable");
+    throw new Error("Windows could not locate its system runtime directory");
   }
   return {
     command: options.powerShellPath || (systemRoot
@@ -428,16 +429,15 @@ function runWindowsDpapi(input, options, operation) {
     "-ExpectedLength", String(input.length),
   ];
   // Keep the injected direct runner for deterministic tests. Production uses
-  // the fixed Node bridge because spawnSync -> PowerShell can leave stdin
-  // unread on Windows; the bridge writes the same bytes through an async pipe.
+  // a fixed Node bridge that compiles a fixed C# helper before reading any
+  // secret, then writes the same bytes through an asynchronous pipe.
   const runner = options.runPowerShell || spawnSync;
   const runnerCommand = options.runPowerShell ? command : process.execPath;
   const runnerArgs = options.runPowerShell
     ? powerShellArgs
     : [
         WINDOWS_DPAPI_BRIDGE,
-        "--powershell", command,
-        "--helper", WINDOWS_DPAPI_HELPER,
+        "--source", WINDOWS_DPAPI_SOURCE,
         "--operation", operation,
         "--length", String(input.length),
         "--max", String(MAX_DPAPI_OUTPUT_BYTES),

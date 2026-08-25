@@ -37,12 +37,47 @@ const FAIL = "fail";
 const WARN = "warn";
 const SKIP = "skip";
 
+const CREDENTIAL_GATE_ERROR = "refused: content carries live credential(s)";
+const CREDENTIAL_GATE_DETAIL =
+  "Rotate them, strip them from the source, then re-ingest. Nothing was written.";
+
+/**
+ * Accept only the credential scanner's production refusal contract.
+ *
+ * A bare 422 can be a validation error, and a response that merely contains
+ * the word "refused" can come from a proxy or an unrelated guard. Neither is
+ * proof that credential-shaped content was recognized before storage.
+ */
+export function credentialGateRefusalVerdict({ status, text }) {
+  if (status !== 422) return { accepted: false, reason: `expected HTTP 422, received ${status}` };
+  let payload;
+  try {
+    payload = JSON.parse(String(text || ""));
+  } catch {
+    return { accepted: false, reason: "HTTP 422 did not carry JSON" };
+  }
+  if (!payload || Array.isArray(payload) || typeof payload !== "object") {
+    return { accepted: false, reason: "HTTP 422 did not carry an error object" };
+  }
+  if (payload.error !== CREDENTIAL_GATE_ERROR) {
+    return { accepted: false, reason: "HTTP 422 was not the credential-gate error" };
+  }
+  if (!Array.isArray(payload.labels) || !payload.labels.includes("cloudflare_token_new")) {
+    return { accepted: false, reason: "credential-gate response did not name the canary provider" };
+  }
+  if (payload.detail !== CREDENTIAL_GATE_DETAIL) {
+    return { accepted: false, reason: "credential-gate response did not confirm that nothing was written" };
+  }
+  return { accepted: true, reason: "structured credential refusal confirmed" };
+}
+
 export class Acceptance {
-  constructor({ base, adminKey, manifest, fetchImpl = fetch }) {
+  constructor({ base, adminKey, manifest, expectVersion = null, fetchImpl = fetch }) {
     this.base = String(base).replace(/\/+$/, "");
     this.key = adminKey;
     this.m = manifest || {};
     this.fetch = fetchImpl;
+    this.expectVersion = expectVersion;
     this.results = [];
     this.tierFailed = null;
   }
@@ -53,9 +88,14 @@ export class Acceptance {
     return status;
   }
 
-  async get(path, { auth = true } = {}) {
+  async request(path, { auth = true, method = "GET", body } = {}) {
     const res = await this.fetch(this.base + path, {
-      headers: auth ? { "X-Admin-Key": this.key } : {},
+      method,
+      headers: {
+        ...(auth ? { "X-Admin-Key": this.key } : {}),
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
     });
     const text = await res.text();
     let json = null;
@@ -67,6 +107,14 @@ export class Acceptance {
     return { status: res.status, ok: res.ok, json, text };
   }
 
+  async get(path, options = {}) {
+    return this.request(path, options);
+  }
+
+  async post(path, body, options = {}) {
+    return this.request(path, { ...options, method: "POST", body });
+  }
+
   /* ------------------------------------------------------- tier 1: reach */
 
   async tierReach() {
@@ -74,7 +122,16 @@ export class Acceptance {
     try {
       const h = await this.get("/health", { auth: false });
       if (!h.ok) return this.record(t, "health responds", FAIL, `HTTP ${h.status}`);
-      this.record(t, "health responds", PASS, `version ${h.json?.version ?? "?"}`);
+      const observedVersion = h.json?.version ?? null;
+      if (this.expectVersion && observedVersion !== this.expectVersion) {
+        return this.record(
+          t,
+          "health responds",
+          FAIL,
+          `expected version ${this.expectVersion}, received ${observedVersion || "none"}`,
+        );
+      }
+      this.record(t, "health responds", PASS, `version ${observedVersion ?? "?"}`);
     } catch (e) {
       return this.record(t, "health responds", FAIL, e.message);
     }
@@ -82,7 +139,7 @@ export class Acceptance {
     // Auth must actually be enforced. An install that answers without a key is
     // a public copy of the client's private records, which is the single worst
     // outcome this system can produce.
-    const noKey = await this.get("/api/rag/unified?q=test", { auth: false });
+    const noKey = await this.post("/api/rag/unified", { q: "test" }, { auth: false });
     this.record(
       t,
       "unauthenticated request is refused",
@@ -90,8 +147,10 @@ export class Acceptance {
       `HTTP ${noKey.status}${noKey.status !== 401 ? " — THE BRAIN IS ANSWERING WITHOUT A KEY" : ""}`
     );
 
-    const badKey = await this.fetch(`${this.base}/api/rag/unified?q=test`, {
-      headers: { "X-Admin-Key": "definitely-not-the-key" },
+    const badKey = await this.fetch(`${this.base}/api/rag/unified`, {
+      method: "POST",
+      headers: { "X-Admin-Key": "definitely-not-the-key", "Content-Type": "application/json" },
+      body: JSON.stringify({ q: "test" }),
     });
     this.record(
       t,
@@ -168,7 +227,7 @@ export class Acceptance {
 
     let answered = 0;
     for (const q of probes) {
-      const r = await this.get(`/api/rag/unified?q=${encodeURIComponent(q)}&limit=5&rerank=0`);
+      const r = await this.post("/api/rag/unified", { q, limit: 5, rerank: 0 });
       const n = r.json?.results?.length || 0;
       if (n > 0) answered++;
       this.record(
@@ -189,9 +248,7 @@ export class Acceptance {
     // break quietly, because it only fails when the LLM key, the spend cap or
     // the model name is wrong, none of which show up until someone asks a
     // question.
-    const think = await this.get(
-      `/api/rag/think?q=${encodeURIComponent(probes[0])}&limit=5`
-    );
+    const think = await this.post("/api/rag/think", { q: probes[0], limit: 5 });
     if (!think.ok) {
       this.record(t, "think endpoint", FAIL, `HTTP ${think.status}`);
     } else if (think.json?.answer) {
@@ -259,8 +316,10 @@ export class Acceptance {
     });
     const text = await res.text();
 
-    if (res.status === 422 || /refused/i.test(text)) {
-      this.record(t, "credential gate refuses a token", PASS, `HTTP ${res.status}`);
+    const gate = credentialGateRefusalVerdict({ status: res.status, text });
+
+    if (gate.accepted) {
+      this.record(t, "credential gate refuses a token", PASS, `HTTP ${res.status}, ${gate.reason}`);
     } else if (res.ok) {
       // The probe just wrote a synthetic credential into a live brain, because
       // the gate that should have stopped it is not running. There is no
@@ -277,7 +336,12 @@ export class Acceptance {
           `        Then deploy a build with the credential scanner enabled.`
       );
     } else {
-      this.record(t, "credential gate refuses a token", WARN, `unexpected HTTP ${res.status}`);
+      this.record(
+        t,
+        "credential gate refuses a token",
+        FAIL,
+        `the exact refusal contract was not observed: ${gate.reason}`,
+      );
     }
 
     // The refusal must name the provider without quoting the secret, or the

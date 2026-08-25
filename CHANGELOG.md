@@ -34,6 +34,17 @@ leave private issue notes that can be reviewed without exposing client data.**
 - Google authentication helpers, scheduled Drive refresh, eval, Cloudflare
   probes, and AI-tool registration children receive narrowly allowlisted
   environments instead of inheriting unrelated desktop credentials.
+- `brain setup` and the new `brain update` can ask for the scoped Cloudflare
+  token in a no-echo terminal prompt. The token exists only for that command.
+  It is not written to the environment, arguments, manifest, logs, or issue
+  journal.
+- `brain update` now requires a D1 restore bookmark before any mutation, checks
+  the exact Worker version, runs the full acceptance suite, reads the committed
+  D1 version back, and only then atomically advances the local manifest.
+- Evaluation now blocks on every repeat of every critical retrieval and
+  unsupported-question case. Owner-local artifacts use opaque case IDs,
+  owner-only files, provenance hashes, and no raw questions, paths, titles, or
+  target URLs.
 
 ## 0.1.9
 

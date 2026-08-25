@@ -102,6 +102,9 @@ function cloudflareHarness({ routePost = "ok", routeEnabled = true, schedule = "
     if (path.endsWith("/workers/scripts/fixture-brain/subdomain") && method === "GET") {
       return apiResponse({ enabled: routeEnabled });
     }
+    if (path === "/client/v4/accounts/fixture-account/workers/subdomain" && method === "GET") {
+      return apiResponse({ subdomain: "fixture-account" });
+    }
     if (path.endsWith("/workers/scripts/fixture-brain/schedules") && method === "PUT") {
       return schedule === "ok"
         ? apiResponse([])

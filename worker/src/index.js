@@ -4,8 +4,8 @@
  * Extracted from a single-tenant brain and genericized. Five routes:
  *
  *   GET  /health                        open
- *   GET  /api/rag/unified?q=            ranked excerpts
- *   GET  /api/rag/think?q=              cited answer + explicit gaps
+ *   POST /api/rag/unified               ranked excerpts (private JSON body)
+ *   POST /api/rag/think                 cited answer + explicit gaps
  *   POST /api/admin/brain/ingest        write path, credential-gated
  *   GET  /api/admin/brain/documents     per-source counts and freshness
  *
@@ -17,8 +17,8 @@
  * entire users/sessions stack, which is the single largest simplification.
  */
 
-import { jsonResponse, cachedJson, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
-import { scan as scanSecrets } from "./lib/secret-scan.js";
+import { jsonResponse, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
+import { scanEnvelope as scanEnvelopeSecrets } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
 import { drainOutbox, outboxDepth, forget, forgetFamilies, listSourceFamilies, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
@@ -26,7 +26,7 @@ import { embedText, embedTexts } from "./lib/supabase.js";
 /* ------------------------------------------------------------ retrieval */
 
 /**
- * Pull the filters out of the query string once, so both routes and both
+ * Pull the filters out of the private request body once, so both routes and both
  * storage backends see the same object.
  */
 function filtersFrom(url) {
@@ -36,6 +36,44 @@ function filtersFrom(url) {
     if (v) f[k] = v;
   }
   return f;
+}
+
+const RAG_PARAMETER_KEYS = new Set([
+  "q", "limit", "rerank", "graph_boost", "rrf_k",
+  "weight_curated", "weight_drive", "weight_message",
+  "source", "client", "category", "from", "to", "top_folder", "platform",
+]);
+
+/**
+ * Parse retrieval input without ever placing a private question in a URL.
+ *
+ * The small URL-like shape lets the mature ranking code keep one parameter
+ * contract while the real HTTP request remains a no-store authenticated POST.
+ */
+async function privateRagParameters(request) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return null;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const searchParams = new URLSearchParams();
+  for (const [key, value] of Object.entries(body)) {
+    if (!RAG_PARAMETER_KEYS.has(key) || value === undefined || value === null) continue;
+    if (!["string", "number", "boolean"].includes(typeof value)) continue;
+    searchParams.set(key, String(value));
+  }
+  return { searchParams };
+}
+
+/** Prevent browser, proxy, and edge caches from retaining private answers. */
+function privateNoStore(response) {
+  const headers = new Headers(response.headers);
+  headers.set("Cache-Control", "private, no-store, max-age=0");
+  headers.set("Pragma", "no-cache");
+  headers.set("Vary", "X-Admin-Key");
+  return new Response(response.body, { status: response.status, headers });
 }
 
 async function unifiedRetrieve(env, url, { matchCount, ftsCount }) {
@@ -204,7 +242,8 @@ export function computeGaps(results) {
 /* -------------------------------------------------------------- routes */
 
 async function handleUnified(env, request) {
-  const url = new URL(request.url);
+  const url = await privateRagParameters(request);
+  if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
   const q = url.searchParams.get("q");
   if (!q || !q.trim()) return jsonResponse({ error: "Missing q" }, 400);
 
@@ -218,7 +257,7 @@ async function handleUnified(env, request) {
   });
   const ignored = ignoredFilters.length ? { ignored_filters: ignoredFilters } : {};
   if (degraded === "fts") {
-    return jsonResponse({ query: q, mode: "unified", degraded, ...ignored, results: retrieved });
+    return jsonResponse({ mode: "unified", degraded, ...ignored, results: retrieved });
   }
 
   // The drive corpus stores one row per chunk, so one file can occupy several
@@ -241,14 +280,15 @@ async function handleUnified(env, request) {
   if (Array.isArray(matches)) matches = matches.slice(0, limit);
 
   return jsonResponse({
-    query: q, mode: "unified", reranked: doRerank,
+    mode: "unified", reranked: doRerank,
     degraded: degraded || undefined, ...ignored, results: matches,
   });
 }
 
 async function handleThink(env, request) {
   const unsupportedAnswer = "The documents do not answer the question.";
-  const url = new URL(request.url);
+  const url = await privateRagParameters(request);
+  if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
   const q = (url.searchParams.get("q") || "").trim();
   if (!q) return jsonResponse({ error: "Missing q" }, 400);
   const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit")) || 8, 1), 20);
@@ -261,7 +301,6 @@ async function handleThink(env, request) {
 
   if (results.length === 0) {
     return jsonResponse({
-      query: q,
       mode: "think",
       degraded: degraded || undefined,
       answer: null,
@@ -324,8 +363,8 @@ async function handleThink(env, request) {
   let approvedDocs = docs;
   let evidenceGate = null;
 
-  // Owner name is templated per install. This is the line that was hardcoded
-  // to "James Guldan" in the original and would otherwise ship to every client.
+  // Owner name is templated per install. A hardcoded source-instance name here
+  // would otherwise ship to every client.
   const owner = env.BRAIN_OWNER || "the owner";
   const system = [
     `You are ${owner}'s second brain. You answer questions using ONLY the numbered documents provided.`,
@@ -496,7 +535,6 @@ async function handleThink(env, request) {
   }
 
   return jsonResponse({
-    query: q,
     mode: "think",
     degraded: degraded || undefined,
     answer,
@@ -555,7 +593,7 @@ async function handleIngest(env, request) {
   // whichever door it arrives through. Named, never quoted: the refusal must
   // be actionable without becoming its own leak.
   if (env.CREDENTIAL_SCANNER !== "off") {
-    const secrets = scanSecrets(content);
+    const secrets = scanEnvelopeSecrets(envelope);
     if (secrets.shouldRefuse) {
       return jsonResponse(
         {
@@ -652,7 +690,7 @@ async function handleIngestBatch(env, request) {
     }
 
     if (scannerOn) {
-      const secrets = scanSecrets(envelope.content);
+      const secrets = scanEnvelopeSecrets(envelope);
       if (secrets.shouldRefuse) {
         tally.refused++;
         // Named, never quoted. The refusal has to be actionable without becoming
@@ -995,19 +1033,22 @@ export default {
       });
     }
 
-    const readRoute =
-      request.method === "GET" &&
-      (path === "/api/rag/unified" || path === "/api/rag/think");
+    const readRoute = path === "/api/rag/unified" || path === "/api/rag/think";
     if (!(readRoute ? validateReadKey(request, env) : validateAdminKey(request, env))) {
       return jsonResponse({ error: "unauthorized" }, 401);
     }
 
     try {
-      if (path === "/api/rag/unified" && request.method === "GET") {
-        return await cachedJson(request, env, ctx, 120, () => handleUnified(env, request));
+      if (readRoute && request.method === "GET") {
+        return privateNoStore(jsonResponse({
+          error: "Private questions must be sent as a JSON POST body, never in the URL",
+        }, 405));
       }
-      if (path === "/api/rag/think" && request.method === "GET") {
-        return await cachedJson(request, env, ctx, 300, () => handleThink(env, request));
+      if (path === "/api/rag/unified" && request.method === "POST") {
+        return privateNoStore(await handleUnified(env, request));
+      }
+      if (path === "/api/rag/think" && request.method === "POST") {
+        return privateNoStore(await handleThink(env, request));
       }
       if (path === "/api/admin/brain/ingest" && request.method === "POST") {
         return await handleIngest(env, request);

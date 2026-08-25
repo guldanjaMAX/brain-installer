@@ -36,7 +36,7 @@ remains a compatibility fallback for an older token, not an install requirement.
 
 ```bash
 node brain.mjs doctor                        # check this machine first
-node brain.mjs setup                         # nothing to a working brain, one command
+node brain.mjs setup                         # hidden token prompt, then one-command setup
 ```
 
 `setup` runs everything below in the only order that works, generates the admin
@@ -45,7 +45,7 @@ available individually:
 
 ```bash
 cp templates/brain.manifest.json ./acme.manifest.json   # then edit it
-export CLOUDFLARE_API_TOKEN='...'
+export CLOUDFLARE_API_TOKEN='...'            # automation only; interactive setup prompts securely
 
 node brain.mjs verify     ./acme.manifest.json   # token, account, every service
 node brain.mjs provision  ./acme.manifest.json   # D1 + Vectorize, writes IDs back
@@ -81,6 +81,14 @@ node brain.mjs ingest     ./acme.manifest.json --path ~/Documents --source clien
 
 node brain.mjs test       ./acme.manifest.json   # full acceptance suite
 ```
+
+The supported beginner update is `brain update [manifest]`. It verifies the
+account, requires a pre-change D1 bookmark, migrates, deploys, reconciles
+allowed Worker secrets, requires exact-version health plus the full acceptance
+suite, commits and reads back D1 version state, then atomically commits and
+reads back the local manifest version. The older `brain upgrade` command uses
+the same engine and cannot bypass those gates. Neither path restores D1
+automatically because that would discard writes made after the bookmark.
 
 Always `--dry-run` first. It walks, extracts and judges every file without
 sending anything, and prints what would be skipped and why. On a real corpus
@@ -423,7 +431,14 @@ architecture change.
 
 ```bash
 npm test
+npm run test:eval
 ```
+
+The eval lane is separate so retrieval metric, provenance, template, and
+artifact changes can be exercised quickly. It uses only synthetic fixtures and
+starts a local HTTP brain; it never reads an installed brain or private golden
+set. See `docs/EVALUATION.md` for the v2 contracts, release gates, and staged
+diagnosis model.
 
 `test/migrations.test.mjs` applies every migration to a real SQLite database and
 asserts the FTS5 triggers actually keep the index in step. It exists because
@@ -434,3 +449,8 @@ The published package includes the reviewed eval runtime, configuration, and
 blank golden-set template. Private baselines and client golden question files
 are excluded. `package.json` uses an allowlist rather than a denylist so private
 evaluation data cannot be included by accident.
+
+`brain eval --artifacts <new-directory>` writes a sanitized internal v1 report
+set with opaque case IDs. The directory and files are owner-only, are never
+overwritten, and are never uploaded. It is intentionally not labeled as the v2
+run-artifact schema described in `docs/EVALUATION.md`.
