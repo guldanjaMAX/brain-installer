@@ -140,6 +140,67 @@ function pendingRevisionMarker(hash) {
   return `pending:${hash}:${revision}`;
 }
 
+function validDeferredRevision(revision) {
+  const hashIsValid = /^[a-f0-9]{64}$/.test(revision?.hash || "");
+  const markerPrefix = hashIsValid ? `pending:${revision.hash}:` : "";
+  return Boolean(
+    revision?.doc_uid &&
+    revision?.source &&
+    revision.doc_uid.startsWith(`${revision.source}:`) &&
+    typeof revision.pending_marker === "string" &&
+    revision.pending_marker.startsWith(markerPrefix) &&
+    /^[a-f0-9]{32}$/.test(revision.pending_marker.slice(markerPrefix.length)) &&
+    Number.isSafeInteger(revision.ingested_at) &&
+    revision.ingested_at > 0
+  );
+}
+
+/**
+ * Build the source-statistics half of an atomic revision commit.
+ *
+ * The JSON array uses one bind regardless of batch size, keeping a maximum
+ * 50-document request below D1's per-statement bind ceiling. Only document
+ * rows that still own the exact pending marker contribute freshness. With no
+ * owners, the aggregate's HAVING clause emits no row and corpus_stats is left
+ * byte-for-byte unchanged.
+ */
+function sourceStatsCommitStatement(env, source, revisions) {
+  const candidates = JSON.stringify(revisions.map((revision) => [
+    revision.doc_uid,
+    revision.pending_marker,
+    revision.ingested_at,
+  ]));
+  return env.DB.prepare(
+    `WITH candidates AS (
+       SELECT json_extract(value, '$[0]') AS doc_uid,
+              json_extract(value, '$[1]') AS pending_marker,
+              CAST(json_extract(value, '$[2]') AS INTEGER) AS ingested_at
+       FROM json_each(?2)
+     ), committing AS (
+       SELECT candidates.ingested_at
+       FROM candidates
+       JOIN documents
+         ON documents.doc_uid = candidates.doc_uid
+        AND documents.source = ?1
+        AND documents.content_hash = candidates.pending_marker
+     ), source_counts AS (
+       SELECT COUNT(DISTINCT doc_uid) AS documents, COUNT(*) AS chunks
+       FROM chunks WHERE source = ?1
+     )
+     INSERT INTO corpus_stats (source, documents, chunks, last_ingest_at)
+     SELECT ?1,
+            MAX(source_counts.documents),
+            MAX(source_counts.chunks),
+            MAX(committing.ingested_at)
+     FROM committing CROSS JOIN source_counts
+     HAVING COUNT(*) > 0
+     ON CONFLICT(source) DO UPDATE SET
+       documents = excluded.documents,
+       chunks = excluded.chunks,
+       last_ingest_at = MAX(COALESCE(corpus_stats.last_ingest_at, 0), excluded.last_ingest_at)`
+  ).bind(source, candidates);
+}
+
 /* ---------------------------------------------------------------- D1 backend */
 
 const d1Backend = {
@@ -317,30 +378,28 @@ const d1Backend = {
       };
     }
 
-    // DERIVED, not incremented. The previous version added the new chunk count
-    // to the running total, but a re-ingest DELETEs the old chunks first, so
-    // every update inflated the number. This is the one figure a client is told
-    // to trust, so it is recomputed from the rows that actually exist rather
-    // than accumulated and hoped for.
-    await env.DB.prepare(
-      `INSERT INTO corpus_stats (source, documents, chunks, last_ingest_at)
-       SELECT ?1, COUNT(DISTINCT doc_uid), COUNT(*), ?2 FROM chunks WHERE source = ?1
-       ON CONFLICT(source) DO UPDATE SET
-         documents = excluded.documents,
-         chunks = excluded.chunks,
-         last_ingest_at = excluded.last_ingest_at`
-    )
-      .bind(source_type, now)
-      .run();
-
-    // Only this request's unique marker may commit. A merely matching final
-    // content hash is ambiguous because a same-content concurrent revision may
-    // have written different title or filter metadata under that hash.
-    const committed = await env.DB.prepare(
-      `UPDATE documents SET content_hash = ?2
-       WHERE doc_uid = ?1 AND content_hash = ?3`
-    ).bind(docUid, hash, pendingHash).run();
-    if (Number(committed?.meta?.changes) !== 1) {
+    // Recompute derived counts and commit this exact revision in one D1
+    // transaction. The stats statement is marker-bound, so a superseded
+    // request neither advances freshness nor changes counts. Stats runs first
+    // while the marker exists; the following exact CAS is guaranteed to see
+    // the same transaction snapshot or the whole batch rolls back.
+    const revision = {
+      doc_uid: docUid,
+      source: source_type,
+      hash,
+      pending_marker: pendingHash,
+      ingested_at: now,
+    };
+    const finalization = await env.DB.batch([
+      sourceStatsCommitStatement(env, source_type, [revision]),
+      env.DB.prepare(
+        `UPDATE documents SET content_hash = ?2
+         WHERE doc_uid = ?1 AND content_hash = ?3`
+      ).bind(docUid, hash, pendingHash),
+    ]);
+    const statsCommitted = Number(finalization?.[0]?.meta?.changes) === 1;
+    const revisionCommitted = Number(finalization?.[1]?.meta?.changes) === 1;
+    if (!statsCommitted || !revisionCommitted) {
       throw new Error("ingest revision was superseded before commit; retry this document");
     }
 
@@ -393,33 +452,30 @@ const d1Backend = {
     const outcomes = revisions.map(() => ({ ok: false, error: "ingest finalization failed; retry this document" }));
     const bySource = new Map();
 
+    // A repeated marker is not a legitimate second revision and makes its
+    // timestamp ambiguous. Exclude every copy rather than guess which supplied
+    // freshness value belongs to the marker.
+    const markerCounts = new Map();
+    for (const revision of revisions) {
+      if (!validDeferredRevision(revision)) continue;
+      markerCounts.set(revision.pending_marker, (markerCounts.get(revision.pending_marker) || 0) + 1);
+    }
+
     for (let index = 0; index < revisions.length; index++) {
       const revision = revisions[index];
-      const hashIsValid = /^[a-f0-9]{64}$/.test(revision?.hash || "");
-      const markerPrefix = hashIsValid ? `pending:${revision.hash}:` : "";
-      const markerIsValid = typeof revision?.pending_marker === "string" &&
-        revision.pending_marker.startsWith(markerPrefix) &&
-        /^[a-f0-9]{32}$/.test(revision.pending_marker.slice(markerPrefix.length));
-      if (!revision?.doc_uid || !revision?.source || !hashIsValid || !markerIsValid) continue;
+      if (!validDeferredRevision(revision) || markerCounts.get(revision.pending_marker) !== 1) continue;
       const group = bySource.get(revision.source) || [];
       group.push({ ...revision, index });
       bySource.set(revision.source, group);
     }
 
     for (const [source, group] of bySource) {
-      const lastIngestAt = Math.max(...group.map((revision) => Number(revision.ingested_at) || 0));
       try {
-        // At most 50 documents enter the route, so this remains below D1's
-        // 100-statement batch ceiling even with the one source-stat statement.
+        // One JSON bind carries every marker/timestamp into the statistics CTE.
+        // With at most 50 revisions, this is at most 51 D1 statements and each
+        // statement remains far below the per-statement bind ceiling.
         const batchResults = await env.DB.batch([
-          env.DB.prepare(
-            `INSERT INTO corpus_stats (source, documents, chunks, last_ingest_at)
-             SELECT ?1, COUNT(DISTINCT doc_uid), COUNT(*), ?2 FROM chunks WHERE source = ?1
-             ON CONFLICT(source) DO UPDATE SET
-               documents = excluded.documents,
-               chunks = excluded.chunks,
-               last_ingest_at = MAX(COALESCE(corpus_stats.last_ingest_at, 0), excluded.last_ingest_at)`
-          ).bind(source, lastIngestAt),
+          sourceStatsCommitStatement(env, source, group),
           ...group.map((revision) => env.DB.prepare(
             `UPDATE documents SET content_hash = ?2
              WHERE doc_uid = ?1 AND content_hash = ?3`
@@ -434,10 +490,11 @@ const d1Backend = {
           `SELECT doc_uid, content_hash FROM documents WHERE doc_uid IN (${placeholders})`
         ).bind(...group.map((revision) => revision.doc_uid)).all();
         const committed = new Map((results || []).map((row) => [row.doc_uid, row.content_hash]));
+        const statsCommitted = Number(batchResults[0]?.meta?.changes) === 1;
         for (let groupIndex = 0; groupIndex < group.length; groupIndex++) {
           const revision = group[groupIndex];
           const changedThisMarker = Number(batchResults[groupIndex + 1]?.meta?.changes) === 1;
-          outcomes[revision.index] = changedThisMarker && committed.get(revision.doc_uid) === revision.hash
+          outcomes[revision.index] = statsCommitted && changedThisMarker && committed.get(revision.doc_uid) === revision.hash
             ? { ok: true }
             : { ok: false, error: "ingest revision could not be verified; retry this document" };
         }

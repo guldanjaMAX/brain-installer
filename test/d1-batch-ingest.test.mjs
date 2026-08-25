@@ -15,8 +15,17 @@ for (const file of readdirSync(migrationDir).filter((name) => name.endsWith(".sq
   for (const sql of splitStatements(readFileSync(join(migrationDir, file), "utf8"))) sqlite.exec(sql);
 }
 
-const metrics = { remote_calls: 0, stats_scans: 0 };
-const control = { fail_chunk_doc_uid: null };
+const metrics = {
+  remote_calls: 0,
+  stats_scans: 0,
+  max_batch_statements: 0,
+  max_statement_binds: 0,
+};
+const control = {
+  fail_chunk_doc_uid: null,
+  fail_finalize_cas_doc_uid: null,
+  before_finalize_batch: null,
+};
 
 function execute(sql, params, mode) {
   if (/INSERT INTO corpus_stats/.test(sql)) metrics.stats_scans++;
@@ -45,14 +54,33 @@ const DB = {
   prepare: (sql) => prepared(sql),
   async batch(statements) {
     metrics.remote_calls++;
+    metrics.max_batch_statements = Math.max(metrics.max_batch_statements, statements.length);
+    metrics.max_statement_binds = Math.max(
+      metrics.max_statement_binds,
+      ...statements.map((statement) => statement.params.length)
+    );
     if (control.fail_chunk_doc_uid && statements.some((statement) =>
       /INSERT INTO chunks/.test(statement.sql) && statement.params[1] === control.fail_chunk_doc_uid
     )) throw new Error("synthetic chunk write failure");
+    if (control.before_finalize_batch && statements.some((statement) =>
+      /UPDATE documents SET content_hash/.test(statement.sql)
+    )) {
+      const hook = control.before_finalize_batch;
+      control.before_finalize_batch = null;
+      hook(statements);
+    }
 
     sqlite.exec("BEGIN");
     try {
       const results = statements.map((statement) => {
-        if (/^\s*(SELECT|WITH|PRAGMA)\b/i.test(statement.sql)) {
+        if (control.fail_finalize_cas_doc_uid &&
+            /UPDATE documents SET content_hash/.test(statement.sql) &&
+            statement.params[0] === control.fail_finalize_cas_doc_uid) {
+          throw new Error("synthetic final CAS failure");
+        }
+        const readOnly = /^\s*(SELECT|PRAGMA)\b/i.test(statement.sql) ||
+          (/^\s*WITH\b/i.test(statement.sql) && !/\b(INSERT|UPDATE|DELETE)\b/i.test(statement.sql));
+        if (readOnly) {
           return { success: true, results: execute(statement.sql, statement.params, "all").results };
         }
         const result = execute(statement.sql, statement.params, "run");
@@ -101,6 +129,8 @@ assert.equal(first.failed, 0);
 assert.equal(first.results.length, 50);
 assert.equal(metrics.remote_calls, 203);
 assert.equal(metrics.stats_scans, 1);
+assert.equal(metrics.max_batch_statements, 51);
+assert.ok(metrics.max_statement_binds <= 100);
 assert.deepEqual({ ...sqlite.prepare(
   `SELECT
      (SELECT COUNT(*) FROM documents) AS documents,
@@ -164,6 +194,64 @@ assert.match(sqlite.prepare("SELECT text FROM chunks WHERE doc_uid = 'message:du
 // report success. The stale finalizer must fail even after it reads the same
 // final content hash written by the winner.
 const store = storeFor(env);
+const plainRow = (row) => row ? { ...row } : null;
+const statsFor = (source) => plainRow(sqlite.prepare(
+  "SELECT source, documents, chunks, last_ingest_at FROM corpus_stats WHERE source = ?"
+).get(source));
+const actualCountsFor = (source) => plainRow(sqlite.prepare(
+  `SELECT COUNT(DISTINCT doc_uid) AS documents, COUNT(*) AS chunks
+   FROM chunks WHERE source = ?`
+).get(source));
+const outboxFor = (docUid) => sqlite.prepare(
+  `SELECT chunk_uid, vector_id, op, queued_at, attempts, last_error
+   FROM vector_outbox WHERE chunk_uid LIKE ? ORDER BY chunk_uid`
+).all(`${docUid}#%`).map((row) => ({ ...row }));
+const assertStatsMatchRows = (source, expectedFreshness) => {
+  const stats = statsFor(source);
+  const actual = actualCountsFor(source);
+  assert.equal(stats.documents, actual.documents);
+  assert.equal(stats.chunks, actual.chunks);
+  assert.equal(stats.last_ingest_at, expectedFreshness);
+};
+const assertOneUpsert = (docUid) => {
+  const rows = outboxFor(docUid);
+  assert.equal(rows.length, 1);
+  const { queued_at, ...stable } = rows[0];
+  assert.ok(Number.isSafeInteger(queued_at) && queued_at > 0);
+  assert.deepEqual(stable, {
+    chunk_uid: `${docUid}#0`,
+    vector_id: `${docUid}#0`,
+    op: "upsert",
+    attempts: 0,
+    last_error: null,
+  });
+};
+
+// A statement failure after the marker-bound statistics statement must roll
+// the whole D1 batch back. The revision stays pending and the exact same marker
+// remains safe to retry.
+{
+  const staged = await store.ingest(env, envelope("atomic-retry"), { deferFinalize: true });
+  const revision = staged.deferred_revision;
+  revision.ingested_at = 5_000;
+  sqlite.prepare("UPDATE corpus_stats SET last_ingest_at = ? WHERE source = 'message'").run(4_000);
+  const beforeStats = statsFor("message");
+  const beforeOutbox = outboxFor(revision.doc_uid);
+  control.fail_finalize_cas_doc_uid = revision.doc_uid;
+  const failed = await store.finalizeIngestBatch(env, [revision]);
+  control.fail_finalize_cas_doc_uid = null;
+  assert.equal(failed[0].ok, false);
+  assert.deepEqual(statsFor("message"), beforeStats);
+  assert.equal(sqlite.prepare("SELECT content_hash FROM documents WHERE doc_uid = ?").get(revision.doc_uid).content_hash,
+    revision.pending_marker);
+  assert.deepEqual(outboxFor(revision.doc_uid), beforeOutbox);
+
+  const retried = await store.finalizeIngestBatch(env, [revision]);
+  assert.equal(retried[0].ok, true);
+  assertStatsMatchRows("message", 5_000);
+  assert.deepEqual(outboxFor(revision.doc_uid), beforeOutbox);
+}
+
 async function stageMetadataRace(sourceId) {
   const content = "Synthetic shared content whose metadata revisions differ.";
   const alpha = {
@@ -203,26 +291,68 @@ async function stageMetadataRace(sourceId) {
   const guarded = sqlite.prepare("SELECT title, category FROM chunks WHERE doc_uid = ?").get(docUid);
   assert.equal(guarded.title, "Synthetic beta title");
   assert.equal(guarded.category, "beta");
-  return { alpha: alphaStaged.deferred_revision, beta: betaStaged.deferred_revision };
+  assertOneUpsert(docUid);
+  return {
+    docUid,
+    alpha: alphaStaged.deferred_revision,
+    beta: betaStaged.deferred_revision,
+  };
 }
 
+// All-stale finalization is a true no-op. In particular it cannot refresh the
+// counts to include the staged document or advance freshness with its supplied
+// timestamp. The later exact-marker winner atomically refreshes both.
 {
   const race = await stageMetadataRace("race-stale-first");
+  sqlite.prepare("UPDATE corpus_stats SET last_ingest_at = ? WHERE source = 'message'").run(10_000);
+  race.alpha.ingested_at = 90_000;
+  race.beta.ingested_at = 20_000;
+  const beforeStaleStats = statsFor("message");
+  const beforeStaleOutbox = outboxFor(race.docUid);
   const stale = await store.finalizeIngestBatch(env, [race.alpha]);
+  assert.deepEqual(statsFor("message"), beforeStaleStats);
+  assert.deepEqual(outboxFor(race.docUid), beforeStaleOutbox);
   const winner = await store.finalizeIngestBatch(env, [race.beta]);
   assert.equal(stale[0].ok, false);
   assert.equal(winner[0].ok, true);
+  assertStatsMatchRows("message", 20_000);
+  assert.deepEqual(outboxFor(race.docUid), beforeStaleOutbox);
 }
 
+// Winner-first/stale-second proves a matching final hash is not success and a
+// stale later timestamp cannot advance already truthful source freshness.
 {
   const race = await stageMetadataRace("race-winner-first");
+  sqlite.prepare("UPDATE corpus_stats SET last_ingest_at = ? WHERE source = 'message'").run(30_000);
+  race.alpha.ingested_at = 99_000;
+  race.beta.ingested_at = 40_000;
+  const expectedOutbox = outboxFor(race.docUid);
   const winner = await store.finalizeIngestBatch(env, [race.beta]);
+  assertStatsMatchRows("message", 40_000);
+  const afterWinnerStats = statsFor("message");
   const stale = await store.finalizeIngestBatch(env, [race.alpha]);
   assert.equal(winner[0].ok, true);
   assert.equal(stale[0].ok, false);
+  assert.deepEqual(statsFor("message"), afterWinnerStats);
+  assert.deepEqual(outboxFor(race.docUid), expectedOutbox);
 }
 
-for (const sourceId of ["race-stale-first", "race-winner-first"]) {
+// One source transaction may contain both a stale revision and its exact-marker
+// winner. Only the winner contributes its timestamp, while each receipt keeps
+// its own CAS result.
+{
+  const race = await stageMetadataRace("race-mixed");
+  sqlite.prepare("UPDATE corpus_stats SET last_ingest_at = ? WHERE source = 'message'").run(50_000);
+  race.alpha.ingested_at = 999_000;
+  race.beta.ingested_at = 60_000;
+  const expectedOutbox = outboxFor(race.docUid);
+  const outcomes = await store.finalizeIngestBatch(env, [race.alpha, race.beta]);
+  assert.deepEqual(outcomes.map((outcome) => outcome.ok), [false, true]);
+  assertStatsMatchRows("message", 60_000);
+  assert.deepEqual(outboxFor(race.docUid), expectedOutbox);
+}
+
+for (const sourceId of ["race-stale-first", "race-winner-first", "race-mixed"]) {
   const docUid = `message:${sourceId}`;
   const document = sqlite.prepare(
     "SELECT title, category, content_hash FROM documents WHERE doc_uid = ?"
@@ -236,6 +366,90 @@ for (const sourceId of ["race-stale-first", "race-winner-first"]) {
   assert.equal(chunk.title, "Synthetic beta title");
   assert.equal(chunk.category, "beta");
   assert.match(chunk.text, /^\[Synthetic beta title\]/);
+  assertOneUpsert(docUid);
+}
+
+// The ordinary one-document path uses the same atomic marker-bound finalizer.
+// Simulate a concurrent same-content metadata revision taking ownership just
+// before the final D1 batch. The superseded request must throw without changing
+// corpus_stats, and its stale CAS must not disturb the winner's outbox state.
+{
+  const source = "upload";
+  const sourceId = "single-superseded";
+  const docUid = `${source}:${sourceId}`;
+  const content = "Synthetic shared single-ingest content.";
+  const base = {
+    ...envelope(sourceId, content, source),
+    title: "Synthetic base title",
+    metadata: { category: "base", platform: "synthetic" },
+  };
+  const callsBeforeBase = metrics.remote_calls;
+  await store.ingest(env, base);
+  assert.equal(metrics.remote_calls - callsBeforeBase, 6);
+  sqlite.prepare("UPDATE corpus_stats SET last_ingest_at = ? WHERE source = ?").run(70_000, source);
+  const beforeStats = statsFor(source);
+
+  const alpha = {
+    ...base,
+    title: "Synthetic single alpha title",
+    metadata: { category: "alpha", platform: "synthetic" },
+  };
+  const beta = {
+    ...base,
+    title: "Synthetic single beta title",
+    metadata: { category: "beta", platform: "synthetic" },
+  };
+  let winnerMarker = null;
+  control.before_finalize_batch = (statements) => {
+    const cas = statements.find((statement) => /UPDATE documents SET content_hash/.test(statement.sql));
+    assert.equal(cas.params[0], docUid);
+    const winnerNonce = cas.params[2].endsWith("e".repeat(32)) ? "d".repeat(32) : "e".repeat(32);
+    winnerMarker = `pending:${cas.params[1]}:${winnerNonce}`;
+    sqlite.prepare(
+      `UPDATE documents
+       SET title = ?, category = ?, platform = ?, ingested_at = ?, content_hash = ?
+       WHERE doc_uid = ?`
+    ).run(beta.title, "beta", "synthetic", 80_000, winnerMarker, docUid);
+    sqlite.prepare(
+      `UPDATE chunks SET title = ?, category = ?, platform = ?, text = ?
+       WHERE doc_uid = ?`
+    ).run(beta.title, "beta", "synthetic", `[${beta.title}]\n\n${content}`, docUid);
+    sqlite.prepare(
+      `UPDATE vector_outbox
+       SET op = 'upsert', queued_at = ?, attempts = 0, last_error = NULL
+       WHERE chunk_uid = ?`
+    ).run(80_000, `${docUid}#0`);
+  };
+
+  await assert.rejects(
+    store.ingest(env, alpha),
+    /superseded before commit/
+  );
+  assert.deepEqual(statsFor(source), beforeStats);
+  assert.equal(sqlite.prepare("SELECT content_hash FROM documents WHERE doc_uid = ?").get(docUid).content_hash, winnerMarker);
+  assert.deepEqual(plainRow(sqlite.prepare(
+    "SELECT title, category, platform FROM chunks WHERE doc_uid = ?"
+  ).get(docUid)), {
+    title: beta.title,
+    category: "beta",
+    platform: "synthetic",
+  });
+  assert.deepEqual(outboxFor(docUid), [{
+    chunk_uid: `${docUid}#0`,
+    vector_id: `${docUid}#0`,
+    op: "upsert",
+    queued_at: 80_000,
+    attempts: 0,
+    last_error: null,
+  }]);
+
+  const repairedSingle = await store.ingest(env, beta);
+  assert.equal(repairedSingle.action, "updated");
+  const repairedStats = statsFor(source);
+  assert.ok(repairedStats.last_ingest_at > 70_000);
+  assertStatsMatchRows(source, repairedStats.last_ingest_at);
+  assert.match(sqlite.prepare("SELECT content_hash FROM documents WHERE doc_uid = ?").get(docUid).content_hash, /^[a-f0-9]{64}$/);
+  assertOneUpsert(docUid);
 }
 
 console.log("d1-batch-ingest: real SQLite integration and performance structure passed");

@@ -126,12 +126,14 @@ so an unchanged 50-document safety rescan is one database round trip rather than
 50 sequential reads. Changed documents still enter the normal pending-hash
 write path. Each attempt owns a revision-unique marker, and its chunk deletes,
 chunk writes, outbox writes, and final commit are conditional on still owning
-that marker. The exact compare-and-swap result and one derived statistics
-refresh commit together per touched source, followed by exact readback. A final
-content hash by itself is not proof because same-content revisions can carry
-different metadata. Repeated identities in one request deliberately use the
-original sequential path because revision order is part of their correctness
-contract.
+that marker. The exact compare-and-swap and one derived statistics refresh
+commit together per touched source, followed by exact readback. The refresh
+derives freshness only from markers that still belong to that transaction, so
+an all-stale finalizer leaves counts and `last_ingest_at` unchanged. The same
+atomic rule covers ordinary one-document ingest. A final content hash by itself
+is not proof because same-content revisions can carry different metadata.
+Repeated identities in one request deliberately use the original sequential
+path because revision order is part of their correctness contract.
 
 Drive removal candidates from policy, source deletion, and intentional quality
 skips are intersected with the current stored-family inventory and approved as

@@ -110,6 +110,13 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
     } else if (/INSERT INTO chunks/i.test(sql)) {
       rows.chunks.set(binds[0], { chunk_uid: binds[0], doc_uid: binds[1], text: binds[3] });
       changes = 1;
+    } else if (/INSERT INTO corpus_stats/i.test(sql)) {
+      const candidates = JSON.parse(binds[1] || "[]");
+      changes = candidates.some(([docUid, marker]) =>
+        rows.document?.doc_uid === docUid &&
+        rows.document?.source === binds[0] &&
+        rows.document?.content_hash === marker
+      ) ? 1 : 0;
     }
     return { changes };
   };

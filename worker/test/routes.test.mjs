@@ -704,7 +704,11 @@ function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocU
       }
     } else if (/INSERT INTO corpus_stats/.test(sql)) {
       calls.stats_scans++;
-      changes = 1;
+      const candidates = JSON.parse(b[1] || "[]");
+      changes = candidates.some(([docUid, marker]) => {
+        const row = documents.get(docUid);
+        return row?.source === b[0] && row?.content_hash === marker;
+      }) ? 1 : 0;
     }
     return { changes };
   };
@@ -952,8 +956,8 @@ const doc = (id, content = "some ordinary meeting content about the retainer") =
   const body = await (await post(env, "/api/admin/brain/ingest/batch", { docs: [first, second] })).json();
   check("two revisions of one identity preserve sequential created-then-updated receipts",
     body.created === 1 && body.updated === 1 && body.results.map((row) => row.status).join(",") === "created,updated", JSON.stringify(body));
-  check("duplicate identities never use delayed source finalization",
-    calls.finalizer_batches === 0 && calls.stats_scans === 2, JSON.stringify(calls));
+  check("duplicate identities finalize sequentially rather than as one delayed group",
+    calls.finalizer_batches === 2 && calls.stats_scans === 2 && calls.remote === 12, JSON.stringify(calls));
   check("the final duplicate revision is committed rather than left pending",
     /^[a-f0-9]{64}$/.test(documents.get("meeting:same")?.content_hash || ""));
 }
