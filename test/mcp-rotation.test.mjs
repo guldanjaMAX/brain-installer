@@ -309,7 +309,19 @@ try {
   const runtimeEnvironment = {
     HOME: sandbox,
     ...(process.platform === "win32"
-      ? { USERNAME: nativeFileOptions.username }
+      ? {
+          SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || process.env.WINDIR,
+          TEMP: process.env.TEMP,
+          TMP: process.env.TMP,
+          USERPROFILE: process.env.USERPROFILE,
+          HOMEDRIVE: process.env.HOMEDRIVE,
+          HOMEPATH: process.env.HOMEPATH,
+          APPDATA: process.env.APPDATA,
+          LOCALAPPDATA: process.env.LOCALAPPDATA,
+          USERNAME: nativeFileOptions.username,
+          USERDOMAIN: process.env.USERDOMAIN,
+          ComSpec: process.env.ComSpec,
+        }
       : { USER: "fixture-user" }),
     BRAIN_MANIFEST: manifestPath,
     BRAIN_KEY: retiredKey,
