@@ -1329,8 +1329,13 @@ function validateGolden(golden, path) {
 }
 
 main()
-  .then((code) => process.exit(code))
+  // Let fetch/undici close its handles before Node returns the verdict. A
+  // forced process.exit can race libuv handle cleanup on Windows and turn a
+  // deliberate eval failure into the native UV_HANDLE_CLOSING crash code.
+  .then((code) => {
+    process.exitCode = code;
+  })
   .catch((e) => {
     console.error(`\n  eval failed: ${e.message}\n`);
-    process.exit(2);
+    process.exitCode = 2;
   });
