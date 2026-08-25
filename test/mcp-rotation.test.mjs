@@ -308,7 +308,9 @@ try {
   /* Runtime locator wins over a stale legacy value and refreshes on rejection. */
   const runtimeEnvironment = {
     HOME: sandbox,
-    USER: "fixture-user",
+    ...(process.platform === "win32"
+      ? { USERNAME: nativeFileOptions.username }
+      : { USER: "fixture-user" }),
     BRAIN_MANIFEST: manifestPath,
     BRAIN_KEY: retiredKey,
   };
