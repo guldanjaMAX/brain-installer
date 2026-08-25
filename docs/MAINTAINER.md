@@ -115,6 +115,16 @@ the owner through `brain update <manifest>` for the verified paused-writer
 cutover, followed by `brain setup <manifest>`. The migration runner resumes the
 committed prefix; setup then persists the admin key and completes convergence.
 
+For a manifest with a declared `keychain://` admin-key locator, setup and update
+create the immutable execution copy in a fresh owner-only directory under the
+OS temporary root. This avoids Apple File Provider changing ctime/mtime on a
+new adjacent copy inside a synced manifest folder. The original manifest keeps
+the same strict fingerprint, inode, ctime, and mtime revalidation. The copy
+contains only manifest bytes and the non-secret Keychain locator, never the
+Keychain value, and cleanup removes only the exact inode and empty directory it
+created. Legacy adjacent-file credentials retain an adjacent execution copy so
+their path-relative key lookup remains correct.
+
 The normal maximum 50-document, one-chunk batch uses 53 D1 binding round trips,
 but Cloudflare bills/counts its 352 SQL statements. The Worker reserves a
 conservative worst-case statement cost before any write and refuses requests

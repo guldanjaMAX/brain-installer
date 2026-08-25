@@ -37,18 +37,20 @@ import {
   fstatSync,
   fsyncSync,
   lstatSync,
+  mkdtempSync,
   mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   statSync,
   unlinkSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, isAbsolute, join, dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
@@ -2385,22 +2387,62 @@ function revalidateUpdateManifest(pin, stage) {
   return current;
 }
 
+function removeOwnedExecutionDirectory(path, expectedStat) {
+  if (!path || !expectedStat) return;
+  try {
+    const current = lstatSync(path);
+    if (current.isDirectory() && !current.isSymbolicLink() &&
+        current.dev === expectedStat.dev && current.ino === expectedStat.ino) {
+      // Never recurse. An unexpected/replaced child makes rmdir fail and leaves
+      // the directory for review instead of deleting something we do not own.
+      rmdirSync(path);
+    }
+  } catch {
+    // Cleanup cannot replace the lifecycle command's real result.
+  }
+}
+
 function writePinnedExecutionManifest(pin) {
-  const path = join(
-    dirname(pin.target),
-    `.${basename(pin.target)}.brain-update-${process.pid}-${randomBytes(8).toString("hex")}.tmp`,
-  );
+  const keyReference = pin.manifest?.operations?.admin_key_secret;
+  const usePrivateDirectory = typeof keyReference === "string" &&
+    keyReference.startsWith("keychain://");
   const bytes = Buffer.from(pin.raw, "utf8");
+  let path;
   let descriptor;
   let createdStat = null;
+  let privateDirectory = null;
+  let privateDirectoryStat = null;
   let completed = false;
   try {
+    let parent = dirname(pin.target);
+    if (usePrivateDirectory) {
+      // Apple File Provider can update ctime/mtime on a newly created file in a
+      // synced manifest directory. Keep the immutable execution copy outside
+      // that provider. The raw manifest contains only the non-secret Keychain
+      // locator; this function never reads or copies the Keychain value.
+      privateDirectory = mkdtempSync(join(tmpdir(), "financial-brain-update-"));
+      chmodSync(privateDirectory, 0o700);
+      privateDirectoryStat = lstatSync(privateDirectory);
+      if (!privateDirectoryStat.isDirectory() || privateDirectoryStat.isSymbolicLink() ||
+          (process.platform !== "win32" && (privateDirectoryStat.mode & 0o077) !== 0)) {
+        throw new Error("the private pinned-manifest directory did not verify");
+      }
+      parent = privateDirectory;
+    }
+    path = join(
+      parent,
+      `.${basename(pin.target)}.brain-update-${process.pid}-${randomBytes(8).toString("hex")}.tmp`,
+    );
     descriptor = openSync(
       path,
       fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW || 0),
       0o600,
     );
     createdStat = fstatSync(descriptor);
+    if (!createdStat.isFile() || createdStat.nlink !== 1 ||
+        (process.platform !== "win32" && (createdStat.mode & 0o077) !== 0)) {
+      throw new Error("the private pinned manifest file did not verify");
+    }
     if (writeSync(descriptor, bytes, 0, bytes.length, 0) !== bytes.length) {
       throw new Error("the pinned execution manifest write was incomplete");
     }
@@ -2412,11 +2454,15 @@ function writePinnedExecutionManifest(pin) {
       throw new Error("the pinned execution manifest did not verify");
     }
     completed = true;
-    return executionPin;
+    return Object.freeze({
+      ...executionPin,
+      cleanupDirectory: privateDirectory,
+      cleanupDirectoryStat: privateDirectoryStat,
+    });
   } finally {
     bytes.fill(0);
     if (descriptor !== undefined) closeSync(descriptor);
-    if (!completed && createdStat) {
+    if (!completed && createdStat && path) {
       try {
         const current = lstatSync(path);
         if (current.dev === createdStat.dev && current.ino === createdStat.ino && current.nlink === 1) {
@@ -2427,6 +2473,7 @@ function writePinnedExecutionManifest(pin) {
         // path is never removed as if it were still ours.
       }
     }
+    if (!completed) removeOwnedExecutionDirectory(privateDirectory, privateDirectoryStat);
   }
 }
 
@@ -2440,6 +2487,7 @@ function removePinnedExecutionManifest(pin) {
     // Cleanup cannot replace the update's real result. A replaced path is left
     // untouched rather than deleting something we did not create.
   }
+  removeOwnedExecutionDirectory(pin.cleanupDirectory, pin.cleanupDirectoryStat);
 }
 
 function cloudflareIdentity(manifest) {

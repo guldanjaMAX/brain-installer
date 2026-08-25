@@ -27,7 +27,7 @@ import {
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   cloudflareTokenAvailable,
@@ -267,10 +267,17 @@ const manifestFixture = (version = "0.1.9") => ({
   const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-upgrade-provider-")));
   try {
     const manifestPath = join(sandbox, "brain.manifest.json");
-    writeFileSync(manifestPath, JSON.stringify(manifestFixture()));
+    const keychainManifest = manifestFixture();
+    keychainManifest.operations = {
+      admin_key_secret: "keychain://fixture-brain-admin/owner-fixture",
+    };
+    const syntheticKeychainValue = `fixture-${"private-value".repeat(4)}`;
+    writeFileSync(manifestPath, JSON.stringify(keychainManifest));
     const events = [];
     let accountChecks = 0;
     const executionPaths = new Set();
+    let privateExecutionPath = null;
+    let privateExecutionDirectory = null;
     let d1Version = "0.1.9";
     await cmdUpgrade(manifestPath, {
       resolveAccount: async () => {
@@ -300,9 +307,28 @@ const manifestFixture = (version = "0.1.9") => ({
       },
       cmdMigrate: async (path, options) => {
         executionPaths.add(path);
+        privateExecutionPath = path;
+        privateExecutionDirectory = dirname(path);
         events.push("migrate");
         check("only the verified cutover authorizes live writer migrations",
           options?.vectorDrainQuiesced === true, JSON.stringify(options));
+        check("a Keychain-backed execution copy is outside the synced manifest parent",
+          dirname(path) !== sandbox && !path.startsWith(`${sandbox}/`), path);
+        if (process.platform !== "win32") {
+          check("the private execution directory is owner-only",
+            (lstatSync(dirname(path)).mode & 0o777) === 0o700, String(lstatSync(dirname(path)).mode & 0o777));
+          check("the private execution manifest is owner-only",
+            (lstatSync(path).mode & 0o777) === 0o600, String(lstatSync(path).mode & 0o777));
+        }
+        const executionBytes = readFileSync(path, "utf8");
+        check("the execution copy carries only the non-secret Keychain locator",
+          executionBytes.includes("keychain://fixture-brain-admin/owner-fixture") &&
+            !executionBytes.includes(syntheticKeychainValue), executionBytes);
+        const originalDuringUpdate = JSON.parse(readFileSync(manifestPath, "utf8"));
+        check("the original synced manifest remains separately pinned during remote stages",
+          originalDuringUpdate.brain.version === "0.1.9" &&
+            originalDuringUpdate.operations.admin_key_secret === keychainManifest.operations.admin_key_secret,
+          JSON.stringify(originalDuringUpdate));
       },
       cmdDeploy: async (path, options) => {
         executionPaths.add(path);
@@ -368,9 +394,17 @@ const manifestFixture = (version = "0.1.9") => ({
       JSON.stringify([...executionPaths]),
     );
     check(
-      "the private execution manifest is removed after success",
-      !readdirSync(sandbox).some((name) => name.includes(".brain-update-")),
+      "the private execution manifest and its owner-only directory are removed after success",
+      privateExecutionPath && privateExecutionDirectory &&
+        !existsSync(privateExecutionPath) && !existsSync(privateExecutionDirectory) &&
+        !readdirSync(sandbox).some((name) => name.includes(".brain-update-")),
     );
+    const committedManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    check("the original manifest commit preserves its Keychain locator without copying a credential",
+      committedManifest.brain.version === "0.1.14" &&
+        committedManifest.operations.admin_key_secret === keychainManifest.operations.admin_key_secret &&
+        !readFileSync(manifestPath, "utf8").includes(syntheticKeychainValue),
+      JSON.stringify(committedManifest));
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
   }
@@ -406,8 +440,10 @@ const manifestFixture = (version = "0.1.9") => ({
         return { results: [] };
       },
       cf: async () => { events.push("bookmark"); return { bookmark: "non-d1-bookmark" }; },
-      cmdMigrate: async (_path, options) => {
+      cmdMigrate: async (path, options) => {
         events.push("migrate");
+        check("a legacy adjacent-key manifest keeps its execution copy beside the manifest",
+          dirname(path) === sandbox && path !== manifestPath, path);
         check("non-D1 migration does not claim a vector-writer cutover",
           options?.vectorDrainQuiesced !== true, JSON.stringify(options));
       },

@@ -50,6 +50,10 @@ report success.**
   write when database freshness cannot be proven. It prints the verified
   paused-writer update and setup-rerun commands instead of guessing that no
   renamed Worker can still use the database.
+- Keychain-backed setup and update keep their immutable execution copy in an
+  owner-only OS temporary directory, outside synced manifest folders. The
+  original manifest remains fingerprint-pinned, no credential value is copied,
+  and the temporary file and directory are removed after the lifecycle run.
 - A D1 rollback deliberately leaves the Worker paused. Provider-only vectors
   written after the bookmark cannot be enumerated by reindex, so supervised
   recovery must recreate/rebind a clean Vectorize index and all metadata
