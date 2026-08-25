@@ -1139,6 +1139,8 @@ async function markProjectionVerifiedIfExact(env) {
  * replaced while an older mutation was in flight. getByIds then proves the
  * exact upsert generation, rather than accepting an old vector with the same id.
  */
+const VECTOR_GET_BY_IDS_LIMIT = 20;
+
 async function confirmSubmittedVectors(env, rows) {
   if (!rows.length) return { confirmed: 0, confirmedDeletes: 0, confirmedUpserts: 0, retrying: 0, waiting: 0 };
   const fence = await projectionFenceState(env);
@@ -1157,14 +1159,20 @@ async function confirmSubmittedVectors(env, rows) {
       : row.vector_id || row.chunk_uid,
   })));
   const ids = [...new Set(rows.map((row) => row.provider_vector_id))];
-  let visible;
-  try {
-    visible = await env.VECTORIZE.getByIds(ids);
-  } catch (error) {
-    throw new Error(`the vector index could not verify accepted changes: ${String(error?.message || error).slice(0, 240)}`);
-  }
-  if (!Array.isArray(visible)) {
-    throw new Error("the vector index returned an invalid visibility receipt");
+  const visible = [];
+  for (let start = 0; start < ids.length; start += VECTOR_GET_BY_IDS_LIMIT) {
+    let page;
+    try {
+      page = await env.VECTORIZE.getByIds(ids.slice(start, start + VECTOR_GET_BY_IDS_LIMIT));
+    } catch (error) {
+      throw new Error(`the vector index could not verify accepted changes: ${String(error?.message || error).slice(0, 240)}`);
+    }
+    if (!Array.isArray(page)) {
+      // Do not acknowledge an earlier page until every requested id has an
+      // unambiguous readback receipt.
+      throw new Error("the vector index returned an invalid visibility receipt");
+    }
+    visible.push(...page);
   }
   const byId = new Map(visible.map((vector) => [vector?.id, vector]));
   let confirmed = [];

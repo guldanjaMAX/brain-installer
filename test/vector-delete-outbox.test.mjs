@@ -34,6 +34,7 @@ function makeEnv({
   autoProcessVectorMutations = true,
   deleteThrows = false,
   enforceD1PatternLimit = false,
+  invalidGetByIdsPage = null,
 } = {}) {
   const db = new DatabaseSync(":memory:");
   const dir = fileURLToPath(new URL("../migrations/d1/", import.meta.url));
@@ -52,6 +53,7 @@ function makeEnv({
   let mutationSequence = 0;
   let processedUpToMutation = null;
   const pendingVectorMutations = [];
+  const getByIdsCalls = [];
   const accept = (apply) => {
     const mutationId = `fixture-mutation-${++mutationSequence}`;
     if (autoProcessVectorMutations) {
@@ -130,14 +132,19 @@ function makeEnv({
           for (const id of ids) visible.delete(id);
         });
       },
-      getByIds: async (ids) => ids.map((id) => visible.get(id)).filter(Boolean),
+      getByIds: async (ids) => {
+        getByIdsCalls.push([...ids]);
+        if (ids.length > 20) throw new Error("Vectorize getByIds accepts at most 20 ids");
+        if (getByIdsCalls.length === invalidGetByIdsPage) return { invalid: true };
+        return ids.map((id) => visible.get(id)).filter(Boolean);
+      },
       describe: async () => ({
         vectorCount: visible.size,
         processedUpToMutation,
       }),
     },
   };
-  return { env, db, deleted, upserted, visible, d1Queries };
+  return { env, db, deleted, upserted, visible, d1Queries, getByIdsCalls };
 }
 
 const insertDocument = (db, uid, source = "drive") => db.prepare(
@@ -161,6 +168,142 @@ async function drainFully(env, options = {}, maxRounds = 20) {
     if (part.remaining === 0) return total;
   }
   throw new Error(`fixture drain did not settle: ${JSON.stringify(total)}`);
+}
+
+const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
+  const receipt = env._acceptVectorMutation(() => {});
+  db.prepare(
+    `UPDATE vector_outbox
+        SET submitted_mutation_id=?, submitted_at=?`,
+  ).run(receipt.mutationId, submittedAt);
+  db.prepare(
+    `UPDATE install_state
+        SET vector_projection_mutation_id=?, vector_projection_submitted_at=?
+      WHERE id=1`,
+  ).run(receipt.mutationId, submittedAt);
+  return receipt.mutationId;
+};
+
+/* Confirmation readback is provider-paged independently from the D1 drain
+   batch. Recombining pages must retain exact-generation upserts, absent
+   deletes, duplicate delete ids and their row-level CAS receipts. */
+{
+  const { env, db, visible, getByIdsCalls } = makeEnv();
+  const exactUpserts = [];
+  const requestedIds = new Set();
+  for (let i = 0; i < 32; i++) {
+    const docUid = `drive:paged-upsert-${i}`;
+    const chunkUid = `${docUid}#0`;
+    insertDocument(db, docUid);
+    insertChunk(db, chunkUid, docUid, 0);
+    db.prepare(
+      `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at)
+       VALUES (?, ?, 'upsert', ?)`,
+    ).run(chunkUid, chunkUid, i);
+    exactUpserts.push(chunkUid);
+    requestedIds.add(chunkUid);
+  }
+  const staleDocUid = "drive:paged-stale-upsert";
+  const staleChunkUid = `${staleDocUid}#0`;
+  insertDocument(db, staleDocUid);
+  insertChunk(db, staleChunkUid, staleDocUid, 0);
+  db.prepare(
+    `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at)
+     VALUES (?, ?, 'upsert', 32)`,
+  ).run(staleChunkUid, staleChunkUid);
+  requestedIds.add(staleChunkUid);
+
+  for (let i = 0; i < 28; i++) {
+    const chunkUid = `delete:paged-absent-${i}`;
+    const vectorId = `vector:paged-absent-${i}`;
+    db.prepare(
+      `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at)
+       VALUES (?, ?, 'delete', ?)`,
+    ).run(chunkUid, vectorId, 33 + i);
+    requestedIds.add(vectorId);
+  }
+  db.prepare(
+    `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at)
+     VALUES ('delete:paged-visible', 'vector:paged-visible', 'delete', 61)`,
+  ).run();
+  requestedIds.add("vector:paged-visible");
+  for (let i = 0; i < 3; i++) {
+    db.prepare(
+      `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at)
+       VALUES (?, 'vector:paged-shared-absent', 'delete', ?)`,
+    ).run(`delete:paged-shared-${i}`, 62 + i);
+  }
+  requestedIds.add("vector:paged-shared-absent");
+
+  markAllOutboxSubmitted(env, db);
+  for (const chunkUid of exactUpserts) {
+    const generation = db.prepare(
+      "SELECT generation FROM vector_outbox WHERE chunk_uid=?",
+    ).get(chunkUid).generation;
+    visible.set(chunkUid, {
+      id: chunkUid,
+      values: [0.1],
+      metadata: { outbox_generation: String(generation) },
+    });
+  }
+  const staleGeneration = db.prepare(
+    "SELECT generation FROM vector_outbox WHERE chunk_uid=?",
+  ).get(staleChunkUid).generation;
+  visible.set(staleChunkUid, {
+    id: staleChunkUid,
+    values: [0.2],
+    metadata: { outbox_generation: String(staleGeneration - 1) },
+  });
+  visible.set("vector:paged-visible", {
+    id: "vector:paged-visible",
+    values: [0.3],
+    metadata: { outbox_generation: "old" },
+  });
+
+  const confirmed = await drainOutbox(env, { embed: async () => [9], batchSize: 100 });
+  const requested = getByIdsCalls.flat();
+  const retained = db.prepare(
+    `SELECT chunk_uid, op, attempts, submitted_mutation_id
+       FROM vector_outbox ORDER BY chunk_uid`,
+  ).all();
+  check("more than 57 unique visibility ids are read in deterministic pages of at most 20",
+    requestedIds.size === 63 && getByIdsCalls.map((page) => page.length).join(",") === "20,20,20,3" &&
+      requested.length === requestedIds.size && new Set(requested).size === requestedIds.size &&
+      requested.every((id) => requestedIds.has(id)),
+    JSON.stringify({ unique: requestedIds.size, pages: getByIdsCalls.map((page) => page.length) }));
+  check("paged readback confirms only exact generations and absent deletes",
+    confirmed.drained === 63 && confirmed.upserted === 32 && confirmed.deleted === 31 &&
+      confirmed.failed === 2 && confirmed.remaining === 2 && retained.length === 2 &&
+      retained.every((row) => row.attempts === 1 && row.submitted_mutation_id === null) &&
+      retained.some((row) => row.chunk_uid === staleChunkUid && row.op === "upsert") &&
+      retained.some((row) => row.chunk_uid === "delete:paged-visible" && row.op === "delete"),
+    JSON.stringify({ confirmed, retained }));
+}
+
+/* No page is acknowledged until the whole provider readback is valid. */
+{
+  const { env, db, getByIdsCalls } = makeEnv({ invalidGetByIdsPage: 2 });
+  for (let i = 0; i < 25; i++) {
+    db.prepare(
+      `INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at)
+       VALUES (?, ?, 'delete', ?)`,
+    ).run(`delete:invalid-page-${i}`, `vector:invalid-page-${i}`, i);
+  }
+  const mutationId = markAllOutboxSubmitted(env, db);
+  let error = null;
+  try {
+    await drainOutbox(env, { embed: async () => [9], batchSize: 100 });
+  } catch (caught) {
+    error = caught;
+  }
+  const retained = db.prepare(
+    `SELECT attempts, submitted_mutation_id FROM vector_outbox`,
+  ).all();
+  check("an invalid second visibility page fails the entire confirmation closed",
+    /invalid visibility receipt/.test(error?.message || "") &&
+      getByIdsCalls.map((page) => page.length).join(",") === "20,5" && retained.length === 25 &&
+      retained.every((row) => row.attempts === 0 && row.submitted_mutation_id === mutationId),
+    JSON.stringify({ message: error?.message, pages: getByIdsCalls.map((page) => page.length) }));
 }
 
 /* Vectorize accepts writes asynchronously. An accepted receipt is not proof
