@@ -143,10 +143,13 @@ function pendingRevisionMarker(hash) {
 function validDeferredRevision(revision) {
   const hashIsValid = /^[a-f0-9]{64}$/.test(revision?.hash || "");
   const markerPrefix = hashIsValid ? `pending:${revision.hash}:` : "";
+  const sourceIsValid = typeof revision?.source === "string" && revision.source.length > 0;
+  const docUidIsValid = typeof revision?.doc_uid === "string" &&
+    sourceIsValid &&
+    revision.doc_uid.length > revision.source.length + 1 &&
+    revision.doc_uid.startsWith(`${revision.source}:`);
   return Boolean(
-    revision?.doc_uid &&
-    revision?.source &&
-    revision.doc_uid.startsWith(`${revision.source}:`) &&
+    docUidIsValid &&
     typeof revision.pending_marker === "string" &&
     revision.pending_marker.startsWith(markerPrefix) &&
     /^[a-f0-9]{32}$/.test(revision.pending_marker.slice(markerPrefix.length)) &&

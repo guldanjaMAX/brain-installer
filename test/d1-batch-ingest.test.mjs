@@ -194,6 +194,29 @@ assert.match(sqlite.prepare("SELECT text FROM chunks WHERE doc_uid = 'message:du
 // report success. The stale finalizer must fail even after it reads the same
 // final content hash written by the winner.
 const store = storeFor(env);
+
+// Malformed internal revision receipts fail closed before any D1 call. In
+// particular, validation must never invoke String methods on attacker-shaped
+// numeric or object values.
+{
+  const hash = "a".repeat(64);
+  const revision = {
+    source: "message",
+    hash,
+    pending_marker: `pending:${hash}:${"b".repeat(32)}`,
+    ingested_at: 1,
+  };
+  const callsBefore = metrics.remote_calls;
+  const invalid = await store.finalizeIngestBatch(env, [
+    { ...revision, doc_uid: 42 },
+    { ...revision, doc_uid: { value: "message:object" } },
+    { ...revision, doc_uid: "" },
+    revision,
+  ]);
+  assert.deepEqual(invalid.map((outcome) => outcome.ok), [false, false, false, false]);
+  assert.equal(metrics.remote_calls, callsBefore);
+}
+
 const plainRow = (row) => row ? { ...row } : null;
 const statsFor = (source) => plainRow(sqlite.prepare(
   "SELECT source, documents, chunks, last_ingest_at FROM corpus_stats WHERE source = ?"
