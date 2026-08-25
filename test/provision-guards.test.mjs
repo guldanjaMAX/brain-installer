@@ -511,10 +511,13 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
 {
   const fs = await import("node:fs/promises");
   const src = await fs.readFile(new URL("../brain.mjs", import.meta.url), "utf-8");
-  const i = src.indexOf("if (e instanceof Fatal) {");
-  const block = src.slice(i, i + 900);
+  const i = src.indexOf("const reviewRequired = e instanceof DriveRemovalReviewRequired;");
+  const block = src.slice(i, i + 1_100);
   check("a Fatal prints on stdout, so PowerShell does not dress it up as a crash",
-    /console\.log\(`\$\{c\.red\("fail"\)\}/.test(block), block.slice(0, 160));
+    /if \(e instanceof Fatal \|\| reviewRequired\)/.test(block) &&
+      /const label = reviewRequired \? c\.yellow\("review required"\) : c\.red\("fail"\)/.test(block) &&
+      /console\.log\(`\$\{label\}/.test(block) &&
+      !/console\.error/.test(block), block.slice(0, 300));
   check("and still exits 1, because that is the machine-readable part", /process\.exit\(1\)/.test(block));
 }
 
