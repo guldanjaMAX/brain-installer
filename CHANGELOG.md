@@ -4,6 +4,26 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.11
+
+**A Drive refresh now stops before an unexpectedly large cleanup can remove
+material from the brain.**
+
+- Source policy exclusions, Drive deletions, and files newly refused by quality
+  or credential checks are compared with the live stored-document inventory and
+  combined into one deterministic removal plan.
+- A plan above 100 documents or above 10% of the stored Drive corpus stops
+  before planned deletion and before its source cursor advances.
+- The stopped run shows only aggregate category counts and an opaque plan
+  fingerprint. It never prints filenames or document IDs. Re-running with the
+  exact `--approve-removals <fingerprint>` value approves only that exact plan;
+  any change requires a new review.
+- Failed or interrupted removals return through the same aggregate gate on the
+  next run, so a retry cannot bypass the protection.
+- Cloudflare prerequisite copy now states the current platform truth: Free can
+  create Vectorize, while Workers Paid remains the supported production
+  baseline because Free has prototype-scale vector, daily-write, and CPU limits.
+
 ## 0.1.10
 
 **Credentials now stay in the storage chosen by each install, and failures

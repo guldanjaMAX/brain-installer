@@ -578,9 +578,9 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     /hasCredentialScannerProgress\([\s\S]*state\.done\[key\] === listedVersion/.test(remote || "") &&
       /recordCredentialScannerProgress\(state, scannerFingerprint, plan\.stateKey, plan\.hash\)/.test(remote || ""),
     String(remote).slice(0, 2200));
-  const remoteCleanupConfirmed = String(remote).indexOf('assertNoPendingRemovals(vanished');
+  const remoteCleanupConfirmed = String(remote).indexOf('assertDriveRemovalPlanSafe(driveRemovalPlan');
   const remoteScannerCommitted = String(remote).indexOf('commitCredentialScannerProgress(state, scannerFingerprint)');
-  check("remote scanner progress commits only after full-sweep deletion is confirmed",
+  check("remote scanner progress commits only after the aggregate Drive removal plan is approved",
     remoteCleanupConfirmed !== -1 && remoteScannerCommitted > remoteCleanupConfirmed,
     `cleanup=${remoteCleanupConfirmed} commit=${remoteScannerCommitted}`);
   const versionCheck = String(remote).indexOf("state.done[key] === listedVersion");

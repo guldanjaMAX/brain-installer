@@ -90,6 +90,7 @@ const expected = [
   "onboarding/08-provisioning-prerequisites.md",
   "operations/admin-key-file.mjs",
   "operations/admin-key-persistence.mjs",
+  "operations/drive-removal-plan.mjs",
   "operations/drive-scheduler.mjs",
   "operations/windows-dpapi.ps1",
   "operations/windows-dpapi-bridge.mjs",

@@ -19,14 +19,14 @@ asset and installs into a folder owned by your user account, so it needs no Git,
 Mac or Linux:
 
 ```bash
-npm install --global --ignore-scripts --no-audit --no-fund --prefix "$HOME/.financial-brain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.10/brain-installer-0.1.10.tgz"
+npm install --global --ignore-scripts --no-audit --no-fund --prefix "$HOME/.financial-brain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.11/brain-installer-0.1.11.tgz"
 export PATH="$HOME/.financial-brain/bin:$PATH"
 ```
 
 Windows PowerShell:
 
 ```powershell
-npm.cmd install --global --ignore-scripts --no-audit --no-fund --prefix "$env:LOCALAPPDATA\FinancialBrain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.10/brain-installer-0.1.10.tgz"
+npm.cmd install --global --ignore-scripts --no-audit --no-fund --prefix "$env:LOCALAPPDATA\FinancialBrain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.11/brain-installer-0.1.11.tgz"
 $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
 ```
 
@@ -46,9 +46,10 @@ brain doctor       # check your machine has everything it needs
 You need two things first. `brain doctor` checks all of them and tells you
 exactly what to do about anything missing.
 
-1. **A Cloudflare account on the Workers Paid plan.** 5 USD a month. The
-   meaning-based search index cannot be created on the free tier at all, and
-   this is the one requirement with no workaround.
+1. **A Cloudflare account on the Workers Paid plan.** 5 USD a month minimum.
+   Cloudflare now lets Free accounts create the meaning-search index, but Free
+   has prototype-scale vector, daily database-write, and Worker CPU limits. Paid
+   is the supported production baseline so a real corpus does not hard-stop.
 2. **A Cloudflare API token**, created in your own account, with exactly four
    permissions: Workers Scripts Edit, D1 Edit, Vectorize Edit and Workers AI
    Read. The token can be limited to your account and given an expiry.
@@ -99,6 +100,14 @@ brain will not know.
 
 Then drop `--dry-run` to load it for real. Large loads are resumable: if it is
 interrupted, run the same command again and it continues from where it stopped.
+
+A Drive refresh may discover files that were deleted, newly excluded, or no
+longer readable. It combines every removal reason into one plan. Up to 100
+documents and 10% of the stored Drive corpus can be reconciled as routine
+source changes. A plan crossing either limit stops before deleting anything or
+advancing the Drive cursor. It prints aggregate counts and an opaque approval
+fingerprint, never filenames or document IDs. Review the cause, then add the
+exact `--approve-removals <fingerprint>` value only when the plan is expected.
 
 Ask directly in the terminal, even if you do not have Claude Code or Codex:
 

@@ -79,7 +79,7 @@ The brain runs entirely inside accounts you own. I never hold a copy of your dat
 
 **5.2** Do you already have a Cloudflare account? If not, you will create one.
 
-**5.3** Is that account on the **Workers Paid plan**? It is 5 USD a month, and it is not optional: the part of the brain that finds documents by meaning cannot be created on the free tier at all. Check under Workers and Pages, then Plans. Send a screenshot of that page rather than answering from memory.
+**5.3** Is that account on the **Workers Paid plan**? It has a 5 USD monthly minimum, and it is our required production baseline. Cloudflare now lets a Free account create the meaning-search index, but Free has prototype-scale vector capacity, daily database writes, and Worker CPU. A real corpus can hard-stop during its first load. Check under Workers and Pages, then Plans. Send a screenshot of that page rather than answering from memory.
 
 > Why I ask: this is the single most common way an install session dies in its first ten minutes. Two minutes and a card fix it in advance; discovering it live costs the session.
 
@@ -91,7 +91,7 @@ The brain runs entirely inside accounts you own. I never hold a copy of your dat
 
 **5.6** What computer will you run the install from: Windows or Mac? And do you already use **Claude Code** or **Codex** on it? Either works, both is fine, and the brain will be wired into whichever you have.
 
-**5.7** Before our session, run the preflight on that machine and send me what it prints. It takes two minutes and checks everything at once: Node, your Cloudflare sign-in, the paid plan, and your AI tools. The exact commands are in the setup sheet I will send with the installer; the last line should say "ready to install".
+**5.7** Before our session, run the preflight on that machine and send me what it prints. It takes two minutes and checks Node, your Cloudflare sign-in, Vectorize access, and your AI tools. The Paid-plan proof is the dashboard screenshot from 5.3. The exact commands are in the setup sheet I will send with the installer; the last line should say "ready to install".
 
 > Why I ask: every answer above can also be checked by the preflight, and the preflight does not misremember. When 5.7 comes back green, the install session is boring, which is the goal.
 

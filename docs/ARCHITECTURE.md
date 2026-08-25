@@ -120,6 +120,13 @@ resumable. A failure stays retryable. Drive policy changes and periodic full
 sweeps compare source truth with stored families so excluded, deleted, moved,
 or no-longer-accessible files can be removed safely.
 
+Drive removal candidates from policy, source deletion, and intentional quality
+skips are intersected with the current stored-family inventory and approved as
+one deterministic plan. Crossing either the 100-document limit or the 10%
+stored-corpus limit stops before planned deletion and cursor commit. Approval
+binds to an opaque fingerprint of the exact categorized target set, so a
+changed plan requires a new decision without exposing source identifiers.
+
 ### Connector status
 
 | Source | Current path |

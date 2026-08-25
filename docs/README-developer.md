@@ -5,7 +5,7 @@ keyword search live in D1, vectors live in Vectorize, and the Worker fuses them.
 Nothing runs on our infrastructure, and nothing but a scoped token is held during
 the engagement.
 
-**Status: 0.1.10.** Provisioning, retrieval, resumable folder ingest, deletion,
+**Status: 0.1.11.** Provisioning, retrieval, resumable folder ingest, deletion,
 upgrade rollback, and `brain setup` are verified end to end against real
 Cloudflare on macOS. Google Drive OAuth and a bounded real-account ingest have
 also been verified. The complete Drive baseline is the remaining production
@@ -19,8 +19,10 @@ completed. See "What is not built" before promising anything to anyone.
 ## Requirements
 
 - Node 22 or newer (uses `node:sqlite` for the migration tests)
-- A Cloudflare account **on the Workers Paid plan**, 5 USD a month. Vectorize
-  cannot create an index on the free tier at all.
+- A Cloudflare account **on the Workers Paid plan**, 5 USD a month minimum.
+  Vectorize has a Free allowance, but its vector capacity, D1 daily-write limit,
+  and Worker CPU limit are prototype-scale. Paid is this product's supported
+  production baseline.
 - A Cloudflare API token created in the client's own account with: Workers
   Scripts Edit, D1 Edit, Vectorize Edit and Workers AI Read. It drives verify,
   provisioning, migrations, deploy and secrets. Add Workers R2 Storage Edit only
@@ -174,7 +176,9 @@ file-id, path-prefix and filename-part exclusions before downloading content.
 An excluded document already present in the brain is removed rather than left
 stranded. Gmail has no folder path and does not use these rules.
 
-Flags: `--dry-run`, `--source <name>`, `--limit <n>`, `--reset`.
+Flags: `--dry-run`, `--source <name>`, `--limit <n>`, `--reset`, and the
+exact-plan acknowledgement `--approve-removals <fingerprint>` when a Drive
+cleanup exceeds its routine safety limits.
 
 ---
 
@@ -244,10 +248,17 @@ Google Workspace account should use "Internal" instead and avoids this entirely.
 a re-sync proportional to what changed rather than to the corpus.
 
 **Drive deletions are applied.** When a file is deleted or trashed in Drive, the
-next incremental sync removes it from the brain, chunks and vectors both. A
-deletion that cannot be applied is kept in the state file and retried on the
-following run rather than lost. **Gmail does not report deletions**, so a deleted
-message stays until the source is re-ingested with `--reset`.
+next incremental sync removes it from the brain, chunks and vectors both. The
+sync first intersects policy, source-deletion, and intentional-skip candidates
+with the authenticated stored-family inventory, deduplicates them, and checks
+one aggregate plan. More than 100 removals or more than 10% of the stored Drive
+corpus stops before any planned deletion or cursor advancement. The refusal
+shows category counts and an opaque SHA-256 fingerprint, never source IDs. Only
+the exact `--approve-removals <fingerprint>` value can authorize that exact
+plan. A deletion that cannot be applied is kept in the state file and retried
+through the same aggregate gate rather than lost. **Gmail does not report
+deletions**, so a deleted message stays until the source is re-ingested with
+`--reset`.
 
 Oversized Drive documents are reconciled as a family. A revision that changes
 from one document to several parts, changes its part count, or becomes small

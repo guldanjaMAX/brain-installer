@@ -47,8 +47,9 @@ export const VECTORIZE_REMEDY =
   "  Temporary fallback: run `npx wrangler@4 login` in the account owner's browser.\n" +
   "  Provision can use that session for Vectorize while the API token drives the\n" +
   "  remaining steps.\n" +
-  "  The account must ALSO be on the Workers Paid plan (5 USD a month). Vectorize\n" +
-  "  cannot create an index on the free tier at all.";
+  "  Workers Paid (5 USD monthly minimum) is the supported production baseline.\n" +
+  "  Free can create Vectorize, but its vector, daily-write, and CPU limits are\n" +
+  "  prototype-scale and can hard-stop a real corpus.";
 
 /** The token scopes, in one place, for the same reason. */
 export const CF_TOKEN_SCOPES = ["Workers Scripts: Edit", "D1: Edit", "Vectorize: Edit", "Workers AI: Read"];
@@ -312,9 +313,10 @@ export function checkVectorize(accountId) {
     "Vectorize",
     FAIL,
     paid ? "the account is not on the Workers Paid plan" : "unreachable",
-    "Vectorize requires the Workers Paid plan, 5 USD a month. There is no free allowance,\n" +
-      "  and an index cannot be created on the free tier at all.\n" +
-      "  Cloudflare dashboard > Workers & Pages > Plans > upgrade, then re-run.\n" +
+    "Recreate the scoped token with Vectorize: Edit, then re-run. Workers Paid\n" +
+      "  (5 USD monthly minimum) is the supported production baseline because Free\n" +
+      "  has prototype-scale vector, daily-write, and Worker CPU limits.\n" +
+      "  Confirm the plan separately in Cloudflare dashboard > Workers & Pages > Plans.\n" +
       "  Without it the brain can only match documents that repeat the words in the question."
   );
 }

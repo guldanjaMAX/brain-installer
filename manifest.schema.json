@@ -51,7 +51,7 @@
             "d1_database_id": { "type": "string" },
             "vectorize_index": {
               "type": "string",
-              "description": "Created by provision at 768 dimensions, cosine. Those are the output shape of @cf/baai/bge-base-en-v1.5 and are not free choices. Requires the Workers Paid plan."
+              "description": "Created by provision at 768 dimensions, cosine. Those are the output shape of @cf/baai/bge-base-en-v1.5 and are not free choices. Free can create this index, but Paid is the supported production baseline because Free has prototype-scale vector, daily-write, and Worker CPU limits."
             },
             "drain_cron": { "type": "string", "default": "*/5 * * * *" },
             "r2_bucket": { "type": "string", "description": "Created by provision, but NOT YET WIRED: nothing binds or reads it." },

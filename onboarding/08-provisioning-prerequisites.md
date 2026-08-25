@@ -1,7 +1,7 @@
 # Provisioning prerequisites
 
 Everything that must be true **before** an install session starts. Verified
-against live Cloudflare on 2026-08-17.
+against live Cloudflare and current Cloudflare limits on 2026-08-24.
 
 Supersedes the Supabase account steps in `02-client-effort-and-timeline.md`.
 The brain no longer needs Supabase: it runs on the client's own Cloudflare
@@ -14,7 +14,7 @@ account alone.
 | # | Thing | Time | Why |
 |---|---|---|---|
 | 1 | A Cloudflare account | 5 min | Everything lives here. Theirs, not ours |
-| 2 | **Workers Paid plan on it** | 2 min | 5 USD/month. **Vectorize cannot create an index on the free tier at all** |
+| 2 | **Workers Paid plan on it** | 2 min | 5 USD/month minimum. The Free plan is prototype-scale, not a supported production home for a real corpus |
 | 3 | An account-scoped, expiring API token | 5 min | One token drives every Cloudflare step |
 
 Nothing else. No Supabase, no second AI vendor, no database password.
@@ -23,14 +23,23 @@ Nothing else. No Supabase, no second AI vendor, no database password.
 
 ## Item 2 is the one that bites
 
-Vectorize is a paid-plan feature. There is no free allowance and no trial. If
-the account is on the free plan, `brain provision` fails at the Vectorize step
-and the install stops there.
+Vectorize now has a Free allowance, but that does not make the Free plan a safe
+production baseline for this product. At 768 dimensions, its 5 million stored
+vector dimensions hold only about 6,500 chunks. The Free plan also hard-stops at
+100,000 D1 row writes per day and 10 ms of Worker CPU per request. A normal
+personal or company corpus can cross those limits during its first load.
 
 **Confirm it before the session, not during it.** Cloudflare dashboard, Workers
 and Pages, Plans. It should say Paid. Upgrading takes about two minutes and a
-card, but discovering it live burns the first ten minutes of a session in front
-of a client, which is the worst possible ten minutes to burn.
+card. `brain doctor` proves Vectorize access, but Cloudflare does not expose the
+plan check through the scoped install token, so the dashboard remains the plan
+proof.
+
+Current limits:
+
+- Vectorize pricing: https://developers.cloudflare.com/vectorize/platform/pricing/
+- D1 pricing: https://developers.cloudflare.com/d1/platform/pricing/
+- Workers limits: https://developers.cloudflare.com/workers/platform/limits/
 
 ---
 
@@ -82,8 +91,8 @@ looks healthy and answers badly, and that is far worse than failing loudly.
 
 ## What "keyword-only" actually costs
 
-Worth being able to say out loud, because a client will ask why the paid plan is
-non-negotiable.
+Worth being able to say out loud, because a client will ask why Paid is our
+supported production baseline.
 
 Without Vectorize, the brain can only find documents that **repeat the words in
 the question**. Ask "how do we stop overwhelming a new customer with decades of

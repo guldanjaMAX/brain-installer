@@ -18,7 +18,7 @@
     "timezone": "America/Phoenix"
   },
   "brain": {
-    "version": "0.1.10",
+    "version": "0.1.11",
     "domain": "brain.acme.com",
     "worker_name": "acme-brain"
   },
@@ -36,8 +36,8 @@
         "metadata index. `npx wrangler@4 login` is only a fallback for an older",
         "token that does not carry that permission.",
         "",
-        "The account must ALSO be on the Workers Paid plan, 5 USD a month.",
-        "Vectorize cannot create an index on the free tier at all."
+        "The account must ALSO be on the Workers Paid plan, 5 USD a month minimum.",
+        "Free can create Vectorize, but its vector, daily-write, and Worker CPU limits are prototype-scale. Paid is the supported production baseline."
       ],
       "account_id": "REQUIRED_client_account_id",
       "storage": "d1",

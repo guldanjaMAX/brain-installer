@@ -96,6 +96,18 @@ import {
   readAdminKeyDurably,
   readAdminKeyFromKeychain,
 } from "./operations/admin-key-persistence.mjs";
+import {
+  DRIVE_REMOVAL_MAX_COUNT,
+  DRIVE_REMOVAL_MAX_RATIO,
+  assertDriveRemovalPlanSafe,
+  buildDriveRemovalPlan,
+} from "./operations/drive-removal-plan.mjs";
+export {
+  DRIVE_REMOVAL_MAX_COUNT,
+  DRIVE_REMOVAL_MAX_RATIO,
+  assertDriveRemovalPlanSafe,
+  buildDriveRemovalPlan,
+};
 
 // fileURLToPath, never `new URL(...).pathname`. The latter is percent-encoded,
 // so any install path containing a space resolves to a directory that does not
@@ -2835,7 +2847,7 @@ function assertSourceName(name) {
  */
 export const VALUE_FLAGS = new Set([
   "path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark", "export",
-  "golden", "k", "repeat", "baseline", "save", "artifacts",
+  "golden", "k", "repeat", "baseline", "save", "artifacts", "approve-removals",
 ]);
 
 /** Read an exact Drive-id exclusion list from either its portable shape or a migration receipt. */
@@ -2982,6 +2994,30 @@ export function remoteFamilyOutcomes(plans, sentCounts, acceptedCounts) {
     incomplete: settled.filter(
       (plan) => Number(acceptedCounts.get(plan.stateKey) || 0) !== plan.expectedParts
     ),
+  };
+}
+
+/**
+ * Decide what may happen after every part of a remote logical document has a
+ * receipt. Only a fully accepted replacement may remove obsolete family
+ * members immediately. A permanent refusal becomes a later source-removal
+ * candidate; a storage failure preserves the prior family and its retry.
+ */
+export function remoteFamilySettlement(outcome, rejectedFamilyParts = new Map()) {
+  const completed = [...(outcome?.completed || [])];
+  const incomplete = [...(outcome?.incomplete || [])].map((plan) => {
+    const statuses = [...new Set(rejectedFamilyParts.get(plan.stateKey) || ["failed"])];
+    return { plan, statuses };
+  });
+  return {
+    reconciliations: completed.map(({ base_doc_uid, keep_doc_uids }) => ({
+      base_doc_uid,
+      keep_doc_uids,
+    })),
+    incomplete,
+    intentionalRemovalUids: incomplete
+      .filter(({ statuses }) => statuses.length > 0 && statuses.every((status) => status === "refused"))
+      .map(({ plan }) => plan.base_doc_uid),
   };
 }
 
@@ -3893,6 +3929,9 @@ async function cmdIngest(manifestPath) {
   // the credential gate, resume state and the skip report. Only the producer
   // differs.
   if (flags.from) return cmdIngestRemote(m, manifestPath, flags);
+  if (flags["approve-removals"] !== undefined) {
+    die("--approve-removals is only valid with --from drive.");
+  }
 
   const root = flags.path;
   if (!root) {
@@ -4515,6 +4554,14 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     die(`--from ${which} is not a source. Available: drive, gmail.`);
   }
 
+  const removalApproval = flags["approve-removals"];
+  if (removalApproval !== undefined) {
+    if (which !== "drive") die("--approve-removals is only valid with --from drive.");
+    if (typeof removalApproval !== "string" || !/^[0-9a-f]{64}$/.test(removalApproval)) {
+      die("--approve-removals needs the exact 64-character lowercase fingerprint printed by the stopped Drive sync.");
+    }
+  }
+
   const sourceName = assertSourceName(flags.source === true || !flags.source ? which : flags.source);
   const dry = !!flags["dry-run"];
   // A deployed connector talks to the brain's authenticated data-plane route.
@@ -4616,33 +4663,20 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     for (const item of group) {
       if (item.familyPlan) familyPlans.set(item.familyPlan.stateKey, item.familyPlan);
     }
-    let part;
-    try {
-      part = await sendBatches({
-        base, adminKey, groups: [group], state, statePath, skips, quiet: true,
-        onResult: (item, result) => {
-          if (!item.familyPlan) return;
-          const key = item.familyPlan.stateKey;
-          if (["created", "updated", "unchanged"].includes(result.status)) {
-            acceptedFamilyParts.set(key, (acceptedFamilyParts.get(key) || 0) + 1);
-          } else {
-            const statuses = rejectedFamilyParts.get(key) || [];
-            statuses.push(result.status);
-            rejectedFamilyParts.set(key, statuses);
-          }
-        },
-      });
-    } catch (error) {
-      const touched = [...new Map(group.filter((item) => item.familyPlan)
-        .map((item) => [item.familyPlan.stateKey, item.familyPlan])).values()];
-      if (touched.length) {
-        await reconcileDocumentFamilies({
-          families: touched.map((plan) => ({ base_doc_uid: plan.base_doc_uid, keep_doc_uids: [] })),
-          base, adminKey,
-        });
-      }
-      throw error;
-    }
+    const part = await sendBatches({
+      base, adminKey, groups: [group], state, statePath, skips, quiet: true,
+      onResult: (item, result) => {
+        if (!item.familyPlan) return;
+        const key = item.familyPlan.stateKey;
+        if (["created", "updated", "unchanged"].includes(result.status)) {
+          acceptedFamilyParts.set(key, (acceptedFamilyParts.get(key) || 0) + 1);
+        } else {
+          const statuses = rejectedFamilyParts.get(key) || [];
+          statuses.push(result.status);
+          rejectedFamilyParts.set(key, statuses);
+        }
+      },
+    });
     addTally(part);
     for (const item of group) {
       if (!item.familyPlan) continue;
@@ -4651,23 +4685,22 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     }
 
     const outcome = remoteFamilyOutcomes(familyPlans.values(), sentFamilyParts, acceptedFamilyParts);
-    const reconciliation = [
-      ...outcome.completed.map(({ base_doc_uid, keep_doc_uids }) => ({ base_doc_uid, keep_doc_uids })),
-      ...outcome.incomplete.map(({ base_doc_uid }) => ({ base_doc_uid, keep_doc_uids: [] })),
-    ];
-    if (reconciliation.length) {
-      const staleParts = await reconcileDocumentFamilies({ families: reconciliation, base, adminKey });
+    const settlement = remoteFamilySettlement(outcome, rejectedFamilyParts);
+    if (settlement.reconciliations.length) {
+      const staleParts = await reconcileDocumentFamilies({
+        families: settlement.reconciliations, base, adminKey,
+      });
       if (staleParts) ok(`${staleParts} obsolete split-document part(s) removed`);
     }
+    intentionalRemovalUids.push(...settlement.intentionalRemovalUids);
     for (const plan of outcome.completed) {
       recordAcceptedDocumentState(state, plan);
       if (scannerPolicyChanged) {
         recordCredentialScannerProgress(state, scannerFingerprint, plan.stateKey, plan.hash);
       }
     }
-    for (const plan of outcome.incomplete) {
+    for (const { plan, statuses } of settlement.incomplete) {
       delete state.done[plan.stateKey];
-      const statuses = [...new Set(rejectedFamilyParts.get(plan.stateKey) || ["failed"])];
       state.skipped[plan.stateKey] = `logical document was not indexed because part status was ${statuses.join(", ")}`;
     }
     for (const plan of [...outcome.completed, ...outcome.incomplete]) {
@@ -4690,11 +4723,11 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     });
     runOpened = true;
 
-    // A prior deletion or intentional-skip cleanup is part of source truth,
-    // regardless of whether the next run is Drive, Gmail, incremental, or a
-    // full sweep. Retry it before accepting a newer cursor.
+    // Gmail retains the historical immediate-retry path. Drive pending work is
+    // deliberately held for the single aggregate plan below, otherwise a
+    // failed large cleanup could bypass the new approval gate on its next run.
     const pending = Object.keys(state.removed || {});
-    if (pending.length) {
+    if (which !== "drive" && pending.length) {
       const retried = await applyDriveRemovals({
         uids: pending, base, adminKey, state, dryRun: false, label: "pending source removal",
       });
@@ -4706,6 +4739,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
 
   if (which === "drive") {
     const drive = await import("./connectors/google-drive.mjs");
+    const sourceDeletedUids = [];
     if (!incremental && state.sync_token) info(`${driveDecision.reason}; using a full Drive comparison`);
     if (sourcePolicy.excludeFileIds.length) info(`${sourcePolicy.excludeFileIds.length} reviewed Drive file-id exclusion(s) enforced`);
     if (sourcePolicy.excludePaths.length) info(`${sourcePolicy.excludePaths.length} Drive path exclusion(s) enforced`);
@@ -4735,17 +4769,11 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       if (ch) {
         files = ch.changed;
         nextSync = ch.nextToken || nextSync;
-      // Deletions are APPLIED, not merely recorded. A brain that keeps
-      // answering from a document the client deleted in Drive is worse than one
-      // that never had it: they believe it is gone.
+        // Deletions are collected now and applied only after every reason can
+        // be reviewed as one plan. An active changed file wins over a stale
+        // removal entry when the change feed contains both.
         if (ch.removed.length) {
-        const uids = ch.removed.map((id) => `${sourceName}:${id}`);
-        const removed = await applyDriveRemovals({
-          uids, base, adminKey, state, dryRun: dry, label: "Drive deletion",
-        });
-        if (removed.applied) ok(`${removed.applied} document(s) removed to match Drive deletions`);
-        if (!dry) saveState(statePath, state);
-        assertNoPendingRemovals(removed, "Drive deletion");
+          sourceDeletedUids.push(...ch.removed.map((id) => `${sourceName}:${id}`));
         }
 
         // Drive emits the changed ancestor folder, not synthetic changes for
@@ -4838,28 +4866,106 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     })) {
       await consumeGroup(group);
     }
-    const policyRemoved = await applyDriveRemovals({
-      uids: excludedUids, base, adminKey, state, dryRun: dry, label: "source policy",
-    });
-    if (policyRemoved.applied) ok(`${policyRemoved.applied} document(s) removed to enforce the Drive source policy`);
-    if (!dry && excludedUids.length) saveState(statePath, state);
-    assertNoPendingRemovals(policyRemoved, "source policy removal");
 
-    // Change feeds tell us what Drive says changed. Only a complete listing can
-    // prove which previously-indexed files no longer exist or are no longer
-    // visible to this account. Compare logical family ids only after the walk
-    // and every ingest batch completed, then refuse to advance the cursor if
-    // any stale family cannot be removed.
-    if (!incremental && !dry) {
-      const seenUids = new Set(files.map((file) => `${sourceName}:${file.id}`));
-      const storedUids = await listStoredSourceFamilies({ base, adminKey, source: sourceName });
-      const vanishedUids = [...storedUids].filter((uid) => !seenUids.has(uid));
-      const vanished = await applyDriveRemovals({
-        uids: vanishedUids, base, adminKey, state, dryRun: false, label: "full-sweep source deletion",
+    if (dry) {
+      // A preview has no authenticated inventory, but still reports every
+      // observed category. It cannot delete or advance a cursor.
+      await applyDriveRemovals({
+        uids: excludedUids, base, adminKey, state, dryRun: true, label: "source policy",
       });
-      if (vanished.applied) ok(`${vanished.applied} stale document(s) removed after the full Drive comparison`);
-      if (vanishedUids.length) saveState(statePath, state);
-      assertNoPendingRemovals(vanished, "full-sweep source deletion");
+      await applyDriveRemovals({
+        uids: sourceDeletedUids, base, adminKey, state, dryRun: true, label: "Drive deletion",
+      });
+      await applyDriveRemovals({
+        uids: intentionalRemovalUids, base, adminKey, state, dryRun: true, label: "intentional source skip",
+      });
+      intentionalRemovalUids.length = 0;
+    } else {
+      // Inventory after every accepted batch, then make one decision covering
+      // policy, source deletion, and quality refusal. No planned delete call is
+      // allowed above this assertion.
+      const seenUids = new Set(files.map((file) => `${sourceName}:${file.id}`));
+      const explicitlyDeletedUids = sourceDeletedUids.filter((uid) => !seenUids.has(uid));
+      const pendingDriveUids = Object.keys(state.removed || {});
+      // A no-change incremental refresh has nothing destructive to decide and
+      // should not page through a large corpus merely to prove zero. Full
+      // sweeps always inventory because absence itself is a deletion signal.
+      const needsStoredInventory = !incremental || excludedUids.length ||
+        explicitlyDeletedUids.length || intentionalRemovalUids.length || pendingDriveUids.length;
+      const storedUids = needsStoredInventory
+        ? await listStoredSourceFamilies({ base, adminKey, source: sourceName })
+        : new Set();
+      const vanishedUids = incremental
+        ? explicitlyDeletedUids
+        : [...explicitlyDeletedUids, ...[...storedUids].filter((uid) => !seenUids.has(uid))];
+
+      // A valid prior forget may have reached the Worker even if its response
+      // was lost. Inventory is authoritative; clear only local retry markers
+      // for families that are already absent so they cannot block re-ingest.
+      for (const uid of pendingDriveUids) {
+        if (!storedUids.has(uid)) {
+          delete state.removed[uid];
+          delete state.done[uid];
+        }
+      }
+
+      const driveRemovalPlan = buildDriveRemovalPlan({
+        storedFamilies: storedUids,
+        activeFamilies: seenUids,
+        policyCandidates: excludedUids,
+        vanishedCandidates: [...vanishedUids, ...pendingDriveUids],
+        intentionalCandidates: intentionalRemovalUids,
+      });
+      saveState(statePath, state);
+      assertDriveRemovalPlanSafe(driveRemovalPlan, removalApproval);
+
+      const currentlyPlanned = new Set(Object.values(driveRemovalPlan.targets).flat());
+      let clearedRestoredPending = false;
+      for (const uid of pendingDriveUids) {
+        if (storedUids.has(uid) && seenUids.has(uid) && !currentlyPlanned.has(uid)) {
+          delete state.removed[uid];
+          clearedRestoredPending = true;
+        }
+      }
+      if (clearedRestoredPending) saveState(statePath, state);
+
+      if (driveRemovalPlan.total) {
+        const percent = (driveRemovalPlan.ratio * 100).toFixed(1);
+        const disposition = driveRemovalPlan.tooLarge ? "approved" : "within the unattended safety limits";
+        info(`Drive cleanup plan ${disposition}: ${driveRemovalPlan.total} of ${driveRemovalPlan.stored} stored documents (${percent}%)`);
+      }
+
+      const categories = [
+        ["source_policy", "source policy", "document(s) removed to enforce the Drive source policy"],
+        ["source_deleted", "Drive source deletion", "stale document(s) removed to match Drive source truth"],
+        ["intentional_skip", "intentional source skip", "previously-indexed document(s) removed because the source now skips them"],
+      ];
+      for (const [category, label, success] of categories) {
+        const result = await applyDriveRemovals({
+          uids: driveRemovalPlan.targets[category], base, adminKey, state, dryRun: false, label,
+        });
+        if (result.applied) ok(`${result.applied} ${success}`);
+        if (driveRemovalPlan.targets[category].length) saveState(statePath, state);
+        assertNoPendingRemovals(result, label);
+      }
+      if (driveRemovalPlan.total) {
+        const afterRemoval = await listStoredSourceFamilies({ base, adminKey, source: sourceName });
+        const plannedTargets = Object.values(driveRemovalPlan.targets).flat();
+        const stillStored = plannedTargets.filter((uid) => afterRemoval.has(uid));
+        if (stillStored.length) {
+          const failedAt = new Date().toISOString();
+          state.removed = {
+            ...(state.removed || {}),
+            ...Object.fromEntries(stillStored.map((uid) => [uid, failedAt])),
+          };
+          saveState(statePath, state);
+          throw new Error(
+            `${stillStored.length} planned Drive removal(s) remained after exact source-inventory readback. ` +
+              "The source cursor was not advanced; re-running will retry them through the same approval gate."
+          );
+        }
+      }
+      intentionalRemovalUids.length = 0;
     }
     // NOT saved yet. Advancing the cursor before the batches it covers have
     // been accepted means a mid-send failure permanently skips those documents:
@@ -4951,7 +5057,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   }
   process.stdout.write("\r");
 
-  await flushIntentionalRemovals();
+  if (which !== "drive") await flushIntentionalRemovals();
 
   info(`${scanned} scanned; ${prepared} document(s) prepared in ${batchNo} batch(es); ${unchanged} unchanged; ${skips.length} skipped`);
 
@@ -5000,7 +5106,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     // every batch and Drive family cleanup succeeds above. A thrown Drive/Gmail
     // fetch therefore stays retryable and is also visible immediately instead
     // of lingering as a green or anonymous `indexing` row.
-    if (intentionalRemovalUids.length && !dry) {
+    if (which !== "drive" && intentionalRemovalUids.length && !dry) {
       try {
         await flushIntentionalRemovals({ strict: false });
       } catch (cleanupError) {
@@ -7250,7 +7356,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain support    --clear --yes         clear private local issue notes
 
   brain ingest takes --source <name>, --limit <n>, --dry-run, and --reset. It is
-  resumable: re-run the same command to continue an interrupted load.
+  resumable: re-run the same command to continue an interrupted load. A large
+  Drive cleanup stops first and prints the exact --approve-removals fingerprint.
 
   brain sources takes --add <name> [--kind <drive|gmail|calendar|upload>] to register one,
   and --source <name> --refresh <hourly|daily|weekly|monthly|never> to say how often it

@@ -48,7 +48,7 @@ These are yours. I never own them, and that is the entire point: your material l
 | # | Account | Your time | What it is for |
 |---|---|---|---|
 | 1 | **Cloudflare** | 10 min | The brain itself, its database, and its file storage. Free to create |
-| 2 | **Workers Paid, on that same Cloudflare account** | 2 min | 5 USD/month. Vectorize holds the search index and CANNOT be created on the free tier. See `08-provisioning-prerequisites.md` |
+| 2 | **Workers Paid, on that same Cloudflare account** | 2 min | 5 USD/month minimum. Free can create Vectorize now, but its vector, daily-write, and CPU ceilings are prototype-scale. See `08-provisioning-prerequisites.md` |
 Written answers run on Cloudflare Workers AI, so there is no second AI-provider
 account or credential. Plus one grant:
 
@@ -118,7 +118,7 @@ Print this, or forward it to whoever is doing the setup.
 
 - [ ] Intake sheet returned, including all ten questions in section 6
 - [ ] Cloudflare account created, and I have been told which email it is under
-- [ ] Cloudflare account upgraded to Workers Paid (verify with `node brain.mjs doctor`, which actually checks it via Vectorize, NOT by asking)
+- [ ] Cloudflare account upgraded to Workers Paid (verify in the Cloudflare dashboard; `node brain.mjs doctor` separately proves Vectorize access)
 - [ ] Read-only access granted to the folders named at intake
 - [ ] Workspace or personal gmail.com question answered, and if personal, the publishing step scheduled
 - [ ] Anything from section 3 (what it must never see) confirmed in writing
