@@ -98,7 +98,7 @@ function fakeDpapi() {
   };
 }
 
-function fakeWindowsAcl() {
+function fakeWindowsAcl({ retainHandles = process.platform !== "win32" } = {}) {
   const calls = [];
   const retainedHandles = [];
   return {
@@ -106,7 +106,13 @@ function fakeWindowsAcl() {
     retainedHandles,
     runAcl(command, args, options) {
       calls.push({ command, args: [...args], env: { ...options.env } });
-      retainedHandles.push({ path: args[0], descriptor: openSync(args[0], "r") });
+      // POSIX lets this test keep an old read handle while rename replaces a
+      // path. Native Windows intentionally refuses that sharing violation, so
+      // its normal replacement fixture closes ACL work before commit and a
+      // dedicated test below verifies the locked-destination failure boundary.
+      if (retainHandles) {
+        retainedHandles.push({ path: args[0], descriptor: openSync(args[0], "r") });
+      }
       if (readFileSync(args[0]).length !== 0) {
         return { status: 1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
       }
@@ -260,8 +266,8 @@ try {
       closeSync(descriptor);
       return bytes;
     });
-    check("handles opened before Windows ACL replacement can observe only ciphertext",
-      retainedViews.length >= 3 && retainedViews.every((bytes) =>
+    check("retained ACL test handles can observe only ciphertext",
+      (process.platform === "win32" || retainedViews.length >= 3) && retainedViews.every((bytes) =>
         bytes.toString("ascii").startsWith("BRAIN-GOOGLE-TOKENS-DPAPI-V1\n") &&
         !bytes.includes(Buffer.from(record.google.refresh_token)) &&
         !bytes.includes(Buffer.from(replacement.google.refresh_token))));
@@ -282,6 +288,37 @@ try {
       acl.calls.every((call) => childEnvironmentIsScrubbed(call.env) &&
         !JSON.stringify(call).includes(record.google.refresh_token) &&
         !JSON.stringify(call).includes(replacement.google.refresh_token)));
+  }
+
+  if (process.platform === "win32") {
+    const root = join(directory, "windows-locked-destination");
+    const path = join(root, "google-tokens.json");
+    const dpapi = fakeDpapi();
+    const acl = fakeWindowsAcl();
+    const base = {
+      backend: "file",
+      platform: "win32",
+      username: process.env.USERNAME || process.env.USER,
+      path,
+      environment: process.env,
+      runAcl: acl.runAcl,
+      runPowerShell: dpapi.runPowerShell,
+    };
+    saveTokens(record, { ...base, randomBytes: () => Buffer.alloc(8, 0x71) });
+    const held = openSync(path, "r");
+    let error;
+    try {
+      saveTokens(replacement, { ...base, randomBytes: () => Buffer.alloc(8, 0x72) });
+    } catch (caught) {
+      error = caught;
+    } finally {
+      closeSync(held);
+    }
+    check("a Windows sharing lock refuses replacement without corrupting the prior token",
+      /replacement could not be committed/i.test(error?.message || "") &&
+      JSON.stringify(loadTokens(base)) === JSON.stringify(record), error?.message);
+    check("a refused Windows sharing lock leaves no transaction residue",
+      readdirSync(root).join(",") === "google-tokens.json", readdirSync(root).join(","));
   }
 
   {
