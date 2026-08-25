@@ -2,16 +2,15 @@
 /**
  * Verified recovery contract for a Cloudflare-native Brain.
  *
- * D1 is the durable record and Vectorize is derived. Recovery therefore exports
- * one full D1 SQL artifact, restores it only into a separately identified empty
- * target, rebuilds every vector from D1, and requires health plus release-eval
- * gates before the target can be called usable.
+ * D1 is the durable record and Vectorize is derived. Recovery therefore builds
+ * one restorable D1 SQL artifact, restores it only into a separately identified
+ * empty target, rebuilds every vector from D1, and requires health plus
+ * release-eval gates before the target can be called usable.
  *
- * This module deliberately does not contain a live Cloudflare executor yet.
- * `runVerifiedRecovery` is executable with injected stage adapters, while the
- * shipped CLI creates and inspects owner-only plans and state. A future field-
- * reviewed adapter may close over credentials and private locators; none of
- * those values may enter the plan, state, adapter context, or command output.
+ * `runVerifiedRecovery` remains provider-neutral. The separately reviewed
+ * Cloudflare field-gate adapter closes over credentials and private locators;
+ * none of those values may enter this plan, state, adapter context, or command
+ * output.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -292,7 +291,7 @@ export function buildVerifiedRecoveryPlan(sourceManifestPath, targetManifestPath
     runtime_contract_fingerprint: source.runtimeFingerprint,
     artifact: {
       format: "cloudflare_d1_full_sql",
-      relative_name: "d1-export.sql",
+      relative_name: ".brain-recovery-export.sql",
       digest: "sha256",
       owner_only: true,
       refuse_existing: true,
@@ -323,8 +322,15 @@ export function buildVerifiedRecoveryPlan(sourceManifestPath, targetManifestPath
   return validateVerifiedRecoveryPlan(plan);
 }
 
-/** Re-read both manifests and prove they still bind to the reviewed plan. */
-export function assertVerifiedRecoveryManifestBindings(
+/**
+ * Re-read both manifests once and return the exact ephemeral provider binding.
+ *
+ * The returned object must remain ephemeral. Recovery helpers never serialize
+ * it. It exists so a provider adapter can use the same stable bytes that were
+ * checked against the reviewed plan instead of reopening a path after choosing
+ * where a credential or write will go.
+ */
+export function inspectVerifiedRecoveryManifestBindings(
   planInput,
   sourceManifestPath,
   targetManifestPath,
@@ -343,6 +349,40 @@ export function assertVerifiedRecoveryManifestBindings(
       target.runtimeFingerprint !== plan.runtime_contract_fingerprint) {
     fail("verified recovery manifest binding changed after plan review");
   }
+  const ephemeral = (loaded, contract) => Object.freeze({
+    ...contract.identity,
+    clientSlug: contract.slug,
+    productVersion: contract.version,
+    adminKeySecret: loaded.manifest.operations?.admin_key_secret === undefined
+      ? null
+      : boundedIdentity(
+        loaded.manifest.operations.admin_key_secret,
+        "recovery admin-key locator",
+      ),
+    recoveryFieldGate: loaded.manifest.operations?.recovery_field_gate === undefined
+      ? null
+      : structuredClone(loaded.manifest.operations.recovery_field_gate),
+  });
+  return Object.freeze({
+    planFingerprint: plan.plan_fingerprint,
+    sourceManifestFingerprint: sourceLoaded.fingerprint,
+    targetManifestFingerprint: targetLoaded.fingerprint,
+    source: ephemeral(sourceLoaded, source),
+    target: ephemeral(targetLoaded, target),
+  });
+}
+
+/** Re-read both manifests and prove they still bind to the reviewed plan. */
+export function assertVerifiedRecoveryManifestBindings(
+  planInput,
+  sourceManifestPath,
+  targetManifestPath,
+) {
+  inspectVerifiedRecoveryManifestBindings(
+    planInput,
+    sourceManifestPath,
+    targetManifestPath,
+  );
   return true;
 }
 
@@ -360,7 +400,7 @@ export function validateVerifiedRecoveryPlan(input) {
     "format", "relative_name", "digest", "owner_only", "refuse_existing",
     "max_single_import_bytes",
   ])) || input.artifact.format !== "cloudflare_d1_full_sql" ||
-      input.artifact.relative_name !== "d1-export.sql" || input.artifact.digest !== "sha256" ||
+      input.artifact.relative_name !== ".brain-recovery-export.sql" || input.artifact.digest !== "sha256" ||
       input.artifact.owner_only !== true || input.artifact.refuse_existing !== true ||
       input.artifact.max_single_import_bytes !== MAX_SINGLE_D1_IMPORT_BYTES) {
     fail("verified recovery export policy is invalid");
@@ -416,7 +456,7 @@ function evidenceKeys(stage) {
     export_d1: ["artifact_sha256", "artifact_bytes"],
     verify_export: [
       "artifact_sha256", "artifact_bytes", "integrity", "schema_fingerprint",
-      "aggregate_fingerprint", "document_count", "chunk_count", "fts_count",
+      "aggregate_fingerprint", "content_fingerprint", "document_count", "chunk_count", "fts_count",
     ],
     prove_target_clean: [
       "target_resource_fingerprint", "user_table_count", "vector_count",
@@ -425,7 +465,7 @@ function evidenceKeys(stage) {
     restore_d1: ["artifact_sha256", "import_completed"],
     verify_d1: [
       "integrity", "schema_fingerprint", "aggregate_fingerprint",
-      "document_count", "chunk_count", "fts_count",
+      "content_fingerprint", "document_count", "chunk_count", "fts_count",
     ],
     rebuild_vectorize: ["chunk_count", "vector_count", "pending_outbox", "failed_vectors"],
     verify_health: ["status", "failure_count", "vector_backlog"],
@@ -453,6 +493,7 @@ function validateStageEvidence(stage, input, plan, completed) {
     hashValue(evidence.artifact_sha256, "verified recovery export artifact");
     hashValue(evidence.schema_fingerprint, "verified recovery export schema");
     hashValue(evidence.aggregate_fingerprint, "verified recovery export aggregates");
+    hashValue(evidence.content_fingerprint, "verified recovery export durable data");
     positiveInteger(evidence.artifact_bytes, "verified recovery export bytes");
     nonNegativeInteger(evidence.document_count, "verified recovery export document count");
     nonNegativeInteger(evidence.chunk_count, "verified recovery export chunk count");
@@ -483,12 +524,14 @@ function validateStageEvidence(stage, input, plan, completed) {
     const exported = completedEvidence(completed, "verify_export");
     hashValue(evidence.schema_fingerprint, "restored D1 schema");
     hashValue(evidence.aggregate_fingerprint, "restored D1 aggregates");
+    hashValue(evidence.content_fingerprint, "restored D1 durable data");
     nonNegativeInteger(evidence.document_count, "restored D1 document count");
     nonNegativeInteger(evidence.chunk_count, "restored D1 chunk count");
     nonNegativeInteger(evidence.fts_count, "restored D1 FTS count");
     if (evidence.integrity !== "ok" || evidence.chunk_count !== evidence.fts_count ||
         evidence.schema_fingerprint !== exported?.schema_fingerprint ||
         evidence.aggregate_fingerprint !== exported?.aggregate_fingerprint ||
+        evidence.content_fingerprint !== exported?.content_fingerprint ||
         evidence.document_count !== exported?.document_count ||
         evidence.chunk_count !== exported?.chunk_count || evidence.fts_count !== exported?.fts_count) {
       fail("restored D1 did not match the verified export");

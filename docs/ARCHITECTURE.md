@@ -97,6 +97,16 @@ waits for the new version, and records success. Rollback is explicit and does
 not pretend Vectorize is transactionally restored with D1; reindex is the repair
 path for a derived index.
 
+Verified recovery keeps orchestration provider-neutral and places all live
+Cloudflare access behind a separate disposable-only adapter. The adapter binds
+reviewed manifests to exact D1, Vectorize, Worker deployment, runtime values,
+and secret names before either source export or target access. Its target
+execution approval also binds the immutable Worker version and a manually
+reviewed empty route/custom-domain claim. D1 remains the durable authority. FTS
+and Vectorize are rebuilt derived state. Recovery control files contain
+fingerprints and bounded evidence only; the owner-only SQL export is the sole
+recovery artifact that contains corpus data.
+
 ## Ingest lifecycle
 
 All producers converge on the same document envelope and batch write path:

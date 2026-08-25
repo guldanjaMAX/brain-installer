@@ -48,6 +48,7 @@ eval/eval.config.local.json
 .brain-recovery-*.json.tmp-*
 .brain-recovery-*.sql
 .brain-recovery-*.sql.tmp-*
+.brain-recovery-*.lock
 
 # Adjacent fallback admin-key files contain the Brain's live authentication
 # secret. Atomic writes briefly create the matching residue beside them.

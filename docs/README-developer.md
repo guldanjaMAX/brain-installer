@@ -107,6 +107,17 @@ existing resources rather than duplicating them, and **refuses** to adopt a
 Vectorize index with the wrong dimensions or metric rather than silently writing
 vectors that would be rejected or mis-ranked.
 
+Verified recovery uses the provider-neutral state machine in
+`operations/verified-recovery.mjs` and the disposable-only Cloudflare adapter in
+`operations/cloudflare-recovery-adapter.mjs`. The adapter can export the
+reviewed source, restore only an exact empty `recovery-gate-<nonce>` target,
+rebuild Vectorize, and run health plus release evaluation. It cannot create,
+deploy, promote, delete, or destroy resources. The run requires five previewed
+approval fingerprints, including the blocking source-export window, pinned
+target Worker version and manually reviewed empty routes, and exact
+Keychain-backed Wrangler wrapper. See `docs/RECOVERY.md` for the private
+artifact rules and remaining live field gate.
+
 Run `node brain.mjs` with no arguments for the full command list.
 
 ---

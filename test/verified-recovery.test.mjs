@@ -107,6 +107,7 @@ function clock(start = Date.parse("2026-08-25T12:00:00.000Z")) {
 const artifactHash = "a".repeat(64);
 const schemaHash = "b".repeat(64);
 const aggregateHash = "c".repeat(64);
+const contentHash = "d".repeat(64);
 
 function evidenceFor(stage, context, override = {}) {
   const values = {
@@ -120,6 +121,7 @@ function evidenceFor(stage, context, override = {}) {
       integrity: "ok",
       schema_fingerprint: schemaHash,
       aggregate_fingerprint: aggregateHash,
+      content_fingerprint: contentHash,
       document_count: 3,
       chunk_count: 5,
       fts_count: 5,
@@ -139,6 +141,7 @@ function evidenceFor(stage, context, override = {}) {
       integrity: "ok",
       schema_fingerprint: schemaHash,
       aggregate_fingerprint: aggregateHash,
+      content_fingerprint: contentHash,
       document_count: 3,
       chunk_count: 5,
       fts_count: 5,
@@ -185,6 +188,7 @@ try {
   assert.match(plan.plan_fingerprint, /^[0-9a-f]{64}$/);
   assert.deepEqual(plan.stages, VERIFIED_RECOVERY_STAGES);
   assert.equal(plan.artifact.format, "cloudflare_d1_full_sql");
+  assert.equal(plan.artifact.relative_name, ".brain-recovery-export.sql");
   assert.equal(plan.artifact.owner_only, true);
   assert.equal(plan.isolation.required_initial_user_tables, 0);
   assert.equal(plan.isolation.required_initial_vectors, 0);

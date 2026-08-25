@@ -64,6 +64,7 @@ test("private questions use JSON POST bodies and never enter URLs", async () => 
   assert.equal(calls.length, 2);
   for (const call of calls) {
     assert.equal(call.method, "POST");
+    assert.equal(call.redirect, "error");
     assert.equal(new URL(call.url).search, "");
     assert.equal(call.headers["Content-Type"], "application/json");
   }

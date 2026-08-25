@@ -1,7 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packageJson = JSON.parse(readFileSync(resolve(ROOT, "package.json"), "utf8"));
@@ -65,6 +66,7 @@ const expected = [
   "eval/corpus-contract.mjs",
   "eval/eval.config.json",
   "eval/golden/TEMPLATE.golden.json",
+  "eval/golden-validation.mjs",
   "eval/profile.mjs",
   "eval/run.mjs",
   "eval/schema/corpus-contract-v1.schema.json",
@@ -105,6 +107,7 @@ const expected = [
   "operations/curated-sync-scheduler.mjs",
   "operations/drive-removal-plan.mjs",
   "operations/drive-scheduler.mjs",
+  "operations/cloudflare-recovery-adapter.mjs",
   "operations/verified-recovery.mjs",
   "operations/windows-dpapi.ps1",
   "operations/windows-dpapi-bridge.mjs",
@@ -148,6 +151,7 @@ const requiredGitIgnored = [
   ".brain-recovery-state.json.tmp-deadbeef",
   ".brain-recovery-export.sql",
   "brain.corpus-contract.json",
+  ".brain-recovery-field-gate.lock",
 ];
 const gitIgnoreFailures = requiredGitIgnored.filter((path) =>
   spawnSync("git", ["check-ignore", "--quiet", "--no-index", path], {
@@ -174,8 +178,65 @@ const privateTextMatches = expected.flatMap((path) => {
     .map(([label]) => `${path} (${label})`);
 });
 
+// A packlist can name every file and still hide a broken relative import.
+// Build and unpack the actual tarball, then import the recovery adapter from
+// that isolated package tree. The probe invokes no CLI entry point or network.
+let packedAdapterImportFailed = false;
+const packageProbeDirectory = mkdtempSync(join(tmpdir(), "brain-package-probe-"));
+try {
+  const actualPack = spawnSync(
+    "npm",
+    ["pack", "--json", "--ignore-scripts", "--pack-destination", packageProbeDirectory],
+    {
+      cwd: ROOT,
+      encoding: "utf-8",
+      shell: process.platform === "win32",
+      timeout: 60_000,
+    },
+  );
+  let filename = null;
+  try { filename = JSON.parse(actualPack.stdout)?.[0]?.filename || null; } catch { /* fixed failure below */ }
+  if (actualPack.status !== 0 || !filename) {
+    packedAdapterImportFailed = true;
+  } else {
+    const extracted = spawnSync("tar", [
+      "-xzf", join(packageProbeDirectory, filename), "-C", packageProbeDirectory,
+    ], {
+      encoding: "utf-8",
+      shell: process.platform === "win32",
+      timeout: 60_000,
+    });
+    const adapterPath = join(
+      packageProbeDirectory,
+      "package",
+      "operations",
+      "cloudflare-recovery-adapter.mjs",
+    );
+    const importProbe = extracted.status === 0
+      ? spawnSync(process.execPath, [
+          "--input-type=module",
+          "--eval",
+          "const {pathToFileURL}=await import('node:url');await import(pathToFileURL(process.env.PACK_IMPORT_PATH).href)",
+        ], {
+          encoding: "utf-8",
+          env: {
+            PATH: process.env.PATH || "",
+            ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+            ...(process.env.WINDIR ? { WINDIR: process.env.WINDIR } : {}),
+            PACK_IMPORT_PATH: adapterPath,
+          },
+          timeout: 60_000,
+        })
+      : { status: null };
+    packedAdapterImportFailed = extracted.status !== 0 || importProbe.status !== 0;
+  }
+} finally {
+  rmSync(packageProbeDirectory, { recursive: true, force: true });
+}
+
 if (packed.status !== 0 || !files.length || forbidden.length || missing.length || unexpected.length ||
-    bundleConfigMismatch || dependencyMismatch.length || gitIgnoreFailures.length || privateTextMatches.length) {
+    bundleConfigMismatch || dependencyMismatch.length || gitIgnoreFailures.length || privateTextMatches.length ||
+    packedAdapterImportFailed) {
   console.error("FAIL  published package privacy allowlist");
   if (packed.status !== 0) {
     console.error(
@@ -196,6 +257,7 @@ if (packed.status !== 0 || !files.length || forbidden.length || missing.length |
   if (privateTextMatches.length) {
     console.error(`source-instance identity appears in packaged product text: ${privateTextMatches.join(", ")}`);
   }
+  if (packedAdapterImportFailed) console.error("packed recovery adapter import probe failed");
   process.exit(1);
 }
 

@@ -133,6 +133,18 @@
           "pattern": "^keychain://[^/]+/.+$",
           "description": "Optional non-secret macOS Keychain locator, keychain://<service>/<account>, for the brain admin key used by unattended ingest. Standard setup fills a deterministic locator automatically on macOS when no legacy adjacent .brain-admin-key exists. Windows keeps the adjacent key under DPAPI CurrentUser; Linux uses an owner-only adjacent file. brain secrets exactly verifies durable desired state before applying it to the Worker. A failed remote write can be retried with no ADMIN_KEY export. The secret value never enters the manifest or plist."
         },
+        "recovery_field_gate": {
+          "type": "object",
+          "description": "Short-lived, manually reviewed isolation evidence for a disposable recovery target. Never add this to a production manifest. The adapter binds the immutable Worker version and requires both route lists to be empty before it can use the disposable target key.",
+          "required": ["worker_version_id", "routes", "custom_domains", "reviewed_at"],
+          "properties": {
+            "worker_version_id": { "type": "string", "minLength": 1 },
+            "routes": { "type": "array", "maxItems": 0 },
+            "custom_domains": { "type": "array", "maxItems": 0 },
+            "reviewed_at": { "type": "string", "format": "date-time" }
+          },
+          "additionalProperties": false
+        },
         "google_token_store": {
           "enum": ["auto", "keychain", "file"],
           "default": "auto",
