@@ -646,9 +646,9 @@ export function cleanupAdminKeyFileResidue(destination, options = {}) {
 }
 
 export function writeAdminKeyFile(destination, secret, options = {}) {
+  validateAdminKeyValue(secret);
   const validation = validateAdminKeyFileDestination(destination, options);
   const path = validation.path;
-  validateAdminKeyValue(secret);
   const platform = options.platform ?? process.platform;
   const getUid = options.getUid ?? process.getuid;
   const expectedUid = platform !== "win32" && typeof getUid === "function" ? getUid() : null;
