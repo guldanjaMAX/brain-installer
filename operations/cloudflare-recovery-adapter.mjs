@@ -1064,7 +1064,11 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     config.approveDisposableTarget === plan.target_resource_fingerprint &&
     config.approveTargetExecution === pins.isolation.approvalFingerprint &&
     config.approveSourceExportBlocking === plan.source_resource_fingerprint &&
-    config.approveWrapper === pins.wrapper.hash;
+    config.approveWrapper === pins.wrapper.hash &&
+    // A valid replacement golden can change the recovery verdict just as much
+    // as a different target can. Bind its exact bytes into every invocation so
+    // a supervised stop cannot resume under an unreviewed evaluation suite.
+    config.approveGolden === pins.golden.hash;
 
   const revalidate = () => assertLocalPinsUnchanged(pins, config, plan);
 
@@ -1661,6 +1665,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     revalidate,
     targetExecutionApprovalFingerprint: pins.isolation.approvalFingerprint,
     wrapperApprovalFingerprint: pins.wrapper.hash,
+    goldenApprovalFingerprint: pins.golden.hash,
     acquireLock: () => acquireFieldGateLock(pins.artifacts.path, plan.plan_fingerprint),
     releaseLock: (lock) => releaseFieldGateLock(lock, pins.artifacts.path),
   });
@@ -1695,6 +1700,7 @@ export function previewCloudflareRecoveryFieldGate(configInput, dependencies = {
     target_execution_approval_fingerprint: gate.targetExecutionApprovalFingerprint,
     source_export_blocking_approval_fingerprint: plan.source_resource_fingerprint,
     wrapper_approval_fingerprint: gate.wrapperApprovalFingerprint,
+    golden_approval_fingerprint: gate.goldenApprovalFingerprint,
     status: status.status,
     current_stage: status.current_stage,
     completed_stages: status.completed_stages,
@@ -1721,9 +1727,11 @@ export async function runCloudflareRecoveryFieldGate(configInput, dependencies =
     approveTargetExecution: configInput.approveTargetExecution,
     approveSourceExportBlocking: configInput.approveSourceExportBlocking,
     approveWrapper: configInput.approveWrapper,
+    approveGolden: configInput.approveGolden,
   }, dependencies);
   if (configInput.approveTargetExecution !== gate.targetExecutionApprovalFingerprint ||
-      configInput.approveWrapper !== gate.wrapperApprovalFingerprint) {
+      configInput.approveWrapper !== gate.wrapperApprovalFingerprint ||
+      configInput.approveGolden !== gate.goldenApprovalFingerprint) {
     refuse("RECOVERY_FIELD_GATE_APPROVAL_MISMATCH");
   }
   const lock = gate.acquireLock();
@@ -1756,6 +1764,7 @@ const CLI_VALUE_FLAGS = Object.freeze(new Set([
   "source-manifest", "target-manifest", "plan", "state", "artifact-directory",
   "wrangler-wrapper", "golden", "approve-plan", "approve-disposable-target",
   "approve-target-execution", "approve-source-export-blocking", "approve-wrapper",
+  "approve-golden",
   "stop-after-stage",
 ]));
 
@@ -1780,7 +1789,7 @@ export function parseCloudflareRecoveryCliArguments(argv) {
     "wrangler-wrapper", "golden",
     ...(command === "run" ? [
       "approve-plan", "approve-disposable-target", "approve-target-execution",
-      "approve-source-export-blocking", "approve-wrapper",
+      "approve-source-export-blocking", "approve-wrapper", "approve-golden",
     ] : []),
   ];
   const allowed = [
@@ -1809,6 +1818,7 @@ export function parseCloudflareRecoveryCliArguments(argv) {
       approveTargetExecution: values["approve-target-execution"],
       approveSourceExportBlocking: values["approve-source-export-blocking"],
       approveWrapper: values["approve-wrapper"],
+      approveGolden: values["approve-golden"],
       ...(stopAfterStage ? { stopAfterStage } : {}),
     } : {}),
   });
@@ -1816,7 +1826,7 @@ export function parseCloudflareRecoveryCliArguments(argv) {
 
 function printUsage() {
   console.log("usage: node operations/cloudflare-recovery-adapter.mjs preview --source-manifest <file> --target-manifest <file> --plan <file> --state <file> --artifact-directory <private-dir> --wrangler-wrapper <owner-only-wrapper> --golden <private-release-suite>");
-  console.log("       node operations/cloudflare-recovery-adapter.mjs run <same flags> --approve-plan <fingerprint> --approve-disposable-target <fingerprint> --approve-target-execution <fingerprint> --approve-source-export-blocking <fingerprint> --approve-wrapper <fingerprint> [--stop-after-stage <export_d1|restore_d1|rebuild_vectorize>]");
+  console.log("       node operations/cloudflare-recovery-adapter.mjs run <same flags> --approve-plan <fingerprint> --approve-disposable-target <fingerprint> --approve-target-execution <fingerprint> --approve-source-export-blocking <fingerprint> --approve-wrapper <fingerprint> --approve-golden <fingerprint> [--stop-after-stage <export_d1|restore_d1|rebuild_vectorize>]");
 }
 
 async function main(argv = process.argv.slice(2)) {

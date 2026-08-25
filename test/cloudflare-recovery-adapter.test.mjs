@@ -490,6 +490,7 @@ try {
     initialized.plan.source_resource_fingerprint,
   );
   assert.match(preview.wrapper_approval_fingerprint, /^[0-9a-f]{64}$/);
+  assert.equal(preview.golden_approval_fingerprint, hash(readFileSync(goldenPath)));
   assert.deepEqual(RECOVERY_FIELD_GATE_STOP_STAGES, [
     "export_d1", "restore_d1", "rebuild_vectorize",
   ]);
@@ -501,6 +502,7 @@ try {
     approveTargetExecution: preview.target_execution_approval_fingerprint,
     approveSourceExportBlocking: preview.source_export_blocking_approval_fingerprint,
     approveWrapper: preview.wrapper_approval_fingerprint,
+    approveGolden: preview.golden_approval_fingerprint,
   });
   const previewText = JSON.stringify(preview);
   for (const forbidden of [privateSentinel, fixtureAdminKey, sourceManifest.brain.domain, wrapperPath]) {
@@ -531,9 +533,11 @@ try {
     "--approve-target-execution", preview.target_execution_approval_fingerprint,
     "--approve-source-export-blocking", preview.source_export_blocking_approval_fingerprint,
     "--approve-wrapper", preview.wrapper_approval_fingerprint,
+    "--approve-golden", preview.golden_approval_fingerprint,
     "--stop-after-stage", "restore_d1",
   ]);
   assert.equal(parsedStop.stopAfterStage, "restore_d1");
+  assert.equal(parsedStop.approveGolden, preview.golden_approval_fingerprint);
   assert.throws(
     () => parseCloudflareRecoveryCliArguments([
       "preview",
@@ -564,6 +568,7 @@ try {
         "--approve-target-execution", preview.target_execution_approval_fingerprint,
         "--approve-source-export-blocking", preview.source_export_blocking_approval_fingerprint,
         "--approve-wrapper", preview.wrapper_approval_fingerprint,
+        "--approve-golden", preview.golden_approval_fingerprint,
       ],
       "--stop-after-stage", "verify_health",
     ]),
@@ -592,6 +597,7 @@ try {
       approveTargetExecution: preview.target_execution_approval_fingerprint,
       approveSourceExportBlocking: preview.source_export_blocking_approval_fingerprint,
       approveWrapper: preview.wrapper_approval_fingerprint,
+      approveGolden: preview.golden_approval_fingerprint,
     }, replacedWrapperHarness.dependencies),
     (error) => error.code === "RECOVERY_FIELD_GATE_APPROVAL_MISMATCH",
   );
@@ -639,6 +645,7 @@ try {
       approveTargetExecution: preview.target_execution_approval_fingerprint,
       approveSourceExportBlocking: preview.source_export_blocking_approval_fingerprint,
       approveWrapper: preview.wrapper_approval_fingerprint,
+      approveGolden: preview.golden_approval_fingerprint,
       stopAfterStage: "verify_health",
     }, invalidStopHarness.dependencies),
     (error) => error.code === "RECOVERY_FIELD_GATE_STOP_STAGE_INVALID",
@@ -672,37 +679,97 @@ try {
     approveTargetExecution: drillPreview.target_execution_approval_fingerprint,
     approveSourceExportBlocking: drillPreview.source_export_blocking_approval_fingerprint,
     approveWrapper: drillPreview.wrapper_approval_fingerprint,
-    stopAfterStage: "restore_d1",
+    approveGolden: drillPreview.golden_approval_fingerprint,
   });
   const drillHarness = providerHarness();
-  await assert.rejects(
-    runCloudflareRecoveryFieldGate(approvedDrillConfig, drillHarness.dependencies),
-    (error) => error instanceof CloudflareRecoveryAdapterError &&
-      error.code === "RECOVERY_FIELD_GATE_INTENTIONAL_INTERRUPTION",
-  );
-  const drillCheckpoint = loadVerifiedRecoveryState(
-    drillStatePath,
-    drillInitialized.plan,
-  );
-  assert.equal(drillCheckpoint.status, "running");
-  assert.equal(drillCheckpoint.current_stage, "verify_d1");
-  assert.equal(drillCheckpoint.stage_status, "pending");
-  assert.equal(drillCheckpoint.failure, null);
-  assert.deepEqual(
-    drillCheckpoint.completed.map((entry) => entry.id),
-    ["export_d1", "verify_export", "prove_target_clean", "restore_d1"],
-  );
-  assert.equal(drillHarness.importCalls, 1);
-  assert.equal(drillHarness.evalCalls, 0);
-  assert.equal(existsSync(join(drillArtifactDirectory, ".brain-recovery-field-gate.lock")), false);
+  const exportCalls = () => drillHarness.wranglerCalls.filter((call) =>
+    call.env.CLOUDFLARE_ACCOUNT_ID === sourceManifest.infrastructure.cloudflare.account_id &&
+      call.args[0] === "d1" && call.args[1] === "export").length;
+  const rebuildCalls = () => drillHarness.fetchCalls.filter((call) =>
+    new URL(call.url).pathname === "/api/admin/brain/reindex" &&
+      JSON.parse(call.options.body).confirm === true).length;
+  const runToCheckpoint = async (stopAfterStage, currentStage, completedStages) => {
+    await assert.rejects(
+      runCloudflareRecoveryFieldGate(
+        { ...approvedDrillConfig, stopAfterStage },
+        drillHarness.dependencies,
+      ),
+      (error) => error instanceof CloudflareRecoveryAdapterError &&
+        error.code === "RECOVERY_FIELD_GATE_INTENTIONAL_INTERRUPTION",
+    );
+    const checkpoint = loadVerifiedRecoveryState(drillStatePath, drillInitialized.plan);
+    assert.equal(checkpoint.status, "running");
+    assert.equal(checkpoint.current_stage, currentStage);
+    assert.equal(checkpoint.stage_status, "pending");
+    assert.equal(checkpoint.failure, null);
+    assert.deepEqual(checkpoint.completed.map((entry) => entry.id), completedStages);
+    assert.equal(
+      existsSync(join(drillArtifactDirectory, ".brain-recovery-field-gate.lock")),
+      false,
+    );
+  };
 
+  await runToCheckpoint("export_d1", "verify_export", ["export_d1"]);
+  assert.deepEqual([exportCalls(), drillHarness.importCalls, rebuildCalls()], [1, 0, 0]);
+
+  // A supervised resume must use the exact golden bytes that were previewed.
+  // Replacing them with another structurally valid release suite cannot inherit
+  // the old approval or reach Cloudflare, Keychain, import, or evaluation.
+  const swappedGolden = releaseGolden();
+  swappedGolden.questions[0].question = `${privateSentinel} reviewed replacement`;
+  writePrivateJson(goldenPath, swappedGolden);
+  assert.notEqual(hash(readFileSync(goldenPath)), drillPreview.golden_approval_fingerprint);
+  const callsBeforeGoldenSwap = Object.freeze({
+    wrangler: drillHarness.wranglerCalls.length,
+    adminReads: drillHarness.adminReads,
+    imports: drillHarness.importCalls,
+    evals: drillHarness.evalCalls,
+  });
+  await assert.rejects(
+    runCloudflareRecoveryFieldGate(
+      { ...approvedDrillConfig, stopAfterStage: "restore_d1" },
+      drillHarness.dependencies,
+    ),
+    (error) => error instanceof CloudflareRecoveryAdapterError &&
+      error.code === "RECOVERY_FIELD_GATE_APPROVAL_MISMATCH",
+  );
+  assert.deepEqual({
+    wrangler: drillHarness.wranglerCalls.length,
+    adminReads: drillHarness.adminReads,
+    imports: drillHarness.importCalls,
+    evals: drillHarness.evalCalls,
+  }, callsBeforeGoldenSwap);
+  assert.equal(
+    loadVerifiedRecoveryState(drillStatePath, drillInitialized.plan).current_stage,
+    "verify_export",
+  );
+  assert.equal(
+    existsSync(join(drillArtifactDirectory, ".brain-recovery-field-gate.lock")),
+    false,
+  );
+  writePrivateJson(goldenPath, releaseGolden());
+  assert.equal(hash(readFileSync(goldenPath)), drillPreview.golden_approval_fingerprint);
+
+  await runToCheckpoint("restore_d1", "verify_d1", [
+    "export_d1", "verify_export", "prove_target_clean", "restore_d1",
+  ]);
+  assert.deepEqual([exportCalls(), drillHarness.importCalls, rebuildCalls()], [1, 1, 0]);
+
+  await runToCheckpoint("rebuild_vectorize", "verify_health", [
+    "export_d1", "verify_export", "prove_target_clean", "restore_d1",
+    "verify_d1", "rebuild_vectorize",
+  ]);
+  assert.deepEqual([exportCalls(), drillHarness.importCalls, rebuildCalls()], [1, 1, 1]);
+  assert.equal(drillHarness.evalCalls, 0);
+
+  // Reusing the last boundary proves a completed rebuild neither re-stops nor replays.
   const resumedDrill = await runCloudflareRecoveryFieldGate(
-    approvedDrillConfig,
+    { ...approvedDrillConfig, stopAfterStage: "rebuild_vectorize" },
     drillHarness.dependencies,
   );
   assert.equal(resumedDrill.ok, true);
   assert.equal(resumedDrill.status.status, "complete");
-  assert.equal(drillHarness.importCalls, 1);
+  assert.deepEqual([exportCalls(), drillHarness.importCalls, rebuildCalls()], [1, 1, 1]);
   assert.equal(drillHarness.evalCalls, 1);
   assert.equal(existsSync(join(drillArtifactDirectory, ".brain-recovery-field-gate.lock")), false);
 
@@ -714,6 +781,7 @@ try {
     approveTargetExecution: preview.target_execution_approval_fingerprint,
     approveSourceExportBlocking: preview.source_export_blocking_approval_fingerprint,
     approveWrapper: preview.wrapper_approval_fingerprint,
+    approveGolden: preview.golden_approval_fingerprint,
   }, harness.dependencies);
   assert.equal(completed.ok, true);
   assert.equal(completed.status.status, "complete");

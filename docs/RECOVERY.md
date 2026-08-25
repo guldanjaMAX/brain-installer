@@ -126,7 +126,7 @@ node operations/cloudflare-recovery-adapter.mjs preview \
   --golden <private-release-golden>
 ```
 
-The preview returns five independent approvals:
+The preview returns six independent approvals:
 
 - `plan_fingerprint` binds the full reviewed recovery policy and both manifests;
 - `target_approval_fingerprint` binds the isolated D1, Vectorize, Worker, and
@@ -135,9 +135,11 @@ The preview returns five independent approvals:
   the manually reviewed empty route and custom-domain claim;
 - `source_export_blocking_approval_fingerprint` binds the source whose D1
   export will take a blocking lock during the approved maintenance window;
-- `wrapper_approval_fingerprint` binds the exact Keychain-backed wrapper bytes.
+- `wrapper_approval_fingerprint` binds the exact Keychain-backed wrapper bytes;
+- `golden_approval_fingerprint` is the SHA-256 of the exact private release
+  golden bytes that will judge the restored Brain.
 
-Copy all five values from that preview into the run command:
+Copy all six values from that preview into the run command:
 
 ```bash
 node operations/cloudflare-recovery-adapter.mjs run \
@@ -153,12 +155,13 @@ node operations/cloudflare-recovery-adapter.mjs run \
   --approve-target-execution <target-execution-fingerprint> \
   --approve-source-export-blocking <source-export-fingerprint> \
   --approve-wrapper <wrapper-fingerprint> \
+  --approve-golden <golden-fingerprint> \
   --stop-after-stage restore_d1
 ```
 
 `--stop-after-stage` is an optional supervised drill control. Its only accepted
 values are `export_d1`, `restore_d1`, and `rebuild_vectorize`. The field gate
-still requires all five approvals and completes all verification leading to the
+still requires all six approvals and completes all verification leading to the
 named stage. It then persists that stage's completed evidence, releases the
 field-gate lock, reports only the fixed code
 `RECOVERY_FIELD_GATE_INTENTIONAL_INTERRUPTION`, and exits nonzero. Re-run the
@@ -179,8 +182,9 @@ One disposable target can exercise all three checkpoint boundaries in order:
    run continues through health and release evaluation without rebuilding it.
 
 Changing only this stop boundary does not authorize another resource or write.
-The same manifests, target execution claim, wrapper, plan, and five approval
-fingerprints remain mandatory on every invocation.
+The same manifests, target execution claim, wrapper, private golden bytes,
+plan, and six approval fingerprints remain mandatory on every invocation. A
+valid but changed golden set is refused before Cloudflare or Keychain access.
 
 The adapter reopens and fingerprints the wrapper, manifests, golden set, and
 artifact directory before and after every stage. Wrangler receives a narrow

@@ -102,8 +102,10 @@ Cloudflare access behind a separate disposable-only adapter. The adapter binds
 reviewed manifests to exact D1, Vectorize, Worker deployment, runtime values,
 and secret names before either source export or target access. Its target
 execution approval also binds the immutable Worker version and a manually
-reviewed empty route/custom-domain claim. D1 remains the durable authority. FTS
-and Vectorize are rebuilt derived state. Recovery control files contain
+reviewed empty route/custom-domain claim. A separate approval binds the exact
+private release golden SHA-256 across every supervised stop and resume. D1
+remains the durable authority. FTS and Vectorize are rebuilt derived state.
+Recovery control files contain
 fingerprints and bounded evidence only; the owner-only SQL export is the sole
 recovery artifact that contains corpus data.
 

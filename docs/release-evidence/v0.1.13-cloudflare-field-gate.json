@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "release": "0.1.13",
+  "candidate_commit": "a5bad44977dd990082a988d67d9872a1264053fe",
+  "completed_at": "2026-08-25T13:47:08Z",
+  "environment": "disposable real Cloudflare Worker, D1, Vectorize, and Workers AI",
+  "corpus": "synthetic only",
+  "harness_sha256": "18d916e6f4b19f92700ae36ca90ac5bed6c265026785d4d7b7e76a80a542a776",
+  "result": "passed",
+  "preflight_verification": {
+    "d1_documents": 0,
+    "d1_chunks": 0,
+    "d1_vector_backlog": 0,
+    "vectorize_vectors": 0,
+    "vectorize_dimensions": 768,
+    "vectorize_metric": "cosine",
+    "metadata_indexes": [
+      "category",
+      "client",
+      "document_date",
+      "platform",
+      "source",
+      "top_folder"
+    ],
+    "worker_exact_d1_binding": true,
+    "worker_exact_vectorize_binding": true,
+    "worker_active_deployment_percent": 100,
+    "worker_custom_domains": 0
+  },
+  "observations": {
+    "worker_version": "0.1.13",
+    "changed_batch_documents": 50,
+    "changed_batch_ms": 8673,
+    "unchanged_batch_documents": 50,
+    "unchanged_batch_ms": 89,
+    "mixed_batch_ms": 526,
+    "concurrent_receipts": [
+      "failed",
+      "updated"
+    ],
+    "large_document_chunks": 99,
+    "embedded_operations": 151,
+    "verified_documents": 53,
+    "cleanup_documents": 53,
+    "final_vector_backlog": 0,
+    "critical_diagnosis_issues": 0
+  },
+  "cleanup_verification": {
+    "worker_health_http_status": 404,
+    "matching_workers": 0,
+    "matching_d1_databases": 0,
+    "matching_vectorize_indexes": 0,
+    "matching_custom_domains": 0,
+    "matching_keychain_items": 0
+  },
+  "scope_note": "The live gate proves disposable real-service ingestion, embedding, retrieval, diagnosis, and cleanup behavior. It does not certify a private corpus or production recovery."
+}
