@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -286,11 +286,45 @@ try {
       title: "Fixture",
     }],
   }));
+  const evalServerPortFile = join(sandbox, "eval-loopback-port");
+  const evalServer = spawn(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    `
+      import { writeFileSync } from "node:fs";
+      import { createServer } from "node:http";
+      const [portFile, encodedResponse] = process.argv.slice(1);
+      const response = decodeURIComponent(encodedResponse);
+      const server = createServer((request, reply) => {
+        request.resume();
+        request.on("end", () => {
+          reply.writeHead(200, { "content-type": "application/json" });
+          reply.end(response);
+        });
+      });
+      server.listen(0, "127.0.0.1", () => {
+        writeFileSync(portFile, String(server.address().port), { mode: 0o600 });
+      });
+      process.once("SIGTERM", () => server.close(() => process.exit(0)));
+    `,
+    evalServerPortFile,
+    evalFixtureResponse,
+  ], {
+    stdio: "ignore",
+    windowsHide: true,
+  });
   let evalResult;
   try {
+    const waitState = new Int32Array(new SharedArrayBuffer(4));
+    const evalServerDeadline = Date.now() + 5_000;
+    while (!existsSync(evalServerPortFile) && Date.now() < evalServerDeadline) {
+      Atomics.wait(waitState, 0, 0, 10);
+    }
+    assert.equal(existsSync(evalServerPortFile), true, "loopback eval fixture did not start");
+    const evalServerPort = readFileSync(evalServerPortFile, "utf8").trim();
     evalResult = spawnSync(process.execPath, [
       fileURLToPath(new URL("../eval/run.mjs", import.meta.url)),
-      "--base", `data:application/json,${evalFixtureResponse}#fixture`,
+      "--base", `http://127.0.0.1:${evalServerPort}`,
       "--golden", evalGoldenPath,
       "--no-think",
     ], {
@@ -302,6 +336,7 @@ try {
     });
   } finally {
     evalInput.fill(0);
+    evalServer.kill("SIGTERM");
   }
   assert.equal(evalResult.status, 0, `${evalResult.stdout}\n${evalResult.stderr}`);
   assert.doesNotMatch(`${evalResult.stdout}${evalResult.stderr}`, new RegExp(replacementKey));

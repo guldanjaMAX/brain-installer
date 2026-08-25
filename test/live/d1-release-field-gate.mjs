@@ -43,6 +43,7 @@ async function request(path, { method = "GET", body } = {}) {
       ...(body === undefined ? {} : { "Content-Type": "application/json" }),
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    redirect: "error",
     signal: AbortSignal.timeout(60_000),
   });
   const text = await response.text();
@@ -81,7 +82,9 @@ assert.equal(health.body.version, expectedVersion);
 // Make the synthetic gate repeatable after a harness assertion or network
 // interruption. The manifest checks above prevent this cleanup from running
 // against an ordinary client Brain.
-const prior = await request(`/api/admin/brain/source-families?source=${source}&limit=1000`);
+const prior = await request("/api/admin/brain/source-families", {
+  method: "POST", body: { source, limit: 1000 },
+});
 if (prior.body.families.length) {
   await request("/api/admin/brain/forget", {
     method: "POST",
@@ -135,7 +138,9 @@ const large = await ingest([envelope("large", paragraphs, "Synthetic high chunk 
 assert.equal(large.failed, 0);
 assert.ok(Number(large.results[0]?.chunks) >= 60);
 
-const families = await request(`/api/admin/brain/source-families?source=${source}&limit=1000`);
+const families = await request("/api/admin/brain/source-families", {
+  method: "POST", body: { source, limit: 1000 },
+});
 assert.equal(families.body.families.length, 53);
 assert.equal(families.body.next_cursor, null);
 
@@ -187,7 +192,9 @@ for (let attempt = 0; attempt < 8; attempt++) {
 }
 assert.equal(deleteRemaining, 0);
 
-const after = await request(`/api/admin/brain/source-families?source=${source}&limit=1000`);
+const after = await request("/api/admin/brain/source-families", {
+  method: "POST", body: { source, limit: 1000 },
+});
 assert.deepEqual(after.body.families, []);
 
 console.log(JSON.stringify({

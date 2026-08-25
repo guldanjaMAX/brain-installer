@@ -111,6 +111,15 @@ function response(status, body) {
   };
 }
 
+function sourceFamilyBody(url, options) {
+  const parsed = new URL(url);
+  assert.equal(parsed.pathname, "/api/admin/brain/source-families");
+  assert.equal(parsed.search, "", "private family identities must not enter request URLs");
+  assert.equal(options.method, "POST");
+  assert.equal(options.headers["Content-Type"], "application/json");
+  return JSON.parse(options.body);
+}
+
 function allStatus(prepared, value) {
   return new Map(prepared.documents.map((document) => [document.logicalFingerprint, value]));
 }
@@ -452,10 +461,9 @@ try {
     },
     fetch: async (url, options) => {
       auditCalls.push({ url, options });
-      assert.equal(options.method, undefined);
       assert.equal(options.redirect, "manual");
       assert.equal(url.includes("fixture-cloudflare-key"), false);
-      const cursor = new URL(url).searchParams.get("cursor");
+      const { cursor } = sourceFamilyBody(url, options);
       if (!cursor) {
         return response(200, {
           source: "drive",
@@ -564,8 +572,8 @@ try {
     },
     fetch: async (url, options) => {
       assert.equal(options.redirect, "manual");
-      if (!options.method) {
-        const source = new URL(url).searchParams.get("source");
+      if (new URL(url).pathname === "/api/admin/brain/source-families") {
+        const { source } = sourceFamilyBody(url, options);
         return response(200, {
           source,
           families: completeFamilies(source),
@@ -615,8 +623,8 @@ try {
       adminKey: `fixture-${name}-key`,
     }),
     fetch: async (url, options) => {
-      if (!options.method) {
-        const source = new URL(url).searchParams.get("source");
+      if (new URL(url).pathname === "/api/admin/brain/source-families") {
+        const { source } = sourceFamilyBody(url, options);
         const families = completeFamilies(source);
         return response(200, {
           source,
@@ -645,8 +653,8 @@ try {
       return { baseUrl: "https://cloudflare.invalid", adminKey: "fixture-cloudflare-key" };
     },
     fetch: async (url, options) => {
-      if (!options.method) {
-        const source = new URL(url).searchParams.get("source");
+      if (new URL(url).pathname === "/api/admin/brain/source-families") {
+        const { source } = sourceFamilyBody(url, options);
         return response(200, {
           source,
           families: source === "curated" ? completeFamilies(source) : [],
@@ -676,8 +684,8 @@ try {
         adminKey: `fixture-${name}-key`,
       }),
       fetch: async (url, options) => {
-        if (!options.method) {
-          const source = new URL(url).searchParams.get("source");
+        if (new URL(url).pathname === "/api/admin/brain/source-families") {
+          const { source } = sourceFamilyBody(url, options);
           return response(200, {
             source,
             families: completeFamilies(source),

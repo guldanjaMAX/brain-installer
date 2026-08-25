@@ -80,7 +80,7 @@ async function runFixture({
     }
     if (url.pathname === "/api/admin/brain/source-families") {
       response.end(JSON.stringify({
-        source: "curated", families: ["curated:doc-a"], next_cursor: null,
+        source: null, families: ["curated:doc-a"], next_cursor: null,
       }));
       return;
     }
@@ -287,6 +287,84 @@ test("corpus inventory mismatches fail with stage codes and no private source id
   assert.ok(reasons.includes("EXCLUDED_SOURCE_INDEXED"));
   const shareable = `${JSON.stringify(result.runArtifact)}\n${result.failuresArtifact}\n${result.junitArtifact}\n${result.corpusCoverageArtifact}`;
   assert.doesNotMatch(shareable, /missing-private-id|Excluded Record|private-excluded-source|doc-a/i);
+});
+
+test("a live source missing from corpus_stats cannot disappear from completeness", async () => {
+  const result = await runFixture({
+    questions: [{
+      id: "stats-drift",
+      kind: "single",
+      risk: "critical",
+      question: "Which fixture is present?",
+      expect: [{ any_of: ["curated:doc-a"] }],
+    }],
+    corpusContract: corpusContractFixture(),
+    artifacts: true,
+    route: ({ url }) => url.pathname === "/api/admin/brain/source-families"
+      ? {
+          body: {
+            source: null,
+            families: ["curated:doc-a", "shadow:private-indexed-family"],
+            next_cursor: null,
+          },
+        }
+      : null,
+  });
+
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /UNKNOWN_INDEX_SOURCE \(1\)/);
+  assert.match(result.stdout, /SOURCE_INVENTORY_SUMMARY_DRIFT \(1\)/);
+  assert.equal(result.runArtifact.corpus.documents, 2);
+  assert.equal(result.runArtifact.corpus.sources, 2);
+  assert.equal(result.runArtifact.corpus.inventory_summary_mismatches, 1);
+  assert.doesNotMatch(JSON.stringify(result.runArtifact), /private-indexed-family/);
+});
+
+test("corpus pagination keeps a private continuation identity out of every URL", async () => {
+  const requestUrls = [];
+  const requestBodies = [];
+  const result = await runFixture({
+    questions: [{
+      id: "private-pagination",
+      kind: "single",
+      risk: "critical",
+      question: "Which fixture is present?",
+      expect: [{ any_of: ["curated:doc-a"] }],
+    }],
+    args: ["--no-think"],
+    artifacts: true,
+    route: ({ url, request, body }) => {
+      if (url.pathname === "/api/admin/brain/documents") {
+        return {
+          body: {
+            rows: [{
+              source_type: "curated", documents: 2, chunks: 2, embedded: 2,
+              last_ingested: "2026-08-24T00:00:00.000Z",
+            }],
+            vector_backlog: { pending: 0 },
+          },
+        };
+      }
+      if (url.pathname !== "/api/admin/brain/source-families") return null;
+      requestUrls.push(request.url);
+      requestBodies.push(body);
+      return body.cursor
+        ? { body: { source: null, families: ["curated:z-final"], next_cursor: null } }
+        : {
+            body: {
+              source: null,
+              families: ["curated:private-medical-record-id"],
+              next_cursor: "curated:private-medical-record-id",
+            },
+          };
+    },
+  });
+
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(requestUrls.length, 4, "the before and after brackets each use two pages");
+  assert.equal(requestUrls.every((url) => new URL(url, "http://fixture").search === ""), true);
+  assert.equal(requestBodies.filter((body) => body.cursor === "curated:private-medical-record-id").length, 2);
+  assert.doesNotMatch(JSON.stringify(result.runArtifact), /private-medical-record-id/);
 });
 
 test("an incomplete corpus contract stops before credentials or network", async () => {
@@ -562,7 +640,7 @@ test("the distributed runner records reproducible provenance and CI artifacts", 
     }
     if (url.pathname === "/api/admin/brain/source-families") {
       response.end(JSON.stringify({
-        source: "curated",
+        source: null,
         families: ["curated:doc-a", "curated:doc-b"],
         next_cursor: null,
       }));
@@ -621,8 +699,9 @@ test("the distributed runner records reproducible provenance and CI artifacts", 
     assert.equal(runArtifact.artifact_kind, "brain-retrieval-eval");
     assert.deepEqual(runArtifact.corpus, {
       status: "observed", documents: 2, chunks: 4, embedded: 4, vector_backlog: 0, sources: 1,
+      inventory_summary_mismatches: 0,
       snapshot_hash: runArtifact.corpus.snapshot_hash,
-      fingerprint_basis: "logical-family-identities-source-versions-and-index-state",
+      fingerprint_basis: "live-logical-family-identities-and-index-state",
       bracketed: true,
     });
     assert.match(runArtifact.corpus.snapshot_hash, /^sha256:[a-f0-9]{64}$/);
@@ -930,7 +1009,7 @@ test("a content change with unchanged corpus counts invalidates the bracketed ru
       state.inventoryCalls = (state.inventoryCalls || 0) + 1;
       return {
         body: {
-          source: "curated",
+          source: null,
           families: [state.inventoryCalls === 1 ? "curated:doc-a" : "curated:doc-b"],
           next_cursor: null,
         },

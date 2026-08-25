@@ -1294,28 +1294,55 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
  * `meta.part_of` points at their base uid. The DISTINCT happens before the
  * cursor and LIMIT so a split file occupies exactly one reconciliation slot.
  */
-export async function listSourceFamilies(env, { source, cursor = "", limit = 500 } = {}) {
-  const { results } = await env.DB.prepare(
-    `SELECT family_doc_uid
-       FROM (
-         SELECT DISTINCT CASE
-           WHEN json_valid(meta)
-            AND json_type(meta,'$.part_of') = 'text'
-            AND length(json_extract(meta,'$.part_of')) > 0
-             THEN CASE
-               WHEN substr(json_extract(meta,'$.part_of'), 1, length(?1) + 1) = ?1 || ':'
-                 THEN json_extract(meta,'$.part_of')
-               ELSE ?1 || ':' || json_extract(meta,'$.part_of')
-             END
-           ELSE doc_uid
-         END AS family_doc_uid
-           FROM documents
-          WHERE source = ?1 AND deleted_at IS NULL
-       )
-      WHERE family_doc_uid > ?2
-      ORDER BY family_doc_uid ASC
-      LIMIT ?3`
-  ).bind(source, cursor, limit + 1).all();
+export async function listSourceFamilies(env, { source = null, cursor = "", limit = 500 } = {}) {
+  // With no source filter this query derives the complete source set from live
+  // document rows themselves. `corpus_stats` is useful operational metadata,
+  // but it is denormalized and therefore cannot be the discovery boundary for
+  // a completeness proof. A missing stats row must not hide an indexed family.
+  const statement = source
+    ? env.DB.prepare(
+      `SELECT family_doc_uid
+         FROM (
+           SELECT DISTINCT CASE
+             WHEN json_valid(meta)
+              AND json_type(meta,'$.part_of') = 'text'
+              AND length(json_extract(meta,'$.part_of')) > 0
+               THEN CASE
+                 WHEN substr(json_extract(meta,'$.part_of'), 1, length(?1) + 1) = ?1 || ':'
+                   THEN json_extract(meta,'$.part_of')
+                 ELSE ?1 || ':' || json_extract(meta,'$.part_of')
+               END
+             ELSE doc_uid
+           END AS family_doc_uid
+             FROM documents
+            WHERE source = ?1 AND deleted_at IS NULL
+         )
+        WHERE family_doc_uid > ?2
+        ORDER BY family_doc_uid ASC
+        LIMIT ?3`
+    ).bind(source, cursor, limit + 1)
+    : env.DB.prepare(
+      `SELECT family_doc_uid
+         FROM (
+           SELECT DISTINCT CASE
+             WHEN json_valid(meta)
+              AND json_type(meta,'$.part_of') = 'text'
+              AND length(json_extract(meta,'$.part_of')) > 0
+               THEN CASE
+                 WHEN substr(json_extract(meta,'$.part_of'), 1, length(source) + 1) = source || ':'
+                   THEN json_extract(meta,'$.part_of')
+                 ELSE source || ':' || json_extract(meta,'$.part_of')
+               END
+             ELSE doc_uid
+           END AS family_doc_uid
+             FROM documents
+            WHERE deleted_at IS NULL
+         )
+        WHERE family_doc_uid > ?1
+        ORDER BY family_doc_uid ASC
+        LIMIT ?2`
+    ).bind(cursor, limit + 1);
+  const { results } = await statement.all();
 
   const page = (results || []).slice(0, limit).map((row) => String(row.family_doc_uid));
   return {

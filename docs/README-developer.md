@@ -598,7 +598,10 @@ brain eval <manifest> --corpus-contract ./brain.corpus-contract.json
 The mode-0600 contract is validated twice before credential use and is bound to
 the manifest `client.slug`. A complete contract and complete per-connector
 snapshots reconcile every expected logical source family against the
-authenticated read-only D1 family inventory. Eligible sources must exist;
+authenticated read-only D1 family inventory. Private family identities and
+cursors travel in JSON POST bodies, never URLs, and the response is private and
+no-store. The complete source set is derived from live D1 documents instead of
+denormalized corpus statistics. Eligible sources must exist;
 excluded, quarantined, and tombstoned sources must not; and unknown indexed
 families fail. Aggregate slice counts and stage-specific codes enter the normal
 JSON, JSONL, CSV, and JUnit artifacts. Private locators, source identities,

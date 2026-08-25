@@ -4370,10 +4370,18 @@ export async function listStoredSourceFamilies({ base, adminKey, source }) {
   for (;;) {
     if (seenCursors.has(cursor)) throw new Error("source-family inventory repeated a cursor");
     seenCursors.add(cursor);
-    const query = new URLSearchParams({ source: normalizedSource, limit: "1000" });
-    if (cursor) query.set("cursor", cursor);
-    const res = await http(`${base}/api/admin/brain/source-families?${query}`, {
-      headers: { "X-Admin-Key": adminKey },
+    const res = await http(`${base}/api/admin/brain/source-families`, {
+      method: "POST",
+      redirect: "error",
+      headers: {
+        "X-Admin-Key": adminKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        source: normalizedSource,
+        limit: 1000,
+        ...(cursor ? { cursor } : {}),
+      }),
     }, { what: "the source-family inventory" });
     const raw = await res.text();
     let body = null;

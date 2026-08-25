@@ -76,6 +76,10 @@
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
     },
+    "connector": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
     "hash": {
       "type": "string",
       "pattern": "^sha256:[a-f0-9]{64}$"
@@ -94,7 +98,7 @@
       ],
       "properties": {
         "connector": {
-          "$ref": "#/$defs/slug"
+          "$ref": "#/$defs/connector"
         },
         "observed_at": {
           "$ref": "#/$defs/timestamp"
@@ -153,7 +157,7 @@
           "$ref": "#/$defs/slug"
         },
         "connector": {
-          "$ref": "#/$defs/slug"
+          "$ref": "#/$defs/connector"
         },
         "locator_kind": {
           "enum": [

@@ -291,8 +291,15 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   const originalFetch = globalThis.fetch;
   const calls = [];
   globalThis.fetch = async (url, options) => {
-    calls.push({ url: String(url), key: options?.headers?.["X-Admin-Key"] });
-    const cursor = new URL(String(url)).searchParams.get("cursor");
+    const requestBody = JSON.parse(String(options?.body || "{}"));
+    calls.push({
+      url: String(url),
+      key: options?.headers?.["X-Admin-Key"],
+      method: options?.method,
+      redirect: options?.redirect,
+      body: requestBody,
+    });
+    const cursor = requestBody.cursor;
     const body = cursor
       ? { source: "drive", families: ["drive:c"], next_cursor: null }
       : { source: "drive", families: ["drive:a", "drive:b"], next_cursor: "drive:b" };
@@ -302,6 +309,10 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     const families = await listStoredSourceFamilies({ base: "https://brain.example", adminKey: "admin-only", source: "drive" });
     check("a full source inventory follows every page", [...families].join(",") === "drive:a,drive:b,drive:c", [...families].join(","));
     check("source inventory uses only the brain admin credential", calls.length === 2 && calls.every((call) => call.key === "admin-only"), JSON.stringify(calls));
+    check("private source cursors stay in POST bodies and redirects are refused",
+      calls.every((call) => new URL(call.url).search === "" && call.method === "POST" && call.redirect === "error") &&
+        calls[1]?.body?.cursor === "drive:b",
+      JSON.stringify(calls));
   } finally {
     globalThis.fetch = originalFetch;
   }

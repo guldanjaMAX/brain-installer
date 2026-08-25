@@ -19,6 +19,7 @@ const CONNECTOR = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const HASH = /^sha256:[a-f0-9]{64}$/;
 const CONTROL = /[\u0000-\u001f\u007f]/;
 const MIME_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
+const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|[+-](\d{2}):(\d{2}))$/;
 
 const TOP_LEVEL_FIELDS = new Set([
   "schema_version", "contract_id", "contract_version", "installation_ref",
@@ -87,8 +88,8 @@ function assertString(value, label, { min = 1, max = 4096, pattern = null } = {}
   return value;
 }
 
-function assertPrivateIdentifier(value, label) {
-  assertString(value, label);
+function assertPrivateIdentifier(value, label, options = {}) {
+  assertString(value, label, options);
   if (CONTROL.test(value)) fail(`${label} contains a control character`);
   return value;
 }
@@ -99,6 +100,24 @@ function assertHash(value, label) {
 
 function timestampMs(value, label) {
   assertString(value, label, { max: 64 });
+  const match = RFC3339.exec(value);
+  if (!match) fail(`${label} is not an RFC 3339 timestamp`);
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText,
+    offsetHourText, offsetMinuteText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const daysInMonth = month >= 1 && month <= 12
+    ? [31, (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 29 : 28,
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+    : 0;
+  if (day < 1 || day > daysInMonth || Number(hourText) > 23 ||
+      Number(minuteText) > 59 || Number(secondText) > 59 ||
+      (offsetHourText !== undefined && (
+        Number(offsetHourText) > 23 || Number(offsetMinuteText) > 59
+      ))) {
+    fail(`${label} is not an RFC 3339 timestamp`);
+  }
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) fail(`${label} is not a timestamp`);
   return parsed;
@@ -238,7 +257,7 @@ export function validateCorpusContract(contract, {
     }
     assertHash(source.content_hash, `${label} content_hash`);
     if (source.source_version !== undefined) {
-      assertPrivateIdentifier(source.source_version, `${label} source_version`);
+      assertPrivateIdentifier(source.source_version, `${label} source_version`, { max: 512 });
     }
     assertNullableTimestamp(source.modified_at, `${label} modified_at`);
     assertNullableTimestamp(source.effective_from, `${label} effective_from`);
@@ -415,7 +434,10 @@ export function createCorpusReconciliationCollector(bundle) {
       else unknown++;
     },
 
-    finish() {
+    finish({ inventoryMismatchCount = 0 } = {}) {
+      if (!Number.isSafeInteger(inventoryMismatchCount) || inventoryMismatchCount < 0) {
+        fail("Brain inventory mismatch count is invalid", "SOURCE_INVENTORY_INVALID");
+      }
       const failures = new Map();
       const dimensions = new Map();
       let indexed = 0;
@@ -465,6 +487,14 @@ export function createCorpusReconciliationCollector(bundle) {
 
       if (unknown > 0) {
         addFailure(failures, CORPUS_FAILURE_STAGES.inventory, "UNKNOWN_INDEX_SOURCE", unknown);
+      }
+      if (inventoryMismatchCount > 0) {
+        addFailure(
+          failures,
+          CORPUS_FAILURE_STAGES.inventory,
+          "SOURCE_INVENTORY_SUMMARY_DRIFT",
+          inventoryMismatchCount,
+        );
       }
       const failureList = [...failures.values()].sort((a, b) =>
         a.stage.localeCompare(b.stage) || a.code.localeCompare(b.code));

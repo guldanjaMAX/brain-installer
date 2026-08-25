@@ -53,9 +53,11 @@ const ROW = {
 const call = (env, path) => {
   const url = new URL("https://b.example" + path);
   const isRag = url.pathname === "/api/rag/unified" || url.pathname === "/api/rag/think";
+  const isSourceFamilies = url.pathname === "/api/admin/brain/source-families";
   const init = { headers: { "X-Admin-Key": "k" } };
-  if (isRag) {
+  if (isRag || isSourceFamilies) {
     const body = Object.fromEntries(url.searchParams);
+    if (isSourceFamilies && body.limit !== undefined) body.limit = Number(body.limit);
     url.search = "";
     init.method = "POST";
     init.headers["Content-Type"] = "application/json";
@@ -558,14 +560,17 @@ function mkSourceFamilyEnv(documents, extra = {}) {
             seen.binds.push(binds);
             return {
               all: async () => {
-                const [source, cursor, limit] = binds;
+                const sourceScoped = /WHERE source = \?1/.test(sql);
+                const [source, cursor, limit] = sourceScoped
+                  ? binds
+                  : [null, binds[0], binds[1]];
                 const familyUids = documents
-                  .filter((row) => row.source === source && row.deleted_at == null)
+                  .filter((row) => (source === null || row.source === source) && row.deleted_at == null)
                   .map((row) => {
                     try {
                       const partOf = JSON.parse(row.meta || "{}")?.part_of;
                       return typeof partOf === "string" && partOf
-                        ? (partOf.startsWith(`${source}:`) ? partOf : `${source}:${partOf}`)
+                        ? (partOf.startsWith(`${row.source}:`) ? partOf : `${row.source}:${partOf}`)
                         : row.doc_uid;
                     } catch {
                       return row.doc_uid;
@@ -606,8 +611,12 @@ function mkSourceFamilyEnv(documents, extra = {}) {
     firstResponse.status === 200 && first.source === "drive", JSON.stringify(first));
   check("split parts collapse to one live logical family before pagination",
     first.families.join(",") === "drive:a,drive:b", JSON.stringify(first));
-  check("a full page returns its last logical uid as an opaque continuation cursor",
+  check("a full page returns its last logical uid as a private body continuation cursor",
     first.next_cursor === "drive:b", JSON.stringify(first));
+  check("private source-family responses cannot be cached",
+    /private/.test(firstResponse.headers.get("cache-control") || "") &&
+      /no-store/.test(firstResponse.headers.get("cache-control") || ""),
+    firstResponse.headers.get("cache-control") || "missing");
 
   const secondResponse = await call(env,
     `/api/admin/brain/source-families?source=drive&limit=2&cursor=${encodeURIComponent(first.next_cursor)}`);
@@ -626,31 +635,72 @@ function mkSourceFamilyEnv(documents, extra = {}) {
     /family_doc_uid > \?2/.test(sql) && /ORDER BY family_doc_uid ASC/.test(sql) && seen.binds[0]?.[2] === 3,
     `${sql} ${JSON.stringify(seen.binds[0])}`);
 
+  const globalResponse = await call(env, "/api/admin/brain/source-families?limit=1000");
+  const global = await globalResponse.json();
+  check("the global completeness inventory derives every live source from documents",
+    global.source === null &&
+      global.families.join(",") === "drive:a,drive:b,drive:d,drive:e,gmail:a",
+    JSON.stringify(global));
+  const globalSql = seen.sql.at(-1) || "";
+  check("the global source inventory cannot skip a family through corpus-stats drift",
+    /FROM documents/.test(globalSql) && !/corpus_stats/.test(globalSql) && seen.binds.at(-1)?.[1] === 1001,
+    `${globalSql} ${JSON.stringify(seen.binds.at(-1))}`);
+
   const unauthenticated = await worker.fetch(
-    new Request("https://b.example/api/admin/brain/source-families?source=drive"), env, {});
+    new Request("https://b.example/api/admin/brain/source-families", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: "drive" }),
+    }), env, {});
   check("source-family enumeration refuses an unauthenticated caller", unauthenticated.status === 401, String(unauthenticated.status));
 
   const readOnlyEnv = { ...env, RAG_PROXY_KEY: "read-only" };
   const readOnly = await worker.fetch(new Request(
-    "https://b.example/api/admin/brain/source-families?source=drive",
-    { headers: { "X-Admin-Key": "read-only" } }
+    "https://b.example/api/admin/brain/source-families",
+    {
+      method: "POST",
+      headers: { "X-Admin-Key": "read-only", "Content-Type": "application/json" },
+      body: JSON.stringify({ source: "drive" }),
+    }
   ), readOnlyEnv, {});
   check("the read-only retrieval credential cannot enumerate source families", readOnly.status === 401, String(readOnly.status));
 }
 
 {
   const { env, seen } = mkSourceFamilyEnv([]);
+  const post = (body) => worker.fetch(new Request(
+    "https://b.example/api/admin/brain/source-families",
+    {
+      method: "POST",
+      headers: { "X-Admin-Key": "k", "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  ), env, {});
   const responses = await Promise.all([
-    call(env, "/api/admin/brain/source-families"),
-    call(env, "/api/admin/brain/source-families?source=drive%20%25"),
-    call(env, "/api/admin/brain/source-families?source=drive&limit=0"),
-    call(env, "/api/admin/brain/source-families?source=drive&limit=1001"),
-    call(env, "/api/admin/brain/source-families?source=drive&limit=2.5"),
-    call(env, "/api/admin/brain/source-families?source=drive&cursor=gmail%3Aa"),
-    call(env, "/api/admin/brain/source-families?source=drive&source=gmail"),
+    post({ source: "drive %" }),
+    post({ source: "drive", limit: 0 }),
+    post({ source: "drive", limit: 1001 }),
+    post({ source: "drive", limit: 2.5 }),
+    post({ source: "drive", cursor: "gmail:a" }),
+    post({ source: "drive", unexpected: true }),
   ]);
-  check("source-family reconciliation validates source, limit, cursor and duplicate parameters",
+  check("source-family reconciliation validates source, limit, cursor and unknown fields",
     responses.every((response) => response.status === 400), responses.map((response) => response.status).join(","));
+
+  const legacyGet = await worker.fetch(new Request(
+    "https://b.example/api/admin/brain/source-families",
+    { headers: { "X-Admin-Key": "k" } },
+  ), env, {});
+  check("source-family GET is refused before a private cursor can enter a URL",
+    legacyGet.status === 405 && /no-store/.test(legacyGet.headers.get("cache-control") || ""),
+    `${legacyGet.status} ${legacyGet.headers.get("cache-control") || "missing"}`);
+
+  const failed = await call(mkSourceFamilyEnv([], {
+    DB: { prepare() { throw new Error("fixture inventory failure"); } },
+  }).env, "/api/admin/brain/source-families?source=drive");
+  check("source-family failure responses cannot be cached",
+    failed.status === 500 && /no-store/.test(failed.headers.get("cache-control") || ""),
+    `${failed.status} ${failed.headers.get("cache-control") || "missing"}`);
 
   const max = await call(env, "/api/admin/brain/source-families?source=drive&limit=1000");
   check("the documented 1000-family page limit is accepted with one lookahead row",
@@ -667,11 +717,23 @@ function mkSourceFamilyEnv(documents, extra = {}) {
     source_type: "meeting", documents: 3, logical_documents: 2,
     total: 4, embedded: 4, last_ingest_at: 1750000000000,
   }]);
-  const b = await (await call(env, "/api/admin/brain/documents")).json();
+  const documentsResponse = await call(env, "/api/admin/brain/documents");
+  const b = await documentsResponse.json();
   check("documents names the backend", b.backend === "d1", JSON.stringify(b));
   check("documents separates source files from stored split parts",
     b.rows[0]?.documents === 2 && b.rows[0]?.logical_documents === 2 && b.rows[0]?.stored_documents === 3, JSON.stringify(b.rows[0]));
   check("and reports vector backlog", b.vector_backlog && "pending" in b.vector_backlog, JSON.stringify(b.vector_backlog));
+  check("private aggregate inventory responses cannot be cached",
+    /no-store/.test(documentsResponse.headers.get("cache-control") || ""),
+    documentsResponse.headers.get("cache-control") || "missing");
+
+  const failedDocuments = await call({
+    STORAGE: "d1", ADMIN_KEY: "k",
+    DB: { prepare() { throw new Error("fixture documents failure"); } },
+  }, "/api/admin/brain/documents");
+  check("private aggregate inventory failures cannot be cached",
+    failedDocuments.status === 500 && /no-store/.test(failedDocuments.headers.get("cache-control") || ""),
+    `${failedDocuments.status} ${failedDocuments.headers.get("cache-control") || "missing"}`);
 }
 
 /* ================= batch ingest ================= */

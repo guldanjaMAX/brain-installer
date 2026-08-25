@@ -1,9 +1,9 @@
 /**
  * brain-client — the only thing in eval/ that touches the network.
  *
- * Every endpoint is read-only. Private questions use POST bodies so they never
- * enter URLs, while corpus inventory remains GET. The eval must never be able
- * to change a brain it is measuring.
+ * Every endpoint is read-only. Private questions and family identities use
+ * POST bodies so they never enter URLs. Aggregate corpus counts remain GET.
+ * The eval must never be able to change a brain it is measuring.
  *
  * Two details that are load bearing rather than decorative:
  *
@@ -21,9 +21,45 @@
 const BROWSER_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 
+function isLoopbackHost(hostname) {
+  if (hostname === "localhost" || hostname === "[::1]") return true;
+  if (!/^127(?:\.[0-9]{1,3}){3}$/.test(hostname)) return false;
+  return hostname.split(".").every((part) => Number(part) >= 0 && Number(part) <= 255);
+}
+
+/** Keep credentials on authenticated HTTPS, with HTTP reserved for local tests. */
+export function normalizeBrainBase(value) {
+  let url;
+  try {
+    url = new URL(String(value));
+  } catch {
+    throw new Error("brain base URL is invalid");
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error("brain base URL must not contain credentials, a query, or a fragment");
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopbackHost(url.hostname))) {
+    throw new Error("brain base URL must use HTTPS (HTTP is allowed only on loopback)");
+  }
+  return url.toString().replace(/\/+$/, "");
+}
+
+function assertResponseStayedOnBrain(response, requestedUrl) {
+  if (response?.redirected === true) {
+    const error = new Error("brain request redirected; credentialed redirects are refused");
+    error.retryable = false;
+    throw error;
+  }
+  if (response?.url && new URL(response.url).origin !== new URL(requestedUrl).origin) {
+    const error = new Error("brain response came from a different origin");
+    error.retryable = false;
+    throw error;
+  }
+}
+
 export class BrainClient {
   constructor({ base, adminKey, timeoutMs = 30000, retries = 2, fetchImpl = fetch }) {
-    this.base = String(base).replace(/\/+$/, "");
+    this.base = normalizeBrainBase(base);
     this.key = adminKey;
     this.timeoutMs = timeoutMs;
     this.retries = retries;
@@ -36,8 +72,13 @@ export class BrainClient {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
       try {
-        const res = await this.fetch(this.base + path, {
+        const requestUrl = this.base + path;
+        const res = await this.fetch(requestUrl, {
           method,
+          // Custom authentication headers survive cross-origin redirects in
+          // Node's fetch implementation. Refusing every redirect prevents a
+          // misconfigured vanity domain from forwarding the admin key.
+          redirect: "error",
           headers: {
             "X-Admin-Key": this.key,
             "User-Agent": BROWSER_UA,
@@ -46,6 +87,7 @@ export class BrainClient {
           body: body === undefined ? undefined : JSON.stringify(body),
           signal: ctrl.signal,
         });
+        assertResponseStayedOnBrain(res, requestUrl);
         const text = await res.text();
         if (!res.ok) {
           // A 5xx or a rate limit is worth another try; a 401 or a 404 will
@@ -113,10 +155,22 @@ export class BrainClient {
     return this.#get(`/api/admin/brain/documents?_cb=${Date.now()}`);
   }
 
-  async health() {
-    const res = await this.fetch(`${this.base}/health?_cb=${Date.now()}`, {
-      headers: { "User-Agent": BROWSER_UA },
+  /** Private logical-family pagination; identities and cursors stay in the body. */
+  async sourceFamilies({ source = null, cursor = "", limit = 1000 } = {}) {
+    return this.#post("/api/admin/brain/source-families", {
+      ...(source === null ? {} : { source }),
+      ...(cursor ? { cursor } : {}),
+      limit,
     });
+  }
+
+  async health() {
+    const requestUrl = `${this.base}/health?_cb=${Date.now()}`;
+    const res = await this.fetch(requestUrl, {
+      headers: { "User-Agent": BROWSER_UA },
+      redirect: "error",
+    });
+    assertResponseStayedOnBrain(res, requestUrl);
     let body = null;
     try {
       body = await res.json();

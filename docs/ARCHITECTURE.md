@@ -278,7 +278,10 @@ boundary that search cannot infer from itself. Before credential use, the
 evaluator validates a stable owner-only file, its complete connector snapshots,
 and its binding to the manifest client slug. During the normal read-only corpus
 bracket it compares each expected logical family with the authenticated D1
-family inventory. Results retain only aggregate counts, declared slice labels,
+family inventory. The evaluator sends cursors only in JSON POST bodies, refuses
+redirected responses, and derives the source set from live documents instead of
+denormalized statistics.
+Results retain only aggregate counts, declared slice labels,
 hashes, and typed stage codes. Private paths, source identities, document names,
 versions, and content never enter shareable artifacts. This proves logical
 presence and expected policy absence. Content-version and extraction equality

@@ -921,78 +921,47 @@ function canonicalInventory(docs) {
 }
 
 const CORPUS_PAGE_LIMIT = 1000;
-const CORPUS_USER_AGENT =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
-
-async function authenticatedCorpusGet(client, path) {
-  let lastError = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Number(client.timeoutMs || 30000));
-    try {
-      const response = await client.fetch(`${client.base}${path}`, {
-        headers: { "X-Admin-Key": client.key, "User-Agent": CORPUS_USER_AGENT },
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        lastError = new Error(`corpus inventory endpoint returned HTTP ${response.status}`);
-        if (response.status !== 429 && response.status < 500) throw lastError;
-      } else {
-        try {
-          return await response.json();
-        } catch {
-          throw new Error("corpus inventory endpoint did not return JSON");
-        }
-      }
-    } catch (error) {
-      lastError = error;
-      if (attempt === 2) break;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  throw lastError || new Error("corpus inventory endpoint failed");
-}
-
-async function fingerprintSourceFamilies(client, row, observeFamily = null) {
-  const source = row.source_type;
-  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(source)) {
-    throw new Error("inventory source label cannot be paged safely");
-  }
-  const hasher = createHash("sha256");
+async function fingerprintSourceFamilies(client, inventoryRows, observeFamily = null) {
+  const sourceFingerprints = new Map();
   let cursor = "";
   let count = 0;
   let previousFamily = "";
   const seenCursors = new Set();
 
   while (true) {
-    const query = new URLSearchParams({ source, limit: String(CORPUS_PAGE_LIMIT) });
-    if (cursor) query.set("cursor", cursor);
-    query.set("_cb", `${Date.now()}-${count}`);
-    const body = await authenticatedCorpusGet(client, `/api/admin/brain/source-families?${query}`);
-    if (body?.source !== source || !Array.isArray(body?.families)) {
+    const body = await client.sourceFamilies({ cursor, limit: CORPUS_PAGE_LIMIT });
+    if (body?.source !== null || !Array.isArray(body?.families)) {
       throw new Error("source-family inventory response is malformed");
     }
     if (body.families.length > CORPUS_PAGE_LIMIT) {
       throw new Error("source-family inventory page exceeded its requested limit");
     }
     for (const family of body.families) {
-      if (typeof family !== "string" || !family.startsWith(`${source}:`)) {
+      const separator = typeof family === "string" ? family.indexOf(":") : -1;
+      const source = separator > 0 ? family.slice(0, separator) : "";
+      if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(source) ||
+          !family.startsWith(`${source}:`) || /[\u0000-\u001f\u007f]/.test(family)) {
         throw new Error("source-family inventory contains an invalid family identity");
       }
       if (previousFamily && family <= previousFamily) {
         throw new Error("source-family inventory is not strictly ordered and unique");
       }
       previousFamily = family;
+      let fingerprint = sourceFingerprints.get(source);
+      if (!fingerprint) {
+        fingerprint = { source_type: source, families: 0, hasher: createHash("sha256") };
+        sourceFingerprints.set(source, fingerprint);
+      }
       const bytes = Buffer.from(family, "utf8");
-      hasher.update(String(bytes.length));
-      hasher.update(":");
-      hasher.update(bytes);
-      hasher.update("\n");
+      fingerprint.hasher.update(String(bytes.length));
+      fingerprint.hasher.update(":");
+      fingerprint.hasher.update(bytes);
+      fingerprint.hasher.update("\n");
+      fingerprint.families++;
       if (observeFamily) observeFamily(source, family);
       count++;
-      if (count > row.documents) {
-        throw new Error("source-family inventory exceeded the declared document count");
+      if (!Number.isSafeInteger(count)) {
+        throw new Error("source-family inventory count is too large");
       }
     }
     const next = body.next_cursor;
@@ -1003,39 +972,61 @@ async function fingerprintSourceFamilies(client, row, observeFamily = null) {
     seenCursors.add(next);
     cursor = next;
   }
-  if (count !== row.documents) {
-    throw new Error("source-family inventory count does not match the corpus summary");
+
+  const summaries = new Map(inventoryRows.map((row) => [row.source_type, row.documents]));
+  const allSources = new Set([...summaries.keys(), ...sourceFingerprints.keys()]);
+  let inventoryMismatchCount = 0;
+  for (const source of allSources) {
+    if ((summaries.get(source) ?? 0) !== (sourceFingerprints.get(source)?.families ?? 0)) {
+      inventoryMismatchCount++;
+    }
   }
-  return { source_type: source, families: count, family_hash: `sha256:${hasher.digest("hex")}` };
+  return {
+    total: count,
+    live_sources: sourceFingerprints.size,
+    inventory_mismatch_count: inventoryMismatchCount,
+    fingerprints: [...sourceFingerprints.values()]
+      .sort((a, b) => a.source_type.localeCompare(b.source_type))
+      .map(({ source_type, families, hasher }) => ({
+        source_type,
+        families,
+        family_hash: `sha256:${hasher.digest("hex")}`,
+      })),
+  };
 }
 
 async function collectCorpusSnapshot(client, contractBundle = null) {
   try {
     const inventory = canonicalInventory(await client.documents());
-    const familyFingerprints = [];
     const reconciliation = contractBundle
       ? createCorpusReconciliationCollector(contractBundle)
       : null;
-    for (const row of inventory.rows) {
-      familyFingerprints.push(await fingerprintSourceFamilies(
-        client,
-        row,
-        reconciliation ? (source, family) => reconciliation.observe(source, family) : null,
-      ));
+    const familyInventory = await fingerprintSourceFamilies(
+      client,
+      inventory.rows,
+      reconciliation ? (source, family) => reconciliation.observe(source, family) : null,
+    );
+    if (!reconciliation && familyInventory.inventory_mismatch_count > 0) {
+      throw new Error("source-family inventory does not match the corpus summary");
     }
     const sum = (field) => inventory.rows.reduce((total, row) => total + row[field], 0);
-    const fingerprintMaterial = { inventory, family_fingerprints: familyFingerprints };
+    const fingerprintMaterial = { inventory, family_fingerprints: familyInventory.fingerprints };
     const snapshot = {
       status: "observed",
-      documents: sum("documents"),
+      documents: familyInventory.total,
       chunks: sum("chunks"),
       embedded: sum("embedded"),
       vector_backlog: inventory.pending,
-      sources: inventory.rows.length,
+      sources: familyInventory.live_sources,
+      inventory_summary_mismatches: familyInventory.inventory_mismatch_count,
       snapshot_hash: hashLabel(JSON.stringify(fingerprintMaterial)),
-      fingerprint_basis: "logical-family-identities-source-versions-and-index-state",
+      fingerprint_basis: "live-logical-family-identities-and-index-state",
     };
-    if (reconciliation) snapshot.completeness = reconciliation.finish();
+    if (reconciliation) {
+      snapshot.completeness = reconciliation.finish({
+        inventoryMismatchCount: familyInventory.inventory_mismatch_count,
+      });
+    }
     return snapshot;
   } catch (error) {
     const unavailable = { status: "not_observable", reason: "CONTENT_FINGERPRINT_UNAVAILABLE" };

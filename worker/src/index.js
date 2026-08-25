@@ -7,6 +7,7 @@
  *   POST /api/rag/unified               ranked excerpts (private JSON body)
  *   POST /api/rag/think                 cited answer + explicit gaps
  *   POST /api/admin/brain/ingest        write path, credential-gated
+ *   POST /api/admin/brain/source-families read-only private inventory paging
  *   GET  /api/admin/brain/documents     per-source counts and freshness
  *
  * Everything except /health requires X-Admin-Key.
@@ -1034,51 +1035,71 @@ const SOURCE_FAMILY_DEFAULT_LIMIT = 500;
 const SOURCE_FAMILY_MAX_LIMIT = 1000;
 
 /**
- * Page through the live logical document families for a source.
+ * Page through live logical document families without putting a private family
+ * identity in a request URL. Omitting `source` returns every live family and is
+ * the completeness path: its source set comes from D1 documents, never from
+ * denormalized corpus statistics.
  *
- * The returned cursor is deliberately opaque to clients. Internally it is the
- * last family uid in D1's lexical order, which makes a full sweep resumable
- * without loading the installed corpus into connector memory.
+ * The cursor is the last family uid in D1 lexical order. It is therefore
+ * private instance material and travels only in authenticated JSON bodies,
+ * never in a URL, log-friendly error, or shareable artifact.
  */
-async function handleSourceFamilies(env, url) {
+async function handleSourceFamilies(env, request) {
+  const respond = (body, status = 200) => privateNoStore(jsonResponse(body, status));
   if (backendOf(env) !== D1) {
-    return jsonResponse({ error: "source families apply to the d1 backend only" }, 400);
+    return respond({ error: "source families apply to the d1 backend only" }, 400);
   }
 
-  if (url.searchParams.getAll("source").length !== 1) {
-    return jsonResponse({ error: "source is required exactly once" }, 400);
+  const declaredBytes = Number(request.headers.get("content-length") || 0);
+  if (declaredBytes > 32 * 1024) {
+    return respond({ error: "source-family request is too large" }, 413);
   }
-  const source = String(url.searchParams.get("source") || "").trim().toLowerCase();
-  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(source)) {
-    return jsonResponse({ error: "source must contain only lowercase letters, numbers, underscores or hyphens" }, 400);
+  let raw;
+  let body;
+  try {
+    raw = await request.text();
+    if (new TextEncoder().encode(raw).length > 32 * 1024) {
+      return respond({ error: "source-family request is too large" }, 413);
+    }
+    body = JSON.parse(raw || "{}");
+  } catch {
+    return respond({ error: "source-family request must be a JSON object" }, 400);
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return respond({ error: "source-family request must be a JSON object" }, 400);
+  }
+  const extras = Object.keys(body).filter((field) => !["source", "cursor", "limit"].includes(field));
+  if (extras.length > 0) {
+    return respond({ error: "source-family request has unknown fields" }, 400);
   }
 
-  if (url.searchParams.getAll("limit").length > 1) {
-    return jsonResponse({ error: `limit must be an integer from 1 to ${SOURCE_FAMILY_MAX_LIMIT}` }, 400);
-  }
-  const limitText = url.searchParams.get("limit");
-  if (limitText !== null && !/^[1-9][0-9]{0,3}$/.test(limitText)) {
-    return jsonResponse({ error: `limit must be an integer from 1 to ${SOURCE_FAMILY_MAX_LIMIT}` }, 400);
-  }
-  const limit = limitText === null ? SOURCE_FAMILY_DEFAULT_LIMIT : Number(limitText);
-  if (limit > SOURCE_FAMILY_MAX_LIMIT) {
-    return jsonResponse({ error: `limit must be an integer from 1 to ${SOURCE_FAMILY_MAX_LIMIT}` }, 400);
+  const source = body.source === undefined || body.source === null ? null : body.source;
+  if (source !== null && (
+    typeof source !== "string" || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(source)
+  )) {
+    return respond({ error: "source must contain only lowercase letters, numbers, underscores or hyphens" }, 400);
   }
 
-  if (url.searchParams.getAll("cursor").length > 1) {
-    return jsonResponse({ error: "cursor must be supplied at most once" }, 400);
+  const limit = body.limit === undefined ? SOURCE_FAMILY_DEFAULT_LIMIT : body.limit;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > SOURCE_FAMILY_MAX_LIMIT) {
+    return respond({ error: `limit must be an integer from 1 to ${SOURCE_FAMILY_MAX_LIMIT}` }, 400);
   }
-  const cursor = url.searchParams.get("cursor") || "";
+
+  const cursor = body.cursor === undefined || body.cursor === null ? "" : body.cursor;
+  if (typeof cursor !== "string") {
+    return respond({ error: "cursor must be a string" }, 400);
+  }
   const cursorBytes = new TextEncoder().encode(cursor).length;
   if (cursor && (
-    cursorBytes > 2048 ||
+    cursorBytes > 16 * 1024 ||
     /[\u0000-\u001f\u007f]/.test(cursor) ||
-    !cursor.startsWith(`${source}:`)
+    (source !== null && !cursor.startsWith(`${source}:`)) ||
+    (source === null && !/^[a-z0-9][a-z0-9_-]{0,63}:/.test(cursor))
   )) {
-    return jsonResponse({ error: "cursor is not valid for this source" }, 400);
+    return respond({ error: "cursor is not valid for this inventory" }, 400);
   }
 
-  return jsonResponse(await listSourceFamilies(env, { source, cursor, limit }));
+  return respond(await listSourceFamilies(env, { source, cursor, limit }));
 }
 
 async function handleDocuments(env) {
@@ -1142,11 +1163,16 @@ export default {
       if (path === "/api/admin/brain/source-expectation" && request.method === "POST") {
         return await handleSourceExpectation(env, request);
       }
+      if (path === "/api/admin/brain/source-families" && request.method === "POST") {
+        return await handleSourceFamilies(env, request);
+      }
       if (path === "/api/admin/brain/source-families" && request.method === "GET") {
-        return await handleSourceFamilies(env, url);
+        return privateNoStore(jsonResponse({
+          error: "source-family inventory must use a JSON POST body so private cursors never enter URLs",
+        }, 405));
       }
       if (path === "/api/admin/brain/documents" && request.method === "GET") {
-        return await handleDocuments(env);
+        return privateNoStore(await handleDocuments(env));
       }
       // Per-source freshness. Separate from /documents on purpose: that endpoint
       // answers "how much is in here", this one answers "how much of it is
@@ -1223,7 +1249,12 @@ export default {
       }
       return jsonResponse({ error: "not found" }, 404);
     } catch (e) {
-      return jsonResponse({ error: e.message }, 500);
+      const response = jsonResponse({ error: e.message }, 500);
+      if (path === "/api/admin/brain/source-families" ||
+          path === "/api/admin/brain/documents") {
+        return privateNoStore(response);
+      }
+      return response;
     }
   },
 

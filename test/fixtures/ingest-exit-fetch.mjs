@@ -99,7 +99,8 @@ globalThis.fetch = async (input, options = {}) => {
   }
 
   if (url.hostname === "fixture.invalid" && url.pathname === "/api/admin/brain/source-families") {
-    return json({ source: url.searchParams.get("source"), families: [], next_cursor: null });
+    const request = JSON.parse(String(options.body || "{}"));
+    return json({ source: request.source, families: [], next_cursor: null });
   }
 
   if (url.hostname === "fixture.invalid" && url.pathname === "/api/admin/brain/source-receipt") {

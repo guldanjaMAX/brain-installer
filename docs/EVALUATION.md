@@ -121,7 +121,11 @@ For each contract source, `index_source_id` names the private bare identity used
 by the Brain index. Older v1 contracts without that optional field use
 `canonical_locator`, preserving the original schema behavior. The evaluator
 prefixes that value with `connector` when needed, then reconciles it against the
-authenticated, paginated `/api/admin/brain/source-families` observation. An
+authenticated, paginated `/api/admin/brain/source-families` observation. The
+read-only endpoint accepts only JSON POST bodies, refuses redirects in the eval
+client, and returns private no-store responses. Family identities and page
+cursors never enter request URLs. Its global inventory derives source labels
+from live D1 document rows rather than denormalized corpus statistics. An
 `eligible` source must be present. An `excluded`, `quarantined`, or `tombstoned`
 source must be absent. Every observed family not in the complete independent
 contract is unknown.
@@ -133,7 +137,7 @@ extraction mode, sensitivity, and expected policy state. Its typed failures are:
 |---|---|
 | Contract preflight | `CORPUS_INVENTORY_INCOMPLETE` |
 | Connector snapshot | `CONNECTOR_SNAPSHOT_INCOMPLETE` |
-| Source inventory | `SOURCE_NOT_INDEXED`, `UNKNOWN_INDEX_SOURCE`, `SOURCE_INVENTORY_INVALID`, `SOURCE_INVENTORY_NOT_OBSERVABLE` |
+| Source inventory | `SOURCE_NOT_INDEXED`, `UNKNOWN_INDEX_SOURCE`, `SOURCE_INVENTORY_INVALID`, `SOURCE_INVENTORY_NOT_OBSERVABLE`, `SOURCE_INVENTORY_SUMMARY_DRIFT` |
 | Policy state | `EXCLUDED_SOURCE_INDEXED`, `QUARANTINED_SOURCE_INDEXED`, `TOMBSTONED_SOURCE_INDEXED` |
 
 Supplying the contract makes every one of those failures blocking in both smoke

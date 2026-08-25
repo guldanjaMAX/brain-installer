@@ -946,12 +946,15 @@ async function listCloudflareFamilies(source, resolved, options = {}) {
   const request = options.fetch ?? globalThis.fetch;
   let cursor = "";
   for (let page = 0; page < 10_000; page++) {
-    const query = new URLSearchParams({ source, limit: "1000" });
-    if (cursor) query.set("cursor", cursor);
     let response;
     try {
-      response = await request(`${resolved.baseUrl}/api/admin/brain/source-families?${query}`, {
-        headers: { "X-Admin-Key": resolved.adminKey },
+      response = await request(`${resolved.baseUrl}/api/admin/brain/source-families`, {
+        method: "POST",
+        headers: {
+          "X-Admin-Key": resolved.adminKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ source, limit: 1000, ...(cursor ? { cursor } : {}) }),
         redirect: "manual",
         signal: options.abortSignal?.() ?? AbortSignal.timeout(options.targetTimeoutMs ?? TARGET_TIMEOUT_MS),
       });

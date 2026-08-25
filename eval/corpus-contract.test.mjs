@@ -4,6 +4,7 @@ import {
   chmodSync,
   linkSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -116,6 +117,47 @@ test("strict corpus preflight validates topology and manifest binding", () => {
     }),
     /maps two sources to one index family/,
   );
+
+  const dottedConnector = fixtureContract();
+  dottedConnector.connector_snapshots[0].connector = "drive.private";
+  dottedConnector.sources.forEach((source) => { source.connector = "drive.private"; });
+  assert.throws(
+    () => validateCorpusContract(dottedConnector, {
+      installationRef: "fixture-install",
+      now: Date.parse("2026-08-25T01:00:00.000Z"),
+    }),
+    /connector is invalid/,
+  );
+
+  const longVersion = fixtureContract();
+  longVersion.sources[0].source_version = "x".repeat(513);
+  assert.throws(
+    () => validateCorpusContract(longVersion, {
+      installationRef: "fixture-install",
+      now: Date.parse("2026-08-25T01:00:00.000Z"),
+    }),
+    /source_version is invalid/,
+  );
+
+  for (const capturedAt of ["2026-08-25", "2026-02-30T00:00:00Z"]) {
+    const invalidTimestamp = fixtureContract();
+    invalidTimestamp.captured_at = capturedAt;
+    assert.throws(
+      () => validateCorpusContract(invalidTimestamp, {
+        installationRef: "fixture-install",
+        now: Date.parse("2026-08-25T01:00:00.000Z"),
+      }),
+      /RFC 3339 timestamp/,
+    );
+  }
+
+  const schema = JSON.parse(readFileSync(
+    new URL("./schema/corpus-contract-v1.schema.json", import.meta.url),
+    "utf8",
+  ));
+  assert.equal(schema.$defs.connector.pattern, "^[a-z0-9][a-z0-9_-]{0,63}$");
+  assert.equal(schema.$defs.source.properties.connector.$ref, "#/$defs/connector");
+  assert.equal(schema.$defs.source.properties.source_version.maxLength, 512);
 });
 
 test("incomplete independent snapshots are not observable before credentials", () => {
@@ -246,4 +288,18 @@ test("missing, policy-leak, and unknown sources retain stage-specific aggregate 
     code: "SOURCE_INVENTORY_NOT_OBSERVABLE",
     count: 1,
   }]);
+});
+
+test("a denormalized inventory-summary mismatch is a blocking aggregate failure", () => {
+  const contract = fixtureContract();
+  const collector = createCorpusReconciliationCollector({ contract, contract_hash: HASH_B });
+  collector.observe("drive", "drive:document-a");
+  const result = collector.finish({ inventoryMismatchCount: 1 });
+  assert.equal(result.status, "fail");
+  assert.deepEqual(result.failures, [{
+    stage: "source_inventory",
+    code: "SOURCE_INVENTORY_SUMMARY_DRIFT",
+    count: 1,
+  }]);
+  assert.equal(corpusCompletenessHardGates(result)[0].reason, "SOURCE_INVENTORY_SUMMARY_DRIFT");
 });
