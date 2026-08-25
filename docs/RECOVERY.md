@@ -189,9 +189,10 @@ valid but changed golden set is refused before Cloudflare or Keychain access.
 The adapter reopens and fingerprints the wrapper, manifests, golden set, and
 artifact directory before and after every stage. Wrangler receives a narrow
 child environment and transient private log directory, and runs from a private
-copy of the exact approved wrapper. Wrangler logging and telemetry are disabled,
-and every command explicitly disables experimental provisioning, automatic
-resource creation, and skill installation. Authenticated HTTPS
+copy of the exact approved wrapper. Wrangler logging is sanitized and telemetry
+is disabled. Every command explicitly disables experimental provisioning and
+automatic resource creation; executing the exact local wrapper avoids package
+or skill installation paths. Authenticated HTTPS
 requests refuse redirects, contain no private values in URLs, and read the
 target admin key from Keychain only after the target identity is proven.
 Provider diagnostics, credentials, corpus content, and resource names never

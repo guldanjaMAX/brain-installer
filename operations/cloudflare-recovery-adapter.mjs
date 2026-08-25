@@ -131,7 +131,6 @@ const SAFE_WRANGLER_PREFIXES = Object.freeze([
 const WRANGLER_FAIL_CLOSED_FLAGS = Object.freeze([
   "--experimental-provision=false",
   "--experimental-auto-create=false",
-  "--install-skills=false",
 ]);
 
 const TABLE_INVENTORY_SQL =

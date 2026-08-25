@@ -261,8 +261,11 @@ function providerHarness({
     for (const flag of [
       "--experimental-provision=false",
       "--experimental-auto-create=false",
-      "--install-skills=false",
     ]) assert.equal(args.includes(flag), true);
+    // Wrangler 4.73 rejects this obsolete flag before executing even a
+    // read-only JSON command. The pinned local wrapper already prevents any
+    // package or skill installation path.
+    assert.equal(args.includes("--install-skills=false"), false);
 
     const cloudflare = bindingForAccount(env.CLOUDFLARE_ACCOUNT_ID);
     if (args[0] === "d1" && args[1] === "list") {
