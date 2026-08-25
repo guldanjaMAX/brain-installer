@@ -14,6 +14,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fetchBrainWithAdminKey } from "../components/brain-http.mjs";
 import { batches, splitOversized } from "../ingest/envelope-batching.mjs";
+import { GATE_VERSION, sanitizeEnvelope } from "../worker/src/lib/secret-scan.js";
 import { readProtectedStateJson, saveProtectedStateJson } from "./state-file.mjs";
 
 const SOURCE_API = "https://api.supabase.com/v1";
@@ -540,6 +541,7 @@ const failure = (laneState, item, status, error) => {
 };
 
 const freshLaneState = () => ({
+  content_safety_version: GATE_VERSION,
   cursor: "", high_water: null, complete: false, pages: 0,
   source_rows: 0, source_chunks: 0, envelopes: 0, target_chunks: 0,
   created: 0, updated: 0, unchanged: 0, refused: 0, failed: 0,
@@ -563,6 +565,11 @@ export async function runLane({
 }) {
   const config = laneConfig(lane, { excludedDriveFileIds: migrationPolicy?.excluded_drive_file_ids || [] });
   const laneState = state.lanes[lane] ||= freshLaneState();
+  if (laneState.content_safety_version !== GATE_VERSION) {
+    throw new Error(
+      "migration content-safety rules changed; reset and reconcile this lane so previously stored documents are sanitized"
+    );
+  }
   if (laneState.migration_policy && !migrationPolicy) {
     throw new Error("this lane was started with a migration policy; the same policy is required to resume");
   }
@@ -602,7 +609,7 @@ export async function runLane({
     let transformFailed = false;
     for (const row of rows) {
       try {
-        const envelope = rowToEnvelope(lane, row);
+        const envelope = sanitizeEnvelope(rowToEnvelope(lane, row));
         if (!envelope.content.trim()) throw new Error("source row produced empty content");
         for (const part of splitOversized(envelope)) {
           const hash = sha256(JSON.stringify(part));

@@ -12,7 +12,7 @@ import {
   driveSyncDecision, listStoredSourceFamilies, credentialScannerFingerprint, postSourceExpectation,
   resolveAdminKey, recordAcceptedDocumentState, addLocalPathAliases, recordLocalSkippedDocumentState,
   ensureCredentialScannerProgress, recordCredentialScannerProgress, hasCredentialScannerProgress,
-  commitCredentialScannerProgress,
+  commitCredentialScannerProgress, safeIngestDisplay, reportSkips,
   VALUE_FLAGS,
 } from "../brain.mjs";
 
@@ -72,9 +72,10 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   check("credential scanner mode is part of Drive policy identity",
     drivePolicyFingerprint(cfg, true) !== drivePolicyFingerprint(cfg, false));
   check("credential scanner version is a durable rescan marker",
-    credentialScannerFingerprint(true, 2) !== credentialScannerFingerprint(true, 3));
+    credentialScannerFingerprint(true, 3) !== credentialScannerFingerprint(true, 4));
   const scannerV2 = credentialScannerFingerprint(true, 2);
   const scannerV3 = credentialScannerFingerprint(true, 3);
+  const scannerV4 = credentialScannerFingerprint(true, 4);
   const interruptedScanner = { done: { "drive:file": "revision-1" } };
   ensureCredentialScannerProgress(interruptedScanner, scannerV2);
   recordCredentialScannerProgress(interruptedScanner, scannerV2, "drive:file", "revision-1");
@@ -92,6 +93,11 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   check("scanner progress becomes authoritative only at the final commit",
     interruptedScanner.credential_scanner_fingerprint === scannerV3 &&
       !("credential_scanner_progress" in interruptedScanner), JSON.stringify(interruptedScanner));
+  ensureCredentialScannerProgress(interruptedScanner, scannerV4);
+  check("v4 capability-link safety invalidates a completed v3 scanner receipt",
+    !hasCredentialScannerProgress(interruptedScanner, scannerV3, "drive:file", "revision-1") &&
+      !hasCredentialScannerProgress(interruptedScanner, scannerV4, "drive:file", "revision-1"),
+    JSON.stringify(interruptedScanner));
   const freshDecision = driveSyncDecision({
     syncToken: "cursor", policyFingerprint, savedPolicyFingerprint: policyFingerprint,
     lastFullSweepAt: "2026-08-22T12:00:00.000Z", now: Date.parse("2026-08-23T12:00:00.000Z"),
@@ -120,6 +126,34 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   }, true);
   check("client preflight scans connector path metadata",
     pathRefusal?.labels?.includes("openai_api_key") && !pathRefusal.reason.includes(boundarySecret), JSON.stringify(pathRefusal));
+
+  const paymentToken = "Pw8Ks4".repeat(8);
+  const capabilityUrl = `https://invoice.stripe.com/i/acct_fixture123/test_${paymentToken}`;
+  const mixedTitle = `Active billing ${capabilityUrl} credentials ${boundarySecret}`;
+  const mixedRefusal = credentialRefusalOf({ content: "ordinary prose", title: mixedTitle }, true);
+  const refusalSkip = {
+    path: safeIngestDisplay(mixedTitle),
+    reason: mixedRefusal.reason,
+  };
+  const refusalState = { skipped: { "drive:fixture": mixedRefusal.reason } };
+  const refusalLogs = [];
+  const originalLog = console.log;
+  try {
+    console.log = (...args) => refusalLogs.push(args.map(String).join(" "));
+    await reportSkips([refusalSkip]);
+  } finally {
+    console.log = originalLog;
+  }
+  const refusalPrivacySurface = JSON.stringify({ refusalSkip, refusalState, refusalLogs });
+  check("refused billing titles retain a useful sanitized display label",
+    mixedRefusal?.labels?.includes("openai_api_key") &&
+      refusalSkip.path.includes("Active billing") &&
+      refusalSkip.path.includes("[REDACTED:sensitive_payment_url]") &&
+      refusalSkip.path.includes("[REDACTED:openai_api_key]"), refusalPrivacySurface);
+  check("capability URLs and refused credentials never reach skip state or log output",
+    !refusalPrivacySurface.includes(paymentToken) &&
+      !refusalPrivacySurface.includes("invoice.stripe.com") &&
+      !refusalPrivacySurface.includes(boundarySecret), refusalPrivacySurface);
 
   const plans = [
     { stateKey: "drive:a", expectedParts: 2 },
@@ -712,6 +746,10 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   check("a Drive sweep checks listing metadata before downloading bytes",
     versionCheck !== -1 && driveDownload !== -1 && versionCheck < driveDownload,
     `version=${versionCheck} download=${driveDownload}`);
+  check("Drive and Gmail refusal paths never use a raw envelope title",
+    !/path: r\.envelope\.title/.test(remote || "") &&
+      (String(remote).match(/path: safeIngestDisplay\(envelope\.title/g) || []).length >= 2,
+    String(remote).slice(0, 2200));
 
   // And the ones that genuinely need Cloudflare should NOT have been changed.
   for (const name of ["cmdProvision", "cmdDeploy", "cmdMigrate"]) {

@@ -37,7 +37,7 @@ import {
   adminKeyPersistencePlan,
   readAdminKeyDurably,
 } from "./admin-key-persistence.mjs";
-import { scanEnvelope } from "../worker/src/lib/secret-scan.js";
+import { sanitizeEnvelope, scanEnvelope } from "../worker/src/lib/secret-scan.js";
 
 export const CURATED_SYNC_PLAN_VERSION = 1;
 export const CURATED_SYNC_LEDGER_VERSION = 3;
@@ -583,19 +583,23 @@ export function prepareCuratedCorpus(planInput, options = {}) {
     const logicalFingerprint = sha256(
       `curated-sync-logical-v1\0${plan.namespace}\0${document.sourceType}\0${document.sourceId}`,
     );
-    const legacyEnvelope = {
+    const legacyEnvelope = sanitizeEnvelope({
       source_type: document.sourceType,
       source_id: document.sourceId,
       title,
       content,
       metadata,
-    };
+    });
     const cloudflareEnvelope = {
       ...legacyEnvelope,
       source_type: "curated",
       source_id: `brain:${document.sourceType}:${document.sourceId}`,
     };
-    const neutralEnvelope = Object.freeze({ title, content, metadata });
+    const neutralEnvelope = Object.freeze({
+      title: legacyEnvelope.title,
+      content: legacyEnvelope.content,
+      metadata: legacyEnvelope.metadata,
+    });
     const envelopeHash = sha256(
       `curated-sync-envelope-v1\0${canonical(neutralEnvelope)}`,
     );

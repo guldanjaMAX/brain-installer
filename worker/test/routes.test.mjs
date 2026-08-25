@@ -742,6 +742,7 @@ function mkSourceFamilyEnv(documents, extra = {}) {
 // partial-failure path is exercised rather than assumed.
 function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocUid = null, preflightFail = false } = {}) {
   const written = [];
+  const storedTexts = [];
   const documents = new Map();
   const calls = { remote: 0, stats_scans: 0, stats_attempts: 0, finalizer_batches: 0 };
   const control = { explodeOn, finalizeFailSource, failChunkDocUid, preflightFail };
@@ -753,10 +754,14 @@ function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocU
       documents.set(b[0], {
         ...prior,
         doc_uid: b[0], source: b[1], source_id: b[2], title: b[3],
+        uri: b[4], document_date: b[5], date_source: b[6], date_reliable: b[7],
         client: b[8], category: b[9], top_folder: b[10], platform: b[11],
-        content_hash: b[13],
+        content_hash: b[13], meta: b[14],
       });
       written.push(String(b[2]));
+      changes = 1;
+    } else if (/INSERT INTO chunks/.test(sql)) {
+      storedTexts.push(String(b[3] || ""));
       changes = 1;
     } else if (/UPDATE documents SET content_hash/.test(sql)) {
       const row = documents.get(b[0]);
@@ -828,7 +833,7 @@ function mkBatchEnv({ explodeOn = null, finalizeFailSource = null, failChunkDocU
       },
     },
   };
-  return { env, written, documents, calls, control };
+  return { env, written, storedTexts, documents, calls, control };
 }
 const post = (env, path, body) =>
   worker.fetch(new Request("https://b.example" + path, {
@@ -840,6 +845,139 @@ const doc = (id, content = "some ordinary meeting content about the retainer") =
   ({ source_type: "meeting", source_id: id, title: `T${id}`, content });
 
 {
+  const { env, storedTexts, documents } = mkBatchEnv();
+  const paymentToken = "Qz8Lm4".repeat(8);
+  const capabilityUrl = `https://invoice.stripe.com/i/acct_fixture123/test_${paymentToken}`;
+  const response = await worker.fetch(new Request("https://b.example/api/admin/brain/ingest", {
+    method: "POST", headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({
+      source_type: "message", source_id: "stable-single",
+      content: `Billing remains active. https://billing.stripe.com/p/session/live_${paymentToken} Follow up Friday.`,
+      uri: capabilityUrl,
+      date_source: `billing import ${capabilityUrl}`,
+      metadata: {
+        [`private lookup ${capabilityUrl}`]: `billing metadata ${capabilityUrl}`,
+      },
+    }),
+  }), env, {});
+  const receipt = await response.text();
+  const stored = storedTexts.join("\n");
+  const durableDocument = JSON.stringify(documents.get("message:stable-single") || {});
+  check("single ingest stores useful prose with a fixed capability-link marker",
+    response.status === 200 && stored.includes("Billing remains active.") && stored.includes("[REDACTED:sensitive_payment_url]"));
+  check("single ingest never stores or echoes the capability URL token",
+    !stored.includes(paymentToken) && !durableDocument.includes(paymentToken) && !receipt.includes(paymentToken));
+  check("single ingest sanitizes D1 URI, date source, and metadata keys before storage",
+    durableDocument.includes("[REDACTED:sensitive_payment_url]") &&
+      !durableDocument.includes("invoice.stripe.com"));
+}
+
+{
+  const paymentToken = "Vr6Ny3".repeat(8);
+  const capabilityUrl = `https://invoice.stripe.com/i/acct_fixture123/test_${paymentToken}`;
+  const observedLogs = [];
+  const rpcCalls = [];
+  const originalFetch = globalThis.fetch;
+  const original = { log: console.log, warn: console.warn, error: console.error };
+  let response;
+  try {
+    globalThis.fetch = async (url, options = {}) => {
+      rpcCalls.push({ url: String(url), body: String(options.body || "") });
+      return new Response(JSON.stringify([{ id: "synthetic-row", action: "created" }]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    console.log = (...args) => observedLogs.push(args.map(String).join(" "));
+    console.warn = (...args) => observedLogs.push(args.map(String).join(" "));
+    console.error = (...args) => observedLogs.push(args.map(String).join(" "));
+    response = await worker.fetch(new Request("https://b.example/api/admin/brain/ingest", {
+      method: "POST",
+      headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+      body: JSON.stringify({
+        source_type: "message",
+        source_id: "stable-legacy-message",
+        source_subtype: `billing thread ${capabilityUrl}`,
+        content: "Useful billing context remains searchable.",
+        metadata: {
+          [`private lookup ${capabilityUrl}`]: `Follow-up context ${capabilityUrl}`,
+        },
+      }),
+    }), {
+      STORAGE: "supabase",
+      ADMIN_KEY: "k",
+      SUPABASE_URL: "https://supabase.example.invalid",
+      SUPABASE_SERVICE_ROLE_KEY: "synthetic-service-role",
+    }, {});
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = original.log;
+    console.warn = original.warn;
+    console.error = original.error;
+  }
+  const rawReceipt = await response.text();
+  const rpcBody = rpcCalls[0]?.body || "";
+  const parsedRpc = JSON.parse(rpcBody || "{}");
+  check("legacy Supabase source_subtype is sanitized before its RPC storage boundary",
+    response.status === 200 &&
+      parsedRpc.p_source_subtype.includes("billing thread") &&
+      parsedRpc.p_source_subtype.includes("[REDACTED:sensitive_payment_url]"));
+  check("legacy Supabase RPC input, receipt, and logs never contain the capability token",
+    rpcCalls.length === 1 &&
+      !rpcBody.includes(paymentToken) && !rpcBody.includes("invoice.stripe.com") &&
+      !rawReceipt.includes(paymentToken) && !observedLogs.join("\n").includes(paymentToken));
+  check("legacy Supabase metadata keys and values are sanitized without dropping useful prose",
+    rpcBody.includes("private lookup [REDACTED:sensitive_payment_url]") &&
+      rpcBody.includes("Follow-up context [REDACTED:sensitive_payment_url]") &&
+      parsedRpc.p_content === "Useful billing context remains searchable.");
+}
+
+{
+  const paymentToken = "Nm9Qw2".repeat(8);
+  const capabilityUrl = `https://invoice.stripe.com/i/acct_fixture123/live_${paymentToken}?s=em`;
+
+  const single = mkBatchEnv();
+  const singleResponse = await worker.fetch(new Request("https://b.example/api/admin/brain/ingest", {
+    method: "POST", headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ source_type: "message", source_id: capabilityUrl, content: "Useful billing prose." }),
+  }), single.env, {});
+  const singleReceipt = await singleResponse.text();
+  check("single ingest fails closed when a capability URL is used as source_id",
+    singleResponse.status === 422 && single.written.length === 0 && single.storedTexts.length === 0);
+  check("unsafe single-ingest identity is never echoed",
+    !singleReceipt.includes(paymentToken) && !singleReceipt.includes("invoice.stripe.com"));
+
+  const batch = mkBatchEnv();
+  const observedLogs = [];
+  const original = { log: console.log, warn: console.warn, error: console.error };
+  let batchResponse;
+  try {
+    console.log = (...args) => observedLogs.push(args.map(String).join(" "));
+    console.warn = (...args) => observedLogs.push(args.map(String).join(" "));
+    console.error = (...args) => observedLogs.push(args.map(String).join(" "));
+    batchResponse = await post(batch.env, "/api/admin/brain/ingest/batch", {
+      docs: [
+        { source_type: "message", source_id: capabilityUrl, content: "One" },
+        { source_type: capabilityUrl, source_id: "stable-id", content: "Two" },
+        { source_type: "message", source_id: { nested: capabilityUrl }, content: "Three" },
+      ],
+    });
+  } finally {
+    console.log = original.log;
+    console.warn = original.warn;
+    console.error = original.error;
+  }
+  const rawReceipt = await batchResponse.text();
+  const receipt = JSON.parse(rawReceipt);
+  check("batch ingest fails closed without echoing an unsafe source identity",
+    receipt.refused === 3 && receipt.results.every((slot) =>
+      slot.source_id === null && slot.source_type === null && slot.status === "refused"), rawReceipt);
+  check("unsafe batch identity reaches no store, vector-bound text, receipt, or log",
+    batch.written.length === 0 && batch.storedTexts.length === 0 &&
+      !rawReceipt.includes(paymentToken) && !observedLogs.join("\n").includes(paymentToken));
+}
+
+{
   const { env } = mkBatchEnv();
   const r = await post(env, "/api/admin/brain/ingest/batch", { docs: [doc("a"), doc("b"), doc("c")] });
   const b = await r.json();
@@ -847,6 +985,32 @@ const doc = (id, content = "some ordinary meeting content about the retainer") =
   check("and reports one result slot per document", b.results.length === 3);
   check("each slot names its source_id, so a caller can resume precisely",
     b.results.every((x, i) => x.source_id === ["a", "b", "c"][i]), JSON.stringify(b.results));
+}
+
+/* Capability URLs are removed without discarding the billing record. All
+   connector and migration source types converge at this exact storage gate. */
+{
+  const { env, storedTexts } = mkBatchEnv();
+  const paymentToken = "Xy7Ab9".repeat(8);
+  const billing = `Billing remains active through Friday. https://invoice.stripe.com/i/acct_fixture123/live_${paymentToken}?s=em Follow up next week.`;
+  const docs = ["drive", "gmail", "message", "migration"].map((source, index) => ({
+    source_type: source,
+    source_id: `stable-${index}`,
+    title: `Billing ${index}`,
+    content: billing,
+  }));
+  const response = await post(env, "/api/admin/brain/ingest/batch", { docs });
+  const rawReceipt = await response.text();
+  const receipt = JSON.parse(rawReceipt);
+  const stored = storedTexts.join("\n");
+  check("Drive, Gmail, messages and migrations keep their stable receipt identity",
+    receipt.results.every((slot, index) => slot.source_id === `stable-${index}`), rawReceipt);
+  check("capability URLs never reach D1 or vector-bound chunk text",
+    !stored.includes(paymentToken) && stored.includes("[REDACTED:sensitive_payment_url]"));
+  check("useful billing context survives capability-link sanitization",
+    stored.includes("Billing remains active through Friday.") && stored.includes("Follow up next week."));
+  check("capability URLs never enter the ingest receipt",
+    !rawReceipt.includes(paymentToken) && !rawReceipt.includes("invoice.stripe.com"));
 }
 
 /* One bad document must not cost the other 49. */

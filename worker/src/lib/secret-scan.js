@@ -1,9 +1,9 @@
 /**
- * secret-scan v3 — credential detection for the ingest endpoint.
+ * secret-scan v4 — credential and capability-link safety for ingest.
  *
- * Port of ~/CocoIndex/secret_scan.py v2. The two must stay in step: the
- * indexer and this Worker are two doors into the same index, and a gate on one
- * door only is not a gate.
+ * The credential shapes began as a port of ~/CocoIndex/secret_scan.py v2. The
+ * shipped connector and Worker now import this module directly, so both doors
+ * use one rule set instead of relying on two manually synchronized copies.
  *
  * TIERING
  *   CONFIRMED  known provider key shape, or a credential in a structural
@@ -31,10 +31,122 @@
 export const CONFIRMED = "confirmed";
 export const SUSPECTED = "suspected";
 export const CLEAN = "clean";
-// v3 scans every string in the ingest envelope separately. That scope change
-// must advance the durable fingerprint so previously accepted titles and path
-// metadata are reconsidered by the next source sweep.
-export const GATE_VERSION = 3;
+// v4 adds content-preserving capability-link sanitization. The durable version
+// forces previously accepted content through the new transform on the next
+// complete source sweep.
+export const GATE_VERSION = 4;
+
+// Some HTTPS links are credentials in URL form. Unlike a provider API key, a
+// private payment link normally appears inside useful billing prose, so
+// refusing the whole document would discard the context the brain needs. These
+// narrowly identified Stripe capability URLs are replaced before ordinary
+// credential scanning and storage. Public, reusable Payment Links use
+// buy.stripe.com and are intentionally absent from this list.
+export const SENSITIVE_LINK_REDACTION = "[REDACTED:sensitive_payment_url]";
+const SENSITIVE_LINK_RULES = [
+  // Hosted Invoice Page. Stripe documents this as a secure, private URL with a
+  // long random identifier. Include query parameters in the replacement.
+  /https:\/\/invoice\.stripe\.com\/i\/acct_[A-Za-z0-9_-]{6,}\/[A-Za-z0-9_-]{40,}(?:[?#][^\s<>"'`)\]}]*)?/gi,
+  // The invoice PDF carries the same private identifier as the Hosted Invoice
+  // Page and exposes the same customer-specific billing record.
+  /https:\/\/pay\.stripe\.com\/invoice\/acct_[A-Za-z0-9_-]{6,}\/[A-Za-z0-9_-]{40,}(?:\/pdf)?(?:[?#][^\s<>"'`)\]}]*)?/gi,
+  // Billing Portal sessions are short-lived authenticated entry points for one
+  // customer, not public pages.
+  /https:\/\/billing\.stripe\.com\/p\/session\/[A-Za-z0-9_-]{40,}(?:[?#][^\s<>"'`)\]}]*)?/gi,
+  // Hosted Checkout can use a custom domain, so the cs_test_/cs_live_ session
+  // token and path are the authority rather than a stripe.com host allowlist.
+  /https:\/\/[A-Za-z0-9.-]+(?::\d+)?\/(?:c\/)?pay\/cs_[A-Za-z0-9_-]{20,}(?:[?#][^\s<>"'`)\]}]*)?/gi,
+];
+
+/** Replace only recognized bearer/capability URLs, preserving nearby prose. */
+export function sanitizeSensitiveLinks(text, replacement = SENSITIVE_LINK_REDACTION) {
+  if (!text || typeof text !== "string") return text;
+  let out = text;
+  for (const pattern of SENSITIVE_LINK_RULES) {
+    pattern.lastIndex = 0;
+    out = out.replace(pattern, replacement);
+  }
+  return out;
+}
+
+/** True when a string contains a capability URL covered by the sanitizer. */
+export function hasSensitiveLink(text) {
+  return typeof text === "string" && sanitizeSensitiveLinks(text) !== text;
+}
+
+/**
+ * Transport identities are echoed in receipts and become durable keys, so they
+ * cannot be safely rewritten. Refuse the envelope generically instead.
+ */
+export function hasSensitiveTransportIdentity(envelope) {
+  if (!envelope || typeof envelope !== "object") return false;
+  const seen = new Set();
+  const contains = (value) => {
+    if (typeof value === "string") return hasSensitiveLink(value);
+    if (!value || typeof value !== "object" || seen.has(value)) return false;
+    seen.add(value);
+    if (Array.isArray(value)) return value.some(contains);
+    return Object.entries(value).some(([key, item]) => hasSensitiveLink(key) || contains(item));
+  };
+  return contains(envelope.source_type) || contains(envelope.source_id);
+}
+
+/**
+ * Sanitize every non-identity string and object key without changing transport
+ * identity. This deliberately walks arbitrary fields rather than maintaining
+ * a brittle allowlist of today's storage schema. In particular
+ * source_type/source_id remain byte-for-byte stable so resume receipts and
+ * lifecycle reconciliation still address the same record.
+ */
+export function sanitizeEnvelope(envelope) {
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) return envelope;
+  const seen = new Map();
+  const assign = (target, rawKey, value) => {
+    const base = sanitizeSensitiveLinks(rawKey);
+    let key = base;
+    // Two private keys can collapse to the same fixed marker. Keep every value
+    // without retaining either original key.
+    for (let suffix = 2; Object.prototype.hasOwnProperty.call(target, key); suffix++) {
+      key = `${base}_${suffix}`;
+    }
+    Object.defineProperty(target, key, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  };
+  const copy = (value) => {
+    if (typeof value === "string") return sanitizeSensitiveLinks(value);
+    if (!value || typeof value !== "object") return value;
+    if (seen.has(value)) return seen.get(value);
+    const target = Array.isArray(value) ? [] : {};
+    seen.set(value, target);
+    if (Array.isArray(value)) {
+      for (const item of value) target.push(copy(item));
+    } else {
+      for (const [key, item] of Object.entries(value)) assign(target, key, copy(item));
+    }
+    return target;
+  };
+  const sanitized = {};
+  seen.set(envelope, sanitized);
+  for (const [key, value] of Object.entries(envelope)) {
+    // These two values are durable transport identity. The Worker checks them
+    // before this transform and refuses rather than silently changing either.
+    if (key === "source_type" || key === "source_id") {
+      Object.defineProperty(sanitized, key, {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    } else {
+      assign(sanitized, key, copy(value));
+    }
+  }
+  return sanitized;
+}
 
 // Anchors that respect the token alphabet rather than JS's word definition. A
 // trailing \b cannot fire after '-', which made Google keys ending in '-'
@@ -304,14 +416,13 @@ export function scan(text) {
 }
 
 /**
- * Scan every human-authored string that can feed chunking or searchable
- * document metadata.
+ * Scan every non-identity string or key that can feed storage.
  *
  * Content is not the only searchable text. The D1 store prepends `title` to
  * every chunk, while connector paths and other human-readable metadata are
- * retained with the document. Walking `content`, `title`, `uri`, and the full
- * nested `metadata` value keeps both ingest doors on the same policy as those
- * fields evolve. Transport identity fields stay outside this pass: batch
+ * retained with the document. Walking every non-identity field and nested key
+ * keeps both ingest doors on the same policy as the envelope evolves.
+ * Transport identity fields stay outside this pass: batch
  * receipts must echo `source_id` exactly so clients can resume safely, and
  * connector-generated ids are not embedded document text.
  *
@@ -344,10 +455,17 @@ export function scanEnvelope(envelope) {
       for (const item of value) visit(item);
       return;
     }
-    for (const item of Object.values(value)) visit(item);
+    for (const [key, item] of Object.entries(value)) {
+      visit(key);
+      visit(item);
+    }
   };
 
-  for (const value of [envelope.content, envelope.title, envelope.uri, envelope.metadata]) visit(value);
+  for (const [key, value] of Object.entries(envelope)) {
+    if (key === "source_type" || key === "source_id") continue;
+    visit(key);
+    visit(value);
+  }
   return {
     verdict: shouldRefuse ? CONFIRMED : shouldFlag ? SUSPECTED : CLEAN,
     labels: [...labels],

@@ -75,7 +75,12 @@ async function ingestLib() {
   }
 }
 import { authorize, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
-import { scanEnvelope as scanEnvelopeSecrets, GATE_VERSION as CREDENTIAL_GATE_VERSION } from "./worker/src/lib/secret-scan.js";
+import {
+  redact as redactConfirmedSecrets,
+  scanEnvelope as scanEnvelopeSecrets,
+  sanitizeEnvelope as sanitizeIngestEnvelope,
+  GATE_VERSION as CREDENTIAL_GATE_VERSION,
+} from "./worker/src/lib/secret-scan.js";
 import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mjs";
 import { runAll as doctorRunAll, summarize as doctorSummarize, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
 import {
@@ -1929,7 +1934,7 @@ async function cmdMigrate(manifestPath, { silent = false } = {}) {
       m.client?.slug || "unknown",
       PRODUCT_VERSION,
       schemaVersion,
-      m.safety?.credential_scanner?.gate_version ?? 2,
+      Math.max(Number(m.safety?.credential_scanner?.gate_version || 0), CREDENTIAL_GATE_VERSION),
       now,
       m.brain?.ring || "stable",
     ]
@@ -3203,6 +3208,15 @@ export function credentialRefusalOf(envelope, enabled = true) {
   };
 }
 
+/** A refusal label can be printed and journaled, so it must be safe itself. */
+export function safeIngestDisplay(...candidates) {
+  const value = candidates.find((candidate) =>
+    candidate !== undefined && candidate !== null && String(candidate).trim()
+  );
+  const sanitized = sanitizeIngestEnvelope({ display: String(value ?? "unnamed document") }).display;
+  return redactConfirmedSecrets(sanitized);
+}
+
 /**
  * Refuse to write a secret somewhere it will be published or lost.
  *
@@ -4077,16 +4091,17 @@ async function cmdIngest(manifestPath) {
       if (scannerPolicyChanged && previouslyKnownKeys.has(key)) scannerRescanSkips.push(r.skip);
       return { skip: r.skip };
     }
-    const refusal = credentialRefusalOf(r.envelope, scannerOn);
+    const envelope = sanitizeIngestEnvelope(r.envelope);
+    const refusal = credentialRefusalOf(envelope, scannerOn);
     if (refusal) {
-      const skip = { path: f.rel, reason: refusal.reason };
+      const skip = { path: safeIngestDisplay(envelope.title, f.rel), reason: refusal.reason };
       recordLocalSkippedDocumentState(state, {
         stateKey: key, nativePath: f.rel, reason: refusal.reason,
       });
       intentionalRemovalKeys.add(key);
       return { skip };
     }
-    const envelopes = splitOversized(r.envelope);
+    const envelopes = splitOversized(envelope);
     return {
       hash: r.hash,
       envelopes,
@@ -4907,14 +4922,15 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         intentionalRemovalUids.push(key);
         return { skip: r.skip };
       }
-      const refusal = credentialRefusalOf(r.envelope, scannerOn);
+      const envelope = sanitizeIngestEnvelope(r.envelope);
+      const refusal = credentialRefusalOf(envelope, scannerOn);
       if (refusal) {
-        const skip = { path: r.envelope.title || f.name || f.id, id: f.id, reason: refusal.reason };
+        const skip = { path: safeIngestDisplay(envelope.title, f.name, f.id), id: f.id, reason: refusal.reason };
         state.skipped[key] = refusal.reason;
         intentionalRemovalUids.push(key);
         return { skip };
       }
-      const envelopes = splitOversized(r.envelope);
+      const envelopes = splitOversized(envelope);
       const familyPlan = {
         stateKey: key,
         hash: r.version,
@@ -5092,14 +5108,15 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         unchanged++;
         return { unchanged: true };
       }
-      const refusal = credentialRefusalOf(r.envelope, scannerOn);
+      const envelope = sanitizeIngestEnvelope(r.envelope);
+      const refusal = credentialRefusalOf(envelope, scannerOn);
       if (refusal) {
-        const skip = { path: r.envelope.title || id, id, reason: refusal.reason };
+        const skip = { path: safeIngestDisplay(envelope.title, id), id, reason: refusal.reason };
         state.skipped[key] = refusal.reason;
         intentionalRemovalUids.push(key);
         return { skip };
       }
-      const envelopes = splitOversized(r.envelope);
+      const envelopes = splitOversized(envelope);
       if (scanned % 200 === 0) process.stdout.write(`\r  fetched ${scanned}...   `);
       return {
         hash: r.version, envelopes, rel: id, stateKey: key, deferState: true,
@@ -5313,14 +5330,16 @@ function reportNotes(notes) {
 }
 
 /** Group skips by reason. A flat list of 40,000 lines tells a client nothing. */
-async function reportSkips(skips) {
+export async function reportSkips(skips) {
   if (!skips.length) return;
   const byReason = new Map();
   for (const s of skips) {
     // Collapse the variable part so counts aggregate meaningfully.
     const key = String(s.reason).replace(/\d+(\.\d+)?/g, "N");
     if (!byReason.has(key)) byReason.set(key, []);
-    byReason.get(key).push(s.path);
+    // Defense in depth for extractor/walk skips that did not pass through the
+    // credential-refusal helper above.
+    byReason.get(key).push(safeIngestDisplay(s.path));
   }
   console.log(`\n  ${skips.length} file(s) not indexed:`);
   for (const [reason, paths] of [...byReason.entries()].sort((a, b) => b[1].length - a[1].length)) {

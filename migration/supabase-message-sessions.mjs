@@ -16,7 +16,7 @@ import {
   MESSAGE_CHAT_PLATFORMS, MESSAGE_SESSION_DEFAULTS, MessageSessionizer,
   messageRowDisposition,
 } from "../ingest/message-session.mjs";
-import { GATE_VERSION, scan as scanSecrets } from "../worker/src/lib/secret-scan.js";
+import { GATE_VERSION, sanitizeEnvelope, scanEnvelope as scanSecrets } from "../worker/src/lib/secret-scan.js";
 import {
   assertTargetReceiptIdentity, getTargetInventory, isDirectExecution, postSourceReceipt,
   postTargetBatch, querySupabase,
@@ -158,6 +158,28 @@ const normalizeLane = (lane, { legacy = false } = {}) => {
   return lane;
 };
 
+// A missing fingerprint is safe only for an untouched lane. Once any source
+// boundary, cursor, session, receipt, or accounting value has been persisted,
+// stamping today's gate version would falsely claim earlier documents passed
+// rules that did not exist when they were written.
+const hasUnfingerprintedProgress = (lane) => Boolean(
+  lane.complete || lane.high_water || lane.cursor || lane.scope ||
+  lane.expected_source_messages !== null || lane.accounting ||
+  lane.accounting_verified_at || lane.completed_at || lane.receipt_recorded_at ||
+  lane.target_readback || lane.last_checkpoint_at ||
+  (Array.isArray(lane.active) && lane.active.length) ||
+  (Array.isArray(lane.refusals) && lane.refusals.length) ||
+  (lane.skipped_by_reason && Object.keys(lane.skipped_by_reason).length) ||
+  [
+    "pages", "source_messages", "candidate_documents", "candidate_parts",
+    "target_documents", "target_chunks", "created", "updated", "unchanged",
+    "refused", "failed", "skipped", "legacy_unclassified_source_messages",
+    "legacy_pending_source_messages", "legacy_candidate_documents",
+    "legacy_target_documents", "legacy_refused", "represented_source_messages",
+    "skipped_source_messages", "candidate_source_messages",
+  ].some((key) => Number(lane[key] || 0) > 0)
+);
+
 function validateMessageState(state) {
   if (!state || typeof state !== "object" || Array.isArray(state)) throw new Error("message migration state is invalid");
   if (state.version !== MESSAGE_STATE_VERSION || state.schema !== MESSAGE_STATE_SCHEMA) {
@@ -234,7 +256,7 @@ export function saveMessageState(path, state) {
   saveProtectedStateJson(path, state, { label: "message migration checkpoint" });
 }
 
-export function messageMigrationConfigFingerprint(scope) {
+export function messageMigrationConfigFingerprint(scope, gateVersion = GATE_VERSION) {
   return createHash("sha256").update(JSON.stringify({
     algorithm: MESSAGE_ALGORITHM_VERSION,
     eligibility: ELIGIBLE,
@@ -242,7 +264,7 @@ export function messageMigrationConfigFingerprint(scope) {
     chat_platforms: MESSAGE_CHAT_PLATFORMS,
     sessionizer: MESSAGE_SESSION_DEFAULTS,
     split_max_chars: MAX_DOC_CHARS,
-    credential_gate_version: GATE_VERSION,
+    credential_gate_version: gateVersion,
     scope,
   })).digest("hex");
 }
@@ -271,8 +293,9 @@ export async function sendMessageEnvelopes(envelopes, postFn, {
     total + nonNegativeInteger(Number(envelope?.metadata?.message_count || 1), "candidate source count"), 0
   );
   const safe = [];
-  for (const envelope of envelopes) {
-    const scan = scanSecrets(envelope.content);
+  for (const rawEnvelope of envelopes) {
+    const envelope = sanitizeEnvelope(rawEnvelope);
+    const scan = scanSecrets(envelope);
     if (scan.shouldRefuse) {
       tally.refused++;
       tally.candidate_parts++;
@@ -515,6 +538,11 @@ export async function runMessageMigration({
   // object in memory. Callers commonly reuse it for the real run.
   const workingState = dryRun ? structuredClone(state) : state;
   const lane = normalizeLane(workingState.message_sessions ||= freshLane());
+  if (!lane.config_fingerprint && hasUnfingerprintedProgress(lane)) {
+    throw new Error(
+      "progressed legacy message migration has no content-safety identity; archive the checkpoint, reset, and reconcile the lane"
+    );
+  }
   let boundaryChanged = false;
   let scope;
   if (lane.scope) {
@@ -586,7 +614,9 @@ export async function runMessageMigration({
 
   const fingerprint = messageMigrationConfigFingerprint(lane.scope);
   if (lane.config_fingerprint && lane.config_fingerprint !== fingerprint) {
-    throw new Error("message migration configuration changed after the lane started");
+    throw new Error(
+      "message migration configuration changed after the lane started; archive the checkpoint, reset, and reconcile the lane"
+    );
   }
   if (!lane.config_fingerprint) {
     lane.config_fingerprint = fingerprint;

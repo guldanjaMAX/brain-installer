@@ -39,6 +39,11 @@ refuse redirects.**
 - Credential help uses hidden prompts, durable per-install storage, or an
   approved secret manager. Public instructions no longer teach owners to paste
   administrative keys or Cloudflare tokens into shell commands.
+- Private Stripe invoice, Checkout, and Billing Portal links are replaced with
+  a fixed marker before storage while the surrounding billing conversation
+  remains searchable. Public reusable Payment Links remain intact. The v4
+  safety marker forces existing source documents to be checked again, and an
+  older message-migration checkpoint requires an explicit reviewed reset.
 - An oversized Drive cleanup now says `review required` instead of reporting an
   installer bug. It still removes nothing and withholds the Drive cursor until
   the owner approves the exact aggregate plan.

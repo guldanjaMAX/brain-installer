@@ -346,13 +346,90 @@ await check("version-one checkpoints keep their historical Owner and UTC default
       projectRef: "synthetic-project",
       targetUrl: "https://different.example",
     }), /another target brain/);
-    await runMessageMigration({
+    const result = await runMessageMigration({
       state,
       queryFn: async () => [],
       postFn: async () => ({ results: [] }),
     });
+    assert.equal(result.status, "complete");
     assert.equal(state.message_sessions.scope.owner_label, "Owner");
     assert.equal(state.message_sessions.scope.grouping_timezone, "UTC");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await check("a completed version-one checkpoint without a safety fingerprint fails closed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "brain-state-legacy-complete-fixture-"));
+  chmodSync(dir, 0o700);
+  try {
+    const path = join(dir, "legacy-complete.json");
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      project_ref: "synthetic-project",
+      target_url: "https://brain.example",
+      message_sessions: { complete: true },
+    }) + "\n", { mode: 0o600 });
+    const state = loadMessageState(path, {
+      projectRef: "synthetic-project",
+      targetUrl: "https://brain.example",
+    });
+    let queries = 0;
+    let posts = 0;
+    let saves = 0;
+    await assert.rejects(() => runMessageMigration({
+      state,
+      queryFn: async () => { queries++; return []; },
+      postFn: async () => { posts++; return { results: [] }; },
+      saveFn: () => { saves++; },
+    }), /content-safety identity.*reset.*reconcile/);
+    assert.equal(queries, 0);
+    assert.equal(posts, 0);
+    assert.equal(saves, 0);
+    assert.equal(state.message_sessions.config_fingerprint, null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await check("an incomplete progressed version-one checkpoint without a safety fingerprint fails closed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "brain-state-legacy-progress-fixture-"));
+  chmodSync(dir, 0o700);
+  try {
+    const path = join(dir, "legacy-progress.json");
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      project_ref: "synthetic-project",
+      target_url: "https://brain.example",
+      message_sessions: {
+        complete: false,
+        pages: 4,
+        source_messages: 4000,
+        candidate_documents: 3987,
+        candidate_parts: 3987,
+        target_documents: 3987,
+        created: 3987,
+        high_water: { ts: "2026-08-01T00:00:00.000Z", id: "high-water" },
+        cursor: { ts: "2026-07-20T00:00:00.000Z", id: "cursor" },
+      },
+    }) + "\n", { mode: 0o600 });
+    const state = loadMessageState(path, {
+      projectRef: "synthetic-project",
+      targetUrl: "https://brain.example",
+    });
+    let queries = 0;
+    let posts = 0;
+    let saves = 0;
+    await assert.rejects(() => runMessageMigration({
+      state,
+      queryFn: async () => { queries++; return []; },
+      postFn: async () => { posts++; return { results: [] }; },
+      saveFn: () => { saves++; },
+    }), /progressed legacy.*content-safety identity.*reset.*reconcile/);
+    assert.equal(queries, 0);
+    assert.equal(posts, 0);
+    assert.equal(saves, 0);
+    assert.equal(state.message_sessions.config_fingerprint, null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

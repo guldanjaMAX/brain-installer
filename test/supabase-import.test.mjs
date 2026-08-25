@@ -128,6 +128,47 @@ const check = (name, condition, detail = "") => {
   check("rerunning a complete lane posts nothing twice", second.status === "complete" && posts === 1, `posts=${posts}`);
 }
 
+/* Migration sanitizes before hashing, splitting, or posting. */
+{
+  const state = { version: 1, lanes: {} };
+  const paymentToken = "Rt5Vn8".repeat(8);
+  const page = [{
+    cursor_id: "1", d1_key: "billing-1", title: "Billing", category: "note",
+    content: `The account remains active. https://invoice.stripe.com/i/acct_fixture123/test_${paymentToken}?s=em Follow up Friday.`,
+  }];
+  let pageCalls = 0;
+  let posted = null;
+  const queryFn = async (sql) => /max\(id\)/.test(sql)
+    ? [{ high_water: "1" }]
+    : pageCalls++ === 0 ? page : [];
+  const result = await runLane({
+    lane: "curated", state, queryFn,
+    postFn: async (items) => {
+      posted = JSON.stringify(items);
+      return { results: items.map(({ envelope }) => ({
+        source_id: envelope.source_id, source_type: envelope.source_type, status: "created", chunks: 1,
+      })) };
+    },
+    saveFn: () => {},
+  });
+  check("migration keeps useful billing prose while replacing a capability URL",
+    result.status === "complete" && posted.includes("The account remains active.") &&
+      posted.includes("[REDACTED:sensitive_payment_url]") && posted.includes("Follow up Friday."));
+  check("migration never posts the capability token", !posted.includes(paymentToken));
+
+  let staleSafetyBlocked = false;
+  try {
+    await runLane({
+      lane: "curated",
+      state: { version: 1, lanes: { curated: { complete: true, done: {} } } },
+      queryFn: async () => [], postFn: async () => ({ results: [] }),
+    });
+  } catch (error) {
+    staleSafetyBlocked = /content-safety rules changed/.test(error.message);
+  }
+  check("an older completed migration cannot bypass a new content-safety version", staleSafetyBlocked);
+}
+
 /* A target failure records the document and refuses to advance the cursor. */
 {
   const state = { version: 1, lanes: {} };

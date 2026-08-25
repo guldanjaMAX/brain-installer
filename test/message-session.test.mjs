@@ -2,7 +2,7 @@ import { emailEnvelope, MessageSessionizer, messageRowDisposition } from "../ing
 import { win32 } from "node:path";
 import {
   isMessageMigrationDirectExecution, messageExpectedCountSql, messageHighWaterSql,
-  messagePageSql, sendMessageEnvelopes,
+  messageMigrationConfigFingerprint, messagePageSql, sendMessageEnvelopes,
 } from "../migration/supabase-message-sessions.mjs";
 
 let fail = 0, ran = 0;
@@ -23,6 +23,10 @@ const check = (name, condition, detail = "") => {
   check("message migration direct-entry detection rejects another Windows script",
     !isMessageMigrationDirectExecution("C:\\Program Files\\Brain Installer\\migration\\other.mjs", pathOptions));
 }
+
+check("v4 content safety invalidates a completed v3 message-migration checkpoint",
+  messageMigrationConfigFingerprint({ owner_label: "Owner", grouping_timezone: "UTC" }, 3) !==
+    messageMigrationConfigFingerprint({ owner_label: "Owner", grouping_timezone: "UTC" }, 4));
 
 const row = (overrides = {}) => ({
   id: "m1", thread_id: "t1", platform: "imessage", thread_title: "Taylor",
@@ -117,6 +121,25 @@ const row = (overrides = {}) => ({
     })),
   }));
   check("message migration accounts for target receipts", receipt.created === 1 && receipt.target_chunks === 2, JSON.stringify(receipt));
+}
+
+{
+  const paymentToken = "Uv6Kp3".repeat(8);
+  const envelope = emailEnvelope(row({
+    id: "billing-email", platform: "email",
+    body: `The client remains active. https://checkout.stripe.com/c/pay/cs_live_${paymentToken}#fidfixture Follow up Friday.`,
+  }));
+  let posted = null;
+  const receipt = await sendMessageEnvelopes([envelope], async (items) => {
+    posted = JSON.stringify(items);
+    return { results: items.map(({ envelope: item }) => ({
+      source_id: item.source_id, source_type: item.source_type, status: "created", chunks: 1,
+    })) };
+  });
+  check("message migration preserves billing prose and posts a redaction marker",
+    receipt.created === 1 && posted.includes("The client remains active.") &&
+      posted.includes("[REDACTED:sensitive_payment_url]") && posted.includes("Follow up Friday."));
+  check("message migration never posts the capability token", !posted.includes(paymentToken));
 }
 
 {

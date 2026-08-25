@@ -57,6 +57,20 @@ New message migrations require both values. A version-one checkpoint keeps its
 historical owner label and UTC grouping behavior. Changing either value after
 the lane starts requires a deliberate reset and reconciliation.
 
+Content-safety rules are also part of the checkpoint identity. When an upgrade
+changes them, any older lane with prior progress stops instead of stamping the
+new version and claiming its earlier documents were rechecked. Only a truly
+untouched checkpoint can adopt the current rules. Archive the owner-only
+checkpoint, remove it from the active state path, and rerun the same command
+with `--reset` and the exact same owner label, timezone, and date bounds. Stable
+source ids make this an idempotent replacement, not a second message corpus.
+Drain the vector outbox and rerun once more so target readback can record
+completion.
+
+The generic importer behaves the same way through its per-lane
+`content_safety_version`; use its explicit `--reset-lane` flag after archiving
+the prior checkpoint and reviewing the lane's source boundary and policy.
+
 The state file is written after every accepted batch. It records the fixed
 source high-water mark, cursor, receipts, counts, refusals, failures, and the
 resolved Drive policy. Message migration freezes the eligible row count with

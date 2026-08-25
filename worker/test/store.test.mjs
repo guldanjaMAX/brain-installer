@@ -1,4 +1,5 @@
 import { backendOf, chunkGeometry, chunkText, storeFor, CHUNK_SIZE, D1, SUPABASE } from "../src/lib/store.js";
+import { sanitizeEnvelope } from "../src/lib/secret-scan.js";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + d)); if (!c) fail++; };
 
@@ -179,6 +180,9 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
         };
       },
       async batch(statements) {
+        if (statements.every((statement) => /SELECT content_hash/i.test(statement.sql))) {
+          return statements.map(() => ({ results: rows.document ? [{ ...rows.document }] : [] }));
+        }
         batches++;
         if (failAfterDocumentWrite) {
           failAfterDocumentWrite = false;
@@ -237,6 +241,48 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
   check("retry rebuilds title-bearing chunks after a metadata-only failure",
     renamedRepair.action === "updated" && [...rows.chunks.values()].every((chunk) => chunk.text.startsWith("[Renamed retry file]")),
     JSON.stringify(renamedRepair));
+
+  const paymentToken = "Jk7Wp4".repeat(8);
+  const invoiceUrl = `https://invoice.stripe.com/i/acct_fixture123/live_${paymentToken}?s=em`;
+  const portalUrl = `https://billing.stripe.com/p/session/live_${paymentToken}`;
+  const checkoutUrl = `https://checkout.stripe.com/c/pay/cs_live_${paymentToken}#fidfixture`;
+  rows.document.uri = invoiceUrl;
+  rows.document.document_date = Date.parse("2026-08-01T00:00:00Z");
+  rows.document.date_source = portalUrl;
+  rows.document.date_reliable = 1;
+  rows.document.meta = JSON.stringify({
+    keep: "billing context",
+    nested: { [checkoutUrl]: "private key", link: invoiceUrl },
+  });
+
+  const sanitizedRevision = sanitizeEnvelope({
+    ...renamed,
+    uri: invoiceUrl,
+    date_source: portalUrl,
+    date_reliable: false,
+    metadata: {
+      platform: "drive",
+      keep: "billing context",
+      nested: { [checkoutUrl]: "private key", link: invoiceUrl },
+    },
+  });
+  const backend = storeFor(env);
+  const [safetyPreflight] = await backend.preflightIngestBatch(env, [sanitizedRevision]);
+  check("D1 preflight rejects unchanged when URI, date source, or full metadata need sanitization",
+    safetyPreflight.unchanged === false, JSON.stringify(safetyPreflight));
+  const safetyRepair = await backend.ingest(env, sanitizedRevision, { prepared: safetyPreflight.prepared });
+  const durableSafetyFields = JSON.stringify({
+    uri: rows.document.uri,
+    date_source: rows.document.date_source,
+    meta: rows.document.meta,
+  });
+  check("same-content v4 ingest rewrites old sensitive URI and arbitrary metadata",
+    safetyRepair.action === "updated" && !durableSafetyFields.includes(paymentToken), durableSafetyFields);
+  check("v4 rewrite preserves useful metadata while sanitizing nested values and keys",
+    durableSafetyFields.includes("billing context") &&
+      durableSafetyFields.includes("[REDACTED:sensitive_payment_url]") &&
+      !durableSafetyFields.includes("invoice.stripe.com") &&
+      !durableSafetyFields.includes("checkout.stripe.com"), durableSafetyFields);
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nstore: all ${ran} tests passed`);

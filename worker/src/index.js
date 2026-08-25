@@ -19,7 +19,11 @@
  */
 
 import { jsonResponse, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
-import { scanEnvelope as scanEnvelopeSecrets } from "./lib/secret-scan.js";
+import {
+  hasSensitiveTransportIdentity,
+  scanEnvelope as scanEnvelopeSecrets,
+  sanitizeEnvelope as sanitizeIngestEnvelope,
+} from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
 import { drainOutbox, outboxDepth, forget, forgetFamilies, listSourceFamilies, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
@@ -585,6 +589,20 @@ async function handleIngest(env, request) {
     );
   }
 
+  // source_type/source_id are both receipt and storage identities. Rewriting
+  // either would break resume and lifecycle semantics, while echoing either
+  // would turn the refusal into another copy of the capability URL.
+  if (hasSensitiveTransportIdentity(envelope)) {
+    return jsonResponse(
+      {
+        error: "refused: unsafe transport identity",
+        detail: "Use a stable non-URL source identity. Nothing was written.",
+      },
+      422
+    );
+  }
+
+  envelope = sanitizeIngestEnvelope(envelope);
   const { source_type, source_id, content } = envelope || {};
   if (!source_type || !source_id || typeof content !== "string") {
     return jsonResponse({ error: "source_type, source_id and content (string) are required" }, 400);
@@ -692,7 +710,20 @@ async function handleIngestBatch(env, request) {
   // this safety fallback does not dilute the high-volume path it protects.
   const identityCounts = new Map();
   for (let inputIndex = 0; inputIndex < docs.length; inputIndex++) {
-    const envelope = docs[inputIndex];
+    const rawEnvelope = docs[inputIndex];
+    if (hasSensitiveTransportIdentity(rawEnvelope)) {
+      tally.refused++;
+      // Deliberately omit both echoed identity values. The client treats this
+      // receipt as unconfirmed and cannot advance its source cursor.
+      results[inputIndex] = {
+        source_id: null,
+        source_type: null,
+        status: "refused",
+        labels: ["sensitive_transport_identity"],
+      };
+      continue;
+    }
+    const envelope = sanitizeIngestEnvelope(rawEnvelope);
     const ref = envelope && envelope.source_id != null ? String(envelope.source_id) : null;
     const slot = { source_id: ref, source_type: envelope?.source_type ?? null };
 

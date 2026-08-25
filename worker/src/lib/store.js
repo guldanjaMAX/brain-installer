@@ -24,6 +24,7 @@
 
 import * as d1 from "./store-d1.js";
 import { embedText, supabaseRpc } from "./supabase.js";
+import { sanitizeEnvelope, sanitizeSensitiveLinks } from "./secret-scan.js";
 
 export const D1 = "d1";
 export const SUPABASE = "supabase";
@@ -121,15 +122,125 @@ async function prepareD1Envelope(env, envelope) {
   };
 }
 
+function jsonValue(raw, fallback = {}) {
+  if (raw && typeof raw === "object") return raw;
+  if (typeof raw !== "string" || !raw.trim()) return fallback;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// SQLite json_patch follows JSON Merge Patch semantics. Mirror it here only to
+// decide whether the persisted row is truly unchanged; D1 remains the writer.
+function mergeJsonPatch(target, patch) {
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) return patch;
+  const base = target && typeof target === "object" && !Array.isArray(target)
+    ? structuredClone(target)
+    : {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete base[key];
+    else if (value && typeof value === "object" && !Array.isArray(value)) {
+      base[key] = mergeJsonPatch(base[key], value);
+    } else {
+      base[key] = structuredClone(value);
+    }
+  }
+  return base;
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+const safePriorString = (value) => typeof value === "string" ? sanitizeSensitiveLinks(value) : value;
+
+/**
+ * Derive the row D1 will hold after its preserve-when-omitted update rules.
+ * Previously the no-op check covered only title and filter columns. A safety
+ * transform in URI or arbitrary JSON metadata could therefore be skipped even
+ * though the old private URL remained durable and vector-adjacent.
+ */
+function d1PersistedState(prior, prepared) {
+  const current = prior || {};
+  const safeTitle = safePriorString(current.title);
+  const safeUri = safePriorString(current.uri);
+  const safeDateSource = safePriorString(current.date_source);
+  const safeClient = safePriorString(current.client);
+  const safeCategory = safePriorString(current.category);
+  const safeTopFolder = safePriorString(current.top_folder);
+  const safePlatform = safePriorString(current.platform);
+
+  const priorMeta = jsonValue(current.meta);
+  const safePriorMeta = sanitizeEnvelope({ metadata: priorMeta }).metadata || {};
+  const targetMeta = mergeJsonPatch(safePriorMeta, prepared.md);
+  const priorMetaChangedBySafety = canonicalJson(priorMeta) !== canonicalJson(safePriorMeta);
+
+  const incomingDateSource = prepared.envelope.date_source ?? (prepared.docDate ? "provided" : null);
+  const forceDateSourceSafety = safeDateSource !== current.date_source;
+  const replaceDate = Boolean(prepared.envelope.date_reliable) || current.document_date == null;
+  const targetDateSource = forceDateSourceSafety
+    ? safeDateSource
+    : replaceDate ? incomingDateSource : current.date_source ?? null;
+
+  const forceClientSafety = safeClient !== current.client;
+  const forceCategorySafety = safeCategory !== current.category;
+  const forceTopFolderSafety = safeTopFolder !== current.top_folder;
+  const forcePlatformSafety = safePlatform !== current.platform;
+
+  return {
+    title: prepared.title != null ? prepared.title : safeTitle ?? null,
+    uri: prepared.envelope.uri != null ? prepared.envelope.uri : safeUri ?? null,
+    document_date: replaceDate
+      ? (Number.isFinite(prepared.docDate) ? prepared.docDate : null)
+      : current.document_date ?? null,
+    date_source: targetDateSource,
+    date_reliable: Math.max(Number(current.date_reliable || 0), prepared.envelope.date_reliable ? 1 : 0),
+    client: prepared.hasClient ? prepared.incomingClient : safeClient ?? null,
+    category: prepared.hasCategory ? prepared.incomingCategory : safeCategory ?? null,
+    top_folder: prepared.hasTopFolder ? prepared.incomingTopFolder : safeTopFolder ?? null,
+    platform: prepared.hasPlatform ? prepared.incomingPlatform : safePlatform ?? null,
+    meta: targetMeta,
+    // Bind a safe prior value only when an omitted incoming field would
+    // otherwise preserve an already-stored capability URL.
+    writeTitle: prepared.title != null ? prepared.title : safeTitle !== current.title ? safeTitle : null,
+    writeUri: prepared.envelope.uri != null ? prepared.envelope.uri : safeUri !== current.uri ? safeUri : null,
+    writeDateSource: forceDateSourceSafety ? safeDateSource : incomingDateSource,
+    forceDateSourceSafety,
+    writeClient: prepared.hasClient ? prepared.incomingClient : safeClient,
+    writeCategory: prepared.hasCategory ? prepared.incomingCategory : safeCategory,
+    writeTopFolder: prepared.hasTopFolder ? prepared.incomingTopFolder : safeTopFolder,
+    writePlatform: prepared.hasPlatform ? prepared.incomingPlatform : safePlatform,
+    writeHasClient: prepared.hasClient || forceClientSafety,
+    writeHasCategory: prepared.hasCategory || forceCategorySafety,
+    writeHasTopFolder: prepared.hasTopFolder || forceTopFolderSafety,
+    writeHasPlatform: prepared.hasPlatform || forcePlatformSafety,
+    writeMeta: priorMetaChangedBySafety ? targetMeta : prepared.md,
+    replaceMeta: priorMetaChangedBySafety,
+  };
+}
+
 function d1MetadataChanged(prior, prepared) {
   if (!prior) return false;
+  const target = d1PersistedState(prior, prepared);
   return (
-    (prepared.title != null && prepared.title !== prior.title) ||
-    (prepared.envelope.date_reliable && Number.isFinite(prepared.docDate) && prepared.docDate !== prior.document_date) ||
-    (prepared.hasClient && prepared.incomingClient !== prior.client) ||
-    (prepared.hasCategory && prepared.incomingCategory !== prior.category) ||
-    (prepared.hasTopFolder && prepared.incomingTopFolder !== prior.top_folder) ||
-    (prepared.hasPlatform && prepared.incomingPlatform !== prior.platform)
+    target.title !== (prior.title ?? null) ||
+    target.uri !== (prior.uri ?? null) ||
+    target.document_date !== (prior.document_date ?? null) ||
+    target.date_source !== (prior.date_source ?? null) ||
+    target.date_reliable !== Number(prior.date_reliable || 0) ||
+    target.client !== (prior.client ?? null) ||
+    target.category !== (prior.category ?? null) ||
+    target.top_folder !== (prior.top_folder ?? null) ||
+    target.platform !== (prior.platform ?? null) ||
+    canonicalJson(target.meta) !== canonicalJson(jsonValue(prior.meta))
   );
 }
 
@@ -263,7 +374,8 @@ const d1Backend = {
     const prior = Object.prototype.hasOwnProperty.call(input, "prior")
       ? input.prior
       : await env.DB.prepare(
-        `SELECT content_hash, title, document_date, date_reliable, client, category, top_folder, platform
+        `SELECT content_hash, title, uri, document_date, date_source, date_reliable,
+                client, category, top_folder, platform, meta
          FROM documents WHERE doc_uid = ?1`
       ).bind(docUid).first();
     // Identical content AND filter identity is a no-op. Folder moves and title
@@ -276,6 +388,7 @@ const d1Backend = {
     }
 
     const now = Date.now();
+    const persisted = d1PersistedState(prior, input);
 
     // `content_hash` is the commit marker for a complete document revision.
     // Move it to a value that can never equal a real SHA-256 before touching the
@@ -300,6 +413,7 @@ const d1Backend = {
            WHEN excluded.date_reliable = 1 OR documents.document_date IS NULL THEN excluded.document_date
            ELSE documents.document_date END,
          date_source=CASE
+           WHEN ?20 = 1 THEN excluded.date_source
            WHEN excluded.date_reliable = 1 OR documents.document_date IS NULL THEN excluded.date_source
            ELSE documents.date_source END,
          date_reliable=MAX(COALESCE(documents.date_reliable, 0), COALESCE(excluded.date_reliable, 0)),
@@ -308,16 +422,23 @@ const d1Backend = {
          top_folder=CASE WHEN ?18 = 1 THEN excluded.top_folder ELSE documents.top_folder END,
          platform=CASE WHEN ?19 = 1 THEN excluded.platform ELSE documents.platform END,
          ingested_at=excluded.ingested_at, content_hash=excluded.content_hash,
-         meta=json_patch(COALESCE(documents.meta, '{}'), excluded.meta)`
+         meta=CASE WHEN ?21 = 1 THEN excluded.meta
+                   ELSE json_patch(COALESCE(documents.meta, '{}'), excluded.meta) END`
     )
       .bind(
-        docUid, source_type, String(source_id), title ?? null, envelope.uri ?? null,
+        docUid, source_type, String(source_id), persisted.writeTitle ?? null, persisted.writeUri ?? null,
         Number.isFinite(docDate) ? docDate : null,
-        envelope.date_source ?? (docDate ? "provided" : null),
+        persisted.writeDateSource ?? null,
         envelope.date_reliable ? 1 : 0,
-        incomingClient, incomingCategory, incomingTopFolder, incomingPlatform,
-        now, pendingHash, JSON.stringify(md),
-        hasClient ? 1 : 0, hasCategory ? 1 : 0, hasTopFolder ? 1 : 0, hasPlatform ? 1 : 0
+        persisted.writeClient ?? null, persisted.writeCategory ?? null,
+        persisted.writeTopFolder ?? null, persisted.writePlatform ?? null,
+        now, pendingHash, JSON.stringify(persisted.writeMeta),
+        persisted.writeHasClient ? 1 : 0,
+        persisted.writeHasCategory ? 1 : 0,
+        persisted.writeHasTopFolder ? 1 : 0,
+        persisted.writeHasPlatform ? 1 : 0,
+        persisted.forceDateSourceSafety ? 1 : 0,
+        persisted.replaceMeta ? 1 : 0
       )
       .run();
 
@@ -419,7 +540,8 @@ const d1Backend = {
     if (!envelopes.length) return [];
     const prepared = await Promise.all(envelopes.map((envelope) => prepareD1Envelope(env, envelope)));
     const priorResults = await env.DB.batch(prepared.map((input) => env.DB.prepare(
-      `SELECT content_hash, title, document_date, date_reliable, client, category, top_folder, platform
+      `SELECT content_hash, title, uri, document_date, date_source, date_reliable,
+              client, category, top_folder, platform, meta
        FROM documents WHERE doc_uid = ?1`
     ).bind(input.docUid)));
 
