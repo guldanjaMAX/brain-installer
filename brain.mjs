@@ -5170,19 +5170,29 @@ async function sendBatches({
   let n = 0;
   for (const group of groups) {
     n++;
-    const res = await http(`${base}/api/admin/brain/ingest/batch`, {
-      method: "POST",
-      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
-      body: JSON.stringify({ docs: group.map((g) => g.envelope) }),
-    // A batch is up to 50 documents to chunk, hash and queue, so it is allowed
-    // materially longer than a health probe before it is called dead.
-    }, { timeoutMs: 180_000, what: "the ingest batch" });
+    let res, raw;
+    try {
+      ({ res, raw } = await requestIngestBatch({
+        base,
+        adminKey,
+        docs: group.map((g) => g.envelope),
+        onRetry: (_error, attempt, attempts) => info(
+          `the ingest batch connection was interrupted. Retrying ${attempt}/${attempts - 1}; ` +
+            "an accepted copy is safe and will be reported as unchanged."
+        ),
+      }));
+    } catch (error) {
+      saveState(statePath, state);
+      die(
+        `batch ${n}/${groups.length} could not be confirmed: ${String(error?.message || error)}\n` +
+          "      Progress was saved. Re-run the same command to continue."
+      );
+    }
     // A 200 is NOT proof anything was ingested. Cloudflare Access pages, SSO
     // interstitials and misrouted requests all answer 200 with HTML, and
     // parsing that into {} produced a green "ok  0 created" with exit 0. A load
     // that silently did nothing, reported as success, is the worst outcome this
     // command has, so a real receipt is required before anything is believed.
-    const raw = await res.text();
     let body = null;
     try {
       body = JSON.parse(raw);
@@ -6571,41 +6581,56 @@ function crash(err) {
  */
 const HTTP_TIMEOUT_MS = 60_000;
 
-async function http(url, opts = {}, { timeoutMs = HTTP_TIMEOUT_MS, what = "the request" } = {}) {
+function translatedHttpFailure(error, url, { timeoutMs = HTTP_TIMEOUT_MS, what = "the request" } = {}) {
   let host = "the server";
   try {
     host = new URL(String(url)).host;
   } catch { /* a relative or odd URL still deserves a real error below */ }
+  const name = error?.name || "";
+  const code = String(error?.cause?.code || error?.code || "");
+  let message;
+  let retryable = false;
+  if (name === "TimeoutError" || name === "AbortError") {
+    retryable = true;
+    message =
+      `${what} timed out after ${Math.round(timeoutMs / 1000)}s (${host}).\n` +
+      "      Nothing is stuck: whatever had already completed is saved, and re-running\n" +
+      "      the same command continues from there. Check the connection, a VPN, or a\n" +
+      "      corporate proxy, then try again.";
+  } else if (["ENOTFOUND", "EAI_AGAIN"].includes(code)) {
+    retryable = true;
+    message = `${host} could not be resolved (${code}). Check the network connection or a DNS/VPN setting.`;
+  } else if (
+    ["ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT", "UND_ERR_SOCKET"].includes(code) ||
+    /^UND_ERR_.*TIMEOUT$/.test(code)
+  ) {
+    retryable = true;
+    message = `the connection to ${host} failed (${code}). This is usually a network blip; re-running the command is safe.`;
+  } else if (/certificate|self-signed|CERT_/i.test(`${code} ${String(error?.message || "")}`)) {
+    message =
+      `the TLS certificate for ${host} was rejected.\n` +
+      "      On a corporate network this usually means an inspecting proxy. Ask IT for the\n" +
+      "      root certificate, or run this from a different network.";
+  } else {
+    message = `${what} failed talking to ${host}: ${error?.message || String(error)}`;
+  }
+  const translated = new Error(message);
+  translated.retryable = retryable;
+  return translated;
+}
+
+async function http(url, opts = {}, {
+  timeoutMs = HTTP_TIMEOUT_MS,
+  what = "the request",
+  fetchImpl = fetch,
+} = {}) {
   try {
-    return await guardBrainAdminFetch(fetch, url, {
+    return await guardBrainAdminFetch(fetchImpl, url, {
       ...opts,
       signal: AbortSignal.timeout(timeoutMs),
     });
-  } catch (e) {
-    const name = e?.name || "";
-    if (name === "TimeoutError" || name === "AbortError") {
-      throw new Error(
-        `${what} timed out after ${Math.round(timeoutMs / 1000)}s (${host}).\n` +
-          "      Nothing is stuck: whatever had already completed is saved, and re-running\n" +
-          "      the same command continues from there. Check the connection, a VPN, or a\n" +
-          "      corporate proxy, then try again."
-      );
-    }
-    const code = e?.cause?.code || e?.code || "";
-    if (["ENOTFOUND", "EAI_AGAIN"].includes(code)) {
-      throw new Error(`${host} could not be resolved (${code}). Check the network connection or a DNS/VPN setting.`);
-    }
-    if (["ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT"].includes(code)) {
-      throw new Error(`the connection to ${host} failed (${code}). This is usually a network blip; re-running the command is safe.`);
-    }
-    if (/certificate|self-signed|CERT_/i.test(String(e?.message))) {
-      throw new Error(
-        `the TLS certificate for ${host} was rejected.\n` +
-          "      On a corporate network this usually means an inspecting proxy. Ask IT for the\n" +
-          "      root certificate, or run this from a different network."
-      );
-    }
-    throw new Error(`${what} failed talking to ${host}: ${e?.message || String(e)}`);
+  } catch (error) {
+    throw translatedHttpFailure(error, url, { timeoutMs, what });
   }
 }
 
@@ -6620,21 +6645,105 @@ async function http(url, opts = {}, { timeoutMs = HTTP_TIMEOUT_MS, what = "the r
 export async function retryTransient(operation, {
   attempts = 3,
   delayMs = 2_000,
+  maxDelayMs = 30_000,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  shouldRetry = () => true,
   onRetry = () => {},
 } = {}) {
+  const totalAttempts = Math.max(1, Math.trunc(Number(attempts) || 1));
+  const baseDelay = Math.max(0, Number(delayMs) || 0);
+  const delayCeiling = Math.max(baseDelay, Number(maxDelayMs) || baseDelay);
   let lastError;
-  for (let attempt = 1; attempt <= attempts; attempt++) {
+  for (let attempt = 1; attempt <= totalAttempts; attempt++) {
     try {
       return await operation(attempt);
     } catch (error) {
       lastError = error;
-      if (attempt >= attempts) throw error;
-      onRetry(error, attempt, attempts);
-      await sleep(delayMs * attempt);
+      if (attempt >= totalAttempts || !shouldRetry(error, attempt, totalAttempts)) throw error;
+      onRetry(error, attempt, totalAttempts);
+      await sleep(Math.min(delayCeiling, baseDelay * (2 ** (attempt - 1))));
     }
   }
   throw lastError;
+}
+
+const RETRYABLE_INGEST_STATUS = new Set([408, 425, 429]);
+
+function isRetryableIngestStatus(status) {
+  const value = Number(status);
+  return RETRYABLE_INGEST_STATUS.has(value) || value >= 500;
+}
+
+class RetryableIngestResponse extends Error {
+  constructor(result) {
+    super(`the ingest batch returned temporary HTTP ${result.res.status}`);
+    this.name = "RetryableIngestResponse";
+    this.retryable = true;
+    this.result = result;
+  }
+}
+
+/**
+ * Send one exact ingest batch through a bounded retry boundary.
+ *
+ * Repeating this POST is safe: document identity plus content hash make an
+ * accepted first copy return `unchanged` when its response was lost. Only
+ * transport failures and explicitly temporary HTTP statuses enter this path;
+ * credential, permission, validation and other 4xx responses return at once
+ * for the existing receipt/error handling below.
+ */
+export async function requestIngestBatch({
+  base,
+  adminKey,
+  docs,
+  attempts = 5,
+  delayMs = 2_000,
+  maxDelayMs = 30_000,
+  fetchImpl = fetch,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  onRetry = () => {},
+} = {}) {
+  const url = `${base}/api/admin/brain/ingest/batch`;
+  try {
+    return await retryTransient(async () => {
+      const res = await http(url, {
+        method: "POST",
+        headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+        body: JSON.stringify({ docs }),
+      // A batch is up to 50 documents to chunk, hash and queue, so it is allowed
+      // materially longer than a health probe before it is called dead.
+      }, { timeoutMs: 180_000, what: "the ingest batch", fetchImpl });
+      let raw;
+      try {
+        // The server can commit a safe write and then lose the response body.
+        // Keeping body reads inside the retry boundary makes that case resumable
+        // without weakening the exact receipt validation performed by the caller.
+        raw = await res.text();
+      } catch (error) {
+        const translated = translatedHttpFailure(error, url, {
+          timeoutMs: 180_000,
+          what: "the ingest batch response",
+        });
+        if (!res.ok && !isRetryableIngestStatus(res.status)) translated.retryable = false;
+        throw translated;
+      }
+      const result = { res, raw };
+      if (isRetryableIngestStatus(res.status)) throw new RetryableIngestResponse(result);
+      return result;
+    }, {
+      attempts,
+      delayMs,
+      maxDelayMs,
+      sleep,
+      shouldRetry: (error) => error?.retryable === true,
+      onRetry,
+    });
+  } catch (error) {
+    // After the bounded retry budget, preserve the final HTTP response so the
+    // established status/body path emits the same actionable failure as before.
+    if (error instanceof RetryableIngestResponse) return error.result;
+    throw error;
+  }
 }
 
 
@@ -7211,6 +7320,7 @@ async function cmdDrain(manifestPath) {
       method: "POST",
       headers: { "X-Admin-Key": adminKey },
     }, { timeoutMs: 180_000, what: "the drain" }), {
+      shouldRetry: (error) => error?.retryable === true,
       onRetry: (error, attempt, attempts) => info(
         `the drain request hit a network error (${String(error?.message || error).split("\n", 1)[0]}). ` +
         `Retrying ${attempt}/${attempts - 1}; completed chunks are already safe.`

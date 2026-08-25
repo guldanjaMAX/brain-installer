@@ -471,6 +471,110 @@ function ingestExitCli(scenario) {
   }
   check("retry remains bounded and preserves the final error",
     terminalCalls === 3 && terminal?.message === "still offline", `calls=${terminalCalls} error=${terminal?.message}`);
+
+  const docs = [{ source_id: "synthetic-doc", content: "synthetic body" }];
+  const receipt = (status = "created") => JSON.stringify({
+    created: status === "created" ? 1 : 0,
+    updated: 0,
+    unchanged: status === "unchanged" ? 1 : 0,
+    refused: 0,
+    failed: 0,
+    results: [{ source_id: "synthetic-doc", status }],
+  });
+
+  let dnsCalls = 0;
+  const dnsWaits = [];
+  const dnsRetries = [];
+  const dnsResult = await mod.requestIngestBatch({
+    base: "https://brain.invalid",
+    adminKey: "synthetic-admin-key",
+    docs,
+    fetchImpl: async () => {
+      dnsCalls++;
+      if (dnsCalls < 5) {
+        const error = new Error("RAW_DNS_FAILURE_SENTINEL");
+        error.code = "ENOTFOUND";
+        throw error;
+      }
+      return new Response(receipt(), { status: 200 });
+    },
+    sleep: async (ms) => { dnsWaits.push(ms); },
+    onRetry: (error) => { dnsRetries.push(error.message); },
+  });
+  check("an ingest batch retries a transient DNS failure and then accepts the receipt",
+    dnsCalls === 5 && JSON.parse(dnsResult.raw).results[0]?.status === "created", `calls=${dnsCalls}`);
+  check("ingest transport retry uses bounded exponential backoff",
+    JSON.stringify(dnsWaits) === JSON.stringify([2_000, 4_000, 8_000, 16_000]), JSON.stringify(dnsWaits));
+  check("translated DNS retry errors omit the raw transport message",
+    dnsRetries.length === 4 && dnsRetries.every((message) =>
+      /brain\.invalid could not be resolved \(ENOTFOUND\)/.test(message) && !message.includes("RAW_DNS_FAILURE_SENTINEL")),
+    dnsRetries.join(" | "));
+
+  let acceptedWrites = 0;
+  const lostResponseWaits = [];
+  const lostResponseRetries = [];
+  const recoveredWrite = await mod.requestIngestBatch({
+    base: "https://brain.invalid",
+    adminKey: "synthetic-admin-key",
+    docs,
+    fetchImpl: async () => {
+      // Increment before the body read: the first request represents a write
+      // accepted by the server whose response stream is then lost in transit.
+      const acceptedAttempt = ++acceptedWrites;
+      return {
+        ok: true,
+        status: 200,
+        redirected: false,
+        url: "",
+        text: async () => {
+          if (acceptedAttempt === 1) {
+            const error = new Error("RAW_RESPONSE_BODY_SENTINEL");
+            error.code = "ECONNRESET";
+            throw error;
+          }
+          return receipt("unchanged");
+        },
+      };
+    },
+    sleep: async (ms) => { lostResponseWaits.push(ms); },
+    onRetry: (error) => { lostResponseRetries.push(error.message); },
+  });
+  check("a lost response after an accepted ingest write safely retries the exact batch",
+    acceptedWrites === 2 && JSON.parse(recoveredWrite.raw).results[0]?.status === "unchanged" &&
+      JSON.stringify(lostResponseWaits) === JSON.stringify([2_000]), `writes=${acceptedWrites}`);
+  check("response-body network errors are sanitized before retry reporting",
+    lostResponseRetries.length === 1 && /ECONNRESET/.test(lostResponseRetries[0]) &&
+      !lostResponseRetries[0].includes("RAW_RESPONSE_BODY_SENTINEL"), lostResponseRetries.join(" | "));
+
+  let temporaryHttpCalls = 0;
+  const temporaryHttp = await mod.requestIngestBatch({
+    base: "https://brain.invalid",
+    adminKey: "synthetic-admin-key",
+    docs,
+    fetchImpl: async () => {
+      temporaryHttpCalls++;
+      return temporaryHttpCalls === 1
+        ? new Response(JSON.stringify({ error: "synthetic unavailable" }), { status: 503 })
+        : new Response(receipt(), { status: 200 });
+    },
+    sleep: async () => {},
+  });
+  check("an ingest batch retries a temporary 5xx response",
+    temporaryHttpCalls === 2 && temporaryHttp.res.status === 200, `calls=${temporaryHttpCalls}`);
+
+  let authCalls = 0;
+  const authResponse = await mod.requestIngestBatch({
+    base: "https://brain.invalid",
+    adminKey: "synthetic-admin-key",
+    docs,
+    fetchImpl: async () => {
+      authCalls++;
+      return new Response(JSON.stringify({ error: "synthetic unauthorized" }), { status: 401 });
+    },
+    sleep: async () => { throw new Error("auth response must not sleep"); },
+  });
+  check("an ingest batch does not retry credential or other ordinary 4xx responses",
+    authCalls === 1 && authResponse.res.status === 401, `calls=${authCalls} status=${authResponse.res.status}`);
 }
 {
   // A hang is worse than a failure: every network call must have a deadline.
@@ -479,7 +583,7 @@ function ingestExitCli(scenario) {
   const bare = (src.match(/await fetch\(/g) || []).length;
   check("no bare fetch remains outside the http() wrapper", bare === 0, `${bare} found`);
   check("the wrapper routes admin requests through the exact-origin guard",
-    /await guardBrainAdminFetch\(fetch, url/.test(src));
+    /await guardBrainAdminFetch\(fetchImpl, url/.test(src));
   check("the wrapper sets a timeout", /AbortSignal\.timeout/.test(src));
   for (const sig of ["timed out after", "could not be resolved", "connection to"]) {
     check(`network failures are translated: "${sig}"`, src.includes(sig));
@@ -496,7 +600,11 @@ function ingestExitCli(scenario) {
   const src = readFileSync(CLI, "utf-8");
   const loop = src.slice(src.indexOf("async function sendBatches"));
   const body = loop.slice(0, loop.indexOf("\nasync function") > 0 ? loop.indexOf("\nasync function") : 4000);
-  check("the send loop reads the raw body, not res.json()", /const raw = await res\.text\(\)/.test(body));
+  const request = src.slice(src.indexOf("export async function requestIngestBatch"));
+  const requestBody = request.slice(0,
+    request.indexOf("\n\n/**") > 0 ? request.indexOf("\n\n/**") : 5000);
+  check("the send loop uses the bounded ingest request helper", /await requestIngestBatch\(/.test(body));
+  check("the request helper reads the raw body, not res.json()", /raw = await res\.text\(\)/.test(requestBody));
   check("and requires a results array before believing a 200", /Array\.isArray\(body\.results\)/.test(body));
   check("and names HTML as an Access or SSO page", /Access or SSO page/.test(body));
   check("and says nothing was marked as loaded", /Nothing was marked as loaded/.test(body));
