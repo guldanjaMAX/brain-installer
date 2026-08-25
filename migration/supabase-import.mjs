@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { batches, splitOversized } from "../ingest/run.mjs";
+import { batches, splitOversized } from "../ingest/envelope-batching.mjs";
 import { readProtectedStateJson, saveProtectedStateJson } from "./state-file.mjs";
 
 const SOURCE_API = "https://api.supabase.com/v1";

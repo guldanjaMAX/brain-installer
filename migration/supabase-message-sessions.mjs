@@ -11,7 +11,7 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { MAX_DOC_CHARS, batches, splitOversized } from "../ingest/run.mjs";
+import { MAX_DOC_CHARS, batches, splitOversized } from "../ingest/envelope-batching.mjs";
 import {
   MESSAGE_CHAT_PLATFORMS, MESSAGE_SESSION_DEFAULTS, MessageSessionizer,
   messageRowDisposition,

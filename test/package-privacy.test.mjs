@@ -71,6 +71,7 @@ const expected = [
   "eval/schema/run-artifact-v2.schema.json",
   "eval/scorer.mjs",
   "ingest/doc-date.mjs",
+  "ingest/envelope-batching.mjs",
   "ingest/extract.mjs",
   "ingest/formats.mjs",
   "ingest/message-session.mjs",

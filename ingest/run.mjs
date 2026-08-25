@@ -26,12 +26,19 @@ import {
 import { join, relative, sep, basename, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { extract, canExtract, extensionOf, isBinaryFormat } from "./extract.mjs";
+import {
+  MAX_DOC_CHARS, batches, envelopeBytes, splitOversized,
+} from "./envelope-batching.mjs";
 // Side-effect import: registers pdf/docx/xlsx/pptx/eml and pulls in their
 // dependencies. Importing it here rather than in extract.mjs keeps the core
 // registry honestly dependency-free.
 import "./formats.mjs";
 import { textQuality, isLikelyBinary } from "./quality.mjs";
 import { documentDate } from "./doc-date.mjs";
+
+// Preserve the original ingest/run.mjs API while letting migration-only code
+// import the dependency-free boundary directly.
+export { MAX_DOC_CHARS, batches, envelopeBytes, splitOversized };
 
 /** Never worth walking into. */
 const SKIP_DIRS = new Set([
@@ -177,85 +184,6 @@ export async function prepare(file, { sourceName }) {
     },
     note,
   };
-}
-
-/**
- * A document larger than one request must be split, not sent whole.
- *
- * The Worker caps a batch at 1MB, and it caps it for a real reason: chunking and
- * hashing a huge payload exceeds the CPU budget and the request is killed
- * mid-flight. Sending an oversized document anyway produced a 413 and lost the
- * document with a confusing error, which is the worst of both outcomes.
- *
- * Parts keep the original identity in their ids ("path#part2of3") so a citation
- * still points at the real file, and each part is chunked and retrievable
- * normally. The cost is that a passage spanning a part boundary is only found
- * from one side, which is a far smaller loss than the whole document.
- */
-export const MAX_DOC_CHARS = 400_000;
-
-export function splitOversized(envelope, maxChars = MAX_DOC_CHARS) {
-  const text = envelope.content || "";
-  // Characters are the slicing unit but BYTES are the constraint, so a corpus
-  // where one character costs three bytes has to split proportionally harder.
-  // Without this a single CJK document can clear the character budget and still
-  // exceed the Worker's byte cap on its own, which no amount of batching fixes.
-  const bytes = Buffer.byteLength(text, "utf8");
-  const ratio = text.length ? bytes / text.length : 1;
-  const effective = ratio > 1.05 ? Math.max(20_000, Math.floor(maxChars / ratio)) : maxChars;
-  if (bytes <= effective * ratio && text.length <= effective) return [envelope];
-
-  const parts = [];
-  for (let i = 0; i < text.length; i += effective) parts.push(text.slice(i, i + effective));
-
-  return parts.map((content, i) => ({
-    ...envelope,
-    source_id: `${envelope.source_id}#part${i + 1}of${parts.length}`,
-    title: `${envelope.title || envelope.source_id} (part ${i + 1} of ${parts.length})`,
-    content,
-    metadata: {
-      ...(envelope.metadata || {}),
-      part: i + 1,
-      part_count: parts.length,
-      part_of: envelope.source_id,
-    },
-  }));
-}
-
-/**
- * The Worker caps a request in BYTES. Budgeting in characters is not the same
- * measurement, and the gap is not academic: three Japanese documents totalling
- * 810,000 characters serialise to 2.32 MB and are refused 413 by a 1 MB cap.
- *
- * Worse than the failure is what follows it. The client is told "fix the cause
- * and re-run", and the re-run deterministically rebuilds the identical
- * oversized batch and dies in the same place, forever, with nothing they can
- * actually fix. Any accented European text, CJK, emoji, or simply a lot of
- * escaped newlines and quotes gets there.
- */
-export function envelopeBytes(envelope) {
-  // Measure the JSON that actually goes on the wire, not just the content:
-  // escaping, titles and metadata are all real bytes.
-  return Buffer.byteLength(JSON.stringify(envelope), "utf8");
-}
-
-/** Group envelopes so no request exceeds what the Worker will accept. */
-export function batches(items, { maxDocs = 50, maxBytes = 900_000 } = {}) {
-  const out = [];
-  let cur = [];
-  let bytes = 0;
-  for (const it of items) {
-    const n = envelopeBytes(it.envelope);
-    if (cur.length && (cur.length >= maxDocs || bytes + n > maxBytes)) {
-      out.push(cur);
-      cur = [];
-      bytes = 0;
-    }
-    cur.push(it);
-    bytes += n;
-  }
-  if (cur.length) out.push(cur);
-  return out;
 }
 
 /**
