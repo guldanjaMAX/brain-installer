@@ -703,6 +703,9 @@ export function canStageDocumentRevision(chunkCount) {
     3 + (chunkCount * 2) <= D1_TRANSACTION_SLICE_STATEMENTS;
 }
 
+const hasVerifiedWrite = (result) =>
+  Number.isSafeInteger(result?.meta?.changes) && result.meta.changes > 0;
+
 /**
  * Atomically stage one document revision under its unique pending marker.
  *
@@ -785,9 +788,10 @@ export async function stageDocumentRevision(env, {
   if (!Array.isArray(results) || results.length !== statements.length) {
     throw new Error("atomic D1 staging returned an incomplete result set");
   }
-  if (requiredWriteIndexes.some((index) => Number(results[index]?.meta?.changes) !== 1)) {
-    // A zero-row guarded write means this revision did not own its marker. The
-    // pending state remains retryable and must not receive a successful receipt.
+  if (requiredWriteIndexes.some((index) => !hasVerifiedWrite(results[index]))) {
+    // D1 includes trigger effects in meta.changes, so a successful guarded
+    // write may report more than one row. Zero or a malformed count still means
+    // ownership was not proven and must never receive a successful receipt.
     throw new Error("atomic D1 staging could not verify revision ownership");
   }
 

@@ -722,15 +722,25 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 /* ---- bounded atomic staging saves calls without coupling documents ---- */
 {
   const batches = [];
-  let forceUnverifiedChunk = false;
+  const noOverride = Symbol("no override");
+  const missingMeta = Symbol("missing meta");
+  let requiredReceiptOverride = noOverride;
+  let lastBatchResults = [];
   const env = {
     DB: {
       prepare: (sql) => ({ bind: (...args) => ({ _sql: sql, _args: args }) }),
       batch: async (statements) => {
         batches.push(statements);
-        return statements.map((_, index) => ({
-          meta: { changes: forceUnverifiedChunk && index === 3 ? 0 : 1 },
-        }));
+        const triggerAmplifiedChanges = new Map([[0, 2], [3, 4], [4, 3]]);
+        lastBatchResults = statements.map((_, index) => {
+          if (index === 3 && requiredReceiptOverride !== noOverride) {
+            return requiredReceiptOverride === missingMeta
+              ? {}
+              : { meta: { changes: requiredReceiptOverride } };
+          }
+          return { meta: { changes: triggerAmplifiedChanges.get(index) ?? 0 } };
+        });
+        return lastBatchResults;
       },
     },
   };
@@ -753,22 +763,38 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("atomic chunks inherit the merged durable filter metadata",
     /documents\.client/.test(batches[0][3]._sql) && /documents\.platform/.test(batches[0][3]._sql), batches[0][3]._sql);
   check("atomic staging reports its exact durable and queued rows", staged.written === 1 && staged.queued === 1);
+  check("trigger-amplified positive D1 change counts prove guarded revision ownership",
+    [0, 3, 4].map((index) => lastBatchResults[index]?.meta?.changes).join(",") === "2,4,3");
   check("the atomic-stage bound accepts 48 chunks and refuses 49",
     canStageDocumentRevision(48) && !canStageDocumentRevision(49));
 
-  forceUnverifiedChunk = true;
-  let failedClosed = false;
-  try {
-    await stageDocumentRevision(env, {
-      documentStatement: { _sql: "INSERT INTO documents", _args: [] },
-      docUid: "message:atomic-unverified",
-      chunks: [{ ...chunk, chunk_uid: "message:atomic-unverified#0", doc_uid: "message:atomic-unverified" }],
-      expectedContentHash: marker,
-    });
-  } catch {
-    failedClosed = true;
+  const invalidReceipts = [
+    ["zero", 0],
+    ["missing", missingMeta],
+    ["string", "2"],
+    ["fractional", 1.5],
+    ["negative", -1],
+    ["non-finite", Infinity],
+  ];
+  for (const [label, receipt] of invalidReceipts) {
+    requiredReceiptOverride = receipt;
+    let failedClosed = false;
+    try {
+      await stageDocumentRevision(env, {
+        documentStatement: { _sql: "INSERT INTO documents", _args: [] },
+        docUid: `message:atomic-unverified-${label}`,
+        chunks: [{
+          ...chunk,
+          chunk_uid: `message:atomic-unverified-${label}#0`,
+          doc_uid: `message:atomic-unverified-${label}`,
+        }],
+        expectedContentHash: marker,
+      });
+    } catch (error) {
+      failedClosed = error?.message === "atomic D1 staging could not verify revision ownership";
+    }
+    check(`a ${label} guarded-write receipt cannot receive success`, failedClosed);
   }
-  check("a guarded atomic write with no changed row cannot receive success", failedClosed);
 }
 
 /* ---- source forget must stay below D1's 100-variable statement limit ---- */
