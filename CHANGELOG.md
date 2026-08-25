@@ -13,6 +13,11 @@ refuse redirects.**
 - Exact copies collapse only during retrieval when their source, date, and
   content match. Stored documents remain untouched, so the behavior is
   reversible and source evidence is preserved.
+- A strongly isolated keyword result now receives a bounded hybrid-search
+  boost, so an exact record number or rare marker cannot disappear beneath
+  generic semantic matches. Ordinary keyword noise is not promoted, result
+  scores remain ordered, and the D1 backend now honors the documented RRF
+  tuning value.
 - Resumable message migration freezes its source boundary, records exact batch
   receipts, locks concurrent runs, and refuses an ambiguous owner label or
   timezone before creating a new checkpoint.

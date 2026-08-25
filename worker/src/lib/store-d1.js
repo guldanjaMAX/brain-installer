@@ -23,12 +23,17 @@
  * same range, not even the same sign direction, and neither is calibrated
  * across corpora. Any alpha * cosine + (1 - alpha) * normalised_bm25 scheme
  * requires normalising two distributions nobody can observe globally. RRF
- * throws the magnitudes away and uses rank position only, which makes the
- * incomparability disappear. Same arithmetic the Postgres version used; the
- * only difference is gathering the lists over two calls instead of one query.
+ * throws cross-system magnitudes away and uses rank position only, which makes
+ * the incomparability disappear. FTS magnitude is consulted only within its
+ * own result list to recognize a clearly isolated lexical champion; it is never
+ * blended with cosine similarity. Same arithmetic the Postgres version used;
+ * the only difference is gathering the lists over two calls instead of one
+ * query.
  */
 
 const RRF_K = 60;
+const LEXICAL_CHAMPION_RATIO = 4;
+const LEXICAL_CHAMPION_TARGET_RANK = 5;
 
 /**
  * Vectorize caps a vector id at 64 BYTES.
@@ -315,8 +320,9 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
  * Pulls a wider candidate pool than the caller asked for, because fusion can
  * only promote a document that appears in one of the lists.
  */
-export async function search(env, { query, embedding, limit = 10, filters = {}, weights = {} }) {
+export async function search(env, { query, embedding, limit = 10, filters = {}, weights = {}, rrfK = RRF_K }) {
   const pool = Math.min(Math.max(limit * 3, 30), VECTOR_TOPK_MAX);
+  const fusionK = Math.min(Math.max(Number(rrfK) || RRF_K, 1), 1e3);
 
   const [kw, vec] = await Promise.all([
     searchKeyword(env, query, { limit: pool, filters }).catch(() => []),
@@ -335,10 +341,64 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
         ? "no-embedding"
         : null;
 
-  const fused = fuseRRF([
+  const documentKey = (row) => row.content_hash
+    ? `${row.source || ""}|${row.content_hash}|${row.document_date ?? "undated"}`
+    : row.doc_uid || `${row.source || ""}|${row.source_id || row.title || row.chunk_uid}`;
+
+  // FTS5's score ratio is meaningful inside one query even though its absolute
+  // magnitude is not comparable across corpora or with Vectorize similarity.
+  // A bounded third rank list can retain a clearly isolated lexical document
+  // without blending those incompatible scores.
+  const lexicalWeight = Number(weights.keyword ?? 1.0);
+  const firstKeyword = kw[0] || null;
+  const firstKeywordMagnitude = Math.abs(Number(firstKeyword?.score));
+  const firstKeywordKey = firstKeyword ? documentKey(firstKeyword) : null;
+  const nextKeywordDocument = firstKeywordKey === null
+    ? null
+    : kw.find((row) => documentKey(row) !== firstKeywordKey) || null;
+  const nextKeywordMagnitude = Math.abs(Number(nextKeywordDocument?.score));
+  const hasSelectiveKeywordChampion =
+    limit >= LEXICAL_CHAMPION_TARGET_RANK &&
+    lexicalWeight > 0 &&
+    Number.isFinite(firstKeywordMagnitude) &&
+    nextKeywordDocument !== null &&
+    Number.isFinite(nextKeywordMagnitude) &&
+    nextKeywordMagnitude > 0 &&
+    firstKeywordMagnitude >= nextKeywordMagnitude * LEXICAL_CHAMPION_RATIO;
+
+  const rankLists = [
     { items: vec, weight: weights.vector ?? 1.0 },
     { items: kw, weight: weights.keyword ?? 1.0 },
-  ]);
+  ];
+  let fused = fuseRRF(rankLists, { k: fusionK });
+  if (hasSelectiveKeywordChampion) {
+    const seen = new Set();
+    const rankedDocuments = [];
+    for (const row of fused) {
+      const key = documentKey(row);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rankedDocuments.push(row);
+    }
+    const championDocumentRank = rankedDocuments.findIndex(
+      (row) => documentKey(row) === firstKeywordKey,
+    );
+    if (championDocumentRank >= LEXICAL_CHAMPION_TARGET_RANK) {
+      const championChunk = fused.find((row) => row.chunk_uid === firstKeyword.chunk_uid);
+      const cutoff = rankedDocuments[LEXICAL_CHAMPION_TARGET_RANK - 1];
+      const requiredContribution = Number(cutoff?.rrf_score) - Number(championChunk?.rrf_score) + 1e-12;
+      const boundedWeight = Math.min(
+        lexicalWeight,
+        Math.max(0, requiredContribution * (fusionK + 1)),
+      );
+      if (Number.isFinite(boundedWeight) && boundedWeight > 0) {
+        fused = fuseRRF([
+          ...rankLists,
+          { items: [firstKeyword], weight: boundedWeight },
+        ], { k: fusionK });
+      }
+    }
+  }
 
   // Retrieval ranks chunks, but the public result contract ranks documents.
   // Collapse the wide fused pool BEFORE applying the caller's limit so a long
@@ -351,9 +411,7 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
     // legitimate repeated record or message at a different time, and because
     // a source filter must never be collapsed into evidence from another
     // connector. Rows from an older schema still fall back to document identity.
-    const key = row.content_hash
-      ? `${row.source || ""}|${row.content_hash}|${row.document_date ?? "undated"}`
-      : row.doc_uid || `${row.source || ""}|${row.source_id || row.title || row.chunk_uid}`;
+    const key = documentKey(row);
     if (seenDocuments.has(key)) continue;
     seenDocuments.add(key);
     // content_hash is an internal dedupe key, not part of the authenticated

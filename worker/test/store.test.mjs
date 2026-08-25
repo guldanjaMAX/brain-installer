@@ -78,6 +78,40 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
   check("undated stays null", r.results[0].ts === null, String(r.results[0].ts));
 }
 
+/* ---- the public D1 rrf_k control must reach the fusion arithmetic ---- */
+{
+  const keyword = [
+    { chunk_uid: "c", doc_uid: "c", source_id: "c", text: "c", source: "drive" },
+    { chunk_uid: "d", doc_uid: "d", source_id: "d", text: "d", source: "drive" },
+  ];
+  const vectors = [
+    { chunk_uid: "a", doc_uid: "a", source_id: "a", text: "a", source: "drive" },
+    { chunk_uid: "b", doc_uid: "b", source_id: "b", text: "b", source: "drive" },
+    keyword[0],
+  ];
+  const env = {
+    STORAGE: "d1",
+    AI: { run: async () => ({ data: [[0.1]] }) },
+    VECTORIZE: { query: async () => ({ matches: vectors.map((row) => ({ id: row.chunk_uid })) }) },
+    DB: {
+      prepare: (sql) => ({
+        bind: (...ids) => ({
+          all: async () => ({
+            results: /FROM chunks_fts/.test(sql)
+              ? keyword
+              : ids.map((id) => vectors.find((row) => row.chunk_uid === id)).filter(Boolean),
+          }),
+        }),
+      }),
+    },
+  };
+  const r = await storeFor(env).search(env, { query: "c", limit: 10, rrfK: 1 });
+  const c = r.results.find((row) => row.chunk_uid === "c");
+  check("D1 honors rrf_k instead of silently using its default",
+    Math.abs(c.score - (1 / 4 + 1 / 2)) < 1e-9,
+    String(c.score));
+}
+
 /* ---- a failed revision cannot commit its hash before its chunks ---- */
 {
   const rows = { document: null, chunks: new Map() };

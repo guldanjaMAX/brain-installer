@@ -77,6 +77,128 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("repeat chunks cannot evict a different document before the limit", r.results.map((x) => x.doc_uid).join(",") === "d1,d2", JSON.stringify(r.results));
 }
 
+/* ---- a uniquely selective keyword hit remains visible in hybrid search ---- */
+{
+  const lexical = {
+    chunk_uid: "lexical#0", doc_uid: "lexical", source_id: "lexical",
+    text: "the exact rare marker", source: "drive", score: -8,
+  };
+  const distractors = Array.from({ length: 12 }, (_, i) => ({
+    chunk_uid: `semantic-${i}#0`, doc_uid: `semantic-${i}`, source_id: `semantic-${i}`,
+    text: `generic semantic result ${i}`, source: "drive", score: -0.0001,
+  }));
+  const env = {
+    DB: {
+      prepare: (sql) => ({
+        bind: (...ids) => ({
+          all: async () => ({
+            results: /FROM chunks_fts/.test(sql)
+              ? [lexical, ...distractors]
+              : ids.map((id) => distractors.find((row) => row.chunk_uid === id)).filter(Boolean),
+          }),
+        }),
+      }),
+    },
+    VECTORIZE: {
+      query: async () => ({ matches: distractors.map((row) => ({ id: row.chunk_uid })) }),
+    },
+  };
+  const r = await search(env, { query: "exact rare marker", embedding: [0.1], limit: 10 });
+  const pure = fuseRRF([
+    { items: distractors },
+    { items: [lexical, ...distractors] },
+  ]);
+  const pureRank = pure.findIndex((row) => row.chunk_uid === lexical.chunk_uid) + 1;
+  const lexicalRank = r.results.findIndex((row) => row.chunk_uid === lexical.chunk_uid) + 1;
+  check("the fixture proves ordinary RRF buried the selective lexical champion",
+    pureRank > 5, String(pureRank));
+  check("a selective lexical champion cannot be buried below rank five", lexicalRank > 0 && lexicalRank <= 5, String(lexicalRank));
+  check("the selective lexical list does not duplicate the document",
+    r.results.filter((row) => row.chunk_uid === lexical.chunk_uid).length === 1,
+    JSON.stringify(r.results));
+  check("hybrid results remain ordered by their reported RRF score",
+    r.results.every((row, index) => index === 0 || r.results[index - 1].rrf_score >= row.rrf_score),
+    JSON.stringify(r.results.map((row) => row.rrf_score)));
+
+  const weakKeyword = { ...lexical, score: -0.399 };
+  const weakDistractors = distractors.map((row, index) => ({
+    ...row,
+    score: index === 0 ? -0.1 : row.score,
+  }));
+  const weakEnv = {
+    ...env,
+    DB: {
+      prepare: (sql) => ({
+        bind: (...ids) => ({
+          all: async () => ({
+            results: /FROM chunks_fts/.test(sql)
+              ? [weakKeyword, ...weakDistractors]
+              : ids.map((id) => weakDistractors.find((row) => row.chunk_uid === id)).filter(Boolean),
+          }),
+        }),
+      }),
+    },
+  };
+  const weak = await search(weakEnv, { query: "generic words", embedding: [0.1], limit: 10 });
+  check("a 3.99x keyword leader cannot trigger the lexical boost",
+    weak.results[0]?.chunk_uid === distractors[0].chunk_uid,
+    JSON.stringify(weak.results));
+
+  const exactBoundary = await search({
+    ...weakEnv,
+    DB: {
+      prepare: (sql) => ({
+        bind: (...ids) => ({
+          all: async () => ({
+            results: /FROM chunks_fts/.test(sql)
+              ? [{ ...weakKeyword, score: -0.4 }, ...weakDistractors]
+              : ids.map((id) => weakDistractors.find((row) => row.chunk_uid === id)).filter(Boolean),
+          }),
+        }),
+      }),
+    },
+  }, { query: "exact boundary", embedding: [0.1], limit: 10 });
+  check("an observed 4x separation activates the bounded lexical boost",
+    exactBoundary.results.findIndex((row) => row.chunk_uid === lexical.chunk_uid) + 1 === 5,
+    JSON.stringify(exactBoundary.results));
+
+  const sameDocumentOnly = [
+    lexical,
+    { ...lexical, chunk_uid: "lexical#1", score: -4 },
+    { ...lexical, chunk_uid: "lexical#2", score: -2 },
+  ];
+  const noRunner = await search({
+    ...env,
+    DB: {
+      prepare: (sql) => ({
+        bind: (...ids) => ({
+          all: async () => ({
+            results: /FROM chunks_fts/.test(sql)
+              ? sameDocumentOnly
+              : ids.map((id) => distractors.find((row) => row.chunk_uid === id)).filter(Boolean),
+          }),
+        }),
+      }),
+    },
+  }, { query: "one long document", embedding: [0.1], limit: 10 });
+  const noRunnerChampion = noRunner.results.find((row) => row.chunk_uid === lexical.chunk_uid);
+  check("a keyword pool monopolized by one document is not treated as selective evidence",
+    Math.abs(noRunnerChampion.rrf_score - (1 / 61)) < 1e-9,
+    String(noRunnerChampion.rrf_score));
+
+  const tiny = await search(env, { query: "exact rare marker", embedding: [0.1], limit: 4 });
+  check("the lexical safety lane does not rewrite result budgets below five",
+    !tiny.results.some((row) => row.chunk_uid === lexical.chunk_uid),
+    JSON.stringify(tiny.results));
+
+  const disabled = await search(env, {
+    query: "exact rare marker", embedding: [0.1], limit: 10, weights: { keyword: 0 },
+  });
+  check("zero keyword weight disables the lexical champion boost",
+    !disabled.results.some((row) => row.chunk_uid === lexical.chunk_uid),
+    JSON.stringify(disabled.results));
+}
+
 /* ---- exact copied documents collapse without erasing time or source context ---- */
 {
   const same = [

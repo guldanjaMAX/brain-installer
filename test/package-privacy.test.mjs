@@ -55,6 +55,7 @@ const expected = [
   "docs/COMPETITIVE-BENCHMARK.md",
   "docs/ENGINEERING-STANDARDS.md",
   "docs/EVALUATION.md",
+  "docs/MAINTAINER.md",
   "docs/RECOVERY.md",
   "docs/LEGACY-SUPABASE-EXIT.md",
   "docs/README-developer.md",

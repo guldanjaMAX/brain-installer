@@ -19,6 +19,8 @@ Engineering changes follow [the code, test, documentation, and tracking
 standard](./ENGINEERING-STANDARDS.md). Architecturally significant choices are
 recorded in [append-only decision records](./decisions/README.md), beginning
 with the [Cloudflare-native install decision](./decisions/001-cloudflare-native-standard.md).
+The [maintainer guide](./MAINTAINER.md) gives the exact safe change, package,
+release, owner-update, rollback, credential, and issue-evidence workflow.
 
 ---
 

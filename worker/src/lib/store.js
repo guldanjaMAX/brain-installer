@@ -207,14 +207,14 @@ function sourceStatsCommitStatement(env, source, revisions) {
 /* ---------------------------------------------------------------- D1 backend */
 
 const d1Backend = {
-  async search(env, { query, limit, filters = {}, weights = {} }) {
+  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60 }) {
     let embedding = null;
     try {
       embedding = await embedText(env, query);
     } catch {
       // Degrade to keyword rather than fail. store-d1 reports which side answered.
     }
-    const r = await d1.search(env, { query, embedding, limit, filters, weights });
+    const r = await d1.search(env, { query, embedding, limit, filters, weights, rrfK });
     return {
       results: r.results.map((x) => {
         const sourceId = x.source_id || (
