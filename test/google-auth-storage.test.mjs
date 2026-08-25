@@ -42,6 +42,11 @@ const ambientCredentials = {
   USER: "fixture-user",
   USERNAME: "fixture-user",
   SystemRoot: "C:\\Windows",
+  USERPROFILE: "C:\\Users\\fixture-user",
+  APPDATA: "C:\\Users\\fixture-user\\AppData\\Roaming",
+  LOCALAPPDATA: "C:\\Users\\fixture-user\\AppData\\Local",
+  TEMP: "C:\\Users\\fixture-user\\AppData\\Local\\Temp",
+  TMP: "C:\\Users\\fixture-user\\AppData\\Local\\Temp",
   DISPLAY: ":99",
   ADMIN_KEY: "ambient-admin-secret",
   CLOUDFLARE_API_TOKEN: "ambient-cloudflare-secret",
@@ -160,7 +165,7 @@ try {
   /* ================= atomic file fallback ================= */
   {
     const path = join(directory, "file", "google-tokens.json");
-    saveTokens(record, { backend: "file", platform: "linux", path });
+    saveTokens(record, { backend: "file", path });
     check("file fallback round-trips the complete credential record",
       JSON.stringify(loadTokens({ backend: "file", path })) === JSON.stringify(record));
     if (process.platform !== "win32") {
@@ -178,7 +183,7 @@ try {
 
   if (process.platform !== "win32") {
     const path = join(directory, "permissive-file", "google-tokens.json");
-    saveTokens(record, { backend: "file", platform: "linux", path });
+    saveTokens(record, { backend: "file", path });
     const original = readFileSync(path);
     chmodSync(path, 0o644);
     let loadError;
@@ -268,7 +273,9 @@ try {
         !metadata.includes(replacement.google.refresh_token);
     });
     check("DPAPI helpers receive secrets only on stdin and inherit no ambient credentials",
-      allDpapiMetadataSafe);
+      allDpapiMetadataSafe && dpapi.calls.every((call) =>
+        call.env.USERPROFILE === ambientCredentials.USERPROFILE &&
+        call.env.LOCALAPPDATA === ambientCredentials.LOCALAPPDATA));
     check("Windows ACL helpers inherit no ambient credentials or OAuth values",
       acl.calls.every((call) => childEnvironmentIsScrubbed(call.env) &&
         !JSON.stringify(call).includes(record.google.refresh_token) &&
@@ -596,7 +603,7 @@ try {
   /* ================= verified legacy migration ================= */
   {
     const path = join(directory, "migration", "google-tokens.json");
-    saveTokens(record, { backend: "file", path });
+    saveTokens(record, { backend: "file", platform: "linux", path });
     const keychain = fakeKeychain();
     const options = { backend: "keychain", platform: "darwin", runSecurity: keychain.runSecurity, path };
     const loaded = loadTokens(options);
@@ -606,7 +613,7 @@ try {
   }
   {
     const path = join(directory, "failed-migration", "google-tokens.json");
-    saveTokens(record, { backend: "file", path });
+    saveTokens(record, { backend: "file", platform: "linux", path });
     const keychain = fakeKeychain({ corruptAfterWrite: true });
     let error = null;
     try {

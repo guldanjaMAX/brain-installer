@@ -82,7 +82,12 @@ export function googleAuthChildEnvironment(
   if (platform === "win32") {
     const systemRoot = environment?.SystemRoot || environment?.SYSTEMROOT || environment?.WINDIR;
     if (typeof systemRoot === "string" && systemRoot) clean.SystemRoot = systemRoot;
-    for (const name of ["TEMP", "TMP"]) {
+    // CurrentUser DPAPI needs the loaded profile's runtime locators. This is a
+    // fixed allowlist, so API keys and other inherited credentials stay out.
+    for (const name of [
+      "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+      "APPDATA", "LOCALAPPDATA", "USERNAME", "USERDOMAIN", "ComSpec",
+    ]) {
       const value = environment?.[name];
       if (typeof value === "string" && value) clean[name] = value;
     }

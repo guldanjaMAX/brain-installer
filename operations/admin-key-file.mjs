@@ -33,6 +33,10 @@ const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const MAX_ADMIN_KEY_FILE_BYTES = 64 * 1024;
 const DEFAULT_RESIDUE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const RESIDUE_NAME = /^\.\.brain-admin-key\.\d+\.[0-9a-f]{16}\.(tmp|bak)$/;
+const WINDOWS_RUNTIME_ENV = Object.freeze([
+  "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+  "APPDATA", "LOCALAPPDATA", "USERNAME", "USERDOMAIN", "ComSpec",
+]);
 
 // The scripts are fixed command-line metadata. The value being protected is
 // read as raw bytes from redirected stdin, never interpolated into the script,
@@ -253,8 +257,8 @@ export function validateAdminKeyFileDestination(destination, options = {}) {
   return Object.freeze({ path, replaced: prior !== null });
 }
 
-function windowsPowerShellRuntime() {
-  const systemRoot = process.env.SystemRoot || process.env.SYSTEMROOT || process.env.WINDIR;
+function windowsPowerShellRuntime(environment = process.env) {
+  const systemRoot = environment.SystemRoot || environment.SYSTEMROOT || environment.WINDIR;
   if (!systemRoot) {
     // Cross-platform unit tests inject the runner and never execute this name.
     // A real Windows process should always have SystemRoot; refusing to inherit
@@ -265,8 +269,11 @@ function windowsPowerShellRuntime() {
     return { command: "powershell.exe", env: {} };
   }
   const env = { SystemRoot: systemRoot };
-  for (const name of ["TEMP", "TMP"]) {
-    if (typeof process.env[name] === "string" && process.env[name]) env[name] = process.env[name];
+  // DPAPI CurrentUser depends on the loaded Windows profile. Keep only the
+  // profile/runtime locators PowerShell and DPAPI need, never the caller's
+  // credential-bearing environment.
+  for (const name of WINDOWS_RUNTIME_ENV) {
+    if (typeof environment[name] === "string" && environment[name]) env[name] = environment[name];
   }
   return {
     command: join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
@@ -275,7 +282,7 @@ function windowsPowerShellRuntime() {
 }
 
 function runWindowsDpapi(script, input, options, operation, secretForMetadataCheck = null) {
-  const { command, env } = windowsPowerShellRuntime();
+  const { command, env } = windowsPowerShellRuntime(options.environment ?? process.env);
   if (!Buffer.isBuffer(input) || input.length < 1 || input.length > 64 * 1024) {
     throw new Error("Windows DPAPI received an invalid admin key payload size");
   }

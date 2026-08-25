@@ -223,6 +223,16 @@ try {
     { secret: secretA, cipher: cipherA },
     { secret: secretB, cipher: cipherB },
   ]);
+  const windowsEnvironment = {
+    SystemRoot: "C:\\Windows",
+    USERPROFILE: "C:\\Users\\fixture-user",
+    APPDATA: "C:\\Users\\fixture-user\\AppData\\Roaming",
+    LOCALAPPDATA: "C:\\Users\\fixture-user\\AppData\\Local",
+    TEMP: "C:\\Users\\fixture-user\\AppData\\Local\\Temp",
+    USERNAME: "fixture-user",
+    ADMIN_KEY: "must-not-reach-child",
+    CLOUDFLARE_API_TOKEN: "must-not-reach-child",
+  };
 
   // An install created before DPAPI support must remain usable. No decrypt
   // subprocess is needed for a file without the versioned envelope marker.
@@ -238,6 +248,7 @@ try {
   writeAdminKeyFile(windowsPath, secretB, {
     platform: "win32",
     username: "fixture-user",
+    environment: windowsEnvironment,
     randomBytes: entropy(3),
     runPowerShell: simulated.runPowerShell,
     runAcl: (args) => {
@@ -287,6 +298,8 @@ try {
     assert.equal(Object.hasOwn(call.env, "BRAIN_ADMIN_KEY"), false);
     assert.equal(Object.hasOwn(call.env, "BRAIN_KEY"), false);
   }
+  assert.equal(protectCall.env.USERPROFILE, windowsEnvironment.USERPROFILE);
+  assert.equal(protectCall.env.LOCALAPPDATA, windowsEnvironment.LOCALAPPDATA);
 
   const windowsStagedRoot = join(sandbox, "windows-staged-mismatch");
   mkdirSync(windowsStagedRoot);
