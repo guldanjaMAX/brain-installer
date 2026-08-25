@@ -71,11 +71,13 @@ function fakeDpapi() {
     calls,
     runPowerShell(command, args, options) {
       const input = Buffer.from(options.input || Buffer.alloc(0));
-      const script = String(args.at(-1) || "");
-      const protect = script.includes("]::Protect(");
-      const unprotect = script.includes("]::Unprotect(");
-      const framed = script.includes(`[int]$expectedLength = ${input.length}`) &&
-        !script.includes("__BRAIN_INPUT_LENGTH__");
+      const operationAt = args.indexOf("-Operation");
+      const lengthAt = args.indexOf("-ExpectedLength");
+      const operation = operationAt >= 0 ? args[operationAt + 1] : null;
+      const protect = operation === "protect";
+      const unprotect = operation === "unprotect";
+      const framed = lengthAt >= 0 && args[lengthAt + 1] === String(input.length) &&
+        args.includes("-File") && String(args[args.indexOf("-File") + 1] || "").endsWith("windows-dpapi.ps1");
       calls.push({
         args: [...args], command, env: { ...options.env }, input,
         protect, unprotect,

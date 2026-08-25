@@ -27,6 +27,7 @@ import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { TextDecoder } from "node:util";
+import { fileURLToPath } from "node:url";
 
 const WINDOWS_DPAPI_HEADER = Buffer.from("BRAIN-ADMIN-KEY-DPAPI-V1\n", "ascii");
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
@@ -37,72 +38,7 @@ const WINDOWS_RUNTIME_ENV = Object.freeze([
   "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
   "APPDATA", "LOCALAPPDATA", "USERNAME", "USERDOMAIN", "ComSpec",
 ]);
-
-// The scripts are fixed command-line metadata. The value being protected is
-// read as raw bytes from redirected stdin, never interpolated into the script,
-// argv, or the child environment. Raw stdout also avoids PowerShell's text
-// encoding and newline behavior changing either the ciphertext or plaintext.
-// CurrentUser binds portability to this Windows profile; it does not attempt to
-// defend against an administrator or malicious code already running as it.
-const DPAPI_PROTECT_SCRIPT = String.raw`
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Security
-[int]$expectedLength = __BRAIN_INPUT_LENGTH__
-[byte[]]$plain = $null
-[byte[]]$protectedBytes = $null
-try {
-  if ($expectedLength -lt 1) { throw 'DPAPI input length is invalid' }
-  $inputStream = [Console]::OpenStandardInput()
-  $plain = New-Object byte[] $expectedLength
-  $offset = 0
-  while ($offset -lt $expectedLength) {
-    $read = $inputStream.Read($plain, $offset, $expectedLength - $offset)
-    if ($read -le 0) { throw 'DPAPI input ended before the declared length' }
-    $offset += $read
-  }
-  $protectedBytes = [System.Security.Cryptography.ProtectedData]::Protect(
-    $plain,
-    $null,
-    [System.Security.Cryptography.DataProtectionScope]::CurrentUser
-  )
-  $output = [Console]::OpenStandardOutput()
-  $output.Write($protectedBytes, 0, $protectedBytes.Length)
-  $output.Flush()
-} finally {
-  if ($null -ne $plain) { [Array]::Clear($plain, 0, $plain.Length) }
-  if ($null -ne $protectedBytes) { [Array]::Clear($protectedBytes, 0, $protectedBytes.Length) }
-}
-`;
-
-const DPAPI_UNPROTECT_SCRIPT = String.raw`
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Security
-[int]$expectedLength = __BRAIN_INPUT_LENGTH__
-[byte[]]$protectedBytes = $null
-[byte[]]$plain = $null
-try {
-  if ($expectedLength -lt 1) { throw 'DPAPI input length is invalid' }
-  $inputStream = [Console]::OpenStandardInput()
-  $protectedBytes = New-Object byte[] $expectedLength
-  $offset = 0
-  while ($offset -lt $expectedLength) {
-    $read = $inputStream.Read($protectedBytes, $offset, $expectedLength - $offset)
-    if ($read -le 0) { throw 'DPAPI input ended before the declared length' }
-    $offset += $read
-  }
-  $plain = [System.Security.Cryptography.ProtectedData]::Unprotect(
-    $protectedBytes,
-    $null,
-    [System.Security.Cryptography.DataProtectionScope]::CurrentUser
-  )
-  $output = [Console]::OpenStandardOutput()
-  $output.Write($plain, 0, $plain.Length)
-  $output.Flush()
-} finally {
-  if ($null -ne $protectedBytes) { [Array]::Clear($protectedBytes, 0, $protectedBytes.Length) }
-  if ($null -ne $plain) { [Array]::Clear($plain, 0, $plain.Length) }
-}
-`;
+const WINDOWS_DPAPI_HELPER = fileURLToPath(new URL("./windows-dpapi.ps1", import.meta.url));
 
 function lstatIfPresent(path) {
   try {
@@ -281,21 +217,19 @@ function windowsPowerShellRuntime(environment = process.env) {
   };
 }
 
-function runWindowsDpapi(script, input, options, operation, secretForMetadataCheck = null) {
+function runWindowsDpapi(input, options, operation, secretForMetadataCheck = null) {
   const { command, env } = windowsPowerShellRuntime(options.environment ?? process.env);
   if (!Buffer.isBuffer(input) || input.length < 1 || input.length > 64 * 1024) {
     throw new Error("Windows DPAPI received an invalid admin key payload size");
-  }
-  const commandScript = script.replace("__BRAIN_INPUT_LENGTH__", String(input.length));
-  if (commandScript === script || commandScript.includes("__BRAIN_INPUT_LENGTH__")) {
-    throw new Error("Windows DPAPI input framing could not be prepared safely");
   }
   const args = [
     "-NoLogo",
     "-NoProfile",
     "-NonInteractive",
     "-ExecutionPolicy", "Bypass",
-    "-Command", commandScript,
+    "-File", WINDOWS_DPAPI_HELPER,
+    "-Operation", operation,
+    "-ExpectedLength", String(input.length),
   ];
   if (secretForMetadataCheck) {
     const metadata = [command, ...args, ...Object.entries(env).flat()].join("\0");
@@ -344,7 +278,7 @@ function protectAdminKeyForWindows(secret, options) {
   const plain = Buffer.from(secret, "utf8");
   let protectedBytes;
   try {
-    protectedBytes = runWindowsDpapi(DPAPI_PROTECT_SCRIPT, plain, options, "protect", secret);
+    protectedBytes = runWindowsDpapi(plain, options, "protect", secret);
     const encoded = protectedBytes.toString("base64");
     return Buffer.from(`${WINDOWS_DPAPI_HEADER.toString("ascii")}${encoded}\n`, "ascii");
   } finally {
@@ -378,7 +312,7 @@ function decodeAdminKeyPayload(bytes, platform, options) {
     const protectedBytes = parseWindowsDpapiEnvelope(bytes);
     let plain;
     try {
-      plain = runWindowsDpapi(DPAPI_UNPROTECT_SCRIPT, protectedBytes, options, "unprotect");
+      plain = runWindowsDpapi(protectedBytes, options, "unprotect");
       return validateAdminKeyValue(UTF8_DECODER.decode(plain));
     } finally {
       protectedBytes.fill(0);
