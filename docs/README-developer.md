@@ -553,6 +553,16 @@ starts a local HTTP brain; it never reads an installed brain or private golden
 set. See `docs/EVALUATION.md` for the v2 contracts, release gates, and staged
 diagnosis model.
 
+`test/live/d1-release-field-gate.mjs` is the opt-in real-service release gate.
+It is never part of `npm test` because it creates billable Cloudflare resources.
+Run it only against a newly provisioned manifest whose name explicitly says
+`Synthetic Field Gate`. It exercises changed, unchanged, mixed, concurrent,
+high-chunk, embedding, retrieval, diagnosis, and confirmed cleanup behavior,
+then prints an aggregate-only receipt. Preserve the sanitized receipt under
+`docs/release-evidence/` and delete the exact disposable Worker, D1 database,
+Vectorize index, and temporary admin-key item. The harness refuses ordinary
+client manifests and never accepts or prints a private corpus.
+
 `brain eval <manifest>` uses the `smoke` profile by default. It is diagnostic,
 not certification. `brain eval <manifest> --profile release` fails before
 reading the admin key or contacting the brain unless the private suite has at
