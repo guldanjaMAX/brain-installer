@@ -1,7 +1,7 @@
 # Shared Brain maintainer guide
 
 This is the operating guide for engineers who maintain the shared installer.
-It describes the 0.1.13 product line, how to change and release it safely, and
+It describes the 0.1.14 product line, how to change and release it safely, and
 how to update an owner's existing Brain. It is not an instance handoff. Never
 put an owner's manifest, resource identifiers, source details, private golden
 set, support export, or credentials in this repository.
@@ -40,7 +40,7 @@ Then read these files before changing their area:
 Preserve a dirty working tree. Identify who owns each existing change before
 editing the same file, and never discard unrelated work to make a test pass.
 
-## The 0.1.13 architecture
+## The 0.1.14 architecture
 
 There is one product and many isolated installs:
 
@@ -73,13 +73,15 @@ owner's Cloudflare Worker
   retrieval, ingest, health, evaluation, drain, and reindex use the deployed
   Brain and its separately stored admin key.
 
-Version 0.1.13 adds retrieval-time duplicate collapsing, stronger resumable
-migration boundaries, a durable installed-manifest pointer, redirect refusal
-for authenticated Brain requests, private corpus and answer canaries, guarded
-recovery drills, pinned release automation, and tarball privacy inspection.
+Version 0.1.14 strengthens current-status retrieval so stale records and
+transaction-system evidence cannot silently establish a current client
+relationship. It also makes full message replay exact and fail-closed across
+high-water snapshots, reconciliation, crash recovery, and live inventory
+verification. Version 0.1.13 established the duplicate collapsing, durable
+installed-manifest pointer, guarded recovery, and release-safety foundations.
 `CHANGELOG.md` is the authoritative owner-facing list.
 
-The code line is not a release merely because `package.json` says `0.1.13`. A
+The code line is not a release merely because `package.json` says `0.1.14`. A
 release exists only when its exact reviewed commit is tagged, all six CI jobs
 pass, required live field gates have evidence, GitHub publishes one immutable
 asset with the verified digest, and the public install and update pages point
@@ -330,7 +332,7 @@ There is no shared master credential and no support backdoor.
 
 Recognized command failures already create immutable, sanitized local issue
 events under the current user's private Brain support directory. This is
-automatic local collection, not telemetry. Version 0.1.13 has no automatic
+automatic local collection, not telemetry. Version 0.1.14 has no automatic
 upload and no network path in the journal module.
 
 An event can contain the product version, command, platform, architecture, Node

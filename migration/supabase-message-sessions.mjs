@@ -18,14 +18,15 @@ import {
 } from "../ingest/message-session.mjs";
 import { GATE_VERSION, sanitizeEnvelope, scanEnvelope as scanSecrets } from "../worker/src/lib/secret-scan.js";
 import {
-  assertTargetReceiptIdentity, getTargetInventory, isDirectExecution, postSourceReceipt,
-  postTargetBatch, querySupabase,
+  assertTargetReceiptIdentity, getTargetInventory, isDirectExecution,
+  listTargetSourceFamilies, postSourceReceipt, postTargetBatch, querySupabase,
+  reconcileTargetFamilies,
 } from "./supabase-import.mjs";
 import { readProtectedStateJson, saveProtectedStateJson } from "./state-file.mjs";
 
 export const MESSAGE_STATE_VERSION = 2;
 export const MESSAGE_STATE_SCHEMA = "brain-message-migration";
-const MESSAGE_ALGORITHM_VERSION = "message-sessions-v2-timezone";
+const MESSAGE_ALGORITHM_VERSION = "message-sessions-v3-exact-reconciliation";
 const ELIGIBLE = "coalesce(m.flagged, false) = false AND m.ts IS NOT NULL AND m.body IS NOT NULL AND length(trim(m.body)) >= 4";
 const cleanUrl = (value) => String(value || "").replace(/\/+$/, "");
 const sqlText = (value) => `'${String(value ?? "").replaceAll("'", "''")}'`;
@@ -84,6 +85,17 @@ export function messageExpectedCountSql(highWater, scope = {}) {
             AND (m.ts, m.id::text) <= (${sqlText(highWater.ts)}::timestamptz, ${sqlText(highWater.id)})`;
 }
 
+export function messageFrozenBoundarySql(highWater, scope = {}) {
+  if (!highWater?.ts || !highWater?.id) throw new Error("message migration high-water mark is missing");
+  return `SELECT m.ts::text AS ts, m.id::text AS id,
+                  count(*) OVER()::text AS eligible_rows
+          FROM messaging.messages m
+          WHERE ${ELIGIBLE}
+            ${rangeSql(scope)}
+            AND (m.ts, m.id::text) <= (${sqlText(highWater.ts)}::timestamptz, ${sqlText(highWater.id)})
+          ORDER BY m.ts DESC, m.id DESC LIMIT 1`;
+}
+
 const freshLane = () => ({
   high_water: null,
   cursor: null,
@@ -110,6 +122,11 @@ const freshLane = () => ({
   represented_source_messages: 0,
   skipped_source_messages: 0,
   candidate_source_messages: 0,
+  accepted_family_hashes: [],
+  reconciled_refused_families: 0,
+  reconciled_accepted_families: 0,
+  source_boundary: null,
+  target_reconciliation: null,
   skipped_by_reason: {},
   refusals: [],
   scope: null,
@@ -167,8 +184,10 @@ const hasUnfingerprintedProgress = (lane) => Boolean(
   lane.expected_source_messages !== null || lane.accounting ||
   lane.accounting_verified_at || lane.completed_at || lane.receipt_recorded_at ||
   lane.target_readback || lane.last_checkpoint_at ||
+  lane.source_boundary || lane.target_reconciliation ||
   (Array.isArray(lane.active) && lane.active.length) ||
   (Array.isArray(lane.refusals) && lane.refusals.length) ||
+  (Array.isArray(lane.accepted_family_hashes) && lane.accepted_family_hashes.length) ||
   (lane.skipped_by_reason && Object.keys(lane.skipped_by_reason).length) ||
   [
     "pages", "source_messages", "candidate_documents", "candidate_parts",
@@ -176,7 +195,8 @@ const hasUnfingerprintedProgress = (lane) => Boolean(
     "refused", "failed", "skipped", "legacy_unclassified_source_messages",
     "legacy_pending_source_messages", "legacy_candidate_documents",
     "legacy_target_documents", "legacy_refused", "represented_source_messages",
-    "skipped_source_messages", "candidate_source_messages",
+    "skipped_source_messages", "candidate_source_messages", "reconciled_refused_families",
+    "reconciled_accepted_families",
   ].some((key) => Number(lane[key] || 0) > 0)
 );
 
@@ -197,7 +217,34 @@ function validateMessageState(state) {
   nonNegativeInteger(lane.expected_source_messages, "expected source count", { nullable: true });
   if (typeof lane.complete !== "boolean") throw new Error("message migration completion flag is invalid");
   if (typeof lane.legacy_defaults_applied !== "boolean") throw new Error("message migration compatibility marker is invalid");
-  if (!Array.isArray(lane.active) || !Array.isArray(lane.refusals)) throw new Error("message migration collections are invalid");
+  if (!Array.isArray(lane.active) || !Array.isArray(lane.refusals) ||
+      !Array.isArray(lane.accepted_family_hashes)) {
+    throw new Error("message migration collections are invalid");
+  }
+  if (lane.accepted_family_hashes.some((value) => !/^[a-f0-9]{64}$/.test(String(value))) ||
+      lane.accepted_family_hashes.some((value, index, values) => index > 0 && value <= values[index - 1])) {
+    throw new Error("message migration accepted-family identity set is invalid");
+  }
+  nonNegativeInteger(lane.reconciled_refused_families, "reconciled refusal family count");
+  nonNegativeInteger(lane.reconciled_accepted_families, "reconciled accepted family count");
+  if (lane.source_boundary !== null && (
+    !lane.source_boundary ||
+    !Number.isSafeInteger(lane.source_boundary.minimum_source_messages) ||
+    lane.source_boundary.minimum_source_messages < 0 ||
+    !/^[a-f0-9]{64}$/.test(String(lane.source_boundary.high_water_sha256 || ""))
+  )) {
+    throw new Error("message migration reviewed source boundary is invalid");
+  }
+  if (lane.target_reconciliation !== null && (
+    !lane.target_reconciliation ||
+    !Number.isSafeInteger(lane.target_reconciliation.expected_families) ||
+    lane.target_reconciliation.expected_families < 0 ||
+    !Number.isSafeInteger(lane.target_reconciliation.removed_extra_families) ||
+    lane.target_reconciliation.removed_extra_families < 0 ||
+    !/^[a-f0-9]{64}$/.test(String(lane.target_reconciliation.identity_sha256 || ""))
+  )) {
+    throw new Error("message migration target reconciliation is invalid");
+  }
   for (const session of lane.active) {
     if (!session || typeof session !== "object" || Array.isArray(session) ||
         !session.first_id || !session.last_id || !session.thread_id || !session.platform ||
@@ -256,7 +303,7 @@ export function saveMessageState(path, state) {
   saveProtectedStateJson(path, state, { label: "message migration checkpoint" });
 }
 
-export function messageMigrationConfigFingerprint(scope, gateVersion = GATE_VERSION) {
+export function messageMigrationConfigFingerprint(scope, gateVersion = GATE_VERSION, sourceBoundary = null) {
   return createHash("sha256").update(JSON.stringify({
     algorithm: MESSAGE_ALGORITHM_VERSION,
     eligibility: ELIGIBLE,
@@ -266,50 +313,94 @@ export function messageMigrationConfigFingerprint(scope, gateVersion = GATE_VERS
     split_max_chars: MAX_DOC_CHARS,
     credential_gate_version: gateVersion,
     scope,
+    source_boundary: sourceBoundary,
   })).digest("hex");
 }
 
+export function messageHighWaterSha256(marker) {
+  const canonical = marker === null ? null : {
+    ts: new Date(String(marker?.ts || "")).toISOString(),
+    id: String(marker?.id || ""),
+  };
+  if (canonical && !canonical.id) throw new Error("message migration high-water identity is invalid");
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+const normalizeSourceBoundary = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("message migration needs a reviewed minimum source count and high-water hash");
+  }
+  const minimum = Number(value.minimum_source_messages);
+  const highWaterSha256 = String(value.high_water_sha256 || "").toLowerCase();
+  if (!Number.isSafeInteger(minimum) || minimum < 0 || !/^[a-f0-9]{64}$/.test(highWaterSha256)) {
+    throw new Error("message migration reviewed source boundary is invalid");
+  }
+  return { minimum_source_messages: minimum, high_water_sha256: highWaterSha256 };
+};
+
+const messageFamilyUid = (sourceId) => `message:${String(sourceId || "")}`;
+const familyIdentityHash = (familyUid) => createHash("sha256").update(String(familyUid)).digest("hex");
+const identitySetSha256 = (hashes) => createHash("sha256")
+  .update(JSON.stringify([...new Set(hashes)].sort()))
+  .digest("hex");
+
 const itemize = (envelopes) => envelopes.flatMap((envelope) =>
-  splitOversized(envelope).map((part) => ({ envelope: part }))
+  splitOversized(envelope).map((part) => ({
+    envelope: part,
+    family_uid: messageFamilyUid(envelope.source_id),
+  }))
 );
 
 const emptyTally = () => ({
   candidate_documents: 0, candidate_parts: 0, candidate_source_messages: 0,
   target_documents: 0, target_chunks: 0,
   created: 0, updated: 0, unchanged: 0, refused: 0, failed: 0,
+  accepted_family_hashes: [], refused_family_hashes: [],
+  reconciled_refused_families: 0, reconciled_accepted_families: 0,
   refusals: [],
 });
 
 const transientTargetError = (value) => /(?:network connection lost|timed? ?out|fetch failed|connection reset|econnreset|eai_again|temporar(?:y|ily)|overloaded|returned (?:429|5\d\d))/i.test(String(value || ""));
 
 export async function sendMessageEnvelopes(envelopes, postFn, {
+  reconcileFn,
   attempts = 3,
   delayMs = 1000,
   sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)),
 } = {}) {
+  if (typeof postFn !== "function" || typeof reconcileFn !== "function") {
+    throw new Error("message target ingest and exact family reconciliation are required");
+  }
   const tally = emptyTally();
   tally.candidate_documents = envelopes.length;
   tally.candidate_source_messages = envelopes.reduce((total, envelope) =>
     total + nonNegativeInteger(Number(envelope?.metadata?.message_count || 1), "candidate source count"), 0
   );
-  const safe = [];
+  const families = new Map();
+  const safeItems = [];
   for (const rawEnvelope of envelopes) {
     const envelope = sanitizeEnvelope(rawEnvelope);
+    const familyUid = messageFamilyUid(envelope.source_id);
+    if (!envelope.source_id || families.has(familyUid)) {
+      throw new Error("message migration produced a missing or repeated family identity");
+    }
     const scan = scanSecrets(envelope);
     if (scan.shouldRefuse) {
-      tally.refused++;
       tally.candidate_parts++;
-      if (tally.refusals.length < 1000) tally.refusals.push({
-        source_id: envelope.source_id,
-        labels: scan.labels,
+      families.set(familyUid, {
+        familyUid, sourceId: envelope.source_id, parts: [], outcomes: [],
+        refused: true, labels: [...new Set(scan.labels || [])],
       });
     } else {
-      safe.push(envelope);
+      const parts = itemize([envelope]);
+      tally.candidate_parts += parts.length;
+      families.set(familyUid, {
+        familyUid, sourceId: envelope.source_id, parts, outcomes: [], refused: false, labels: [],
+      });
+      safeItems.push(...parts);
     }
   }
-  const items = itemize(safe);
-  tally.candidate_parts += items.length;
-  for (const group of batches(items)) {
+  for (const group of batches(safeItems)) {
     let receipt;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       try {
@@ -332,25 +423,72 @@ export async function sendMessageEnvelopes(envelopes, postFn, {
       const item = group[i];
       const slot = receipt.results[i];
       const status = slot?.status;
+      const family = families.get(item.family_uid);
+      if (!family) throw new Error("message target receipt has no logical family");
       if (["created", "updated", "unchanged"].includes(status)) {
         const chunks = Number(slot.chunks || 0);
         if (!Number.isSafeInteger(chunks) || chunks < 0) {
           throw new Error(`message target receipt has an invalid chunk count at slot ${i + 1}`);
         }
-        tally[status]++;
-        tally.target_documents++;
-        tally.target_chunks += chunks;
+        family.outcomes.push({ status, chunks });
       } else if (status === "refused") {
-        tally.refused++;
-        if (tally.refusals.length < 1000) tally.refusals.push({
-          source_id: item.envelope.source_id,
-          labels: slot.labels || [],
-        });
+        family.refused = true;
+        family.labels.push(...(slot.labels || []));
       } else {
         tally.failed++;
         throw new Error(`message target rejected receipt slot ${i + 1}`);
       }
     }
+  }
+
+  for (const family of families.values()) {
+    if (!family.refused && family.outcomes.length !== family.parts.length) {
+      throw new Error("message target receipt did not settle every family part");
+    }
+  }
+
+  const plans = [...families.values()].map((family) => ({
+    base_doc_uid: family.familyUid,
+    keep_doc_uids: family.refused
+      ? []
+      : family.parts.map((item) => messageFamilyUid(item.envelope.source_id)),
+  }));
+  if (plans.length) {
+    let reconciliation;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        reconciliation = await reconcileFn(plans);
+      } catch (error) {
+        if (attempt >= attempts || !transientTargetError(error?.message || error)) throw error;
+        await sleep(delayMs * attempt);
+        continue;
+      }
+      break;
+    }
+    if (reconciliation?.families !== plans.length) {
+      throw new Error("message target family cleanup was not exactly confirmed");
+    }
+    tally.reconciled_refused_families = plans.filter((plan) => !plan.keep_doc_uids.length).length;
+    tally.reconciled_accepted_families = plans.length - tally.reconciled_refused_families;
+  }
+
+  for (const family of families.values()) {
+    const identityHash = familyIdentityHash(family.familyUid);
+    if (family.refused) {
+      tally.refused += Math.max(1, family.parts.length);
+      tally.refused_family_hashes.push(identityHash);
+      if (tally.refusals.length < 1000) tally.refusals.push({
+        source_id: family.sourceId,
+        labels: [...new Set(family.labels)],
+      });
+      continue;
+    }
+    for (const outcome of family.outcomes) {
+      tally[outcome.status]++;
+      tally.target_documents++;
+      tally.target_chunks += outcome.chunks;
+    }
+    tally.accepted_family_hashes.push(identityHash);
   }
   return tally;
 }
@@ -359,9 +497,15 @@ const mergeTally = (lane, tally) => {
   for (const key of [
     "candidate_documents", "candidate_parts", "candidate_source_messages",
     "target_documents", "target_chunks", "created", "updated", "unchanged", "refused", "failed",
+    "reconciled_refused_families", "reconciled_accepted_families",
   ]) {
     lane[key] += Number(tally[key] || 0);
   }
+  const accepted = new Set(lane.accepted_family_hashes || []);
+  for (const hash of tally.refused_family_hashes || []) accepted.delete(hash);
+  for (const hash of tally.accepted_family_hashes || []) accepted.add(hash);
+  lane.accepted_family_hashes = [...accepted].sort();
+  lane.target_reconciliation = null;
   if (tally.refusals?.length) {
     lane.refusals.push(...tally.refusals);
     if (lane.refusals.length > 1000) lane.refusals.splice(0, lane.refusals.length - 1000);
@@ -405,6 +549,45 @@ const assertMessagePage = (rows, cursor, highWater, limit) => {
   }
 };
 
+async function verifyReviewedSourceBoundary({ queryFn, scope, boundary, lane }) {
+  // The first invocation binds to the reviewed latest row. A resume instead
+  // re-reads only the frozen prefix, proving that its saved terminal row still
+  // exists and that no earlier eligible row disappeared. Newer messages are
+  // deliberately outside this run and cannot strand a long replay.
+  const rows = await queryFn(lane.high_water
+    ? messageFrozenBoundarySql(lane.high_water, scope)
+    : messageHighWaterSql(scope));
+  if (!Array.isArray(rows) || rows.length > 1) {
+    throw new Error("message migration reviewed source boundary query returned an invalid shape");
+  }
+  const high = rows[0] || null;
+  let marker = null;
+  let eligibleRows = 0;
+  if (high) {
+    if (!high.ts || !high.id || !Number.isFinite(Date.parse(high.ts))) {
+      throw new Error("message migration source high-water mark is invalid");
+    }
+    marker = { ts: high.ts, id: String(high.id) };
+    eligibleRows = parseExpectedCount(high.eligible_rows);
+    if (eligibleRows < 1) throw new Error("message migration source boundary count is inconsistent");
+  }
+  if (messageHighWaterSha256(marker) !== boundary.high_water_sha256) {
+    throw new Error("message migration source high-water continuity check failed");
+  }
+  if (eligibleRows < boundary.minimum_source_messages) {
+    throw new Error(
+      `message migration source count is below the reviewed minimum (${eligibleRows} < ${boundary.minimum_source_messages})`
+    );
+  }
+  if (lane.high_water && (!marker || markerCompare(lane.high_water, marker) !== 0)) {
+    throw new Error("message migration source high-water changed after the checkpoint started");
+  }
+  if (lane.expected_source_messages !== null && lane.expected_source_messages !== eligibleRows) {
+    throw new Error("message migration source count changed after the checkpoint started");
+  }
+  return { marker, eligibleRows };
+}
+
 export function verifyMessageAccounting(lane) {
   const expected = nonNegativeInteger(lane.expected_source_messages, "expected source count");
   if (lane.source_messages !== expected) {
@@ -438,6 +621,15 @@ export function verifyMessageAccounting(lane) {
   if (expected > 0 && markerCompare(lane.cursor, lane.high_water) !== 0) {
     throw new Error("message migration cannot complete before reaching the fixed high-water mark");
   }
+  const acceptedFamilyHashes = [...new Set(lane.accepted_family_hashes || [])].sort();
+  if (lane.reconciled_accepted_families !== acceptedFamilyHashes.length) {
+    throw new Error("message migration accepted-family cleanup accounting does not balance");
+  }
+  if (!lane.target_reconciliation ||
+      lane.target_reconciliation.expected_families !== acceptedFamilyHashes.length ||
+      lane.target_reconciliation.identity_sha256 !== identitySetSha256(acceptedFamilyHashes)) {
+    throw new Error("message migration cannot complete without exact target-family reconciliation");
+  }
   return {
     expected_source_messages: expected,
     processed_source_messages: lane.source_messages,
@@ -448,6 +640,9 @@ export function verifyMessageAccounting(lane) {
     candidate_parts: lane.candidate_parts,
     accepted_parts_after_upgrade: acceptedAfterUpgrade,
     refused_parts_after_upgrade: refusedAfterUpgrade,
+    accepted_families: acceptedFamilyHashes.length,
+    reconciled_refused_families: lane.reconciled_refused_families,
+    reconciled_accepted_families: lane.reconciled_accepted_families,
   };
 }
 
@@ -473,7 +668,7 @@ export function messageCompletionReceipt(lane, completedAt = new Date().toISOStr
     run_id: runId,
     lane: "manual",
     completed_at: at.toISOString(),
-    complete_sweep: false,
+    complete_sweep: true,
     detail: [
       "Message migration complete",
       `expected=${accounting.expected_source_messages}`,
@@ -482,6 +677,9 @@ export function messageCompletionReceipt(lane, completedAt = new Date().toISOStr
       `legacy_unclassified=${accounting.legacy_unclassified_source_messages}`,
       `accepted_parts=${accounting.accepted_parts_after_upgrade}`,
       `refused_parts=${accounting.refused_parts_after_upgrade}`,
+      `families=${accounting.accepted_families}`,
+      `refusal_deletions=${accounting.reconciled_refused_families}`,
+      `accepted_family_reconciliations=${accounting.reconciled_accepted_families}`,
     ].join("; "),
   };
 }
@@ -502,17 +700,81 @@ export function verifyMessageTargetInventory(lane, inventory) {
     throw new Error(`message migration data is durable but ${pending} vector operations are still pending`);
   }
   const messageRow = inventory.rows.find((row) => row?.source_type === "message");
+  if (messageRow && messageRow.document_counts_exact !== true) {
+    throw new Error("message migration target readback is not based on exact live document counts");
+  }
+  if (!messageRow && (lane.target_documents !== 0 || lane.accepted_family_hashes.length !== 0)) {
+    throw new Error("message migration target readback is missing the message source");
+  }
   const stored = messageRow ? Number(messageRow.stored_documents) : 0;
+  const logical = messageRow ? Number(messageRow.logical_documents ?? messageRow.documents) : 0;
   if (!Number.isSafeInteger(stored) || stored < 0) {
     throw new Error("message migration target readback has no valid stored-document count");
   }
-  if (stored < lane.target_documents) {
-    throw new Error("message migration target readback contains fewer stored documents than accepted receipts");
+  if (stored !== lane.target_documents) {
+    throw new Error("message migration target readback does not exactly match accepted physical documents");
+  }
+  if (!Number.isSafeInteger(logical) || logical !== lane.accepted_family_hashes.length) {
+    throw new Error("message migration target readback does not exactly match reconciled logical families");
   }
   return {
     backend: "d1",
     stored_documents: stored,
+    logical_documents: logical,
     vector_backlog: 0,
+    verified_at: new Date().toISOString(),
+  };
+}
+
+export async function reconcileMessageTargetFamilies(lane, { listFn, deleteFn } = {}) {
+  if (typeof listFn !== "function" || typeof deleteFn !== "function") {
+    throw new Error("message target exact family reconciliation is required");
+  }
+  if (lane?.scope?.from || lane?.scope?.to) {
+    throw new Error("exact message target reconciliation requires an all-time source scope");
+  }
+  const expected = [...new Set(lane?.accepted_family_hashes || [])].sort();
+  const inspect = async () => {
+    const families = await listFn();
+    if (!Array.isArray(families)) throw new Error("message target family inventory is not an array");
+    const byHash = new Map();
+    let previous = "";
+    for (const family of families) {
+      if (typeof family !== "string" || !family.startsWith("message:") || family <= previous) {
+        throw new Error("message target family inventory has an invalid identity order");
+      }
+      const hash = familyIdentityHash(family);
+      if (byHash.has(hash)) throw new Error("message target family inventory has an identity collision");
+      byHash.set(hash, family);
+      previous = family;
+    }
+    return byHash;
+  };
+
+  let actual = await inspect();
+  const expectedSet = new Set(expected);
+  const missing = expected.filter((hash) => !actual.has(hash));
+  if (missing.length) {
+    throw new Error(`message target reconciliation is missing ${missing.length} expected families`);
+  }
+  const extras = [...actual.entries()]
+    .filter(([hash]) => !expectedSet.has(hash))
+    .map(([, family]) => family);
+  if (extras.length) {
+    const deletion = await deleteFn(extras);
+    if (deletion?.families !== extras.length) {
+      throw new Error("message target reconciliation extra-family deletion was not exactly confirmed");
+    }
+    actual = await inspect();
+  }
+  const finalHashes = [...actual.keys()].sort();
+  if (JSON.stringify(finalHashes) !== JSON.stringify(expected)) {
+    throw new Error("message target reconciliation did not converge to the exact expected identity set");
+  }
+  return {
+    expected_families: expected.length,
+    removed_extra_families: extras.length,
+    identity_sha256: identitySetSha256(expected),
     verified_at: new Date().toISOString(),
   };
 }
@@ -521,9 +783,12 @@ export async function runMessageMigration({
   state,
   queryFn,
   postFn,
+  reconcileFn,
+  listTargetFamiliesFn,
   saveFn = () => {},
   ownerLabel,
   groupingTimezone,
+  sourceBoundary,
   pageSize = 1000,
   maxRows = Infinity,
   dryRun = false,
@@ -612,7 +877,21 @@ export async function runMessageMigration({
     boundaryChanged = true;
   }
 
-  const fingerprint = messageMigrationConfigFingerprint(lane.scope);
+  const requestedBoundary = sourceBoundary === undefined
+    ? lane.source_boundary
+    : normalizeSourceBoundary(sourceBoundary);
+  if (!requestedBoundary) {
+    throw new Error("message migration needs a reviewed minimum source count and high-water hash");
+  }
+  if (lane.source_boundary && JSON.stringify(lane.source_boundary) !== JSON.stringify(requestedBoundary)) {
+    throw new Error("message migration reviewed source boundary changed; reset and reconcile the lane");
+  }
+  if (!lane.source_boundary) {
+    lane.source_boundary = requestedBoundary;
+    boundaryChanged = true;
+  }
+
+  const fingerprint = messageMigrationConfigFingerprint(lane.scope, GATE_VERSION, lane.source_boundary);
   if (lane.config_fingerprint && lane.config_fingerprint !== fingerprint) {
     throw new Error(
       "message migration configuration changed after the lane started; archive the checkpoint, reset, and reconcile the lane"
@@ -623,46 +902,78 @@ export async function runMessageMigration({
     boundaryChanged = true;
   }
 
-  if (!lane.high_water) {
-    const [high] = await queryFn(messageHighWaterSql(scope));
-    if (!high?.ts || !high?.id) {
-      lane.expected_source_messages = 0;
-      if (dryRun) return { status: "dry_run", run_rows: 0, run_pages: 0, ...lane };
-      lane.accounting = verifyMessageAccounting(lane);
-      lane.accounting_verified_at = new Date().toISOString();
-      lane.completed_at ||= lane.accounting_verified_at;
-      lane.complete = true;
-      saveFn(workingState);
-      return { status: "complete", run_rows: 0, run_pages: 0, ...lane };
-    }
-    if (!Number.isFinite(Date.parse(high.ts)) || !String(high.id).trim()) {
-      throw new Error("message migration source high-water mark is invalid");
-    }
-    lane.high_water = { ts: high.ts, id: high.id };
-    if (high.eligible_rows !== undefined) {
-      lane.expected_source_messages = parseExpectedCount(high.eligible_rows);
-      if (lane.expected_source_messages < 1) {
-        throw new Error("message migration source boundary count is inconsistent");
-      }
-    }
+  // This source-only check runs on every invocation and before any target
+  // mutation. It prevents an empty, truncated, or replaced project from using
+  // old target rows as evidence that the replay succeeded.
+  const reviewedBoundary = await verifyReviewedSourceBoundary({
+    queryFn,
+    scope: lane.scope,
+    boundary: lane.source_boundary,
+    lane,
+  });
+  if (!dryRun && (typeof reconcileFn !== "function" || typeof listTargetFamiliesFn !== "function")) {
+    throw new Error("message migration exact target deletion and inventory functions are required");
+  }
+  const deleteFamiliesFn = dryRun ? null : (families) => reconcileFn(
+    families.map((base_doc_uid) => ({ base_doc_uid, keep_doc_uids: [] })),
+  );
+  if (!lane.high_water && reviewedBoundary.marker) {
+    lane.high_water = reviewedBoundary.marker;
     boundaryChanged = true;
   }
   if (lane.expected_source_messages === null) {
-    const [count] = await queryFn(messageExpectedCountSql(lane.high_water, lane.scope));
-    lane.expected_source_messages = parseExpectedCount(count?.eligible_rows);
-    if (lane.expected_source_messages < lane.source_messages) {
-      throw new Error("message migration source count is below the already processed checkpoint");
-    }
+    lane.expected_source_messages = reviewedBoundary.eligibleRows;
     boundaryChanged = true;
   }
   if (boundaryChanged && !dryRun) saveFn(workingState);
 
   if (lane.complete) {
+    if (!dryRun) {
+      lane.target_reconciliation = await reconcileMessageTargetFamilies(lane, {
+        listFn: listTargetFamiliesFn,
+        deleteFn: deleteFamiliesFn,
+      });
+      // A process can save `complete` and crash before target readback or the
+      // source receipt. Reconciliation on that recovery run is another target
+      // mutation window, so repeat the frozen-prefix proof before returning a
+      // completion result.
+      await verifyReviewedSourceBoundary({
+        queryFn,
+        scope: lane.scope,
+        boundary: lane.source_boundary,
+        lane,
+      });
+    }
     lane.accounting = verifyMessageAccounting(lane);
     if (!lane.accounting_verified_at) {
       lane.accounting_verified_at = new Date().toISOString();
-      if (!dryRun) saveFn(workingState);
     }
+    if (!dryRun) saveFn(workingState);
+    return { status: "complete", run_rows: 0, run_pages: 0, ...lane };
+  }
+
+  if (lane.expected_source_messages === 0) {
+    if (dryRun) return { status: "dry_run", run_rows: 0, run_pages: 0, ...lane };
+    lane.target_reconciliation = await reconcileMessageTargetFamilies(lane, {
+      listFn: listTargetFamiliesFn,
+      deleteFn: deleteFamiliesFn,
+    });
+    lane.accounting = verifyMessageAccounting(lane);
+    // Recheck the frozen source prefix after target writes and immediately
+    // before certifying completion. A late backfill can sort behind the saved
+    // cursor; without this second read, the first snapshot count could remain
+    // balanced while a newly eligible historical row was silently omitted.
+    await verifyReviewedSourceBoundary({
+      queryFn,
+      scope: lane.scope,
+      boundary: lane.source_boundary,
+      lane,
+    });
+    lane.accounting_verified_at = new Date().toISOString();
+    lane.completed_at ||= lane.accounting_verified_at;
+    lane.complete = true;
+    lane.last_checkpoint_at = new Date().toISOString();
+    saveFn(workingState);
     return { status: "complete", run_rows: 0, run_pages: 0, ...lane };
   }
 
@@ -691,9 +1002,21 @@ export async function runMessageMigration({
         if (lane.source_messages !== lane.expected_source_messages) {
           throw new Error(`message migration accounting mismatch: processed ${lane.source_messages} of ${lane.expected_source_messages} eligible rows`);
         }
-        mergeTally(lane, await sendMessageEnvelopes(finalEnvelopes, postFn));
+        mergeTally(lane, await sendMessageEnvelopes(finalEnvelopes, postFn, { reconcileFn }));
         lane.active = [];
+        lane.target_reconciliation = await reconcileMessageTargetFamilies(lane, {
+          listFn: listTargetFamiliesFn,
+          deleteFn: deleteFamiliesFn,
+        });
         lane.accounting = verifyMessageAccounting(lane);
+        // See the empty-source completion branch above. This closes the same
+        // backfill race for a non-empty replay after its final target writes.
+        await verifyReviewedSourceBoundary({
+          queryFn,
+          scope: lane.scope,
+          boundary: lane.source_boundary,
+          lane,
+        });
         lane.accounting_verified_at = new Date().toISOString();
         lane.completed_at ||= lane.accounting_verified_at;
         lane.complete = true;
@@ -728,7 +1051,7 @@ export async function runMessageMigration({
         chars: envelope.content.length,
       });
     } else {
-      const tally = await sendMessageEnvelopes(envelopes, postFn);
+      const tally = await sendMessageEnvelopes(envelopes, postFn, { reconcileFn });
       mergeTally(lane, tally);
       lane.cursor = { ts: rows.at(-1).ts, id: rows.at(-1).id };
       lane.active = sessionizer.snapshot();
@@ -795,6 +1118,14 @@ async function main() {
   if (!accessToken) throw new Error("set SUPABASE_ACCESS_TOKEN; it is read at runtime and never stored");
   if (!dryRun && !targetUrl) throw new Error("pass --target or set BRAIN_URL");
   if (!dryRun && !adminKey) throw new Error("set ADMIN_KEY for the isolated target brain");
+  if (!/^\d+$/.test(String(flags["minimum-source-messages"] ?? "")) ||
+      !/^[a-f0-9]{64}$/i.test(String(flags["expected-high-water-sha256"] || ""))) {
+    throw new Error("pass --minimum-source-messages and --expected-high-water-sha256 from reviewed source evidence");
+  }
+  const minimumSourceMessages = Number(flags["minimum-source-messages"]);
+  if (!Number.isSafeInteger(minimumSourceMessages)) {
+    throw new Error("--minimum-source-messages is outside the safe integer range");
+  }
 
   const statePath = resolve(flags.state || ".brain-migration-message-sessions.json");
   if (flags.reset && existsSync(statePath)) throw new Error("--reset requires removing or archiving the existing state file deliberately");
@@ -804,9 +1135,19 @@ async function main() {
     state,
     queryFn,
     postFn: (items) => postTargetBatch({ targetUrl, adminKey, items }),
+    reconcileFn: (plans) => reconcileTargetFamilies({
+      targetUrl, adminKey, source: "message", plans,
+    }),
+    listTargetFamiliesFn: () => listTargetSourceFamilies({
+      targetUrl, adminKey, source: "message",
+    }),
     saveFn: (next) => saveMessageState(statePath, next),
     ownerLabel: flags["owner-label"],
     groupingTimezone: flags.timezone,
+    sourceBoundary: {
+      minimum_source_messages: minimumSourceMessages,
+      high_water_sha256: String(flags["expected-high-water-sha256"]).toLowerCase(),
+    },
     pageSize: positiveInt(flags["page-size"], 1000, 5000),
     maxRows: flags["max-rows"] ? positiveInt(flags["max-rows"], 10000) : dryRun ? 10000 : Infinity,
     dryRun,
@@ -843,6 +1184,10 @@ async function main() {
     accepted_parts: result.target_documents,
     refused_parts: result.refused,
     failed_parts: result.failed,
+    accepted_families: result.accepted_family_hashes?.length || 0,
+    reconciled_refused_families: result.reconciled_refused_families || 0,
+    reconciled_accepted_families: result.reconciled_accepted_families || 0,
+    removed_extra_families: result.target_reconciliation?.removed_extra_families || 0,
     active_sessions: result.active?.length || 0,
     would_create_documents: result.would_create_documents,
     would_create_parts: result.would_create_parts,

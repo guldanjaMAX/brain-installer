@@ -31,9 +31,17 @@
  * query.
  */
 
+import { currentEvidenceCandidates } from "./query-intent.js";
+
 const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
 const LEXICAL_CHAMPION_TARGET_RANK = 5;
+const CURRENT_INTENT_RRF_WEIGHT = 1.25;
+// The answer route reads at most 900 characters from a retrieved snippet. Keep
+// both modalities inside that window when their best chunks differ, rather than
+// letting either a keyword-heavy header or a semantically similar preamble erase
+// the other chunk's evidence.
+const COMPOSED_EVIDENCE_PART_MAX_CHARS = 400;
 
 /**
  * Vectorize caps a vector id at 64 BYTES.
@@ -85,6 +93,11 @@ export async function metadataTokenFor(value) {
 // to a corpus-size cutoff. The full eval set, not a guessed chunk threshold,
 // decides whether candidate depth is sufficient.
 const VECTOR_TOPK_MAX = 100;
+export const D1_QUERY_BIND_LIMIT = 100;
+// Ranking prefixes must not change because one route asked for 8 results and
+// another asked for 12. Both retrieval systems always contribute the same
+// bounded candidate depth; `limit` is applied only after fusion.
+export const RETRIEVAL_CANDIDATE_DEPTH = VECTOR_TOPK_MAX;
 
 /**
  * Reciprocal rank fusion.
@@ -94,20 +107,127 @@ const VECTOR_TOPK_MAX = 100;
  * A document absent from a list contributes nothing rather than a penalty,
  * which is what lets a strong keyword hit with no vector match still surface.
  */
-export function fuseRRF(lists, { k = RRF_K } = {}) {
+export function fuseRRF(lists, { k = RRF_K, keyOf = (item) => item?.chunk_uid } = {}) {
   const scores = new Map();
   const seen = new Map();
-  for (const { items, weight = 1.0 } of lists) {
+  let sequence = 0;
+  for (const { items, weight = 1.0, itemWeight = () => 1.0 } of lists) {
     items.forEach((item, i) => {
-      const uid = item.chunk_uid;
+      const uid = keyOf(item);
       if (!uid) return;
-      scores.set(uid, (scores.get(uid) || 0) + weight / (k + i + 1));
-      if (!seen.has(uid)) seen.set(uid, item);
+      const multiplier = Number(itemWeight(item));
+      const contribution = Number(weight) * (Number.isFinite(multiplier) ? Math.max(0, multiplier) : 1) / (k + i + 1);
+      if (!Number.isFinite(contribution) || contribution <= 0) return;
+      scores.set(uid, (scores.get(uid) || 0) + contribution);
+      const prior = seen.get(uid);
+      if (!prior || contribution > prior.contribution) {
+        seen.set(uid, { item, contribution, sequence: prior?.sequence ?? sequence++ });
+      }
     });
   }
   return [...scores.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([uid, score]) => ({ ...seen.get(uid), chunk_uid: uid, rrf_score: score }));
+    .sort((a, b) => b[1] - a[1] || seen.get(a[0]).sequence - seen.get(b[0]).sequence)
+    .map(([uid, score]) => ({ ...seen.get(uid).item, rrf_score: score }));
+}
+
+/** Public retrieval is document-ranked even though both indexes store chunks. */
+export function retrievalDocumentKey(row) {
+  return row?.content_hash
+    ? `${row.source || ""}|${row.content_hash}|${row.document_date ?? "undated"}`
+    : row?.doc_uid || `${row?.source || ""}|${row?.source_id || row?.title || row?.chunk_uid}`;
+}
+
+export function collapseRankedDocuments(items) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items || []) {
+    const key = retrievalDocumentKey(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function exactTermPositions(text, term) {
+  const positions = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const index = text.indexOf(term, cursor);
+    if (index < 0) break;
+    const before = index === 0 ? "" : text[index - 1];
+    const afterIndex = index + term.length;
+    const after = afterIndex >= text.length ? "" : text[afterIndex];
+    if (!/[a-z0-9]/i.test(before) && !/[a-z0-9]/i.test(after)) positions.push(index);
+    cursor = index + Math.max(1, term.length);
+  }
+  return positions;
+}
+
+function boundedEvidencePart(value, query) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= COMPOSED_EVIDENCE_PART_MAX_CHARS) return text;
+
+  const lower = text.toLowerCase();
+  const terms = [...new Set(String(query || "").toLowerCase().match(/[a-z0-9]+/g) || [])]
+    .filter((term) => term.length >= 2 && !FTS_STOPWORDS.has(term))
+    .map((term, order) => ({ term, order, positions: exactTermPositions(lower, term) }))
+    .filter((entry) => entry.positions.length > 0)
+    .sort((a, b) =>
+      a.positions.length - b.positions.length || b.term.length - a.term.length || a.order - b.order
+    );
+
+  let anchor = 0;
+  if (terms.length) {
+    // Anchor on the rarest matching query term. For repeated occurrences, use
+    // the window containing the most other query terms. This keeps an exact
+    // fact near the end of a long chunk instead of returning only its preamble.
+    let bestCoverage = -1;
+    for (const position of terms[0].positions) {
+      const start = Math.max(0, Math.min(
+        text.length - COMPOSED_EVIDENCE_PART_MAX_CHARS,
+        position - Math.floor(COMPOSED_EVIDENCE_PART_MAX_CHARS / 2),
+      ));
+      const window = lower.slice(start, start + COMPOSED_EVIDENCE_PART_MAX_CHARS);
+      const coverage = terms.reduce((count, entry) => count + (window.includes(entry.term) ? 1 : 0), 0);
+      if (coverage > bestCoverage) {
+        bestCoverage = coverage;
+        anchor = position;
+      }
+    }
+  }
+
+  const start = Math.max(0, Math.min(
+    text.length - COMPOSED_EVIDENCE_PART_MAX_CHARS,
+    anchor - Math.floor(COMPOSED_EVIDENCE_PART_MAX_CHARS / 2),
+  ));
+  const end = start + COMPOSED_EVIDENCE_PART_MAX_CHARS;
+  let excerpt = text.slice(start, end);
+  if (start > 0) excerpt = `…${excerpt.slice(1)}`;
+  if (end < text.length) excerpt = `${excerpt.slice(0, -1).trimEnd()}…`;
+  return excerpt;
+}
+
+/**
+ * One document can match keywords in one chunk and semantics in another. RRF
+ * ranks the document, so its public evidence must preserve both independent
+ * reasons it ranked. The bounded composition fits in /think's prompt window and
+ * remains deterministic; identical chunks are emitted only once.
+ */
+function composeDocumentEvidence(vectorRow, keywordRow, query) {
+  if (!keywordRow) return vectorRow;
+  if (!vectorRow) return keywordRow;
+
+  const keywordText = boundedEvidencePart(keywordRow.text, query);
+  const vectorText = boundedEvidencePart(vectorRow.text, query);
+  if (!keywordText) return { ...keywordRow, text: vectorText };
+  if (!vectorText || keywordRow.chunk_uid === vectorRow.chunk_uid || keywordText === vectorText) {
+    return { ...keywordRow, text: keywordText };
+  }
+  return {
+    ...keywordRow,
+    text: `Keyword-matched excerpt:\n${keywordText}\n\nSemantic excerpt from the same document:\n${vectorText}`,
+  };
 }
 
 /**
@@ -234,7 +354,7 @@ export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
   const sql = `
     SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
            c.client, c.category, c.top_folder, c.platform,
-           d.source_id, d.uri, d.content_hash,
+           d.source_id, d.uri, d.content_hash, d.date_source, d.date_reliable,
            bm25(chunks_fts) AS score
     FROM chunks_fts
     JOIN chunks c ON c.id = chunks_fts.rowid
@@ -293,20 +413,28 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
   }
   const resolved = ids.map((i) => hashMap.get(i) || i);
 
-  // Hydrate in ONE query, then restore Vectorize's ordering. A DB that returns
-  // rows in its own order would silently destroy the ranking, which is the
-  // whole point of having called the vector index.
-  const placeholders = resolved.map((_, i) => "?" + (i + 1)).join(",");
-  const f = filterSql(filters, "c", resolved.length + 1);
-  const { results } = await env.DB.prepare(
-    `SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
-            c.client, c.category, c.top_folder, c.platform,
-            d.source_id, d.uri, d.content_hash
-     FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid
-     WHERE c.chunk_uid IN (${placeholders})${f.clause}`
-  )
-    .bind(...resolved, ...f.params)
-    .all();
+  // D1 permits 100 bound values per statement. A full Vectorize page already
+  // contains 100 ids, so adding even one exact-authority filter used to make
+  // hydration fail and search silently degrade to keyword-only. Partition ids
+  // after reserving bind slots for every filter, then restore Vectorize order.
+  const filterParameterCount = filterSql(filters, "c", 1).params.length;
+  const hydrationBatchSize = Math.max(1, D1_QUERY_BIND_LIMIT - filterParameterCount);
+  const results = [];
+  for (let start = 0; start < resolved.length; start += hydrationBatchSize) {
+    const batch = resolved.slice(start, start + hydrationBatchSize);
+    const placeholders = batch.map((_, i) => "?" + (i + 1)).join(",");
+    const f = filterSql(filters, "c", batch.length + 1);
+    const { results: hydrated } = await env.DB.prepare(
+      `SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
+              c.client, c.category, c.top_folder, c.platform,
+              d.source_id, d.uri, d.content_hash, d.date_source, d.date_reliable
+       FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid
+       WHERE c.chunk_uid IN (${placeholders})${f.clause}`
+    )
+      .bind(...batch, ...f.params)
+      .all();
+    results.push(...(hydrated || []));
+  }
 
   const byUid = new Map((results || []).map((r) => [r.chunk_uid, r]));
   // A vector whose chunk is missing from D1 means the two systems have drifted.
@@ -321,7 +449,7 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
  * only promote a document that appears in one of the lists.
  */
 export async function search(env, { query, embedding, limit = 10, filters = {}, weights = {}, rrfK = RRF_K }) {
-  const pool = Math.min(Math.max(limit * 3, 30), VECTOR_TOPK_MAX);
+  const pool = RETRIEVAL_CANDIDATE_DEPTH;
   const fusionK = Math.min(Math.max(Number(rrfK) || RRF_K, 1), 1e3);
 
   const [kw, vec] = await Promise.all([
@@ -341,25 +469,37 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
         ? "no-embedding"
         : null;
 
-  const documentKey = (row) => row.content_hash
-    ? `${row.source || ""}|${row.content_hash}|${row.document_date ?? "undated"}`
-    : row.doc_uid || `${row.source || ""}|${row.source_id || row.title || row.chunk_uid}`;
+  // Collapse BEFORE assigning rank positions. Otherwise ten chunks from one
+  // file consume ten ranks, and keyword evidence in one chunk cannot combine
+  // with semantic evidence from another chunk in the same document.
+  const kwDocuments = collapseRankedDocuments(kw);
+  const vecDocuments = collapseRankedDocuments(vec);
+
+  const boundedWeight = (value, fallback = 1) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.min(Math.max(number, 0), 10) : fallback;
+  };
+  const sourceWeight = (row) => Object.prototype.hasOwnProperty.call(weights, row?.source)
+    ? boundedWeight(weights[row.source])
+    : 1;
 
   // FTS5's score ratio is meaningful inside one query even though its absolute
   // magnitude is not comparable across corpora or with Vectorize similarity.
   // A bounded third rank list can retain a clearly isolated lexical document
   // without blending those incompatible scores.
-  const lexicalWeight = Number(weights.keyword ?? 1.0);
-  const firstKeyword = kw[0] || null;
+  const vectorWeight = boundedWeight(weights.vector);
+  const lexicalWeight = boundedWeight(weights.keyword);
+  const firstKeyword = kwDocuments[0] || null;
   const firstKeywordMagnitude = Math.abs(Number(firstKeyword?.score));
-  const firstKeywordKey = firstKeyword ? documentKey(firstKeyword) : null;
+  const firstKeywordKey = firstKeyword ? retrievalDocumentKey(firstKeyword) : null;
   const nextKeywordDocument = firstKeywordKey === null
     ? null
-    : kw.find((row) => documentKey(row) !== firstKeywordKey) || null;
+    : kwDocuments.find((row) => retrievalDocumentKey(row) !== firstKeywordKey) || null;
   const nextKeywordMagnitude = Math.abs(Number(nextKeywordDocument?.score));
   const hasSelectiveKeywordChampion =
     limit >= LEXICAL_CHAMPION_TARGET_RANK &&
     lexicalWeight > 0 &&
+    sourceWeight(firstKeyword) > 0 &&
     Number.isFinite(firstKeywordMagnitude) &&
     nextKeywordDocument !== null &&
     Number.isFinite(nextKeywordMagnitude) &&
@@ -367,53 +507,74 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
     firstKeywordMagnitude >= nextKeywordMagnitude * LEXICAL_CHAMPION_RATIO;
 
   const rankLists = [
-    { items: vec, weight: weights.vector ?? 1.0 },
-    { items: kw, weight: weights.keyword ?? 1.0 },
+    { items: vecDocuments, weight: vectorWeight, itemWeight: sourceWeight },
+    { items: kwDocuments, weight: lexicalWeight, itemWeight: sourceWeight },
   ];
-  let fused = fuseRRF(rankLists, { k: fusionK });
+  const currentInputs = [
+    ...(vectorWeight > 0 ? vecDocuments : []),
+    ...(lexicalWeight > 0 ? kwDocuments : []),
+  ];
+  const currentDocuments = collapseRankedDocuments(
+    currentEvidenceCandidates(query, currentInputs, { filters, owner: env.BRAIN_OWNER }),
+  );
+  if (currentDocuments.length) {
+    rankLists.push({ items: currentDocuments, weight: CURRENT_INTENT_RRF_WEIGHT, itemWeight: sourceWeight });
+  }
+  let fused = fuseRRF(rankLists, { k: fusionK, keyOf: retrievalDocumentKey });
   if (hasSelectiveKeywordChampion) {
-    const seen = new Set();
-    const rankedDocuments = [];
-    for (const row of fused) {
-      const key = documentKey(row);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      rankedDocuments.push(row);
-    }
+    const rankedDocuments = fused;
     const championDocumentRank = rankedDocuments.findIndex(
-      (row) => documentKey(row) === firstKeywordKey,
+      (row) => retrievalDocumentKey(row) === firstKeywordKey,
     );
     if (championDocumentRank >= LEXICAL_CHAMPION_TARGET_RANK) {
-      const championChunk = fused.find((row) => row.chunk_uid === firstKeyword.chunk_uid);
+      const championChunk = fused.find((row) => retrievalDocumentKey(row) === firstKeywordKey);
       const cutoff = rankedDocuments[LEXICAL_CHAMPION_TARGET_RANK - 1];
       const requiredContribution = Number(cutoff?.rrf_score) - Number(championChunk?.rrf_score) + 1e-12;
-      const boundedWeight = Math.min(
+      const championSourceWeight = sourceWeight(firstKeyword) || 1;
+      const championBoostWeight = Math.min(
         lexicalWeight,
-        Math.max(0, requiredContribution * (fusionK + 1)),
+        Math.max(0, requiredContribution * (fusionK + 1) / championSourceWeight),
       );
-      if (Number.isFinite(boundedWeight) && boundedWeight > 0) {
+      if (Number.isFinite(championBoostWeight) && championBoostWeight > 0) {
         fused = fuseRRF([
           ...rankLists,
-          { items: [firstKeyword], weight: boundedWeight },
-        ], { k: fusionK });
+          { items: [firstKeyword], weight: championBoostWeight, itemWeight: sourceWeight },
+        ], { k: fusionK, keyOf: retrievalDocumentKey });
       }
     }
   }
 
-  // Retrieval ranks chunks, but the public result contract ranks documents.
-  // Collapse the wide fused pool BEFORE applying the caller's limit so a long
-  // file cannot consume several slots and evict a different document.
-  const seenDocuments = new Set();
+  // RRF combines document scores, but an answer still needs concrete evidence.
+  // Preserve both best chunks when the modalities found different passages in
+  // the same document. Choosing either one unconditionally fixes one failure by
+  // creating its mirror: a name-only keyword header can erase the semantic fact,
+  // just as a generic vector chunk can erase an exact billing statement.
+  const vectorRepresentatives = new Map();
+  if (vectorWeight > 0) {
+    for (const row of vecDocuments) {
+      const key = retrievalDocumentKey(row);
+      if (!vectorRepresentatives.has(key)) vectorRepresentatives.set(key, row);
+    }
+  }
+  const keywordRepresentatives = new Map();
+  if (lexicalWeight > 0) {
+    for (const row of kwDocuments) {
+      const key = retrievalDocumentKey(row);
+      if (!keywordRepresentatives.has(key)) keywordRepresentatives.set(key, row);
+    }
+  }
+  fused = fused.map((row) => {
+    const key = retrievalDocumentKey(row);
+    const representative = composeDocumentEvidence(
+      vectorRepresentatives.get(key), keywordRepresentatives.get(key), query,
+    );
+    return representative
+      ? { ...row, ...representative, rrf_score: row.rrf_score }
+      : row;
+  });
+
   const documents = [];
   for (const row of fused) {
-    // Exact copies under different paths should not consume several public
-    // result slots. Preserve source and date because identical text can be a
-    // legitimate repeated record or message at a different time, and because
-    // a source filter must never be collapsed into evidence from another
-    // connector. Rows from an older schema still fall back to document identity.
-    const key = documentKey(row);
-    if (seenDocuments.has(key)) continue;
-    seenDocuments.add(key);
     // content_hash is an internal dedupe key, not part of the authenticated
     // search response contract or a stable source identifier for clients.
     const { content_hash: _internalContentHash, ...publicRow } = row;

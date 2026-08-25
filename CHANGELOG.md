@@ -4,6 +4,27 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.14
+
+**Current-status answers now fail closed on stale or wrong-authority evidence,
+and complete message replays prove the exact source and target before they can
+report success.**
+
+- Explicit current questions rank the newest reliable evidence for the named
+  subject without allowing another named person, the brain owner, or an
+  unverified file date to take its place. Historically bounded questions stay
+  historical even when they contain words such as “latest” or “current.”
+- Billing and subscription systems can establish invoice, account, and
+  subscription state, but they cannot establish an ongoing client relationship.
+  Mixed claims are checked clause by clause and unsupported relationship claims
+  are refused.
+- Hybrid retrieval now preserves both the keyword and semantic passages that
+  caused a document to rank, including relevant text late in a long chunk.
+- Full message replay reconciles exact logical families, removes obsolete split
+  parts and refused legacy copies, recounts live physical documents, and checks
+  the frozen source again immediately before every completion path. A backfilled
+  historical row blocks completion instead of being silently missed.
+
 ## 0.1.13
 
 **Repeated evidence no longer crowds out real results, migrations resume

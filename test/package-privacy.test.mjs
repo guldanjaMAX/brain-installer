@@ -121,6 +121,7 @@ const expected = [
   "templates/brain.manifest.json",
   "worker/src/index.js",
   "worker/src/lib/core.js",
+  "worker/src/lib/query-intent.js",
   "worker/src/lib/secret-scan.js",
   "worker/src/lib/store-d1.js",
   "worker/src/lib/store.js",

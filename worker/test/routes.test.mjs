@@ -48,7 +48,7 @@ function mkEnv(rows, { vectorIds = [], vectorThrows = false, countRow = null, ex
 const ROW = {
   chunk_uid: "meeting:123#0", doc_uid: "meeting:123", text: "We agreed to defer the retainer.",
   source: "meeting", source_id: "123", uri: "meeting://123", title: "Q3 sync", document_date: 1750000000000, client: "Acme", category: "meeting",
-  top_folder: "Clients", platform: "imessage",
+  date_reliable: 1, date_source: "fixture:event_date", top_folder: "Clients", platform: "imessage",
 };
 const call = (env, path) => {
   const url = new URL("https://b.example" + path);
@@ -104,8 +104,22 @@ const call = (env, path) => {
   check("unified returns results from D1", r.status === 200 && b.results.length === 1, JSON.stringify(b).slice(0, 200));
   check("private questions are not echoed in retrieval responses", !("query" in b), JSON.stringify(b));
   check("a hit carries its document date", b.results[0].ts === new Date(1750000000000).toISOString());
+  check("a hit exposes whether that date is reliable and where it came from",
+    b.results[0].date_reliable === true && b.results[0].date_source === "fixture:event_date", JSON.stringify(b.results[0]));
   check("and its client", b.results[0].client === "Acme");
   check("a hit exposes stable document identity, not its chunk id", b.results[0].ref_key === "123" && b.results[0].chunk_uid === "meeting:123#0", JSON.stringify(b.results[0]));
+}
+
+/* The public source-weight contract is live on D1, including an explicit zero. */
+{
+  const drive = { ...ROW, chunk_uid: "drive-weight#0", doc_uid: "drive-weight", source_id: "drive-weight", source: "drive", title: "Acme drive" };
+  const message = { ...ROW, chunk_uid: "message-weight#0", doc_uid: "message-weight", source_id: "message-weight", source: "message", title: "Acme message" };
+  const { env } = mkEnv([drive, message], { vectorIds: [] });
+  const weighted = await (await call(env, "/api/rag/unified?q=Acme&limit=2&rerank=0&weight_message=5")).json();
+  check("D1 source weighting changes the public order", weighted.results[0]?.source === "message", JSON.stringify(weighted.results));
+  const disabled = await (await call(env, "/api/rag/unified?q=Acme&limit=2&rerank=0&weight_message=0")).json();
+  check("an explicit zero source weight is not rewritten to one",
+    disabled.results.length === 1 && disabled.results[0]?.source === "drive", JSON.stringify(disabled.results));
 }
 
 /* Multiple matching chunks from one document consume one public result slot. */
@@ -114,6 +128,33 @@ const call = (env, path) => {
   const { env } = mkEnv([ROW, second], { vectorIds: ["meeting:123#0", "meeting:123#1"] });
   const b = await (await call(env, "/api/rag/unified?q=retainer&limit=5")).json();
   check("one document cannot crowd out the result page with repeat chunks", b.results.length === 1, JSON.stringify(b.results));
+}
+
+/* Every route and public limit normalizes the same fixed pre-slice window. */
+{
+  const substantive = (index) => ({
+    ...ROW, chunk_uid: `substantive-${index}#0`, doc_uid: `substantive-${index}`,
+    source_id: `substantive-${index}`, title: `Substantive record ${index}`,
+    text: `Roadmap evidence ${index}`,
+  });
+  const scaffolding = Array.from({ length: 25 }, (_, index) => ({
+    ...ROW, chunk_uid: `scaffold-${index}#0`, doc_uid: `scaffold-${index}`,
+    source_id: `scaffold-${index}`, title: index % 2 ? "README.md" : "package-lock.json",
+    text: `Roadmap scaffolding ${index}`,
+  }));
+  const rows = [
+    ...Array.from({ length: 5 }, (_, index) => substantive(index)),
+    ...scaffolding,
+    ...Array.from({ length: 20 }, (_, index) => substantive(index + 5)),
+  ];
+  const { env } = mkEnv(rows, { vectorIds: [] });
+  const small = await (await call(env, "/api/rag/unified?q=roadmap&limit=10&rerank=0")).json();
+  const wide = await (await call(env, "/api/rag/unified?q=roadmap&limit=50&rerank=0")).json();
+  check("scaffolding demotion has one route-independent ranking prefix",
+    small.results.map((row) => row.ref_key).join(",") ===
+      wide.results.slice(0, 10).map((row) => row.ref_key).join(",") &&
+      small.results.every((row) => !/README|package-lock/.test(row.title || "")),
+    JSON.stringify({ small: small.results, wide: wide.results.slice(0, 10) }));
 }
 
 /* ---- a filter must reach the database, not be dropped on the floor ---- */
@@ -189,6 +230,319 @@ const call = (env, path) => {
   check("the evidence gate requires every material part", /every material part/.test(gate?.messages?.[0]?.content || ""), JSON.stringify(gate));
   check("the answer contract forbids cross-entity evidence transfer", /different entity or context/.test(system), system);
   check("ambiguous owner context requires an explicit evidence tie", /tie it to the brain owner/.test(system), system);
+  check("the answer contract treats older evidence as history for current-status questions",
+    /older source establishes history only/.test(system), system);
+  check("the temporal contract says billing activity alone cannot establish relationship status",
+    /Billing or payment activity alone/.test(system) &&
+      /newest cited document must itself explicitly support/i.test(gate?.messages?.[0]?.content || ""),
+    JSON.stringify({ system, gate }));
+}
+
+/* ---- current-status ranking and citations share one deterministic timeline ---- */
+{
+  const stale = {
+    ...ROW,
+    chunk_uid: "taylor-stale#0", doc_uid: "taylor-stale", source_id: "taylor-stale", source: "message",
+    title: "Taylor account summary", text: "Taylor was listed as an active client.",
+    document_date: Date.parse("2026-05-01T00:00:00Z"), date_reliable: 1, date_source: "fixture:summary_date",
+  };
+  const current = {
+    ...ROW,
+    chunk_uid: "taylor-current#0", doc_uid: "taylor-current", source_id: "taylor-current", source: "message",
+    title: "Taylor conversation", text: "Taylor confirmed the engagement remains active. The August invoice payment failed for insufficient funds.",
+    document_date: Date.parse("2026-08-19T00:00:00Z"), date_reliable: 1, date_source: "fixture:message_timestamp",
+  };
+  const currentQuestion = "What is going on with billing with Taylor? Are they still a client?";
+  const path = `/api/rag/unified?q=${encodeURIComponent(currentQuestion)}&limit=2&rerank=0`;
+  const thinkPath = `/api/rag/think?q=${encodeURIComponent(currentQuestion)}&limit=2`;
+  const { env } = mkEnv([stale, current], {
+    vectorIds: [],
+    extra: {
+      AI: {
+        run: async (model, input) => {
+          if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+            ? { response: { supported: true, complete: true, evidence: [1], reason: "newest direct evidence" }, usage: {} }
+            : { response: "Taylor is still an active client as of 2026-08-19 [1]. The August payment failed for insufficient funds [1].", usage: {} };
+        },
+      },
+    },
+  });
+  const unified = await (await call(env, path)).json();
+  const think = await (await call(env, thinkPath)).json();
+  const configuredProvider = await (await call(
+    { ...env, ANTHROPIC_API_KEY: "fixture-provider-key" },
+    `/api/rag/unified?q=${encodeURIComponent(currentQuestion)}&limit=2`,
+  )).json();
+  check("explicit current intent places the newest reliable entity evidence first",
+    unified.results[0]?.ref_key === "taylor-current", JSON.stringify(unified.results));
+  check("unified and think expose the same deterministic result prefix",
+    unified.results.map((row) => row.ref_key).join(",") === think.results.map((row) => row.ref_key).join(","),
+    JSON.stringify({ unified: unified.results, think: think.results }));
+  check("a configured rerank provider does not change ordering unless rerank is explicitly enabled",
+    configuredProvider.reranked === false &&
+      configuredProvider.results.map((row) => row.ref_key).join(",") === think.results.map((row) => row.ref_key).join(","),
+    JSON.stringify(configuredProvider));
+  check("the newest current-status citation keeps its date provenance",
+    think.answer?.includes("still an active client") && think.citations[0]?.ref === "taylor-current" &&
+      think.citations[0]?.date_reliable === true && think.citations[0]?.date_source === "fixture:message_timestamp",
+    JSON.stringify(think));
+}
+
+/* Co-citing a newest billing event cannot refresh an older relationship claim. */
+{
+  const stale = {
+    ...ROW,
+    chunk_uid: "billing-stale#0", doc_uid: "billing-stale", source_id: "billing-stale", source: "message",
+    title: "Taylor old relationship", text: "Taylor was an active client in May.",
+    document_date: Date.parse("2026-05-01T00:00:00Z"), date_reliable: 1,
+  };
+  const billingOnly = {
+    ...ROW,
+    chunk_uid: "billing-current#0", doc_uid: "billing-current", source_id: "billing-current", source: "message",
+    title: "Taylor August invoice", text: "Taylor's August invoice payment failed for insufficient funds.",
+    document_date: Date.parse("2026-08-19T00:00:00Z"), date_reliable: 1,
+  };
+  const { env } = mkEnv([stale, billingOnly], {
+    vectorIds: [],
+    extra: {
+      AI: {
+        run: async (model, input) => {
+          if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+            ? { response: { supported: true, complete: true, evidence: [1, 2], reason: "both records were cited" }, usage: {} }
+            : { response: "Taylor is still an active client as of 2026-08-19 [1][2]. The August payment failed for insufficient funds [1].", usage: {} };
+        },
+      },
+    },
+  });
+  const question = encodeURIComponent("What is going on with billing with Taylor? Are they still a client?");
+  const body = await (await call(env, `/api/rag/think?q=${question}&limit=2`)).json();
+  check("newest billing-only evidence cannot establish an ongoing client relationship",
+    body.answer === "The documents do not answer the question." &&
+      /did not itself support/.test(body.evidence_gate?.reason || ""), JSON.stringify(body));
+}
+
+/* Authority is claim-scoped. Transaction systems can prove their own account
+   state, but a provider's Customer object is not an active client relationship. */
+{
+  const currentRow = (source, text) => ({
+    ...ROW,
+    chunk_uid: `${source}-authority#0`, doc_uid: `${source}-authority`, source_id: `${source}-authority`,
+    source, title: "Taylor current record", text,
+    document_date: Date.parse("2026-08-20T00:00:00Z"), date_reliable: 1,
+    date_source: "fixture:provider_snapshot",
+  });
+  const answerEnv = (row, answer) => mkEnv([row], {
+    vectorIds: [],
+    extra: {
+      AI: {
+        run: async (model, input) => {
+          if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+            ? { response: { supported: true, complete: true, evidence: [1], reason: "fixture approval" }, usage: {} }
+            : { response: answer, usage: {} };
+        },
+      },
+    },
+  }).env;
+
+  const stripeRelationship = await (await call(
+    answerEnv(
+      currentRow("stripe", "Customer Taylor. Subscription active. Account open."),
+      "Taylor is still a client [1].",
+    ),
+    `/api/rag/think?q=${encodeURIComponent("Is Taylor still a client?")}&limit=1`,
+  )).json();
+  check("a Stripe customer or subscription cannot prove an active client relationship",
+    stripeRelationship.answer === "The documents do not answer the question." &&
+      /did not itself support/.test(stripeRelationship.evidence_gate?.reason || ""),
+    JSON.stringify(stripeRelationship));
+
+  const stripeImpliedRelationship = await (await call(
+    answerEnv(
+      currentRow("stripe", "Customer Taylor. Subscription active. Account open."),
+      "Taylor remains active [1].",
+    ),
+    `/api/rag/think?q=${encodeURIComponent("Is Taylor still a client?")}&limit=1`,
+  )).json();
+  check("an implied relationship claim cannot bypass Stripe's claim scope",
+    stripeImpliedRelationship.answer === "The documents do not answer the question." &&
+      /did not itself support/.test(stripeImpliedRelationship.evidence_gate?.reason || ""),
+    JSON.stringify(stripeImpliedRelationship));
+
+  const stripeMixedRelationship = await (await call(
+    answerEnv(
+      currentRow("stripe", "Customer Taylor. Subscription active. Account open."),
+      "Taylor's account is active, and the relationship remains ongoing [1].",
+    ),
+    `/api/rag/think?q=${encodeURIComponent("Is Taylor still a client?")}&limit=1`,
+  )).json();
+  check("a transaction clause cannot hide an unsupported relationship claim",
+    stripeMixedRelationship.answer === "The documents do not answer the question." &&
+      /did not itself support/.test(stripeMixedRelationship.evidence_gate?.reason || ""),
+    JSON.stringify(stripeMixedRelationship));
+
+  const crmRelationship = await (await call(
+    answerEnv(
+      currentRow("crm", "Taylor is an active client; the relationship remains active."),
+      "Taylor is still an active client [1].",
+    ),
+    `/api/rag/think?q=${encodeURIComponent("Is Taylor still a client?")}&limit=1`,
+  )).json();
+  check("a live CRM relationship record can establish current client status",
+    crmRelationship.answer === "Taylor is still an active client [1].",
+    JSON.stringify(crmRelationship));
+
+  const oppositeCrmRelationship = await (await call(
+    answerEnv(
+      currentRow("crm", "Taylor client relationship inactive and closed."),
+      "Taylor is still an active client [1].",
+    ),
+    `/api/rag/think?q=${encodeURIComponent("Is Taylor still an active client?")}&limit=1`,
+  )).json();
+  check("an authoritative CRM record must support the claimed status polarity",
+    oppositeCrmRelationship.answer === "The documents do not answer the question." &&
+      /did not itself support/.test(oppositeCrmRelationship.evidence_gate?.reason || ""),
+    JSON.stringify(oppositeCrmRelationship));
+
+  const matchingNegativeCrm = await (await call(
+    answerEnv(
+      currentRow("crm", "Taylor client relationship inactive and closed."),
+      "Taylor is no longer an active client [1].",
+    ),
+    `/api/rag/think?q=${encodeURIComponent("Is Taylor still an active client?")}&limit=1`,
+  )).json();
+  check("a matching negative CRM relationship state remains answerable",
+    matchingNegativeCrm.answer === "Taylor is no longer an active client [1].",
+    JSON.stringify(matchingNegativeCrm));
+
+  const stripeSubscription = await (await call(
+    answerEnv(
+      currentRow("stripe", "Taylor subscription active. Account open."),
+      "Taylor's subscription is currently active [1].",
+    ),
+    `/api/rag/think?q=${encodeURIComponent("Is Taylor's subscription currently active?")}&limit=1`,
+  )).json();
+  check("Stripe remains authoritative for its own subscription status",
+    stripeSubscription.answer === "Taylor's subscription is currently active [1].",
+    JSON.stringify(stripeSubscription));
+}
+
+/* Negative current-status language and missing as-of dates are gated too. */
+{
+  const stale = {
+    ...ROW,
+    chunk_uid: "negative-stale#0", doc_uid: "negative-stale", source_id: "negative-stale", source: "message",
+    title: "Taylor old relationship", text: "Taylor was an active client.",
+    document_date: Date.parse("2026-05-01T00:00:00Z"), date_reliable: 1,
+  };
+  const current = {
+    ...ROW,
+    chunk_uid: "negative-current#0", doc_uid: "negative-current", source_id: "negative-current", source: "message",
+    title: "Taylor current relationship", text: "Taylor's engagement remains active.",
+    document_date: Date.parse("2026-08-19T00:00:00Z"), date_reliable: 1,
+  };
+  const answerEnv = (answer, evidence) => mkEnv([stale, current], {
+    vectorIds: [],
+    extra: {
+      AI: {
+        run: async (model, input) => {
+          if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+            ? { response: { supported: true, complete: true, evidence, reason: "fixture approval" }, usage: {} }
+            : { response: answer, usage: {} };
+        },
+      },
+    },
+  }).env;
+  const question = encodeURIComponent("What is Taylor's current client status?");
+  const negative = await (await call(
+    answerEnv("Taylor is no longer a client [2].", [2]),
+    `/api/rag/think?q=${question}&limit=2`,
+  )).json();
+  check("no-longer status language cannot rely on stale evidence",
+    negative.answer === "The documents do not answer the question." &&
+      /older evidence/.test(negative.evidence_gate?.reason || ""), JSON.stringify(negative));
+  const unqualified = await (await call(
+    answerEnv("Taylor is still an active client [1].", [1]),
+    `/api/rag/think?q=${question}&limit=2`,
+  )).json();
+  check("a non-authoritative current-status claim requires an exact as-of date",
+    unqualified.answer === "The documents do not answer the question." &&
+      /exact as-of date/.test(unqualified.evidence_gate?.reason || ""), JSON.stringify(unqualified));
+}
+
+/* A missing reliable timeline must engage the deterministic gate rather than
+   handing the decision entirely to a permissive semantic verifier. */
+{
+  const unreliable = {
+    ...ROW,
+    chunk_uid: "unreliable-current#0", doc_uid: "unreliable-current", source_id: "unreliable-current",
+    source: "message", title: "Taylor status note", text: "Taylor remains an active client.",
+    document_date: Date.parse("2026-08-20T00:00:00Z"), date_reliable: 0,
+    date_source: "fixture:file_mtime",
+  };
+  const { env } = mkEnv([unreliable], {
+    vectorIds: [],
+    extra: {
+      AI: {
+        run: async (model, input) => {
+          if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          return String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+            ? { response: { supported: true, complete: true, evidence: [1], reason: "fixture approval" }, usage: {} }
+            : { response: "Taylor is still an active client [1].", usage: {} };
+        },
+      },
+    },
+  });
+  const body = await (await call(
+    env,
+    `/api/rag/think?q=${encodeURIComponent("Is Taylor still a client right now?")}&limit=1`,
+  )).json();
+  check("a present-status claim fails closed when no reliable-dated evidence exists",
+    body.answer === "The documents do not answer the question." &&
+      /no reliable-dated evidence/.test(body.evidence_gate?.reason || ""),
+    JSON.stringify(body));
+}
+
+{
+  const stale = {
+    ...ROW,
+    chunk_uid: "stale-status#0", doc_uid: "stale-status", source_id: "stale-status", source: "message",
+    title: "Taylor old status", text: "Taylor was listed as an active client.",
+    document_date: Date.parse("2026-05-01T00:00:00Z"), date_reliable: 1,
+  };
+  const current = {
+    ...ROW,
+    chunk_uid: "current-status#0", doc_uid: "current-status", source_id: "current-status", source: "message",
+    title: "Taylor current status", text: "Taylor confirmed the engagement remains active in the newest conversation.",
+    document_date: Date.parse("2026-08-19T00:00:00Z"), date_reliable: 1,
+  };
+  const gatePrompts = [];
+  const { env } = mkEnv([stale, current], {
+    vectorIds: [],
+    extra: {
+      AI: {
+        run: async (model, input) => {
+          if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          if (String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")) {
+            gatePrompts.push(input);
+            return { response: { supported: true, complete: true, evidence: [2], reason: "stale statement is explicit" }, usage: {} };
+          }
+          return { response: "Taylor is still an active client [2].", usage: {} };
+        },
+      },
+    },
+  });
+  const question = encodeURIComponent("What is Taylor's current client status? Are they still active?");
+  const body = await (await call(env, `/api/rag/think?q=${question}&limit=2`)).json();
+  check("a stale-only citation cannot establish present status when newer direct evidence exists",
+    body.answer === "The documents do not answer the question." && body.evidence_gate?.supported === false &&
+      /newer direct evidence/.test(body.evidence_gate?.reason || ""), JSON.stringify(body));
+  check("the semantic verifier receives the newest direct evidence for comparison",
+    /NEWEST RELIABLE-DATED DIRECT EVIDENCE/.test(gatePrompts[0]?.messages?.at(-1)?.content || ""),
+    JSON.stringify(gatePrompts));
 }
 
 {
@@ -714,7 +1068,7 @@ function mkSourceFamilyEnv(documents, extra = {}) {
 /* ---- documents reports the backend and the vector backlog ---- */
 {
   const { env } = mkEnv([{
-    source_type: "meeting", documents: 3, logical_documents: 2,
+    source_type: "meeting", stored_documents: 3, logical_documents: 2,
     total: 4, embedded: 4, last_ingest_at: 1750000000000,
   }]);
   const documentsResponse = await call(env, "/api/admin/brain/documents");

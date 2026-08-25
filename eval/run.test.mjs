@@ -519,6 +519,72 @@ test("an answerable case executes deterministic claims and citation resolution w
   assert.match(result.stdout, /no semantic judge or faithfulness claim/);
 });
 
+test("a current-status canary requires newest direct evidence in the top five and for every answer claim", async () => {
+  const question = "What is going on with billing with Taylor? Are they still a client?";
+  const result = await runFixture({
+    questions: [{
+      id: "current-status-two-claim",
+      kind: "single",
+      risk: "critical",
+      domains: ["billing", "client-status"],
+      formats: ["message"],
+      question,
+      expect: [{
+        slot_id: "newest-direct-evidence",
+        doc: "Taylor current conversation",
+        any_of: ["message:taylor-current"],
+      }],
+      answer_expect: {
+        claim_boundary: "sentence",
+        claims: [
+          {
+            claim_id: "billing-status",
+            contains_any: ["the August invoice payment failed for insufficient funds"],
+            evidence_slot_ids: ["newest-direct-evidence"],
+          },
+          {
+            claim_id: "client-status",
+            contains_any: ["Taylor remains an active client"],
+            evidence_slot_ids: ["newest-direct-evidence"],
+          },
+        ],
+      },
+    }],
+    artifacts: true,
+    route: ({ url }) => {
+      if (url.searchParams.get("q") !== question) return null;
+      if (url.pathname === "/api/rag/unified") {
+        return {
+          body: {
+            results: [
+              { source: "message", ref_key: "taylor-stale", title: "Taylor old summary" },
+              { source: "curated", ref_key: "noise-1", title: "Noise 1" },
+              { source: "curated", ref_key: "noise-2", title: "Noise 2" },
+              { source: "curated", ref_key: "noise-3", title: "Noise 3" },
+              { source: "message", ref_key: "taylor-current", title: "Taylor current conversation" },
+            ],
+          },
+        };
+      }
+      if (url.pathname === "/api/rag/think") {
+        return {
+          body: {
+            answer: "The August invoice payment failed for insufficient funds [1]. Taylor remains an active client [1].",
+            citations: [{ n: 1, source: "message", ref: "taylor-current", title: "Taylor current conversation" }],
+            gaps: [],
+          },
+        };
+      }
+      return null;
+    },
+  });
+
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(result.runArtifact.cases[0].satisfied_at, 5);
+  assert.equal(result.runArtifact.cases[0].deterministic_answer.pass, true);
+  assert.equal(result.runArtifact.cases[0].deterministic_answer.resolved_claims, 2);
+});
+
 test("a critical answer with a citation to the wrong source fails the gate", async () => {
   const result = await runFixture({
     questions: [{

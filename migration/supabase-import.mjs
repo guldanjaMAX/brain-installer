@@ -476,6 +476,169 @@ export async function getTargetInventory({
   return body;
 }
 
+/** Read every live logical family for one target source without putting a private cursor in a URL. */
+export async function listTargetSourceFamilies({
+  targetUrl, adminKey, source, fetchImpl = fetch, timeoutMs = 30_000,
+  maxResponseBytes = TARGET_RESPONSE_MAX_BYTES,
+}) {
+  if (!targetUrl) throw new Error("BRAIN_URL is missing");
+  if (!adminKey) throw new Error("ADMIN_KEY is missing");
+  const normalizedSource = String(source || "").trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(normalizedSource)) {
+    throw new Error("target family source is invalid");
+  }
+  const endpoint = new URL(`${cleanUrl(targetUrl)}/api/admin/brain/source-families`);
+  const families = [];
+  const seenCursors = new Set();
+  let cursor = "";
+  for (;;) {
+    if (seenCursors.has(cursor)) throw new Error("target family inventory repeated a cursor");
+    seenCursors.add(cursor);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let response;
+    let raw;
+    try {
+      response = await fetchBrainWithAdminKey(fetchImpl, endpoint.href, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: normalizedSource,
+          limit: 1000,
+          ...(cursor ? { cursor } : {}),
+        }),
+        signal: controller.signal,
+      }, () => adminKey);
+      assertExactResponseUrl(response, endpoint, "target family inventory");
+      raw = await readBoundedResponseText(response, {
+        maxBytes: maxResponseBytes,
+        label: "target family inventory response",
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") throw new Error(`target family inventory timed out after ${timeoutMs}ms`);
+      throw new Error(`target family inventory failed: ${error?.message || error}`);
+    } finally {
+      clearTimeout(timer);
+    }
+    let body;
+    try { body = JSON.parse(raw); }
+    catch { throw new Error(`target family inventory returned non-JSON (${response.status})`); }
+    if (!response.ok) throw new Error(`target family inventory returned ${response.status}`);
+    if (body?.source !== normalizedSource || !Array.isArray(body?.families) || body.families.length > 1000) {
+      throw new Error("target family inventory returned an invalid page");
+    }
+    let previous = cursor;
+    for (const family of body.families) {
+      if (typeof family !== "string" || !family.startsWith(`${normalizedSource}:`) || family <= previous) {
+        throw new Error("target family inventory returned an invalid identity order");
+      }
+      families.push(family);
+      previous = family;
+    }
+    if (body.next_cursor === null) return families;
+    if (typeof body.next_cursor !== "string" || !body.families.length ||
+        body.next_cursor !== body.families.at(-1)) {
+      throw new Error("target family inventory returned an invalid next cursor");
+    }
+    cursor = body.next_cursor;
+  }
+}
+
+/**
+ * Idempotently remove exact logical families and validate the authenticated
+ * receipt without ever including their identities in an error or aggregate.
+ */
+export async function reconcileTargetFamilies({
+  targetUrl, adminKey, source, plans, fetchImpl = fetch, timeoutMs = 30_000,
+  maxResponseBytes = TARGET_RESPONSE_MAX_BYTES,
+}) {
+  if (!targetUrl) throw new Error("BRAIN_URL is missing");
+  if (!adminKey) throw new Error("ADMIN_KEY is missing");
+  const normalizedSource = String(source || "").trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(normalizedSource)) {
+    throw new Error("target family deletion source is invalid");
+  }
+  const normalized = (plans || []).map((plan) => ({
+    base_doc_uid: String(plan?.base_doc_uid || ""),
+    keep_doc_uids: [...new Set((plan?.keep_doc_uids || []).map(String))].sort(),
+  })).sort((left, right) => left.base_doc_uid.localeCompare(right.base_doc_uid));
+  if (new Set(normalized.map((plan) => plan.base_doc_uid)).size !== normalized.length) {
+    throw new Error("target family reconciliation repeats an identity");
+  }
+  for (const plan of normalized) {
+    const family = plan.base_doc_uid;
+    if (!family.startsWith(`${normalizedSource}:`) || /[\u0000-\u001f\u007f]/.test(family) ||
+        new TextEncoder().encode(family).length > 16 * 1024 ||
+        plan.keep_doc_uids.some((uid) =>
+          uid !== family && !uid.startsWith(`${family}#part`)
+        )) {
+      throw new Error("target family deletion contains an invalid identity");
+    }
+  }
+  if (!normalized.length) return { families: 0, documents: 0, vector_cleanup_queued: 0 };
+
+  const endpoint = new URL(`${cleanUrl(targetUrl)}/api/admin/brain/forget`);
+  let documents = 0;
+  let vectorCleanupQueued = 0;
+  for (let offset = 0; offset < normalized.length; offset += 50) {
+    const group = normalized.slice(offset, offset + 50);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let response;
+    let raw;
+    try {
+      response = await fetchBrainWithAdminKey(fetchImpl, endpoint.href, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          families: group,
+          confirm: true,
+        }),
+        signal: controller.signal,
+      }, () => adminKey);
+      assertExactResponseUrl(response, endpoint, "target family deletion");
+      raw = await readBoundedResponseText(response, {
+        maxBytes: maxResponseBytes,
+        label: "target family deletion response",
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") throw new Error(`target family deletion timed out after ${timeoutMs}ms`);
+      throw new Error(`target family deletion failed: ${error?.message || error}`);
+    } finally {
+      clearTimeout(timer);
+    }
+    let body;
+    try { body = JSON.parse(raw); }
+    catch { throw new Error(`target family deletion returned non-JSON (${response.status})`); }
+    if (!response.ok) throw new Error(`target family deletion returned ${response.status}`);
+    const targets = body?.targets;
+    const removed = Number(body?.documents);
+    const queued = Number(body?.vector_cleanup_queued || 0);
+    if (body?.dry_run !== false || !Array.isArray(targets) ||
+        !Number.isSafeInteger(removed) || removed < 0 || removed !== targets.length ||
+        !Number.isSafeInteger(queued) || queued < 0 || new Set(targets).size !== targets.length) {
+      throw new Error("target family deletion returned an invalid confirmed receipt");
+    }
+    for (const target of targets) {
+      if (typeof target !== "string" || !group.some((plan) =>
+        target === plan.base_doc_uid || target.startsWith(`${plan.base_doc_uid}#part`)
+      )) {
+        throw new Error("target family deletion receipt contained an unrelated identity");
+      }
+    }
+    documents += removed;
+    vectorCleanupQueued += queued;
+  }
+  return { families: normalized.length, documents, vector_cleanup_queued: vectorCleanupQueued };
+}
+
+export async function deleteTargetFamilies(options) {
+  return reconcileTargetFamilies({
+    ...options,
+    plans: (options?.families || []).map((base_doc_uid) => ({ base_doc_uid, keep_doc_uids: [] })),
+  });
+}
+
 /** Close a completed migration lane with a source-registry receipt. */
 export async function postSourceReceipt({
   targetUrl, adminKey, receipt, fetchImpl = fetch, timeoutMs = 30_000,

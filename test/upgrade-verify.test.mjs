@@ -77,7 +77,7 @@ const manifestFixture = (version = "0.1.9") => ({
     base: "https://fixture.invalid",
     adminKey: "fixture-admin-key",
     manifest: {},
-    expectVersion: "0.1.13",
+    expectVersion: "0.1.14",
     fetchImpl: async () => new Response(body("0.1.9"), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -85,7 +85,7 @@ const manifestFixture = (version = "0.1.9") => ({
   });
   await suite.tierReach();
   check("the full acceptance suite rejects an old Worker version",
-    suite.results[0]?.status === "fail" && /expected version 0\.1\.13/.test(suite.results[0]?.detail || ""),
+    suite.results[0]?.status === "fail" && /expected version 0\.1\.14/.test(suite.results[0]?.detail || ""),
     JSON.stringify(suite.results));
 }
 
@@ -146,7 +146,7 @@ const manifestFixture = (version = "0.1.9") => ({
         }
         if (/UPDATE install_state/i.test(sql)) {
           events.push("version");
-          d1Version = "0.1.13";
+          d1Version = "0.1.14";
         }
         if (/SELECT product_version FROM install_state/i.test(sql)) {
           events.push("readback");
@@ -183,16 +183,16 @@ const manifestFixture = (version = "0.1.9") => ({
       cmdHealth: async (path, options) => {
         executionPaths.add(path);
         events.push("health");
-        check("upgrade health requires the running package version", options.expectVersion === "0.1.13");
+        check("upgrade health requires the running package version", options.expectVersion === "0.1.14");
       },
       cmdTest: async (path, options) => {
         executionPaths.add(path);
         events.push("test");
-        check("upgrade acceptance requires the running package version", options.expectVersion === "0.1.13");
+        check("upgrade acceptance requires the running package version", options.expectVersion === "0.1.14");
       },
       commitManifestVersion: (path, version) => {
         events.push("manifest");
-        check("manifest advances only to the running package version", version === "0.1.13");
+        check("manifest advances only to the running package version", version === "0.1.14");
         return commitManifestVersion(path, version);
       },
     });
@@ -295,9 +295,9 @@ const manifestFixture = (version = "0.1.9") => ({
   try {
     const manifestPath = join(sandbox, "brain.manifest.json");
     writeFileSync(manifestPath, JSON.stringify(manifestFixture(), null, 2) + "\n");
-    commitManifestVersion(manifestPath, "0.1.13");
+    commitManifestVersion(manifestPath, "0.1.14");
     const committed = JSON.parse(readFileSync(manifestPath, "utf8"));
-    check("the local manifest records the verified package version", committed.brain.version === "0.1.13");
+    check("the local manifest records the verified package version", committed.brain.version === "0.1.14");
     check("the manifest commit leaves no temporary file", !readdirSync(sandbox).some((name) => name.endsWith(".tmp")));
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
@@ -416,7 +416,7 @@ const manifestFixture = (version = "0.1.9") => ({
       resolveAccount: async () => ({ id: "fixture-account" }),
       d1Query: async (_account, _database, sql) => {
         if (/sqlite_master/i.test(sql)) return { results: [] };
-        if (/UPDATE install_state/i.test(sql)) d1Version = "0.1.13";
+        if (/UPDATE install_state/i.test(sql)) d1Version = "0.1.14";
         if (/SELECT product_version FROM install_state/i.test(sql)) {
           return { results: [{ product_version: d1Version }] };
         }
@@ -431,7 +431,7 @@ const manifestFixture = (version = "0.1.9") => ({
     });
     check(
       "a successful empty install_state read follows the legacy migration path",
-      JSON.parse(readFileSync(legacyPath, "utf8")).brain.version === "0.1.13",
+      JSON.parse(readFileSync(legacyPath, "utf8")).brain.version === "0.1.14",
     );
   } finally {
     rmSync(sandbox, { recursive: true, force: true });

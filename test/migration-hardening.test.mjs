@@ -6,13 +6,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  getTargetInventory, postSourceReceipt, postTargetBatch, querySupabase,
-  readBoundedResponseText,
+  deleteTargetFamilies, getTargetInventory, listTargetSourceFamilies,
+  postSourceReceipt, postTargetBatch, querySupabase, readBoundedResponseText,
 } from "../migration/supabase-import.mjs";
 import {
   MESSAGE_STATE_SCHEMA, MESSAGE_STATE_VERSION, loadMessageState,
-  messageCompletionReceipt, runMessageMigration,
-  verifyMessageTargetInventory,
+  messageCompletionReceipt, messageHighWaterSha256, reconcileMessageTargetFamilies,
+  runMessageMigration, sendMessageEnvelopes, verifyMessageTargetInventory,
 } from "../migration/supabase-message-sessions.mjs";
 import {
   protectedStatePreviousPath, readProtectedStateJson, saveProtectedStateJson,
@@ -119,6 +119,61 @@ await check("source, target, and completion calls refuse automatic redirects", a
     fetchImpl: async () => { insecureTargetCalls++; return response("{}"); },
   }), /HTTPS.*loopback/i);
   assert.equal(insecureTargetCalls, 0, "migration refuses insecure target before fetch");
+});
+
+await check("target-family inventory and deletion use authenticated exact receipts", async () => {
+  const seen = [];
+  const families = await listTargetSourceFamilies({
+    targetUrl: "https://brain.example",
+    adminKey: "fixture-admin",
+    source: "message",
+    fetchImpl: async (url, options) => {
+      const request = JSON.parse(options.body);
+      seen.push({
+        url,
+        authenticated: new Headers(options.headers).get("X-Admin-Key") === "fixture-admin",
+        request,
+      });
+      const body = request.cursor
+        ? { source: "message", families: ["message:zulu"], next_cursor: null }
+        : { source: "message", families: ["message:one", "message:two"], next_cursor: "message:two" };
+      return response(JSON.stringify(body), { url });
+    },
+  });
+  assert.deepEqual(families, ["message:one", "message:two", "message:zulu"]);
+  assert.equal(seen.length, 2);
+  assert.ok(seen.every((entry) => entry.authenticated));
+  assert.equal(seen[1].request.cursor, "message:two");
+
+  const deletion = await deleteTargetFamilies({
+    targetUrl: "https://brain.example",
+    adminKey: "fixture-admin",
+    source: "message",
+    families: ["message:one", "message:two"],
+    fetchImpl: async (url, options) => {
+      const request = JSON.parse(options.body);
+      assert.equal(new Headers(options.headers).get("X-Admin-Key"), "fixture-admin");
+      assert.equal(request.confirm, true);
+      assert.equal(request.families.length, 2);
+      return response(JSON.stringify({
+        documents: 3,
+        vector_cleanup_queued: 1,
+        dry_run: false,
+        targets: ["message:one", "message:two", "message:two#part1of2"],
+      }), { url });
+    },
+  });
+  assert.deepEqual(deletion, { families: 2, documents: 3, vector_cleanup_queued: 1 });
+
+  await assert.rejects(() => deleteTargetFamilies({
+    targetUrl: "https://brain.example",
+    adminKey: "fixture-admin",
+    source: "message",
+    families: ["message:one"],
+    fetchImpl: async (url) => response(JSON.stringify({
+      documents: 1, dry_run: false, targets: ["message:unrelated"],
+    }), { url }),
+  }), /unrelated identity/);
 });
 
 await check("migration responses are bounded before JSON parsing", async () => {
@@ -266,6 +321,14 @@ const freshState = () => ({
   target_url: "https://brain.example",
   message_sessions: undefined,
 });
+const EMPTY_SOURCE_BOUNDARY = Object.freeze({
+  minimum_source_messages: 0,
+  high_water_sha256: messageHighWaterSha256(null),
+});
+const EMPTY_TARGET = Object.freeze({
+  reconcileFn: async (plans) => ({ families: plans.length, documents: 0 }),
+  listTargetFamiliesFn: async () => [],
+});
 
 await check("new migrations require and pin an explicit owner label and IANA timezone", async () => {
   await assert.rejects(() => runMessageMigration({
@@ -281,6 +344,8 @@ await check("new migrations require and pin an explicit owner label and IANA tim
     postFn: async () => ({ results: [] }),
     ownerLabel: "Fixture Owner",
     groupingTimezone: "America/Denver",
+    sourceBoundary: EMPTY_SOURCE_BOUNDARY,
+    ...EMPTY_TARGET,
   });
   assert.equal(result.status, "complete");
   assert.equal(state.message_sessions.scope.owner_label, "Fixture Owner");
@@ -316,6 +381,7 @@ await check("a dry run leaves the caller's checkpoint object byte-for-byte uncha
     dryRun: true,
     ownerLabel: "Fixture Owner",
     groupingTimezone: "UTC",
+    sourceBoundary: EMPTY_SOURCE_BOUNDARY,
   });
   assert.equal(result.status, "dry_run");
   assert.deepEqual(state, before);
@@ -350,6 +416,8 @@ await check("version-one checkpoints keep their historical Owner and UTC default
       state,
       queryFn: async () => [],
       postFn: async () => ({ results: [] }),
+      sourceBoundary: EMPTY_SOURCE_BOUNDARY,
+      ...EMPTY_TARGET,
     });
     assert.equal(result.status, "complete");
     assert.equal(state.message_sessions.scope.owner_label, "Owner");
@@ -458,22 +526,46 @@ const syntheticRows = (count = 47) => Array.from({ length: count }, (_, index) =
 
 const sourceFor = (rows, { expected = rows.length } = {}) => async (sql) => {
   if (/ORDER BY m\.ts DESC, m\.id DESC LIMIT 1/.test(sql)) {
-    const high = rows.at(-1);
-    return high ? [{ ts: high.ts, id: high.id, eligible_rows: String(expected) }] : [];
+    const frozen = sql.match(/\(m\.ts, m\.id::text\) <= \('([^']+)'::timestamptz, '([^']+)'\)/);
+    const eligible = frozen
+      ? rows.filter((row) => row.ts < frozen[1] || (row.ts === frozen[1] && row.id <= frozen[2]))
+      : rows;
+    const high = eligible.at(-1);
+    return high ? [{
+      ts: high.ts,
+      id: high.id,
+      eligible_rows: String(frozen ? eligible.length : expected),
+    }] : [];
   }
   if (/SELECT count\(\*\)::text AS eligible_rows/.test(sql)) {
     return [{ eligible_rows: String(expected) }];
   }
   const cursorMatch = sql.match(/\(m\.ts, m\.id::text\) > \('([^']+)'::timestamptz, '([^']+)'\)/);
+  const upperMatch = sql.match(/\(m\.ts, m\.id::text\) <= \('([^']+)'::timestamptz, '([^']+)'\)/);
   const limit = Number(sql.match(/LIMIT (\d+)/)?.[1] || rows.length);
+  const boundedRows = upperMatch
+    ? rows.filter((row) => row.ts < upperMatch[1] || (row.ts === upperMatch[1] && row.id <= upperMatch[2]))
+    : rows;
   const start = cursorMatch
-    ? rows.findIndex((row) => row.ts === cursorMatch[1] && row.id === cursorMatch[2]) + 1
+    ? boundedRows.findIndex((row) => row.ts === cursorMatch[1] && row.id === cursorMatch[2]) + 1
     : 0;
-  return structuredClone(rows.slice(start, start + limit));
+  return structuredClone(boundedRows.slice(start, start + limit));
 };
+
+const sourceBoundaryFor = (rows, minimum = rows.length) => ({
+  minimum_source_messages: minimum,
+  high_water_sha256: messageHighWaterSha256(rows.length ? {
+    ts: rows.at(-1).ts,
+    id: rows.at(-1).id,
+  } : null),
+});
 
 const targetStore = () => {
   const documents = new Map();
+  const logicalFamily = (serialized, key) => {
+    const envelope = JSON.parse(serialized);
+    return `message:${envelope.metadata?.part_of || envelope.source_id || key.slice("message:".length)}`;
+  };
   return {
     documents,
     post: async (items) => ({
@@ -489,6 +581,24 @@ const targetStore = () => {
         };
       }),
     }),
+    list: async () => [...new Set(
+      [...documents.entries()].map(([key, serialized]) => logicalFamily(serialized, key)),
+    )].sort(),
+    reconcile: async (plans) => {
+      const requested = new Map(plans.map((plan) => [
+        plan.base_doc_uid,
+        new Set(plan.keep_doc_uids),
+      ]));
+      let removed = 0;
+      for (const [key, serialized] of [...documents.entries()]) {
+        const keep = requested.get(logicalFamily(serialized, key));
+        if (keep && !keep.has(key)) {
+          documents.delete(key);
+          removed++;
+        }
+      }
+      return { families: requested.size, documents: removed };
+    },
   };
 };
 
@@ -499,6 +609,172 @@ const random = (seed) => () => {
   return seed / 2 ** 32;
 };
 
+await check("reviewed source evidence blocks empty or truncated replacements before target writes", async () => {
+  const reviewedRows = syntheticRows(6);
+  const boundary = sourceBoundaryFor(reviewedRows, reviewedRows.length);
+  for (const queryFn of [
+    async () => [],
+    sourceFor(reviewedRows, { expected: reviewedRows.length - 1 }),
+  ]) {
+    const state = freshState();
+    let posts = 0;
+    let reconciliations = 0;
+    let inventories = 0;
+    let saves = 0;
+    await assert.rejects(() => runMessageMigration({
+      state,
+      queryFn,
+      postFn: async () => { posts++; return { results: [] }; },
+      reconcileFn: async (plans) => { reconciliations++; return { families: plans.length }; },
+      listTargetFamiliesFn: async () => { inventories++; return []; },
+      saveFn: () => { saves++; },
+      ownerLabel: "Fixture Owner",
+      groupingTimezone: "UTC",
+      sourceBoundary: boundary,
+    }), /high-water continuity|below the reviewed minimum/);
+    assert.equal(posts, 0);
+    assert.equal(reconciliations, 0);
+    assert.equal(inventories, 0);
+    assert.equal(saves, 0);
+    assert.notEqual(state.message_sessions?.complete, true);
+  }
+});
+
+await check("resume verifies the frozen prefix while ignoring messages newer than its saved high-water", async () => {
+  const initialRows = syntheticRows(12);
+  const laterRows = syntheticRows(13);
+  const state = freshState();
+  const target = targetStore();
+  const first = await runMessageMigration({
+    state,
+    queryFn: sourceFor(initialRows),
+    postFn: target.post,
+    reconcileFn: target.reconcile,
+    listTargetFamiliesFn: target.list,
+    ownerLabel: "Fixture Owner",
+    groupingTimezone: "UTC",
+    sourceBoundary: sourceBoundaryFor(initialRows),
+    maxRows: 3,
+    pageSize: 3,
+  });
+  assert.equal(first.status, "checkpointed");
+  const resumed = await runMessageMigration({
+    state,
+    queryFn: sourceFor(laterRows),
+    postFn: target.post,
+    reconcileFn: target.reconcile,
+    listTargetFamiliesFn: target.list,
+    pageSize: 4,
+  });
+  assert.equal(resumed.status, "complete");
+  assert.equal(resumed.expected_source_messages, initialRows.length);
+  assert.equal(resumed.source_messages, initialRows.length);
+  assert.equal(resumed.cursor.id, initialRows.at(-1).id);
+});
+
+await check("a refusal cleanup failure cannot advance the source cursor", async () => {
+  const rows = syntheticRows(1);
+  rows[0].body = `CLOUDFLARE_API_TOKEN=cfut_${"A".repeat(48)}`;
+  const state = freshState();
+  const target = targetStore();
+  target.documents.set("message:id-0001", JSON.stringify({
+    source_type: "message", source_id: "id-0001", metadata: {}, content: "old accepted fixture",
+  }));
+  let posts = 0;
+  await assert.rejects(() => runMessageMigration({
+    state,
+    queryFn: sourceFor(rows),
+    postFn: async () => { posts++; return { results: [] }; },
+    reconcileFn: async () => { throw new Error("Network connection lost during exact cleanup"); },
+    listTargetFamiliesFn: target.list,
+    ownerLabel: "Fixture Owner",
+    groupingTimezone: "UTC",
+    sourceBoundary: sourceBoundaryFor(rows),
+    pageSize: 1,
+  }), /Network connection lost/);
+  assert.equal(posts, 0);
+  assert.equal(state.message_sessions.cursor, null);
+  assert.equal(state.message_sessions.source_messages, 0);
+  assert.equal(state.message_sessions.complete, false);
+  assert.equal(target.documents.size, 1);
+
+  const completed = await runMessageMigration({
+    state,
+    queryFn: sourceFor(rows),
+    postFn: target.post,
+    reconcileFn: target.reconcile,
+    listTargetFamiliesFn: target.list,
+    pageSize: 1,
+  });
+  assert.equal(completed.status, "complete");
+  assert.equal(completed.reconciled_refused_families, 1);
+  assert.equal(target.documents.size, 0);
+});
+
+await check("accepted split families prune every obsolete physical part before settling", async () => {
+  const target = targetStore();
+  for (let part = 1; part <= 3; part++) {
+    const sourceId = `split-family#part${part}of3`;
+    target.documents.set(`message:${sourceId}`, JSON.stringify({
+      source_type: "message",
+      source_id: sourceId,
+      content: `obsolete part ${part}`,
+      metadata: { part, part_count: 3, part_of: "split-family" },
+    }));
+  }
+  const receipt = await sendMessageEnvelopes([
+    {
+      source_type: "message",
+      source_id: "split-family",
+      title: "Synthetic oversized family",
+      content: "x".repeat(500_000),
+      metadata: { message_count: 1 },
+    },
+  ], target.post, { reconcileFn: target.reconcile });
+  assert.equal(receipt.target_documents, 2);
+  assert.equal(receipt.reconciled_accepted_families, 1);
+  assert.deepEqual([...target.documents.keys()].sort(), [
+    "message:split-family#part1of2",
+    "message:split-family#part2of2",
+  ]);
+});
+
+await check("full replay removes extra logical families and refuses missing expected families", async () => {
+  const rows = syntheticRows(4);
+  const target = targetStore();
+  target.documents.set("message:obsolete", JSON.stringify({
+    source_type: "message", source_id: "obsolete", metadata: {}, content: "obsolete fixture",
+  }));
+  const state = freshState();
+  const completed = await runMessageMigration({
+    state,
+    queryFn: sourceFor(rows),
+    postFn: target.post,
+    reconcileFn: target.reconcile,
+    listTargetFamiliesFn: target.list,
+    ownerLabel: "Fixture Owner",
+    groupingTimezone: "UTC",
+    sourceBoundary: sourceBoundaryFor(rows),
+  });
+  assert.equal(completed.status, "complete");
+  assert.equal(completed.target_reconciliation.removed_extra_families, 1);
+  assert.ok(!target.documents.has("message:obsolete"));
+
+  const missingState = freshState();
+  const missingTarget = targetStore();
+  await assert.rejects(() => runMessageMigration({
+    state: missingState,
+    queryFn: sourceFor(rows),
+    postFn: missingTarget.post,
+    reconcileFn: missingTarget.reconcile,
+    listTargetFamiliesFn: async () => [],
+    ownerLabel: "Fixture Owner",
+    groupingTimezone: "UTC",
+    sourceBoundary: sourceBoundaryFor(rows),
+  }), /missing [1-9][0-9]* expected families/);
+  assert.equal(missingState.message_sessions.complete, false);
+});
+
 await check("random page sizes and repeated restarts preserve the exact document set", async () => {
   const rows = syntheticRows();
   const baselineState = freshState();
@@ -507,8 +783,11 @@ await check("random page sizes and repeated restarts preserve the exact document
     state: baselineState,
     queryFn: sourceFor(rows),
     postFn: baselineTarget.post,
+    reconcileFn: baselineTarget.reconcile,
+    listTargetFamiliesFn: baselineTarget.list,
     ownerLabel: "Fixture Owner",
     groupingTimezone: "America/Denver",
+    sourceBoundary: sourceBoundaryFor(rows),
     pageSize: 17,
   });
   assert.equal(baseline.status, "complete");
@@ -524,8 +803,11 @@ await check("random page sizes and repeated restarts preserve the exact document
         state,
         queryFn: sourceFor(rows),
         postFn: target.post,
+        reconcileFn: target.reconcile,
+        listTargetFamiliesFn: target.list,
         ownerLabel: restart === 0 ? "Fixture Owner" : undefined,
         groupingTimezone: restart === 0 ? "America/Denver" : undefined,
+        sourceBoundary: restart === 0 ? sourceBoundaryFor(rows) : undefined,
         pageSize: 1 + Math.floor(nextRandom() * 9),
         maxRows: 1 + Math.floor(nextRandom() * 13),
       });
@@ -553,8 +835,11 @@ await check("an ambiguous committed response restarts without advancing or dupli
     state,
     queryFn: sourceFor(rows),
     postFn: ambiguousPost,
+    reconcileFn: target.reconcile,
+    listTargetFamiliesFn: target.list,
     ownerLabel: "Fixture Owner",
     groupingTimezone: "UTC",
+    sourceBoundary: sourceBoundaryFor(rows),
     pageSize: 1,
     maxRows: 1,
   }), /Network connection lost/);
@@ -568,6 +853,8 @@ await check("an ambiguous committed response restarts without advancing or dupli
     state: structuredClone(state),
     queryFn: sourceFor(rows),
     postFn: target.post,
+    reconcileFn: target.reconcile,
+    listTargetFamiliesFn: target.list,
     pageSize: 4,
   });
   assert.equal(result.status, "complete");
@@ -584,12 +871,96 @@ await check("final completion is blocked when the frozen source count does not b
     state,
     queryFn: sourceFor(rows, { expected: rows.length + 1 }),
     postFn: target.post,
+    reconcileFn: target.reconcile,
+    listTargetFamiliesFn: target.list,
     ownerLabel: "Fixture Owner",
     groupingTimezone: "UTC",
+    sourceBoundary: sourceBoundaryFor(rows),
     pageSize: 4,
   }), /processed 9 of 10 eligible rows/);
   assert.equal(state.message_sessions.complete, false);
   assert.equal(state.message_sessions.accounting, null);
+});
+
+await check("a historical row backfilled behind the cursor cannot be certified as complete", async () => {
+  const initialRows = syntheticRows(2);
+  const liveRows = structuredClone(initialRows);
+  const boundary = sourceBoundaryFor(initialRows);
+  const state = freshState();
+  const target = targetStore();
+  const source = sourceFor(liveRows);
+  let pageQueries = 0;
+  const queryFn = async (sql) => {
+    const result = await source(sql);
+    if (/ORDER BY m\.ts, m\.id\s+LIMIT/.test(sql) && ++pageQueries === 1) {
+      const backfill = {
+        ...structuredClone(initialRows[0]),
+        cursor_id: "id-backfill",
+        id: "id-backfill",
+        ts: new Date(Date.parse(initialRows[0].ts) - 60_000).toISOString(),
+        body: "Synthetic historical backfill",
+      };
+      liveRows.unshift(backfill);
+    }
+    return result;
+  };
+
+  await assert.rejects(() => runMessageMigration({
+    state,
+    queryFn,
+    postFn: target.post,
+    reconcileFn: target.reconcile,
+    listTargetFamiliesFn: target.list,
+    ownerLabel: "Fixture Owner",
+    groupingTimezone: "UTC",
+    sourceBoundary: boundary,
+    pageSize: 1,
+  }), /source count changed after the checkpoint started/);
+  assert.equal(state.message_sessions.complete, false);
+  assert.equal(state.message_sessions.expected_source_messages, 2);
+  assert.equal(liveRows.length, 3);
+});
+
+await check("complete-state recovery rechecks for backfills after target reconciliation", async () => {
+  const initialRows = syntheticRows(2);
+  const state = freshState();
+  const target = targetStore();
+  await runMessageMigration({
+    state,
+    queryFn: sourceFor(initialRows),
+    postFn: target.post,
+    reconcileFn: target.reconcile,
+    listTargetFamiliesFn: target.list,
+    ownerLabel: "Fixture Owner",
+    groupingTimezone: "UTC",
+    sourceBoundary: sourceBoundaryFor(initialRows),
+    pageSize: 1,
+  });
+  assert.equal(state.message_sessions.complete, true);
+
+  const liveRows = structuredClone(initialRows);
+  let inserted = false;
+  const listWithBackfill = async () => {
+    if (!inserted) {
+      inserted = true;
+      liveRows.unshift({
+        ...structuredClone(initialRows[0]),
+        cursor_id: "id-recovery-backfill",
+        id: "id-recovery-backfill",
+        ts: new Date(Date.parse(initialRows[0].ts) - 60_000).toISOString(),
+        body: "Synthetic recovery-window backfill",
+      });
+    }
+    return target.list();
+  };
+  await assert.rejects(() => runMessageMigration({
+    state,
+    queryFn: sourceFor(liveRows),
+    postFn: target.post,
+    reconcileFn: target.reconcile,
+    listTargetFamiliesFn: listWithBackfill,
+  }), /source count changed after the checkpoint started/);
+  assert.equal(liveRows.length, 3);
 });
 
 await check("completion receipts are available only after aggregate accounting verifies", async () => {
@@ -598,8 +969,10 @@ await check("completion receipts are available only after aggregate accounting v
     state,
     queryFn: async () => [],
     postFn: async () => ({ results: [] }),
+    ...EMPTY_TARGET,
     ownerLabel: "Fixture Owner",
     groupingTimezone: "UTC",
+    sourceBoundary: EMPTY_SOURCE_BOUNDARY,
   });
   state.message_sessions.target_readback = verifyMessageTargetInventory(state.message_sessions, {
     backend: "d1",
@@ -608,7 +981,7 @@ await check("completion receipts are available only after aggregate accounting v
   });
   const receipt = messageCompletionReceipt(state.message_sessions, "2026-01-01T00:00:00Z");
   assert.equal(receipt.source, "message");
-  assert.equal(receipt.complete_sweep, false);
+  assert.equal(receipt.complete_sweep, true);
   assert.match(receipt.run_id, /^migration-[a-f0-9]{32}$/);
   assert.equal(receipt.run_id, messageCompletionReceipt(
     state.message_sessions, "2026-01-02T00:00:00Z",
@@ -625,8 +998,10 @@ await check("completion waits for exact D1 visibility and an empty vector outbox
     state,
     queryFn: async () => [],
     postFn: async () => ({ results: [] }),
+    ...EMPTY_TARGET,
     ownerLabel: "Fixture Owner",
     groupingTimezone: "UTC",
+    sourceBoundary: EMPTY_SOURCE_BOUNDARY,
   });
   assert.throws(() => verifyMessageTargetInventory(state.message_sessions, {
     backend: "d1", rows: [], vector_backlog: { pending: 3 },
@@ -641,9 +1016,14 @@ await check("completion waits for exact D1 visibility and an empty vector outbox
   lane.candidate_parts = 2;
   assert.throws(() => verifyMessageTargetInventory(lane, {
     backend: "d1",
-    rows: [{ source_type: "message", stored_documents: 1 }],
+    rows: [{ source_type: "message", stored_documents: 1, document_counts_exact: true }],
     vector_backlog: { pending: 0 },
-  }), /fewer stored documents/);
+  }), /does not exactly match accepted physical documents/);
+  assert.throws(() => verifyMessageTargetInventory(lane, {
+    backend: "d1",
+    rows: [{ source_type: "message", stored_documents: 2, logical_documents: 0 }],
+    vector_backlog: { pending: 0 },
+  }), /not based on exact live document counts/);
 });
 
 console.log(`\nmigration hardening: ${ran - failed}/${ran} passed`);

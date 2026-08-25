@@ -29,19 +29,19 @@ const fresh = new Date().toISOString();
 const old = new Date(Date.now() - 90 * 864e5).toISOString();
 
 let g = computeGaps([
-  { ts: fresh, source: "drive" }, { ts: fresh, source: "message" }, { ts: fresh, source: "curated" },
+  { ts: fresh, source: "drive", date_reliable: true }, { ts: fresh, source: "message", date_reliable: true }, { ts: fresh, source: "curated", date_reliable: true },
 ]);
 check("fresh multi-corpus = no gaps", g.length === 0, JSON.stringify(g.map(x => x.type)));
 
-g = computeGaps([{ ts: old, source: "curated" }, { ts: old, source: "message" }, { ts: old, source: "drive" }]);
+g = computeGaps([{ ts: old, source: "curated", date_reliable: true }, { ts: old, source: "message", date_reliable: true }, { ts: old, source: "drive", date_reliable: true }]);
 check("stale detected", g.some(x => x.type === "stale"), JSON.stringify(g.map(x => x.type)));
 check("stale reports days", g.find(x => x.type === "stale").days_since_newest >= 89);
 
-g = computeGaps([{ ts: old, source: "drive" }, { ts: old, source: "drive" }, { ts: old, source: "drive" }]);
+g = computeGaps([{ ts: old, source: "drive", date_reliable: true }, { ts: old, source: "drive", date_reliable: true }, { ts: old, source: "drive", date_reliable: true }]);
 check("drive mtime qualifier present", g.find(x => x.type === "stale").detail.includes("sync touch"));
 check("single_corpus detected", g.some(x => x.type === "single_corpus"));
 
-g = computeGaps([{ ts: fresh, source: "drive" }]);
+g = computeGaps([{ ts: fresh, source: "drive", date_reliable: true }]);
 check("thin coverage detected", g.some(x => x.type === "thin_coverage"));
 check("thin coverage counts", g.find(x => x.type === "thin_coverage").count === 1);
 
@@ -56,7 +56,7 @@ check("empty input does not throw", Array.isArray(computeGaps([])));
 {
   const fresh2 = new Date().toISOString();
   let g = computeGaps([
-    { ts: fresh2, source: "drive" }, { ts: fresh2, source: "curated" },
+    { ts: fresh2, source: "drive", date_reliable: true }, { ts: fresh2, source: "curated", date_reliable: true },
     { source: "drive" }, { source: "drive" },
   ]);
   check("partially undated fires at 50%", g.some(x => x.type === "partially_undated"),
@@ -65,7 +65,7 @@ check("empty input does not throw", Array.isArray(computeGaps([])));
   check("reports the counts", p && p.undated_count === 2 && p.total === 4, JSON.stringify(p));
 
   // All dated: must NOT fire.
-  g = computeGaps([{ ts: fresh2, source: "drive" }, { ts: fresh2, source: "curated" }, { ts: fresh2, source: "message" }]);
+  g = computeGaps([{ ts: fresh2, source: "drive", date_reliable: true }, { ts: fresh2, source: "curated", date_reliable: true }, { ts: fresh2, source: "message", date_reliable: true }]);
   check("does not fire when all dated", !g.some(x => x.type === "partially_undated"));
 
   // All undated: the original `undated` gap owns that case, not this one.
@@ -73,10 +73,18 @@ check("empty input does not throw", Array.isArray(computeGaps([])));
   check("all-undated stays 'undated'", g.some(x => x.type === "undated") && !g.some(x => x.type === "partially_undated"));
 
   // One in eight is below threshold and would just be noise.
-  g = computeGaps(Array.from({length: 7}, () => ({ ts: fresh2, source: "drive" })).concat([{ source: "drive" }]));
+  g = computeGaps(Array.from({length: 7}, () => ({ ts: fresh2, source: "drive", date_reliable: true })).concat([{ source: "drive" }]));
   check("below threshold stays quiet", !g.some(x => x.type === "partially_undated"),
         JSON.stringify(g.map(x => x.type)));
 }
+
+g = computeGaps([
+  { ts: old, source: "message", date_reliable: true },
+  { ts: fresh, source: "drive", date_reliable: false },
+  { ts: old, source: "curated", date_reliable: true },
+]);
+check("an unreliable fresh timestamp cannot hide reliably stale evidence",
+  g.some((gap) => gap.type === "stale"), JSON.stringify(g));
 
 console.log(fail ? `\n${fail} FAILURES` : "\nworker: all tests passed");
 process.exit(fail ? 1 : 0);

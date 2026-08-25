@@ -33,6 +33,7 @@ const row = (overrides = {}) => ({
   direction: "in", sender_name: "Taylor", category: "message",
   ts: "2026-08-23T10:00:00.000Z", body: "First note", ...overrides,
 });
+const confirmedReconcile = async (plans) => ({ families: plans.length, documents: 0 });
 
 {
   const envelope = emailEnvelope(row({ id: "e1", platform: "email", direction: "out", body: "The proposal is attached." }), { ownerLabel: "James" });
@@ -119,7 +120,7 @@ const row = (overrides = {}) => ({
     results: items.map(({ envelope: item }) => ({
       source_id: item.source_id, source_type: item.source_type, status: "created", chunks: 2,
     })),
-  }));
+  }), { reconcileFn: confirmedReconcile });
   check("message migration accounts for target receipts", receipt.created === 1 && receipt.target_chunks === 2, JSON.stringify(receipt));
 }
 
@@ -135,7 +136,7 @@ const row = (overrides = {}) => ({
     return { results: items.map(({ envelope: item }) => ({
       source_id: item.source_id, source_type: item.source_type, status: "created", chunks: 1,
     })) };
-  });
+  }, { reconcileFn: confirmedReconcile });
   check("message migration preserves billing prose and posts a redaction marker",
     receipt.created === 1 && posted.includes("The client remains active.") &&
       posted.includes("[REDACTED:sensitive_payment_url]") && posted.includes("Follow up Friday."));
@@ -154,7 +155,7 @@ const row = (overrides = {}) => ({
     return calls === 1
       ? { results: [{ ...identity, status: "failed", error: "D1_ERROR: Network connection lost." }] }
       : { results: [{ ...identity, status: "unchanged", chunks: 2 }] };
-  }, { delayMs: 1, sleep: async () => {} });
+  }, { reconcileFn: confirmedReconcile, delayMs: 1, sleep: async () => {} });
   check("a transient D1 receipt is retried idempotently", calls === 2 && receipt.unchanged === 1, JSON.stringify({ calls, receipt }));
 }
 
@@ -170,7 +171,7 @@ const row = (overrides = {}) => ({
         status: "failed",
         error: "D1 constraint violation",
       }] };
-    }, { delayMs: 1, sleep: async () => {} });
+    }, { reconcileFn: confirmedReconcile, delayMs: 1, sleep: async () => {} });
   } catch (caught) {
     error = caught;
   }
@@ -179,12 +180,23 @@ const row = (overrides = {}) => ({
 
 {
   let posted = 0;
+  let deleted = [];
   const envelope = emailEnvelope(row({
     id: "secret-email", platform: "email",
     body: `CLOUDFLARE_API_TOKEN=cfut_${"A".repeat(48)}`,
   }));
-  const receipt = await sendMessageEnvelopes([envelope], async () => { posted++; return { results: [] }; });
+  const receipt = await sendMessageEnvelopes(
+    [envelope],
+    async () => { posted++; return { results: [] }; },
+    { reconcileFn: async (plans) => {
+      deleted = plans;
+      return { families: plans.length, documents: 0 };
+    } },
+  );
   check("a credential excludes the whole message before oversized splitting", receipt.refused === 1 && posted === 0, JSON.stringify(receipt));
+  check("a local refusal confirms deletion of the exact prior target family",
+    deleted.length === 1 && deleted[0].base_doc_uid === "message:secret-email" &&
+      deleted[0].keep_doc_uids.length === 0 && receipt.reconciled_refused_families === 1);
   check("message refusal reports labels but never the value", receipt.refusals[0].labels.includes("cloudflare_token_new") && !JSON.stringify(receipt).includes("cfut_"));
 }
 

@@ -334,24 +334,26 @@ const d1Backend = {
             : x.doc_uid || x.chunk_uid
         );
         return {
-        chunk_uid: x.chunk_uid,
-        doc_uid: x.doc_uid || null,
-        source_id: sourceId,
-        // Public identity is document-level. A chunk id changes when geometry
-        // changes and used to let one document consume most of a result page.
-        ref_key: sourceId,
-        drive_file_id: x.source === "drive" ? sourceId : null,
-        source: x.source,
-        title: x.title,
-        snippet: x.text,
-        uri: x.uri || null,
-        client: x.client ?? null,
-        category: x.category ?? null,
-        top_folder: x.top_folder ?? null,
-        platform: x.platform ?? null,
-        ts: x.document_date ? new Date(Number(x.document_date)).toISOString() : null,
-        score: x.rrf_score,
-      };
+          chunk_uid: x.chunk_uid,
+          doc_uid: x.doc_uid || null,
+          source_id: sourceId,
+          // Public identity is document-level. A chunk id changes when geometry
+          // changes and used to let one document consume most of a result page.
+          ref_key: sourceId,
+          drive_file_id: x.source === "drive" ? sourceId : null,
+          source: x.source,
+          title: x.title,
+          snippet: x.text,
+          uri: x.uri || null,
+          client: x.client ?? null,
+          category: x.category ?? null,
+          top_folder: x.top_folder ?? null,
+          platform: x.platform ?? null,
+          ts: x.document_date ? new Date(Number(x.document_date)).toISOString() : null,
+          date_reliable: x.date_reliable === true || x.date_reliable === 1 || x.date_reliable === "1",
+          date_source: x.date_source || null,
+          score: x.rrf_score,
+        };
       }),
       degraded: r.degraded,
       ignored_filters: r.ignored_filters,
@@ -635,18 +637,33 @@ const d1Backend = {
 
   async stats(env) {
     const { results } = await env.DB.prepare(
-      `SELECT s.source AS source_type, s.documents, s.chunks AS total,
+      `WITH source_names AS (
+         SELECT source FROM corpus_stats
+         UNION
+         SELECT source FROM documents WHERE deleted_at IS NULL
+       ), document_counts AS (
+         SELECT source,
+                COUNT(*) AS stored_documents,
+                COUNT(DISTINCT COALESCE(
+                  CASE WHEN json_valid(meta) THEN json_extract(meta,'$.part_of') END,
+                  source_id
+                )) AS logical_documents
+           FROM documents
+          WHERE deleted_at IS NULL
+          GROUP BY source
+       )
+       SELECT n.source AS source_type,
+              COALESCE(d.stored_documents, 0) AS stored_documents,
+              COALESCE(d.logical_documents, 0) AS logical_documents,
+              COALESCE(s.chunks, 0) AS total,
               s.last_ingest_at,
-              (SELECT COUNT(DISTINCT COALESCE(
-                        CASE WHEN json_valid(d.meta) THEN json_extract(d.meta,'$.part_of') END,
-                        d.source_id
-                      ))
-                 FROM documents d WHERE d.source = s.source) AS logical_documents,
-              s.chunks - COALESCE(o.pending, 0) AS embedded
-       FROM corpus_stats s
+              COALESCE(s.chunks, 0) - COALESCE(o.pending, 0) AS embedded
+       FROM source_names n
+       LEFT JOIN corpus_stats s ON s.source = n.source
+       LEFT JOIN document_counts d ON d.source = n.source
        LEFT JOIN (SELECT c.source, count(*) AS pending
                     FROM vector_outbox v JOIN chunks c ON c.chunk_uid = v.chunk_uid
-                   GROUP BY c.source) o ON o.source = s.source`
+                   GROUP BY c.source) o ON o.source = n.source`
     ).all();
     return {
       rows: (results || []).map((r) => ({
@@ -657,7 +674,11 @@ const d1Backend = {
         // ignore the one time it means something.
         documents: Number(r.logical_documents || 0),
         logical_documents: Number(r.logical_documents || 0),
-        stored_documents: Number(r.documents || 0),
+        // These two counts come from the live documents table, not the
+        // denormalized corpus_stats cache. Replay completion uses this marker to
+        // reject an older Worker that could falsely confirm a stale count.
+        stored_documents: Number(r.stored_documents || 0),
+        document_counts_exact: true,
         chunks: Number(r.total || 0),
         total: Number(r.total || 0),
         embedded: Number(r.embedded || 0),
@@ -684,6 +705,7 @@ const supabaseBackend = {
           chunk_uid: r.d1_key, ref_key: r.d1_key, source: "curated",
           title: r.title, snippet: String(r.content || "").slice(0, 900),
           ts: r.meeting_date || null, score: null,
+          date_reliable: null, date_source: null,
           client: r.client_name || null, category: r.category || null,
           top_folder: r.top_folder || null, platform: r.platform || null,
         })),
@@ -703,6 +725,7 @@ const supabaseBackend = {
       results: (matches || []).map((r) => ({
         chunk_uid: r.ref_key, ref_key: r.ref_key, source: r.source, title: r.title,
         snippet: r.snippet, ts: r.ts || null, score: r.rrf_score,
+        date_reliable: null, date_source: null,
         client: r.client || null, category: r.category || null,
         top_folder: r.top_folder || null, platform: r.platform || null,
       })),

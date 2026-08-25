@@ -285,5 +285,34 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
       !durableSafetyFields.includes("checkout.stripe.com"), durableSafetyFields);
 }
 
+/* ---- completion inventory must recount live documents, not trust its cache ---- */
+{
+  let statsSql = "";
+  const env = {
+    STORAGE: "d1",
+    DB: {
+      prepare(sql) {
+        statsSql = sql;
+        return { all: async () => ({ results: [{
+          source_type: "message",
+          stored_documents: 7,
+          logical_documents: 6,
+          total: 12,
+          embedded: 12,
+          last_ingest_at: 1750000000000,
+        }] }) };
+      },
+    },
+  };
+  const inventory = await storeFor(env).stats(env);
+  const row = inventory.rows[0];
+  check("D1 inventory discovers live-document sources even when corpus_stats is absent",
+    /SELECT source FROM documents WHERE deleted_at IS NULL/.test(statsSql), statsSql);
+  check("D1 inventory derives physical and logical counts from live documents",
+    /COUNT\(\*\) AS stored_documents/.test(statsSql) && /GROUP BY source/.test(statsSql) &&
+      row.stored_documents === 7 && row.logical_documents === 6 && row.document_counts_exact === true,
+    JSON.stringify(row));
+}
+
 console.log(fail ? `\n${fail} FAILURES` : `\nstore: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);
