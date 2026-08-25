@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { writePrivateEvalTemplate } from "../brain.mjs";
+import { evalChildArguments, writePrivateEvalTemplate } from "../brain.mjs";
 
 const sandbox = mkdtempSync(join(tmpdir(), "brain-eval-init-"));
 try {
@@ -45,6 +45,17 @@ try {
 
   const ignore = readFileSync(new URL("../.gitignore", import.meta.url), "utf8");
   assert.match(ignore, /^brain\.golden\.json$/m);
+
+  const explicitDefaultArgs = evalChildArguments(
+    "https://brain.fixture.invalid",
+    destination,
+    "smoke",
+  );
+  assert.deepEqual(
+    explicitDefaultArgs.slice(-2),
+    ["--profile", "smoke"],
+    "the child must never inherit a different profile from its local config",
+  );
 
   const cli = fileURLToPath(new URL("../brain.mjs", import.meta.url));
   const isolateSupport = fileURLToPath(new URL("./fixtures/isolate-support-root.mjs", import.meta.url));

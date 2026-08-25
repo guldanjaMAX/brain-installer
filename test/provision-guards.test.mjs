@@ -535,12 +535,18 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
       /m\.brain\?\.domain \? null : await resolveAccount\(m\)/.test(b));
   }
   const evalCommand = bodyOf("cmdEval");
+  const evalArgumentsStart = src.indexOf("export function evalChildArguments(");
+  const evalArgumentsEnd = src.indexOf("/** Create the owner's private eval set", evalArgumentsStart);
+  const evalArguments = evalArgumentsStart === -1
+    ? null
+    : src.slice(evalArgumentsStart, evalArgumentsEnd === -1 ? evalArgumentsStart + 1800 : evalArgumentsEnd);
   check("brain eval forwards the named profile to the shipped evaluator",
-    /\["profile", "limit", "k", "repeat", "baseline", "save", "artifacts"\]/.test(evalCommand || ""),
-    String(evalCommand).slice(-1100));
+    /evalChildArguments\(base, goldenPath, requestedProfile, flags\)/.test(evalCommand || "") &&
+      /"--profile", requestedProfile/.test(evalArguments || ""),
+    `${String(evalCommand).slice(-700)}\n${String(evalArguments).slice(0, 700)}`);
   check("brain eval forwards graph-boost to the shipped evaluator",
-    /\["rerank", "graph-boost", "no-think", "json"\]/.test(evalCommand || ""),
-    String(evalCommand).slice(-900));
+    /\["rerank", "graph-boost", "no-think", "json"\]/.test(evalArguments || ""),
+    String(evalArguments).slice(-900));
   const health = bodyOf("cmdHealth");
   check("domain-based health never dereferences a deliberately absent Cloudflare account",
     /const sub = acct\s*\? await cf/.test(health || ""), String(health).slice(0, 900));

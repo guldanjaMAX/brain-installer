@@ -6817,6 +6817,23 @@ export function evalChildEnvironment(environment = process.env) {
   return localToolEnvironment(environment, { BRAIN_ADMIN_KEY_STDIN: "1" });
 }
 
+/** Build the evaluator command line with an explicit profile every time. */
+export function evalChildArguments(base, goldenPath, requestedProfile, flags = {}) {
+  const args = [
+    join(HERE, "eval", "run.mjs"),
+    "--base", base,
+    "--golden", goldenPath,
+    "--profile", requestedProfile,
+  ];
+  for (const f of ["limit", "k", "repeat", "baseline", "save", "artifacts"]) {
+    if (flags[f] && flags[f] !== true) args.push(`--${f}`, String(flags[f]));
+  }
+  for (const f of ["rerank", "graph-boost", "no-think", "json"]) {
+    if (flags[f]) args.push(`--${f}`);
+  }
+  return args;
+}
+
 /** Create the owner's private eval set once, without links or broad file modes. */
 export function writePrivateEvalTemplate(destination, options = {}) {
   if (options.force) {
@@ -6911,13 +6928,18 @@ async function cmdEval(manifestPath) {
     );
   }
 
+  // The top-level command owns this default and always passes it to the child.
+  // A locally edited eval.config.json must not let the parent preflight smoke
+  // while the child silently selects release after credential resolution.
+  const requestedProfile = flags.profile && flags.profile !== true
+    ? String(flags.profile)
+    : "smoke";
+
   // This must stay ahead of account/base/admin-key resolution. Besides being
   // faster, that ordering makes the documented pre-credential release gate a
   // real product invariant rather than a property of the child runner alone.
   try {
-    const preflight = assertEvalProfilePreflight(goldenPath, flags.profile && flags.profile !== true
-      ? String(flags.profile)
-      : "smoke");
+    const preflight = assertEvalProfilePreflight(goldenPath, requestedProfile);
     if (preflight.profile === "release" && flags["no-think"]) {
       throw new Error(
         "--no-think cannot be used with the release profile because every required unanswerable case must run",
@@ -6936,11 +6958,7 @@ async function cmdEval(manifestPath) {
   const adminKey = resolveAdminKey(manifestPath);
   if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
 
-  const args = [join(HERE, "eval", "run.mjs"), "--base", base, "--golden", goldenPath];
-  for (const f of ["profile", "limit", "k", "repeat", "baseline", "save", "artifacts"]) {
-    if (flags[f] && flags[f] !== true) args.push(`--${f}`, String(flags[f]));
-  }
-  for (const f of ["rerank", "graph-boost", "no-think", "json"]) if (flags[f]) args.push(`--${f}`);
+  const args = evalChildArguments(base, goldenPath, requestedProfile, flags);
 
   const keyInput = Buffer.from(`${adminKey}\n`, "utf8");
   let r;
