@@ -26,6 +26,7 @@ const mkEnv = ({ chunks = 0, outbox = 0, inserted = 0 } = {}) => {
         const shape = (b = []) => ({
           bind: (...bb) => shape(bb),
           first: async () => {
+            if (/SELECT schema_version FROM install_state/.test(q)) return { schema_version: 13 };
             if (/FROM chunks c JOIN documents/.test(q)) return { n: chunks };
             if (/vector_projection_bootstrap_epoch AS epoch/.test(q)) {
               return {

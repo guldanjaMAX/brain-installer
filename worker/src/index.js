@@ -25,7 +25,7 @@ import {
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 
@@ -1502,6 +1502,23 @@ export default {
           dryRun: body.confirm !== true,
           bootstrap: body.bootstrap === true,
         });
+        return jsonResponse(r);
+      }
+      if (path === "/api/admin/brain/bootstrap" && request.method === "POST") {
+        if (backendOf(env) !== D1) {
+          return jsonResponse({ error: "bootstrap applies to the d1 backend only" }, 400);
+        }
+        if (env.VECTOR_DRAIN_MODE !== "paused-for-upgrade") {
+          return jsonResponse({
+            error: "the accelerated bootstrap requires the verified upgrade pause",
+            paused: false,
+          }, 409);
+        }
+        const r = await acceleratedVectorBootstrap(env, {
+          embed: (text) => embedText(env, text),
+          embedBatch: (texts) => embedTexts(env, texts),
+        });
+        if (r.busy) return jsonResponse(r, 409);
         return jsonResponse(r);
       }
       if (path === "/api/admin/brain/drain" && request.method === "POST") {

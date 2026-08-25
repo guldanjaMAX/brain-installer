@@ -1479,7 +1479,8 @@ export async function drainOutbox(env, options = {}) {
   // Upgrade cutovers deploy this exact code in a paused mode before changing
   // the lease schema. Return before even acquiring D1 state so the paused
   // Worker is a provable zero-writer compatibility bridge for old installs.
-  if (env?.VECTOR_DRAIN_MODE === "paused-for-upgrade") {
+  if (env?.VECTOR_DRAIN_MODE === "paused-for-upgrade" &&
+      options.allowPausedBootstrap !== true) {
     return {
       drained: 0, deleted: 0, upserted: 0, submitted: 0, waiting: 0, failed: 0,
       remaining: 0, errors: [], busy: false, paused: true,
@@ -1556,7 +1557,7 @@ export async function drainOutbox(env, options = {}) {
       result.failed += Number(part.failed || 0);
       result.remaining = Number(part.remaining || 0);
       result.errors.push(...(part.errors || []).slice(0, Math.max(0, 3 - result.errors.length)));
-      if (result.remaining === 0) {
+      if (result.remaining === 0 && options.disableBootstrapAdvance !== true) {
         const bootstrap = await bootstrapVectorProjectionPage(env, { now: now() });
         result.remaining = bootstrap.pending;
         if (bootstrap.pending > 0) {
@@ -2210,18 +2211,522 @@ export async function bootstrapVectorProjectionPage(env, {
   };
 }
 
-/** Start a whole-corpus bootstrap, or resume the current durable epoch. */
-export async function resetVectorProjectionBootstrap(env) {
+export const ACCELERATED_BOOTSTRAP_PAGE_SIZE = 1000;
+export const ACCELERATED_BOOTSTRAP_WINDOW = 3;
+const ACCELERATED_BOOTSTRAP_CONCURRENCY = 6;
+const ACCELERATED_BOOTSTRAP_PROTOCOL = "bootstrap-v2";
+
+async function mapBounded(values, limit, operation) {
+  const output = new Array(values.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, values.length) }, async () => {
+    while (cursor < values.length) {
+      const index = cursor++;
+      output[index] = await operation(values[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return output;
+}
+
+async function bootstrapStateV2(env) {
+  const state = await env.DB.prepare(
+    `SELECT schema_version, vector_projection_status AS status,
+            vector_projection_bootstrap_epoch AS epoch,
+            vector_projection_bootstrap_cursor AS cursor,
+            vector_projection_bootstrap_high_water AS high_water,
+            vector_projection_bootstrap_protocol AS protocol,
+            vector_projection_bootstrap_base_count AS base_count
+       FROM install_state WHERE id = 1`
+  ).first();
+  if (!state || Number(state.schema_version) < 13) {
+    throw new Error("the accelerated vector bootstrap schema is not active");
+  }
+  const epoch = Number(state.epoch);
+  const baseCount = Number(state.base_count);
+  if (!Number.isSafeInteger(epoch) || epoch < 0 ||
+      !Number.isSafeInteger(baseCount) || baseCount < 0) {
+    throw new Error("the accelerated vector bootstrap state is invalid");
+  }
+  return {
+    ...state,
+    epoch,
+    baseCount,
+    cursor: state.cursor === null || state.cursor === undefined ? "" : String(state.cursor),
+    highWater: state.high_water === null || state.high_water === undefined ? "" : String(state.high_water),
+  };
+}
+
+async function acceleratedBootstrapReceipt(env, phase) {
+  const state = await bootstrapStateV2(env);
+  const [counts, queue, batches, readiness] = await Promise.all([
+    env.DB.prepare("SELECT count(*) AS n FROM chunks").first(),
+    env.DB.prepare(
+      `SELECT count(*) AS n,
+              sum(CASE WHEN submitted_mutation_id IS NULL THEN 1 ELSE 0 END) AS queued,
+              sum(CASE WHEN submitted_mutation_id IS NOT NULL THEN 1 ELSE 0 END) AS submitted,
+              sum(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS failed
+         FROM vector_outbox`
+    ).first(),
+    env.DB.prepare(
+      `SELECT COALESCE(sum(CASE WHEN status='confirmed' THEN row_count ELSE 0 END),0) AS confirmed,
+              sum(CASE WHEN status IN ('queued','submitted') THEN 1 ELSE 0 END) AS in_flight
+         FROM vector_bootstrap_batches WHERE epoch=?1`
+    ).bind(state.epoch).first(),
+    vectorReadiness(env),
+  ]);
+  const total = Number(counts?.n);
+  const confirmed = state.baseCount + Number(batches?.confirmed || 0);
+  const queued = Number(queue?.queued || 0);
+  const submitted = Number(queue?.submitted || 0);
+  const failed = Number(queue?.failed || 0);
+  const inFlight = Number(batches?.in_flight || 0);
+  if (![total, confirmed, queued, submitted, failed, inFlight].every(
+    (value) => Number.isSafeInteger(value) && value >= 0,
+  ) || confirmed > total || inFlight > ACCELERATED_BOOTSTRAP_WINDOW) {
+    throw new Error("the accelerated vector bootstrap receipt is invalid");
+  }
+  const complete = state.status === "verified" && confirmed === total &&
+    queued === 0 && submitted === 0 && inFlight === 0 && failed === 0 &&
+    readiness.ready === true && readiness.expected_vectors === total &&
+    readiness.actual_vectors === total;
+  return {
+    protocol: ACCELERATED_BOOTSTRAP_PROTOCOL,
+    phase: complete ? "complete" : phase,
+    epoch: state.epoch,
+    total,
+    confirmed,
+    queued,
+    submitted,
+    remaining: total - confirmed,
+    in_flight_batches: inFlight,
+    failed,
+    complete,
+    vector_ready: readiness.ready === true,
+    expected_vectors: readiness.expected_vectors,
+    actual_vectors: readiness.actual_vectors,
+  };
+}
+
+async function activateAcceleratedBootstrap(env, state) {
+  if (state.protocol === ACCELERATED_BOOTSTRAP_PROTOCOL) return state;
+  if (state.protocol !== null && state.protocol !== undefined && state.protocol !== "") {
+    throw new Error("the vector bootstrap protocol is not supported by this Worker");
+  }
+  const pending = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+  if (Number(pending?.n || 0) !== 0) return null;
   const result = await env.DB.prepare(
     `UPDATE install_state
+        SET vector_projection_bootstrap_protocol=?2,
+            vector_projection_bootstrap_base_count=(
+              SELECT count(*) FROM chunks
+               WHERE chunk_uid <= COALESCE(vector_projection_bootstrap_cursor,'')
+            ),
+            vector_projection_bootstrap_high_water=(SELECT MAX(chunk_uid) FROM chunks)
+      WHERE id=1 AND schema_version>=13
+        AND vector_projection_bootstrap_epoch=?1
+        AND vector_projection_status='bootstrap_required'
+        AND vector_projection_bootstrap_protocol IS NULL
+        AND NOT EXISTS (SELECT 1 FROM vector_outbox)`
+  ).bind(state.epoch, ACCELERATED_BOOTSTRAP_PROTOCOL).run();
+  if (drainLeaseChanges(result) !== 1) {
+    throw new Error("the accelerated vector bootstrap could not establish its durable boundary");
+  }
+  return bootstrapStateV2(env);
+}
+
+async function queueAcceleratedBootstrapBatch(env, state, now) {
+  const { results: candidates } = await env.DB.prepare(
+    `SELECT chunk_uid FROM chunks
+      WHERE chunk_uid>?1 AND chunk_uid<=?2
+      ORDER BY chunk_uid LIMIT ?3`
+  ).bind(state.cursor, state.highWater, ACCELERATED_BOOTSTRAP_PAGE_SIZE + 1).all();
+  if (!Array.isArray(candidates)) throw new Error("the accelerated bootstrap page is invalid");
+  const page = candidates.slice(0, ACCELERATED_BOOTSTRAP_PAGE_SIZE);
+  if (!page.length) return false;
+  const endCursor = String(page.at(-1)?.chunk_uid || "");
+  if (!endCursor) throw new Error("the accelerated bootstrap cursor is invalid");
+  const sequence = await env.DB.prepare(
+    "SELECT COALESCE(max(batch_no),0)+1 AS n FROM vector_bootstrap_batches WHERE epoch=?1"
+  ).bind(state.epoch).first();
+  const batchNo = Number(sequence?.n);
+  if (!Number.isSafeInteger(batchNo) || batchNo < 1) {
+    throw new Error("the accelerated bootstrap batch identity is invalid");
+  }
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO vector_bootstrap_batches
+         (epoch,batch_no,start_cursor,end_cursor,row_count,status)
+       VALUES (?1,?2,?3,?4,?5,'queued')`
+    ).bind(state.epoch, batchNo, state.cursor, endCursor, page.length),
+    env.DB.prepare(
+      `INSERT INTO vector_outbox
+         (chunk_uid,vector_id,op,queued_at,attempts,last_error)
+       SELECT chunk_uid,COALESCE(vector_id,chunk_uid),'upsert',?3,0,NULL
+         FROM chunks WHERE chunk_uid>?1 AND chunk_uid<=?2
+         ORDER BY chunk_uid`
+    ).bind(state.cursor, endCursor, now),
+    // Generation assignment clears old bootstrap tags. Attach the exact fresh
+    // generations only after every insert trigger has run.
+    env.DB.prepare(
+      `UPDATE vector_outbox SET bootstrap_epoch=?3,bootstrap_batch=?4
+        WHERE chunk_uid>?1 AND chunk_uid<=?2 AND submitted_mutation_id IS NULL`
+    ).bind(state.cursor, endCursor, state.epoch, batchNo),
+    env.DB.prepare(
+      `UPDATE install_state SET vector_projection_bootstrap_cursor=?3
+        WHERE id=1 AND schema_version>=13
+          AND vector_projection_status='bootstrap_required'
+          AND vector_projection_bootstrap_epoch=?1
+          AND COALESCE(vector_projection_bootstrap_cursor,'')=?2`
+    ).bind(state.epoch, state.cursor, endCursor),
+  ]);
+  if (!Array.isArray(results) || results.length !== 4 ||
+      drainLeaseChanges(results[0]) !== 1 ||
+      drainLeaseChanges(results[2]) !== page.length ||
+      drainLeaseChanges(results[3]) !== 1) {
+    throw new Error("the accelerated bootstrap batch receipt was ambiguous");
+  }
+  return true;
+}
+
+async function embedAcceleratedBatch(rows, { embed, embedBatch, embedGroup = 50 }) {
+  if (!Number.isInteger(embedGroup) || embedGroup < 1 || embedGroup > 100) {
+    throw new Error("the accelerated bootstrap embedding group is invalid");
+  }
+  const groups = [];
+  for (let start = 0; start < rows.length; start += embedGroup) {
+    groups.push({ start, rows: rows.slice(start, start + embedGroup) });
+  }
+  const embeddedGroups = await mapBounded(
+    groups,
+    ACCELERATED_BOOTSTRAP_CONCURRENCY,
+    async (group) => {
+      try {
+        const output = await embedBatch(group.rows.map((row) => row.text));
+        if (!Array.isArray(output) || output.length !== group.rows.length) {
+          throw new Error("Workers AI returned an incomplete embedding batch");
+        }
+        return output;
+      } catch {
+        const output = [];
+        for (const row of group.rows) output.push(await embed(row.text));
+        return output;
+      }
+    },
+  );
+  return embeddedGroups.flat();
+}
+
+async function submitAcceleratedBootstrapBatch(env, batch, lease, options) {
+  const { results: rows } = await env.DB.prepare(
+    `SELECT o.chunk_uid,o.generation,c.text,c.source,c.doc_uid,c.document_date,
+            c.client,c.category,c.top_folder,c.platform
+       FROM vector_outbox o JOIN chunks c ON c.chunk_uid=o.chunk_uid
+      WHERE o.bootstrap_epoch=?1 AND o.bootstrap_batch=?2
+        AND o.op='upsert' AND o.submitted_mutation_id IS NULL
+      ORDER BY o.chunk_uid`
+  ).bind(batch.epoch, batch.batch_no).all();
+  if (!Array.isArray(rows) || rows.length !== Number(batch.row_count)) {
+    throw new Error("the accelerated bootstrap queued batch is incomplete");
+  }
+  const values = await embedAcceleratedBatch(rows, options);
+  if (values.length !== rows.length) throw new Error("the accelerated bootstrap embeddings are incomplete");
+  const vectors = [];
+  const mapping = [];
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index];
+    const vectorId = await vectorIdFor(row.chunk_uid);
+    mapping.push({ u: row.chunk_uid, v: vectorId, g: row.generation });
+    vectors.push({ id: vectorId, values: values[index], metadata: await vectorMetadataFor(row) });
+  }
+  if (new Set(mapping.map((row) => row.v)).size !== mapping.length) {
+    throw new Error("the accelerated bootstrap vector identities are not unique");
+  }
+  const mappingJson = JSON.stringify(mapping);
+  if (new TextEncoder().encode(mappingJson).length > 1_800_000) {
+    throw new Error("the accelerated bootstrap identity receipt is too large");
+  }
+  await renewDrainLease(env, lease.ownerToken, { now: lease.now() });
+  const providerReceipt = await env.VECTORIZE.upsert(vectors);
+  const mutationId = acceptedMutationId(providerReceipt);
+  const submittedAt = lease.now();
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE install_state
+          SET vector_projection_mutation_id=?1,vector_projection_submitted_at=?2
+        WHERE id=1 AND schema_version>=13`
+    ).bind(mutationId, submittedAt),
+    env.DB.prepare(
+      `UPDATE chunks AS c SET vector_id=(
+         SELECT json_extract(value,'$.v') FROM json_each(?1)
+          WHERE json_extract(value,'$.u')=c.chunk_uid
+       ) WHERE EXISTS (
+         SELECT 1 FROM json_each(?1) m JOIN vector_outbox o
+           ON o.chunk_uid=json_extract(m.value,'$.u')
+          AND o.generation=json_extract(m.value,'$.g')
+          AND o.bootstrap_epoch=?2 AND o.bootstrap_batch=?3
+          WHERE o.chunk_uid=c.chunk_uid
+       )`
+    ).bind(mappingJson, batch.epoch, batch.batch_no),
+    env.DB.prepare(
+      `UPDATE vector_outbox
+          SET submitted_mutation_id=?3,submitted_at=?4,last_error=NULL
+        WHERE bootstrap_epoch=?1 AND bootstrap_batch=?2
+          AND op='upsert' AND submitted_mutation_id IS NULL`
+    ).bind(batch.epoch, batch.batch_no, mutationId, submittedAt),
+    env.DB.prepare(
+      `UPDATE vector_bootstrap_batches
+          SET status='submitted',mutation_id=?3,submitted_at=?4
+        WHERE epoch=?1 AND batch_no=?2 AND status='queued'
+          AND (SELECT count(*) FROM vector_outbox
+                WHERE bootstrap_epoch=?1 AND bootstrap_batch=?2
+                  AND submitted_mutation_id=?3)=row_count`
+    ).bind(batch.epoch, batch.batch_no, mutationId, submittedAt),
+  ]);
+  if (!Array.isArray(results) || results.length !== 4 ||
+      drainLeaseChanges(results[0]) !== 1 ||
+      drainLeaseChanges(results[1]) !== rows.length ||
+      drainLeaseChanges(results[2]) !== rows.length ||
+      drainLeaseChanges(results[3]) !== 1) {
+    throw new Error("the accelerated bootstrap mutation receipt was ambiguous");
+  }
+  return rows.length;
+}
+
+async function confirmAcceleratedBootstrapBatch(env, batch, now) {
+  const { results: rows } = await env.DB.prepare(
+    `SELECT chunk_uid,generation,submitted_mutation_id
+       FROM vector_outbox
+      WHERE bootstrap_epoch=?1 AND bootstrap_batch=?2
+      ORDER BY chunk_uid`
+  ).bind(batch.epoch, batch.batch_no).all();
+  if (!Array.isArray(rows) || rows.length !== Number(batch.row_count) ||
+      rows.some((row) => row.submitted_mutation_id !== batch.mutation_id)) {
+    throw new Error("the accelerated bootstrap submitted batch is incomplete");
+  }
+  const expected = await Promise.all(rows.map(async (row) => ({
+    ...row,
+    vector_id: await vectorIdFor(row.chunk_uid),
+  })));
+  const pages = [];
+  for (let start = 0; start < expected.length; start += VECTOR_GET_BY_IDS_LIMIT) {
+    pages.push(expected.slice(start, start + VECTOR_GET_BY_IDS_LIMIT));
+  }
+  const exactPages = await mapBounded(
+    pages,
+    ACCELERATED_BOOTSTRAP_CONCURRENCY,
+    async (page) => {
+      const visible = await env.VECTORIZE.getByIds(page.map((row) => row.vector_id));
+      if (!Array.isArray(visible)) throw new Error("the vector index returned an invalid bootstrap visibility receipt");
+      const byId = new Map(visible.map((vector) => [vector?.id, vector]));
+      return page.every((row) =>
+        String(byId.get(row.vector_id)?.metadata?.outbox_generation ?? "") === String(row.generation));
+    },
+  );
+  // Retain only one boolean per page. getByIds includes full vector values, so
+  // retaining 1,000 responses at once would spend most of a Worker's memory on
+  // data whose only purpose is this metadata equality check.
+  if (!exactPages.every(Boolean)) return false;
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `DELETE FROM vector_outbox
+        WHERE bootstrap_epoch=?1 AND bootstrap_batch=?2
+          AND submitted_mutation_id=?3`
+    ).bind(batch.epoch, batch.batch_no, batch.mutation_id),
+    env.DB.prepare(
+      `UPDATE vector_bootstrap_batches SET status='confirmed',confirmed_at=?4
+        WHERE epoch=?1 AND batch_no=?2 AND status='submitted' AND mutation_id=?3`
+    ).bind(batch.epoch, batch.batch_no, batch.mutation_id, now),
+  ]);
+  if (!Array.isArray(results) || results.length !== 2 ||
+      drainLeaseChanges(results[0]) !== rows.length || drainLeaseChanges(results[1]) !== 1) {
+    throw new Error("the accelerated bootstrap confirmation receipt was ambiguous");
+  }
+  return true;
+}
+
+/**
+ * Re-project legacy vectors in provider-sized, disjoint batches while every
+ * ordinary corpus writer remains blocked by the upgrade compatibility Worker.
+ */
+export async function acceleratedVectorBootstrap(env, options = {}) {
+  if (env?.VECTOR_DRAIN_MODE !== "paused-for-upgrade") {
+    throw new Error("the accelerated vector bootstrap requires the verified upgrade pause");
+  }
+  let state = await bootstrapStateV2(env);
+  if (!["bootstrap_required", "pending", "verified"].includes(String(state.status))) {
+    throw new Error("the accelerated vector bootstrap state is unavailable");
+  }
+  // Finish at most one schema-12 residue page before establishing the bulk-v2
+  // boundary. This handles a 0.1.14 update interrupted after queue or submit.
+  if (state.protocol !== ACCELERATED_BOOTSTRAP_PROTOCOL) {
+    const residue = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+    if (Number(residue?.n || 0) > 0) {
+      await drainOutbox(env, {
+        ...options,
+        allowPausedBootstrap: true,
+        disableBootstrapAdvance: true,
+        maxBatches: 10,
+      });
+      // A pending schema-12 last page can become fully verified in that drain.
+      // Adopt it only when no v2 batch exists, or its rows would be counted
+      // once as the base and again by their durable batch receipts.
+      await env.DB.prepare(
+        `UPDATE install_state
+            SET vector_projection_bootstrap_protocol=?1,
+                vector_projection_bootstrap_base_count=(SELECT count(*) FROM chunks)
+          WHERE id=1 AND schema_version>=13
+            AND vector_projection_status='verified'
+            AND NOT EXISTS (SELECT 1 FROM vector_outbox)
+            AND NOT EXISTS (
+              SELECT 1 FROM vector_bootstrap_batches
+               WHERE epoch=vector_projection_bootstrap_epoch
+            )`
+      ).bind(ACCELERATED_BOOTSTRAP_PROTOCOL).run();
+      return acceleratedBootstrapReceipt(env, "legacy_drain");
+    }
+  }
+
+  if (state.status === "pending") {
+    await markProjectionVerifiedIfExact(env);
+    state = await bootstrapStateV2(env);
+  }
+  if (state.status === "verified") {
+    await env.DB.prepare(
+      `UPDATE install_state
+          SET vector_projection_bootstrap_protocol=?1,
+              vector_projection_bootstrap_base_count=(SELECT count(*) FROM chunks)
+        WHERE id=1 AND schema_version>=13
+          AND vector_projection_status='verified'
+          AND NOT EXISTS (SELECT 1 FROM vector_outbox)
+          AND NOT EXISTS (
+            SELECT 1 FROM vector_bootstrap_batches
+             WHERE epoch=vector_projection_bootstrap_epoch
+          )`
+    ).bind(ACCELERATED_BOOTSTRAP_PROTOCOL).run();
+    return acceleratedBootstrapReceipt(env, "waiting");
+  }
+  if (state.status !== "bootstrap_required") {
+    return acceleratedBootstrapReceipt(env, "waiting");
+  }
+
+  const now = typeof options.now === "function" ? options.now : Date.now;
+  const lease = await acquireDrainLease(env, { now: now() });
+  if (!lease.acquired) {
+    const receipt = await acceleratedBootstrapReceipt(env, "waiting");
+    return { ...receipt, busy: true, retry_after_seconds: lease.retryAfterSeconds };
+  }
+  let phase = "waiting";
+  let operationError = null;
+  try {
+    state = await activateAcceleratedBootstrap(env, state);
+    if (!state) throw new Error("the accelerated bootstrap boundary changed; retry from durable state");
+
+    const submitted = await env.DB.prepare(
+      `SELECT * FROM vector_bootstrap_batches
+        WHERE epoch=?1 AND status='submitted' ORDER BY batch_no`
+    ).bind(state.epoch).all();
+    for (const batch of submitted?.results || []) {
+      if (await confirmAcceleratedBootstrapBatch(env, batch, now())) phase = "building";
+    }
+
+    let inFlight = await env.DB.prepare(
+      `SELECT count(*) AS n FROM vector_bootstrap_batches
+        WHERE epoch=?1 AND status IN ('queued','submitted')`
+    ).bind(state.epoch).first();
+    const durableInFlight = Number(inFlight?.n || 0);
+    if (!Number.isSafeInteger(durableInFlight) || durableInFlight < 0 ||
+        durableInFlight > ACCELERATED_BOOTSTRAP_WINDOW) {
+      throw new Error("the accelerated bootstrap in-flight window is invalid");
+    }
+    while (Number(inFlight?.n || 0) < ACCELERATED_BOOTSTRAP_WINDOW) {
+      state = await bootstrapStateV2(env);
+      if (!state.highWater || state.cursor === state.highWater) break;
+      if (!await queueAcceleratedBootstrapBatch(env, state, now())) break;
+      phase = "building";
+      inFlight = { n: Number(inFlight?.n || 0) + 1 };
+    }
+
+    const queued = await env.DB.prepare(
+      `SELECT * FROM vector_bootstrap_batches
+        WHERE epoch=?1 AND status='queued' ORDER BY batch_no`
+    ).bind(state.epoch).all();
+    for (const batch of queued?.results || []) {
+      await submitAcceleratedBootstrapBatch(
+        env,
+        batch,
+        { ownerToken: lease.ownerToken, now },
+        {
+          embed: options.embed,
+          embedBatch: options.embedBatch,
+          embedGroup: options.embedGroup || 50,
+        },
+      );
+      phase = "building";
+    }
+
+    state = await bootstrapStateV2(env);
+    const unfinished = await env.DB.prepare(
+      `SELECT count(*) AS n FROM vector_bootstrap_batches
+        WHERE epoch=?1 AND status<>'confirmed'`
+    ).bind(state.epoch).first();
+    const outbox = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+    if (state.cursor === state.highWater && Number(unfinished?.n || 0) === 0 &&
+        Number(outbox?.n || 0) === 0) {
+      await env.DB.prepare(
+        `UPDATE install_state SET vector_projection_status='pending'
+          WHERE id=1 AND schema_version>=13
+            AND vector_projection_status='bootstrap_required'
+            AND COALESCE(vector_projection_bootstrap_cursor,'')=
+                COALESCE(vector_projection_bootstrap_high_water,'')`
+      ).run();
+      if (await markProjectionVerifiedIfExact(env)) phase = "complete";
+    }
+  } catch (error) {
+    operationError = error;
+  }
+  let releaseError = null;
+  try {
+    if (!await releaseDrainLease(env, lease.ownerToken)) {
+      releaseError = new Error("accelerated vector bootstrap lease ownership was lost before release");
+    }
+  } catch (error) {
+    releaseError = error;
+  }
+  if (operationError) throw operationError;
+  if (releaseError) throw releaseError;
+  return acceleratedBootstrapReceipt(env, phase);
+}
+
+/** Start a whole-corpus bootstrap, or resume the current durable epoch. */
+export async function resetVectorProjectionBootstrap(env) {
+  const installed = await env.DB.prepare(
+    "SELECT schema_version FROM install_state WHERE id=1"
+  ).first();
+  const schemaVersion = Number(installed?.schema_version);
+  if (!Number.isSafeInteger(schemaVersion) || schemaVersion < 12) {
+    throw new Error("the vector bootstrap reset schema is unavailable");
+  }
+  const resetSql = schemaVersion >= 13
+    ? `UPDATE install_state
+        SET vector_projection_status = CASE
+              WHEN EXISTS (SELECT 1 FROM chunks) THEN 'bootstrap_required' ELSE 'verified' END,
+            vector_projection_bootstrap_epoch = vector_projection_bootstrap_epoch + 1,
+            vector_projection_bootstrap_cursor = NULL,
+            vector_projection_bootstrap_high_water = (SELECT MAX(chunk_uid) FROM chunks),
+            vector_projection_bootstrap_protocol = NULL,
+            vector_projection_bootstrap_base_count = 0
+      WHERE id = 1 AND schema_version >= 12
+        AND vector_projection_status <> 'bootstrap_required'`
+    : `UPDATE install_state
         SET vector_projection_status = CASE
               WHEN EXISTS (SELECT 1 FROM chunks) THEN 'bootstrap_required' ELSE 'verified' END,
             vector_projection_bootstrap_epoch = vector_projection_bootstrap_epoch + 1,
             vector_projection_bootstrap_cursor = NULL,
             vector_projection_bootstrap_high_water = (SELECT MAX(chunk_uid) FROM chunks)
       WHERE id = 1 AND schema_version >= 12
-        AND vector_projection_status <> 'bootstrap_required'`
-  ).run();
+        AND vector_projection_status <> 'bootstrap_required'`;
+  const result = await env.DB.prepare(resetSql).run();
   const reset = drainLeaseChanges(result);
   if (![0, 1].includes(reset)) {
     throw new Error("the vector bootstrap could not be reset durably");

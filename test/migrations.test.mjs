@@ -74,7 +74,7 @@ check(`all ${applied} statements across ${files.length} files applied`, true);
 
 /* ---- the objects the worker hard-depends on must exist ---- */
 const names = new Set(db.prepare("SELECT name FROM sqlite_master").all().map((r) => r.name));
-for (const t of ["documents", "chunks", "chunks_fts", "vector_outbox", "corpus_stats", "schema_migrations", "install_state"]) {
+for (const t of ["documents", "chunks", "chunks_fts", "vector_outbox", "vector_bootstrap_batches", "corpus_stats", "schema_migrations", "install_state"]) {
   check(`${t} exists`, names.has(t), [...names].join(", "));
 }
 for (const t of ["chunks_ai", "chunks_ad", "chunks_au"]) {
@@ -104,6 +104,8 @@ check("vector_outbox has a durable drain CAS generation",
   const outboxColumns = new Set(db.prepare("PRAGMA table_info(vector_outbox)").all().map((r) => r.name));
   check("vector_outbox retains an accepted async mutation receipt",
     outboxColumns.has("submitted_mutation_id") && outboxColumns.has("submitted_at"));
+  check("vector_outbox can join an exact row generation to one bootstrap batch",
+    outboxColumns.has("bootstrap_epoch") && outboxColumns.has("bootstrap_batch"));
 }
 check("install_state owns the monotonic outbox clock",
   new Set(db.prepare("PRAGMA table_info(install_state)").all().map((r) => r.name)).has("outbox_generation"));
@@ -116,6 +118,9 @@ check("install_state owns the monotonic outbox clock",
   check("install_state owns the latest Vectorize processing fence",
     installColumns.has("vector_projection_mutation_id") &&
       installColumns.has("vector_projection_submitted_at"));
+  check("install_state owns the accelerated bootstrap protocol and verified base",
+    installColumns.has("vector_projection_bootstrap_protocol") &&
+      installColumns.has("vector_projection_bootstrap_base_count"));
 }
 for (const trigger of ["vector_outbox_generation_ai", "vector_outbox_generation_au"]) {
   check(`trigger ${trigger} exists`, names.has(trigger), "outbox generations could reuse a stale drain token");
@@ -223,12 +228,13 @@ for (const trigger of ["vector_outbox_generation_ai", "vector_outbox_generation_
     lease.acquired === true && await releaseDrainLease(upgradedEnv, "upgraded-worker") === true);
 }
 
-/* ---- 0010-0012 resume after every independently committed statement ---- */
+/* ---- 0010-0013 resume after every independently committed statement ---- */
 {
   const restartStatements = [
     ...splitStatements(readFileSync(join(DIR, "0010_vector_outbox_generation.sql"), "utf-8")),
     ...splitStatements(readFileSync(join(DIR, "0011_vector_drain_lease.sql"), "utf-8")),
     ...splitStatements(readFileSync(join(DIR, "0012_vector_visibility_receipts.sql"), "utf-8")),
+    ...splitStatements(readFileSync(join(DIR, "0013_accelerated_vector_bootstrap.sql"), "utf-8")),
   ];
   const makeLegacy = () => {
     const candidate = new DatabaseSync(":memory:");
@@ -278,18 +284,24 @@ for (const trigger of ["vector_outbox_generation_ai", "vector_outbox_generation_
                 vector_drain_lease_owner owner,
                 vector_drain_lease_expires_at expires,
                 vector_projection_mutation_id mutation_id,
-                vector_projection_submitted_at mutation_submitted_at
+                vector_projection_submitted_at mutation_submitted_at,
+                vector_projection_bootstrap_protocol bootstrap_protocol,
+                vector_projection_bootstrap_base_count bootstrap_base_count
          FROM install_state WHERE id = 1`,
       ).get();
       const queue = candidate.prepare(
-        `SELECT generation, attempts, last_error, submitted_mutation_id, submitted_at FROM vector_outbox
+        `SELECT generation, attempts, last_error, submitted_mutation_id, submitted_at,
+                bootstrap_epoch, bootstrap_batch FROM vector_outbox
          WHERE chunk_uid = 'restart#0'`,
       ).get();
       const objects = new Set(candidate.prepare("SELECT name FROM sqlite_master").all().map((row) => row.name));
       if (!(queue.generation > 0 && queue.attempts === 3 && queue.last_error === "preserve me" &&
             state.outbox_generation >= queue.generation && state.owner === null && state.expires === null &&
             state.mutation_id === null && state.mutation_submitted_at === null &&
+            state.bootstrap_protocol === null && state.bootstrap_base_count === 0 &&
             queue.submitted_mutation_id === null && queue.submitted_at === null &&
+            queue.bootstrap_epoch === null && queue.bootstrap_batch === null &&
+            objects.has("vector_bootstrap_batches") &&
             objects.has("vector_outbox_generation_ai") && objects.has("vector_outbox_generation_au"))) {
         everyResumePassed = false;
         resumeDetail = `fault ${faultAfter}: ${JSON.stringify({ state, queue, objects: [...objects] })}`;
@@ -301,7 +313,7 @@ for (const trigger of ["vector_outbox_generation_ai", "vector_outbox_generation_
     candidate.close();
     if (!everyResumePassed) break;
   }
-  check("0010-0012 resume safely after every independently committed statement",
+  check("0010-0013 resume safely after every independently committed statement",
     everyResumePassed, resumeDetail);
 
   const incompatible = makeLegacy();
@@ -313,6 +325,65 @@ for (const trigger of ["vector_outbox_generation_ai", "vector_outbox_generation_
 check("restart guard refuses an existing migration column with the wrong contract",
     /incompatible schema/.test(refused?.message || ""), refused?.message);
   incompatible.close();
+}
+
+/* ---- 0013 adopts only a quiescent schema-12 verified cut ---- */
+{
+  const makeVerified12 = ({ pending = false } = {}) => {
+    const candidate = new DatabaseSync(":memory:");
+    for (const file of files.filter((name) => name < "0013_")) {
+      for (const statement of splitStatements(readFileSync(join(DIR, file), "utf-8"))) {
+        candidate.exec(statement);
+      }
+    }
+    candidate.exec(
+      `INSERT INTO install_state
+         (id,client_slug,product_version,schema_version,gate_version,installed_at,ring,
+          vector_projection_status,vector_projection_bootstrap_epoch,
+          vector_projection_bootstrap_cursor,vector_projection_bootstrap_high_water)
+       VALUES (1,'verified-12','0.1.14',12,0,'2026-01-01T00:00:00Z','test',
+               'verified',1,'legacy:verified#0','legacy:verified#0');
+       INSERT INTO documents (doc_uid,source,source_id,title,ingested_at,content_hash)
+       VALUES ('legacy:verified','legacy','verified','Verified',1,'verified-hash');
+       INSERT INTO chunks (chunk_uid,doc_uid,chunk_ix,text,source,title,vector_id)
+       VALUES ('legacy:verified#0','legacy:verified',0,'verified text','legacy','Verified','legacy:verified#0');`,
+    );
+    if (pending) {
+      candidate.exec(
+        `INSERT INTO vector_outbox (chunk_uid,vector_id,op,queued_at)
+         VALUES ('legacy:pending-delete','legacy:pending-delete','delete',2);
+         UPDATE install_state SET vector_projection_status='verified' WHERE id=1;`,
+      );
+    }
+    for (const statement of splitStatements(
+      readFileSync(join(DIR, "0013_accelerated_vector_bootstrap.sql"), "utf-8"),
+    )) candidate.exec(statement);
+    candidate.prepare("UPDATE install_state SET schema_version=13 WHERE id=1").run();
+    return candidate;
+  };
+
+  const quiescent = makeVerified12();
+  const adopted = quiescent.prepare(
+    `SELECT vector_projection_bootstrap_protocol protocol,
+            vector_projection_bootstrap_base_count base_count
+       FROM install_state WHERE id=1`,
+  ).get();
+  check("0013 adopts an already exact schema-12 projection without re-embedding",
+    adopted.protocol === "bootstrap-v2" && adopted.base_count === 1,
+    JSON.stringify(adopted));
+  quiescent.close();
+
+  const pending = makeVerified12({ pending: true });
+  const deferred = pending.prepare(
+    `SELECT vector_projection_bootstrap_protocol protocol,
+            vector_projection_bootstrap_base_count base_count,
+            (SELECT count(*) FROM vector_outbox) pending
+       FROM install_state WHERE id=1`,
+  ).get();
+  check("0013 defers adoption while an older outbox receipt still needs confirmation",
+    deferred.protocol === null && deferred.base_count === 1 && deferred.pending === 1,
+    JSON.stringify(deferred));
+  pending.close();
 }
 
 /* ---- 0012 bootstraps large legacy corpora in bounded resumable pages ---- */
@@ -570,13 +641,13 @@ check("restart guard refuses an existing migration column with the wrong contrac
            FROM vector_outbox WHERE chunk_uid='command-legacy#0'`,
       ).get();
       const receipts = candidate.prepare(
-        "SELECT version,checksum FROM schema_migrations WHERE version IN (10,11,12) ORDER BY version",
+        "SELECT version,checksum FROM schema_migrations WHERE version IN (10,11,12,13) ORDER BY version",
       ).all();
       const interveningAfter = interveningGeneration === null ? null : candidate.prepare(
         "SELECT generation FROM vector_outbox WHERE chunk_uid='intervening#0'",
       ).get().generation;
       const objects = new Set(candidate.prepare("SELECT name FROM sqlite_master").all().map((row) => row.name));
-      if (!(receipts.length === 3 && state.schema_version === 12 &&
+      if (!(receipts.length === 4 && state.schema_version === 13 &&
             state.outbox_generation >= queue.generation && state.owner === null && state.expires === null &&
             state.mutation_id === null && state.mutation_submitted_at === null &&
             queue.submitted_mutation_id === null && queue.submitted_at === null &&
@@ -652,7 +723,7 @@ check("restart guard refuses an existing migration column with the wrong contrac
        FROM install_state WHERE id=1`,
   ).get();
   check("migration seeds a missing singleton as an unverified nonempty projection",
-    seededSingleton?.schema_version === 12 &&
+    seededSingleton?.schema_version === 13 &&
       seededSingleton.status === "bootstrap_required" && seededSingleton.epoch === 1 &&
       seededSingleton.cursor === null && seededSingleton.high_water === "legacy:missing-row#0",
     JSON.stringify(seededSingleton));

@@ -9,6 +9,9 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  ACCELERATED_BOOTSTRAP_PAGE_SIZE,
+  ACCELERATED_BOOTSTRAP_WINDOW,
+  acceleratedVectorBootstrap,
   acquireDrainLease,
   DRAIN_D1_QUERY_BUDGET,
   drainBatchQueryUpperBound,
@@ -49,6 +52,7 @@ function makeEnv({
 
   const deleted = [];
   const upserted = [];
+  const upsertBatches = [];
   const visible = new Map();
   let mutationSequence = 0;
   let processedUpToMutation = null;
@@ -64,12 +68,13 @@ function makeEnv({
     }
     return { mutationId };
   };
-  const d1Queries = { submitted: 0 };
+  const d1Queries = { submitted: 0, maxBinds: 0 };
   const prepare = (sql) => {
     const shape = (params = []) => ({
       bind: (...next) => shape(next),
       all: async () => {
         d1Queries.submitted++;
+        d1Queries.maxBinds = Math.max(d1Queries.maxBinds, params.length);
         if (enforceD1PatternLimit && /\b(?:LIKE|GLOB)\b/i.test(sql) &&
             params.some((value) => new TextEncoder().encode(String(value)).length > 50)) {
           throw new Error("LIKE or GLOB pattern too complex");
@@ -78,10 +83,12 @@ function makeEnv({
       },
       first: async () => {
         d1Queries.submitted++;
+        d1Queries.maxBinds = Math.max(d1Queries.maxBinds, params.length);
         return db.prepare(sql).get(...params) ?? null;
       },
       run: async () => {
         d1Queries.submitted++;
+        d1Queries.maxBinds = Math.max(d1Queries.maxBinds, params.length);
         const result = db.prepare(sql).run(...params);
         return { success: true, results: [], meta: { changes: Number(result.changes || 0) } };
       },
@@ -106,6 +113,10 @@ function makeEnv({
       prepare,
       batch: async (statements) => {
         d1Queries.submitted += statements.length;
+        d1Queries.maxBinds = Math.max(
+          d1Queries.maxBinds,
+          ...statements.map((statement) => statement._params.length),
+        );
         db.exec("BEGIN");
         try {
           const results = statements.map((statement) => {
@@ -121,10 +132,13 @@ function makeEnv({
       },
     },
     VECTORIZE: {
-      upsert: async (vectors) => accept(() => {
-        upserted.push(...vectors);
-        for (const vector of vectors) visible.set(vector.id, structuredClone(vector));
-      }),
+      upsert: async (vectors) => {
+        upsertBatches.push(vectors.map((vector) => vector.id));
+        return accept(() => {
+          upserted.push(...vectors);
+          for (const vector of vectors) visible.set(vector.id, structuredClone(vector));
+        });
+      },
       deleteByIds: async (ids) => {
         if (deleteThrows) throw new Error("Vectorize temporarily unavailable");
         return accept(() => {
@@ -144,7 +158,7 @@ function makeEnv({
       }),
     },
   };
-  return { env, db, deleted, upserted, visible, d1Queries, getByIdsCalls };
+  return { env, db, deleted, upserted, upsertBatches, visible, d1Queries, getByIdsCalls };
 }
 
 const insertDocument = (db, uid, source = "drive") => db.prepare(
@@ -1236,6 +1250,215 @@ const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
     result.vectors === 0 && result.vector_cleanup_queued === 1 && result.vector_error === null,
     JSON.stringify(result));
   check("and preserves the delete operation for the next drain", db.prepare("SELECT count(*) n FROM vector_outbox WHERE op='delete'").get().n === 1);
+}
+
+/* Schema 13 fills a provider-sized three-mutation window, then resumes from
+   durable batch receipts. No batch is acknowledged until every exact
+   generation is visible through provider-paged getByIds. */
+{
+  const {
+    env, db, upsertBatches, visible, d1Queries, getByIdsCalls,
+  } = makeEnv({ autoProcessVectorMutations: false });
+  env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
+  insertDocument(db, "drive:accelerated-bootstrap");
+  const total = (2 * ACCELERATED_BOOTSTRAP_PAGE_SIZE) + 1;
+  for (let index = 0; index < total; index++) {
+    const uid = `drive:accelerated-bootstrap#${String(index).padStart(5, "0")}`;
+    insertChunk(db, uid, "drive:accelerated-bootstrap", index);
+  }
+  db.prepare(
+    `UPDATE install_state
+        SET schema_version=13,
+            vector_projection_status='bootstrap_required',
+            vector_projection_bootstrap_epoch=1,
+            vector_projection_bootstrap_cursor=NULL,
+            vector_projection_bootstrap_high_water=(SELECT MAX(chunk_uid) FROM chunks),
+            vector_projection_bootstrap_protocol=NULL,
+            vector_projection_bootstrap_base_count=0,
+            vector_projection_mutation_id=NULL,
+            vector_projection_submitted_at=NULL
+      WHERE id=1`,
+  ).run();
+  let clock = 10_000;
+  const options = {
+    now: () => ++clock,
+    embed: async () => [0.1],
+    embedBatch: async (texts) => texts.map(() => [0.1]),
+  };
+
+  const submitted = await acceleratedVectorBootstrap(env, options);
+  const submittedRows = db.prepare(
+    `SELECT batch_no,row_count,status,mutation_id FROM vector_bootstrap_batches
+      WHERE epoch=1 ORDER BY batch_no`,
+  ).all();
+  check("accelerated bootstrap submits three disjoint provider-sized durable batches",
+    submitted.phase === "building" && submitted.total === total && submitted.confirmed === 0 &&
+      submitted.submitted === total && submitted.in_flight_batches === ACCELERATED_BOOTSTRAP_WINDOW &&
+      upsertBatches.length === ACCELERATED_BOOTSTRAP_WINDOW &&
+      JSON.stringify(upsertBatches.map((batch) => batch.length)) === JSON.stringify([1000, 1000, 1]) &&
+      submittedRows.every((row) => row.status === "submitted" && typeof row.mutation_id === "string"),
+    JSON.stringify({ submitted, submittedRows, sizes: upsertBatches.map((batch) => batch.length) }));
+  check("bootstrap responses expose aggregate progress only",
+    JSON.stringify(Object.keys(submitted).sort()) === JSON.stringify([
+      "actual_vectors", "complete", "confirmed", "epoch", "expected_vectors", "failed",
+      "in_flight_batches", "phase", "protocol", "queued", "remaining", "submitted",
+      "total", "vector_ready",
+    ]) && !JSON.stringify(submitted).includes("drive:accelerated-bootstrap"),
+    JSON.stringify(submitted));
+
+  env._processNextVectorMutation();
+  const partial = await acceleratedVectorBootstrap(env, options);
+  check("crash resume confirms only the exact visible batch without re-upserting",
+    partial.confirmed === 1000 && partial.remaining === 1001 && partial.submitted === 1001 &&
+      partial.in_flight_batches === 2 && upsertBatches.length === 3 &&
+      db.prepare("SELECT count(*) n FROM vector_outbox").get().n === 1001,
+    JSON.stringify(partial));
+
+  while (env._processNextVectorMutation()) {}
+  const staleId = upsertBatches[1][0];
+  const exactGeneration = visible.get(staleId).metadata.outbox_generation;
+  visible.get(staleId).metadata.outbox_generation = "stale-generation";
+  const stale = await acceleratedVectorBootstrap(env, options);
+  const batchStates = db.prepare(
+    `SELECT batch_no,status FROM vector_bootstrap_batches
+      WHERE epoch=1 ORDER BY batch_no`,
+  ).all();
+  check("one stale generation retains its entire batch while another exact batch confirms",
+    stale.confirmed === 1001 && stale.submitted === 1000 && stale.in_flight_batches === 1 &&
+      db.prepare("SELECT count(*) n FROM vector_outbox").get().n === 1000 &&
+      JSON.stringify(batchStates.map((row) => row.status)) ===
+        JSON.stringify(["confirmed", "submitted", "confirmed"]),
+    JSON.stringify({ stale, batchStates }));
+  visible.get(staleId).metadata.outbox_generation = exactGeneration;
+  const complete = await acceleratedVectorBootstrap(env, options);
+  const finalState = db.prepare(
+    `SELECT vector_projection_status status,vector_drain_lease_owner owner,
+            vector_drain_lease_expires_at expires
+       FROM install_state WHERE id=1`,
+  ).get();
+  check("exact batch confirmation converges to the full count and readiness fence",
+    complete.complete === true && complete.phase === "complete" && complete.confirmed === total &&
+      complete.remaining === 0 && complete.queued === 0 && complete.submitted === 0 &&
+      complete.in_flight_batches === 0 && complete.failed === 0 && complete.vector_ready === true &&
+      complete.expected_vectors === total && complete.actual_vectors === total &&
+      finalState.status === "verified" && finalState.owner === null && finalState.expires === null,
+    JSON.stringify({ complete, finalState }));
+  check("visibility proof respects the provider's 20-id readback limit",
+    getByIdsCalls.length > 0 && getByIdsCalls.every((ids) => ids.length >= 1 && ids.length <= 20),
+    JSON.stringify(getByIdsCalls.map((ids) => ids.length)));
+  check("the full multi-call bootstrap stays below one invocation's D1 limits",
+    d1Queries.submitted < 1000 && d1Queries.maxBinds <= 100,
+    JSON.stringify(d1Queries));
+  check("the exact generation receipt reached every visible vector",
+    visible.size === total && [...visible.values()].every((vector) =>
+      typeof vector?.metadata?.outbox_generation === "string"),
+    String(visible.size));
+}
+
+/* One malformed provider page invalidates the whole batch receipt. The lease
+   is still released, no row is CAS-cleared, and a later exact read resumes. */
+{
+  const { env, db } = makeEnv({
+    autoProcessVectorMutations: false,
+    invalidGetByIdsPage: 1,
+  });
+  env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
+  insertDocument(db, "drive:accelerated-invalid-page");
+  for (let index = 0; index < 21; index++) {
+    insertChunk(
+      db,
+      `drive:accelerated-invalid-page#${String(index).padStart(3, "0")}`,
+      "drive:accelerated-invalid-page",
+      index,
+    );
+  }
+  db.prepare(
+    `UPDATE install_state
+        SET schema_version=13,vector_projection_status='bootstrap_required',
+            vector_projection_bootstrap_epoch=2,
+            vector_projection_bootstrap_cursor=NULL,
+            vector_projection_bootstrap_high_water=(SELECT MAX(chunk_uid) FROM chunks),
+            vector_projection_bootstrap_protocol=NULL,
+            vector_projection_bootstrap_base_count=0
+      WHERE id=1`,
+  ).run();
+  let clock = 20_000;
+  const options = {
+    now: () => ++clock,
+    embed: async () => [0.2],
+    embedBatch: async (texts) => texts.map(() => [0.2]),
+  };
+  await acceleratedVectorBootstrap(env, options);
+  env._processNextVectorMutation();
+  let malformedError = null;
+  try {
+    await acceleratedVectorBootstrap(env, options);
+  } catch (error) {
+    malformedError = error;
+  }
+  const retained = db.prepare(
+    `SELECT (SELECT count(*) FROM vector_outbox) pending,
+            (SELECT status FROM vector_bootstrap_batches WHERE epoch=2 AND batch_no=1) status,
+            vector_drain_lease_owner owner
+       FROM install_state WHERE id=1`,
+  ).get();
+  check("a malformed visibility page fails closed without clearing a partial batch",
+    /invalid bootstrap visibility receipt/.test(malformedError?.message || "") &&
+      retained.pending === 21 && retained.status === "submitted" && retained.owner === null,
+    JSON.stringify({ message: malformedError?.message, retained }));
+  const recovered = await acceleratedVectorBootstrap(env, options);
+  check("a transient malformed visibility receipt resumes without another upsert",
+    recovered.complete === true && recovered.confirmed === 21,
+    JSON.stringify(recovered));
+}
+
+/* A live lease returns a bounded aggregate busy receipt before embedding or
+   Vectorize mutation. Active-mode callers are refused before any DB work. */
+{
+  const { env, db, upsertBatches } = makeEnv({ autoProcessVectorMutations: false });
+  env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
+  insertDocument(db, "drive:accelerated-busy");
+  insertChunk(db, "drive:accelerated-busy#0", "drive:accelerated-busy", 0);
+  db.prepare(
+    `UPDATE install_state
+        SET schema_version=13,vector_projection_status='bootstrap_required',
+            vector_projection_bootstrap_epoch=3,
+            vector_projection_bootstrap_cursor=NULL,
+            vector_projection_bootstrap_high_water=(SELECT MAX(chunk_uid) FROM chunks),
+            vector_projection_bootstrap_protocol='bootstrap-v2',
+            vector_projection_bootstrap_base_count=0
+      WHERE id=1`,
+  ).run();
+  const held = await acquireDrainLease(env, {
+    ownerToken: "accelerated-busy-owner",
+    now: 30_000,
+    ttlMs: 60_000,
+  });
+  const busy = await acceleratedVectorBootstrap(env, {
+    now: () => 30_001,
+    embed: async () => { throw new Error("busy bootstrap embedded"); },
+    embedBatch: async () => { throw new Error("busy bootstrap embedded"); },
+  });
+  check("accelerated bootstrap exposes an aggregate bounded busy receipt",
+    held.acquired === true && busy.busy === true && busy.retry_after_seconds === 60 &&
+      busy.in_flight_batches === 0 && upsertBatches.length === 0 &&
+      !JSON.stringify(busy).includes("accelerated-busy-owner"),
+    JSON.stringify(busy));
+  await releaseDrainLease(env, "accelerated-busy-owner");
+
+  env.VECTOR_DRAIN_MODE = "active";
+  let activeError = null;
+  try {
+    await acceleratedVectorBootstrap(env, {
+      embed: async () => { throw new Error("active bootstrap embedded"); },
+      embedBatch: async () => { throw new Error("active bootstrap embedded"); },
+    });
+  } catch (error) {
+    activeError = error;
+  }
+  check("accelerated bootstrap cannot run outside the verified pause",
+    /requires the verified upgrade pause/.test(activeError?.message || "") && upsertBatches.length === 0,
+    activeError?.message);
 }
 
 console.log(`\nvector delete outbox: ${ran - fail}/${ran} passed`);

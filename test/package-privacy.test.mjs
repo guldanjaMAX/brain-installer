@@ -96,6 +96,7 @@ const expected = [
   "migrations/d1/0010_vector_outbox_generation.sql",
   "migrations/d1/0011_vector_drain_lease.sql",
   "migrations/d1/0012_vector_visibility_receipts.sql",
+  "migrations/d1/0013_accelerated_vector_bootstrap.sql",
   "onboarding/01-intake-RUNBOOK.md",
   "onboarding/01-intake-questionnaire.md",
   "onboarding/02-client-effort-and-timeline.md",

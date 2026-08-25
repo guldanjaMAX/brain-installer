@@ -1868,6 +1868,107 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
     forbiddenCalls === 0, String(forbiddenCalls));
 }
 
+/* The one paused-mode write exception is the authenticated schema-13 bootstrap
+   coordinator. Its public contract is aggregate-only and fixed so the CLI can
+   fail closed on any incompatible Worker. */
+{
+  let aiCalls = 0;
+  let vectorWrites = 0;
+  let d1Writes = 0;
+  const env = {
+    STORAGE: "d1",
+    ADMIN_KEY: "k",
+    VECTOR_DRAIN_MODE: "paused-for-upgrade",
+    AI: { run: async () => { aiCalls++; throw new Error("empty bootstrap embedded"); } },
+    VECTORIZE: {
+      describe: async () => ({ vectorCount: 0, processedUpToMutation: null }),
+      upsert: async () => { vectorWrites++; throw new Error("empty bootstrap wrote vectors"); },
+    },
+    DB: {
+      prepare(sql) {
+        const statement = {
+          bind() { return statement; },
+          run: async () => {
+            d1Writes++;
+            return { meta: { changes: 1 } };
+          },
+          first: async () => {
+            if (/SELECT schema_version, vector_projection_status AS status/.test(sql)) {
+              return {
+                schema_version: 13,
+                status: "verified",
+                epoch: 0,
+                cursor: null,
+                high_water: null,
+                protocol: "bootstrap-v2",
+                base_count: 0,
+              };
+            }
+            if (/^SELECT count\(\*\) AS n FROM chunks/.test(sql.trim())) return { n: 0 };
+            if (/sum\(CASE WHEN submitted_mutation_id IS NULL/.test(sql)) {
+              return { n: 0, queued: 0, submitted: 0, failed: 0 };
+            }
+            if (/FROM vector_bootstrap_batches WHERE epoch/.test(sql)) {
+              return { confirmed: 0, in_flight: 0 };
+            }
+            if (/vector_projection_mutation_id AS mutation_id/.test(sql)) {
+              return {
+                schema_version: 13,
+                mutation_id: null,
+                mutation_submitted_at: null,
+                projection_status: "verified",
+                bootstrap_epoch: 0,
+                bootstrap_cursor: null,
+                bootstrap_high_water: null,
+                expected_vectors: 0,
+                pending: 0,
+                submitted: 0,
+                oldest_queued_at: null,
+              };
+            }
+            throw new Error(`unexpected bootstrap SQL: ${sql}`);
+          },
+        };
+        return statement;
+      },
+    },
+  };
+  const response = await post(env, "/api/admin/brain/bootstrap", {});
+  const receipt = await response.json();
+  check("the paused schema-13 bootstrap route returns the strict aggregate contract",
+    response.status === 200 && receipt.protocol === "bootstrap-v2" &&
+      receipt.phase === "complete" && receipt.complete === true &&
+      JSON.stringify(Object.keys(receipt).sort()) === JSON.stringify([
+        "actual_vectors", "complete", "confirmed", "epoch", "expected_vectors", "failed",
+        "in_flight_batches", "phase", "protocol", "queued", "remaining", "submitted",
+        "total", "vector_ready",
+      ]),
+    JSON.stringify(receipt));
+  check("an empty bootstrap performs no embedding or vector write",
+    aiCalls === 0 && vectorWrites === 0 && d1Writes === 1,
+    JSON.stringify({ aiCalls, vectorWrites, d1Writes }));
+
+  let activeProviderCalls = 0;
+  const activeEnv = {
+    ...env,
+    VECTOR_DRAIN_MODE: "active",
+    DB: { prepare: () => { activeProviderCalls++; throw new Error("active bootstrap touched D1"); } },
+    AI: { run: async () => { activeProviderCalls++; } },
+    VECTORIZE: { upsert: async () => { activeProviderCalls++; } },
+  };
+  const active = await post(activeEnv, "/api/admin/brain/bootstrap", {});
+  const activeBody = await active.json();
+  check("the bootstrap route refuses active mode before any provider access",
+    active.status === 409 && activeBody.paused === false && activeProviderCalls === 0,
+    JSON.stringify({ activeBody, activeProviderCalls }));
+  const unauthorized = await worker.fetch(new Request(
+    "https://b.example/api/admin/brain/bootstrap",
+    { method: "POST", body: "{}" },
+  ), env, {});
+  check("the bootstrap route remains behind the admin key", unauthorized.status === 401,
+    String(unauthorized.status));
+}
+
 {
   let attemptedOwner = null;
   let vectorWrites = 0;
