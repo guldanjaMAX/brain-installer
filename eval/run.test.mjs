@@ -31,7 +31,7 @@ function run(command, args, options) {
 }
 
 async function runFixture({
-  questions, args = [], route = null, artifacts = false, baseline = undefined, save = false,
+  questions, goldenFields = {}, args = [], route = null, artifacts = false, baseline = undefined, save = false,
 }) {
   const root = mkdtempSync(join(tmpdir(), "brain-eval-case-"));
   const key = "fixture-private-key";
@@ -97,7 +97,7 @@ async function runFixture({
   try {
     const address = await listen(server);
     const golden = join(root, "private-owner-suite.golden.json");
-    writeFileSync(golden, JSON.stringify({ install: "private-owner", questions }));
+    writeFileSync(golden, JSON.stringify({ install: "private-owner", ...goldenFields, questions }));
     const environment = { BRAIN_ADMIN_KEY: key };
     for (const name of [
       "PATH", "HOME", "USERPROFILE", "SystemRoot", "SYSTEMROOT", "WINDIR", "TEMP", "TMP",
@@ -135,6 +135,64 @@ async function runFixture({
     rmSync(root, { recursive: true, force: true });
   }
 }
+
+test("release profile rejects an undersized suite before credentials or network access", async () => {
+  let requests = 0;
+  const privateText = "PRIVATE question that must not be copied into release diagnostics";
+  const result = await runFixture({
+    questions: [{
+      id: "private-case-id",
+      kind: "single",
+      risk: "critical",
+      domains: ["general"],
+      formats: ["text"],
+      question: privateText,
+      expect: [{ any_of: ["drive_path:Private/Owner/File.pdf"] }],
+    }],
+    args: ["--profile", "release"],
+    route: () => { requests++; return null; },
+  });
+
+  assert.equal(result.code, 2);
+  assert.equal(requests, 0, "release coverage must fail before contacting the brain");
+  assert.match(result.stderr, /release profile coverage gate failed before retrieval/);
+  assert.match(result.stderr, /suite has 1 cases; release requires at least 60/);
+  assert.doesNotMatch(result.stderr, /PRIVATE question|private-case-id|Private\/Owner\/File\.pdf/);
+});
+
+test("release profile passes its exact aggregate coverage floor and records the profile", async () => {
+  const questions = Array.from({ length: 60 }, (_, index) => {
+    const unanswerable = index >= 55;
+    return {
+      id: `release-${index + 1}`,
+      kind: unanswerable ? "unanswerable" : "single",
+      risk: index < 5 ? "critical" : "normal",
+      domains: ["general"],
+      formats: ["text"],
+      question: `Synthetic release question ${index + 1}`,
+      expect: unanswerable ? [] : [{ any_of: ["curated:doc-a"] }],
+    };
+  });
+  const result = await runFixture({
+    questions,
+    goldenFields: {
+      release_slices: {
+        risk: ["critical", "normal"],
+        domain: ["general"],
+        format: ["text"],
+        query_kind: ["single", "unanswerable"],
+      },
+    },
+    args: ["--profile", "release"],
+    artifacts: true,
+  });
+
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /profile\s+release \(v1 retrieval-suite coverage floor passed\)/);
+  assert.equal(result.runArtifact.suite.profile, "release");
+  assert.equal(result.runArtifact.suite.profile_coverage.minimums.suite_cases, 60);
+  assert.deepEqual(result.runArtifact.suite.profile_coverage.failures, []);
+});
 
 test("the distributed runner records reproducible provenance and CI artifacts", async () => {
   const key = "fixture-eval-admin-key";

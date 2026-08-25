@@ -548,6 +548,14 @@ starts a local HTTP brain; it never reads an installed brain or private golden
 set. See `docs/EVALUATION.md` for the v2 contracts, release gates, and staged
 diagnosis model.
 
+`brain eval <manifest>` uses the `smoke` profile by default. It is diagnostic,
+not certification. `brain eval <manifest> --profile release` fails before
+reading the admin key or contacting the brain unless the private suite has at
+least 60 cases, explicit risk, domain, format, and query-kind declarations, and
+at least five cases in every declared slice. That is a v1 retrieval-suite
+coverage gate. Full answer, citation, corpus-completeness, authorization,
+confidence-bound, latency-budget, and cost certification remain v2 work.
+
 `test/migrations.test.mjs` applies every migration to a real SQLite database and
 asserts the FTS5 triggers actually keep the index in step. It exists because
 migration 0004 once shipped broken: the SQL splitter shredded its trigger bodies,

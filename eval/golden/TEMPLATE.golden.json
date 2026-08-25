@@ -5,6 +5,13 @@
   "created": "REPLACE-WITH-the-date",
   "built_by": "the person who owns this brain",
 
+  "release_slices": {
+    "risk": ["critical", "normal"],
+    "domain": ["replace-with-domain", "general"],
+    "format": ["replace-with-format", "negative"],
+    "query_kind": ["single", "multi", "temporal", "person", "unanswerable"]
+  },
+
   "_how_to_read_this": [
     "This is the acceptance test for YOUR brain. It is not a benchmark and it is",
     "not comparable to anyone else's, because it is built from your documents and",
@@ -36,7 +43,15 @@
     "another important slice actually works. A critical retrieval miss fails",
     "the run even when the overall average looks healthy.",
     "",
-    "Run it with:  brain eval <manifest>",
+    "Run the smoke profile while writing it:  brain eval <manifest>",
+    "Run the structural release gate after it reaches 60 reviewed cases:",
+    "brain eval <manifest> --profile release",
+    "Every label used by a release case must be named in release_slices, and",
+    "each named slice needs at least 5 cases. Release also requires critical,",
+    "unanswerable, and at least one answerable query-kind slice.",
+    "This v1 release gate proves suite coverage plus the existing retrieval and",
+    "refusal checks. It does not yet certify answer claims, citations, complete",
+    "source inventory, or document-level authorization.",
     "Measure how much it varies between runs with:  brain eval <manifest> --repeat 3"
   ],
 

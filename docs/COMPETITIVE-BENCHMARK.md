@@ -105,8 +105,11 @@ parts that make an install supportable, recoverable, and safe to reproduce.
 
 The current evaluator already provides a useful deterministic core: document-level
 Recall@K, MRR, unanswerable-question refusal, repeatability measurement, provenance,
-and baseline regression detection. Extend it rather than replacing it with a
-judge-only score.
+baseline regression detection, and a named release profile that enforces a
+60-case suite plus five cases per explicitly declared risk, domain, format, and
+query-kind slice. That release profile is a structural retrieval-suite gate,
+not full answer, citation, corpus-completeness, or security certification.
+Extend it rather than replacing it with a judge-only score.
 
 A complete case should record:
 
@@ -167,4 +170,3 @@ exports to R2. The installer still needs its own verified restore workflow becau
 normal D1 export does not support virtual tables such as FTS5 and can block database
 requests while running. See [Time Travel and backups](https://developers.cloudflare.com/d1/reference/time-travel/)
 and [D1 import and export limitations](https://developers.cloudflare.com/d1/best-practices/import-export-data/).
-

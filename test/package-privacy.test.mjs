@@ -57,6 +57,7 @@ const expected = [
   "eval/brain-client.mjs",
   "eval/eval.config.json",
   "eval/golden/TEMPLATE.golden.json",
+  "eval/profile.mjs",
   "eval/run.mjs",
   "eval/schema/corpus-contract-v1.schema.json",
   "eval/schema/eval-suite-v2.schema.json",

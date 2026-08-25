@@ -29,6 +29,7 @@ import { basename, dirname, resolve, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BrainClient } from "./brain-client.mjs";
+import { evaluateProfileCoverage, formatProfileFailures } from "./profile.mjs";
 import { localToolEnvironment } from "../doctor.mjs";
 import {
   scoreQuestion,
@@ -116,7 +117,7 @@ async function writePrivateNewFile(path, content) {
 
 /* ------------------------------------------------------------------ config */
 
-const VALUE_FLAGS = new Set(["config", "golden", "base", "limit", "k", "baseline", "save", "repeat", "artifacts"]);
+const VALUE_FLAGS = new Set(["config", "golden", "base", "profile", "limit", "k", "baseline", "save", "repeat", "artifacts"]);
 const BOOL_FLAGS = new Set(["rerank", "graph-boost", "no-think", "json", "help"]);
 
 /**
@@ -412,6 +413,8 @@ function sanitizedRunArtifact(run, k) {
       hash: run.provenance.suite_hash,
       cases: run.suite_question_count,
       executions: run.questions.length,
+      profile: run.profile,
+      profile_coverage: run.profile_coverage,
     },
     target: { hash: run.provenance.target_hash },
     code: {
@@ -532,6 +535,7 @@ function report(run, regressions, improvements, k) {
   L.push("");
   L.push(`  brain      ${run.base}`);
   L.push(`  golden     ${run.goldenLabel}  (${agg.n} scored, ${refusals.total} unanswerable)`);
+  L.push(`  profile    ${run.profile}${run.profile === "release" ? " (v1 retrieval-suite coverage floor passed)" : " (diagnostic; not certification)"}`);
   L.push(`  variant    limit=${variant.limit} rerank=${variant.rerank} graph_boost=${variant.graphBoost}`);
   L.push("");
   L.push(`  QUESTION PASS@${k}   ${pct(agg.recall[k])}   <- all required evidence found`);
@@ -970,6 +974,7 @@ function assertBaselineCompatible(run, baseline) {
   }
   if (baseline.k !== undefined && Number(baseline.k) !== Number(run.k)) mismatches.push("k cutoff");
   if (baseline.repeat !== undefined && Number(baseline.repeat) !== Number(run.repeat)) mismatches.push("repeat count");
+  if ((baseline.profile || "smoke") !== run.profile) mismatches.push("evaluation profile");
   const pairs = [
     ["suite", baseline.provenance?.suite_hash, run.provenance?.suite_hash],
     ["target", baseline.provenance?.target_hash, run.provenance?.target_hash],
@@ -1010,6 +1015,7 @@ async function main() {
         "  --config <path>     config file (default eval/eval.config.json)",
         "  --golden <path>     golden set JSON, overrides the config",
         "  --base <url>        brain base URL, overrides the config",
+        "  --profile <name>    smoke (default) or release suite-coverage gate",
         "  --limit <n>         results requested per question (default/minimum 10 for nDCG@10)",
         "  --k <n>             evidence cutoff for question pass and quality metrics (default 5)",
         "  --rerank            turn the reranker on for this run",
@@ -1056,6 +1062,11 @@ async function main() {
   const goldenBytes = await readFile(goldenPath);
   const golden = JSON.parse(goldenBytes.toString("utf8"));
   validateGolden(golden, goldenPath);
+  const profile = String(flags.profile || cfg.profile || "smoke").trim().toLowerCase();
+  const profileCoverage = evaluateProfileCoverage(golden, profile);
+  if (profileCoverage.failures.length > 0) {
+    throw new Error(formatProfileFailures(profileCoverage));
+  }
 
   const k = Number(flags.k || cfg.k || 5);
   const opts = {
@@ -1219,6 +1230,8 @@ async function main() {
     goldenLabel: `${golden.install || "unnamed"} (${golden.questions.length} questions)`,
     suite_question_count: golden.questions.length,
     golden_path: goldenPath,
+    profile,
+    profile_coverage: profileCoverage,
     variant: { limit: opts.limit, rerank: opts.rerank, graphBoost: opts.graphBoost },
     k,
     repeat,

@@ -5,11 +5,13 @@ sources, retrieves the complete evidence, answers from that evidence, cites it,
 refuses unsupported questions, and does not cross an ownership boundary. It is
 designed for one shared installer and many isolated, private installations.
 
-This document is a specification. The current `eval/run.mjs` harness implements
-the earlier retrieval and refusal checks. The v2 schemas do not by themselves
-enable the commands, metrics, inventory readback, answer judging, or reports
-described here. Each rollout step below must be implemented and tested before
-its corresponding claim is made.
+This document contains both the shipped v1 behavior and the v2 specification.
+The current `eval/run.mjs` harness implements retrieval and refusal checks plus
+two named profiles: diagnostic `smoke` and a deterministic `release` suite
+coverage gate. The v2 schemas do not by themselves enable the remaining
+commands, metrics, inventory readback, answer judging, or reports described
+here. Each rollout step below must be implemented and tested before its
+corresponding claim is made.
 
 ## Product and instance boundary
 
@@ -111,23 +113,41 @@ opaque evidence references; diagnoses; timing; and cost.
 Unavailable evidence is recorded as `not_observable` with a reason code. A null
 field must never imply that provenance was successfully collected.
 
-## Evaluation tiers
+## Evaluation profiles and future tiers
 
-### `brain eval smoke`
+### `brain eval <manifest> --profile smoke`
 
-Fast, deterministic, and free of LLM judging. Run it after setup, ingest, sync,
-or a retrieval change. It checks health and authentication, corpus accounting
-when a contract is available, vector backlog, exclusions and quarantine,
-critical retrieval canaries, exact-value fixtures, and synthetic isolation
-fixtures.
+This is the shipped default. It runs the current deterministic retrieval and
+refusal harness against any non-empty valid v1 suite. Use it while writing a
+suite and after setup, ingest, sync, or a retrieval change. A smoke pass is a
+diagnostic result. It is not release certification, even when every small-set
+case passes.
 
-### `brain eval release`
+### `brain eval <manifest> --profile release`
 
-Runs the frozen reviewed suite before a release. It measures retrieval, exact
-claims, answers, citations, abstention, regression, latency, and cost. Critical
-stochastic cases repeat three times by default and must pass every repeat.
+This shipped v1 profile refuses to contact the brain unless the private suite
+meets all of these structural floors:
 
-### `brain eval deep`
+- at least 60 cases;
+- an explicit `release_slices` contract for `risk`, `domain`, `format`, and
+  `query_kind`;
+- an explicit label in every dimension on every case;
+- at least five cases in every named required slice;
+- a named `critical` risk slice; and
+- named `unanswerable` plus at least one answerable query-kind slice.
+
+Every label used by a case must be declared in `release_slices`. The gate emits
+aggregate counts only and runs before the admin key is read or a network call is
+made. After the floor passes, the existing v1 retrieval, refusal, provenance,
+regression, and critical-case gates run normally.
+
+This is v1 retrieval-suite release qualification, not full v2 certification.
+It does not prove that the declared slices cover every real corpus region, and
+it does not yet gate answer claims, citations, complete source inventory,
+document-level authorization, confidence bounds, latency budgets, or cost.
+Those claims remain blocked until their executable v2 contracts ship.
+
+### Future: `brain eval deep`
 
 Runs nightly or weekly. It audits source and extraction coverage, tested corpus
 regions, OCR and table canaries, adversarial cases, updates, tombstones, access
@@ -135,14 +155,14 @@ changes, stale and conflicting sources, and rank stability. It may generate
 synthetic candidate questions for uncovered strata, but generated candidates
 do not affect a release until reviewed.
 
-### `brain eval monitor`
+### Future: `brain eval monitor`
 
 Samples owner-local production outcomes and explicit feedback. A thumbs-up is
 useful evidence, not ground truth. Reviewed failures and corrections can be
 promoted into candidate, reviewed, and finally gold cases. Questions, answers,
 and retrieved text remain local.
 
-### `brain eval explain <case-id>`
+### Future: `brain eval explain <case-id>`
 
 Shows the earliest failed stage, later symptoms, expected opaque source, page,
 best observed rank, whether evidence entered the prompt, claim and citation
@@ -252,10 +272,13 @@ The private explanation for a required claim should answer:
 Without a complete corpus contract, the honest answer to "what source is
 missing?" is "not knowable from the index alone."
 
-## Initial release gates
+## Initial v2 release gates
 
 These are strong starting targets. An installation may raise them. Lowering a
 gate requires a versioned policy decision backed by evidence.
+
+Except for the current v1 critical retrieval and refusal gates, the targets in
+this section are specification until their scorers, policies, and tests ship.
 
 Hard gates are not averaged away:
 
@@ -323,6 +346,11 @@ grow toward 120 reviewed cases, and a mature adversarial suite toward 300 or
 more. Sample count alone is not quality. Every important domain, format, and
 query kind needs explicit reviewed representation.
 
+The shipped v1 release profile enforces the 60-case floor and five cases per
+declared slice. The owner still has to review the cases and declare the right
+slices. Only an independent corpus contract can reveal an important source or
+domain that was omitted from both the suite and its declaration.
+
 Corpus chunk or semantic-cluster coverage can reveal regions no question has
 ever exercised. It is structural test adequacy, not proof of answer quality.
 Use it to propose candidates, then review those candidates before promotion.
@@ -332,9 +360,10 @@ Use it to propose candidates, then review those candidates before promotion.
 The current retrieval harness produces an internal v1 artifact set:
 
 - `run.json`: sanitized retrieval metrics, opaque case IDs, provenance hashes,
-  and hard-gate results;
+  the named profile and aggregate profile-coverage evidence, and hard-gate
+  results;
 - `failures.jsonl`: sanitized case failures and diagnosis codes;
-- `coverage.csv`: reviewed counts and metrics by slice;
+- `coverage.csv`: case counts and metrics by slice;
 - `junit.xml`: release-gate integration for CI.
 
 These files are created in a new owner-only directory, each file is owner-only,
@@ -356,6 +385,11 @@ raw error, stack, trace, prompt, or credential.
 ## Rollout order
 
 ### Batch 1: executable contracts and deterministic retrieval
+
+The v1 runtime now covers the deterministic retrieval metrics, privacy-safe
+artifacts, critical-case gates, and named structural release-profile floor. It
+does not validate or execute the complete v2 suite, policy, corpus, or artifact
+contracts below.
 
 1. Validate suite, gate-policy, and run-artifact schemas.
 2. Preserve v1 scorer behavior with compatibility fixtures.

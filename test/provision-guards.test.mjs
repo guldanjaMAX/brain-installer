@@ -20,7 +20,7 @@ let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 200))); if (!c) fail++; };
 const throws = async (fn) => { try { await fn(); return null; } catch (e) { return e.message || String(e); } };
 
-for (const flag of ["golden", "k", "repeat", "baseline", "save", "artifacts"]) {
+for (const flag of ["golden", "profile", "k", "repeat", "baseline", "save", "artifacts"]) {
   check(`eval value flag --${flag} cannot silently become boolean true`, VALUE_FLAGS.has(flag));
 }
 
@@ -535,6 +535,9 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
       /m\.brain\?\.domain \? null : await resolveAccount\(m\)/.test(b));
   }
   const evalCommand = bodyOf("cmdEval");
+  check("brain eval forwards the named profile to the shipped evaluator",
+    /\["profile", "limit", "k", "repeat", "baseline", "save", "artifacts"\]/.test(evalCommand || ""),
+    String(evalCommand).slice(-1100));
   check("brain eval forwards graph-boost to the shipped evaluator",
     /\["rerank", "graph-boost", "no-think", "json"\]/.test(evalCommand || ""),
     String(evalCommand).slice(-900));
@@ -603,7 +606,7 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   const pkg = JSON.parse(await fs.readFile(new URL("../package.json", import.meta.url), "utf-8"));
   const files = pkg.files || [];
   check("the eval runner ships, so a client can actually run it",
-    files.includes("eval/run.mjs") && files.includes("eval/scorer.mjs"));
+    files.includes("eval/run.mjs") && files.includes("eval/scorer.mjs") && files.includes("eval/profile.mjs"));
   check("a blank question template ships", files.includes("eval/golden/TEMPLATE.golden.json"));
   check("no real golden set is in the allowlist",
     !files.some((f) => /eval\/golden\//.test(f) && !/TEMPLATE/.test(f)),

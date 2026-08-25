@@ -2847,7 +2847,7 @@ function assertSourceName(name) {
  */
 export const VALUE_FLAGS = new Set([
   "path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark", "export",
-  "golden", "k", "repeat", "baseline", "save", "artifacts", "approve-removals",
+  "golden", "profile", "k", "repeat", "baseline", "save", "artifacts", "approve-removals",
 ]);
 
 /** Read an exact Drive-id exclusion list from either its portable shape or a migration receipt. */
@@ -6900,7 +6900,7 @@ async function cmdEval(manifestPath) {
   if (!adminKey) die("no admin key found: set ADMIN_KEY or keep .brain-admin-key next to the manifest.");
 
   const args = [join(HERE, "eval", "run.mjs"), "--base", base, "--golden", goldenPath];
-  for (const f of ["limit", "k", "repeat", "baseline", "save", "artifacts"]) {
+  for (const f of ["profile", "limit", "k", "repeat", "baseline", "save", "artifacts"]) {
     if (flags[f] && flags[f] !== true) args.push(`--${f}`, String(flags[f]));
   }
   for (const f of ["rerank", "graph-boost", "no-think", "json"]) if (flags[f]) args.push(`--${f}`);
