@@ -47,14 +47,32 @@ import {
 
 const DEFAULT_SCHEDULER_PATH = fileURLToPath(import.meta.url);
 const LOCKF_PATH = "/usr/bin/lockf";
+const LSOF_PATH = "/usr/sbin/lsof";
+const PS_PATH = "/bin/ps";
+const SH_PATH = "/bin/sh";
+const TRUE_PATH = "/usr/bin/true";
 const LOCK_BUSY_EXIT = 75;
 const LOCKF_ABNORMAL_CHILD_EXIT = 70;
 const LOCK_CHILD_FD = 3;
+const CHILD_FAILURE_JOURNALED_EXIT = 65;
+const CHILD_FAILURE_UNJOURNALED_EXIT = 66;
+const INTERNAL_EXECUTE_COMMAND = "__execute-held-lock";
+const LOCK_BOOTSTRAP = 'exec 3<"$1" || exit 66; shift; exec "$@"';
+const LOCK_BOOTSTRAP_NAME = "brain-curated-lock-bootstrap";
 const FRESHNESS_SCHEMA_VERSION = 1;
 const MAX_FRESHNESS_BYTES = 64 * 1024;
 const STALE_GRACE = 1.5;
+const MAX_FUTURE_SKEW_SECONDS = 5 * 60;
 const SAFE_LOCALE_ENV = new Set([
   "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME",
+]);
+const FRESHNESS_KEYS = new Set([
+  "schema_version", "completed_at", "config_hash", "corpus_fingerprint", "documents",
+  "target_coverage", "historical_raw_drive",
+]);
+const TARGET_COVERAGE_KEYS = new Set(["cloudflare", "legacy"]);
+const HISTORICAL_RAW_DRIVE_KEYS = new Set([
+  "checksum_matches", "presence_unverified", "checksum_mismatches", "deletion_eligible",
 ]);
 
 function fail(message) {
@@ -68,6 +86,16 @@ function currentUid() {
 function assertOwned(info, label) {
   const uid = currentUid();
   if (uid !== null && info.uid !== uid) fail(`${label} is not owned by the current user`);
+}
+
+function exactObjectKeys(value, expected) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).length === expected.size &&
+    Object.keys(value).every((key) => expected.has(key));
+}
+
+function nonNegativeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0;
 }
 
 function ensurePrivateDirectory(path) {
@@ -265,6 +293,163 @@ export function safeCuratedSchedulerEnvironment(environment = process.env) {
   return clean;
 }
 
+function lockProofEnvironment() {
+  return { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" };
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function assertPrivateLockIdentity(info, label) {
+  const bigint = typeof info.nlink === "bigint";
+  if (!info.isFile() || info.nlink !== (bigint ? 1n : 1)) {
+    fail(`${label} is not a private regular file`);
+  }
+  const uid = currentUid();
+  if (uid !== null && info.uid !== (bigint ? BigInt(uid) : uid)) {
+    fail(`${label} is not owned by the current user`);
+  }
+  const unsafeMode = bigint ? (info.mode & 0o077n) !== 0n : (info.mode & 0o077) !== 0;
+  if (process.platform !== "win32" && unsafeMode) {
+    fail(`${label} is not owner-only`);
+  }
+}
+
+function defaultLockParentExecutable(options = {}, expectedLock) {
+  const parentPid = options.parentPid ?? process.ppid;
+  if (!Number.isSafeInteger(parentPid) || parentPid < 1) {
+    fail("curated scheduler could not verify its lockf parent");
+  }
+  const result = spawnSync(
+    PS_PATH,
+    ["-p", String(parentPid), "-o", "comm="],
+    {
+      encoding: "utf8",
+      env: lockProofEnvironment(),
+      maxBuffer: 4 * 1024,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5_000,
+    },
+  );
+  if (result?.error || result?.status !== 0) {
+    fail("curated scheduler could not verify its lockf parent");
+  }
+  if (String(result.stdout ?? "").trim() !== LOCKF_PATH) {
+    return String(result.stdout ?? "").trim();
+  }
+
+  // The lockf parent must still hold fd 3 on this exact inode. Asking lsof for
+  // field output without `n` avoids reading or retaining any path string.
+  const descriptor = spawnSync(
+    LSOF_PATH,
+    ["-a", "-p", String(parentPid), "-d", String(LOCK_CHILD_FD), "-F", "pftDi"],
+    {
+      encoding: "utf8",
+      env: lockProofEnvironment(),
+      maxBuffer: 4 * 1024,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5_000,
+    },
+  );
+  const fields = String(descriptor.stdout ?? "").split(/\r?\n/).filter(Boolean);
+  const device = fields.find((line) => line.startsWith("D"))?.slice(1);
+  const inode = fields.find((line) => line.startsWith("i"))?.slice(1);
+  let deviceNumber;
+  let inodeNumber;
+  try {
+    deviceNumber = BigInt(device ?? "");
+    inodeNumber = BigInt(inode ?? "");
+  } catch {
+    fail("curated scheduler could not verify the lockf parent descriptor");
+  }
+  if (descriptor?.error || descriptor?.status !== 0 ||
+      !fields.includes(`p${parentPid}`) || !fields.includes(`f${LOCK_CHILD_FD}`) ||
+      !fields.includes("tREG") || deviceNumber !== expectedLock?.dev ||
+      inodeNumber !== expectedLock?.ino) {
+    fail("curated scheduler could not verify the lockf parent descriptor");
+  }
+  return LOCKF_PATH;
+}
+
+function defaultLockContentionProbe(descriptor) {
+  return spawnSync(
+    LOCKF_PATH,
+    ["-k", "-s", "-t", "0", `/dev/fd/${LOCK_CHILD_FD}`, TRUE_PATH],
+    {
+      env: lockProofEnvironment(),
+      shell: false,
+      stdio: ["ignore", "ignore", "ignore", descriptor],
+      timeout: 5_000,
+    },
+  );
+}
+
+/**
+ * Prove the internal execute child is below native lockf and fd 3 still names
+ * the exact reviewed lock. Merely opening the file is insufficient: a second
+ * independent descriptor must observe active contention before credentials
+ * or a target network call become reachable.
+ */
+export function assertInheritedCuratedSchedulerLock(plan, options = {}) {
+  const descriptor = options.lockDescriptor ?? LOCK_CHILD_FD;
+  let inherited;
+  let named;
+  try {
+    inherited = fstatSync(descriptor, { bigint: true });
+    named = lstatSync(plan.lockPath, { bigint: true });
+  } catch {
+    fail("curated scheduler execute requires its inherited lock descriptor");
+  }
+  assertPrivateLockIdentity(inherited, "curated scheduler inherited lock");
+  if (named.isSymbolicLink()) fail("curated scheduler lock path changed before execution");
+  assertPrivateLockIdentity(named, "curated scheduler lock path");
+  if (!sameFileIdentity(inherited, named)) {
+    fail("curated scheduler inherited lock does not match its reviewed path");
+  }
+
+  const inspectParent = options.inspectLockParent ?? defaultLockParentExecutable;
+  if (inspectParent(options, inherited) !== LOCKF_PATH) {
+    fail("curated scheduler execute is not running below the required lockf parent");
+  }
+
+  let probeDescriptor;
+  let result;
+  try {
+    probeDescriptor = openSync(
+      plan.lockPath,
+      fsConstants.O_RDWR | (fsConstants.O_NOFOLLOW || 0),
+    );
+    const probeInfo = fstatSync(probeDescriptor, { bigint: true });
+    if (!sameFileIdentity(inherited, probeInfo)) {
+      fail("curated scheduler lock path changed during verification");
+    }
+    const probe = options.probeLockContention ?? defaultLockContentionProbe;
+    result = probe(probeDescriptor, options);
+  } catch (error) {
+    if (error?.message?.startsWith("curated scheduler")) throw error;
+    fail("curated scheduler could not verify its active lock");
+  } finally {
+    if (probeDescriptor !== undefined) {
+      try { closeSync(probeDescriptor); } catch { /* best effort */ }
+    }
+  }
+  if (result?.error || result?.status !== LOCK_BUSY_EXIT || result?.signal) {
+    fail("curated scheduler execute does not hold the expected active lock");
+  }
+
+  let after;
+  try { after = lstatSync(plan.lockPath, { bigint: true }); } catch {
+    fail("curated scheduler lock path changed during verification");
+  }
+  if (after.isSymbolicLink() || !sameFileIdentity(inherited, after)) {
+    fail("curated scheduler lock path changed during verification");
+  }
+  assertPrivateLockIdentity(after, "curated scheduler lock path");
+}
+
 function assertExpectedConfiguration(plan, expected) {
   if (!/^[0-9a-f]{64}$/.test(String(expected ?? ""))) {
     fail("curated scheduling requires its exact prepared configuration hash before credentials may be read");
@@ -294,10 +479,68 @@ function successReceipt(plan, report, now = new Date()) {
   };
 }
 
+function validateFreshnessReceipt(value, now) {
+  if (!exactObjectKeys(value, FRESHNESS_KEYS) ||
+      value.schema_version !== FRESHNESS_SCHEMA_VERSION ||
+      !/^[0-9a-f]{64}$/.test(String(value.config_hash ?? "")) ||
+      !/^[0-9a-f]{64}$/.test(String(value.corpus_fingerprint ?? "")) ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(String(value.completed_at ?? "")) ||
+      !Number.isSafeInteger(value.documents) || value.documents < 1 ||
+      !exactObjectKeys(value.target_coverage, TARGET_COVERAGE_KEYS) ||
+      !exactObjectKeys(value.historical_raw_drive, HISTORICAL_RAW_DRIVE_KEYS)) {
+    return { ok: false, reason: "invalid_shape" };
+  }
+  const completed = new Date(value.completed_at);
+  if (!Number.isFinite(completed.getTime()) || completed.toISOString() !== value.completed_at) {
+    return { ok: false, reason: "invalid_timestamp" };
+  }
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+    return { ok: false, reason: "invalid_clock" };
+  }
+  if (completed.getTime() - now.getTime() > MAX_FUTURE_SKEW_SECONDS * 1000) {
+    return { ok: false, reason: "future_timestamp" };
+  }
+  const coverage = value.target_coverage;
+  if (!nonNegativeInteger(coverage.cloudflare) || !nonNegativeInteger(coverage.legacy) ||
+      coverage.cloudflare !== value.documents || coverage.legacy !== value.documents) {
+    return { ok: false, reason: "invalid_coverage" };
+  }
+  const historical = value.historical_raw_drive;
+  if (!nonNegativeInteger(historical.checksum_matches) ||
+      !nonNegativeInteger(historical.presence_unverified) ||
+      !nonNegativeInteger(historical.checksum_mismatches) ||
+      historical.deletion_eligible !== false ||
+      historical.checksum_matches + historical.presence_unverified +
+        historical.checksum_mismatches > value.documents) {
+    return { ok: false, reason: "invalid_historical_aggregate" };
+  }
+  return {
+    ok: true,
+    value: Object.freeze({
+      schema_version: value.schema_version,
+      completed_at: value.completed_at,
+      config_hash: value.config_hash,
+      corpus_fingerprint: value.corpus_fingerprint,
+      documents: value.documents,
+      target_coverage: Object.freeze({
+        cloudflare: coverage.cloudflare,
+        legacy: coverage.legacy,
+      }),
+      historical_raw_drive: Object.freeze({
+        checksum_matches: historical.checksum_matches,
+        presence_unverified: historical.presence_unverified,
+        checksum_mismatches: historical.checksum_mismatches,
+        deletion_eligible: false,
+      }),
+    }),
+  };
+}
+
 /** Execute inside the already-held lock and advance freshness only on full dual confirmation. */
 export async function executeScheduledCuratedSync(planPath, options = {}) {
   const plan = buildCuratedSchedulerPlan(planPath, options);
   assertExpectedConfiguration(plan, options.expectedConfigHash);
+  assertInheritedCuratedSchedulerLock(plan, options);
   const runner = options.runSync ?? runCuratedDualSync;
   const report = await runner(plan.curatedPlan, {
     mode: "sync",
@@ -322,14 +565,18 @@ export function runScheduledCuratedSync(planPath, options = {}) {
   const spawn = options.spawn ?? spawnSync;
   let result;
   try {
-    // lockf accepts /dev/fd/N and locks that already-open descriptor. Passing
-    // the validated owner-only file as fd 3 removes the path reopen between
-    // our no-follow checks and lock acquisition.
+    // macOS lockf keeps the advisory lock in its waiting parent and closes
+    // extra descriptors before it launches the command. A static shell shim
+    // therefore reopens the non-secret lock path read-only as fd 3 before
+    // execing Node. The child proves that fd, the current path, and the inode
+    // under active contention are still identical before touching credentials.
     result = spawn(
       LOCKF_PATH,
       [
         "-k", "-s", "-t", "0", `/dev/fd/${LOCK_CHILD_FD}`,
-        plan.nodePath, plan.schedulerPath, "execute", plan.path,
+        SH_PATH, "-c", LOCK_BOOTSTRAP, LOCK_BOOTSTRAP_NAME,
+        plan.lockPath,
+        plan.nodePath, plan.schedulerPath, INTERNAL_EXECUTE_COMMAND, plan.path,
         "--config-hash", plan.configHash,
       ],
       {
@@ -350,24 +597,32 @@ export function runScheduledCuratedSync(planPath, options = {}) {
   // exits EX_SOFTWARE (70) with result.signal === null when the locked child
   // was signaled or stopped. Preserve that distinction for issue journaling.
   const childAbnormallyTerminated = result?.status === LOCKF_ABNORMAL_CHILD_EXIT;
+  const childJournaled = result?.status === CHILD_FAILURE_JOURNALED_EXIT;
   return {
     ...plan,
     status: result?.status === 0 ? "complete" : "failed",
     code: Number.isInteger(result?.status) ? result.status : 1,
     signal: result?.signal ?? null,
     childAbnormallyTerminated,
+    childJournaled,
   };
 }
 
-function readFreshness(plan) {
+function readFreshness(plan, now) {
   if (!existsSync(plan.freshnessPath)) return { status: "missing", stale: true };
   try {
     assertSafeFreshnessDestination(plan.freshnessPath);
-    const value = JSON.parse(readFileSync(plan.freshnessPath, "utf8"));
-    if (value?.schema_version !== FRESHNESS_SCHEMA_VERSION ||
-        !/^[0-9a-f]{64}$/.test(String(value?.config_hash ?? "")) ||
-        !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(String(value?.completed_at ?? ""))) {
-      return { status: "invalid", stale: true };
+    const checked = validateFreshnessReceipt(
+      JSON.parse(readFileSync(plan.freshnessPath, "utf8")),
+      now,
+    );
+    if (!checked.ok) {
+      return { status: "invalid", stale: true, reason: checked.reason };
+    }
+    const value = checked.value;
+    if (value.config_hash === plan.configHash &&
+        value.documents !== plan.curatedPlan.expectedDocuments) {
+      return { status: "invalid", stale: true, reason: "document_count_mismatch" };
     }
     return value.config_hash === plan.configHash
       ? { status: "observed", value }
@@ -379,9 +634,9 @@ function readFreshness(plan) {
 
 export function statusScheduledCuratedSync(planPath, options = {}) {
   const plan = buildCuratedSchedulerPlan(planPath, options);
-  const observed = readFreshness(plan);
-  if (observed.status !== "observed") return { ...plan, freshness: observed };
   const now = options.now instanceof Date ? options.now : new Date(options.now ?? Date.now());
+  const observed = readFreshness(plan, now);
+  if (observed.status !== "observed") return { ...plan, freshness: observed };
   const completed = new Date(observed.value.completed_at);
   const ageSeconds = Math.max(0, Math.floor((now.getTime() - completed.getTime()) / 1000));
   const staleAfterSeconds = Math.ceil(plan.expectedRefreshSeconds * STALE_GRACE);
@@ -413,9 +668,14 @@ export function recordCuratedSchedulerFailure(options = {}) {
   }
 }
 
-/** Normal child failures journal themselves; only abnormal termination is ours. */
+/**
+ * A caught execute failure exits with a dedicated child-journaled code. Every
+ * other failed wrapper result is parent-owned, including command exec failure,
+ * runtime startup failure, and abnormal termination before the child journal.
+ */
 export function recordCuratedSchedulerResult(result, options = {}) {
-  if (!result?.signal && !result?.childAbnormallyTerminated) return null;
+  if (!result || result.childJournaled) return null;
+  if (result.status !== "failed" && !result.signal && !result.childAbnormallyTerminated) return null;
   return recordCuratedSchedulerFailure(options);
 }
 
@@ -427,12 +687,13 @@ function printSupportReceipt(eventId) {
 
 export function parseCuratedSchedulerCliArguments(argv) {
   if (!Array.isArray(argv)) fail("curated scheduler arguments are invalid");
-  const [command, planPath, flag, configHash, ...extra] = argv;
-  if (!new Set(["run", "execute", "status"]).has(command) ||
+  const [rawCommand, planPath, flag, configHash, ...extra] = argv;
+  if (!new Set(["run", INTERNAL_EXECUTE_COMMAND, "status"]).has(rawCommand) ||
       typeof planPath !== "string" || !planPath || planPath.startsWith("--") ||
       extra.length) {
     fail("curated scheduler arguments are invalid");
   }
+  const command = rawCommand === INTERNAL_EXECUTE_COMMAND ? "execute" : rawCommand;
   if (command === "status") {
     if (argv.length !== 2) fail("curated scheduler arguments are invalid");
     return Object.freeze({ command, planPath, expectedConfigHash: undefined });
@@ -460,14 +721,21 @@ async function main(argv = process.argv.slice(2)) {
     parsed = parseCuratedSchedulerCliArguments(argv);
   } catch {
     console.log("usage: node operations/curated-sync-scheduler.mjs status <private-plan>");
-    console.log("       node operations/curated-sync-scheduler.mjs <run|execute> <private-plan> --config-hash <sha256>");
+    console.log("       node operations/curated-sync-scheduler.mjs run <private-plan> --config-hash <sha256>");
     return 1;
   }
   const { command, planPath, expectedConfigHash } = parsed;
   if (command === "execute") {
-    const result = await executeScheduledCuratedSync(planPath, { expectedConfigHash });
-    console.log(`[${new Date().toISOString()}] curated sync ${result.status}`);
-    return result.code;
+    try {
+      const result = await executeScheduledCuratedSync(planPath, { expectedConfigHash });
+      console.log(`[${new Date().toISOString()}] curated sync ${result.status}`);
+      return result.code;
+    } catch (error) {
+      console.error(`Curated scheduler failed: ${String(error?.message || "unknown failure")}`);
+      const eventId = recordCuratedSchedulerFailure();
+      printSupportReceipt(eventId);
+      return eventId ? CHILD_FAILURE_JOURNALED_EXIT : CHILD_FAILURE_UNJOURNALED_EXIT;
+    }
   }
   if (command === "run") {
     const result = runScheduledCuratedSync(planPath, { expectedConfigHash });

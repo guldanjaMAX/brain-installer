@@ -427,19 +427,27 @@ for a reviewed plan. Its LaunchAgent definition contains only the plan locator
 and a configuration hash. That hash binds the normalized plan plus both complete
 target-manifest fingerprints, including domains and Keychain locators; changing
 any of them stops before Keychain access until the service is reviewed and
-reinstalled. Both `run` and `execute` require that exact 64-character hash and
-reject missing, empty, duplicate, or unknown CLI arguments. `run` strips ambient
-credentials, opens and validates the owner-only lock without following links,
-and passes that already-open descriptor to a nonblocking native `lockf`; only
-that lock holder may open Keychain-backed target credentials. A complete
+reinstalled. The public `run` command requires that exact 64-character hash and
+rejects missing, empty, duplicate, or unknown CLI arguments. Its internal child
+command is omitted from public usage and requires the same hash. `run` strips
+ambient credentials, opens and validates the owner-only lock without following
+links, and passes that already-open descriptor to a nonblocking native `lockf`.
+Before Keychain or network access, the child proves fd 3 is the same stable lock
+inode, its parent is the native `lockf`, and an independent descriptor observes
+active contention. Merely opening the lock or copying the hash cannot bypass
+that gate. A complete
 dual-target confirmation atomically advances an owner-only aggregate freshness
 receipt. A normal child
-failure records one bounded local support-journal event in the child; an
-abnormal signal or pre-child wrapper failure is recorded by the parent. macOS
+failure records one bounded local support-journal event and returns a dedicated
+handled exit code; every other nonzero result is parent-owned, so a missing
+command, runtime startup failure, abnormal signal, or pre-child wrapper failure
+still produces one event without duplicating the handled child. macOS
 `lockf` translates a signaled or stopped child to exit 70, so the wrapper treats
 that exact result as abnormal even though Node receives no signal name. Neither
 receipt contains paths, source identities, document names, URLs, content, raw
-errors, or credentials.
+errors, or credentials. Freshness rejects malformed aggregates and timestamps
+more than five minutes ahead of the local clock, and any configuration change is
+always stale.
 
 The scheduler wrapper and plist renderer do not silently install or replace a
 LaunchAgent. Production rollout still requires independent review, one

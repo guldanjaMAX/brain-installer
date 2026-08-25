@@ -21,8 +21,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
+  assertInheritedCuratedSchedulerLock,
   buildCuratedSchedulerPlan,
   executeScheduledCuratedSync,
   parseCuratedSchedulerCliArguments,
@@ -122,6 +124,10 @@ try {
     parseCuratedSchedulerCliArguments(["run", planPath, "--config-hash", plan.configHash]),
     { command: "run", planPath, expectedConfigHash: plan.configHash },
   );
+  assert.deepEqual(
+    parseCuratedSchedulerCliArguments(["__execute-held-lock", planPath, "--config-hash", plan.configHash]),
+    { command: "execute", planPath, expectedConfigHash: plan.configHash },
+  );
   for (const invalid of [
     [],
     ["status", planPath, "--unknown"],
@@ -130,7 +136,8 @@ try {
     ["run", planPath, "--config-hash", ""],
     ["run", planPath, "--config-hash", plan.configHash, "--config-hash", plan.configHash],
     ["run", planPath, "--unknown", plan.configHash],
-    ["execute", "--unknown", "--config-hash", plan.configHash],
+    ["execute", planPath, "--config-hash", plan.configHash],
+    ["__execute-held-lock", "--unknown", "--config-hash", plan.configHash],
   ]) {
     assert.throws(
       () => parseCuratedSchedulerCliArguments(invalid),
@@ -196,6 +203,7 @@ try {
   assert.equal(busySpawn.command, "/usr/bin/lockf");
   assert.deepEqual(busySpawn.args.slice(0, 4), ["-k", "-s", "-t", "0"]);
   assert.equal(busySpawn.args[4], "/dev/fd/3");
+  assert.equal(busySpawn.args[12], "__execute-held-lock");
   assert.equal(busySpawn.args.includes("fixture-admin-secret"), false);
   assert.equal(Object.hasOwn(busySpawn.options.env, "ADMIN_KEY"), false);
   assert.equal(Object.hasOwn(busySpawn.options.env, "CLOUDFLARE_API_TOKEN"), false);
@@ -250,6 +258,116 @@ try {
   );
   assert.equal(missingHashSpawned, 0);
 
+  let bypassRunnerCalls = 0;
+  const directDescriptor = openSync(plan.lockPath, fsConstants.O_RDWR);
+  try {
+    await assert.rejects(
+      executeScheduledCuratedSync(planPath, {
+        ...common,
+        expectedConfigHash: plan.configHash,
+        lockDescriptor: directDescriptor,
+        inspectLockParent: () => "/not-lockf",
+        runSync: async () => { bypassRunnerCalls++; return report; },
+      }),
+      /not running below the required lockf parent/,
+    );
+  } finally {
+    closeSync(directDescriptor);
+  }
+  assert.equal(bypassRunnerCalls, 0);
+
+  const unlockedDescriptor = openSync(plan.lockPath, fsConstants.O_RDWR);
+  try {
+    await assert.rejects(
+      executeScheduledCuratedSync(planPath, {
+        ...common,
+        expectedConfigHash: plan.configHash,
+        lockDescriptor: unlockedDescriptor,
+        inspectLockParent: () => "/usr/bin/lockf",
+        probeLockContention: () => ({ status: 0, signal: null }),
+        runSync: async () => { bypassRunnerCalls++; return report; },
+      }),
+      /does not hold the expected active lock/,
+    );
+  } finally {
+    closeSync(unlockedDescriptor);
+  }
+  assert.equal(bypassRunnerCalls, 0);
+
+  const forgedDescriptor = openSync(plan.lockPath, fsConstants.O_RDWR);
+  try {
+    await assert.rejects(
+      executeScheduledCuratedSync(planPath, {
+        ...common,
+        expectedConfigHash: "b".repeat(64),
+        lockDescriptor: forgedDescriptor,
+        inspectLockParent: () => "/usr/bin/lockf",
+        probeLockContention: () => ({ status: 75, signal: null }),
+        runSync: async () => { bypassRunnerCalls++; return report; },
+      }),
+      /changed after this LaunchAgent was prepared/,
+    );
+  } finally {
+    closeSync(forgedDescriptor);
+  }
+  assert.equal(bypassRunnerCalls, 0);
+
+  if (process.platform === "darwin") {
+    const schedulerModuleUrl = new URL("../operations/curated-sync-scheduler.mjs", import.meta.url).href;
+    const proofScript = [
+      `import { buildCuratedSchedulerPlan, assertInheritedCuratedSchedulerLock } from ${JSON.stringify(schedulerModuleUrl)};`,
+      `const plan = buildCuratedSchedulerPlan(${JSON.stringify(planPath)}, ${JSON.stringify(common)});`,
+      "assertInheritedCuratedSchedulerLock(plan);",
+    ].join("\n");
+    const proofDescriptor = openSync(plan.lockPath, fsConstants.O_RDWR);
+    let nativeProof;
+    try {
+      nativeProof = spawnSync(
+        "/usr/bin/lockf",
+        [
+          "-k", "-s", "-t", "0", "/dev/fd/3",
+          "/bin/sh", "-c", 'exec 3<"$1" || exit 66; shift; exec "$@"', "brain-curated-lock-bootstrap",
+          plan.lockPath,
+          process.execPath, "--input-type=module", "-e", proofScript,
+        ],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe", proofDescriptor] },
+      );
+    } finally {
+      closeSync(proofDescriptor);
+    }
+    assert.equal(nativeProof.status, 0, nativeProof.stderr);
+
+    const nativeChildHome = join(sandbox, "native-child-home");
+    mkdirSync(nativeChildHome, { recursive: true, mode: 0o700 });
+    const nativeCommon = {
+      ...common,
+      home: nativeChildHome,
+      schedulerPath: fileURLToPath(schedulerModuleUrl),
+    };
+    const nativePlan = buildCuratedSchedulerPlan(planPath, nativeCommon);
+    const nativeHandled = runScheduledCuratedSync(planPath, {
+      ...nativeCommon,
+      expectedConfigHash: nativePlan.configHash,
+      env: { HOME: nativeChildHome, PATH: "/usr/bin:/bin", LANG: "C" },
+      spawn(command, args, options) {
+        return spawnSync(command, args, {
+          ...options,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe", options.stdio[3]],
+        });
+      },
+      rotateLogs: () => {},
+    });
+    assert.equal(nativeHandled.code, 65);
+    assert.equal(nativeHandled.childJournaled, true);
+    const nativeEvents = join(nativeChildHome, ".brain", "support", "events");
+    assert.equal(readdirSync(nativeEvents).length, 1);
+    assert.equal(recordCuratedSchedulerResult(nativeHandled, {
+      journalOptions: { root: nativeChildHome },
+    }), null);
+    assert.equal(readdirSync(nativeEvents).length, 1);
+  }
+
   let rotations = 0;
   const complete = runScheduledCuratedSync(planPath, {
     ...common,
@@ -262,16 +380,25 @@ try {
 
   let capturedRunOptions;
   const completedAt = new Date("2026-08-25T14:10:00.000Z");
-  const executed = await executeScheduledCuratedSync(planPath, {
-    ...common,
-    expectedConfigHash: plan.configHash,
-    now: completedAt,
-    runSync: async (_curatedPlan, options) => {
-      capturedRunOptions = options;
-      return report;
-    },
-    randomBytes: () => Buffer.alloc(8, 7),
-  });
+  const verifiedUnitDescriptor = openSync(plan.lockPath, fsConstants.O_RDWR);
+  let executed;
+  try {
+    executed = await executeScheduledCuratedSync(planPath, {
+      ...common,
+      expectedConfigHash: plan.configHash,
+      now: completedAt,
+      lockDescriptor: verifiedUnitDescriptor,
+      inspectLockParent: () => "/usr/bin/lockf",
+      probeLockContention: () => ({ status: 75, signal: null }),
+      runSync: async (_curatedPlan, options) => {
+        capturedRunOptions = options;
+        return report;
+      },
+      randomBytes: () => Buffer.alloc(8, 7),
+    });
+  } finally {
+    closeSync(verifiedUnitDescriptor);
+  }
   assert.equal(executed.status, "complete");
   assert.equal(capturedRunOptions.mode, "sync");
   assert.equal(capturedRunOptions.planPath, planPath);
@@ -297,6 +424,39 @@ try {
   });
   assert.equal(stale.freshness.stale, true);
 
+  writeFileSync(plan.freshnessPath, `${JSON.stringify({
+    ...executed.receipt,
+    completed_at: new Date(completedAt.getTime() + 10 * 60_000).toISOString(),
+  })}\n`, { mode: 0o600 });
+  const future = statusScheduledCuratedSync(planPath, { ...common, now: completedAt });
+  assert.deepEqual(
+    { status: future.freshness.status, stale: future.freshness.stale, reason: future.freshness.reason },
+    { status: "invalid", stale: true, reason: "future_timestamp" },
+  );
+
+  writeFileSync(plan.freshnessPath, `${JSON.stringify({
+    ...executed.receipt,
+    target_coverage: { cloudflare: 1, legacy: 0 },
+  })}\n`, { mode: 0o600 });
+  const malformedCoverage = statusScheduledCuratedSync(planPath, {
+    ...common,
+    now: new Date(completedAt.getTime() + 60_000),
+  });
+  assert.equal(malformedCoverage.freshness.status, "invalid");
+  assert.equal(malformedCoverage.freshness.reason, "invalid_coverage");
+
+  writeFileSync(plan.freshnessPath, `${JSON.stringify({
+    ...executed.receipt,
+    private_path: "/private/fixture.md",
+  })}\n`, { mode: 0o600 });
+  const extraField = statusScheduledCuratedSync(planPath, {
+    ...common,
+    now: new Date(completedAt.getTime() + 60_000),
+  });
+  assert.equal(extraField.freshness.status, "invalid");
+  assert.equal(JSON.stringify(extraField.freshness).includes("/private/fixture.md"), false);
+  writeFileSync(plan.freshnessPath, `${JSON.stringify(executed.receipt)}\n`, { mode: 0o600 });
+
   const abnormal = runScheduledCuratedSync(planPath, {
     ...common,
     expectedConfigHash: plan.configHash,
@@ -316,7 +476,6 @@ try {
     },
   });
   assert.match(abnormalEventId, /^evt_[0-9a-f]{32}$/);
-  assert.equal(recordCuratedSchedulerResult({ status: "failed", code: 1 }), null);
   assert.equal(
     readdirSync(join(signalJournalRoot, ".brain", "support", "events")).length,
     1,
@@ -344,6 +503,69 @@ try {
     assert.equal(nativeSignal.signal, null);
     assert.equal(nativeSignal.childAbnormallyTerminated, true);
   }
+
+  const handledChild = runScheduledCuratedSync(planPath, {
+    ...common,
+    expectedConfigHash: plan.configHash,
+    spawn: () => ({ status: 65, signal: null }),
+    rotateLogs: () => {},
+  });
+  assert.equal(handledChild.status, "failed");
+  assert.equal(handledChild.childJournaled, true);
+  const handledJournalRoot = join(sandbox, "handled-child-journal");
+  mkdirSync(handledJournalRoot, { recursive: true, mode: 0o700 });
+  const handledChildEvent = recordCuratedSchedulerFailure({
+    journalOptions: {
+      root: handledJournalRoot,
+      now: new Date("2026-08-25T14:10:40.000Z"),
+      randomBytes: () => Buffer.alloc(16, 10),
+    },
+  });
+  assert.match(handledChildEvent, /^evt_[0-9a-f]{32}$/);
+  assert.equal(recordCuratedSchedulerResult(handledChild, {
+    journalOptions: {
+      root: handledJournalRoot,
+      now: new Date("2026-08-25T14:10:41.000Z"),
+      randomBytes: () => Buffer.alloc(16, 11),
+    },
+  }), null);
+  assert.equal(
+    readdirSync(join(handledJournalRoot, ".brain", "support", "events")).length,
+    1,
+  );
+
+  const missingNodeCommon = { ...common, nodePath: join(sandbox, "missing-node") };
+  const missingNodePlan = buildCuratedSchedulerPlan(planPath, missingNodeCommon);
+  const missingCommandSpawn = process.platform === "darwin"
+    ? (command, args, options) => spawnSync(command, args, {
+      ...options,
+      stdio: ["ignore", "ignore", "pipe", options.stdio[3]],
+    })
+    : () => ({ status: 1, signal: null });
+  const missingCommand = runScheduledCuratedSync(planPath, {
+    ...missingNodeCommon,
+    expectedConfigHash: missingNodePlan.configHash,
+    spawn: missingCommandSpawn,
+    rotateLogs: () => {},
+  });
+  assert.equal(missingCommand.status, "failed");
+  assert.notEqual(missingCommand.code, 0);
+  assert.notEqual(missingCommand.code, 65);
+  assert.equal(missingCommand.childJournaled, false);
+  const preJournalRoot = join(sandbox, "pre-journal-failure");
+  mkdirSync(preJournalRoot, { recursive: true, mode: 0o700 });
+  const preJournalEvent = recordCuratedSchedulerResult(missingCommand, {
+    journalOptions: {
+      root: preJournalRoot,
+      now: new Date("2026-08-25T14:10:50.000Z"),
+      randomBytes: () => Buffer.alloc(16, 12),
+    },
+  });
+  assert.match(preJournalEvent, /^evt_[0-9a-f]{32}$/);
+  assert.equal(
+    readdirSync(join(preJournalRoot, ".brain", "support", "events")).length,
+    1,
+  );
 
   // A target domain or Keychain locator is part of the loaded service
   // definition even though it lives in a target manifest rather than the plan.
@@ -381,7 +603,10 @@ try {
     /changed after this LaunchAgent was prepared/,
   );
   assert.equal(driftSpawned, 0);
-  const changed = statusScheduledCuratedSync(planPath, common);
+  const changed = statusScheduledCuratedSync(planPath, {
+    ...common,
+    now: new Date(completedAt.getTime() + 60_000),
+  });
   assert.equal(changed.freshness.status, "configuration_changed");
   assert.equal(changed.freshness.stale, true);
 
