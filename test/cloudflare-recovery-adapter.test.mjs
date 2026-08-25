@@ -311,6 +311,9 @@ function providerHarness({
       });
     }
     if (args[0] === "d1" && args[1] === "export") {
+      // Wrangler 4.73 removed --skip-confirmation from d1 export. Export has no
+      // confirmation option, while restore continues to use d1 execute --yes.
+      assert.equal(args.includes("--skip-confirmation"), false);
       const output = args[args.indexOf("--output") + 1];
       const exportedTables = args
         .map((value, index) => value === "--table" ? args[index + 1] : null)
@@ -692,14 +695,23 @@ try {
     new URL(call.url).pathname === "/api/admin/brain/reindex" &&
       JSON.parse(call.options.body).confirm === true).length;
   const runToCheckpoint = async (stopAfterStage, currentStage, completedStages) => {
-    await assert.rejects(
-      runCloudflareRecoveryFieldGate(
+    let stopped = null;
+    try {
+      const unexpected = await runCloudflareRecoveryFieldGate(
         { ...approvedDrillConfig, stopAfterStage },
         drillHarness.dependencies,
-      ),
-      (error) => error instanceof CloudflareRecoveryAdapterError &&
-        error.code === "RECOVERY_FIELD_GATE_INTENTIONAL_INTERRUPTION",
-    );
+      );
+      assert.fail(
+        `expected intentional checkpoint after ${stopAfterStage}; ` +
+        `runner returned ${unexpected?.errorCode || unexpected?.status?.status || "unknown"}`,
+      );
+    } catch (error) {
+      stopped = error;
+    }
+    if (!(stopped instanceof CloudflareRecoveryAdapterError)) {
+      assert.fail(stopped?.message || "checkpoint did not raise the adapter interruption");
+    }
+    assert.equal(stopped.code, "RECOVERY_FIELD_GATE_INTENTIONAL_INTERRUPTION");
     const checkpoint = loadVerifiedRecoveryState(drillStatePath, drillInitialized.plan);
     assert.equal(checkpoint.status, "running");
     assert.equal(checkpoint.current_stage, currentStage);

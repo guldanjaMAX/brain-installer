@@ -1287,7 +1287,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     try {
       await wrangler(binding, [
         "d1", "export", binding.databaseName,
-        "--remote", "--no-schema", "--skip-confirmation", "--output", path,
+        "--remote", "--no-schema", "--output", path,
         ...RECOVERY_EXPORT_TABLES.flatMap((table) => ["--table", table]),
       ]);
       if (process.platform !== "win32") chmodSync(path, 0o600);
@@ -1414,7 +1414,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       try {
         await wrangler(pins.binding.source, [
           "d1", "export", pins.binding.source.databaseName,
-          "--remote", "--no-schema", "--skip-confirmation", "--output", dataPartial,
+          "--remote", "--no-schema", "--output", dataPartial,
           ...RECOVERY_EXPORT_TABLES.flatMap((table) => ["--table", table]),
         ]);
         if (process.platform !== "win32") chmodSync(dataPartial, 0o600);
