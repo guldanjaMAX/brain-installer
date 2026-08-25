@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "release": "0.1.13",
+  "candidate_commit": "767e79e511d9c3118db95af84c343bcba946acec",
+  "completed_at": "2026-08-25T14:50:36.446Z",
+  "environment": "disposable real Cloudflare Worker, D1, Vectorize, and Workers AI",
+  "corpus": "fictional synthetic recovery fixture only",
+  "result": "passed",
+  "code_fingerprints": {
+    "recovery_adapter_sha256": "df7d962219ae28183df2486139c6bed1361290adfddd8b8a726289e9c47624f8",
+    "recovery_state_machine_sha256": "a34263db0db52be1da57b52eba7cd008fbaf9b67f500531743eef5259a7ee103",
+    "retrieval_sha256": "2e29f3d15ef4ed0b71dab0bd7c20b6873b2356d5a75075c22196f7a7b7d6cc4a",
+    "fixture_corpus_sha256": "bd73d723ed67449661b0a3c5cad3975ba522f1df99ff81f90772fd22b227bd19",
+    "golden_sha256": "9e422d03e8a697e573cbaf26ee01c682e70afe6aebf2f1358dd5e5f3fbe7255f"
+  },
+  "preflight_verification": {
+    "target_user_tables": 0,
+    "target_vectors": 0,
+    "vectorize_dimensions": 768,
+    "vectorize_metric": "cosine",
+    "worker_active_deployment_percent": 100,
+    "worker_secret_names": [
+      "ADMIN_KEY"
+    ],
+    "worker_custom_domains": 0,
+    "worker_routes": 0,
+    "six_approval_fingerprints_bound": true
+  },
+  "checkpoint_verification": {
+    "forced_interruptions": [
+      "export_d1",
+      "restore_d1",
+      "rebuild_vectorize"
+    ],
+    "resumed_without_repeating_completed_external_effects": true,
+    "completed_stages": 8,
+    "total_stages": 8
+  },
+  "restore_verification": {
+    "documents": 55,
+    "chunks": 57,
+    "fts_rows": 57,
+    "vectors": 57,
+    "failed_vectors": 0,
+    "pending_vector_outbox": 0,
+    "source_and_restored_schema_match": true,
+    "source_and_restored_content_match": true,
+    "source_and_restored_aggregates_match": true,
+    "database_integrity": "ok"
+  },
+  "evaluation": {
+    "profile": "release",
+    "cases": 60,
+    "answerable_cases": 55,
+    "semantic_canaries": 5,
+    "unanswerable_cases": 5,
+    "critical_failures": 0,
+    "unauthorized_retrievals": 0,
+    "source_pre_restore_runs": 2,
+    "source_question_pass_at_5": 1,
+    "source_honest_refusal_rate": 1,
+    "long_document_case_rank": 5,
+    "restored_target_status": "pass"
+  },
+  "regression_discovered_and_fixed": {
+    "category": "selective lexical candidate burial in hybrid fusion",
+    "recovery_parity_before_fix": true,
+    "initial_release_evaluation_passed": false,
+    "golden_changed": false,
+    "retry_until_lucky_used": false,
+    "bounded_lexical_fusion_fix_field_verified": true
+  },
+  "health_verification": {
+    "failure_count": 0,
+    "vector_backlog": 0,
+    "status": "pass"
+  },
+  "scope_note": "This proves exact synthetic D1 export and restore, FTS recreation, Vectorize rebuild, checkpoint resume behavior, release-profile retrieval, semantic canaries, and unsupported-question refusal on the named candidate commit. It does not certify James's corpus completeness, OCR quality, private answer accuracy, or document-level permissions."
+}
