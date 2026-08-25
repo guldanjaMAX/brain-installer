@@ -48,9 +48,14 @@ import {
 const DEFAULT_SCHEDULER_PATH = fileURLToPath(import.meta.url);
 const LOCKF_PATH = "/usr/bin/lockf";
 const LOCK_BUSY_EXIT = 75;
+const LOCKF_ABNORMAL_CHILD_EXIT = 70;
+const LOCK_CHILD_FD = 3;
 const FRESHNESS_SCHEMA_VERSION = 1;
 const MAX_FRESHNESS_BYTES = 64 * 1024;
 const STALE_GRACE = 1.5;
+const SAFE_LOCALE_ENV = new Set([
+  "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME",
+]);
 
 function fail(message) {
   throw new Error(message);
@@ -93,11 +98,13 @@ function preparePrivateLock(path) {
     if (!info.isFile() || info.nlink !== 1) fail("curated scheduler lock is not a private regular file");
     assertOwned(info, "curated scheduler lock");
     fchmodSync(descriptor, 0o600);
+    return descriptor;
   } catch (error) {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* best effort */ }
+    }
     if (error?.message?.startsWith("curated scheduler")) throw error;
     fail("curated scheduler lock could not be prepared safely");
-  } finally {
-    if (descriptor !== undefined) closeSync(descriptor);
   }
 }
 
@@ -249,11 +256,20 @@ export function safeCuratedSchedulerEnvironment(environment = process.env) {
   const clean = safeIngestEnvironment(environment);
   delete clean.BRAIN_DEBUG;
   delete clean.BRAIN_GOOGLE_TOKEN_STORE;
+  // The shared Drive scheduler accepts LC_* broadly. This wrapper has a
+  // stricter no-ambient-credential contract, so retain only POSIX locale names
+  // and refuse secret-shaped custom variables hiding behind that prefix.
+  for (const name of Object.keys(clean)) {
+    if (name.startsWith("LC_") && !SAFE_LOCALE_ENV.has(name)) delete clean[name];
+  }
   return clean;
 }
 
 function assertExpectedConfiguration(plan, expected) {
-  if (expected && expected !== plan.configHash) {
+  if (!/^[0-9a-f]{64}$/.test(String(expected ?? ""))) {
+    fail("curated scheduling requires its exact prepared configuration hash before credentials may be read");
+  }
+  if (expected !== plan.configHash) {
     fail("curated sync plan changed after this LaunchAgent was prepared; review and reinstall it before credentials may be read");
   }
 }
@@ -302,31 +318,44 @@ export function runScheduledCuratedSync(planPath, options = {}) {
   assertExpectedConfiguration(plan, options.expectedConfigHash);
   ensurePrivateDirectory(join(plan.home, ".brain"));
   ensurePrivateDirectory(plan.logsDir);
-  preparePrivateLock(plan.lockPath);
+  const lockDescriptor = preparePrivateLock(plan.lockPath);
   const spawn = options.spawn ?? spawnSync;
-  const result = spawn(
-    LOCKF_PATH,
-    [
-      "-k", "-s", "-t", "0", plan.lockPath,
-      plan.nodePath, plan.schedulerPath, "execute", plan.path,
-      "--config-hash", plan.configHash,
-    ],
-    {
-      cwd: plan.planDirectory,
-      env: safeCuratedSchedulerEnvironment(options.env ?? process.env),
-      stdio: ["ignore", "inherit", "inherit"],
-    },
-  );
+  let result;
+  try {
+    // lockf accepts /dev/fd/N and locks that already-open descriptor. Passing
+    // the validated owner-only file as fd 3 removes the path reopen between
+    // our no-follow checks and lock acquisition.
+    result = spawn(
+      LOCKF_PATH,
+      [
+        "-k", "-s", "-t", "0", `/dev/fd/${LOCK_CHILD_FD}`,
+        plan.nodePath, plan.schedulerPath, "execute", plan.path,
+        "--config-hash", plan.configHash,
+      ],
+      {
+        cwd: plan.planDirectory,
+        env: safeCuratedSchedulerEnvironment(options.env ?? process.env),
+        stdio: ["ignore", "inherit", "inherit", lockDescriptor],
+      },
+    );
+  } finally {
+    closeSync(lockDescriptor);
+  }
   if (result?.error) throw result.error;
   if (result?.status === LOCK_BUSY_EXIT) {
     return { ...plan, status: "skipped", code: 0, reason: "curated sync is already running" };
   }
   (options.rotateLogs ?? rotateDriveSchedulerLogs)(plan, options);
+  // macOS lockf does not surface the command's signal through spawnSync. It
+  // exits EX_SOFTWARE (70) with result.signal === null when the locked child
+  // was signaled or stopped. Preserve that distinction for issue journaling.
+  const childAbnormallyTerminated = result?.status === LOCKF_ABNORMAL_CHILD_EXIT;
   return {
     ...plan,
     status: result?.status === 0 ? "complete" : "failed",
     code: Number.isInteger(result?.status) ? result.status : 1,
     signal: result?.signal ?? null,
+    childAbnormallyTerminated,
   };
 }
 
@@ -340,7 +369,9 @@ function readFreshness(plan) {
         !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(String(value?.completed_at ?? ""))) {
       return { status: "invalid", stale: true };
     }
-    return { status: value.config_hash === plan.configHash ? "observed" : "configuration_changed", value };
+    return value.config_hash === plan.configHash
+      ? { status: "observed", value }
+      : { status: "configuration_changed", stale: true, value };
   } catch {
     return { status: "invalid", stale: true };
   }
@@ -382,15 +413,35 @@ export function recordCuratedSchedulerFailure(options = {}) {
   }
 }
 
+/** Normal child failures journal themselves; only abnormal termination is ours. */
+export function recordCuratedSchedulerResult(result, options = {}) {
+  if (!result?.signal && !result?.childAbnormallyTerminated) return null;
+  return recordCuratedSchedulerFailure(options);
+}
+
 function printSupportReceipt(eventId) {
   if (!eventId) return;
   console.error(`Private issue note ${eventId} was saved locally. Nothing was uploaded or sent.`);
   console.error("Review the exact safe record with: brain support --preview");
 }
 
-function optionValue(argv, name) {
-  const index = argv.indexOf(name);
-  return index >= 0 && index + 1 < argv.length ? argv[index + 1] : null;
+export function parseCuratedSchedulerCliArguments(argv) {
+  if (!Array.isArray(argv)) fail("curated scheduler arguments are invalid");
+  const [command, planPath, flag, configHash, ...extra] = argv;
+  if (!new Set(["run", "execute", "status"]).has(command) ||
+      typeof planPath !== "string" || !planPath || planPath.startsWith("--") ||
+      extra.length) {
+    fail("curated scheduler arguments are invalid");
+  }
+  if (command === "status") {
+    if (argv.length !== 2) fail("curated scheduler arguments are invalid");
+    return Object.freeze({ command, planPath, expectedConfigHash: undefined });
+  }
+  if (argv.length !== 4 || flag !== "--config-hash" ||
+      !/^[0-9a-f]{64}$/.test(String(configHash ?? ""))) {
+    fail("curated scheduler run and execute require one exact configuration hash");
+  }
+  return Object.freeze({ command, planPath, expectedConfigHash: configHash });
 }
 
 function statusSummary(result) {
@@ -404,12 +455,15 @@ function statusSummary(result) {
 }
 
 async function main(argv = process.argv.slice(2)) {
-  const [command, planPath] = argv;
-  if (!command || !planPath || !["run", "execute", "status"].includes(command)) {
-    console.log("usage: node operations/curated-sync-scheduler.mjs <run|execute|status> <private-plan> [--config-hash <sha256>]");
+  let parsed;
+  try {
+    parsed = parseCuratedSchedulerCliArguments(argv);
+  } catch {
+    console.log("usage: node operations/curated-sync-scheduler.mjs status <private-plan>");
+    console.log("       node operations/curated-sync-scheduler.mjs <run|execute> <private-plan> --config-hash <sha256>");
     return 1;
   }
-  const expectedConfigHash = optionValue(argv, "--config-hash") ?? undefined;
+  const { command, planPath, expectedConfigHash } = parsed;
   if (command === "execute") {
     const result = await executeScheduledCuratedSync(planPath, { expectedConfigHash });
     console.log(`[${new Date().toISOString()}] curated sync ${result.status}`);
@@ -418,7 +472,7 @@ async function main(argv = process.argv.slice(2)) {
   if (command === "run") {
     const result = runScheduledCuratedSync(planPath, { expectedConfigHash });
     console.log(`[${new Date().toISOString()}] ${result.reason ?? `curated sync ${result.status}`}`);
-    if (result.signal) printSupportReceipt(recordCuratedSchedulerFailure());
+    printSupportReceipt(recordCuratedSchedulerResult(result));
     return result.code;
   }
   console.log(JSON.stringify(statusSummary(statusScheduledCuratedSync(planPath)), null, 2));

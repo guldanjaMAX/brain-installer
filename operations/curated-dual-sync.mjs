@@ -185,6 +185,16 @@ function optionalSchedulerPlan(value) {
   if (timezone !== null && (!timezone || timezone.length > 100 || PATH_CONTROL.test(timezone))) {
     fail("scheduler.timezone is invalid");
   }
+  if (timezone !== null) {
+    try {
+      // Intl uses the host's IANA time-zone database. Merely accepting a
+      // printable label would let a reviewed plan claim a zone launchd cannot
+      // mean, while the job actually fires in the Mac's local zone.
+      new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format(0);
+    } catch {
+      fail("scheduler.timezone must be a valid IANA time-zone identifier");
+    }
+  }
   return Object.freeze({ slug, cron, timezone });
 }
 

@@ -427,12 +427,17 @@ for a reviewed plan. Its LaunchAgent definition contains only the plan locator
 and a configuration hash. That hash binds the normalized plan plus both complete
 target-manifest fingerprints, including domains and Keychain locators; changing
 any of them stops before Keychain access until the service is reviewed and
-reinstalled. `run` strips ambient credentials and invokes an
-`execute` child through a nonblocking native `lockf`; only that lock holder may
-open Keychain-backed target credentials. A complete dual-target confirmation
-atomically advances an owner-only aggregate freshness receipt. A normal child
+reinstalled. Both `run` and `execute` require that exact 64-character hash and
+reject missing, empty, duplicate, or unknown CLI arguments. `run` strips ambient
+credentials, opens and validates the owner-only lock without following links,
+and passes that already-open descriptor to a nonblocking native `lockf`; only
+that lock holder may open Keychain-backed target credentials. A complete
+dual-target confirmation atomically advances an owner-only aggregate freshness
+receipt. A normal child
 failure records one bounded local support-journal event in the child; an
-abnormal signal or pre-child wrapper failure is recorded by the parent. Neither
+abnormal signal or pre-child wrapper failure is recorded by the parent. macOS
+`lockf` translates a signaled or stopped child to exit 70, so the wrapper treats
+that exact result as abnormal even though Node receives no signal name. Neither
 receipt contains paths, source identities, document names, URLs, content, raw
 errors, or credentials.
 
