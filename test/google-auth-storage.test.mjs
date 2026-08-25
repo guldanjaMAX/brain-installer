@@ -640,28 +640,34 @@ try {
   }
 
   /* ================= verified legacy migration ================= */
-  {
-    const path = join(directory, "migration", "google-tokens.json");
-    saveTokens(record, { backend: "file", platform: "linux", path });
-    const keychain = fakeKeychain();
-    const options = { backend: "keychain", platform: "darwin", runSecurity: keychain.runSecurity, path };
-    const loaded = loadTokens(options);
-    check("a legacy file is copied to Keychain and read back before removal",
-      JSON.stringify(loaded) === JSON.stringify(record) && keychain.passwords.size > 1);
-    check("the verified legacy credential file is removed", !existsSync(path));
-  }
-  {
-    const path = join(directory, "failed-migration", "google-tokens.json");
-    saveTokens(record, { backend: "file", platform: "linux", path });
-    const keychain = fakeKeychain({ corruptAfterWrite: true });
-    let error = null;
-    try {
-      loadTokens({ backend: "keychain", platform: "darwin", runSecurity: keychain.runSecurity, path });
-    } catch (caught) {
-      error = caught;
+  // These fixtures exercise migration from a real POSIX mode-0600 file into
+  // macOS Keychain. NTFS cannot reproduce that inode/mode precondition, while
+  // the native Windows block below separately covers plaintext-to-DPAPI
+  // migration and rollback on Windows itself.
+  if (process.platform !== "win32") {
+    {
+      const path = join(directory, "migration", "google-tokens.json");
+      saveTokens(record, { backend: "file", platform: "linux", path });
+      const keychain = fakeKeychain();
+      const options = { backend: "keychain", platform: "darwin", runSecurity: keychain.runSecurity, path };
+      const loaded = loadTokens(options);
+      check("a legacy file is copied to Keychain and read back before removal",
+        JSON.stringify(loaded) === JSON.stringify(record) && keychain.passwords.size > 1);
+      check("the verified legacy credential file is removed", !existsSync(path));
     }
-    check("a failed Keychain verification raises a clear error", !!error && /verification failed/i.test(error.message), error?.message);
-    check("a failed migration leaves the legacy credential file untouched", existsSync(path));
+    {
+      const path = join(directory, "failed-migration", "google-tokens.json");
+      saveTokens(record, { backend: "file", platform: "linux", path });
+      const keychain = fakeKeychain({ corruptAfterWrite: true });
+      let error = null;
+      try {
+        loadTokens({ backend: "keychain", platform: "darwin", runSecurity: keychain.runSecurity, path });
+      } catch (caught) {
+        error = caught;
+      }
+      check("a failed Keychain verification raises a clear error", !!error && /verification failed/i.test(error.message), error?.message);
+      check("a failed migration leaves the legacy credential file untouched", existsSync(path));
+    }
   }
   {
     const keychain = fakeKeychain();
@@ -677,15 +683,20 @@ try {
   }
 
   /* ================= platform and explicit selection ================= */
-  {
-    const path = join(directory, "linux-default", "google-tokens.json");
-    saveTokens(record, { platform: "linux", path, env: {} });
-    check("non-macOS defaults to the file fallback", existsSync(path));
-  }
-  {
-    const path = join(directory, "mac-explicit-file", "google-tokens.json");
-    saveTokens(record, { platform: "darwin", path, env: { BRAIN_GOOGLE_TOKEN_STORE: "file" } });
-    check("macOS can explicitly select the file fallback", existsSync(path));
+  // Simulated POSIX file selection still requires real POSIX mode semantics.
+  // Linux and macOS matrix jobs cover these paths; Windows has the native
+  // DPAPI selection and replacement checks immediately below.
+  if (process.platform !== "win32") {
+    {
+      const path = join(directory, "linux-default", "google-tokens.json");
+      saveTokens(record, { platform: "linux", path, env: {} });
+      check("non-macOS defaults to the file fallback", existsSync(path));
+    }
+    {
+      const path = join(directory, "mac-explicit-file", "google-tokens.json");
+      saveTokens(record, { platform: "darwin", path, env: { BRAIN_GOOGLE_TOKEN_STORE: "file" } });
+      check("macOS can explicitly select the file fallback", existsSync(path));
+    }
   }
 
   if (process.platform === "win32") {
