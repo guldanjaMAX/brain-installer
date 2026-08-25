@@ -323,6 +323,7 @@ const WINDOWS_DPAPI_HEADER = Buffer.from("BRAIN-GOOGLE-TOKENS-DPAPI-V1\n", "asci
 const MAX_TOKEN_STORE_BYTES = 2 * 1024 * 1024;
 const MAX_DPAPI_OUTPUT_BYTES = MAX_TOKEN_STORE_BYTES + 64 * 1024;
 const WINDOWS_DPAPI_HELPER = fileURLToPath(new URL("../operations/windows-dpapi.ps1", import.meta.url));
+const WINDOWS_DPAPI_BRIDGE = fileURLToPath(new URL("../operations/windows-dpapi-bridge.mjs", import.meta.url));
 
 function lstatIfPresent(path) {
   try {
@@ -420,12 +421,27 @@ function runWindowsDpapi(input, options, operation) {
   if (!Buffer.isBuffer(input) || input.length < 1 || input.length > MAX_DPAPI_OUTPUT_BYTES) {
     throw new Error("Windows DPAPI received an invalid Google credential payload size");
   }
-  const args = [
+  const powerShellArgs = [
     "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
     "-File", WINDOWS_DPAPI_HELPER,
     "-Operation", operation,
     "-ExpectedLength", String(input.length),
   ];
+  // Keep the injected direct runner for deterministic tests. Production uses
+  // the fixed Node bridge because spawnSync -> PowerShell can leave stdin
+  // unread on Windows; the bridge writes the same bytes through an async pipe.
+  const runner = options.runPowerShell || spawnSync;
+  const runnerCommand = options.runPowerShell ? command : process.execPath;
+  const runnerArgs = options.runPowerShell
+    ? powerShellArgs
+    : [
+        WINDOWS_DPAPI_BRIDGE,
+        "--powershell", command,
+        "--helper", WINDOWS_DPAPI_HELPER,
+        "--operation", operation,
+        "--length", String(input.length),
+        "--max", String(MAX_DPAPI_OUTPUT_BYTES),
+      ];
   let result;
   let stdout;
   let stderr;
@@ -433,7 +449,7 @@ function runWindowsDpapi(input, options, operation) {
     ? "Windows could not protect the Google credential record with DPAPI"
     : "Windows could not decrypt the Google credential record with DPAPI for the current user";
   try {
-    result = (options.runPowerShell || spawnSync)(command, args, {
+    result = runner(runnerCommand, runnerArgs, {
       encoding: null,
       env,
       input,

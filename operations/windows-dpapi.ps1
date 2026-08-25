@@ -5,7 +5,7 @@ param(
   [string]$Operation,
 
   [Parameter(Mandatory = $true)]
-  [ValidateRange(1, 65536)]
+  [ValidateRange(1, 3145728)]
   [int]$ExpectedLength
 )
 

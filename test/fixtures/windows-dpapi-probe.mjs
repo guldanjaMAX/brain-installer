@@ -27,18 +27,23 @@ for (const name of [
 
 const command = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 const helper = fileURLToPath(new URL("../../operations/windows-dpapi.ps1", import.meta.url));
+const bridge = fileURLToPath(new URL("../../operations/windows-dpapi-bridge.mjs", import.meta.url));
 
 function invoke(operation, input) {
-  return spawnSync(command, [
-    "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-    "-File", helper, "-Operation", operation, "-ExpectedLength", String(input.length),
+  return spawnSync(process.execPath, [
+    bridge,
+    "--powershell", command,
+    "--helper", helper,
+    "--operation", operation,
+    "--length", String(input.length),
+    "--max", "65536",
   ], {
     encoding: null,
     env: environment,
     input,
     stdio: ["pipe", "pipe", "pipe"],
     shell: false,
-    timeout: 10_000,
+    timeout: 30_000,
     windowsHide: true,
   });
 }

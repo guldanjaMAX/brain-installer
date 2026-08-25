@@ -39,6 +39,7 @@ const WINDOWS_RUNTIME_ENV = Object.freeze([
   "APPDATA", "LOCALAPPDATA", "USERNAME", "USERDOMAIN", "ComSpec",
 ]);
 const WINDOWS_DPAPI_HELPER = fileURLToPath(new URL("./windows-dpapi.ps1", import.meta.url));
+const WINDOWS_DPAPI_BRIDGE = fileURLToPath(new URL("./windows-dpapi-bridge.mjs", import.meta.url));
 
 function lstatIfPresent(path) {
   try {
@@ -222,7 +223,7 @@ function runWindowsDpapi(input, options, operation, secretForMetadataCheck = nul
   if (!Buffer.isBuffer(input) || input.length < 1 || input.length > 64 * 1024) {
     throw new Error("Windows DPAPI received an invalid admin key payload size");
   }
-  const args = [
+  const powerShellArgs = [
     "-NoLogo",
     "-NoProfile",
     "-NonInteractive",
@@ -231,14 +232,29 @@ function runWindowsDpapi(input, options, operation, secretForMetadataCheck = nul
     "-Operation", operation,
     "-ExpectedLength", String(input.length),
   ];
+  // Node's synchronous Windows child path can leave PowerShell's stdin unread.
+  // Tests inject the PowerShell runner directly; production uses a fixed Node
+  // bridge whose asynchronous pipe reliably closes stdin after the exact bytes.
+  const runner = options.runPowerShell ?? spawnSync;
+  const runnerCommand = options.runPowerShell ? command : process.execPath;
+  const runnerArgs = options.runPowerShell
+    ? powerShellArgs
+    : [
+        WINDOWS_DPAPI_BRIDGE,
+        "--powershell", command,
+        "--helper", WINDOWS_DPAPI_HELPER,
+        "--operation", operation,
+        "--length", String(input.length),
+        "--max", String(MAX_ADMIN_KEY_FILE_BYTES),
+      ];
   if (secretForMetadataCheck) {
-    const metadata = [command, ...args, ...Object.entries(env).flat()].join("\0");
+    const metadata = [runnerCommand, ...runnerArgs, ...Object.entries(env).flat()].join("\0");
     const encodedSecret = Buffer.from(secretForMetadataCheck, "utf8").toString("base64");
     if (metadata.includes(secretForMetadataCheck) || metadata.includes(encodedSecret)) {
       throw new Error("Windows refused to expose the admin key in PowerShell process metadata");
     }
   }
-  const result = (options.runPowerShell ?? spawnSync)(command, args, {
+  const result = runner(runnerCommand, runnerArgs, {
     encoding: null,
     env,
     input,
