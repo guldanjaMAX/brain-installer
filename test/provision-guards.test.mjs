@@ -336,9 +336,107 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     !seen.options.headers.Authorization && out.run_id === "run_1", JSON.stringify(seen.options.headers));
   check("source lifecycle uses a bounded request", seen.policy?.timeoutMs === 30000, JSON.stringify(seen.policy));
 
-  const bad = await throws(() => postSourceReceipt("https://brain.example", "k", { status: "ready" }, async () =>
-    new Response(JSON.stringify({ status: "error" }), { status: 200 })));
-  check("a mismatched lifecycle acknowledgement is not believed", /not accepted/.test(bad || ""), bad);
+  const retryReceipt = {
+    source: "drive", kind: "drive", status: "indexing", run_id: "run_retry", lane: "full",
+  };
+  const acceptedRetryReceipt = () => new Response(JSON.stringify({
+    source: "drive", status: "indexing", run_id: "run_retry",
+  }), { status: 200 });
+  let transportCalls = 0;
+  const transportWaits = [];
+  const transportErrors = [];
+  const transportRecovered = await postSourceReceipt(
+    "https://brain.example",
+    "admin-only",
+    retryReceipt,
+    async () => {
+      transportCalls++;
+      if (transportCalls < 5) {
+        const cause = new Error("RAW_LIFECYCLE_TRANSPORT_SENTINEL");
+        cause.code = "UND_ERR_CONNECT_TIMEOUT";
+        throw new TypeError("fetch failed", { cause });
+      }
+      return acceptedRetryReceipt();
+    },
+    {
+      sleep: async (ms) => { transportWaits.push(ms); },
+      onRetry: (error) => { transportErrors.push(error.message); },
+    },
+  );
+  check("source lifecycle retries a transient connect timeout through the fifth attempt",
+    transportCalls === 5 && transportRecovered.run_id === "run_retry", `calls=${transportCalls}`);
+  check("source lifecycle retry uses the bounded 2/4/8/16 second backoff",
+    JSON.stringify(transportWaits) === JSON.stringify([2_000, 4_000, 8_000, 16_000]),
+    JSON.stringify(transportWaits));
+  check("source lifecycle transport retry errors are sanitized",
+    transportErrors.length === 4 && transportErrors.every((message) =>
+      /UND_ERR_CONNECT_TIMEOUT/.test(message) && !message.includes("RAW_LIFECYCLE_TRANSPORT_SENTINEL")),
+    transportErrors.join(" | "));
+
+  let acceptedWrites = 0;
+  const bodyWaits = [];
+  const bodyRecovered = await postSourceReceipt(
+    "https://brain.example",
+    "admin-only",
+    retryReceipt,
+    async () => {
+      const acceptedAttempt = ++acceptedWrites;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => {
+          if (acceptedAttempt === 1) {
+            const error = new Error("RAW_LIFECYCLE_BODY_SENTINEL");
+            error.code = "ECONNRESET";
+            throw error;
+          }
+          return JSON.stringify({ source: "drive", status: "indexing", run_id: "run_retry" });
+        },
+      };
+    },
+    { sleep: async (ms) => { bodyWaits.push(ms); } },
+  );
+  check("source lifecycle safely retries an accepted upsert whose response body was lost",
+    acceptedWrites === 2 && bodyRecovered.run_id === "run_retry" &&
+      JSON.stringify(bodyWaits) === JSON.stringify([2_000]), `writes=${acceptedWrites}`);
+
+  let temporaryCalls = 0;
+  const temporaryRecovered = await postSourceReceipt(
+    "https://brain.example",
+    "admin-only",
+    retryReceipt,
+    async () => {
+      temporaryCalls++;
+      return temporaryCalls === 1
+        ? new Response(JSON.stringify({ error: "synthetic unavailable" }), { status: 503 })
+        : acceptedRetryReceipt();
+    },
+    { sleep: async () => {} },
+  );
+  check("source lifecycle retries a temporary 5xx response",
+    temporaryCalls === 2 && temporaryRecovered.run_id === "run_retry", `calls=${temporaryCalls}`);
+
+  let authCalls = 0;
+  const authFailure = await throws(() => postSourceReceipt(
+    "https://brain.example",
+    "admin-only",
+    retryReceipt,
+    async () => {
+      authCalls++;
+      return new Response(JSON.stringify({ error: "synthetic unauthorized" }), { status: 401 });
+    },
+    { sleep: async () => { throw new Error("auth response must not retry"); } },
+  ));
+  check("source lifecycle does not retry authentication or ordinary 4xx responses",
+    authCalls === 1 && /not accepted/.test(authFailure || ""), `calls=${authCalls} error=${authFailure}`);
+
+  let mismatchCalls = 0;
+  const bad = await throws(() => postSourceReceipt("https://brain.example", "k", { status: "ready" }, async () => {
+    mismatchCalls++;
+    return new Response(JSON.stringify({ status: "error" }), { status: 200 });
+  }, { sleep: async () => { throw new Error("mismatched receipt must not retry"); } }));
+  check("a mismatched lifecycle acknowledgement is not believed or retried",
+    mismatchCalls === 1 && /not accepted/.test(bad || ""), `calls=${mismatchCalls} error=${bad}`);
   const wrongIdentity = await throws(() => postSourceReceipt("https://brain.example", "k", {
     source: "drive", status: "ready", run_id: "run_expected",
   }, async () => new Response(JSON.stringify({

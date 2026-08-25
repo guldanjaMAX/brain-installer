@@ -4523,14 +4523,57 @@ export function assertDriveLimitSafe(options = {}) {
   return assertRemoteLimitSafe({ source: "Drive", ...options });
 }
 
-/** Post one connector lifecycle receipt through the installed brain itself. */
-export async function postSourceReceipt(base, adminKey, receipt, request = http) {
-  const res = await request(`${base}/api/admin/brain/source-receipt`, {
-    method: "POST",
-    headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
-    body: JSON.stringify(receipt),
-  }, { timeoutMs: 30_000, what: "the source freshness receipt" });
-  const raw = await res.text();
+/** Post one idempotent connector lifecycle receipt through the installed brain itself. */
+export async function postSourceReceipt(base, adminKey, receipt, request = http, {
+  attempts = 5,
+  delayMs = 2_000,
+  maxDelayMs = 30_000,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  onRetry = () => {},
+} = {}) {
+  const url = `${base}/api/admin/brain/source-receipt`;
+  let res, raw;
+  try {
+    ({ res, raw } = await retryTransient(async () => {
+      let response;
+      try {
+        response = await request(url, {
+          method: "POST",
+          headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+          body: JSON.stringify(receipt),
+        }, { timeoutMs: 30_000, what: "the source freshness receipt" });
+      } catch (error) {
+        if (typeof error?.retryable === "boolean") throw error;
+        throw translatedHttpFailure(error, url, { timeoutMs: 30_000, what: "the source freshness receipt" });
+      }
+      let responseRaw;
+      try {
+        responseRaw = await response.text();
+      } catch (error) {
+        const translated = translatedHttpFailure(error, url, {
+          timeoutMs: 30_000,
+          what: "the source freshness receipt response",
+        });
+        if (!response.ok && !isRetryableHttpStatus(response.status)) translated.retryable = false;
+        throw translated;
+      }
+      const result = { res: response, raw: responseRaw };
+      if (isRetryableHttpStatus(response.status)) {
+        throw new RetryableHttpResponse(result, "the source freshness receipt");
+      }
+      return result;
+    }, {
+      attempts,
+      delayMs,
+      maxDelayMs,
+      sleep,
+      shouldRetry: (error) => error?.retryable === true,
+      onRetry,
+    }));
+  } catch (error) {
+    if (error instanceof RetryableHttpResponse) ({ res, raw } = error.result);
+    else throw error;
+  }
   let body = null;
   try { body = JSON.parse(raw); } catch { /* checked below */ }
   const identityMatches = body?.source === receipt.source &&
@@ -6667,17 +6710,17 @@ export async function retryTransient(operation, {
   throw lastError;
 }
 
-const RETRYABLE_INGEST_STATUS = new Set([408, 425, 429]);
+const RETRYABLE_HTTP_STATUS = new Set([408, 425, 429]);
 
-function isRetryableIngestStatus(status) {
+function isRetryableHttpStatus(status) {
   const value = Number(status);
-  return RETRYABLE_INGEST_STATUS.has(value) || value >= 500;
+  return RETRYABLE_HTTP_STATUS.has(value) || value >= 500;
 }
 
-class RetryableIngestResponse extends Error {
-  constructor(result) {
-    super(`the ingest batch returned temporary HTTP ${result.res.status}`);
-    this.name = "RetryableIngestResponse";
+class RetryableHttpResponse extends Error {
+  constructor(result, what) {
+    super(`${what} returned temporary HTTP ${result.res.status}`);
+    this.name = "RetryableHttpResponse";
     this.retryable = true;
     this.result = result;
   }
@@ -6724,11 +6767,11 @@ export async function requestIngestBatch({
           timeoutMs: 180_000,
           what: "the ingest batch response",
         });
-        if (!res.ok && !isRetryableIngestStatus(res.status)) translated.retryable = false;
+        if (!res.ok && !isRetryableHttpStatus(res.status)) translated.retryable = false;
         throw translated;
       }
       const result = { res, raw };
-      if (isRetryableIngestStatus(res.status)) throw new RetryableIngestResponse(result);
+      if (isRetryableHttpStatus(res.status)) throw new RetryableHttpResponse(result, "the ingest batch");
       return result;
     }, {
       attempts,
@@ -6741,7 +6784,7 @@ export async function requestIngestBatch({
   } catch (error) {
     // After the bounded retry budget, preserve the final HTTP response so the
     // established status/body path emits the same actionable failure as before.
-    if (error instanceof RetryableIngestResponse) return error.result;
+    if (error instanceof RetryableHttpResponse) return error.result;
     throw error;
   }
 }
