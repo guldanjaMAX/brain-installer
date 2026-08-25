@@ -90,6 +90,7 @@ const expected = [
   "onboarding/08-provisioning-prerequisites.md",
   "operations/admin-key-file.mjs",
   "operations/admin-key-persistence.mjs",
+  "operations/curated-dual-sync.mjs",
   "operations/drive-removal-plan.mjs",
   "operations/drive-scheduler.mjs",
   "operations/windows-dpapi.ps1",
@@ -126,6 +127,9 @@ const dependencyMismatch = [...reviewedBundles].filter(([name, version]) =>
 const requiredGitIgnored = [
   ".brain-admin-key",
   ".brain-admin-key.tmp-deadbeef",
+  ".brain-curated-sync-plan.json",
+  ".brain-curated-sync-ledger.json",
+  ".brain-curated-sync-ledger.json.tmp-deadbeef",
 ];
 const gitIgnoreFailures = requiredGitIgnored.filter((path) =>
   spawnSync("git", ["check-ignore", "--quiet", "--no-index", path], {

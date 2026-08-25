@@ -33,6 +33,11 @@ eval/eval.config.local.json
 .brain-ingest-*.json
 .brain-ingest-*.json.tmp-*
 
+# Exact curated inventories, target locators and coverage receipts are private
+# instance state. Only the generic operation that reads them is product source.
+.brain-curated-sync-*.json
+.brain-curated-sync-*.json.tmp-*
+
 # Adjacent fallback admin-key files contain the Brain's live authentication
 # secret. Atomic writes briefly create the matching residue beside them.
 .brain-admin-key

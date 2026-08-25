@@ -346,6 +346,40 @@ exceed that cap until it exits, so stale-run monitoring still matters. Rotation
 refuses links, hard links, foreign-owned files, and paths outside the per-user
 `.brain` runtime.
 
+### Legacy curated collections during migration
+
+`operations/curated-dual-sync.mjs` is the internal rollback-compatible path for
+a small Markdown collection that already has a live legacy ingest target. It is
+not part of a fresh install. A private mode-0600 sidecar plan names the exact
+expected files, their authoritative, superseded or plain role, their existing
+legacy identities, both target manifests, and the private coverage-ledger
+destination. The plan and ledger are ignored by Git and never belong in the
+package.
+
+The operation has three explicit modes. `--dry-run` reads no credential and
+makes no request. `--audit` reads the Cloudflare Drive-family inventory but
+writes no document. `--sync` builds every transformed envelope once and sends
+the same title, content and metadata independently to the existing endpoint and
+to the Cloudflare identity `curated:brain:<legacy source type>:<legacy source
+id>`. The legacy write stays in place until retrieval evaluation approves a
+cutover.
+
+Enumeration is the first gate. A missing root, an unreadable directory, zero
+Markdown files, a count change, an unexpected file, a missing planned file or a
+role-count change stops before Keychain access and before either network target.
+This matters for unattended macOS jobs because a privacy-denied cloud mount can
+look like an empty successful walk. After a valid walk, failure of one target
+cannot suppress the other. The command exits unsuccessfully unless every
+target receipt is complete, so rerunning is the recovery path.
+
+The atomically replaced owner-only ledger contains salted logical fingerprints,
+content SHA-256 values, roles, bounded target receipt states and aggregate raw
+Drive duplicate counts. It contains no filenames, paths, source IDs, URLs,
+document content or credentials. Raw Drive duplicates are matched internally
+from the private Drive resume state to the authenticated Cloudflare
+source-family inventory; only role-level counts and opaque document
+fingerprints leave that comparison.
+
 ---
 
 ## Private local issue journal
