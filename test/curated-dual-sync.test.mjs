@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildCuratedCoverageLedger,
+  inspectCuratedTargetContracts,
   loadCuratedSyncPlan,
   prepareCuratedCorpus,
   readStableRegularSource,
@@ -89,8 +90,8 @@ function plan(overrides = {}) {
       plain: { content_prefix: "", title_prefix: "" },
     },
     common_metadata: { category: "fixture" },
-    legacy_target: { manifest: "legacy.manifest.json" },
-    cloudflare_target: { manifest: "cloudflare.manifest.json" },
+    legacy_target: { manifest: "legacy.manifest.json", backend: "legacy_notes_supabase" },
+    cloudflare_target: { manifest: "cloudflare.manifest.json", backend: "cloudflare_d1" },
     raw_drive: {
       state_file: ".brain-ingest-drive.json",
       path_prefix: "Fixture",
@@ -112,6 +113,16 @@ function response(status, body) {
 
 function allStatus(prepared, value) {
   return new Map(prepared.documents.map((document) => [document.logicalFingerprint, value]));
+}
+
+function completeFamilies(source) {
+  return source === "curated"
+    ? [
+        "curated:brain:custom:fixture-alpha-id",
+        "curated:brain:curated:fixture-beta-id",
+        "curated:brain:custom:fixture-gamma-id",
+      ]
+    : ["drive:fixture-alpha", "drive:fixture-beta", "drive:fixture-gamma"];
 }
 
 try {
@@ -258,6 +269,134 @@ try {
   assert.equal(mismatchError.message.includes("gamma"), false);
   assert.equal(mismatchError.message.includes("delta"), false);
 
+  // A complete transformed-envelope scan covers content, derived/explicit
+  // title and nested metadata as one fail-closed corpus before target/key use.
+  const credentialCorpus = join(sandbox, "credential-corpus");
+  mkdirSync(join(credentialCorpus, "nested"), { recursive: true, mode: 0o700 });
+  const syntheticCredential = ["sk", "ant", "api03", "A".repeat(40)].join("-");
+  writeFileSync(join(credentialCorpus, "alpha.md"), `# Safe heading\n${syntheticCredential}\n`, { mode: 0o600 });
+  writeFileSync(join(credentialCorpus, "nested", "beta.md"), "# Safe body\n", { mode: 0o600 });
+  writeFileSync(join(credentialCorpus, "nested", "gamma.markdown"), "# Safe body\n", { mode: 0o600 });
+  const credentialPlan = plan({ root: "credential-corpus" });
+  credentialPlan.documents[1].title = syntheticCredential;
+  credentialPlan.documents[2].metadata.nested = { human_note: syntheticCredential };
+  let credentialResolvers = 0;
+  let credentialRequests = 0;
+  let credentialWrites = 0;
+  let credentialError;
+  try {
+    await runCuratedDualSync(credentialPlan, {
+      mode: "sync",
+      planDirectory: sandbox,
+      resolveTarget: async () => { credentialResolvers++; return {}; },
+      fetch: async () => { credentialRequests++; return response(500, {}); },
+      writeLedger: () => { credentialWrites++; },
+    });
+  } catch (error) { credentialError = error; }
+  assert.match(credentialError?.message || "", /refused 3 of 3 transformed documents/);
+  assert.equal(credentialError.message.includes(syntheticCredential), false);
+  assert.equal(credentialResolvers, 0);
+  assert.equal(credentialRequests, 0);
+  assert.equal(credentialWrites, 0);
+
+  // The final pass re-opens every source. A byte-hash change after transform
+  // and scan stops before target resolution or ledger replacement.
+  let snapshotReads = 0;
+  let finalResolvers = 0;
+  let finalWrites = 0;
+  await assert.rejects(
+    () => runCuratedDualSync(plan(), {
+      mode: "sync",
+      planDirectory: sandbox,
+      readStableSource(path, options) {
+        snapshotReads++;
+        const snapshot = readStableRegularSource(path, options);
+        if (snapshotReads === 4) return { ...snapshot, rawSha256: "f".repeat(64) };
+        return snapshot;
+      },
+      resolveTarget: async () => { finalResolvers++; return {}; },
+      writeLedger: () => { finalWrites++; },
+    }),
+    /final snapshot verification failed for 1 changed documents/,
+  );
+  assert.equal(snapshotReads, 6);
+  assert.equal(finalResolvers, 0);
+  assert.equal(finalWrites, 0);
+
+  // Target identity can be resolved and validated without reading an admin
+  // credential. This exercises the production manifest parser and D1 contract.
+  writeFileSync(join(sandbox, "legacy.manifest.json"), JSON.stringify({
+    brain: { domain: "legacy-contract.invalid" },
+  }), { mode: 0o600 });
+  writeFileSync(join(sandbox, "cloudflare.manifest.json"), JSON.stringify({
+    brain: { domain: "cloudflare-contract.invalid" },
+    infrastructure: { cloudflare: { storage: "d1" } },
+  }), { mode: 0o600 });
+  const contracts = inspectCuratedTargetContracts(plan(), { planDirectory: sandbox });
+  assert.equal(contracts.legacy.origin, "https://legacy-contract.invalid");
+  assert.equal(contracts.cloudflare.origin, "https://cloudflare-contract.invalid");
+  assert.notEqual(contracts.legacy.backend, contracts.cloudflare.backend);
+
+  // The ledger may never alias any input or credential sidecar, even through
+  // an absolute path. Every collision is refused before a writer is invoked.
+  const collisionPlanPath = join(sandbox, ".collision-plan.json");
+  writeFileSync(collisionPlanPath, JSON.stringify(plan()), { mode: 0o600 });
+  const protectedCollisions = [
+    collisionPlanPath,
+    join(corpus, "alpha.md"),
+    join(sandbox, "legacy.manifest.json"),
+    join(sandbox, ".brain-admin-key"),
+    stateFile,
+  ];
+  for (const destination of protectedCollisions) {
+    let writes = 0;
+    await assert.rejects(
+      () => runCuratedDualSync(plan({ ledger_file: destination }), {
+        mode: "dry-run",
+        planDirectory: sandbox,
+        planPath: collisionPlanPath,
+        writeLedger: () => { writes++; },
+      }),
+      /collides with protected sync input/,
+    );
+    assert.equal(writes, 0);
+  }
+
+  const invalidLedger = join(sandbox, ".invalid-ledger.json");
+  writeFileSync(invalidLedger, "{}\n", { mode: 0o600 });
+  const invalidBefore = readFileSync(invalidLedger);
+  await assert.rejects(
+    () => runCuratedDualSync(plan({ ledger_file: invalidLedger }), {
+      mode: "dry-run",
+      planDirectory: sandbox,
+    }),
+    /unsupported schema/,
+  );
+  assert.deepEqual(readFileSync(invalidLedger), invalidBefore);
+
+  // The target-neutral envelope hash catches title or metadata drift even
+  // when transformed content bytes are unchanged, and feeds corpus identity.
+  const titlePlan = plan();
+  titlePlan.documents[0].title = "Changed synthetic title";
+  const metadataPlan = plan({ common_metadata: { category: "changed-fixture" } });
+  const preparedTitle = prepareCuratedCorpus(titlePlan, { planDirectory: sandbox });
+  const preparedMetadata = prepareCuratedCorpus(metadataPlan, { planDirectory: sandbox });
+  const baseAlpha = prepared.documents.find((document) => document.relativePath === "alpha.md");
+  const titleAlpha = preparedTitle.documents.find((document) => document.relativePath === "alpha.md");
+  const metadataAlpha = preparedMetadata.documents.find((document) => document.relativePath === "alpha.md");
+  assert.equal(titleAlpha.contentHash, baseAlpha.contentHash);
+  assert.equal(metadataAlpha.contentHash, baseAlpha.contentHash);
+  assert.notEqual(titleAlpha.envelopeHash, baseAlpha.envelopeHash);
+  assert.notEqual(metadataAlpha.envelopeHash, baseAlpha.envelopeHash);
+  assert.notEqual(
+    buildCuratedCoverageLedger(preparedTitle).corpus_fingerprint,
+    buildCuratedCoverageLedger(prepared).corpus_fingerprint,
+  );
+  assert.notEqual(
+    buildCuratedCoverageLedger(preparedMetadata).corpus_fingerprint,
+    buildCuratedCoverageLedger(prepared).corpus_fingerprint,
+  );
+
   // Dry-run still produces the desired-state hash ledger but cannot touch a
   // durable credential or the network.
   let dryLedger;
@@ -269,7 +408,7 @@ try {
     writeLedger: (_path, value) => { dryLedger = value; },
   });
   assert.equal(dry.ok, true);
-  assert.equal(dry.rawDriveChecksumDuplicates.total, 0);
+  assert.equal(dry.rawDriveHistoricalChecksumMatches.total, 0);
   assert.equal(dryLedger.documents.every((document) => document.targets.legacy === "not_attempted"), true);
 
   // Read-only audit pages through the authenticated Cloudflare family list and
@@ -286,6 +425,7 @@ try {
     fetch: async (url, options) => {
       auditCalls.push({ url, options });
       assert.equal(options.method, undefined);
+      assert.equal(options.redirect, "manual");
       assert.equal(url.includes("fixture-cloudflare-key"), false);
       const cursor = new URL(url).searchParams.get("cursor");
       if (!cursor) {
@@ -305,25 +445,31 @@ try {
   });
   assert.equal(audit.ok, true);
   assert.equal(auditCalls.length, 2);
-  assert.deepEqual(audit.rawDriveChecksumDuplicates, {
+  assert.deepEqual(audit.rawDriveHistoricalChecksumMatches, {
     total: 1,
     authoritative: 1,
     superseded: 0,
     plain: 0,
   });
-  assert.deepEqual(audit.rawDriveChecksumMismatches, {
+  assert.deepEqual(audit.rawDriveHistoricalChecksumMismatches, {
     total: 1,
     authoritative: 0,
     superseded: 1,
     plain: 0,
   });
-  assert.deepEqual(audit.rawDrivePresenceUnverified, {
+  assert.deepEqual(audit.rawDriveHistoricalPresenceUnverified, {
     total: 1,
     authoritative: 0,
     superseded: 0,
     plain: 1,
   });
   const auditText = JSON.stringify(auditLedger);
+  assert.equal(auditLedger.raw_drive_evidence.deletion_eligible, false);
+  assert.equal(auditLedger.raw_drive_evidence.reason, "server_revision_unbound");
+  assert.equal(auditText.includes("checksum_confirmed_duplicate"), false);
+  assert.equal(auditText.includes("raw_drive_checksum_duplicates"), false);
+  assert.equal(auditLedger.documents.some((document) =>
+    document.raw_drive === "historical_checksum_match"), true);
   for (const privateFixture of [
     "alpha.md", "beta.md", "gamma.markdown",
     "fixture-alpha-id", "fixture-beta-id", "fixture-gamma-id",
@@ -333,22 +479,68 @@ try {
     assert.equal(auditText.includes(privateFixture), false, `ledger omitted ${privateFixture}`);
   }
 
+  // Manual redirect handling prevents an authenticated request from following
+  // a response onto another origin. Fetch sees one request and no credential
+  // ever reaches the advertised redirect destination.
+  let redirectCalls = 0;
+  const redirected = await runCuratedDualSync(plan(), {
+    mode: "audit",
+    planDirectory: sandbox,
+    resolveTarget: async () => ({
+      baseUrl: "https://cloudflare.invalid",
+      backend: "cloudflare_d1",
+      adminKey: "fixture-cloudflare-key",
+    }),
+    fetch: async (_url, options) => {
+      redirectCalls++;
+      assert.equal(options.redirect, "manual");
+      return response(302, { location: "https://redirect.invalid" });
+    },
+    writeLedger: () => {},
+  });
+  assert.equal(redirected.ok, false);
+  assert.equal(redirectCalls, 1);
+
+  let sameOriginNetwork = 0;
+  await assert.rejects(
+    () => runCuratedDualSync(plan(), {
+      mode: "sync",
+      planDirectory: sandbox,
+      resolveTarget: async (_target, _directory, _options, name) => ({
+        baseUrl: "https://same-origin.invalid",
+        backend: name === "legacy" ? "legacy_notes_supabase" : "cloudflare_d1",
+        adminKey: `fixture-${name}-key`,
+      }),
+      fetch: async () => { sameOriginNetwork++; return response(500, {}); },
+      writeLedger: () => {},
+    }),
+    /distinct backends and origins/,
+  );
+  assert.equal(sameOriginNetwork, 0);
+
   // A legacy per-document failure cannot suppress Cloudflare. Every Cloudflare
   // identity is the exact migrated curated identity and receives the same bytes.
   const postCalls = { legacy: [], cloudflare: [] };
+  const resolutionCalls = { legacy: 0, cloudflare: 0 };
   let partialLedger;
   const partial = await runCuratedDualSync(plan(), {
     mode: "sync",
     planDirectory: sandbox,
-    resolveTarget: async (_target, _directory, _options, name) => ({
-      baseUrl: name === "legacy" ? "https://legacy.invalid" : "https://cloudflare.invalid",
-      adminKey: name === "legacy" ? "fixture-legacy-key" : "fixture-cloudflare-key",
-    }),
+    resolveTarget: async (_target, _directory, _options, name) => {
+      resolutionCalls[name]++;
+      return {
+        baseUrl: name === "legacy" ? "https://legacy.invalid" : "https://cloudflare.invalid",
+        backend: name === "legacy" ? "legacy_notes_supabase" : "cloudflare_d1",
+        adminKey: name === "legacy" ? "fixture-legacy-key" : "fixture-cloudflare-key",
+      };
+    },
     fetch: async (url, options) => {
+      assert.equal(options.redirect, "manual");
       if (!options.method) {
+        const source = new URL(url).searchParams.get("source");
         return response(200, {
-          source: "drive",
-          families: ["drive:fixture-alpha", "drive:fixture-beta", "drive:fixture-gamma"],
+          source,
+          families: completeFamilies(source),
           next_cursor: null,
         });
       }
@@ -369,6 +561,7 @@ try {
   assert.equal(partial.ok, false);
   assert.equal(postCalls.legacy.length, 3);
   assert.equal(postCalls.cloudflare.length, 3);
+  assert.deepEqual(resolutionCalls, { legacy: 1, cloudflare: 1 });
   assert.equal(partial.targetCoverage.legacy_confirmed.total, 2);
   assert.equal(partial.targetCoverage.cloudflare_confirmed.total, 3);
   for (const cloudEnvelope of postCalls.cloudflare) {
@@ -383,6 +576,36 @@ try {
   }
   assert.equal(partialLedger.target_coverage.cloudflare_confirmed.total, 3);
 
+  // A syntactically valid Cloudflare POST receipt is still downgraded unless
+  // the exact curated source family can be read back from that same origin.
+  const missingReadback = await runCuratedDualSync(plan(), {
+    mode: "sync",
+    planDirectory: sandbox,
+    resolveTarget: async (_target, _directory, _options, name) => ({
+      baseUrl: `https://${name}.invalid`,
+      backend: name === "legacy" ? "legacy_notes_supabase" : "cloudflare_d1",
+      adminKey: `fixture-${name}-key`,
+    }),
+    fetch: async (url, options) => {
+      if (!options.method) {
+        const source = new URL(url).searchParams.get("source");
+        const families = completeFamilies(source);
+        return response(200, {
+          source,
+          families: source === "curated" ? families.slice(0, 2) : families,
+          next_cursor: null,
+        });
+      }
+      const envelope = JSON.parse(options.body);
+      return url.startsWith("https://legacy.invalid")
+        ? response(200, { brain_doc_id: `legacy-${envelope.source_id}`, action: "unchanged" })
+        : response(200, { doc_uid: `curated:${envelope.source_id}`, action: "unchanged" });
+    },
+    writeLedger: () => {},
+  });
+  assert.equal(missingReadback.targetCoverage.cloudflare_confirmed.total, 2);
+  assert.equal(missingReadback.ok, false);
+
   // Even total credential-resolution failure at the rollback target leaves all
   // Cloudflare writes reachable and visible as confirmed.
   let cloudOnlyPosts = 0;
@@ -395,7 +618,12 @@ try {
     },
     fetch: async (url, options) => {
       if (!options.method) {
-        return response(200, { source: "drive", families: [], next_cursor: null });
+        const source = new URL(url).searchParams.get("source");
+        return response(200, {
+          source,
+          families: source === "curated" ? completeFamilies(source) : [],
+          next_cursor: null,
+        });
       }
       cloudOnlyPosts++;
       const envelope = JSON.parse(options.body);
@@ -421,9 +649,10 @@ try {
       }),
       fetch: async (url, options) => {
         if (!options.method) {
+          const source = new URL(url).searchParams.get("source");
           return response(200, {
-            source: "drive",
-            families: ["drive:fixture-alpha", "drive:fixture-beta", "drive:fixture-gamma"],
+            source,
+            families: completeFamilies(source),
             next_cursor: null,
           });
         }
@@ -446,7 +675,7 @@ try {
   const observations = {
     legacy: allStatus(prepared, "confirmed"),
     cloudflare: allStatus(prepared, "confirmed"),
-    rawDrive: allStatus(prepared, "checksum_confirmed_duplicate"),
+    rawDrive: allStatus(prepared, "historical_checksum_match"),
   };
   const stableLedger = buildCuratedCoverageLedger(prepared, observations);
   const firstWrite = writeCuratedCoverageLedger(ledgerFile, stableLedger, {

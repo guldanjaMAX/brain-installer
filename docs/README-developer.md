@@ -352,9 +352,10 @@ refuses links, hard links, foreign-owned files, and paths outside the per-user
 a small Markdown collection that already has a live legacy ingest target. It is
 not part of a fresh install. A private mode-0600 sidecar plan names the exact
 expected files, their authoritative, superseded or plain role, their existing
-legacy identities, both target manifests, and the private coverage-ledger
-destination. The plan and ledger are ignored by Git and never belong in the
-package.
+legacy identities, both target manifests, each target's fixed backend contract,
+and the private coverage-ledger destination. The plan and ledger are ignored by
+Git and never belong in the package. `legacy_target.backend` must be
+`legacy_notes_supabase`; `cloudflare_target.backend` must be `cloudflare_d1`.
 
 The operation has three explicit modes. `--dry-run` reads no credential and
 makes no request. `--audit` reads the Cloudflare Drive-family inventory but
@@ -368,19 +369,45 @@ Enumeration is the first gate. A missing root, an unreadable directory, zero
 Markdown files, a count change, an unexpected file, a missing planned file or a
 role-count change stops before Keychain access and before either network target.
 This matters for unattended macOS jobs because a privacy-denied cloud mount can
-look like an empty successful walk. After a valid walk, failure of one target
-cannot suppress the other. The command exits unsuccessfully unless every
-target receipt is complete, so rerunning is the recovery path.
+look like an empty successful walk. Every final title, metadata value and content
+body then passes the same confirmed-credential scanner as Worker ingest. The
+entire corpus is rejected as one bounded aggregate if any transformed envelope
+fails. Finally, every source is reopened through a no-follow descriptor and its
+raw SHA-256 is compared with the first pass. All of these checks finish before
+an admin key can be read or a request can be made.
+
+Target resolution occurs once per required target. HTTPS origins are normalized,
+legacy and Cloudflare must use distinct origins and backends, and every
+authenticated fetch uses manual redirect handling. A redirect is a target
+failure, never an invitation to forward a key. Cloudflare POST receipts must
+echo the exact deterministic document identity, then the operation reads the
+curated source-family inventory back from the same origin and confirms every
+identity. The legacy endpoint has no equivalent exact identity readback, so its
+bounded document receipt remains the strongest available proof. After a valid
+preflight, failure of one target cannot suppress the other. The command exits
+unsuccessfully unless every target receipt is complete, so rerunning is the
+recovery path.
 
 The atomically replaced owner-only ledger contains salted logical fingerprints,
-content SHA-256 values, roles, bounded target receipt states and aggregate raw
-Drive checksum findings. It contains no filenames, paths, source IDs, URLs,
-document content or credentials. The operation calls a raw Drive family a
-checksum-confirmed duplicate only when the family is live and Drive's stored
-MD5 matches the exact local bytes read. A driveVersion value that is merely a
-file size, or has no checksum, is reported as unverified presence. A different
-MD5 is reported as a mismatch. Only role-level counts and opaque document
-fingerprints leave that comparison.
+content SHA-256 values, canonical target-neutral envelope SHA-256 values, roles,
+bounded target receipt states and aggregate raw Drive history findings. The
+corpus fingerprint includes the envelope hash, so a title-only or metadata-only
+change cannot hide behind unchanged content. The ledger contains no filenames,
+paths, source IDs, URLs, document content or credentials. Before replacement,
+an existing ledger must parse as a supported schema. The ledger path must not
+alias the plan, a corpus source, either target manifest, an adjacent admin-key
+sidecar, or the raw Drive state file, including through a real-path or hard-link
+collision.
+
+Raw Drive comparison is explicitly historical evidence, not live deletion
+proof. A historical checksum match means the local raw MD5 equals the checksum
+recorded in the resume state and a family with that historical identity is
+currently present. A driveVersion value that is merely a file size, or has no
+checksum, is reported as historical unverified presence. A different MD5 is a
+historical mismatch. Every ledger sets `raw_drive_evidence.deletion_eligible`
+to `false`. Deletion remains forbidden until a server endpoint can bind the
+currently stored family to a specific revision and return a content hash for
+that revision.
 
 Each Markdown revision is opened with the operating system's no-follow flag,
 read from that descriptor, and checked with descriptor metadata before and
@@ -390,6 +417,14 @@ Provider change time is not revision identity because hydration can update it
 during a read without changing source bytes. The collection is enumerated again
 after all reads. A cloud-sync replacement or an inventory change therefore
 stops the run before either target is contacted.
+
+This operation is not yet installed as a scheduler. Production rollout remains
+blocked on a private single-instance scheduler lock, a last-success freshness
+check, and bounded metadata-only support-journal events wired around this exact
+command. Reusing the Drive scheduler wrapper without a reviewed command and
+lock-identity contract could create overlapping medical syncs or misleading
+freshness, so those controls must be added and tested before any LaunchAgent is
+changed.
 
 ---
 

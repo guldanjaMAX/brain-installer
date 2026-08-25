@@ -37,9 +37,10 @@ import {
   adminKeyPersistencePlan,
   readAdminKeyDurably,
 } from "./admin-key-persistence.mjs";
+import { scanEnvelope } from "../worker/src/lib/secret-scan.js";
 
 export const CURATED_SYNC_PLAN_VERSION = 1;
-export const CURATED_SYNC_LEDGER_VERSION = 2;
+export const CURATED_SYNC_LEDGER_VERSION = 3;
 export const CURATED_SYNC_ROLES = Object.freeze([
   "authoritative",
   "superseded",
@@ -50,7 +51,12 @@ const ROLE_SET = new Set(CURATED_SYNC_ROLES);
 const RECEIPT_ACTIONS = new Set(["created", "updated", "unchanged"]);
 const MARKDOWN_EXTENSIONS = new Set([".md", ".markdown"]);
 const TARGET_NAMES = Object.freeze(["legacy", "cloudflare"]);
+const TARGET_BACKENDS = Object.freeze({
+  legacy: "legacy_notes_supabase",
+  cloudflare: "cloudflare_d1",
+});
 const MAX_PLAN_BYTES = 5 * 1024 * 1024;
+const MAX_LEDGER_BYTES = 5 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES = 1_000_000;
 const TARGET_TIMEOUT_MS = 180_000;
 const PATH_CONTROL = /[\u0000-\u001f\u007f]/;
@@ -69,9 +75,9 @@ const RAW_DRIVE_STATUS_VALUES = new Set([
   "state_unmapped",
   "not_verified",
   "not_present",
-  "presence_unverified",
-  "checksum_mismatch",
-  "checksum_confirmed_duplicate",
+  "historical_presence_unverified",
+  "historical_checksum_mismatch",
+  "historical_checksum_match",
 ]);
 
 function sha256(value) {
@@ -150,10 +156,15 @@ function checkedMetadata(value, label) {
   return structuredClone(value);
 }
 
-function targetPlan(value, label) {
+function targetPlan(value, label, name) {
   const target = plainObject(value, label);
+  const backend = String(target.backend ?? "");
+  if (backend !== TARGET_BACKENDS[name]) {
+    fail(`${label}.backend must be ${TARGET_BACKENDS[name]}`);
+  }
   return Object.freeze({
     manifest: safeInstancePath(target.manifest, `${label}.manifest`),
+    backend,
   });
 }
 
@@ -279,8 +290,8 @@ export function validateCuratedSyncPlan(input) {
     transforms: Object.freeze(transforms),
     excludedDirectories: Object.freeze([...new Set(excluded)]),
     commonMetadata: checkedMetadata(plan.common_metadata, "common_metadata"),
-    legacyTarget: targetPlan(plan.legacy_target, "legacy_target"),
-    cloudflareTarget: targetPlan(plan.cloudflare_target, "cloudflare_target"),
+    legacyTarget: targetPlan(plan.legacy_target, "legacy_target", "legacy"),
+    cloudflareTarget: targetPlan(plan.cloudflare_target, "cloudflare_target", "cloudflare"),
     rawDrive,
     ledgerFile: safeInstancePath(
       plan.ledger_file ?? ".brain-curated-sync-ledger.json",
@@ -400,7 +411,7 @@ function assertRegularOwner(info, options = {}) {
  * lstat followed by readFile can therefore validate one inode and read another.
  * Opening first with O_NOFOLLOW, comparing descriptor metadata before and after
  * the read, and proving the path still names that descriptor closes that
- * window. The returned MD5 is over the exact bytes read, before UTF-8 decoding.
+ * window. The returned hashes are over the exact bytes read, before UTF-8 decoding.
  */
 export function readStableRegularSource(path, options = {}) {
   const openSource = options.openSource ?? openSync;
@@ -435,6 +446,7 @@ export function readStableRegularSource(path, options = {}) {
     return Object.freeze({
       body: bytes.toString("utf8"),
       rawMd5: createHash("md5").update(bytes).digest("hex"),
+      rawSha256: createHash("sha256").update(bytes).digest("hex"),
       stats: after,
     });
   } catch (error) {
@@ -551,11 +563,19 @@ export function prepareCuratedCorpus(planInput, options = {}) {
       source_type: "curated",
       source_id: `brain:${document.sourceType}:${document.sourceId}`,
     };
+    const neutralEnvelope = Object.freeze({ title, content, metadata });
+    const envelopeHash = sha256(
+      `curated-sync-envelope-v1\0${canonical(neutralEnvelope)}`,
+    );
     return Object.freeze({
+      absolutePath: absolute,
       relativePath: document.relativePath,
       role: document.role,
       contentHash,
       rawMd5: snapshot.rawMd5,
+      rawSha256: snapshot.rawSha256,
+      envelopeHash,
+      neutralEnvelope,
       logicalFingerprint,
       legacyEnvelope: Object.freeze(legacyEnvelope),
       cloudflareEnvelope: Object.freeze(cloudflareEnvelope),
@@ -573,6 +593,46 @@ export function prepareCuratedCorpus(planInput, options = {}) {
 
   documents.sort((left, right) => left.logicalFingerprint.localeCompare(right.logicalFingerprint));
   return Object.freeze({ plan, planDirectory, root, documents: Object.freeze(documents) });
+}
+
+/** Scan all transformed searchable fields as one corpus-wide fail-closed gate. */
+export function assertCuratedEnvelopesCredentialSafe(prepared, options = {}) {
+  const scanner = options.scanEnvelope ?? scanEnvelope;
+  let refused = 0;
+  const labels = new Set();
+  for (const document of prepared.documents) {
+    const result = scanner(document.neutralEnvelope);
+    if (!result?.shouldRefuse) continue;
+    refused++;
+    for (const label of result.labels || []) {
+      if (labels.size < 8 && /^[a-z0-9 _.-]{1,80}$/i.test(String(label))) labels.add(String(label));
+    }
+  }
+  if (refused) {
+    const bounded = [...labels].sort().slice(0, 8).join(", ") || "confirmed credential shape";
+    fail(`credential scan refused ${refused} of ${prepared.documents.length} transformed documents (${bounded})`);
+  }
+}
+
+/**
+ * Re-open and rehash every raw source after transformation and scanning.
+ * No credential or network call is permitted until this second complete pass
+ * proves that the bytes about to be sent are still the bytes that were scanned.
+ */
+export function verifyCuratedSourceSnapshot(prepared, options = {}) {
+  const snapshotReader = options.readStableSource ?? readStableRegularSource;
+  let changed = 0;
+  for (const document of prepared.documents) {
+    const snapshot = snapshotReader(document.absolutePath, options);
+    if (snapshot.rawSha256 !== document.rawSha256) changed++;
+  }
+  const after = enumerateMarkdown(prepared.root, prepared.plan.excludedDirectories);
+  const expected = prepared.plan.documents.map((document) => document.relativePath).sort();
+  const mismatch = planSetMismatch(after, expected);
+  if (changed || after.length !== expected.length || mismatch.missing || mismatch.unexpected) {
+    fail(`curated corpus final snapshot verification failed for ${changed} changed documents and ${mismatch.missing + mismatch.unexpected} inventory differences`);
+  }
+  return true;
 }
 
 function privateStateData(prepared) {
@@ -633,7 +693,15 @@ function driveFamiliesByLogicalDocument(prepared) {
   return mapped;
 }
 
-async function defaultResolveTarget(target, planDirectory, options = {}) {
+function targetDomain(manifest) {
+  const domain = String(manifest?.brain?.domain ?? "").trim().toLowerCase();
+  if (!/^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/.test(domain) || !domain.includes(".")) {
+    fail("target manifest brain.domain is invalid");
+  }
+  return domain;
+}
+
+function readTargetManifest(target, planDirectory) {
   const manifestPath = resolveFromPlan(planDirectory, target.manifest);
   let manifest;
   try {
@@ -641,14 +709,83 @@ async function defaultResolveTarget(target, planDirectory, options = {}) {
   } catch {
     fail("target manifest could not be read and validated");
   }
-  const domain = String(manifest?.brain?.domain ?? "").trim().toLowerCase();
-  if (!/^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/.test(domain) || !domain.includes(".")) {
-    fail("target manifest brain.domain is invalid");
+  const domain = targetDomain(manifest);
+  if (target.backend === TARGET_BACKENDS.cloudflare && manifest?.infrastructure?.cloudflare?.storage !== "d1") {
+    fail("Cloudflare target manifest must declare d1 storage");
   }
+  return { manifestPath, manifest, baseUrl: `https://${domain}`, origin: `https://${domain}` };
+}
+
+/** Read and validate target identities without touching an admin credential. */
+export function inspectCuratedTargetContracts(planInput, options = {}) {
+  const planDirectory = options.planDirectory ?? process.cwd();
+  const plan = planInput?.schemaVersion === CURATED_SYNC_PLAN_VERSION
+    ? planInput
+    : validateCuratedSyncPlan(planInput);
+  const targets = {};
+  for (const name of TARGET_NAMES) {
+    const target = name === "legacy" ? plan.legacyTarget : plan.cloudflareTarget;
+    const descriptor = readTargetManifest(target, planDirectory);
+    targets[name] = Object.freeze({
+      name,
+      backend: target.backend,
+      baseUrl: descriptor.baseUrl,
+      origin: descriptor.origin,
+      manifestPath: descriptor.manifestPath,
+    });
+  }
+  if (targets.legacy.backend === targets.cloudflare.backend ||
+      targets.legacy.origin === targets.cloudflare.origin) {
+    fail("curated sync targets must use distinct backends and origins");
+  }
+  return Object.freeze(targets);
+}
+
+async function defaultResolveTarget(target, planDirectory, options = {}, name) {
+  const { manifestPath, manifest, baseUrl, origin } = readTargetManifest(target, planDirectory);
   const persistence = adminKeyPersistencePlan(manifestPath, manifest, options);
   const adminKey = readAdminKeyDurably(persistence, options);
   if (!adminKey) fail("target durable admin key is unavailable");
-  return { baseUrl: `https://${domain}`, adminKey };
+  return { name, backend: target.backend, baseUrl, origin, adminKey };
+}
+
+function validateResolvedTarget(name, target, resolved) {
+  if (!resolved?.baseUrl || !resolved?.adminKey) fail("target resolution is incomplete");
+  let url;
+  try { url = new URL(resolved.baseUrl); } catch { fail("target resolution has an invalid origin"); }
+  if (url.protocol !== "https:" || url.username || url.password ||
+      url.pathname !== "/" || url.search || url.hash) {
+    fail("target resolution must be an HTTPS origin");
+  }
+  const backend = resolved.backend ?? target.backend;
+  if (backend !== TARGET_BACKENDS[name] || target.backend !== TARGET_BACKENDS[name]) {
+    fail("target resolution backend does not match its contract");
+  }
+  return Object.freeze({ ...resolved, name, backend, baseUrl: url.origin, origin: url.origin });
+}
+
+async function resolveRequiredTargets(prepared, options, mode) {
+  if (mode === "dry-run") return Object.freeze({});
+  const resolver = options.resolveTarget ?? defaultResolveTarget;
+  const names = mode === "sync" ? TARGET_NAMES : ["cloudflare"];
+  const resolved = {};
+  const candidates = await Promise.all(names.map(async (name) => {
+    const target = name === "legacy" ? prepared.plan.legacyTarget : prepared.plan.cloudflareTarget;
+    try { return await resolver(target, prepared.planDirectory, options, name); } catch { return null; }
+  }));
+  for (let index = 0; index < names.length; index++) {
+    const name = names[index];
+    const target = name === "legacy" ? prepared.plan.legacyTarget : prepared.plan.cloudflareTarget;
+    resolved[name] = candidates[index] === null
+      ? null
+      : validateResolvedTarget(name, target, candidates[index]);
+  }
+  if (resolved.legacy && resolved.cloudflare &&
+      (resolved.legacy.backend === resolved.cloudflare.backend ||
+       resolved.legacy.origin === resolved.cloudflare.origin)) {
+    fail("curated sync targets must use distinct backends and origins");
+  }
+  return Object.freeze(resolved);
 }
 
 function blankTargetStatuses(prepared) {
@@ -667,16 +804,15 @@ async function parseJsonResponse(response) {
   }
 }
 
-async function postOneTarget(name, prepared, options = {}) {
+function responseStayedOnOrigin(response, origin) {
+  if (!response?.url) return true;
+  try { return new URL(response.url).origin === origin; } catch { return false; }
+}
+
+async function postOneTarget(name, prepared, resolved, options = {}) {
   const statuses = blankTargetStatuses(prepared);
   const actions = { created: 0, updated: 0, unchanged: 0 };
-  const target = name === "legacy" ? prepared.plan.legacyTarget : prepared.plan.cloudflareTarget;
-  const resolveTarget = options.resolveTarget ?? defaultResolveTarget;
-  let resolved;
-  try {
-    resolved = await resolveTarget(target, prepared.planDirectory, options, name);
-    if (!resolved?.baseUrl || !resolved?.adminKey) throw new Error("invalid target resolution");
-  } catch {
+  if (!resolved) {
     setAll(statuses, "credential_unavailable");
     return { statuses, actions };
   }
@@ -697,6 +833,7 @@ async function postOneTarget(name, prepared, options = {}) {
           "X-Admin-Key": resolved.adminKey,
         },
         body: JSON.stringify(envelope),
+        redirect: "manual",
         signal: options.abortSignal?.() ?? AbortSignal.timeout(options.targetTimeoutMs ?? TARGET_TIMEOUT_MS),
       });
     } catch {
@@ -710,7 +847,7 @@ async function postOneTarget(name, prepared, options = {}) {
       statuses.set(document.logicalFingerprint, "network_error");
       continue;
     }
-    if (!response.ok) {
+    if (!response.ok || !responseStayedOnOrigin(response, resolved.origin)) {
       statuses.set(document.logicalFingerprint, "http_error");
       continue;
     }
@@ -730,7 +867,7 @@ async function postOneTarget(name, prepared, options = {}) {
 
 async function postOneTargetSafely(name, prepared, options) {
   try {
-    return await postOneTarget(name, prepared, options);
+    return await postOneTarget(name, prepared, options.resolvedTargets?.[name], options);
   } catch {
     // A malformed response object or another target-local exception is still a
     // retryable target failure. Collapsing it to a bounded status preserves the
@@ -741,30 +878,19 @@ async function postOneTargetSafely(name, prepared, options) {
   }
 }
 
-async function listCloudflareDriveFamilies(prepared, options = {}) {
-  const resolveTarget = options.resolveTarget ?? defaultResolveTarget;
-  let resolved;
-  try {
-    resolved = await resolveTarget(
-      prepared.plan.cloudflareTarget,
-      prepared.planDirectory,
-      options,
-      "cloudflare",
-    );
-    if (!resolved?.baseUrl || !resolved?.adminKey) throw new Error("invalid target resolution");
-  } catch {
-    return { ok: false, families: new Set() };
-  }
+async function listCloudflareFamilies(source, resolved, options = {}) {
+  if (!resolved) return { ok: false, families: new Set() };
   const families = new Set();
   const request = options.fetch ?? globalThis.fetch;
   let cursor = "";
   for (let page = 0; page < 10_000; page++) {
-    const query = new URLSearchParams({ source: "drive", limit: "1000" });
+    const query = new URLSearchParams({ source, limit: "1000" });
     if (cursor) query.set("cursor", cursor);
     let response;
     try {
       response = await request(`${resolved.baseUrl}/api/admin/brain/source-families?${query}`, {
         headers: { "X-Admin-Key": resolved.adminKey },
+        redirect: "manual",
         signal: options.abortSignal?.() ?? AbortSignal.timeout(options.targetTimeoutMs ?? TARGET_TIMEOUT_MS),
       });
     } catch {
@@ -776,11 +902,12 @@ async function listCloudflareDriveFamilies(prepared, options = {}) {
     } catch {
       return { ok: false, families: new Set() };
     }
-    if (!response.ok || body?.source !== "drive" || !Array.isArray(body?.families)) {
+    if (!response.ok || !responseStayedOnOrigin(response, resolved.origin) ||
+        body?.source !== source || !Array.isArray(body?.families)) {
       return { ok: false, families: new Set() };
     }
     for (const family of body.families) {
-      if (typeof family !== "string" || !family.startsWith("drive:")) {
+      if (typeof family !== "string" || !family.startsWith(`${source}:`)) {
         return { ok: false, families: new Set() };
       }
       families.add(family);
@@ -806,13 +933,13 @@ function rawDriveStatuses(prepared, mapped, live) {
         const present = candidates.filter((candidate) => live.families.has(candidate.family));
         if (!present.length) status = "not_present";
         else if (present.some((candidate) => candidate.driveMd5 === document.rawMd5)) {
-          status = "checksum_confirmed_duplicate";
+          status = "historical_checksum_match";
         } else if (present.some((candidate) => candidate.driveMd5 === null)) {
           // driveVersion falls back to size when Drive provides no MD5. Same
           // path and size are presence evidence, never byte-equality evidence.
-          status = "presence_unverified";
+          status = "historical_presence_unverified";
         } else {
-          status = "checksum_mismatch";
+          status = "historical_checksum_mismatch";
         }
       }
     }
@@ -853,6 +980,7 @@ export function buildCuratedCoverageLedger(prepared, observations = {}) {
     return {
       logical_fingerprint: document.logicalFingerprint,
       content_sha256: document.contentHash,
+      envelope_sha256: document.envelopeHash,
       role: document.role,
       targets: { cloudflare: cloudflareStatus, legacy: legacyStatus },
       raw_drive: rawDriveStatus,
@@ -861,6 +989,7 @@ export function buildCuratedCoverageLedger(prepared, observations = {}) {
   documents.sort((left, right) => left.logical_fingerprint.localeCompare(right.logical_fingerprint));
   const corpusFingerprint = sha256(canonical(documents.map((document) => ({
     content_sha256: document.content_sha256,
+    envelope_sha256: document.envelope_sha256,
     logical_fingerprint: document.logical_fingerprint,
     role: document.role,
   }))));
@@ -873,15 +1002,63 @@ export function buildCuratedCoverageLedger(prepared, observations = {}) {
       cloudflare_confirmed: aggregateByRole(prepared, cloudflare, "confirmed"),
       legacy_confirmed: aggregateByRole(prepared, legacy, "confirmed"),
     },
-    raw_drive_checksum_duplicates: aggregateByRole(
+    raw_drive_historical_checksum_matches: aggregateByRole(
       prepared,
       rawDrive,
-      "checksum_confirmed_duplicate",
+      "historical_checksum_match",
     ),
-    raw_drive_presence_unverified: aggregateByRole(prepared, rawDrive, "presence_unverified"),
-    raw_drive_checksum_mismatches: aggregateByRole(prepared, rawDrive, "checksum_mismatch"),
+    raw_drive_historical_presence_unverified: aggregateByRole(prepared, rawDrive, "historical_presence_unverified"),
+    raw_drive_historical_checksum_mismatches: aggregateByRole(prepared, rawDrive, "historical_checksum_mismatch"),
+    raw_drive_evidence: {
+      deletion_eligible: false,
+      proof_scope: "historical_resume_state_plus_current_family_presence",
+      reason: "server_revision_unbound",
+    },
     documents,
   };
+}
+
+function validateExistingLedger(value) {
+  const ledger = plainObject(value, "existing coverage ledger");
+  if (![2, CURATED_SYNC_LEDGER_VERSION].includes(ledger.schema_version) ||
+      !/^[0-9a-f]{64}$/.test(String(ledger.corpus_fingerprint ?? "")) ||
+      !Number.isInteger(ledger.documents_expected) || ledger.documents_expected < 1 ||
+      !Array.isArray(ledger.documents) || ledger.documents.length !== ledger.documents_expected) {
+    fail("existing coverage ledger has an unsupported schema");
+  }
+  for (const document of ledger.documents) {
+    if (!document || typeof document !== "object" || Array.isArray(document) ||
+        !/^[0-9a-f]{64}$/.test(String(document.logical_fingerprint ?? "")) ||
+        !/^[0-9a-f]{64}$/.test(String(document.content_sha256 ?? "")) ||
+        (ledger.schema_version === CURATED_SYNC_LEDGER_VERSION &&
+         !/^[0-9a-f]{64}$/.test(String(document.envelope_sha256 ?? ""))) ||
+        !ROLE_SET.has(document.role)) {
+      fail("existing coverage ledger has an unsupported schema");
+    }
+  }
+  return ledger;
+}
+
+function pathIdentity(path) {
+  const absolute = resolve(path);
+  if (existsSync(absolute)) {
+    const info = statSync(absolute, { bigint: true });
+    return { absolute, real: realpathSync.native(absolute), inode: `${info.dev}:${info.ino}` };
+  }
+  const parent = dirname(absolute);
+  const realParent = existsSync(parent) ? realpathSync.native(parent) : resolve(parent);
+  return { absolute, real: join(realParent, basename(absolute)), inode: null };
+}
+
+export function assertLedgerDoesNotCollide(path, protectedPaths = []) {
+  const ledger = pathIdentity(path);
+  for (const protectedPath of protectedPaths.filter(Boolean)) {
+    const protectedIdentity = pathIdentity(protectedPath);
+    if (ledger.absolute === protectedIdentity.absolute || ledger.real === protectedIdentity.real ||
+        (ledger.inode && ledger.inode === protectedIdentity.inode)) {
+      fail("coverage ledger destination collides with protected sync input");
+    }
+  }
 }
 
 function assertLedgerDestination(path, options = {}) {
@@ -896,12 +1073,21 @@ function assertLedgerDestination(path, options = {}) {
     }
     if ((info.mode & 0o077) !== 0) fail("coverage ledger destination is not owner-only");
   }
+  if (info.size < 2 || info.size > MAX_LEDGER_BYTES) {
+    fail("existing coverage ledger has an invalid size");
+  }
+  let existing;
+  try { existing = JSON.parse(readFileSync(path, "utf8")); } catch {
+    fail("existing coverage ledger could not be parsed");
+  }
+  validateExistingLedger(existing);
 }
 
 /** Atomically replace the private ledger with canonical, owner-only bytes. */
 export function writeCuratedCoverageLedger(path, ledger, options = {}) {
   const absolute = resolve(path);
   const directory = dirname(absolute);
+  assertLedgerDoesNotCollide(absolute, options.protectedPaths ?? []);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   assertLedgerDestination(absolute, options);
   const bytes = Buffer.from(`${canonical(ledger)}\n`, "utf8");
@@ -942,8 +1128,8 @@ export function writeCuratedCoverageLedger(path, ledger, options = {}) {
 /**
  * Run one of three explicit modes:
  *   dry-run: exact local inventory and hashes only, no credential or network;
- *   audit:   read-only Cloudflare duplicate inventory, no ingest writes;
- *   sync:    independent legacy and Cloudflare writes plus duplicate audit.
+ *   audit:   read-only Cloudflare historical-family evidence, no ingest writes;
+ *   sync:    independent legacy and Cloudflare writes plus historical evidence.
  */
 export async function runCuratedDualSync(planInput, options = {}) {
   const mode = String(options.mode ?? "");
@@ -955,11 +1141,44 @@ export async function runCuratedDualSync(planInput, options = {}) {
     planDirectory: options.planDirectory ?? process.cwd(),
   });
 
+  const ledgerPath = resolveFromPlan(prepared.planDirectory, prepared.plan.ledgerFile);
+  const protectedPaths = [
+    options.planPath,
+    ...prepared.documents.map((document) => document.absolutePath),
+    ...TARGET_NAMES.flatMap((name) => {
+      const target = name === "legacy" ? prepared.plan.legacyTarget : prepared.plan.cloudflareTarget;
+      const manifest = resolveFromPlan(prepared.planDirectory, target.manifest);
+      return [manifest, join(dirname(manifest), ".brain-admin-key")];
+    }),
+    prepared.plan.rawDrive
+      ? resolveFromPlan(prepared.planDirectory, prepared.plan.rawDrive.stateFile)
+      : null,
+  ].filter(Boolean);
+  assertLedgerDoesNotCollide(ledgerPath, protectedPaths);
+  assertLedgerDestination(ledgerPath, options);
+
+  // All transformed human-searchable fields are scanned as a complete set.
+  // A second raw-byte pass then proves the scan covered the exact source bytes
+  // still present immediately before any durable credential can be touched.
+  assertCuratedEnvelopesCredentialSafe(prepared, options);
+  verifyCuratedSourceSnapshot(prepared, options);
+
+  // Production manifests are identity-only inspected before Keychain access.
+  // Injected resolvers are validated from their returned backend and origin.
+  if (mode !== "dry-run" && !options.resolveTarget) {
+    inspectCuratedTargetContracts(prepared.plan, {
+      ...options,
+      planDirectory: prepared.planDirectory,
+    });
+  }
+
   let mapped = new Map();
   if (prepared.plan.rawDrive) mapped = driveFamiliesByLogicalDocument(prepared);
+  const resolvedTargets = await resolveRequiredTargets(prepared, options, mode);
+  const targetOptions = { ...options, resolvedTargets };
   let live = { ok: false, families: new Set() };
   if (mode !== "dry-run" && prepared.plan.rawDrive) {
-    live = await listCloudflareDriveFamilies(prepared, options);
+    live = await listCloudflareFamilies("drive", resolvedTargets.cloudflare, options);
   }
   const rawDrive = rawDriveStatuses(prepared, mapped, live);
 
@@ -970,9 +1189,21 @@ export async function runCuratedDualSync(planInput, options = {}) {
     // must not prevent Cloudflare from converging, and the reverse is equally
     // important while legacy retrieval remains the rollback path.
     [legacyResult, cloudflareResult] = await Promise.all([
-      postOneTargetSafely("legacy", prepared, options),
-      postOneTargetSafely("cloudflare", prepared, options),
+      postOneTargetSafely("legacy", prepared, targetOptions),
+      postOneTargetSafely("cloudflare", prepared, targetOptions),
     ]);
+    // D1 exposes exact stored source families, so a POST receipt is not final
+    // confirmation until the same target can read back every expected identity.
+    if ([...cloudflareResult.statuses.values()].some((value) => value === "confirmed")) {
+      const readback = await listCloudflareFamilies("curated", resolvedTargets.cloudflare, options);
+      for (const document of prepared.documents) {
+        if (cloudflareResult.statuses.get(document.logicalFingerprint) !== "confirmed") continue;
+        const expected = `curated:${document.cloudflareEnvelope.source_id}`;
+        if (!readback.ok || !readback.families.has(expected)) {
+          cloudflareResult.statuses.set(document.logicalFingerprint, "invalid_receipt");
+        }
+      }
+    }
   }
 
   const ledger = buildCuratedCoverageLedger(prepared, {
@@ -980,9 +1211,8 @@ export async function runCuratedDualSync(planInput, options = {}) {
     cloudflare: cloudflareResult.statuses,
     rawDrive,
   });
-  const ledgerPath = resolveFromPlan(prepared.planDirectory, prepared.plan.ledgerFile);
   const writer = options.writeLedger ?? writeCuratedCoverageLedger;
-  writer(ledgerPath, ledger, options);
+  writer(ledgerPath, ledger, { ...options, protectedPaths });
 
   const allConfirmed = (statuses) => [...statuses.values()].every((value) => value === "confirmed");
   const auditComplete = !prepared.plan.rawDrive || live.ok || mode === "dry-run";
@@ -995,9 +1225,9 @@ export async function runCuratedDualSync(planInput, options = {}) {
     count: prepared.documents.length,
     roles: { ...prepared.plan.expectedRoles },
     corpusFingerprint: ledger.corpus_fingerprint,
-    rawDriveChecksumDuplicates: ledger.raw_drive_checksum_duplicates,
-    rawDrivePresenceUnverified: ledger.raw_drive_presence_unverified,
-    rawDriveChecksumMismatches: ledger.raw_drive_checksum_mismatches,
+    rawDriveHistoricalChecksumMatches: ledger.raw_drive_historical_checksum_matches,
+    rawDriveHistoricalPresenceUnverified: ledger.raw_drive_historical_presence_unverified,
+    rawDriveHistoricalChecksumMismatches: ledger.raw_drive_historical_checksum_mismatches,
     targetCoverage: ledger.target_coverage,
     actions: {
       legacy: legacyResult.actions,
@@ -1047,16 +1277,21 @@ async function main(argv = process.argv.slice(2)) {
       return 0;
     }
     const { plan, planDirectory } = loadCuratedSyncPlan(args.planPath);
-    const report = await runCuratedDualSync(plan, { mode: args.mode, planDirectory });
+    const report = await runCuratedDualSync(plan, {
+      mode: args.mode,
+      planDirectory,
+      planPath: resolve(args.planPath),
+    });
     console.log(
       `curated ${report.mode}: ${report.count} documents; ` +
       `${report.roles.authoritative} authoritative, ${report.roles.superseded} superseded, ` +
       `${report.roles.plain} plain`,
     );
     console.log(
-      `checksum-confirmed raw Drive duplicates: ${report.rawDriveChecksumDuplicates.total}; ` +
-      `unverified presence: ${report.rawDrivePresenceUnverified.total}; ` +
-      `checksum mismatches: ${report.rawDriveChecksumMismatches.total}; ` +
+      `historical raw Drive checksum matches: ${report.rawDriveHistoricalChecksumMatches.total}; ` +
+      `historical unverified presence: ${report.rawDriveHistoricalPresenceUnverified.total}; ` +
+      `historical checksum mismatches: ${report.rawDriveHistoricalChecksumMismatches.total}; ` +
+      `deletion proof: unavailable; ` +
       `coverage ledger ${report.ok ? "updated" : "updated with incomplete receipts"}`,
     );
     return report.ok ? 0 : 1;
