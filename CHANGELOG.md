@@ -4,6 +4,33 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.12
+
+**Large imports are faster, concurrent updates fail closed, and release checks
+now prove that the private test suite covers the promised risk areas.**
+
+- A 50-document D1 batch now performs one identity preflight and one source
+  statistics refresh instead of repeating full source work for every document.
+  The same request structure dropped from 350 remote D1 calls to 203 in the
+  deterministic integration test, while an unchanged 50-document retry drops
+  to one read-only D1 batch.
+- Every changed revision owns a unique pending marker. Chunk replacement,
+  vector outbox writes, source statistics, and the final content-hash commit
+  are bound to that marker, so a stale concurrent request cannot report another
+  request's successful write as its own.
+- Curated dual-target sync tooling now verifies the complete transformed
+  envelope, the unchanged raw source bytes, exact target receipts, target
+  readback, and an owner-only coverage ledger before it reports success.
+  Historical raw copies are evidence only and are never deletion eligible.
+- The curated scheduler uses a single-instance lock, a credential-free child
+  environment, configuration fingerprints, aggregate freshness receipts, and
+  private local support events. Installing or replacing a live schedule remains
+  an explicit supervised operation.
+- `brain eval --profile release` now requires at least 60 labeled private cases,
+  explicit domain, format, risk, and query-kind coverage, and five cases in each
+  declared slice. Every release unanswerable case must run and pass. Small suites
+  remain useful under the clearly labeled diagnostic `smoke` profile.
+
 ## 0.1.11
 
 **A Drive refresh now stops before an unexpectedly large cleanup can remove

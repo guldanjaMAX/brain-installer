@@ -5,7 +5,7 @@ keyword search live in D1, vectors live in Vectorize, and the Worker fuses them.
 Nothing runs on our infrastructure, and nothing but a scoped token is held during
 the engagement.
 
-**Status: 0.1.11.** Provisioning, retrieval, resumable folder ingest, deletion,
+**Status: 0.1.12.** Provisioning, retrieval, resumable folder ingest, deletion,
 upgrade rollback, and `brain setup` are verified end to end against real
 Cloudflare on macOS. Google Drive OAuth and a bounded real-account ingest have
 also been verified. The complete Drive baseline is the remaining production
