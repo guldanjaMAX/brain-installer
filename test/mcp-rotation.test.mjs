@@ -468,7 +468,9 @@ try {
   const childEnvironment = {
     PATH: process.env.PATH || "/usr/bin:/bin",
     HOME: claudeHome,
-    USER: "fixture-user",
+    ...(process.platform === "win32"
+      ? { ...windowsRuntimeBasics, USERNAME: nativeFileOptions.username }
+      : { USER: "fixture-user" }),
     LANG: "C",
     ADMIN_KEY: replacementKey,
     BRAIN_KEY: retiredKey,
