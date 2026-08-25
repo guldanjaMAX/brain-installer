@@ -452,8 +452,11 @@ try {
   rmSync(orphanBackup);
   const orphanTemp = join(orphanRoot, "..brain-admin-key.404.5555555555555555.tmp");
   writeFileSync(orphanTemp, "incomplete staged state", { mode: 0o600 });
-  assert.equal(validateAdminKeyFileDestination(orphanPath).replaced, false);
-  assert.throws(() => readAdminKeyFile(orphanPath), /file does not exist/i);
+  const nativeDestinationOptions = process.platform === "win32"
+    ? { username: "fixture-user" }
+    : {};
+  assert.equal(validateAdminKeyFileDestination(orphanPath, nativeDestinationOptions).replaced, false);
+  assert.throws(() => readAdminKeyFile(orphanPath, nativeDestinationOptions), /file does not exist/i);
 
   const windowsCaseRoot = join(sandbox, "windows-case-normalized-parent");
   mkdirSync(windowsCaseRoot, { mode: 0o700 });
