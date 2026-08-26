@@ -184,6 +184,11 @@ const INSTALL_STATE_NULL_NORMALIZED_COLUMNS = Object.freeze([
   "vector_projection_bootstrap_protocol",
 ]);
 const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
+  // Queue generations belong to the target's derived Vectorize projection.
+  // A resumable bootstrap advances this counter as it creates outbox rows,
+  // even though no document or chunk content changed. Reset it alongside the
+  // queue itself so corpus fingerprints remain stable across safe retries.
+  "outbox_generation",
   "vector_projection_bootstrap_base_count",
 ]);
 const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 13;

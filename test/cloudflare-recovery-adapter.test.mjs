@@ -185,7 +185,7 @@ const fixtureInstallState = Object.freeze({
 });
 const normalizedInstallStateSql =
   `INSERT INTO "install_state" (${installStateColumns.map(([name]) => `"${name}"`).join(",")}) VALUES (` +
-  `1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,9,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004',NULL,0);\n`;
+  `1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,0,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004',NULL,0);\n`;
 const schemaRows = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((name) => ({
     type: "table",
@@ -296,7 +296,8 @@ function snapshotForChunkCount(chunkCount) {
   const first = await normalizedInstallStateExport({}, appliedMigrations, readRows);
   source.prepare(
     `UPDATE install_state
-        SET vector_drain_lease_owner='different-live-owner',
+        SET outbox_generation=123456,
+            vector_drain_lease_owner='different-live-owner',
             vector_drain_lease_expires_at=111111,
             vector_projection_mutation_id='different-live-mutation',
             vector_projection_submitted_at=222222
@@ -311,7 +312,8 @@ function snapshotForChunkCount(chunkCount) {
   assert.equal(sql.includes("source-only-mutation"), false);
   destination.exec(sql);
   assert.deepEqual({ ...destination.prepare(
-    `SELECT vector_drain_lease_owner owner,
+    `SELECT outbox_generation generation,
+            vector_drain_lease_owner owner,
             vector_drain_lease_expires_at expires,
             vector_projection_mutation_id mutation,
             vector_projection_submitted_at submitted,
@@ -324,6 +326,7 @@ function snapshotForChunkCount(chunkCount) {
             (SELECT count(*) FROM vector_bootstrap_batches) batch_count
        FROM install_state WHERE id=1`,
   ).get() }, {
+    generation: 0,
     owner: null,
     expires: null,
     mutation: null,
@@ -685,6 +688,7 @@ function providerHarness({
       } else if (/^SELECT[\s\S]+FROM install_state ORDER BY id$/.test(sql)) {
         assert.match(sql, /NULL AS "vector_drain_lease_owner"/);
         assert.match(sql, /NULL AS "vector_drain_lease_expires_at"/);
+        assert.match(sql, /0 AS "outbox_generation"/);
         assert.match(sql, /NULL AS "vector_projection_mutation_id"/);
         assert.match(sql, /NULL AS "vector_projection_submitted_at"/);
         assert.match(sql, /CASE WHEN EXISTS \(SELECT 1 FROM chunks\) THEN 'bootstrap_required' ELSE 'verified' END AS "vector_projection_status"/);
@@ -700,6 +704,7 @@ function providerHarness({
           // projects both ephemeral columns to NULL before they reach JS.
           vector_drain_lease_owner: null,
           vector_drain_lease_expires_at: null,
+          outbox_generation: 0,
           vector_projection_mutation_id: null,
           vector_projection_submitted_at: null,
           vector_projection_status: "bootstrap_required",

@@ -127,8 +127,9 @@ expiry are invocation-local coordination, not recoverable state. Recovery
 therefore excludes `install_state` from the raw provider export, recreates its
 reviewed singleton row with lease and mutation fields forced to SQL `NULL`, a
 corpus-derived bootstrap status/epoch, and the exact `MAX(chunk_uid)` high-water,
-then forces the bulk-bootstrap protocol/base to `NULL`/zero and excludes its
-provider-specific batch receipts before hashing the remaining durable data.
+then resets the derived outbox generation and bulk-bootstrap base to zero,
+forces the bootstrap protocol to `NULL`, and excludes provider-specific queue
+and batch receipts before hashing the remaining durable data.
 Exact older migration prefixes remain inspectable by the offline verifier only.
 The field recovery runner requires schema 13 on both source and restored target
 before it can export or invoke the current drain protocol.

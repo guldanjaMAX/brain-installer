@@ -134,11 +134,12 @@ The SQL artifact never carries live derived-index coordination. The adapter
 exports the reviewed `install_state` row separately from the raw provider tables
 and forces the ephemeral drain lease owner/expiry and projection mutation
 ID/submission time to `NULL`. It also resets the bulk-bootstrap protocol to
-`NULL` and its verified base count to zero because those receipts prove only the
-source Vectorize index. For a nonempty corpus it records `bootstrap_required`,
-epoch 1, a null cursor, and the exact SQL `MAX(chunk_uid)` high-water. The
-`vector_bootstrap_batches` table remains in the restored schema, but its
-provider-specific history is excluded from the export and recreated empty.
+`NULL`, its verified base count to zero, and `outbox_generation` to zero because
+the queue counter and those receipts prove only the source Vectorize index. For
+a nonempty corpus it records `bootstrap_required`, epoch 1, a null cursor, and
+the exact SQL `MAX(chunk_uid)` high-water. The `vector_outbox` and
+`vector_bootstrap_batches` tables remain in the restored schema, but their
+provider-specific rows are excluded from the export and recreated empty.
 The normalized row is then hashed together with the remaining durable table
 export, so a retry cannot reuse a recovery artifact poisoned by an
 invocation-local lease, mutation fence, or old provider receipt. Older exact
