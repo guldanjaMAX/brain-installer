@@ -1,7 +1,7 @@
 # Shared Brain maintainer guide
 
 This is the operating guide for engineers who maintain the shared installer.
-It describes the 0.1.15 product line, how to change and release it safely, and
+It describes the 0.1.16 product line, how to change and release it safely, and
 how to update an owner's existing Brain. It is not an instance handoff. Never
 put an owner's manifest, resource identifiers, source details, private golden
 set, support export, or credentials in this repository.
@@ -40,7 +40,7 @@ Then read these files before changing their area:
 Preserve a dirty working tree. Identify who owns each existing change before
 editing the same file, and never discard unrelated work to make a test pass.
 
-## The 0.1.15 architecture
+## The 0.1.16 architecture
 
 There is one product and many isolated installs:
 
@@ -75,10 +75,12 @@ owner's Cloudflare Worker
   retrieval, ingest, health, evaluation, drain, and reindex use the deployed
   Brain and its separately stored admin key.
 
-The 0.1.15 candidate keeps the 0.1.14 current-status and message-replay
+The 0.1.16 candidate keeps the 0.1.14 current-status and message-replay
 guarantees while making exact legacy projection upgrades practical for large
-corpora. The previous 99-row path remains the conservative active reindex path;
-the lifecycle-only accelerated path requires the verified paused boundary.
+corpora. It replaces a rough trigger-amplified D1 change count with exact
+chunk-to-vector mapping readback during accelerated bootstrap. The previous
+99-row path remains the conservative active reindex path; the lifecycle-only
+accelerated path requires the verified paused boundary.
 The 0.1.14 line strengthened current-status retrieval so stale records and
 transaction-system evidence cannot silently establish a current client
 relationship. It also makes full message replay exact and fail-closed across
@@ -150,12 +152,12 @@ source checkout against a protected checkpoint. Its final readback requires
 exact D1 document/family counts and `vector_readiness` before it records a
 completion receipt.
 
-Do not describe 0.1.15 as live or recovery-verified merely because these files
+Do not describe 0.1.16 as live or recovery-verified merely because these files
 or deterministic tests exist. The exact candidate still requires its disposable
 provider field gate, recovery drill evidence, six-job CI matrix, immutable
 release artifact verification, and each install's private release evaluation.
 
-The code line is not a release merely because `package.json` says `0.1.15`. A
+The code line is not a release merely because `package.json` says `0.1.16`. A
 release exists only when its exact reviewed commit is tagged, all six CI jobs
 pass, required live field gates have evidence, GitHub publishes one immutable
 asset with the verified digest, and the public install and update pages point

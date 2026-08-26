@@ -34,10 +34,13 @@ const check = (name, condition, detail = "") => {
 };
 
 function makeEnv({
+  acceleratedVectorIdReportedChanges = null,
   autoProcessVectorMutations = true,
   deleteThrows = false,
   enforceD1PatternLimit = false,
   invalidGetByIdsPage = null,
+  malformedAcceleratedVectorIdReadback = false,
+  skipAcceleratedVectorIdUpdate = false,
 } = {}) {
   const db = new DatabaseSync(":memory:");
   const dir = fileURLToPath(new URL("../migrations/d1/", import.meta.url));
@@ -84,6 +87,10 @@ function makeEnv({
       first: async () => {
         d1Queries.submitted++;
         d1Queries.maxBinds = Math.max(d1Queries.maxBinds, params.length);
+        if (malformedAcceleratedVectorIdReadback &&
+            /FROM json_each\(\?1\) m JOIN chunks c/.test(sql)) {
+          return { n: "not-a-count" };
+        }
         return db.prepare(sql).get(...params) ?? null;
       },
       run: async () => {
@@ -120,8 +127,16 @@ function makeEnv({
         db.exec("BEGIN");
         try {
           const results = statements.map((statement) => {
+            if (skipAcceleratedVectorIdUpdate &&
+                /UPDATE chunks AS c SET vector_id/.test(statement._sql)) {
+              return { success: true, results: [], meta: { changes: 0 } };
+            }
             const result = db.prepare(statement._sql).run(...statement._params);
-            return { success: true, results: [], meta: { changes: Number(result.changes || 0) } };
+            const changes = Number.isSafeInteger(acceleratedVectorIdReportedChanges) &&
+                /UPDATE chunks AS c SET vector_id/.test(statement._sql)
+              ? acceleratedVectorIdReportedChanges
+              : Number(result.changes || 0);
+            return { success: true, results: [], meta: { changes } };
           });
           db.exec("COMMIT");
           return results;
@@ -1250,6 +1265,163 @@ const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
     result.vectors === 0 && result.vector_cleanup_queued === 1 && result.vector_error === null,
     JSON.stringify(result));
   check("and preserves the delete operation for the next drain", db.prepare("SELECT count(*) n FROM vector_outbox WHERE op='delete'").get().n === 1);
+}
+
+/* The vector-id UPDATE is already desired state for this short identity. D1's
+   rough receipt may be zero or include chunks_au's FTS writes; only exact
+   mapping readback is a success receipt. */
+for (const reportedChanges of [0, 9]) {
+  const { env, db, upsertBatches } = makeEnv({
+    acceleratedVectorIdReportedChanges: reportedChanges,
+  });
+  env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
+  insertDocument(db, "drive:accelerated-idempotent-id");
+  insertChunk(
+    db,
+    "drive:accelerated-idempotent-id#0",
+    "drive:accelerated-idempotent-id",
+    0,
+  );
+  db.prepare(
+    `UPDATE install_state
+        SET schema_version=13,vector_projection_status='bootstrap_required',
+            vector_projection_bootstrap_epoch=10,
+            vector_projection_bootstrap_cursor=NULL,
+            vector_projection_bootstrap_high_water=(SELECT MAX(chunk_uid) FROM chunks),
+            vector_projection_bootstrap_protocol=NULL,
+            vector_projection_bootstrap_base_count=0
+      WHERE id=1`,
+  ).run();
+  let clock = 9_000;
+  const options = {
+    now: () => ++clock,
+    embed: async () => [0.1],
+    embedBatch: async (texts) => texts.map(() => [0.1]),
+  };
+
+  const submitted = await acceleratedVectorBootstrap(env, options);
+  const complete = await acceleratedVectorBootstrap(env, options);
+  check(`an idempotent chunk vector-id write uses exact readback when D1 reports ${reportedChanges} changes`,
+    submitted.submitted === 1 && complete.complete === true && complete.confirmed === 1 &&
+      upsertBatches.length === 1,
+    JSON.stringify({ submitted, complete, upsertBatches: upsertBatches.length }));
+}
+
+/* A malformed D1 mapping readback never converts a committed provider and D1
+   submission into a success receipt. Its durable submitted batch can still be
+   confirmed on retry without another provider mutation. */
+{
+  const { env, db, upsertBatches } = makeEnv({
+    malformedAcceleratedVectorIdReadback: true,
+  });
+  env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
+  insertDocument(db, "drive:accelerated-malformed-mapping");
+  insertChunk(
+    db,
+    "drive:accelerated-malformed-mapping#0",
+    "drive:accelerated-malformed-mapping",
+    0,
+  );
+  db.prepare(
+    `UPDATE install_state
+        SET schema_version=13,vector_projection_status='bootstrap_required',
+            vector_projection_bootstrap_epoch=11,
+            vector_projection_bootstrap_cursor=NULL,
+            vector_projection_bootstrap_high_water=(SELECT MAX(chunk_uid) FROM chunks),
+            vector_projection_bootstrap_protocol=NULL,
+            vector_projection_bootstrap_base_count=0
+      WHERE id=1`,
+  ).run();
+  let clock = 9_500;
+  const options = {
+    now: () => ++clock,
+    embed: async () => [0.1],
+    embedBatch: async (texts) => texts.map(() => [0.1]),
+  };
+  let readbackError = null;
+  try {
+    await acceleratedVectorBootstrap(env, options);
+  } catch (error) {
+    readbackError = error;
+  }
+  const retained = db.prepare(
+    `SELECT (SELECT status FROM vector_bootstrap_batches
+              WHERE epoch=11 AND batch_no=1) status,
+            (SELECT count(*) FROM vector_outbox
+              WHERE bootstrap_epoch=11 AND bootstrap_batch=1
+                AND submitted_mutation_id IS NOT NULL) submitted,
+            vector_drain_lease_owner owner
+       FROM install_state WHERE id=1`,
+  ).get();
+  check("a malformed accelerated vector-id readback fails closed after the durable submission",
+    /mutation receipt was ambiguous/.test(readbackError?.message || "") &&
+      retained.status === "submitted" && retained.submitted === 1 && retained.owner === null &&
+      upsertBatches.length === 1,
+    JSON.stringify({ message: readbackError?.message, retained, upsertBatches: upsertBatches.length }));
+  const recovered = await acceleratedVectorBootstrap(env, options);
+  check("a submitted batch resumes after malformed mapping readback without another provider mutation",
+    recovered.complete === true && recovered.confirmed === 1 && upsertBatches.length === 1,
+    JSON.stringify({ recovered, upsertBatches: upsertBatches.length }));
+}
+
+/* An interrupted request resumes from submitted D1 state. Confirmation must
+   re-prove the stored mapping before provider visibility can clear the batch. */
+{
+  const { env, db, upsertBatches } = makeEnv({
+    skipAcceleratedVectorIdUpdate: true,
+  });
+  env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
+  const docUid = "drive:accelerated-incomplete-mapping";
+  const chunkUid = `${docUid}:${"x".repeat(80)}#0`;
+  insertDocument(db, docUid);
+  insertChunk(db, chunkUid, docUid, 0, "legacy-vector-id");
+  db.prepare(
+    `UPDATE install_state
+        SET schema_version=13,vector_projection_status='bootstrap_required',
+            vector_projection_bootstrap_epoch=12,
+            vector_projection_bootstrap_cursor=NULL,
+            vector_projection_bootstrap_high_water=(SELECT MAX(chunk_uid) FROM chunks),
+            vector_projection_bootstrap_protocol=NULL,
+            vector_projection_bootstrap_base_count=0
+      WHERE id=1`,
+  ).run();
+  let clock = 9_750;
+  const options = {
+    now: () => ++clock,
+    embed: async () => [0.1],
+    embedBatch: async (texts) => texts.map(() => [0.1]),
+  };
+  let readbackError = null;
+  try {
+    await acceleratedVectorBootstrap(env, options);
+  } catch (error) {
+    readbackError = error;
+  }
+  let resumeError = null;
+  try {
+    await acceleratedVectorBootstrap(env, options);
+  } catch (error) {
+    resumeError = error;
+  }
+  const retained = db.prepare(
+    `SELECT (SELECT status FROM vector_bootstrap_batches
+              WHERE epoch=12 AND batch_no=1) status,
+            (SELECT count(*) FROM vector_outbox
+              WHERE bootstrap_epoch=12 AND bootstrap_batch=1) pending,
+            vector_drain_lease_owner owner
+       FROM install_state WHERE id=1`,
+  ).get();
+  check("resume cannot confirm a provider-visible vector whose D1 identity mapping is incomplete",
+    /mutation receipt was ambiguous/.test(readbackError?.message || "") &&
+      /submitted batch is incomplete/.test(resumeError?.message || "") &&
+      retained.status === "submitted" && retained.pending === 1 && retained.owner === null &&
+      upsertBatches.length === 1,
+    JSON.stringify({
+      readback: readbackError?.message,
+      resume: resumeError?.message,
+      retained,
+      upsertBatches: upsertBatches.length,
+    }));
 }
 
 /* Schema 13 fills a provider-sized three-mutation window, then resumes from

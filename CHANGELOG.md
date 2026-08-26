@@ -4,6 +4,29 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.16
+
+**Large Cloudflare upgrades now trust exact vector identity readback instead of
+a rough database change counter, so already-committed batches resume cleanly.**
+
+- D1 change metadata can include the full-text-search trigger work caused by a
+  chunk update. That makes it useful for diagnostics, but not an exact receipt
+  for how many vector identities reached their desired values.
+- The paused upgrade now reads back every chunk-to-vector mapping in each
+  1,000-row batch before accepting it. The guarded install-state, outbox, and
+  batch transitions keep their strict ownership receipts.
+- An interrupted request rechecks the stored mapping before provider visibility
+  can confirm the batch. A real partial mapping stays submitted and blocks
+  completion instead of becoming a false success.
+- Existing schema-13 progress is retained. Re-running the update resumes its
+  durable batches without deleting source documents or starting the corpus
+  projection over.
+
+After updating, run `brain status <manifest>`, `brain health <manifest>`, and
+`brain test <manifest>`. Status must report schema 13. Health and test must pass
+with zero pending or submitted vector work, exact expected and actual vector
+counts, and a query-ready semantic index before you rely on Brain answers.
+
 ## 0.1.15
 
 **Large existing brains can complete an exact Cloudflare upgrade in hours

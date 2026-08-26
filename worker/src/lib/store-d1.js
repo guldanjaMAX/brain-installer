@@ -2485,9 +2485,24 @@ async function submitAcceleratedBootstrapBatch(env, batch, lease, options) {
   ]);
   if (!Array.isArray(results) || results.length !== 4 ||
       drainLeaseChanges(results[0]) !== 1 ||
-      drainLeaseChanges(results[1]) !== rows.length ||
       drainLeaseChanges(results[2]) !== rows.length ||
       drainLeaseChanges(results[3]) !== 1) {
+    throw new Error("the accelerated bootstrap mutation receipt was ambiguous");
+  }
+  // D1 derives its rough meta.changes indication from sqlite3_total_changes(),
+  // and chunks_au also rewrites the external FTS row for every chunks UPDATE.
+  // It therefore cannot prove how many vector_id values reached desired state.
+  // Read back the complete mapping instead. The install fence, outbox
+  // transition, and batch transition remain exact ownership receipts above
+  // because each changes one guarded row set with no triggers.
+  const mappingReceipt = await env.DB.prepare(
+    `SELECT count(*) AS n
+       FROM json_each(?1) m JOIN chunks c
+         ON c.chunk_uid=json_extract(m.value,'$.u')
+      WHERE c.vector_id=json_extract(m.value,'$.v')`
+  ).bind(mappingJson).first();
+  const mapped = Number(mappingReceipt?.n);
+  if (!Number.isSafeInteger(mapped) || mapped !== rows.length) {
     throw new Error("the accelerated bootstrap mutation receipt was ambiguous");
   }
   return rows.length;
@@ -2495,10 +2510,11 @@ async function submitAcceleratedBootstrapBatch(env, batch, lease, options) {
 
 async function confirmAcceleratedBootstrapBatch(env, batch, now) {
   const { results: rows } = await env.DB.prepare(
-    `SELECT chunk_uid,generation,submitted_mutation_id
-       FROM vector_outbox
-      WHERE bootstrap_epoch=?1 AND bootstrap_batch=?2
-      ORDER BY chunk_uid`
+    `SELECT o.chunk_uid,o.generation,o.submitted_mutation_id,
+            c.vector_id AS stored_vector_id
+       FROM vector_outbox o JOIN chunks c ON c.chunk_uid=o.chunk_uid
+      WHERE o.bootstrap_epoch=?1 AND o.bootstrap_batch=?2
+      ORDER BY o.chunk_uid`
   ).bind(batch.epoch, batch.batch_no).all();
   if (!Array.isArray(rows) || rows.length !== Number(batch.row_count) ||
       rows.some((row) => row.submitted_mutation_id !== batch.mutation_id)) {
@@ -2508,6 +2524,12 @@ async function confirmAcceleratedBootstrapBatch(env, batch, now) {
     ...row,
     vector_id: await vectorIdFor(row.chunk_uid),
   })));
+  // A request can be interrupted after the transactional submission but before
+  // its mapping readback. Re-prove the D1 mapping on every resume so provider
+  // visibility can never acknowledge an unresolvable hashed vector identity.
+  if (expected.some((row) => row.stored_vector_id !== row.vector_id)) {
+    throw new Error("the accelerated bootstrap submitted batch is incomplete");
+  }
   const pages = [];
   for (let start = 0; start < expected.length; start += VECTOR_GET_BY_IDS_LIMIT) {
     pages.push(expected.slice(start, start + VECTOR_GET_BY_IDS_LIMIT));
