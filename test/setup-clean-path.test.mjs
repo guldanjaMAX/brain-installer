@@ -455,9 +455,9 @@ try {
   const partialState = partialDb.prepare(
     "SELECT schema_version, vector_projection_status FROM install_state WHERE id=1",
   ).get();
-  assert.equal(partialState.schema_version, 12);
+  assert.equal(partialState.schema_version, 13);
   assert.equal(partialState.vector_projection_status, "verified");
-  assert.equal(partialDb.prepare("SELECT COUNT(*) count FROM schema_migrations").get().count, 12);
+  assert.equal(partialDb.prepare("SELECT COUNT(*) count FROM schema_migrations").get().count, 13);
   partialDb.close();
 
   if (process.platform !== "win32") {

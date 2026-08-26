@@ -19,7 +19,7 @@ asset and installs into a folder owned by your user account, so it needs no Git,
 Mac or Linux:
 
 ```bash
-npm install --global --ignore-scripts --no-audit --no-fund --prefix "$HOME/.financial-brain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.14/brain-installer-0.1.14.tgz"
+npm install --global --ignore-scripts --no-audit --no-fund --prefix "$HOME/.financial-brain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.15/brain-installer-0.1.15.tgz"
 # Optional: makes the shorter `brain` examples work in this Terminal window.
 export PATH="$HOME/.financial-brain/bin:$PATH"
 ```
@@ -27,7 +27,7 @@ export PATH="$HOME/.financial-brain/bin:$PATH"
 Windows PowerShell:
 
 ```powershell
-npm.cmd install --global --ignore-scripts --no-audit --no-fund --prefix "$env:LOCALAPPDATA\FinancialBrain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.14/brain-installer-0.1.14.tgz"
+npm.cmd install --global --ignore-scripts --no-audit --no-fund --prefix "$env:LOCALAPPDATA\FinancialBrain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.15/brain-installer-0.1.15.tgz"
 # Optional: makes the shorter `brain` examples work in this PowerShell window.
 $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
 ```
@@ -136,12 +136,16 @@ On Windows, use:
 
 The update verifies the Cloudflare account, requires a D1 restore bookmark,
 deploys and verifies a temporary paused Worker, waits for older Worker requests
-to finish, applies migrations, deploys active mode, resumes any bounded vector
-bootstrap, runs exact-version health and the full acceptance suite, reads the
-committed version back from D1, and only then updates the local manifest. Paused
-mode rejects every corpus/source write, not only vector drain. A failed update
-keeps the bookmark and tells you the safe rerun path. It never restores
-automatically because restoring would discard newer writes.
+to finish, and applies migrations. A legacy corpus is then rebuilt in durable
+1,000-vector batches while writes remain paused. Several disjoint batches may
+be accepted at once, but every vector must read back with its exact generation
+before its batch is acknowledged. An interrupted run resumes from D1 instead of
+starting over. Only after that proof does update deploy active mode, run
+exact-version health and the full acceptance suite, read the committed version
+back from D1, and update the local manifest. Paused mode rejects every
+corpus/source write, not only vector drain. A failed update keeps the bookmark
+and tells you the safe rerun path. It never restores automatically because
+restoring would discard newer writes.
 
 ---
 

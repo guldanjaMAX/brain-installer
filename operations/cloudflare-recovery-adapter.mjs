@@ -4,8 +4,10 @@
  *
  * This file can export the reviewed source D1 database and write only to an
  * already-provisioned target whose D1, Vectorize, Worker, and hostname all carry
- * one explicit recovery-gate nonce. It cannot create, deploy, route, destroy,
- * or promote a resource. Cloudflare control-plane credentials stay inside an
+ * one explicit recovery-gate nonce. It cannot create, upload, route, or destroy
+ * a resource. Its only deployment mutation promotes one separately reviewed,
+ * immutable active version after a paused version has completed the exact
+ * Vectorize rebuild. Cloudflare control-plane credentials stay inside an
  * owner-only wrapper such as a macOS Keychain-backed Wrangler launcher. The
  * Brain admin key is read from the target manifest's exact Keychain locator and
  * is used only in request headers or evaluator stdin.
@@ -70,9 +72,13 @@ const MAX_SQLITE_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_HTTP_BYTES = 2 * 1024 * 1024;
 const MAX_WRANGLER_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVAL_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_BOOTSTRAP_DURATION_MS = 6 * 60 * 60 * 1000;
+const MAX_BOOTSTRAP_ROUNDS = 20_000;
+const BOOTSTRAP_POLL_MS = 3_000;
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const DISPOSABLE_WORKER_RE = /(?:^|-)recovery-gate-([a-z0-9]{8,24})$/;
+const WORKER_VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9-]{1,127}$/;
 
 /**
  * Checkpoint boundaries available to a supervised live drill. Read-only stages
@@ -104,6 +110,7 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "documents",
   "chunks",
   "vector_outbox",
+  "vector_bootstrap_batches",
   "corpus_stats",
   "sync_runs",
 ]);
@@ -116,7 +123,8 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
  */
 export const RECOVERY_EXPORT_TABLES = Object.freeze(
   RECOVERY_DURABLE_TABLES.filter((table) =>
-    table !== "vector_outbox" && table !== "install_state"),
+    table !== "vector_outbox" && table !== "vector_bootstrap_batches" &&
+      table !== "install_state"),
 );
 
 const SAFE_WRANGLER_PREFIXES = Object.freeze([
@@ -166,12 +174,19 @@ const INSTALL_STATE_PROJECTION_COLUMNS = Object.freeze([
   "vector_projection_status", "vector_projection_bootstrap_epoch",
   "vector_projection_bootstrap_cursor", "vector_projection_bootstrap_high_water",
 ]);
+const INSTALL_STATE_BOOTSTRAP_V2_COLUMNS = Object.freeze([
+  "vector_projection_bootstrap_protocol", "vector_projection_bootstrap_base_count",
+]);
 const INSTALL_STATE_NULL_NORMALIZED_COLUMNS = Object.freeze([
   ...INSTALL_STATE_LEASE_COLUMNS,
   "vector_projection_mutation_id", "vector_projection_submitted_at",
   "vector_projection_bootstrap_cursor",
+  "vector_projection_bootstrap_protocol",
 ]);
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 12;
+const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
+  "vector_projection_bootstrap_base_count",
+]);
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 13;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -181,7 +196,12 @@ function quoteIdentifier(value) {
 }
 
 const AGGREGATE_FIELDS = Object.freeze([
-  ...RECOVERY_DURABLE_TABLES.map((table) => [table, `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`]),
+  ...RECOVERY_DURABLE_TABLES.map((table) => [
+    table,
+    table === "vector_bootstrap_batches"
+      ? "SELECT 0"
+      : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
+  ]),
   ["chunks_fts", "SELECT COUNT(*) FROM chunks_fts"],
   ["documents_ingested_max", "SELECT COALESCE(MAX(ingested_at),0) FROM documents"],
   ["documents_text_bytes", "SELECT COALESCE(SUM(length(COALESCE(title,''))+length(COALESCE(uri,''))+length(COALESCE(meta,''))+length(content_hash)),0) FROM documents"],
@@ -421,26 +441,43 @@ function inspectRecoveryIsolationClaim(binding, targetResourceFingerprint) {
     ? Object.keys(claim).sort()
     : [];
   if (canonical(keys) !== canonical([
-    "custom_domains", "reviewed_at", "routes", "worker_version_id",
+    "active_worker_version_id", "custom_domains", "paused_worker_version_id",
+    "reviewed_at", "routes", "worker_script_etag",
   ])) {
     refuse("RECOVERY_TARGET_EXECUTION_UNREVIEWED");
   }
-  const workerVersionId = exactString(
-    claim.worker_version_id,
+  const pausedWorkerVersionId = exactString(
+    claim.paused_worker_version_id,
+    "RECOVERY_TARGET_EXECUTION_UNREVIEWED",
+  );
+  const activeWorkerVersionId = exactString(
+    claim.active_worker_version_id,
+    "RECOVERY_TARGET_EXECUTION_UNREVIEWED",
+  );
+  const workerScriptEtag = exactString(
+    claim.worker_script_etag,
     "RECOVERY_TARGET_EXECUTION_UNREVIEWED",
   );
   const reviewedAt = new Date(claim.reviewed_at);
   if (!Array.isArray(claim.routes) || claim.routes.length !== 0 ||
       !Array.isArray(claim.custom_domains) || claim.custom_domains.length !== 0 ||
+      !WORKER_VERSION_RE.test(pausedWorkerVersionId) ||
+      !WORKER_VERSION_RE.test(activeWorkerVersionId) ||
+      pausedWorkerVersionId === activeWorkerVersionId ||
+      !SHA256_RE.test(workerScriptEtag) ||
       typeof claim.reviewed_at !== "string" ||
       !Number.isFinite(reviewedAt.getTime()) || reviewedAt.toISOString() !== claim.reviewed_at) {
     refuse("RECOVERY_TARGET_EXECUTION_UNREVIEWED");
   }
   return Object.freeze({
-    workerVersionId,
+    pausedWorkerVersionId,
+    activeWorkerVersionId,
+    workerScriptEtag,
     approvalFingerprint: sha256(canonical({
       target_resource_fingerprint: targetResourceFingerprint,
-      worker_version_id: workerVersionId,
+      paused_worker_version_id: pausedWorkerVersionId,
+      active_worker_version_id: activeWorkerVersionId,
+      worker_script_etag: workerScriptEtag,
       reviewed_at: claim.reviewed_at,
       routes: [],
       custom_domains: [],
@@ -566,7 +603,11 @@ function wrapperEnvironment(accountId, callDirectory, environment = process.env)
     ...keychain,
     PATH: "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin",
     CLOUDFLARE_ACCOUNT_ID: String(accountId),
-    WRANGLER_LOG: "none",
+    // Wrangler 4 suppresses command stdout, including --json and --version,
+    // when WRANGLER_LOG is "none" or "error". "log" preserves the machine
+    // response while WRANGLER_LOG_SANITIZE and the owner-only temp directory
+    // keep diagnostic material bounded and private.
+    WRANGLER_LOG: "log",
     WRANGLER_LOG_SANITIZE: "true",
     WRANGLER_LOG_PATH: join(callDirectory, "logs"),
     WRANGLER_SEND_METRICS: "false",
@@ -576,9 +617,16 @@ function wrapperEnvironment(accountId, callDirectory, environment = process.env)
   });
 }
 
-function isAllowedWranglerCommand(args) {
-  return SAFE_WRANGLER_PREFIXES.some((prefix) =>
-    prefix.length <= args.length && prefix.every((part, index) => args[index] === part));
+function isAllowedWranglerCommand(args, approvedMutation = null) {
+  if (SAFE_WRANGLER_PREFIXES.some((prefix) =>
+    prefix.length <= args.length && prefix.every((part, index) => args[index] === part))) {
+    return true;
+  }
+  // The only state-changing Wrangler command in this adapter promotes one
+  // already-uploaded version to 100 percent. A shape check is insufficient:
+  // bind the version and Worker to the separately approved execution claim.
+  return Array.isArray(approvedMutation) &&
+    canonical(args) === canonical(approvedMutation);
 }
 
 function normalizedChildResult(result) {
@@ -679,6 +727,7 @@ function expectedInstallStateColumns(migrations) {
     ...(latest >= 10 ? ["outbox_generation"] : []),
     ...(latest >= 11 ? INSTALL_STATE_LEASE_COLUMNS : []),
     ...(latest >= 12 ? INSTALL_STATE_PROJECTION_COLUMNS : []),
+    ...(latest >= 13 ? INSTALL_STATE_BOOTSTRAP_V2_COLUMNS : []),
   ]);
 }
 
@@ -715,6 +764,7 @@ export async function normalizedInstallStateExport(binding, migrations, readRows
   }
   const recoveryValue = (name, row = null) => {
     if (INSTALL_STATE_NULL_NORMALIZED_COLUMNS.includes(name)) return null;
+    if (INSTALL_STATE_ZERO_NORMALIZED_COLUMNS.includes(name)) return 0;
     return row?.[name];
   };
   const projection = expectedColumns.map((name) => {
@@ -897,10 +947,16 @@ function assertSameRecoveryCorpus(left, right, code = "RECOVERY_D1_SNAPSHOT_MISM
   return true;
 }
 
-function assertExpectedTables(rows) {
+function expectedRecoveryTables(migrations) {
+  const latest = migrations?.at(-1)?.version || RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION;
+  return RECOVERY_DURABLE_TABLES.filter((table) =>
+    latest >= 13 || table !== "vector_bootstrap_batches");
+}
+
+function assertExpectedTables(rows, migrations) {
   if (!Array.isArray(rows)) refuse("RECOVERY_TABLE_INVENTORY_INVALID");
   const names = rows.map((row) => exactString(row?.name, "RECOVERY_TABLE_INVENTORY_INVALID"));
-  if (canonical(names) !== canonical([...RECOVERY_DURABLE_TABLES].sort())) {
+  if (canonical(names) !== canonical(expectedRecoveryTables(migrations).sort())) {
     refuse("RECOVERY_TABLE_INVENTORY_INVALID");
   }
   return names;
@@ -1002,7 +1058,7 @@ export async function verifyRecoverySqlArtifact(artifactPath, {
     }
     const quick = groups[0].rows[0];
     const migrations = validateMigrationContract(groups[1].rows);
-    assertExpectedTables(groups[2].rows);
+    assertExpectedTables(groups[2].rows, migrations);
     const schemaRows = normalizeSchemaRows(groups[3].rows);
     const aggregateRow = groups[4].rows[0];
     if (!aggregateRow) {
@@ -1193,23 +1249,93 @@ async function exactFetch(fetchImpl, base, path, options = {}, timeoutMs = 180_0
   return response;
 }
 
-function validateDrainReceipt(body) {
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    refuse("RECOVERY_DRAIN_RECEIPT_INVALID");
+const BOOTSTRAP_PHASES = new Set(["legacy_drain", "building", "waiting", "complete"]);
+const BOOTSTRAP_RECEIPT_FIELDS = Object.freeze([
+  "protocol", "phase", "epoch", "total", "confirmed", "queued", "submitted",
+  "remaining", "in_flight_batches", "failed", "complete", "vector_ready",
+  "expected_vectors", "actual_vectors",
+]);
+const BOOTSTRAP_BUSY_FIELDS = Object.freeze([
+  "protocol", "busy", "remaining", "retry_after_seconds",
+]);
+
+function exactAggregateReceiptFields(body, expected, code) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) refuse(code);
+  const actual = Object.keys(body).sort();
+  const wanted = [...expected].sort();
+  if (actual.length !== wanted.length || actual.some((field, index) => field !== wanted[index])) {
+    // Do not echo fields or values. This endpoint is allowed to return aggregate
+    // progress only, so unexpected response material never reaches a terminal.
+    refuse(code);
   }
-  const drained = nonNegativeInteger(body.drained, "RECOVERY_DRAIN_RECEIPT_INVALID");
-  const submitted = nonNegativeInteger(body.submitted, "RECOVERY_DRAIN_RECEIPT_INVALID");
-  const waiting = nonNegativeInteger(body.waiting, "RECOVERY_DRAIN_RECEIPT_INVALID");
-  const remaining = nonNegativeInteger(body.remaining, "RECOVERY_DRAIN_RECEIPT_INVALID");
-  if (typeof body.vector_ready !== "boolean" || waiting > remaining ||
-      (remaining === 0 && waiting !== 0) || (remaining > 0 && body.vector_ready)) {
-    refuse("RECOVERY_DRAIN_RECEIPT_INVALID");
+}
+
+function validateBootstrapReceipt(body, expectedTotal) {
+  const code = "RECOVERY_BOOTSTRAP_RECEIPT_INVALID";
+  exactAggregateReceiptFields(body, BOOTSTRAP_RECEIPT_FIELDS, code);
+  if (body.protocol !== "bootstrap-v2" || !BOOTSTRAP_PHASES.has(body.phase) ||
+      typeof body.complete !== "boolean" || typeof body.vector_ready !== "boolean") {
+    refuse(code);
   }
-  if (remaining === 0 && !body.vector_ready) refuse("RECOVERY_VECTORIZE_NOT_READY");
-  if (remaining > 0 && drained === 0 && submitted === 0 && waiting === 0) {
-    refuse("RECOVERY_DRAIN_STALLED");
+  const receipt = Object.freeze({
+    protocol: body.protocol,
+    phase: body.phase,
+    epoch: nonNegativeInteger(body.epoch, code),
+    total: nonNegativeInteger(body.total, code),
+    confirmed: nonNegativeInteger(body.confirmed, code),
+    queued: nonNegativeInteger(body.queued, code),
+    submitted: nonNegativeInteger(body.submitted, code),
+    remaining: nonNegativeInteger(body.remaining, code),
+    inFlightBatches: nonNegativeInteger(body.in_flight_batches, code),
+    failed: nonNegativeInteger(body.failed, code),
+    complete: body.complete,
+    vectorReady: body.vector_ready,
+    expectedVectors: nonNegativeInteger(body.expected_vectors, code),
+    actualVectors: nonNegativeInteger(body.actual_vectors, code),
+  });
+  if (receipt.total !== expectedTotal || receipt.expectedVectors !== expectedTotal ||
+      receipt.actualVectors > expectedTotal || receipt.inFlightBatches > 3 ||
+      receipt.confirmed > receipt.total ||
+      receipt.remaining !== receipt.total - receipt.confirmed ||
+      receipt.queued + receipt.submitted > receipt.remaining || receipt.failed !== 0 ||
+      (receipt.phase === "complete") !== receipt.complete ||
+      (!receipt.complete && receipt.vectorReady) ||
+      (receipt.complete && (
+        receipt.remaining !== 0 || receipt.queued !== 0 || receipt.submitted !== 0 ||
+        receipt.inFlightBatches !== 0 || !receipt.vectorReady ||
+        receipt.actualVectors !== expectedTotal
+      ))) {
+    refuse(code);
   }
-  return Object.freeze({ drained, submitted, waiting, remaining, vectorReady: body.vector_ready });
+  return receipt;
+}
+
+function validateBootstrapBusyReceipt(body, previousRemaining) {
+  const code = "RECOVERY_BOOTSTRAP_BUSY_RECEIPT_INVALID";
+  exactAggregateReceiptFields(body, BOOTSTRAP_BUSY_FIELDS, code);
+  if (body.protocol !== "bootstrap-v2" || body.busy !== true) refuse(code);
+  const remaining = nonNegativeInteger(body.remaining, code);
+  const retryAfterSeconds = nonNegativeInteger(body.retry_after_seconds, code);
+  if (retryAfterSeconds < 1 || retryAfterSeconds > 1_200 ||
+      (previousRemaining !== null && remaining > previousRemaining)) {
+    refuse(code);
+  }
+  return Object.freeze({ remaining, retryAfterSeconds });
+}
+
+function validateBootstrapProgress(previous, current) {
+  if (!previous) return current;
+  if (current.epoch !== previous.epoch || current.total !== previous.total ||
+      current.confirmed < previous.confirmed || current.remaining > previous.remaining ||
+      (previous.phase !== "legacy_drain" && current.phase === "legacy_drain")) {
+    refuse("RECOVERY_BOOTSTRAP_PROGRESS_INVALID");
+  }
+  if (current.phase === "building" && [
+    "confirmed", "remaining", "queued", "submitted", "inFlightBatches", "actualVectors",
+  ].every((field) => current[field] === previous[field])) {
+    refuse("RECOVERY_BOOTSTRAP_STALLED");
+  }
+  return current;
 }
 
 function validateExactVectorInventory(inventory, expectedVectors, code = "RECOVERY_HEALTH_FAILED") {
@@ -1275,6 +1401,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
   const runWranglerImpl = dependencies.runWrangler ?? defaultRunWrangler;
   const fetchImpl = dependencies.fetchImpl ?? fetch;
   const sleep = dependencies.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+  const now = dependencies.now ?? Date.now;
   const verifySqlArtifact = dependencies.verifySqlArtifact ?? verifyRecoverySqlArtifact;
   const readAdminKey = dependencies.readAdminKey ?? ((locator) =>
     defaultReadAdminKey(locator, config.environment));
@@ -1297,7 +1424,16 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     text = false,
     timeoutMs = MAX_WRANGLER_TIMEOUT_MS,
   } = {}) {
-    if (!isAllowedWranglerCommand(args)) refuse("RECOVERY_WRANGLER_COMMAND_REFUSED");
+    const approvedMutation = binding.accountId === pins.binding.target.accountId &&
+        binding.workerName === pins.binding.target.workerName
+      ? [
+          "versions", "deploy", `${pins.isolation.activeWorkerVersionId}@100%`,
+          "--name", pins.binding.target.workerName, "-y",
+        ]
+      : null;
+    if (!isAllowedWranglerCommand(args, approvedMutation)) {
+      refuse("RECOVERY_WRANGLER_COMMAND_REFUSED");
+    }
     revalidate();
     const callDirectory = mkdtempSync(join(pins.artifacts.path, ".brain-recovery-runtime-"));
     let result;
@@ -1378,9 +1514,169 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     return Object.freeze({ vectorCount, dimensions });
   }
 
-  async function assertExactCloudflareResources(binding, role) {
+  async function inspectWorkerVersion(binding, role, versionId, expectedMode = null) {
+    const version = await wranglerJson(binding, [
+      "versions", "view", versionId, "--name", binding.workerName, "--json",
+    ]);
+    if (!version || version.id !== versionId) {
+      refuse(role === "target"
+        ? "RECOVERY_TARGET_EXECUTION_CHANGED"
+        : "RECOVERY_WORKER_BINDINGS_INVALID");
+    }
+    const resources = version?.resources;
+    if (!resources || typeof resources !== "object" || Array.isArray(resources) ||
+        canonical(Object.keys(resources).sort()) !==
+          canonical(["bindings", "script", "script_runtime"])) {
+      refuse("RECOVERY_WORKER_CODE_INVALID");
+    }
+    const script = resources.script;
+    const runtime = resources.script_runtime;
+    if (!script || typeof script !== "object" || Array.isArray(script) ||
+        canonical(Object.keys(script).sort()) !==
+          canonical(["etag", "handlers", "last_deployed_from", "named_handlers"]) ||
+        !runtime || typeof runtime !== "object" || Array.isArray(runtime) ||
+        canonical(Object.keys(runtime).sort()) !==
+          canonical(["compatibility_date", "usage_model"])) {
+      refuse("RECOVERY_WORKER_CODE_INVALID");
+    }
+    const scriptEtag = exactString(script.etag, "RECOVERY_WORKER_CODE_INVALID");
+    if (!SHA256_RE.test(scriptEtag) || script.last_deployed_from !== "api" ||
+        !Array.isArray(script.handlers) ||
+        canonical([...script.handlers].sort()) !== canonical(["fetch", "scheduled"]) ||
+        !Array.isArray(script.named_handlers) ||
+        script.named_handlers.some((entry) =>
+          !entry || typeof entry !== "object" || Array.isArray(entry)) ||
+        runtime.compatibility_date !== "2026-01-01" ||
+        runtime.usage_model !== "standard") {
+      refuse("RECOVERY_WORKER_CODE_INVALID");
+    }
+
+    const bindings = resources.bindings;
+    if (!Array.isArray(bindings) || bindings.some((entry) =>
+      !entry || typeof entry !== "object" || Array.isArray(entry))) {
+      refuse("RECOVERY_WORKER_BINDINGS_INVALID");
+    }
+    const requiredBindingNames = [
+      "AI", "ANSWER_MODEL", "BRAIN_NAME", "BRAIN_OWNER", "BRAIN_VERSION",
+      "CHUNK_OVERLAP", "CHUNK_SIZE", "CREDENTIAL_SCANNER", "DAILY_LLM_CAP_USD",
+      "DB", "STORAGE", "VECTORIZE",
+    ];
+    const actualNonSecretNames = bindings
+      .filter((entry) => entry.type !== "secret_text" && entry.name !== "VECTOR_DRAIN_MODE")
+      .map((entry) => exactString(entry.name, "RECOVERY_WORKER_BINDINGS_INVALID"))
+      .sort();
+    const expectedNonSecretNames = [...requiredBindingNames].sort();
+    if (canonical(actualNonSecretNames) !== canonical(expectedNonSecretNames)) {
+      refuse("RECOVERY_WORKER_BINDINGS_INVALID");
+    }
+    const exactlyOne = (predicate) => bindings.filter(predicate).length === 1;
+    if (!exactlyOne((entry) =>
+      entry.type === "d1" && entry.name === "DB" && entry.id === binding.databaseId &&
+        entry.database_id === binding.databaseId) ||
+        !exactlyOne((entry) =>
+          entry.type === "vectorize" && entry.name === "VECTORIZE" &&
+          entry.index_name === binding.vectorizeIndex) ||
+        !exactlyOne((entry) =>
+          entry.type === "ai" && entry.name === "AI" && entry.project === "<catalog>") ||
+        !exactlyOne((entry) =>
+          entry.type === "plain_text" && entry.name === "STORAGE" && entry.text === "d1") ||
+        !exactlyOne((entry) =>
+          entry.type === "plain_text" && entry.name === "BRAIN_NAME" &&
+          entry.text === binding.clientSlug) ||
+        !exactlyOne((entry) =>
+          entry.type === "plain_text" && entry.name === "BRAIN_VERSION" &&
+          entry.text === binding.productVersion)) {
+      refuse("RECOVERY_WORKER_BINDINGS_INVALID");
+    }
+    const plainText = (name) => {
+      const matches = bindings.filter((entry) =>
+        entry.type === "plain_text" && entry.name === name);
+      if (matches.length !== 1) refuse("RECOVERY_WORKER_BINDINGS_INVALID");
+      return exactString(matches[0].text, "RECOVERY_WORKER_BINDINGS_INVALID");
+    };
+    const chunkSize = plainText("CHUNK_SIZE");
+    const chunkOverlap = plainText("CHUNK_OVERLAP");
+    const dailyCap = plainText("DAILY_LLM_CAP_USD");
+    const chunkSizeNumber = Number(chunkSize);
+    const chunkOverlapNumber = Number(chunkOverlap);
+    if (!/^\d+$/.test(chunkSize) || !Number.isSafeInteger(chunkSizeNumber) ||
+        chunkSizeNumber < 1 || !/^\d+$/.test(chunkOverlap) ||
+        !Number.isSafeInteger(chunkOverlapNumber) || chunkOverlapNumber >= chunkSizeNumber ||
+        !/^\d+(?:\.\d+)?$/.test(dailyCap) || !Number.isFinite(Number(dailyCap)) ||
+        Number(dailyCap) < 0 ||
+        !["on", "off"].includes(plainText("CREDENTIAL_SCANNER"))) {
+      refuse("RECOVERY_WORKER_BINDINGS_INVALID");
+    }
+    plainText("BRAIN_OWNER");
+    plainText("ANSWER_MODEL");
+    const secretNames = bindings
+      .filter((entry) => entry.type === "secret_text")
+      .map((entry) => String(entry.name || ""))
+      .sort();
+    const allowedSecrets = role === "source"
+      ? new Set(["ADMIN_KEY", "RAG_PROXY_KEY"])
+      : new Set(["ADMIN_KEY"]);
+    if (!secretNames.includes("ADMIN_KEY") ||
+        secretNames.some((name) => !allowedSecrets.has(name)) ||
+        (role === "target" && canonical(secretNames) !== canonical(["ADMIN_KEY"]))) {
+      refuse("RECOVERY_WORKER_BINDINGS_INVALID");
+    }
+    if (role === "target") {
+      const modeBindings = bindings.filter((entry) => entry?.name === "VECTOR_DRAIN_MODE");
+      const paused = modeBindings.length === 1 &&
+        modeBindings[0]?.type === "plain_text" &&
+        modeBindings[0]?.text === "paused-for-upgrade";
+      const active = modeBindings.length === 0;
+      if ((expectedMode === "paused" && !paused) ||
+          (expectedMode === "active" && !active) ||
+          !["paused", "active"].includes(expectedMode)) {
+        refuse("RECOVERY_TARGET_EXECUTION_MODE_INVALID");
+      }
+    }
+    const comparable = bindings
+      .filter((entry) => entry.name !== "VECTOR_DRAIN_MODE")
+      .map((entry) => structuredClone(entry))
+      .sort((left, right) => canonical(left).localeCompare(canonical(right)));
+    return Object.freeze({
+      comparable: Object.freeze(comparable.map(Object.freeze)),
+      code: Object.freeze({
+        script: structuredClone(script),
+        runtime: structuredClone(runtime),
+      }),
+      scriptEtag,
+    });
+  }
+
+  async function assertReviewedTargetVersions(binding) {
+    const paused = await inspectWorkerVersion(
+      binding,
+      "target",
+      pins.isolation.pausedWorkerVersionId,
+      "paused",
+    );
+    const active = await inspectWorkerVersion(
+      binding,
+      "target",
+      pins.isolation.activeWorkerVersionId,
+      "active",
+    );
+    if (paused.scriptEtag !== pins.isolation.workerScriptEtag ||
+        active.scriptEtag !== pins.isolation.workerScriptEtag ||
+        canonical(paused.code) !== canonical(active.code)) {
+      refuse("RECOVERY_WORKER_CODE_INVALID");
+    }
+    if (canonical(paused.comparable) !== canonical(active.comparable)) {
+      refuse("RECOVERY_WORKER_BINDINGS_INVALID");
+    }
+    return true;
+  }
+
+  async function assertExactCloudflareResources(binding, role, targetMode = null) {
     if (role !== "source" && role !== "target") {
       refuse("RECOVERY_WORKER_BINDINGS_INVALID");
+    }
+    if (role === "target" && !["paused", "active", "either"].includes(targetMode)) {
+      refuse("RECOVERY_TARGET_EXECUTION_MODE_INVALID");
     }
     const databases = await wranglerJson(binding, ["d1", "list", "--json"]);
     if (!Array.isArray(databases)) refuse("RECOVERY_D1_RESOURCE_AMBIGUOUS");
@@ -1413,49 +1709,24 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       deployment.versions[0]?.version_id,
       "RECOVERY_WORKER_DEPLOYMENT_AMBIGUOUS",
     );
-    if (role === "target" && versionId !== pins.isolation.workerVersionId) {
+    if (role === "source") {
+      await inspectWorkerVersion(binding, role, versionId);
+      return Object.freeze({ vectorCount: info.vectorCount, workerVersionId: versionId });
+    }
+    const deployedMode = versionId === pins.isolation.pausedWorkerVersionId
+      ? "paused"
+      : versionId === pins.isolation.activeWorkerVersionId
+        ? "active"
+        : null;
+    if (!deployedMode || (targetMode !== "either" && targetMode !== deployedMode)) {
       refuse("RECOVERY_TARGET_EXECUTION_CHANGED");
     }
-    const version = await wranglerJson(binding, [
-      "versions", "view", versionId, "--name", binding.workerName, "--json",
-    ]);
-    const bindings = version?.resources?.bindings;
-    if (role === "target" && version?.id !== pins.isolation.workerVersionId) {
-      refuse("RECOVERY_TARGET_EXECUTION_CHANGED");
-    }
-    if (!Array.isArray(bindings) || bindings.some((entry) =>
-      !entry || typeof entry !== "object" || Array.isArray(entry))) {
-      refuse("RECOVERY_WORKER_BINDINGS_INVALID");
-    }
-    const exactlyOne = (predicate) => bindings.filter(predicate).length === 1;
-    if (!exactlyOne((entry) =>
-      entry.type === "d1" && entry.name === "DB" && entry.id === binding.databaseId) ||
-        !exactlyOne((entry) =>
-          entry.type === "vectorize" && entry.name === "VECTORIZE" &&
-          entry.index_name === binding.vectorizeIndex) ||
-        !exactlyOne((entry) =>
-          entry.type === "plain_text" && entry.name === "STORAGE" && entry.text === "d1") ||
-        !exactlyOne((entry) =>
-          entry.type === "plain_text" && entry.name === "BRAIN_NAME" &&
-          entry.text === binding.clientSlug) ||
-        !exactlyOne((entry) =>
-          entry.type === "plain_text" && entry.name === "BRAIN_VERSION" &&
-          entry.text === binding.productVersion)) {
-      refuse("RECOVERY_WORKER_BINDINGS_INVALID");
-    }
-    const secretNames = bindings
-      .filter((entry) => entry.type === "secret_text")
-      .map((entry) => String(entry.name || ""))
-      .sort();
-    const allowedSecrets = role === "source"
-      ? new Set(["ADMIN_KEY", "RAG_PROXY_KEY"])
-      : new Set(["ADMIN_KEY"]);
-    if (!secretNames.includes("ADMIN_KEY") ||
-        secretNames.some((name) => !allowedSecrets.has(name)) ||
-        (role === "target" && canonical(secretNames) !== canonical(["ADMIN_KEY"]))) {
-      refuse("RECOVERY_WORKER_BINDINGS_INVALID");
-    }
-    return Object.freeze({ vectorCount: info.vectorCount });
+    await assertReviewedTargetVersions(binding);
+    return Object.freeze({
+      vectorCount: info.vectorCount,
+      workerVersionId: versionId,
+      targetMode: deployedMode,
+    });
   }
 
   async function remoteMigrationContract(binding) {
@@ -1469,8 +1740,9 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
   ) {
     const migrations = await remoteMigrationContract(binding);
     if (migrations.at(-1)?.version !== RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION) {
-      // The current Worker drains only the schema-12 generation, lease, and
-      // async-visibility protocol. A historical exact-prefix artifact remains
+      // The current Worker requires the schema-13 generation, lease,
+      // async-visibility, and durable bulk-bootstrap protocol. A historical
+      // exact-prefix artifact remains
       // inspectable offline, but the field runner has no implicit live-upgrade
       // authority and therefore stops before export, restore, or provider I/O.
       refuse(code);
@@ -1486,7 +1758,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     if (verifyFtsIntegrity) await d1Rows(binding, FTS_INTEGRITY_SQL);
     const migrationRows = await d1Rows(binding, MIGRATION_CONTRACT_SQL);
     const checkedMigrations = validateMigrationContract(migrationRows);
-    assertExpectedTables(await d1Rows(binding, TABLE_INVENTORY_SQL));
+    assertExpectedTables(await d1Rows(binding, TABLE_INVENTORY_SQL), checkedMigrations);
     const schemaRows = normalizeSchemaRows(await d1Rows(binding, LOGICAL_SCHEMA_SQL));
     const aggregateRows = await d1Rows(binding, AGGREGATE_SQL);
     if (aggregateRows.length !== 1) refuse("RECOVERY_AGGREGATE_INVALID");
@@ -1634,17 +1906,100 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     try { return await operation(key); } finally { revalidate(); }
   }
 
-  async function postAdmin(path, key, body = undefined) {
-    const response = await exactFetch(fetchImpl, dataPlaneBase(pins.binding.target), path, {
-      method: "POST",
-      headers: {
-        "X-Admin-Key": key,
-        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    if (!response.ok) refuse("RECOVERY_DATA_PLANE_WRITE_FAILED");
-    return boundedJsonResponse(response);
+  async function targetHealth(expectedMode) {
+    const response = await exactFetch(
+      fetchImpl,
+      dataPlaneBase(pins.binding.target),
+      "/health",
+      { method: "GET" },
+      60_000,
+    );
+    if (!response.ok) refuse("RECOVERY_HEALTH_FAILED");
+    const health = await boundedJsonResponse(response);
+    if (health?.ok !== true || health?.version !== pins.binding.target.productVersion ||
+        health?.brain !== pins.binding.target.clientSlug ||
+        health?.vector_writer_protocol !== "lease-v1" ||
+        health?.vector_drain_mode !== expectedMode) {
+      refuse("RECOVERY_HEALTH_IDENTITY_MISMATCH");
+    }
+    return health;
+  }
+
+  async function targetVectorInventory(key, expectedVectors, code) {
+    const response = await exactFetch(
+      fetchImpl,
+      dataPlaneBase(pins.binding.target),
+      "/api/admin/brain/documents",
+      { method: "GET", headers: { "X-Admin-Key": key } },
+    );
+    if (!response.ok) refuse(code);
+    return validateExactVectorInventory(
+      await boundedJsonResponse(response),
+      expectedVectors,
+      code,
+    );
+  }
+
+  async function drivePausedBootstrap(key, expectedTotal) {
+    const startedAt = nonNegativeInteger(now(), "RECOVERY_BOOTSTRAP_CLOCK_INVALID");
+    let previous = null;
+    let previousRemaining = expectedTotal;
+    for (let round = 0; round < MAX_BOOTSTRAP_ROUNDS; round++) {
+      const currentTime = nonNegativeInteger(now(), "RECOVERY_BOOTSTRAP_CLOCK_INVALID");
+      if (currentTime < startedAt || currentTime - startedAt > MAX_BOOTSTRAP_DURATION_MS) {
+        refuse("RECOVERY_BOOTSTRAP_LIMIT_REACHED");
+      }
+      const response = await exactFetch(
+        fetchImpl,
+        dataPlaneBase(pins.binding.target),
+        "/api/admin/brain/bootstrap",
+        {
+          method: "POST",
+          headers: { "X-Admin-Key": key },
+        },
+      );
+      if (response.status === 409) {
+        const busy = validateBootstrapBusyReceipt(
+          await boundedJsonResponse(response),
+          previousRemaining,
+        );
+        previousRemaining = busy.remaining;
+        const waitMs = busy.retryAfterSeconds * 1_000;
+        if (currentTime + waitMs - startedAt > MAX_BOOTSTRAP_DURATION_MS) {
+          refuse("RECOVERY_BOOTSTRAP_LIMIT_REACHED");
+        }
+        await sleep(waitMs);
+        continue;
+      }
+      if (!response.ok) refuse("RECOVERY_DATA_PLANE_WRITE_FAILED");
+      const receipt = validateBootstrapProgress(
+        previous,
+        validateBootstrapReceipt(await boundedJsonResponse(response), expectedTotal),
+      );
+      previous = receipt;
+      previousRemaining = receipt.remaining;
+      if (receipt.complete) return receipt;
+      await sleep(BOOTSTRAP_POLL_MS);
+    }
+    refuse("RECOVERY_BOOTSTRAP_LIMIT_REACHED");
+  }
+
+  async function exactTargetVectorCount(expectedVectors) {
+    let count = null;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      count = (await vectorInfo(pins.binding.target)).vectorCount;
+      if (count === expectedVectors) return count;
+      if (count > expectedVectors) refuse("RECOVERY_VECTORIZE_COUNT_MISMATCH");
+      await sleep(5_000);
+    }
+    refuse("RECOVERY_VECTORIZE_COUNT_MISMATCH");
+  }
+
+  async function promoteReviewedActiveWorker() {
+    await wrangler(pins.binding.target, [
+      "versions", "deploy", `${pins.isolation.activeWorkerVersionId}@100%`,
+      "--name", pins.binding.target.workerName, "-y",
+    ]);
   }
 
   const adapters = {
@@ -1655,7 +2010,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         pins.binding.source,
         "RECOVERY_SOURCE_UPGRADE_REQUIRED",
       );
-      assertExpectedTables(await d1Rows(pins.binding.source, TABLE_INVENTORY_SQL));
+      assertExpectedTables(await d1Rows(pins.binding.source, TABLE_INVENTORY_SQL), migrations);
       const dataPartial = join(pins.artifacts.path, ".brain-recovery-export.sql.tmp-data");
       const combinedPartial = join(pins.artifacts.path, ".brain-recovery-export.sql.tmp-combined");
       if (reconcileExportResidue(
@@ -1737,7 +2092,8 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
 
     prove_target_clean: async (context) => {
       assertContext(context, "prove_target_clean");
-      const resources = await assertExactCloudflareResources(pins.binding.target, "target");
+      const resources = await assertExactCloudflareResources(pins.binding.target, "target", "paused");
+      await targetHealth("paused-for-upgrade");
       const userTableCount = await targetUserTableCount();
       return Object.freeze({
         target_resource_fingerprint: plan.target_resource_fingerprint,
@@ -1756,7 +2112,8 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
           artifact.artifact_bytes !== exported?.artifact_bytes) {
         refuse("RECOVERY_EXPORT_ARTIFACT_CHANGED");
       }
-      const resources = await assertExactCloudflareResources(pins.binding.target, "target");
+      const resources = await assertExactCloudflareResources(pins.binding.target, "target", "paused");
+      await targetHealth("paused-for-upgrade");
       const tables = await targetUserTableCount();
       if (tables > 0) {
         // A populated target is reconcilable only after this exact stage had an
@@ -1788,6 +2145,8 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
 
     verify_d1: async (context) => {
       assertContext(context, "verify_d1");
+      await assertExactCloudflareResources(pins.binding.target, "target", "paused");
+      await targetHealth("paused-for-upgrade");
       await requireCurrentVectorProtocol(pins.binding.target);
       const restored = await targetDatabaseSnapshot();
       return restored;
@@ -1797,7 +2156,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       assertContext(context, "rebuild_vectorize");
       // Recheck on every resumed rebuild. An old journal checkpoint or an
       // out-of-band target replacement must never route schema-prefix data to
-      // the current drain endpoint.
+      // the current bulk bootstrap endpoint.
       await requireCurrentVectorProtocol(pins.binding.target);
       const restored = completedEvidence(context, "verify_d1");
       assertSameRecoveryCorpus(
@@ -1810,55 +2169,69 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
           (initialOutbox.pending_outbox !== 0 || initialOutbox.failed_vectors !== 0)) {
         refuse("RECOVERY_VECTORIZE_TARGET_AMBIGUOUS");
       }
-      const resources = await assertExactCloudflareResources(pins.binding.target, "target");
+      const resources = await assertExactCloudflareResources(pins.binding.target, "target", "either");
+      if (context.attempt === 1 && resources.targetMode !== "paused") {
+        refuse("RECOVERY_TARGET_EXECUTION_CHANGED");
+      }
       if (resources.vectorCount > restored.chunk_count) refuse("RECOVERY_VECTORIZE_TARGET_AMBIGUOUS");
       if (context.attempt === 1 && resources.vectorCount !== 0) {
         refuse("RECOVERY_VECTORIZE_TARGET_AMBIGUOUS");
       }
 
-      const visibility = await withTargetKey(async (key) => {
-        // The verified artifact already normalizes a nonempty corpus to one
-        // bootstrap epoch with its exact SQL high-water. Never call reindex
-        // here: resetting the epoch on a stage retry would discard committed
-        // cursor progress and make a large restore restart from page one.
-        let settled = false;
-        for (let round = 0; round < 400; round++) {
-          const receipt = validateDrainReceipt(await postAdmin("/api/admin/brain/drain", key));
-          if (receipt.remaining === 0) {
-            settled = true;
-            break;
-          }
-          if (receipt.waiting > 0) await sleep(3_000);
+      if (resources.targetMode === "paused") {
+        await targetHealth("paused-for-upgrade");
+        await withTargetKey(async (key) => {
+          // The verified artifact already normalizes a nonempty corpus to one
+          // bootstrap epoch with its exact SQL high-water. Never call reindex
+          // here: resetting the epoch on a retry would discard durable cursor
+          // and provider-receipt progress.
+          await drivePausedBootstrap(key, restored.chunk_count);
+          await targetVectorInventory(
+            key,
+            restored.chunk_count,
+            "RECOVERY_VECTORIZE_NOT_READY",
+          );
+        });
+        const pausedOutbox = await targetOutbox();
+        if (pausedOutbox.pending_outbox !== 0 || pausedOutbox.failed_vectors !== 0) {
+          refuse("RECOVERY_VECTORIZE_NOT_READY");
         }
-        if (!settled) refuse("RECOVERY_DRAIN_LIMIT_REACHED");
-
-        // An accepted Vectorize mutation is not necessarily query-visible.
-        // The Worker is the only surface that can combine its processed fence,
-        // exact getByIds confirmations, D1 queue, and provider count. Require
-        // that receipt before the recovery stage can checkpoint success.
-        const inventoryResponse = await exactFetch(
-          fetchImpl,
-          dataPlaneBase(pins.binding.target),
-          "/api/admin/brain/documents",
-          { method: "GET", headers: { "X-Admin-Key": key } },
+        await exactTargetVectorCount(restored.chunk_count);
+        // Bootstrap may only mutate projection receipts and the derived index.
+        // Re-prove the restored corpus immediately before active code becomes
+        // reachable so a compromised or drifting paused Worker cannot smuggle
+        // a D1 content change through a vector-complete receipt.
+        assertSameRecoveryCorpus(
+          await targetDatabaseSnapshot(),
+          restored,
+          "RECOVERY_TARGET_CHANGED_DURING_REINDEX",
         );
-        if (!inventoryResponse.ok) refuse("RECOVERY_VECTORIZE_NOT_READY");
-        return validateExactVectorInventory(
-          await boundedJsonResponse(inventoryResponse),
-          restored.chunk_count,
-          "RECOVERY_VECTORIZE_NOT_READY",
-        );
-      });
-
-      const outbox = await targetOutbox();
-      let vectors = null;
-      for (let attempt = 0; attempt < 60; attempt++) {
-        const info = await vectorInfo(pins.binding.target);
-        vectors = info.vectorCount;
-        if (vectors === restored.chunk_count) break;
-        await sleep(5_000);
+        await assertExactCloudflareResources(pins.binding.target, "target", "paused");
+        await targetHealth("paused-for-upgrade");
+        // Both immutable versions and every binding were proven above. This is
+        // the only state-changing Worker command the adapter permits. If the
+        // command succeeds remotely but its response is lost, the next stage
+        // attempt reconciles the already-active version from exact evidence.
+        await promoteReviewedActiveWorker();
       }
-      if (vectors !== restored.chunk_count) refuse("RECOVERY_VECTORIZE_COUNT_MISMATCH");
+
+      await assertExactCloudflareResources(pins.binding.target, "target", "active");
+      await targetHealth("active");
+      await withTargetKey((key) => targetVectorInventory(
+        key,
+        restored.chunk_count,
+        "RECOVERY_VECTORIZE_NOT_READY",
+      ));
+      const outbox = await targetOutbox();
+      if (outbox.pending_outbox !== 0 || outbox.failed_vectors !== 0) {
+        refuse("RECOVERY_VECTORIZE_NOT_READY");
+      }
+      const vectors = await exactTargetVectorCount(restored.chunk_count);
+      assertSameRecoveryCorpus(
+        await targetDatabaseSnapshot(),
+        restored,
+        "RECOVERY_TARGET_CHANGED_DURING_REINDEX",
+      );
       return Object.freeze({
         chunk_count: restored.chunk_count,
         vector_count: vectors,
@@ -1869,28 +2242,16 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
 
     verify_health: async (context) => {
       assertContext(context, "verify_health");
-      await assertExactCloudflareResources(pins.binding.target, "target");
+      await assertExactCloudflareResources(pins.binding.target, "target", "active");
       const base = dataPlaneBase(pins.binding.target);
-      const healthResponse = await exactFetch(fetchImpl, base, "/health", { method: "GET" }, 60_000);
-      if (!healthResponse.ok) refuse("RECOVERY_HEALTH_FAILED");
-      const health = await boundedJsonResponse(healthResponse);
-      if (health?.ok !== true || health?.version !== pins.binding.target.productVersion ||
-          health?.brain !== pins.binding.target.clientSlug) {
-        refuse("RECOVERY_HEALTH_IDENTITY_MISMATCH");
-      }
+      await targetHealth("active");
       const rebuilt = completedEvidence(context, "rebuild_vectorize");
       const expectedVectors = nonNegativeInteger(
         rebuilt?.chunk_count,
         "RECOVERY_HEALTH_FAILED",
       );
       await withTargetKey(async (key) => {
-        const inventoryResponse = await exactFetch(fetchImpl, base, "/api/admin/brain/documents", {
-          method: "GET",
-          headers: { "X-Admin-Key": key },
-        });
-        if (!inventoryResponse.ok) refuse("RECOVERY_HEALTH_FAILED");
-        const inventory = await boundedJsonResponse(inventoryResponse);
-        validateExactVectorInventory(inventory, expectedVectors, "RECOVERY_HEALTH_FAILED");
+        await targetVectorInventory(key, expectedVectors, "RECOVERY_HEALTH_FAILED");
         const noKey = await exactFetch(fetchImpl, base, "/api/rag/unified", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1913,7 +2274,8 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     verify_eval: async (context) => {
       assertContext(context, "verify_eval");
       revalidate();
-      await assertExactCloudflareResources(pins.binding.target, "target");
+      await assertExactCloudflareResources(pins.binding.target, "target", "active");
+      await targetHealth("active");
       const key = readAdminKey(pins.targetAdminLocator);
       if (typeof key !== "string" || !key || key.length > 4096 || /[\r\n\0]/.test(key)) {
         refuse("RECOVERY_TARGET_KEYCHAIN_VALUE_INVALID");
@@ -1935,6 +2297,11 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         if (result?.status !== 0 || result?.signal || result?.error) {
           refuse("RECOVERY_RELEASE_EVAL_FAILED");
         }
+        // A long private evaluation cannot inherit its success across an
+        // out-of-band deployment. Prove the exact active version and protocol
+        // again before checkpointing the release result.
+        await assertExactCloudflareResources(pins.binding.target, "target", "active");
+        await targetHealth("active");
       } finally {
         input.fill(0);
         revalidate();

@@ -1,7 +1,7 @@
 # Shared Brain maintainer guide
 
 This is the operating guide for engineers who maintain the shared installer.
-It describes the 0.1.14 product line, how to change and release it safely, and
+It describes the 0.1.15 product line, how to change and release it safely, and
 how to update an owner's existing Brain. It is not an instance handoff. Never
 put an owner's manifest, resource identifiers, source details, private golden
 set, support export, or credentials in this repository.
@@ -40,7 +40,7 @@ Then read these files before changing their area:
 Preserve a dirty working tree. Identify who owns each existing change before
 editing the same file, and never discard unrelated work to make a test pass.
 
-## The 0.1.14 architecture
+## The 0.1.15 architecture
 
 There is one product and many isolated installs:
 
@@ -75,7 +75,11 @@ owner's Cloudflare Worker
   retrieval, ingest, health, evaluation, drain, and reindex use the deployed
   Brain and its separately stored admin key.
 
-The 0.1.14 candidate strengthens current-status retrieval so stale records and
+The 0.1.15 candidate keeps the 0.1.14 current-status and message-replay
+guarantees while making exact legacy projection upgrades practical for large
+corpora. The previous 99-row path remains the conservative active reindex path;
+the lifecycle-only accelerated path requires the verified paused boundary.
+The 0.1.14 line strengthened current-status retrieval so stale records and
 transaction-system evidence cannot silently establish a current client
 relationship. It also makes full message replay exact and fail-closed across
 high-water snapshots, reconciliation, crash recovery, and target inventory
@@ -83,7 +87,7 @@ verification. Version 0.1.13 established the duplicate collapsing, durable
 installed-manifest pointer, guarded recovery, and release-safety foundations.
 `CHANGELOG.md` is the authoritative owner-facing list.
 
-Three append-only migrations make the D1-to-Vectorize protocol durable:
+Four append-only migrations make the D1-to-Vectorize protocol durable:
 
 - `0010` replaces millisecond timestamps as revision identity with a monotonic
   install-state generation. Every cleanup and failure update uses generation,
@@ -96,16 +100,22 @@ Three append-only migrations make the D1-to-Vectorize protocol durable:
   `getByIds` readback must confirm the change before the row leaves the queue.
   Existing corpora start `bootstrap_required`; a durable high-water and 99-row
   cursor rebuild the projection without materializing a corpus-sized queue.
+- `0013` adds durable accelerated-bootstrap batch receipts. While the verified
+  write barrier is active, disjoint 1,000-row batches may be submitted through
+  a bounded in-flight window. Exact-generation `getByIds` readback must confirm
+  every row before its batch and outbox receipts can be cleared.
 
 `brain update` deploys a paused compatibility Worker and verifies its exact
 version/writer mode, waits one complete supported lease window, runs these
-migrations, deploys active mode, and verifies active mode again. This closes the
-rolling interval in which an older Worker could write without the lease. The
-migration runner is restart-safe after every independently committed statement.
-Paused mode is a complete corpus-write barrier: ingest, batch ingest, source
-receipts/expectations, forget, reindex, manual drain, and cron drain all stop
-before D1 or provider access. After active deploy, update and resumed setup run
-the bounded drain to exact visibility before health or acceptance can pass.
+migrations, and keeps the barrier active while any schema-13 legacy bootstrap
+finishes. It then deploys active mode and verifies that mode again. This closes
+the rolling interval in which an older Worker could write without the lease.
+The migration runner is restart-safe after every independently committed
+statement. Paused mode is a complete corpus-write barrier: ingest, batch
+ingest, source receipts/expectations, forget, reindex, manual drain, and cron
+drain all stop before D1 or provider access. The accelerated batch loop is also
+crash-resumable. Active mode is deployed only after the full projection receipt
+is verified; health and acceptance still run afterward.
 
 A setup interrupted after D1 commits an early migration statement can leave an
 `install_state` table without its singleton or migration receipt. A rerun with
@@ -140,12 +150,12 @@ source checkout against a protected checkpoint. Its final readback requires
 exact D1 document/family counts and `vector_readiness` before it records a
 completion receipt.
 
-Do not describe 0.1.14 as live or recovery-verified merely because these files
+Do not describe 0.1.15 as live or recovery-verified merely because these files
 or deterministic tests exist. The exact candidate still requires its disposable
 provider field gate, recovery drill evidence, six-job CI matrix, immutable
 release artifact verification, and each install's private release evaluation.
 
-The code line is not a release merely because `package.json` says `0.1.14`. A
+The code line is not a release merely because `package.json` says `0.1.15`. A
 release exists only when its exact reviewed commit is tagged, all six CI jobs
 pass, required live field gates have evidence, GitHub publishes one immutable
 asset with the verified digest, and the public install and update pages point

@@ -30,7 +30,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  ACCELERATED_BOOTSTRAP_MAX_MS,
+  ACCELERATED_BOOTSTRAP_MAX_ROUNDS,
   cloudflareTokenAvailable,
+  cmdAcceleratedBootstrap,
   cmdRollback,
   cmdRollbackInteractive,
   cmdUpdate,
@@ -38,6 +41,11 @@ import {
   commitManifestVersion,
   compareSemver,
   healthProbeVerdict,
+  runAcceleratedBootstrap,
+  validateAcceleratedBootstrapBusyReceipt,
+  validateAcceleratedBootstrapCompletion,
+  validateAcceleratedBootstrapProgress,
+  validateAcceleratedBootstrapReceipt,
   VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS,
 } from "../brain.mjs";
 import { DRAIN_LEASE_TTL_MS } from "../worker/src/lib/store-d1.js";
@@ -54,6 +62,7 @@ const cmdUpgrade = (manifestPath, options = {}) => cmdUpgradeWithRealQuiescence(
   manifestPath,
   {
     waitForVectorDrainQuiescence: async () => {},
+    cmdBootstrap: async () => bootstrapCompletion(),
     cmdDrain: async () => {},
     ...options,
   },
@@ -84,6 +93,39 @@ const manifestFixture = (version = "0.1.9") => ({
   retrieval: { answer_model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", rerank: false },
 });
 
+const bootstrapReceipt = (overrides = {}) => ({
+  protocol: "bootstrap-v2",
+  phase: "building",
+  epoch: 1,
+  total: 3_000,
+  confirmed: 1_000,
+  queued: 1_000,
+  submitted: 1_000,
+  remaining: 2_000,
+  in_flight_batches: 2,
+  failed: 0,
+  complete: false,
+  vector_ready: false,
+  expected_vectors: 3_000,
+  actual_vectors: 1_000,
+  ...overrides,
+});
+
+const bootstrapResponse = (receipt, status = 200) => new Response(JSON.stringify(receipt), {
+  status,
+  headers: { "content-type": "application/json" },
+});
+
+const bootstrapCompletion = () => ({
+  epoch: 1,
+  total: 3_000,
+  confirmed: 3_000,
+  remaining: 0,
+  rounds: 3,
+  complete: true,
+  vector_ready: true,
+});
+
 /* ---- the exact failure Jay saw ---- */
 {
   const v = V({ ok: true, body: body("0.1.1"), expectVersion: "0.1.2", attempt: 1, attempts: 6 });
@@ -95,8 +137,8 @@ const manifestFixture = (version = "0.1.9") => ({
   check("paused cutover health requires the expected mode and leased writer protocol",
     V({
       ok: true,
-      body: cutoverBody("0.1.14", "paused-for-upgrade"),
-      expectVersion: "0.1.14",
+      body: cutoverBody("0.1.15", "paused-for-upgrade"),
+      expectVersion: "0.1.15",
       expectDrainMode: "paused-for-upgrade",
       attempt: 1,
       attempts: 6,
@@ -104,8 +146,8 @@ const manifestFixture = (version = "0.1.9") => ({
   check("version-only old health cannot masquerade as a paused compatibility worker",
     V({
       ok: true,
-      body: body("0.1.14"),
-      expectVersion: "0.1.14",
+      body: body("0.1.15"),
+      expectVersion: "0.1.15",
       expectDrainMode: "paused-for-upgrade",
       attempt: 6,
       attempts: 6,
@@ -113,8 +155,8 @@ const manifestFixture = (version = "0.1.9") => ({
   check("a paused compatibility Worker is retried while active mode propagates",
     V({
       ok: true,
-      body: cutoverBody("0.1.14", "paused-for-upgrade"),
-      expectVersion: "0.1.14",
+      body: cutoverBody("0.1.15", "paused-for-upgrade"),
+      expectVersion: "0.1.15",
       expectDrainMode: "active",
       attempt: 1,
       attempts: 6,
@@ -122,8 +164,8 @@ const manifestFixture = (version = "0.1.9") => ({
   check("a compatibility Worker still paused after the retry budget fails closed",
     V({
       ok: true,
-      body: cutoverBody("0.1.14", "paused-for-upgrade"),
-      expectVersion: "0.1.14",
+      body: cutoverBody("0.1.15", "paused-for-upgrade"),
+      expectVersion: "0.1.15",
       expectDrainMode: "active",
       attempt: 6,
       attempts: 6,
@@ -131,8 +173,8 @@ const manifestFixture = (version = "0.1.9") => ({
   check("active mode is accepted only with the leased writer protocol",
     V({
       ok: true,
-      body: cutoverBody("0.1.14", "active"),
-      expectVersion: "0.1.14",
+      body: cutoverBody("0.1.15", "active"),
+      expectVersion: "0.1.15",
       expectDrainMode: "active",
       attempt: 2,
       attempts: 6,
@@ -142,13 +184,333 @@ const manifestFixture = (version = "0.1.9") => ({
     `${VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS} < ${DRAIN_LEASE_TTL_MS}`);
 }
 
+/* ---- schema-13 bootstrap receipts are aggregate-only and exact ---- */
+{
+  const complete = bootstrapReceipt({
+    phase: "complete",
+    confirmed: 3_000,
+    queued: 0,
+    submitted: 0,
+    remaining: 0,
+    in_flight_batches: 0,
+    complete: true,
+    vector_ready: true,
+    expected_vectors: 3_000,
+    actual_vectors: 3_000,
+  });
+  const validated = validateAcceleratedBootstrapReceipt(complete);
+  check("a complete bulk-bootstrap receipt proves exact query-visible equality",
+    validated.complete === true && validated.confirmed === 3_000 && validated.remaining === 0);
+  check("the bootstrap runner has a generous but finite production boundary",
+    ACCELERATED_BOOTSTRAP_MAX_MS === 6 * 60 * 60 * 1_000 &&
+      ACCELERATED_BOOTSTRAP_MAX_ROUNDS === 20_000);
+  check("the active-deploy gate accepts only the runner's exact completion proof",
+    validateAcceleratedBootstrapCompletion(bootstrapCompletion()).complete === true);
+
+  let completionShapeError = null;
+  try {
+    validateAcceleratedBootstrapCompletion({ ...bootstrapCompletion(), failed: 0 });
+  } catch (error) { completionShapeError = error; }
+  check("the active-deploy gate rejects every extra completion field",
+    /aggregate-only response contract/.test(completionShapeError?.message || ""),
+    completionShapeError?.message);
+
+  let malformedError = null;
+  try {
+    validateAcceleratedBootstrapReceipt({
+      ...complete,
+      source_id: "private-fixture-that-must-not-be-printed",
+    });
+  } catch (error) { malformedError = error; }
+  check("an unexpected identifier field is rejected without echoing it",
+    /aggregate-only response contract/.test(malformedError?.message || "") &&
+      !/private-fixture/.test(malformedError?.message || ""),
+    malformedError?.message);
+
+  let countError = null;
+  try {
+    validateAcceleratedBootstrapReceipt(bootstrapReceipt({ remaining: 1_999 }));
+  } catch (error) { countError = error; }
+  check("bootstrap counts must reconcile exactly",
+    /counts did not reconcile/.test(countError?.message || ""), countError?.message);
+
+  const busy = validateAcceleratedBootstrapBusyReceipt({
+    protocol: "bootstrap-v2",
+    busy: true,
+    remaining: 2_000,
+    retry_after_seconds: 3,
+  });
+  check("the bounded busy receipt carries only aggregate retry state",
+    busy.remaining === 2_000 && busy.retryAfterSeconds === 3);
+}
+
+/* ---- the bootstrap loop is sequential, pinned, monotonic, and resumable ---- */
+{
+  const responses = [
+    bootstrapReceipt({
+      phase: "legacy_drain",
+      confirmed: 0,
+      queued: 0,
+      submitted: 0,
+      remaining: 3_000,
+      in_flight_batches: 0,
+      actual_vectors: 3_000,
+    }),
+    bootstrapReceipt(),
+    bootstrapReceipt({
+      phase: "waiting",
+      queued: 0,
+      submitted: 2_000,
+      in_flight_batches: 2,
+      actual_vectors: 2_000,
+    }),
+    bootstrapReceipt({
+      phase: "complete",
+      confirmed: 3_000,
+      queued: 0,
+      submitted: 0,
+      remaining: 0,
+      in_flight_batches: 0,
+      complete: true,
+      vector_ready: true,
+      expected_vectors: 3_000,
+      actual_vectors: 3_000,
+    }),
+  ];
+  const events = [];
+  let clock = 0;
+  const result = await runAcceleratedBootstrap({
+    request: async ({ round, attempt, timeoutMs }) => {
+      events.push(`request:${round}.${attempt}`);
+      check("each accelerated request receives a bounded timeout",
+        timeoutMs >= 1_000 && timeoutMs <= 180_000, String(timeoutMs));
+      return bootstrapResponse(responses.shift());
+    },
+    beforeRequest: async ({ round, attempt }) => events.push(`pin-before:${round}.${attempt}`),
+    afterRequest: async ({ round, attempt }) => events.push(`pin-after:${round}.${attempt}`),
+    now: () => clock,
+    sleep: async (milliseconds) => { events.push(`sleep:${milliseconds}`); clock += milliseconds; },
+  });
+  check("the accelerated loop finishes only on the exact complete receipt",
+    result.complete === true && result.confirmed === 3_000 && result.rounds === 4,
+    JSON.stringify(result));
+  check("every remote bootstrap attempt is bracketed by manifest pin checks",
+    events.filter((event) => event.startsWith("pin-before:")).length === 4 &&
+      events.filter((event) => event.startsWith("pin-after:")).length === 4 &&
+      events.every((event, index) => !event.startsWith("request:") || (
+        events[index - 1] === event.replace("request:", "pin-before:") &&
+        events[index + 1] === event.replace("request:", "pin-after:")
+      )),
+    events.join(","));
+  check("legacy cleanup and provider waiting poll instead of hot-looping",
+    events.filter((event) => event === "sleep:3000").length === 2, events.join(","));
+
+  let noProgressError = null;
+  try {
+    const same = validateAcceleratedBootstrapReceipt(bootstrapReceipt());
+    validateAcceleratedBootstrapProgress(same, same);
+  } catch (error) { noProgressError = error; }
+  check("a building response cannot claim progress while every aggregate is unchanged",
+    /without aggregate progress/.test(noProgressError?.message || ""), noProgressError?.message);
+}
+
+/* ---- receipt transport, busy ownership, and legacy stalls are bounded ---- */
+{
+  const complete = bootstrapReceipt({
+    phase: "complete",
+    confirmed: 3_000,
+    queued: 0,
+    submitted: 0,
+    remaining: 0,
+    in_flight_batches: 0,
+    complete: true,
+    vector_ready: true,
+    actual_vectors: 3_000,
+  });
+  let attempts = 0;
+  let postChecks = 0;
+  const retrySleeps = [];
+  const retried = await runAcceleratedBootstrap({
+    request: async () => {
+      attempts++;
+      if (attempts === 1) {
+        return {
+          status: 200,
+          ok: true,
+          text: async () => { throw new Error("synthetic private stream detail"); },
+        };
+      }
+      return bootstrapResponse(complete);
+    },
+    afterRequest: async () => { postChecks++; },
+    sleep: async (milliseconds) => { retrySleeps.push(milliseconds); },
+  });
+  check("an interrupted durable receipt is retried inside the pinned attempt boundary",
+    retried.complete === true && attempts === 2 && postChecks === 2 && retrySleeps[0] === 2_000,
+    JSON.stringify({ attempts, postChecks, retrySleeps }));
+
+  let clock = 0;
+  const busySleeps = [];
+  const busyResponses = [
+    bootstrapResponse({
+      protocol: "bootstrap-v2",
+      busy: true,
+      remaining: 3_000,
+      retry_after_seconds: 180,
+    }, 409),
+    bootstrapResponse(complete),
+  ];
+  const afterBusy = await runAcceleratedBootstrap({
+    request: async () => busyResponses.shift(),
+    now: () => clock,
+    sleep: async (milliseconds) => { busySleeps.push(milliseconds); clock += milliseconds; },
+  });
+  check("a busy bootstrap honors the Worker's requested ownership delay",
+    afterBusy.complete === true && busySleeps[0] === 180_000,
+    JSON.stringify(busySleeps));
+
+  clock = 0;
+  let legacyRequests = 0;
+  const legacySleeps = [];
+  const legacy = bootstrapReceipt({
+    phase: "legacy_drain",
+    confirmed: 0,
+    queued: 0,
+    submitted: 0,
+    remaining: 3_000,
+    in_flight_batches: 0,
+    actual_vectors: 3_000,
+  });
+  const afterLegacy = await runAcceleratedBootstrap({
+    request: async () => {
+      legacyRequests++;
+      return bootstrapResponse(legacyRequests < 3 ? legacy : complete);
+    },
+    now: () => clock,
+    sleep: async (milliseconds) => { legacySleeps.push(milliseconds); clock += milliseconds; },
+  });
+  check("an unchanged legacy drain polls with bounded backoff instead of issuing a hot loop",
+    afterLegacy.complete === true && legacyRequests === 3 &&
+      legacySleeps.join(",") === "3000,3000",
+    JSON.stringify({ legacyRequests, legacySleeps }));
+}
+
+/* ---- interruption preserves durable progress and a rerun resumes it ---- */
+{
+  let firstError = null;
+  try {
+    await runAcceleratedBootstrap({
+      request: async () => bootstrapResponse(bootstrapReceipt()),
+      maxRounds: 1,
+    });
+  } catch (error) { firstError = error; }
+  check("a bounded interruption gives the exact safe rerun action",
+    /1-round safety limit/.test(firstError?.message || "") &&
+      /Completed batches are durable.*brain update.*resume/is.test(firstError?.message || ""),
+    firstError?.message);
+
+  const resumed = [
+    bootstrapReceipt({
+      confirmed: 2_000,
+      queued: 0,
+      submitted: 1_000,
+      remaining: 1_000,
+      in_flight_batches: 1,
+      actual_vectors: 2_000,
+    }),
+    bootstrapReceipt({
+      phase: "complete",
+      confirmed: 3_000,
+      queued: 0,
+      submitted: 0,
+      remaining: 0,
+      in_flight_batches: 0,
+      complete: true,
+      vector_ready: true,
+      actual_vectors: 3_000,
+    }),
+  ];
+  const result = await runAcceleratedBootstrap({
+    request: async () => bootstrapResponse(resumed.shift()),
+  });
+  check("a later runner accepts the same epoch's advanced durable counters",
+    result.complete === true && result.confirmed === 3_000 && result.rounds === 2,
+    JSON.stringify(result));
+}
+
+/* ---- a provider stall reaches the wall-clock gate without a green exit ---- */
+{
+  let clock = 0;
+  let timedOut = null;
+  try {
+    await runAcceleratedBootstrap({
+      request: async () => bootstrapResponse(bootstrapReceipt({
+        phase: "waiting",
+        confirmed: 0,
+        queued: 0,
+        submitted: 3_000,
+        remaining: 3_000,
+        in_flight_batches: 3,
+        actual_vectors: 0,
+      })),
+      now: () => clock,
+      sleep: async (milliseconds) => { clock += milliseconds; },
+      maxDurationMs: 1_000,
+    });
+  } catch (error) { timedOut = error; }
+  check("the bootstrap wall-clock limit fails closed with a resumable action",
+    /wall-clock safety limit/.test(timedOut?.message || "") &&
+      /3000 aggregate row\(s\) remaining/.test(timedOut?.message || "") &&
+      /Worker remains paused/.test(timedOut?.message || ""),
+    timedOut?.message);
+}
+
+/* ---- the endpoint uses admin auth and an empty POST body ---- */
+{
+  const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-bootstrap-http-")));
+  try {
+    const manifestPath = join(sandbox, "brain.manifest.json");
+    writeFileSync(manifestPath, JSON.stringify(manifestFixture()));
+    const calls = [];
+    await cmdAcceleratedBootstrap(manifestPath, {
+      resolveAccount: async () => ({ id: "fixture-account" }),
+      baseUrl: "https://fixture.invalid",
+      adminKey: "fixture-admin-key",
+      http: async (url, init, transport) => {
+        calls.push({ url, init, transport });
+        return bootstrapResponse(bootstrapReceipt({
+          phase: "complete",
+          confirmed: 3_000,
+          queued: 0,
+          submitted: 0,
+          remaining: 0,
+          in_flight_batches: 0,
+          complete: true,
+          vector_ready: true,
+          actual_vectors: 3_000,
+        }));
+      },
+    });
+    check("the accelerated endpoint is an authenticated empty POST",
+      calls.length === 1 &&
+        calls[0].url === "https://fixture.invalid/api/admin/brain/bootstrap" &&
+        calls[0].init.method === "POST" && calls[0].init.redirect === "error" &&
+        calls[0].init.headers["X-Admin-Key"] === "fixture-admin-key" &&
+        !Object.prototype.hasOwnProperty.call(calls[0].init, "body") &&
+        calls[0].transport.timeoutMs <= 180_000,
+      JSON.stringify(calls.map((call) => ({ url: call.url, method: call.init.method }))));
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+}
+
 /* ---- full acceptance independently enforces the deployed version ---- */
 {
   const suite = new Acceptance({
     base: "https://fixture.invalid",
     adminKey: "fixture-admin-key",
     manifest: {},
-    expectVersion: "0.1.14",
+    expectVersion: "0.1.15",
     fetchImpl: async () => new Response(body("0.1.9"), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -156,7 +518,7 @@ const manifestFixture = (version = "0.1.9") => ({
   });
   await suite.tierReach();
   check("the full acceptance suite rejects an old Worker version",
-    suite.results[0]?.status === "fail" && /expected version 0\.1\.14/.test(suite.results[0]?.detail || ""),
+    suite.results[0]?.status === "fail" && /expected version 0\.1\.15/.test(suite.results[0]?.detail || ""),
     JSON.stringify(suite.results));
 }
 
@@ -171,7 +533,7 @@ const manifestFixture = (version = "0.1.9") => ({
   const lagged = new Acceptance({
     base: "https://fixture.invalid",
     adminKey: "fixture-admin-key",
-    manifest: manifestFixture("0.1.14"),
+    manifest: manifestFixture("0.1.15"),
     fetchImpl: async () => new Response(JSON.stringify(inventory({
       ready: false,
       reason: "accepted_mutation_processing",
@@ -191,7 +553,7 @@ const manifestFixture = (version = "0.1.9") => ({
   const converged = new Acceptance({
     base: "https://fixture.invalid",
     adminKey: "fixture-admin-key",
-    manifest: manifestFixture("0.1.14"),
+    manifest: manifestFixture("0.1.15"),
     fetchImpl: async () => new Response(JSON.stringify(inventory({
       ready: true,
       reason: null,
@@ -207,7 +569,7 @@ const manifestFixture = (version = "0.1.9") => ({
     converged.results.find((result) => result.name === "semantic index is query-ready")?.status === "pass",
     JSON.stringify(converged.results));
 
-  const omittedStorage = manifestFixture("0.1.14");
+  const omittedStorage = manifestFixture("0.1.15");
   delete omittedStorage.infrastructure.cloudflare.storage;
   const misbound = new Acceptance({
     base: "https://fixture.invalid",
@@ -236,7 +598,7 @@ const manifestFixture = (version = "0.1.9") => ({
   const degraded = new Acceptance({
     base: "https://fixture.invalid",
     adminKey: "fixture-admin-key",
-    manifest: manifestFixture("0.1.14"),
+    manifest: manifestFixture("0.1.15"),
     fetchImpl: async (_url, init) => {
       const body = JSON.parse(String(init?.body || "{}"));
       return new Response(JSON.stringify({
@@ -319,7 +681,7 @@ const manifestFixture = (version = "0.1.9") => ({
         }
         if (/UPDATE install_state/i.test(sql)) {
           events.push("version");
-          d1Version = "0.1.14";
+          d1Version = "0.1.15";
         }
         if (/SELECT product_version FROM install_state/i.test(sql)) {
           events.push("readback");
@@ -357,6 +719,19 @@ const manifestFixture = (version = "0.1.9") => ({
             originalDuringUpdate.operations.admin_key_secret === keychainManifest.operations.admin_key_secret,
           JSON.stringify(originalDuringUpdate));
       },
+      cmdBootstrap: async (path, options) => {
+        executionPaths.add(path);
+        events.push("bootstrap");
+        check("the paused bootstrap receives per-request manifest pin guards",
+          typeof options?.beforeRequest === "function" && typeof options?.afterRequest === "function");
+        // A large corpus can need hundreds of requests. These guards must pin
+        // local bytes without multiplying Cloudflare account-list calls.
+        for (let round = 1; round <= 100; round++) {
+          await options.beforeRequest({ round, attempt: 1 });
+          await options.afterRequest({ round, attempt: 1 });
+        }
+        return bootstrapCompletion();
+      },
       cmdDeploy: async (path, options) => {
         executionPaths.add(path);
         events.push(options?.pauseVectorDrainForUpgrade ? "deploy-paused" : "deploy-active");
@@ -393,7 +768,7 @@ const manifestFixture = (version = "0.1.9") => ({
           : options.reachOnly
             ? "health-active-cutover"
             : "health-active-final");
-        check("upgrade health requires the running package version", options.expectVersion === "0.1.14");
+        check("upgrade health requires the running package version", options.expectVersion === "0.1.15");
         if (options.expectDrainMode === "paused-for-upgrade") {
           check("the compatibility health probe is paused-mode and reach-only",
             options.reachOnly === true, JSON.stringify(options));
@@ -408,20 +783,21 @@ const manifestFixture = (version = "0.1.9") => ({
       cmdTest: async (path, options) => {
         executionPaths.add(path);
         events.push("test");
-        check("upgrade acceptance requires the running package version", options.expectVersion === "0.1.14");
+        check("upgrade acceptance requires the running package version", options.expectVersion === "0.1.15");
       },
       commitManifestVersion: (path, version) => {
         events.push("manifest");
-        check("manifest advances only to the running package version", version === "0.1.14");
+        check("manifest advances only to the running package version", version === "0.1.15");
         return commitManifestVersion(path, version);
       },
     });
     check(
       "upgrade proves active propagation before secret reconciliation and vector convergence",
-      events.join(",") === "state,bookmark,deploy-paused,health-paused,quiescence,migrate,deploy-active,health-active-cutover,reconcile,drain,health-active-final,test,version,readback,manifest,log",
+      events.join(",") === "state,bookmark,deploy-paused,health-paused,quiescence,migrate,bootstrap,deploy-active,health-active-cutover,reconcile,drain,health-active-final,test,version,readback,manifest,log",
       events.join(","),
     );
-    check("every remote lifecycle stage revalidates the token account", accountChecks >= 10, String(accountChecks));
+    check("remote account revalidation is lifecycle-bounded, not bootstrap-round-bounded",
+      accountChecks >= 10 && accountChecks < 30, String(accountChecks));
     check(
       "mutating and acceptance stages use one pinned execution manifest",
       executionPaths.size === 1 && !executionPaths.has(manifestPath),
@@ -435,7 +811,7 @@ const manifestFixture = (version = "0.1.9") => ({
     );
     const committedManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
     check("the original manifest commit preserves its Keychain locator without copying a credential",
-      committedManifest.brain.version === "0.1.14" &&
+      committedManifest.brain.version === "0.1.15" &&
         committedManifest.operations.admin_key_secret === keychainManifest.operations.admin_key_secret &&
         !readFileSync(manifestPath, "utf8").includes(syntheticKeychainValue),
       JSON.stringify(committedManifest));
@@ -464,7 +840,7 @@ const manifestFixture = (version = "0.1.9") => ({
         }
         if (/UPDATE install_state/i.test(sql)) {
           events.push("version");
-          d1Version = "0.1.14";
+          d1Version = "0.1.15";
         }
         if (/SELECT product_version/i.test(sql)) {
           events.push("readback");
@@ -621,6 +997,21 @@ const manifestFixture = (version = "0.1.9") => ({
           events.push(`migrate-${options?.vectorDrainQuiesced === true}`);
           if (failureStage === "migration") throw new Error("synthetic migration failure");
         },
+        cmdBootstrap: async (_path, options) => {
+          events.push("bootstrap");
+          if (failureStage === "bootstrap-pin-drift") {
+            await options.beforeRequest({ round: 1, attempt: 1 });
+            events.push("bootstrap-receipt");
+            const changed = JSON.parse(readFileSync(manifestPath, "utf8"));
+            changed.client.slug = "changed-after-receipt";
+            writeFileSync(manifestPath, JSON.stringify(changed));
+            await options.afterRequest({ round: 1, attempt: 1 });
+          }
+          if (failureStage === "bootstrap") {
+            return { ...bootstrapCompletion(), complete: false, vector_ready: false, remaining: 1_000 };
+          }
+          return bootstrapCompletion();
+        },
         reconcileWorkerProviderSecrets: async () => { events.push("reconcile"); },
         cmdDrain: async () => {
           events.push("converge");
@@ -646,17 +1037,38 @@ const manifestFixture = (version = "0.1.9") => ({
 
   const deployFailure = await runFailure("active-deploy");
   check("an ambiguous final upload stops before health, acceptance, and version commits",
-    deployFailure.events.join(",") === "deploy-paused,health-paused-reach,wait,migrate-true,deploy-active" &&
+    deployFailure.events.join(",") === "deploy-paused,health-paused-reach,wait,migrate-true,bootstrap,deploy-active" &&
       deployFailure.versionWrites === 0 && deployFailure.manifestWrites === 0 &&
       deployFailure.manifestVersion === "0.1.9" &&
       /active-deploy-bookmark/.test(deployFailure.error?.message || "") &&
       /active vector-drain deployment/.test(deployFailure.error?.message || ""),
     JSON.stringify({ ...deployFailure, error: deployFailure.error?.message }));
 
+  const bootstrapPinDrift = await runFailure("bootstrap-pin-drift");
+  check("manifest drift after receipt bytes arrive prevents the active deployment",
+    bootstrapPinDrift.events.join(",") ===
+      "deploy-paused,health-paused-reach,wait,migrate-true,bootstrap,bootstrap-receipt" &&
+      bootstrapPinDrift.versionWrites === 0 && bootstrapPinDrift.manifestWrites === 0 &&
+      bootstrapPinDrift.manifestVersion === "0.1.9" &&
+      /manifest changed during accelerated legacy vector bootstrap request 1\.1 receipt/.test(
+        bootstrapPinDrift.error?.message || "") &&
+      /bootstrap-pin-drift-bookmark/.test(bootstrapPinDrift.error?.message || ""),
+    JSON.stringify({ ...bootstrapPinDrift, error: bootstrapPinDrift.error?.message }));
+
+  const bootstrapFailure = await runFailure("bootstrap");
+  check("an incomplete accelerated bootstrap cannot deploy active mode",
+    bootstrapFailure.events.join(",") ===
+      "deploy-paused,health-paused-reach,wait,migrate-true,bootstrap" &&
+      bootstrapFailure.versionWrites === 0 && bootstrapFailure.manifestWrites === 0 &&
+      bootstrapFailure.manifestVersion === "0.1.9" &&
+      /accelerated legacy vector bootstrap/.test(bootstrapFailure.error?.message || "") &&
+      /bootstrap-bookmark/.test(bootstrapFailure.error?.message || ""),
+    JSON.stringify({ ...bootstrapFailure, error: bootstrapFailure.error?.message }));
+
   const activeHealthFailure = await runFailure("active-health");
   check("a still-paused deployment stops before reconciliation, convergence, and version commits",
     activeHealthFailure.events.join(",") ===
-      "deploy-paused,health-paused-reach,wait,migrate-true,deploy-active,health-active-reach" &&
+      "deploy-paused,health-paused-reach,wait,migrate-true,bootstrap,deploy-active,health-active-reach" &&
       activeHealthFailure.versionWrites === 0 && activeHealthFailure.manifestWrites === 0 &&
       activeHealthFailure.manifestVersion === "0.1.9" &&
       /active vector-drain health verification/.test(activeHealthFailure.error?.message || "") &&
@@ -666,7 +1078,7 @@ const manifestFixture = (version = "0.1.9") => ({
   const convergenceFailure = await runFailure("convergence");
   check("an incomplete projection bootstrap blocks health, acceptance, and every version commit",
     convergenceFailure.events.join(",") ===
-      "deploy-paused,health-paused-reach,wait,migrate-true,deploy-active,health-active-reach,reconcile,converge" &&
+      "deploy-paused,health-paused-reach,wait,migrate-true,bootstrap,deploy-active,health-active-reach,reconcile,converge" &&
       convergenceFailure.versionWrites === 0 && convergenceFailure.manifestWrites === 0 &&
       convergenceFailure.manifestVersion === "0.1.9" &&
       /vector projection convergence/.test(convergenceFailure.error?.message || "") &&
@@ -680,9 +1092,9 @@ const manifestFixture = (version = "0.1.9") => ({
   try {
     const manifestPath = join(sandbox, "brain.manifest.json");
     writeFileSync(manifestPath, JSON.stringify(manifestFixture(), null, 2) + "\n");
-    commitManifestVersion(manifestPath, "0.1.14");
+    commitManifestVersion(manifestPath, "0.1.15");
     const committed = JSON.parse(readFileSync(manifestPath, "utf8"));
-    check("the local manifest records the verified package version", committed.brain.version === "0.1.14");
+    check("the local manifest records the verified package version", committed.brain.version === "0.1.15");
     check("the manifest commit leaves no temporary file", !readdirSync(sandbox).some((name) => name.endsWith(".tmp")));
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
@@ -801,7 +1213,7 @@ const manifestFixture = (version = "0.1.9") => ({
       resolveAccount: async () => ({ id: "fixture-account" }),
       d1Query: async (_account, _database, sql) => {
         if (/sqlite_master/i.test(sql)) return { results: [] };
-        if (/UPDATE install_state/i.test(sql)) d1Version = "0.1.14";
+        if (/UPDATE install_state/i.test(sql)) d1Version = "0.1.15";
         if (/SELECT product_version FROM install_state/i.test(sql)) {
           return { results: [{ product_version: d1Version }] };
         }
@@ -816,7 +1228,7 @@ const manifestFixture = (version = "0.1.9") => ({
     });
     check(
       "a successful empty install_state read follows the legacy migration path",
-      JSON.parse(readFileSync(legacyPath, "utf8")).brain.version === "0.1.14",
+      JSON.parse(readFileSync(legacyPath, "utf8")).brain.version === "0.1.15",
     );
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
@@ -925,7 +1337,7 @@ const manifestFixture = (version = "0.1.9") => ({
     } catch (caught) { accountError = caught; }
     check(
       "a changed token account stops before the next remote stage",
-      /account identity changed during active vector-drain deployment/.test(accountError?.message || "") && secondDeploy === 1,
+      /account identity changed during accelerated legacy vector bootstrap/.test(accountError?.message || "") && secondDeploy === 1,
       accountError?.message,
     );
   } finally {
@@ -999,7 +1411,7 @@ const manifestFixture = (version = "0.1.9") => ({
       cmdHealth: async (_path, options) => {
         actions.push(options.expectDrainMode === "paused-for-upgrade" ? "health-paused" : "health-active");
         check("rollback proves exact paused writer mode before restore",
-          options.expectVersion === "0.1.14" && options.reachOnly === true &&
+          options.expectVersion === "0.1.15" && options.reachOnly === true &&
             options.expectDrainMode === "paused-for-upgrade",
           JSON.stringify(options));
       },
@@ -1018,15 +1430,28 @@ const manifestFixture = (version = "0.1.9") => ({
         );
       },
       d1Query: async (_account, _database, sql) => {
+        if (/SELECT schema_version FROM install_state/.test(sql)) {
+          actions.push("schema");
+          return { results: [{ schema_version: 13 }] };
+        }
         if (/UPDATE install_state/.test(sql)) {
           actions.push("invalidate");
           check("rollback clears restored lease ownership before supervised recovery",
             /vector_drain_lease_owner\s*=\s*NULL/.test(sql) &&
-              /vector_drain_lease_expires_at\s*=\s*NULL/.test(sql), sql);
+              /vector_drain_lease_expires_at\s*=\s*NULL/.test(sql) &&
+              /vector_projection_bootstrap_protocol\s*=\s*NULL/.test(sql) &&
+              /vector_projection_bootstrap_base_count\s*=\s*0/.test(sql), sql);
           return { results: [], meta: { changes: 1 } };
+        }
+        if (/DELETE FROM vector_bootstrap_batches/.test(sql)) {
+          actions.push("reset-batches");
+          return { results: [], meta: { changes: 2 } };
         }
         if (/UPDATE vector_outbox/.test(sql)) {
           actions.push("reset-receipts");
+          check("rollback clears provider receipts and bulk batch tags together",
+            /bootstrap_epoch\s*=\s*NULL/.test(sql) &&
+              /bootstrap_batch\s*=\s*NULL/.test(sql), sql);
           return { results: [], meta: { changes: 1 } };
         }
         if (/SELECT vector_projection_status/.test(sql)) {
@@ -1041,6 +1466,10 @@ const manifestFixture = (version = "0.1.9") => ({
             high_water: "fixture#9",
             chunk_high_water: "fixture#9",
             submitted_rows: 0,
+            bootstrap_protocol: null,
+            bootstrap_base_count: 0,
+            bootstrap_batch_count: 0,
+            tagged_rows: 0,
           }] };
         }
         actions.push("history");
@@ -1052,11 +1481,48 @@ const manifestFixture = (version = "0.1.9") => ({
       "explicit confirmation is the only path that performs the restore",
       restored?.confirmed === true && restored?.restored === true &&
         restored?.requiresVectorizeRecreation === true &&
-        actions.join(",") === "account,deploy-paused,health-paused,quiesce,restore,invalidate,reset-receipts,readback,history",
+        actions.join(",") === "account,deploy-paused,health-paused,quiesce,restore,schema,invalidate,reset-batches,reset-receipts,readback,history",
       actions.join(","),
     );
     check("rollback never reactivates a Worker against an orphaned provider index",
       !actions.includes("deploy-active") && !actions.includes("health-active"), actions.join(","));
+
+    const schema12Sql = [];
+    const schema12Restore = await cmdRollback(manifestPath, "fixture-bookmark", {
+      confirmed: true,
+      resolveAccount: async () => ({ id: "fixture-account" }),
+      cmdDeploy: async () => {},
+      cmdHealth: async () => {},
+      waitForVectorDrainQuiescence: async () => {},
+      cf: async () => {},
+      d1Query: async (_account, _database, sql) => {
+        schema12Sql.push(sql);
+        if (/SELECT schema_version FROM install_state/.test(sql)) {
+          return { results: [{ schema_version: 12 }] };
+        }
+        if (/SELECT vector_projection_status/.test(sql)) {
+          return { results: [{
+            status: "bootstrap_required",
+            lease_owner: null,
+            lease_expires_at: null,
+            mutation_id: null,
+            mutation_submitted_at: null,
+            cursor: null,
+            high_water: "fixture#9",
+            chunk_high_water: "fixture#9",
+            submitted_rows: 0,
+          }] };
+        }
+        return { results: [], meta: { changes: 1 } };
+      },
+    });
+    check("a schema-12 restore uses its prefix-safe receipt reset without schema-13 names",
+      schema12Restore?.restored === true &&
+        schema12Sql.some((sql) => /UPDATE install_state/.test(sql)) &&
+        schema12Sql.some((sql) => /UPDATE vector_outbox/.test(sql)) &&
+        !schema12Sql.some((sql) =>
+          /vector_bootstrap_batches|vector_projection_bootstrap_protocol|\bbootstrap_epoch\s*=\s*NULL|\bbootstrap_batch\s*=/.test(sql)),
+      schema12Sql.join("\n"));
 
     const prefixActions = [];
     let prefixRollbackError = null;
@@ -1072,9 +1538,12 @@ const manifestFixture = (version = "0.1.9") => ({
         },
         waitForVectorDrainQuiescence: async () => { prefixActions.push("quiesce"); },
         cf: async () => { prefixActions.push("restore-prefix"); },
-        d1Query: async () => {
-          prefixActions.push("schema12-invalidate");
-          throw new Error("no such column: vector_projection_status");
+        d1Query: async (_account, _database, sql) => {
+          prefixActions.push("schema-prefix-read");
+          if (/SELECT schema_version FROM install_state/.test(sql)) {
+            return { results: [{ schema_version: 11 }] };
+          }
+          throw new Error("unexpected prefix mutation");
         },
       });
     } catch (caught) { prefixRollbackError = caught; }
@@ -1082,7 +1551,7 @@ const manifestFixture = (version = "0.1.9") => ({
       "a pre-schema12 bookmark fails closed after restore with the Worker still paused",
       /Worker remains paused.*brain update.*forward-migrate/is.test(prefixRollbackError?.message || "") &&
         prefixActions.join(",") ===
-          "deploy-paused,health:paused-for-upgrade,quiesce,restore-prefix,schema12-invalidate" &&
+          "deploy-paused,health:paused-for-upgrade,quiesce,restore-prefix,schema-prefix-read" &&
         !prefixActions.includes("DEPLOY-ACTIVE"),
       `${prefixRollbackError?.message}; ${prefixActions.join(",")}`,
     );

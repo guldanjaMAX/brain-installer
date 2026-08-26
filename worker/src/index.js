@@ -1518,7 +1518,16 @@ export default {
           embed: (text) => embedText(env, text),
           embedBatch: (texts) => embedTexts(env, texts),
         });
-        if (r.busy) return jsonResponse(r, 409);
+        if (r.busy) {
+          // The CLI treats 409 as a separate exact contract. Do not mix the
+          // ordinary progress fields into this lease-only retry receipt.
+          return jsonResponse({
+            protocol: r.protocol,
+            busy: true,
+            remaining: r.remaining,
+            retry_after_seconds: r.retry_after_seconds,
+          }, 409);
+        }
         return jsonResponse(r);
       }
       if (path === "/api/admin/brain/drain" && request.method === "POST") {

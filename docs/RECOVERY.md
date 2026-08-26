@@ -46,10 +46,14 @@ The reviewed order is fixed:
 5. Export the restored durable tables back from D1 and require integrity,
    schema, aggregate counts, and the exact data SHA-256 to match the source
    artifact.
-6. Drain the normalized durable bootstrap in bounded 99-chunk pages until every
-   D1 chunk has one query-visible vector, the provider mutation fence is
-   processed, the outbox and submitted counts are zero, and no vector failed.
-   A retry resumes the saved epoch/cursor and never calls reindex to reset it.
+6. While the reviewed compatibility Worker is deployed in
+   `paused-for-upgrade` mode, drive the schema-13 `/api/admin/brain/bootstrap`
+   contract until every D1 chunk has one query-visible vector, all durable batch
+   receipts are confirmed, the outbox and submitted counts are zero, and no
+   vector failed. A retry resumes the saved epoch, cursor, and batch history and
+   never calls reindex to reset them. After exact inventory and provider-count
+   proof, deploy only the pre-reviewed immutable active Worker version and prove
+   that exact version and `active` mode before continuing.
 7. Run post-restore health with zero failures and exact `vector_readiness`:
    `ready=true`, zero pending/submitted work, and equal D1/Vectorize counts.
 8. Run the release evaluation profile with zero critical failures and zero
@@ -75,8 +79,10 @@ is required above that boundary.
 
 `operations/cloudflare-recovery-adapter.mjs` is the reviewed live provider
 adapter. It can exercise the state machine only against an already-provisioned
-disposable target. It has no command that creates, deploys, promotes, deletes,
-or destroys a Cloudflare resource. It does not touch Supabase.
+disposable target. It cannot create, upload, delete, or destroy a Cloudflare
+resource. Its sole Worker mutation is the exact 100-percent deployment of the
+active immutable version already named in the reviewed target claim, after the
+paused bootstrap has passed exact vector proof. It does not touch Supabase.
 
 A normal full D1 export cannot include an FTS5 virtual table. The adapter never
 drops or changes source FTS. It exports data only from the exact reviewed table
@@ -98,19 +104,25 @@ for that exact source. It is not a claim that the adapter can detect traffic.
 Before preview, prepare all of these locally and out of band:
 
 - reviewed source and target manifests that produced the private recovery plan;
-- an empty disposable D1 database, zero-count Vectorize index, and deployed
-  Worker in the reviewed Cloudflare account;
+- an empty disposable D1 database, zero-count Vectorize index, and two immutable
+  Worker versions in the reviewed Cloudflare account. The paused version must be
+  the sole version deployed at 100 percent before the first field-gate stage;
 - one shared random nonce in the target Worker, D1, and Vectorize names. The
   Worker name must end in `recovery-gate-<nonce>` and its hostname must be the
   matching `*.workers.dev` hostname. Production-like names are refused;
-- exact Worker bindings to the target D1 and Vectorize resources, the reviewed
-  Brain identity and version, and only the `ADMIN_KEY` secret;
+- exact bindings on both Worker versions to the target D1 and Vectorize
+  resources, the reviewed Brain identity and version, and only the `ADMIN_KEY`
+  secret. Their bindings must be identical except that the paused version has
+  exactly `VECTOR_DRAIN_MODE=paused-for-upgrade` and the active version has no
+  `VECTOR_DRAIN_MODE` binding;
 - a fresh manual Cloudflare review that the target Worker has no routes and no
-  custom domains. Record the immutable deployed version ID, empty route lists,
-  and review timestamp in the target manifest's
-  `operations.recovery_field_gate`. The adapter pins that version on every
-  stage, but route inventory is a manually reviewed assertion because Wrangler
-  does not expose it through this adapter;
+  custom domains. Record the immutable paused version as
+  `paused_worker_version_id`, the immutable active version as
+  `active_worker_version_id`, their identical reviewed script hash as
+  `worker_script_etag`, the empty route lists, and review timestamp in the target manifest's
+  `operations.recovery_field_gate`. The adapter pins and inspects both versions
+  on every target stage, but route inventory is a manually reviewed assertion
+  because Wrangler does not expose it through this adapter;
 - the target manifest's `operations.admin_key_secret` Keychain locator, with
   the disposable target key already stored there;
 - an executable Wrangler wrapper in an owner-controlled, non-writable-by-others
@@ -121,14 +133,19 @@ Before preview, prepare all of these locally and out of band:
 The SQL artifact never carries live derived-index coordination. The adapter
 exports the reviewed `install_state` row separately from the raw provider tables
 and forces the ephemeral drain lease owner/expiry and projection mutation
-ID/submission time to `NULL`. For a nonempty corpus it records
-`bootstrap_required`, epoch 1, a null cursor, and the exact SQL
-`MAX(chunk_uid)` high-water. The normalized row is then hashed together with the
-remaining durable table export, so a retry cannot reuse a recovery artifact
-poisoned by an invocation-local lease or mutation fence. Older exact migration
-prefixes remain offline-inspectable, but the live field runner refuses a source
-or restored target below schema 12 because it cannot safely use the current
-lease and visibility protocol without an explicit upgrade.
+ID/submission time to `NULL`. It also resets the bulk-bootstrap protocol to
+`NULL` and its verified base count to zero because those receipts prove only the
+source Vectorize index. For a nonempty corpus it records `bootstrap_required`,
+epoch 1, a null cursor, and the exact SQL `MAX(chunk_uid)` high-water. The
+`vector_bootstrap_batches` table remains in the restored schema, but its
+provider-specific history is excluded from the export and recreated empty.
+The normalized row is then hashed together with the remaining durable table
+export, so a retry cannot reuse a recovery artifact poisoned by an
+invocation-local lease, mutation fence, or old provider receipt. Older exact
+migration prefixes remain offline-inspectable, but the live field runner refuses
+a source or restored target below schema 13 because it cannot safely use the
+current lease, visibility, and durable bulk-bootstrap protocol without an
+explicit upgrade.
 
 The preview is local only. It reads and fingerprints those files but does not
 invoke Wrangler, read Keychain, or call either Brain:
@@ -149,7 +166,7 @@ The preview returns six independent approvals:
 - `plan_fingerprint` binds the full reviewed recovery policy and both manifests;
 - `target_approval_fingerprint` binds the isolated D1, Vectorize, Worker, and
   hostname identity;
-- `target_execution_approval_fingerprint` binds the pinned Worker version plus
+- `target_execution_approval_fingerprint` binds both pinned Worker versions plus
   the manually reviewed empty route and custom-domain claim;
 - `source_export_blocking_approval_fingerprint` binds the source whose D1
   export will take a blocking lock during the approved maintenance window;
@@ -219,13 +236,18 @@ necessary corpus copy and remains mode `0600` in the owner-only directory.
 
 Interrupted runs resume from the persisted stage. A retry after import accepts
 only an exact completed target or the original empty target. Any partial or
-ambiguous target stops for review. A leftover
+ambiguous target stops for review. The vector rebuild resumes from schema-13
+durable bootstrap receipts while the paused version remains deployed. If the
+active-version deployment succeeded but its local response was lost, a retry
+accepts the already-active target only after exact corpus, vector inventory,
+outbox, provider count, immutable version, binding, and active-mode proof. A
+first rebuild attempt that finds the active version is refused. A leftover
 `.brain-recovery-field-gate.lock` is also fail-closed; inspect the prior process
 and private state before removing that lock manually.
 
 Passing deterministic tests is not a production recovery claim. The remaining
 live release gate is to provision the disposable resources out of band, refresh
-the manual no-route/no-custom-domain review and pinned version claim, pause
+the manual no-route/no-custom-domain review and both pinned version claims, pause
 source writes for the approved export window, and complete one full run. That
 run must exercise the three deterministic post-checkpoint stops above,
 followed by independent Cloudflare confirmation that source resources and

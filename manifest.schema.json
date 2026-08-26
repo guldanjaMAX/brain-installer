@@ -135,10 +135,12 @@
         },
         "recovery_field_gate": {
           "type": "object",
-          "description": "Short-lived, manually reviewed isolation evidence for a disposable recovery target. Never add this to a production manifest. The adapter binds the immutable Worker version and requires both route lists to be empty before it can use the disposable target key.",
-          "required": ["worker_version_id", "routes", "custom_domains", "reviewed_at"],
+          "description": "Short-lived, manually reviewed isolation evidence for a disposable recovery target. Never add this to a production manifest. The adapter binds distinct immutable paused and active Worker versions plus their shared script hash, and requires both route lists to be empty before it can use the disposable target key.",
+          "required": ["paused_worker_version_id", "active_worker_version_id", "worker_script_etag", "routes", "custom_domains", "reviewed_at"],
           "properties": {
-            "worker_version_id": { "type": "string", "minLength": 1 },
+            "paused_worker_version_id": { "type": "string", "minLength": 1 },
+            "active_worker_version_id": { "type": "string", "minLength": 1 },
+            "worker_script_etag": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
             "routes": { "type": "array", "maxItems": 0 },
             "custom_domains": { "type": "array", "maxItems": 0 },
             "reviewed_at": { "type": "string", "format": "date-time" }

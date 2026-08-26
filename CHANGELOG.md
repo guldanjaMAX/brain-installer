@@ -4,6 +4,31 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.15
+
+**Large existing brains can complete an exact Cloudflare upgrade in hours
+instead of spending days on serialized 99-vector mutations.**
+
+- Legacy vectors are rebuilt in durable 1,000-row batches while the Worker is
+  in its verified paused mode. Several disjoint batches may be in flight, but
+  no batch is acknowledged until every vector reads back with the exact D1
+  generation that produced it.
+- Batch identity, provider mutation receipt, submitted count, and confirmed
+  count are stored in D1. An interrupted update resumes those receipts instead
+  of repeating completed vectors or trusting a local progress file.
+- The ordinary cron and manual drain keep their stricter one-writer path for
+  overlapping updates and deletes. The faster protocol exists only inside the
+  paused, quiesced whole-corpus upgrade boundary.
+- The scale gate came from a large field upgrade: the previous exact path was
+  safe but moved only about 120 to 180 vectors per minute. This release
+  keeps the exact readback proof and removes that serialization bottleneck for
+  every install.
+
+After updating, run `brain health <manifest>` and `brain test <manifest>`.
+Both must report schema 13, zero pending or submitted vector work, exact
+expected and actual vector counts, and a query-ready semantic index before you
+rely on Brain answers.
+
 ## 0.1.14
 
 **Current-status answers now fail closed on stale or wrong-authority evidence,

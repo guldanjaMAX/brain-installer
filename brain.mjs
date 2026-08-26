@@ -2058,13 +2058,13 @@ export async function cmdMigrate(manifestPath, options = {}) {
     if (!silent) ok(`schema up to date (${all.length} migration(s) applied)`);
   }
 
-  // 0010-0012 change the protocol used by every Vectorize writer. A public
+  // 0010-0013 change the protocol used by every Vectorize writer. A public
   // `brain migrate` against an already-running pre-lease Worker would recreate
   // the rolling race that update's paused compatibility deployment prevents.
   // The private option is passed only by the verified setup/update cutover; it
   // is intentionally not a CLI flag.
   if ((m.infrastructure?.cloudflare?.storage || "d1") === "d1" &&
-      pending.some((migration) => [10, 11, 12].includes(migration.version)) &&
+      pending.some((migration) => [10, 11, 12, 13].includes(migration.version)) &&
       options.vectorDrainQuiesced !== true) {
     let installTable;
     try {
@@ -2086,7 +2086,7 @@ export async function cmdMigrate(manifestPath, options = {}) {
       // eligible for the direct fresh-install path; every other prefix must use
       // setup/update's paused-worker quiescence protocol.
       die(
-        "this existing brain needs the verified vector-writer cutover before migrations 0010-0012.\n" +
+        "this existing brain needs the verified vector-writer cutover before migrations 0010-0013.\n" +
           "      Run `brain update` instead; direct migrate was stopped before changing D1.",
       );
     }
@@ -2104,7 +2104,7 @@ export async function cmdMigrate(manifestPath, options = {}) {
     if (!inventory || !Array.isArray(inventory.results) || inventory.results.length !== 1 ||
         Number(inventory.results[0]?.user_table_count) !== 0) {
       die(
-        "this database is not provably fresh, so migrations 0010-0012 require the verified writer cutover.\n" +
+        "this database is not provably fresh, so migrations 0010-0013 require the verified writer cutover.\n" +
           "      Run `brain update` instead; direct migrate was stopped before changing D1.",
       );
     }
@@ -2524,12 +2524,370 @@ function installStateRow(response) {
 // check, not the reason an old Worker is assumed to honor a lease it never had.
 export const VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS = 20 * 60 * 1000;
 
+// A large legacy corpus can need hundreds of bulk bootstrap requests plus
+// visibility polling. Six hours is a safety boundary, not an estimate: every
+// accepted page is durable, and the supported recovery is to rerun update and
+// resume the same epoch rather than keeping an installer alive indefinitely.
+export const ACCELERATED_BOOTSTRAP_MAX_MS = 6 * 60 * 60 * 1000;
+export const ACCELERATED_BOOTSTRAP_MAX_ROUNDS = 20_000;
+const ACCELERATED_BOOTSTRAP_POLL_MS = 3_000;
+const ACCELERATED_BOOTSTRAP_REQUEST_MAX_MS = 180_000;
+const BOOTSTRAP_PHASES = new Set(["legacy_drain", "building", "waiting", "complete"]);
+const BOOTSTRAP_RECEIPT_FIELDS = Object.freeze([
+  "protocol",
+  "phase",
+  "epoch",
+  "total",
+  "confirmed",
+  "queued",
+  "submitted",
+  "remaining",
+  "in_flight_batches",
+  "failed",
+  "complete",
+  "vector_ready",
+  "expected_vectors",
+  "actual_vectors",
+]);
+const BOOTSTRAP_BUSY_FIELDS = Object.freeze([
+  "protocol",
+  "busy",
+  "remaining",
+  "retry_after_seconds",
+]);
+const BOOTSTRAP_COMPLETION_FIELDS = Object.freeze([
+  "epoch",
+  "total",
+  "confirmed",
+  "remaining",
+  "rounds",
+  "complete",
+  "vector_ready",
+]);
+
+function exactAggregateReceiptFields(body, expected, label) {
+  const actual = Object.keys(body).sort();
+  const wanted = [...expected].sort();
+  if (actual.length !== wanted.length || actual.some((field, index) => field !== wanted[index])) {
+    // Do not echo unexpected values or field names. This endpoint's privacy
+    // contract is aggregate-only, so contract drift must not reach a terminal.
+    die(`${label} did not match the aggregate-only response contract. Nothing was declared complete.`);
+  }
+}
+
+/** Validate and sanitize one aggregate-only paused bootstrap receipt. */
+export function validateAcceleratedBootstrapReceipt(body) {
+  const label = "the accelerated bootstrap receipt";
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    die("accelerated bootstrap returned HTTP success without a valid aggregate receipt. Nothing was declared complete.");
+  }
+  exactAggregateReceiptFields(body, BOOTSTRAP_RECEIPT_FIELDS, label);
+  if (body.protocol !== "bootstrap-v2" || !BOOTSTRAP_PHASES.has(body.phase)) {
+    die(`${label} did not identify the supported protocol and phase. Nothing was declared complete.`);
+  }
+  const receipt = {
+    protocol: body.protocol,
+    phase: body.phase,
+    epoch: nonNegativeReceiptCount(body, "epoch", label),
+    total: nonNegativeReceiptCount(body, "total", label),
+    confirmed: nonNegativeReceiptCount(body, "confirmed", label),
+    queued: nonNegativeReceiptCount(body, "queued", label),
+    submitted: nonNegativeReceiptCount(body, "submitted", label),
+    remaining: nonNegativeReceiptCount(body, "remaining", label),
+    in_flight_batches: nonNegativeReceiptCount(body, "in_flight_batches", label),
+    failed: nonNegativeReceiptCount(body, "failed", label),
+    complete: body.complete,
+    vector_ready: body.vector_ready,
+    expected_vectors: nonNegativeReceiptCount(body, "expected_vectors", label),
+    actual_vectors: nonNegativeReceiptCount(body, "actual_vectors", label),
+  };
+  if (typeof receipt.complete !== "boolean" || typeof receipt.vector_ready !== "boolean") {
+    die(`${label} did not include boolean completion and readiness proofs. Nothing was declared complete.`);
+  }
+  if (receipt.in_flight_batches > 3 || receipt.confirmed > receipt.total ||
+      receipt.remaining !== receipt.total - receipt.confirmed ||
+      receipt.queued + receipt.submitted > receipt.remaining) {
+    die(`${label} counts did not reconcile. Nothing was declared complete.`);
+  }
+  if ((receipt.phase === "complete") !== receipt.complete) {
+    die(`${label} completion phase contradicted its completion flag. Nothing was declared complete.`);
+  }
+  if (!receipt.complete && receipt.vector_ready) {
+    die(`${label} claimed query readiness before the bootstrap completed. Nothing was declared complete.`);
+  }
+  if (receipt.complete && (
+    receipt.remaining !== 0 || receipt.queued !== 0 || receipt.submitted !== 0 ||
+    receipt.in_flight_batches !== 0 || receipt.failed !== 0 || !receipt.vector_ready ||
+    receipt.expected_vectors !== receipt.actual_vectors ||
+    receipt.expected_vectors !== receipt.total
+  )) {
+    die(`${label} did not prove an empty, query-visible completed projection. Nothing was declared complete.`);
+  }
+  return Object.freeze(receipt);
+}
+
+/** Validate and sanitize the one allowed 409 response without exposing its owner. */
+export function validateAcceleratedBootstrapBusyReceipt(body) {
+  const label = "the accelerated bootstrap busy receipt";
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    die(`${label} was invalid. Nothing was declared complete.`);
+  }
+  exactAggregateReceiptFields(body, BOOTSTRAP_BUSY_FIELDS, label);
+  if (body.protocol !== "bootstrap-v2" || body.busy !== true) {
+    die(`${label} did not identify a supported retry. Nothing was declared complete.`);
+  }
+  const remaining = nonNegativeReceiptCount(body, "remaining", label);
+  const retryAfterSeconds = nonNegativeReceiptCount(body, "retry_after_seconds", label);
+  if (retryAfterSeconds < 1 || retryAfterSeconds > 1_200) {
+    die(`${label} included an unsafe retry delay. Nothing was declared complete.`);
+  }
+  return Object.freeze({ remaining, retryAfterSeconds });
+}
+
+/**
+ * Prove that a resumed bootstrap only advances one durable epoch.
+ *
+ * Queue and in-flight counts can move between disjoint phases, so confirmed
+ * and remaining are the cumulative authority. Once legacy cleanup has ended it
+ * can never reappear, and a response calling itself "building" must change at
+ * least one aggregate progress signal instead of creating a hot no-op loop.
+ */
+export function validateAcceleratedBootstrapProgress(previous, current) {
+  if (!previous) return current;
+  if (current.epoch !== previous.epoch || current.total !== previous.total) {
+    die("the accelerated bootstrap changed its durable epoch or total during one update. Re-run `brain update <manifest>`; the Worker remains paused.");
+  }
+  if (current.confirmed < previous.confirmed || current.remaining > previous.remaining) {
+    die("the accelerated bootstrap cumulative progress moved backward. Re-run `brain update <manifest>`; the Worker remains paused.");
+  }
+  if (previous.phase !== "legacy_drain" && current.phase === "legacy_drain") {
+    die("the accelerated bootstrap returned to legacy cleanup after bulk work began. Re-run `brain update <manifest>`; the Worker remains paused.");
+  }
+  if (current.phase === "building") {
+    const changed = [
+      "confirmed",
+      "remaining",
+      "queued",
+      "submitted",
+      "in_flight_batches",
+      "actual_vectors",
+    ].some((field) => current[field] !== previous[field]);
+    if (!changed) {
+      die("the accelerated bootstrap claimed to build without aggregate progress. Re-run `brain update <manifest>`; the Worker remains paused.");
+    }
+  }
+  return current;
+}
+
+/** Keep active deployment unreachable unless the loop returned its own exact proof. */
+export function validateAcceleratedBootstrapCompletion(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    die("the accelerated bootstrap did not return its exact completion proof. Re-run `brain update <manifest>`; the Worker remains paused.");
+  }
+  exactAggregateReceiptFields(result, BOOTSTRAP_COMPLETION_FIELDS,
+    "the accelerated bootstrap completion proof");
+  if (result.complete !== true || result.vector_ready !== true ||
+      !Number.isSafeInteger(result.epoch) || result.epoch < 0 ||
+      !Number.isSafeInteger(result.total) || result.total < 0 ||
+      !Number.isSafeInteger(result.confirmed) || result.confirmed !== result.total ||
+      result.remaining !== 0 || !Number.isSafeInteger(result.rounds) || result.rounds < 1) {
+    die("the accelerated bootstrap did not return its exact completion proof. Re-run `brain update <manifest>`; the Worker remains paused.");
+  }
+  return result;
+}
+
+/**
+ * Drive the authenticated paused bootstrap to one exact completion receipt.
+ * Each request is idempotent and durable, so network retries and a later update
+ * run resume progress instead of resetting it. The caller supplies pin checks
+ * around every HTTP attempt so a long run cannot outlive its reviewed manifest.
+ */
+export async function runAcceleratedBootstrap({
+  request,
+  beforeRequest = async () => {},
+  afterRequest = async () => {},
+  now = Date.now,
+  sleep = (milliseconds) => new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds)),
+  maxDurationMs = ACCELERATED_BOOTSTRAP_MAX_MS,
+  maxRounds = ACCELERATED_BOOTSTRAP_MAX_ROUNDS,
+  onProgress = () => {},
+} = {}) {
+  if (typeof request !== "function" || typeof beforeRequest !== "function" ||
+      typeof afterRequest !== "function" || typeof now !== "function" ||
+      typeof sleep !== "function" || typeof onProgress !== "function") {
+    throw new TypeError("the accelerated bootstrap runner dependencies are invalid");
+  }
+  const duration = Number.isSafeInteger(maxDurationMs)
+    ? Math.min(ACCELERATED_BOOTSTRAP_MAX_MS, Math.max(1_000, maxDurationMs))
+    : ACCELERATED_BOOTSTRAP_MAX_MS;
+  const roundLimit = Number.isSafeInteger(maxRounds)
+    ? Math.min(ACCELERATED_BOOTSTRAP_MAX_ROUNDS, Math.max(1, maxRounds))
+    : ACCELERATED_BOOTSTRAP_MAX_ROUNDS;
+  const startedAt = Number(now());
+  if (!Number.isFinite(startedAt) || startedAt < 0) {
+    throw new TypeError("the accelerated bootstrap clock is invalid");
+  }
+  const deadline = startedAt + duration;
+  let previous = null;
+  let lastRemaining = null;
+  let rounds = 0;
+
+  for (let round = 1; round <= roundLimit; round++) {
+    const roundNow = Number(now());
+    if (!Number.isFinite(roundNow) || roundNow < startedAt || roundNow >= deadline) break;
+    rounds = round;
+    const response = await retryTransient(async (attempt) => {
+      const attemptNow = Number(now());
+      if (!Number.isFinite(attemptNow) || attemptNow < startedAt || attemptNow >= deadline) {
+        const error = new Error("the accelerated bootstrap safety deadline was reached");
+        error.retryable = false;
+        throw error;
+      }
+      await beforeRequest({ round, attempt });
+      let primaryError = null;
+      try {
+        const result = await request({
+          round,
+          attempt,
+          timeoutMs: Math.max(1_000, Math.min(
+            ACCELERATED_BOOTSTRAP_REQUEST_MAX_MS,
+            deadline - attemptNow,
+          )),
+        });
+        if (!result || typeof result.status !== "number" ||
+            typeof result.ok !== "boolean" || typeof result.text !== "function") {
+          throw new Error("the accelerated bootstrap returned an invalid HTTP response");
+        }
+        let raw;
+        try {
+          raw = await result.text();
+        } catch {
+          const error = new Error("the accelerated bootstrap response was interrupted before its durable receipt arrived");
+          error.retryable = true;
+          throw error;
+        }
+        if (result.status !== 409 && isRetryableHttpStatus(result.status)) {
+          const error = new Error("the accelerated bootstrap received a retryable HTTP response");
+          error.retryable = true;
+          throw error;
+        }
+        let body = null;
+        try { body = JSON.parse(raw); } catch { /* validated below without echoing bytes */ }
+        return { status: result.status, ok: result.ok, body };
+      } catch (error) {
+        primaryError = error;
+        throw error;
+      } finally {
+        try {
+          await afterRequest({ round, attempt });
+        } catch (pinError) {
+          // A post-attempt pin failure is authoritative after a received
+          // receipt. If the transport itself failed, preserve that retryable
+          // error; the next preflight repeats the pin check before any POST.
+          if (!primaryError) throw pinError;
+        }
+      }
+    }, {
+      shouldRetry: (error) => error?.retryable === true,
+      sleep,
+      onRetry: () => info("the accelerated bootstrap request was interrupted; retrying durable progress"),
+    });
+
+    if (response.status === 409) {
+      const busy = validateAcceleratedBootstrapBusyReceipt(response.body);
+      if (lastRemaining !== null && busy.remaining > lastRemaining) {
+        die("the accelerated bootstrap busy receipt moved progress backward. Re-run `brain update <manifest>`; the Worker remains paused.");
+      }
+      lastRemaining = busy.remaining;
+      const remainingMs = Math.max(0, deadline - Number(now()));
+      const delayMs = Math.min(
+        busy.retryAfterSeconds * 1_000,
+        remainingMs,
+      );
+      if (delayMs <= 0) break;
+      info(`accelerated bootstrap is held by another bounded request; ${busy.remaining} aggregate row(s) remain`);
+      await sleep(delayMs);
+      continue;
+    }
+    if (!response.ok) {
+      die(`accelerated bootstrap failed with HTTP ${response.status}. No response content was printed. Re-run \`brain update <manifest>\`; the Worker remains paused.`);
+    }
+    const receipt = validateAcceleratedBootstrapReceipt(response.body);
+    validateAcceleratedBootstrapProgress(previous, receipt);
+    if (lastRemaining !== null && receipt.remaining > lastRemaining) {
+      die("the accelerated bootstrap remaining count increased. Re-run `brain update <manifest>`; the Worker remains paused.");
+    }
+    if (receipt.failed > 0) {
+      die(`the accelerated bootstrap reported ${receipt.failed} failed aggregate operation(s). Re-run \`brain update <manifest>\`; the Worker remains paused.`);
+    }
+    previous = receipt;
+    lastRemaining = receipt.remaining;
+    onProgress(receipt);
+    info(`${receipt.confirmed}/${receipt.total} legacy vector(s) confirmed; ${receipt.remaining} remain`);
+    if (receipt.complete) {
+      return validateAcceleratedBootstrapCompletion(Object.freeze({
+        epoch: receipt.epoch,
+        total: receipt.total,
+        confirmed: receipt.confirmed,
+        remaining: receipt.remaining,
+        rounds,
+        complete: true,
+        vector_ready: true,
+      }));
+    }
+    if (receipt.phase === "waiting" || receipt.phase === "legacy_drain") {
+      const delayMs = Math.min(
+        ACCELERATED_BOOTSTRAP_POLL_MS,
+        Math.max(0, deadline - Number(now())),
+      );
+      if (delayMs <= 0) break;
+      await sleep(delayMs);
+    }
+  }
+
+  const boundary = Number(now()) >= deadline
+    ? `${Math.ceil(duration / 3_600_000)}-hour wall-clock safety limit`
+    : `${roundLimit}-round safety limit`;
+  die(
+    `the accelerated bootstrap reached its ${boundary} with ${lastRemaining ?? "an unknown number of"} aggregate row(s) remaining.\n` +
+      "      Completed batches are durable. Re-run `brain update <manifest>` to resume; the Worker remains paused.",
+  );
+}
+
+/** Run the aggregate-only bootstrap endpoint through the manifest's durable admin key. */
+export async function cmdAcceleratedBootstrap(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const resolveBootstrapAccount = options.resolveAccount ?? resolveAccount;
+  const resolveBootstrapBase = options.resolveBaseUrl ?? resolveBaseUrl;
+  const resolveBootstrapKey = options.resolveAdminKey ?? ((path) =>
+    resolveAdminKey(path, { ignoreEnvironment: true }));
+  const callHttp = options.http ?? http;
+  const acct = m.brain?.domain ? null : await resolveBootstrapAccount(m);
+  const base = options.baseUrl ?? await resolveBootstrapBase(m, acct);
+  const adminKey = options.adminKey ?? resolveBootstrapKey(manifestPath);
+  if (!adminKey) {
+    die("no durable admin key was found, so the paused bootstrap could not be authenticated. Repair the declared key store, then re-run `brain update <manifest>`.");
+  }
+  return runAcceleratedBootstrap({
+    ...options,
+    request: ({ timeoutMs }) => callHttp(`${base}/api/admin/brain/bootstrap`, {
+      method: "POST",
+      redirect: "error",
+      headers: { "X-Admin-Key": adminKey },
+    }, {
+      timeoutMs,
+      what: "the accelerated legacy vector bootstrap",
+    }),
+  });
+}
+
 export async function cmdUpgrade(manifestPath, options = {}) {
   const resolveUpgradeAccount = options.resolveAccount ?? resolveAccount;
   const queryDatabase = options.d1Query ?? d1Query;
   const callCloudflare = options.cf ?? cf;
   const migrate = options.cmdMigrate ?? cmdMigrate;
   const deploy = options.cmdDeploy ?? cmdDeploy;
+  const bootstrapProjection = options.cmdBootstrap ?? cmdAcceleratedBootstrap;
   const reconcileProviders = options.reconcileWorkerProviderSecrets ?? reconcileWorkerProviderSecrets;
   const drainProjection = options.cmdDrain ?? cmdDrain;
   const verifyHealth = options.cmdHealth ?? cmdHealth;
@@ -2713,6 +3071,23 @@ export async function cmdUpgrade(manifestPath, options = {}) {
         await runStage("migration", () => migrate(executionPin.target, {
           vectorDrainQuiesced: true,
         }));
+        // Schema 0013 turns the legacy one-page-at-a-time bootstrap into an
+        // authenticated aggregate-only bulk protocol. Keep the Worker paused
+        // until its exact completion receipt proves every durable page. A
+        // timeout or malformed receipt therefore cannot expose a partially
+        // migrated corpus to active writers, and rerunning update resumes the
+        // same epoch.
+        await runStage("accelerated legacy vector bootstrap", async () => {
+          const completion = await bootstrapProjection(executionPin.target, {
+            beforeRequest: ({ round, attempt }) => assertStageFiles(
+              `accelerated legacy vector bootstrap request ${round}.${attempt} preflight`,
+            ),
+            afterRequest: ({ round, attempt }) => assertStageFiles(
+              `accelerated legacy vector bootstrap request ${round}.${attempt} receipt`,
+            ),
+          });
+          return validateAcceleratedBootstrapCompletion(completion);
+        });
         await runStage("active vector-drain deployment", () => deploy(executionPin.target, {
           persistDomain: false,
           pauseVectorDrainForUpgrade: false,
@@ -2736,11 +3111,10 @@ export async function cmdUpgrade(manifestPath, options = {}) {
         return reconcileProviders(manifest, account, scriptName, optionalWorkerSecretNames(manifest));
       });
       if (usesD1VectorOutbox) {
-        // Schema 0012 marks every legacy corpus unverified. The active leased
-        // drain advances a durable 99-row high-water cursor, exact-confirms
-        // each async Vectorize page, and resumes safely if update is rerun.
-        // Health and acceptance remain unreachable until that full projection
-        // has a verified receipt.
+        // The paused bulk bootstrap proves the legacy projection first. The
+        // ordinary active leased drain remains mandatory because it closes any
+        // steady-state outbox work that arrived before the paused boundary and
+        // independently verifies normal post-upgrade operation.
         await runStage("vector projection convergence", () =>
           drainProjection(executionPin.target));
       }
@@ -2867,6 +3241,21 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
   ok("D1 restored");
   if (usesD1VectorOutbox) {
     try {
+      const schemaReceipt = await queryDatabase(
+        acct.id,
+        dbId,
+        "SELECT schema_version FROM install_state WHERE id = 1",
+      );
+      if (!schemaReceipt || !Array.isArray(schemaReceipt.results) ||
+          schemaReceipt.results.length !== 1 ||
+          !Number.isSafeInteger(Number(schemaReceipt.results[0]?.schema_version))) {
+        throw new Error("restored schema version did not read back");
+      }
+      const restoredSchemaVersion = Number(schemaReceipt.results[0].schema_version);
+      if (restoredSchemaVersion < 12) {
+        throw new Error("restored schema predates the supervised vector protocol");
+      }
+      const hasBulkBootstrap = restoredSchemaVersion >= 13;
       await queryDatabase(
         acct.id,
         dbId,
@@ -2879,15 +3268,25 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
                 vector_projection_bootstrap_cursor = NULL,
                 vector_projection_bootstrap_high_water = (SELECT MAX(chunk_uid) FROM chunks),
                 vector_projection_mutation_id = NULL,
-                vector_projection_submitted_at = NULL
+                vector_projection_submitted_at = NULL${hasBulkBootstrap ? `,
+                vector_projection_bootstrap_protocol = NULL,
+                vector_projection_bootstrap_base_count = 0` : ""}
           WHERE id = 1 AND schema_version >= 12`,
       );
+      if (hasBulkBootstrap) {
+        // Batch receipts describe one particular provider index and mutation
+        // history. A D1 restore cannot make those external receipts true for
+        // the clean replacement index, so recovery always restarts them empty.
+        await queryDatabase(acct.id, dbId, "DELETE FROM vector_bootstrap_batches");
+      }
       await queryDatabase(
         acct.id,
         dbId,
         `UPDATE vector_outbox
-            SET submitted_mutation_id = NULL, submitted_at = NULL
-          WHERE submitted_mutation_id IS NOT NULL OR submitted_at IS NOT NULL`,
+            SET submitted_mutation_id = NULL, submitted_at = NULL${hasBulkBootstrap ? `,
+                bootstrap_epoch = NULL, bootstrap_batch = NULL` : ""}
+          WHERE submitted_mutation_id IS NOT NULL OR submitted_at IS NOT NULL${hasBulkBootstrap ? `
+             OR bootstrap_epoch IS NOT NULL OR bootstrap_batch IS NOT NULL` : ""}`,
       );
       const receipt = await queryDatabase(
         acct.id,
@@ -2901,7 +3300,12 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
                 vector_projection_bootstrap_high_water AS high_water,
                 (SELECT MAX(chunk_uid) FROM chunks) AS chunk_high_water,
                 (SELECT COUNT(*) FROM vector_outbox
-                  WHERE submitted_mutation_id IS NOT NULL OR submitted_at IS NOT NULL) AS submitted_rows
+                  WHERE submitted_mutation_id IS NOT NULL OR submitted_at IS NOT NULL) AS submitted_rows${hasBulkBootstrap ? `,
+                vector_projection_bootstrap_protocol AS bootstrap_protocol,
+                vector_projection_bootstrap_base_count AS bootstrap_base_count,
+                (SELECT COUNT(*) FROM vector_bootstrap_batches) AS bootstrap_batch_count,
+                (SELECT COUNT(*) FROM vector_outbox
+                  WHERE bootstrap_epoch IS NOT NULL OR bootstrap_batch IS NOT NULL) AS tagged_rows` : ""}
            FROM install_state WHERE id = 1`,
       );
       if (!receipt || !Array.isArray(receipt.results) || receipt.results.length !== 1 ||
@@ -2912,7 +3316,13 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
           receipt.results[0]?.mutation_submitted_at !== null ||
           receipt.results[0]?.cursor !== null ||
           Number(receipt.results[0]?.submitted_rows) !== 0 ||
-          receipt.results[0]?.high_water !== receipt.results[0]?.chunk_high_water) {
+          receipt.results[0]?.high_water !== receipt.results[0]?.chunk_high_water ||
+          (hasBulkBootstrap && (
+            receipt.results[0]?.bootstrap_protocol !== null ||
+            Number(receipt.results[0]?.bootstrap_base_count) !== 0 ||
+            Number(receipt.results[0]?.bootstrap_batch_count) !== 0 ||
+            Number(receipt.results[0]?.tagged_rows) !== 0
+          ))) {
         throw new Error("projection invalidation did not read back");
       }
     } catch {

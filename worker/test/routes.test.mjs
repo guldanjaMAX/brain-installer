@@ -1948,6 +1948,71 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
     aiCalls === 0 && vectorWrites === 0 && d1Writes === 1,
     JSON.stringify({ aiCalls, vectorWrites, d1Writes }));
 
+  const busyEnv = {
+    ...env,
+    DB: {
+      prepare(sql) {
+        const statement = {
+          bind() { return statement; },
+          run: async () => {
+            if (/SET vector_drain_lease_owner/.test(sql)) return { meta: { changes: 0 } };
+            throw new Error(`unexpected busy bootstrap write: ${sql}`);
+          },
+          first: async () => {
+            if (/SELECT schema_version, vector_projection_status AS status/.test(sql)) {
+              return {
+                schema_version: 13,
+                status: "bootstrap_required",
+                epoch: 4,
+                cursor: null,
+                high_water: null,
+                protocol: "bootstrap-v2",
+                base_count: 0,
+              };
+            }
+            if (/CASE WHEN vector_drain_lease_owner IS NULL/.test(sql)) {
+              return { held: 1, schema_ready: 1, expires_at: Date.now() + 180_000 };
+            }
+            if (/^SELECT count\(\*\) AS n FROM chunks/.test(sql.trim())) return { n: 0 };
+            if (/sum\(CASE WHEN submitted_mutation_id IS NULL/.test(sql)) {
+              return { n: 0, queued: 0, submitted: 0, failed: 0 };
+            }
+            if (/FROM vector_bootstrap_batches WHERE epoch/.test(sql)) {
+              return { confirmed: 0, in_flight: 0 };
+            }
+            if (/vector_projection_mutation_id AS mutation_id/.test(sql)) {
+              return {
+                schema_version: 13,
+                mutation_id: null,
+                mutation_submitted_at: null,
+                projection_status: "bootstrap_required",
+                bootstrap_epoch: 4,
+                bootstrap_cursor: null,
+                bootstrap_high_water: null,
+                expected_vectors: 0,
+                pending: 0,
+                submitted: 0,
+                oldest_queued_at: null,
+              };
+            }
+            throw new Error(`unexpected busy bootstrap SQL: ${sql}`);
+          },
+        };
+        return statement;
+      },
+    },
+  };
+  const busyResponse = await post(busyEnv, "/api/admin/brain/bootstrap", {});
+  const busyReceipt = await busyResponse.json();
+  check("the bootstrap route returns the CLI's exact lease-busy contract",
+    busyResponse.status === 409 && busyReceipt.protocol === "bootstrap-v2" &&
+      busyReceipt.busy === true && busyReceipt.remaining === 0 &&
+      Number.isInteger(busyReceipt.retry_after_seconds) &&
+      JSON.stringify(Object.keys(busyReceipt).sort()) === JSON.stringify([
+        "busy", "protocol", "remaining", "retry_after_seconds",
+      ]),
+    JSON.stringify(busyReceipt));
+
   let activeProviderCalls = 0;
   const activeEnv = {
     ...env,

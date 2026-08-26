@@ -48,6 +48,11 @@ const goldenPath = join(sandbox, "brain.golden.json");
 const privateSentinel = "fixture-private-question-and-provider-output";
 const fixtureAdminKey = "fixture-private-admin-key-value";
 const wrapperScript = "#!/bin/sh\nexec wrangler \"$@\"\n";
+const sourceWorkerVersionId = "fixture-source-version-id";
+const pausedWorkerVersionId = "fixture-paused-version-id";
+const activeWorkerVersionId = "fixture-active-version-id";
+const workerScriptEtag = "a".repeat(64);
+const sourceWorkerScriptEtag = "b".repeat(64);
 
 const sourceManifest = {
   manifest_version: 1,
@@ -91,7 +96,9 @@ const targetManifest = {
   operations: {
     admin_key_secret: "keychain://fixture-brain-recovery/owner",
     recovery_field_gate: {
-      worker_version_id: "fixture-version-id",
+      paused_worker_version_id: pausedWorkerVersionId,
+      active_worker_version_id: activeWorkerVersionId,
+      worker_script_etag: workerScriptEtag,
       routes: [],
       custom_domains: [],
       reviewed_at: "2026-08-25T11:55:00.000Z",
@@ -149,12 +156,14 @@ const installStateColumns = Object.freeze([
   ["vector_projection_bootstrap_epoch", "INTEGER"],
   ["vector_projection_bootstrap_cursor", "TEXT"],
   ["vector_projection_bootstrap_high_water", "TEXT"],
+  ["vector_projection_bootstrap_protocol", "TEXT"],
+  ["vector_projection_bootstrap_base_count", "INTEGER"],
 ]);
 const fixtureInstallState = Object.freeze({
   id: 1,
   client_slug: "fixture-brain",
   product_version: "0.1.12",
-  schema_version: 12,
+  schema_version: 13,
   gate_version: 4,
   installed_at: "2026-08-25T12:00:00.000Z",
   last_upgraded_at: null,
@@ -169,10 +178,14 @@ const fixtureInstallState = Object.freeze({
   vector_projection_bootstrap_epoch: 1,
   vector_projection_bootstrap_cursor: null,
   vector_projection_bootstrap_high_water: "fixture:chunk#0004",
+  // This proof belongs to the source Vectorize index and must never survive a
+  // recovery into the target's new index.
+  vector_projection_bootstrap_protocol: "bootstrap-v2",
+  vector_projection_bootstrap_base_count: 5,
 });
 const normalizedInstallStateSql =
   `INSERT INTO "install_state" (${installStateColumns.map(([name]) => `"${name}"`).join(",")}) VALUES (` +
-  `1,'fixture-brain','0.1.12',12,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,9,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004');\n`;
+  `1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,9,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004',NULL,0);\n`;
 const schemaRows = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((name) => ({
     type: "table",
@@ -227,6 +240,22 @@ const expectedSnapshot = Object.freeze({
   content_fingerprint: deterministicDataFingerprint,
 });
 
+function snapshotForChunkCount(chunkCount) {
+  const aggregate = {
+    ...aggregateTemplate,
+    chunks: String(chunkCount),
+    chunks_fts: String(chunkCount),
+    chunks_id_max: String(chunkCount),
+    chunks_text_bytes: String(chunkCount * 100),
+  };
+  return Object.freeze({
+    ...expectedSnapshot,
+    aggregate_fingerprint: hash(canonical(aggregate)),
+    chunk_count: chunkCount,
+    fts_count: chunkCount,
+  });
+}
+
 // Exercise the normalization projection against real SQLite, not only the
 // provider harness. A live lease and mutation fence are invocation-local and
 // never enter the artifact; a nonempty corpus receives its exact binary-order
@@ -245,12 +274,23 @@ const expectedSnapshot = Object.freeze({
        (id,client_slug,product_version,schema_version,gate_version,installed_at,ring,
         vector_drain_lease_owner,vector_drain_lease_expires_at,
         vector_projection_mutation_id,vector_projection_submitted_at)
-     VALUES (1,'fixture-brain','0.1.12',12,4,'2026-08-25T12:00:00.000Z','stable',
+     VALUES (1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z','stable',
              'raw-live-owner-must-not-export',999999,'raw-live-mutation-must-not-export',888888);
      INSERT INTO documents (doc_uid,source,source_id,ingested_at,content_hash)
      VALUES ('fixture:doc','fixture','doc',1,'hash');
      INSERT INTO chunks (chunk_uid,doc_uid,chunk_ix,text,source)
-     VALUES ('fixture:chunk#0004','fixture:doc',0,'restored fixture text','fixture');`,
+     VALUES ('fixture:chunk#0004','fixture:doc',0,'restored fixture text','fixture');
+     DELETE FROM vector_outbox;
+     UPDATE install_state
+        SET vector_projection_status='verified',
+            vector_projection_bootstrap_epoch=7,
+            vector_projection_bootstrap_cursor='fixture:chunk#0004',
+            vector_projection_bootstrap_high_water='fixture:chunk#0004',
+            vector_projection_bootstrap_protocol='bootstrap-v2',
+            vector_projection_bootstrap_base_count=1;
+     INSERT INTO vector_bootstrap_batches
+       (epoch,batch_no,start_cursor,end_cursor,row_count,status,mutation_id,submitted_at,confirmed_at)
+     VALUES (7,1,'','fixture:chunk#0004',1,'confirmed','source-only-mutation',1,2);`,
   );
   const readRows = async (_binding, sql) => source.prepare(sql).all();
   const first = await normalizedInstallStateExport({}, appliedMigrations, readRows);
@@ -267,6 +307,8 @@ const expectedSnapshot = Object.freeze({
   const sql = first.toString("utf8");
   assert.equal(sql.includes("raw-live-owner-must-not-export"), false);
   assert.equal(sql.includes("different-live-owner"), false);
+  assert.equal(sql.includes("bootstrap-v2"), false);
+  assert.equal(sql.includes("source-only-mutation"), false);
   destination.exec(sql);
   assert.deepEqual({ ...destination.prepare(
     `SELECT vector_drain_lease_owner owner,
@@ -276,7 +318,10 @@ const expectedSnapshot = Object.freeze({
             vector_projection_status status,
             vector_projection_bootstrap_epoch epoch,
             vector_projection_bootstrap_cursor cursor,
-            vector_projection_bootstrap_high_water high_water
+            vector_projection_bootstrap_high_water high_water,
+            vector_projection_bootstrap_protocol protocol,
+            vector_projection_bootstrap_base_count base_count,
+            (SELECT count(*) FROM vector_bootstrap_batches) batch_count
        FROM install_state WHERE id=1`,
   ).get() }, {
     owner: null,
@@ -287,7 +332,62 @@ const expectedSnapshot = Object.freeze({
     epoch: 1,
     cursor: null,
     high_water: "fixture:chunk#0004",
+    protocol: null,
+    base_count: 0,
+    batch_count: 0,
   });
+  source.close();
+  destination.close();
+}
+
+// Historical schema-12 artifacts remain inspectable offline. The projection
+// must not mention schema-13 columns while still resetting the visibility
+// bootstrap for a fresh derived index.
+{
+  const source = new DatabaseSync(":memory:");
+  const destination = new DatabaseSync(":memory:");
+  const migrationDirectory = join(process.cwd(), "migrations", "d1");
+  const migrationNames = readdirSync(migrationDirectory)
+    .filter((entry) => entry.endsWith(".sql"))
+    .sort()
+    .slice(0, 12);
+  for (const name of migrationNames) {
+    const sql = readFileSync(join(migrationDirectory, name), "utf8");
+    source.exec(sql);
+    destination.exec(sql);
+  }
+  source.exec(
+    `INSERT INTO install_state
+       (id,client_slug,product_version,schema_version,gate_version,installed_at,ring)
+     VALUES (1,'prefix-brain','0.1.14',12,4,'2026-08-25T12:00:00.000Z','stable');
+     INSERT INTO documents (doc_uid,source,source_id,ingested_at,content_hash)
+     VALUES ('prefix:doc','fixture','doc',1,'prefix-hash');
+     INSERT INTO chunks (chunk_uid,doc_uid,chunk_ix,text,source)
+     VALUES ('prefix:chunk#0001','prefix:doc',0,'prefix fixture text','fixture');`,
+  );
+  const prefixMigrations = appliedMigrations.slice(0, 12);
+  const readRows = async (_binding, sql) => source.prepare(sql).all();
+  const normalized = await normalizedInstallStateExport({}, prefixMigrations, readRows);
+  const sql = normalized.toString("utf8");
+  assert.equal(sql.includes("vector_projection_bootstrap_protocol"), false);
+  assert.equal(sql.includes("vector_projection_bootstrap_base_count"), false);
+  assert.equal(sql.includes("vector_bootstrap_batches"), false);
+  destination.exec(sql);
+  assert.deepEqual({ ...destination.prepare(
+    `SELECT schema_version,
+            vector_projection_status status,
+            vector_projection_bootstrap_epoch epoch,
+            vector_projection_bootstrap_cursor cursor,
+            vector_projection_bootstrap_high_water high_water
+       FROM install_state WHERE id=1`,
+  ).get() }, {
+    schema_version: 12,
+    status: "bootstrap_required",
+    epoch: 1,
+    cursor: null,
+    high_water: "prefix:chunk#0001",
+  });
+  normalized.fill(0);
   source.close();
   destination.close();
 }
@@ -341,34 +441,57 @@ function response(body, status = 200, headers = {}) {
 
 function providerHarness({
   ambiguousSourceD1 = false,
+  activeScriptEtag = workerScriptEtag,
+  activeVersionMode = null,
+  bootstrapMutatesCorpus = false,
+  bootstrapBusyOnce = false,
+  bootstrapPageSize = 3_000,
+  bootstrapReceiptTransform = (receipt) => receipt,
+  busyReceiptTransform = (receipt) => receipt,
+  deploymentChangesDuringEval = false,
   redirectHealth = false,
   redirectInventory = false,
   extraTargetSecret = false,
-  failDrainOnce = false,
-  failDrainAfterSubmitOnce = false,
+  extraTargetBinding = false,
+  failBootstrapOnce = false,
+  failBootstrapAfterProgressOnce = false,
+  failPromotionAfterApplyOnce = false,
+  healthModeOverride = null,
+  healthProtocolOverride = null,
   initialTargetRestored = false,
   initialVectorCount = 0,
   missingVectorCount = false,
-  readinessLagAfterDrain = false,
+  pausedVersionMode = "paused-for-upgrade",
+  pausedScriptEtag = workerScriptEtag,
+  promotionNoop = false,
+  readinessLagAfterBootstrap = false,
   sourceDrainLease = false,
-  sourceMigrationVersion = 12,
-  targetMigrationVersion = 12,
+  sourceMigrationVersion = 13,
+  targetChunkCount = 5,
+  targetMigrationVersion = 13,
   sourceInstallStateMissing = false,
-  targetVersionId = "fixture-version-id",
+  splitTargetDeployment = false,
+  targetVersionId = pausedWorkerVersionId,
 } = {}) {
   let targetRestored = initialTargetRestored;
   let vectorCount = initialVectorCount;
   let outbox = 0;
-  let bootstrapRequired = initialTargetRestored;
+  let bootstrapRequired = initialTargetRestored && initialVectorCount < targetChunkCount;
   let bootstrapEpoch = 1;
   let bootstrapCursor = null;
+  let bootstrapConfirmed = initialVectorCount;
+  let currentTargetVersionId = targetVersionId;
+  let corpusMutated = false;
   let evalCalls = 0;
   let adminReads = 0;
   let importCalls = 0;
-  let drainFailuresRemaining = failDrainOnce ? 1 : 0;
-  let postSubmitDrainFailuresRemaining = failDrainAfterSubmitOnce ? 1 : 0;
-  let vectorMutationSubmitted = false;
-  let drainCalls = 0;
+  let bootstrapFailuresRemaining = failBootstrapOnce ? 1 : 0;
+  let postProgressBootstrapFailuresRemaining = failBootstrapAfterProgressOnce ? 1 : 0;
+  let bootstrapBusyRemaining = bootstrapBusyOnce ? 1 : 0;
+  let readinessLagRemaining = readinessLagAfterBootstrap ? 1 : 0;
+  let promotionFailuresRemaining = failPromotionAfterApplyOnce ? 1 : 0;
+  let bootstrapCalls = 0;
+  let promotionCalls = 0;
   let sleepCalls = 0;
   let normalizedLeaseSelections = 0;
   const wranglerCalls = [];
@@ -385,7 +508,7 @@ function providerHarness({
     assert.equal(Object.hasOwn(env, "ADMIN_KEY"), false);
     assert.equal(Object.keys(env).some((name) => /SUPABASE|ANTHROPIC/.test(name)), false);
     assert.equal(env.WRANGLER_LOG_SANITIZE, "true");
-    assert.equal(env.WRANGLER_LOG, "none");
+    assert.equal(env.WRANGLER_LOG, "log");
     assert.equal(env.CLOUDFLARE_ACCOUNT_ID === sourceManifest.infrastructure.cloudflare.account_id ||
       env.CLOUDFLARE_ACCOUNT_ID === targetManifest.infrastructure.cloudflare.account_id, true);
     writeFileSync(join(env.WRANGLER_LOG_PATH, "fixture.log"), "aggregate-only fixture log\n", { mode: 0o600 });
@@ -427,27 +550,93 @@ function providerHarness({
     }
     if (args[0] === "deployments" && args[1] === "status") {
       const isSource = env.CLOUDFLARE_ACCOUNT_ID === sourceManifest.infrastructure.cloudflare.account_id;
-      return ok({ versions: [{ version_id: isSource ? "fixture-version-id" : targetVersionId, percentage: 100 }] });
+      if (!isSource && splitTargetDeployment) {
+        return ok({ versions: [
+          { version_id: pausedWorkerVersionId, percentage: 50 },
+          { version_id: activeWorkerVersionId, percentage: 50 },
+        ] });
+      }
+      return ok({ versions: [{
+        version_id: isSource ? sourceWorkerVersionId : currentTargetVersionId,
+        percentage: 100,
+      }] });
     }
     if (args[0] === "versions" && args[1] === "view") {
       const isSource = env.CLOUDFLARE_ACCOUNT_ID === sourceManifest.infrastructure.cloudflare.account_id;
       const manifest = isSource ? sourceManifest : targetManifest;
+      const requestedVersionId = args[2];
+      const targetMode = requestedVersionId === pausedWorkerVersionId
+        ? pausedVersionMode
+        : requestedVersionId === activeWorkerVersionId
+          ? activeVersionMode
+          : null;
+      const scriptEtag = isSource
+        ? sourceWorkerScriptEtag
+        : requestedVersionId === pausedWorkerVersionId
+          ? pausedScriptEtag
+          : activeScriptEtag;
       return ok({
-        id: "fixture-version-id",
+        id: requestedVersionId,
         resources: {
+          script: {
+            etag: scriptEtag,
+            handlers: ["fetch", "scheduled"],
+            last_deployed_from: "api",
+            named_handlers: [],
+          },
+          script_runtime: {
+            compatibility_date: "2026-01-01",
+            usage_model: "standard",
+          },
           bindings: [
-            { type: "d1", name: "DB", id: cloudflare.d1_database_id },
+            {
+              type: "d1",
+              name: "DB",
+              id: cloudflare.d1_database_id,
+              database_id: cloudflare.d1_database_id,
+            },
+            { type: "ai", name: "AI", project: "<catalog>" },
             { type: "vectorize", name: "VECTORIZE", index_name: cloudflare.vectorize_index },
             { type: "plain_text", name: "STORAGE", text: "d1" },
             { type: "plain_text", name: "BRAIN_NAME", text: manifest.client.slug },
+            { type: "plain_text", name: "BRAIN_OWNER", text: manifest.client.display_name },
             { type: "plain_text", name: "BRAIN_VERSION", text: manifest.brain.version },
+            { type: "plain_text", name: "CHUNK_SIZE", text: "1500" },
+            { type: "plain_text", name: "CHUNK_OVERLAP", text: "300" },
+            { type: "plain_text", name: "DAILY_LLM_CAP_USD", text: "10" },
+            {
+              type: "plain_text",
+              name: "ANSWER_MODEL",
+              text: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            },
+            { type: "plain_text", name: "CREDENTIAL_SCANNER", text: "on" },
             { type: "secret_text", name: "ADMIN_KEY" },
+            ...(!isSource && targetMode !== null
+              ? [{ type: "plain_text", name: "VECTOR_DRAIN_MODE", text: targetMode }]
+              : []),
             ...(!isSource && extraTargetSecret
               ? [{ type: "secret_text", name: "UNREVIEWED_SECRET" }]
+              : []),
+            ...(!isSource && extraTargetBinding
+              ? [{ type: "plain_text", name: "UNREVIEWED_MODE", text: "enabled" }]
               : []),
           ],
         },
       });
+    }
+    if (args[0] === "versions" && args[1] === "deploy") {
+      assert.deepEqual(args.slice(0, 6), [
+        "versions", "deploy", `${activeWorkerVersionId}@100%`,
+        "--name", targetManifest.brain.worker_name, "-y",
+      ]);
+      assert.equal(env.CLOUDFLARE_ACCOUNT_ID, targetManifest.infrastructure.cloudflare.account_id);
+      promotionCalls++;
+      if (!promotionNoop) currentTargetVersionId = activeWorkerVersionId;
+      if (promotionFailuresRemaining > 0) {
+        promotionFailuresRemaining--;
+        return { status: 1, stdout: Buffer.alloc(0), stderr: Buffer.from("synthetic lost promotion response") };
+      }
+      return ok();
     }
     if (args[0] === "d1" && args[1] === "export") {
       // Wrangler 4.73 removed --skip-confirmation from d1 export. Export has no
@@ -459,14 +648,21 @@ function providerHarness({
         .filter(Boolean);
       assert.deepEqual(exportedTables, [...RECOVERY_EXPORT_TABLES]);
       assert.equal(exportedTables.includes("vector_outbox"), false);
+      assert.equal(exportedTables.includes("vector_bootstrap_batches"), false);
       assert.equal(exportedTables.includes("install_state"), false);
-      writeFileSync(output, deterministicDataExport, { mode: 0o600 });
+      writeFileSync(
+        output,
+        corpusMutated ? `${deterministicDataExport}\n-- synthetic corpus mutation\n` : deterministicDataExport,
+        { mode: 0o600 },
+      );
       return ok();
     }
     if (args[0] === "d1" && args[1] === "execute" && args.includes("--file")) {
       importCalls++;
       targetRestored = true;
       bootstrapRequired = true;
+      bootstrapConfirmed = 0;
+      vectorCount = 0;
       return ok();
     }
     if (args[0] === "d1" && args[1] === "execute" && args.includes("--command")) {
@@ -495,6 +691,8 @@ function providerHarness({
         assert.match(sql, /CASE WHEN EXISTS \(SELECT 1 FROM chunks\) THEN 1 ELSE 0 END AS "vector_projection_bootstrap_epoch"/);
         assert.match(sql, /NULL AS "vector_projection_bootstrap_cursor"/);
         assert.match(sql, /\(SELECT MAX\(chunk_uid\) FROM chunks\) AS "vector_projection_bootstrap_high_water"/);
+        assert.match(sql, /NULL AS "vector_projection_bootstrap_protocol"/);
+        assert.match(sql, /0 AS "vector_projection_bootstrap_base_count"/);
         normalizedLeaseSelections++;
         rows = sourceInstallStateMissing ? [] : [{
           ...fixtureInstallState,
@@ -508,14 +706,33 @@ function providerHarness({
           vector_projection_bootstrap_epoch: 1,
           vector_projection_bootstrap_cursor: null,
           vector_projection_bootstrap_high_water: "fixture:chunk#0004",
+          vector_projection_bootstrap_protocol: null,
+          vector_projection_bootstrap_base_count: 0,
         }];
       } else if (/SELECT name FROM sqlite_schema/.test(sql)) {
         rows = [...RECOVERY_DURABLE_TABLES].sort().map((name) => ({ name }));
       } else if (/SELECT type,name,tbl_name/.test(sql)) {
         rows = schemaRows;
       } else if (/documents_ingested_max/.test(sql)) {
+        assert.match(
+          sql,
+          /CAST\(\(SELECT 0\) AS TEXT\) AS "vector_bootstrap_batches"/,
+        );
+        const aggregate = env.CLOUDFLARE_ACCOUNT_ID === targetManifest.infrastructure.cloudflare.account_id &&
+            targetRestored
+          ? {
+              ...aggregateTemplate,
+              chunks: String(targetChunkCount),
+              chunks_fts: String(targetChunkCount),
+              chunks_id_max: String(targetChunkCount),
+              chunks_text_bytes: String(targetChunkCount * 100),
+              ...(corpusMutated
+                ? { chunks_text_bytes: String(targetChunkCount * 100 + 1) }
+                : {}),
+            }
+          : aggregateTemplate;
         rows = [{
-          ...aggregateTemplate,
+          ...aggregate,
           vector_outbox: String(outbox),
           vector_drain_lease_owner_present: "0",
           vector_drain_lease_expiry_present: "0",
@@ -549,73 +766,67 @@ function providerHarness({
     const path = parsedUrl.pathname;
     if (path === "/health") {
       if (redirectHealth) return response({}, 302, { location: "https://redirected.fixture.invalid/health" });
-      return response({ ok: true, brain: "fixture-brain", version: "0.1.12" });
-    }
-    if (path === "/api/admin/brain/reindex") {
-      assert.equal(options.headers["X-Admin-Key"], fixtureAdminKey);
-      const body = JSON.parse(options.body);
-      if (!body.confirm) return response({
-        source: null, dry_run: true, chunks: 5, queued: 0, already_queued: 0,
-      });
-      const alreadyQueued = outbox;
-      const queued = 0;
-      bootstrapRequired = true;
-      bootstrapEpoch++;
-      bootstrapCursor = null;
-      vectorMutationSubmitted = false;
       return response({
-        source: null,
-        dry_run: false,
-        chunks: 5,
-        queued,
-        already_queued: alreadyQueued,
-        pending: alreadyQueued,
-        bootstrap_required: true,
-        bootstrap_epoch: bootstrapEpoch,
+        ok: true,
+        brain: "fixture-brain",
+        version: "0.1.12",
+        vector_drain_mode: healthModeOverride ??
+          (currentTargetVersionId === pausedWorkerVersionId ? "paused-for-upgrade" : "active"),
+        vector_writer_protocol: healthProtocolOverride ?? "lease-v1",
       });
     }
-    if (path === "/api/admin/brain/drain") {
+    if (path === "/api/admin/brain/bootstrap") {
       assert.equal(options.headers["X-Admin-Key"], fixtureAdminKey);
-      drainCalls++;
-      if (drainFailuresRemaining > 0) {
-        drainFailuresRemaining--;
-        throw new TypeError("synthetic interrupted drain");
+      assert.equal(currentTargetVersionId, pausedWorkerVersionId);
+      assert.equal(options.body, undefined);
+      bootstrapCalls++;
+      if (bootstrapFailuresRemaining > 0) {
+        bootstrapFailuresRemaining--;
+        throw new TypeError("synthetic interrupted bootstrap");
       }
-      if (postSubmitDrainFailuresRemaining > 0 && vectorMutationSubmitted) {
-        postSubmitDrainFailuresRemaining--;
-        throw new TypeError("synthetic interruption after durable submission");
+      if (bootstrapBusyRemaining > 0) {
+        bootstrapBusyRemaining--;
+        return response(busyReceiptTransform({
+          protocol: "bootstrap-v2",
+          busy: true,
+          remaining: targetChunkCount - bootstrapConfirmed,
+          retry_after_seconds: 2,
+        }), 409);
       }
-      if (bootstrapRequired && outbox === 0) {
-        outbox = 5;
-        bootstrapRequired = false;
-        bootstrapCursor = "fixture:chunk#0004";
+      if (bootstrapRequired && bootstrapConfirmed < targetChunkCount) {
+        bootstrapConfirmed = Math.min(
+          targetChunkCount,
+          bootstrapConfirmed + bootstrapPageSize,
+        );
+        vectorCount = bootstrapConfirmed;
+        bootstrapCursor = `fixture:chunk#${String(Math.max(0, bootstrapConfirmed - 1)).padStart(8, "0")}`;
       }
-      if (outbox > 0 && !vectorMutationSubmitted) {
-        vectorMutationSubmitted = true;
-        return response({
-          drained: 0,
-          submitted: outbox,
-          waiting: outbox,
-          remaining: outbox,
-          vector_ready: false,
-          readiness_reason: "accepted_mutation_processing",
-          expected_vectors: 5,
-          actual_vectors: vectorCount,
-        });
+      if (postProgressBootstrapFailuresRemaining > 0 && bootstrapConfirmed > 0) {
+        postProgressBootstrapFailuresRemaining--;
+        throw new TypeError("synthetic interruption after durable bootstrap progress");
       }
-      vectorCount = 5;
-      outbox = 0;
-      vectorMutationSubmitted = false;
-      return response({
-        drained: 5,
+      const countComplete = bootstrapConfirmed === targetChunkCount;
+      const visibilityLagged = countComplete && readinessLagRemaining > 0;
+      if (visibilityLagged) readinessLagRemaining--;
+      const complete = countComplete && !visibilityLagged;
+      if (complete) bootstrapRequired = false;
+      if (complete && bootstrapMutatesCorpus) corpusMutated = true;
+      return response(bootstrapReceiptTransform({
+        protocol: "bootstrap-v2",
+        phase: complete ? "complete" : countComplete ? "waiting" : "building",
+        epoch: bootstrapEpoch,
+        total: targetChunkCount,
+        confirmed: bootstrapConfirmed,
+        queued: 0,
         submitted: 0,
-        waiting: 0,
-        remaining: 0,
-        vector_ready: true,
-        readiness_reason: null,
-        expected_vectors: 5,
-        actual_vectors: 5,
-      });
+        remaining: targetChunkCount - bootstrapConfirmed,
+        in_flight_batches: 0,
+        failed: 0,
+        complete,
+        vector_ready: complete,
+        expected_vectors: targetChunkCount,
+        actual_vectors: visibilityLagged ? Math.max(0, targetChunkCount - 1) : vectorCount,
+      }));
     }
     if (path === "/api/admin/brain/documents") {
       assert.equal(options.headers["X-Admin-Key"], fixtureAdminKey);
@@ -624,7 +835,7 @@ function providerHarness({
         // Location host, so the authenticated header cannot cross origins.
         throw new TypeError("redirect mode is set to error");
       }
-      const ready = !readinessLagAfterDrain && !bootstrapRequired && outbox === 0 && vectorCount === 5;
+      const ready = !bootstrapRequired && outbox === 0 && vectorCount === targetChunkCount;
       return response({
         backend: "d1",
         rows: [],
@@ -632,16 +843,16 @@ function providerHarness({
           pending: outbox,
           upserts: outbox,
           deletes: 0,
-          submitted: vectorMutationSubmitted ? outbox : 0,
+          submitted: 0,
           oldest_queued_at: outbox ? 1_777_000_000_000 : null,
         },
         vector_readiness: {
           ready,
           reason: ready ? null : "accepted_mutation_processing",
-          expected_vectors: 5,
-          actual_vectors: ready ? 5 : Math.max(0, vectorCount - 1),
+          expected_vectors: targetChunkCount,
+          actual_vectors: ready ? targetChunkCount : Math.max(0, vectorCount - 1),
           pending: outbox,
-          submitted: vectorMutationSubmitted ? outbox : 0,
+          submitted: 0,
           action: ready ? null : "Wait briefly, then run brain drain again.",
         },
       });
@@ -681,9 +892,11 @@ function providerHarness({
         assert.equal(env.BRAIN_ADMIN_KEY_STDIN, "1");
         assert.equal(args.includes("--profile"), true);
         assert.equal(args[args.indexOf("--profile") + 1], "release");
+        if (deploymentChangesDuringEval) currentTargetVersionId = "fixture-unreviewed-version-id";
         return { status: 0 };
       },
       sleep: async () => { sleepCalls++; },
+      now: () => Date.parse("2026-08-25T13:00:00.000Z"),
       clock: (() => {
         let value = Date.parse("2026-08-25T13:00:00.000Z");
         return () => new Date(value += 1000);
@@ -692,7 +905,10 @@ function providerHarness({
     get adminReads() { return adminReads; },
     get evalCalls() { return evalCalls; },
     get importCalls() { return importCalls; },
-    get drainCalls() { return drainCalls; },
+    get bootstrapCalls() { return bootstrapCalls; },
+    get bootstrapConfirmed() { return bootstrapConfirmed; },
+    get currentTargetVersionId() { return currentTargetVersionId; },
+    get promotionCalls() { return promotionCalls; },
     get sleepCalls() { return sleepCalls; },
     get wranglerCalls() { return wranglerCalls; },
     get fetchCalls() { return fetchCalls; },
@@ -705,6 +921,15 @@ function providerHarness({
 }
 
 try {
+  const recoveryFieldGateSchema = JSON.parse(
+    readFileSync(join(process.cwd(), "manifest.schema.json"), "utf8"),
+  ).properties.operations.properties.recovery_field_gate;
+  assert.deepEqual(recoveryFieldGateSchema.required, [
+    "paused_worker_version_id", "active_worker_version_id", "worker_script_etag",
+    "routes", "custom_domains", "reviewed_at",
+  ]);
+  assert.equal(recoveryFieldGateSchema.additionalProperties, false);
+
   writePrivateJson(sourceManifestPath, sourceManifest);
   writePrivateJson(targetManifestPath, targetManifest);
   mkdirSync(artifactDirectory, { mode: 0o700 });
@@ -1019,7 +1244,9 @@ try {
     "verify_d1", "rebuild_vectorize",
   ]);
   assert.deepEqual([exportCalls(), drillHarness.importCalls, rebuildCalls()], [1, 1, 0]);
-  assert.equal(drillHarness.drainCalls, 2);
+  assert.equal(drillHarness.bootstrapCalls, 1);
+  assert.equal(drillHarness.promotionCalls, 1);
+  assert.equal(drillHarness.currentTargetVersionId, activeWorkerVersionId);
   assert.equal(drillHarness.evalCalls, 0);
 
   // Reusing the last boundary proves a completed rebuild neither re-stops nor replays.
@@ -1030,7 +1257,8 @@ try {
   assert.equal(resumedDrill.ok, true);
   assert.equal(resumedDrill.status.status, "complete");
   assert.deepEqual([exportCalls(), drillHarness.importCalls, rebuildCalls()], [1, 1, 0]);
-  assert.equal(drillHarness.drainCalls, 2);
+  assert.equal(drillHarness.bootstrapCalls, 1);
+  assert.equal(drillHarness.promotionCalls, 1);
   assert.equal(drillHarness.evalCalls, 1);
   assert.equal(existsSync(join(drillArtifactDirectory, ".brain-recovery-field-gate.lock")), false);
 
@@ -1049,14 +1277,19 @@ try {
   assert.equal(completed.status.completed_stages, 8);
   assert.equal(harness.importCalls, 1);
   assert.equal(harness.evalCalls, 1);
-  assert.equal(harness.adminReads, 3);
+  assert.equal(harness.adminReads, 4);
   assert.equal(harness.fetchCalls.every((call) => call.options.redirect === "error"), true);
   assert.equal(harness.fetchCalls.every((call) => call.options.cache === "no-store"), true);
   assert.equal(harness.fetchCalls.every((call) => new URL(call.url).search === ""), true);
   assert.equal(harness.wranglerCalls.every((call) => call.command !== wrapperPath), true);
-  assert.equal(harness.wranglerCalls.some((call) =>
-    ["create", "delete", "deploy", "rollback"].includes(call.args[1]) ||
-    ["create", "delete", "deploy", "rollback"].includes(call.args[0])), false);
+  const stateChangingWorkerCalls = harness.wranglerCalls.filter((call) =>
+    ["create", "delete", "deploy", "rollback", "upload"].includes(call.args[1]) ||
+    ["create", "delete", "deploy", "rollback", "upload"].includes(call.args[0]));
+  assert.equal(stateChangingWorkerCalls.length, 1);
+  assert.deepEqual(stateChangingWorkerCalls[0].args.slice(0, 6), [
+    "versions", "deploy", `${activeWorkerVersionId}@100%`,
+    "--name", targetManifest.brain.worker_name, "-y",
+  ]);
   assert.equal(harness.wranglerCalls.some((call) =>
     call.env.CLOUDFLARE_ACCOUNT_ID === sourceManifest.infrastructure.cloudflare.account_id &&
     call.args.includes("integrity-check")), false);
@@ -1108,7 +1341,7 @@ try {
     (error) => error.code === "RECOVERY_D1_RESOURCE_AMBIGUOUS",
   );
 
-  const prefixSourceHarness = providerHarness({ sourceMigrationVersion: 11 });
+  const prefixSourceHarness = providerHarness({ sourceMigrationVersion: 12 });
   const prefixSourceGate = createCloudflareRecoveryFieldGateAdapters(
     approvedAdapterConfig,
     prefixSourceHarness.dependencies,
@@ -1187,7 +1420,10 @@ try {
   const retriedLeasedVerification = await verifyLeasedExport();
   assert.equal(firstLeasedVerification.aggregate_fingerprint, retriedLeasedVerification.aggregate_fingerprint);
 
-  const redirectHarness = providerHarness({ redirectHealth: true });
+  const redirectHarness = providerHarness({
+    redirectHealth: true,
+    targetVersionId: activeWorkerVersionId,
+  });
   const redirectGate = createCloudflareRecoveryFieldGateAdapters(
     approvedAdapterConfig,
     redirectHarness.dependencies,
@@ -1206,7 +1442,10 @@ try {
   assert.equal(redirectHarness.fetchCalls.some((call) =>
     new URL(call.url).hostname === "redirected.fixture.invalid"), false);
 
-  const authenticatedRedirectHarness = providerHarness({ redirectInventory: true });
+  const authenticatedRedirectHarness = providerHarness({
+    redirectInventory: true,
+    targetVersionId: activeWorkerVersionId,
+  });
   const authenticatedRedirectGate = createCloudflareRecoveryFieldGateAdapters(
     approvedAdapterConfig,
     authenticatedRedirectHarness.dependencies,
@@ -1238,6 +1477,53 @@ try {
       completed: [],
     }),
     (error) => error.code === "RECOVERY_WORKER_BINDINGS_INVALID",
+  );
+
+  const extraBindingHarness = providerHarness({ extraTargetBinding: true });
+  const extraBindingGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    extraBindingHarness.dependencies,
+  );
+  await assert.rejects(
+    extraBindingGate.adapters.prove_target_clean({
+      stage: "prove_target_clean",
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }),
+    (error) => error.code === "RECOVERY_WORKER_BINDINGS_INVALID",
+  );
+
+  const mismatchedCodeHarness = providerHarness({
+    activeScriptEtag: "c".repeat(64),
+  });
+  const mismatchedCodeGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    mismatchedCodeHarness.dependencies,
+  );
+  await assert.rejects(
+    mismatchedCodeGate.adapters.prove_target_clean({
+      stage: "prove_target_clean",
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }),
+    (error) => error.code === "RECOVERY_WORKER_CODE_INVALID",
+  );
+
+  const splitDeploymentHarness = providerHarness({ splitTargetDeployment: true });
+  const splitDeploymentGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    splitDeploymentHarness.dependencies,
+  );
+  await assert.rejects(
+    splitDeploymentGate.adapters.prove_target_clean({
+      stage: "prove_target_clean",
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }),
+    (error) => error.code === "RECOVERY_WORKER_DEPLOYMENT_AMBIGUOUS",
   );
 
   const missingVectorCountHarness = providerHarness({ missingVectorCount: true });
@@ -1322,10 +1608,10 @@ try {
 
   // A resumed journal can carry an old verify_d1 checkpoint. Recheck the live
   // target schema before any current drain or Vectorize call instead of
-  // assuming the historical checkpoint has the schema-12 writer protocol.
+  // assuming the historical checkpoint has the schema-13 writer protocol.
   const prefixTargetHarness = providerHarness({
     initialTargetRestored: true,
-    targetMigrationVersion: 11,
+    targetMigrationVersion: 12,
   });
   const prefixTargetGate = createCloudflareRecoveryFieldGateAdapters(
     approvedAdapterConfig,
@@ -1346,7 +1632,7 @@ try {
 
   const interruptedHarness = providerHarness({
     initialTargetRestored: true,
-    failDrainOnce: true,
+    failBootstrapOnce: true,
   });
   const interruptedGate = createCloudflareRecoveryFieldGateAdapters(
     approvedAdapterConfig,
@@ -1372,12 +1658,13 @@ try {
     pending_outbox: 0,
     failed_vectors: 0,
   });
-  assert.equal(interruptedHarness.drainCalls, 3);
-  assert.equal(interruptedHarness.sleepCalls, 1);
+  assert.equal(interruptedHarness.bootstrapCalls, 2);
+  assert.equal(interruptedHarness.sleepCalls, 0);
+  assert.equal(interruptedHarness.promotionCalls, 1);
 
   const progressedHarness = providerHarness({
     initialTargetRestored: true,
-    failDrainAfterSubmitOnce: true,
+    failBootstrapAfterProgressOnce: true,
   });
   const progressedGate = createCloudflareRecoveryFieldGateAdapters(
     approvedAdapterConfig,
@@ -1388,29 +1675,280 @@ try {
     (error) => error.code === "RECOVERY_DATA_PLANE_REQUEST_FAILED",
   );
   assert.equal(progressedHarness.bootstrapEpoch, 1);
-  assert.equal(progressedHarness.bootstrapCursor, "fixture:chunk#0004");
+  assert.equal(progressedHarness.bootstrapCursor, "fixture:chunk#00000004");
   const resumedProgress = await progressedGate.adapters.rebuild_vectorize({
     ...rebuildContext,
     attempt: 2,
   });
   assert.equal(resumedProgress.vector_count, 5);
   assert.equal(progressedHarness.bootstrapEpoch, 1);
-  assert.equal(progressedHarness.bootstrapCursor, "fixture:chunk#0004");
+  assert.equal(progressedHarness.bootstrapCursor, "fixture:chunk#00000004");
   assert.equal(progressedHarness.fetchCalls.some((call) =>
     new URL(call.url).pathname === "/api/admin/brain/reindex"), false);
 
   const laggedVisibilityHarness = providerHarness({
     initialTargetRestored: true,
-    readinessLagAfterDrain: true,
+    readinessLagAfterBootstrap: true,
   });
   const laggedVisibilityGate = createCloudflareRecoveryFieldGateAdapters(
     approvedAdapterConfig,
     laggedVisibilityHarness.dependencies,
   );
-  await assert.rejects(
-    laggedVisibilityGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 }),
-    (error) => error.code === "RECOVERY_VECTORIZE_NOT_READY",
+  const laggedVisibility = await laggedVisibilityGate.adapters.rebuild_vectorize({
+    ...rebuildContext,
+    attempt: 1,
+  });
+  assert.equal(laggedVisibility.vector_count, 5);
+  assert.equal(laggedVisibilityHarness.bootstrapCalls, 2);
+  assert.equal(laggedVisibilityHarness.sleepCalls, 1);
+
+  // The old active /drain loop could submit at most 79,200 restored rows. The
+  // paused schema-13 bootstrap advances its durable provider-receipt cursor
+  // until exact completion, with no corpus-sized adapter ceiling.
+  const largeChunkCount = 80_001;
+  const largeSnapshot = snapshotForChunkCount(largeChunkCount);
+  const largeHarness = providerHarness({
+    initialTargetRestored: true,
+    targetChunkCount: largeChunkCount,
+  });
+  const largeGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    largeHarness.dependencies,
   );
+  const largeResult = await largeGate.adapters.rebuild_vectorize({
+    ...rebuildContext,
+    attempt: 1,
+    completed: [{ id: "verify_d1", evidence: largeSnapshot }],
+  });
+  assert.deepEqual(largeResult, {
+    chunk_count: largeChunkCount,
+    vector_count: largeChunkCount,
+    pending_outbox: 0,
+    failed_vectors: 0,
+  });
+  assert.equal(largeHarness.bootstrapCalls, Math.ceil(largeChunkCount / 3_000));
+  assert.equal(largeHarness.promotionCalls, 1);
+  assert.equal(largeHarness.fetchCalls.some((call) =>
+    new URL(call.url).pathname === "/api/admin/brain/drain"), false);
+
+  const busyHarness = providerHarness({ initialTargetRestored: true, bootstrapBusyOnce: true });
+  const busyGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    busyHarness.dependencies,
+  );
+  const busyResult = await busyGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 });
+  assert.equal(busyResult.vector_count, 5);
+  assert.equal(busyHarness.bootstrapCalls, 2);
+  assert.equal(busyHarness.sleepCalls, 1);
+
+  const malformedReceiptHarness = providerHarness({
+    initialTargetRestored: true,
+    bootstrapReceiptTransform: (receipt) => ({ ...receipt, unreviewed_detail: "refuse" }),
+  });
+  const malformedReceiptGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    malformedReceiptHarness.dependencies,
+  );
+  await assert.rejects(
+    malformedReceiptGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 }),
+    (error) => error.code === "RECOVERY_BOOTSTRAP_RECEIPT_INVALID",
+  );
+  assert.equal(malformedReceiptHarness.promotionCalls, 0);
+
+  const malformedBusyHarness = providerHarness({
+    initialTargetRestored: true,
+    bootstrapBusyOnce: true,
+    busyReceiptTransform: (receipt) => ({ ...receipt, error: "unreviewed" }),
+  });
+  const malformedBusyGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    malformedBusyHarness.dependencies,
+  );
+  await assert.rejects(
+    malformedBusyGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 }),
+    (error) => error.code === "RECOVERY_BOOTSTRAP_BUSY_RECEIPT_INVALID",
+  );
+  assert.equal(malformedBusyHarness.promotionCalls, 0);
+
+  const mutatedCorpusHarness = providerHarness({
+    initialTargetRestored: true,
+    bootstrapMutatesCorpus: true,
+  });
+  const mutatedCorpusGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    mutatedCorpusHarness.dependencies,
+  );
+  await assert.rejects(
+    mutatedCorpusGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 }),
+    (error) => error.code === "RECOVERY_TARGET_CHANGED_DURING_REINDEX",
+  );
+  assert.equal(mutatedCorpusHarness.promotionCalls, 0);
+
+  const promotionNoopHarness = providerHarness({
+    initialTargetRestored: true,
+    promotionNoop: true,
+  });
+  const promotionNoopGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    promotionNoopHarness.dependencies,
+  );
+  await assert.rejects(
+    promotionNoopGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 }),
+    (error) => error.code === "RECOVERY_TARGET_EXECUTION_CHANGED",
+  );
+  assert.equal(promotionNoopHarness.promotionCalls, 1);
+
+  const badPausedModeHarness = providerHarness({ pausedVersionMode: "active" });
+  const badPausedModeGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    badPausedModeHarness.dependencies,
+  );
+  await assert.rejects(
+    badPausedModeGate.adapters.prove_target_clean({
+      stage: "prove_target_clean",
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }),
+    (error) => error.code === "RECOVERY_TARGET_EXECUTION_MODE_INVALID",
+  );
+  assert.equal(badPausedModeHarness.bootstrapCalls, 0);
+  assert.equal(badPausedModeHarness.promotionCalls, 0);
+
+  const badActiveModeHarness = providerHarness({ activeVersionMode: "paused-for-upgrade" });
+  const badActiveModeGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    badActiveModeHarness.dependencies,
+  );
+  await assert.rejects(
+    badActiveModeGate.adapters.prove_target_clean({
+      stage: "prove_target_clean",
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }),
+    (error) => error.code === "RECOVERY_TARGET_EXECUTION_MODE_INVALID",
+  );
+  assert.equal(badActiveModeHarness.bootstrapCalls, 0);
+  assert.equal(badActiveModeHarness.promotionCalls, 0);
+
+  const badHealthModeHarness = providerHarness({ healthModeOverride: "active" });
+  const badHealthModeGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    badHealthModeHarness.dependencies,
+  );
+  await assert.rejects(
+    badHealthModeGate.adapters.prove_target_clean({
+      stage: "prove_target_clean",
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }),
+    (error) => error.code === "RECOVERY_HEALTH_IDENTITY_MISMATCH",
+  );
+  assert.equal(badHealthModeHarness.bootstrapCalls, 0);
+  assert.equal(badHealthModeHarness.promotionCalls, 0);
+
+  const badHealthProtocolHarness = providerHarness({ healthProtocolOverride: "legacy" });
+  const badHealthProtocolGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    badHealthProtocolHarness.dependencies,
+  );
+  await assert.rejects(
+    badHealthProtocolGate.adapters.prove_target_clean({
+      stage: "prove_target_clean",
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }),
+    (error) => error.code === "RECOVERY_HEALTH_IDENTITY_MISMATCH",
+  );
+
+  const pausedFinalGateHarness = providerHarness();
+  const pausedFinalGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    pausedFinalGateHarness.dependencies,
+  );
+  await assert.rejects(
+    pausedFinalGate.adapters.verify_health({
+      stage: "verify_health",
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [{ id: "rebuild_vectorize", evidence: { chunk_count: 5 } }],
+    }),
+    (error) => error.code === "RECOVERY_TARGET_EXECUTION_CHANGED",
+  );
+  await assert.rejects(
+    pausedFinalGate.adapters.verify_eval({
+      stage: "verify_eval",
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }),
+    (error) => error.code === "RECOVERY_TARGET_EXECUTION_CHANGED",
+  );
+
+  const changingEvalHarness = providerHarness({
+    deploymentChangesDuringEval: true,
+    targetVersionId: activeWorkerVersionId,
+  });
+  const changingEvalGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    changingEvalHarness.dependencies,
+  );
+  await assert.rejects(
+    changingEvalGate.adapters.verify_eval({
+      stage: "verify_eval",
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }),
+    (error) => error.code === "RECOVERY_TARGET_EXECUTION_CHANGED",
+  );
+  assert.equal(changingEvalHarness.evalCalls, 1);
+
+  const activeFirstAttemptHarness = providerHarness({
+    initialTargetRestored: true,
+    initialVectorCount: 5,
+    targetVersionId: activeWorkerVersionId,
+  });
+  const activeFirstAttemptGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    activeFirstAttemptHarness.dependencies,
+  );
+  await assert.rejects(
+    activeFirstAttemptGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 }),
+    (error) => error.code === "RECOVERY_TARGET_EXECUTION_CHANGED",
+  );
+  assert.equal(activeFirstAttemptHarness.bootstrapCalls, 0);
+  assert.equal(activeFirstAttemptHarness.promotionCalls, 0);
+  const reconciledActive = await activeFirstAttemptGate.adapters.rebuild_vectorize({
+    ...rebuildContext,
+    attempt: 2,
+  });
+  assert.equal(reconciledActive.vector_count, 5);
+  assert.equal(activeFirstAttemptHarness.promotionCalls, 0);
+
+  const ambiguousPromotionHarness = providerHarness({
+    initialTargetRestored: true,
+    failPromotionAfterApplyOnce: true,
+  });
+  const ambiguousPromotionGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    ambiguousPromotionHarness.dependencies,
+  );
+  await assert.rejects(
+    ambiguousPromotionGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 }),
+    (error) => error.code === "RECOVERY_WRANGLER_CALL_FAILED",
+  );
+  assert.equal(ambiguousPromotionHarness.currentTargetVersionId, activeWorkerVersionId);
+  const reconciledPromotion = await ambiguousPromotionGate.adapters.rebuild_vectorize({
+    ...rebuildContext,
+    attempt: 2,
+  });
+  assert.equal(reconciledPromotion.vector_count, 5);
+  assert.equal(ambiguousPromotionHarness.bootstrapCalls, 1);
+  assert.equal(ambiguousPromotionHarness.promotionCalls, 1);
 
   const productionTargetPath = join(sandbox, "production-target.manifest.json");
   const productionPlanPath = join(sandbox, ".brain-recovery-production-plan.json");
@@ -1472,6 +2010,21 @@ try {
     assert.equal(local.chunk_count, 0);
     assert.equal(local.fts_count, 0);
 
+    // Confirmed bulk-bootstrap receipts are durable evidence for one provider
+    // index, but not part of the recoverable corpus. Even a source retaining
+    // that history must produce the same normalized structural aggregate.
+    const batchHistoryArtifact = join(sandbox, ".brain-recovery-batch-history-verifier.sql");
+    const batchHistory =
+      "INSERT INTO vector_bootstrap_batches " +
+      "(epoch,batch_no,start_cursor,end_cursor,row_count,status,mutation_id,submitted_at,confirmed_at) " +
+      "VALUES (7,1,'fixture:start','fixture:end',1,'confirmed','fixture-mutation',1,2);";
+    writeFileSync(batchHistoryArtifact, `${sql}\n${batchHistory}\n`, { mode: 0o600 });
+    chmodSync(batchHistoryArtifact, 0o600);
+    const withBatchHistory = await verifyRecoverySqlArtifact(batchHistoryArtifact);
+    assert.equal(withBatchHistory.schema_fingerprint, local.schema_fingerprint);
+    assert.equal(withBatchHistory.aggregate_fingerprint, local.aggregate_fingerprint);
+    assert.equal(withBatchHistory.document_count, local.document_count);
+
     // D1 removes full-line SQL comments from sqlite_schema. The exact migration
     // checksums remain separately pinned, so schema comparison must treat only
     // those non-semantic comments and whitespace as equivalent.
@@ -1504,6 +2057,25 @@ try {
     const prefix = await verifyRecoverySqlArtifact(prefixArtifact);
     assert.equal(prefix.integrity, "ok");
     assert.equal(prefix.document_count, 0);
+
+    // Schema 12 is the immediate historical prefix. Its exact artifact remains
+    // inspectable offline even though live recovery requires schema 13.
+    const schema12MigrationNames = readdirSync(join(process.cwd(), "migrations", "d1"))
+      .filter((name) => /^\d+_.*\.sql$/.test(name))
+      .sort()
+      .slice(0, 12);
+    const schema12Schema = schema12MigrationNames
+      .map((name) => readFileSync(join(process.cwd(), "migrations", "d1", name), "utf8"))
+      .join("\n\n");
+    const schema12Receipts = appliedMigrations.slice(0, 12).map((row) =>
+      `INSERT INTO schema_migrations (version,name,applied_at,checksum) VALUES (` +
+      `${row.version},'${row.name}','2026-08-25T12:00:00.000Z','${row.checksum}');`).join("\n");
+    const schema12Artifact = join(sandbox, ".brain-recovery-schema12-prefix-verifier.sql");
+    writeFileSync(schema12Artifact, `${schema12Schema}\n${schema12Receipts}\n`, { mode: 0o600 });
+    chmodSync(schema12Artifact, 0o600);
+    const schema12 = await verifyRecoverySqlArtifact(schema12Artifact);
+    assert.equal(schema12.integrity, "ok");
+    assert.equal(schema12.document_count, 0);
   }
 
   console.log("PASS  Cloudflare recovery adapter is disposable-only, credential-safe, redirect-safe, and resumable");

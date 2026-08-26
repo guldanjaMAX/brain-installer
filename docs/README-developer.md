@@ -5,12 +5,13 @@ keyword search live in D1, vectors live in Vectorize, and the Worker fuses them.
 Nothing runs on our infrastructure, and nothing but a scoped token is held during
 the engagement.
 
-**Status: 0.1.14.** Provisioning, retrieval, resumable folder ingest, deletion,
+**Status: 0.1.15.** Provisioning, retrieval, resumable folder ingest, deletion,
 upgrade rollback, and `brain setup` are verified end to end against real
 Cloudflare on macOS. Google Drive OAuth and a bounded real-account ingest have
-also been verified. The complete Drive baseline and the recovery adapter's
-disposable real-Cloudflare drill are the remaining production field gates for
-this release. Gmail uses the same tested cursor and storage
+also been verified. The complete Drive baseline, the schema-13 disposable
+recovery drill, and completion of the accelerated bootstrap on a large live
+corpus are the remaining production field gates for this release. Gmail uses
+the same tested cursor and storage
 pipeline but has not completed a real-account production run. The full suite and
 packed CLI pass on Windows in CI, but no real-account Windows install has been
 completed. See "What is not built" before promising anything to anyone.
@@ -96,11 +97,16 @@ node brain.mjs test       ./acme.manifest.json   # full acceptance suite
 
 The supported beginner update is `brain update [manifest]`. It verifies the
 account, requires a pre-change D1 bookmark, deploys and verifies a paused
-compatibility Worker, waits the declared 20-minute old-invocation window,
-migrates, deploys active mode, resumes any durable 99-row vector bootstrap,
-reconciles allowed Worker secrets, requires exact-version health plus the full acceptance suite, commits and reads back D1
-version state, then atomically commits and reads back the local manifest
-version. Paused mode rejects every corpus and source mutation before D1 access.
+compatibility Worker, waits the declared 20-minute old-invocation window, and
+migrates. While the write barrier remains active, schema 13 rebuilds a legacy
+projection through durable 1,000-row batches with a bounded number of disjoint
+mutations in flight. Exact `getByIds` generation readback acknowledges each
+batch, and D1 receipts make interruption resumable. Update deploys active mode
+only after the whole projection is verified, then reconciles allowed Worker
+secrets, requires exact-version health plus the full acceptance suite, commits
+and reads back D1 version state, and atomically commits and reads back the local
+manifest version. Paused mode rejects every corpus and source mutation before
+D1 access.
 The older `brain upgrade` command uses the same engine and cannot
 bypass those gates. Neither path restores D1 automatically because that would
 discard writes made after the bookmark. Direct `brain migrate` refuses a live
@@ -129,11 +135,14 @@ Verified recovery uses the provider-neutral state machine in
 `operations/verified-recovery.mjs` and the disposable-only Cloudflare adapter in
 `operations/cloudflare-recovery-adapter.mjs`. The adapter can export the
 reviewed source, restore only an exact empty `recovery-gate-<nonce>` target,
-rebuild Vectorize, and run health plus release evaluation. It cannot create,
-deploy, promote, delete, or destroy resources. The run requires six previewed
-approval fingerprints, including the blocking source-export window, pinned
-target Worker version and manually reviewed empty routes, and exact
-Keychain-backed Wrangler wrapper and private release golden bytes. See
+rebuild Vectorize while a reviewed paused Worker is deployed, promote only its
+separately reviewed immutable active version to 100 percent, and run health
+plus release evaluation. It cannot create, upload, route, delete, or destroy
+resources. The two versions must have the same reviewed script hash and exact
+bindings except for paused mode. The run requires six previewed approval
+fingerprints, including the blocking source-export window, both pinned target
+Worker versions and manually reviewed empty routes, and exact Keychain-backed
+Wrangler wrapper and private release golden bytes. See
 `docs/RECOVERY.md` for the private artifact rules and remaining live field
 gate.
 

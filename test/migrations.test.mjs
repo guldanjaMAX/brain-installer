@@ -511,9 +511,9 @@ check("restart guard refuses an existing migration column with the wrong contrac
   check("a full bootstrap page respects the shared 100-bind D1 ceiling",
     observed.maxBinds === 100 && observed.batchWidths.every((width) => width <= 2),
     JSON.stringify(observed));
-  check("the James-sized 736,643-chunk projection has a finite resumable page plan",
-    Math.ceil(736_643 / VECTOR_BOOTSTRAP_PAGE_SIZE) === 7_441,
-    String(Math.ceil(736_643 / VECTOR_BOOTSTRAP_PAGE_SIZE)));
+  check("a synthetic million-chunk projection has a finite resumable page plan",
+    Math.ceil(1_000_000 / VECTOR_BOOTSTRAP_PAGE_SIZE) === 10_102,
+    String(Math.ceil(1_000_000 / VECTOR_BOOTSTRAP_PAGE_SIZE)));
   candidate.close();
 }
 

@@ -242,6 +242,41 @@ one. This is the failure that looks fine from every angle except the answers.
 
 ---
 
+### 5c. An update stopped during `accelerated legacy vector bootstrap`
+
+**You see:** update reports a network interruption, a six-hour safety limit, or
+an aggregate bootstrap failure. The Worker says corpus writes are paused.
+
+**Why:** a pre-0.1.15 corpus must receive an exact generation receipt for every
+legacy vector. The updater stores each accepted and confirmed 1,000-row batch
+in D1. It keeps the write barrier active when the run stops because activating
+the Worker would make an incomplete semantic projection look finished.
+
+**Fix:** run the same supported update again:
+
+```
+brain update <manifest>
+```
+
+It waits out the writer boundary again, then resumes the saved D1 batch and
+epoch. Do not run `brain deploy`, edit D1, or reset the projection cursor by
+hand. Existing retrieval remains available while source and corpus writes are
+paused.
+
+After update succeeds, require both checks:
+
+```
+brain health <manifest>
+brain test <manifest>
+```
+
+Both must report zero pending and submitted vector work with exact expected and
+actual counts.
+
+**Who:** you. Call [INSTALLER CONTACT] if the same aggregate failure repeats.
+
+---
+
 ### 6. Search works, but there are no written answers
 
 **You see:** results come back with sources, but no written answer. The response carries an `answer_error` naming one of two things.

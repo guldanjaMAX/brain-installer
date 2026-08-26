@@ -99,7 +99,13 @@ restart-safe after every independently committed statement. A D1 upgrade
 captures a required bookmark, deploys and verifies the paused compatibility
 Worker, waits the same old-invocation window, migrates, deploys active mode,
 reconciles allowed provider secrets, waits for the new version, and records
-success. Direct `brain migrate` refuses a live D1 install that needs the writer
+success. Schema 13 changes that ordering only for an existing legacy
+projection: after migration, the verified write barrier stays active while the
+Worker rebuilds durable 1,000-row batches. A bounded number of disjoint provider
+mutations may be accepted concurrently. Every row carries its D1 generation,
+and exact `getByIds` readback must match that generation before the batch
+receipt can be cleared. Only a fully verified projection permits the active
+deployment. Direct `brain migrate` refuses a live D1 install that needs the writer
 protocol migrations because it cannot prove that older Worker invocations are
 quiescent. Rollback is explicit and does not pretend Vectorize is
 transactionally restored with D1. It leaves the Worker paused until supervised
@@ -121,10 +127,11 @@ expiry are invocation-local coordination, not recoverable state. Recovery
 therefore excludes `install_state` from the raw provider export, recreates its
 reviewed singleton row with lease and mutation fields forced to SQL `NULL`, a
 corpus-derived bootstrap status/epoch, and the exact `MAX(chunk_uid)` high-water,
-then hashes that normalized row with the remaining durable data. Exact older
-migration prefixes remain inspectable by the offline verifier only. The field
-recovery runner requires schema 12 on both source and restored target before it
-can export or invoke the current drain protocol.
+then forces the bulk-bootstrap protocol/base to `NULL`/zero and excludes its
+provider-specific batch receipts before hashing the remaining durable data.
+Exact older migration prefixes remain inspectable by the offline verifier only.
+The field recovery runner requires schema 13 on both source and restored target
+before it can export or invoke the current drain protocol.
 
 ## Ingest lifecycle
 
@@ -270,9 +277,13 @@ This creates a deliberate temporary state:
 indexes or drift make the derived index untrustworthy. It cannot remove unknown
 provider-only ids, so rollback/excess recovery first requires a clean supervised
 index replacement and rebind. Reindex does not need the original source files.
-Whole-corpus rebuilds record one durable epoch and advance in 99-chunk pages.
-Re-running reindex while that epoch is in progress resumes its cursor instead
-of resetting completed pages.
+Ordinary whole-corpus reindex records one durable epoch and advances in
+conservative 99-chunk pages while the Brain remains active. A lifecycle upgrade
+has a stronger write barrier and a different scale profile: schema 13 tags
+durable 1,000-row batches, permits only disjoint batches in its bounded
+in-flight window, and confirms the exact generation of every vector before
+advancing the verified receipt. Re-running either path resumes its D1 cursor
+and provider receipts instead of resetting completed pages.
 
 ## Retrieval and answer flow
 
