@@ -2524,6 +2524,19 @@ function installStateRow(response) {
 // check, not the reason an old Worker is assumed to honor a lease it never had.
 export const VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS = 20 * 60 * 1000;
 
+/**
+ * Make the deliberately long writer-safety boundary visible to the owner.
+ * Field evidence showed that a silent wait looks exactly like a hung process,
+ * which caused a correct paused cutover to be interrupted before migration.
+ */
+export async function waitForVectorDrainCutover(waiter, { nextStep = "database migration" } = {}) {
+  const minutes = Math.ceil(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS / 60_000);
+  info(`safety pause: waiting ${minutes} minutes for older database writers to finish`);
+  info(`Keep this window open. The Worker is safely paused, but ${nextStep} has not started yet.`);
+  await waiter(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS);
+  ok(`safety pause complete; starting ${nextStep}`);
+}
+
 // A large legacy corpus can need hundreds of bulk bootstrap requests plus
 // visibility polling. Six hours is a safety boundary, not an estimate: every
 // accepted page is durable, and the supported recovery is to rerun update and
@@ -3067,7 +3080,7 @@ export async function cmdUpgrade(manifestPath, options = {}) {
             reachOnly: true,
           }));
         await runStage("vector-drain quiescence", () =>
-          waitForVectorDrainQuiescence(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS));
+          waitForVectorDrainCutover(waitForVectorDrainQuiescence));
         await runStage("migration", () => migrate(executionPin.target, {
           vectorDrainQuiesced: true,
         }));
@@ -3231,7 +3244,9 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
       reachOnly: true,
     });
     revalidateUpdateManifest(pin, "rollback paused vector-drain health verification");
-    await waitForVectorDrainQuiescence(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS);
+    await waitForVectorDrainCutover(waitForVectorDrainQuiescence, {
+      nextStep: "the D1 restore",
+    });
     revalidateUpdateManifest(pin, "rollback vector-drain quiescence");
   }
   await callCloudflare(`/accounts/${acct.id}/d1/database/${dbId}/time_travel/restore?bookmark=${encodeURIComponent(bookmark)}`, {
@@ -6709,7 +6724,7 @@ export async function cmdSetup(manifestPath, options = {}) {
           ((milliseconds) => new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds)));
         await runPinnedSetupStage(
           "setup vector-drain quiescence",
-          () => waitForVectorDrainQuiescence(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS),
+          () => waitForVectorDrainCutover(waitForVectorDrainQuiescence),
         );
         await runPinnedSetupStage(
           "setup migration",

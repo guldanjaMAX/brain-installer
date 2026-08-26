@@ -47,6 +47,7 @@ import {
   validateAcceleratedBootstrapProgress,
   validateAcceleratedBootstrapReceipt,
   VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS,
+  waitForVectorDrainCutover,
 } from "../brain.mjs";
 import { DRAIN_LEASE_TTL_MS } from "../worker/src/lib/store-d1.js";
 import { Acceptance, credentialGateRefusalVerdict } from "../acceptance.mjs";
@@ -80,6 +81,27 @@ const cutoverBody = (v, mode, protocol = "lease-v1") => JSON.stringify({
   vector_writer_protocol: protocol,
   vector_drain_mode: mode,
 });
+
+/* ---- the mandatory writer grace cannot look like a hung installer ---- */
+{
+  const output = [];
+  const priorLog = console.log;
+  let waited = null;
+  try {
+    console.log = (...values) => output.push(values.map(String).join(" "));
+    await waitForVectorDrainCutover(async (milliseconds) => { waited = milliseconds; });
+  } finally {
+    console.log = priorLog;
+  }
+  const rendered = output.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  check(
+    "the writer safety pause names its full duration and tells the owner to keep the window open",
+    waited === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS &&
+      /waiting 20 minutes/i.test(rendered) && /keep this window open/i.test(rendered) &&
+      /migration has not started yet/i.test(rendered) && /pause complete; starting database migration/i.test(rendered),
+    rendered,
+  );
+}
 const manifestFixture = (version = "0.1.9") => ({
   client: { slug: "fixture" },
   brain: { worker_name: "fixture-brain", version },

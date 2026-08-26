@@ -21,6 +21,9 @@ a rough database change counter, so already-committed batches resume cleanly.**
 - Existing schema-13 progress is retained. Re-running the update resumes its
   durable batches without deleting source documents or starting the corpus
   projection over.
+- The required 20-minute writer safety pause now says exactly what it is doing,
+  tells the owner to keep the window open, and confirms when migration starts.
+  A safe paused update no longer looks like a hung installer.
 
 After updating, run `brain status <manifest>`, `brain health <manifest>`, and
 `brain test <manifest>`. Status must report schema 13. Health and test must pass
