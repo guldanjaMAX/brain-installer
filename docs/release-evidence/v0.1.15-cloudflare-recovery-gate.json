@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "release": "0.1.15",
+  "candidate_commit": "209948b433433c6e281ba81a29571dff982c96bc",
+  "completed_at": "2026-08-26T01:11:54.833Z",
+  "environment": "fresh disposable real Cloudflare Worker, D1, Vectorize, and Workers AI",
+  "corpus": "fictional synthetic recovery fixture only",
+  "result": "passed",
+  "code_fingerprints": {
+    "recovery_adapter_sha256": "774d0200d992c98ec55f9a4fb849a1750a6697d38f6fe79ee223588a0dc2acd3",
+    "recovery_state_machine_sha256": "a34263db0db52be1da57b52eba7cd008fbaf9b67f500531743eef5259a7ee103",
+    "d1_store_sha256": "fefaff9ef15e3f8935f6779fd50b0538271c7baa7fe33ebe3da34d43362bed71",
+    "schema_13_migration_sha256": "be67ec689175ff5d15c6a091854e68d5406a80dccbb9159840eb197bd7a60c34",
+    "golden_sha256": "9e422d03e8a697e573cbaf26ee01c682e70afe6aebf2f1358dd5e5f3fbe7255f"
+  },
+  "preflight_verification": {
+    "target_user_tables": 0,
+    "target_vectors": 0,
+    "vectorize_dimensions": 768,
+    "vectorize_metric": "cosine",
+    "worker_active_deployment_percent": 100,
+    "worker_secret_names": [
+      "ADMIN_KEY"
+    ],
+    "worker_custom_domains": 0,
+    "worker_routes": 0,
+    "worker_versions_distinct_and_immutable": true,
+    "paused_and_active_bindings_differ_only_by_drain_mode": true,
+    "six_approval_fingerprints_bound": true
+  },
+  "checkpoint_verification": {
+    "forced_interruptions": [
+      "export_d1",
+      "restore_d1",
+      "rebuild_vectorize"
+    ],
+    "resumed_from_durable_provider_receipts": true,
+    "completed_stages": 8,
+    "total_stages": 8
+  },
+  "restore_verification": {
+    "documents": 55,
+    "chunks": 57,
+    "fts_rows": 57,
+    "vectors": 57,
+    "failed_vectors": 0,
+    "pending_vector_outbox": 0,
+    "source_and_restored_schema_match": true,
+    "source_and_restored_content_match": true,
+    "database_integrity": "ok"
+  },
+  "evaluation": {
+    "profile": "release",
+    "cases": 60,
+    "critical_failures": 0,
+    "unauthorized_retrievals": 0,
+    "restored_target_status": "pass"
+  },
+  "regression_discovered_and_fixed": {
+    "category": "derived outbox generation was incorrectly treated as immutable corpus content",
+    "first_target_promoted": false,
+    "raw_durable_table_export_changed": false,
+    "failed_target_reused_for_final_proof": false,
+    "fresh_second_target_field_verified": true,
+    "retry_until_lucky_used": false
+  },
+  "health_verification": {
+    "failure_count": 0,
+    "vector_backlog": 0,
+    "status": "pass"
+  },
+  "scope_note": "This proves exact schema-13 synthetic D1 export and restore, FTS recreation, resumable accelerated Vectorize rebuild, immutable paused-to-active promotion, health, and release-profile evaluation on the named candidate code. It does not certify James's corpus completeness, OCR quality, private answer accuracy, or document-level permissions."
+}

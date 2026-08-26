@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "release": "0.1.15",
+  "candidate_commit": "209948b433433c6e281ba81a29571dff982c96bc",
+  "completed_at": "2026-08-26T01:06:58.703Z",
+  "environment": "Jay-owned isolated Cloudflare preview using the same installer and update path",
+  "corpus": "10 fictional synthetic documents only",
+  "result": "passed",
+  "runtime_verification": {
+    "worker_version": "0.1.15",
+    "schema_version": 13,
+    "credential_gate_version": 4,
+    "documents": 10,
+    "chunks": 10,
+    "vectors": 10,
+    "pending_vector_operations": 0,
+    "acceptance_checks_passed": 23,
+    "acceptance_checks_failed": 0,
+    "diagnosis_critical_issues": 0
+  },
+  "release_evaluation": {
+    "golden_sha256": "238ecf9f3c6d00cace0a2543cfb04428c5e4391293e5a617478b6a085da3b0e9",
+    "profile": "release",
+    "cases": 60,
+    "executions": 180,
+    "repeat_count": 3,
+    "required_slice_minimum": 5,
+    "required_slice_failures": 0,
+    "question_pass_at_5": 1,
+    "complete_evidence_at_5": 1,
+    "slot_recall_at_5": 1,
+    "ndcg_at_10": 1,
+    "duplicate_waste_at_5": 0,
+    "unanswerable_executions": 27,
+    "honest_refusals": 27,
+    "regressions": 0,
+    "rank_changes_between_repeats": 0,
+    "hard_gates_passed": true
+  },
+  "scope_note": "This proves that a collaborator-owned Cloudflare install can take the same 0.1.15 update, remain query-ready, and pass the full synthetic release suite. It contains no James, Jay, client, medical, legal, tax, billing, credit, or other real private data. It does not replace a customer's own corpus-specific evaluation."
+}
