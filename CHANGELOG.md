@@ -147,6 +147,31 @@ failed partway through" runbook entry are both updated to match every one
 of the above, including an explicit statement that iMessage live capture
 requires a Mac in the loop with no way around it, and that Google Meet
 transcripts already land in Drive today with no connector needed at all.
+**Your brain is now a connector: it appears inside the Claude apps and
+ChatGPT, on your phone, with nothing to install.**
+
+- In Claude (Settings, Connectors) or ChatGPT (Settings, Connectors), add a
+  custom connector and paste one URL: `https://<your brain's address>/mcp`.
+  Your browser opens your brain's own approval page and you approve with
+  your passkey — the same face or fingerprint that opens the app.
+- What a connector can do is exactly what the app can: ask questions and
+  read cited answers with their confidence percentages, search your
+  documents, and read one document at a time. It can never add, change, or
+  delete anything, whatever happens to its token.
+- Connector access is yours to end at any moment: every approval is
+  individually revocable, tokens expire on their own after thirty days, and
+  Sign out everywhere ends every connector along with every device — one
+  revocation story, no special cases.
+- No outside login service is involved. The approval flow, the tokens, and
+  their storage all live inside your own Cloudflare account, like everything
+  else about your brain.
+- Also in this release: large ingests no longer stall against the database
+  write budget — batches now pack themselves to fit it, found live when a
+  two-day catch-up was refused in one over-full call.
+
+After updating, run `brain setup <manifest>` (applies migration 0015), then
+`brain mcp-config <manifest>` to see your connector URL and the exact
+click-path for each app.
 
 ## 0.1.19
 

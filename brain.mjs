@@ -3821,6 +3821,17 @@ export async function cmdMcpConfig(manifestPath) {
   );
 
   console.log(
+    `${c.bold("Claude app (phone + claude.ai) and ChatGPT")}: the brain is also a remote\n` +
+      "  connector — no software on the device at all.\n\n" +
+      `    Connector URL:  ${base}/mcp\n\n` +
+      "  Claude: Settings -> Connectors -> Add custom connector -> paste the URL.\n" +
+      "  ChatGPT: Settings -> Connectors (or Apps & Connectors) -> Create -> paste the URL.\n" +
+      "  Either way the browser opens this brain's own approval page; the owner\n" +
+      "  approves with their passkey. Connectors are read-only and die with\n" +
+      "  Sign out everywhere.\n"
+  );
+
+  console.log(
     `${c.bold("After an admin-key rotation")}: replace any older manual MCP entry with this\n` +
       "  locator-only version and restart the AI tool. Setup refreshes Claude Code and\n" +
       "  Codex registrations automatically. Claude Desktop remains a manual config update.\n"

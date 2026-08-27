@@ -36,6 +36,11 @@ import {
   handleOwnerAuth, handleAdminInvite, handleAdminDevices, validateOwnerSession,
 } from "./lib/owner-auth.js";
 import { handleZoomWebhook } from "./lib/zoom.js";
+import {
+  handleOAuthMetadata, handleProtectedResourceMetadata, handleRegister,
+  handleAuthorizePage, handleAuthorizeDecision, handleToken, validateConnectorToken,
+} from "./lib/oauth.js";
+import { handleMcp } from "./lib/mcp-endpoint.js";
 
 /* ------------------------------------------------------------ retrieval */
 
@@ -1493,6 +1498,38 @@ export default {
     if (path === "/api/webhooks/zoom") {
       if (request.method !== "POST") return jsonResponse({ error: "not found" }, 404);
       return handleZoomWebhook(env, request, ctx);
+    }
+
+    // Remote connectors (the Claude apps, ChatGPT): OAuth discovery and
+    // ceremonies in front of the gate, and the MCP endpoint guarded by the
+    // bearer token those ceremonies earn — exactly the read-only class.
+    if (path === "/.well-known/oauth-authorization-server") return handleOAuthMetadata(url);
+    if (path === "/.well-known/oauth-protected-resource") return handleProtectedResourceMetadata(url);
+    if (path === "/oauth/register" && request.method === "POST") return handleRegister(env, request);
+    if (path === "/oauth/authorize" && request.method === "GET") return handleAuthorizePage(env, url);
+    if (path === "/oauth/authorize/decision" && request.method === "POST") return handleAuthorizeDecision(env, request, url);
+    if (path === "/oauth/token" && request.method === "POST") return handleToken(env, request);
+    if (path === "/mcp") {
+      if (!(await validateConnectorToken(request, env))) {
+        return new Response(JSON.stringify({ error: "unauthorized" }), {
+          status: 401,
+          headers: {
+            "Content-Type": "application/json",
+            // RFC 9728: tells an MCP client where its OAuth discovery starts.
+            "WWW-Authenticate": `Bearer resource_metadata="${url.origin}/.well-known/oauth-protected-resource"`,
+          },
+        });
+      }
+      const internalJson = (targetPath, body) =>
+        new Request(url.origin + targetPath, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      return handleMcp(env, request, url, {
+        think: async (body) => (await handleThink(env, internalJson("/api/rag/think", body))).json(),
+        search: async (body) => (await handleUnified(env, internalJson("/api/rag/unified", body))).json(),
+      });
     }
 
     const readRoute = path === "/api/rag/unified" || path === "/api/rag/think";
