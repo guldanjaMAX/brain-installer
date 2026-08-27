@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { mintSessionCookie, validateSessionCookie, clearSessionCookie, SESSION_COOKIE } from "../src/lib/sessions.mjs";
+import { mintSessionCookie, validateSessionCookie, clearSessionCookie, SESSION_COOKIE } from "../src/lib/sessions.js";
 
 const env = { SESSION_SIGNING_KEY: "f".repeat(64) };
 const requestWith = (cookie) => new Request("https://brain.example.com/api/app/me", {

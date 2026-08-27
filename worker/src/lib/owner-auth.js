@@ -14,18 +14,18 @@
  */
 
 import { jsonResponse } from "./core.js";
-import { verifyRegistration, verifyAssertion, b64uDecode } from "./webauthn.mjs";
+import { verifyRegistration, verifyAssertion, b64uDecode } from "./webauthn.js";
 import {
   mintSessionCookie, validateSessionCookie, clearSessionCookie,
-} from "./sessions.mjs";
+} from "./sessions.js";
 import {
   issueChallenge, consumeChallenge,
   issueEnrollmentCode, peekEnrollmentCode, consumeEnrollmentCode,
   storePasskey, findPasskey, recordPasskeyUse,
   listPasskeys, renamePasskey, revokePasskey,
   sessionGeneration, bumpSessionGeneration,
-} from "./auth-store.mjs";
-import { appPageHtml } from "./app-page.mjs";
+} from "./auth-store.js";
+import { appPageHtml } from "./app-page.js";
 
 const APP_HEADER = "X-Brain-App";
 

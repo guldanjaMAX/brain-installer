@@ -31,7 +31,7 @@ import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-int
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
 import {
   handleOwnerAuth, handleAdminInvite, handleAdminDevices, validateOwnerSession,
-} from "./lib/owner-auth.mjs";
+} from "./lib/owner-auth.js";
 
 /* ------------------------------------------------------------ retrieval */
 

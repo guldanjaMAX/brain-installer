@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { verifyRegistration, verifyAssertion, b64uEncode, b64uDecode, derSignatureToRaw } from "../src/lib/webauthn.mjs";
+import { verifyRegistration, verifyAssertion, b64uEncode, b64uDecode, derSignatureToRaw } from "../src/lib/webauthn.js";
 import { makeCredential, signAssertion, clientData, attestationObject, rawSignatureToDer } from "./webauthn-fixtures.mjs";
 
 const RP = "brain.example.com";
