@@ -64,3 +64,9 @@ eval/eval.config.local.json
 brain-support-*.jsonl
 support-bundle*.json
 docs/*-readiness-*.md
+
+# Internal planning and design notes. This repository is PUBLIC and clients
+# install from it directly, so commercial reasoning, pricing strategy and
+# unshipped-gate status stay local. Product honesty about limitations belongs
+# in the shipped docs, where it is written for the owner; strategy does not.
+planning/

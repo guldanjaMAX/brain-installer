@@ -57,6 +57,15 @@ import {
   rememberInstalledManifest,
 } from "../operations/installed-manifest.mjs";
 
+// Every fixture below that says "the running package version" means exactly
+// that, so it is read from package.json rather than hardcoded. A literal here
+// broke the suite on every release bump (found 0.1.16 -> 0.1.17) while
+// asserting nothing extra: the version-alignment invariants live in
+// current-version.test.mjs.
+const RUNNING_VERSION = JSON.parse(
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"),
+).version;
+
 // Production waits the full cutover grace. Unit tests inject a zero-time
 // waiter while still asserting the exact duration requested by cmdUpgrade.
 const cmdUpgrade = (manifestPath, options = {}) => cmdUpgradeWithRealQuiescence(
@@ -159,8 +168,8 @@ const bootstrapCompletion = () => ({
   check("paused cutover health requires the expected mode and leased writer protocol",
     V({
       ok: true,
-      body: cutoverBody("0.1.16", "paused-for-upgrade"),
-      expectVersion: "0.1.16",
+      body: cutoverBody(RUNNING_VERSION, "paused-for-upgrade"),
+      expectVersion: RUNNING_VERSION,
       expectDrainMode: "paused-for-upgrade",
       attempt: 1,
       attempts: 6,
@@ -168,8 +177,8 @@ const bootstrapCompletion = () => ({
   check("version-only old health cannot masquerade as a paused compatibility worker",
     V({
       ok: true,
-      body: body("0.1.16"),
-      expectVersion: "0.1.16",
+      body: body(RUNNING_VERSION),
+      expectVersion: RUNNING_VERSION,
       expectDrainMode: "paused-for-upgrade",
       attempt: 6,
       attempts: 6,
@@ -177,8 +186,8 @@ const bootstrapCompletion = () => ({
   check("a paused compatibility Worker is retried while active mode propagates",
     V({
       ok: true,
-      body: cutoverBody("0.1.16", "paused-for-upgrade"),
-      expectVersion: "0.1.16",
+      body: cutoverBody(RUNNING_VERSION, "paused-for-upgrade"),
+      expectVersion: RUNNING_VERSION,
       expectDrainMode: "active",
       attempt: 1,
       attempts: 6,
@@ -186,8 +195,8 @@ const bootstrapCompletion = () => ({
   check("a compatibility Worker still paused after the retry budget fails closed",
     V({
       ok: true,
-      body: cutoverBody("0.1.16", "paused-for-upgrade"),
-      expectVersion: "0.1.16",
+      body: cutoverBody(RUNNING_VERSION, "paused-for-upgrade"),
+      expectVersion: RUNNING_VERSION,
       expectDrainMode: "active",
       attempt: 6,
       attempts: 6,
@@ -195,8 +204,8 @@ const bootstrapCompletion = () => ({
   check("active mode is accepted only with the leased writer protocol",
     V({
       ok: true,
-      body: cutoverBody("0.1.16", "active"),
-      expectVersion: "0.1.16",
+      body: cutoverBody(RUNNING_VERSION, "active"),
+      expectVersion: RUNNING_VERSION,
       expectDrainMode: "active",
       attempt: 2,
       attempts: 6,
@@ -532,7 +541,7 @@ const bootstrapCompletion = () => ({
     base: "https://fixture.invalid",
     adminKey: "fixture-admin-key",
     manifest: {},
-    expectVersion: "0.1.16",
+    expectVersion: RUNNING_VERSION,
     fetchImpl: async () => new Response(body("0.1.9"), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -540,7 +549,8 @@ const bootstrapCompletion = () => ({
   });
   await suite.tierReach();
   check("the full acceptance suite rejects an old Worker version",
-    suite.results[0]?.status === "fail" && /expected version 0\.1\.16/.test(suite.results[0]?.detail || ""),
+    suite.results[0]?.status === "fail" &&
+      (suite.results[0]?.detail || "").includes(`expected version ${RUNNING_VERSION}`),
     JSON.stringify(suite.results));
 }
 
@@ -555,7 +565,7 @@ const bootstrapCompletion = () => ({
   const lagged = new Acceptance({
     base: "https://fixture.invalid",
     adminKey: "fixture-admin-key",
-    manifest: manifestFixture("0.1.16"),
+    manifest: manifestFixture(RUNNING_VERSION),
     fetchImpl: async () => new Response(JSON.stringify(inventory({
       ready: false,
       reason: "accepted_mutation_processing",
@@ -575,7 +585,7 @@ const bootstrapCompletion = () => ({
   const converged = new Acceptance({
     base: "https://fixture.invalid",
     adminKey: "fixture-admin-key",
-    manifest: manifestFixture("0.1.16"),
+    manifest: manifestFixture(RUNNING_VERSION),
     fetchImpl: async () => new Response(JSON.stringify(inventory({
       ready: true,
       reason: null,
@@ -591,7 +601,7 @@ const bootstrapCompletion = () => ({
     converged.results.find((result) => result.name === "semantic index is query-ready")?.status === "pass",
     JSON.stringify(converged.results));
 
-  const omittedStorage = manifestFixture("0.1.16");
+  const omittedStorage = manifestFixture(RUNNING_VERSION);
   delete omittedStorage.infrastructure.cloudflare.storage;
   const misbound = new Acceptance({
     base: "https://fixture.invalid",
@@ -620,7 +630,7 @@ const bootstrapCompletion = () => ({
   const degraded = new Acceptance({
     base: "https://fixture.invalid",
     adminKey: "fixture-admin-key",
-    manifest: manifestFixture("0.1.16"),
+    manifest: manifestFixture(RUNNING_VERSION),
     fetchImpl: async (_url, init) => {
       const body = JSON.parse(String(init?.body || "{}"));
       return new Response(JSON.stringify({
@@ -703,7 +713,7 @@ const bootstrapCompletion = () => ({
         }
         if (/UPDATE install_state/i.test(sql)) {
           events.push("version");
-          d1Version = "0.1.16";
+          d1Version = RUNNING_VERSION;
         }
         if (/SELECT product_version FROM install_state/i.test(sql)) {
           events.push("readback");
@@ -790,7 +800,7 @@ const bootstrapCompletion = () => ({
           : options.reachOnly
             ? "health-active-cutover"
             : "health-active-final");
-        check("upgrade health requires the running package version", options.expectVersion === "0.1.16");
+        check("upgrade health requires the running package version", options.expectVersion === RUNNING_VERSION);
         if (options.expectDrainMode === "paused-for-upgrade") {
           check("the compatibility health probe is paused-mode and reach-only",
             options.reachOnly === true, JSON.stringify(options));
@@ -805,11 +815,11 @@ const bootstrapCompletion = () => ({
       cmdTest: async (path, options) => {
         executionPaths.add(path);
         events.push("test");
-        check("upgrade acceptance requires the running package version", options.expectVersion === "0.1.16");
+        check("upgrade acceptance requires the running package version", options.expectVersion === RUNNING_VERSION);
       },
       commitManifestVersion: (path, version) => {
         events.push("manifest");
-        check("manifest advances only to the running package version", version === "0.1.16");
+        check("manifest advances only to the running package version", version === RUNNING_VERSION);
         return commitManifestVersion(path, version);
       },
     });
@@ -833,7 +843,7 @@ const bootstrapCompletion = () => ({
     );
     const committedManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
     check("the original manifest commit preserves its Keychain locator without copying a credential",
-      committedManifest.brain.version === "0.1.16" &&
+      committedManifest.brain.version === RUNNING_VERSION &&
         committedManifest.operations.admin_key_secret === keychainManifest.operations.admin_key_secret &&
         !readFileSync(manifestPath, "utf8").includes(syntheticKeychainValue),
       JSON.stringify(committedManifest));
@@ -862,7 +872,7 @@ const bootstrapCompletion = () => ({
         }
         if (/UPDATE install_state/i.test(sql)) {
           events.push("version");
-          d1Version = "0.1.16";
+          d1Version = RUNNING_VERSION;
         }
         if (/SELECT product_version/i.test(sql)) {
           events.push("readback");
@@ -1114,9 +1124,9 @@ const bootstrapCompletion = () => ({
   try {
     const manifestPath = join(sandbox, "brain.manifest.json");
     writeFileSync(manifestPath, JSON.stringify(manifestFixture(), null, 2) + "\n");
-    commitManifestVersion(manifestPath, "0.1.16");
+    commitManifestVersion(manifestPath, RUNNING_VERSION);
     const committed = JSON.parse(readFileSync(manifestPath, "utf8"));
-    check("the local manifest records the verified package version", committed.brain.version === "0.1.16");
+    check("the local manifest records the verified package version", committed.brain.version === RUNNING_VERSION);
     check("the manifest commit leaves no temporary file", !readdirSync(sandbox).some((name) => name.endsWith(".tmp")));
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
@@ -1235,7 +1245,7 @@ const bootstrapCompletion = () => ({
       resolveAccount: async () => ({ id: "fixture-account" }),
       d1Query: async (_account, _database, sql) => {
         if (/sqlite_master/i.test(sql)) return { results: [] };
-        if (/UPDATE install_state/i.test(sql)) d1Version = "0.1.16";
+        if (/UPDATE install_state/i.test(sql)) d1Version = RUNNING_VERSION;
         if (/SELECT product_version FROM install_state/i.test(sql)) {
           return { results: [{ product_version: d1Version }] };
         }
@@ -1250,7 +1260,7 @@ const bootstrapCompletion = () => ({
     });
     check(
       "a successful empty install_state read follows the legacy migration path",
-      JSON.parse(readFileSync(legacyPath, "utf8")).brain.version === "0.1.16",
+      JSON.parse(readFileSync(legacyPath, "utf8")).brain.version === RUNNING_VERSION,
     );
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
@@ -1433,7 +1443,7 @@ const bootstrapCompletion = () => ({
       cmdHealth: async (_path, options) => {
         actions.push(options.expectDrainMode === "paused-for-upgrade" ? "health-paused" : "health-active");
         check("rollback proves exact paused writer mode before restore",
-          options.expectVersion === "0.1.16" && options.reachOnly === true &&
+          options.expectVersion === RUNNING_VERSION && options.reachOnly === true &&
             options.expectDrainMode === "paused-for-upgrade",
           JSON.stringify(options));
       },

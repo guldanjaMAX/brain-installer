@@ -96,6 +96,7 @@ import {
   recordSupportEvent,
 } from "./support-journal.mjs";
 import { readAdminKeyFile, validateAdminKeyValue } from "./operations/admin-key-file.mjs";
+import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
 import { guardBrainAdminFetch } from "./components/brain-http.mjs";
 import {
   adminKeyPersistencePlan,
@@ -1307,7 +1308,10 @@ export async function cmdSecrets(manifestPath, options = {}) {
   // What a D1 install actually reads. The worker embeds through the AI binding,
   // so there is no database credential to set: the brain's storage is D1 and
   // Vectorize inside the client's own account, reachable only by their worker.
-  const needed = ["ADMIN_KEY"];
+  // RAG_PROXY_KEY is derived from ADMIN_KEY, not read from the shell, so it is
+  // "needed" in the same sense: available exactly when the admin key is. Until
+  // it is set, any UI proxy has to carry the admin key, which can drain.
+  const needed = ["ADMIN_KEY", "RAG_PROXY_KEY"];
   const optional = optionalWorkerSecretNames(m);
   const explicitAdminKey = Object.hasOwn(options, "explicitAdminKey")
     ? options.explicitAdminKey
@@ -1406,7 +1410,11 @@ export async function cmdSecrets(manifestPath, options = {}) {
   await reconcileWorkerProviderSecrets(m, acct, scriptName, optional);
 
   for (const name of provided) {
-    const value = name === "ADMIN_KEY" ? adminKey : process.env[name];
+    const value = name === "ADMIN_KEY"
+      ? adminKey
+      : name === "RAG_PROXY_KEY"
+        ? deriveRagProxyKey(adminKey)
+        : process.env[name];
     try {
       await cf(`/accounts/${acct.id}/workers/scripts/${scriptName}/secrets`, {
         method: "PUT",
@@ -1423,6 +1431,18 @@ export async function cmdSecrets(manifestPath, options = {}) {
             "  secrets is safe: the deploy carries keep_bindings, so setting them afterwards\n" +
             "  sticks and later deploys preserve them. The durable ADMIN_KEY was kept for that retry."
         );
+      }
+      if (name === "RAG_PROXY_KEY") {
+        // The brain is fully usable without this key; its absence just means a
+        // UI proxy must carry the admin key, which is where every install was
+        // before this existed. Failing the whole command here would turn a
+        // working install into a broken one over a hardening improvement.
+        warn(
+          "the read-only RAG_PROXY_KEY could not be set on the Worker. The brain is fine and\n" +
+            "        ADMIN_KEY is unaffected. Until this succeeds, any UI proxy must carry the full\n" +
+            "        admin key, which can ingest, purge, reindex and drain. Rerun `brain secrets`."
+        );
+        continue;
       }
       if (name === "ADMIN_KEY") {
         die(
@@ -1478,6 +1498,14 @@ export async function cmdSecrets(manifestPath, options = {}) {
       info(
         "If Claude Desktop has a manual entry for this brain, replace it with the locator-only\n" +
           "        output from `brain mcp-config <manifest>`, then restart Claude Desktop."
+      );
+      continue;
+    }
+    if (name === "RAG_PROXY_KEY") {
+      ok("secret RAG_PROXY_KEY set, derived from this brain's admin key");
+      info(
+        "this key answers questions and nothing else. Give it to a UI proxy instead of the\n" +
+          "        admin key. Rotating ADMIN_KEY also rotates it."
       );
       continue;
     }
@@ -8169,15 +8197,57 @@ async function cmdEval(manifestPath) {
       `    2. THEN find which document should answer each one and name it.\n\n` +
       `    3. Add 4 or 5 questions you KNOW it cannot answer, marked unanswerable.\n` +
       `       These are the most valuable entries in the file.\n\n` +
-      `  Then run:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")}\n`
+      `  Then run:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")}\n` +
+      `  Or build it in a guided session instead:  --golden-20\n`
     );
     return;
+  }
+
+  if (flags["golden-20"]) {
+    // The guided Golden 20 session: the owner writes questions from memory,
+    // the brain's own retrieval locates the evidence, the owner confirms it.
+    // Cloudflare is OPTIONAL here for the same reason as scoring: the session
+    // talks to the worker over HTTPS with the admin key, so the handoff
+    // ritual keeps working after our account token is revoked.
+    const sessionAccount = m.brain?.domain ? null : await resolveAccount(m);
+    const sessionBase = await resolveBaseUrl(m, sessionAccount);
+    const sessionKey = resolveAdminKey(manifestPath);
+    if (!sessionKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
+    const { BrainClient } = await import("./eval/brain-client.mjs");
+    const { runGolden20Session } = await import("./eval/golden-20.mjs");
+    let session;
+    try {
+      session = await runGolden20Session({
+        goldenPath,
+        client: new BrainClient({ base: sessionBase, adminKey: sessionKey }),
+        askFn: ask,
+        log: (line) => console.log(line),
+        manifest: m,
+        now: () => new Date(),
+      });
+    } catch (error) {
+      die(error?.message || "the Golden 20 session failed");
+    }
+    if (session.total === 0) {
+      console.log("  No questions were written, so there is nothing to score yet.");
+      closePrompts();
+      return;
+    }
+    const scoreNow = (await ask("Score it now with the smoke profile? (y/n)", "y")).toLowerCase();
+    closePrompts();
+    if (scoreNow !== "y") {
+      console.log(`  Score later with:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")}`);
+      return;
+    }
+    // Fall through into normal scoring: build twenty, then watch them score,
+    // in one sitting. That first scorecard is the handoff artifact.
   }
 
   if (!existsSync(goldenPath)) {
     die(
       `no question set at ${relative(process.cwd(), goldenPath)}.` + "\n" +
         `  Create one with:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")} --init` + "\n" +
+        `  Or build it in a guided session:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")} --golden-20` + "\n" +
         "  It has to be YOUR questions about YOUR documents. A generic test would" + "\n" +
         "  measure nothing about this brain."
     );
@@ -8798,6 +8868,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain reindex    <manifest>            rebuild the vector index from D1, no source files needed
     brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
+    brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail  authorise the client's own Google account
     brain ingest     <manifest> --path <dir>  load a folder into the brain

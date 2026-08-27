@@ -88,7 +88,14 @@ function cloudflareHarness({ routePost = "ok", routeEnabled = true, schedule = "
   const fetchImpl = async (url, options = {}) => {
     const path = new URL(String(url)).pathname;
     const method = options.method || "GET";
-    calls.push({ path, method });
+    // Record which secret each PUT carries. A bare count cannot tell "ADMIN_KEY
+    // and the derived read-only key" apart from "the same secret written twice"
+    // or "the wrong secret written once".
+    let secretName;
+    if (method === "PUT" && path.endsWith("/secrets") && typeof options.body === "string") {
+      try { secretName = JSON.parse(options.body)?.name; } catch { secretName = "<unparseable>"; }
+    }
+    calls.push({ path, method, ...(secretName ? { secretName } : {}) });
     if (path === "/client/v4/accounts" && method === "GET") {
       return apiResponse([{ id: "fixture-account", name: "Fixture account" }]);
     }
@@ -263,7 +270,11 @@ try {
   );
   const secretWrites = secretHarness.calls.filter((call) =>
     call.method === "PUT" && call.path.endsWith("/secrets"));
-  assert.equal(secretWrites.length, 1, "the optional secret is written before the required-key failure");
+  assert.deepEqual(
+    secretWrites.map((call) => call.secretName),
+    ["SUPABASE_URL"],
+    "with no admin key there is nothing to derive from, so only the optional secret is written",
+  );
 
   const adminHarness = cloudflareHarness();
   await isolatedRuntime({
@@ -273,8 +284,13 @@ try {
       ADMIN_KEY: "fixture-admin-value".padEnd(48, "x"),
     },
   }, () => cmdSecrets(noRouteManifest, { assertKeyDirSafe: () => {} }));
-  assert.equal(adminHarness.calls.filter((call) =>
-    call.method === "PUT" && call.path.endsWith("/secrets")).length, 1);
+  assert.deepEqual(
+    adminHarness.calls
+      .filter((call) => call.method === "PUT" && call.path.endsWith("/secrets"))
+      .map((call) => call.secretName),
+    ["ADMIN_KEY", "RAG_PROXY_KEY"],
+    "a keyed install writes the admin key and the read-only key derived from it, in that order",
+  );
 
   console.log("report/deploy exit contracts: all focused tests passed");
 } finally {

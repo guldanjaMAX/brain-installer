@@ -1,0 +1,319 @@
+/**
+ * golden-20 — a guided session that builds an install's first golden question
+ * set live against the brain it will judge.
+ *
+ * The blank template asks the owner to author questions alone, and the field
+ * result of that is an empty workbook: the eval machinery exists but no client
+ * sits down with a JSON file and writes 20 questions unprompted. This session
+ * is the handoff ritual instead — operator and owner fill twenty slots
+ * together in one sitting, and the file it writes is immediately scorable by
+ * eval/run.mjs.
+ *
+ * Two invariants carried over from the workbook, because they are what make
+ * the score mean anything:
+ *
+ *   Questions are written FROM MEMORY, before any retrieval is shown. The
+ *   session runs retrieval only AFTER the question text is committed, so the
+ *   wording cannot borrow from the document that will answer it.
+ *
+ *   Unanswerable questions are first-class. Five of the twenty slots are
+ *   things the brain must refuse, because a brain that confabulates an answer
+ *   to a question about a deal that never happened is more dangerous than one
+ *   that misses a real document.
+ *
+ * The retrieval-assisted step is the reason this takes twenty minutes instead
+ * of an afternoon: the owner never hand-locates evidence references. The
+ * session runs their question, shows the distinct documents that came back,
+ * and the ones they confirm become the expect entry via the same identity
+ * scheme the scorer matches on (identitiesOf), so Drive evidence stays stable
+ * across re-indexes.
+ *
+ * Dependencies are injected (client, askFn, log, now) so the whole session is
+ * testable with a scripted terminal and a fake brain. Only the private-file
+ * write touches the filesystem directly, with the same O_EXCL 0600 discipline
+ * as writePrivateEvalTemplate: the file holds real names and real figures the
+ * moment the first question lands.
+ */
+
+import {
+  closeSync, constants as fsConstants, chmodSync, fstatSync, fsyncSync,
+  lstatSync, openSync, readFileSync, unlinkSync, writeFileSync, existsSync,
+} from "node:fs";
+import { dirname, resolve } from "node:path";
+
+import { dedupeByDocument, identitiesOf } from "./scorer.mjs";
+import { validateGolden } from "./golden-validation.mjs";
+
+/**
+ * The Golden 20. Kind names are the executable query-kind vocabulary the
+ * validator and release slices already use; the mix mirrors the categories
+ * that found real defects in field probing (2026-08-26): stale current-state
+ * answers surface under `temporal`, speaker misattribution under `person`,
+ * confabulation under `unanswerable`.
+ */
+export const GOLDEN_20_PLAN = [
+  {
+    kind: "single", count: 6,
+    coach: "A fact one document should answer: a price, a date, a decision, a clause.",
+  },
+  {
+    kind: "multi", count: 3,
+    coach: "An answer needing TWO OR MORE documents together. Confirm every required document; each becomes required evidence.",
+  },
+  {
+    kind: "temporal", count: 3,
+    coach: "Something that CHANGED: a current status, an address, a rate. The newest truth must beat the best-attested old one.",
+  },
+  {
+    kind: "person", count: 3,
+    coach: "Who said or did a thing, where mixing people up would matter.",
+  },
+  {
+    kind: "unanswerable", count: 5,
+    coach: "Something plausible the brain genuinely does NOT have: a deal that never happened, a policy never written. It must refuse.",
+  },
+];
+
+export const GOLDEN_20_TARGET = GOLDEN_20_PLAN.reduce((n, s) => n + s.count, 0);
+
+/** Sounds like a refusal, for the informational unanswerable live check only. */
+const REFUSAL_HINT =
+  /do(es)? not (contain|answer|mention|include)|no (information|mention|record)|nothing recorded|not (found|recorded|mentioned)|cannot answer|unable to answer/i;
+
+/**
+ * Create-or-rewrite a private golden file. Creation is O_EXCL 0600 so a
+ * concurrent writer or a pre-placed symlink cannot capture the content; a
+ * rewrite (the session saves after every slot, so a crash costs one question,
+ * not twenty) first proves the path is still a regular single-link file.
+ */
+export function writeGoldenPrivate(destination, golden) {
+  const path = resolve(destination);
+  const payload = JSON.stringify(golden, null, 2) + "\n";
+  if (existsSync(path)) {
+    const identity = lstatSync(path);
+    if (!identity.isFile() || identity.isSymbolicLink() || identity.nlink !== 1) {
+      throw new Error("the golden set destination is no longer a private regular file");
+    }
+    writeFileSync(path, payload, { mode: 0o600 });
+    if (process.platform !== "win32") chmodSync(path, 0o600);
+    return path;
+  }
+  const parent = lstatSync(dirname(path));
+  if (!parent.isDirectory() || parent.isSymbolicLink()) {
+    throw new Error("the golden set directory must be a real directory, not a link");
+  }
+  let descriptor = null;
+  let created = false;
+  try {
+    descriptor = openSync(
+      path,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW || 0),
+      0o600,
+    );
+    created = true;
+    const identity = fstatSync(descriptor);
+    if (!identity.isFile() || identity.nlink !== 1) {
+      throw new Error("the golden set destination is not a private regular file");
+    }
+    writeFileSync(descriptor, payload);
+    fsyncSync(descriptor);
+    if (process.platform !== "win32") chmodSync(path, 0o600);
+  } catch (error) {
+    if (descriptor !== null) {
+      try { closeSync(descriptor); } catch { /* cleanup below still runs */ }
+      descriptor = null;
+    }
+    if (created) {
+      try { unlinkSync(path); } catch { /* never hide the original failure */ }
+    }
+    throw error;
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
+  return path;
+}
+
+function loadOrStartGolden(goldenPath, manifest, now) {
+  if (existsSync(goldenPath)) {
+    const golden = JSON.parse(readFileSync(goldenPath, "utf8"));
+    if (!Array.isArray(golden.questions)) golden.questions = [];
+    return golden;
+  }
+  return {
+    install: manifest?.client?.slug || "install",
+    brain_label: manifest?.client?.display_name || manifest?.client?.slug || "brain",
+    created: now().toISOString().slice(0, 10),
+    built_by: "the owner and the operator, in a guided Golden 20 session",
+    _how_to_read_this: [
+      "Built with `brain eval --golden-20`: each question was written from",
+      "memory BEFORE retrieval ran, then the owner confirmed which returned",
+      "documents are the right evidence. Unanswerable entries are questions",
+      "the brain must refuse. Score with `brain eval <manifest>`.",
+    ],
+    questions: [],
+  };
+}
+
+function nextQuestionId(golden) {
+  const taken = new Set(golden.questions.map((q) => String(q.id)));
+  for (let n = golden.questions.length + 1; ; n++) {
+    const id = `g${String(n).padStart(2, "0")}`;
+    if (!taken.has(id)) return id;
+  }
+}
+
+/** Remaining slots per kind after whatever an earlier session already wrote. */
+export function remainingPlan(golden, plan = GOLDEN_20_PLAN) {
+  const have = {};
+  for (const q of golden.questions) have[q.kind] = (have[q.kind] || 0) + 1;
+  return plan
+    .map((slot) => ({ ...slot, count: Math.max(0, slot.count - (have[slot.kind] || 0)) }))
+    .filter((slot) => slot.count > 0);
+}
+
+function parsePicks(text, max) {
+  const picks = [];
+  for (const piece of String(text).split(/[\s,]+/)) {
+    if (!piece) continue;
+    if (!/^\d+$/.test(piece)) return null;
+    const n = Number(piece);
+    if (n < 1 || n > max || picks.includes(n)) return null;
+    picks.push(n);
+  }
+  return picks.length ? picks : null;
+}
+
+async function captureEvidence({ kind, question, client, askFn, log }) {
+  let results = [];
+  try {
+    results = dedupeByDocument(await client.retrieve(question, { limit: 10 }));
+  } catch (error) {
+    log(`  retrieval failed (${error.message}); you can still name the document yourself.`);
+  }
+  const shown = results.slice(0, 8);
+  if (shown.length) {
+    log("  The brain returned these documents:");
+    shown.forEach((r, i) => {
+      const title = String(r.title || r.ref_key || "untitled").slice(0, 96);
+      log(`    ${i + 1}. [${r.source || "unknown"}] ${title}`);
+    });
+  } else {
+    log("  The brain returned nothing for this question.");
+  }
+  const picked = parsePicks(
+    await askFn("Which are the RIGHT source documents? (numbers like 1 or 1,3 — n for none)", "n"),
+    shown.length,
+  );
+  if (picked) {
+    const chosen = picked.map((n) => shown[n - 1]);
+    if (kind === "multi") {
+      // Required together: an answer assembled from half the evidence is not
+      // an answer, so each confirmed document is its own required slot.
+      return chosen.map((r) => ({
+        doc: String(r.title || r.ref_key || "untitled"),
+        any_of: identitiesOf(r),
+      }));
+    }
+    // Alternates for the same fact: any one of the confirmed documents
+    // satisfies the question, so their identities share one slot.
+    return [{
+      doc: String(chosen[0].title || chosen[0].ref_key || "untitled"),
+      any_of: chosen.flatMap((r) => identitiesOf(r)),
+    }];
+  }
+  const fallback = (await askFn(
+    "None were right. (u) it is actually unanswerable, (t) type the document title, (s) skip",
+    "s",
+  )).toLowerCase();
+  if (fallback === "u") return "unanswerable";
+  if (fallback === "t") {
+    const doc = await askFn("Document title, as ingested");
+    if (!doc) return "skip";
+    const source = await askFn("Its source (drive, curated, message, ...)", "drive");
+    // Title-only evidence: honest about being weaker than a confirmed
+    // reference, and the validator requires the source to be named.
+    return [{ doc, source }];
+  }
+  return "skip";
+}
+
+/**
+ * Run the guided session. Returns { added, skipped, total, complete, path }.
+ * Throws on an unreadable existing file or an unwritable destination; a
+ * retrieval or think failure never aborts a session someone is sitting in.
+ */
+export async function runGolden20Session({
+  goldenPath,
+  client,
+  askFn,
+  log = () => {},
+  manifest = null,
+  now = () => new Date(),
+  plan = GOLDEN_20_PLAN,
+}) {
+  const golden = loadOrStartGolden(goldenPath, manifest, now);
+  const slots = remainingPlan(golden, plan);
+  const target = plan.reduce((n, s) => n + s.count, 0);
+  if (!slots.length) {
+    log(`  ${goldenPath} already holds a complete set of ${golden.questions.length}. Nothing to add.`);
+    return { added: 0, skipped: 0, total: golden.questions.length, complete: true, path: goldenPath };
+  }
+
+  log("");
+  log(`  Golden ${target} — ${golden.questions.length} written, ${slots.reduce((n, s) => n + s.count, 0)} to go.`);
+  log("  Write each question FROM MEMORY. Do not open files: a question written");
+  log("  while reading a document borrows its wording and flatters the score.");
+  log("  A blank question skips the slot; re-run --golden-20 later to finish.");
+
+  let added = 0;
+  let skipped = 0;
+  for (const slot of slots) {
+    for (let i = 0; i < slot.count; i++) {
+      log("");
+      log(`  [${slot.kind}] ${slot.coach}`);
+      const question = await askFn("Question");
+      if (!question) {
+        skipped++;
+        continue;
+      }
+
+      const entry = { id: nextQuestionId(golden), kind: slot.kind, question };
+      if (slot.kind === "unanswerable") {
+        // Informational only: show today's behaviour, store no expectation.
+        // The scorer is the judge; this is the owner watching it refuse.
+        try {
+          const thought = await client.think(question, { limit: 6 });
+          const refused = thought?.answer == null || REFUSAL_HINT.test(String(thought.answer));
+          log(refused
+            ? "  Good: the brain refuses this today."
+            : "  Careful: the brain ANSWERED this today. The eval will fail here until that confabulation is fixed — which is the point.");
+        } catch {
+          log("  (could not run the live refusal check; the eval will still test it)");
+        }
+      } else {
+        const evidence = await captureEvidence({ kind: slot.kind, question, client, askFn, log });
+        if (evidence === "skip") {
+          skipped++;
+          continue;
+        }
+        if (evidence === "unanswerable") entry.kind = "unanswerable";
+        else entry.expect = evidence;
+      }
+
+      golden.questions.push(entry);
+      // Save after every accepted slot: a crash costs one question, not the
+      // twenty minutes the owner just spent.
+      writeGoldenPrivate(goldenPath, golden);
+      added++;
+    }
+  }
+
+  if (golden.questions.length) {
+    validateGolden(golden, goldenPath);
+    writeGoldenPrivate(goldenPath, golden);
+  }
+  const complete = remainingPlan(golden, plan).length === 0;
+  log("");
+  log(`  ${golden.questions.length}/${target} questions on file${complete ? " — the set is complete." : `; ${skipped} slot(s) skipped for later.`}`);
+  return { added, skipped, total: golden.questions.length, complete, path: goldenPath };
+}

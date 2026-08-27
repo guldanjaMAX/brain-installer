@@ -4,6 +4,32 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.17
+
+**`brain eval --golden-20` builds your acceptance question set with you, live
+against your brain, in one sitting.**
+
+- Twenty slots with a fixed mix: six single-document facts, three answers that
+  need several documents together, three things that changed over time, three
+  who-said-what questions, and five questions the brain must refuse because the
+  right answer does not exist anywhere in your documents.
+- You write every question from memory, BEFORE retrieval runs, so the wording
+  cannot borrow from the document that will answer it and flatter the score.
+- After each question, the brain's own retrieval shows what it found and you
+  confirm which documents are the right evidence — no hand-editing JSON, no
+  hunting for references. Drive evidence is recorded by stable file identity,
+  so the set keeps working after a re-index.
+- Each unanswerable question is checked live on the spot: the session tells you
+  whether the brain refuses it today or invents an answer, which is exactly
+  what you want to see before trusting it with something that matters.
+- The file saves after every question. An interrupted session loses nothing;
+  run `--golden-20` again to fill the remaining slots.
+- The session ends by offering to score the set immediately. That first
+  scorecard — your brain, judged on your questions — is the handoff artifact.
+
+After updating, run `brain eval <manifest> --golden-20` sitting next to the
+person who owns the brain. Existing golden sets and scoring are unchanged.
+
 ## 0.1.16
 
 **Large Cloudflare upgrades now trust exact vector identity readback instead of
