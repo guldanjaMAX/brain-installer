@@ -110,6 +110,7 @@ const expected = [
   "onboarding/08-provisioning-prerequisites.md",
   "operations/admin-key-file.mjs",
   "operations/admin-key-persistence.mjs",
+  "operations/cloudflare-token-store.mjs",
   "operations/rag-proxy-key.mjs",
   "operations/curated-dual-sync.mjs",
   "operations/curated-sync-scheduler.mjs",

@@ -96,6 +96,13 @@ import {
   recordSupportEvent,
 } from "./support-journal.mjs";
 import { readAdminKeyFile, validateAdminKeyValue } from "./operations/admin-key-file.mjs";
+import {
+  loadStoredCloudflareToken,
+  storeCloudflareToken,
+  forgetCloudflareToken,
+  hasStoredCloudflareToken,
+  storedTokenReference,
+} from "./operations/cloudflare-token-store.mjs";
 import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
 import { guardBrainAdminFetch } from "./components/brain-http.mjs";
 import { confidenceLine } from "./worker/src/lib/confidence.js";
@@ -411,6 +418,30 @@ export function readHiddenCloudflareToken({ input = process.stdin, output = proc
 
 export async function withCloudflareToken(action, options = {}) {
   if (cloudflareTokenAvailable()) return action();
+
+  // Durable per-account copy: one paste per machine, ever. Attempted only
+  // when the caller names the account — a keyless lookup could hand a
+  // neighbouring account's token to the wrong install, and test paths that
+  // pass no accountId keep their exact historical behavior.
+  if (options.accountId) {
+    let stored = null;
+    try {
+      stored = (options.loadStoredCloudflareToken ?? loadStoredCloudflareToken)(options.accountId);
+    } catch (error) {
+      // A broken keychain must present as itself, not as an every-run prompt.
+      warn(String(error?.message || error));
+    }
+    if (stored) {
+      return cloudflareTokenSession.run(stored, async () => {
+        try {
+          return await action();
+        } finally {
+          stored.fill(0);
+        }
+      });
+    }
+  }
+
   const prompt = options.readCloudflareToken ?? readHiddenCloudflareToken;
   const prompted = await prompt();
   let entered;
@@ -419,6 +450,28 @@ export async function withCloudflareToken(action, options = {}) {
   } finally {
     if (Buffer.isBuffer(prompted)) prompted.fill(0);
   }
+
+  // Offer to remember it, once, right after a successful manual entry. Gated
+  // on a named account, macOS, and a real terminal: automation and tests
+  // must never write to a keychain as a side effect.
+  if (options.accountId &&
+      (options.platform ?? process.platform) === "darwin" &&
+      (options.interactive ?? process.stdin.isTTY)) {
+    const askFn = options.askFn ?? ask;
+    const save = (await askFn(
+      `Remember this token for account ${options.accountId} in this Mac's Keychain, so future runs skip the prompt? (y/n)`,
+      "y",
+    )).toLowerCase();
+    if (save === "y") {
+      try {
+        (options.storeCloudflareToken ?? storeCloudflareToken)(options.accountId, entered);
+        ok("token stored. Remove it any time with: brain token <manifest> --forget");
+      } catch (error) {
+        warn(`could not store the token (${String(error?.message || error)}); continuing without saving`);
+      }
+    }
+  }
+
   return cloudflareTokenSession.run(entered, async () => {
     try {
       return await action();
@@ -8753,12 +8806,39 @@ async function cmdSchedule(manifestPath) {
   return result;
 }
 
+/** The account this manifest provisions into, for the per-account token store. */
+function manifestAccountId(manifestPath) {
+  try {
+    return loadManifest(manifestPath).m?.infrastructure?.cloudflare?.account_id || null;
+  } catch {
+    return null; // the command's own manifest load reports the real problem
+  }
+}
+
 async function cmdSetupInteractive(manifestPath) {
-  return withCloudflareToken(() => cmdSetup(manifestPath));
+  return withCloudflareToken(() => cmdSetup(manifestPath), { accountId: manifestAccountId(manifestPath) });
 }
 
 async function cmdUpgradeInteractive(manifestPath) {
-  return withCloudflareToken(() => cmdUpgrade(manifestPath));
+  return withCloudflareToken(() => cmdUpgrade(manifestPath), { accountId: manifestAccountId(manifestPath) });
+}
+
+/** Is a Cloudflare token stored on this machine for this install's account? */
+async function cmdToken(manifestPath) {
+  const flags = parseFlags(process.argv.slice(3));
+  const accountId = manifestAccountId(manifestPath);
+  if (!accountId) die("this manifest names no Cloudflare account, so there is no token slot to inspect.");
+  if (flags.forget) {
+    const removed = forgetCloudflareToken(accountId);
+    if (removed) ok(`stored Cloudflare token removed (${storedTokenReference(accountId)})`);
+    else info(`nothing stored for this account (${storedTokenReference(accountId)})`);
+    return;
+  }
+  info(hasStoredCloudflareToken(accountId)
+    ? `a Cloudflare token is stored for this account: ${storedTokenReference(accountId)}.\n` +
+      "      Provisioning runs load it automatically. Remove it with --forget — and always at client handoff:\n" +
+      "      revoking the token in Cloudflare does not delete this machine's stored copy."
+    : `nothing stored (${storedTokenReference(accountId)}). The next interactive setup or update will prompt once and offer to remember it.`);
 }
 
 /** Beginner update path: verify custody first, then run the fully gated upgrade. */
@@ -8803,7 +8883,7 @@ export async function cmdUpdate(manifestPath, options = {}) {
       }
     }
     return upgradeResult;
-  }, options);
+  }, { accountId: manifestAccountId(pin.target), ...options });
 }
 
 export async function cmdRollbackInteractive(manifestPath, bookmarkArg, options = {}) {
@@ -8814,7 +8894,7 @@ export async function cmdRollbackInteractive(manifestPath, bookmarkArg, options 
       ...(options.rollbackOptions || {}),
       confirmed: true,
     }),
-    options,
+    { accountId: manifestAccountId(manifestPath), ...options },
   );
 }
 
@@ -8852,6 +8932,7 @@ const commands = {
   reindex: cmdReindex,
   diagnose: cmdDiagnose,
   eval: cmdEval,
+  token: cmdToken,
   update: cmdUpdate,
   upgrade: cmdUpgradeInteractive,
   rollback: dispatchRollback,
@@ -8877,6 +8958,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it
+    brain token      <manifest>            is a Cloudflare token remembered on this Mac? --forget removes it
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail  authorise the client's own Google account
     brain ingest     <manifest> --path <dir>  load a folder into the brain

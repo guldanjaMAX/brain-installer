@@ -4,6 +4,34 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.18
+
+**Type your Cloudflare token once per computer, not once per command.**
+
+- The first interactive `brain setup` or `brain update` on a machine still
+  prompts for the token with hidden entry — and now offers to remember it in
+  the macOS Keychain. Say yes once and every later provisioning run on that
+  machine loads it automatically. Routine commands (`ask`, `eval`, `health`,
+  `test`) never needed it and still don't.
+- Storage is per Cloudflare account, so a machine that manages several
+  accounts can never provision one install with a neighbour's token. The
+  token never appears in a command line, a file, or a log — it moves between
+  the prompt and the Keychain the same guarded way the admin key always has.
+- `brain token <manifest>` shows whether a token is remembered for that
+  install's account; `brain token <manifest> --forget` removes it. Client
+  handoff now includes that forget step explicitly: revoking a token in
+  Cloudflare does not delete a stored copy, so the handoff ritual does both,
+  with the client watching.
+- New computer, or this one dies? Nothing is lost: mint a fresh token in the
+  Cloudflare dashboard (one minute) and the first run on the new machine
+  offers to remember it. Fresh token per machine also means one laptop can be
+  revoked without touching the others. `CLOUDFLARE_API_TOKEN` from a secret
+  manager still wins for automation, unchanged.
+
+After updating, run `brain setup <manifest>` once interactively, accept the
+offer, then run it again and watch it skip the prompt. `brain token
+<manifest>` confirms what is stored.
+
 ## 0.1.17
 
 **`brain eval --golden-20` builds your acceptance question set with you, live

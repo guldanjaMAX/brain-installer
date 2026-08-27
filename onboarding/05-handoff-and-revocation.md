@@ -18,6 +18,7 @@ At **[TIME] on [DATE]**, with you watching:
 | What | Action | Result |
 |---|---|---|
 | My Cloudflare API token for your account | Deleted | I can no longer see, deploy to, or delete anything in your Cloudflare account |
+| The stored copy of that token on my computer | Removed with `brain token <manifest> --forget`, with you watching | My machine's keychain holds nothing for your account — a revoked token must also stop existing locally, not linger as clutter |
 | My access to your [Google Drive folders / source] | Removed by you | I can no longer read any of your source material |
 | Your admin key | Rotated by you, to a value I have never seen | I cannot query your brain, even at its public address |
 
