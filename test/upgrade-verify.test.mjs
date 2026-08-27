@@ -1067,6 +1067,17 @@ const bootstrapCompletion = () => ({
       /run brain update again/i.test(migrationFailure.error?.message || ""),
     JSON.stringify({ ...migrationFailure, error: migrationFailure.error?.message }));
 
+  // The pause itself is correct: a half-migrated schema must not meet live
+  // writers. What was wrong is that the operator was never told, so one field
+  // install sat unable to accept a document for eight days while /health
+  // reported ok. A failure inside the paused window has to say so.
+  const pausedWarning = /CANNOT ACCEPT DOCUMENTS/i;
+  check("a failure inside the paused window tells the operator the brain is not accepting documents",
+    pausedWarning.test(migrationFailure.error?.message || "") &&
+      /do not clear VECTOR_DRAIN_MODE by hand/i.test(migrationFailure.error?.message || "") &&
+      /brain health/i.test(migrationFailure.error?.message || ""),
+    migrationFailure.error?.message);
+
   const deployFailure = await runFailure("active-deploy");
   check("an ambiguous final upload stops before health, acceptance, and version commits",
     deployFailure.events.join(",") === "deploy-paused,health-paused-reach,wait,migrate-true,bootstrap,deploy-active" &&
@@ -1108,6 +1119,9 @@ const bootstrapCompletion = () => ({
     JSON.stringify({ ...activeHealthFailure, error: activeHealthFailure.error?.message }));
 
   const convergenceFailure = await runFailure("convergence");
+  check("a failure after writes resume does NOT claim the brain is paused",
+    !/CANNOT ACCEPT DOCUMENTS/i.test(convergenceFailure.error?.message || ""),
+    convergenceFailure.error?.message);
   check("an incomplete projection bootstrap blocks health, acceptance, and every version commit",
     convergenceFailure.events.join(",") ===
       "deploy-paused,health-paused-reach,wait,migrate-true,bootstrap,deploy-active,health-active-reach,reconcile,converge" &&

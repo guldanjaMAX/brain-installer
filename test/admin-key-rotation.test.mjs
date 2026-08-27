@@ -434,6 +434,7 @@ try {
     "persist:ADMIN_KEY",
     "remote:ADMIN_KEY",
     "remote:RAG_PROXY_KEY",
+    "remote:SESSION_SIGNING_KEY",
   ]);
   assert.equal(readAdminKeyFile(join(cliAdjacentDir, ".brain-admin-key")), replacementKey);
   assert.equal(adjacentRun.output.includes(replacementKey), false);
@@ -464,6 +465,7 @@ try {
     "delete:SUPABASE_SERVICE_ROLE_KEY",
     "remote:ADMIN_KEY",
     "remote:RAG_PROXY_KEY",
+    "remote:SESSION_SIGNING_KEY",
   ]);
   assert.equal(
     cleanupEvents.includes("delete:UNRELATED_FIXTURE_SECRET"),
@@ -493,6 +495,7 @@ try {
     "account",
     "remote:ADMIN_KEY",
     "remote:RAG_PROXY_KEY",
+    "remote:SESSION_SIGNING_KEY",
     "remote:SUPABASE_URL",
     "remote:SUPABASE_SERVICE_ROLE_KEY",
   ]);
@@ -519,6 +522,7 @@ try {
     "account",
     "remote:ADMIN_KEY",
     "remote:RAG_PROXY_KEY",
+    "remote:SESSION_SIGNING_KEY",
     "remote:ANTHROPIC_API_KEY",
   ]);
 
@@ -850,7 +854,7 @@ try {
     platform: "darwin",
     persistenceOptions: { runChild: cliKeychain.runChild, environment: { ADMIN_KEY: replacementKey } },
   }));
-  assert.deepEqual(keychainEvents, ["account", "remote:ADMIN_KEY", "remote:RAG_PROXY_KEY"]);
+  assert.deepEqual(keychainEvents, ["account", "remote:ADMIN_KEY", "remote:RAG_PROXY_KEY", "remote:SESSION_SIGNING_KEY"]);
   assert.equal(cliKeychain.stored, replacementKey);
   assert.equal(existsSync(join(cliKeychainDir, ".brain-admin-key")), false);
   assert.equal(keychainRun.output.includes(replacementKey), false);
@@ -925,7 +929,7 @@ try {
       throw new Error("a no-env retry must not rewrite durable desired state");
     },
   }));
-  assert.deepEqual(retryEvents, ["account", "remote:ADMIN_KEY", "remote:RAG_PROXY_KEY"]);
+  assert.deepEqual(retryEvents, ["account", "remote:ADMIN_KEY", "remote:RAG_PROXY_KEY", "remote:SESSION_SIGNING_KEY"]);
   assert.equal(retryRun.output.includes(replacementKey), false);
 
   /* Account resolution is read-only and occurs before local desired state changes. */

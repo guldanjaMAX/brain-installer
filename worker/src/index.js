@@ -29,6 +29,9 @@ import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, 
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
+import {
+  handleOwnerAuth, handleAdminInvite, handleAdminDevices, validateOwnerSession,
+} from "./lib/owner-auth.mjs";
 
 /* ------------------------------------------------------------ retrieval */
 
@@ -1400,20 +1403,46 @@ export default {
     const path = url.pathname;
 
     if (path === "/health") {
+      // ok reports whether this brain can do its job, not whether the Worker
+      // is running. A paused install returns 503 on seven write paths
+      // including ingest, so it cannot accept a document. Reporting ok:true
+      // through that turned one failed update into eight silent days in the
+      // field: the owner dropped nothing in, and no monitor watching this
+      // route had any reason to say otherwise. The HTTP status stays 200 on
+      // purpose, because update's own paused-mode probe has to succeed while
+      // the pause is deliberately in force.
+      const paused = env.VECTOR_DRAIN_MODE === "paused-for-upgrade";
       return jsonResponse({
-        ok: true,
+        ok: !paused,
+        status: paused ? "paused-for-upgrade" : "ok",
+        ...(paused
+          ? {
+            reason: "This brain cannot accept documents right now. An update " +
+              "paused its corpus writes and did not finish. Anything added " +
+              "while it is paused is refused rather than stored.",
+            accepting_documents: false,
+          }
+          : { accepting_documents: true }),
         brain: env.BRAIN_NAME || "brain",
         version: env.BRAIN_VERSION || "0.1.0",
         vector_writer_protocol: "lease-v1",
-        vector_drain_mode: env.VECTOR_DRAIN_MODE === "paused-for-upgrade"
-          ? "paused-for-upgrade"
-          : "active",
+        vector_drain_mode: paused ? "paused-for-upgrade" : "active",
         ts: new Date().toISOString(),
       });
     }
 
+    // Owner surface: /app and the passkey ceremonies sit in FRONT of the key
+    // gate — their auth is the ceremony itself, or the session cookie a
+    // ceremony earned. Nothing routed there reaches past the read-only
+    // privilege class (see owner-auth.mjs).
+    if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/")) {
+      return handleOwnerAuth(env, request, url, path);
+    }
+
     const readRoute = path === "/api/rag/unified" || path === "/api/rag/think";
-    if (!(readRoute ? validateReadKey(request, env) : validateAdminKey(request, env))) {
+    const keyAuthorized = readRoute ? validateReadKey(request, env) : validateAdminKey(request, env);
+    // A passkey session is accepted exactly where the read-only proxy key is.
+    if (!keyAuthorized && !(readRoute && await validateOwnerSession(request, env))) {
       return jsonResponse({ error: "unauthorized" }, 401);
     }
 
@@ -1434,6 +1463,12 @@ export default {
       }
       if (path === "/api/rag/think" && request.method === "POST") {
         return privateNoStore(await handleThink(env, request));
+      }
+      if (path === "/api/admin/auth/invite" && request.method === "POST") {
+        return handleAdminInvite(env, url);
+      }
+      if (path.startsWith("/api/admin/auth/devices")) {
+        return handleAdminDevices(env, request, path);
       }
       if (path === "/api/admin/brain/ingest" && request.method === "POST") {
         return await handleIngest(env, request);

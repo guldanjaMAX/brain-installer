@@ -158,6 +158,7 @@ const installStateColumns = Object.freeze([
   ["vector_projection_bootstrap_high_water", "TEXT"],
   ["vector_projection_bootstrap_protocol", "TEXT"],
   ["vector_projection_bootstrap_base_count", "INTEGER"],
+  ["session_generation", "INTEGER"],
 ]);
 const fixtureInstallState = Object.freeze({
   id: 1,
@@ -182,10 +183,13 @@ const fixtureInstallState = Object.freeze({
   // recovery into the target's new index.
   vector_projection_bootstrap_protocol: "bootstrap-v2",
   vector_projection_bootstrap_base_count: 5,
+  // Live owner-session coordination; zero-normalized on export like the
+  // outbox generation, so a recovery never resurrects old session cookies.
+  session_generation: 4,
 });
 const normalizedInstallStateSql =
   `INSERT INTO "install_state" (${installStateColumns.map(([name]) => `"${name}"`).join(",")}) VALUES (` +
-  `1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,0,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004',NULL,0);\n`;
+  `1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,0,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004',NULL,0,0);\n`;
 const schemaRows = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((name) => ({
     type: "table",
@@ -469,9 +473,11 @@ function providerHarness({
   promotionNoop = false,
   readinessLagAfterBootstrap = false,
   sourceDrainLease = false,
-  sourceMigrationVersion = 13,
+  // Current-protocol installs report whatever the newest real migration is,
+  // so a new additive migration never breaks these fixtures (found 13 -> 14).
+  sourceMigrationVersion = appliedMigrations.at(-1).version,
   targetChunkCount = 5,
-  targetMigrationVersion = 13,
+  targetMigrationVersion = appliedMigrations.at(-1).version,
   sourceInstallStateMissing = false,
   splitTargetDeployment = false,
   targetVersionId = pausedWorkerVersionId,
@@ -697,6 +703,7 @@ function providerHarness({
         assert.match(sql, /\(SELECT MAX\(chunk_uid\) FROM chunks\) AS "vector_projection_bootstrap_high_water"/);
         assert.match(sql, /NULL AS "vector_projection_bootstrap_protocol"/);
         assert.match(sql, /0 AS "vector_projection_bootstrap_base_count"/);
+        assert.match(sql, /0 AS "session_generation"/);
         normalizedLeaseSelections++;
         rows = sourceInstallStateMissing ? [] : [{
           ...fixtureInstallState,
@@ -713,6 +720,7 @@ function providerHarness({
           vector_projection_bootstrap_high_water: "fixture:chunk#0004",
           vector_projection_bootstrap_protocol: null,
           vector_projection_bootstrap_base_count: 0,
+          session_generation: 0,
         }];
       } else if (/SELECT name FROM sqlite_schema/.test(sql)) {
         rows = [...RECOVERY_DURABLE_TABLES].sort().map((name) => ({ name }));

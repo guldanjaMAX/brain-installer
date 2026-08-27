@@ -113,6 +113,13 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "vector_bootstrap_batches",
   "corpus_stats",
   "sync_runs",
+  // Schema 14: the owner's enrolled passkeys are durable (losing them on a
+  // recovery would lock every device out until a new invite); challenges and
+  // enrollment codes are single-use fifteen-minute security state and are
+  // deliberately NOT exported below.
+  "owner_passkeys",
+  "auth_challenges",
+  "enrollment_codes",
 ]);
 
 /**
@@ -124,7 +131,10 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
 export const RECOVERY_EXPORT_TABLES = Object.freeze(
   RECOVERY_DURABLE_TABLES.filter((table) =>
     table !== "vector_outbox" && table !== "vector_bootstrap_batches" &&
-      table !== "install_state"),
+      table !== "install_state" &&
+      // Live single-use auth material never enters a resumable artifact: a
+      // recovered brain re-issues challenges and invites from scratch.
+      table !== "auth_challenges" && table !== "enrollment_codes"),
 );
 
 const SAFE_WRANGLER_PREFIXES = Object.freeze([
@@ -190,8 +200,16 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   // queue itself so corpus fingerprints remain stable across safe retries.
   "outbox_generation",
   "vector_projection_bootstrap_base_count",
+  // Owner session state is live coordination, not corpus. A recovered brain
+  // restarts at the default generation (zero reads as 1), so session cookies
+  // validate only against the recovered value — never resurrected exactly.
+  // Owners re-sign-in with their passkey; that is a tap, not a loss.
+  "session_generation",
 ]);
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 13;
+// Schema 14 added the additive owner-passkey tables and the
+// session_generation column; the vector protocol itself is unchanged, but
+// the recovery contract tracks the EXACT current schema by design.
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 14;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -203,7 +221,10 @@ function quoteIdentifier(value) {
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
     table,
-    table === "vector_bootstrap_batches"
+    // Literal zeros keep older migration prefixes queryable without
+    // referencing tables they do not have. Passkey restoration correctness is
+    // proven by the export content itself, not by the corpus aggregate.
+    ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes"].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -733,6 +754,7 @@ function expectedInstallStateColumns(migrations) {
     ...(latest >= 11 ? INSTALL_STATE_LEASE_COLUMNS : []),
     ...(latest >= 12 ? INSTALL_STATE_PROJECTION_COLUMNS : []),
     ...(latest >= 13 ? INSTALL_STATE_BOOTSTRAP_V2_COLUMNS : []),
+    ...(latest >= 14 ? ["session_generation"] : []),
   ]);
 }
 
@@ -952,10 +974,13 @@ function assertSameRecoveryCorpus(left, right, code = "RECOVERY_D1_SNAPSHOT_MISM
   return true;
 }
 
+const SCHEMA_14_TABLES = Object.freeze(["owner_passkeys", "auth_challenges", "enrollment_codes"]);
+
 function expectedRecoveryTables(migrations) {
   const latest = migrations?.at(-1)?.version || RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION;
   return RECOVERY_DURABLE_TABLES.filter((table) =>
-    latest >= 13 || table !== "vector_bootstrap_batches");
+    (latest >= 13 || table !== "vector_bootstrap_batches") &&
+    (latest >= 14 || !SCHEMA_14_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {

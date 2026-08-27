@@ -4,6 +4,39 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.19
+
+**Your brain now has its own app, and your face is the key.**
+
+- Open `https://<your brain's address>/app` on any device: ask a question,
+  read the cited answer with its confidence line, no software to install. On
+  a phone, add it to the home screen and it behaves like an app.
+- Sign-in is a passkey — Face ID, fingerprint, or your device PIN. No
+  password exists to forget, phish, or reuse: your device holds the private
+  half, and your brain stores only the public half, in your own database.
+- Setup is one tap. Whoever operates the install runs
+  `brain invite <manifest>` and sends you the link; you open it on your
+  phone, tap once, done. Apple and Google sync the passkey to your other
+  devices automatically, and a brand-new computer signs in by pointing your
+  phone at the QR your browser shows.
+- Settings, in the app: every enrolled device with when it was last used,
+  rename, revoke (removing the last one is refused so you can never silently
+  lock yourself out), and Sign out everywhere.
+- The session a passkey earns can read and ask — nothing else. It cannot add
+  documents, delete anything, or reach any admin function; those still
+  require the operator's keys. A lost phone is a reading credential with an
+  expiry, and one tap of Sign out everywhere ends even that.
+- Passkeys bind to your brain's exact domain (your own domain or the default
+  workers.dev address — your choice at setup). Settle the domain before the
+  first invite; changing it later means enrolling again.
+- Operators: `brain devices <manifest>` lists enrolled passkeys and
+  `--revoke` removes one; `brain secrets` now also derives the
+  session-signing secret, so existing installs get all of this on their next
+  setup or update, with nothing new to store.
+
+After updating, run `brain setup <manifest>` (applies migration 0014 and the
+new secret), then `brain invite <manifest>` and enroll your own phone first.
+
 ## 0.1.18
 
 **Type your Cloudflare token once per computer, not once per command.**

@@ -288,8 +288,8 @@ try {
     adminHarness.calls
       .filter((call) => call.method === "PUT" && call.path.endsWith("/secrets"))
       .map((call) => call.secretName),
-    ["ADMIN_KEY", "RAG_PROXY_KEY"],
-    "a keyed install writes the admin key and the read-only key derived from it, in that order",
+    ["ADMIN_KEY", "RAG_PROXY_KEY", "SESSION_SIGNING_KEY"],
+    "a keyed install writes the admin key and both keys derived from it, in that order",
   );
 
   console.log("report/deploy exit contracts: all focused tests passed");

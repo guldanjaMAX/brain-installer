@@ -3,11 +3,18 @@ import { DatabaseSync } from "node:sqlite";
 import {
   mkdtempSync,
   lstatSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
+
+// Terminal schema facts come from the migrations directory, not a literal,
+// so adding migration 00NN never breaks this suite (found at 13 -> 14).
+const MIGRATION_FILES = readdirSync(new URL("../migrations/d1/", import.meta.url))
+  .filter((name) => /^\d{4}_.+\.sql$/.test(name));
+const LATEST_SCHEMA = Math.max(...MIGRATION_FILES.map((name) => Number(name.slice(0, 4))));
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -455,9 +462,9 @@ try {
   const partialState = partialDb.prepare(
     "SELECT schema_version, vector_projection_status FROM install_state WHERE id=1",
   ).get();
-  assert.equal(partialState.schema_version, 13);
+  assert.equal(partialState.schema_version, LATEST_SCHEMA);
   assert.equal(partialState.vector_projection_status, "verified");
-  assert.equal(partialDb.prepare("SELECT COUNT(*) count FROM schema_migrations").get().count, 13);
+  assert.equal(partialDb.prepare("SELECT COUNT(*) count FROM schema_migrations").get().count, MIGRATION_FILES.length);
   partialDb.close();
 
   if (process.platform !== "win32") {

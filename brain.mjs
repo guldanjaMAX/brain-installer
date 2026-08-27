@@ -104,6 +104,7 @@ import {
   storedTokenReference,
 } from "./operations/cloudflare-token-store.mjs";
 import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
+import { deriveSessionSigningKey } from "./operations/session-signing-key.mjs";
 import { guardBrainAdminFetch } from "./components/brain-http.mjs";
 import { confidenceLine } from "./worker/src/lib/confidence.js";
 import {
@@ -1365,7 +1366,7 @@ export async function cmdSecrets(manifestPath, options = {}) {
   // RAG_PROXY_KEY is derived from ADMIN_KEY, not read from the shell, so it is
   // "needed" in the same sense: available exactly when the admin key is. Until
   // it is set, any UI proxy has to carry the admin key, which can drain.
-  const needed = ["ADMIN_KEY", "RAG_PROXY_KEY"];
+  const needed = ["ADMIN_KEY", "RAG_PROXY_KEY", "SESSION_SIGNING_KEY"];
   const optional = optionalWorkerSecretNames(m);
   const explicitAdminKey = Object.hasOwn(options, "explicitAdminKey")
     ? options.explicitAdminKey
@@ -1468,7 +1469,9 @@ export async function cmdSecrets(manifestPath, options = {}) {
       ? adminKey
       : name === "RAG_PROXY_KEY"
         ? deriveRagProxyKey(adminKey)
-        : process.env[name];
+        : name === "SESSION_SIGNING_KEY"
+          ? deriveSessionSigningKey(adminKey)
+          : process.env[name];
     try {
       await cf(`/accounts/${acct.id}/workers/scripts/${scriptName}/secrets`, {
         method: "PUT",
@@ -1495,6 +1498,15 @@ export async function cmdSecrets(manifestPath, options = {}) {
           "the read-only RAG_PROXY_KEY could not be set on the Worker. The brain is fine and\n" +
             "        ADMIN_KEY is unaffected. Until this succeeds, any UI proxy must carry the full\n" +
             "        admin key, which can ingest, purge, reindex and drain. Rerun `brain secrets`."
+        );
+        continue;
+      }
+      if (name === "SESSION_SIGNING_KEY") {
+        // Same non-fatal posture: the brain answers fine without passkey
+        // sign-ins; only the /app page is waiting on this secret.
+        warn(
+          "the SESSION_SIGNING_KEY could not be set on the Worker. ADMIN_KEY is unaffected.\n" +
+            "        Until this succeeds, passkey sign-ins on the /app page will not work. Rerun `brain secrets`."
         );
         continue;
       }
@@ -1560,6 +1572,14 @@ export async function cmdSecrets(manifestPath, options = {}) {
       info(
         "this key answers questions and nothing else. Give it to a UI proxy instead of the\n" +
           "        admin key. Rotating ADMIN_KEY also rotates it."
+      );
+      continue;
+    }
+    if (name === "SESSION_SIGNING_KEY") {
+      ok("secret SESSION_SIGNING_KEY set, derived from this brain's admin key");
+      info(
+        "signs the owner's passkey session cookies on the /app page. Rotating ADMIN_KEY\n" +
+          "        rotates it too, which signs every device out — correct for a rotation."
       );
       continue;
     }
@@ -3137,6 +3157,12 @@ export async function cmdUpgrade(manifestPath, options = {}) {
 
     info(`upgrading ${fromVersion} -> ${toVersion}`);
     let stage = "migration";
+    // True between the paused deployment and the active one. If the run dies in
+    // that window the install stays paused, which is correct (a partially
+    // migrated corpus must not meet live writers) but invisible: seven write
+    // paths including ingest return 503 and nothing says so. One field install
+    // sat like that for eight days and silently accepted no documents.
+    let corpusPausedByThisRun = false;
     const runStage = async (name, action) => {
       stage = name;
       const context = await assertStageContext(name);
@@ -3162,6 +3188,7 @@ export async function cmdUpgrade(manifestPath, options = {}) {
           persistDomain: false,
           pauseVectorDrainForUpgrade: true,
         }));
+        corpusPausedByThisRun = true;
         await runStage("paused vector-drain health verification", () =>
           verifyHealth(executionPin.target, {
             expectVersion: toVersion,
@@ -3194,6 +3221,7 @@ export async function cmdUpgrade(manifestPath, options = {}) {
           persistDomain: false,
           pauseVectorDrainForUpgrade: false,
         }));
+        corpusPausedByThisRun = false;
         // Cloudflare can keep routing this client to the paused compatibility
         // deployment for a few seconds after the active upload succeeds. Prove
         // the exact active mode is serving before the first corpus mutation;
@@ -3267,7 +3295,19 @@ export async function cmdUpgrade(manifestPath, options = {}) {
           "      Do not restore it as the first response. A D1 restore discards newer writes and\n" +
           "      does not restore Vectorize. A restore requires reviewed clean-index recreation/rebind\n" +
           "      before reindex because provider-only excess vectors cannot be enumerated from D1.\n" +
-          "      Safe default: fix the reported issue and run brain update again.",
+          "      Safe default: fix the reported issue and run brain update again." +
+          (corpusPausedByThisRun
+            ? "\n\n" +
+              "      THIS BRAIN CANNOT ACCEPT DOCUMENTS RIGHT NOW.\n" +
+              "      The update paused its corpus writes before changing the schema and did not\n" +
+              "      reach the step that resumes them. Ingest, forget and reindex return 503 until\n" +
+              "      it does. Anything added meanwhile is refused, not queued, so do not drop files\n" +
+              "      in and assume they landed.\n" +
+              "      This pause is deliberate: resuming writes over a half-migrated schema is worse\n" +
+              "      than staying paused. Do not clear VECTOR_DRAIN_MODE by hand.\n" +
+              "      Confirm the state any time with `brain health <manifest>`; it reports\n" +
+              "      accepting_documents false while this lasts."
+            : ""),
       );
     }
     ok(`upgrade verified, now at ${toVersion}`);
@@ -8823,6 +8863,69 @@ async function cmdUpgradeInteractive(manifestPath) {
   return withCloudflareToken(() => cmdUpgrade(manifestPath), { accountId: manifestAccountId(manifestPath) });
 }
 
+/** Mint a one-time passkey enrollment link for the brain's owner. */
+async function cmdInvite(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  // Cloudflare is OPTIONAL here, deliberately: inviting a new device must
+  // keep working after our account token is revoked at handoff.
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
+  const res = await http(`${base}/api/admin/auth/invite`, {
+    method: "POST",
+    headers: { "X-Admin-Key": adminKey },
+  }, { timeoutMs: 30_000, what: "the enrollment invite" });
+  if (!res.ok) die(`invite failed (${res.status}): ${(await res.text()).slice(0, 200)}`);
+  const invite = await res.json();
+  ok("one-time enrollment link minted (valid 15 minutes, single use)");
+  console.log(`\n  ${invite.url}\n`);
+  console.log(
+    "  Send it to the owner however you already talk (text it, AirDrop it). They open\n" +
+    "  it on THEIR device, tap once, Face ID or fingerprint — that is the whole setup.\n" +
+    `  Passkeys bind to ${invite.rp_id} exactly; changing the brain's domain later\n` +
+    "  requires re-enrollment, so settle the domain before the first invite.\n"
+  );
+  return invite;
+}
+
+/** List or revoke the owner's enrolled passkeys. */
+async function cmdDevices(manifestPath) {
+  const flags = parseFlags(process.argv.slice(3));
+  const { m } = loadManifest(manifestPath);
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
+  if (flags.revoke && flags.revoke !== true) {
+    const res = await http(`${base}/api/admin/auth/devices/revoke`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ credential_id: String(flags.revoke) }),
+    }, { timeoutMs: 30_000, what: "the device revocation" });
+    const verdict = await res.json();
+    if (verdict.removed) ok("passkey revoked");
+    else warn(verdict.reason || `revoke failed (${res.status})`);
+    return verdict;
+  }
+  const res = await http(`${base}/api/admin/auth/devices`, {
+    headers: { "X-Admin-Key": adminKey },
+  }, { timeoutMs: 30_000, what: "the device list" });
+  if (!res.ok) die(`device list failed (${res.status}): ${(await res.text()).slice(0, 200)}`);
+  const { devices } = await res.json();
+  if (!devices?.length) {
+    info("no passkeys enrolled yet. Mint a link with `brain invite <manifest>`.");
+    return { devices: [] };
+  }
+  console.log("");
+  for (const device of devices) {
+    const used = device.last_used_at ? `last used ${new Date(device.last_used_at).toISOString().slice(0, 10)}` : "never used";
+    console.log(`  ${device.nickname || "unnamed device"}  ·  ${used}  ·  id ${String(device.credential_id).slice(0, 16)}…`);
+  }
+  console.log("\n  Revoke one with: brain devices <manifest> --revoke <full credential id>\n");
+  return { devices };
+}
+
 /** Is a Cloudflare token stored on this machine for this install's account? */
 async function cmdToken(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
@@ -8932,6 +9035,8 @@ const commands = {
   reindex: cmdReindex,
   diagnose: cmdDiagnose,
   eval: cmdEval,
+  invite: cmdInvite,
+  devices: cmdDevices,
   token: cmdToken,
   update: cmdUpdate,
   upgrade: cmdUpgradeInteractive,
@@ -8959,6 +9064,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it
     brain token      <manifest>            is a Cloudflare token remembered on this Mac? --forget removes it
+    brain invite     <manifest>            one-tap passkey enrollment link for the owner (Face ID, 15 min)
+    brain devices    <manifest>            enrolled passkeys; --revoke <credential id> removes one
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail  authorise the client's own Google account
     brain ingest     <manifest> --path <dir>  load a folder into the brain

@@ -24,6 +24,11 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DIR = join(HERE, "..", "migrations", "d1");
+// The terminal schema version is whatever the newest migration file says, so
+// adding 00NN never breaks a hardcoded pin here (found at 13 -> 14).
+const LATEST_SCHEMA = Math.max(
+  ...readdirSync(DIR).filter((f) => /^\d{4}_.+\.sql$/.test(f)).map((f) => Number(f.slice(0, 4))),
+);
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 300))); if (!c) fail++; };
@@ -647,7 +652,7 @@ check("restart guard refuses an existing migration column with the wrong contrac
         "SELECT generation FROM vector_outbox WHERE chunk_uid='intervening#0'",
       ).get().generation;
       const objects = new Set(candidate.prepare("SELECT name FROM sqlite_master").all().map((row) => row.name));
-      if (!(receipts.length === 4 && state.schema_version === 13 &&
+      if (!(receipts.length === 4 && state.schema_version === LATEST_SCHEMA &&
             state.outbox_generation >= queue.generation && state.owner === null && state.expires === null &&
             state.mutation_id === null && state.mutation_submitted_at === null &&
             queue.submitted_mutation_id === null && queue.submitted_at === null &&
@@ -723,7 +728,7 @@ check("restart guard refuses an existing migration column with the wrong contrac
        FROM install_state WHERE id=1`,
   ).get();
   check("migration seeds a missing singleton as an unverified nonempty projection",
-    seededSingleton?.schema_version === 13 &&
+    seededSingleton?.schema_version === LATEST_SCHEMA &&
       seededSingleton.status === "bootstrap_required" && seededSingleton.epoch === 1 &&
       seededSingleton.cursor === null && seededSingleton.high_water === "legacy:missing-row#0",
     JSON.stringify(seededSingleton));
