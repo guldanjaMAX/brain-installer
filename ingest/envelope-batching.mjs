@@ -47,20 +47,51 @@ export function envelopeBytes(envelope) {
   return Buffer.byteLength(JSON.stringify(envelope), "utf8");
 }
 
-/** Group wrapped envelopes below both Worker request ceilings. */
-export function batches(items, { maxDocs = 50, maxBytes = 900_000 } = {}) {
+/**
+ * Mirror of the worker's conservative D1 statement estimate for one envelope
+ * (worker/src/lib/store.js: 9 fixed statements plus 2 per sliding-window
+ * chunk at the default 1500/300 geometry). Deliberately duplicated rather
+ * than imported: this module stays dependency-free by design, and a test
+ * imports the worker's real estimator to prove the two never drift.
+ */
+export function estimatedStatements(envelope) {
+  const body = String(envelope?.content || "");
+  const chunks = !body.trim()
+    ? 0
+    : body.length <= 1500
+      ? 1
+      : 1 + Math.ceil((body.length - 1500) / 1200);
+  return 9 + chunks * 2;
+}
+
+/**
+ * Group wrapped envelopes below every Worker request ceiling.
+ *
+ * maxStatements packs to ten percent under the worker's own 900-statement
+ * budget, so estimator drift fails SMALL (a slightly shorter batch) instead
+ * of large (a refused 413 wall). Found live: a two-day Drive catch-up packed
+ * fifty chunky documents — 1,666 estimated statements — into one call the
+ * worker rightly refused. Document count and bytes alone cannot see chunk
+ * weight. splitOversized caps any single document at ~677 statements, so one
+ * item always fits a batch alone.
+ */
+export function batches(items, { maxDocs = 50, maxBytes = 900_000, maxStatements = 810 } = {}) {
   const out = [];
   let cur = [];
   let bytes = 0;
+  let statements = 0;
   for (const it of items) {
     const n = envelopeBytes(it.envelope);
-    if (cur.length && (cur.length >= maxDocs || bytes + n > maxBytes)) {
+    const s = estimatedStatements(it.envelope);
+    if (cur.length && (cur.length >= maxDocs || bytes + n > maxBytes || statements + s > maxStatements)) {
       out.push(cur);
       cur = [];
       bytes = 0;
+      statements = 0;
     }
     cur.push(it);
     bytes += n;
+    statements += s;
   }
   if (cur.length) out.push(cur);
   return out;

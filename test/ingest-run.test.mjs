@@ -1,4 +1,5 @@
-import { walk, prepare, batches, batchStream, splitOversized, loadState, saveState, MAX_FILE_BYTES, MAX_DOC_CHARS } from "../ingest/run.mjs";
+import { walk, prepare, batches, batchStream, splitOversized, estimatedStatements, loadState, saveState, MAX_FILE_BYTES, MAX_DOC_CHARS } from "../ingest/run.mjs";
+import { estimateD1IngestStatements } from "../worker/src/lib/store.js";
 import { extract, isBinaryFormat, register, supported } from "../ingest/extract.mjs";
 import { extractPdf, pdfPassIsolated } from "../ingest/formats.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync, readdirSync } from "node:fs";
@@ -250,6 +251,26 @@ function textPdf() {
     byBytes.every((b) => b.reduce((n, x) => n + x.envelope.content.length, 0) <= 900_000));
   check("nothing is lost across batches", byBytes.flat().length === 10);
   check("an empty input yields no batches", batches([]).length === 0);
+
+  // The statement ceiling: fifty chunky documents fit the doc and byte
+  // ceilings while estimating far beyond the worker's 900-statement budget —
+  // the exact shape a two-day Drive catch-up refused live with a 413.
+  const chunky = mk(50, 40_000); // ~34 chunks -> ~77 statements per document
+  const byStatements = batches(chunky);
+  check("splits on estimated D1 statements", byStatements.length >= 5, String(byStatements.length));
+  check("no batch exceeds the statement ceiling",
+    byStatements.every((b) => b.reduce((n, x) => n + estimatedStatements(x.envelope), 0) <= 810));
+  check("nothing is lost across statement splits", byStatements.flat().length === 50);
+  // The local mirror must never drift from the worker's real estimator.
+  for (const size of [0, 10, 1500, 1501, 40_000, MAX_DOC_CHARS]) {
+    const envelope = { source_id: "probe", content: size ? "x".repeat(size) : "" };
+    check(`statement estimate matches the worker at ${size} chars`,
+      estimatedStatements(envelope) === estimateD1IngestStatements({}, [envelope]),
+      `${estimatedStatements(envelope)} != ${estimateD1IngestStatements({}, [envelope])}`);
+  }
+  check("a maximally split part still fits one batch alone",
+    estimatedStatements({ source_id: "p", content: "x".repeat(MAX_DOC_CHARS) }) <= 810);
+
   // WRONG BEFORE: this asserted that an oversized document is emitted as its own
   // batch. It is, and the Worker then 413s it and the document is LOST. It has
   // to be split before it ever reaches batching.

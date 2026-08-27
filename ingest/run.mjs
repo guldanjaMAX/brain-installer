@@ -27,7 +27,7 @@ import { join, relative, sep, basename, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { extract, canExtract, extensionOf, isBinaryFormat } from "./extract.mjs";
 import {
-  MAX_DOC_CHARS, batches, envelopeBytes, splitOversized,
+  MAX_DOC_CHARS, batches, envelopeBytes, estimatedStatements, splitOversized,
 } from "./envelope-batching.mjs";
 // Side-effect import: registers pdf/docx/xlsx/pptx/eml and pulls in their
 // dependencies. Importing it here rather than in extract.mjs keeps the core
@@ -38,7 +38,7 @@ import { documentDate } from "./doc-date.mjs";
 
 // Preserve the original ingest/run.mjs API while letting migration-only code
 // import the dependency-free boundary directly.
-export { MAX_DOC_CHARS, batches, envelopeBytes, splitOversized };
+export { MAX_DOC_CHARS, batches, envelopeBytes, estimatedStatements, splitOversized };
 
 /** Never worth walking into. */
 const SKIP_DIRS = new Set([
