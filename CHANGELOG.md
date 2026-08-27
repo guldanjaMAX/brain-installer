@@ -27,8 +27,27 @@ against your brain, in one sitting.**
 - The session ends by offering to score the set immediately. That first
   scorecard — your brain, judged on your questions — is the handoff artifact.
 
+**Every answer now tells you how much to trust it.**
+
+- `brain ask` prints a confidence line under each answer: a percentage with
+  its band and the exact signals that produced it — how many independent
+  documents agree, whether their dates are verified, and whether the brain has
+  a known blind spot right now (a stalled source, an incomplete vector index).
+- The number is a fixed, documented rubric over signals the answer pipeline
+  already verifies — the same inputs always give the same number, and it is
+  capped below 95 because retrieval can never prove completeness.
+- Refusals get their own version: "Confidence nothing is recorded" is high
+  when retrieval was healthy and every candidate was rejected, and drops
+  sharply when a blind spot means the absence might be ours, not the record's.
+- Answers weave the evidence date into time-sensitive claims ("per the
+  2026-07-31 call transcript"), so a claim can be checked instead of trusted.
+- API consumers get the same data as a structured `confidence` field on
+  `/api/rag/think`; the answer text itself is unchanged, so existing golden
+  sets, refusal scoring, and integrations keep working untouched.
+
 After updating, run `brain eval <manifest> --golden-20` sitting next to the
-person who owns the brain. Existing golden sets and scoring are unchanged.
+person who owns the brain, then `brain ask` any question and read the new
+confidence line. Existing golden sets and scoring are unchanged.
 
 ## 0.1.16
 

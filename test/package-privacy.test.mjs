@@ -127,6 +127,7 @@ const expected = [
   "support-journal.mjs",
   "templates/brain.manifest.json",
   "worker/src/index.js",
+  "worker/src/lib/confidence.js",
   "worker/src/lib/core.js",
   "worker/src/lib/query-intent.js",
   "worker/src/lib/secret-scan.js",

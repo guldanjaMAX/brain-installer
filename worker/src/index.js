@@ -28,6 +28,7 @@ import { storeFor, backendOf, D1 } from "./lib/store.js";
 import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
+import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
 
 /* ------------------------------------------------------------ retrieval */
 
@@ -423,18 +424,20 @@ async function handleThink(env, request) {
   const results = Array.isArray(matches) ? matches : [];
 
   if (results.length === 0) {
+    const emptyGaps = [
+      {
+        type: "no_results",
+        detail: "The brain has nothing on this query. Say so plainly rather than inferring.",
+      },
+    ];
     return jsonResponse({
       mode: "think",
       degraded: degraded || undefined,
       answer: null,
       citations: [],
       results: [],
-      gaps: [
-        {
-          type: "no_results",
-          detail: "The brain has nothing on this query. Say so plainly rather than inferring.",
-        },
-      ],
+      gaps: emptyGaps,
+      confidence: refusalConfidence({ gaps: emptyGaps, degraded, resultCount: 0 }),
     });
   }
 
@@ -515,6 +518,7 @@ async function handleThink(env, request) {
     "9. A planning interview, decisions-so-far note, proposal, template, or draft can describe intended legal terms, but it cannot establish what the owner is actually bound by. Only a final or executed governing agreement can do that.",
     "10. For an explicit current, latest, still, or going-on question, an older source establishes history only. A present-status claim must cite newest reliable-dated evidence that itself states that status. Billing or payment activity alone does not establish an ongoing client, customer, contract, or relationship status.",
     "11. A message, file, meeting note, or other non-authoritative source supports only an as-of statement tied to its exact reliable date. Authority is claim-specific: billing and subscription systems can establish their own account or subscription state, but only a relationship system such as a CRM can establish an unqualified current client or customer relationship. Otherwise state the exact as-of date or say current status cannot be confirmed.",
+    "12. When a claim rests on reliably dated evidence, weave that date into the sentence naturally, like: per the 2026-07-31 call transcript. A dated claim can be checked; an undated one has to be trusted. Never state a date the documents do not carry.",
     env.BRAIN_STYLE_RULE || "",
   ]
     .filter(Boolean)
@@ -713,6 +717,20 @@ async function handleThink(env, request) {
     }
   }
 
+  // Trust metadata beside the answer, never inside it: the refusal sentence
+  // is a verbatim contract (worker tests and the eval refusal scorer both pin
+  // it), so the confidence rubric travels as its own field.
+  const confidence = answerError
+    ? undefined
+    : answer === unsupportedAnswer || !approvedDocs.length
+      ? refusalConfidence({
+          gaps,
+          degraded,
+          resultCount: results.length,
+          sources: [...new Set(results.map((r) => r.source).filter(Boolean))],
+        })
+      : computeAnswerConfidence({ approvedDocs, gaps, degraded });
+
   return jsonResponse({
     mode: "think",
     degraded: degraded || undefined,
@@ -721,6 +739,7 @@ async function handleThink(env, request) {
     model: model || undefined,
     evidence_gate: evidenceGate || undefined,
     gaps,
+    confidence,
     citations: approvedDocs.map((d) => ({
       n: d.n, title: d.title, source: d.source, ref: d.ref, ts: d.ts,
       date_reliable: d.date_reliable, date_source: d.date_source,

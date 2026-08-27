@@ -98,6 +98,7 @@ import {
 import { readAdminKeyFile, validateAdminKeyValue } from "./operations/admin-key-file.mjs";
 import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
 import { guardBrainAdminFetch } from "./components/brain-http.mjs";
+import { confidenceLine } from "./worker/src/lib/confidence.js";
 import {
   adminKeyPersistencePlan,
   parseAdminKeySecretReference,
@@ -1853,6 +1854,13 @@ export async function cmdAsk(manifestPath, options = {}) {
     ? body.answer.trim()
     : "The documents do not answer the question.";
   console.log(`\n${answer}\n`);
+  // Trust metadata is a separate line by design: the answer string is a
+  // verbatim contract (the refusal scorer reads every clause of it), so the
+  // rubric score rides beside it rather than inside it.
+  const trust = confidenceLine(body.confidence, {
+    refused: /^The documents do not answer/i.test(answer),
+  });
+  if (trust) console.log(`  ${c.dim(trust)}\n`);
   if (body.answer_error) warn(`answer generation reported: ${String(body.answer_error).slice(0, 160)}`);
   if (body.degraded) warn(`search is degraded: ${String(body.degraded).slice(0, 80)}`);
   const citations = Array.isArray(body.citations) ? body.citations : [];
