@@ -8666,13 +8666,14 @@ export async function cmdConnectImessage(manifestPath, flags = {}, options = {})
  * Drain last, so the first scheduled tick starts from a caught-up cursor.
  */
 export async function cmdConnectWhatsapp(manifestPath, flags = {}, options = {}) {
-  if ((options.platform ?? process.platform) !== "darwin") {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "darwin" && platform !== "win32") {
     die(
-      "installing WhatsApp capture needs macOS: the capture daemon is kept alive by a\n" +
-        "      per-user LaunchAgent, and no Windows service or Startup-task supervision is\n" +
-        "      built in this installer yet. The daemon itself cross-compiles for Windows, so\n" +
-        "      this is a missing installer, not a missing capability — but nothing here will\n" +
-        "      pretend to install something it cannot keep running."
+      `installing WhatsApp capture needs macOS or Windows; this machine reports ${platform}.\n` +
+        "      The capture daemon has to be kept alive by something, and the two supervisors\n" +
+        "      built here are a macOS LaunchAgent and a Windows Scheduled Task. The daemon\n" +
+        "      itself is portable Go, so this is a missing installer, not a missing capability\n" +
+        "      — but nothing here will pretend to install something it cannot keep running."
     );
   }
   if (!manifestPath || String(manifestPath).startsWith("--")) {
@@ -8688,8 +8689,19 @@ export async function cmdConnectWhatsapp(manifestPath, flags = {}, options = {})
   }
 
   const whatsapp = options.whatsapp ?? await import("./connectors/whatsapp.mjs");
-  const daemonAgent = options.whatsappDaemon ?? await import("./operations/whatsapp-daemon.mjs");
-  const drainScheduler = options.whatsappDrainScheduler ?? await import("./operations/whatsapp-drain-scheduler.mjs");
+  // The two supervisors are loaded lazily and per platform: the macOS module
+  // throws on a non-darwin platform by design, so importing both unconditionally
+  // would be fine but pointless, and keeping the branch at the import makes the
+  // "one of these two runs, never both" rule visible rather than implied.
+  const daemonAgent = platform === "darwin"
+    ? (options.whatsappDaemon ?? await import("./operations/whatsapp-daemon.mjs"))
+    : null;
+  const drainScheduler = platform === "darwin"
+    ? (options.whatsappDrainScheduler ?? await import("./operations/whatsapp-drain-scheduler.mjs"))
+    : null;
+  const windowsSupervision = platform === "win32"
+    ? (options.windowsSupervision ?? await import("./operations/windows-supervision.mjs"))
+    : null;
 
   // Step 1: the binary, before any promise about pairing.
   let binary;
@@ -8751,12 +8763,38 @@ export async function cmdConnectWhatsapp(manifestPath, flags = {}, options = {})
 
   // Step 4: the supervised daemon. Installed only after the foreground copy has
   // exited, so the two never hold the session store at once.
-  const daemon = daemonAgent.installWhatsappDaemon(manifestPath, {
-    ...(options.daemonOptions || {}),
-    binaryPath: binary.path,
-    ...(options.dataDir ? { dataDir: options.dataDir } : {}),
-  });
-  ok("capture daemon installed and running under launchd (it restarts itself if it crashes or the network drops)");
+  const daemon = platform === "win32"
+    ? windowsSupervision.installWindowsSupervision(manifestPath, {
+      ...(options.daemonOptions || {}),
+      kind: "whatsapp-daemon",
+      binaryPath: binary.path,
+      ...(options.dataDir ? { dataDir: options.dataDir } : {}),
+    })
+    : daemonAgent.installWhatsappDaemon(manifestPath, {
+      ...(options.daemonOptions || {}),
+      binaryPath: binary.path,
+      ...(options.dataDir ? { dataDir: options.dataDir } : {}),
+    });
+  if (platform === "win32") {
+    // WHAT IS SAID HERE IS WHAT WAS INSTALLED, NOT WHAT WAS WANTED. Which
+    // Windows mechanism a non-administrator can actually register is decided by
+    // the machine's policy, not by this code, so the rung is probed at install
+    // time and every consequence of the one that worked is stated here.
+    if (!daemon.installed) {
+      for (const warning of daemon.warnings || []) warn(warning);
+      die(
+        "nothing was installed to keep WhatsApp capture running on this PC, so capture would\n" +
+          "      have stopped the moment this command exited. The linked device is paired and the\n" +
+          "      session is saved; re-run this once Task Scheduler is available for your account."
+      );
+    }
+    for (const line of windowsSupervision.mechanismDisclosure(daemon.mechanism)) info(line);
+    for (const warning of daemon.warnings || []) warn(warning);
+    if (daemon.supervised) ok(`capture daemon installed as Scheduled Task ${daemon.taskName} and started`);
+    else warn(`capture daemon installed as a Startup-folder launcher at ${daemon.startupPath}, which does not restart it`);
+  } else {
+    ok("capture daemon installed and running under launchd (it restarts itself if it crashes or the network drops)");
+  }
 
   // Step 5: the initial drain, in the foreground, with counts.
   if (!flags["no-initial-load"]) {
@@ -8768,17 +8806,50 @@ export async function cmdConnectWhatsapp(manifestPath, flags = {}, options = {})
 
   // Step 6: the drain tick, plus the freshness expectation that makes
   // `brain sources` honest about whether capture is actually reaching the brain.
-  const installed = drainScheduler.installWhatsappDrainScheduler(manifestPath, options.schedulerOptions || {});
+  //
+  // THE EXPECTATION IS POSTED ONLY IF SOMETHING IS ACTUALLY SCHEDULED. An
+  // expectation is a promise that this source refreshes; posting one for a lane
+  // that nothing on this machine runs would turn `brain sources` from silent
+  // into wrong. When the drain could not be scheduled, no expectation is set,
+  // and the source reports "no refresh scheduled" — which is the true sentence.
+  const installed = platform === "win32"
+    ? windowsSupervision.installWindowsSupervision(manifestPath, {
+      ...(options.schedulerOptions || {}),
+      kind: "whatsapp-drain",
+      ...(options.dataDir ? { dataDir: options.dataDir } : {}),
+    })
+    : drainScheduler.installWhatsappDrainScheduler(manifestPath, options.schedulerOptions || {});
   for (const warning of installed.warnings || []) warn(warning);
   const postExpectation = options.postSourceExpectation ?? postSourceExpectation;
-  await postExpectation(base, adminKey, {
-    source: "whatsapp", kind: "whatsapp", expected_refresh_seconds: installed.expectedRefreshSeconds,
-  });
-  ok(`WhatsApp drain installed for ${installed.cron} (a new message appears within about a minute)`);
-  ok(`freshness expectation set to ${installed.expectedRefreshSeconds} seconds`);
-  info(`daemon definition: ${daemon.plistPath}`);
-  info(`daemon logs: ${daemon.stdoutPath} and ${daemon.stderrPath}`);
-  info(`drain definition: ${installed.plistPath}`);
+  if (installed.expectedRefreshSeconds) {
+    await postExpectation(base, adminKey, {
+      source: "whatsapp", kind: "whatsapp", expected_refresh_seconds: installed.expectedRefreshSeconds,
+    });
+    ok(`freshness expectation set to ${installed.expectedRefreshSeconds} seconds`);
+  } else {
+    // Clear rather than leave whatever a previous install left behind: a stale
+    // one-minute expectation against a lane nothing runs would report this
+    // source as permanently STALE instead of as never scheduled.
+    await postExpectation(base, adminKey, {
+      source: "whatsapp", kind: "whatsapp", expected_refresh_seconds: null,
+    });
+    warn(
+      "no freshness expectation was set, because nothing on this PC is scheduled to load captured\n" +
+        "      messages into the brain. This source will report that it has no refresh scheduled\n" +
+        "      rather than reporting itself as live. Load it by hand with:\n" +
+        `        brain ingest ${manifestPath} --from whatsapp`
+    );
+  }
+  if (platform === "win32") {
+    if (installed.installed) ok(`WhatsApp drain installed as Scheduled Task ${installed.taskName} (a new message appears within about a minute)`);
+    info(`daemon task: ${daemon.taskName}`);
+    info(`logs: ${daemon.logPath} and ${installed.logPath}`);
+  } else {
+    ok(`WhatsApp drain installed for ${installed.cron} (a new message appears within about a minute)`);
+    info(`daemon definition: ${daemon.plistPath}`);
+    info(`daemon logs: ${daemon.stdoutPath} and ${daemon.stderrPath}`);
+    info(`drain definition: ${installed.plistPath}`);
+  }
   info(`to stop and remove capture later: brain disconnect whatsapp ${manifestPath}`);
   return { daemon, drain: installed, paired };
 }
@@ -9173,27 +9244,57 @@ export async function cmdDisconnectImessage(manifestPath, flags = {}, options = 
  * place WhatsApp treats as authoritative anyway.
  */
 export async function cmdDisconnectWhatsapp(manifestPath, flags = {}, options = {}) {
-  if ((options.platform ?? process.platform) !== "darwin") {
-    die("the WhatsApp capture LaunchAgents only exist on macOS, so there is nothing to disconnect here.");
+  const platform = options.platform ?? process.platform;
+  if (platform !== "darwin" && platform !== "win32") {
+    die(`WhatsApp capture is only ever installed on macOS or Windows, so there is nothing to disconnect on ${platform}.`);
   }
   if (!manifestPath || String(manifestPath).startsWith("--")) {
     die("usage: brain disconnect whatsapp <manifest>");
   }
   const { m } = loadManifest(manifestPath);
-  const daemonAgent = options.whatsappDaemon ?? await import("./operations/whatsapp-daemon.mjs");
-  const drainScheduler = options.whatsappDrainScheduler ?? await import("./operations/whatsapp-drain-scheduler.mjs");
+  const daemonAgent = platform === "darwin"
+    ? (options.whatsappDaemon ?? await import("./operations/whatsapp-daemon.mjs"))
+    : null;
+  const drainScheduler = platform === "darwin"
+    ? (options.whatsappDrainScheduler ?? await import("./operations/whatsapp-drain-scheduler.mjs"))
+    : null;
+  const windowsSupervision = platform === "win32"
+    ? (options.windowsSupervision ?? await import("./operations/windows-supervision.mjs"))
+    : null;
 
   // Step 1: the drain tick, so no scheduled pass races the final one below.
-  const drainRemoved = drainScheduler.removeWhatsappDrainScheduler(manifestPath, options.schedulerOptions || {});
+  const drainRemoved = platform === "win32"
+    ? windowsSupervision.removeWindowsSupervision(manifestPath, {
+      ...(options.schedulerOptions || {}),
+      kind: "whatsapp-drain",
+      ...(options.dataDir ? { dataDir: options.dataDir } : {}),
+    })
+    : drainScheduler.removeWhatsappDrainScheduler(manifestPath, options.schedulerOptions || {});
   ok(drainRemoved.removed || drainRemoved.loaded ? "WhatsApp drain schedule removed" : "the WhatsApp drain schedule was not installed");
 
   // Step 2: the daemon itself. Nothing new reaches the outbox after this.
-  const daemonRemoved = daemonAgent.removeWhatsappDaemon(manifestPath, {
-    ...(options.daemonOptions || {}),
-    ...(options.dataDir ? { dataDir: options.dataDir } : {}),
-  });
-  ok(daemonRemoved.removed || daemonRemoved.wasLoaded ? "capture daemon stopped and removed" : "the capture daemon was not installed");
-  info(`daemon logs preserved at ${daemonRemoved.stdoutPath} and ${daemonRemoved.stderrPath}`);
+  // On Windows this also sweeps the Startup-folder launcher whether or not that
+  // was the rung in use, so a machine that was moved between rungs never ends up
+  // with a second thing quietly starting the daemon at the next sign-in.
+  const daemonRemoved = platform === "win32"
+    ? windowsSupervision.removeWindowsSupervision(manifestPath, {
+      ...(options.daemonOptions || {}),
+      kind: "whatsapp-daemon",
+      ...(options.dataDir ? { dataDir: options.dataDir } : {}),
+    })
+    : daemonAgent.removeWhatsappDaemon(manifestPath, {
+      ...(options.daemonOptions || {}),
+      ...(options.dataDir ? { dataDir: options.dataDir } : {}),
+    });
+  ok(daemonRemoved.removed || daemonRemoved.wasLoaded || daemonRemoved.wasInstalled
+    ? "capture daemon stopped and removed"
+    : "the capture daemon was not installed");
+  if (platform === "win32") {
+    info(`daemon log preserved at ${daemonRemoved.logPath}`);
+    if (daemonRemoved.startupRemoved) info("the Startup-folder launcher was removed too");
+  } else {
+    info(`daemon logs preserved at ${daemonRemoved.stdoutPath} and ${daemonRemoved.stderrPath}`);
+  }
 
   // Step 3: load whatever the daemon captured but the drain had not reached,
   // then close still-open conversations so dormant threads stay searchable.
@@ -13063,7 +13164,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail,calendar  authorise the client's own Google account
     brain connect imessage <manifest>      verify Full Disk Access, load history, capture live (Mac only)
-    brain connect whatsapp <manifest> --accept-risk  pair a linked device and capture live (Mac only, opt-in)
+    brain connect whatsapp <manifest> --accept-risk  pair a linked device and capture live (Mac or Windows, opt-in)
     brain connect zoom     <manifest>      Zoom cloud-recording transcripts (needs a paid Zoom seat)
     brain connect imap     <manifest>      any IMAP mailbox (Yahoo, Fastmail, iCloud, a host): app
                                            password entered hidden, proven by a real read first

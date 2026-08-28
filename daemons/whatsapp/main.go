@@ -20,6 +20,15 @@
 //	WA_DB_PATH      explicit whatsmeow session store path (always honored)
 //	WA_OUTBOX_PATH  explicit outbox path (always honored)
 //
+// Flags, for supervisors that cannot set an environment variable — a Windows
+// Scheduled Task action has no way to do it, and wrapping the command in a
+// shell to work around that would put a console window in the supervision path:
+//
+//	--data-dir <dir>   same meaning as WA_DATA_DIR, and wins over it
+//	--log-file <path>  append the log here instead of stderr, because Task
+//	                   Scheduler cannot redirect a child's output
+//	--version          print the build stamp and exit
+//
 // Exit is graceful on SIGINT/SIGTERM.
 package main
 
@@ -54,6 +63,66 @@ const logPrefix = "[wa-daemon] "
 // version is stamped by build.sh via -ldflags "-X main.version=...".
 var version = "dev"
 
+// options are the two things a supervisor has to be able to tell this process
+// that a launchd plist could pass in the environment and a Windows Scheduled
+// Task cannot.
+//
+// Task Scheduler's XML schema has no way to set an environment variable for an
+// action. Wrapping the command in `cmd /c set WA_DATA_DIR=... && wa-daemon.exe`
+// would work and would also put a shell and a visible console window into the
+// supervision path, so the knobs are command-line flags instead. Environment
+// variables keep working exactly as before; a flag simply wins over one, which
+// is the same precedence rule the paths package already applies to explicit
+// configuration.
+type options struct {
+	dataDir string
+	logFile string
+	rest    []string
+}
+
+// parseOptions reads the flags this daemon accepts. It is deliberately a small
+// hand-rolled parser rather than the flag package: the daemon takes no other
+// arguments, and an unknown argument must be a named refusal rather than a
+// usage dump from a library.
+func parseOptions(argv []string) (options, error) {
+	var out options
+	for i := 0; i < len(argv); i++ {
+		switch argv[i] {
+		case "--data-dir", "--log-file":
+			if i+1 >= len(argv) || argv[i+1] == "" {
+				return out, fmt.Errorf("%s needs a path", argv[i])
+			}
+			if argv[i] == "--data-dir" {
+				out.dataDir = argv[i+1]
+			} else {
+				out.logFile = argv[i+1]
+			}
+			i++
+		default:
+			out.rest = append(out.rest, argv[i])
+		}
+	}
+	if len(out.rest) > 0 {
+		return out, fmt.Errorf("unrecognised argument %q (this daemon takes --data-dir, --log-file, --version)", out.rest[0])
+	}
+	return out, nil
+}
+
+// getenvWith returns a lookup where an explicitly-passed flag beats the ambient
+// environment for exactly the one name it overrides, and everything else falls
+// through unchanged.
+func getenvWith(base func(string) string, name, value string) func(string) string {
+	if value == "" {
+		return base
+	}
+	return func(key string) string {
+		if key == name {
+			return value
+		}
+		return base(key)
+	}
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
 	log.SetPrefix(logPrefix)
@@ -63,12 +132,37 @@ func main() {
 		return
 	}
 
+	opts, err := parseOptions(os.Args[1:])
+	if err != nil {
+		log.Fatalf("arguments: %v", err)
+	}
+
+	// A supervised process on Windows has nowhere to write: Task Scheduler
+	// cannot redirect stdio, so without this the only record of why capture
+	// stopped is gone. Opened append-only; the supervisor caps the file at the
+	// two moments this process is provably stopped.
+	if opts.logFile != "" {
+		if err := os.MkdirAll(filepath.Dir(opts.logFile), 0o700); err != nil {
+			log.Fatalf("log directory %s: %v", filepath.Dir(opts.logFile), err)
+		}
+		handle, err := os.OpenFile(opts.logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			log.Fatalf("log file %s: %v", opts.logFile, err)
+		}
+		defer handle.Close()
+		log.SetOutput(handle)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// ── Where everything lives ────────────────────────────────────────
 	home, _ := os.UserHomeDir()
-	resolved, err := paths.Resolve(paths.Env{Getenv: os.Getenv, GOOS: runtime.GOOS, Home: home})
+	resolved, err := paths.Resolve(paths.Env{
+		Getenv: getenvWith(os.Getenv, paths.EnvDataDir, opts.dataDir),
+		GOOS:   runtime.GOOS,
+		Home:   home,
+	})
 	if err != nil {
 		log.Fatalf("paths: %v", err)
 	}
