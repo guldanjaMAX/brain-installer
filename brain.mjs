@@ -531,6 +531,34 @@ function saveManifest(path, m) {
   writeFileSync(path, JSON.stringify(m, null, 2) + "\n");
 }
 
+/**
+ * The shortest path a person can retype, which is not always the relative one.
+ *
+ * The success screen is the last thing a client reads, and it rendered the
+ * manifest as `../../../../../../../private/tmp/...` because the manifest sat
+ * outside the working directory (bench, 2026-08-28). Seven levels of `..` in
+ * the command they are told to run looks broken. Prefer relative only when it
+ * is genuinely shorter and does not climb out of sight.
+ */
+function displayPath(target) {
+  const absolute = resolve(target);
+  const rel = relative(process.cwd(), absolute);
+  if (!rel) return absolute;
+  const climbs = (rel.match(/(^|[/\\])\.\.($|[/\\])/g) || []).length;
+  if (climbs > 1 || rel.length >= absolute.length) return absolute;
+  return rel;
+}
+
+/** Exported only so a test can pin the display rule without a real install. */
+export function displayPathForTesting(target, cwd) {
+  const absolute = resolve(target);
+  const rel = relative(cwd, absolute);
+  if (!rel) return absolute;
+  const climbs = (rel.match(/(^|[/\\])\.\.($|[/\\])/g) || []).length;
+  if (climbs > 1 || rel.length >= absolute.length) return absolute;
+  return rel;
+}
+
 function commandPath(value) {
   const text = String(value).replace(/[\r\n"]/g, "");
   return /^[a-z0-9_./:\\-]+$/i.test(text) ? text : `"${text}"`;
@@ -6790,7 +6818,7 @@ export async function cmdSetup(manifestPath, options = {}) {
 
   /* --- 2. the manifest, asked for once --- */
   const target = manifestPath || flags.manifest || "./brain.manifest.json";
-  const shownTarget = commandPath(relative(process.cwd(), target));
+  const shownTarget = commandPath(displayPath(target));
   let m;
   if (existsSync(target)) {
     m = loadManifest(target).m;
@@ -7007,12 +7035,27 @@ export async function cmdSetup(manifestPath, options = {}) {
   });
 
   /* --- 5. wire it into the tools people actually use --- */
-  console.log(`\n  ${c.bold("Step 5 of 6")}  connecting it to your AI tools\n`);
-  const connectAgents = options.wireAgents ?? wireAgents;
-  const wiring = await connectAgents(m, target, {
-    ...(options.agentOptions || {}),
-    existingOnly: false,
-  });
+  //
+  // Skippable, because this step edits config files belonging to WHOEVER RAN
+  // the command, not to the brain. When the owner installs their own brain that
+  // is the whole point. When someone installs on a client's behalf from their
+  // own laptop, every install silently leaves an MCP server pointing at that
+  // client's brain behind, with no uninstall, which contradicts revoking access
+  // at handoff. `--no-connect` is the way to say "not this machine".
+  const skipConnect = process.argv.includes("--no-connect") || options.connectAgents === false;
+  let wiring = { wired: [], failures: [] };
+  if (skipConnect) {
+    console.log(`\n  ${c.bold("Step 5 of 6")}  connecting it to your AI tools\n`);
+    info("skipped (--no-connect). Nothing on this computer was changed.");
+    info(`connect a machine later with: brain mcp-config ${shownTarget}`);
+  } else {
+    console.log(`\n  ${c.bold("Step 5 of 6")}  connecting it to your AI tools\n`);
+    const connectAgents = options.wireAgents ?? wireAgents;
+    wiring = await connectAgents(m, target, {
+      ...(options.agentOptions || {}),
+      existingOnly: false,
+    });
+  }
   const wired = Array.isArray(wiring) ? wiring : (wiring?.wired || []);
   const wiringFailures = Array.isArray(wiring) ? [] : (wiring?.failures || []);
   if (wiringFailures.length) {
@@ -9186,6 +9229,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
 
   install
     brain setup      [manifest]            nothing to a working brain, one command
+    brain setup      [manifest] --no-connect  same, without touching THIS computer's AI tool config
     brain ask        <manifest>            ask a private question in this terminal
     brain doctor     [manifest]            check this machine has everything it needs
     brain verify     <manifest>            check the token and resolve the account
