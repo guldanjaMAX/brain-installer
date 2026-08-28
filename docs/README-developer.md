@@ -5,7 +5,16 @@ keyword search live in D1, vectors live in Vectorize, and the Worker fuses them.
 Nothing runs on our infrastructure, and nothing but a scoped token is held during
 the engagement.
 
-**Status: 0.1.16.** Provisioning, retrieval, resumable folder ingest, deletion,
+**Applies to release 0.1.22.**
+
+**Label: internal.** The label is not a mood. It is computed in
+`test/release-state.test.mjs` from the evidence files actually present in
+`docs/release-evidence/`, against the gates declared in `docs/release-gates.json`,
+and no release may record a label larger than its evidence. This version has no
+evidence artifact for any gate, so `internal` is the honest label and the suite
+refuses to let it read otherwise.
+
+Provisioning, retrieval, resumable folder ingest, deletion,
 upgrade rollback, and `brain setup` are verified end to end against real
 Cloudflare on macOS. Google Drive OAuth and a bounded real-account ingest have
 also been verified. The complete Drive baseline, the schema-13 disposable

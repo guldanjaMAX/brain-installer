@@ -21,13 +21,21 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { platform } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { tokenStorageStatus } from "./connectors/google-auth.mjs";
 import {
   credentialStoreDescription,
   probeCredentialStore,
 } from "./operations/credential-store-probe.mjs";
+import {
+  DEFAULT_REGISTER_PATH,
+  evaluateLegalRegister,
+  loadLegalRegister,
+  outstandingWork,
+} from "./operations/legal-register.mjs";
 
 export const OK = "ok";
 export const WARN = "warn";
@@ -1166,6 +1174,108 @@ export function checkEditPermissions() {
  * So this is an honest CANNOT CHECK with an exact place to look, rather than an
  * inference dressed up as a result.
  */
+/**
+ * The client-facing paperwork this install owes, and whether it describes THIS
+ * release.
+ *
+ * WHY IT IS HERE RATHER THAN SOMEWHERE LATER
+ *
+ * This is the one command that runs on the client's own machine days before
+ * anything is provisioned, which is the last moment where "there is no privacy
+ * notice" is still a scheduling problem rather than a thing discovered after a
+ * household's financial archive has already been read.
+ *
+ * IT REPORTS, IT DOES NOT DECIDE. Whether missing paperwork should stop an
+ * install is a founder's call and not this file's, so the severity comes from
+ * `blocks_install` in the register. Today every entry is false, with the reason
+ * written beside it, so this is a warning and the exit code is unchanged.
+ * Flipping one to true makes it a blocker with no code change here.
+ *
+ * AND IT SAYS WHAT IT CANNOT SEE. It reads files inside the installed package.
+ * Paperwork held in a drive folder or an e-signature account is invisible to
+ * it, so the wording is always "not in this install", never "you have none".
+ */
+export function checkClientPaperwork(options = {}) {
+  const name = "Client paperwork";
+  let register;
+  let version;
+  let state;
+  try {
+    // The evaluation is INSIDE the try, not just the load. An injected register
+    // is validated by evaluateLegalRegister, and when that threw outside this
+    // block a malformed register took the entire pre-install run down with it
+    // rather than producing the one finding it should have.
+    register = options.register ?? loadLegalRegister(options.registerPath ?? DEFAULT_REGISTER_PATH);
+    version = options.version ?? readPackageVersion(options.packageJsonPath);
+    state = evaluateLegalRegister({ register, version, root: options.root });
+  } catch (error) {
+    // A register this command cannot read is itself a finding. Reporting OK
+    // here would be the exact failure the four-state model exists to prevent.
+    return cannotCheck(
+      name,
+      "the paperwork register shipped with this package could not be read",
+      "Nothing here can say which client documents exist or which release they describe.\n" +
+        `  Reported cause: ${String(error?.message || error).slice(0, 160)}\n` +
+        "  Check by hand, before install day, that the client has been shown the terms,\n" +
+        "  privacy notice, data-processing terms, subprocessor list and retention policy\n" +
+        "  that apply to the exact version being installed.",
+    );
+  }
+
+  if (state.satisfied) {
+    return check(name, OK, `${state.total} client document(s) present and stamped to ${version}`);
+  }
+
+  const outstanding = outstandingWork(register, state);
+  const lines = outstanding.map((item) => {
+    const where = item.state === "stale"
+      ? `stamped to ${item.stamped}, not ${version}`
+      : item.state === "unstamped"
+        ? "present but bound to no release"
+        : item.state === "unapproved"
+          ? "present and current, but no approval is recorded"
+          : "not in this install";
+    return `    ${item.title} — ${where}\n      needs: ${item.needs}\n      from: ${item.supplied_by}`;
+  });
+
+  const summary = [
+    `${state.not_ready.length} of ${state.total} not ready for ${version}`,
+    state.missing.length ? `${state.missing.length} absent` : null,
+    state.stale.length ? `${state.stale.length} stamped to another release` : null,
+    state.unstamped.length ? `${state.unstamped.length} bound to no release` : null,
+    state.unapproved.length ? `${state.unapproved.length} unapproved` : null,
+  ].filter(Boolean).join(", ");
+
+  const fix =
+    "The next install reads the client's own documents, mail and records through storage\n" +
+    "  and model providers. These are the documents they are entitled to see, or sign,\n" +
+    "  before that happens, each bound to the exact release that will do the reading:\n\n" +
+    lines.join("\n") + "\n\n" +
+    "  A document bound to no release, or to an older one, is not a smaller problem than a\n" +
+    "  missing one for the subprocessor list in particular: one release can add a company.\n" +
+    "  This check reads files inside the installed package only. If signed paperwork exists\n" +
+    "  elsewhere, nothing here can see it, and this line is not evidence that it does not.\n" +
+    "  None of this is legal advice and nothing in the package establishes that any of these\n" +
+    "  documents is sufficient. A founder writes them; a lawyer reads them.";
+
+  return check(
+    name,
+    state.blocking_not_ready.length ? FAIL : WARN,
+    summary,
+    fix,
+  );
+}
+
+function readPackageVersion(packageJsonPath) {
+  const path = packageJsonPath ??
+    resolve(dirname(fileURLToPath(import.meta.url)), "package.json");
+  const version = JSON.parse(readFileSync(path, "utf8")).version;
+  if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) {
+    throw new Error("the package version could not be read");
+  }
+  return version;
+}
+
 export function checkWorkersPaidPlan() {
   return cannotCheck(
     "Workers Paid plan",
@@ -1264,6 +1374,7 @@ export async function runPreinstall({
   networkCheck = checkNetwork,
   storeCheck = checkCredentialStore,
   toolChecks = [checkClaudeCode, checkCodex],
+  paperworkCheck = checkClientPaperwork,
 } = {}) {
   const out = [];
   const push = (x) => { out.push(x); if (onResult) onResult(x); return x; };
@@ -1294,6 +1405,7 @@ export async function runPreinstall({
 
   push(checkEditPermissions());
   push(checkWorkersPaidPlan());
+  push(paperworkCheck());
   if (includeWrangler) push(checkWrangler());
   for (const tool of toolChecks) push(tool());
   push(checkGoogleConnection(googleStorageStatus));

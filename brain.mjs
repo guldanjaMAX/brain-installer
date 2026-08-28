@@ -96,6 +96,7 @@ import {
 import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mjs";
 import { runAll as doctorRunAll, summarize as doctorSummarize, checkBankFeedRedirect, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
 import { runPreinstall, formatPreinstallReport, preinstallExitCode, platformLabel } from "./doctor.mjs";
+import { recordedReleaseState, releaseStateBanner } from "./operations/release-state.mjs";
 import {
   SUPPORT_MAX_AGE_DAYS,
   SUPPORT_MAX_BYTES,
@@ -2485,7 +2486,8 @@ async function cmdStatus(manifestPath) {
 /**
  * Full upgrade: snapshot, migrate, deploy, verify.
  *
- * ROLLBACK IS DELIBERATELY NOT AUTOMATIC.
+ * DATA RESTORE IS DELIBERATELY NOT AUTOMATIC. CODE AND DATA ARE NOT THE SAME
+ * ROLLBACK.
  *
  * The obvious design restores the D1 bookmark on any failed check. But a
  * restore is itself destructive and irreversible, and running one unattended
@@ -2493,6 +2495,23 @@ async function cmdStatus(manifestPath) {
  * potential data loss. So this captures the bookmark, prints it, and stops.
  * A restore stays a reviewed decision because D1 recovery also requires a
  * Vectorize rebuild before semantic retrieval is trustworthy again.
+ *
+ * That refusal used to be written as a refusal of "rollback", full stop, which
+ * read as a refusal of code rollback too and put this file in direct conflict
+ * with a requirement that upgrades roll back automatically. They are different
+ * operations. Replacing Worker code is reversible and costs nothing; restoring
+ * D1 destroys every write since the bookmark. The scope of each failure is now
+ * classified by `upgradeFailureScope` and the guidance matches it, so a run
+ * that stopped before touching the schema no longer recites a destructive-
+ * restore warning at somebody whose material never moved.
+ *
+ * Automatic redeployment of the PREVIOUS Worker version, in the window where
+ * the compatibility build is deployed and paused but the migration has not run,
+ * is permitted by that split and is NOT implemented here. The installer never
+ * captures a previous-version handle, and adding an unattended deploy on a
+ * failure path without a live field gate would replace one known state with an
+ * unverified one. That is written down as an open item, with what it needs, in
+ * docs/decisions/003-upgrade-rollback-scope.md rather than left as a silence.
  */
 export function commitManifestVersion(manifestPath, version) {
   const pin = pinUpdateManifest(manifestPath);
@@ -3167,6 +3186,119 @@ export async function cmdAcceleratedBootstrap(manifestPath, options = {}) {
   });
 }
 
+/**
+ * The stages an upgrade can fail in BEFORE the schema can have changed.
+ *
+ * Order matters and is the runner's own order: install state is read, a restore
+ * bookmark is captured, the compatibility build is deployed PAUSED, its paused
+ * mode is proved, and old in-flight drains are given a grace window. Only after
+ * all of that does `migration` run. Nothing in this list alters a table or
+ * writes a document.
+ *
+ * Anything NOT in this list is treated as schema-advanced, so a stage nobody
+ * remembered to add here is misclassified in the safe direction — towards "the
+ * schema may have changed" — rather than towards "nothing happened".
+ */
+export const UPGRADE_PRE_SCHEMA_STAGES = Object.freeze([
+  "install-state preflight",
+  "D1 bookmark capture",
+  "paused vector-drain deployment",
+  "paused vector-drain health verification",
+  "vector-drain quiescence",
+]);
+
+/**
+ * How much of the client's data this failure could possibly have touched.
+ *
+ * WHY THIS EXISTS
+ *
+ * A release-honesty report set a requirement that upgrades roll back
+ * automatically against this file's own long-standing refusal to do that. Both
+ * cannot be right, and the reason they collided is that "rollback" was being
+ * used for two operations with completely different blast radii: replacing
+ * Worker code, which is reversible and costs nothing, and restoring D1, which
+ * destroys every write since the bookmark and does not restore Vectorize at
+ * all. See docs/decisions/003-upgrade-rollback-scope.md.
+ *
+ * This function is the code-side half of that split. It does not perform any
+ * rollback. It establishes which of three states the install was left in, so
+ * the guidance a person reads matches what actually happened instead of
+ * reciting a destructive-restore warning at somebody whose data never moved.
+ *
+ *   code-only        stopped before the migration. No schema change, no
+ *                    document written or removed. The bookmark is irrelevant.
+ *   schema-partial   stopped inside the migration. The one genuinely unknown
+ *                    state, and the one `brain doctor --repair` exists for.
+ *   schema-advanced  stopped after the migration committed. The schema moved
+ *                    and the corpus may have been written.
+ */
+export function upgradeFailureScope(stage) {
+  if (stage === "migration") return "schema-partial";
+  return UPGRADE_PRE_SCHEMA_STAGES.includes(stage) ? "code-only" : "schema-advanced";
+}
+
+/**
+ * The failure message, matched to the scope.
+ *
+ * Until this split, all three scopes printed one message: the D1 bookmark, and
+ * a warning not to restore it. For a run that stopped before it changed
+ * anything that reads as "your data is in danger and here is the dangerous
+ * thing you must not do", which is both untrue and the exact shape of advice
+ * somebody panics past. The paused-corpus block is unchanged and still appends
+ * to every scope, because a paused brain is a fact about right now regardless
+ * of what did or did not change.
+ */
+export function upgradeFailureGuidance({ stage, scope, bookmark, message, corpusPaused = false }) {
+  const paused = corpusPaused
+    ? "\n\n" +
+      "      THIS BRAIN CANNOT ACCEPT DOCUMENTS RIGHT NOW.\n" +
+      "      The update paused its corpus writes before changing the schema and did not\n" +
+      "      reach the step that resumes them. Ingest, forget and reindex return 503 until\n" +
+      "      it does. Anything added meanwhile is refused, not queued, so do not drop files\n" +
+      "      in and assume they landed.\n" +
+      "      This pause is deliberate: resuming writes over a half-migrated schema is worse\n" +
+      "      than staying paused. Do not clear VECTOR_DRAIN_MODE by hand.\n" +
+      "      Confirm the state any time with `brain health <manifest>`; it reports\n" +
+      "      accepting_documents false while this lasts."
+    : "";
+
+  if (scope === "code-only") {
+    return `update stopped during ${stage}: ${message}\n` +
+      "      Your brain's stored material did not change. This run stopped before the schema\n" +
+      "      migration began: no table was altered, no document was written or removed, and\n" +
+      "      the only D1 write was this run's own history row.\n" +
+      "      A D1 restore is NOT the repair for this. It would discard writes that have\n" +
+      "      nothing to do with this failure, and it would not restore Vectorize.\n" +
+      "      Safe default: fix the reported issue and run brain update again.\n" +
+      `      Recorded for completeness rather than as an instruction, D1 bookmark: ${bookmark}` +
+      paused;
+  }
+
+  if (scope === "schema-partial") {
+    return `update stopped during ${stage}: ${message}\n` +
+      "      The migration may have committed part of its work, so this is the one failure\n" +
+      "      where the schema is genuinely in an unknown state.\n" +
+      "      First response, which previews and changes nothing until you add --yes:\n" +
+      "          brain doctor <manifest> --repair\n" +
+      "      Do not restore as the first response. A D1 restore discards newer writes and\n" +
+      "      does not restore Vectorize. A restore requires reviewed clean-index recreation/rebind\n" +
+      "      before reindex because provider-only excess vectors cannot be enumerated from D1.\n" +
+      "      If the repair cannot resume it, fix the reported issue and run brain update again.\n" +
+      `      D1 recovery bookmark: ${bookmark}` +
+      paused;
+  }
+
+  return `update stopped during ${stage}: ${message}\n` +
+    `      D1 recovery bookmark: ${bookmark}\n` +
+    "      The schema has already advanced and the corpus may have been written, so this\n" +
+    "      failure is the one where the bookmark matters.\n" +
+    "      Do not restore it as the first response. A D1 restore discards newer writes and\n" +
+    "      does not restore Vectorize. A restore requires reviewed clean-index recreation/rebind\n" +
+    "      before reindex because provider-only excess vectors cannot be enumerated from D1.\n" +
+    "      Safe default: fix the reported issue and run brain update again." +
+    paused;
+}
+
 export async function cmdUpgrade(manifestPath, options = {}) {
   const resolveUpgradeAccount = options.resolveAccount ?? resolveAccount;
   const queryDatabase = options.d1Query ?? d1Query;
@@ -3452,27 +3584,19 @@ export async function cmdUpgrade(manifestPath, options = {}) {
 
       await runStage("verified history commit", () => logRun("verified", null, { required: true }));
     } catch (error) {
-      await logRun("failed", `stage:${stage}`);
-      die(
-        `update stopped during ${stage}: ${error.message}\n` +
-          `      D1 recovery bookmark: ${bookmark}\n` +
-          "      Do not restore it as the first response. A D1 restore discards newer writes and\n" +
-          "      does not restore Vectorize. A restore requires reviewed clean-index recreation/rebind\n" +
-          "      before reindex because provider-only excess vectors cannot be enumerated from D1.\n" +
-          "      Safe default: fix the reported issue and run brain update again." +
-          (corpusPausedByThisRun
-            ? "\n\n" +
-              "      THIS BRAIN CANNOT ACCEPT DOCUMENTS RIGHT NOW.\n" +
-              "      The update paused its corpus writes before changing the schema and did not\n" +
-              "      reach the step that resumes them. Ingest, forget and reindex return 503 until\n" +
-              "      it does. Anything added meanwhile is refused, not queued, so do not drop files\n" +
-              "      in and assume they landed.\n" +
-              "      This pause is deliberate: resuming writes over a half-migrated schema is worse\n" +
-              "      than staying paused. Do not clear VECTOR_DRAIN_MODE by hand.\n" +
-              "      Confirm the state any time with `brain health <manifest>`; it reports\n" +
-              "      accepting_documents false while this lasts."
-            : ""),
-      );
+      // The scope is recorded as well as printed. `brain status` reads the last
+      // five upgrade runs, and "failed at stage X" alone never said whether the
+      // schema had moved, which is the first thing anyone picking the install
+      // up afterwards needs to know.
+      const scope = upgradeFailureScope(stage);
+      await logRun("failed", `stage:${stage} scope:${scope}`);
+      die(upgradeFailureGuidance({
+        stage,
+        scope,
+        bookmark,
+        message: error.message,
+        corpusPaused: corpusPausedByThisRun,
+      }));
     }
     ok(`upgrade verified, now at ${toVersion}`);
   } finally {
@@ -11580,8 +11704,28 @@ export async function requestIngestBatch({
  * they are running against what is installed, because "am I on the new one" is
  * the first question an upgrade raises.
  */
-async function cmdWhatsnew(manifestPath) {
+export async function cmdWhatsnew(manifestPath, options = {}) {
   console.log("");
+  // Said before the changelog, not after it: the changelog describes what the
+  // release contains, and this describes how much of it has been proven. A
+  // client reading a release labelled anything other than production is
+  // entitled to know that before they read the feature list, not instead of it.
+  //
+  // This repeats a claim recorded at release time. docs/release-evidence/ is
+  // not in the package allowlist, so nothing here measures anything, and the
+  // wording must never imply that it did.
+  const gatesPath = options.gatesPath ?? join(HERE, "docs", "release-gates.json");
+  try {
+    const banner = releaseStateBanner(
+      recordedReleaseState(JSON.parse(readFileSync(gatesPath, "utf-8")), PRODUCT_VERSION),
+    );
+    if (banner) { warn(banner); console.log(""); }
+  } catch {
+    // An unreadable or invalid gate manifest is itself worth saying out loud.
+    // Silence here would render exactly like a production release.
+    warn(`the release gate record shipped with ${PRODUCT_VERSION} could not be read, so nothing here can say which gates it met.`);
+    console.log("");
+  }
   let installed = null;
   if (manifestPath && existsSync(manifestPath)) {
     try {
