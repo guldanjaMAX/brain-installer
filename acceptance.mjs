@@ -22,7 +22,8 @@
  * of consequential failures.
  *
  *   1 reach      is it up, is auth enforced
- *   2 data       is anything in it, is it fresh
+ *   2 data       is anything in it, and is EVERY source that should be
+ *                refreshing still refreshing
  *   3 retrieval  does a real question return real sources
  *   4 safety     does the credential gate actually refuse
  *   5 operations schema version, migrations, spend cap
@@ -71,6 +72,161 @@ export function credentialGateRefusalVerdict({ status, text }) {
     return { accepted: false, reason: "credential-gate response did not confirm that nothing was written" };
   }
   return { accepted: true, reason: "structured credential refusal confirmed" };
+}
+
+/**
+ * States the Worker reports for a source that WAS expected to keep itself
+ * current and has not. Each one is a FAILURE, not a warning: a client reading
+ * a green acceptance report is being told their brain is current, and a source
+ * in one of these states makes that sentence false.
+ */
+const FRESHNESS_DEAD = new Set(["stale", "broken", "never_synced"]);
+
+/** One sentence a person can act on at 9pm, per dead state. */
+const FRESHNESS_SENTENCE = {
+  stale: (s) =>
+    `last read ${s.days_since_ingest ?? "?"} day(s) ago but expected to refresh about every ` +
+    `${s.expected_every_days ?? "?"} day(s); anything added since is not in the brain`,
+  broken: (s) => s.reason || "the last sync failed",
+  never_synced: () =>
+    "expected to refresh but has never completed a sync, so its contents may be missing entirely",
+};
+
+const shortLabel = (s) =>
+  s.state === "stale" && Number.isFinite(Number(s.days_since_ingest))
+    ? `${s.name} (${s.days_since_ingest}d)`
+    : s.name;
+
+/**
+ * Judge freshness PER SOURCE, against what each source was actually expected
+ * to do.
+ *
+ * This replaces a check that took the newest ingest timestamp across every
+ * source and called the whole corpus fresh if that single value was recent. On
+ * any install with one fast source — message capture runs every minute — that
+ * check passed forever, including while the client's most important corpus had
+ * been dead for months. It was a corpus-wide claim supported by one source.
+ *
+ * The expectation itself is NOT reinvented here. `/api/admin/brain/freshness`
+ * already owns it: a schedule is recorded when a connector's scheduler is
+ * installed, a source with no expectation is never called stale because it was
+ * never going to update, and a source we cannot reach on our own reads
+ * "manual" rather than being blamed for a limit of the architecture. Deriving a
+ * second notion of staleness in the test would let the acceptance report and
+ * `brain sources` disagree about the same install, and the client would have no
+ * way to tell which one was lying.
+ *
+ * Returns records rather than recording them, so the judgement is testable
+ * without a Worker.
+ */
+export function freshnessVerdicts({ ok, status, payload, expectedBackend = "d1" } = {}) {
+  const HEADLINE = "every source expected to refresh is current";
+
+  // A check that cannot run says so. It never passes.
+  if (String(expectedBackend || "").toLowerCase() !== "d1") {
+    return [{
+      name: HEADLINE,
+      status: SKIP,
+      detail:
+        `per-source freshness is implemented for the d1 backend and this install declares ` +
+        `${expectedBackend || "no"} storage, so no freshness claim is made either way`,
+    }];
+  }
+  if (!ok) {
+    return [{
+      name: HEADLINE,
+      status: FAIL,
+      detail:
+        `the freshness endpoint did not answer (HTTP ${status ?? "?"}). Freshness is UNVERIFIED: ` +
+        `this install cannot tell you whether any source has stopped updating. Upgrade the ` +
+        `Worker, then re-run.`,
+    }];
+  }
+  if (payload?.unavailable) {
+    return [{
+      name: HEADLINE,
+      status: FAIL,
+      detail: "the Worker could not read its sources table, so no source's freshness could be checked",
+    }];
+  }
+  const sources = Array.isArray(payload?.sources) ? payload.sources : null;
+  if (!sources) {
+    return [{
+      name: HEADLINE,
+      status: FAIL,
+      detail: "the freshness endpoint returned no per-source list, so freshness is unverified",
+    }];
+  }
+  if (!sources.length) {
+    return [{
+      name: HEADLINE,
+      status: WARN,
+      detail:
+        "no sources are registered in this install, so nothing here can be judged fresh or stale. " +
+        "Register the corpora with `brain sources <manifest> --add <name>`.",
+    }];
+  }
+
+  const dead = sources.filter((s) => FRESHNESS_DEAD.has(s.state));
+  const unscheduled = sources.filter((s) => s.state === "unscheduled");
+  const manual = sources.filter((s) => s.state === "manual");
+  const indexing = sources.filter((s) => s.state === "indexing");
+  const current = sources.filter((s) => s.state === "ok");
+  const judged = dead.length + current.length + indexing.length;
+
+  const aside = [
+    unscheduled.length ? `${unscheduled.length} unscheduled` : null,
+    manual.length ? `${manual.length} loaded by hand and never judged stale` : null,
+    indexing.length ? `${indexing.length} mid-sync` : null,
+  ].filter(Boolean);
+
+  // "0 of 0 current" is a vacuous green, and a vacuous green is the same lie
+  // in a smaller font. When nothing in the install is expected to refresh, say
+  // that instead of reporting a perfect score over an empty set.
+  const headline = judged === 0
+    ? {
+        name: HEADLINE,
+        status: WARN,
+        detail:
+          `no source in this install is expected to refresh, so nothing here is being kept ` +
+          `current${aside.length ? ` (${aside.join("; ")})` : ""}`,
+      }
+    : {
+        name: HEADLINE,
+        status: dead.length ? FAIL : PASS,
+        detail: dead.length
+          ? `${dead.length} of ${judged} scheduled source(s) have stopped updating: ` +
+            `${dead.map(shortLabel).join(", ")}` +
+            (aside.length ? ` (${aside.join("; ")})` : "")
+          : `${current.length + indexing.length} of ${judged} scheduled source(s) current` +
+            (aside.length ? ` (${aside.join("; ")})` : ""),
+      };
+  const out = [headline];
+
+  // One line per source that is not current, because "something is stale" is
+  // not something anyone can act on.
+  for (const s of dead) {
+    out.push({
+      name: `freshness: ${s.name}`,
+      status: FAIL,
+      detail: `${String(s.state).toUpperCase().replace(/_/g, " ")} — ` +
+        `${(FRESHNESS_SENTENCE[s.state] || (() => s.state))(s)}`,
+    });
+  }
+  // Not a failure and not a pass. Nothing on this machine refreshes this
+  // source, which is the honest state on a platform where the product installs
+  // no scheduler at all, and it must be visible rather than quietly green.
+  for (const s of unscheduled) {
+    out.push({
+      name: `freshness: ${s.name}`,
+      status: WARN,
+      detail:
+        "NO REFRESH IS SCHEDULED. It can be refreshed automatically but nothing on this " +
+        "install does, so it will not update until a schedule is set, and no staleness " +
+        "claim is made about it either way.",
+    });
+  }
+  return out;
 }
 
 export class Acceptance {
@@ -232,20 +388,18 @@ export class Acceptance {
       );
     }
 
-    const freshest = rows
-      .map((r) => (r.last_ingested ? Date.parse(r.last_ingested) : NaN))
-      .filter(Number.isFinite)
-      .sort((a, b) => b - a)[0];
-    if (!freshest) {
-      this.record(t, "corpus freshness", WARN, "no ingest timestamps reported");
-    } else {
-      const days = Math.floor((Date.now() - freshest) / 864e5);
-      this.record(
-        t,
-        "corpus is fresh",
-        days <= 2 ? PASS : days <= 14 ? WARN : FAIL,
-        `newest ingest ${days} day(s) ago`
-      );
+    // Freshness is a PER-SOURCE claim and never a corpus-wide one. Ask the
+    // Worker's expectation-aware surface rather than re-deriving staleness
+    // here, so this check and `brain sources` can never disagree about which
+    // source is dead.
+    const freshness = await this.get("/api/admin/brain/freshness");
+    for (const verdict of freshnessVerdicts({
+      ok: freshness.ok,
+      status: freshness.status,
+      payload: freshness.json,
+      expectedBackend,
+    })) {
+      this.record(t, verdict.name, verdict.status, verdict.detail);
     }
   }
 
