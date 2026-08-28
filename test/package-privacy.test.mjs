@@ -84,6 +84,7 @@ const expected = [
   "connectors/google-calendar.mjs",
   "connectors/google-drive.mjs",
   "connectors/keychain-write.exp",
+  "connectors/whatsapp.mjs",
   "docs/ARCHITECTURE.md",
   "docs/COMPETITIVE-BENCHMARK.md",
   "docs/ENGINEERING-STANDARDS.md",
