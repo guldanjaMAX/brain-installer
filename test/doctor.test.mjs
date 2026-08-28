@@ -77,10 +77,24 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("the missing-token remedy uses hidden entry rather than shell history",
     /brain setup.*brain update.*hidden token entry/is.test(v.fix) &&
       !/export\s+CLOUDFLARE_API_TOKEN|CLOUDFLARE_API_TOKEN\s*=\s*['\"]/i.test(v.fix), v.fix);
-  const tokenCheck = checkCfToken();
+  const tokenCheck = await checkCfToken();
   check("doctor's required-token fix never prints a pasteable token command",
     tokenCheck.status === FAIL && /without echo|secret manager/i.test(tokenCheck.fix) &&
       !/export\s+CLOUDFLARE_API_TOKEN|CLOUDFLARE_API_TOKEN\s*=\s*['\"]/i.test(tokenCheck.fix), tokenCheck.fix);
+  // A token that has no token to recreate should never be told to recreate one.
+  check("the no-token remedy does not tell you to RECREATE a token you do not have",
+    !/Recreate the account-scoped token/i.test(tokenCheck.fix), tokenCheck.fix);
+  check("and it does not call it the CLIENT's account, which the owner may be reading",
+    !/CLIENT's account/.test(tokenCheck.fix), tokenCheck.fix);
+  // Presence is not validity. This regressed once as "ok, ready to install"
+  // on a completely bogus token, which is the worst possible false green.
+  const bogus = await checkCfToken("cfut_thisIsNotARealTokenAtAll1234567890");
+  check("a syntactically plausible but invalid token FAILS rather than passing",
+    bogus.status === FAIL || bogus.status === WARN, JSON.stringify(bogus));
+  if (bogus.status === FAIL) {
+    check("and the invalid-token message says what to actually check",
+      /copied whole|expired|API Tokens/i.test(bogus.fix), bogus.fix);
+  }
   if (saved) process.env.CLOUDFLARE_API_TOKEN = saved;
 }
 {
