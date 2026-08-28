@@ -12,7 +12,7 @@ never having been built).
 
 `test/sms-backup.test.mjs` (line 4) and `evidence/WP-03.md` (lines 5 and
 10, in the original text) named the real pilot client by first name
-("Chet") when explaining why WP-03 was built ahead of confirming his phone
+when explaining why WP-03 was built ahead of confirming his phone
 OS. Neither file ships inside the npm package — both are outside
 `package.json`'s `"files"` array, and `test/package-privacy.test.mjs` only
 ever scanned files destined for `npm pack` — so there was no
@@ -84,11 +84,12 @@ architecture. That decision is left for a human. In its place:
 
 While building the connector rehearsal below (Part 2), `test/google-drive.test.mjs`
 turned out to already contain a REAL client email and the REAL owner email
-in a synthetic Gmail test fixture (`"From: Eli <eli@azlawns.com>\r\nTo:
-james@jamesguldan.com\r\n..."`, lines ~382-386), present since the repo's
+in a synthetic Gmail test fixture (a real From/To header pair at
+lines ~382-386), present since the repo's
 very first commit (`9b28f7e`, 2026-08-18) — long before this branch existed.
-`eli@azlawns.com` is James Guldan's real active client (Eli Hall, AZ Lawns /
-AMS Landscaping, per the project's own CLAUDE.md). This is exactly the kind
+The From address belongs to a real, active client of the business (the
+addresses themselves are deliberately not repeated in this file; see the
+fix commit for the before/after). This is exactly the kind
 of exposure this scrub exists to prevent, but it is in a file this task did
 not name and fixing it correctly means updating that file's own assertions
 (which regex-match the email address), which is more than a drive-by edit.
