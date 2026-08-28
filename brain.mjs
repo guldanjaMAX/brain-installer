@@ -84,7 +84,7 @@ import {
   GATE_VERSION as CREDENTIAL_GATE_VERSION,
 } from "./worker/src/lib/secret-scan.js";
 import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mjs";
-import { runAll as doctorRunAll, summarize as doctorSummarize, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
+import { runAll as doctorRunAll, summarize as doctorSummarize, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY, CF_TOKEN_REJECTED_REMEDY, isCredentialRejection } from "./doctor.mjs";
 import {
   SUPPORT_MAX_AGE_DAYS,
   SUPPORT_MAX_BYTES,
@@ -7822,6 +7822,17 @@ export function resolveAdminKey(manifestPath, {
 function crash(err) {
   const msg = err && err.message ? err.message : String(err);
   const supportEventId = recordSupportFailure(err, { unexpected: true });
+  // A refused credential is not a bug in this tool, and saying so is worse than
+  // saying nothing: a mistyped or expired token is the single most likely
+  // install-day mistake, and "not something you did wrong" is the one sentence
+  // that stops the owner from fixing it (bench, 2026-08-28).
+  if (isCredentialRejection(err)) {
+    console.error(`\n${c.red("fail")}  Cloudflare refused the credential: ${msg}`);
+    console.error("  " + CF_TOKEN_REJECTED_REMEDY.split("\n").join("\n  "));
+    console.error("\n  Nothing was created or half-written. Re-run once the token is right.");
+    printSupportReceipt(supportEventId, (line) => console.error(line));
+    process.exit(1);
+  }
   console.error(`\n${c.red("unexpected error")}  ${msg}`);
   console.error("  This is a bug in the installer, not something you did wrong.");
   console.error("  Every command here is safe to run again: nothing is left half-written that");
