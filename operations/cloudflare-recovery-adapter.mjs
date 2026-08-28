@@ -120,6 +120,23 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "owner_passkeys",
   "auth_challenges",
   "enrollment_codes",
+  // Schema 15: the structured financial ledger. Every one of these is durable
+  // and every one is exported. A recovered brain that came back with its
+  // documents and without its ledger would answer a question about money from
+  // prose alone, silently, which is the exact failure the ledger exists to end.
+  "fin_entities",
+  "fin_accounts",
+  "fin_account_coverage",
+  "fin_documents",
+  "fin_statements",
+  "fin_transactions",
+  "fin_balance_snapshots",
+  "fin_obligations",
+  "fin_deadlines",
+  "fin_exceptions",
+  "fin_open_items",
+  "fin_reconciliations",
+  "fin_reconciliation_claims",
 ]);
 
 /**
@@ -206,10 +223,12 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   // Owners re-sign-in with their passkey; that is a tap, not a loss.
   "session_generation",
 ]);
-// Schema 14 added the additive owner-passkey tables and the
-// session_generation column; the vector protocol itself is unchanged, but
-// the recovery contract tracks the EXACT current schema by design.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 14;
+// Schema 15 added the additive financial-ledger tables. As with schema 14's
+// owner-passkey tables, the vector protocol itself is unchanged, but the
+// recovery contract tracks the EXACT current schema by design: a drill against
+// a database one migration behind would export a table set that does not match
+// the reviewed list, and refusing is the whole point of pinning it.
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 15;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -218,13 +237,38 @@ function quoteIdentifier(value) {
   return `"${value}"`;
 }
 
+// Schema 15: the structured financial ledger, added as one additive migration.
+// Listed once and consumed twice, by the aggregate projection and by the
+// expected-table gate, so the two cannot drift apart.
+const SCHEMA_15_TABLES = Object.freeze([
+  "fin_entities",
+  "fin_accounts",
+  "fin_account_coverage",
+  "fin_documents",
+  "fin_statements",
+  "fin_transactions",
+  "fin_balance_snapshots",
+  "fin_obligations",
+  "fin_deadlines",
+  "fin_exceptions",
+  "fin_open_items",
+  "fin_reconciliations",
+  "fin_reconciliation_claims",
+]);
+
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
     table,
     // Literal zeros keep older migration prefixes queryable without
     // referencing tables they do not have. Passkey restoration correctness is
     // proven by the export content itself, not by the corpus aggregate.
-    ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes"].includes(table)
+    // Literal zeros also cover the schema-15 ledger tables, for the same reason
+    // the passkey tables take one: this aggregate is queried against databases
+    // at several migration prefixes, and a COUNT against a table a prefix does
+    // not have fails the whole snapshot. Ledger restoration correctness is
+    // proven by the exported content, which these tables are fully part of.
+    ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
+     ...SCHEMA_15_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -980,7 +1024,8 @@ function expectedRecoveryTables(migrations) {
   const latest = migrations?.at(-1)?.version || RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION;
   return RECOVERY_DURABLE_TABLES.filter((table) =>
     (latest >= 13 || table !== "vector_bootstrap_batches") &&
-    (latest >= 14 || !SCHEMA_14_TABLES.includes(table)));
+    (latest >= 14 || !SCHEMA_14_TABLES.includes(table)) &&
+    (latest >= 15 || !SCHEMA_15_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {
