@@ -2,6 +2,12 @@
 > everywhere it appears, and replace `[WORKER_NAME]` with this install's worker
 > name from the manifest. A runbook that says "call me" with no name or number
 > is a dead end at 2am.
+>
+> An unfilled copy of this file also ships inside the installed package, so
+> somebody will eventually read it with the placeholders still in it. If you are
+> that reader: `[INSTALLER CONTACT]` is whoever set your brain up, and
+> `[WORKER_NAME]` is the `worker_name` in your manifest. Every command below
+> works as written either way.
 
 # Runbook: the ten things most likely to go wrong
 
@@ -40,6 +46,14 @@ node brain.mjs sources <manifest>
 ```
 
 That prints one line per source with its status (pending, indexing, ready, or error), how many documents it holds, and when it last took anything in. When the durable admin key is available it also cross-checks those counts against what your brain actually holds and flags any gap, because the registry's number is its last receipt and the brain is the authority. **A drift of thousands is the cheapest signal available that a load died halfway.**
+
+And the one that checks the parts of the install that are not questions and answers at all:
+
+```
+node brain.mjs doctor <manifest>
+```
+
+Given a manifest it goes past this machine and reads your brain's own state: whether it is paused partway through an upgrade, and whether every applied database change still matches the file it came from. That second check is the only thing that catches entry 9 before an update walks into it.
 
 ---
 
@@ -95,6 +109,31 @@ If local persistence fails, the Worker was not changed. Never copy the Windows
 `.brain-admin-key` envelope into another credential field.
 
 **Who:** you.
+
+---
+
+### 1b. Every command is refused, but the same address opens fine in a browser
+
+**You see:** commands against the brain fail with something that is not the brain's own answer. Instead of JSON you get an HTML page, or a body containing `error code: 1010`. It tends to start all at once, across every command, and it survives rotating the key. Then you paste the same address into a browser and it answers normally. That contradiction is the whole signature, and it is why this reads as a broken install rather than a blocked client.
+
+**Why:** something in front of your brain is refusing programs. Cloudflare's bot protection decides per request, and it can turn away a client that does not look like a browser before your brain ever sees it. The refusal happens above your brain, so your key is never read and is never at fault. The installer's own commands identify themselves as `node`, which is exactly the kind of client such a rule is written to stop.
+
+**Tell it apart in ten seconds.** The `/health` endpoint needs no key, so this probe carries no credential at all. Run both lines:
+
+```
+curl -sS -i https://<your brain's address>/health
+curl -sS -i -A "Mozilla/5.0" https://<your brain's address>/health
+```
+
+If the first returns an HTML page or `error code: 1010` and the second returns JSON, you have your answer: your client was blocked, your brain is up. If both return the same thing, this is not your failure and entry 1 or entry 2 is the one to read.
+
+**Fix:** stop the rule from applying to your brain's hostname. In the Cloudflare dashboard, open the zone that holds that hostname, then Security, and look at both the bot settings and any WAF custom rule that matches on user agent. Your brain is an API that your own tools call. It is not a public website that needs bot filtering, and filtering it blocks only you.
+
+**This applies only when your brain is on your own domain.** An address ending in `.workers.dev` does not sit inside a zone you configure, so no zone rule of yours is refusing it, and the cause is somewhere else.
+
+**One useful asymmetry:** the MCP server that connects your AI tools sends a browser User-Agent on every call already, and says so by name if it is refused anyway. So if your AI tools still answer while your terminal commands are refused, that gap points here. It is a signal and not a proof, because a rule matching on anything other than the user agent refuses both.
+
+**Who:** you, in the dashboard.
 
 ---
 
@@ -396,16 +435,48 @@ migration 0002_llm_call_log was already applied but its content has changed.
       Never edit an applied migration. Add a new one instead.
 ```
 
-**Why:** somebody edited a database change file after it had already run. This is a hard stop on purpose. If it were allowed, two installs would silently have different databases while both reporting the same version, which is the worst possible state to debug: everything reports as up to date and nothing matches.
+Every `migrate`, `update`, and `upgrade` stops there, and stays stopped until this is reconciled.
 
-**Fix:** restore that file to its original content, then add a **new** file with the next number for whatever change you actually wanted.
+**Why:** the bytes of a database change file are no longer the bytes that ran. The most common cause is not somebody rewriting the SQL, it is a line-ending change made by a different editor or a different machine. The stop is deliberate. If it were allowed through, two installs would silently have different databases while both reporting the same version, which is the worst possible state to debug: everything reports as up to date and nothing matches.
+
+**Fix:** reconcile the recorded checksum. Nothing about your database is wrong, so nothing needs to be re-run or restored. The schema is already in the state the current file describes. Only the fingerprint recorded next to it is stale, and that is the one thing this changes.
+
+First look at what changed. This reads and prints, and changes nothing:
 
 ```
-git checkout migrations/d1/0002_llm_call_log.sql
+node brain.mjs doctor <manifest> --repair-checksum
+```
+
+It reads your database, so like `brain setup` and `brain update` it asks for the Cloudflare token at a hidden prompt, or reuses the one this machine already remembers.
+
+For every migration that no longer matches, it prints when it was applied, both checksums, the current file's size in lines and bytes, and whether the difference is only line endings. That last line is a proof rather than a guess: it converts the current file to LF and to CRLF and checks each against the recorded checksum. If neither reproduces it, it says `not confirmable as a pure line-ending change` and tells you to review the file by hand, because the bytes that originally ran were never kept, only their checksum was.
+
+When the preview is right, confirm it:
+
+```
+node brain.mjs doctor <manifest> --repair-checksum --yes
+```
+
+That records the current file's checksum for each drifted migration and does nothing else. No migration SQL runs. Then confirm normal work is unblocked:
+
+```
+node brain.mjs status <manifest>
 node brain.mjs migrate <manifest>
 ```
 
-**Who:** me, or whoever is maintaining the code.
+**`--repair` will not fix this, and it is the wrong reach.** It replays the same update path, which runs the same check and stops in the same place. `--rollback` does not fit either, because there is no bad change to restore away from.
+
+**You do not need Git for this, and you do not need this file's history.** Your install is an unpacked release rather than a checkout, so there is nothing to check out and nothing to revert. Reconciliation is the whole fix, on the machine where the brain actually runs.
+
+**With one honest exception.** When the preview says `not confirmable as a pure line-ending change`, it is telling you the truth about its own limits. The bytes that originally ran were never kept, so it cannot show you what changed, and on an install with no history of that file neither can anything else. Confirming is still narrow in what it touches, but you would be accepting a difference nobody has read. Send that preview to [INSTALLER CONTACT] before you add `--yes`. A drift that is confirmed as line endings needs no such call.
+
+**Prevention:** plain `node brain.mjs doctor <manifest>`, with no flags at all, now checks this on its own and reports `migration checksums` as a FAIL naming the exact migration. That is on purpose: it is meant to find this before an update walks into it, not after.
+
+**If it was an update that hit this, check whether your brain is also paused.** An update can reach the migration step after it has already deployed the paused build, so this stop can leave writes paused as well. `brain health <manifest>` reporting `accepting_documents: false` is that state, and entry 10 covers it. Reconcile the checksum first either way, because `--repair` keeps hitting the same stop until you do, then finish the update.
+
+**Who:** you.
+
+**If you maintain the source repository** and the file was edited there by mistake, restoring it in your own checkout and adding a **new** migration with the next number is the right fix in that repository. That is a separate job from the install above, and doing it there does not repair an install that has already stopped.
 
 ---
 

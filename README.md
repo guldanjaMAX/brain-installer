@@ -234,6 +234,12 @@ brain health ./brain.manifest.json    # what is wrong with the brain
 brain secrets ./brain.manifest.json   # exact durable ADMIN_KEY rotation command
 ```
 
+The failures most likely to hit a working install, each with what you see, why
+it happens, and the exact command, are in
+[onboarding/06-runbook-top-ten-failures.md](onboarding/06-runbook-top-ten-failures.md).
+It ships inside this package, so it is on your machine already and readable with
+no network.
+
 For an admin-key rotation, use an approved no-history credential launcher to
 provide the replacement only to `brain secrets`. Never paste or export the
 replacement in a shell command. After a read-only Cloudflare account check, the
