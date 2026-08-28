@@ -157,6 +157,11 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   // auth_challenges: a recovered brain starts its hour clean.
   "recovery_codes",
   "recovery_attempts",
+  // Schema 20: the Zoom delivery ledger. DURABLE and exported. It is the only
+  // record that a transcript Zoom announced is still owed, so a recovered brain
+  // that came back without it would quietly forget every meeting it had not yet
+  // stored, which is the exact silent loss the ledger was added to end.
+  "zoom_deliveries",
 ]);
 
 /**
@@ -257,13 +262,14 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // Schema 15 added the additive financial-ledger tables, 17 added the chunk
 // token-fit columns, 18 added two provenance COLUMNS to `documents`
 // (text_source, text_reliable) so an OCR'd document is distinguishable from one
-// read from a text layer, and 19 added the two recovery-card tables. The vector
+// read from a text layer, 19 added the two recovery-card tables, and 20 added
+// the Zoom delivery ledger. The vector
 // protocol is unchanged throughout, but the recovery contract tracks the EXACT
 // current schema by design: a drill against a database one migration behind
 // would export a column set that does not match the reviewed list, and refusing
 // is the whole point of pinning it. Bumping this is a required step of shipping
 // any migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 19;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 20;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -305,6 +311,12 @@ const SCHEMA_19_TABLES = Object.freeze([
   "recovery_attempts",
 ]);
 
+// Schema 20: the Zoom delivery ledger, which records a transcript as owed
+// before the webhook is acknowledged.
+const SCHEMA_20_TABLES = Object.freeze([
+  "zoom_deliveries",
+]);
+
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
     table,
@@ -317,7 +329,8 @@ const AGGREGATE_FIELDS = Object.freeze([
     // not have fails the whole snapshot. Ledger restoration correctness is
     // proven by the exported content, which these tables are fully part of.
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
-     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_19_TABLES].includes(table)
+     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_19_TABLES,
+     ...SCHEMA_20_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1077,7 +1090,8 @@ function expectedRecoveryTables(migrations) {
     (latest >= 14 || !SCHEMA_14_TABLES.includes(table)) &&
     (latest >= 15 || !SCHEMA_15_TABLES.includes(table)) &&
     (latest >= 16 || !SCHEMA_16_TABLES.includes(table)) &&
-    (latest >= 19 || !SCHEMA_19_TABLES.includes(table)));
+    (latest >= 19 || !SCHEMA_19_TABLES.includes(table)) &&
+    (latest >= 20 || !SCHEMA_20_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {
