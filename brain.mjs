@@ -632,14 +632,32 @@ export async function chooseSetupAccount(prompt, options = {}) {
 
 /* ------------------------------------------------------------- commands */
 
+/**
+ * The bucket this manifest asks for, or null when it asks for none.
+ *
+ * Verify and provision have to agree about whether R2 is in play, and they did
+ * not. A blank name is not a request.
+ */
+export function r2BucketRequested(cfg) {
+  const name = String(cfg?.r2_bucket ?? "").trim();
+  return name || null;
+}
+
 async function cmdVerify(manifestPath) {
   const { m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
   ok(`token valid, account "${acct.name}" (${acct.id})`);
 
   // R2 needs separate activation and a card on file, even for the free tier.
-  // It is the most common mid-install surprise, so it is checked up front.
-  try {
+  // It is the most common mid-install surprise, so it is checked up front, but
+  // ONLY when the manifest names a bucket. Provision skipped its R2 step in
+  // silence for a manifest with no bucket while verify probed R2 anyway and
+  // told the owner to add a payment method for storage this brain never
+  // touches (bench, 2026-08-28, F-09). One predicate, read by both.
+  const r2Bucket = r2BucketRequested(m.infrastructure?.cloudflare);
+  if (!r2Bucket) {
+    info("this install does not use R2 file storage, so it is not checked");
+  } else try {
     await cf(`/accounts/${acct.id}/r2/buckets`);
     ok("R2 is enabled");
   } catch (e) {
@@ -921,7 +939,8 @@ async function cmdProvision(manifestPath) {
   cfg.d1_database_id = db.uuid;
 
   // R2, optional. A failure here is not fatal: the brain runs without it.
-  if (cfg.r2_bucket) {
+  // Same predicate verify uses, so the two can never disagree again.
+  if (r2BucketRequested(cfg)) {
     try {
       const buckets = await cf(`/accounts/${acct.id}/r2/buckets`);
       const found = (buckets.buckets || []).find((b) => b.name === cfg.r2_bucket);

@@ -320,3 +320,90 @@ does not use R2.
 251 seconds from nothing to a deployed, migrated, secret-bearing brain. No
 20-minute safety pause: the pause seen earlier was triggered by running the
 granular steps out of order first, not by a clean install.
+
+---
+
+## Break-tests (INS-03), first real run: 2026-08-28
+
+Five injections against a live account, judged on one question: **could a
+non-technical owner act on this message without calling us?**
+
+| # | Injection | Verdict |
+|---|---|---|
+| BT-1 | Invalid `CLOUDFLARE_API_TOKEN`, `brain verify` | **CALL US** — see F-10 |
+| BT-2 | Invalid token, `brain doctor` on the released v0.1.19 | **CALL US** — fixed on main |
+| BT-3 | Valid token, wrong `account_id` in the manifest | **ACT ON IT** — model message |
+| BT-4 | SIGINT mid-provision, then plain re-run | **ACT ON IT** — recovers, 47s |
+| BT-5 | Network loss mid-run | not run; needs a controlled network shim |
+
+### BT-2, the released version, is the case the fix was written for
+
+On v0.1.19 (what every client installs today) a completely invalid token
+produces this, verbatim:
+
+```
+  ok    Node                v24.13.1
+  ok    Network             reached api.cloudflare.com (HTTP 400)
+
+  What to do
+  Vectorize
+      Recreate the account-scoped token with Vectorize: Edit. ...
+fail  1 blocking problem(s).
+```
+
+The token is never mentioned. The owner is sent to fix Vectorize permissions
+they do not have a problem with. On `main` the same input now says: *"The value
+in CLOUDFLARE_API_TOKEN is not a token Cloudflare will accept."* Confirmed by
+running both.
+
+### BT-3 is what a good failure looks like
+
+```
+fail  the manifest declares account 0000...0000, but this token can only see:
+        da7ea4a7...  <account name>
+      Refusing to provision into a different account than the manifest names.
+```
+
+States the mismatch, shows the real value, explains the refusal. Use this as
+the house pattern.
+
+### F-10 (SERIOUS, open): `verify` blames itself for the client's typo
+
+An invalid token in `brain verify` produces:
+
+```
+unexpected error  GET /accounts failed (403): 9109: Invalid access token
+  This is a bug in the installer, not something you did wrong.
+```
+
+It is not a bug in the installer, and it *is* something the owner can fix. A
+mistyped or expired token is the single most likely install-day mistake, and
+this is the one message that tells them to stop trying. Still present on main:
+the doctor fix hardened `checkCfToken`, not `verify`'s error path. A 403 with
+Cloudflare code 9109 / 10000 must be classified as a credential problem and
+routed to the token remedy, never to the unexpected-error handler.
+
+### F-11 (MINOR, open): the success screen prints a path like `../../../../../../../private/tmp/...`
+
+The final screen — the last thing a client reads — renders the manifest path
+relative to cwd, which for any manifest outside the working directory produces
+a wall of `../`. It appears three times: the "manifest updated" line, `brain
+ask <path>`, and `brain ingest <path>`. Print an absolute path, or the relative
+one only when it is actually shorter.
+
+### F-12 (MODERATE, open): setup edits the operator's own global MCP config
+
+`brain setup` detects local Claude Code / Codex installs and writes the new
+brain into `~/.claude.json` and `~/.codex/config.toml`, then prints "It is
+connected to: Claude Code, Codex." There is no opt-out flag and no uninstall.
+
+For a client installing their own brain this is the right default. For whoever
+runs installs *for* clients it is not: every install silently adds an MCP
+server pointing at that client's brain to the operator's machine, and it stays
+there after handoff, which sits badly beside the promise that we keep nothing
+and revoke access at handoff. It also accumulates dead entries for every test
+or trial install.
+
+Suggested: a `--no-connect` flag (and honour it in `setup`), plus teardown
+guidance. Verified during testing that a test install left a live
+`[mcp_servers.brain-test-bt]` block behind; it had to be removed by hand.
