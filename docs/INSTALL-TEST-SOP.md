@@ -255,3 +255,68 @@ only. A real client installs on their own host, where WARP works normally.
 
 Add to the pre-run checklist: `warp-cli --accept-tos status` must not report
 `Connected` when a VM install test is about to run.
+
+---
+
+## Second bench run: 2026-08-28, a real provision end to end
+
+Ran `brain verify` → `provision` → `migrate` → `deploy` → `secrets` against a
+live account, then a clean `brain setup` from nothing. Four findings.
+
+### F-06 (SERIOUS, fixed): the index was named after the template placeholder
+
+`provision` created a real Vectorize index literally called
+`filled_in_by_provisioner`. The template ships that string for three fields;
+two are ids it genuinely fills in, the third is the index NAME, and a truthy
+placeholder sailed past the `|| <slug>-brain` default.
+
+The name is not the danger. Provision **adopts** an index whose name matches,
+so a second install into the same account would adopt the first one's index
+and two clients would share a vector store. Fixed in `brain.mjs`; two
+regression tests in `test/provision-guards.test.mjs`.
+
+### F-07 (MODERATE, open): the printed next-steps do not work
+
+`provision` ends with "next: brain migrate, then deploy, then secrets, then
+health". Following that exact sequence **fails at `secrets`**:
+
+```
+fail  no ADMIN_KEY was found in durable storage. Run `brain setup <manifest>`
+```
+
+Only `brain setup` generates the admin key, so the granular path the tool
+recommends is a dead end. The failure text is good and names the fix; the
+guidance that led there is the defect. Either the hint should say `brain setup`,
+or `secrets` should generate the key.
+
+### F-08 (SERIOUS, open): a healthy clean install exits 1 with raw HTML
+
+A clean `brain setup` provisioned, migrated, deployed and set all three secrets
+correctly, then ended:
+
+```
+fail  drain failed (404): <!DOCTYPE html>
+      <!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> <![endif]-->
+```
+
+Exit code 1. The install was **fine**: `/health` returned
+`{"ok":true,"status":"ok"}` moments later. The 404 is the workers.dev route not
+being live yet when setup immediately called drain, and the handler prints the
+raw Cloudflare error page into the client's terminal.
+
+This is the mirror of the token bug. That one claimed success it had not
+earned; this one claims failure that did not happen, on a working install, on
+install day. Drain needs a short retry against a fresh deploy, and the error
+path must never dump an HTML body to the terminal.
+
+### F-09 (MINOR, open): R2 warns even when the manifest disables it
+
+With `r2_bucket: null`, `verify` still probes R2 and warns the client must
+enable it "which requires a payment method". Confusing for an install that
+does not use R2.
+
+### Timing on a clean run
+
+251 seconds from nothing to a deployed, migrated, secret-bearing brain. No
+20-minute safety pause: the pause seen earlier was triggered by running the
+granular steps out of order first, not by a clean install.
