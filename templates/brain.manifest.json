@@ -100,6 +100,20 @@
       ],
       "enabled": false
     },
+    "zoom": {
+      "_comment": [
+        "Zoom cloud-recording transcripts. Requires a PAID (Licensed) Zoom seat:",
+        "the free Basic tier cannot cloud record at all, so it can never produce",
+        "a transcript, and `brain connect zoom` refuses it rather than connecting",
+        "into a silent nothing. You create a Server-to-Server OAuth app in YOUR",
+        "OWN Zoom account with the cloud_recording:read:admin scope; connect",
+        "verifies it live, writes its four values as secrets on YOUR OWN worker,",
+        "and proves the webhook answers Zoom's validation before you paste the",
+        "URL into Zoom. NEW recordings only: nothing backfills older ones.",
+        "`brain disconnect zoom` removes the secrets so deliveries are refused."
+      ],
+      "enabled": false
+    },
     "slack": {
       "enabled": false,
       "bot_token_secret": "secret://SLACK_BOT_TOKEN"

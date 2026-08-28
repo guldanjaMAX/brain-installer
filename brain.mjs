@@ -207,7 +207,8 @@ function supportSourceForCommand(command = "") {
     return "local";
   }
   if (command === "connect" || command === "disconnect") {
-    if (String(process.argv[3] || "").toLowerCase() === "imessage") return "imessage";
+    const which = String(process.argv[3] || "").toLowerCase();
+    if (which === "imessage" || which === "zoom") return which;
     return "installer";
   }
   if (SUPPORT_REMOTE_COMMANDS.has(command)) return "cloudflare";
