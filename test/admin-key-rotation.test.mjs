@@ -470,7 +470,7 @@ try {
   assert.equal(
     cleanupEvents.includes("delete:UNRELATED_FIXTURE_SECRET"),
     false,
-    "provider cleanup never broadens beyond the three known manifest-gated names",
+    "provider cleanup never broadens beyond the manifest-gated provider secret names",
   );
 
   const supabaseDir = join(sandbox, "explicit-supabase");
