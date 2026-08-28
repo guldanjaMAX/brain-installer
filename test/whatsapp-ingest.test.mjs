@@ -128,6 +128,62 @@ function fakeAgents() {
   };
 }
 
+/* ---------- a fake Windows supervisor, mirroring the real return shape ---- */
+// `supervised` and `expectedRefreshSeconds` are the two fields the CLI actually
+// branches on, so a fake that got them wrong would make these tests meaningless.
+// Both come straight from the real module's contract: an unsupervised rung
+// carries no expectation.
+function fakeWindowsSupervision({ mechanism = "task-s4u", drainInstalls = true } = {}) {
+  const events = [];
+  const supervised = mechanism === "task-s4u" || mechanism === "task-logon";
+  return {
+    events,
+    windowsSupervision: {
+      mechanismDisclosure: (name) => [`disclosure for ${name}`],
+      installWindowsSupervision: (path, opts) => {
+        const kind = opts?.kind;
+        events.push([`${kind}:install`, opts?.binaryPath || null, mechanism]);
+        const drain = kind === "whatsapp-drain";
+        const installed = drain ? (supervised && drainInstalls) : true;
+        return {
+          kind, mechanism, installed, supervised: supervised && installed,
+          taskName: `\\brain-installer\\acme-${kind}`,
+          startupPath: supervised ? null : `/fake/Startup/brain-acme-${kind}.cmd`,
+          logPath: `/fake/logs/acme-${kind}.log`,
+          dataDir,
+          expectedRefreshSeconds: drain && supervised && drainInstalls ? 60 : null,
+          warnings: supervised ? [] : ["this rung does not restart anything"],
+        };
+      },
+      removeWindowsSupervision: (path, opts) => {
+        events.push([`${opts?.kind}:remove`]);
+        return {
+          kind: opts?.kind, removed: true, wasInstalled: true, startupRemoved: true,
+          logPath: `/fake/logs/acme-${opts?.kind}.log`,
+        };
+      },
+    },
+  };
+}
+
+/* ------------------- what the operator was actually told ------------------ */
+// Some of what this command promises is only visible in what it PRINTS. Posting
+// a null expectation and posting a 60-second one produce different sentences on
+// screen but can produce the same request body, so the sentence is the thing
+// that has to be asserted or the guard between them is untested.
+async function capturingConsole(run) {
+  const lines = [];
+  const realLog = console.log;
+  console.log = (...parts) => { lines.push(parts.join(" ")); };
+  try {
+    return { value: await run(), lines };
+  } catch (error) {
+    return { error, lines };
+  } finally {
+    console.log = realLog;
+  }
+}
+
 /* ------------ a scripted stand-in for the daemon process, for pairing ----- */
 function scriptedDaemon(lines, { exitAfter = false } = {}) {
   return () => {
@@ -246,13 +302,18 @@ try {
       /corpora\.whatsapp\.enabled is not true/.test(String(error?.message)), String(error?.message));
   }
   {
+    // Windows is supervised now. A platform with NEITHER supervisor is the case
+    // that still refuses, and it refuses for the same honest reason as before:
+    // the daemon is portable, the installer is not, and nothing here installs
+    // something it cannot keep running.
     let error = null;
     try {
       await cmdConnectWhatsapp(manifestPathWithDataDir, { "accept-risk": true },
-        { ...makeBrainFakes().options, platform: "win32" });
+        { ...makeBrainFakes().options, platform: "linux" });
     } catch (caught) { error = caught; }
-    check("connect on Windows refuses and calls it a missing installer, not a missing capability",
-      /needs macOS/.test(String(error?.message)) &&
+    check("connect on a platform with no supervisor refuses and names both the ones that exist",
+      /needs macOS or Windows/.test(String(error?.message)) &&
+      /LaunchAgent and a Windows Scheduled Task/.test(String(error?.message)) &&
       /missing installer, not a missing capability/.test(String(error?.message)),
       String(error?.message));
   }
@@ -401,6 +462,133 @@ try {
     check("an unreachable brain never blocks stopping the background processes",
       result.daemon.removed === true && result.drain.removed === true &&
       agents.events.length === 2, JSON.stringify(agents.events));
+  }
+  /* ================= the same commands, on Windows ======================= */
+  {
+    // The Windows lane runs the SAME command function through the SAME steps.
+    // What changes is which supervisor it calls and, when that supervisor can
+    // only manage an unsupervised launcher, what it is willing to claim.
+    const binary = join(sandbox, "wa-daemon-windows-amd64.exe");
+    writeFileSync(binary, "MZ");
+    chmodSync(binary, 0o755);
+    const fakes = makeBrainFakes();
+    const win = fakeWindowsSupervision({ mechanism: "task-s4u" });
+    rmSync(join(sandbox, ".brain-ingest-whatsapp.json"), { force: true });
+    const result = await cmdConnectWhatsapp(manifestPathWithDataDir, { daemon: binary, "accept-risk": true }, {
+      ...fakes.options, ...win, platform: "win32", env: {},
+      pairOptions: {
+        spawn: scriptedDaemon([
+          "[wa-daemon] paired with 14155550100:1@s.whatsapp.net",
+          "[wa-daemon] history chunk INITIAL_BOOTSTRAP: convs=2 inserted=4 duplicate=0 skipped=0",
+        ]),
+        historyQuietMs: 5, historyMaxMs: 500, pairTimeoutMs: 500,
+      },
+    });
+    check("connect on Windows pairs, then installs the daemon task, then the drain task, in that order",
+      JSON.stringify(win.events.map((e) => e[0])) ===
+      JSON.stringify(["whatsapp-daemon:install", "whatsapp-drain:install"]),
+      JSON.stringify(win.events));
+    check("no macOS LaunchAgent module is even loaded on the Windows path",
+      result.daemon.taskName !== undefined && result.daemon.plistPath === undefined,
+      JSON.stringify(Object.keys(result.daemon)));
+    check("the Windows daemon task is installed with the binary that was actually paired",
+      win.events[0][1] === binary, String(win.events[0][1]));
+    check("a supervised Windows install DOES carry the one-minute freshness expectation",
+      fakes.expectations.length === 1 && fakes.expectations[0].source === "whatsapp" &&
+      fakes.expectations[0].expected_refresh_seconds === 60,
+      JSON.stringify(fakes.expectations));
+  }
+  {
+    // THE HONESTY CASE. Windows would only allow an unsupervised launcher, so
+    // the drain cannot be scheduled. The expectation must be CLEARED rather than
+    // set: an expectation is a promise the source refreshes, and nothing on this
+    // machine is going to.
+    const binary = join(sandbox, "wa-daemon-windows-amd64.exe");
+    const fakes = makeBrainFakes();
+    const win = fakeWindowsSupervision({ mechanism: "startup-folder" });
+    rmSync(join(sandbox, ".brain-ingest-whatsapp.json"), { force: true });
+    const said = await capturingConsole(() =>
+      cmdConnectWhatsapp(manifestPathWithDataDir, { daemon: binary, "accept-risk": true }, {
+        ...fakes.options, ...win, platform: "win32", env: {},
+        pairOptions: {
+          spawn: scriptedDaemon(["[wa-daemon] paired with 14155550100:1@s.whatsapp.net"]),
+          historyQuietMs: 5, historyMaxMs: 500, pairTimeoutMs: 500,
+        },
+      }));
+    check("an unsupervised Windows install posts NO refresh expectation",
+      fakes.expectations.length === 1 && fakes.expectations[0].expected_refresh_seconds === null,
+      JSON.stringify(fakes.expectations));
+    check("it CLEARS rather than leaves a previous expectation, so the source cannot read as permanently stale",
+      fakes.expectations[0].source === "whatsapp" && fakes.expectations[0].kind === "whatsapp",
+      JSON.stringify(fakes.expectations));
+    // The request body for "cleared" and for "set to nothing" is the same
+    // request. What separates an honest run from a dishonest one is the sentence
+    // the operator reads, so that is what is asserted here.
+    check("and NEVER prints that an expectation was set, because none was",
+      !said.lines.some((line) => /freshness expectation set to/.test(line)),
+      JSON.stringify(said.lines.filter((l) => /expectation/.test(l))));
+    check("it says instead that nothing on this PC will load captured messages, and how to do it by hand",
+      said.lines.some((line) => /nothing on this PC is scheduled to load captured/.test(line)) &&
+      said.lines.some((line) => /--from whatsapp/.test(line)),
+      JSON.stringify(said.lines.filter((l) => /scheduled|whatsapp/.test(l)).slice(-4)));
+    check("capture itself was still installed, because a client who gets capture at sign-in is better off than one who gets a refusal",
+      win.events.some((e) => e[0] === "whatsapp-daemon:install"), JSON.stringify(win.events));
+  }
+  {
+    // Nothing at all could be installed. Pairing already happened and the
+    // session is saved, so the refusal has to say that rather than implying the
+    // work was lost.
+    const binary = join(sandbox, "wa-daemon-windows-amd64.exe");
+    const fakes = makeBrainFakes();
+    const win = fakeWindowsSupervision({ mechanism: "none" });
+    win.windowsSupervision.installWindowsSupervision = (path, opts) => {
+      win.events.push([`${opts?.kind}:install`, null, "none"]);
+      return { kind: opts?.kind, mechanism: "none", installed: false, supervised: false,
+        expectedRefreshSeconds: null, warnings: ["nothing on this machine can keep a process alive"] };
+    };
+    let error = null;
+    try {
+      await cmdConnectWhatsapp(manifestPathWithDataDir, { daemon: binary, "accept-risk": true }, {
+        ...fakes.options, ...win, platform: "win32", env: {},
+        pairOptions: {
+          spawn: scriptedDaemon(["[wa-daemon] paired with 14155550100:1@s.whatsapp.net"]),
+          historyQuietMs: 5, historyMaxMs: 500, pairTimeoutMs: 500,
+        },
+      });
+    } catch (caught) { error = caught; }
+    check("when nothing can keep capture running, connect refuses instead of reporting a working install",
+      /nothing was installed to keep WhatsApp capture running/.test(String(error?.message)),
+      String(error?.message));
+    check("and says the pairing survived, so the operator does not re-pair needlessly",
+      /linked device is paired/.test(String(error?.message)) &&
+      /session is saved/.test(String(error?.message)),
+      String(error?.message));
+    check("no freshness expectation was posted by the refused run",
+      fakes.expectations.length === 0, JSON.stringify(fakes.expectations));
+  }
+  {
+    const fakes = makeBrainFakes();
+    const win = fakeWindowsSupervision();
+    const result = await cmdDisconnectWhatsapp(manifestPathWithDataDir, {}, {
+      ...fakes.options, ...win, platform: "win32",
+    });
+    check("disconnect on Windows stops the drain task BEFORE the daemon task",
+      JSON.stringify(win.events.map((e) => e[0])) ===
+      JSON.stringify(["whatsapp-drain:remove", "whatsapp-daemon:remove"]),
+      JSON.stringify(win.events));
+    check("and clears the freshness expectation, exactly as the macOS path does",
+      fakes.expectations.length === 1 && fakes.expectations[0].expected_refresh_seconds === null,
+      JSON.stringify(fakes.expectations));
+    check("removal reports the Startup-folder launcher swept too, whichever rung was in use",
+      result.daemon.startupRemoved === true, JSON.stringify(result.daemon));
+  }
+  {
+    let error = null;
+    try {
+      await cmdDisconnectWhatsapp(manifestPathWithDataDir, {}, { ...makeBrainFakes().options, platform: "linux" });
+    } catch (caught) { error = caught; }
+    check("disconnect on a platform that never had capture says so plainly",
+      /only ever installed on macOS or Windows/.test(String(error?.message)), String(error?.message));
   }
 } finally {
   rmSync(sandbox, { recursive: true, force: true });

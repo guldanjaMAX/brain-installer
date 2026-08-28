@@ -190,6 +190,29 @@ const named = (suite, needle) =>
 }
 
 /* ================================================================
+   3b. A LIVE-CAPTURE SOURCE THAT NOTHING SUPERVISES
+   The Windows case: the installer could only manage an unsupervised
+   launcher, so it deliberately posted no expectation. The acceptance
+   checklist a client is judged against must name that rather than
+   passing it in silence.
+   ================================================================ */
+{
+  const rows = [
+    { name: "whatsapp", kind: "whatsapp", status: "ready", last_ingest_at: ago(2 * DAY),
+      expected_refresh_seconds: null, document_count: 812 },
+  ];
+  const suite = await tierDataFor(rows);
+  const line = suite.results.find((r) => r.name === "freshness: whatsapp");
+  check("an unsupervised capture source gets its own line rather than vanishing into the headline",
+    line !== undefined, JSON.stringify(suite.results.map((r) => r.name)));
+  check("it warns rather than passing, because nothing on that machine refreshes it",
+    line?.status === "warn" && /NO REFRESH IS SCHEDULED/.test(line?.detail || ""), JSON.stringify(line));
+  check("and nothing in the run reports this corpus as current",
+    !suite.results.some((r) => r.status === "pass" && /whatsapp/.test(r.detail || "")),
+    JSON.stringify(suite.results.filter((r) => r.status === "pass").map((r) => r.detail)));
+}
+
+/* ================================================================
    4. A GENUINELY FRESH INSTALL STILL PASSES
    Paranoia that fails everything is the same uselessness in the other
    direction.

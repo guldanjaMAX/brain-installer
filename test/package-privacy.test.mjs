@@ -171,6 +171,7 @@ const expected = [
   "operations/imessage-scheduler.mjs",
   "operations/whatsapp-daemon.mjs",
   "operations/whatsapp-drain-scheduler.mjs",
+  "operations/windows-supervision.mjs",
   "operations/installed-manifest.mjs",
   "operations/cloudflare-recovery-adapter.mjs",
   "operations/verified-recovery.mjs",

@@ -127,5 +127,28 @@ const DAILY = 86400;
   check("and IS marked automatable, because it could be scheduled", by.gmail.automatable === true);
 }
 
+/* ---- a live-capture connector nothing is supervising is NOT quietly fine ---- */
+{
+  // The case this exists for: a Windows install where the installer could only
+  // manage an unsupervised launcher, so it deliberately posted no expectation.
+  // These used to read "manual", whose sentence is "you load this by hand from a
+  // machine we cannot reach, so it is never reported as stale" — the most
+  // reassuring thing that could possibly be said about a connector the client
+  // believes is capturing their messages right now.
+  const f = await freshnessReport(mk([
+    { name: "whatsapp", kind: "whatsapp", status: "ready", last_ingest_at: daysAgo(6), document_count: 812 },
+    { name: "imessage", kind: "imessage", status: "ready", last_ingest_at: daysAgo(6), document_count: 4_100 },
+    { name: "statements", kind: "upload", status: "ready", last_ingest_at: daysAgo(6), document_count: 9 },
+  ]), { now: NOW });
+  const by = Object.fromEntries(f.sources.map((s) => [s.name, s]));
+  check("an enabled capture connector with nothing scheduling it reads unscheduled, never manual",
+    by.whatsapp.state === "unscheduled" && by.imessage.state === "unscheduled",
+    JSON.stringify([by.whatsapp.state, by.imessage.state]));
+  check("and is marked automatable, because a supervisor on that machine could keep it current",
+    by.whatsapp.automatable === true && by.imessage.automatable === true);
+  check("a genuinely hand-loaded corpus is still manual, so the distinction stays meaningful",
+    by.statements.state === "manual" && by.statements.automatable === false, JSON.stringify(by.statements));
+}
+
 console.log(`\nfreshness: ${ran - fail}/${ran} passed`);
 if (fail) process.exit(1);

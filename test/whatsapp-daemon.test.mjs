@@ -19,8 +19,9 @@
 // build fully distinct labels, plists, logs and locks.
 //
 // WHAT THIS CANNOT PROVE: that launchd actually keeps the daemon alive across
-// a crash or a reboot, and anything at all about Windows, where no
-// supervision is built. Both are named in evidence/WP-07-cli.md.
+// a crash or a reboot. Named in evidence/WP-07-cli.md. Windows supervision is
+// a separate mechanism in operations/windows-supervision.mjs with its own
+// suite, test/windows-supervision.test.mjs.
 
 import {
   existsSync,
@@ -253,8 +254,11 @@ try {
   {
     let error = null;
     try { buildWhatsappDaemonPlan(manifestPath, opts({ platform: "win32" })); } catch (caught) { error = caught; }
-    check("a non-Mac install refuses and says Windows supervision is not built",
-      /Windows service supervision is not built/.test(error?.message), error?.message);
+    // This module supervises with launchd and only launchd. A Windows caller
+    // arriving here is a routing bug, so the refusal has to name the module
+    // that should have been used rather than reading as a missing capability.
+    check("a Windows caller is refused and pointed at the Windows supervisor",
+      /windows-supervision\.mjs/.test(error?.message) && /Scheduled Task/.test(error?.message), error?.message);
   }
   {
     const disabled = join(directory, "wa-disabled", "brain.manifest.json");
@@ -386,8 +390,10 @@ try {
   {
     check("the daemon spec names itself as a daemon, not a scheduler",
       WHATSAPP_DAEMON_SPEC.kind === "whatsapp-daemon", WHATSAPP_DAEMON_SPEC.kind);
-    check("the module says in its own source that Windows supervision is not built",
-      /Windows service or Startup-task\s*\n?\s*\*?\s*supervision is NOT built/.test(
+    check("the module says in its own source that it is the launchd half, and names the other one",
+      /supervises with launchd/.test(
+        readFileSync(new URL("../operations/whatsapp-daemon.mjs", import.meta.url), "utf-8")
+      ) && /operations\/windows-supervision\.mjs/.test(
         readFileSync(new URL("../operations/whatsapp-daemon.mjs", import.meta.url), "utf-8")
       ));
   }
