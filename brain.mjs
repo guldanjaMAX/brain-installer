@@ -203,7 +203,7 @@ function supportSourceForCommand(command = "") {
   if (command === "ingest") {
     const index = process.argv.indexOf("--from");
     const remote = index >= 0 ? process.argv[index + 1] : null;
-    if (["calendar", "drive", "gmail", "imessage"].includes(remote)) return remote;
+    if (["calendar", "drive", "gmail", "imessage", "iphone-backup"].includes(remote)) return remote;
     return "local";
   }
   if (command === "connect" || command === "disconnect") {
@@ -3850,7 +3850,7 @@ function assertSourceName(name) {
  * filename", which is intended.
  */
 export const VALUE_FLAGS = new Set([
-  "path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark", "export",
+  "path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark", "export", "backup",
   "golden", "profile", "k", "repeat", "baseline", "save", "artifacts",
   "corpus-contract", "approve-removals",
 ]);
@@ -4944,6 +4944,12 @@ async function cmdIngest(manifestPath) {
   // rather than being forced through machinery built for files.
   if (String(flags.from).toLowerCase() === "calendar") return cmdIngestCalendar(m, manifestPath, flags);
   if (String(flags.from).toLowerCase() === "imessage") return cmdIngestImessage(m, manifestPath, flags);
+  // The one-time iPhone backup load: a snapshot producer with no cursor and
+  // no live half, so it owns its own command rather than joining the remote
+  // connectors that all resume from one.
+  if (["iphone-backup", "iphone"].includes(String(flags.from).toLowerCase())) {
+    return cmdIngestIphoneBackup(m, manifestPath, flags);
+  }
   if (flags.from) return cmdIngestRemote(m, manifestPath, flags);
   if (flags["approve-removals"] !== undefined) {
     die("--approve-removals is only valid with --from drive.");
@@ -5999,6 +6005,185 @@ export async function cmdIngestImessage(m, manifestPath, flags, options = {}) {
     warn(`${tally.refused} conversation document(s) refused by the credential gate (a live credential was texted)`);
   }
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
+  return result;
+}
+
+/**
+ * `brain ingest <manifest> --from iphone-backup`.
+ *
+ * A ONE-TIME history load out of an unencrypted local iPhone backup. This is
+ * the only route by which an owner with no Mac gets their iMessage and SMS
+ * history into their brain at all, because Apple exposes live message history
+ * to a local process on macOS and nowhere else.
+ *
+ * It is a snapshot and the command says so out loud, twice: nothing arrives
+ * after the load, and the newest message it can possibly hold is the one that
+ * existed when that backup was taken. Calling it a connector would be the
+ * kind of small lie that costs a client relationship in week three.
+ *
+ * Runs on Windows and macOS alike — no platform gate, no shelled-out tool, no
+ * POSIX-shaped path anywhere in the path it walks. The extraction underneath
+ * is literally the live Mac connector's own query and row mapping, so a
+ * conversation loaded here and the same conversation captured live produce
+ * the same document, keyed the same way, and the second one to arrive is
+ * recognised as unchanged rather than duplicated.
+ */
+export async function cmdIngestIphoneBackup(m, manifestPath, flags, options = {}) {
+  const backupLib = options.iphoneBackup ?? await import("./connectors/iphone-backup.mjs");
+  const { batches, splitOversized } = await ingestLib();
+  const sourceName = assertSourceName(
+    flags.source === true || !flags.source ? "iphone-backup" : flags.source
+  );
+  const dry = !!flags["dry-run"];
+
+  // Resolve and inspect BEFORE any credential or network work, so an owner
+  // pointing at the wrong folder — or at an encrypted backup — learns that
+  // first, named as itself, instead of watching an admin-key error scroll by.
+  let located;
+  try {
+    const resolved = backupLib.resolveBackupDirectory({
+      path: flags.backup && flags.backup !== true ? String(flags.backup) : null,
+      home: options.home,
+      platform: options.platform ?? process.platform,
+      env: options.env ?? process.env,
+    });
+    located = await backupLib.locateSmsDatabase(resolved.directory);
+  } catch (error) {
+    if (error?.name === "IphoneBackupError") {
+      const remediation = Array.isArray(error.detail) && error.reason === "backup_encrypted"
+        ? `\n      ${error.detail.join("\n      ")}`
+        : "";
+      die(`${error.message}${remediation}`);
+    }
+    throw error;
+  }
+
+  const backup = located.backup;
+  const device = [backup.device?.name, backup.device?.ios_version ? `iOS ${backup.device.ios_version}` : null]
+    .filter(Boolean).join(", ");
+  info(`backup ${backup.directory}${device ? ` (${device})` : ""}`);
+  if (backup.backup_taken_at) info(`this backup was taken ${backup.backup_taken_at}`);
+  for (const warning of backup.warnings || []) warn(warning);
+  info(
+    "history only: this is a point-in-time snapshot, not a connection. Nothing new arrives " +
+    "after this load. To bring history forward, take a fresh backup and run this again."
+  );
+
+  const resolveIngestAccount = options.resolveAccount ?? resolveAccount;
+  const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+  const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
+  const acct = dry ? null : m.brain?.domain ? null : await resolveIngestAccount(m);
+  const base = dry ? null : await resolveBase(m, acct);
+  const adminKey = dry ? null : resolveKey(manifestPath);
+  if (!adminKey && !dry) {
+    die(
+      "no durable admin key was found. Re-run `brain setup <manifest>` to generate and persist one; " +
+        "do not paste the key into a shell command."
+    );
+  }
+
+  const postReceipt = options.postSourceReceipt ?? postSourceReceipt;
+  const sendBatch = options.requestIngestBatch ?? requestIngestBatch;
+
+  const tally = { created: 0, updated: 0, unchanged: 0, refused: 0, failed: 0 };
+  const sendEnvelopes = async (envelopes) => {
+    const docs = envelopes
+      // The session envelope's generic "message" source_type becomes THIS
+      // load's name, so `brain forget --source iphone-backup` scopes to
+      // exactly these documents and nothing else.
+      .map((envelope) => ({ ...envelope, source_type: sourceName }))
+      .flatMap((envelope) => splitOversized(envelope))
+      .map((envelope) => ({ envelope }));
+    for (const group of batches(docs)) {
+      const { res, raw } = await sendBatch({ base, adminKey, docs: group.map((g) => g.envelope) });
+      let body = null;
+      try { body = JSON.parse(raw); } catch { /* validated below */ }
+      if (!res.ok || !body) {
+        throw new Error(`the ingest batch failed with ${res.status}: ${String(raw).slice(0, 200)}`);
+      }
+      const results = validateBatchReceipt(body, group);
+      for (const r of results) {
+        tally[r.status]++;
+        if (r.status === "failed") {
+          throw new Error(`the brain reported a document failure for ${r.source_id}: ${r.error || "unknown"}`);
+        }
+      }
+    }
+  };
+
+  const runId = `sync_${randomBytes(16).toString("hex")}`;
+  const startedAt = new Date().toISOString();
+  let receiptOpened = false;
+  if (!dry) {
+    await postReceipt(base, adminKey, {
+      source: sourceName, kind: "iphone-backup", status: "indexing",
+      run_id: runId, lane: "manual", started_at: startedAt,
+      detail: "iPhone backup history load started",
+    });
+    receiptOpened = true;
+  }
+
+  let result;
+  try {
+    result = await backupLib.loadBackupHistory({
+      located,
+      sendEnvelopes,
+      ownerLabel: m.client?.display_name || "Owner",
+      groupingTimezone: m.client?.timezone || "UTC",
+      maxRows: flags.limit ? parseInt(flags.limit, 10) : Infinity,
+      dryRun: dry,
+      onPage: ({ page, rows }) => {
+        process.stdout.write(`\r  page ${page}: ${rows} message row(s) read   `);
+      },
+    });
+  } catch (error) {
+    if (receiptOpened) {
+      try {
+        await postReceipt(base, adminKey, {
+          source: sourceName, kind: "iphone-backup", status: "error", run_id: runId,
+          lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
+          error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
+          detail: "iPhone backup history load aborted; re-running re-reads the whole backup safely",
+        });
+      } catch (receiptError) {
+        warn(`the load failed and its error receipt could not be recorded: ${String(receiptError?.message || receiptError).slice(0, 160)}`);
+      }
+    }
+    if (error?.name === "IphoneBackupError") die(error.message);
+    throw error;
+  }
+  if (result.pages) process.stdout.write("\n");
+
+  const skipped = result.rows_skipped;
+  const span = result.earliest && result.latest
+    ? `${result.earliest.slice(0, 10)} to ${result.latest.slice(0, 10)}`
+    : "no dated messages";
+  const summary =
+    `${result.rows_seen} message row(s) read in ${result.pages} page(s); ${result.rows_pushed} sessionized ` +
+    `across ${result.threads} conversation thread(s), ${span}; ` +
+    `${skipped.no_text} without text (tapbacks/attachments), ${skipped.no_timestamp + skipped.no_guid} unusable; ` +
+    `${result.documents_sent} conversation document(s) sent`;
+
+  if (dry) {
+    info(summary);
+    ok("dry run, nothing was sent");
+    return result;
+  }
+  if (result.truncated) warn(`--limit stopped this load early; it is NOT a complete history of the backup`);
+
+  await postReceipt(base, adminKey, {
+    source: sourceName, kind: "iphone-backup", status: "ready",
+    run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
+    docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
+    detail: `iPhone backup one-time history load (snapshot, not live capture): ${summary}`,
+  });
+
+  info(summary);
+  ok(`${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged`);
+  if (tally.refused) {
+    warn(`${tally.refused} conversation document(s) refused by the credential gate (a live credential was texted)`);
+  }
+  info(`remove this load with: brain forget ${manifestPath} --source ${sourceName}`);
   return result;
 }
 
@@ -10166,6 +10351,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain ingest     <manifest> --from drive  load from a connected remote source
     brain ingest     <manifest> --from calendar  sync Google Calendar (--dry-run to preview)
     brain ingest     <manifest> --from imessage  one incremental Messages capture pass (Mac only)
+    brain ingest     <manifest> --from iphone-backup  one-time message history from an unencrypted
+                                           local iPhone backup; a snapshot, not live capture (any OS)
     brain mcp-config <manifest>            config to connect the client's AI tools
     brain schedule   <manifest> --install  install unattended Drive refresh on macOS
     brain support    [--preview|--export <file>]  inspect private local issue notes
