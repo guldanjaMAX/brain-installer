@@ -2,11 +2,11 @@ import { textQuality, isLikelyBinary, stripMarkup, MIN_CHARS } from "../ingest/q
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
 
-const PROSE = "We agreed to defer the retainer increase until October, and to revisit the coverage register before the quarterly review. Brian will send the updated schedule.";
+const PROSE = "We agreed to defer the retainer increase until October, and to revisit the coverage register before the quarterly review. Taylor will send the updated schedule.";
 
 /* ---- real text must pass. A false reject silently loses a document. ---- */
 check("ordinary prose passes", textQuality(PROSE).ok);
-check("a short but real note passes", textQuality("Call Eli about the AMS pricing change tomorrow.").ok);
+check("a short but real note passes", textQuality("Call Devon about the Northwind pricing change tomorrow.").ok);
 check("prose that MENTIONS a token is not junk",
   textQuality(PROSE + " The key was rotated: sk-live-abcdefghijklmnop.").ok);
 check("a table of numbers is still text", textQuality(
