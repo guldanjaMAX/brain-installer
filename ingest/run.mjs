@@ -33,8 +33,10 @@ import {
 // dependencies. Importing it here rather than in extract.mjs keeps the core
 // registry honestly dependency-free.
 import "./formats.mjs";
-import { textQuality, isLikelyBinary } from "./quality.mjs";
+import { textQuality, isLikelyBinary, utf16Encoding } from "./quality.mjs";
 import { documentDate } from "./doc-date.mjs";
+import { detectWhatsAppExport, parseWhatsAppExport, deriveThreadTitle } from "./whatsapp-export.mjs";
+import { MessageSessionizer } from "./message-session.mjs";
 
 // Preserve the original ingest/run.mjs API while letting migration-only code
 // import the dependency-free boundary directly.
@@ -122,6 +124,59 @@ export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES } =
 
 const sha = (b) => createHash("sha256").update(b).digest("hex");
 
+/** Same decode the core plain-text extractor uses: real encoding, BOM stripped. */
+function decodeText(buf) {
+  const enc = utf16Encoding(buf) || "utf-8";
+  const text = new TextDecoder(enc, { fatal: false }).decode(buf);
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+/**
+ * One export file, many documents. Sessionizes through the same
+ * message-session.mjs every other chat platform uses, so a WhatsApp export
+ * lands identically to iMessage/SMS/Messenger history once those connectors
+ * exist. Returns `envelopes` (plural) rather than `envelope`; the caller in
+ * cmdIngest keys the whole family on the file's own path since there is no
+ * single document identity to key on.
+ */
+async function prepareWhatsAppExport(file, buf, hash, { sourceName }) {
+  const text = decodeText(buf);
+  const threadId = `${sourceName}:${file.rel.split(sep).join("/")}`;
+  const threadTitle = deriveThreadTitle(file.name);
+  const parsed = await parseWhatsAppExport(text, { threadId, threadTitle });
+
+  if (parsed.ambiguous) {
+    return {
+      hash,
+      skip: {
+        path: file.rel,
+        reason:
+          "this WhatsApp export's dates could not be safely resolved (day/month order is " +
+          "ambiguous and the chat is too short or too regular to tell from ordering alone). " +
+          "Refusing to guess rather than risk silently mis-dating every message. Check what " +
+          "regional date format the exporting phone uses, or export a longer history.",
+      },
+    };
+  }
+  if (!parsed.rows.length) {
+    return {
+      hash,
+      skip: {
+        path: file.rel,
+        reason: `no addressable messages found (${parsed.skippedMedia} media placeholder(s), ` +
+          `${parsed.skippedSystem} system notice(s) skipped)`,
+      },
+    };
+  }
+
+  const sessionizer = new MessageSessionizer({ groupingTimezone: "UTC" });
+  const envelopes = [];
+  for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
+  envelopes.push(...sessionizer.finish());
+
+  return { hash, envelopes };
+}
+
 /**
  * Read one file and turn it into an ingest envelope, or into a reasoned skip.
  */
@@ -133,6 +188,16 @@ export async function prepare(file, { sourceName }) {
     return { skip: { path: file.rel, reason: `could not read the file: ${e.code || e.message}` } };
   }
   const hash = sha(buf);
+
+  // Content-sniffed, not extension-alone: most .txt files are not a WhatsApp
+  // export, and the ordinary plain-text extractor below is exactly right for
+  // them. Only a file that actually looks like one export routes here.
+  if (extensionOf(file.name) === ".txt" && !isLikelyBinary(buf)) {
+    const peek = decodeText(buf);
+    if (detectWhatsAppExport(peek)) {
+      return prepareWhatsAppExport(file, buf, hash, { sourceName });
+    }
+  }
 
   if (!canExtract(file.name)) {
     return { hash, skip: { path: file.rel, reason: `no extractor for "${extensionOf(file.name) || "(no extension)"}" files` } };

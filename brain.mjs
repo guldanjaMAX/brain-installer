@@ -5050,6 +5050,59 @@ async function cmdIngest(manifestPath) {
   const prepareOne = async (f) => {
     const r = await prepare(f, { sourceName });
     if (r.note) notes.push({ path: f.rel, note: r.note });
+
+    // A multi-document producer (today: a WhatsApp export sessionized into
+    // many conversation documents from one .txt file) has no single envelope
+    // identity to key state on, so the file's own path is the family key.
+    // Every other branch below is unchanged from the single-envelope path;
+    // this only widens what "one prepared unit" is allowed to mean.
+    if (r.envelopes) {
+      const key = String(f.rel).split(sep).join("/");
+      if (!scannerPolicyChanged && r.hash && state.done[key] === r.hash) {
+        recordAcceptedDocumentState(state, {
+          stateKey: key,
+          hash: r.hash,
+          skipKeys: [f.rel, ...r.envelopes.map((e) => e.source_id)],
+          legacyPartRoot: f.rel,
+          protectedSkipKeys: protectedLocalSkipKeys,
+        });
+        unchanged++;
+        return { unchanged: true };
+      }
+      const sanitized = r.envelopes.map((e) => sanitizeIngestEnvelope(e));
+      // One refused document is treated as a whole-file refusal rather than
+      // partially loading the rest. This is the same conservative posture as
+      // every other credential-gate refusal in this tool: nothing half-loads
+      // from a source that just tripped the scanner.
+      for (const envelope of sanitized) {
+        const refusal = credentialRefusalOf(envelope, scannerOn);
+        if (refusal) {
+          const skip = { path: safeIngestDisplay(envelope.title, f.rel), reason: refusal.reason };
+          recordLocalSkippedDocumentState(state, {
+            stateKey: key, nativePath: f.rel, reason: refusal.reason,
+          });
+          intentionalRemovalKeys.add(key);
+          return { skip };
+        }
+      }
+      return {
+        hash: r.hash,
+        envelopes: sanitized,
+        rel: f.rel,
+        stateKey: key,
+        deferState: true,
+        familyPlan: {
+          stateKey: key,
+          hash: r.hash,
+          expectedParts: sanitized.length,
+          base_doc_uid: `${sourceName}:${key}`,
+          keep_doc_uids: sanitized.map((envelope) => `${sourceName}:${envelope.source_id}`),
+          skipKeys: [key, f.rel, ...sanitized.map((envelope) => envelope.source_id)],
+          legacyPartRoot: [key, f.rel],
+        },
+      };
+    }
+
     const key = r.envelope ? r.envelope.source_id : String(f.rel).split(sep).join("/");
     if (!scannerPolicyChanged && r.hash && state.done[key] === r.hash) {
       recordAcceptedDocumentState(state, {
