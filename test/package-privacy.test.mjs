@@ -155,6 +155,8 @@ const expected = [
   "operations/drive-removal-plan.mjs",
   "operations/drive-scheduler.mjs",
   "operations/imessage-scheduler.mjs",
+  "operations/whatsapp-daemon.mjs",
+  "operations/whatsapp-drain-scheduler.mjs",
   "operations/installed-manifest.mjs",
   "operations/cloudflare-recovery-adapter.mjs",
   "operations/verified-recovery.mjs",
