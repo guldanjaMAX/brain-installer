@@ -2397,8 +2397,22 @@ export async function freshnessReport(env, { now = Date.now() } = {}) {
   } catch {
     return { sources: [], unavailable: true };
   }
-  // Kinds we can refresh without the client's machine being on.
-  const AUTOMATABLE = new Set(["drive", "gmail", "calendar"]);
+  // Kinds something can keep current on its own, so an absent schedule is a gap
+  // worth naming rather than the normal state of a finished one-off load.
+  //
+  // CLOUD kinds refresh without the client's machine being on at all.
+  //
+  // CAPTURE kinds refresh only while a supervisor is alive on the client's own
+  // machine, and they are in this set for exactly that reason. A live-capture
+  // connector with no expectation used to read "manual", whose sentence is "you
+  // load this by hand from a machine we cannot reach, so it is never reported as
+  // stale" — the most reassuring thing that could possibly be said about a
+  // connector the client believes is capturing their messages right now. The
+  // real case is a Windows install where the installer could only manage an
+  // unsupervised launcher and therefore deliberately posted no expectation: the
+  // honest reading of that is "nothing is scheduled to refresh this", which is
+  // what `unscheduled` already says everywhere it appears.
+  const AUTOMATABLE = new Set(["drive", "gmail", "calendar", "imessage", "whatsapp"]);
   return {
     sources: rows.map((s) => {
       const last = s.last_ingest_at ? Date.parse(s.last_ingest_at) : NaN;
