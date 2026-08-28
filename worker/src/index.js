@@ -1515,7 +1515,8 @@ export default {
     if (path === "/oauth/authorize/decision" && request.method === "POST") return handleAuthorizeDecision(env, request, url);
     if (path === "/oauth/token" && request.method === "POST") return handleToken(env, request);
     if (path === "/mcp") {
-      if (!(await validateConnectorToken(request, env))) {
+      const grant = await validateConnectorToken(request, env);
+      if (!grant) {
         return new Response(JSON.stringify({ error: "unauthorized" }), {
           status: 401,
           headers: {
@@ -1532,8 +1533,17 @@ export default {
           body: JSON.stringify(body),
         });
       return handleMcp(env, request, url, {
+        grant,
         think: async (body) => (await handleThink(env, internalJson("/api/rag/think", body))).json(),
         search: async (body) => (await handleUnified(env, internalJson("/api/rag/unified", body))).json(),
+        // Writes take the ordinary ingest door rather than a private one, so
+        // the credential scanner, the statement budget and every other guard
+        // apply to a connector exactly as they do to a folder or a Drive sync.
+        write: async (envelope) => (await handleIngest(env, internalJson("/api/admin/brain/ingest", envelope))).json(),
+        // Deletes PREVIEW by default. dryRun is only lifted when the caller
+        // passes confirm, so a model acting on text it read cannot remove a
+        // client's records in one step.
+        forget: async ({ docUids, confirm }) => forget(env, { docUids, dryRun: !confirm }),
       });
     }
 

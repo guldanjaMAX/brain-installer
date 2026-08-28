@@ -192,6 +192,7 @@ const expected = [
   "worker/src/lib/fin-upload.js",
   "worker/src/lib/mcp-endpoint.js",
   "worker/src/lib/oauth.js",
+  "worker/src/lib/remember-contract.js",
   "worker/src/lib/owner-auth.js",
   "worker/src/lib/sessions.js",
   "worker/src/lib/webauthn.js",

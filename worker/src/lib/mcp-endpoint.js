@@ -25,6 +25,9 @@ import { confidenceLine } from "./confidence.js";
 // never be reported as an absence. retrieval-status.js names an MCP server as
 // a consumer that has to defend itself, and this is the remote one.
 import { answerText, confidenceText, unavailableSearch } from "./answer-render.js";
+// The same contract the local MCP server enforces. Two surfaces writing to one
+// brain under two standards is how a record quietly becomes untrustworthy.
+import { validateLesson, renderLesson } from "./remember-contract.js";
 
 const PROTOCOLS = new Set(["2025-06-18", "2025-03-26", "2024-11-05"]);
 const MAX_FETCH_CHARS = 60_000;
@@ -63,6 +66,48 @@ const TOOLS = [
       type: "object",
       properties: { id: { type: "string", description: "A result id from search." } },
       required: ["id"],
+    },
+  },
+];
+
+/** Tools that change the brain. Offered only when the grant includes write. */
+const WRITE_TOOLS = [
+  {
+    name: "remember",
+    description:
+      "Record something durable in the brain, or CORRECT something it has wrong. " +
+      "Use this the moment the owner tells you the brain is mistaken: pass the id " +
+      "being corrected as `supersedes` so the record keeps why it changed instead " +
+      "of silently overwriting. State how you know in `verification` whenever you " +
+      "claim `verified`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "One line stating the fact itself, not the topic." },
+        body: { type: "string", description: "The fact with its conditions. At least 40 characters." },
+        confidence: {
+          type: "string", enum: ["verified", "inferred", "unverified"],
+          description: "verified = you can say how you know. inferred = reasoned. unverified = reported.",
+        },
+        verification: { type: "string", description: "Required when confidence is verified. How you know." },
+        supersedes: { type: "string", description: "The id this corrects, e.g. lesson/old-slug." },
+        tags: { type: "array", items: { type: "string" } },
+      },
+      required: ["title", "body", "confidence"],
+    },
+  },
+  {
+    name: "forget",
+    description:
+      "Remove documents from the brain. PREVIEWS by default and returns what would " +
+      "go; pass confirm true only after the owner has seen that list and agreed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ids: { type: "array", items: { type: "string" }, description: "Document ids, as search returns them." },
+        confirm: { type: "boolean", description: "Omit to preview. True only with the owner's explicit agreement." },
+      },
+      required: ["ids"],
     },
   },
 ];
@@ -160,6 +205,56 @@ async function runFetch(env, args, origin) {
   }));
 }
 
+async function runRemember(deps, args) {
+  const checked = validateLesson(args);
+  if (!checked.ok) {
+    // Return the refusals as guidance rather than a bare error: the model can
+    // usually satisfy them on a second try, and the contract exists to make
+    // the record better rather than to make writing hard.
+    return toolError(`this cannot be recorded yet:\n- ${checked.errors.join("\n- ")}`);
+  }
+  const v = checked.value;
+  const result = await deps.write({
+    source_type: "curated",
+    source_id: v.source_id,
+    title: v.title,
+    content: renderLesson(v),
+    // Provenance: everything written through a connector says so, so a later
+    // answer can show where a claim came from and the owner can review a run
+    // of them rather than finding them mixed into their own material.
+    metadata: {
+      category: "lesson",
+      written_by: "connector",
+      confidence: v.confidence,
+      ...(v.supersedes ? { supersedes: v.supersedes } : {}),
+      ...(v.tags.length ? { tags: v.tags } : {}),
+    },
+  });
+  if (result?.error) return toolError(`the brain refused this: ${result.error}`);
+  const lines = [`Recorded as ${v.source_id}.`];
+  if (v.supersedes) lines.push(`It supersedes ${v.supersedes}, which stays readable as history.`);
+  // Surface a downgrade rather than hiding it: the owner should know the brain
+  // recorded something weaker than was claimed.
+  for (const warning of checked.warnings) lines.push(`Note: ${warning}`);
+  return text(lines.join("\n"));
+}
+
+async function runForget(deps, args) {
+  const ids = Array.isArray(args?.ids) ? args.ids.map(String).filter(Boolean) : [];
+  if (!ids.length) return toolError("ids is required: pass the document ids you mean to remove");
+  const confirm = args?.confirm === true;
+  const result = await deps.forget({ docUids: ids, confirm });
+  const count = result?.documents ?? result?.removed ?? ids.length;
+  if (!confirm) {
+    return text(
+      `Nothing has been removed. This WOULD remove ${count} document(s):\n` +
+      ids.map((i) => `- ${i}`).join("\n") +
+      "\n\nShow this list to the owner and call forget again with confirm true " +
+      "only if they agree.");
+  }
+  return text(`Removed ${count} document(s).`);
+}
+
 /**
  * Handle one MCP request. `deps.think` and `deps.search` are injected by the
  * router so this module never imports the route handlers (no cycle) and a
@@ -195,7 +290,11 @@ export async function handleMcp(env, request, url, deps) {
     return new Response(null, { status: 202 });
   }
   if (method === "ping") return rpcResult(id, {});
-  if (method === "tools/list") return rpcResult(id, { tools: TOOLS });
+  if (method === "tools/list") {
+    // A read-only grant is never shown the write tools. Advertising a tool the
+    // token cannot use teaches the model to try and fail in front of the owner.
+    return rpcResult(id, { tools: deps.grant?.canWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS });
+  }
   if (method === "tools/call") {
     const name = String(params?.name || "");
     const args = params?.arguments || {};
@@ -203,6 +302,14 @@ export async function handleMcp(env, request, url, deps) {
       if (name === "ask") return rpcResult(id, await runAsk(deps, args));
       if (name === "search") return rpcResult(id, await runSearch(deps, args, url.origin));
       if (name === "fetch") return rpcResult(id, await runFetch(env, args, url.origin));
+      if (name === "remember" || name === "forget") {
+        if (!deps.grant?.canWrite) {
+          return rpcResult(id, toolError(
+            `this connection can only read. Reconnect and approve write access to use ${name}.`));
+        }
+        if (name === "remember") return rpcResult(id, await runRemember(deps, args));
+        return rpcResult(id, await runForget(deps, args));
+      }
     } catch (error) {
       return rpcResult(id, toolError(String(error?.message || error).slice(0, 200)));
     }

@@ -240,6 +240,95 @@ test("a degraded search never reaches a phone as an absence claim", async () => 
     "a bare empty array reads as 'your corpus has nothing' to the model consuming it");
 });
 
+test("write access: correcting the brain is the point, and the contract still applies", async () => {
+  const { handleMcp } = await import("../src/lib/mcp-endpoint.js");
+  const written = [];
+  const deps = {
+    grant: { scope: "read write", canWrite: true },
+    think: async () => ({ answer: null, citations: [], results: [] }),
+    search: async () => ({ results: [] }),
+    write: async (envelope) => { written.push(envelope); return { ok: true }; },
+    forget: async (body) => ({ documents: body.docUids.length, dryRun: !body.confirm }),
+  };
+  const url = new URL(ORIGIN + "/mcp");
+  const call = async (name, args, id = 1) => (await (await handleMcp(
+    { BRAIN_NAME: "fixture" },
+    jsonPost("/mcp", { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }),
+    url, deps,
+  )).json()).result.content[0].text;
+
+  // The write tools are offered only to a grant that can use them.
+  const listed = await (await handleMcp({ BRAIN_NAME: "fixture" },
+    jsonPost("/mcp", { jsonrpc: "2.0", id: 9, method: "tools/list" }), url, deps)).json();
+  assert.deepEqual(listed.result.tools.map((t) => t.name),
+    ["ask", "search", "fetch", "remember", "forget"]);
+
+  // A correction supersedes rather than overwrites, and is marked as written
+  // by a connector so the owner can tell it from their own material.
+  const ok = await call("remember", {
+    title: "The retainer paused in August",
+    body: "The pause runs August and September and was agreed on the call, not in July as recorded.",
+    confidence: "verified", verification: "read the 2026-07-22 transcript",
+    supersedes: "lesson/retainer-paused-july",
+  });
+  assert.match(ok, /Recorded as lesson\//);
+  assert.match(ok, /supersedes lesson\/retainer-paused-july/);
+  assert.equal(written[0].metadata.written_by, "connector");
+  assert.equal(written[0].metadata.supersedes, "lesson/retainer-paused-july");
+  assert.equal(written[0].source_type, "curated");
+
+  // The contract is not relaxed just because the caller is a remote model.
+  const thin = await call("remember", { title: "x", body: "too short", confidence: "verified" });
+  assert.match(thin, /at least 40 characters/);
+  const unproven = await call("remember", {
+    title: "A claim", body: "y".repeat(50), confidence: "verified",
+  });
+  assert.match(unproven, /how you know/);
+
+  // One observation cannot claim a pattern; confidence is capped and SAID so.
+  const over = await call("remember", {
+    title: "Ingest", body: "This always fails when the vector index is rebuilding, every time without fail.",
+    confidence: "verified", verification: "saw it once today",
+  });
+  assert.match(over, /Note:/);
+  assert.match(over, /inferred/);
+
+  // A delete previews first. A model acting on text it read must not be able
+  // to remove an owner's records in a single step.
+  const preview = await call("forget", { ids: ["drive:doc-1", "drive:doc-2"] });
+  assert.match(preview, /Nothing has been removed/);
+  assert.match(preview, /WOULD remove 2 document/);
+  const confirmed = await call("forget", { ids: ["drive:doc-1"], confirm: true });
+  assert.match(confirmed, /Removed 1 document/);
+});
+
+test("a read-only grant is neither shown nor allowed the write tools", async () => {
+  const { handleMcp } = await import("../src/lib/mcp-endpoint.js");
+  let wrote = false;
+  const deps = {
+    grant: { scope: "read", canWrite: false },
+    think: async () => ({ answer: null, citations: [], results: [] }),
+    search: async () => ({ results: [] }),
+    write: async () => { wrote = true; return { ok: true }; },
+    forget: async () => { wrote = true; return {}; },
+  };
+  const url = new URL(ORIGIN + "/mcp");
+  const listed = await (await handleMcp({ BRAIN_NAME: "fixture" },
+    jsonPost("/mcp", { jsonrpc: "2.0", id: 1, method: "tools/list" }), url, deps)).json();
+  assert.deepEqual(listed.result.tools.map((t) => t.name), ["ask", "search", "fetch"],
+    "advertising a tool the token cannot use teaches the model to fail in front of the owner");
+
+  for (const name of ["remember", "forget"]) {
+    const attempt = await (await handleMcp({ BRAIN_NAME: "fixture" },
+      jsonPost("/mcp", { jsonrpc: "2.0", id: 2, method: "tools/call",
+        params: { name, arguments: { title: "t", body: "b".repeat(50), confidence: "unverified", ids: ["x"] } } }),
+      url, deps)).json();
+    assert.equal(attempt.result.isError, true, `${name} must be refused without write scope`);
+    assert.match(attempt.result.content[0].text, /can only read/);
+  }
+  assert.equal(wrote, false, "a read-only grant must never reach the write path at all");
+});
+
 test("a connector token can never reach past the read-only class", async () => {
   const db = connectorDb();
   const testEnv = env(db);

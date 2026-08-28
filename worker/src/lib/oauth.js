@@ -84,7 +84,7 @@ export function handleOAuthMetadata(url) {
     grant_types_supported: ["authorization_code"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: ["read"],
+    scopes_supported: ["read", "write"],
   });
 }
 
@@ -93,7 +93,7 @@ export function handleProtectedResourceMetadata(url) {
     resource: `${url.origin}/mcp`,
     authorization_servers: [url.origin],
     bearer_methods_supported: ["header"],
-    scopes_supported: ["read"],
+    scopes_supported: ["read", "write"],
   });
 }
 
@@ -142,13 +142,27 @@ async function loadClient(env, clientId) {
   }
 }
 
+/**
+ * Reduce a requested scope string to the subset this brain grants.
+ *
+ * Read is always included: a connector that cannot read cannot do anything
+ * useful, and a token with write alone would be a strictly stranger thing to
+ * hold. Unknown scopes are dropped rather than passed through, so a client
+ * asking for something this server has never heard of gets a working token
+ * with defined powers instead of an error or an accident.
+ */
+export function normalizeScope(requested) {
+  const asked = new Set(String(requested || "read").split(/[\s+]+/).filter(Boolean));
+  return asked.has("write") ? "read write" : "read";
+}
+
 function authorizeParams(url) {
   const p = url.searchParams;
   return {
     client_id: p.get("client_id") || "",
     redirect_uri: p.get("redirect_uri") || "",
     state: p.get("state") || "",
-    scope: p.get("scope") || "read",
+    scope: normalizeScope(p.get("scope")),
     code_challenge: p.get("code_challenge") || "",
     code_challenge_method: p.get("code_challenge_method") || "",
     response_type: p.get("response_type") || "",
@@ -175,6 +189,18 @@ export async function handleAuthorizePage(env, url) {
   }
 
   const name = esc(client.client_name || "A connector");
+  const writes = params.scope.includes("write");
+  // Say what the grant actually allows. A client approving write access has to
+  // be told they are approving write access, in a sentence rather than a scope
+  // string, and told what stays out of reach either way.
+  const grantSentence = writes
+    ? `${esc(client.client_name || "A connector")} will be able to ask questions, read the answers, ` +
+      "and add or correct things in your brain. Removing anything shows you what " +
+      "would go first and waits for you to confirm. Everything it writes is marked " +
+      "as coming from it. It cannot reach your settings or administration."
+    : `${esc(client.client_name || "A connector")} will be able to ask questions and read the ` +
+      "answers. It cannot add, change or remove anything, and cannot reach your " +
+      "settings or administration.";
   const owner = String(env.BRAIN_OWNER || "").trim();
   // "Dana's brain", not "acme-brain-shadow". The consent screen is the
   // second thing a client ever sees and the first that names a third party, so
@@ -199,10 +225,7 @@ export async function handleAuthorizePage(env, url) {
       ${name} is asking to reach ${brain}. Here is exactly what that allows.
     </p>
 
-    <p class="mt-4 text-ink-soft leading-relaxed">
-      This grant currently allows reading only: ${name} can ask questions and
-      read the answers. It cannot reach settings or administration.
-    </p>
+    <p class="mt-4 text-ink-soft leading-relaxed">${grantSentence}</p>
 
     <button id="approve"
       class="mt-7 w-full rounded-xl bg-accent px-5 py-3.5 text-white font-semibold disabled:opacity-55 transition-opacity">
@@ -286,7 +309,7 @@ export async function handleAuthorizeDecision(env, request, url) {
   try {
     await env.DB.prepare(
       "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, code_challenge, scope, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).bind(await sha256Hex(code), client.client_id, params.redirect_uri, params.code_challenge, "read", Date.now() + CODE_TTL_MS).run();
+    ).bind(await sha256Hex(code), client.client_id, params.redirect_uri, params.code_challenge, params.scope, Date.now() + CODE_TTL_MS).run();
   } catch (error) {
     guard(error);
   }
@@ -357,7 +380,7 @@ export async function validateConnectorToken(request, env) {
   let row;
   try {
     row = await env.DB.prepare(
-      "SELECT token_hash, session_generation, expires_at, revoked_at FROM oauth_tokens WHERE token_hash = ?",
+      "SELECT token_hash, scope, session_generation, expires_at, revoked_at FROM oauth_tokens WHERE token_hash = ?",
     ).bind(await sha256Hex(match[1])).first();
   } catch (error) {
     if (/no such table/i.test(String(error?.message || error))) return false;
@@ -367,5 +390,7 @@ export async function validateConnectorToken(request, env) {
   if (Number(row.session_generation) !== (await sessionGeneration(env))) return false;
   await env.DB.prepare("UPDATE oauth_tokens SET last_used_at = ? WHERE token_hash = ?")
     .bind(Date.now(), row.token_hash).run();
-  return true;
+  // Truthy for any valid token, and carries the granted scope so the endpoint
+  // can refuse a write from a read-only grant.
+  return { scope: String(row.scope || "read"), canWrite: String(row.scope || "").includes("write") };
 }
