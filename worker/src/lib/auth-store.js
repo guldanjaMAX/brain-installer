@@ -199,3 +199,187 @@ export async function bumpSessionGeneration(env) {
     guard(error);
   }
 }
+
+/* --------------------------------------------------------- recovery codes */
+
+/**
+ * The way back in when every enrolled device is gone (migration 0019).
+ *
+ * A recovery code is NOT a second sign-in. It authorises exactly one WebAuthn
+ * registration, with user verification, on a device the person is holding —
+ * so what they end up with is a passkey, checked by the same unskippable
+ * checklist as any other. That is why this is not a weaker door: the thing it
+ * REPLACES as the only escape hatch is the admin key, which can also ingest,
+ * purge, reindex and drain.
+ *
+ * Excludes I, L, O, 0 and 1 so a code read off paper cannot be mistranscribed
+ * into a different valid code. 20 characters over 31 symbols is ~99 bits.
+ */
+const RECOVERY_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+const RECOVERY_CODE_LENGTH = 20;
+export const RECOVERY_CODE_COUNT = 5;
+export const RECOVERY_FAIL_LIMIT = 10;
+export const RECOVERY_FAIL_WINDOW_MS = 60 * 60 * 1000;
+
+const RECOVERY_MIGRATION_HINT =
+  "recovery-code tables are missing; run `brain setup <manifest>` to apply migration 0019";
+
+function recoveryGuard(error) {
+  if (/no such table|no such column/i.test(String(error?.message || error))) {
+    throw new Error(RECOVERY_MIGRATION_HINT);
+  }
+  throw error;
+}
+
+/** One code, grouped for reading aloud and typing back in. */
+export function generateRecoveryCode() {
+  let out = "";
+  // Rejection sampling: 256 is not a multiple of 31, so `byte % 31` alone
+  // would make the first nine symbols measurably likelier than the rest.
+  const ceiling = Math.floor(256 / RECOVERY_ALPHABET.length) * RECOVERY_ALPHABET.length;
+  while (out.length < RECOVERY_CODE_LENGTH) {
+    for (const byte of crypto.getRandomValues(new Uint8Array(32))) {
+      if (byte >= ceiling) continue;
+      out += RECOVERY_ALPHABET[byte % RECOVERY_ALPHABET.length];
+      if (out.length === RECOVERY_CODE_LENGTH) break;
+    }
+  }
+  return out.match(/.{1,5}/g).join("-");
+}
+
+/**
+ * Accept what a human actually types: lowercase, spaces, the printed dashes,
+ * a stray tab from a password manager. Characters OUTSIDE the alphabet are
+ * dropped rather than mapped onto a neighbour — a silent substitution could
+ * turn one person's typo into another person's valid code.
+ */
+export function normalizeRecoveryCode(input) {
+  return String(input || "").toUpperCase().split("")
+    .filter((character) => RECOVERY_ALPHABET.includes(character)).join("");
+}
+
+const codeKey = (code) => sha256Hex(normalizeRecoveryCode(code));
+
+/**
+ * Mint a fresh set. Every UNUSED code is destroyed first, so the card in the
+ * owner's safe is always exactly one set: printing new ones is also how you
+ * revoke a set you think somebody photographed. Used rows are kept as history.
+ */
+export async function issueRecoveryCodes(env, count = RECOVERY_CODE_COUNT) {
+  const codes = Array.from({ length: count }, generateRecoveryCode);
+  try {
+    await env.DB.prepare("DELETE FROM recovery_codes WHERE used_at IS NULL").run();
+    const now = Date.now();
+    for (const code of codes) {
+      await env.DB.prepare(
+        "INSERT INTO recovery_codes (code_hash, created_at) VALUES (?, ?)",
+      ).bind(await codeKey(code), now).run();
+    }
+  } catch (error) {
+    recoveryGuard(error);
+  }
+  return codes;
+}
+
+/**
+ * How many are left, for the owner's screen. Never returns a code.
+ *
+ * This one does NOT throw on a missing table. It is read on every load of the
+ * owner's page, and an install whose Worker is newer than its migrations must
+ * still be able to sign in and ask questions — it just has no card yet, which
+ * is exactly what `available: false` says. Every route that would ACT on a
+ * recovery code checks `available` first and refuses loudly.
+ */
+export async function recoveryCodeStatus(env) {
+  try {
+    const row = await env.DB.prepare(
+      "SELECT count(*) AS total, sum(CASE WHEN used_at IS NULL THEN 1 ELSE 0 END) AS unused FROM recovery_codes",
+    ).first();
+    return { available: true, total: Number(row?.total || 0), unused: Number(row?.unused || 0) };
+  } catch (error) {
+    if (/no such table|no such column/i.test(String(error?.message || error))) {
+      return { available: false, total: 0, unused: 0 };
+    }
+    throw error;
+  }
+}
+
+export const RECOVERY_UNAVAILABLE = RECOVERY_MIGRATION_HINT;
+
+/** Valid and unused, WITHOUT spending it — a failed Face ID must not burn one. */
+export async function peekRecoveryCode(env, code) {
+  try {
+    const row = await env.DB.prepare(
+      "SELECT used_at FROM recovery_codes WHERE code_hash = ?",
+    ).bind(await codeKey(code)).first();
+    return Boolean(row && !row.used_at);
+  } catch (error) {
+    recoveryGuard(error);
+  }
+}
+
+/**
+ * Spend one, exactly once. The guard is in the UPDATE, not in a preceding
+ * SELECT: two tabs racing the same code must produce one winner, and D1
+ * reports the row count it actually changed. A runtime that does not report
+ * one is refused rather than assumed successful — an unproven single-use
+ * claim is worse than a failed recovery, because it is invisible.
+ */
+export async function consumeRecoveryCode(env, code, note) {
+  try {
+    const result = await env.DB.prepare(
+      "UPDATE recovery_codes SET used_at = ?, used_note = ? WHERE code_hash = ? AND used_at IS NULL",
+    ).bind(Date.now(), String(note || "").slice(0, 80) || null, await codeKey(code)).run();
+    const changes = result?.meta?.changes;
+    return typeof changes === "number" && changes === 1;
+  } catch (error) {
+    recoveryGuard(error);
+  }
+}
+
+/* ------------------------------------------------- recovery-attempt brake */
+
+/**
+ * Entropy is what stops a guess; this brake is what makes a grind slow and
+ * VISIBLE. Failures inside the window are counted in the owner's own database,
+ * so it holds across Worker isolates rather than only within one.
+ */
+export async function recoveryThrottle(env, now = Date.now()) {
+  try {
+    const since = now - RECOVERY_FAIL_WINDOW_MS;
+    const row = await env.DB.prepare(
+      "SELECT count(*) AS n, COALESCE(min(attempted_at), 0) AS oldest FROM recovery_attempts WHERE attempted_at > ?",
+    ).bind(since).first();
+    const failures = Number(row?.n || 0);
+    return {
+      failures,
+      locked: failures >= RECOVERY_FAIL_LIMIT,
+      retry_after_ms: failures >= RECOVERY_FAIL_LIMIT
+        ? Math.max(0, Number(row?.oldest || now) + RECOVERY_FAIL_WINDOW_MS - now)
+        : 0,
+    };
+  } catch (error) {
+    recoveryGuard(error);
+  }
+}
+
+export async function recordRecoveryFailure(env, now = Date.now()) {
+  try {
+    await env.DB.prepare("INSERT INTO recovery_attempts (attempted_at) VALUES (?)").bind(now).run();
+    // Bounded by construction: rows outside the window can never affect a
+    // verdict, so they are swept rather than accumulated.
+    await env.DB.prepare("DELETE FROM recovery_attempts WHERE attempted_at <= ?")
+      .bind(now - RECOVERY_FAIL_WINDOW_MS).run();
+  } catch (error) {
+    recoveryGuard(error);
+  }
+}
+
+/** Knowing a live code proves the owner is the owner; the brake resets. */
+export async function clearRecoveryFailures(env) {
+  try {
+    await env.DB.prepare("DELETE FROM recovery_attempts").run();
+  } catch (error) {
+    recoveryGuard(error);
+  }
+}

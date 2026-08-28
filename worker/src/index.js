@@ -43,7 +43,8 @@ import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js"
 import { emptyRetrievalDisclosure, degradedCause } from "./lib/retrieval-status.js";
 import { subsystemFailure, withCompleteness } from "./lib/failure.js";
 import {
-  handleOwnerAuth, handleAdminInvite, handleAdminDevices, validateOwnerSession,
+  handleOwnerAuth, handleAdminInvite, handleAdminDevices, handleAdminRecoveryCodes,
+  validateOwnerSession,
 } from "./lib/owner-auth.js";
 import { handleZoomWebhook } from "./lib/zoom.js";
 
@@ -1671,6 +1672,9 @@ export default {
       }
       if (path === "/api/admin/auth/invite" && request.method === "POST") {
         return handleAdminInvite(env, url);
+      }
+      if (path === "/api/admin/auth/recovery-codes" && request.method === "POST") {
+        return handleAdminRecoveryCodes(env);
       }
       if (path.startsWith("/api/admin/auth/devices")) {
         return handleAdminDevices(env, request, path);
