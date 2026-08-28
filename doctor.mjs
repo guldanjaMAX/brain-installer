@@ -411,6 +411,91 @@ export function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_TOKEN)
   );
 }
 
+/**
+ * Where a bank returns the account holder's browser after they authorise.
+ *
+ * Must equal `redirectUriFor()` in `worker/src/lib/bank-feed.js`. The two live
+ * in different runtimes — this one runs on the operator's laptop, that one runs
+ * in the client's worker — so they are two constants, and
+ * `test/bank-feed-secrets.test.mjs` fails if they ever drift apart.
+ */
+export const BANK_FEED_REDIRECT_PATH = "/app/connect/bank";
+
+export function bankFeedRedirectUri(domain) {
+  const host = String(domain).replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  return `https://${host}${BANK_FEED_REDIRECT_PATH}`;
+}
+
+/**
+ * The check that has to happen BEFORE an operator is sitting with a client.
+ *
+ * A bank's own login page bounces the browser out and back, and the address it
+ * comes back to must be REGISTERED WITH THE PROVIDER IN ADVANCE. Every brain
+ * has its own hostname, so every install needs its own registration, and the
+ * failure mode is the worst kind: the client authorises at their bank, the bank
+ * returns them, and the last step dies. In front of them, mid-session, with
+ * nothing to do about it for however long a dashboard edit takes to propagate.
+ *
+ * So this is a doctor check and not a runtime error. It is offline on purpose:
+ * it needs no credential and no network, which means it runs in the quiet hour
+ * before the session rather than during it.
+ */
+export function checkBankFeedRedirect(manifest) {
+  const feed = manifest?.corpora?.bank_feed;
+  if (!feed?.enabled) return check("Bank feed", OK, "not in use on this brain");
+
+  const domain = manifest?.brain?.domain;
+  if (!domain) {
+    return check(
+      "Bank feed", WARN,
+      "this brain has no address yet, so its return address cannot be checked",
+      "  Run `brain deploy <manifest>` first. It saves the live address, and this\n" +
+      "  check can then tell you the exact return address to register."
+    );
+  }
+
+  const required = bankFeedRedirectUri(domain);
+  const declared = Array.isArray(feed.registered_redirect_uris) ? feed.registered_redirect_uris : [];
+  const missingConfig = [
+    !feed.api_base && "corpora.bank_feed.api_base",
+    !feed.link_sdk_url && "corpora.bank_feed.link_sdk_url",
+    !feed.link_global && "corpora.bank_feed.link_global",
+  ].filter(Boolean);
+
+  if (!declared.includes(required)) {
+    return check(
+      "Bank feed", FAIL,
+      "the return address for this brain is not recorded as registered",
+      "  Register this exact address with the bank-data provider, in the CLIENT'S OWN\n" +
+      "  provider dashboard, before the session:\n\n" +
+      `      ${required}\n\n` +
+      "  Then record it in the manifest so this check can confirm it:\n" +
+      `      corpora.bank_feed.registered_redirect_uris: ["${required}"]\n\n` +
+      "  Skip this and the client will authorise successfully at their bank and then\n" +
+      "  land on a dead return, with you sitting next to them."
+    );
+  }
+  if (missingConfig.length) {
+    return check(
+      "Bank feed", WARN,
+      `return address registered; ${missingConfig.length} setting(s) still undeclared`,
+      `  Add to the manifest: ${missingConfig.join(", ")}.\n` +
+      "  Without them the worker has no provider host and the connect page has no\n" +
+      "  library to load, so the connect button does nothing."
+    );
+  }
+  const environment = feed.environment === "production" ? "production" : "sandbox";
+  return check(
+    "Bank feed", OK,
+    `${environment}; return address registered (${required})`,
+    environment === "sandbox"
+      ? "  Sandbox is right for a rehearsal, and it is what lets an install be practised\n" +
+        "  the same day. Switch to production once the client's own provider approval\n" +
+        "  lands, and register the same return address in that environment too."
+      : undefined
+  );
+}
+
 export async function checkNetwork() {
   try {
     const res = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {

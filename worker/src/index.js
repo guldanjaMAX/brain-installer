@@ -19,6 +19,7 @@
  */
 
 import { jsonResponse, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
+import { handleBankFeed } from "./lib/bank-feed.js";
 import {
   hasSensitiveTransportIdentity,
   scanEnvelope as scanEnvelopeSecrets,
@@ -1467,6 +1468,16 @@ export default {
     // privilege class (see owner-auth.mjs).
     if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/")) {
       return handleOwnerAuth(env, request, url, path);
+    }
+
+    // The bank feed's owner surface sits in FRONT of the key gate for exactly
+    // the reason /app does: the account holder's passkey session IS the
+    // authorisation, and a page that asked a client to paste the admin key
+    // would be training them to hand out a credential that can ingest, purge,
+    // reindex and drain. Operator-only routes inside the handler still take the
+    // admin key; nothing here widens the key gate.
+    if (path === "/app/connect/bank" || path.startsWith("/api/bank-feed/")) {
+      return handleBankFeed(env, request, url, path, ctx);
     }
 
     // The Zoom webhook sits in FRONT of the key gate because Zoom cannot send

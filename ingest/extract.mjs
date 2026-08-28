@@ -240,6 +240,39 @@ register(".rtf", async (buf) => {
   return { text };
 }, "rich text");
 
+/* ----------------------------------------------------------- bank exports */
+
+/**
+ * OFX and QFX: the export every bank on earth already offers its own customer.
+ *
+ * The TEXT registered here is deliberately coarse — a period, a balance, and a
+ * line per transaction — because a bank export read as prose answers almost
+ * nothing. The FIGURES land in the structured ledger through
+ * `worker/src/lib/fin-import.js`, where they can be added up and traced back to
+ * this file. Registering the extension is what stops the file being skipped for
+ * having no extractor, which is the silent failure this registry exists to end.
+ *
+ * Imported lazily so a folder with no bank export in it never loads the reader.
+ */
+for (const ext of [".ofx", ".qfx"]) {
+  register(ext, async (buf, { name } = {}) => {
+    const { readBankExport, renderBankExportText } = await import("./bank-export.mjs");
+    const envelope = readBankExport(buf, { name });
+    if (!envelope.ok) return { text: null, error: envelope.refusal };
+    const text = renderBankExportText(envelope);
+    if (!text.trim()) return { text: null, error: `this ${ext} file holds no readable transactions` };
+    const unreadable = envelope.accounts
+      .reduce((total, account) => total + account.transactions.filter((t) => t.unparsedReason).length, 0);
+    return {
+      text,
+      note: unreadable
+        ? `${unreadable} line(s) in this export could not be read and are recorded as unread rather than dropped`
+        : undefined,
+    };
+  }, "bank export");
+}
+
+
 /* -------------------------------------------------------------------- eml */
 
 /**

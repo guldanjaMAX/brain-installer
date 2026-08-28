@@ -221,6 +221,49 @@
               "description": "The named source this folder loads under, which is also the undo: brain forget <manifest> --source <name> removes exactly what it loaded."
             }
           }
+        },
+        "bank_feed": {
+          "type": "object",
+          "description": "A hosted, read-only bank connection the ACCOUNT HOLDER authorises themselves, in their own browser, on their own bank's screen. No password, one-time code, or bank credential is ever seen, requested, handled, or stored by the operator or by this codebase; what the brain receives is a read-only reference for fetching transaction history, and it is stored encrypted in the client's own D1. Setting enabled:true is also what makes BANK_FEED_CLIENT_ID and BANK_FEED_SECRET eligible worker secrets: with it false they are DELETED by the next `brain secrets` run, which is the intended behaviour for a brain that does not use the feed. Recommended posture is per-client credentials in the client's own provider account, so one leaked worker secret is one client's exposure. Start in sandbox so an install can be rehearsed the same day, before the client's production approval lands. `brain doctor` fails when registered_redirect_uris does not contain this brain's own return address, because that registration cannot be fixed while a client is sitting in front of you mid-authorisation.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "environment": {
+              "enum": [
+                "sandbox",
+                "production"
+              ],
+              "default": "sandbox"
+            },
+            "api_base": {
+              "type": "string",
+              "format": "uri",
+              "description": "The provider's HTTPS API origin for the selected environment. Deployed as the BANK_FEED_API_BASE worker var. There is deliberately no default in code: a missing host must fail at the operator, never reach an unintended endpoint."
+            },
+            "link_sdk_url": {
+              "type": "string",
+              "format": "uri",
+              "description": "The provider's browser SDK URL. The connect page's Content-Security-Policy is widened to exactly this URL's origin and to nothing else."
+            },
+            "link_global": {
+              "type": "string",
+              "description": "The global name the provider's SDK installs on window."
+            },
+            "registered_redirect_uris": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "format": "uri"
+              },
+              "description": "The return addresses actually registered in the client's own provider dashboard. Must contain https://<brain.domain>/app/connect/bank."
+            },
+            "entity_slug": {
+              "type": "string",
+              "description": "Which fin_entities scope feed rows belong to. Defaults to primary."
+            }
+          }
         }
       }
     },

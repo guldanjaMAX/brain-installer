@@ -84,7 +84,7 @@ import {
   GATE_VERSION as CREDENTIAL_GATE_VERSION,
 } from "./worker/src/lib/secret-scan.js";
 import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mjs";
-import { runAll as doctorRunAll, summarize as doctorSummarize, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
+import { runAll as doctorRunAll, summarize as doctorSummarize, checkBankFeedRedirect, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
 import {
   SUPPORT_MAX_AGE_DAYS,
   SUPPORT_MAX_BYTES,
@@ -1284,10 +1284,27 @@ export async function cmdDeploy(manifestPath, options = {}) {
   info("next: brain secrets <manifest>, then brain health <manifest>");
 }
 
+/**
+ * Every provider secret this installer MANAGES on a client's worker.
+ *
+ * Managed means reconciled: a name in this list that is present on the worker
+ * and NOT returned by `optionalWorkerSecretNames` for that manifest is DELETED
+ * by the next `brain secrets` run. That is the point — it is how a brain
+ * switched off Supabase stops carrying a Supabase credential.
+ *
+ * It is also a loaded gun, and the bank-feed names are the reason to say so
+ * out loud. Adding a name here WITHOUT teaching `optionalWorkerSecretNames`
+ * to return it when the manifest enables that feature means the next routine
+ * `brain secrets` run silently deletes it, and every bank connection on that
+ * install stops working with no error anywhere. The two functions are one
+ * change and must never be edited apart.
+ */
 export const WORKER_PROVIDER_SECRET_NAMES = Object.freeze([
   "ANTHROPIC_API_KEY",
   "SUPABASE_URL",
   "SUPABASE_SERVICE_ROLE_KEY",
+  "BANK_FEED_CLIENT_ID",
+  "BANK_FEED_SECRET",
 ]);
 
 export function optionalWorkerSecretNames(m) {
@@ -1300,11 +1317,18 @@ export function optionalWorkerSecretNames(m) {
   const answerModel = String(
     m.retrieval?.answer_model || "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
   );
+  // The bank feed's two service identifiers are eligible exactly when the
+  // manifest turns the feed on. This half is not optional politeness: it is
+  // what stops `reconcileWorkerProviderSecrets` from deleting them on the next
+  // routine run and disconnecting every bank the client authorised. See the
+  // note on WORKER_PROVIDER_SECRET_NAMES above; the two change together.
+  const bankFeed = m.corpora?.bank_feed?.enabled === true;
   return Object.freeze([
     ...(storage === "supabase" ? ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"] : []),
     ...(m.retrieval?.rerank === true || !answerModel.startsWith("@cf/")
       ? ["ANTHROPIC_API_KEY"]
       : []),
+    ...(bankFeed ? ["BANK_FEED_CLIENT_ID", "BANK_FEED_SECRET"] : []),
   ]);
 }
 
@@ -9231,6 +9255,16 @@ async function cmdDoctor(manifestPath) {
     checks.push(checksumCheck);
     const checksumMark = checksumCheck.status === D_OK ? c.green("ok  ") : checksumCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
     console.log(`  ${checksumMark}  ${checksumCheck.name.padEnd(18)}  ${checksumCheck.detail}`);
+
+    // Offline and cheap, so it runs here rather than at connect time. The one
+    // bank-feed failure that is unrecoverable in front of a client is a return
+    // address nobody registered.
+    try {
+      const feedCheck = checkBankFeedRedirect(loadManifest(manifestPath).m);
+      checks.push(feedCheck);
+      const feedMark = feedCheck.status === D_OK ? c.green("ok  ") : feedCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
+      console.log(`  ${feedMark}  ${feedCheck.name.padEnd(18)}  ${feedCheck.detail}`);
+    } catch { /* doctor must work without a valid manifest */ }
   }
 
   const s = doctorSummarize(checks);

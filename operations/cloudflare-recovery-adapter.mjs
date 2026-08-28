@@ -137,6 +137,16 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "fin_open_items",
   "fin_reconciliations",
   "fin_reconciliation_claims",
+  // Schema 16: hosted bank-feed connector state. `bank_feed_items` holds the
+  // ENCRYPTED read-only access reference, and a recovered brain that came back
+  // without it would look connected and silently read nothing further. The
+  // backfill queue comes with it so an interrupted history load resumes rather
+  // than restarting from scratch. Link sessions are single-use, minutes-long
+  // handoff state and are deliberately NOT exported below, exactly like
+  // auth_challenges.
+  "bank_feed_items",
+  "bank_feed_backfill",
+  "bank_feed_link_sessions",
 ]);
 
 /**
@@ -150,8 +160,10 @@ export const RECOVERY_EXPORT_TABLES = Object.freeze(
     table !== "vector_outbox" && table !== "vector_bootstrap_batches" &&
       table !== "install_state" &&
       // Live single-use auth material never enters a resumable artifact: a
-      // recovered brain re-issues challenges and invites from scratch.
-      table !== "auth_challenges" && table !== "enrollment_codes"),
+      // recovered brain re-issues challenges and invites from scratch, and an
+      // abandoned bank-authorisation session is the same kind of thing.
+      table !== "auth_challenges" && table !== "enrollment_codes" &&
+      table !== "bank_feed_link_sessions"),
 );
 
 const SAFE_WRANGLER_PREFIXES = Object.freeze([
@@ -228,7 +240,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // recovery contract tracks the EXACT current schema by design: a drill against
 // a database one migration behind would export a table set that does not match
 // the reviewed list, and refusing is the whole point of pinning it.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 15;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 16;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -256,6 +268,14 @@ const SCHEMA_15_TABLES = Object.freeze([
   "fin_reconciliation_claims",
 ]);
 
+// Schema 16: the hosted bank-feed connector's own tables, listed for the same
+// two reasons and consumed the same two ways.
+const SCHEMA_16_TABLES = Object.freeze([
+  "bank_feed_items",
+  "bank_feed_backfill",
+  "bank_feed_link_sessions",
+]);
+
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
     table,
@@ -268,7 +288,7 @@ const AGGREGATE_FIELDS = Object.freeze([
     // not have fails the whole snapshot. Ledger restoration correctness is
     // proven by the exported content, which these tables are fully part of.
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
-     ...SCHEMA_15_TABLES].includes(table)
+     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1025,7 +1045,8 @@ function expectedRecoveryTables(migrations) {
   return RECOVERY_DURABLE_TABLES.filter((table) =>
     (latest >= 13 || table !== "vector_bootstrap_batches") &&
     (latest >= 14 || !SCHEMA_14_TABLES.includes(table)) &&
-    (latest >= 15 || !SCHEMA_15_TABLES.includes(table)));
+    (latest >= 15 || !SCHEMA_15_TABLES.includes(table)) &&
+    (latest >= 16 || !SCHEMA_16_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {
