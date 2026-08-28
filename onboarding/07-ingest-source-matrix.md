@@ -8,6 +8,8 @@ I would rather lose a sale to an honest table than win one and spend week three 
 
 ## Summary
 
+**One command loads all of it:** `node brain.mjs load <manifest>` sweeps every source below that your manifest has switched on and that is connected, in one run, and prints one report saying what went in and what did not. See [One command that loads everything](#one-command-that-loads-everything-brain-load) for exactly what it does and does not do. The per-source commands in the table stay available for loading one thing at a time.
+
 | Source | Status |
 |---|---|
 | Google Drive | **Built.** In production |
@@ -79,6 +81,52 @@ Shared mailboxes and group threads contain messages from people who never agreed
 Anything you can turn into text can be put into your brain directly, one document at a time or in bulk. This is the fallback for every source with no connector, and it always works.
 
 Everything arriving this way passes the **credential gate**: if a document contains a live password or API key, it is refused, the kind of credential is named, and its value is never quoted back. Nothing is written. That gate runs on every door into your index, because a gate on one door is not a gate.
+
+### One command that loads everything: `brain load`
+
+Install day used to be seven separate commands, run in an order nobody had written down, producing seven separate reports. `brain load` is that whole day in one line:
+
+```
+node brain.mjs load <manifest>
+```
+
+It reads your manifest, works out which sources you actually have, runs every one of them that is both **switched on** and **connected right now**, and prints one report at the end.
+
+**What it does.**
+
+- **It takes the work from your manifest, not from a list in the code.** If your install does not use WhatsApp, WhatsApp never appears as work. If a new connector is added later and your manifest declares it, it is picked up without anyone editing a list.
+- **One source failing does not stop the others.** A dead Gmail token does not prevent Drive and Calendar from loading. The failure is caught, the sweep carries on, and every failure is listed at the end with what to do about it. This is deliberate: a partial load with an honest list beats an aborted run.
+- **It tells you what is IN and what is NOT**, in three separate lists: what loaded, what was skipped and why, what failed and why. A skipped source is never counted as loaded. If a count is not available it says *unknown*, never zero. If a source loaded in part it says so in those words.
+- **It is resumable.** It keeps no progress file of its own. Every source already remembers where it got to, and re-running the command is how an interrupted load finishes. For that same reason it refuses `--reset`: resetting everything at once is almost never what anyone means. Reset one source deliberately with `brain ingest <manifest> --from drive --reset`.
+- **It runs cheap sources first.** Calendar, then messages, then your folders, then Gmail, then Drive, with a one-time iPhone backup last. You see something working in the first minute rather than after forty silent ones.
+
+**What it does not do.**
+
+- It does not connect anything. If a source is switched on in your manifest but not yet authorized on this machine, it is skipped with the exact command that would connect it. Connecting is a decision, not something a load should do on your behalf.
+- It does not load Zoom, ever, and this is not a gap. Zoom **pushes**: a finished cloud recording calls your brain's own webhook and the transcript loads itself. There is nothing for a sweep to fetch, so it says so rather than printing a reassuring line for work it did not do.
+- It does not reach anything your manifest does not name. Folders on your machine are read only if you list them under `corpora.upload.folders`.
+- It does not make a source work that is not built. A corpus your manifest declares that this version has no loader for is reported as exactly that, out loud.
+
+**Options.**
+
+| Flag | What it does |
+|---|---|
+| `--dry-run` | Reads every source and reports what it holds, and **sends nothing**. Nothing is written, no progress is saved. Run this in front of the client before the first real sweep: they see the exact scope of what is about to be read, before it is read |
+| `--only <a,b>` | Run only these sources. This is how you rerun one source after fixing it, without redoing the whole sweep |
+| `--skip <a,b>` | Run everything except these |
+| `--limit <n>` | Cap every source. Useful for a fast demo; everything it touches is reported as an incomplete load, because it is |
+
+Source names are the keys under `corpora` in your manifest, and the obvious short forms work too: `drive`, `mail`, `gcal`, `iphone`. A name that is not in your manifest is refused rather than silently sweeping nothing.
+
+**Reading the report.** The bottom of the output is the part that matters:
+
+```
+  totals: 4 loaded, 4 skipped, 1 failed, of 9 declared
+  943 created, 14 updated, 127 unchanged, 7 conversation document(s) sent
+  5 of 9 declared source(s) are NOT in the brain. The lists above say which, and why.
+```
+
+If a source failed, the command exits non-zero **after** printing the whole report, so a script can tell, and a person can still read what did work.
 
 ### Every load has a name, and the name is an undo
 
