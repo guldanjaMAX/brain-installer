@@ -6704,6 +6704,232 @@ export async function cmdDoctorRepair(manifestPath, options = {}) {
   return runUpgrade(manifestPath, options.upgradeOptions || {});
 }
 
+/**
+ * Everything `brain doctor <manifest> --repair-checksum` needs to reconcile
+ * an APPLIED migration whose file content no longer matches what ran.
+ *
+ * This is a different failure than probeUpgradePause/cmdDoctorRepair above
+ * cover, and it needs its own path rather than folding into --repair:
+ * cmdMigrate's checksum guard (`checksum !== mig.checksum`, above) fires
+ * BEFORE any pending migration is even considered, unconditionally, with no
+ * force flag anywhere in the file. Replaying cmdUpgrade (what --repair does)
+ * walks straight back into that same die() and re-strands the install — this
+ * is not a resume/rollback situation at all. The install is not mid-
+ * migration; an already-applied migration's bytes drifted afterward (a
+ * line-ending change is the confirmed cause on the one real install stuck
+ * this way — see evidence/WP-00-checksum-reconciliation.md), so the fix is
+ * neither "run the SQL again" nor "restore a snapshot" — it is "the schema is
+ * presumably already in the state this edited file describes; show exactly
+ * what changed, and once a human accepts it, update the STORED checksum to
+ * match, without touching the schema at all."
+ *
+ * Read-only; deliberately tolerant of every resolution failure (missing
+ * dbId, no Cloudflare token, a D1 outage), same as probeUpgradePause, so this
+ * can run unconditionally as part of plain `brain doctor <manifest>` and
+ * catch the drift BEFORE an operator ever runs `brain update` and gets
+ * stranded by it — which is exactly how this reached a live install with no
+ * warning anywhere.
+ */
+export async function diagnoseChecksumDrift(manifestPath, options = {}) {
+  let m;
+  try {
+    ({ m } = (options.loadManifest ?? loadManifest)(manifestPath));
+  } catch (error) {
+    return { checked: false, reason: `manifest could not be read: ${String(error?.message || error).slice(0, 160)}` };
+  }
+
+  const dbId = m.infrastructure?.cloudflare?.d1_database_id;
+  if (!dbId) return { checked: false, reason: "no d1_database_id in the manifest" };
+
+  let acct;
+  try {
+    acct = await (options.resolveAccount ?? resolveAccount)(m);
+  } catch (error) {
+    return {
+      checked: false,
+      reason: `could not resolve this install's Cloudflare account: ${String(error?.message || error).slice(0, 160)}`,
+    };
+  }
+
+  // Deliberately NOT reusing the shared appliedVersions() helper here: it
+  // swallows every query failure into an empty list ("table does not exist
+  // yet, so nothing is applied" — correct for cmdMigrate, which only cares
+  // whether it is safe to proceed). This check exists to REPORT drift
+  // honestly, so a real query failure must degrade to checked:false, not to
+  // a confident "zero drift found" — the exact "degraded state presented as
+  // a confident negative" the product's honesty rules forbid. A missing
+  // table is the one failure that legitimately does mean zero applied
+  // migrations (a brand new install, never yet migrated), so that specific
+  // case alone is treated as empty rather than as a check failure.
+  const queryDatabase = options.d1Query ?? d1Query;
+  let applied;
+  try {
+    const r = await queryDatabase(acct.id, dbId, "SELECT version, checksum, name FROM schema_migrations");
+    applied = r?.results || [];
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (/no such table/i.test(message)) {
+      applied = [];
+    } else {
+      return { checked: false, reason: `could not read schema_migrations: ${message.slice(0, 160)}` };
+    }
+  }
+  const appliedMap = new Map(applied.map((a) => [a.version, a]));
+
+  let migrations;
+  try {
+    migrations = (options.loadMigrations ?? loadMigrations)();
+  } catch (error) {
+    return { checked: false, reason: `could not read local migration files: ${String(error?.message || error).slice(0, 160)}` };
+  }
+
+  const drift = [];
+  for (const mig of migrations) {
+    const prev = appliedMap.get(mig.version);
+    if (prev && prev.checksum !== mig.checksum) {
+      drift.push(describeChecksumDrift(mig, prev));
+    }
+  }
+
+  return { checked: true, drift, acctId: acct.id, dbId };
+}
+
+/**
+ * The one thing worth trying to confirm automatically: is this drift EXACTLY
+ * a line-ending change and nothing else? The confirmed cause on the one real
+ * install stranded by this bug so far, and the only class of drift this tool
+ * can positively confirm without the original applied bytes (only their
+ * checksum was ever stored, by design — see cmdMigrate's INSERT INTO
+ * schema_migrations above). Both directions are checked because either the
+ * applied version or today's file could be the CRLF one.
+ */
+function describeChecksumDrift(mig, prev) {
+  const hashOf = (s) => createHash("sha256").update(s).digest("hex").slice(0, 16);
+  const asLF = mig.sql.replace(/\r\n/g, "\n");
+  const asCRLF = asLF.replace(/\n/g, "\r\n");
+
+  let lineEndingExplanation = null;
+  if (hashOf(asLF) === prev.checksum) {
+    lineEndingExplanation =
+      'a pure line-ending change: the applied migration was recorded with LF ("\\n") line endings; ' +
+      'the current file uses CRLF ("\\r\\n") instead. Converting this file\'s CRLF to LF reproduces ' +
+      `the applied checksum exactly (${prev.checksum}) — the SQL content itself did not change.`;
+  } else if (hashOf(asCRLF) === prev.checksum) {
+    lineEndingExplanation =
+      'a pure line-ending change: the applied migration was recorded with CRLF ("\\r\\n") line endings; ' +
+      'the current file uses LF ("\\n") only. Converting this file\'s LF to CRLF reproduces the applied ' +
+      `checksum exactly (${prev.checksum}) — the SQL content itself did not change.`;
+  }
+
+  return {
+    version: mig.version,
+    name: mig.name,
+    appliedChecksum: prev.checksum,
+    appliedAt: prev.applied_at || null,
+    fileChecksum: mig.checksum,
+    fileBytes: Buffer.byteLength(mig.sql, "utf-8"),
+    fileLines: mig.sql.split(/\r\n|\n/).length,
+    lineEndingExplanation,
+  };
+}
+
+function printChecksumDriftDiagnosis(diagnosis) {
+  console.log("");
+  if (!diagnosis.checked) {
+    warn(`could not check applied migrations for checksum drift: ${diagnosis.reason}`);
+    return;
+  }
+  if (!diagnosis.drift.length) {
+    ok("every applied migration's checksum matches its file. Nothing to reconcile.");
+    return;
+  }
+  for (const entry of diagnosis.drift) {
+    console.log(`  ${c.red(entry.name)}  ${c.dim(`(schema_migrations version ${entry.version})`)}`);
+    console.log(`    applied at:        ${entry.appliedAt || "unknown"}`);
+    console.log(`    applied checksum:  ${entry.appliedChecksum}`);
+    console.log(`    file checksum:     ${entry.fileChecksum}`);
+    console.log(`    current file:      ${entry.fileLines} line(s), ${entry.fileBytes} byte(s)`);
+    if (entry.lineEndingExplanation) {
+      console.log(`    ${c.yellow("likely cause:")} ${entry.lineEndingExplanation}`);
+    } else {
+      console.log(`    ${c.yellow("likely cause:")} not confirmable as a pure line-ending change.`);
+      console.log("      The bytes this migration originally applied were never retained — only their");
+      console.log(`      checksum was. Review ${entry.name} by hand (your own version control history for`);
+      console.log("      this file, if any, is the fastest way) before confirming reconciliation.");
+    }
+    console.log("");
+  }
+}
+
+/**
+ * Update `schema_migrations`'s stored checksum(s) to match the CURRENT file,
+ * for exactly the drift entries the caller already confirmed. Deliberately
+ * does not touch anything else: no migration SQL runs, no other column
+ * changes, no row is inserted or deleted. The schema is presumably already
+ * in (or close to) the state the edited file describes; replaying its SQL
+ * blindly risks a second, different kind of corruption on top of the drift
+ * that caused this in the first place — see cmdMigrate's own comment on the
+ * checksum guard above for why that guard exists at all.
+ */
+export async function applyChecksumReconciliation(manifestPath, drift, options = {}) {
+  const resolveReconcileAccount = options.resolveAccount ?? resolveAccount;
+  const queryDatabase = options.d1Query ?? d1Query;
+  const { m } = (options.loadManifest ?? loadManifest)(manifestPath);
+  const acct = await resolveReconcileAccount(m);
+  const dbId = m.infrastructure?.cloudflare?.d1_database_id;
+  if (!dbId) die("no d1_database_id in the manifest.");
+
+  const reconciled = [];
+  for (const entry of drift) {
+    await queryDatabase(
+      acct.id,
+      dbId,
+      "UPDATE schema_migrations SET checksum = ? WHERE version = ?",
+      [entry.fileChecksum, entry.version],
+    );
+    reconciled.push({ version: entry.version, name: entry.name, checksum: entry.fileChecksum });
+  }
+  return { reconciled, count: reconciled.length };
+}
+
+/**
+ * `brain doctor <manifest> --repair-checksum`.
+ *
+ * Preview by default; acts only on --yes; the diagnosis is always printed in
+ * full first, exactly like cmdDoctorRepair, so a confirmation is never given
+ * blind. There is no "action" branch here the way cmdDoctorRepair has
+ * repair/rollback — there is exactly one thing this command does, on exactly
+ * the set of migrations that actually drifted.
+ */
+export async function cmdRepairChecksum(manifestPath, options = {}) {
+  const confirmed = options.confirmed === true;
+  const diagnose = options.diagnoseChecksumDrift ?? diagnoseChecksumDrift;
+  const applyReconciliation = options.applyChecksumReconciliation ?? applyChecksumReconciliation;
+
+  const diagnosis = await diagnose(manifestPath, options.diagnoseOptions || {});
+  printChecksumDriftDiagnosis(diagnosis);
+
+  if (!diagnosis.checked) {
+    die(`could not check applied migrations for checksum drift: ${diagnosis.reason}`);
+  }
+  if (!diagnosis.drift.length) {
+    return { drift: [] };
+  }
+
+  if (!confirmed) {
+    warn("repair-checksum preview only: nothing was changed.");
+    info("Re-run with --yes to accept the current file content for the migration(s) above and update");
+    info("schema_migrations to match. This does NOT re-run any migration SQL and does not touch the schema.");
+    return { drift: diagnosis.drift, previewed: "repair-checksum" };
+  }
+
+  const result = await applyReconciliation(manifestPath, diagnosis.drift, options.applyOptions || {});
+  for (const entry of result.reconciled) {
+    ok(`schema_migrations reconciled: ${entry.name} now recorded as ${entry.checksum}`);
+  }
+  return { ...result, drift: diagnosis.drift };
+}
+
 /** The one extra doctor check that reads a DEPLOYED brain instead of this machine. */
 async function buildUpgradePauseCheck(manifestPath, options = {}) {
   let probe;
@@ -6727,6 +6953,42 @@ async function buildUpgradePauseCheck(manifestPath, options = {}) {
     };
   }
   return { name: "upgrade state", status: D_OK, detail: "accepting documents" };
+}
+
+/**
+ * The doctor check for plain `brain doctor <manifest>` (no flags): catches an
+ * applied migration's checksum drift BEFORE an operator ever runs
+ * `brain update` and gets stranded by cmdMigrate's unconditional checksum
+ * guard — which is exactly how this reached a live install with zero
+ * warning. Independent of buildUpgradePauseCheck above: this drift can exist
+ * (and be worth fixing) even on a brain that is not currently paused for an
+ * upgrade at all.
+ */
+async function buildChecksumDriftCheck(manifestPath, options = {}) {
+  let diagnosis;
+  try {
+    diagnosis = await (options.diagnoseChecksumDrift ?? diagnoseChecksumDrift)(manifestPath, options);
+  } catch (error) {
+    diagnosis = { checked: false, reason: String(error?.message || error).slice(0, 160) };
+  }
+  if (!diagnosis.checked) {
+    return { name: "migration checksums", status: D_WARN, detail: `not checked: ${diagnosis.reason}` };
+  }
+  if (diagnosis.drift.length) {
+    const names = diagnosis.drift.map((d) => d.name).join(", ");
+    return {
+      name: "migration checksums",
+      status: D_FAIL,
+      detail: `${diagnosis.drift.length} applied migration(s) no longer match their file: ${names}`,
+      fix:
+        "An applied migration's file content changed after it ran (often just a line-ending change).\n" +
+        "  This is a different problem than a stuck upgrade, and --repair will NOT fix it — it replays\n" +
+        "  the same checksum check and fails the same way. Reconcile the stored checksum instead:\n" +
+        "  brain doctor <manifest> --repair-checksum          (preview, changes nothing)\n" +
+        "  brain doctor <manifest> --repair-checksum --yes    (accept the current file, update schema_migrations)",
+    };
+  }
+  return { name: "migration checksums", status: D_OK, detail: "every applied migration matches its file" };
 }
 
 async function cmdDoctor(manifestPath) {
@@ -6759,6 +7021,11 @@ async function cmdDoctor(manifestPath) {
     checks.push(upgradeCheck);
     const mark = upgradeCheck.status === D_OK ? c.green("ok  ") : upgradeCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
     console.log(`  ${mark}  ${upgradeCheck.name.padEnd(18)}  ${upgradeCheck.detail}`);
+
+    const checksumCheck = await buildChecksumDriftCheck(manifestPath);
+    checks.push(checksumCheck);
+    const checksumMark = checksumCheck.status === D_OK ? c.green("ok  ") : checksumCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
+    console.log(`  ${checksumMark}  ${checksumCheck.name.padEnd(18)}  ${checksumCheck.detail}`);
   }
 
   const s = doctorSummarize(checks);
@@ -9424,17 +9691,31 @@ async function dispatchRollback(manifestPath) {
 
 /**
  * `brain doctor [manifest]` with no flags stays the existing pure preflight.
- * `brain doctor <manifest> --repair|--rollback [--yes]` is the new stuck-
- * upgrade path, which needs a Cloudflare token (it reads upgrade_runs and,
- * once confirmed, mutates D1) so it is wrapped in withCloudflareToken exactly
- * like `brain update` and `brain setup` already are.
+ * `brain doctor <manifest> --repair|--rollback [--yes]` is the stuck-upgrade
+ * path (resume or restore a mid-migration pause). `brain doctor <manifest>
+ * --repair-checksum [--yes]` is the DIFFERENT path for an applied migration
+ * whose file content has since changed — see diagnoseChecksumDrift's own
+ * comment for why the two must not be conflated. All three need a Cloudflare
+ * token (they read D1 and, once confirmed, mutate it) so each is wrapped in
+ * withCloudflareToken exactly like `brain update` and `brain setup` already
+ * are. Only one of the three may be requested at a time.
  */
 async function dispatchDoctor(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
   const repairRequested = flags.repair === true;
   const rollbackRequested = flags.rollback === true;
-  if (repairRequested && rollbackRequested) {
-    die("choose only one of --repair or --rollback");
+  const repairChecksumRequested = flags["repair-checksum"] === true;
+  if ([repairRequested, rollbackRequested, repairChecksumRequested].filter(Boolean).length > 1) {
+    die("choose only one of --repair, --rollback, or --repair-checksum");
+  }
+  if (repairChecksumRequested) {
+    if (!manifestPath || manifestPath.startsWith("--") || !existsSync(manifestPath)) {
+      die("usage: brain doctor <manifest> --repair-checksum [--yes]");
+    }
+    return withCloudflareToken(
+      () => cmdRepairChecksum(manifestPath, { confirmed: flags.yes === true }),
+      { accountId: manifestAccountId(manifestPath) },
+    );
   }
   if (repairRequested || rollbackRequested) {
     if (!manifestPath || manifestPath.startsWith("--") || !existsSync(manifestPath)) {
@@ -9519,6 +9800,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain upgrade    <manifest>            snapshot, migrate, deploy, verify
     brain doctor     <manifest> --repair   diagnose a brain stuck mid-upgrade (--yes to resume)
     brain doctor     <manifest> --rollback preview restore to the pre-migration bookmark (--yes performs it)
+    brain doctor     <manifest> --repair-checksum  reconcile an applied migration whose file changed (--yes to apply)
     brain rollback   <manifest> <bookmark> preview D1-only restore (--yes performs it)
     brain schedule   <manifest>            inspect unattended Drive refresh
     brain schedule   <manifest> --remove   remove it and preserve its logs
