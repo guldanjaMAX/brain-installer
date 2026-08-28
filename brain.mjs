@@ -92,6 +92,7 @@ import {
 } from "./worker/src/lib/secret-scan.js";
 import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mjs";
 import { runAll as doctorRunAll, summarize as doctorSummarize, checkBankFeedRedirect, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
+import { runPreinstall, formatPreinstallReport, preinstallExitCode, platformLabel } from "./doctor.mjs";
 import {
   SUPPORT_MAX_AGE_DAYS,
   SUPPORT_MAX_BYTES,
@@ -9403,6 +9404,40 @@ async function buildChecksumDriftCheck(manifestPath, options = {}) {
   return { name: "migration checksums", status: D_OK, detail: "every applied migration matches its file" };
 }
 
+/**
+ * `brain preinstall` — the one command for the CLIENT's own machine, days early.
+ *
+ * Installs run on the client's computer now, so the machine that matters most is
+ * the one with no manifest and no install on it. Everything here is deliberately
+ * argument-free for that reason, and it never dies for want of a token: a
+ * missing token is one of the findings, not a reason to refuse to report.
+ *
+ * The rendering lives in doctor.mjs so that the four-way PASS / FAIL / WARN /
+ * CANNOT CHECK distinction has exactly one implementation and cannot be
+ * flattened back to three by a caller.
+ */
+async function cmdPreinstall(manifestPath) {
+  const hasManifest = Boolean(manifestPath && !String(manifestPath).startsWith("--") && existsSync(manifestPath));
+  let accountId;
+  if (hasManifest) {
+    try { accountId = loadManifest(manifestPath).m?.infrastructure?.cloudflare?.account_id; }
+    catch { /* preinstall must work without a valid manifest */ }
+  }
+
+  info("checking this machine against everything install day needs.");
+  info("nothing is created or changed. The Cloudflare checks need the network.\n");
+
+  const checks = await runPreinstall({
+    cloudflareToken: activeCloudflareToken() || undefined,
+    accountId,
+    hasManifest,
+    osPlatform: process.platform,
+  });
+  console.log(formatPreinstallReport(checks, { platformName: `${platformLabel(process.platform)} (node ${process.version})` }));
+  const code = preinstallExitCode(checks);
+  if (code) process.exitCode = code;
+}
+
 async function cmdDoctor(manifestPath) {
   let accountId;
   if (manifestPath && existsSync(manifestPath)) {
@@ -12230,6 +12265,7 @@ async function dispatchDoctor(manifestPath) {
   if ([repairRequested, rollbackRequested, repairChecksumRequested].filter(Boolean).length > 1) {
     die("choose only one of --repair, --rollback, or --repair-checksum");
   }
+  if (flags.preinstall === true) return cmdPreinstall(manifestPath);
   if (repairChecksumRequested) {
     if (!manifestPath || manifestPath.startsWith("--") || !existsSync(manifestPath)) {
       die("usage: brain doctor <manifest> --repair-checksum [--yes]");
@@ -12481,6 +12517,7 @@ const commands = {
   setup: cmdSetupInteractive,
   ask: cmdAsk,
   doctor: dispatchDoctor,
+  preinstall: cmdPreinstall,
   whatsnew: cmdWhatsnew,
   verify: cmdVerify,
   provision: cmdProvision,
@@ -12519,6 +12556,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
   install
     brain setup      [manifest]            nothing to a working brain, one command
     brain ask        <manifest>            ask a private question in this terminal
+    brain preinstall                       BEFORE install day, on the CLIENT's machine: every
+                                           blocker, plus what cannot be checked from here
     brain doctor     [manifest]            check this machine has everything it needs
     brain verify     <manifest>            check the token and resolve the account
     brain provision  <manifest>            create D1 (and R2), write IDs back

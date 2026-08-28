@@ -55,6 +55,78 @@ Windows PowerShell:
 
 ---
 
+## Before install day
+
+Installs run on the client's own computer, so the machine that decides whether
+install day goes well is the one that has nothing on it yet. Run this on that
+machine, days early, with nothing set up:
+
+Mac or Linux:
+
+```bash
+"$HOME/.financial-brain/bin/brain" preinstall
+```
+
+Windows PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\FinancialBrain\brain.cmd" preinstall
+```
+
+It needs no manifest, no install and no argument. It creates nothing and changes
+nothing. It reports four outcomes, and the fourth is the one that matters:
+
+| Outcome | Meaning |
+| --- | --- |
+| `PASS` | Checked, and good. |
+| `FAIL` | Checked, and broken. The install will hit this. |
+| `WARN` | Works, with a consequence the client needs to hear. |
+| `CANNOT CHECK` | Unknown from this machine. It names the manual step instead. |
+
+`CANNOT CHECK` exists because a check that quietly cannot run is worse than one
+that admits it. Two things genuinely cannot be read with an install-scoped
+token, and both are named with the exact page to open:
+
+- **Read versus Edit on the API token.** Cloudflare exposes no API that reports
+  a token's own permission list, so a passing probe proves the token can *list*
+  a resource, not that it can *create* in it. Confirm the four permissions by
+  eye in **My Profile > API Tokens**.
+- **The Workers Paid plan.** Reading it needs `Billing: Read`, which the install
+  token should not carry. Confirm **Workers & Pages > Plans** in the dashboard.
+
+What it does check on its own: the Node version against what this package
+requires, the operating system and exactly which capabilities it will and will
+not give this client, whether Cloudflare accepts the token at all, which account
+that token installs into, and whether the token can reach D1, Workers, Vectorize,
+Workers AI and R2 individually. Missing Vectorize permission is worth catching
+here in particular: provision creates the D1 database first and contacts
+Vectorize afterwards, so finding it later leaves a half-built install in the
+client's account.
+
+The command exits non-zero only when something is actually known to be broken.
+It never prints "ready" while anything went unchecked.
+
+### On a Windows or Linux machine
+
+Several capabilities are macOS-only, and the report separates the two reasons,
+because one of them can change and the other cannot:
+
+- **Live iMessage capture is not possible off macOS, ever.** Apple keeps message
+  history in `~/Library/Messages/chat.db` and nowhere else. A one-time load from
+  an unencrypted iPhone backup works on Windows; on Linux there is no Apple
+  backup software, so the backup has to be copied over and pointed at directly.
+- **Unattended refresh, WhatsApp capture and keystore-backed secrets are
+  installer gaps.** The capability exists; the macOS LaunchAgent supervision it
+  is built on does not have an equivalent here yet. The practical consequence is
+  that nothing refreshes on its own, and a brain going stale still reports itself
+  healthy, because being out of date is not an error. Agree a manual
+  `brain load` cadence with the client before install day.
+
+Google credentials are stored in the login Keychain on macOS, a DPAPI-encrypted
+file on Windows, and a permission-protected plain file on other platforms.
+
+---
+
 ## Set it up
 
 You need two things first. `brain doctor` checks the technical access and tells
@@ -274,6 +346,7 @@ Every command is safe to run again. Nothing is left half-written that re-running
 cannot finish.
 
 ```bash
+brain preinstall                      # before install day, on the client's machine
 brain doctor                          # what is wrong with this machine
 brain health ./brain.manifest.json    # what is wrong with the brain
 brain secrets ./brain.manifest.json   # exact durable ADMIN_KEY rotation command
