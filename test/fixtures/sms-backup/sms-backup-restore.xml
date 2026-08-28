@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<?xml-stylesheet type="text/xsl" href="sms.xsl"?>
+<smses count="8" backup_set="fixture" backup_date="1704153600000" type="full">
+<sms protocol="0" address="+15551234567" date="1704067200000" type="1" subject="null" body="Hey, are we still on for Tuesday?" toa="null" sc_toa="null" service_center="null" read="1" status="-1" date_sent="1704067100000" locked="0" sub_id="1" readable_date="Jan 1, 2024 12:00:00 AM" contact_name="Alex Rivera" />
+<sms protocol="0" address="+15551234567" date="1704067260000" type="2" subject="null" body="Yes, confirmed &amp; the numbers are ready" toa="null" sc_toa="null" service_center="null" read="1" status="-1" date_sent="1704067260000" locked="0" sub_id="1" readable_date="Jan 1, 2024 12:01:00 AM" contact_name="Alex Rivera" />
+<sms protocol="0" address="+15559876543" date="1704070800000" type="1" subject="null" body="Invoice #4521 is overdue" toa="null" sc_toa="null" service_center="null" read="1" status="-1" date_sent="1704070700000" locked="0" sub_id="1" readable_date="Jan 1, 2024 1:00:00 AM" contact_name="null" />
+<sms protocol="0" address="+15551234567" date="1704153600000" type="1" subject="null" body="Also, don&#39;t forget the deposit slip" toa="null" sc_toa="null" service_center="null" read="1" status="-1" date_sent="1704153500000" locked="0" sub_id="1" readable_date="Jan 2, 2024 12:00:00 AM" contact_name="Alex Rivera" />
+<sms protocol="0" address="+15559876543" date="1704154000000" type="2" subject="null" body="Received, will process today" toa="null" sc_toa="null" service_center="null" read="1" status="-1" date_sent="1704154000000" locked="0" sub_id="1" readable_date="Jan 2, 2024 12:06:40 AM" contact_name="null" />
+<sms protocol="0" address="+15551234567" date="1704154100000" type="1" subject="null" body="" toa="null" sc_toa="null" service_center="null" read="1" status="-1" date_sent="1704154100000" locked="0" sub_id="1" readable_date="Jan 2, 2024 12:08:20 AM" contact_name="Alex Rivera" />
+<mms date="1704154200000" msg_box="1" address="+15551234567" read="1" sub_id="1">
+  <parts>
+    <part seq="0" ct="image/jpeg" name="receipt.jpg" />
+  </parts>
+</mms>
+<sms protocol="0" address="+15551234567" date="1704154300000" type="1" subject="null" body="Sent you the receipt photo above" toa="null" sc_toa="null" service_center="null" read="1" status="-1" date_sent="1704154300000" locked="0" sub_id="1" readable_date="Jan 2, 2024 12:11:40 AM" contact_name="Alex Rivera" />
+</smses>
