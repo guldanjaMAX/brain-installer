@@ -3864,7 +3864,7 @@ function assertSourceName(name) {
 export const VALUE_FLAGS = new Set([
   "path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark", "export", "backup",
   "golden", "profile", "k", "repeat", "baseline", "save", "artifacts",
-  "corpus-contract", "approve-removals",
+  "corpus-contract", "approve-removals", "only", "skip",
 ]);
 
 /** Read an exact Drive-id exclusion list from either its portable shape or a migration receipt. */
@@ -4964,6 +4964,21 @@ async function cmdIngest(manifestPath) {
     return cmdIngestIphoneBackup(m, manifestPath, flags);
   }
   if (flags.from) return cmdIngestRemote(m, manifestPath, flags);
+  return cmdIngestLocal(m, manifestPath, flags);
+}
+
+/**
+ * The local-folder half of `brain ingest`, lifted out of cmdIngest unchanged.
+ *
+ * It was extracted for one reason: `brain load` sweeps every source this
+ * manifest declares, and a folder on disk is one of those sources. Reaching it
+ * used to mean going back through cmdIngest, which reads process.argv, so the
+ * only way to drive it from another command was to forge argv. Taking the
+ * manifest, path and flags as arguments makes it callable the same way every
+ * other per-source ingest already is, and keeps `brain load` running the SAME
+ * walker an operator runs by hand rather than a second copy that could drift.
+ */
+export async function cmdIngestLocal(m, manifestPath, flags) {
   if (flags["approve-removals"] !== undefined) {
     die("--approve-removals is only valid with --from drive.");
   }
@@ -5206,7 +5221,9 @@ async function cmdIngest(manifestPath) {
         console.log(`    ${r.rel}  (${d}, ${r.envelope.content.length} chars)`);
       }
     }
-    return;
+    // dry_run is stated on the returned shape rather than left to be inferred
+    // from a zero, so a sweep reporting this leg can never call a preview a load.
+    return { dry_run: true, would_send: scanned, unchanged, skipped: skips.length };
   }
 
   // Routine ingest is a data-plane operation. Once setup has saved the live
@@ -5378,6 +5395,17 @@ async function cmdIngest(manifestPath) {
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
   assertNoIngestFailures(tally);
   await reportBacklog(manifestPath);
+  // Returned only so a caller that ran this as one leg of a wider sweep can
+  // report a real count instead of "unknown". Reached only after
+  // assertNoIngestFailures, so these numbers describe a completed load.
+  return {
+    created: tally.created,
+    updated: tally.updated,
+    unchanged: unchanged + tally.unchanged,
+    refused: tally.refused,
+    scanned,
+    skipped: skips.length,
+  };
   } catch (error) {
     // Do not leave a source looking perpetually "indexing" when extraction,
     // transport, reconciliation, or the final acceptance check aborts. The
@@ -6375,6 +6403,754 @@ export async function cmdIngestIphoneBackup(m, manifestPath, flags, options = {}
   return result;
 }
 
+
+/* --------------------------------------------------------------- brain load */
+
+/**
+ * `brain load <manifest>` — one command that means "go through everything this
+ * client has, and put it in".
+ *
+ * WHY THIS EXISTS. Install day used to be seven or more separate ingest
+ * commands. The operator had to remember which ones applied to THIS client,
+ * run them in an order nobody had written down, and then hold seven separate
+ * reports in their head to answer the only question the client actually asks:
+ * is my stuff in there now. Every one of those steps was a place to quietly
+ * miss a source, and a missed source does not announce itself — it shows up
+ * three weeks later as an answer the brain should have had.
+ *
+ * WHAT IT REFUSES TO DO. It does not keep a cursor of its own. Every source
+ * already owns durable resume state (a content-hash map, a Google sync token,
+ * a chat.db watermark, an outbox sequence), and a second cursor layered on top
+ * would eventually disagree with the first — at which point one of them is
+ * lying about what is loaded and there is no way to tell which. Re-running
+ * this command IS the resume: each leg resumes itself.
+ *
+ * ONE SOURCE FAILING DOES NOT STOP THE REST. This is the behaviour the whole
+ * command is built around. An operator running this is usually standing next
+ * to the client. A dead Gmail token must not be the reason Drive and Calendar
+ * never loaded. Every leg is caught, recorded, and the sweep continues; the
+ * failures are reported together at the end with what to do about each one.
+ *
+ * THE REPORT IS THE PRODUCT. What is IN the brain and what is NOT has to be
+ * readable at a glance, without inference. A skipped source is never counted
+ * as loaded, an unknown count is printed as "unknown" and never as zero, and a
+ * source that loaded some documents and then failed says so in those words.
+ */
+
+/**
+ * The order legs run in, and why it is this order.
+ *
+ * Cheap and fast first, long bulk last, for a reason that is about the person
+ * watching rather than about throughput: the first minutes of a first load are
+ * when a client decides whether this thing is real. A sweep that opens with
+ * forty silent minutes of Drive extraction and only then prints its first
+ * success has spent its best moment on the least interesting source.
+ *
+ *  10 calendar        Smallest payload in the product. Events are a few lines
+ *                     each, the sync is incremental through Google's own token,
+ *                     and it usually finishes while the operator is still
+ *                     talking. It also answers "who did I meet, and when",
+ *                     which reads as magic in a way a folder count does not.
+ *  20 imessage        Local SQLite read behind a watermark. No remote API, so
+ *  30 whatsapp        nothing here can be rate-limited or refused by a third
+ *                     party mid-sweep. A steady-state pass is near-instant; a
+ *                     first history load is long but cannot block on anything.
+ *  40 upload          The folders the operator pointed at. Local disk, bounded
+ *                     by what was chosen, and usually the priority slice the
+ *                     client already said would be worth it on its own.
+ *  50 gmail           First remote bulk source. Incremental after run one, but
+ *                     a first mailbox load is thousands of messages over a
+ *                     network we do not control.
+ *  60 google_drive    The long pole, deliberately: biggest corpus, slowest
+ *                     extraction (PDF, Docs, Sheets, Slides), and the one most
+ *                     likely to still be running when everything else is done.
+ *                     Everything above it has already reported by then.
+ *  70 iphone_backup   Dead last, and not because of size. It is the only leg
+ *                     with no cursor: it re-reads the whole backup every time.
+ *                     An interrupted sweep should never have to redo it before
+ *                     it can reach a source that would have resumed cheaply.
+ *
+ * Zoom has no number because it has no pull. It posts each new transcript to
+ * the brain's own webhook, so there is nothing for a sweep to fetch, and this
+ * command says that rather than printing a reassuring green line for work it
+ * did not do.
+ */
+
+/** Canonical corpus key for whatever an operator actually types. */
+export function normalizeLoadKey(value) {
+  const raw = String(value ?? "").trim().toLowerCase().replace(/[-\s]/g, "_");
+  const aliases = {
+    drive: "google_drive",
+    googledrive: "google_drive",
+    google_calendar: "calendar",
+    gcal: "calendar",
+    mail: "gmail",
+    email: "gmail",
+    local: "upload",
+    folder: "upload",
+    folders: "upload",
+    files: "upload",
+    imessages: "imessage",
+    messages: "imessage",
+    iphone: "iphone_backup",
+    iphonebackup: "iphone_backup",
+  };
+  return aliases[raw] || raw;
+}
+
+/** The folders a manifest declares for the local-upload corpus, normalized. */
+export function uploadFoldersOf(corpus) {
+  const declared = corpus?.folders ?? corpus?.paths ?? (corpus?.path ? [corpus.path] : []);
+  if (!Array.isArray(declared)) {
+    throw new Error("corpora.upload.folders must be an array of folder paths");
+  }
+  return declared.map((entry) => (
+    typeof entry === "string" ? { path: entry, source: null } : { path: entry?.path, source: entry?.source || null }
+  ));
+}
+
+/**
+ * Read-only probes of whether a source is CONNECTED on this machine.
+ *
+ * Deliberately separate from "enabled". Enabled is a claim in the manifest
+ * about what this client uses; connected is a fact about this machine right
+ * now. Reporting them as one status is how "we loaded everything" gets said
+ * about a source whose token died last Tuesday.
+ */
+export function defaultLoadProbes() {
+  let googleCache = null;
+  const google = () => {
+    if (googleCache) return googleCache;
+    try {
+      const store = loadTokens()?.google;
+      googleCache = { present: !!store?.refresh_token, scopes: Array.isArray(store?.scopes) ? store.scopes : [] };
+    } catch (error) {
+      googleCache = { present: false, scopes: [], error: String(error?.message || error) };
+    }
+    return googleCache;
+  };
+  const googleScope = (scope, connectHint) => () => {
+    const state = google();
+    if (state.error) {
+      return { connected: false, reason: `the stored Google connection could not be read: ${state.error}`, fix: connectHint };
+    }
+    if (!state.present) return { connected: false, reason: "no Google account is connected on this machine", fix: connectHint };
+    if (!state.scopes.includes(scope)) {
+      return {
+        connected: false,
+        reason: `the Google connection on this machine has no "${scope}" scope (it has: ${state.scopes.join(", ") || "none"})`,
+        fix: connectHint,
+      };
+    }
+    return { connected: true };
+  };
+  return {
+    google_drive: googleScope("drive", "brain connect google --scopes drive,gmail,calendar"),
+    gmail: googleScope("gmail", "brain connect google --scopes drive,gmail,calendar"),
+    calendar: googleScope("calendar", "brain connect google --scopes drive,gmail,calendar"),
+    imessage: async ({ m, platform }) => {
+      if (platform !== "darwin") {
+        return {
+          connected: false,
+          reason: "iMessage history lives in chat.db, which exists only on macOS; this machine is not a Mac",
+          fix: "load the history from an unencrypted iPhone backup instead: brain ingest <manifest> --from iphone-backup",
+        };
+      }
+      const imessage = await import("./connectors/imessage.mjs");
+      const probe = imessage.probeChatDb(imessage.defaultChatDbPath());
+      if (probe.ok) return { connected: true };
+      return {
+        connected: false,
+        reason: probe.message,
+        fix: probe.reason === "full_disk_access_denied"
+          ? "grant Full Disk Access, then: brain connect imessage <manifest>"
+          : "brain connect imessage <manifest>",
+      };
+    },
+    whatsapp: async ({ m, options }) => {
+      const whatsapp = await import("./connectors/whatsapp.mjs");
+      const probe = whatsapp.probeOutbox(whatsapp.outboxPathFor(whatsappDataDir(m, options)));
+      if (probe.ok) return { connected: true };
+      return { connected: false, reason: probe.message, fix: "brain connect whatsapp <manifest> --accept-risk" };
+    },
+    iphone_backup: async ({ m }) => {
+      const backupLib = await import("./connectors/iphone-backup.mjs");
+      try {
+        const configured = m?.corpora?.iphone_backup?.backup_path || null;
+        const resolved = backupLib.resolveBackupDirectory({ path: configured ? String(configured) : null });
+        await backupLib.locateSmsDatabase(resolved.directory);
+        return { connected: true };
+      } catch (error) {
+        return {
+          connected: false,
+          reason: String(error?.message || error),
+          fix: "point at the backup explicitly: brain ingest <manifest> --from iphone-backup --backup <folder>",
+        };
+      }
+    },
+  };
+}
+
+/**
+ * The capability table: which manifest corpus keys this build can actually
+ * load, and how.
+ *
+ * The WORK is never taken from here. It is taken from the manifest, and this
+ * is consulted only to answer "is there a loader for what the manifest asked
+ * for". A corpus the manifest declares that has no row here is reported as
+ * having no loader, out loud, rather than silently vanishing from the sweep —
+ * which is exactly the drift a hardcoded source list produces as connectors
+ * are added.
+ */
+export function loadSourceRegistry(commands = {}) {
+  // The per-source commands are injectable for ONE reason: without a seam here
+  // there is no way to prove that this table forwards --dry-run, --limit and
+  // the rest to the command it names. A discrimination pass found exactly that
+  // hole — dropping --dry-run on the way into a leg broke nothing that any
+  // test could see. Defaults are the real commands, so production behaviour is
+  // unchanged and the test drives the real table.
+  const ingestCalendar = commands.ingestCalendar || cmdIngestCalendar;
+  const ingestImessage = commands.ingestImessage || cmdIngestImessage;
+  const ingestWhatsapp = commands.ingestWhatsapp || cmdIngestWhatsapp;
+  const ingestLocal = commands.ingestLocal || cmdIngestLocal;
+  const ingestRemote = commands.ingestRemote || cmdIngestRemote;
+  const ingestIphoneBackup = commands.ingestIphoneBackup || cmdIngestIphoneBackup;
+  return {
+    calendar: {
+      order: 10,
+      label: "Google Calendar",
+      scope: "meetings, attendees, times and who was in the room",
+      legs: ({ m, manifestPath, flags }) => [{
+        source: "calendar",
+        run: () => ingestCalendar(m, manifestPath, { ...flags, from: "calendar" }),
+      }],
+    },
+    imessage: {
+      order: 20,
+      label: "iMessage (this Mac)",
+      scope: "message history from Messages.app, plus forwarded SMS",
+      legs: ({ m, manifestPath, flags }) => [{
+        source: "imessage",
+        run: () => ingestImessage(m, manifestPath, { ...flags, from: "imessage" }),
+      }],
+    },
+    whatsapp: {
+      order: 30,
+      label: "WhatsApp (paired device)",
+      scope: "conversations the paired linked device has captured so far",
+      legs: ({ m, manifestPath, flags }) => [{
+        source: "whatsapp",
+        run: () => ingestWhatsapp(m, manifestPath, { ...flags, from: "whatsapp" }),
+      }],
+    },
+    upload: {
+      order: 40,
+      label: "Folders on this machine",
+      scope: "every readable document under the folders declared in the manifest",
+      legs: ({ m, manifestPath, flags }) => {
+        const folders = uploadFoldersOf(m?.corpora?.upload);
+        if (!folders.length) {
+          return {
+            unavailable: {
+              reason: "enabled, but the manifest names no folder for it to read",
+              fix: 'add  "folders": ["/path/to/folder"]  under corpora.upload, or load one by hand with: '
+                + "brain ingest <manifest> --path <folder>",
+            },
+          };
+        }
+        const unnamed = folders.filter((folder) => !folder.source);
+        if (folders.length > 1 && unnamed.length > 1) {
+          return {
+            unavailable: {
+              reason: `${folders.length} folders are declared and ${unnamed.length} of them have no source name`,
+              fix: 'give each folder its own name so a load stays separately reversible: '
+                + '"folders": [{"path": "...", "source": "contracts"}, {"path": "...", "source": "transcripts"}]',
+            },
+          };
+        }
+        return folders.map((folder) => ({
+          source: folder.source || "upload",
+          detail: folder.path,
+          run: () => ingestLocal(m, manifestPath, {
+            ...flags,
+            path: String(folder.path),
+            source: folder.source || "upload",
+          }),
+        }));
+      },
+    },
+    gmail: {
+      order: 50,
+      label: "Gmail",
+      scope: "mail threads, excluding bulk mail by default",
+      legs: ({ m, manifestPath, flags }) => [{
+        source: "gmail",
+        run: () => ingestRemote(m, manifestPath, { ...flags, from: "gmail" }),
+      }],
+    },
+    google_drive: {
+      order: 60,
+      label: "Google Drive",
+      scope: "documents, sheets, slides and PDFs with a text layer",
+      legs: ({ m, manifestPath, flags }) => [{
+        source: "drive",
+        run: () => ingestRemote(m, manifestPath, { ...flags, from: "drive" }),
+      }],
+    },
+    iphone_backup: {
+      order: 70,
+      label: "iPhone backup (one-time snapshot)",
+      scope: "iMessage and SMS history inside an unencrypted local backup",
+      note: "a point-in-time snapshot, not a connection: nothing new arrives after it",
+      legs: ({ m, manifestPath, flags }) => [{
+        source: "iphone-backup",
+        run: () => ingestIphoneBackup(m, manifestPath, { ...flags, from: "iphone-backup" }),
+      }],
+    },
+    zoom: {
+      order: 80,
+      label: "Zoom cloud recordings",
+      scope: "transcripts of new cloud recordings",
+      // Not a gap. Zoom pushes: a finished recording calls the brain's own
+      // webhook and the transcript loads itself. There is nothing to pull, so
+      // this prints a stated skip instead of a green line for work it did not do.
+      pushOnly: "Zoom posts each new transcript to this brain's webhook on its own, so a sweep has "
+        + "nothing to pull. Recordings made before you connected are never backfilled.",
+    },
+  };
+}
+
+/**
+ * Turn a manifest into an ordered list of legs, with a stated reason for every
+ * one that will not run.
+ *
+ * Derived from `m.corpora`, never from the registry: the manifest is what says
+ * which sources this client has. The registry only answers whether a declared
+ * source has a loader in this build.
+ */
+export async function planLoad({ m, manifestPath, flags = {}, registry, probes, platform, commands, options = {} }) {
+  const table = registry || loadSourceRegistry(commands);
+  const probeTable = { ...defaultLoadProbes(), ...(probes || {}) };
+  const declared = Object.keys(m?.corpora || {}).filter((key) => !key.startsWith("_"));
+  const only = flags.only ? String(flags.only).split(",").map(normalizeLoadKey).filter(Boolean) : null;
+  const skip = flags.skip ? String(flags.skip).split(",").map(normalizeLoadKey).filter(Boolean) : [];
+
+  const known = new Set([...declared.map(normalizeLoadKey), ...Object.keys(table)]);
+  for (const [flag, values] of [["--only", only || []], ["--skip", skip]]) {
+    for (const value of values) {
+      if (!known.has(value)) {
+        die(
+          `${flag} ${value} is not a source in this manifest.\n` +
+            `      Sources declared here: ${declared.join(", ") || "none"}`
+        );
+      }
+    }
+  }
+
+  const entries = [];
+  for (const key of declared) {
+    const canonical = normalizeLoadKey(key);
+    const descriptor = table[canonical];
+    const entry = {
+      key: canonical,
+      manifestKey: key,
+      label: descriptor?.label || key,
+      scope: descriptor?.scope || null,
+      note: descriptor?.note || null,
+      order: descriptor?.order ?? 900,
+      enabled: m.corpora[key]?.enabled === true,
+      status: "ready",
+      reason: null,
+      fix: null,
+      legs: [],
+    };
+
+    if (only && !only.includes(canonical)) {
+      entry.status = "skipped";
+      entry.reason = "not selected by --only";
+    } else if (skip.includes(canonical)) {
+      entry.status = "skipped";
+      entry.reason = "excluded by --skip";
+    } else if (!entry.enabled) {
+      // Three different messages, deliberately. "This client does not use it"
+      // is a different fact from "it is broken", and collapsing them is how a
+      // source nobody ever connected reads as one that merely failed today.
+      entry.status = "skipped";
+      entry.reason = "not enabled in this manifest, so this client does not use it";
+    } else if (!descriptor) {
+      entry.status = "skipped";
+      entry.reason = `enabled in this manifest, but brain ${PRODUCT_VERSION} has no loader for it`;
+      entry.fix = "nothing was loaded from it; put its documents in a folder and load that instead";
+    } else if (descriptor.pushOnly) {
+      entry.status = "skipped";
+      entry.reason = descriptor.pushOnly;
+    } else {
+      const probe = probeTable[canonical];
+      let verdict = { connected: true };
+      if (probe) {
+        try {
+          verdict = await probe({ m, manifestPath, platform: platform ?? process.platform, options });
+        } catch (error) {
+          verdict = { connected: false, reason: `the connection check itself failed: ${String(error?.message || error)}` };
+        }
+      }
+      if (!verdict?.connected) {
+        entry.status = "skipped";
+        entry.reason = `enabled, but not connected on this machine: ${verdict?.reason || "reason not reported"}`;
+        entry.fix = verdict?.fix || null;
+      } else {
+        // A malformed corpus block (folders declared as a string, say) is a
+        // reason to skip THAT source with the problem named, never a reason to
+        // abort a sweep the other seven sources were about to be part of.
+        let legs;
+        try {
+          legs = descriptor.legs({ m, manifestPath, flags });
+        } catch (error) {
+          legs = {
+            unavailable: {
+              reason: `this manifest's ${key} block could not be read: ${String(error?.message || error)}`,
+              fix: `fix corpora.${key} in the manifest, then: brain load <manifest> --only ${canonical}`,
+            },
+          };
+        }
+        if (legs?.unavailable) {
+          entry.status = "skipped";
+          entry.reason = legs.unavailable.reason;
+          entry.fix = legs.unavailable.fix || null;
+        } else {
+          entry.legs = legs;
+        }
+      }
+    }
+    entries.push(entry);
+  }
+
+  entries.sort((a, b) => (a.order - b.order) || a.key.localeCompare(b.key));
+  return entries;
+}
+
+/**
+ * Describe what one leg actually did, in the shape its own command returned.
+ *
+ * Every branch here maps a real return value. The final branch is the one that
+ * matters most: a command that reported nothing gets "counts unknown", never a
+ * zero, because a zero is a claim and unknown is the truth.
+ */
+export function describeLoadResult(result) {
+  if (result && typeof result === "object") {
+    if (result.dry_run) {
+      return {
+        known: true,
+        dryRun: true,
+        counts: null,
+        wouldSend: Number(result.would_send) || 0,
+        text: `${result.would_send} document(s) WOULD be sent, ${result.unchanged ?? 0} unchanged`,
+      };
+    }
+    // calendar: { result, sent, removed }
+    if (result.sent && typeof result.sent === "object") {
+      const s = result.sent;
+      const counts = { created: s.created || 0, updated: s.updated || 0, unchanged: s.unchanged || 0 };
+      const extra = [];
+      if (result.removed) extra.push(`${result.removed} cancellation(s) removed`);
+      if (s.refused?.length) extra.push(`${s.refused.length} refused`);
+      if (s.errors?.length) extra.push(`${s.errors.length} failed to send`);
+      return {
+        known: true,
+        counts,
+        partial: !!(s.errors?.length || s.refused?.length || result.result?.summary?.needs_reconsent),
+        text: `${counts.created} created, ${counts.updated} updated, ${counts.unchanged} unchanged`
+          + (extra.length ? `, ${extra.join(", ")}` : ""),
+      };
+    }
+    // message captures: { documents_sent, rows_seen, ... }
+    if (Number.isFinite(result.documents_sent)) {
+      return {
+        known: true,
+        counts: null,
+        documents: result.documents_sent,
+        partial: !!result.truncated,
+        text: `${result.documents_sent} conversation document(s) sent from ${result.rows_seen ?? "unknown"} new row(s)`
+          + (result.truncated ? "; --limit stopped it early, so this is NOT the full history" : ""),
+      };
+    }
+    // local folder and remote drive/gmail tallies
+    if (Number.isFinite(result.created)) {
+      const counts = { created: result.created, updated: result.updated || 0, unchanged: result.unchanged || 0 };
+      const extra = [];
+      if (result.refused) extra.push(`${result.refused} refused, NOT indexed`);
+      if (result.skipped) extra.push(`${result.skipped} skipped`);
+      return {
+        known: true,
+        counts,
+        partial: !!result.refused,
+        text: `${counts.created} created, ${counts.updated} updated, ${counts.unchanged} unchanged`
+          + (extra.length ? `, ${extra.join(", ")}` : ""),
+      };
+    }
+  }
+  return { known: false, counts: null, text: "loaded, but this connector reported no counts (unknown, not zero)" };
+}
+
+/** Short human duration. A sweep leg that took 41 minutes should not read "2460000ms". */
+export function formatLoadElapsed(ms) {
+  const seconds = Math.max(0, Math.round(Number(ms) || 0) / 1000);
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m${String(Math.round(seconds % 60)).padStart(2, "0")}s`;
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+const LOAD_STATUS_LABEL = {
+  loaded: () => `${c.green("loaded")}`,
+  partial: () => `${c.yellow("partly loaded")}`,
+  skipped: () => `${c.dim("skipped")}`,
+  failed: () => `${c.red("FAILED")}`,
+  review: () => `${c.yellow("STOPPED for review")}`,
+};
+
+/**
+ * Print the consolidated report.
+ *
+ * Split into three named lists rather than one status column, because the
+ * question a reader has is not "what happened to each source" but "what is in
+ * my brain and what is not". A skipped source and a loaded one must never sit
+ * on adjacent lines distinguished only by a word in the middle of them.
+ */
+export function renderLoadReport(entries, { dryRun, totals, log = console.log }) {
+  const loaded = entries.filter((e) => e.status === "loaded" || e.status === "partial");
+  const skipped = entries.filter((e) => e.status === "skipped");
+  const broken = entries.filter((e) => e.status === "failed" || e.status === "review");
+  const pad = (s, n) => String(s).padEnd(n);
+  const width = Math.max(12, ...entries.map((e) => e.label.length));
+
+  log("");
+  log(c.bold(dryRun ? "  load report — DRY RUN, nothing was sent" : "  load report"));
+  log("");
+
+  log(`  ${c.bold(dryRun ? `WOULD LOAD (${loaded.length})` : `IN THE BRAIN (${loaded.length})`)}`);
+  if (!loaded.length) log(`    ${c.dim("nothing")}`);
+  for (const entry of loaded) {
+    log(`    ${LOAD_STATUS_LABEL[entry.status]()}  ${pad(entry.label, width)}  ${entry.summary}  ${c.dim(formatLoadElapsed(entry.elapsed_ms))}`);
+    for (const line of entry.legLines || []) {
+      log(`             ${/NOT loaded/.test(line) ? c.yellow(line) : c.dim(line)}`);
+    }
+    if (entry.status === "partial") {
+      log(`             ${c.yellow(entry.legFailures?.length
+        ? `part of this source is NOT in the brain: ${entry.legFailures.length} of ${entry.legs?.length ?? entry.legFailures.length} did not load`
+        : "part of this source is NOT in the brain, see the line above")}`);
+      log(`             ${c.dim("retry just this one:")} brain load <manifest> --only ${entry.key}`);
+    }
+  }
+
+  log("");
+  log(`  ${c.bold(`NOT LOADED — skipped (${skipped.length})`)}`);
+  if (!skipped.length) log(`    ${c.dim("none")}`);
+  for (const entry of skipped) {
+    log(`    ${c.dim("skipped")}  ${pad(entry.label, width)}  ${entry.reason}`);
+    if (entry.fix) log(`             ${c.dim("fix:")} ${entry.fix}`);
+  }
+
+  log("");
+  log(`  ${c.bold(`NOT LOADED — failed (${broken.length})`)}`);
+  if (!broken.length) log(`    ${c.dim("none")}`);
+  for (const entry of broken) {
+    log(`    ${LOAD_STATUS_LABEL[entry.status]()}  ${pad(entry.label, width)}  ${entry.reason}`);
+    if (entry.fix) log(`             ${c.dim("fix:")} ${entry.fix}`);
+    log(`             ${c.dim("retry just this one:")} brain load <manifest> --only ${entry.key}`);
+  }
+
+  log("");
+  log(`  ${totals.line}`);
+  log(`  ${totals.documents}`);
+  if (totals.warning) log(`  ${c.yellow(totals.warning)}`);
+  log("");
+}
+
+/**
+ * `brain load <manifest>` — sweep every source this manifest has enabled and
+ * connected, in one run, and print one honest report.
+ */
+export async function cmdLoad(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const flags = options.flags || parseFlags(process.argv.slice(4));
+  const log = options.log || console.log;
+
+  if (flags.reset) {
+    die(
+      "brain load will not take --reset.\n" +
+        "      A sweep-wide reset would discard every source's resume progress at once, which is\n" +
+        "      almost never what is wanted and is not undoable. Reset one source deliberately:\n" +
+        "      brain ingest <manifest> --from drive --reset"
+    );
+  }
+  const dryRun = !!flags["dry-run"];
+  if (flags.limit) {
+    warn(`--limit ${flags.limit} applies to EVERY source in this sweep. Nothing loaded under it is a complete load.`);
+  }
+
+  const entries = await planLoad({
+    m,
+    manifestPath,
+    flags,
+    registry: options.registry,
+    commands: options.commands,
+    probes: options.probes,
+    platform: options.platform,
+    options,
+  });
+
+  const runnable = entries.filter((entry) => entry.status === "ready");
+  const client = m.client?.display_name || m.client?.slug || "this install";
+  log("");
+  log(`${c.bold("brain load")}  ${client}`);
+  info(`${entries.length} source(s) declared in this manifest; ${runnable.length} will run`);
+  log("");
+  log(`  ${c.bold(dryRun ? "what WOULD be read" : "what will be read")}`);
+  for (const entry of entries) {
+    if (entry.status === "ready") {
+      log(`    ${c.green("run")}      ${entry.label}${entry.scope ? c.dim(` — ${entry.scope}`) : ""}`);
+      for (const leg of entry.legs) {
+        if (leg.detail) log(`               ${c.dim(leg.detail)}`);
+      }
+      if (entry.note) log(`               ${c.dim(entry.note)}`);
+    } else {
+      log(`    ${c.dim("skip")}     ${entry.label}${c.dim(` — ${entry.reason}`)}`);
+    }
+  }
+  if (dryRun) {
+    log("");
+    info("dry run: each source below is READ so it can report what it holds. Nothing is sent to the brain, and no resume state is written.");
+  }
+  log("");
+
+  let index = 0;
+  for (const entry of runnable) {
+    index++;
+    const started = Date.now();
+    // Printed BEFORE the work, not after. A long leg that prints only on
+    // completion is indistinguishable from a hang to the person watching.
+    log(`${c.bold(`── [${index}/${runnable.length}] ${entry.label}`)}  ${c.dim("starting")}`);
+    const legLines = [];
+    const legResults = [];
+    const legFailures = [];
+    let review = false;
+    // Isolation runs one level deeper than the source. A manifest can declare
+    // several folders under one corpus, each its own named, separately
+    // reversible load; one unreadable folder is no reason to leave the next
+    // one unloaded, for exactly the reason one dead source is no reason to
+    // abandon the sweep.
+    for (const leg of entry.legs) {
+      // Labelled by source name, never by path: the source name is the unit
+      // `brain sources` lists and `brain forget` removes, so it is the handle a
+      // reader can act on. The path is already in the plan printed above.
+      const label = entry.legs.length > 1 ? leg.source : entry.label;
+      try {
+        const described = describeLoadResult(await leg.run());
+        legResults.push(described);
+        if (entry.legs.length > 1) legLines.push(`${label}: ${described.text}`);
+      } catch (error) {
+        if (error instanceof DriveRemovalReviewRequired) review = true;
+        const reason = String(error?.message || error).replace(/\s+/g, " ").trim();
+        legFailures.push({ label, reason });
+        if (entry.legs.length > 1) legLines.push(`${label}: NOT loaded — ${reason}`);
+        log(`${review ? c.yellow("review") : c.red("fail")}  ${label}: ${reason.split("\n")[0]}`);
+      }
+    }
+
+    entry.elapsed_ms = Date.now() - started;
+    entry.legFailures = legFailures;
+    entry.legLines = legLines;
+    entry.counts = legResults.map((r) => r.counts).filter(Boolean);
+    entry.countsKnown = legResults.length > 0 && legResults.every((r) => r.known);
+    entry.documents = legResults.reduce((n, r) => n + (Number.isFinite(r.documents) ? r.documents : 0), 0);
+    entry.wouldSend = legResults.reduce((n, r) => n + (Number.isFinite(r.wouldSend) ? r.wouldSend : 0), 0);
+
+    if (legFailures.length && !legResults.length) {
+      entry.status = review ? "review" : "failed";
+      entry.reason = legFailures.map((f) => f.reason).join(" | ");
+      entry.fix = null;
+      log(`      ${c.dim("continuing with the remaining sources")}`);
+    } else {
+      const partial = legFailures.length > 0 || legResults.some((r) => r.partial) || !!flags.limit;
+      entry.status = partial ? "partial" : "loaded";
+      entry.summary = legResults.length === 1 && entry.legs.length === 1
+        ? legResults[0].text
+        : `${legResults.length} of ${entry.legs.length} folder(s) loaded`;
+      if (flags.limit) entry.summary += `; --limit ${flags.limit} was in force, so this is NOT a complete load`;
+      if (legFailures.length) {
+        log(`${c.yellow("warn")}  ${entry.label}: ${entry.summary}, and ${legFailures.length} did NOT load  ${c.dim(formatLoadElapsed(entry.elapsed_ms))}`);
+      } else {
+        ok(`${entry.label}: ${entry.summary}  ${c.dim(formatLoadElapsed(entry.elapsed_ms))}`);
+      }
+    }
+    log("");
+  }
+
+  const done = entries.filter((e) => e.status === "loaded" || e.status === "partial");
+  const skippedCount = entries.filter((e) => e.status === "skipped").length;
+  const failedCount = entries.filter((e) => e.status === "failed" || e.status === "review").length;
+  const partialCount = entries.filter((e) => e.status === "partial").length;
+  const absentCount = skippedCount + failedCount;
+  const totalsAccumulator = { created: 0, updated: 0, unchanged: 0 };
+  let unknownCounts = 0;
+  let conversationDocs = 0;
+  let wouldSend = 0;
+  for (const entry of done) {
+    if (!entry.countsKnown) unknownCounts++;
+    wouldSend += entry.wouldSend || 0;
+    for (const counts of entry.counts || []) {
+      totalsAccumulator.created += counts.created;
+      totalsAccumulator.updated += counts.updated;
+      totalsAccumulator.unchanged += counts.unchanged;
+    }
+    conversationDocs += entry.documents || 0;
+  }
+
+  // Totals never quietly absorb an unknown into a zero. If a source could not
+  // report its counts, the totals line says how many did not, so the number
+  // beside it is understood as a floor rather than a full accounting.
+  const documentParts = dryRun
+    ? [`${wouldSend} document(s) WOULD be sent`]
+    : [
+      `${totalsAccumulator.created} created`,
+      `${totalsAccumulator.updated} updated`,
+      `${totalsAccumulator.unchanged} unchanged`,
+    ];
+  if (!dryRun && conversationDocs) documentParts.push(`${conversationDocs} conversation document(s) sent`);
+  const totals = {
+    line: `totals: ${done.length} loaded${partialCount ? ` (${partialCount} only partly)` : ""}, `
+      + `${skippedCount} skipped, ${failedCount} failed, of ${entries.length} declared`,
+    documents: unknownCounts
+      ? `${documentParts.join(", ")} — plus ${unknownCounts} source(s) whose counts are UNKNOWN, not zero`
+      : documentParts.join(", "),
+    // "Not in the brain at all" and "in, but incomplete" are counted apart on
+    // purpose. Adding them would report a source that half loaded as missing,
+    // which is its own kind of dishonesty in the other direction.
+    warning: (absentCount || partialCount)
+      ? [
+        absentCount ? `${absentCount} of ${entries.length} declared source(s) are NOT in the brain` : null,
+        partialCount ? `${partialCount} loaded only in part` : null,
+      ].filter(Boolean).join(", and ") + ". The lists above say which, and why."
+      : null,
+  };
+
+  renderLoadReport(entries, { dryRun, totals, log });
+
+  const summary = { entries, totals, dryRun, loaded: done.length, skipped: skippedCount, failed: failedCount };
+  if (failedCount) {
+    // Non-zero, but only after the whole report has printed. The exit code is
+    // for the script; the report above is for the person, and a partial load
+    // with an honest list is still worth every line of it.
+    die(
+      `${failedCount} of ${runnable.length} source(s) ${dryRun ? "could not even be previewed" : "did not load"}`
+        + (done.length ? `; the other ${done.length} ${dryRun ? "previewed fine" : "did"}.` : ".") + "\n"
+        + "      Fix the reported cause, then re-run just that one: brain load <manifest> --only <source>"
+    );
+  }
+  return summary;
+}
+
 /**
  * Ingest from a connected remote source.
  *
@@ -6900,7 +7676,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   if (dry) {
     ok("dry run, nothing was sent");
     await reportSkips(skips);
-    return;
+    return { dry_run: true, would_send: prepared, unchanged, skipped: skips.length };
   }
 
   // Every batch landed, so it is now safe to say "we have everything up to
@@ -6937,6 +7713,16 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
   assertNoIngestFailures(tally);
   await reportBacklog(manifestPath);
+  // Returned for the same reason the local walker returns its tally: a sweep
+  // that ran this leg can then report real counts rather than "unknown".
+  return {
+    created: tally.created,
+    updated: tally.updated,
+    unchanged: unchanged + tally.unchanged,
+    refused: tally.refused,
+    scanned,
+    skipped: skips.length,
+  };
   } catch (error) {
     // The cursor is deliberately outside this path: it is written only after
     // every batch and Drive family cleanup succeeds above. A thrown Drive/Gmail
@@ -10933,6 +11719,7 @@ const commands = {
   "mcp-config": cmdMcpConfig,
   migrate: cmdMigrate,
   ingest: cmdIngest,
+  load: cmdLoad,
   connect: cmdConnect,
   disconnect: cmdDisconnect,
   status: cmdStatus,
@@ -10978,6 +11765,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain connect imessage <manifest>      verify Full Disk Access, load history, capture live (Mac only)
     brain connect whatsapp <manifest> --accept-risk  pair a linked device and capture live (Mac only, opt-in)
     brain connect zoom     <manifest>      Zoom cloud-recording transcripts (needs a paid Zoom seat)
+    brain load       <manifest>            load EVERYTHING this manifest has: one sweep of every
+                                           enabled, connected source, one report at the end
     brain ingest     <manifest> --path <dir>  load a folder into the brain
     brain ingest     <manifest> --from drive  load from a connected remote source
     brain ingest     <manifest> --from calendar  sync Google Calendar (--dry-run to preview)
@@ -11010,6 +11799,17 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
   brain ingest takes --source <name>, --limit <n>, --dry-run, and --reset. It is
   resumable: re-run the same command to continue an interrupted load. A large
   Drive cleanup stops first and prints the exact --approve-removals fingerprint.
+
+  brain load is install day in one command. It reads the manifest, runs every
+  source that is both enabled AND connected, and skips the rest with a stated
+  reason. One source failing never stops the others: failures are collected and
+  reported at the end with what to do about each. It keeps NO cursor of its own,
+  so re-running it resumes each source through that source's own state, and it
+  refuses --reset for the same reason. Takes --dry-run (reads every source and
+  sends nothing, so a client can see the scope first), --only <a,b> and
+  --skip <a,b> to rerun one source after fixing it, and --limit <n>, which marks
+  everything it touches as an incomplete load. Zoom is always skipped: it pushes
+  new transcripts to the brain's webhook, so there is nothing for a sweep to pull.
 
   brain sources takes --add <name> [--kind <drive|gmail|calendar|upload>] to register one,
   and --source <name> --refresh <hourly|daily|weekly|monthly|never> to say how often it
