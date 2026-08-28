@@ -7,6 +7,7 @@
  *   POST /api/rag/unified               ranked excerpts (private JSON body)
  *   POST /api/rag/think                 cited answer + explicit gaps
  *   POST /api/admin/brain/ingest        write path, credential-gated
+ *   POST /api/admin/brain/ocr           one scanned page, read in this account
  *   POST /api/admin/brain/source-families read-only private inventory paging
  *   GET  /api/admin/brain/documents     per-source counts and freshness
  *
@@ -21,6 +22,7 @@
 import { jsonResponse, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
 import { handleBankFeed } from "./lib/bank-feed.js";
 import { handleBankExportImport, BANK_IMPORT_PATH } from "./lib/fin-upload.js";
+import { handleOcr, OCR_PATH } from "./lib/ocr.js";
 import {
   hasSensitiveTransportIdentity,
   scanEnvelope as scanEnvelopeSecrets,
@@ -504,6 +506,8 @@ async function handleThink(env, request) {
     ts: r.ts || null,
     date_reliable: r.date_reliable === true,
     date_source: r.date_source || null,
+    text_source: r.text_source || "native",
+    text_reliable: r.text_reliable !== false,
     current_authoritative: r.current_authoritative === true,
     ref: r.ref_key || r.drive_file_id || null,
     snippet: (r.snippet || "").replace(/\s+/g, " ").slice(0, 900),
@@ -514,7 +518,12 @@ async function handleThink(env, request) {
       const date = d.ts
         ? `${String(d.ts).slice(0, 10)}${d.date_reliable ? " reliable date" : " unverified date"}`
         : null;
-      const meta = [d.source, d.client ? `client: ${d.client}` : null, date]
+      // The answering model is told when a passage was read off a picture, so
+      // it can hedge a figure it was handed rather than repeat it as printed.
+      const read = d.text_source === "ocr" || d.text_source === "ocr_partial"
+        ? "READ BY OCR FROM A SCAN, may be misread"
+        : null;
+      const meta = [d.source, d.client ? `client: ${d.client}` : null, date, read]
         .filter(Boolean)
         .join(", ");
       return `[${d.n}] (${meta}) ${d.title}\n${d.snippet}`;
@@ -772,6 +781,10 @@ async function handleThink(env, request) {
     citations: approvedDocs.map((d) => ({
       n: d.n, title: d.title, source: d.source, ref: d.ref, ts: d.ts,
       date_reliable: d.date_reliable, date_source: d.date_source,
+      // A citation drawn from a scan must never look identical to one drawn
+      // from a text layer. This is the field that makes the difference
+      // visible at the point of reading, which is the only place it counts.
+      text_source: d.text_source, text_reliable: d.text_reliable,
     })),
     results: results.slice(0, limit),
   });
@@ -1534,6 +1547,12 @@ export default {
       // key is the right authority for it.
       if (path === BANK_IMPORT_PATH) {
         return await handleBankExportImport(env, request);
+      }
+      // One page of a scanned document, read by the client's own Workers AI
+      // binding. Inside the key gate and priced against the same daily cap as
+      // every other model call this brain makes.
+      if (path === OCR_PATH && request.method === "POST") {
+        return await handleOcr(env, request);
       }
       if (path === "/api/admin/brain/ingest" && request.method === "POST") {
         return await handleIngest(env, request);

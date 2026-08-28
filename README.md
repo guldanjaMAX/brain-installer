@@ -202,10 +202,24 @@ undifferentiated wall of sentences. It is the same converter the live Zoom
 connector uses, so a call saved by hand and a call delivered by webhook read
 identically.
 
-**Scanned PDFs are refused, not faked.** A scan is a picture of a page with no
-text in it. Rather than index an empty document and let your brain claim it
-knows something it cannot read, it tells you the file needs OCR first. In a real
-corpus that is roughly one PDF in seven.
+**Scanned PDFs can be read, and are marked when they are.** A scan is a picture
+of a page with no text in it, and in a real corpus that is roughly one PDF in
+seven. With OCR turned on, each page is sent to a model inside YOUR OWN
+Cloudflare account and transcribed. Three things are true about that, and the
+product says all three rather than the first one:
+
+- **A machine read it, so it can be wrong.** Every document read this way is
+  marked as OCR, and every answer that leans on one says so and scores lower
+  for it. A blurry read never looks like a clean one.
+- **A page it could not read is named, not skipped.** Unreadable pages appear
+  in the text as `[[page N: could not be read]]`. Nothing is quietly missing.
+- **A bad reading is still refused.** If the model described the page instead
+  of transcribing it, or produced too little to be a page, the file is reported
+  exactly as it was before OCR existed. Refusing beats a confident wrong answer.
+
+It is **off by default**, because it spends money on your account, once per
+scanned page. Turn it on with `safety.ocr.enabled` in the manifest. Before a run
+the installer prints what the pages will cost and how long they will take.
 
 ---
 

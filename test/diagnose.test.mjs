@@ -76,6 +76,23 @@ const source = (db, name) =>
 
 const find = (r, id) => (r.findings || []).find((f) => f.id === id);
 
+/* ---- OCR coverage is reported, because the reader deserves to know how much
+       of the corpus a machine read off a picture ---- */
+{
+  const env = makeEnv({ vectorCount: 3 });
+  source(env._db, "documents");
+  for (const i of [1, 2, 3]) { doc(env._db, `d${i}`); chunk(env._db, `d${i}#0`, `d${i}`); }
+  env._db.prepare("UPDATE documents SET text_source='ocr', text_reliable=0 WHERE doc_uid='d1'").run();
+  env._db.prepare("UPDATE documents SET text_source='ocr_partial', text_reliable=0 WHERE doc_uid='d2'").run();
+  const r = await diagnose(env);
+  const f = find(r, "ocr_coverage");
+  check("OCR-read documents are counted and reported", f?.count === 2, JSON.stringify(f));
+  check("and a half-read one is called out separately",
+    /pages that could not be read/.test(f?.detail || ""), f?.detail);
+  check("it is information, not a defect, so a scanned corpus is not called unhealthy",
+    f?.severity === "info" && r.verdict === "healthy", `${f?.severity} / ${r.verdict}`);
+}
+
 /* ---- a clean install reports clean ---- */
 {
   const env = makeEnv({ vectorCount: 3 });

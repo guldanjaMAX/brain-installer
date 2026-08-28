@@ -243,13 +243,15 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   // Owners re-sign-in with their passkey; that is a tap, not a loss.
   "session_generation",
 ]);
-// Schema 15 added the additive financial-ledger tables and 17 added the chunk
-// token-fit columns. As with schema 14's owner-passkey tables, the vector
-// protocol itself is unchanged, but the recovery contract tracks the EXACT
-// current schema by design: a drill against a database one migration behind
-// would export a column set that does not match the reviewed list, and refusing
-// is the whole point of pinning it.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 17;
+// Schema 15 added the additive financial-ledger tables, 17 added the chunk
+// token-fit columns, and 18 added two provenance COLUMNS to `documents`
+// (text_source, text_reliable) so an OCR'd document is distinguishable from one
+// read from a text layer. No new table in 17 or 18, and the vector protocol is
+// unchanged, but the recovery contract tracks the EXACT current schema by
+// design: a drill against a database one migration behind would export a column
+// set that does not match the reviewed list, and refusing is the whole point of
+// pinning it. Bumping this is a required step of shipping any migration.
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 18;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {

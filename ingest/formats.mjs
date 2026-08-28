@@ -84,9 +84,14 @@ export async function pdfPassIsolated(buf, {
   childPath = PDF_CHILD_PATH,
   timeoutMs = PDF_PROCESS_TIMEOUT_MS,
   maxOutputBytes = PDF_PROCESS_MAX_OUTPUT_BYTES,
+  // Page images are asked for, never assumed. The child only renders when the
+  // document turns out to have no text layer, so the 79% of PDFs that read
+  // normally pay nothing for a feature they do not use.
+  withPageImages = 0,
 } = {}) {
   const bytes = Buffer.from(buf);
   const scriptPath = childPath instanceof URL ? fileURLToPath(childPath) : childPath;
+  const args = withPageImages ? [scriptPath, `--images=${withPageImages}`] : [scriptPath];
 
   return await new Promise((resolve, reject) => {
     let child;
@@ -121,7 +126,7 @@ export async function pdfPassIsolated(buf, {
     };
 
     try {
-      child = spawn(process.execPath, [scriptPath], {
+      child = spawn(process.execPath, args, {
         env: pdfChildEnvironment(),
         stdio: ["pipe", "pipe", "ignore"],
         windowsHide: true,
@@ -189,7 +194,11 @@ export async function pdfPassIsolated(buf, {
       } else if (message?.ok === true) {
         if (typeof message.text !== "string" || !Number.isInteger(message.totalPages) || message.totalPages < 0) {
           failSystem("invalid result protocol");
-        } else finish(pdfResult(message.text, message.totalPages));
+        } else finish({
+          ...pdfResult(message.text, message.totalPages),
+          pageImages: Array.isArray(message.pageImages) ? message.pageImages : null,
+          imageError: typeof message.imageError === "string" ? message.imageError : null,
+        });
       } else failSystem("invalid result protocol");
     });
 
@@ -204,6 +213,54 @@ export async function pdfPassIsolated(buf, {
     timer.unref?.();
     child.stdin.end(bytes);
   });
+}
+
+/**
+ * Read a scanned PDF page by page, then judge the result.
+ *
+ * `ocr(image, { page, totalPages })` returns `{ text }` for a page it read, or
+ * `{ error }` for one it could not. A `fatal` error — the spend cap, a missing
+ * AI binding, an outage — is rethrown untouched, because none of those is
+ * evidence about this document and recording them as "unreadable" would write
+ * a permanently wrong reason into the corpus.
+ *
+ * Returns null when OCR had nothing to work with, so the caller falls back to
+ * the original refusal rather than to a new one that overstates what was tried.
+ */
+async function ocrPdf(ocr, r, scanned) {
+  const { assembleOcr } = await import("./ocr.mjs");
+  const images = Array.isArray(r.pageImages) ? r.pageImages : [];
+  const usable = images.filter(Boolean);
+  if (!usable.length) {
+    const why = r.imageError
+      ? `its pages could not be rendered (${r.imageError})`
+      : "its pages hold no image this can read, so there was nothing to send to OCR";
+    return { text: null, error: `${scanned} OCR was attempted and ${why}.` };
+  }
+
+  const pages = [];
+  for (const image of images) {
+    if (!image) {
+      pages.push({ page: pages.length + 1, error: "this page holds no image, so there was nothing to read" });
+      continue;
+    }
+    let got;
+    try {
+      got = await ocr(image, { page: image.page, totalPages: r.totalPages });
+    } catch (e) {
+      if (e?.fatal === true) throw e;
+      got = { error: String(e?.message || e).slice(0, 160) };
+    }
+    pages.push({ page: image.page, text: got?.text, error: got?.error });
+  }
+
+  const verdict = assembleOcr(pages, { totalPages: r.totalPages, model: ocr.model });
+  if (!verdict.ok) return { text: null, error: `${scanned} ${verdict.refusal}.` };
+  return {
+    text: verdict.text,
+    note: verdict.note,
+    provenance: verdict.provenance,
+  };
 }
 
 /**
@@ -224,10 +281,15 @@ export async function pdfPassIsolated(buf, {
  * unreadable scans. One retry costs milliseconds on a file that is genuinely
  * empty and rescues one that was merely cold.
  */
-export async function extractPdf(buf, { reread } = {}, { pdfPassImpl = pdfPassIsolated } = {}) {
+export async function extractPdf(buf, { reread, ocr } = {}, { pdfPassImpl = pdfPassIsolated } = {}) {
+  // Rendering is requested up front only when there is somewhere to send the
+  // pixels. Without an OCR callback this is byte-for-byte the old behaviour,
+  // which is the point: a PDF with a text layer must never pay for a feature
+  // aimed at the ones without.
+  const wantImages = typeof ocr === "function" ? (ocr.maxPages || 0) || 1_000_000 : 0;
   let r;
   try {
-    r = await pdfPassImpl(buf);
+    r = await pdfPassImpl(buf, wantImages ? { withPageImages: wantImages } : undefined);
   } catch (e) {
     if (e?.fatal === true) throw e;
     const name = e?.name || "";
@@ -240,7 +302,7 @@ export async function extractPdf(buf, { reread } = {}, { pdfPassImpl = pdfPassIs
     const fresh = await reread();
     if (fresh) {
       try {
-        const again = await pdfPassImpl(fresh);
+        const again = await pdfPassImpl(fresh, wantImages ? { withPageImages: wantImages } : undefined);
         if (again.body && again.body.length) r = again;
       } catch (e) {
         if (e?.fatal === true) throw e;
@@ -250,10 +312,16 @@ export async function extractPdf(buf, { reread } = {}, { pdfPassImpl = pdfPassIs
   }
 
   if (!r.body.length) {
-    return {
-      text: null,
-      error: `no text layer: this is a scanned PDF (${r.totalPages} page${r.totalPages === 1 ? "" : "s"} of images). It needs OCR before it can be indexed.`,
-    };
+    // The refusal below is what this product said for its whole life, and it
+    // stays the last word. OCR is an attempt to earn a better answer, never a
+    // licence to invent one: if it produces nothing trustworthy, the document
+    // is still reported rather than indexed with a guessed reading.
+    const scanned = `no text layer: this is a scanned PDF (${r.totalPages} page${r.totalPages === 1 ? "" : "s"} of images).`;
+    if (typeof ocr === "function") {
+      const got = await ocrPdf(ocr, r, scanned);
+      if (got) return got;
+    }
+    return { text: null, error: `${scanned} It needs OCR before it can be indexed.` };
   }
   if (r.perPage < MIN_CHARS_PER_PAGE) {
     // Returned rather than refused. There IS text; there is just not much, and

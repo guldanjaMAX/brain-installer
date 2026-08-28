@@ -243,12 +243,108 @@ export async function spendBudgetStatus(env) {
   };
 }
 
-export async function callLLM(env, { model, system, messages, max_tokens, label, timeoutMs }) {
+/**
+ * Per-model Workers AI rates, in dollars per million tokens.
+ *
+ * A single hard-coded pair used to price every Workers AI call at the answer
+ * model's rate. That is wrong in both directions, and for OCR it is wrong in
+ * the direction that matters: gemma-4 costs $0.10/$0.30 against llama's
+ * $0.293/$2.25, so charging OCR at llama rates overstates its spend roughly 3x
+ * on input and 7.5x on output. The cap would then stop a run that had spent a
+ * fraction of the budget, and the owner would be told they had hit a limit
+ * they were nowhere near.
+ *
+ * Prefix-matched, longest first, so a family rate covers its variants. Read
+ * from the published Workers AI model pages on 2026-08-28.
+ */
+const WORKERS_AI_RATES = [
+  ["@cf/google/gemma-4", { in: 0.1, out: 0.3 }],
+  ["@cf/meta/llama-3.3-70b-instruct-fp8-fast", { in: 0.293, out: 2.25 }],
+];
+
+// The default is the most expensive rate we know, not the cheapest. An unknown
+// model priced optimistically would let the cap fail quiet.
+const WORKERS_AI_FALLBACK_RATE = { in: 0.293, out: 2.25 };
+
+export function workersAiRate(model) {
+  const id = String(model || "");
+  let best = null;
+  for (const [prefix, rate] of WORKERS_AI_RATES) {
+    if (id.startsWith(prefix) && (!best || prefix.length > best.prefix.length)) best = { prefix, rate };
+  }
+  return best ? best.rate : WORKERS_AI_FALLBACK_RATE;
+}
+
+/**
+ * How an image is attached to a Workers AI chat request.
+ *
+ * STATED PLAINLY: this shape is NOT verified against a live account in this
+ * build. Cloudflare's model page for the OCR model lists Vision as a
+ * capability and publishes its prices, but its usage examples are text-only
+ * and it does not document the image field. Two shapes exist in the wild — the
+ * OpenAI-compatible content array with `image_url`, which is what an
+ * instruction-tuned chat model reached through `messages` accepts, and the
+ * older top-level `image` field used by llama-3.2-vision.
+ *
+ * Rather than guess once and fail silently, the shape is a named switch. The
+ * default is the content array; `OCR_IMAGE_FORMAT=image_field` selects the
+ * other. The OCR route reports which shape it sent and returns the provider's
+ * own error verbatim, so a wrong guess costs one call and one variable rather
+ * than a debugging session.
+ */
+export function visionMessages(system, messages, image, env = {}) {
+  const dataUrl = `data:image/png;base64,${image}`;
+  const text = (messages || []).map((m) => m?.content).filter((c) => typeof c === "string").join("\n\n");
+
+  if (env.OCR_IMAGE_FORMAT === "image_field") {
+    return [
+      { role: "system", content: system },
+      { role: "user", content: text, image: dataUrl },
+    ];
+  }
+  return [
+    { role: "system", content: system },
+    {
+      role: "user",
+      content: [
+        ...(text ? [{ type: "text", text }] : []),
+        { type: "image_url", image_url: { url: dataUrl } },
+      ],
+    },
+  ];
+}
+
+export async function callLLM(env, { model, system, messages, max_tokens, label, timeoutMs, image }) {
   const apiKey = env.ANTHROPIC_API_KEY;
   if (!apiKey && !env.AI) {
     const e = new Error("no LLM key configured");
     e.no_key = true;
     throw e;
+  }
+
+  // An image is a page of the client's own scanned document. It has exactly one
+  // legal destination: the Workers AI binding inside their own Cloudflare
+  // account. There is no Anthropic branch for it and there is no default-model
+  // fallback, because either would move a picture of their bank statement to a
+  // provider their manifest does not name. This is a custody claim, so it
+  // refuses rather than degrades.
+  if (image !== undefined) {
+    if (!String(model || "").startsWith("@cf/")) {
+      const e = new Error(
+        `OCR must run on a Cloudflare model inside this account; ${model || "(no model)"} is not one. ` +
+        "Refusing to send a page of a scanned document anywhere else.",
+      );
+      e.provider_mismatch = true;
+      throw e;
+    }
+    if (!env.AI) {
+      const e = new Error(
+        "OCR needs this worker's own Workers AI binding, and there is none. " +
+        "Refusing to send a page of a scanned document to another provider.",
+      );
+      e.provider_mismatch = true;
+      throw e;
+    }
   }
 
   await ensureLogTable(env);
@@ -286,7 +382,9 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
       : env.WORKERS_AI_ANSWER_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
     try {
       const data = await env.AI.run(workersModel, {
-        messages: [{ role: "system", content: system }, ...(messages || [])],
+        messages: image === undefined
+          ? [{ role: "system", content: system }, ...(messages || [])]
+          : visionMessages(system, messages, image, env),
         max_tokens: max_tokens || 1000,
         temperature: 0,
       });
@@ -299,9 +397,10 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
       if (!text) throw new Error("Workers AI returned no answer text");
       const inTok = data?.usage?.prompt_tokens || data?.usage?.input_tokens || 0;
       const outTok = data?.usage?.completion_tokens || data?.usage?.output_tokens || 0;
-      // llama-3.3-70b-fp8-fast: $0.293/M input and $2.25/M output.
-      // Keep the estimate conservative enough for the guard to remain useful.
-      const micros = Math.ceil(inTok * 0.293 + outTok * 2.25);
+      // Priced by the model actually called, per WORKERS_AI_RATES. Keep the
+      // estimate conservative enough for the guard to remain useful.
+      const rate = workersAiRate(workersModel);
+      const micros = Math.ceil(inTok * rate.in + outTok * rate.out);
       chargeIsolate(micros);
       await logCall(env, { label, model: workersModel, status: "ok", micros });
       return {

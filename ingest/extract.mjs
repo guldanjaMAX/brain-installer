@@ -333,7 +333,12 @@ export function canExtract(name) {
  * degraded — a scanned PDF, a truncated sheet — which the caller surfaces rather
  * than swallowing.
  *
- * @returns {Promise<{ text: string|null, how: string|null, unsupported?: true, error?: string, note?: string }>}
+ * It may also return `provenance`, which says how the text was OBTAINED rather
+ * than what it says. This has to be forwarded explicitly: it used to die here,
+ * inside the one function every ingest path funnels through, so a document read
+ * by OCR reached the corpus looking exactly like one read from a text layer.
+ *
+ * @returns {Promise<{ text: string|null, how: string|null, unsupported?: true, error?: string, note?: string, provenance?: object }>}
  */
 export async function extract(buf, name, opts = {}) {
   const ext = extensionOf(name);
@@ -342,7 +347,7 @@ export async function extract(buf, name, opts = {}) {
   try {
     const out = await entry.fn(buf, { name, ...opts });
     if (out && typeof out === "object" && !Array.isArray(out)) {
-      return { text: out.text ?? null, how: entry.label, note: out.note, error: out.error };
+      return { text: out.text ?? null, how: entry.label, note: out.note, error: out.error, provenance: out.provenance };
     }
     return { text: out, how: entry.label };
   } catch (e) {
