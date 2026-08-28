@@ -381,7 +381,7 @@ const gm = await import("../connectors/gmail.mjs");
 }
 {
   const raw = Buffer.from(
-    "From: Eli <eli@azlawns.com>\r\nTo: james@jamesguldan.com\r\nSubject: Retainer\r\nDate: Fri, 14 Aug 2026 10:00:00 -0700\r\n\r\n" +
+    "From: Jordan Lee <jordan.lee@brightfield-partners.test>\r\nTo: morgan.diaz@example-holdings.test\r\nSubject: Retainer\r\nDate: Fri, 14 Aug 2026 10:00:00 -0700\r\n\r\n" +
     "Confirming we agreed to hold the retainer at the current rate through October, and revisit at the quarterly review."
   ).toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
   const r = await gm.toEnvelope(tok, "M1", {}, {
@@ -390,7 +390,7 @@ const gm = await import("../connectors/gmail.mjs");
   });
   check("a message becomes an envelope", !!r.envelope, JSON.stringify(r.skip));
   check("the subject becomes the title", r.envelope.title === "Retainer", r.envelope?.title);
-  check("the sender survives into the text, so it is searchable", /eli@azlawns\.com/.test(r.envelope.content), r.envelope?.content?.slice(0, 120));
+  check("the sender survives into the text, so it is searchable", /jordan\.lee@brightfield-partners\.test/.test(r.envelope.content), r.envelope?.content?.slice(0, 120));
   check("the body survives", /hold the retainer/.test(r.envelope.content));
   // internalDate is a receipt time; unlike a file mtime nothing rewrites it.
   check("internalDate is the document date", r.envelope.occurred_at === new Date(1755172800000).toISOString(), r.envelope?.occurred_at);
