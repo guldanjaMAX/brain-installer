@@ -319,14 +319,44 @@ function balanceSnapshot(tenantId, account, source, envelope, stamp) {
   ];
 }
 
+/**
+ * One sentence saying what the direction of these amounts actually rests on.
+ *
+ * `verified` was checked against balances the source itself stated, `stated`
+ * means the file named the direction of every row outright, and `trusted` means
+ * a format specification said so and nothing checked it. A source that offers
+ * no basis at all gets no sentence rather than a reassuring one.
+ */
+function directionSentence(account) {
+  if (account.directionBasis === "verified") {
+    return "The direction of every amount was verified against the source's own balances.";
+  }
+  if (account.directionBasis === "stated") {
+    return "The direction of every amount is stated by the source itself, row by row.";
+  }
+  if (account.directionBasis === "trusted") {
+    return "The direction of every amount was taken on trust from the format's own specification and was NOT verified against a balance.";
+  }
+  return null;
+}
+
 function coverageStatement(tenantId, account, source, envelope, stamp) {
   // `partial` and a through-date, never `complete`: one export proves the days
   // it covers and says nothing about the days on either side of it.
   const unread = account.transactions.filter((t) => t.unparsedReason).length;
-  const note = unread
-    ? `Read from a bank export covering ${account.periodStart || "an unstated start"} to ${account.periodEnd}. ` +
-      `${unread} line(s) in it could not be read and are recorded as unread.`
-    : `Read from a bank export covering ${account.periodStart || "an unstated start"} to ${account.periodEnd}.`;
+  const note = [
+    `Read from a bank export covering ${account.periodStart || "an unstated start"} to ${account.periodEnd}.`,
+    unread ? `${unread} line(s) in it could not be read and are recorded as unread.` : null,
+    // WHETHER THE DIRECTIONS WERE CHECKED, SAID IN THE LEDGER ITSELF.
+    //
+    // A receipt printed in a terminal is read once by one person. This sentence
+    // is read by whoever asks the brain about the account, months later, which
+    // is the only audience that matters. An unverified reading presented
+    // identically to a verified one is the dishonesty this product exists to
+    // avoid, and one plain sentence in the column the schema already reserves
+    // for plain sentences is the whole cost of avoiding it.
+    directionSentence(account),
+  ].filter(Boolean).join(" ");
   return [
     `INSERT INTO fin_account_coverage
        (tenant_id, account_slug, coverage_status, covered_from, covered_to, basis_note, computed_at,

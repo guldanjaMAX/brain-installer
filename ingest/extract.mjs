@@ -263,12 +263,16 @@ for (const ext of [".ofx", ".qfx"]) {
     if (!text.trim()) return { text: null, error: `this ${ext} file holds no readable transactions` };
     const unreadable = envelope.accounts
       .reduce((total, account) => total + account.transactions.filter((t) => t.unparsedReason).length, 0);
-    return {
-      text,
-      note: unreadable
-        ? `${unreadable} line(s) in this export could not be read and are recorded as unread rather than dropped`
-        : undefined,
-    };
+    // The prose is all this path produces, and saying so is the difference
+    // between an operator who knows the figures are not in the ledger and one
+    // who assumes they are because the file loaded without complaint.
+    const notes = [
+      "the FIGURES in this export are not in the ledger; `brain import bank <manifest> --file <this file>` loads them",
+    ];
+    if (unreadable) {
+      notes.unshift(`${unreadable} line(s) in this export could not be read and are recorded as unread rather than dropped`);
+    }
+    return { text, note: notes.join("; ") };
   }, "bank export");
 }
 

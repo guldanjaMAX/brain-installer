@@ -349,6 +349,133 @@ function maskOf(accountNumber) {
   return digits.length >= 4 ? digits.slice(-4) : (digits || null);
 }
 
+/**
+ * The opening balance the STATEMENT ITSELF states, or null.
+ *
+ * OFX has no required opening-balance element, which is why the check below is
+ * conditional rather than universal. What it does have is `<BALLIST>`, an
+ * optional list of named balances a bank may include, and the one worth reading
+ * is the balance the period STARTED at. Only the file's own opening balance is
+ * accepted as an anchor: it came off the same statement as the transactions and
+ * the closing balance, so if the three disagree the disagreement is about the
+ * figures and nothing else. A balance from anywhere else — a previous month's
+ * import, a figure the operator typed — can disagree for reasons that have
+ * nothing to do with a sign convention (a gap between statements, a pending
+ * item, a correction), and a check that refuses good files for the wrong reason
+ * teaches the operator to switch it off.
+ */
+function openingBalanceFrom(node, exponent) {
+  const list = firstChild(node, "BALLIST");
+  if (!list) return { minor: null, label: null };
+  for (const bal of findAll(list, "BAL")) {
+    const label = [firstValue(bal, "NAME"), firstValue(bal, "DESC")].filter(Boolean).join(" ").trim();
+    if (!/open|begin|previous|prior|start|brought forward/i.test(label)) continue;
+    const parsed = parseMinorUnits(firstValue(bal, "VALUE"), { exponent });
+    if (parsed.error) continue;
+    return { minor: parsed.minor, label: label.slice(0, 60) };
+  }
+  return { minor: null, label: null };
+}
+
+/**
+ * DOES THIS STATEMENT'S OWN ARITHMETIC AGREE WITH THE SPEC'S SIGN CONVENTION?
+ *
+ * The OFX convention above is TRUE BY SPECIFICATION, and until this function
+ * existed it was also never checked. A card export that writes a purchase as a
+ * positive number — rare, but real — would have landed every purchase as money
+ * arriving, every payment as money leaving, and the ledger would have looked
+ * entirely plausible with a citation under every figure. That is the exact
+ * failure mode the CSV reader already refuses to allow, and there was no reason
+ * the OFX reader should get a pass on it just because a document says so.
+ *
+ * So: where the statement states an opening balance, opening plus the period's
+ * activity must equal the closing balance under the convention as written, and
+ * must NOT equal it with every sign flipped. Returns one of four states, and
+ * `unverifiable` is a first-class answer rather than a quiet success.
+ */
+export function verifyOfxDirection(account) {
+  const opening = account.openingBalanceMinor;
+  const closing = account.ledgerBalanceMinor;
+  const unread = account.transactions.filter((txn) => txn.unparsedReason).length;
+  if (opening === null || opening === undefined || closing === null || closing === undefined) {
+    return {
+      state: "unverifiable",
+      reason: "this statement carries no opening balance to check its transactions against, so the " +
+        "direction of every amount is taken on trust from the OFX specification rather than verified",
+    };
+  }
+  if (unread) {
+    return {
+      state: "unverifiable",
+      reason: `${unread} line(s) in this statement could not be read, so its own arithmetic cannot be ` +
+        "closed and the direction of every amount is taken on trust from the OFX specification rather than verified",
+    };
+  }
+  const net = account.transactions.reduce((total, txn) => total + (txn.rawAmountMinor || 0), 0);
+  const asWritten = opening + net === closing;
+  const flipped = opening - net === closing;
+  const figures = {
+    openingBalanceMinor: opening,
+    closingBalanceMinor: closing,
+    netMinor: net,
+    checked: account.transactions.length,
+  };
+  if (asWritten && flipped) {
+    return {
+      state: "unverifiable",
+      ...figures,
+      reason: "every readable amount in this statement nets to zero, so both readings close it and " +
+        "neither one is proved; the direction is taken on trust from the OFX specification",
+    };
+  }
+  if (asWritten) {
+    return {
+      state: "verified",
+      ...figures,
+      reason: `${figures.checked} transaction(s) move this statement from its stated opening balance to its ` +
+        "stated closing balance exactly, and do not when every sign is read the other way",
+    };
+  }
+  if (flipped) return { state: "inverted", ...figures };
+  return { state: "unreconciled", ...figures };
+}
+
+/**
+ * WHY A FILE THAT ONLY FITS INVERTED IS REFUSED RATHER THAN ADOPTED.
+ *
+ * When the flipped reading closes the statement and the written one does not,
+ * there are at least two explanations and the file does not say which: the bank
+ * inverted its amounts, or one of the two balances is wrong (a prior period's
+ * closing written into the opening slot is the common one). Adopting the
+ * flipped reading picks the flattering explanation on the strength of a single
+ * arithmetic identity, and then writes a full month of inverted figures into a
+ * ledger that will be summed by code, and read by people, who never see the
+ * receipt that said so. Refusing costs the owner one re-export. Adopting costs
+ * them a P&L that is exactly backwards with a real citation under every number,
+ * which is the failure this product exists to make impossible.
+ */
+function directionRefusal(account, check) {
+  const where = account.mask ? `the account ending ${account.mask}` : "an account in this file";
+  const money = (value) => formatMinor(value, account.currency);
+  const asWritten = money(check.openingBalanceMinor + check.netMinor);
+  if (check.state === "inverted") {
+    return `the amounts for ${where} are signed the OPPOSITE way round to the OFX specification. Read as the ` +
+      `format defines them, ${money(check.openingBalanceMinor)} opening plus ${money(check.netMinor)} of ` +
+      `activity comes to ${asWritten}, and the statement says it closed at ` +
+      `${money(check.closingBalanceMinor)}; flip every sign and it closes exactly. Either the export inverted ` +
+      "its amounts or one of its two balances is wrong, the file does not say which, so nothing was read from " +
+      "it. Re-download this statement from the bank, and if it comes out the same way, export it as CSV " +
+      "including a running balance column, which is checked row by row.";
+  }
+  return `the transactions for ${where} do not close its own statement under either reading: ` +
+    `${money(check.openingBalanceMinor)} opening plus ${money(check.netMinor)} of activity comes to ` +
+    `${asWritten}, reading every sign the other way comes to ` +
+    `${money(check.openingBalanceMinor - check.netMinor)}, and the statement says it closed at ` +
+    `${money(check.closingBalanceMinor)}. Either this export is missing transactions from the period it ` +
+    "claims to cover, or one of its balances belongs to a different period. Re-export the full statement " +
+    "period and try again.";
+}
+
 function readOfxStatement(node, { isCard }) {
   const currency = String(firstValue(node, "CURDEF") || "USD").toUpperCase().slice(0, 3) || "USD";
   const exponent = currencyExponent(currency);
@@ -367,6 +494,7 @@ function readOfxStatement(node, { isCard }) {
   const ledgerAmount = ledgerBal ? parseMinorUnits(firstValue(ledgerBal, "BALAMT"), { exponent }) : { error: "absent" };
   const availAmount = availBal ? parseMinorUnits(firstValue(availBal, "BALAMT"), { exponent }) : { error: "absent" };
   const balanceAsOf = ledgerBal ? ofxDate(firstValue(ledgerBal, "DTASOF")) : null;
+  const opening = openingBalanceFrom(node, exponent);
 
   const transactions = [];
   const rawTransactions = tranList ? findAll(tranList, "STMTTRN") : [];
@@ -422,6 +550,8 @@ function readOfxStatement(node, { isCard }) {
     periodEnd,
     ledgerBalanceMinor: ledgerAmount.error ? null : ledgerAmount.minor,
     availableBalanceMinor: availAmount.error ? null : availAmount.minor,
+    openingBalanceMinor: opening.minor,
+    openingBalanceLabel: opening.label,
     balanceAsOf,
     transactions,
   };
@@ -461,6 +591,21 @@ export function parseOfx(text) {
       refusal: `this OFX file describes ${accounts.length} account(s) and contains no transactions`,
     };
   }
+
+  // The spec's convention, checked against the statement's own arithmetic
+  // wherever the statement gives us something to check it with. One account
+  // failing refuses the whole file: a file that is wrong about one account has
+  // not earned the benefit of the doubt about the others.
+  const refusals = [];
+  for (const account of accounts) {
+    const check = verifyOfxDirection(account);
+    account.directionCheck = check;
+    account.directionBasis = check.state === "verified" ? "verified" : "trusted";
+    account.directionNote = check.reason || null;
+    if (check.state === "inverted" || check.state === "unreconciled") refusals.push(directionRefusal(account, check));
+  }
+  if (refusals.length) return { ok: false, refusal: refusals.join(" Also: ") };
+
   return { ok: true, accounts, signConvention: OFX_SIGN_CONVENTION };
 }
 
@@ -892,6 +1037,14 @@ export function parseBankCsv(text, { currency = "USD", accountHint = null } = {}
       accountKind: accountHint?.accountKind || "other",
       balanceRole: balanceRoleFor(accountHint?.accountKind || "other"),
       currency,
+      // `verified` only for shape C, where every balance step was checked. The
+      // other two shapes are `stated`: the file names the direction of each row
+      // outright, which is a different and equally good thing, and calling both
+      // "verified" would flatten a distinction the receipt has to be able to
+      // draw. Neither is ever `trusted`, because no CSV shape is accepted on
+      // the strength of a convention nobody checked.
+      directionBasis: mapping.shape === "signed" ? "verified" : "stated",
+      directionNote: mapping.establishedBy,
       periodStart: dated[0] || null,
       periodEnd: dated[dated.length - 1] || null,
       ledgerBalanceMinor: closing.error ? null : closing.minor,
@@ -975,6 +1128,14 @@ export function renderBankExportText(envelope, { maxRows = 500 } = {}) {
     if (account.periodStart && account.periodEnd) lines.push(`Period: ${account.periodStart} to ${account.periodEnd}`);
     if (account.ledgerBalanceMinor !== null && account.balanceAsOf) {
       lines.push(`Statement balance as of ${account.balanceAsOf}: ${formatMinor(account.ledgerBalanceMinor, account.currency)}`);
+    }
+    // Said in the corpus too, not only in the import receipt. Somebody reading
+    // this text months later is entitled to know whether "paid out" below was
+    // checked against a balance or taken on trust from a format specification.
+    if (account.directionBasis === "trusted") {
+      lines.push("Direction of every amount below: taken on trust from the format's own specification, NOT verified against a balance.");
+    } else if (account.directionBasis === "verified") {
+      lines.push("Direction of every amount below: verified against this statement's own balances.");
     }
     const shown = account.transactions.slice(0, maxRows);
     for (const txn of shown) {
