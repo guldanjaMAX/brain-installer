@@ -216,6 +216,33 @@ async function logCall(env, { label, model, status, micros }) {
   }
 }
 
+/**
+ * Where the day's budget stands, for callers that are about to QUEUE billed
+ * work rather than perform it.
+ *
+ * `brain refit` re-splits chunks and queues them for embedding. The embedding
+ * happens later, in the drain, and it is billed to the client's own Cloudflare
+ * account either way. Enqueueing against a budget that is already spent would
+ * route around the cap by deferring it, so the refit asks first.
+ *
+ * `degraded` is passed through rather than smoothed: when the ledger cannot be
+ * read, this is what THIS isolate knows it has spent, and a caller that treats
+ * that as authoritative is claiming more than the guard can prove.
+ */
+export async function spendBudgetStatus(env) {
+  const capUsd = capUsdFor(env);
+  const { micros, degraded } = await readSpend(env);
+  const budgetUsd = degraded ? degradedBudgetUsd(capUsd) : capUsd;
+  return {
+    cap_usd: capUsd,
+    budget_usd: budgetUsd,
+    spent_usd: Number((micros / 1e6).toFixed(4)),
+    degraded,
+    degraded_reason: degraded ? guardState.reason : null,
+    over_cap: micros >= budgetUsd * 1e6,
+  };
+}
+
 export async function callLLM(env, { model, system, messages, max_tokens, label, timeoutMs }) {
   const apiKey = env.ANTHROPIC_API_KEY;
   if (!apiKey && !env.AI) {

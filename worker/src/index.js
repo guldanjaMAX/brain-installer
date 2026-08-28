@@ -27,7 +27,7 @@ import {
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, reindex, refitChunks, searchableCoverage, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
@@ -1421,6 +1421,7 @@ const PAUSED_CORPUS_MUTATION_PATHS = new Set([
   "/api/admin/brain/source-expectation",
   "/api/admin/brain/forget",
   "/api/admin/brain/reindex",
+  "/api/admin/brain/refit",
   "/api/admin/brain/drain",
   // The ledger is not the corpus, but a paused upgrade means a migration is in
   // flight, and financial rows written against a half-migrated schema are the
@@ -1566,6 +1567,47 @@ export default {
       if (path === "/api/admin/brain/diagnose" && request.method === "GET") {
         if (backendOf(env) !== D1) return jsonResponse({ error: "diagnose applies to the d1 backend only" }, 400);
         return jsonResponse(await diagnose(env));
+      }
+      // How much of the corpus the embedder can actually read. Deliberately
+      // its own route rather than a field on /documents: it aggregates over
+      // every chunk, and the corpus summary is on the hot path for health,
+      // report and the acceptance suite.
+      if (path === "/api/admin/brain/searchability" && request.method === "GET") {
+        if (backendOf(env) !== D1) {
+          return jsonResponse({ error: "searchability applies to the d1 backend only" }, 400);
+        }
+        return jsonResponse(await searchableCoverage(env));
+      }
+      /**
+       * Re-split chunks that were cut before embedding, and re-queue them.
+       *
+       * DRY RUN BY DEFAULT, resumable, and bounded to one page of documents per
+       * call. It exists because every corpus loaded before the chunker
+       * respected the embedding window still holds text that meaning-based
+       * search can never reach, and a fix that only helps new documents leaves
+       * that in place.
+       */
+      if (path === "/api/admin/brain/refit" && request.method === "POST") {
+        if (backendOf(env) !== D1) {
+          return jsonResponse({ error: "refit applies to the d1 backend only" }, 400);
+        }
+        const body = await request.json().catch(() => ({}));
+        try {
+          return jsonResponse(await refitChunks(env, {
+            documents: Number.isInteger(body?.documents) ? body.documents : undefined,
+            dryRun: body?.confirm !== true,
+            restart: body?.restart === true,
+          }));
+        } catch (error) {
+          if (error?.spend_capped) {
+            return jsonResponse({
+              error: error.message,
+              spend_capped: true,
+              spend_guard: error.spend,
+            }, 503);
+          }
+          throw error;
+        }
       }
       if (path === "/api/admin/brain/freshness" && request.method === "GET") {
         if (backendOf(env) !== D1) return jsonResponse({ error: "freshness applies to the d1 backend only" }, 400);

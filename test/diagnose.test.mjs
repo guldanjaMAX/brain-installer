@@ -14,6 +14,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { diagnose } from "../worker/src/lib/store-d1.js";
+import { estimateEmbedTokens } from "../worker/src/lib/chunking.js";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
@@ -57,7 +58,15 @@ const doc = (db, id, opts = {}) =>
         opts.date === undefined ? Date.now() : opts.date, Date.now(), opts.hash ?? `h-${id}`);
 
 let _ix = 0;
+// Written the way the current Worker writes: the token count is recorded, so
+// "is this chunk fully searchable" is a stored fact rather than a guess.
 const chunk = (db, uid, docUid, text = "some text", ix = null) =>
+  db.prepare(`INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, embed_tokens) VALUES (?,?,?,?,?,?)`)
+    .run(uid, docUid, ix === null ? _ix++ : ix, text, "documents", estimateEmbedTokens(text));
+
+// Written the way EVERY corpus loaded before this version was: no token count
+// at all. The difference is the whole point of the unmeasured state.
+const legacyChunk = (db, uid, docUid, text = "some text", ix = null) =>
   db.prepare(`INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source) VALUES (?,?,?,?,?)`)
     .run(uid, docUid, ix === null ? _ix++ : ix, text, "documents");
 
@@ -196,9 +205,26 @@ const find = (r, id) => (r.findings || []).find((f) => f.id === id);
   const env = makeEnv({ vectorCount: 3 });
   source(env._db, "documents");
   for (const i of [1, 2, 3]) { doc(env._db, `d${i}`); chunk(env._db, `d${i}#0`, `d${i}`, "x".repeat(3000)); }
-  const f = find(await diagnose(env), "oversized_chunks");
+  const r = await diagnose(env);
+  const f = find(r, "unsearchable_tails");
   check("chunks past the embedding ceiling are caught", f?.count === 3, JSON.stringify(f));
   check("and the consequence is stated, not just the count", /never searchable by meaning/i.test(f?.detail || ""), f?.detail);
+  // It used to be filed under "efficiency" at info level, which read as a note
+  // about wasted storage. Unreachable text is a coverage fault.
+  check("it is a coverage failure, not an efficiency note",
+    f?.area === "coverage" && f?.severity === "crit", JSON.stringify({ area: f?.area, severity: f?.severity }));
+  check("and the verdict is no longer healthy", r.verdict === "problems", r.verdict);
+}
+
+/* ---- a corpus loaded before tokens were counted is UNKNOWN, not fine ---- */
+{
+  const env = makeEnv({ vectorCount: 3 });
+  source(env._db, "documents");
+  for (const i of [1, 2, 3]) { doc(env._db, `d${i}`); legacyChunk(env._db, `d${i}#0`, `d${i}`, "some text"); }
+  const f = find(await diagnose(env), "unsearchable_tails");
+  check("an unmeasured legacy corpus is reported, not passed", f?.count === 3, JSON.stringify(f));
+  check("and it says unknown is not the same as fine", /Unknown is not the same as fine/i.test(f?.detail || ""), f?.detail);
+  check("and it names the repair", /brain refit/.test(f?.action || ""), f?.action);
 }
 
 /* ---- duplicate chunk measurement is exact only inside its safe budget ---- */

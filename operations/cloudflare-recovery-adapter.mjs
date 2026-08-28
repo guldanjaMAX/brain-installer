@@ -216,6 +216,14 @@ const INSTALL_STATE_PROJECTION_COLUMNS = Object.freeze([
 const INSTALL_STATE_BOOTSTRAP_V2_COLUMNS = Object.freeze([
   "vector_projection_bootstrap_protocol", "vector_projection_bootstrap_base_count",
 ]);
+// Chunk-refit progress. Preserved rather than normalised: it records how far a
+// scan of the CHUNK TEXT has got, and the chunk text is exactly what a recovery
+// carries over. Resetting it would make a recovered brain re-walk a corpus it
+// has already repaired, at the client's expense.
+const INSTALL_STATE_REFIT_COLUMNS = Object.freeze([
+  "chunk_refit_cursor", "chunk_refit_started_at", "chunk_refit_completed_at",
+  "chunk_refit_documents", "chunk_refit_chunks_added",
+]);
 const INSTALL_STATE_NULL_NORMALIZED_COLUMNS = Object.freeze([
   ...INSTALL_STATE_LEASE_COLUMNS,
   "vector_projection_mutation_id", "vector_projection_submitted_at",
@@ -235,12 +243,13 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   // Owners re-sign-in with their passkey; that is a tap, not a loss.
   "session_generation",
 ]);
-// Schema 15 added the additive financial-ledger tables. As with schema 14's
-// owner-passkey tables, the vector protocol itself is unchanged, but the
-// recovery contract tracks the EXACT current schema by design: a drill against
-// a database one migration behind would export a table set that does not match
-// the reviewed list, and refusing is the whole point of pinning it.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 16;
+// Schema 15 added the additive financial-ledger tables and 17 added the chunk
+// token-fit columns. As with schema 14's owner-passkey tables, the vector
+// protocol itself is unchanged, but the recovery contract tracks the EXACT
+// current schema by design: a drill against a database one migration behind
+// would export a column set that does not match the reviewed list, and refusing
+// is the whole point of pinning it.
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 17;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -819,6 +828,7 @@ function expectedInstallStateColumns(migrations) {
     ...(latest >= 12 ? INSTALL_STATE_PROJECTION_COLUMNS : []),
     ...(latest >= 13 ? INSTALL_STATE_BOOTSTRAP_V2_COLUMNS : []),
     ...(latest >= 14 ? ["session_generation"] : []),
+    ...(latest >= 17 ? INSTALL_STATE_REFIT_COLUMNS : []),
   ]);
 }
 

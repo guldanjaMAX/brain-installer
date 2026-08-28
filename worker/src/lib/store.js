@@ -30,6 +30,10 @@
 import * as d1 from "./store-d1.js";
 import { embedText, supabaseRpc } from "./supabase.js";
 import { sanitizeEnvelope, sanitizeSensitiveLinks } from "./secret-scan.js";
+import {
+  D1_INGEST_STATEMENT_BUDGET,
+  chunkGeometry, chunkHeader, chunkText, estimateD1IngestStatements, estimateEmbedTokens,
+} from "./chunking.js";
 
 export const D1 = "d1";
 export const SUPABASE = "supabase";
@@ -45,70 +49,26 @@ export function backendOf(env) {
 
 /* ------------------------------------------------------------------ chunking */
 
-// Keep the body below the embedding model's effective 512-token window even
-// after the title header is added. The previous 2000/500 geometry made 93% of
-// The first large field D1 corpus was long enough to be truncated before embedding.
-export const CHUNK_SIZE = 1500;
-export const CHUNK_OVERLAP = 300;
-// Cloudflare's paid Workers limit counts every statement submitted through a
-// D1 batch, not merely one service-binding round trip. Leave ten percent of the
-// 1,000-query invocation limit for platform/runtime evolution rather than
-// discovering the cap after half a request has durable pending revisions.
-export const D1_INGEST_STATEMENT_BUDGET = 900;
-
-export function chunkGeometry(env = {}) {
-  const rawSize = Number.parseInt(env.CHUNK_SIZE, 10);
-  const rawOverlap = Number.parseInt(env.CHUNK_OVERLAP, 10);
-  const size = Number.isFinite(rawSize) ? Math.min(Math.max(rawSize, 256), 1800) : CHUNK_SIZE;
-  const overlap = Number.isFinite(rawOverlap) ? Math.min(Math.max(rawOverlap, 0), size - 1) : CHUNK_OVERLAP;
-  return { size, overlap };
-}
-
-function conservativeChunkCount(content, geometry) {
-  const body = String(content || "");
-  if (!body.trim()) return 0;
-  if (body.length <= geometry.size) return 1;
-  return 1 + Math.ceil((body.length - geometry.size) / (geometry.size - geometry.overlap));
-}
-
-/**
- * Bound one HTTP batch before its first D1 statement.
- *
- * This intentionally assumes every document changed, every unique-document
- * preflight failed after consuming its reads, every source needs its own stats
- * refresh/readback, and every document needs the larger resumable stage. The
- * estimate is therefore above the normal path (50 one-chunk messages submit
- * 352 statements but reserve 550) while still accepting that replay shape.
- */
-export function estimateD1IngestStatements(env, envelopes) {
-  const geometry = chunkGeometry(env);
-  return (envelopes || []).reduce((total, envelope) => {
-    const chunks = conservativeChunkCount(envelope?.content, geometry);
-    return total + 9 + (chunks * 2);
-  }, 0);
-}
-
-/**
- * Sliding window, same geometry as the Drive indexer so a document chunked by
- * either path lands the same way and a citation means the same thing.
- *
- * The document's identity is prepended to every chunk BEFORE embedding, so a
- * fragment that says only "we agreed to defer it" still carries what "it" was
- * about. Cheap, and it is the difference between a retrievable chunk and a
- * floating sentence.
- */
-export function chunkText(text, { size = CHUNK_SIZE, overlap = CHUNK_OVERLAP, header = "" } = {}) {
-  const body = String(text || "");
-  if (!body.trim()) return [];
-  const out = [];
-  const step = Math.max(1, size - overlap);
-  for (let start = 0; start < body.length; start += step) {
-    const piece = body.slice(start, start + size).trim();
-    if (piece) out.push(header ? `${header}\n\n${piece}` : piece);
-    if (start + size >= body.length) break;
-  }
-  return out;
-}
+// The geometry itself lives in ./chunking.js, with no imports, because the
+// installer's ingest batcher and the migration tools size their requests
+// against the SAME arithmetic. Re-exported here so every existing caller keeps
+// importing chunking from the store.
+export {
+  CHUNK_SIZE,
+  CHUNK_OVERLAP,
+  D1_INGEST_STATEMENT_BUDGET,
+  EMBED_TOKEN_BUDGET,
+  EMBED_TOKEN_LIMIT,
+  EMBED_CONTENT_LIMIT,
+  basicTokenFloor,
+  chunkCount,
+  chunkFit,
+  chunkGeometry,
+  chunkHeader,
+  chunkText,
+  estimateD1IngestStatements,
+  estimateEmbedTokens,
+} from "./chunking.js";
 
 async function sha256Hex(s) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(s)));
@@ -485,7 +445,7 @@ const d1Backend = {
         persisted.replaceMeta ? 1 : 0
       );
 
-    const header = title ? `[${title}]` : "";
+    const header = chunkHeader(title);
     const pieces = chunkText(content, { header, ...geometry });
     const baseChunks = pieces.map((text, i) => ({
       chunk_uid: `${docUid}#${i}`,
@@ -495,6 +455,10 @@ const d1Backend = {
       source: source_type,
       title: title ?? null,
       document_date: Number.isFinite(docDate) ? docDate : null,
+      // Recorded at write time so "how much of this corpus is fully searchable"
+      // is a single indexed aggregate rather than a scan of every chunk body.
+      // A NULL here means never measured, which is a third state and not a pass.
+      embed_tokens: estimateEmbedTokens(text),
     }));
 
     let chunks = baseChunks;

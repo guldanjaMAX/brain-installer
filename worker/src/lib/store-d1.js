@@ -32,6 +32,11 @@
  */
 
 import { currentEvidenceCandidates } from "./query-intent.js";
+import {
+  EMBED_CONTENT_LIMIT, EMBED_TOKEN_BUDGET, EMBED_TOKEN_LIMIT,
+  basicTokenFloor, chunkGeometry, chunkHeader, chunkText, estimateEmbedTokens,
+} from "./chunking.js";
+import { spendBudgetStatus } from "./core.js";
 
 const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
@@ -642,29 +647,32 @@ export async function upsertChunks(env, chunks, { expectedContentHash = null } =
     c.vector_id = await vectorIdFor(c.chunk_uid);
     const chunkStatement = env.DB.prepare(
       guarded
-        ? `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id)
-           SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12
+        ? `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id, embed_tokens)
+           SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13
            WHERE EXISTS (
-             SELECT 1 FROM documents WHERE doc_uid = ?2 AND content_hash = ?13
+             SELECT 1 FROM documents WHERE doc_uid = ?2 AND content_hash = ?14
            )
            ON CONFLICT(chunk_uid) DO UPDATE SET
              text = excluded.text, title = excluded.title,
              document_date = excluded.document_date,
              client = excluded.client, category = excluded.category,
              top_folder = excluded.top_folder, platform = excluded.platform,
-             vector_id = excluded.vector_id`
-        : `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+             vector_id = excluded.vector_id, embed_tokens = excluded.embed_tokens`
+        : `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id, embed_tokens)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
            ON CONFLICT(chunk_uid) DO UPDATE SET
              text = excluded.text, title = excluded.title,
              document_date = excluded.document_date,
              client = excluded.client, category = excluded.category,
              top_folder = excluded.top_folder, platform = excluded.platform,
-             vector_id = excluded.vector_id`
+             vector_id = excluded.vector_id, embed_tokens = excluded.embed_tokens`
     ).bind(
       c.chunk_uid, c.doc_uid, c.chunk_ix, c.text, c.source, c.title ?? null,
       c.document_date ?? null, c.client ?? null, c.category ?? null,
       c.top_folder ?? null, c.platform ?? null, c.vector_id,
+      // Never write a guess here. A caller that did not measure leaves NULL,
+      // which the health surface reports as unmeasured rather than as fitting.
+      Number.isInteger(c.embed_tokens) ? c.embed_tokens : estimateEmbedTokens(c.text),
       ...(guarded ? [expectedContentHash] : [])
     );
     stmts.push(chunkStatement);
@@ -767,9 +775,9 @@ export async function stageDocumentRevision(env, {
     chunk.vector_id = await vectorIdFor(chunk.chunk_uid);
     requiredWriteIndexes.push(statements.length);
     statements.push(env.DB.prepare(
-      `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id)
+      `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id, embed_tokens)
        SELECT ?1,?2,?3,?4,?5,?6,?7,
-              documents.client, documents.category, documents.top_folder, documents.platform, ?8
+              documents.client, documents.category, documents.top_folder, documents.platform, ?8, ?10
        FROM documents
        WHERE documents.doc_uid = ?2 AND documents.content_hash = ?9
        ON CONFLICT(chunk_uid) DO UPDATE SET
@@ -777,11 +785,12 @@ export async function stageDocumentRevision(env, {
          document_date = excluded.document_date,
          client = excluded.client, category = excluded.category,
          top_folder = excluded.top_folder, platform = excluded.platform,
-         vector_id = excluded.vector_id`
+         vector_id = excluded.vector_id, embed_tokens = excluded.embed_tokens`
     ).bind(
       chunk.chunk_uid, chunk.doc_uid, chunk.chunk_ix, chunk.text, chunk.source,
       chunk.title ?? null, chunk.document_date ?? null, chunk.vector_id,
-      expectedContentHash
+      expectedContentHash,
+      Number.isInteger(chunk.embed_tokens) ? chunk.embed_tokens : estimateEmbedTokens(chunk.text)
     ));
 
     requiredWriteIndexes.push(statements.length);
@@ -1639,8 +1648,6 @@ export async function drainOutbox(env, options = {}) {
  * drain's batching, poison quarantine and vector_id write-back all apply
  * unchanged. INSERT OR IGNORE keeps it safe to run twice.
  */
-/** Chunks past this are near the embedding model's 512-token ceiling and risk silent truncation. */
-const CHUNK_CHAR_WARN = 1800;
 const q1 = async (env, sql, ...bind) => {
   const st = env.DB.prepare(sql);
   return await (bind.length ? st.bind(...bind) : st).first();
@@ -1650,6 +1657,302 @@ const qAll = async (env, sql, ...bind) => {
   const r = await (bind.length ? st.bind(...bind) : st).all();
   return r?.results || [];
 };
+
+/* ------------------------------------------------- how much is reachable */
+
+/** Over-budget chunks sampled for a PROVEN verdict rather than an estimated one. */
+const TRUNCATION_PROOF_SAMPLE = 25;
+
+/**
+ * How much of this corpus the embedder can actually read.
+ *
+ * This is the honesty half of the truncation fix. Before it, a corpus where
+ * ninety five percent of chunks were cut before embedding was indistinguishable
+ * from a complete one: every document counted, every chunk had a vector, every
+ * health probe passed, and the answers looked plausible because the HEAD of
+ * each chunk did embed. The only visible symptom was that retrieval seemed
+ * mediocre, which reads as a quality opinion rather than as a fault.
+ *
+ * Three states, and the third is the point:
+ *
+ *   fitting     - measured, and the whole chunk reaches meaning-based search
+ *   over_budget - measured, and the tail does not
+ *   unmeasured  - written before this install could count tokens. UNKNOWN.
+ *
+ * `unmeasured` is never folded into `fitting`. An unknown reported as a pass is
+ * the same defect as a degraded index reporting an absence, so the percentage
+ * below is a FLOOR and `unmeasured_pct` is how much room is left above it.
+ */
+export async function searchableCoverage(env) {
+  const row = await q1(env,
+    `SELECT count(*) AS chunks,
+            sum(CASE WHEN embed_tokens IS NULL THEN 1 ELSE 0 END) AS unmeasured,
+            sum(CASE WHEN embed_tokens > ?1 THEN 1 ELSE 0 END) AS over_budget
+       FROM chunks`, EMBED_TOKEN_BUDGET);
+  const chunks = Number(row?.chunks || 0);
+  const unmeasured = Number(row?.unmeasured || 0);
+  const overBudget = Number(row?.over_budget || 0);
+  const fitting = Math.max(0, chunks - unmeasured - overBudget);
+  const pct = (n) => (chunks ? Math.round((n / chunks) * 100) : 0);
+
+  // An estimate says a chunk is probably cut. The BASIC TOKEN FLOOR proves it:
+  // BERT splits on whitespace and punctuation and WordPiece only ever expands
+  // those pieces further, so a floor past the ceiling cannot be wrong. Sampled
+  // rather than exhaustive because proving it needs the chunk bodies, and
+  // pulling a whole corpus through one request is not a report.
+  let proven = 0;
+  let sampled = 0;
+  if (overBudget) {
+    const rows = await qAll(env,
+      "SELECT text FROM chunks WHERE embed_tokens > ?1 ORDER BY embed_tokens DESC LIMIT ?2",
+      EMBED_TOKEN_BUDGET, TRUNCATION_PROOF_SAMPLE);
+    sampled = rows.length;
+    for (const r of rows) if (basicTokenFloor(r.text) > EMBED_CONTENT_LIMIT) proven += 1;
+  }
+
+  return {
+    chunks,
+    fitting,
+    over_budget: overBudget,
+    unmeasured,
+    measured: chunks - unmeasured,
+    measured_pct: pct(chunks - unmeasured),
+    // A FLOOR, not a point estimate: unmeasured chunks could be either.
+    fully_searchable_pct: pct(fitting),
+    unmeasured_pct: pct(unmeasured),
+    proven_truncated: proven,
+    proof_sample: sampled,
+    token_budget: EMBED_TOKEN_BUDGET,
+    content_limit: EMBED_CONTENT_LIMIT,
+    token_limit: EMBED_TOKEN_LIMIT,
+    // Said out loud wherever this number is shown. The count is driven by an
+    // estimate that deliberately over-counts; only `proven_truncated` is exact.
+    measurement: "estimated token count, biased to over-count; proven subset sampled",
+  };
+}
+
+/* ------------------------------------------------------------------ refit */
+
+export const REFIT_DEFAULT_DOCUMENTS = 25;
+export const REFIT_MAX_DOCUMENTS = 200;
+
+/** Strip the `[Title]` header a chunk carries so only the body is re-split. */
+function chunkBody(text, title) {
+  const header = chunkHeader(title);
+  const prefix = header ? `${header}\n\n` : "";
+  const body = String(text || "");
+  return prefix && body.startsWith(prefix) ? body.slice(prefix.length) : body;
+}
+
+/**
+ * Re-split ONE document's stored chunks so every piece fits the embedder.
+ *
+ * Works from what D1 already holds, never from the original file, for the same
+ * reason `reindex` does: the source folder may be gone, changed, or was never
+ * on this machine. Each stored chunk body is split where it exceeds the token
+ * budget; nothing is merged and no new overlap is introduced, so the union of
+ * stored text is unchanged and only the boundaries inside a chunk move.
+ *
+ * WRITE ORDER IS DESCENDING, AND THAT IS THE SAFETY PROPERTY.
+ *
+ * Splitting only ever produces MORE chunks, so the new set is a renumbering
+ * that moves text to higher indexes. Writing the highest index first means
+ * every write's content still exists at its old, not-yet-overwritten index at
+ * the moment the write lands. A crash mid-document can therefore leave
+ * duplicated text, never missing text, and re-running repairs it.
+ */
+async function refitDocumentChunks(env, docUid, { geometry }) {
+  const doc = await q1(env,
+    "SELECT content_hash, title FROM documents WHERE doc_uid = ?1 AND deleted_at IS NULL", docUid);
+  if (!doc?.content_hash) return { action: "skipped", reason: "document is gone or unfinished" };
+
+  const rows = await qAll(env,
+    `SELECT chunk_uid, chunk_ix, text, source, title, document_date, client, category,
+            top_folder, platform, embed_tokens
+       FROM chunks WHERE doc_uid = ?1 ORDER BY chunk_ix`, docUid);
+  if (!rows.length) return { action: "skipped", reason: "no chunks" };
+
+  const pieces = [];
+  let split = false;
+  for (const row of rows) {
+    const header = chunkHeader(row.title);
+    const body = chunkBody(row.text, row.title);
+    // No character cap and no overlap here on purpose. The body is already one
+    // stored row, so the only thing that must bind is the embedding window, and
+    // adding overlap inside an already-overlapping window would multiply
+    // redundant vectors for no retrieval gain.
+    const parts = chunkText(body, {
+      size: Math.max(body.length, 1), overlap: 0, header, trim: false,
+    });
+    if (!parts.length) {
+      // A blank chunk yields no pieces. Carry it through unchanged rather than
+      // dropping it: the new set must never be SHORTER than the old one, or
+      // renumbering would leave the tail of the document sitting at indexes
+      // nothing rewrites. Blank chunks are their own diagnostic finding.
+      pieces.push({ text: row.text, from: row });
+      continue;
+    }
+    if (parts.length > 1) split = true;
+    for (const text of parts) pieces.push({ text, from: row });
+  }
+  if (!pieces.length) return { action: "skipped", reason: "no text" };
+
+  if (!split) {
+    // Nothing is over the window. Record the measurement and stop: this
+    // document costs zero embeddings, which is what keeps a refit of a healthy
+    // corpus from becoming a full re-embed nobody asked for.
+    const statements = rows.map((row) => env.DB.prepare(
+      "UPDATE chunks SET embed_tokens = ?2 WHERE chunk_uid = ?1"
+    ).bind(row.chunk_uid, estimateEmbedTokens(row.text)));
+    for (let i = 0; i < statements.length; i += D1_TRANSACTION_SLICE_STATEMENTS) {
+      await env.DB.batch(statements.slice(i, i + D1_TRANSACTION_SLICE_STATEMENTS));
+    }
+    return { action: "measured", chunks: rows.length, added: 0 };
+  }
+
+  const rewritten = pieces.map((piece, index) => ({
+    chunk_uid: `${docUid}#${index}`,
+    doc_uid: docUid,
+    chunk_ix: index,
+    text: piece.text,
+    source: piece.from.source,
+    title: piece.from.title ?? null,
+    document_date: piece.from.document_date ?? null,
+    client: piece.from.client ?? null,
+    category: piece.from.category ?? null,
+    top_folder: piece.from.top_folder ?? null,
+    platform: piece.from.platform ?? null,
+    embed_tokens: estimateEmbedTokens(piece.text),
+  }));
+
+  // Guarded on the document's CURRENT content hash, so an ingest that lands
+  // mid-refit wins outright: its own re-chunk is already correct, and every
+  // statement here becomes a no-op rather than a half-applied fight.
+  await upsertChunks(env, [...rewritten].reverse(), { expectedContentHash: doc.content_hash });
+
+  const after = await q1(env, "SELECT content_hash FROM documents WHERE doc_uid = ?1", docUid);
+  if (after?.content_hash !== doc.content_hash) {
+    return { action: "superseded", chunks: rows.length, added: 0 };
+  }
+  return { action: "refitted", chunks: rewritten.length, added: rewritten.length - rows.length };
+}
+
+/**
+ * Repair a corpus loaded before the embedding window was respected. RESUMABLE.
+ *
+ * Every install that existed before this change holds chunks whose tails were
+ * never embedded, and a fix that only helps new documents leaves that damage in
+ * place forever. This is the path that removes it without the source files.
+ *
+ * It is bounded and opt-in on purpose:
+ *
+ *  - DRY RUN unless `confirm` is passed, like `forget`.
+ *  - `documents` bounds one call; the cursor in install_state resumes the next.
+ *  - Documents whose chunks already fit are MEASURED, not re-embedded, so
+ *    running this on a healthy corpus costs nothing but reads.
+ *  - It refuses to queue work while the day's spend cap is spent, because the
+ *    embedding it queues is billed to the client's own account.
+ */
+export async function refitChunks(env, {
+  documents = REFIT_DEFAULT_DOCUMENTS,
+  dryRun = true,
+  restart = false,
+  now = Date.now(),
+} = {}) {
+  const limit = Number.isInteger(documents)
+    ? Math.min(REFIT_MAX_DOCUMENTS, Math.max(1, documents))
+    : REFIT_DEFAULT_DOCUMENTS;
+  const geometry = chunkGeometry(env);
+
+  const state = await q1(env,
+    `SELECT COALESCE(chunk_refit_cursor, '') AS cursor,
+            chunk_refit_started_at AS started_at,
+            chunk_refit_completed_at AS completed_at,
+            COALESCE(chunk_refit_documents, 0) AS documents,
+            COALESCE(chunk_refit_chunks_added, 0) AS chunks_added
+       FROM install_state WHERE id = 1`);
+  if (!state) throw new Error("this install has no state row, so a refit cannot be resumed");
+  const cursor = restart ? "" : String(state.cursor || "");
+
+  const candidates = await qAll(env,
+    `SELECT d.doc_uid FROM documents d
+      WHERE d.doc_uid > ?1 AND d.deleted_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM chunks c
+           WHERE c.doc_uid = d.doc_uid
+             AND (c.embed_tokens IS NULL OR c.embed_tokens > ?2)
+        )
+      ORDER BY d.doc_uid LIMIT ?3`, cursor, EMBED_TOKEN_BUDGET, limit);
+
+  const coverage = await searchableCoverage(env);
+  const complete = candidates.length < limit;
+
+  if (dryRun) {
+    return {
+      dry_run: true,
+      cursor,
+      documents_pending_page: candidates.length,
+      complete_after_this_page: complete,
+      coverage,
+      action: candidates.length
+        ? "Run again with confirm to repair this page, then keep going until complete."
+        : "Nothing on this page needs repair.",
+    };
+  }
+
+  // The refit does not call the model itself; it queues chunks the drain will
+  // embed. Queueing work whose bill has already been refused is still spending
+  // the client's money, so the guard is consulted BEFORE the first write.
+  const spend = await spendBudgetStatus(env);
+  if (spend.over_cap) {
+    const error = new Error(
+      `the daily spend cap of $${spend.cap_usd} is already reached, so no further embedding will be queued`);
+    error.spend_capped = true;
+    error.spend = spend;
+    throw error;
+  }
+
+  let refitted = 0;
+  let measured = 0;
+  let superseded = 0;
+  let added = 0;
+  let queued = 0;
+  let last = cursor;
+  for (const row of candidates) {
+    const docUid = String(row.doc_uid);
+    const result = await refitDocumentChunks(env, docUid, { geometry });
+    if (result.action === "refitted") { refitted += 1; added += result.added; queued += result.chunks; }
+    else if (result.action === "measured") measured += 1;
+    else if (result.action === "superseded") superseded += 1;
+    last = docUid;
+  }
+
+  await env.DB.prepare(
+    `UPDATE install_state
+        SET chunk_refit_cursor = ?1,
+            chunk_refit_started_at = COALESCE(chunk_refit_started_at, ?2),
+            chunk_refit_completed_at = ?3,
+            chunk_refit_documents = COALESCE(chunk_refit_documents, 0) + ?4,
+            chunk_refit_chunks_added = COALESCE(chunk_refit_chunks_added, 0) + ?5
+      WHERE id = 1`
+  ).bind(complete ? "" : last, now, complete ? now : null, refitted, added).run();
+
+  return {
+    dry_run: false,
+    cursor: complete ? "" : last,
+    complete,
+    documents_examined: candidates.length,
+    documents_refitted: refitted,
+    documents_measured: measured,
+    documents_superseded: superseded,
+    chunks_added: added,
+    // Only the refitted documents queue embeddings. Measured ones cost nothing,
+    // which is why running this on a healthy corpus is not a bill.
+    chunks_queued_for_embedding: queued,
+    spend_guard: spend,
+    coverage: await searchableCoverage(env),
+  };
+}
 
 /**
  * Post-install diagnostic: what is missing, what is stored wrong, what is stored
@@ -1873,14 +2176,32 @@ export async function diagnose(env, {
       action: "Consider loading a summary instead of the raw sheet, or excluding it." });
   });
 
-  await safe("oversized_chunks", async () => {
-    const n = Number((await q1(env, "SELECT count(*) n FROM chunks WHERE length(text) > ?1", CHUNK_CHAR_WARN))?.n || 0);
-    if (!n) return;
-    const pct = totals.chunks ? Math.round((n / totals.chunks) * 100) : 0;
-    add({ id: "oversized_chunks", area: "efficiency", severity: pct >= 20 ? "warn" : "info", count: n,
-      title: `${n} chunk(s) (${pct}%) are long enough to be truncated before embedding`,
-      detail: `The embedding model reads about 512 tokens. Past roughly ${CHUNK_CHAR_WARN} characters the rest is silently cut, so the tail is stored but never searchable by meaning.`,
-      action: "Not urgent, and invisible in every other way. Worth knowing before blaming retrieval quality." });
+  // MOVED OUT OF "efficiency" DELIBERATELY. This was an info-level note about
+  // storing text wastefully, measured in CHARACTERS. It is neither. Text past
+  // the embedding window is not stored wastefully, it is stored UNREACHABLE,
+  // and the unit is tokens: a character threshold reads clean on exactly the
+  // dense documents that are being cut.
+  await safe("unsearchable_tails", async () => {
+    const coverage = await searchableCoverage(env);
+    if (!coverage.chunks) return;
+    if (coverage.unmeasured) {
+      add({ id: "unsearchable_tails", area: "coverage",
+        severity: coverage.unmeasured === coverage.chunks ? "warn" : "info",
+        count: coverage.unmeasured, observable: false,
+        title: `${coverage.unmeasured} chunk(s) (${100 - coverage.measured_pct}%) have never been measured against the embedding window`,
+        detail: "These were written before this install could count tokens, so how much of them reaches meaning-based search is UNKNOWN. Unknown is not the same as fine.",
+        action: "Measure and repair them with `brain refit <manifest> --yes`. Chunks that already fit are only measured, never re-embedded." });
+    }
+    if (coverage.over_budget) {
+      const pct = Math.round((coverage.over_budget / coverage.chunks) * 100);
+      add({ id: "unsearchable_tails", area: "coverage", severity: "crit", count: coverage.over_budget,
+        title: `${coverage.over_budget} chunk(s) (${pct}%) are longer than the embedding window`,
+        detail: `The embedding model reads ${EMBED_CONTENT_LIMIT} tokens. Past that the tail is stored but never searchable by meaning, and the answers still look plausible because the head did embed. ` +
+          (coverage.proven_truncated
+            ? `${coverage.proven_truncated} of these are PROVEN cut, not estimated: their minimum possible token count is already past the ceiling.`
+            : "This count is an estimate that deliberately over-counts; the proven-cut subset is reported separately when a sample is available."),
+        action: "Run `brain refit <manifest> --yes`. It re-splits only the documents that need it, is resumable, and needs no source files." });
+    }
   });
 
   await safe("duplicate_chunks", async () => {

@@ -17,10 +17,11 @@
  * worth paying for. Bad news is the reason it has value.
  */
 
-import { Acceptance } from "./acceptance.mjs";
+import { Acceptance, renderSearchability } from "./acceptance.mjs";
 import { fetchBrainWithAdminKey } from "./components/brain-http.mjs";
 
 const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
+const capitalise = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 const num = (n) => Number(n || 0).toLocaleString("en-US");
 
 function daysAgo(iso) {
@@ -105,6 +106,41 @@ export async function buildReport({ base, adminKey, manifest, installState, upgr
     );
     L.push("");
   }
+
+  /* ------------------------------------------- how much of it is reachable */
+  // The table above says how many items are in the brain and how many have been
+  // processed. Neither of those can tell you whether the WHOLE of a document can
+  // be found, and until this line existed nothing could: a corpus where most of
+  // the text was cut before it was indexed looked exactly like a complete one,
+  // and the answers looked plausible because the start of each piece was
+  // indexed fine. This is the line that separates those two.
+  const searchRes = await fetchBrainWithAdminKey(
+    fetch,
+    `${base}/api/admin/brain/searchability`,
+    {},
+    () => adminKey,
+  );
+  const coverage = searchRes.ok ? await searchRes.json().catch(() => null) : null;
+  L.push("## How much of it can actually be found");
+  L.push("");
+  if (!coverage || !Number.isFinite(Number(coverage.chunks))) {
+    L.push(
+      "**This could not be measured this month.** That is not the same as it being fine: " +
+      "it means this report cannot tell you whether your documents are fully searchable."
+    );
+  } else {
+    L.push(capitalise(renderSearchability(coverage)));
+    if (coverage.over_budget || coverage.unmeasured) {
+      L.push("");
+      L.push(
+        "> Long documents are stored in pieces, and a piece that runs past what the search " +
+        "index can read keeps its ending stored but unfindable by meaning. You would never " +
+        "see this in an answer: the brain replies confidently from the part it did read. " +
+        "The repair does not need your original files and is safe to run at any time."
+      );
+    }
+  }
+  L.push("");
 
   /* ------------------------------------------------------------- freshness */
   L.push("## Is it up to date");

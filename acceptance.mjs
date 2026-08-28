@@ -229,6 +229,45 @@ export function freshnessVerdicts({ ok, status, payload, expectedBackend = "d1" 
   return out;
 }
 
+/**
+ * The owner-facing sentence for "how much of this corpus is fully searchable".
+ *
+ * One function, used by `brain refit`, the acceptance suite and the monthly
+ * report, so those three can never quietly disagree about the same install.
+ *
+ * The wording is doing real work. It says "estimated" where the number is
+ * estimated, it says "not yet measured" instead of folding an unknown into the
+ * good half, and it names the consequence rather than the metric: an owner
+ * cannot act on "N chunks exceed the token budget", but they can act on "part
+ * of these documents cannot be found by meaning".
+ */
+export function renderSearchability(coverage) {
+  if (!coverage || !Number.isSafeInteger(coverage.chunks)) {
+    return "how much of this corpus is fully searchable could NOT be measured";
+  }
+  if (!coverage.chunks) return "there is nothing stored yet, so there is nothing to measure";
+  const parts = [];
+  if (coverage.unmeasured === coverage.chunks) {
+    return "how much of this corpus is fully searchable is UNKNOWN: it was loaded before this " +
+      "brain could measure it. Unknown is not the same as fine.";
+  }
+  parts.push(
+    `at least ${coverage.fully_searchable_pct}% of this corpus is fully searchable ` +
+    `(${coverage.fitting} of ${coverage.chunks} pieces, estimated)`);
+  if (coverage.over_budget) {
+    parts.push(
+      `${coverage.over_budget} piece(s) are longer than the embedding window, so part of what ` +
+      `they say can be found by keyword and never by meaning` +
+      (coverage.proven_truncated
+        ? `; ${coverage.proven_truncated} of the ${coverage.proof_sample} longest were checked and every one of those is definitely cut`
+        : ""));
+  }
+  if (coverage.unmeasured) {
+    parts.push(`${coverage.unmeasured_pct}% has never been measured, so it could be either`);
+  }
+  return parts.join(". ") + ".";
+}
+
 export class Acceptance {
   constructor({ base, adminKey, manifest, expectVersion = null, fetchImpl = fetch }) {
     this.base = String(base).replace(/\/+$/, "");
@@ -386,6 +425,34 @@ export class Acceptance {
             (ready ? "" : `; ${readiness.action || "run brain drain, then brain diagnose"}`)
           : "the Worker did not provide a valid Vectorize visibility receipt",
       );
+    }
+
+    // How much of the corpus the embedder can actually READ.
+    //
+    // Every other check here counts documents and vectors, and all of them pass
+    // on a corpus whose chunks were cut before embedding: the documents are
+    // there, the vectors are there, and the answers are plausible because the
+    // HEAD of each chunk embedded fine. This is the only check that can tell a
+    // partly-searchable corpus from a complete one.
+    if (expectedBackend === "d1") {
+      const searchable = await this.get("/api/admin/brain/searchability");
+      const c = searchable.json;
+      if (!searchable.ok || !c || !Number.isSafeInteger(c.chunks)) {
+        this.record(t, "the whole of each document is searchable", FAIL,
+          `the Worker could not measure it (HTTP ${searchable.status}). This install cannot tell you ` +
+          "how much of its own corpus meaning-based search can reach.");
+      } else if (!c.chunks) {
+        this.record(t, "the whole of each document is searchable", SKIP,
+          "nothing is stored yet, so there is nothing to measure");
+      } else {
+        // Unmeasured is neither a pass nor a failure. It is the honest state of
+        // a corpus loaded before this could be counted, and reporting it as a
+        // pass would be the same defect the finding exists to end.
+        const status = c.over_budget ? FAIL : c.unmeasured ? WARN : PASS;
+        this.record(t, "the whole of each document is searchable", status,
+          renderSearchability(c) +
+          (status === PASS ? "" : " Repair it with `brain refit <manifest> --yes`."));
+      }
     }
 
     // Freshness is a PER-SOURCE claim and never a corpus-wide one. Ask the

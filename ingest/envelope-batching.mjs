@@ -7,8 +7,20 @@
  * packages it will never call.
  */
 
+import { estimateD1IngestStatements } from "../worker/src/lib/chunking.js";
+
 /** Maximum content characters allowed in one document envelope. */
 export const MAX_DOC_CHARS = 400_000;
+
+/**
+ * One document part must always fit a batch by itself, or it can never be sent.
+ * Ten percent under the worker's own 900-statement budget, same headroom the
+ * batcher uses.
+ */
+export const PART_STATEMENT_CEILING = 810;
+
+/** A floor on part size, so pathological density cannot shred a document. */
+export const MIN_PART_CHARS = 20_000;
 
 /**
  * Split a document that cannot fit safely in one Worker request.
@@ -22,7 +34,20 @@ export function splitOversized(envelope, maxChars = MAX_DOC_CHARS) {
   const text = envelope.content || "";
   const bytes = Buffer.byteLength(text, "utf8");
   const ratio = text.length ? bytes / text.length : 1;
-  const effective = ratio > 1.05 ? Math.max(20_000, Math.floor(maxChars / ratio)) : maxChars;
+  let effective = ratio > 1.05 ? Math.max(20_000, Math.floor(maxChars / ratio)) : maxChars;
+
+  // Bytes are not the only ceiling any more. Chunk windows are bounded by the
+  // EMBEDDING window as well as by characters, so a part of dense text — a
+  // ledger, a log, anything not in a Latin script — produces several times the
+  // chunks its length suggests and can exceed the worker's statement budget on
+  // its own. Measure the real text rather than assume a density: a part that
+  // does not fit a batch alone is a 413 nothing downstream can recover from.
+  for (let attempt = 0; attempt < 8 && effective > MIN_PART_CHARS; attempt++) {
+    const probe = { ...envelope, content: text.slice(0, effective) };
+    if (estimatedStatements(probe) <= PART_STATEMENT_CEILING) break;
+    effective = Math.max(MIN_PART_CHARS, Math.floor(effective / 2));
+  }
+
   if (bytes <= effective * ratio && text.length <= effective) return [envelope];
 
   const parts = [];
@@ -48,20 +73,21 @@ export function envelopeBytes(envelope) {
 }
 
 /**
- * Mirror of the worker's conservative D1 statement estimate for one envelope
- * (worker/src/lib/store.js: 9 fixed statements plus 2 per sliding-window
- * chunk at the default 1500/300 geometry). Deliberately duplicated rather
- * than imported: this module stays dependency-free by design, and a test
- * imports the worker's real estimator to prove the two never drift.
+ * The worker's D1 statement estimate for one envelope: 9 fixed statements plus
+ * 2 per chunk.
+ *
+ * This used to be a hand-copied closed form over the character length, on the
+ * grounds that this module stays dependency-free. That held only while every
+ * chunk window was the same width. Windows are now bounded by the EMBEDDING
+ * WINDOW as well, so a page of dense text produces several times as many chunks
+ * as its character count suggests, and a copy that guessed low would size a
+ * batch the worker then refuses with a 413 — after the caller has committed to
+ * sending it. `worker/src/lib/chunking.js` imports nothing at all, so sharing
+ * it keeps this module's real constraint (no extractor packages, no format
+ * registry) while making drift impossible rather than merely tested for.
  */
 export function estimatedStatements(envelope) {
-  const body = String(envelope?.content || "");
-  const chunks = !body.trim()
-    ? 0
-    : body.length <= 1500
-      ? 1
-      : 1 + Math.ceil((body.length - 1500) / 1200);
-  return 9 + chunks * 2;
+  return estimateD1IngestStatements({}, [envelope]);
 }
 
 /**

@@ -75,7 +75,16 @@ async function tierDataFor(rows) {
     adminKey: "fixture-admin-key",
     manifest,
     fetchImpl: async (url) => {
-      const body = String(url).includes("/freshness") ? freshness : documentsPayload(rows);
+      const href = String(url);
+      // A fully measured, fully fitting corpus, so the ONLY thing that can fail
+      // a tier-2 run in these fixtures is still freshness.
+      const body = href.includes("/searchability")
+        ? {
+          chunks: 10, fitting: 10, over_budget: 0, unmeasured: 0, measured: 10,
+          measured_pct: 100, fully_searchable_pct: 100, unmeasured_pct: 0,
+          proven_truncated: 0, proof_sample: 0,
+        }
+        : href.includes("/freshness") ? freshness : documentsPayload(rows);
       return new Response(JSON.stringify(body), {
         status: 200, headers: { "content-type": "application/json" },
       });

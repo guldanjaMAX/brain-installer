@@ -195,7 +195,7 @@ const die = (s) => {
 
 const SUPPORT_REMOTE_COMMANDS = new Set([
   "deploy", "diagnose", "drain", "health", "migrate", "provision",
-  "reindex", "rollback", "secrets", "update", "upgrade", "verify",
+  "refit", "reindex", "rollback", "secrets", "update", "upgrade", "verify",
 ]);
 let currentSupportCommand = "";
 
@@ -11384,6 +11384,131 @@ export function assertDrainComplete({ remaining, rounds, maxRounds = 400 }) {
   return { remaining, rounds };
 }
 
+/**
+ * Accept only the exact refit receipt shape the installed Worker promises.
+ *
+ * A refit that reports progress it did not make is worse than one that fails:
+ * the cursor moves, the pages are never revisited, and the corpus keeps its
+ * unreachable tails while the report says the repair ran.
+ */
+export function validateRefitReceipt(body, { confirm = false } = {}) {
+  const phase = confirm ? "confirmation" : "preview";
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    die(`refit returned HTTP success but no valid ${phase} receipt. Nothing was treated as repaired.`);
+  }
+  if (body.dry_run !== !confirm) {
+    die(`the refit ${phase} receipt did not confirm ${confirm ? "a real repair" : "a dry run"}. Nothing was treated as repaired.`);
+  }
+  const coverage = body.coverage;
+  if (!coverage || typeof coverage !== "object" ||
+      !Number.isSafeInteger(coverage.chunks) || coverage.chunks < 0 ||
+      !Number.isSafeInteger(coverage.over_budget) || coverage.over_budget < 0 ||
+      !Number.isSafeInteger(coverage.unmeasured) || coverage.unmeasured < 0) {
+    die(`the refit ${phase} receipt carried no valid searchable-coverage measurement. Nothing was treated as repaired.`);
+  }
+  if (confirm) {
+    for (const field of ["documents_examined", "documents_refitted", "documents_measured", "chunks_added"]) {
+      nonNegativeReceiptCount(body, field, "the refit confirmation receipt");
+    }
+    if (typeof body.complete !== "boolean") {
+      die("the refit confirmation receipt did not say whether the walk is finished. Nothing was treated as complete.");
+    }
+  }
+  return body;
+}
+
+/**
+ * Repair a corpus whose chunks were cut before embedding.
+ *
+ * Every install loaded before the chunker respected the embedding window holds
+ * text that keyword search finds and meaning-based search cannot, with nothing
+ * anywhere saying so. This walks the corpus a page of documents at a time,
+ * re-splits only what needs it, and queues the repaired chunks for embedding.
+ *
+ * Bounded and resumable on purpose: the cursor lives in the brain's own
+ * install_state, so an interrupted run continues instead of restarting, and a
+ * document whose chunks already fit is MEASURED rather than re-embedded, which
+ * is what keeps a healthy corpus from turning this into a bill.
+ */
+async function cmdRefit(manifestPath) {
+  const { renderSearchability } = await import("./acceptance.mjs");
+  const flags = parseFlags(process.argv.slice(3));
+  const { m } = loadManifest(manifestPath);
+  // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker
+  // over plain HTTPS with the admin key, so it must keep working after our token
+  // is revoked at handoff.
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
+
+  const call = async (confirm) => {
+    const res = await http(`${base}/api/admin/brain/refit`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm, restart: flags.restart === true }),
+    }, { timeoutMs: 120_000, what: "the refit" });
+    const raw = await res.text();
+    if (res.status === 503 && /spend/i.test(raw)) {
+      die(
+        "the refit stopped because this brain's daily spend cap is already reached." + "\n" +
+        "        Nothing was queued. Re-run after the cap resets, or raise" + "\n" +
+        "        safety.daily_llm_spend_cap_usd in the manifest and re-run `brain secrets`."
+      );
+    }
+    if (!res.ok) die(`refit failed (${res.status}): ${raw.slice(0, 200)}`);
+    let body = null;
+    try { body = JSON.parse(raw); } catch { /* validated below */ }
+    return validateRefitReceipt(body, { confirm });
+  };
+
+  const plan = await call(false);
+  const before = plan.coverage;
+  info(renderSearchability(before));
+  if (!before.over_budget && !before.unmeasured) {
+    ok("every chunk in this brain already fits the embedding window");
+    return plan;
+  }
+  if (!flags.yes) {
+    warn(
+      "nothing has changed. This was a preview." + "\n" +
+      `        ${plan.documents_pending_page} document(s) on this page still need repair.` + "\n" +
+      "        Re-run with --yes to repair them. Your documents are not re-read," + "\n" +
+      "        so the source folder is not needed, and chunks that already fit are" + "\n" +
+      "        only measured, never re-embedded."
+    );
+    return plan;
+  }
+
+  let done = null;
+  let pages = 0;
+  // Bounded rather than unbounded: each call is one page, and the cursor in the
+  // brain makes the next call continue rather than start over. A run that is
+  // interrupted here loses a page of progress at most.
+  const maxPages = Number.isFinite(Number(flags.pages)) ? Math.max(1, Number(flags.pages)) : 200;
+  while (pages < maxPages) {
+    done = await call(true);
+    pages += 1;
+    info(
+      `page ${pages}: examined ${done.documents_examined}, repaired ${done.documents_refitted}, ` +
+      `measured ${done.documents_measured}, ${done.chunks_added} chunk(s) added`
+    );
+    if (done.complete) break;
+  }
+  if (done && !done.complete) {
+    warn(
+      `stopped after ${pages} page(s) with the walk unfinished.` + "\n" +
+      "        Re-run `brain refit <manifest> --yes` to continue from where it stopped."
+    );
+  }
+  ok(renderSearchability(done?.coverage || before));
+  if (done?.chunks_queued_for_embedding) {
+    info(`${done.chunks_queued_for_embedding} chunk(s) are queued for embedding.`);
+    return cmdDrain(manifestPath);
+  }
+  return done || plan;
+}
+
 async function cmdReindex(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
   const { m } = loadManifest(manifestPath);
@@ -12208,6 +12333,7 @@ const commands = {
   forget: cmdForget,
   drain: cmdDrain,
   reindex: cmdReindex,
+  refit: cmdRefit,
   diagnose: cmdDiagnose,
   eval: cmdEval,
   invite: cmdInvite,
@@ -12235,6 +12361,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain health     <manifest>            prove the install actually works
     brain drain      <manifest>            finish the vector embedding now, with a live ETA
     brain reindex    <manifest>            rebuild the vector index from D1, no source files needed
+    brain refit      <manifest>            re-split chunks cut short of the embedding window
     brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it

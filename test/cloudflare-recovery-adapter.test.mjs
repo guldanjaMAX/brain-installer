@@ -159,6 +159,11 @@ const installStateColumns = Object.freeze([
   ["vector_projection_bootstrap_protocol", "TEXT"],
   ["vector_projection_bootstrap_base_count", "INTEGER"],
   ["session_generation", "INTEGER"],
+  ["chunk_refit_cursor", "TEXT"],
+  ["chunk_refit_started_at", "INTEGER"],
+  ["chunk_refit_completed_at", "INTEGER"],
+  ["chunk_refit_documents", "INTEGER"],
+  ["chunk_refit_chunks_added", "INTEGER"],
 ]);
 const fixtureInstallState = Object.freeze({
   id: 1,
@@ -186,10 +191,19 @@ const fixtureInstallState = Object.freeze({
   // Live owner-session coordination; zero-normalized on export like the
   // outbox generation, so a recovery never resurrects old session cookies.
   session_generation: 4,
+  // Chunk-refit progress describes the CHUNK TEXT, which a recovery carries
+  // over intact, so it survives the export instead of being normalised away.
+  // Resetting it would make a recovered brain re-walk a corpus it has already
+  // repaired, and the re-embedding is billed to the client.
+  chunk_refit_cursor: "fixture:doc-0002",
+  chunk_refit_started_at: 1756000000000,
+  chunk_refit_completed_at: null,
+  chunk_refit_documents: 3,
+  chunk_refit_chunks_added: 7,
 });
 const normalizedInstallStateSql =
   `INSERT INTO "install_state" (${installStateColumns.map(([name]) => `"${name}"`).join(",")}) VALUES (` +
-  `1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,0,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004',NULL,0,0);\n`;
+  `1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,0,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004',NULL,0,0,'fixture:doc-0002',1756000000000,NULL,3,7);\n`;
 const schemaRows = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((name) => ({
     type: "table",
