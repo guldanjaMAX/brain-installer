@@ -46,7 +46,7 @@ import {
   handleOwnerAuth, handleAdminInvite, handleAdminDevices, handleAdminRecoveryCodes,
   validateOwnerSession,
 } from "./lib/owner-auth.js";
-import { handleZoomWebhook } from "./lib/zoom.js";
+import { handleZoomWebhook, sweepZoomDeliveries } from "./lib/zoom.js";
 
 /* ------------------------------------------------------------ retrieval */
 
@@ -1912,13 +1912,18 @@ export default {
   },
 
   /**
-   * Drain the vector outbox.
+   * The tick that finishes deferred work.
    *
-   * The write path deliberately does NOT embed inline: Vectorize acknowledges a
-   * write before the index reflects it, so doing it in the request would make an
-   * ingest look complete while the chunk is still unfindable. Here it is a queue
-   * that visibly empties, and a failure leaves the rows in place to retry rather
-   * than losing them.
+   * Two queues ride this one schedule, for the same reason. The vector outbox
+   * exists because Vectorize acknowledges a write before the index reflects it,
+   * so embedding inline would make an ingest look complete while the chunk was
+   * still unfindable. The Zoom delivery ledger exists because Zoom's webhook
+   * must be acknowledged before the transcript can be fetched, so a failure
+   * after that acknowledgement has nothing left to retry it. Both are "work
+   * that was promised and is not done yet", and this is where that gets
+   * finished. Adding a second cron for the second queue would have been a
+   * second thing to provision in the client's account and a second thing that
+   * can be missing on install day.
    */
   async scheduled(event, env, ctx) {
     if (backendOf(env) !== D1) return;
@@ -1932,6 +1937,24 @@ export default {
           maxBatches: 10,
         });
         if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
+      })()
+    );
+    // Its own waitUntil and its own catch: a Zoom retry failing must not stop
+    // the vector drain, and the vector drain failing must not strand a
+    // transcript. They share a schedule, not a fate.
+    ctx.waitUntil(
+      (async () => {
+        try {
+          // Corpus writes are paused for a verified upgrade; the webhook already
+          // 503s in that mode, and retrying here would write behind the pause.
+          if (env.VECTOR_DRAIN_MODE === "paused-for-upgrade") return;
+          const z = await sweepZoomDeliveries(env);
+          if (z.available && z.attempted) {
+            console.log(`zoom deliveries: ${z.attempted} retried, ${z.stored} stored, ${z.still_owed} still owed`);
+          }
+        } catch (error) {
+          console.error(`zoom delivery sweep failed: ${String(error?.message || error).slice(0, 200)}`);
+        }
       })()
     );
   },
