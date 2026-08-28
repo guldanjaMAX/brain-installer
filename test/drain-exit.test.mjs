@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
   assertDrainComplete,
+  summariseResponseBody,
   validateDrainBusyReceipt,
   validateDrainReceipt,
   validateReindexReceipt,
@@ -146,3 +147,30 @@ assert.equal(
 );
 
 console.log("drain/reindex exit: all focused tests passed");
+
+/* ---------------------------------------------------------------------------
+ * A clean install once exited 1 with a Cloudflare error page pasted into the
+ * terminal, starting `<!DOCTYPE html>` and three IE conditional comments. The
+ * install was fine; /health returned ok seconds later. No failure path may put
+ * an HTML body in front of a client again.
+ */
+const CLOUDFLARE_ERROR_PAGE = [
+  "<!DOCTYPE html>",
+  '<!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> <![endif]-->',
+  '<!--[if IE 7]>    <html class="no-js ie7 oldie" lang="en-US"> <![endif]-->',
+  "<head><title>404 Not Found</title></head>",
+].join("\n");
+
+const summarisedPage = summariseResponseBody(CLOUDFLARE_ERROR_PAGE);
+assert.doesNotMatch(summarisedPage, /<!DOCTYPE|<html|<!--|<head/i,
+  "an HTML body must never be echoed back to the terminal");
+assert.match(summarisedPage, /not serving the worker yet|web page/i,
+  "the summary has to say what actually happened");
+
+/* JSON bodies still surface their real message. */
+assert.match(summariseResponseBody('{"error":"vector index missing"}'), /vector index missing/);
+assert.match(summariseResponseBody('{"errors":[{"message":"quota exceeded"}]}'), /quota exceeded/);
+
+/* Neither an empty body nor junk may produce an empty or enormous line. */
+assert.match(summariseResponseBody(""), /no body/i);
+assert.ok(summariseResponseBody("x".repeat(5_000)).length <= 200);

@@ -62,6 +62,29 @@ export const VECTORIZE_REMEDY =
 /** The token scopes, in one place, for the same reason. */
 export const CF_TOKEN_SCOPES = ["Workers Scripts: Edit", "D1: Edit", "Vectorize: Edit", "Workers AI: Read"];
 
+/**
+ * What to do when Cloudflare rejects the credential.
+ *
+ * One copy, because two commands used to disagree about whose fault it is.
+ * `brain verify` routed a rejected token to the unexpected-error handler and
+ * told the owner "This is a bug in the installer, not something you did wrong"
+ * (bench, 2026-08-28), which is false and is the one sentence that stops a
+ * person from fixing the most common install-day mistake there is.
+ */
+export const CF_TOKEN_REJECTED_REMEDY =
+  "The value in CLOUDFLARE_API_TOKEN is not a token Cloudflare will accept.\n" +
+  "  Check it was copied whole, with no leading or trailing spaces, and that it\n" +
+  "  has not expired or been deleted: dash.cloudflare.com > My Profile > API Tokens.\n" +
+  `  Scopes: ${CF_TOKEN_SCOPES.join(", ")}.\n` +
+  "  Then run `brain setup` or `brain update` in an interactive terminal; it asks for the token without echo.";
+
+/** Does this failure mean the credential was refused, rather than the tool misbehaving? */
+export function isCredentialRejection(error) {
+  const text = String(error?.message ?? error ?? "");
+  if (/\b(9109|10000)\b/.test(text) && /\b40[13]\b/.test(text)) return true;
+  return /invalid access token|authentication error|unauthori[sz]ed|token has expired/i.test(text);
+}
+
 const IS_WIN = platform() === "win32";
 
 /**

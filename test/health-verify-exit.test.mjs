@@ -159,6 +159,11 @@ if (SCENARIO) {
       return json({ success: true, result: [{ id: "fixture-account", name: "Fixture account" }] });
     }
     if (url.hostname === "api.cloudflare.com" && url.pathname.endsWith("/r2/buckets")) {
+      // A manifest with no bucket must never reach this endpoint. Throwing here
+      // names a reintroduced probe instead of letting it pass as one more warning.
+      if (SCENARIO === "verify-no-r2") {
+        throw new Error("verify probed R2 for a manifest that asks for no bucket");
+      }
       if (SCENARIO === "verify-optional-warnings") {
         return json({ success: false, errors: [{ code: 9109, message: "fixture R2 unavailable" }] }, 403);
       }
@@ -211,6 +216,10 @@ if (SCENARIO) {
     mkdirSync(userRoot, { recursive: true });
     const cloudflare = { account_id: "fixture-account" };
     if (scenario !== "health-default-backend-mismatch") cloudflare.storage = "d1";
+    // Verify only probes R2 for a manifest that asks for a bucket (F-09). The
+    // optional-warnings scenario is about an install that WANTS R2 and cannot
+    // reach it, so it has to name one; verify-no-r2 deliberately names none.
+    if (scenario === "verify-optional-warnings") cloudflare.r2_bucket = "fixture-assets";
     writeFileSync(manifestPath, JSON.stringify({
       client: { slug: "fixture-brain" },
       brain: { domain: "fixture.invalid", worker_name: "fixture-brain" },
@@ -321,6 +330,12 @@ if (SCENARIO) {
     d1Down.output);
   check("unreachable D1 is never downgraded to a warning",
     !/warn\s+D1 not reachable/i.test(d1Down.output), d1Down.output);
+
+  const noR2 = runScenario("verify-no-r2", "verify", { cloudflareToken: true });
+  check("verify does not probe R2 for a manifest that has no bucket",
+    noR2.code === 0 && !/R2 is NOT enabled/.test(noR2.output) &&
+      /does not use R2 file storage/.test(noR2.output),
+    noR2.output);
 
   const optionalWarnings = runScenario("verify-optional-warnings", "verify", { cloudflareToken: true });
   check("optional R2 and Vectorize access remain warnings",
