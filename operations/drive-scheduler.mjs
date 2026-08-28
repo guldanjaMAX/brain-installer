@@ -366,6 +366,37 @@ function assertMac(platform = process.platform, spec = DRIVE_SCHEDULER_SPEC) {
   }
 }
 
+/**
+ * Version managers put the running Node version INSIDE its own path, so the
+ * absolute interpreter baked into the plist stops existing the moment the
+ * owner upgrades Node. launchd then fails the job forever with a spawn error
+ * nobody reads, and the only symptom is that a source quietly stops updating.
+ *
+ * The absolute path is kept deliberately: resolving `node` through PATH at run
+ * time would hand the choice of interpreter to whatever ambient environment
+ * launchd happens to pass, which is the ambient authority the sanitized child
+ * environment exists to remove. So this is made DETECTABLE rather than
+ * "resilient": named at install time, named again by `--status` the moment the
+ * interpreter is gone, and caught downstream by per-source freshness, which
+ * fails the acceptance run when the source stops refreshing.
+ */
+const VERSION_PINNED_INTERPRETER =
+  /(?:\/\.nvm\/versions\/node\/|\/\.fnm\/|\/\.volta\/|\/\.asdf\/|\/n\/versions\/node\/|\/node[@-]?v?\d+(?:\.\d+)*\/)/;
+
+export function isVersionPinnedInterpreter(nodePath) {
+  return VERSION_PINNED_INTERPRETER.test(String(nodePath || ""));
+}
+
+function versionPinnedInterpreterWarning(nodePath, spec = DRIVE_SCHEDULER_SPEC) {
+  if (!isVersionPinnedInterpreter(nodePath)) return null;
+  return (
+    `the ${spec.schedulerNoun} will run ${nodePath}, whose path contains a Node version. ` +
+    "Upgrading or removing that Node version will stop every scheduled run without any " +
+    "other symptom; reinstall the schedule after a Node upgrade, and check " +
+    "`brain schedule <manifest> --status` if a source stops refreshing."
+  );
+}
+
 export function schedulerIdentity(manifestPath, options = {}) {
   const spec = specOf(options);
   const { path, manifest } = readManifest(manifestPath, options.readFile);
@@ -741,6 +772,8 @@ function buildSchedulerReference(manifestPath, options = {}) {
       `LaunchAgent calendar times use this Mac's ${localTimeZone} timezone, while the manifest says ${timeZone}`
     );
   }
+  const interpreterPin = versionPinnedInterpreterWarning(nodePath, spec);
+  if (interpreterPin) warnings.push(interpreterPin);
 
   return {
     ...identity,
@@ -834,8 +867,26 @@ ${args}
   <array>
 ${intervals}
   </array>
+  <!--
+    RunAtLoad is TRUE so a missed schedule is caught up.
+
+    launchd coalesces a calendar firing missed while the Mac is asleep, but a
+    firing missed while the Mac is powered off or the owner is logged out is
+    dropped and never made up. On a laptop with a fixed daily time that is not
+    an occasional miss: if the machine is routinely off at that hour, the job
+    NEVER runs, the source silently stops updating, and the brain keeps
+    answering from whatever it last saw.
+
+    The cost is one extra run per login. It is bounded (the lockf wrapper below
+    still allows only one run at a time, ingest is incremental, and
+    ThrottleInterval caps the rate) and it is the same run the schedule would
+    have performed anyway. Deliberately NOT conditioned on a "last run" marker:
+    a coalescing window wide enough to be worth having is also wide enough to
+    swallow a real firing on an irregular cron, and skipping a scheduled sync
+    to save a little work is the exact failure this whole change exists to fix.
+  -->
   <key>RunAtLoad</key>
-  <false/>
+  <true/>
   <key>ProcessType</key>
   <string>Background</string>
   <key>LowPriorityIO</key>
@@ -1030,8 +1081,23 @@ export function statusScheduler(manifestPath, options = {}) {
   if (installed && !scheduleError) {
     try { definitionMatches = readFileSync(plan.plistPath, "utf-8") === renderLaunchAgentPlist(plan); } catch {}
   }
+  // A LaunchAgent whose interpreter has been upgraded away is loaded, matches
+  // the manifest, and cannot run. Nothing else in this report would say so.
+  const interpreterPresent = existsSync(plan.nodePath);
+  const warnings = [...(plan.warnings || [])];
+  if (!interpreterPresent) {
+    warnings.push(
+      `the ${plan.spec.schedulerNoun} is configured to run ${plan.nodePath}, which no longer exists. ` +
+      "Every scheduled run is failing to start. Reinstall the schedule with " +
+      "`brain schedule <manifest> --install` to pin the interpreter you use now."
+    );
+  }
   return {
     ...plan,
+    warnings,
+    interpreterPath: plan.nodePath,
+    interpreterPresent,
+    interpreterVersionPinned: isVersionPinnedInterpreter(plan.nodePath),
     installed,
     loaded,
     scheduleError,
@@ -1187,6 +1253,9 @@ function cliSummary(result) {
     schedule_error: result.scheduleError,
     definition_matches_manifest: result.definitionMatches,
     definition_drift: result.definitionDrift,
+    interpreter: result.interpreterPath,
+    interpreter_present: result.interpreterPresent,
+    interpreter_version_pinned: result.interpreterVersionPinned,
     plist: result.plistPath,
     stdout_log: result.stdoutPath,
     stderr_log: result.stderrPath,

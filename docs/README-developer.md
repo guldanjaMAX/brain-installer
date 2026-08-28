@@ -346,10 +346,28 @@ mismatch with `client.timezone` instead of silently presenting the wrong
 schedule. Cron fields are numeric; month and weekday names are not accepted
 today.
 
-`RunAtLoad` is deliberately false. A calendar firing missed while this Mac is
-asleep is coalesced by launchd and runs after wake. A firing missed while the
-Mac is powered off or the user is logged out is not caught up, so choose a
-schedule that overlaps the machine's normal logged-in hours.
+`RunAtLoad` is deliberately true. A calendar firing missed while this Mac is
+asleep is coalesced by launchd and runs after wake, but a firing missed while
+the Mac is powered off or the user is logged out is dropped and never made up.
+On a laptop with a fixed daily time that is not an occasional miss: if the
+machine is routinely off at that hour the job never runs at all, and the only
+symptom is a source that silently stops updating. Running at load catches that
+up. The cost is one extra run per login, bounded by the same `lockf` wrapper,
+incremental ingest and `ThrottleInterval` as any other firing. It also means
+installing a schedule performs the first sync immediately instead of waiting
+for tomorrow's calendar time.
+
+The interpreter in `ProgramArguments[0]` is the absolute path of the Node that
+installed the schedule, on purpose: resolving `node` through `PATH` at run time
+would let the ambient environment choose the interpreter, which is the
+authority the sanitized child environment exists to remove. The cost is that a
+version-manager path (`~/.nvm/versions/node/vNN`, `node@NN`, Volta, fnm, asdf)
+stops existing after a routine Node upgrade and every scheduled run then fails
+to start. That is made detectable rather than silent: install warns when the
+interpreter path carries a version, `--status` warns the moment the interpreter
+is gone (`interpreter_present: false`), and per-source freshness fails
+acceptance once the source stops refreshing. The repair is to reinstall the
+schedule.
 
 The plist contains paths, schedule data and a non-secret configuration hash
 only. Google credentials continue to come from the normal token store. Standard
