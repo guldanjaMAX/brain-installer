@@ -28,6 +28,7 @@ import {
   vttToPlainTranscript,
   zoomHmacHex,
   zoomRecordingPathId,
+  zoomTimestampToMs,
 } from "../src/lib/zoom.js";
 
 let fail = 0, ran = 0;
@@ -241,6 +242,51 @@ check("an empty or missing VTT parses to an empty string",
 
   check("the module's HMAC agrees with an independent node:crypto HMAC",
     (await zoomHmacHex(SECRET, "v0:1:{}")) === sign(SECRET, "v0:1:{}"));
+}
+
+/* --------------------------------------------- the timestamp's unit */
+{
+  // Whether Zoom's header is epoch seconds or epoch milliseconds is not
+  // verifiable without a live Zoom account. Guessing wrong would reject every
+  // real event as stale, forever, with a 401 indistinguishable from an
+  // attacker being refused — and unlike the reference, there is no cron here
+  // to quietly cover for it. So both units are accepted.
+  const nowMs = Date.UTC(2026, 7, 28, 12, 0, 0);
+  const nowSeconds = Math.floor(nowMs / 1000);
+
+  check("an epoch-milliseconds timestamp passes through unchanged",
+    zoomTimestampToMs(nowMs) === nowMs);
+  check("an epoch-seconds timestamp is scaled to milliseconds",
+    zoomTimestampToMs(nowSeconds) === nowSeconds * 1000);
+  check("a string timestamp is accepted, as headers always arrive",
+    zoomTimestampToMs(String(nowMs)) === nowMs);
+  check("junk is null, never coerced to 0 and treated as 1970",
+    zoomTimestampToMs("not-a-number") === null && zoomTimestampToMs("") === null &&
+    zoomTimestampToMs(0) === null && zoomTimestampToMs(-5) === null);
+
+  const body = JSON.stringify({ event: ZOOM_TRANSCRIPT_EVENT });
+  // The signature is over the header's ORIGINAL characters either way: Zoom
+  // signed those, so normalizing before hashing would break every signature.
+  const secondsSig = `v0=${sign(SECRET, `v0:${nowSeconds}:${body}`)}`;
+  const inSeconds = await verifyZoomSignature({
+    secret: SECRET, rawBody: body, signature: secondsSig, timestamp: String(nowSeconds), now: nowMs,
+  });
+  check("a fresh event timestamped in SECONDS verifies and is not called stale",
+    inSeconds.ok === true, JSON.stringify(inSeconds));
+
+  const msSig = `v0=${sign(SECRET, `v0:${nowMs}:${body}`)}`;
+  const inMs = await verifyZoomSignature({
+    secret: SECRET, rawBody: body, signature: msSig, timestamp: String(nowMs), now: nowMs,
+  });
+  check("a fresh event timestamped in MILLISECONDS verifies too", inMs.ok === true, JSON.stringify(inMs));
+
+  const staleSeconds = Math.floor((nowMs - 6 * 60 * 1000) / 1000);
+  const staleSig = `v0=${sign(SECRET, `v0:${staleSeconds}:${body}`)}`;
+  const refused = await verifyZoomSignature({
+    secret: SECRET, rawBody: body, signature: staleSig, timestamp: String(staleSeconds), now: nowMs,
+  });
+  check("accepting seconds does NOT weaken the replay window for seconds",
+    refused.ok === false && refused.reason === "stale_timestamp", JSON.stringify(refused));
 }
 
 /* ============================================ route: fail closed, no secret */

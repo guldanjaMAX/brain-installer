@@ -120,6 +120,8 @@ const baseOptions = (extra = {}) => ({
   resolveBaseUrl: async () => "https://brain.northwind-example.test",
   resolveAdminKey: () => "admin-key-for-tests",
   postSourceExpectation: async () => ({ source: "zoom" }),
+  // Real code waits between retries; tests must not.
+  sleep: async () => {},
   probeOptions: { fetchImpl: zoomApi() },
   verifyOptions: { fetchImpl: workerFetch({ ZOOM_WEBHOOK_SECRET_TOKEN: CREDS.ZOOM_WEBHOOK_SECRET_TOKEN }) },
   ...extra,
@@ -251,6 +253,50 @@ try {
     check("a worker running a build with no Zoom route/secret is named as needing a redeploy",
       /not configured/.test(error?.message || "") && /[Rr]edeploy/.test(error?.message || ""),
       error?.message);
+  }
+
+  /* ------------------- a secret that has not propagated yet is retried */
+  {
+    // A secret written seconds ago can miss an already-running isolate. The
+    // first check then answers with the OLD secret, which looks exactly like
+    // the client having copied the wrong Secret Token. Telling them that would
+    // send them back to Zoom to re-copy a value that is already correct.
+    const rec = secretRecorder();
+    let call = 0;
+    const settlesOnSecondTry = async (url, init) => {
+      call++;
+      const env = call === 1
+        ? { ZOOM_WEBHOOK_SECRET_TOKEN: "the-previous-secret" }
+        : { ZOOM_WEBHOOK_SECRET_TOKEN: CREDS.ZOOM_WEBHOOK_SECRET_TOKEN };
+      return workerFetch(env)(url, init);
+    };
+    const { error, output } = await run(() => cmdConnectZoom(manifestPath, {}, baseOptions({
+      putWorkerSecret: rec.put,
+      verifyOptions: { fetchImpl: settlesOnSecondTry },
+    })));
+    check("a secret that lands on the second check still connects",
+      !error && call === 2, error?.message || `checked ${call} times`);
+    check("and the retry is said out loud rather than hidden",
+      /has not answered the validation challenge yet; retrying/.test(output), output.slice(-300));
+    check("and the client still gets the webhook steps",
+      output.includes("recording.transcript_completed"));
+  }
+  {
+    // But retrying is not the same as giving up quietly: a permanently wrong
+    // secret must still stop the wizard after the attempts are spent.
+    const rec = secretRecorder();
+    let call = 0;
+    const neverSettles = async (url, init) => {
+      call++;
+      return workerFetch({ ZOOM_WEBHOOK_SECRET_TOKEN: "permanently-different" })(url, init);
+    };
+    const { error } = await run(() => cmdConnectZoom(manifestPath, {}, baseOptions({
+      putWorkerSecret: rec.put,
+      verifyOptions: { fetchImpl: neverSettles },
+    })));
+    check("a genuinely wrong secret still fails, after a bounded number of tries",
+      /Secret Token it holds is not the one supplied/.test(error?.message || "") && call === 3,
+      error?.message || `checked ${call} times`);
   }
 
   /* ------------------------------ a failed source registration is not fatal */

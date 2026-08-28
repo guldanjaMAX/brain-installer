@@ -85,6 +85,32 @@ export function constantTimeEquals(a, b) {
 }
 
 /**
+ * Zoom's `x-zm-request-timestamp` as epoch milliseconds, whichever unit it
+ * arrived in.
+ *
+ * The reference implementation asserts epoch milliseconds in a comment. That
+ * may well be right, but it is not verifiable without a live Zoom account, and
+ * the consequence of it being wrong is not small: every real event would fall
+ * outside the replay window and be rejected, forever, with a 401 that looks
+ * exactly like an attacker being turned away.
+ *
+ * The reference could afford that ambiguity because it also runs a 15-minute
+ * cron that sweeps for recordings, so a webhook rejecting everything would be
+ * silently covered by the poll. This connector is webhook-only by design, so
+ * the same mistake here is total silent failure with nothing behind it. Both
+ * units are therefore accepted: 1e11 sits between any plausible epoch-seconds
+ * value (~1.8e9 today) and any plausible epoch-milliseconds one (~1.8e12).
+ *
+ * This widens only the REPLAY window. The signature is always computed over
+ * the header's exact original characters, because that is what Zoom signed.
+ */
+export function zoomTimestampToMs(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n < 1e11 ? n * 1000 : n;
+}
+
+/**
  * Verify a real (non-handshake) Zoom event.
  *
  * Zoom signs `v0:{timestamp}:{raw body}` with the app's Secret Token and sends
@@ -96,15 +122,16 @@ export function constantTimeEquals(a, b) {
  */
 export async function verifyZoomSignature({ secret, rawBody, signature, timestamp, now = Date.now() }) {
   if (!secret) return { ok: false, reason: "no_secret" };
+  // The header's original text, never a normalized number: Zoom signed those
+  // exact characters, so reformatting them would break every signature.
   const expected = "v0=" + (await zoomHmacHex(secret, `v0:${timestamp ?? ""}:${rawBody ?? ""}`));
   if (!constantTimeEquals(expected, String(signature ?? ""))) {
     return { ok: false, reason: "bad_signature" };
   }
-  // Replay guard. Zoom's header is epoch milliseconds. A correctly signed body
-  // stays correctly signed forever, so without this a captured request could be
-  // replayed at will.
-  const ts = Number(timestamp);
-  if (!Number.isFinite(ts) || Math.abs(now - ts) > ZOOM_REPLAY_WINDOW_MS) {
+  // Replay guard. A correctly signed body stays correctly signed forever, so
+  // without this a captured request could be replayed at will.
+  const ts = zoomTimestampToMs(timestamp);
+  if (ts === null || Math.abs(now - ts) > ZOOM_REPLAY_WINDOW_MS) {
     return { ok: false, reason: "stale_timestamp" };
   }
   return { ok: true };

@@ -6984,9 +6984,22 @@ export async function cmdConnectZoom(manifestPath, flags = {}, options = {}) {
   const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
   const base = await resolveBase(m, acct);
   const webhookUrl = zoom.zoomWebhookUrl(base);
-  const live = await zoom.verifyLiveWebhookEndpoint(
-    webhookUrl, values.ZOOM_WEBHOOK_SECRET_TOKEN, options.verifyOptions || {},
-  );
+  // A secret written seconds ago does not always reach every running isolate
+  // instantly. Checking once would occasionally tell a client their Secret
+  // Token is wrong when it is right, which sends them back to Zoom to re-copy
+  // a correct value — the worst possible false negative here. A few short
+  // retries cost nothing and remove that whole class of confusion.
+  const sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const attempts = Math.max(1, Number(options.verifyAttempts ?? 3));
+  let live = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    live = await zoom.verifyLiveWebhookEndpoint(
+      webhookUrl, values.ZOOM_WEBHOOK_SECRET_TOKEN, options.verifyOptions || {},
+    );
+    if (live.ok || attempt === attempts) break;
+    info(`the brain has not answered the validation challenge yet; retrying (${attempt} of ${attempts - 1})`);
+    await sleep(2000);
+  }
   if (!live.ok) {
     die(
       `${live.reason}\n` +
