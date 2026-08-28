@@ -43,7 +43,9 @@ Your brain reads what you already have. It does not need you to write anything n
 
 ## 3. What it must never see
 
-This matters as much as what goes in. The brain only ever reads what you point it at, and anything you name here is excluded at the source.
+This matters as much as what goes in. The brain only ever reads what you point it at.
+
+Two ways to say no, and they are not equally strong. Naming the Drive folders it MAY read is the strong one: nothing outside them is ever requested from Google. Naming folders it may NOT read is the ordinary one: the file is refused before any of its content is read and before anything is stored, but its name and folder had to be listed in order to be refused. If something must never have its name leave your Google account, say so at 3.1 and we will scope it by allowlist instead.
 
 **3.1** Any folders, drives, or accounts that are off limits? Personal, medical, legal, HR, anything.
 

@@ -138,6 +138,14 @@
               "type": "boolean",
               "default": false
             },
+            "include_root_ids": {
+              "type": "array",
+              "description": "Deny-by-default Drive scope. When present, the full walk descends from these folder ids and nowhere else, so nothing outside them is ever requested from Google. When absent, connecting Drive means the whole Drive. Drive's changes feed takes no subtree filter, so the incremental lane still receives changes for files outside the allowlist and refuses them on arrival.",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{6,256}$"
+              }
+            },
             "exclude_paths": {
               "type": "array",
               "items": {

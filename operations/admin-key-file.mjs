@@ -219,6 +219,21 @@ function windowsPowerShellRuntime(environment = process.env) {
   };
 }
 
+/**
+ * Mark a DPAPI failure as one, so a caller that catches it can say WHICH half
+ * of the round trip broke.
+ *
+ * The message text is fixed by construction and carries no payload, but the
+ * tag is what travels: verification catches every decode failure the same way,
+ * and "the envelope is malformed" and "Windows refused to decrypt this for you"
+ * need different fixes from whoever is standing at the machine.
+ */
+function taggedDpapiFailure(operation, message) {
+  const error = new Error(message);
+  error.windowsDpapi = operation;
+  return error;
+}
+
 function runWindowsDpapi(input, options, operation, secretForMetadataCheck = null) {
   const { command, env } = windowsPowerShellRuntime(options.environment ?? process.env);
   if (!Buffer.isBuffer(input) || input.length < 1 || input.length > 64 * 1024) {
@@ -269,7 +284,8 @@ function runWindowsDpapi(input, options, operation, secretForMetadataCheck = nul
     // process data, and the caller only needs the safe recovery boundary.
     if (Buffer.isBuffer(result?.stdout)) result.stdout.fill(0);
     if (Buffer.isBuffer(result?.stderr)) result.stderr.fill(0);
-    throw new Error(
+    throw taggedDpapiFailure(
+      operation,
       operation === "protect"
         ? "Windows could not protect the admin key with DPAPI; the prior key was left untouched"
         : "Windows could not decrypt the admin key with DPAPI for the current user",
@@ -281,7 +297,8 @@ function runWindowsDpapi(input, options, operation, secretForMetadataCheck = nul
   if (Buffer.isBuffer(result.stderr)) result.stderr.fill(0);
   if (!output.length || output.length > 64 * 1024) {
     output.fill(0);
-    throw new Error(
+    throw taggedDpapiFailure(
+      operation,
       operation === "protect"
         ? "Windows DPAPI returned no usable ciphertext; the prior key was left untouched"
         : "Windows DPAPI returned no usable admin key for the current user",
@@ -433,8 +450,15 @@ function verifySecretPayload(path, identity, secret, expectedUid, platform, opti
     let decoded;
     try {
       decoded = decodeAdminKeyPayload(bytes, platform, options);
-    } catch {
-      throw new Error(`the admin key ${phase} payload could not be decoded and verified`);
+    } catch (error) {
+      // A DPAPI refusal and a malformed envelope both land here, and until now
+      // both printed the same sentence. The reported field failure was exactly
+      // this: the store failed on the way back out and said nothing about it.
+      throw new Error(
+        error?.windowsDpapi === "unprotect"
+          ? `the admin key ${phase} payload could not be decoded and verified: Windows DPAPI could not unprotect it for the current user`
+          : `the admin key ${phase} payload could not be decoded and verified`,
+      );
     }
     if (decoded !== secret) {
       throw new Error(`the admin key ${phase} payload did not read back exactly`);

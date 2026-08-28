@@ -270,6 +270,47 @@ and restart it after a rotation.
 
 ---
 
+## Anything else that calls the brain: send a browser User-Agent
+
+If you write a script, a notebook or an SDK against a brain, set a browser
+`User-Agent` on every request. This is not cosmetics.
+
+A brain on the client's own domain sits behind whatever Cloudflare zone settings
+that domain carries, and bot protection decides per request. It can refuse a
+client that does not look like a browser BEFORE the worker ever sees it. Measured
+on an unauthenticated `/health`, same URL, same second: `curl` returned 200 while
+Python `urllib` with its default user agent returned 403, and sometimes reset the
+TLS connection before any response at all.
+
+The cost of not knowing this is high, because the symptom is a perfect
+impersonation of a broken install: every command refused at once, surviving a key
+rotation, while the same address opens fine in a browser. Operators rotate a
+credential the edge never read.
+
+- The shipped MCP server (`components/brain-mcp.mjs`) and the eval client
+  (`eval/brain-client.mjs`) already send one.
+- `brain`'s own commands deliberately do NOT. They identify as `node`, which
+  makes the CLI the canary: if the AI tools still answer while the terminal is
+  refused, that gap is itself the diagnosis. Both now RECOGNISE the refusal —
+  `describeBotProtection` in `components/brain-http.mjs` — and say it was refused
+  before it reached the brain, rather than reporting it as an auth failure or an
+  outage.
+- The two-line proof needs no credential, because `/health` needs none:
+
+```bash
+curl -sS -i https://<brain>/health
+curl -sS -i -A "Mozilla/5.0" https://<brain>/health
+```
+
+HTML or `error code: 1010` from the first and JSON from the second means the
+client was blocked and the brain is up. The fix belongs in the zone that holds
+the hostname, not in the install: Security > Bots, plus any WAF custom rule
+matching on user agent. A `.workers.dev` address sits in no zone you configure,
+so this is not the cause there. Full entry:
+`onboarding/06-runbook-top-ten-failures.md`, entry 1b.
+
+---
+
 ## Remote sources: Google Drive, Gmail and IMAP
 
 ```bash

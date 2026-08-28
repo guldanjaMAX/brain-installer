@@ -13,13 +13,21 @@
  * to do about each in words the person reading can act on. A check that reports
  * "failed" without a fix has done half a job.
  *
- * EVERY CHECK IS INDEPENDENT AND NON-DESTRUCTIVE. Doctor never creates anything.
+ * EVERY CHECK IS INDEPENDENT AND NON-DESTRUCTIVE. Doctor never creates anything
+ * in the client's install. The single exception is the credential-store round
+ * trip, which writes a fixed non-secret value into a private temporary directory
+ * it creates and removes, because a store nobody has ever read back is a store
+ * nobody has tested.
  */
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { platform } from "node:os";
 import { tokenStorageStatus } from "./connectors/google-auth.mjs";
+import {
+  credentialStoreDescription,
+  probeCredentialStore,
+} from "./operations/credential-store-probe.mjs";
 
 export const OK = "ok";
 export const WARN = "warn";
@@ -192,6 +200,72 @@ export function checkNode() {
     IS_WIN
       ? "Install Node 22 LTS: winget install OpenJS.NodeJS.LTS\n  Then close this window and open a NEW terminal, or npm will not be on PATH yet."
       : "Install Node 22 LTS from nodejs.org, or: brew install node"
+  );
+}
+
+/**
+ * Round-trip the credential store, rather than confirming one exists.
+ *
+ * A store that accepts a write and cannot return it is the worst shape this
+ * failure takes: setup reports success, the install looks finished, and the
+ * client discovers it when they next need their brain. On Windows the value is
+ * sealed with DPAPI CurrentUser through a compiled helper, so write and read
+ * are genuinely separate things that can fail separately, and the failure that
+ * was reported from the field was the read.
+ *
+ * This writes a published non-secret value into a private temporary directory
+ * through the SAME functions a real admin key uses, reads it back, compares it
+ * exactly, and removes it. It says which platform's store it exercised, because
+ * a green line on macOS proves nothing at all about Windows.
+ */
+export function checkCredentialStore(options = {}) {
+  const probe = (options.probe ?? probeCredentialStore)(options);
+  const description = probe.description || credentialStoreDescription(options.platform);
+  if (probe.ok) {
+    return check(
+      "Credential store",
+      OK,
+      `wrote a test value through ${description} and read back the same bytes`
+    );
+  }
+  if (probe.stage === "setup") {
+    return check(
+      "Credential store",
+      WARN,
+      `the round trip could not be attempted: ${probe.error}`,
+      "Nothing is known to be broken and nothing is known to be working. This needs a\n" +
+        "  writable temporary directory; TMPDIR, TEMP or TMP is unset, full, or not writable.\n" +
+        "  Fix that and re-run `brain doctor`, because the next thing to write here is the\n" +
+        "  admin key and it will not get a second chance."
+    );
+  }
+  const stageWords = {
+    write: "could not store a test value",
+    read: "stored a test value and then could not read it back",
+    compare: "read back a different value than it stored",
+  };
+  const encrypted = probe.encrypted === true;
+  return check(
+    "Credential store",
+    FAIL,
+    `${stageWords[probe.stage] || "failed"} in ${description}: ${probe.error}`,
+    (encrypted
+      ? "This machine seals the admin key with Windows DPAPI for the current user, and that\n" +
+        "  round trip just failed. Do NOT install on top of it: setup would report success and\n" +
+        "  leave a key that cannot be read back.\n" +
+        "  The usual causes, in the order worth checking:\n" +
+        "    1. The helper is compiled into the temp directory and run from there. Software\n" +
+        "       restriction, AppLocker or endpoint protection that blocks executables in TEMP\n" +
+        "       stops this and nothing else on the machine.\n" +
+        "    2. TEMP points through a redirected or roaming path. DPAPI CurrentUser needs the\n" +
+        "       real loaded profile of the account running the command.\n" +
+        "    3. The command is being run as a different account, or elevated, from the one that\n" +
+        "       wrote the value. A DPAPI CurrentUser value belongs to one account only.\n" +
+        "  Confirm the stage in isolation, with four fixed bytes and no credential:\n" +
+        "      node test/fixtures/windows-dpapi-probe.mjs"
+      : "The store could not return what it stored. Check that the temporary directory is\n" +
+        "  writable, that this account owns it, and that no sync client or backup agent is\n" +
+        "  rewriting files underneath it. Re-run `brain doctor` once it is fixed.")
   );
 }
 
@@ -547,6 +621,7 @@ export async function runAll({ accountId, onResult, googleStorageStatus, cloudfl
   // the token, Vectorize, Claude Code, Codex or Google. Silence read as "did not
   // run" when the checks had in fact run and one of them had failed.
   push(checkNode());
+  push(checkCredentialStore());
   push(await checkNetwork());
   push(checkCfToken(cloudflareToken));
   push(await checkVectorizeApi(account, cloudflareToken));
@@ -1187,6 +1262,7 @@ export async function runPreinstall({
   // unreachable API without any of them being a live call or a 120-second npx
   // fetch. Production passes none of these and gets the real thing.
   networkCheck = checkNetwork,
+  storeCheck = checkCredentialStore,
   toolChecks = [checkClaudeCode, checkCodex],
 } = {}) {
   const out = [];
@@ -1195,6 +1271,7 @@ export async function runPreinstall({
 
   push(checkNode());
   push(checkOperatingSystem(osPlatform));
+  push(storeCheck());
   push(await networkCheck());
 
   const identity = await checkCloudflareIdentity(cloudflareToken, probeOptions);

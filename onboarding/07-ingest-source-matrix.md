@@ -66,8 +66,16 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 | Code, stylesheets, build output, lockfiles | Matches a lot of questions and answers almost none of them. Left out deliberately, because it crowds real documents out of your results |
 | Database dumps and backups | Same reason, larger. One dump can flood an index and make everything else harder to find |
 | Anything in a folder whose name starts with `_Private` | Owner-only by convention. Never read, enforced in two independent places |
-| Anything you excluded at intake | Excluded at the source. It is never read, not read and filtered |
+| Anything you excluded at intake | Refused before any content is read or stored. Where that refusal happens differs by source, and the difference is stated exactly under **Where an exclusion is actually enforced** below |
 | Files whose names suggest credentials | Anything looking like a key file, an environment file, or a certificate is refused by name before it is opened |
+
+**Where an exclusion is actually enforced.** This is worth a paragraph rather than a word, because "excluded" can mean two different things and only one of them is a promise about what leaves your account.
+
+- **Gmail** is filtered in the query. The excluded mail is never returned to this system at all.
+- **Drive, with a root allowlist** (`include_root_ids` in your manifest) is filtered in the query too. The walk descends from the folders you named and nowhere else, so a file outside them is never requested from Google: not its content, not its name, not its size, not its id.
+- **Drive, without a root allowlist**, means the whole Drive. That is what "connect Drive" does on its own, and every run says so in its own output rather than leaving you to infer it.
+- **Drive exclusion rules** (excluded paths, name fragments, file ids, and `_Private` folders) are applied to the listing Google returns. The file's name, folder path, size and id were fetched in order to judge it; its **content is never downloaded and nothing about it is stored or indexed**. If your requirement is that a name never leaves your Google account, a root allowlist is the setting that delivers it and an exclusion rule is not.
+- **Drive's incremental updates** cannot be narrowed at all: Google's changes feed is account-wide and offers no folder filter. Changes for files outside your allowlist are delivered to the installer and refused there, before any content is fetched. Google has no API that would let this be done any earlier.
 
 **How it stays current:** scheduled refreshes are normally incremental. A complete Drive comparison runs at least weekly and whenever source policy or folder changes require it. Re-running is safe: a document that has not changed since last time is skipped rather than duplicated.
 
