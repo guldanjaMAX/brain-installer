@@ -203,11 +203,12 @@ function supportSourceForCommand(command = "") {
   if (command === "ingest") {
     const index = process.argv.indexOf("--from");
     const remote = index >= 0 ? process.argv[index + 1] : null;
-    if (["calendar", "drive", "gmail", "imessage"].includes(remote)) return remote;
+    if (["calendar", "drive", "gmail", "imessage", "whatsapp"].includes(remote)) return remote;
     return "local";
   }
   if (command === "connect" || command === "disconnect") {
-    if (String(process.argv[3] || "").toLowerCase() === "imessage") return "imessage";
+    const which = String(process.argv[3] || "").toLowerCase();
+    if (which === "imessage" || which === "whatsapp") return which;
     return "installer";
   }
   if (SUPPORT_REMOTE_COMMANDS.has(command)) return "cloudflare";
@@ -4944,6 +4945,7 @@ async function cmdIngest(manifestPath) {
   // rather than being forced through machinery built for files.
   if (String(flags.from).toLowerCase() === "calendar") return cmdIngestCalendar(m, manifestPath, flags);
   if (String(flags.from).toLowerCase() === "imessage") return cmdIngestImessage(m, manifestPath, flags);
+  if (String(flags.from).toLowerCase() === "whatsapp") return cmdIngestWhatsapp(m, manifestPath, flags);
   if (flags.from) return cmdIngestRemote(m, manifestPath, flags);
   if (flags["approve-removals"] !== undefined) {
     die("--approve-removals is only valid with --from drive.");
@@ -6003,6 +6005,181 @@ export async function cmdIngestImessage(m, manifestPath, flags, options = {}) {
 }
 
 /**
+ * `brain ingest <manifest> --from whatsapp`.
+ *
+ * One drain pass over the capture daemon's local SQLite outbox: read every row
+ * after the cursor, sessionize through the same message-session.mjs every other
+ * chat platform uses, and push the closed conversation documents through the
+ * shared batch endpoint — so the worker's credential gate runs on every
+ * document exactly as it does for Drive and Gmail.
+ *
+ * This is both the manual command an operator runs and the child every
+ * scheduled drain tick spawns, so the two can never drift apart. Unlike the
+ * iMessage pass it is NOT platform-gated: reading a SQLite file works
+ * anywhere, and an operator who copied an outbox onto another machine should
+ * be able to load it. What is macOS-only is installing the capture daemon that
+ * writes the outbox in the first place, which `brain connect whatsapp` says
+ * plainly.
+ */
+export async function cmdIngestWhatsapp(m, manifestPath, flags, options = {}) {
+  const whatsapp = options.whatsapp ?? await import("./connectors/whatsapp.mjs");
+  const { batches, splitOversized } = await ingestLib();
+  const sourceName = assertSourceName(flags.source === true || !flags.source ? "whatsapp" : flags.source);
+  const dry = !!flags["dry-run"];
+  const flushOnly = !!flags["flush-sessions"];
+  const outboxPath = flags.outbox && flags.outbox !== true
+    ? resolve(String(flags.outbox))
+    : whatsapp.outboxPathFor(whatsappDataDir(m, options));
+
+  // Verify the outbox exists BEFORE resolving credentials, so "you have not
+  // paired yet" is the first thing an operator sees, named as itself rather
+  // than disguised as a credential or network problem. A flush-only pass reads
+  // no outbox and skips the probe.
+  if (!flushOnly) {
+    const probe = whatsapp.probeOutbox(outboxPath);
+    if (!probe.ok) die(probe.message);
+  }
+
+  const resolveIngestAccount = options.resolveAccount ?? resolveAccount;
+  const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+  const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
+  const acct = dry ? null : m.brain?.domain ? null : await resolveIngestAccount(m);
+  const base = dry ? null : await resolveBase(m, acct);
+  const adminKey = dry ? null : resolveKey(manifestPath);
+  if (!adminKey && !dry) {
+    die(
+      "no durable admin key was found. Re-run `brain setup <manifest>` to generate and persist one; " +
+        "do not paste the key into a shell command."
+    );
+  }
+
+  const postReceipt = options.postSourceReceipt ?? postSourceReceipt;
+  const sendBatch = options.requestIngestBatch ?? requestIngestBatch;
+  const statePath = join(dirname(resolve(manifestPath)), `.brain-ingest-${sourceName}.json`);
+
+  const tally = { created: 0, updated: 0, unchanged: 0, refused: 0, failed: 0 };
+  const sendEnvelopes = async (envelopes) => {
+    const docs = envelopes
+      // The session envelope's generic "message" source_type becomes THIS
+      // load's name, so `brain forget --source whatsapp` scopes to exactly
+      // these documents and `brain sources` counts them under their source.
+      .map((envelope) => ({ ...envelope, source_type: sourceName }))
+      .flatMap((envelope) => splitOversized(envelope))
+      .map((envelope) => ({ envelope }));
+    for (const group of batches(docs)) {
+      const { res, raw } = await sendBatch({ base, adminKey, docs: group.map((g) => g.envelope) });
+      let body = null;
+      try { body = JSON.parse(raw); } catch { /* validated below */ }
+      if (!res.ok || !body) {
+        throw new Error(`the ingest batch failed with ${res.status}: ${String(raw).slice(0, 200)}`);
+      }
+      const results = validateBatchReceipt(body, group);
+      for (const r of results) {
+        tally[r.status]++;
+        if (r.status === "failed") {
+          throw new Error(`the brain reported a document failure for ${r.source_id}: ${r.error || "unknown"}`);
+        }
+      }
+    }
+  };
+
+  const runId = `sync_${randomBytes(16).toString("hex")}`;
+  const startedAt = new Date().toISOString();
+  let receiptOpened = false;
+  if (!dry) {
+    await postReceipt(base, adminKey, {
+      source: sourceName, kind: "whatsapp", status: "indexing",
+      run_id: runId, lane: "manual", started_at: startedAt,
+      detail: flushOnly ? "WhatsApp open-session flush started" : "WhatsApp outbox drain started",
+    });
+    receiptOpened = true;
+  }
+
+  let result;
+  try {
+    result = await whatsapp.drainOnce({
+      outboxPath,
+      statePath,
+      sendEnvelopes,
+      ownerLabel: m.client?.display_name || "Owner",
+      groupingTimezone: m.client?.timezone || "UTC",
+      maxRows: flags.limit ? parseInt(flags.limit, 10) : Infinity,
+      flushOnly,
+      dryRun: dry,
+      reset: !!flags.reset,
+      onPage: ({ page, rows, watermark }) => {
+        process.stdout.write(`\r  page ${page}: ${rows} row(s), cursor ${watermark}   `);
+      },
+    });
+  } catch (error) {
+    if (receiptOpened) {
+      try {
+        await postReceipt(base, adminKey, {
+          source: sourceName, kind: "whatsapp", status: "error", run_id: runId,
+          lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
+          error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
+          detail: "WhatsApp drain aborted; the cursor stayed at the last durable page",
+        });
+      } catch (receiptError) {
+        warn(`the drain failed and its error receipt could not be recorded: ${String(receiptError?.message || receiptError).slice(0, 160)}`);
+      }
+    }
+    if (whatsapp.OUTBOX_ACCESS_REASONS.includes(error?.reason)) die(error.message);
+    throw error;
+  }
+  if (result.pages) process.stdout.write("\n");
+
+  const skipped = result.rows_skipped;
+  const summary =
+    `${result.rows_seen} new row(s) read in ${result.pages} page(s); ${result.rows_pushed} sessionized; ` +
+    `${skipped.media_only} media-only (no text to store), ${skipped.no_text + skipped.no_identity + skipped.no_timestamp} unusable; ` +
+    `${result.documents_sent} conversation document(s) sent; ${result.sessions_open} session(s) still open; ` +
+    `cursor ${result.watermark}`;
+
+  if (dry) {
+    info(summary);
+    ok("dry run, nothing was sent and no state was saved");
+    return result;
+  }
+
+  await postReceipt(base, adminKey, {
+    source: sourceName, kind: "whatsapp", status: "ready",
+    run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
+    docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
+    detail: `WhatsApp drain: ${summary}`,
+  });
+
+  info(summary);
+  ok(`${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged`);
+  if (tally.refused) {
+    warn(`${tally.refused} conversation document(s) refused by the credential gate (a live credential was messaged)`);
+  }
+  if (result.rows_out_of_order) {
+    // History-sync chunks arrive on concurrent connections, so an older
+    // message can carry a newer outbox position. Sorting fixes it inside a
+    // page; across a page boundary one conversation-day can become two
+    // documents. Nothing is lost or duplicated, and staying quiet about it
+    // would make a thinner-looking thread unexplainable.
+    info(`${result.rows_out_of_order} row(s) arrived out of time order across page boundaries (history sync); their conversation may be split across two documents`);
+  }
+  if (result.outbox_writable === false) {
+    warn("the outbox could not be opened for writing, so its drained markers were not updated. The load itself is unaffected; the daemon will keep reporting them as pending.");
+  }
+  info(`progress saved to ${relative(process.cwd(), statePath)}`);
+  return result;
+}
+
+/** Where this install keeps the capture daemon's data, honoring an override. */
+function whatsappDataDir(m, options = {}) {
+  if (options.dataDir) return resolve(options.dataDir);
+  const configured = m?.operations?.whatsapp_data_dir;
+  if (configured) return resolve(String(configured));
+  const slug = m?.client?.slug;
+  if (!slug) die("the manifest needs a client.slug before WhatsApp capture can place its local data directory.");
+  return join(options.home || homedir(), ".brain", "whatsapp", String(slug));
+}
+
+/**
  * Ingest from a connected remote source.
  *
  * Deliberately shares sendBatches() with the local walker, so a Drive document
@@ -6752,11 +6929,13 @@ async function cmdConnect(target) {
   const flags = parseFlags(process.argv.slice(3));
   const which = (target || "").toLowerCase();
   if (which === "imessage") return cmdConnectImessage(process.argv[4], flags);
+  if (which === "whatsapp") return cmdConnectWhatsapp(process.argv[4], flags);
   if (which !== "google") {
     die(
-      "brain connect supports google and imessage.\n" +
+      "brain connect supports google, imessage and whatsapp.\n" +
         "  Usage: brain connect google --scopes drive,gmail,calendar\n" +
-        "         brain connect imessage <manifest>"
+        "         brain connect imessage <manifest>\n" +
+        "         brain connect whatsapp <manifest> --accept-risk"
     );
   }
 
@@ -6893,6 +7072,145 @@ export async function cmdConnectImessage(manifestPath, flags = {}, options = {})
 }
 
 /**
+ * brain connect whatsapp <manifest> --accept-risk — live capture via a paired
+ * linked device.
+ *
+ * OPT-IN, TWICE, DELIBERATELY. Decision D-2 (whether live WhatsApp capture is
+ * opt-in or default-on, and in what words) is not made yet, so this command
+ * refuses to run unless the install record declares the corpus AND the person
+ * at the keyboard passes --accept-risk after reading the disclosure printed
+ * here. If D-2 later lands on default-on, removing a gate is a one-line change;
+ * a capability that shipped on by default and turned out to get an account
+ * banned is not recoverable in one line.
+ *
+ * The order is deliberate. Resolve the binary before printing anything about
+ * pairing, so a missing daemon is a clean sentence rather than a stack trace
+ * halfway through a wizard. Pair in the FOREGROUND — the QR has to reach a
+ * human, and WhatsApp pushes the link-time history exactly once, so the
+ * foreground run stays alive until that history stops arriving. Only then
+ * install the supervised daemon, because the whatsmeow session store is a
+ * single-writer SQLite file and two copies of the daemon would fight over it.
+ * Drain last, so the first scheduled tick starts from a caught-up cursor.
+ */
+export async function cmdConnectWhatsapp(manifestPath, flags = {}, options = {}) {
+  if ((options.platform ?? process.platform) !== "darwin") {
+    die(
+      "installing WhatsApp capture needs macOS: the capture daemon is kept alive by a\n" +
+        "      per-user LaunchAgent, and no Windows service or Startup-task supervision is\n" +
+        "      built in this installer yet. The daemon itself cross-compiles for Windows, so\n" +
+        "      this is a missing installer, not a missing capability — but nothing here will\n" +
+        "      pretend to install something it cannot keep running."
+    );
+  }
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die("usage: brain connect whatsapp <manifest> --accept-risk [--daemon <binary>] [--no-initial-load]");
+  }
+  const { m } = loadManifest(manifestPath);
+  if (m.corpora?.whatsapp?.enabled !== true) {
+    die(
+      "corpora.whatsapp.enabled is not true in this manifest.\n" +
+        '      Add  "whatsapp": { "enabled": true }  under "corpora" first, so the install\n' +
+        "      record says this machine captures WhatsApp before the machinery exists."
+    );
+  }
+
+  const whatsapp = options.whatsapp ?? await import("./connectors/whatsapp.mjs");
+  const daemonAgent = options.whatsappDaemon ?? await import("./operations/whatsapp-daemon.mjs");
+  const drainScheduler = options.whatsappDrainScheduler ?? await import("./operations/whatsapp-drain-scheduler.mjs");
+
+  // Step 1: the binary, before any promise about pairing.
+  let binary;
+  try {
+    binary = whatsapp.resolveDaemonBinary({
+      explicit: flags.daemon,
+      env: options.env ?? process.env,
+      manifest: m,
+      platform: options.platform ?? process.platform,
+    });
+  } catch (error) {
+    if (error?.reason === "daemon_binary_missing") die(error.message);
+    throw error;
+  }
+
+  // Step 2: the disclosure, then the explicit acceptance. Printed every time,
+  // not only the first, because this is the sentence the owner is agreeing to.
+  console.log("");
+  for (const line of whatsapp.WHATSAPP_DISCLOSURE) console.log(line ? `  ${line}` : "");
+  console.log("");
+  if (!flags["accept-risk"]) {
+    die(
+      "nothing was paired. Live WhatsApp capture is opt-in and stays that way until it is\n" +
+        "      decided otherwise. If you have read the two paragraphs above and want it anyway:\n" +
+        `        brain connect whatsapp ${manifestPath} --accept-risk`
+    );
+  }
+
+  const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
+  const adminKey = resolveKey(manifestPath);
+  if (!adminKey) {
+    die("no admin key found, so WhatsApp capture cannot be reflected in source freshness. Run `brain setup <manifest>` first.");
+  }
+  const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+  const base = await resolveBase(m, null);
+
+  // Step 3: pairing, in the foreground, holding on until the link-time history
+  // has stopped arriving.
+  const dataDir = whatsappDataDir(m, options);
+  info(`capture data directory: ${dataDir}`);
+  info(`capture daemon: ${binary.path} (${binary.source})`);
+  info("starting the capture daemon; scan the QR code below with WhatsApp on the phone");
+  const paired = await whatsapp.pairDaemon({
+    binaryPath: binary.path,
+    dataDir,
+    env: options.env ?? process.env,
+    ...(options.pairOptions || {}),
+  });
+  if (paired.alreadyPaired) {
+    ok("this machine was already paired; the existing linked-device session was reused");
+  } else {
+    ok("paired");
+  }
+  info(
+    paired.historyChunks
+      ? `link-time history: ${paired.historyChunks} chunk(s), ${paired.historyInserted} message(s) captured`
+      : "link-time history: none arrived in this window (WhatsApp decides how much a phone transfers, and it can be nothing)"
+  );
+
+  // Step 4: the supervised daemon. Installed only after the foreground copy has
+  // exited, so the two never hold the session store at once.
+  const daemon = daemonAgent.installWhatsappDaemon(manifestPath, {
+    ...(options.daemonOptions || {}),
+    binaryPath: binary.path,
+    ...(options.dataDir ? { dataDir: options.dataDir } : {}),
+  });
+  ok("capture daemon installed and running under launchd (it restarts itself if it crashes or the network drops)");
+
+  // Step 5: the initial drain, in the foreground, with counts.
+  if (!flags["no-initial-load"]) {
+    info("draining what the daemon captured (safe to interrupt; it resumes where it stopped)");
+    await cmdIngestWhatsapp(m, manifestPath, {}, options);
+  } else {
+    info("skipping the initial drain; the first scheduled tick will begin it");
+  }
+
+  // Step 6: the drain tick, plus the freshness expectation that makes
+  // `brain sources` honest about whether capture is actually reaching the brain.
+  const installed = drainScheduler.installWhatsappDrainScheduler(manifestPath, options.schedulerOptions || {});
+  for (const warning of installed.warnings || []) warn(warning);
+  const postExpectation = options.postSourceExpectation ?? postSourceExpectation;
+  await postExpectation(base, adminKey, {
+    source: "whatsapp", kind: "whatsapp", expected_refresh_seconds: installed.expectedRefreshSeconds,
+  });
+  ok(`WhatsApp drain installed for ${installed.cron} (a new message appears within about a minute)`);
+  ok(`freshness expectation set to ${installed.expectedRefreshSeconds} seconds`);
+  info(`daemon definition: ${daemon.plistPath}`);
+  info(`daemon logs: ${daemon.stdoutPath} and ${daemon.stderrPath}`);
+  info(`drain definition: ${installed.plistPath}`);
+  info(`to stop and remove capture later: brain disconnect whatsapp ${manifestPath}`);
+  return { daemon, drain: installed, paired };
+}
+
+/**
  * brain disconnect — the first disconnect verb in this CLI.
  *
  * Same posture as removeDriveScheduler: removal must remain reachable even
@@ -6903,8 +7221,11 @@ export async function cmdConnectImessage(manifestPath, flags = {}, options = {})
 async function cmdDisconnect(target) {
   const flags = parseFlags(process.argv.slice(3));
   const which = (target || "").toLowerCase();
+  if (which === "whatsapp") return cmdDisconnectWhatsapp(process.argv[4], flags);
   if (which !== "imessage") {
-    die("only `brain disconnect imessage <manifest>` exists today.");
+    die("brain disconnect supports imessage and whatsapp.\n" +
+      "  Usage: brain disconnect imessage <manifest>\n" +
+      "         brain disconnect whatsapp <manifest>");
   }
   return cmdDisconnectImessage(process.argv[4], flags);
 }
@@ -6955,6 +7276,85 @@ export async function cmdDisconnectImessage(manifestPath, flags = {}, options = 
   }
   info("captured conversations remain in the brain; remove them with: brain forget " + manifestPath + " --source imessage");
   return removed;
+}
+
+/**
+ * brain disconnect whatsapp <manifest> — stop capture and undo the install.
+ *
+ * Same posture as the iMessage and Drive removals: every step stays reachable
+ * when the manifest's corpus flag is already off, when the daemon binary has
+ * been deleted, and when the brain is unreachable. Requiring the operator to
+ * re-declare the thing they are switching off would strand a loaded
+ * LaunchAgent, and a network failure must never be the reason a background
+ * process cannot be stopped.
+ *
+ * Order matters: stop the drain tick first so nothing races the final pass,
+ * then stop the daemon so nothing new is captured mid-flush, then drain what
+ * the outbox still holds and close the conversations left open. The last steps
+ * are best-effort by design.
+ *
+ * What is deliberately NOT removed: the linked-device session (deleting it
+ * un-pairs the account, which the owner may not want) and the outbox itself.
+ * The pairing is ended from the phone, under Linked Devices, which is the only
+ * place WhatsApp treats as authoritative anyway.
+ */
+export async function cmdDisconnectWhatsapp(manifestPath, flags = {}, options = {}) {
+  if ((options.platform ?? process.platform) !== "darwin") {
+    die("the WhatsApp capture LaunchAgents only exist on macOS, so there is nothing to disconnect here.");
+  }
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die("usage: brain disconnect whatsapp <manifest>");
+  }
+  const { m } = loadManifest(manifestPath);
+  const daemonAgent = options.whatsappDaemon ?? await import("./operations/whatsapp-daemon.mjs");
+  const drainScheduler = options.whatsappDrainScheduler ?? await import("./operations/whatsapp-drain-scheduler.mjs");
+
+  // Step 1: the drain tick, so no scheduled pass races the final one below.
+  const drainRemoved = drainScheduler.removeWhatsappDrainScheduler(manifestPath, options.schedulerOptions || {});
+  ok(drainRemoved.removed || drainRemoved.loaded ? "WhatsApp drain schedule removed" : "the WhatsApp drain schedule was not installed");
+
+  // Step 2: the daemon itself. Nothing new reaches the outbox after this.
+  const daemonRemoved = daemonAgent.removeWhatsappDaemon(manifestPath, {
+    ...(options.daemonOptions || {}),
+    ...(options.dataDir ? { dataDir: options.dataDir } : {}),
+  });
+  ok(daemonRemoved.removed || daemonRemoved.wasLoaded ? "capture daemon stopped and removed" : "the capture daemon was not installed");
+  info(`daemon logs preserved at ${daemonRemoved.stdoutPath} and ${daemonRemoved.stderrPath}`);
+
+  // Step 3: load whatever the daemon captured but the drain had not reached,
+  // then close still-open conversations so dormant threads stay searchable.
+  // Best-effort: a missing key or an unreachable brain must not make removal
+  // unreachable.
+  try {
+    await cmdIngestWhatsapp(m, manifestPath, {}, options);
+    await cmdIngestWhatsapp(m, manifestPath, { "flush-sessions": true }, options);
+  } catch (error) {
+    warn(
+      "capture is stopped, but the final drain and flush did not complete: " +
+        `${String(error?.message || error).slice(0, 200)}\n` +
+        "      Nothing is lost; re-run `brain ingest " + manifestPath + " --from whatsapp` when the brain is reachable."
+    );
+  }
+
+  // Step 4: clear the freshness expectation, so a deliberately disconnected
+  // source is not forever reported as stale. Also best-effort, same reason.
+  try {
+    const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
+    const adminKey = resolveKey(manifestPath);
+    if (!adminKey) throw new Error("no admin key is available");
+    const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+    const base = await resolveBase(m, null);
+    const postExpectation = options.postSourceExpectation ?? postSourceExpectation;
+    await postExpectation(base, adminKey, {
+      source: "whatsapp", kind: "whatsapp", expected_refresh_seconds: null,
+    });
+    ok("WhatsApp freshness expectation cleared");
+  } catch (error) {
+    warn(`capture is removed, but its remote freshness expectation could not be cleared: ${String(error?.message || error).slice(0, 160)}`);
+  }
+  info("the phone is still linked to this machine; end that under WhatsApp, Settings, Linked Devices");
+  info("captured conversations remain in the brain; remove them with: brain forget " + manifestPath + " --source whatsapp");
+  return { daemon: daemonRemoved, drain: drainRemoved };
 }
 
 /** The token provider for a stored Google connection, or a clear refusal. */
@@ -10162,10 +10562,12 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail,calendar  authorise the client's own Google account
     brain connect imessage <manifest>      verify Full Disk Access, load history, capture live (Mac only)
+    brain connect whatsapp <manifest> --accept-risk  pair a linked device and capture live (Mac only, opt-in)
     brain ingest     <manifest> --path <dir>  load a folder into the brain
     brain ingest     <manifest> --from drive  load from a connected remote source
     brain ingest     <manifest> --from calendar  sync Google Calendar (--dry-run to preview)
     brain ingest     <manifest> --from imessage  one incremental Messages capture pass (Mac only)
+    brain ingest     <manifest> --from whatsapp  one drain of the WhatsApp capture outbox
     brain mcp-config <manifest>            config to connect the client's AI tools
     brain schedule   <manifest> --install  install unattended Drive refresh on macOS
     brain support    [--preview|--export <file>]  inspect private local issue notes
@@ -10184,6 +10586,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain schedule   <manifest>            inspect unattended Drive refresh
     brain schedule   <manifest> --remove   remove it and preserve its logs
     brain disconnect imessage <manifest>   stop live capture, flush open sessions, remove the agent
+    brain disconnect whatsapp <manifest>   stop the capture daemon and its drain, flush, remove both agents
     brain support    --clear --yes         clear private local issue notes
 
   brain ingest takes --source <name>, --limit <n>, --dry-run, and --reset. It is

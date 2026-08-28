@@ -91,6 +91,13 @@
           "properties": {
             "enabled": { "type": "boolean", "default": false }
           }
+        },
+        "whatsapp": {
+          "type": "object",
+          "description": "Live WhatsApp capture through a paired linked device, enforced by brain connect whatsapp (which additionally requires the --accept-risk acknowledgement) and drained by brain ingest --from whatsapp. Opt-in by design while the default posture is undecided: pairing joins the account with an unofficial client, a terms-of-service gray area carrying a small but real ban risk, and link-time history depth is only what the phone chooses to transfer. Installing the capture daemon needs macOS; Windows service supervision is not built. Knobs: operations.whatsapp_drain_cron (default: every minute), operations.whatsapp_daemon_path, operations.whatsapp_data_dir.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false }
+          }
         }
       }
     },
@@ -153,6 +160,21 @@
             "reviewed_at": { "type": "string", "format": "date-time" }
           },
           "additionalProperties": false
+        },
+        "whatsapp_drain_cron": {
+          "type": "string",
+          "minLength": 9,
+          "description": "Numeric five-field cron schedule for draining the WhatsApp capture outbox into the brain. Installed as a per-user macOS LaunchAgent alongside the resident capture daemon. Defaults to every minute when absent."
+        },
+        "whatsapp_daemon_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local path to the built WhatsApp capture daemon binary. Not a secret and not a credential; there is no download-on-connect yet, so the binary is either built from daemons/whatsapp or supplied here. Overridden by --daemon and by BRAIN_WHATSAPP_DAEMON."
+        },
+        "whatsapp_data_dir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local directory holding the WhatsApp linked-device session store and the capture outbox. Both the daemon and the drain read this same value; the default is ~/.brain/whatsapp/<client.slug>."
         },
         "google_token_store": {
           "enum": ["auto", "keychain", "file"],

@@ -83,6 +83,7 @@ export const SUPPORT_SOURCES = Object.freeze([
   "obsidian",
   "scheduler",
   "supabase",
+  "whatsapp",
 ]);
 
 export const SUPPORT_ERROR_CODES = Object.freeze([

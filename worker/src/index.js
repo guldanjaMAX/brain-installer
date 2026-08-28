@@ -1045,7 +1045,7 @@ async function handleIngestBatch(env, request) {
 
 const SOURCE_RECEIPT_STATUSES = new Set(["indexing", "ready", "error"]);
 const SOURCE_RUN_LANES = new Set(["incremental", "sweep", "manual"]);
-const SOURCE_KINDS = new Set(["drive", "gmail", "calendar", "imessage", "slack", "notion", "upload"]);
+const SOURCE_KINDS = new Set(["drive", "gmail", "calendar", "imessage", "whatsapp", "slack", "notion", "upload"]);
 
 function receiptTimeMs(value, fallback = Date.now()) {
   if (value === null || value === undefined || value === "") return fallback;
