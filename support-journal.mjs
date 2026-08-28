@@ -79,6 +79,7 @@ export const SUPPORT_SOURCES = Object.freeze([
   "gmail",
   "imessage",
   "installer",
+  "iphone-backup",
   "local",
   "obsidian",
   "scheduler",

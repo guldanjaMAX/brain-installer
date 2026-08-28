@@ -18,6 +18,7 @@ I would rather lose a sale to an honest table than win one and spend week three 
 | WhatsApp | **Built, as an export.** Your phone's own "Export chat" .txt, dropped in a folder you already ingest. No live capture, no daemon, no third-party app risk |
 | Text messages (Android, and Google Voice) | **Built, as an export.** SMS Backup & Restore's .xml export, or a Google Voice Takeout, dropped in a folder you already ingest |
 | iMessage (Mac) | **Built, Mac-only, live.** `brain connect imessage`: Full Disk Access verified by a real read, full history loaded, then scheduler-tick capture (a new message lands within about a minute, not instantly). **Apple only exposes message history on a Mac; there is no path on Windows** |
+| iPhone messages, no Mac (Windows too) | **Built, as a one-time history load.** `brain ingest --from iphone-backup` reads an **unencrypted** local iPhone backup and loads the iMessage and SMS history inside it. A point-in-time snapshot, **not** live capture: nothing new arrives afterwards. Runs on Windows and macOS. Never yet run against a backup Apple wrote |
 | Facebook Messenger | Not built as a product |
 | Zoom | **Built.** `brain connect zoom`: a webhook on your own worker loads each cloud-recording transcript automatically. **Needs a paid (Licensed) Zoom seat** — the free tier cannot cloud record at all. New recordings only, no backfill. Not yet run against a real Zoom account |
 | Slack | Not built. Priced separately when it is |
@@ -135,11 +136,11 @@ If your meetings are on Zoom instead, there is a connector for that — see the 
 
 Either one, dropped in a folder you already ingest, is detected automatically and loaded the same sessionized way WhatsApp is. Unlike WhatsApp, neither format has a locale-dependent date to get wrong: both write an exact, unambiguous timestamp, so there is no disambiguation step here, only correct reading of it.
 
-**iPhone note:** this Android path does not apply to you if you carry an iPhone. Your texts arrive through the iMessage connector instead (built, Mac-only — see Built, above) — turn on Text Message Forwarding and SMS rides in for free alongside iMessage. There is no live SMS-only path for an iPhone without a Mac in the loop.
+**iPhone note:** this Android path does not apply to you if you carry an iPhone. With a Mac, your texts arrive through the iMessage connector (see above) — turn on Text Message Forwarding and SMS rides in for free alongside iMessage. Without a Mac, the iPhone backup load below is the way in, and it is history only. There is no live SMS path for an iPhone without a Mac in the loop, and there is not going to be one.
 
 ### iMessage (Mac only)
 
-**Built, as live capture on a Mac — and only on a Mac, with no way around that.** Apple only exposes your message history to a local app through `chat.db`, which exists on macOS and nowhere else. If your business runs entirely on Windows, this connector does not help you directly — it needs a Mac physically present and awake to run on, even if the rest of your install is elsewhere. A one-time history load from an encrypted iPhone backup (no Mac needed for that specific path) is still planned separately for exactly this reason; it does not exist yet.
+**Built, as live capture on a Mac — and only on a Mac, with no way around that.** Apple only exposes your message history to a local app through `chat.db`, which exists on macOS and nowhere else. If your business runs entirely on Windows, this connector does not help you directly — it needs a Mac physically present and awake to run on, even if the rest of your install is elsewhere. The one thing that does work without a Mac is a **one-time history load from an unencrypted local iPhone backup**, which is a separate thing described below and is a snapshot rather than live capture.
 
 **What `brain connect imessage <manifest>` does, in order:** verifies Full Disk Access by actually reading the database (macOS requires a one-time grant on the exact Node binary; the command prints the precise steps and refuses to install anything until a real read succeeds — it never guesses), runs the full history load in the foreground so you see its counts, then installs a per-user LaunchAgent that runs a short capture tick about once a minute.
 
@@ -174,6 +175,41 @@ The load is the named source `imessage`: `brain sources` shows its freshness aga
 The load is the named source `zoom`, so `brain sources` shows it and `brain forget <manifest> --source zoom` removes every transcript it loaded. `brain disconnect zoom <manifest>` deletes the four secrets from your worker, which makes the webhook refuse every further delivery; removing the subscription inside your Zoom app is yours to do, and the command tells you where.
 
 **The zero-build alternative still works, and is the way to load old calls.** Save a recording's transcript (the `.vtt` file, or run Otter) into a Drive folder you already ingest, and Drive reads it like any other document — exactly the way Google Meet's own Gemini notes already do with no setup at all.
+
+### iPhone messages without a Mac, from a local backup (Windows or macOS)
+
+**Built, as a one-time history load. It is a snapshot, not a connection.** This reads an **unencrypted** local iPhone backup — the kind Finder on a Mac or the Apple Devices app on Windows makes when you plug the phone in — and loads the iMessage and SMS history that backup contains.
+
+**Say this part out loud before anything else:** nothing new arrives after the load. A message sent one minute after that backup was taken is not in it. Bringing history forward means taking a fresh backup and running the load again. Only the Mac connector above keeps up with an ongoing conversation, and that needs a Mac. This exists so that a business with no Mac still gets its message history in on install day, which is otherwise unreachable.
+
+**How to run it:**
+
+```
+brain ingest <manifest> --from iphone-backup                 # find the backup automatically
+brain ingest <manifest> --from iphone-backup --backup <path> # or name the folder
+brain ingest <manifest> --from iphone-backup --dry-run       # count first, send nothing
+```
+
+With no `--backup`, it looks in the usual place for your operating system — `Library/Application Support/MobileSync/Backup` on a Mac; on Windows, classic iTunes' `%APPDATA%\Apple Computer\MobileSync\Backup`, the Apple Devices app's folder under your user profile, and the Microsoft Store build of iTunes' package cache. If it finds two backups it stops and asks which one, rather than picking for you.
+
+**The encrypted-backup catch, which will affect some of you.** If the backup is encrypted, Apple encrypts its file index too, and this loader does not decrypt backups. It detects that and tells you the exact steps to make an unencrypted one, along with the two things worth knowing first: an unencrypted backup is readable by anything else running on that computer (so make it, load it, delete it, and switch encryption back on), and health data and saved passwords only ride along in an encrypted backup.
+
+**What it loads:**
+
+- **iMessage and SMS, both directions**, tagged `imessage` or `sms` from the conversation's own service, exactly as the Mac connector tags them.
+- **Conversations grouped into bounded sessions**, per thread, per day, split on a six-hour quiet gap — the same shape WhatsApp, SMS and iMessage produce, so a citation points at a conversation rather than one floating text.
+- **The same documents the Mac connector would produce.** The extraction is literally the Mac connector's own code, so loading a conversation from a backup and later capturing it live on a Mac lands as the same document, recognised as unchanged rather than duplicated. Running the same backup twice is safe for the same reason.
+
+**What it does not:**
+
+- **Contact names are not resolved.** People appear as their raw phone number or email address, not their Contacts-card name. Your own messages carry your name from the manifest.
+- **Tapbacks, reactions and attachment-only messages are skipped and counted** — the run report says how many — so a thread in the brain is thinner than the same thread on your phone, and that difference is stated rather than hidden.
+- **Attachments themselves are not read.** Only message text.
+- **It does not decrypt anything**, and it does not read a pre-iOS 10 backup (those index files differently). Both are refused by name rather than failing obscurely.
+
+The load is the named source `iphone-backup` (or whatever you pass to `--source`, if you would rather name it by date). `brain forget <manifest> --source iphone-backup` removes every conversation it loaded and nothing else. `brain sources` lists it as its own kind, so a finished snapshot is never presented as live capture that has gone stale.
+
+**The honest boundary:** this has been proven end to end against a synthetic backup built in the test suite — the file index, the property lists, the write-ahead-log sidecar, the encrypted refusal and the message extraction all have tests. It has **not** yet been run against a backup Apple itself wrote, and it has not been run on a real Windows machine; the Windows path handling is proven by construction rather than by a Windows run. Expect the first real backup to surface something, and tell me what it says rather than working around it.
 
 ---
 

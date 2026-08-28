@@ -1046,8 +1046,15 @@ async function handleIngestBatch(env, request) {
 
 const SOURCE_RECEIPT_STATUSES = new Set(["indexing", "ready", "error"]);
 const SOURCE_RUN_LANES = new Set(["incremental", "sweep", "manual"]);
-const SOURCE_KINDS = new Set(["drive", "gmail", "calendar", "imessage", "zoom", "slack", "notion", "upload"]);
-
+const SOURCE_KINDS = new Set([
+  "drive", "gmail", "calendar", "imessage", "zoom",
+  // A one-time history load out of an iPhone backup. Deliberately its own
+  // kind rather than "imessage": it is a point-in-time snapshot with no
+  // refresh expectation, and `brain sources` should never present it as a
+  // live capture that has gone stale.
+  "iphone-backup",
+  "slack", "notion", "upload",
+]);
 function receiptTimeMs(value, fallback = Date.now()) {
   if (value === null || value === undefined || value === "") return fallback;
   if (typeof value === "number" && Number.isFinite(value)) return value;
