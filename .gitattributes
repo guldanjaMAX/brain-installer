@@ -1,0 +1,10 @@
+# Applied schema migrations are checksummed byte-for-byte (see cmdMigrate's
+# checksum guard in brain.mjs). A line-ending change made by a different git
+# client, editor, or `core.autocrlf` setting silently changes that checksum
+# with no content difference at all, and cmdMigrate then refuses to run
+# ANYTHING against that install until a human reconciles it by hand
+# (`brain doctor <manifest> --repair-checksum`) — this is the confirmed cause
+# of the one real field install stranded by this bug so far. Pinning these
+# files to LF, on every platform, regardless of the local git config, is the
+# cheapest way to stop a new instance of this from being created.
+migrations/d1/*.sql text eol=lf
