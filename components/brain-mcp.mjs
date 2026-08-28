@@ -43,6 +43,11 @@ import { describeFailures, responseIncomplete } from "../worker/src/lib/failure.
 const SERVER_VERSION = "0.1.0";
 const DEFAULT_PROTOCOL = "2025-06-18";
 const TIMEOUT_MS = 120_000;
+// One inventory call walks at most this much of the corpus. 500 is the worker's own
+// default page size for source families; ten pages keeps a chat-latency ceiling on
+// a corpus of any size, and anything past it is reported as a floor, never a total.
+const INVENTORY_PAGE_LIMIT = 500;
+const INVENTORY_MAX_PAGES = 10;
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
 
@@ -230,6 +235,41 @@ function renderLesson(v) {
 /* tools                                                               */
 /* ------------------------------------------------------------------ */
 
+// THE READ-ONLY BOUNDARY. Read this before adding a tool to the list below.
+//
+// This process resolves the FULL admin key, not a read-scoped one. The Worker
+// gates every admin route behind that one credential, and this file calls a
+// handful of them. The TOOLS array is therefore not a menu of conveniences: it
+// is the only thing standing between the host model and forget, reindex,
+// drain, refit, bootstrap, ingest/batch and auth/invite.
+//
+// The objection to keeping the boundary is fair and still loses. A host agent
+// with a shell can read the key off disk and curl those routes itself, so this
+// list is not a privilege boundary. What it is, is the APPROVAL surface, and
+// two facts make that worth defending:
+//
+//   1. A shell `curl` to a destructive endpoint reads as a suspicious Bash
+//      call the owner can refuse. A tool named for the thing they were just
+//      asked to approve does not.
+//   2. Prompt injection is live, not theoretical. brain_search returns 900
+//      character excerpts of the owner's own documents and mail straight into
+//      the host model's context. Give that same model a delete tool and one
+//      hostile document becomes a delete primitive. `forget` dry-runs unless
+//      confirm:true, and that guard sits in the request BODY, where a tool
+//      wrapper can set it and silently defeat it.
+//
+// So every tool here is READ-ONLY, with the single pre-existing exception of
+// brain_remember, which writes one contract-validated lesson and nothing else.
+//
+// Write and repair tools (ingest a folder, refresh a connector, drain,
+// reindex) wait on a credential this process cannot yet resolve: an
+// independently rotatable read-only key. operations/rag-proxy-key.mjs names
+// the same unfinished work, and until it lands, rotating away from a
+// compromised MCP process means rotating the key wired into every MCP config
+// on the machine. Until then the honest way to let the model act is to RETURN
+// THE COMMAND AS A STRING for the owner to run, the posture cmdMcpConfig
+// already takes. brain_forget stays off this list permanently.
+
 const TOOLS = [
   {
     name: "brain_think",
@@ -281,8 +321,44 @@ const TOOLS = [
   {
     name: "brain_health",
     description:
-      "Is the wiring intact and the data fresh? Every failure in this layer looks identical from outside (no results); this tells an empty answer apart from a broken pipe or a stale corpus.",
+      "Is the wiring intact and the data fresh? Every failure in this layer looks identical from outside (no results); this tells an empty answer apart from a broken pipe or a stale corpus. It CANNOT see whether the brain is accepting documents: a paused upgrade refuses every write while these counts still read perfectly normally. Call brain_install_state for that.",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "brain_install_state",
+    description:
+      "Can this install do its job right now, and will it accept a document? Call it before reporting an install healthy, before loading anything, and first whenever something is not working. It reports the version and, the reason it exists, whether corpus writes are PAUSED: a half-finished upgrade refuses every ingest with HTTP 503 while brain_health reports normal counts, so this is the only tool that can see that state.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "brain_sources",
+    description:
+      "Every source registered in this brain: what kind it is, how many documents it holds, when it was last read, and whether that is on schedule. This is the starting point for setting up or narrating an install, because it already knows which connectors exist and which are absent, so ask about what is missing instead of asking the owner to describe an install this tool can see. An empty list carrying sources_status \"unavailable\" means the source table could not be read, which is NOT the same finding as nothing being connected.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "brain_diagnose",
+    description:
+      "What is missing from this brain, or stored wrong, or stored wastefully. Answers \"is what is in here correct and complete\", which health counts cannot: every failure this product has had in the field was silent. Each finding carries the action that fixes it, so read the critical ones out rather than summarising them away.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "brain_inventory",
+    description:
+      "How many distinct real-world documents are actually in here, counted as families so an oversized file split into parts, or one chat export split into conversations, counts once. Use it to play back what a load produced. Pass a source name from brain_sources for a per-source inventory. When complete is false the number is a floor and not a total: say \"at least N\" and pass next_cursor back to continue.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: {
+          type: "string",
+          description: "One registered source name. Omit to inventory the whole corpus.",
+        },
+        cursor: {
+          type: "string",
+          description: "next_cursor from a previous incomplete call, to continue the walk.",
+        },
+      },
+    },
   },
 ];
 
@@ -367,7 +443,7 @@ async function runTool(name, args = {}) {
             : { note: 'No hits. Report "nothing recorded on this" rather than inferring.' }),
       };
     }
-case "brain_remember": {
+    case "brain_remember": {
       const v = validateLesson(args);
       if (!v.ok) {
         return {
@@ -429,6 +505,156 @@ case "brain_remember": {
       }
       return d;
     }
+    case "brain_install_state": {
+      const d = await call("/health");
+      // Three states, not two, because an older Worker predates the field that
+      // reports this and answering for it would be inventing the answer.
+      const declared = typeof d.accepting_documents === "boolean" ? d.accepting_documents : null;
+      const pausedSignal = d.status === "paused-for-upgrade" ||
+        d.vector_drain_mode === "paused-for-upgrade" ||
+        d.ok === false;
+      const paused = declared === false || pausedSignal;
+      const out = {
+        brain: d.brain ?? null,
+        version: d.version ?? null,
+        status: d.status ?? null,
+        accepting_documents: paused ? false : declared,
+        vector_drain_mode: d.vector_drain_mode ?? null,
+        checked_at: d.ts ?? new Date().toISOString(),
+      };
+      if (paused) {
+        // THE BLIND SPOT THIS TOOL EXISTS FOR. /api/admin/brain/ingest is one
+        // of the paused corpus-mutation paths, so brain_remember and every
+        // loader get HTTP 503 here, while brain_health keeps returning the
+        // document counts that were already there and looks entirely well. An
+        // assistant reading health alone tells the owner their brain is fine
+        // while it cannot accept a single document.
+        out.writes_paused = true;
+        out.note = "This brain is NOT accepting documents. A paused upgrade refuses every " +
+          "write with HTTP 503, so anything loaded now is refused rather than stored. Say " +
+          "that before loading anything, and do NOT report this install healthy on the " +
+          "strength of brain_health: document counts read normally in exactly this state." +
+          (d.reason ? " The brain's own reason: " + String(d.reason) : "");
+      } else if (declared === null) {
+        out.writes_paused = null;
+        out.note = "This brain is older than the field that reports whether it is accepting " +
+          "documents, so its write state is UNKNOWN. Do not report it either way. Loading " +
+          "something and reading the result is the only way to find out from here.";
+      } else {
+        out.writes_paused = false;
+      }
+      return out;
+    }
+    case "brain_sources": {
+      const d = await call("/api/admin/brain/freshness");
+      // An empty list means two opposite things and the worker distinguishes
+      // them, so this must too: `unavailable` is the source table failing to
+      // read, and reporting that as "nothing is connected" would be stating an
+      // absence we cannot prove.
+      if (d.unavailable) {
+        return {
+          sources_status: "unavailable",
+          count: null,
+          sources: [],
+          note: "The source list could not be read, so this is NOT a finding that nothing " +
+            "is connected. Report that the check did not run, and retry.",
+        };
+      }
+      const rows = Array.isArray(d.sources) ? d.sources : [];
+      const byState = {};
+      for (const s of rows) byState[s.state] = (byState[s.state] || 0) + 1;
+      const attention = rows
+        .filter((s) => ["broken", "stale", "never_synced"].includes(s.state))
+        .map((s) => ({
+          name: s.name,
+          state: s.state,
+          reason: s.reason ?? null,
+          days_since_ingest: s.days_since_ingest ?? null,
+        }));
+      const out = {
+        sources_status: "ok",
+        count: rows.length,
+        by_state: byState,
+        sources: rows,
+        needs_attention: attention,
+      };
+      if (!rows.length) {
+        out.note = "The source table read cleanly and is empty: nothing has been connected " +
+          "to this brain yet. That IS the finding.";
+      } else if (attention.length) {
+        out.note = `${attention.length} source(s) are not current. A source that stopped ` +
+          "being read looks exactly like a source with nothing new in it, so material added " +
+          "since then is missing from answers without ever showing up as a missing answer.";
+      }
+      return out;
+    }
+    case "brain_diagnose": {
+      const d = await call("/api/admin/brain/diagnose");
+      const rank = { crit: 0, warn: 1, info: 2, ok: 3 };
+      const findings = (Array.isArray(d.findings) ? [...d.findings] : [])
+        .sort((a, b) => (rank[a?.severity] ?? 9) - (rank[b?.severity] ?? 9));
+      const crit = Number(d.summary?.crit || 0);
+      return {
+        verdict: d.verdict ?? null,
+        totals: d.totals ?? null,
+        summary: d.summary ?? null,
+        findings,
+        note: crit
+          ? `${crit} critical finding(s). Every finding carries an action; read the critical ` +
+            "ones out in the owner's words rather than summarising them away."
+          : "No critical findings. That says what is IN this brain is well formed. It does " +
+            "not say the right material was loaded: brain_sources and brain_inventory are " +
+            "what answer that.",
+      };
+    }
+    case "brain_inventory": {
+      const source = typeof args.source === "string" && args.source ? args.source : null;
+      let cursor = typeof args.cursor === "string" ? args.cursor : "";
+      let families = 0;
+      let pages = 0;
+      let next = null;
+      const sample = [];
+      // Bounded on purpose. A chat surface must not walk an unbounded corpus,
+      // and a truncated walk that reported its count as a total would be the
+      // exact overclaim this product exists to refuse.
+      while (pages < INVENTORY_MAX_PAGES) {
+        const d = await call("/api/admin/brain/source-families", {
+          method: "POST",
+          body: {
+            ...(source ? { source } : {}),
+            ...(cursor ? { cursor } : {}),
+            limit: INVENTORY_PAGE_LIMIT,
+          },
+        });
+        const page = Array.isArray(d.families) ? d.families : [];
+        families += page.length;
+        pages += 1;
+        for (const uid of page) if (sample.length < 20) sample.push(String(uid));
+        next = d.next_cursor ?? null;
+        if (!next) break;
+        cursor = next;
+      }
+      const complete = !next;
+      const out = {
+        source,
+        families,
+        complete,
+        pages_walked: pages,
+        sample,
+        ...(complete ? {} : { next_cursor: next }),
+      };
+      if (!complete) {
+        out.note = `This is a FLOOR, not a total: the walk stopped after ${pages} page(s) ` +
+          `with more remaining. Say "at least ${families}" and pass next_cursor back to ` +
+          "continue counting.";
+      } else if (!families) {
+        out.note = source
+          ? `Source "${source}" holds no documents. Either it was never loaded, or a load ` +
+            "failed and left no trace."
+          : "This brain holds no documents at all.";
+      }
+      return out;
+    }
     default:
       throw new Error(`unknown tool: ${name}`);
   }
@@ -450,7 +676,13 @@ Relay the gaps array from brain_think whenever it affects confidence. A cited an
 
 Anchor consultation to the artifact, not the moment: whatever you write before acting should name what came back, including anything that argues against the approach you are taking.
 
-Call brain_remember when a session produces a durable lesson. That is how this record improves instead of merely aging.`;
+Call brain_remember when a session produces a durable lesson. That is how this record improves instead of merely aging.
+
+Before you tell the owner this install is healthy, and before you load anything into it, call brain_install_state. A half-finished upgrade refuses every write with HTTP 503 while brain_health still returns normal document counts, and that is the one state the health counts cannot see.
+
+When you are setting up, diagnosing or narrating an install, brain_sources is where to start. It already knows which sources are registered and how current each one is, so ask the owner about what is MISSING rather than asking them to describe an install this server can see for itself. brain_diagnose says what is stored wrong and what to do about it, and brain_inventory counts what actually landed.
+
+These tools are read-only by design, so there is a hard limit worth stating plainly rather than working around: this server can diagnose, narrate, configure and verify an install, and it cannot authorise one. Every OAuth consent screen, bank login, QR pairing and system permission dialog needs the owner's own hand. When you reach one, print the exact steps and wait.`;
 
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\n");
 const ok = (id, result) => send({ jsonrpc: "2.0", id, result });
