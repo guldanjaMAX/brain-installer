@@ -4,6 +4,31 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.20
+
+**A brain stuck mid-upgrade now tells you, and now has a way out.**
+
+- 0.1.19 made a stalled upgrade honest: `/health` reports
+  `accepting_documents: false` while paused instead of a false `ok: true`.
+  But nothing that reads that field back to a person existed yet — an
+  install could sit paused for days with no command saying so. Now
+  `brain doctor <manifest>` checks the deployed brain's own live state, not
+  only this machine's, and fails loudly with an exact next step if it is
+  paused.
+- New: `brain doctor <manifest> --repair` diagnoses a stuck upgrade
+  precisely — which stage it stopped at, how long ago, and the exact D1
+  recovery bookmark captured just before the migration ran — then resumes it
+  safely once you add `--yes`. Resuming replays the same verified upgrade
+  path (`brain update`), which was already idempotent and restart-safe; this
+  just gives the stuck case its own clear entry point instead of leaving you
+  to reconstruct "run it again" out of an error message.
+- New: `brain doctor <manifest> --rollback` does the same diagnosis, then
+  restores D1 to that exact bookmark once you add `--yes` — no more copying
+  a bookmark out of a die() message by hand. If no bookmark can be found, it
+  refuses rather than guessing.
+- Both are previews without `--yes`: they print what they would do and
+  change nothing until you confirm.
+
 ## 0.1.19
 
 **Your brain now has its own app, and your face is the key.**

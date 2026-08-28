@@ -6430,6 +6430,227 @@ function googleAuth(needed) {
  * problems that otherwise appear live, in front of a client, in the first ten
  * minutes of a session.
  */
+/**
+ * Read-only probe of whether a DEPLOYED brain is currently paused mid-upgrade.
+ *
+ * Deliberately tolerant, the same way checkVectorizeApi in doctor.mjs is: this
+ * runs as part of `brain doctor <manifest>`, which has always worked without a
+ * Cloudflare token. A brain with a custom domain answers /health with no token
+ * at all; one without needs an account lookup first, which does need a token.
+ * Either way, any failure here is reported back as "not checked", never thrown,
+ * so a stuck-upgrade check can never be the reason `brain doctor` itself dies.
+ *
+ * WHY THIS EXISTS: before this, nothing on the CLI side ever looked at
+ * vector_drain_mode. 0.1.19 made /health itself honest (accepting_documents:
+ * false while paused), but `brain doctor` — the one command whose whole job is
+ * telling an operator what is wrong — never read that field. A brain could sit
+ * paused for nine days and a `brain doctor <manifest>` run would report "ready
+ * to install" and say nothing about it, because doctor had never been taught to
+ * ask a deployed brain about its OWN state, only about the local machine's.
+ */
+export async function probeUpgradePause(manifestPath, options = {}) {
+  let m;
+  try {
+    ({ m } = (options.loadManifest ?? loadManifest)(manifestPath));
+  } catch (error) {
+    return { checked: false, reason: `manifest could not be read: ${String(error?.message || error).slice(0, 160)}` };
+  }
+
+  let base;
+  try {
+    const resolveProbeAccount = options.resolveAccount ?? resolveAccount;
+    const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+    const acct = m.brain?.domain ? null : await resolveProbeAccount(m);
+    base = await resolveBase(m, acct);
+  } catch (error) {
+    return { checked: false, reason: `could not resolve this install's URL: ${String(error?.message || error).slice(0, 160)}` };
+  }
+  if (!base) return { checked: false, reason: "could not determine a URL for this install" };
+
+  let res, text;
+  try {
+    res = await (options.http ?? http)(`${base}/health`, {}, { timeoutMs: 15_000, what: "the health check" });
+    text = await res.text();
+  } catch (error) {
+    return { checked: false, reason: `could not reach ${base}/health: ${String(error?.message || error).slice(0, 160)}` };
+  }
+
+  let body = null;
+  try { body = JSON.parse(text); } catch { /* raw text is still returned below */ }
+  if (!res.ok || !body || typeof body !== "object") {
+    return { checked: false, reason: `/health returned ${res.status} with an unreadable body`, base };
+  }
+
+  const paused = body.vector_drain_mode === "paused-for-upgrade" || body.accepting_documents === false;
+  return { checked: true, paused, body, raw: text, base };
+}
+
+/**
+ * Everything `brain doctor <manifest> --repair` needs to explain a stuck
+ * upgrade precisely instead of vaguely: which stage it died at, since when,
+ * and the exact D1 recovery bookmark captured before that migration ran.
+ * Read-only; enrichment on top of probeUpgradePause, never a replacement for
+ * it, so a D1 lookup failure still reports the pause itself accurately.
+ */
+export async function diagnoseStuckUpgrade(manifestPath, options = {}) {
+  const probe = await (options.probeUpgradePause ?? probeUpgradePause)(manifestPath, options);
+  if (!probe.checked || !probe.paused) return probe;
+
+  const { m } = (options.loadManifest ?? loadManifest)(manifestPath);
+  const dbId = m.infrastructure?.cloudflare?.d1_database_id;
+  const resolveDiagnoseAccount = options.resolveAccount ?? resolveAccount;
+  const queryDatabase = options.d1Query ?? d1Query;
+
+  let lastRun = null;
+  let installRow = null;
+  let detailError = null;
+  if (dbId) {
+    try {
+      const acct = await resolveDiagnoseAccount(m);
+      const runs = await queryDatabase(
+        acct.id, dbId,
+        "SELECT started_at, finished_at, from_version, to_version, status, d1_bookmark, detail FROM upgrade_runs ORDER BY started_at DESC LIMIT 1",
+      );
+      lastRun = runs?.results?.[0] || null;
+      const state = await queryDatabase(acct.id, dbId, "SELECT * FROM install_state WHERE id = 1");
+      installRow = state?.results?.[0] || null;
+    } catch (error) {
+      detailError = String(error?.message || error).slice(0, 160);
+    }
+  } else {
+    detailError = "manifest has no d1_database_id";
+  }
+
+  const stage = lastRun?.detail && /^stage:/.test(lastRun.detail)
+    ? lastRun.detail.slice("stage:".length)
+    : null;
+  const pausedSinceMs = lastRun?.started_at ? Date.parse(lastRun.started_at) : null;
+  const pausedForMs = Number.isFinite(pausedSinceMs) ? Date.now() - pausedSinceMs : null;
+
+  return { ...probe, lastRun, installRow, stage, pausedSinceMs, pausedForMs, detailError };
+}
+
+function humanDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "an unknown time";
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `${Math.max(minutes, 1)} minute(s)`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours} hour(s)`;
+  return `${Math.round(hours / 24)} day(s)`;
+}
+
+function printStuckUpgradeDiagnosis(diagnosis) {
+  console.log("");
+  if (!diagnosis.checked) {
+    warn(`could not check this brain's live upgrade state: ${diagnosis.reason}`);
+    return;
+  }
+  if (!diagnosis.paused) {
+    ok("this brain is accepting documents; it is not paused for an upgrade.");
+    return;
+  }
+  console.log(`  ${c.red("this brain cannot accept documents right now")}`);
+  console.log("  An update paused its corpus writes for a schema migration and did not finish.");
+  if (diagnosis.stage) console.log(`    stopped at stage:     ${diagnosis.stage}`);
+  if (diagnosis.lastRun?.from_version || diagnosis.lastRun?.to_version) {
+    console.log(`    upgrade:              ${diagnosis.lastRun.from_version || "?"} -> ${diagnosis.lastRun.to_version || "?"}`);
+  }
+  if (diagnosis.lastRun?.started_at) {
+    console.log(`    paused since:         ${diagnosis.lastRun.started_at} (${humanDuration(diagnosis.pausedForMs)} ago)`);
+  }
+  if (diagnosis.lastRun?.d1_bookmark) console.log(`    D1 recovery bookmark: ${diagnosis.lastRun.d1_bookmark}`);
+  if (diagnosis.detailError) console.log(`    (could not read the full upgrade_runs detail: ${diagnosis.detailError})`);
+  console.log("");
+}
+
+/**
+ * `brain doctor <manifest> --repair` / `--rollback`.
+ *
+ * There is exactly one safe way to resume: replay the same verified upgrade
+ * path (`brain update`). It is idempotent and restart-safe by construction —
+ * see cmdMigrate's per-statement resume and cmdUpgrade's stage-by-stage
+ * die()s, both already proven under test — so repair does not reimplement
+ * that logic. It gives the stuck case its own named, precise entry point
+ * instead of leaving an operator to reconstruct "run brain update again" out
+ * of a wall of error text, which is exactly the gap that left Jay's install
+ * paused for nine days with nothing telling him what to do about it.
+ *
+ * Rollback is the other safe path: restore D1 to the exact bookmark this
+ * stuck run itself captured before it touched the schema. Previously the
+ * operator had to copy that bookmark by hand out of the die() message or the
+ * upgrade_runs table before running `brain rollback`; --rollback reads it
+ * straight from D1 instead.
+ */
+export async function cmdDoctorRepair(manifestPath, options = {}) {
+  const action = options.action === "rollback" ? "rollback" : "repair";
+  const confirmed = options.confirmed === true;
+  const diagnose = options.diagnoseStuckUpgrade ?? diagnoseStuckUpgrade;
+  const runUpgrade = options.cmdUpgrade ?? cmdUpgrade;
+  const runRollback = options.cmdRollback ?? cmdRollback;
+
+  const diagnosis = await diagnose(manifestPath, options.diagnoseOptions || {});
+  printStuckUpgradeDiagnosis(diagnosis);
+
+  if (!diagnosis.checked) {
+    die(`could not determine this brain's upgrade state: ${diagnosis.reason}`);
+  }
+  if (!diagnosis.paused) {
+    return { paused: false };
+  }
+
+  if (action === "rollback") {
+    const bookmark = diagnosis.lastRun?.d1_bookmark;
+    if (!bookmark) {
+      die(
+        "this brain is paused, but no D1 restore bookmark could be found in upgrade_runs for the\n" +
+          "      failed run, so an automatic rollback has no safe target.\n" +
+          "      Resume instead: brain doctor <manifest> --repair --yes\n" +
+          "      Or find the bookmark yourself and run: brain rollback <manifest> <bookmark>",
+      );
+    }
+    if (!confirmed) {
+      warn("rollback preview only: nothing was changed.");
+      info(`Re-run with --yes to restore D1 to bookmark ${bookmark}, captured just before this migration.`);
+      info("This restores D1 only; Vectorize needs supervised recreation before reindex, same as `brain rollback`.");
+      return { paused: true, previewed: "rollback", bookmark };
+    }
+    return runRollback(manifestPath, bookmark, { confirmed: true });
+  }
+
+  if (!confirmed) {
+    warn("repair preview only: nothing was changed.");
+    info("Re-run with --yes to resume: this replays the same verified upgrade path (`brain update`),");
+    info("which resumes safely from wherever the stuck run stopped.");
+    return { paused: true, previewed: "repair" };
+  }
+  return runUpgrade(manifestPath, options.upgradeOptions || {});
+}
+
+/** The one extra doctor check that reads a DEPLOYED brain instead of this machine. */
+async function buildUpgradePauseCheck(manifestPath, options = {}) {
+  let probe;
+  try {
+    probe = await (options.probeUpgradePause ?? probeUpgradePause)(manifestPath, options);
+  } catch (error) {
+    probe = { checked: false, reason: String(error?.message || error).slice(0, 160) };
+  }
+  if (!probe.checked) {
+    return { name: "upgrade state", status: D_WARN, detail: `not checked: ${probe.reason}` };
+  }
+  if (probe.paused) {
+    return {
+      name: "upgrade state",
+      status: D_FAIL,
+      detail: "paused for an upgrade; this brain cannot accept documents",
+      fix:
+        "Diagnose exactly where it stopped: brain doctor <manifest> --repair\n" +
+        "  That resumes the same verified upgrade path once you confirm with --yes.\n" +
+        "  To restore the pre-migration snapshot instead: brain doctor <manifest> --rollback",
+    };
+  }
+  return { name: "upgrade state", status: D_OK, detail: "accepting documents" };
+}
+
 async function cmdDoctor(manifestPath) {
   let accountId;
   if (manifestPath && existsSync(manifestPath)) {
@@ -6452,6 +6673,15 @@ async function cmdDoctor(manifestPath) {
       console.log(`  ${mark}  ${x.name.padEnd(18)}  ${x.detail}`);
     },
   });
+
+  // An install-state check, not a machine-readiness check: only meaningful
+  // once a manifest names a real, presumably-deployed brain.
+  if (manifestPath && existsSync(manifestPath)) {
+    const upgradeCheck = await buildUpgradePauseCheck(manifestPath);
+    checks.push(upgradeCheck);
+    const mark = upgradeCheck.status === D_OK ? c.green("ok  ") : upgradeCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
+    console.log(`  ${mark}  ${upgradeCheck.name.padEnd(18)}  ${upgradeCheck.detail}`);
+  }
 
   const s = doctorSummarize(checks);
   console.log("");
@@ -9013,10 +9243,36 @@ async function dispatchRollback(manifestPath) {
   return cmdRollbackInteractive(manifestPath, bookmark, { confirmed: flags.yes === true });
 }
 
+/**
+ * `brain doctor [manifest]` with no flags stays the existing pure preflight.
+ * `brain doctor <manifest> --repair|--rollback [--yes]` is the new stuck-
+ * upgrade path, which needs a Cloudflare token (it reads upgrade_runs and,
+ * once confirmed, mutates D1) so it is wrapped in withCloudflareToken exactly
+ * like `brain update` and `brain setup` already are.
+ */
+async function dispatchDoctor(manifestPath) {
+  const flags = parseFlags(process.argv.slice(3));
+  const repairRequested = flags.repair === true;
+  const rollbackRequested = flags.rollback === true;
+  if (repairRequested && rollbackRequested) {
+    die("choose only one of --repair or --rollback");
+  }
+  if (repairRequested || rollbackRequested) {
+    if (!manifestPath || manifestPath.startsWith("--") || !existsSync(manifestPath)) {
+      die("usage: brain doctor <manifest> --repair [--yes]\n      or: brain doctor <manifest> --rollback [--yes]");
+    }
+    return withCloudflareToken(
+      () => cmdDoctorRepair(manifestPath, { action: rollbackRequested ? "rollback" : "repair", confirmed: flags.yes === true }),
+      { accountId: manifestAccountId(manifestPath) },
+    );
+  }
+  return cmdDoctor(manifestPath);
+}
+
 const commands = {
   setup: cmdSetupInteractive,
   ask: cmdAsk,
-  doctor: cmdDoctor,
+  doctor: dispatchDoctor,
   whatsnew: cmdWhatsnew,
   verify: cmdVerify,
   provision: cmdProvision,
@@ -9081,6 +9337,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain sources    <manifest>            named ingest sources, counts, last ingest
     brain forget     <manifest>            remove one named source (destructive)
     brain upgrade    <manifest>            snapshot, migrate, deploy, verify
+    brain doctor     <manifest> --repair   diagnose a brain stuck mid-upgrade (--yes to resume)
+    brain doctor     <manifest> --rollback preview restore to the pre-migration bookmark (--yes performs it)
     brain rollback   <manifest> <bookmark> preview D1-only restore (--yes performs it)
     brain schedule   <manifest>            inspect unattended Drive refresh
     brain schedule   <manifest> --remove   remove it and preserve its logs
