@@ -275,7 +275,7 @@ so a second install into the same account would adopt the first one's index
 and two clients would share a vector store. Fixed in `brain.mjs`; two
 regression tests in `test/provision-guards.test.mjs`.
 
-### F-07 (MODERATE, open): the printed next-steps do not work
+### F-07 (MODERATE, FIXED): the printed next-steps do not work
 
 `provision` ends with "next: brain migrate, then deploy, then secrets, then
 health". Following that exact sequence **fails at `secrets`**:
@@ -289,7 +289,7 @@ recommends is a dead end. The failure text is good and names the fix; the
 guidance that led there is the defect. Either the hint should say `brain setup`,
 or `secrets` should generate the key.
 
-### F-08 (SERIOUS, open): a healthy clean install exits 1 with raw HTML
+### F-08 (SERIOUS, FIXED): a healthy clean install exits 1 with raw HTML
 
 A clean `brain setup` provisioned, migrated, deployed and set all three secrets
 correctly, then ended:
@@ -309,7 +309,7 @@ earned; this one claims failure that did not happen, on a working install, on
 install day. Drain needs a short retry against a fresh deploy, and the error
 path must never dump an HTML body to the terminal.
 
-### F-09 (MINOR, open): R2 warns even when the manifest disables it
+### F-09 (MINOR, FIXED): R2 warns even when the manifest disables it
 
 With `r2_bucket: null`, `verify` still probes R2 and warns the client must
 enable it "which requires a payment method". Confusing for an install that
@@ -367,7 +367,7 @@ fail  the manifest declares account 0000...0000, but this token can only see:
 States the mismatch, shows the real value, explains the refusal. Use this as
 the house pattern.
 
-### F-10 (SERIOUS, open): `verify` blames itself for the client's typo
+### F-10 (SERIOUS, FIXED): `verify` blames itself for the client's typo
 
 An invalid token in `brain verify` produces:
 
@@ -407,3 +407,17 @@ or trial install.
 Suggested: a `--no-connect` flag (and honour it in `setup`), plus teardown
 guidance. Verified during testing that a test install left a live
 `[mcp_servers.brain-test-bt]` block behind; it had to be removed by hand.
+
+
+---
+
+## Fix pass, 2026-08-28
+
+F-07, F-08, F-09 and F-10 are fixed, each with a regression test that was
+confirmed to fail when the fix is reverted. Full suite green (1,993 assertions).
+
+Still open: **F-11** (the success screen prints a manifest path as
+`../../../../../../../private/tmp/...`) and **F-12** (`brain setup` writes the
+brain into the operator's own `~/.claude.json` and `~/.codex/config.toml` with
+no opt-out and no uninstall). Neither blocks an install; both are worth doing
+before the operator has run many installs on one machine.
