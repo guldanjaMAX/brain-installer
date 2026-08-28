@@ -741,13 +741,41 @@ export async function pairDaemon({
  * no credential of any kind: it writes two local SQLite files and talks only to
  * WhatsApp. Anything else in the parent environment is dropped rather than
  * inherited into a long-lived background process.
+ *
+ * THE ALLOWLIST IS PER-PLATFORM, AND IT USED NOT TO BE. This kept only the
+ * POSIX names and defaulted PATH to `/usr/bin:/bin:/usr/sbin:/sbin`. On a Mac
+ * that is right and invisible; on Windows it handed the daemon an environment
+ * with no SystemRoot and a PATH naming four directories that do not exist,
+ * which is not a cosmetic difference — Go needs SystemRoot to load system DLLs
+ * and to resolve DNS, so pairing would have failed on Windows before any
+ * supervision was even in play. The Windows names below are the same allowlist
+ * `operations/admin-key-file.mjs` and the DPAPI bridge already use.
  */
-export function daemonEnvironment(environment = process.env, dataDir) {
+const POSIX_DAEMON_ENV = ["HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG"];
+const WINDOWS_DAEMON_ENV = [
+  "SystemRoot", "SystemDrive", "windir", "PATH", "PATHEXT", "ComSpec",
+  "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+  "APPDATA", "LOCALAPPDATA", "USERNAME", "USERDOMAIN",
+  "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+];
+
+export function daemonEnvironment(environment = process.env, dataDir, platform = process.platform) {
   const clean = {};
-  for (const name of ["HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG"]) {
+  const windows = platform === "win32";
+  for (const name of windows ? WINDOWS_DAEMON_ENV : POSIX_DAEMON_ENV) {
     if (environment?.[name] !== undefined) clean[name] = environment[name];
   }
-  if (!clean.PATH) clean.PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+  if (windows) {
+    // Windows environment lookups are case-insensitive but a spawned child gets
+    // exactly the keys handed to it, so accept the casings Windows itself uses.
+    if (!clean.SystemRoot) {
+      const root = environment?.SYSTEMROOT || environment?.WINDIR || environment?.windir;
+      if (root) clean.SystemRoot = root;
+    }
+    if (!clean.PATH && environment?.Path) clean.PATH = environment.Path;
+  } else if (!clean.PATH) {
+    clean.PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+  }
   clean.WA_DATA_DIR = dataDir;
   return clean;
 }
