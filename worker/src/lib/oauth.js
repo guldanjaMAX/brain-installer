@@ -24,6 +24,7 @@
  */
 
 import { jsonResponse } from "./core.js";
+import { FAVICON } from "./app-page.js";
 import { randomToken, sessionGeneration } from "./auth-store.js";
 import { validateOwnerSession } from "./owner-auth.js";
 
@@ -174,27 +175,60 @@ export async function handleAuthorizePage(env, url) {
   }
 
   const name = esc(client.client_name || "A connector");
-  const brain = esc(env.BRAIN_NAME || "your brain");
+  const owner = String(env.BRAIN_OWNER || "").trim();
+  // "Dana's brain", not "acme-brain-shadow". The consent screen is the
+  // second thing a client ever sees and the first that names a third party, so
+  // it has to look like the same product the invite did.
+  const brain = esc(owner
+    ? (/s$/i.test(owner) ? `${owner}' brain` : `${owner}'s brain`)
+    : (env.BRAIN_NAME || "your brain"));
   const query = esc(url.search.slice(1));
   const page = `<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Connect to ${brain}</title>
-<style>
-  body{font:16px/1.55 -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f6;color:#1a1a1a;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
-  .card{background:#fff;border:1px solid #e4e0d8;border-radius:12px;padding:26px;max-width:420px;margin:20px}
-  h1{font-size:18px;margin:0 0 10px} p{color:#666;font-size:14.5px;margin:0 0 8px}
-  button{font:inherit;border:0;border-radius:10px;padding:11px 18px;cursor:pointer;background:#3b5bdb;color:#fff;font-weight:600;margin-top:14px;width:100%}
-  button.quiet{background:transparent;color:#666;font-weight:400}
-  .error{color:#b03030;font-size:14px;margin-top:10px}
-</style>
-<div class="card">
-  <h1>${name} wants to read ${brain}</h1>
-  <p>It will be able to <strong>ask questions and read answers</strong> — nothing else. It can never add, change, or delete anything.</p>
-  <p>Approving uses your passkey. Revoke any time from Settings, or with Sign out everywhere.</p>
-  <button id="approve">Approve with passkey</button>
-  <button id="deny" class="quiet">Cancel</button>
-  <p id="err" class="error" hidden></p>
-</div>
+<title>Connect ${name} to ${brain}</title>
+<meta name="theme-color" content="#faf9f6">
+<link rel="icon" href="${FAVICON}">
+<link rel="stylesheet" href="/app/assets/app.css">
+<body class="min-h-dvh flex items-center justify-center p-5">
+<main class="w-full max-w-md">
+  <div class="flex items-center gap-2.5 text-accent mb-6">
+    <svg viewBox="6 24 88 52" class="w-9 h-9" aria-hidden><path d="M50 50 C50 30 16 30 16 50 C16 70 50 70 50 50 C50 30 84 30 84 50 C84 70 50 70 50 50 Z" fill="none" stroke="currentColor" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span class="font-display text-[15px] tracking-tight text-ink-soft">${brain}</span>
+  </div>
+
+  <div class="bg-card border border-line rounded-2xl p-7 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+    <h1 class="text-[24px] leading-tight tracking-tight font-semibold">Connect ${name}?</h1>
+    <p class="text-ink-soft mt-3 leading-relaxed">
+      ${name} is asking to reach ${brain}. Here is exactly what that allows.
+    </p>
+
+    <ul class="mt-6 space-y-2.5">
+      <li class="flex gap-2.5 text-[15px]">
+        <span class="text-accent font-bold leading-6">✓</span>
+        <span class="leading-6">Ask questions and read the answers</span>
+      </li>
+      <li class="flex gap-2.5 text-[15px]">
+        <span class="text-ink-soft font-bold leading-6">✕</span>
+        <span class="leading-6 text-ink-soft">Add, change or delete anything — never</span>
+      </li>
+      <li class="flex gap-2.5 text-[15px]">
+        <span class="text-ink-soft font-bold leading-6">✕</span>
+        <span class="leading-6 text-ink-soft">Reach any setting or admin function — never</span>
+      </li>
+    </ul>
+
+    <button id="approve"
+      class="mt-7 w-full rounded-xl bg-accent px-5 py-3.5 text-white font-semibold disabled:opacity-55 transition-opacity">
+      Approve with Face ID
+    </button>
+    <button id="deny" class="mt-2 w-full rounded-xl px-5 py-3 text-ink-soft">Cancel</button>
+    <p class="mt-4 text-[13px] text-ink-soft leading-relaxed">
+      Approving uses your passkey. Revoke it any time from Settings, or end every
+      connection at once with Sign out everywhere.
+    </p>
+    <p id="err" class="mt-4 text-[14px] text-red-700" hidden></p>
+  </div>
+</main>
 <script>
 (() => {
   "use strict";
@@ -239,7 +273,11 @@ export async function handleAuthorizePage(env, url) {
   return new Response(page, {
     headers: {
       "Content-Type": "text/html; charset=utf-8",
-      "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'",
+      // style-src 'self' for the shared app stylesheet; the ceremony script
+      // stays inline because this page is served mid-redirect and must not
+      // depend on a second request completing.
+      "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'self'; " +
+        "img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
       "Referrer-Policy": "no-referrer",
       "X-Content-Type-Options": "nosniff",
     },

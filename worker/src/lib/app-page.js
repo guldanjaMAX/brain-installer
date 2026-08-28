@@ -50,7 +50,7 @@ export function brandOgSvg(env) {
 }
 
 // Inline so the tab icon needs no second request and no route of its own.
-const FAVICON = "data:image/svg+xml," + encodeURIComponent(
+export const FAVICON = "data:image/svg+xml," + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="6 24 88 52">' +
   '<path d="M50 50 C50 30 16 30 16 50 C16 70 50 70 50 50 C50 30 84 30 84 50 C84 70 50 70 50 50 Z" ' +
   'fill="none" stroke="#3b5bdb" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/></svg>');
