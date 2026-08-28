@@ -517,14 +517,39 @@ check("double encoding is exactly two passes of encodeURIComponent",
 
 {
   // The default ingest path, not an injected one: this is the gate that must
-  // run on every door. The store is rigged to fail loudly if it is reached.
+  // run on every door. The CORPUS tables are rigged to fail loudly if they are
+  // reached.
+  //
+  // The sentinel used to fire on any use of the DB binding at all. It now fires
+  // on any statement touching `documents` or `chunks`, because the webhook
+  // legitimately writes one `zoom_deliveries` row before it acknowledges Zoom
+  // and one `sources` row after. Narrowing it this way keeps the assertion the
+  // test was actually making — a refused transcript never reaches the corpus —
+  // and makes it stricter than "the binding was untouched", which would have
+  // passed for a write to the wrong table.
   let storeTouched = false;
+  const corpusSentinel = (sql) => {
+    if (/\b(documents|chunks|chunks_fts|vector_outbox)\b/i.test(String(sql))) {
+      storeTouched = true;
+      throw new Error("the store must not be reached for a refused document");
+    }
+  };
+  const ledger = new Map();
   const env = mkEnv({
     extra: {
       VECTORIZE: {},
       DB: {
-        prepare() { storeTouched = true; throw new Error("the store must not be reached for a refused document"); },
-        batch() { storeTouched = true; throw new Error("the store must not be reached for a refused document"); },
+        prepare(sql) {
+          corpusSentinel(sql);
+          const shape = (params = []) => ({
+            bind: (...next) => shape(next),
+            run: async () => { ledger.set(sql, params); return { success: true, meta: { changes: 1 } }; },
+            first: async () => null,
+            all: async () => ({ results: [] }),
+          });
+          return shape();
+        },
+        batch: async (statements) => { corpusSentinel("batch"); return statements.map(() => ({ success: true })); },
       },
     },
   });
@@ -541,6 +566,10 @@ check("double encoding is exactly two passes of encodeURIComponent",
     });
     check("a transcript carrying a live credential is refused before the store",
       response.status === 200 && storeTouched === false, String(storeTouched));
+    check("and the refusal is written down as a settled delivery, not merely logged",
+      [...ledger.keys()].some((sql) => /UPDATE zoom_deliveries/.test(sql) && /'refused'/.test(sql)) ||
+        [...ledger.entries()].some(([sql, params]) => /zoom_deliveries/.test(sql) && params.includes("refused")),
+      JSON.stringify([...ledger.keys()].map((s) => s.slice(0, 60))));
     check("the refusal names the credential kind and never quotes its value",
       /aws_access_key/.test(warnings.join(" ")) && !warnings.join(" ").includes("AKIAZXMPLE4TESTKEY01"),
       warnings.join(" "));
