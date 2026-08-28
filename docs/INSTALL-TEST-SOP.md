@@ -421,3 +421,21 @@ Still open: **F-11** (the success screen prints a manifest path as
 brain into the operator's own `~/.claude.json` and `~/.codex/config.toml` with
 no opt-out and no uninstall). Neither blocks an install; both are worth doing
 before the operator has run many installs on one machine.
+
+
+## F-08, wider than first thought
+
+The first observation was a 404 from the workers.dev route. Re-running against
+fresh installs showed a second symptom with the same shape: `drain failed (401):
+unauthorized`, immediately after setup wrote the three secrets. Retried by hand
+two minutes later, the same drain succeeded with no changes. Both are a
+brand-new install being asked a question before it can answer, and both ended a
+completely healthy setup with exit 1. The warm-up covers both.
+
+**Test-hygiene warning, learned the hard way.** Two runs in this pass appeared to
+show route propagation taking over three minutes. They did not. Both manifests
+were copied from a manifest that had already been through setup, and setup
+writes the live address into `brain.domain`. Drain was correctly calling the
+address it was told to call: a worker that had since been deleted. Always build
+a test manifest from `templates/brain.manifest.json`, never by copying a used
+one, or the tool will look broken while doing exactly the right thing.

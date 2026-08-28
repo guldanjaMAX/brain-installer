@@ -7865,7 +7865,9 @@ const HTTP_TIMEOUT_MS = 60_000;
  * from the brain, so say what it is and keep the bytes for the issue note.
  */
 /** How many times a fresh deploy 404 is treated as route warm-up, not failure. */
-const DRAIN_ROUTE_WARMUP_ATTEMPTS = 5;
+const DRAIN_ROUTE_WARMUP_ATTEMPTS = 10;
+/** Individual warm-up delays stop doubling here, so the wait stays legible. */
+const DRAIN_ROUTE_WARMUP_MAX_DELAY_MS = 30_000;
 
 export function summariseResponseBody(raw) {
   const text = String(raw ?? "").trim();
@@ -8770,20 +8772,47 @@ async function cmdDrain(manifestPath, options = {}) {
     // 2026-08-28). /health returned ok moments later. Give the route a short
     // warm-up before believing a 404, bounded so a genuinely wrong address still
     // fails promptly rather than spinning until the deadline.
-    if (res.status === 404 && routeWarmups < DRAIN_ROUTE_WARMUP_ATTEMPTS) {
-      const delayMs = Math.min(2_000 * 2 ** routeWarmups, Math.max(0, deadline - now()));
+    // 404: the workers.dev route is not live yet. 401: the secrets were set
+    // seconds ago and this worker instance has not picked them up. Both are a
+    // brand-new install being asked a question before it can answer, both were
+    // observed ending a perfectly healthy setup with exit 1 (bench, 2026-08-28),
+    // and both clear on their own within a minute or two.
+    if ((res.status === 404 || res.status === 401) && routeWarmups < DRAIN_ROUTE_WARMUP_ATTEMPTS) {
+      const delayMs = Math.min(
+        2_000 * 2 ** routeWarmups,
+        DRAIN_ROUTE_WARMUP_MAX_DELAY_MS,
+        Math.max(0, deadline - now())
+      );
       if (delayMs > 0) {
         routeWarmups += 1;
         info(
-          `the brain's address is not answering yet (404). This is normal just after a ` +
-          `deploy. Retrying ${routeWarmups}/${DRAIN_ROUTE_WARMUP_ATTEMPTS} in ` +
+          (res.status === 401
+            ? "the brain is not accepting this key yet (401). Secrets set seconds ago take a moment to reach it. "
+            : "the brain's address is not answering yet (404). This is normal just after a deploy. ") +
+          `Retrying ${routeWarmups}/${DRAIN_ROUTE_WARMUP_ATTEMPTS} in ` +
           `${Math.ceil(delayMs / 1_000)} second(s).`
         );
         await wait(delayMs);
         continue;
       }
     }
-    if (!res.ok) die(`drain failed (${res.status}): ${summariseResponseBody(raw)}`);
+    if (!res.ok) {
+      // Everything before drain has already succeeded by this point, so a
+      // failure here is "the brain is built but not finished embedding", not
+      // "the install failed". Say which, and give the one command that resumes.
+      const detail = summariseResponseBody(raw);
+      if ((res.status === 404 || res.status === 401) && routeWarmups >= DRAIN_ROUTE_WARMUP_ATTEMPTS) {
+        die(
+          `the brain is built, but it did not start answering in time (${res.status}).\n` +
+          `  Nothing is wrong with what was created: everything up to this point succeeded.\n` +
+          `  A new address can take a few minutes to go live. Check it with:\n` +
+          `    curl ${base}/health\n` +
+          `  then finish the embedding with:\n` +
+          `    brain drain <manifest>`
+        );
+      }
+      die(`drain failed (${res.status}): ${detail}`);
+    }
     const receipt = validateDrainReceipt(body);
     drained += receipt.drained;
     submitted += receipt.submitted;
