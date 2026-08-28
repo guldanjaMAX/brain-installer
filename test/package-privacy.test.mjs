@@ -180,6 +180,8 @@ const expected = [
   "support-journal.mjs",
   "templates/brain.manifest.json",
   "worker/src/index.js",
+  "worker/src/lib/answer-render.js",
+  "worker/src/lib/app-assets.js",
   "worker/src/lib/app-page.js",
   "worker/src/lib/auth-store.js",
   "worker/src/lib/bank-feed.js",

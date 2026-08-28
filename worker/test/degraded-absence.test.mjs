@@ -463,18 +463,23 @@ const EMPTY_DEGRADED_THINK = {
 }
 
 /* ---- the /app page renders the notice, not the refusal ---- */
-/* The page's render logic is lifted out of the SERVED HTML and executed. An
-   earlier version of this block grepped the source for a pattern and passed
-   even with the branch disabled by `false &&`, which is exactly the kind of
-   test that proves nothing. These call the real shipped functions. */
+/* These call the REAL shipped functions, which is the point: an earlier
+   version grepped the source for a pattern and would have passed with the
+   branch disabled by `false &&`.
+
+   They used to be lifted out of the served HTML by sentinel comments, because
+   the page was hand-written JavaScript inside a template string. The app is now
+   a built bundle, so there is no page to lift them from; they live in
+   answer-render.js, which the Worker page and the React app both import. The
+   assertions below are unchanged, and the mechanism is stricter than before:
+   this imports the module the product actually runs rather than re-evaluating
+   a copy of it. */
 {
-  const { appPageHtml } = await import("../src/lib/app-page.js");
-  const html = appPageHtml({ BRAIN_NAME: "fixture" });
-  const fenced = html.match(/\/\* render-contract:start[\s\S]*?\/\* render-contract:end \*\//);
-  check("/app exposes its render contract to this test", !!fenced, "sentinels missing from the served page");
-  const render = new Function(
-    `${fenced[0]}; return { answerText, confidenceText, unavailableSearch };`,
-  )();
+  const render = await import("../src/lib/answer-render.js");
+  check("/app exposes its render contract to this test",
+    typeof render.answerText === "function" && typeof render.confidenceText === "function" &&
+      typeof render.unavailableSearch === "function",
+    "answer-render.js must export the three render functions");
 
   const degradedBody = {
     status: SEARCH_UNAVAILABLE, degraded: "vector", notice: unavailableNotice("vector"),

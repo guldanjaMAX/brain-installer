@@ -26,6 +26,7 @@ import {
   sessionGeneration, bumpSessionGeneration,
 } from "./auth-store.js";
 import { appPageHtml, brandOgSvg } from "./app-page.js";
+import { APP_JS, APP_CSS } from "./app-assets.js";
 
 const APP_HEADER = "X-Brain-App";
 
@@ -93,15 +94,35 @@ export async function handleOwnerAuth(env, request, url, path) {
       },
     });
   }
+  if (path === "/app/assets/app.js" || path === "/app/assets/app.css") {
+    if (request.method !== "GET") return jsonResponse({ error: "not found" }, 404);
+    const isJs = path.endsWith(".js");
+    return new Response(isJs ? APP_JS : APP_CSS, {
+      headers: {
+        "Content-Type": isJs ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8",
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }
   if (path === "/app" && request.method === "GET") {
     // Absolute URLs: a link scraper resolves og:image against nothing.
     return new Response(appPageHtml(env, url.origin), {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
+        // The shell must never be cached. It carries the per-install owner
+        // name and the bundle id that cache-busts the app, so a stale copy
+        // survives an upgrade and quietly serves the previous build's
+        // identity. It is under a kilobyte; caching it saves nothing and
+        // costs correctness. The bundle itself stays immutable.
+        "Cache-Control": "no-store",
         // The page is self-contained by construction; the CSP makes that a
         // promise instead of a habit. Inline script is the page itself.
+        // Stronger than the inline page it replaced: with the app served from
+        // this origin, 'unsafe-inline' is gone from both script and style.
         "Content-Security-Policy":
-          "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'",
+          "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; " +
+          "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
       },

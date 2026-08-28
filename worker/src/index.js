@@ -1481,7 +1481,7 @@ export default {
     // It sat behind the key gate at first, so every shared invite would have
     // previewed as a 401 instead of an image.
     if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/") ||
-        path.startsWith("/brand/")) {
+        path.startsWith("/brand/") || path.startsWith("/app/assets/")) {
       return handleOwnerAuth(env, request, url, path);
     }
 

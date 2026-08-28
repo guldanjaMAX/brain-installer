@@ -70,3 +70,8 @@ docs/*-readiness-*.md
 # unshipped-gate status stay local. Product honesty about limitations belongs
 # in the shipped docs, where it is written for the owner; strategy does not.
 planning/
+
+# Frontend build inputs. The built bundle ships as worker/src/lib/app-assets.js,
+# which IS committed; dist/ and node_modules are not.
+frontend/node_modules/
+frontend/dist/

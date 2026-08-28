@@ -18,6 +18,12 @@ export type Confidence = { percent: number; band: string; basis: string[] };
 export type Answer = {
   answer: string | null;
   answer_error?: string;
+  // Set when the search itself did not complete. Distinct from a genuine
+  // no-match, and the difference decides what the page is allowed to say.
+  status?: string;
+  degraded?: string;
+  notice?: string;
+  results?: unknown[];
   confidence?: Confidence;
   citations?: Citation[];
 };

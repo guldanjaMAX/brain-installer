@@ -16,6 +16,10 @@ export function Gate({ owner, inviteCode, onIn }: {
   const [error, setError] = useState<string | null>(null);
   const enrolling = Boolean(inviteCode);
   const possessive = owner ? (/s$/i.test(owner) ? `${owner}'` : `${owner}'s`) : "Your";
+  // First name in the greeting: a client opening this is being welcomed, not
+  // addressed formally, and "Dana, your brain is ready" reads like a person
+  // wrote it where "Dana Okonkwo's brain is ready" reads like a database did.
+  const firstName = owner.trim().split(/\s+/)[0] || "";
 
   async function go() {
     setError(null);
@@ -50,7 +54,9 @@ export function Gate({ owner, inviteCode, onIn }: {
 
         <div className="bg-card border border-line rounded-2xl p-7 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
           <h1 className="text-[26px] leading-tight tracking-tight font-semibold">
-            {enrolling ? "Your brain is ready" : "Welcome back"}
+            {enrolling
+              ? firstName ? `${firstName}, your brain is ready` : "Your brain is ready"
+              : firstName ? `Welcome back, ${firstName}` : "Welcome back"}
           </h1>
           <p className="text-ink-soft mt-3 leading-relaxed">
             {enrolling
