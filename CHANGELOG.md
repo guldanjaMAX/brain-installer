@@ -4,6 +4,48 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.22
+
+**Your brain can now read your texts — live, if you have a Mac.**
+
+Until now, messages only entered your brain as exports: WhatsApp's
+per-chat .txt, or Android's SMS backup file. This release adds the first
+LIVE message connector, for iMessage, and it is worth being precise about
+what that means.
+
+- New: `brain connect imessage <manifest>` on a Mac. It first verifies the
+  one macOS permission this needs (Full Disk Access for the exact program
+  that reads the Messages database) by actually reading the database — if
+  the grant is missing it prints the exact steps and installs nothing,
+  rather than installing something that fails silently every minute. Then
+  it loads your full message history in front of you, with counts, and
+  only then schedules ongoing capture.
+- Ongoing capture is a short scheduled pass about once a minute, not an
+  always-running program. A new text appears in your brain within about a
+  minute. A sleeping or closed Mac captures nothing until it wakes, and
+  `brain sources` will say so honestly instead of pretending freshness.
+- SMS text messages ride in alongside iMessage when your iPhone's Text
+  Message Forwarding is on, and are tagged separately so the two stay
+  distinguishable.
+- Honest limits, stated up front: this requires a Mac, full stop — Apple
+  exposes message history nowhere else. People appear as their phone
+  number or email, not their Contacts name. Tapbacks and attachment-only
+  messages are counted and skipped, so a thread here is thinner than the
+  same thread on your phone. Conversations are grouped into bounded
+  per-day sessions, the same shape WhatsApp exports produce.
+- New: `brain disconnect imessage <manifest>` — the first disconnect
+  command in this tool. It stops and removes the capture schedule, saves
+  any conversations still in progress so they stay searchable, and leaves
+  your already-captured history in the brain. Removing the history too is
+  one explicit command: `brain forget <manifest> --source imessage`.
+- Everything captured passes the same credential gate as every other
+  source: a text containing a live password or API key is refused, named,
+  and never stored.
+
+What to check after updating: nothing changes until you run
+`brain connect imessage` yourself. If you do, run `brain sources` the next
+day and confirm the imessage row is fresh.
+
 ## 0.1.21
 
 **A migration whose file changed after it ran can now be reconciled, without

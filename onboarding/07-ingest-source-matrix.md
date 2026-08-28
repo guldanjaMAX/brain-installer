@@ -17,7 +17,7 @@ I would rather lose a sale to an honest table than win one and spend week three 
 | Meetings (Google Meet) | **Built, with no extra work.** Meet's own Gemini notes land as a transcript document in Drive, which is already read |
 | WhatsApp | **Built, as an export.** Your phone's own "Export chat" .txt, dropped in a folder you already ingest. No live capture, no daemon, no third-party app risk |
 | Text messages (Android, and Google Voice) | **Built, as an export.** SMS Backup & Restore's .xml export, or a Google Voice Takeout, dropped in a folder you already ingest |
-| iMessage (Mac) | Not built yet. **Apple only exposes message history on a Mac; there is no path on Windows.** Sprint 1 |
+| iMessage (Mac) | **Built, Mac-only, live.** `brain connect imessage`: Full Disk Access verified by a real read, full history loaded, then scheduler-tick capture (a new message lands within about a minute, not instantly). **Apple only exposes message history on a Mac; there is no path on Windows** |
 | Facebook Messenger | Not built as a product |
 | Zoom | Not built as a connector. **Zero-build v0 available today**, see below |
 | Slack | Not built. Priced separately when it is |
@@ -69,7 +69,7 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 
 Built as a connector. Connect your Google account with the Gmail scope, then run the normal Gmail ingest command. Later runs are incremental through Gmail's history cursor, and bulk mail is excluded by default.
 
-**The honest production boundary:** the connector has passed the product test suite but has not yet completed a real-mailbox production run. The packaged unattended scheduler is currently Drive-only, so Gmail refresh is manual until that scheduler is extended. Treat Gmail as built but not yet production-proven.
+**The honest production boundary:** the connector has passed the product test suite but has not yet completed a real-mailbox production run. The packaged unattended scheduler currently covers Drive and iMessage, not Gmail, so Gmail refresh is manual until it is extended. Treat Gmail as built but not yet production-proven.
 
 Shared mailboxes and group threads contain messages from people who never agreed to be indexed. Your material stays in your own accounts throughout, which handles most of the exposure, but a business indexing a shared inbox should have a written note about it. Cheap to write now, expensive to retrofit after an employee asks.
 
@@ -135,7 +135,24 @@ If your meetings are on Zoom instead, see the Zoom entry below — the same zero
 
 Either one, dropped in a folder you already ingest, is detected automatically and loaded the same sessionized way WhatsApp is. Unlike WhatsApp, neither format has a locale-dependent date to get wrong: both write an exact, unambiguous timestamp, so there is no disambiguation step here, only correct reading of it.
 
-**iPhone note:** this Android path does not apply to you if you carry an iPhone. Your texts arrive through the iMessage connector instead, once it exists (see below) — turn on Text Message Forwarding and SMS rides in for free alongside iMessage. There is no live SMS-only path for an iPhone without a Mac in the loop.
+**iPhone note:** this Android path does not apply to you if you carry an iPhone. Your texts arrive through the iMessage connector instead (built, Mac-only — see Built, above) — turn on Text Message Forwarding and SMS rides in for free alongside iMessage. There is no live SMS-only path for an iPhone without a Mac in the loop.
+
+### iMessage (Mac only)
+
+**Built, as live capture on a Mac — and only on a Mac, with no way around that.** Apple only exposes your message history to a local app through `chat.db`, which exists on macOS and nowhere else. If your business runs entirely on Windows, this connector does not help you directly — it needs a Mac physically present and awake to run on, even if the rest of your install is elsewhere. A one-time history load from an encrypted iPhone backup (no Mac needed for that specific path) is still planned separately for exactly this reason; it does not exist yet.
+
+**What `brain connect imessage <manifest>` does, in order:** verifies Full Disk Access by actually reading the database (macOS requires a one-time grant on the exact Node binary; the command prints the precise steps and refuses to install anything until a real read succeeds — it never guesses), runs the full history load in the foreground so you see its counts, then installs a per-user LaunchAgent that runs a short capture tick about once a minute.
+
+**Capture is scheduler-tick, not instant push.** A new message appears in the brain within about a minute of arriving, when the next tick runs — there is no resident daemon watching the database continuously. A Mac that is asleep or shut does not capture; the next tick after it wakes catches up from exactly where the last one stopped, and `brain sources` reports the staleness honestly in the meantime.
+
+What it captures, and what it does not:
+
+- **Texts, both directions, iMessage and SMS.** SMS conversations arrive in the same database when your iPhone's Text Message Forwarding is on, and are tagged `sms` so they stay distinguishable. Without forwarding, only iMessage traffic exists on the Mac to capture.
+- **Conversations are grouped into bounded sessions** (per thread, per day, split on a six-hour quiet gap) — the same shape WhatsApp and SMS exports produce — so a citation points at a conversation, not one floating text.
+- **Contact names are not resolved.** People you text appear as their raw phone number or email address, not their Contacts-card name. Your own messages carry your name from the manifest.
+- **Tapbacks, reactions and attachment-only messages are skipped and counted** — the run report says how many — so a thread in the brain is thinner than the same thread on your phone, and that difference is stated rather than hidden.
+
+The load is the named source `imessage`: `brain sources` shows its freshness against the once-a-minute expectation, and `brain forget <manifest> --source imessage` removes every captured conversation. `brain disconnect imessage <manifest>` stops and removes the capture agent, flushes still-open conversations so they remain searchable, and leaves already-captured history in the brain unless you forget it explicitly.
 
 ---
 
@@ -171,13 +188,9 @@ If your business runs on Microsoft rather than Google, **this product is not rea
 
 **Not built.** Both are straightforward when the demand justifies them. Airtable in particular needs the meaning of your tables mapped by hand, so it gets quoted as configuration work rather than a connection.
 
-### iMessage, and Facebook Messenger
+### Facebook Messenger
 
-**Not built as an installed product yet.** WhatsApp and SMS both have a built export path today (see Built, above); iMessage and Messenger do not.
-
-**iMessage live capture requires a Mac in the loop, and there is no way around that.** Apple only exposes your message history to a local app through `chat.db`, which exists on macOS and nowhere else. If your business runs entirely on Windows, this connector, when it exists, will not help you directly — it needs a Mac physically present to run on, even if the rest of your install is elsewhere. A one-time history load from an encrypted iPhone backup (no Mac needed for that specific path) is planned separately for exactly this reason. Personal messaging capture of this kind exists in my own brain today; it is not yet part of what is installed for a client, and I am not going to pretend otherwise because it works on my machine.
-
-Facebook Messenger has no export or capture path built at all yet, live or otherwise.
+**Not built,** as a product, in any form — no export parser, no capture path, live or otherwise.
 
 ### Zoom
 
