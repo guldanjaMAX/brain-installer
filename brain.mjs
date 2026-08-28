@@ -12574,6 +12574,38 @@ async function cmdInvite(manifestPath) {
   return invite;
 }
 
+/**
+ * Print a fresh recovery card for the owner.
+ *
+ * Cloudflare is OPTIONAL here for the same reason `brain invite` makes it
+ * optional: printing a new card must keep working after our account token is
+ * revoked at handoff, from the client's own machine with their own admin key.
+ */
+async function cmdRecoveryCodes(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
+  const res = await http(`${base}/api/admin/auth/recovery-codes`, {
+    method: "POST",
+    headers: { "X-Admin-Key": adminKey },
+  }, { timeoutMs: 30_000, what: "the recovery codes" });
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) die(`recovery codes failed (${res.status}): ${String(payload.error || "").slice(0, 200)}`);
+  ok("a new recovery card was printed; every previously unused code is now dead");
+  console.log("");
+  for (const code of payload.recovery_codes || []) console.log(`    ${code}`);
+  console.log(
+    "\n  These are shown ONCE. Give them to the owner on paper, and watch them put the\n" +
+    "  paper somewhere that is not the phone they sign in with. Any ONE of them creates\n" +
+    "  a new passkey on a new device if every enrolled device is lost.\n\n" +
+    "  A code cannot read, ingest, purge or reindex. It can only cut a new key for the\n" +
+    "  same door — which is why it is a safer thing for them to keep than the admin key.\n"
+  );
+  return payload;
+}
+
 /** List or revoke the owner's enrolled passkeys. */
 async function cmdDevices(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
@@ -12994,6 +13026,7 @@ const commands = {
   eval: cmdEval,
   invite: cmdInvite,
   devices: cmdDevices,
+  "recovery-codes": cmdRecoveryCodes,
   token: cmdToken,
   update: cmdUpdate,
   upgrade: cmdUpgradeInteractive,
@@ -13026,6 +13059,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain token      <manifest>            is a Cloudflare token remembered on this Mac? --forget removes it
     brain invite     <manifest>            one-tap passkey enrollment link for the owner (Face ID, 15 min)
     brain devices    <manifest>            enrolled passkeys; --revoke <credential id> removes one
+    brain recovery-codes <manifest>        print a fresh recovery card (5 one-time codes, shown once)
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail,calendar  authorise the client's own Google account
     brain connect imessage <manifest>      verify Full Disk Access, load history, capture live (Mac only)
