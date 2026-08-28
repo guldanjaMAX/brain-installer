@@ -8079,8 +8079,21 @@ async function cmdConnect(target) {
   const unknown = names.filter((n) => !SCOPES[n]);
   if (unknown.length) die(`unknown scope(s): ${unknown.join(", ")}. Choose from: ${Object.keys(SCOPES).join(", ")}`);
 
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  // Adding a scope to an EXISTING connection must not demand credentials this
+  // machine already holds. The stored connection carries the client id and
+  // secret (googleAuth builds its token provider from them), and the scope
+  // refusal tells the operator to re-run this command, so requiring the
+  // environment variables again made that instruction a dead end: the message
+  // named the fix and the fix could not run. Reuse what is stored, and fall
+  // back to the environment only for a first connection.
+  const priorGoogle = (() => {
+    try { return loadTokens().google || null; } catch { return null; }
+  })();
+  const clientId = process.env.GOOGLE_CLIENT_ID || priorGoogle?.client_id;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET || priorGoogle?.client_secret;
+  if (clientId && !process.env.GOOGLE_CLIENT_ID) {
+    info("reusing the Google client already stored on this machine; no credential was re-entered.");
+  }
   if (!clientId) {
     die(
       "GOOGLE_CLIENT_ID is not set.\n\n" +
