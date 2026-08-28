@@ -310,6 +310,21 @@ again removes only the obsolete representation after every replacement part is
 accepted. A document-level failure leaves the Drive cursor unadvanced so the
 same change is retried instead of being acknowledged and lost.
 
+A family is addressed by ONE uid, and there are two ways to belong to it.
+**Structural**: `splitOversized` names each slice `<base>#part1of3`, so the base
+is a literal prefix of every member. **Declared**: one message export (a
+WhatsApp `.txt`, an SMS Backup & Restore `.xml`, a Google Voice Takeout page)
+becomes many conversation-session documents that keep their own
+`message:<first message id>` identity, so nothing in their names points back at
+the file they came from. Each one carries `metadata.family_of` holding the
+fully qualified uid of that file instead. `forgetFamilies` covers both, and it
+refuses any `keep_doc_uids` entry that is neither, because the delete scope
+comes from the base alone: a keep list expressed in the wrong identity space
+protects nothing while the scope is real, and cleanup would then remove the
+revision it was called to reconcile. Any new producer that turns one input into
+many documents must stamp `family_of`; leaving it out is a hard refusal at plan
+time rather than a silently unreconcilable source.
+
 A Google Doc is exported as text, a Sheet as CSV, and a Google Form not at all.
 
 `modifiedTime` is deliberately **not** used as a document date. A sync or a

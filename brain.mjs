@@ -3990,6 +3990,52 @@ export function driveSyncDecision({
   return { incremental: true, reason: "saved change token is current" };
 }
 
+/**
+ * Reconciliation identity for one source file that became MANY documents.
+ *
+ * WHY THIS EXISTS AT ALL. Cleanup addresses a family by ONE uid: forgetFamilies
+ * derives the delete scope from `base_doc_uid` alone, and `keep_doc_uids` are
+ * the members of that scope this revision is protecting. That contract holds
+ * only while the base really does name the family the stored rows belong to.
+ *
+ * THREE WAYS TO MAKE IT HOLD FOR A MESSAGE EXPORT, and why this one:
+ *
+ *   1. Rename the documents. Give each conversation session a source_id derived
+ *      from the file path so the base is a literal prefix, the way splitOversized
+ *      does. Rejected: source_id IS document identity. It is the citation, the
+ *      idempotency key, and the same sessionEnvelope feeds the iMessage,
+ *      WhatsApp-daemon, iPhone-backup and migration paths, which have no file
+ *      path at all. Renaming would duplicate every already-ingested session on
+ *      the next sync of every client who has already loaded one.
+ *   2. Loosen the worker's guard so the current mismatched plan is accepted.
+ *      Rejected, and measured: the delete scope keyed on the file path contains
+ *      none of the `message:<id>` rows, so a permissive guard answers 200 and
+ *      deletes nothing, orphaning stale sessions forever while reporting
+ *      success. It also removes the one signal that says the model is wrong.
+ *   3. Make the relationship TRUE instead of assumed. The producer writes the
+ *      family uid into each document (`metadata.family_of`, ingest/run.mjs), the
+ *      store's delete scope reads it, and the guard checks membership against
+ *      that same declaration. Chosen: document identity is untouched, the
+ *      guard gets stronger rather than weaker, and one declaration also repairs
+ *      applyDriveRemovals, which had the identical wrong-key defect.
+ *
+ * The base is read back off the SANITIZED envelopes rather than recomputed,
+ * so the plan can only ever name the exact string the documents carry.
+ */
+export function declaredFamilyUid(envelopes, { rel } = {}) {
+  const declared = [...new Set((envelopes || []).map(
+    (envelope) => String(envelope?.metadata?.family_of || "")
+  ))];
+  if (declared.length !== 1 || !declared[0]) {
+    throw new Error(
+      `${rel || "a multi-document file"} produced documents that do not agree on one family. ` +
+      "A producer that turns one file into many documents must stamp every envelope with the same " +
+      "metadata.family_of, or cleanup cannot address them as a unit. Nothing was sent."
+    );
+  }
+  return declared[0];
+}
+
 export function completedDriveFamilyPlans(plans, acceptedCounts) {
   return (plans || []).filter((plan) => acceptedCounts.get(plan.stateKey) === plan.expectedParts);
 }
@@ -5078,11 +5124,12 @@ async function cmdIngest(manifestPath) {
     const r = await prepare(f, { sourceName });
     if (r.note) notes.push({ path: f.rel, note: r.note });
 
-    // A multi-document producer (today: a WhatsApp export sessionized into
-    // many conversation documents from one .txt file) has no single envelope
-    // identity to key state on, so the file's own path is the family key.
-    // Every other branch below is unchanged from the single-envelope path;
-    // this only widens what "one prepared unit" is allowed to mean.
+    // A multi-document producer (a WhatsApp export, an SMS Backup & Restore
+    // .xml, a Google Voice Takeout page, each sessionized into many
+    // conversation documents from one file) has no single envelope identity to
+    // key state on, so the file's own path is the state key. Every other branch
+    // below is unchanged from the single-envelope path; this only widens what
+    // "one prepared unit" is allowed to mean.
     if (r.envelopes) {
       const key = String(f.rel).split(sep).join("/");
       if (!scannerPolicyChanged && r.hash && state.done[key] === r.hash) {
@@ -5122,8 +5169,14 @@ async function cmdIngest(manifestPath) {
           stateKey: key,
           hash: r.hash,
           expectedParts: sanitized.length,
-          base_doc_uid: `${sourceName}:${key}`,
-          keep_doc_uids: sanitized.map((envelope) => `${sourceName}:${envelope.source_id}`),
+          // The family uid the documents themselves declare, and the doc_uids
+          // the brain will actually store. Both used to be built from
+          // `sourceName` and the file path, which is neither the namespace nor
+          // the identity a session document is stored under, so a fully
+          // successful ingest ended in a rejected cleanup. See
+          // declaredFamilyUid above for the options and the reasoning.
+          base_doc_uid: declaredFamilyUid(sanitized, { rel: f.rel }),
+          keep_doc_uids: sanitized.map((envelope) => `${envelope.source_type}:${envelope.source_id}`),
           skipKeys: [key, f.rel, ...sanitized.map((envelope) => envelope.source_id)],
           legacyPartRoot: [key, f.rel],
         },

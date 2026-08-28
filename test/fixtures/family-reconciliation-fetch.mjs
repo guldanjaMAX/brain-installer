@@ -1,6 +1,6 @@
 /*
- * REPRODUCTION FIXTURE (failing on purpose). See
- * test/family-reconciliation-repro.test.mjs for what it proves.
+ * REGRESSION FIXTURE. See test/family-reconciliation.test.mjs for what it
+ * proves.
  *
  * Node loads this with --import before brain.mjs, so the CLI's real local
  * folder ingest runs end to end against a scripted brain that never leaves
@@ -25,6 +25,10 @@ import { forgetFamilies } from "../../worker/src/lib/store-d1.js";
 
 const userRoot = String(process.env.BRAIN_FAMILY_REPRO_USER_ROOT || "");
 const evidencePath = String(process.env.BRAIN_FAMILY_REPRO_EVIDENCE || "");
+// A file path here makes the scripted brain OUTLIVE one CLI process, which is
+// what lets a test re-load the same export into the same brain and prove that
+// the second load neither duplicates nor deletes anything.
+const dbPath = String(process.env.BRAIN_FAMILY_REPRO_DB || ":memory:");
 if (!userRoot) throw new Error("BRAIN_FAMILY_REPRO_USER_ROOT is required");
 if (!evidencePath) throw new Error("BRAIN_FAMILY_REPRO_EVIDENCE is required");
 
@@ -41,14 +45,22 @@ const failEveryPart = process.env.BRAIN_FAMILY_REPRO_FAIL_ALL === "1";
 
 /* --------------------------------------------- a real D1-shaped SQLite env */
 
-const db = new DatabaseSync(":memory:");
+const db = new DatabaseSync(dbPath);
 {
+  // A file-backed brain is reused across CLI runs, so the schema is applied
+  // once and then left alone. Re-running the migrations over a populated
+  // database is what a second `brain ingest` would never do either.
+  const alreadyInstalled = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='documents'")
+    .get();
   const dir = fileURLToPath(new URL("../../migrations/d1/", import.meta.url));
-  for (const file of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
-    db.exec(readFileSync(join(dir, file), "utf-8"));
+  if (!alreadyInstalled) {
+    for (const file of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+      db.exec(readFileSync(join(dir, file), "utf-8"));
+    }
   }
   db.prepare(
-    `INSERT INTO install_state
+    `INSERT OR IGNORE INTO install_state
        (id, client_slug, product_version, schema_version, gate_version, installed_at, ring)
      VALUES (1, 'fixture', '0.0.0', 12, 0, '2026-01-01T00:00:00Z', 'test')`
   ).run();
@@ -90,10 +102,17 @@ const workerEnv = {
   },
 };
 
-const storeDocument = (docUid, source, sourceId, title) => db.prepare(
-  `INSERT OR REPLACE INTO documents (doc_uid, source, source_id, title, ingested_at, content_hash)
-   VALUES (?, ?, ?, ?, ?, ?)`
-).run(docUid, source, sourceId, title || docUid, Date.now(), `hash:${docUid}`);
+// meta is stored because the real store stores it (worker/src/lib/store.js
+// writes envelope.metadata into documents.meta). A family a document DECLARES
+// rather than spells out in its name lives there, so a fixture that dropped it
+// could not see the family at all.
+const storeDocument = (docUid, source, sourceId, title, metadata) => db.prepare(
+  `INSERT OR REPLACE INTO documents (doc_uid, source, source_id, title, ingested_at, content_hash, meta)
+   VALUES (?, ?, ?, ?, ?, ?, ?)`
+).run(
+  docUid, source, sourceId, title || docUid, Date.now(), `hash:${docUid}`,
+  JSON.stringify(metadata || {}),
+);
 
 /* --------------------------------------------------------------- evidence */
 
@@ -101,6 +120,7 @@ const initialEvidence = () => ({
   ingestBatches: 0,
   storedDocUids: [],
   forgetRequests: [],
+  forgetResults: [],
   forgetRejections: [],
   receipts: [],
 });
@@ -152,7 +172,7 @@ globalThis.fetch = async (input, options = {}) => {
       const failed = failEveryPart || failSourceIds.has(String(doc.source_id));
       if (failed) return { source_id: doc.source_id, status: "failed", error: "synthetic store failure" };
       const docUid = `${doc.source_type}:${doc.source_id}`;
-      storeDocument(docUid, doc.source_type, doc.source_id, doc.title);
+      storeDocument(docUid, doc.source_type, doc.source_id, doc.title, doc.metadata);
       evidence.storedDocUids.push(docUid);
       return { source_id: doc.source_id, status: "created" };
     });
@@ -174,6 +194,7 @@ globalThis.fetch = async (input, options = {}) => {
     // Exactly what worker/src/index.js does with the real store function.
     try {
       const out = await forgetFamilies(workerEnv, { families, dryRun: body.confirm !== true });
+      evidence.forgetResults.push({ documents: Number(out.documents || 0), dry_run: out.dry_run === true });
       save();
       return json(out);
     } catch (error) {

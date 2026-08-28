@@ -136,6 +136,40 @@ function decodeText(buf) {
 }
 
 /**
+ * The document family that one multi-document source file produces.
+ *
+ * A message export is ONE file that becomes MANY documents, one per
+ * conversation session, and each of those keeps its own message-namespace
+ * identity (`message:<first message id>`) so a citation still points at the
+ * conversation rather than at the container it arrived in. Nothing inside
+ * those uids names the file, so the file cannot be reconciled or removed as a
+ * unit unless every document it produced says out loud which file it came
+ * from. `family_of` is that statement. It carries the FULLY QUALIFIED family
+ * uid (`<source>:<path>`), so no prefixing rule has to be re-derived at read
+ * time and no namespace can be guessed wrong.
+ *
+ * Deliberately NOT `part_of`. `part_of` means "this row is one slice of a
+ * single logical document": storage counts a part_of family as ONE logical
+ * document (worker store.js stats, worker index.js source receipts) and
+ * collapses it into one inventory slot (store-d1.js listSourceFamilies). Two
+ * conversation sessions out of one export are two logical documents with two
+ * separate citations, so borrowing part_of for them would quietly mis-count
+ * every message export. family_of adds the missing "same origin file" edge
+ * without changing what a document is.
+ */
+export function sourceFileFamilyUid(file, sourceName) {
+  return `${sourceName}:${String(file.rel).split(sep).join("/")}`;
+}
+
+/** Stamp every document a multi-document file produced with its family uid. */
+function declareFamily(envelopes, familyUid) {
+  return envelopes.map((envelope) => ({
+    ...envelope,
+    metadata: { ...(envelope.metadata || {}), family_of: familyUid },
+  }));
+}
+
+/**
  * One export file, many documents. Sessionizes through the same
  * message-session.mjs every other chat platform uses, so a WhatsApp export
  * lands identically to iMessage/SMS/Messenger history once those connectors
@@ -178,7 +212,7 @@ async function prepareWhatsAppExport(file, buf, hash, { sourceName }) {
   for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
   envelopes.push(...sessionizer.finish());
 
-  return { hash, envelopes };
+  return { hash, envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)) };
 }
 
 /**
@@ -207,7 +241,7 @@ function prepareSmsBackupXml(file, buf, hash, { sourceName }) {
   const envelopes = [];
   for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
   envelopes.push(...sessionizer.finish());
-  return { hash, envelopes };
+  return { hash, envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)) };
 }
 
 /** One Google Voice Takeout conversation page, many documents. */
@@ -232,7 +266,7 @@ function prepareGoogleVoiceTakeout(file, buf, hash, { sourceName }) {
   const envelopes = [];
   for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
   envelopes.push(...sessionizer.finish());
-  return { hash, envelopes };
+  return { hash, envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)) };
 }
 
 /**
