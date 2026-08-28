@@ -41,10 +41,13 @@
  * what talks to the client's worker. The plist carries WA_DATA_DIR and the OS
  * basics, and a test asserts nothing else appears in it.
  *
- * macOS ONLY, STATED RATHER THAN IMPLIED. Windows service or Startup-task
- * supervision is NOT built. No Windows process-supervision pattern exists
- * anywhere in this repo to follow, and inventing one deserves its own design
- * pass rather than a guess bolted onto this package.
+ * macOS ONLY, STATED RATHER THAN IMPLIED. This module supervises with launchd
+ * and nothing else. Windows is supervised by its own sibling,
+ * `operations/windows-supervision.mjs`, which registers a Scheduled Task; the
+ * two share the label convention, the data-directory resolution and the log
+ * policy, and share no mechanism, because launchd and Task Scheduler agree on
+ * nothing that matters here. A Windows caller reaching this module is a routing
+ * bug, so the refusal below names the module that should have been used.
  */
 
 import {
@@ -98,7 +101,7 @@ function assertMac(platform = process.platform) {
   if (platform !== "darwin") {
     throw new Error(
       `the WhatsApp capture daemon is supervised with a macOS LaunchAgent; this machine reports ${platform}. ` +
-        "Windows service supervision is not built."
+        "On Windows use operations/windows-supervision.mjs, which registers a Scheduled Task."
     );
   }
 }

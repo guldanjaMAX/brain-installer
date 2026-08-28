@@ -68,7 +68,8 @@ export const WHATSAPP_DRAIN_SCHEDULER_SPEC = Object.freeze({
     "brain.domain is required for the unattended WhatsApp drain because the scheduled child intentionally receives no Cloudflare deployment token",
   platformError: (platform) =>
     `unattended WhatsApp draining is scheduled with a macOS LaunchAgent; this machine reports ${platform}. ` +
-    "Windows service supervision is not built, so there is no unattended path there yet.",
+    "On Windows the same tick is scheduled by operations/windows-supervision.mjs, which registers a " +
+    "Scheduled Task and relies on MultipleInstancesPolicy where this path relies on lockf.",
   defaultSchedulerPath: () => SELF_PATH,
   // No connector-specific reference fields: the drain child needs no token
   // store, only the manifest-declared admin key it resolves itself.
