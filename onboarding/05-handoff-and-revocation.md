@@ -59,6 +59,7 @@ Everything. Here it is written down, because "you own it" is worthless if nobody
 | Answer model | Cloudflare Workers AI in [ACCOUNT EMAIL] | Writes the answers in the same account, capped at $[CAP] per day |
 | Source access | [GOOGLE SERVICE ACCOUNT / OAUTH CLIENT] | Read-only access to your own folders |
 | Admin key | [WHERE YOU STORED IT] | The password to your brain. Treat it like one |
+| Your recovery card | [WHERE YOU PUT THE PAPER] | Five one-time codes. Any one of them puts you back into your brain from a brand-new device if you lose every device you can sign in with |
 | Your manifest | `[PATH / REPO]` | The one file that describes your install. Contains no secrets |
 | The installer and its tools | `[PATH / REPO]` | Everything needed to verify, update, or rebuild |
 
@@ -86,6 +87,7 @@ Then, from the installer folder:
 | See what version you are on, and the update history | `node brain.mjs status <manifest>` |
 | Reconnect your AI tools, or add a new machine | `node brain.mjs mcp-config <manifest>` |
 | Change a key or password | `node brain.mjs secrets <manifest>` |
+| Print a new recovery card | `node brain.mjs recovery-codes <manifest>` |
 
 `brain secrets` is the exact admin-key rotation command. It normally reads the
 existing value from the manifest's durable local storage. A deliberate new
@@ -110,6 +112,38 @@ automatically: replace its manual entry with the locator-only output from
 2. Read the failures and warnings at the bottom. The freshness line is the one to watch: a brain that quietly stops taking in new material still answers confidently, using old information.
 3. Run `node brain.mjs sources <manifest>` and check the last ingest date on each line.
 4. Check your Cloudflare bill against the numbers in section 2.
+
+### If you lose the device you sign in with
+
+You sign in to your brain with a passkey — your face or your fingerprint, on
+your own device. If that device is lost, destroyed or wiped, the way back is
+the **recovery card** you were handed at setup: five one-time codes.
+
+On the new device, open [BRAIN URL]/app, tap **"Lost the device you sign in
+with?"** under the Sign in button, and type one code. It creates a new passkey
+there and signs you in, and it signs out every session that existed before — so
+if the old phone was stolen rather than dropped, that ends its access too.
+
+Then print a new card from Settings. Printing one kills every unused code on
+the old card, which is also what to do if you think the paper was photographed.
+
+**A code cannot do anything except let a device sign in.** It cannot read your
+material on its own, cannot load anything, cannot delete anything and cannot
+reach any admin command. That is deliberate: it is a safer thing to keep in a
+drawer than the admin key, which before this existed was the only way back in.
+
+**The honest limit.** If every device AND every recovery code are gone, nothing
+on that page can let you back in, and neither can I — at handoff I deleted my
+token and you rotated the admin key to a value I have never seen. Nothing is
+lost: it all still sits in your Cloudflare account, and `brain invite` with your
+admin key, or a new `ADMIN_KEY` secret set from your own Cloudflare dashboard,
+puts you back. **If your Cloudflare login is also gone, this product cannot
+help you** — everything lives inside that account, and getting it back is
+between you and Cloudflare. Keep that login, its recovery email and its
+two-factor backup somewhere you can reach in a bad week.
+
+`06-runbook-top-ten-failures.md` has all three routes written out step by step,
+under **"You lost the device you sign in with"**.
 
 ### When something breaks
 
@@ -167,6 +201,11 @@ Complete list. Nothing omitted.
 | Your intake answers and my notes | Your ten questions, your sources, your exclusions. No credentials | Until you ask me to delete them |
 | A copy of your manifest | Resource names and IDs. **No secrets.** Every credential in it is a reference to a store, never a value | Until you ask me to delete it |
 | Our email and message history | Whatever we wrote to each other | Normal business records |
+
+I also hold **no recovery code**. The card was printed by your own brain, into
+your own hands, and only the hashes of those codes exist anywhere — inside your
+own database. If I kept a copy it would be a standing key to your business,
+which is the exact thing this whole arrangement exists to avoid.
 
 **No copy of your documents. No copy of your index. No database. No keys.** Not as a matter of discipline, but because the architecture never routed your material through anything I own.
 

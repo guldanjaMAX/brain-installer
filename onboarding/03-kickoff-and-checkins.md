@@ -59,6 +59,22 @@ Then you ask it something. Not one of the ten. Something you thought of this mor
 
 This is the moment it stops being a system I showed you and becomes a thing you own.
 
+## 0:48, your recovery card
+
+Your brain prints five one-time codes onto the screen. They exist for one
+situation: the phone you sign in with is lost, destroyed or wiped, and you need
+back into your own material from a device it has never seen.
+
+Write them down or print them, on paper, before we go any further. Any one of
+them creates a new sign-in on a new device and nothing else — a code cannot
+read, load or delete anything, so it is a safer thing to keep in a drawer than
+the admin key.
+
+Then keep the paper somewhere that is not the phone. A card photographed and
+stored on the device it is meant to replace is not a recovery plan.
+
+I do not keep a copy. Only hashes of those codes exist, in your own database.
+
 ## 0:52, I remove my access
 
 Live, on the screen, with you watching.
@@ -146,6 +162,20 @@ Separate the two kinds of gap out loud:
 Let them type. Resist correcting the first command. A ten second fumble they resolve themselves is worth more than a flawless demo you drive.
 
 Do not use one of the ten questions here. Those are yours to have prepared. This one has to be theirs, unrehearsed, or the moment does not land.
+
+## 0:48, the recovery card
+
+**Watch them write it down.** Do not say "you can screenshot that". A card
+screenshotted onto the phone it exists to replace is not a card, and this is
+the only moment anyone will pay attention to it.
+
+If the codes did not appear because this install predates them, print a set now
+with `brain recovery-codes <manifest>` and hand it over on paper.
+
+Say the honest limit out loud, once: **if every device and every code is gone,
+their Cloudflare login is the last way in, and if that is gone too, nobody can
+help — not you, not us.** It is in the runbook in those words. Saying it here
+is what makes the runbook believable when they read it at 2am.
 
 ## 0:52, the revocation
 

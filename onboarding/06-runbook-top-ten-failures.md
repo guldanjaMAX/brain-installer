@@ -57,6 +57,76 @@ Given a manifest it goes past this machine and reads your brain's own state: whe
 
 ---
 
+## You lost the device you sign in with
+
+This is not one of the ten below, and it does not need a command line. It has
+its own section here because it is the one failure where a person is worried
+about being locked out of their own life, and it needs to be answered first.
+
+**Your brain has a recovery card: five one-time codes, printed when it was set
+up.** Any one of them creates a new sign-in on a new device.
+
+1. On the new phone or laptop, open your brain's address and add `/app`.
+2. Under the Sign in button, tap **"Lost the device you sign in with?"**.
+3. Type one code from the card and follow the Face ID or fingerprint prompt.
+
+You are back in. That code is now used up; four remain, and the card shows how
+many are left in Settings. Every device that was signed in before is signed
+out, on purpose: if the old phone was stolen rather than dropped in a lake, its
+session dies at that moment.
+
+**Print a new card whenever you want.** Sign in, open Settings, and choose
+*Print a new recovery card*. Printing a new one kills every unused code on the
+old one, so it is also what to do if you think somebody photographed it.
+
+### If you never got a card
+
+Brains installed before recovery cards existed do not have one. Sign in on the
+device you still have, open Settings, and *Print a new recovery card*. Do it
+today, not on the day you need it. If the page says recovery codes are not
+available on this install, your database is a version behind: ask
+[INSTALLER CONTACT] to run the update, or run `node brain.mjs update <manifest>`
+yourself.
+
+### If every device and every code is gone
+
+Say it plainly, because a comforting answer here would send you looking for a
+door that is not there: **nothing on that page can let you back in.** Not
+[INSTALLER CONTACT], either — at handoff they deleted their Cloudflare token
+and you rotated the admin key to a value they have never seen, which is the
+whole point of how this was built.
+
+**Nothing is lost.** Every document, every answer and every index is sitting in
+your own Cloudflare account, and you can still get back in through it:
+
+1. **If you still have your admin key**, mint a fresh setup link from the
+   installer folder and open it on your new device:
+
+   ```
+   node brain.mjs invite <manifest>
+   ```
+
+   Then print a new card straight away with
+   `node brain.mjs recovery-codes <manifest>`.
+
+2. **If the admin key is gone too**, you still own the account everything lives
+   in. Log in to Cloudflare, open your worker, and set a new `ADMIN_KEY` secret
+   — or from the installer folder, run `node brain.mjs secrets <manifest>`.
+   Then use `brain invite` as above.
+
+3. **If your Cloudflare login is also gone**, this product cannot help you and
+   neither can [INSTALLER CONTACT]. Everything lives inside that account.
+   Recovering it is between you and Cloudflare's own account recovery, so keep
+   that login, its recovery email and its two-factor backup somewhere you can
+   still reach in a bad week. That is the real single point of failure, and it
+   is better that you know it now than discover it later.
+
+The short version, worth writing on the card itself: **the recovery codes and
+your Cloudflare login are the two things to keep. Everything else can be
+rebuilt from them.**
+
+---
+
 ## Stop and call [INSTALLER CONTACT]: two results that are emergencies
 
 These two are different from everything below. Do not work around them.
