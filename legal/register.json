@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "what_this_is": [
+    "The register of client-facing paperwork this product owes a client BEFORE it reads",
+    "their archive. It is a tracking mechanism, not the paperwork and not legal advice.",
+    "Nothing in this repository establishes that any of these documents is legally",
+    "sufficient; a founder writes them and a lawyer reviews them.",
+    "Each artifact binds itself to a release with the visible line",
+    "'**Applies to release <version>.**', the same stamp the maintainer documents use.",
+    "operations/legal-register.mjs measures the file rather than trusting this register:",
+    "missing, unstamped, stale (stamped to another release), unapproved, or ready.",
+    "An approval is approval of a text describing one version. When the version moves,",
+    "the approval goes stale with it, because a single release can add a processor."
+  ],
+  "cannot_see": [
+    "Anything outside the installed package. If signed paperwork exists in a drive folder,",
+    "an e-signature account, or a founder's inbox, nothing here can know that. Callers must",
+    "report 'no version-bound artifact in this install', never 'the client has no paperwork'."
+  ],
+  "artifacts": [
+    {
+      "id": "CLIENT-TERMS",
+      "title": "Client terms of service",
+      "file": "legal/client-terms.md",
+      "required_before": "archive-read",
+      "approval": "missing",
+      "supplied_by": "founders, reviewed by counsel",
+      "blocks_install": false,
+      "why_not_blocking": "Nothing in code should decide unilaterally that an engagement may not proceed. Whether missing paperwork stops an install is a founder's call, and it is one boolean away: set this to true and the pre-install report turns from a warning into a blocker that returns a non-zero exit code. It is false today because no founder has made that call, not because the paperwork is optional.",
+      "what_a_human_must_supply": "The agreement the client signs for the engagement itself: scope, fee, what the operator does and does not do, what happens at handoff, and which party owns what. It must survive the fact that the operator holds a scoped credential during the engagement and nothing after it."
+    },
+    {
+      "id": "PRIVACY-NOTICE",
+      "title": "Privacy notice",
+      "file": "legal/privacy-notice.md",
+      "required_before": "archive-read",
+      "approval": "missing",
+      "supplied_by": "founders, reviewed by counsel",
+      "blocks_install": false,
+      "why_not_blocking": "Nothing in code should decide unilaterally that an engagement may not proceed, and the pre-install report cannot see paperwork held outside the package. Set this to true and the same finding becomes a blocker with a non-zero exit code. It is false because no founder has made that call, not because the notice is optional.",
+      "what_a_human_must_supply": "What material the product reads, from which sources, on whose instruction, and what the client can ask for afterwards. It has to cover third parties whose personal data arrives incidentally \u2014 message counterparties, calendar attendees, mail senders \u2014 because the client is not the only person in their own archive."
+    },
+    {
+      "id": "DATA-PROCESSING-TERMS",
+      "title": "Data processing terms",
+      "file": "legal/data-processing-terms.md",
+      "required_before": "archive-read",
+      "approval": "missing",
+      "supplied_by": "founders, reviewed by counsel",
+      "blocks_install": false,
+      "why_not_blocking": "Nothing in code should decide unilaterally that an engagement may not proceed. This one is also the likeliest to be waiting on counsel rather than on a founder, so a hard block here would stop installs on somebody else's calendar. Set it to true when the founders decide it should stop one.",
+      "what_a_human_must_supply": "The processing relationship in writing: who is controller, who is processor, on what instructions, with what security commitments, and what happens on termination. This is the artifact most likely to need a lawyer rather than a careful founder."
+    },
+    {
+      "id": "SUBPROCESSOR-LIST",
+      "title": "Named subprocessor list",
+      "file": "legal/subprocessors.md",
+      "required_before": "archive-read",
+      "approval": "missing",
+      "supplied_by": "founders, from a per-release audit of the code",
+      "blocks_install": false,
+      "why_not_blocking": "Same reason as the client terms. Note this is the artifact the release stamp matters most for: a single release can add an outbound host, and a list stamped to an older release can be wrong about which companies received the client's material.",
+      "what_a_human_must_supply": "Every company that can receive client material, in any form, at any point, split into those involved on every install and those the client deliberately turns on. Each row needs whose account it runs in and exactly what triggers it. A draft of this exists outside the repository, written by reading the shipped code; it is unsigned and is not the artifact this register tracks until it is stamped and filed here."
+    },
+    {
+      "id": "RETENTION-AND-DELETION",
+      "title": "Retention and deletion policy",
+      "file": "legal/retention-and-deletion.md",
+      "required_before": "archive-read",
+      "approval": "missing",
+      "supplied_by": "founders, reviewed by counsel",
+      "blocks_install": false,
+      "why_not_blocking": "Nothing in code should decide unilaterally that an engagement may not proceed. Set this to true and the pre-install report turns from a warning into a blocker. It is false because no founder has made that call, not because the policy is optional.",
+      "what_a_human_must_supply": "What the operator retains after handoff and for how long, what the client can have deleted and how fast, and an honest statement of the limit: deleting a database does not erase a platform's own internal retention, so certified deletion is a question for the platform and not something this product can promise on its behalf."
+    }
+  ],
+  "notes": [
+    "No artifact file exists yet. Every entry is in state 'missing', and the pre-install",
+    "report says so rather than staying quiet. That is the honest current state.",
+    "Adding a file is not enough to reach 'ready': it must carry the release stamp for the",
+    "running version AND have its approval recorded here by a human who actually approved it."
+  ]
+}

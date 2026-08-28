@@ -40,7 +40,7 @@ for (const [, tagVersion, assetVersion] of releaseLinks) {
 // Historical references ("version 0.1.13 established ...") are untouched on
 // purpose: an append-only guide has to be able to name old releases. Only the
 // stamp is checked.
-const STAMPED_DOCS = ["docs/README-developer.md", "docs/MAINTAINER.md"];
+const STAMPED_DOCS = ["docs/README-developer.md", "docs/MAINTAINER.md", "legal/README.md"];
 for (const path of STAMPED_DOCS) {
   const stamped = readReleaseStamp(read(path));
   assert.ok(stamped, `${path} carries no "Applies to release" stamp`);
