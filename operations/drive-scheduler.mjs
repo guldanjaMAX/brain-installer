@@ -1,15 +1,30 @@
 #!/usr/bin/env node
 /**
- * Unattended Google Drive ingest for macOS.
+ * Unattended connector scheduling for macOS, with Google Drive ingest as the
+ * first and default connector.
  *
  * A LaunchAgent is machine-local product infrastructure, not an instance-specific
  * artifact. Its label and paths are derived from the client slug, while the
- * schedule comes from operations.ingest_cron in that client's manifest.
+ * schedule comes from that client's manifest.
  *
  * The plist deliberately contains no credentials. The child uses the normal
  * Google token store and brain's normal resolveAdminKey behavior. Cloudflare
  * deployment credentials are removed from the child environment because an
  * ingest against a configured brain.domain does not need them.
+ *
+ * GENERALIZED FOR A SECOND CONNECTOR (WP-06), CAREFULLY. Everything hardened
+ * here — atomic plist staging with rollback, the native lockf single-instance
+ * lock, bounded symlink/hardlink-refusing log rotation, and the config-hash
+ * guard that stops a stale LaunchAgent from reading credentials against an
+ * edited manifest — now runs for ANY connector through a small spec object
+ * (label kind, cron source, manifest validation, child argv/environment).
+ * The Drive spec below reproduces the original behavior byte for byte: the
+ * same label, the same paths, the same messages, and the exact same config
+ * hash payload, so an already-installed Drive LaunchAgent keeps validating
+ * after this refactor. Every previously exported Drive-named function remains
+ * exported with identical behavior; the generic names are the same functions
+ * with the spec parameter left open. See operations/imessage-scheduler.mjs
+ * for the first second consumer.
  */
 
 import {
@@ -80,22 +95,28 @@ const CRON_FIELDS = Object.freeze([
   { name: "weekday", launchd: "Weekday", min: 0, max: 7, normalize: (n) => n === 7 ? 0 : n, cardinality: 7 },
 ]);
 
-function integer(value, label) {
-  if (!/^\d+$/.test(String(value))) throw new Error(`invalid ${label} "${value}" in ingest cron`);
+/** How a cron expression is named in error text, per connector. */
+const DRIVE_CRON_LABELS = Object.freeze({
+  key: "operations.ingest_cron",
+  noun: "ingest cron",
+});
+
+function integer(value, label, cronNoun = DRIVE_CRON_LABELS.noun) {
+  if (!/^\d+$/.test(String(value))) throw new Error(`invalid ${label} "${value}" in ${cronNoun}`);
   return Number(value);
 }
 
-function expandCronField(text, spec) {
+function expandCronField(text, spec, cronNoun = DRIVE_CRON_LABELS.noun) {
   const raw = String(text || "").trim();
-  if (!raw) throw new Error(`missing ${spec.name} in ingest cron`);
+  if (!raw) throw new Error(`missing ${spec.name} in ${cronNoun}`);
   const values = new Set();
 
   for (const segment of raw.split(",")) {
     const pieces = segment.split("/");
-    if (pieces.length > 2) throw new Error(`invalid ${spec.name} "${segment}" in ingest cron`);
+    if (pieces.length > 2) throw new Error(`invalid ${spec.name} "${segment}" in ${cronNoun}`);
     const base = pieces[0];
-    const step = pieces.length === 2 ? integer(pieces[1], `${spec.name} step`) : 1;
-    if (step < 1) throw new Error(`${spec.name} step must be at least 1 in ingest cron`);
+    const step = pieces.length === 2 ? integer(pieces[1], `${spec.name} step`, cronNoun) : 1;
+    if (step < 1) throw new Error(`${spec.name} step must be at least 1 in ${cronNoun}`);
 
     let start;
     let end;
@@ -104,16 +125,16 @@ function expandCronField(text, spec) {
       end = spec.max;
     } else if (base.includes("-")) {
       const range = base.split("-");
-      if (range.length !== 2) throw new Error(`invalid ${spec.name} range "${base}" in ingest cron`);
-      start = integer(range[0], spec.name);
-      end = integer(range[1], spec.name);
+      if (range.length !== 2) throw new Error(`invalid ${spec.name} range "${base}" in ${cronNoun}`);
+      start = integer(range[0], spec.name, cronNoun);
+      end = integer(range[1], spec.name, cronNoun);
     } else {
-      start = integer(base, spec.name);
+      start = integer(base, spec.name, cronNoun);
       end = pieces.length === 2 ? spec.max : start;
     }
 
     if (start < spec.min || start > spec.max || end < spec.min || end > spec.max || start > end) {
-      throw new Error(`${spec.name} "${base}" is outside ${spec.min}-${spec.max} in ingest cron`);
+      throw new Error(`${spec.name} "${base}" is outside ${spec.min}-${spec.max} in ${cronNoun}`);
     }
     for (let n = start; n <= end; n += step) values.add(spec.normalize ? spec.normalize(n) : n);
   }
@@ -130,13 +151,13 @@ function expandCronField(text, spec) {
   };
 }
 
-function cartesianCalendar(fields) {
+function cartesianCalendar(fields, cronNoun = DRIVE_CRON_LABELS.noun) {
   let intervals = [{}];
   for (const field of fields) {
     if (field.fullDomain) continue;
     if (intervals.length * field.values.length > MAX_CALENDAR_INTERVALS) {
       throw new Error(
-        `ingest cron expands to more than ${MAX_CALENDAR_INTERVALS} launchd calendar entries; use a simpler schedule`
+        `${cronNoun} expands to more than ${MAX_CALENDAR_INTERVALS} launchd calendar entries; use a simpler schedule`
       );
     }
     intervals = intervals.flatMap((entry) => field.values.map((value) => ({ ...entry, [field.launchd]: value })));
@@ -149,12 +170,12 @@ function cartesianCalendar(fields) {
  * dictionaries. Lists, ranges and steps are supported. Cron's special OR rule
  * for restricted day-of-month plus weekday is preserved by emitting a union.
  */
-export function cronToCalendarIntervals(expression) {
+export function cronToCalendarIntervals(expression, cronLabels = DRIVE_CRON_LABELS) {
   const pieces = String(expression || "").trim().split(/\s+/).filter(Boolean);
   if (pieces.length !== 5) {
-    throw new Error(`operations.ingest_cron must be a five-field cron expression, received "${expression || ""}"`);
+    throw new Error(`${cronLabels.key} must be a five-field cron expression, received "${expression || ""}"`);
   }
-  const fields = pieces.map((part, index) => expandCronField(part, CRON_FIELDS[index]));
+  const fields = pieces.map((part, index) => expandCronField(part, CRON_FIELDS[index], cronLabels.noun));
   const [minute, hour, day, month, weekday] = fields;
 
   let intervals;
@@ -163,11 +184,11 @@ export function cronToCalendarIntervals(expression) {
     // matches. Expressing the two branches separately avoids a day-by-weekday
     // cartesian expansion while preserving that OR behavior.
     intervals = [
-      ...cartesianCalendar([minute, hour, day, month]),
-      ...cartesianCalendar([minute, hour, month, weekday]),
+      ...cartesianCalendar([minute, hour, day, month], cronLabels.noun),
+      ...cartesianCalendar([minute, hour, month, weekday], cronLabels.noun),
     ];
   } else {
-    intervals = cartesianCalendar(fields);
+    intervals = cartesianCalendar(fields, cronLabels.noun);
   }
 
   const seen = new Set();
@@ -179,7 +200,7 @@ export function cronToCalendarIntervals(expression) {
   });
   if (unique.length > MAX_CALENDAR_INTERVALS) {
     throw new Error(
-      `ingest cron expands to more than ${MAX_CALENDAR_INTERVALS} launchd calendar entries; use a simpler schedule`
+      `${cronLabels.noun} expands to more than ${MAX_CALENDAR_INTERVALS} launchd calendar entries; use a simpler schedule`
     );
   }
   return unique;
@@ -197,13 +218,13 @@ export function cronToCalendarIntervals(expression) {
  * The value is expressed in nominal calendar seconds. DST can move a local
  * firing by one hour, which is already inside freshness's separate 1.5x grace.
  */
-export function expectedRefreshSecondsForCron(expression) {
+export function expectedRefreshSecondsForCron(expression, cronLabels = DRIVE_CRON_LABELS) {
   // Keep the freshness calculator inside the same accepted cron contract as
   // the LaunchAgent renderer, including its expansion-size safety limit.
-  cronToCalendarIntervals(expression);
+  cronToCalendarIntervals(expression, cronLabels);
   const pieces = String(expression || "").trim().split(/\s+/).filter(Boolean);
   const [minute, hour, day, month, weekday] = pieces.map((part, index) =>
-    expandCronField(part, CRON_FIELDS[index])
+    expandCronField(part, CRON_FIELDS[index], cronLabels.noun)
   );
 
   const minuteValues = new Set(minute.values);
@@ -252,7 +273,7 @@ export function expectedRefreshSecondsForCron(expression) {
   }
 
   if (firstOccurrence === null || lastOccurrence === null) {
-    throw new Error(`operations.ingest_cron "${expression || ""}" has no valid calendar firing`);
+    throw new Error(`${cronLabels.key} "${expression || ""}" has no valid calendar firing`);
   }
   maximum = Math.max(maximum, CYCLE_DAYS * DAY_SECONDS + firstOccurrence - lastOccurrence);
   return maximum;
@@ -277,22 +298,84 @@ function clientSlugOf(manifest) {
   return slug;
 }
 
-function assertMac(platform = process.platform) {
+/**
+ * Everything connector-specific about a scheduler, in one reviewed object.
+ * The hardened machinery below (staging, rollback, locks, rotation, the
+ * config-hash guard) is connector-agnostic and reads only from here.
+ *
+ * The Drive spec is the DEFAULT everywhere, and its every string and its
+ * config-hash payload are byte-identical to the pre-generalization code, so
+ * existing installed Drive LaunchAgents keep validating and every existing
+ * test keeps passing without edits.
+ */
+export const DRIVE_SCHEDULER_SPEC = Object.freeze({
+  kind: "drive-ingest",
+  schedulerNoun: "Drive scheduler",
+  activityNoun: "Drive ingest",
+  cronLabels: DRIVE_CRON_LABELS,
+  cronOf: (manifest) => manifest?.operations?.ingest_cron || null,
+  cronMissingError: "the manifest needs operations.ingest_cron before its Drive scheduler can be installed",
+  requireEnabled(manifest) {
+    if (manifest?.corpora?.google_drive?.enabled !== true) {
+      throw new Error("corpora.google_drive.enabled must be true before its scheduler can be installed");
+    }
+  },
+  domainMissingError:
+    "brain.domain is required for unattended Drive ingest because the scheduled child intentionally receives no Cloudflare deployment token",
+  platformError: (platform) =>
+    `unattended Drive scheduling is currently implemented with macOS LaunchAgents; this machine reports ${platform}`,
+  defaultSchedulerPath: () => DEFAULT_SCHEDULER_PATH,
+  referenceExtrasOf: (manifest) => ({
+    googleTokenStore: String(manifest?.operations?.google_token_store || "auto").toLowerCase(),
+  }),
+  validateExtras(reference) {
+    if (!["auto", "keychain", "file"].includes(reference.googleTokenStore)) {
+      throw new Error("operations.google_token_store must be auto, keychain or file");
+    }
+  },
+  // NEVER change this payload's keys or shapes: the hash is baked into every
+  // installed plist's argv, and a computation change strands them all on
+  // "configuration changed; reinstall".
+  configHashPayloadOf: (reference) => ({
+    version: 1,
+    slug: reference.slug,
+    manifest_path: reference.path,
+    brain_path: reference.brainPath,
+    domain: reference.manifest.brain.domain,
+    ingest_cron: reference.cron,
+    admin_key_secret: reference.manifest?.operations?.admin_key_secret || null,
+    google_token_store: reference.googleTokenStore,
+  }),
+  childArgumentsOf: (plan) => ["ingest", plan.path, "--from", "drive"],
+  childEnvironmentOf: (plan, environment) => {
+    const child = safeIngestEnvironment(environment);
+    if (plan.googleTokenStore === "auto") delete child.BRAIN_GOOGLE_TOKEN_STORE;
+    else child.BRAIN_GOOGLE_TOKEN_STORE = plan.googleTokenStore;
+    return child;
+  },
+  configChangedError:
+    "the manifest's scheduled Drive configuration changed after this LaunchAgent was installed; reinstall the scheduler before it may read credentials",
+  busyReason: "Drive ingest is already running",
+});
+
+const specOf = (options = {}) => options.spec || DRIVE_SCHEDULER_SPEC;
+
+function assertMac(platform = process.platform, spec = DRIVE_SCHEDULER_SPEC) {
   if (platform !== "darwin") {
-    throw new Error(
-      `unattended Drive scheduling is currently implemented with macOS LaunchAgents; this machine reports ${platform}`
-    );
+    throw new Error(spec.platformError(platform));
   }
 }
 
 export function schedulerIdentity(manifestPath, options = {}) {
+  const spec = specOf(options);
   const { path, manifest } = readManifest(manifestPath, options.readFile);
   const slug = clientSlugOf(manifest);
   const home = resolve(options.home || homedir());
-  const label = `com.brain-installer.${slug}.drive-ingest`;
+  const label = `com.brain-installer.${slug}.${spec.kind}`;
   const launchAgentsDir = join(home, "Library", "LaunchAgents");
   const runtimeDir = join(home, ".brain");
   return {
+    spec,
     path,
     manifest,
     slug,
@@ -300,10 +383,10 @@ export function schedulerIdentity(manifestPath, options = {}) {
     label,
     plistPath: join(launchAgentsDir, `${label}.plist`),
     logsDir: join(runtimeDir, "logs"),
-    stdoutPath: join(runtimeDir, "logs", `${slug}-drive-ingest.out.log`),
-    stderrPath: join(runtimeDir, "logs", `${slug}-drive-ingest.err.log`),
+    stdoutPath: join(runtimeDir, "logs", `${slug}-${spec.kind}.out.log`),
+    stderrPath: join(runtimeDir, "logs", `${slug}-${spec.kind}.err.log`),
     locksDir: join(runtimeDir, "locks"),
-    lockPath: join(runtimeDir, "locks", `${slug}-drive-ingest.lock`),
+    lockPath: join(runtimeDir, "locks", `${slug}-${spec.kind}.lock`),
   };
 }
 
@@ -639,17 +722,17 @@ export function rotateDriveSchedulerLogs(plan, options = {}) {
   );
 }
 
-function buildDriveSchedulerReference(manifestPath, options = {}) {
-  assertMac(options.platform);
+function buildSchedulerReference(manifestPath, options = {}) {
+  const spec = specOf(options);
+  assertMac(options.platform, spec);
   const identity = schedulerIdentity(manifestPath, options);
   const { manifest } = identity;
   const uid = options.uid ?? (typeof process.getuid === "function" ? process.getuid() : null);
   if (!Number.isInteger(uid) || uid < 0) throw new Error("could not determine the macOS user id for launchd");
 
   const nodePath = resolve(options.nodePath || process.execPath);
-  const schedulerPath = resolve(options.schedulerPath || DEFAULT_SCHEDULER_PATH);
+  const schedulerPath = resolve(options.schedulerPath || spec.defaultSchedulerPath());
   const brainPath = resolve(options.brainPath || DEFAULT_BRAIN_PATH);
-  const googleTokenStore = String(manifest?.operations?.google_token_store || "auto").toLowerCase();
   const timeZone = manifest?.client?.timezone || null;
   const localTimeZone = options.localTimeZone || Intl.DateTimeFormat().resolvedOptions().timeZone || null;
   const warnings = [];
@@ -661,47 +744,35 @@ function buildDriveSchedulerReference(manifestPath, options = {}) {
 
   return {
     ...identity,
-    cron: manifest?.operations?.ingest_cron || null,
+    ...(spec.referenceExtrasOf ? spec.referenceExtrasOf(manifest) : {}),
+    cron: spec.cronOf(manifest),
     uid,
     domain: `gui/${uid}`,
     service: `gui/${uid}/${identity.label}`,
     nodePath,
     schedulerPath,
     brainPath,
-    googleTokenStore,
     timeZone,
     localTimeZone,
     warnings,
   };
 }
 
-function validateDriveSchedulerReference(reference) {
-  if (reference.manifest?.corpora?.google_drive?.enabled !== true) {
-    throw new Error("corpora.google_drive.enabled must be true before its scheduler can be installed");
-  }
+function validateSchedulerReference(reference) {
+  const spec = reference.spec;
+  spec.requireEnabled(reference.manifest);
   if (typeof reference.cron !== "string" || !reference.cron.trim()) {
-    throw new Error("the manifest needs operations.ingest_cron before its Drive scheduler can be installed");
+    throw new Error(spec.cronMissingError);
   }
   if (typeof reference.manifest?.brain?.domain !== "string" || !reference.manifest.brain.domain.trim()) {
-    throw new Error(
-      "brain.domain is required for unattended Drive ingest because the scheduled child intentionally receives no Cloudflare deployment token"
-    );
+    throw new Error(spec.domainMissingError);
   }
-  if (!["auto", "keychain", "file"].includes(reference.googleTokenStore)) {
-    throw new Error("operations.google_token_store must be auto, keychain or file");
-  }
-  const intervals = cronToCalendarIntervals(reference.cron);
-  const expectedRefreshSeconds = expectedRefreshSecondsForCron(reference.cron);
-  const configHash = createHash("sha256").update(JSON.stringify({
-    version: 1,
-    slug: reference.slug,
-    manifest_path: reference.path,
-    brain_path: reference.brainPath,
-    domain: reference.manifest.brain.domain,
-    ingest_cron: reference.cron,
-    admin_key_secret: reference.manifest?.operations?.admin_key_secret || null,
-    google_token_store: reference.googleTokenStore,
-  })).digest("hex");
+  if (spec.validateExtras) spec.validateExtras(reference);
+  const intervals = cronToCalendarIntervals(reference.cron, spec.cronLabels);
+  const expectedRefreshSeconds = expectedRefreshSecondsForCron(reference.cron, spec.cronLabels);
+  const configHash = createHash("sha256")
+    .update(JSON.stringify(spec.configHashPayloadOf(reference)))
+    .digest("hex");
   return {
     ...reference,
     intervals,
@@ -720,9 +791,11 @@ function validateDriveSchedulerReference(reference) {
   };
 }
 
-export function buildDriveSchedulerPlan(manifestPath, options = {}) {
-  return validateDriveSchedulerReference(buildDriveSchedulerReference(manifestPath, options));
+export function buildSchedulerPlan(manifestPath, options = {}) {
+  return validateSchedulerReference(buildSchedulerReference(manifestPath, options));
 }
+
+export const buildDriveSchedulerPlan = buildSchedulerPlan;
 
 function xml(value) {
   return String(value)
@@ -845,7 +918,7 @@ function restorePreviousScheduler(plan, priorPlist, wasLoaded, launchctl) {
   }
   if (wasLoaded && priorPlist !== null && failures.length === 0) {
     const restored = launchctl(["bootstrap", plan.domain, plan.plistPath]);
-    if (restored?.status !== 0) failures.push(launchctlError("reloading the previous Drive scheduler", restored).message);
+    if (restored?.status !== 0) failures.push(launchctlError(`reloading the previous ${plan.spec.schedulerNoun}`, restored).message);
   }
   return failures;
 }
@@ -859,8 +932,8 @@ function failedReplacement(action, result, plan, priorPlist, wasLoaded, launchct
   throw primary;
 }
 
-export function installDriveScheduler(manifestPath, options = {}) {
-  const plan = buildDriveSchedulerPlan(manifestPath, options);
+export function installScheduler(manifestPath, options = {}) {
+  const plan = buildSchedulerPlan(manifestPath, options);
   const launchctl = options.launchctl || defaultLaunchctl;
   mkdirSync(dirname(plan.plistPath), { recursive: true, mode: 0o700 });
   assertSchedulerLockDirectory(plan);
@@ -879,12 +952,12 @@ export function installDriveScheduler(manifestPath, options = {}) {
   }
   if (priorStatus?.error) {
     staged.discard();
-    throw launchctlError("checking the existing Drive scheduler", priorStatus);
+    throw launchctlError(`checking the existing ${plan.spec.schedulerNoun}`, priorStatus);
   }
   const wasLoaded = priorStatus?.status === 0;
   if (wasLoaded && parseLaunchctlStatus(priorStatus.stdout).running) {
     staged.discard();
-    throw new Error("Drive ingest is currently running; wait for it to finish before replacing its scheduler");
+    throw new Error(`${plan.spec.activityNoun} is currently running; wait for it to finish before replacing its scheduler`);
   }
   try {
     // Prepare and bound the exact files before launchd can open them. Check only
@@ -899,7 +972,7 @@ export function installDriveScheduler(manifestPath, options = {}) {
     const stopped = launchctl(["bootout", plan.service]);
     if (stopped?.status !== 0) {
       staged.discard();
-      throw launchctlError("stopping the previous Drive scheduler", stopped);
+      throw launchctlError(`stopping the previous ${plan.spec.schedulerNoun}`, stopped);
     }
   }
 
@@ -909,21 +982,23 @@ export function installDriveScheduler(manifestPath, options = {}) {
     staged.discard();
     const rollbackFailures = restorePreviousScheduler(plan, priorPlist, wasLoaded, launchctl);
     if (rollbackFailures.length) {
-      throw new Error(`writing the staged Drive scheduler failed: ${error.message}; rollback also failed: ${rollbackFailures.join("; ")}`);
+      throw new Error(`writing the staged ${plan.spec.schedulerNoun} failed: ${error.message}; rollback also failed: ${rollbackFailures.join("; ")}`);
     }
-    throw new Error(`writing the staged Drive scheduler failed: ${error.message}`);
+    throw new Error(`writing the staged ${plan.spec.schedulerNoun} failed: ${error.message}`);
   }
   const enabled = launchctl(["enable", plan.service]);
   if (enabled?.status !== 0) {
-    failedReplacement("enabling the Drive scheduler", enabled, plan, priorPlist, wasLoaded, launchctl);
+    failedReplacement(`enabling the ${plan.spec.schedulerNoun}`, enabled, plan, priorPlist, wasLoaded, launchctl);
   }
   const started = launchctl(["bootstrap", plan.domain, plan.plistPath]);
   if (started?.status !== 0) {
-    failedReplacement("loading the Drive scheduler", started, plan, priorPlist, wasLoaded, launchctl);
+    failedReplacement(`loading the ${plan.spec.schedulerNoun}`, started, plan, priorPlist, wasLoaded, launchctl);
   }
 
   return { ...plan, installed: true, loaded: true, replaced: priorPlist !== null };
 }
+
+export const installDriveScheduler = installScheduler;
 
 function parseLaunchctlStatus(output) {
   const text = String(output || "");
@@ -942,14 +1017,14 @@ function parseLaunchctlStatus(output) {
   };
 }
 
-export function statusDriveScheduler(manifestPath, options = {}) {
-  const reference = buildDriveSchedulerReference(manifestPath, options);
+export function statusScheduler(manifestPath, options = {}) {
+  const reference = buildSchedulerReference(manifestPath, options);
   const launchctl = options.launchctl || defaultLaunchctl;
   const result = launchctl(["print", reference.service]);
   const loaded = result?.status === 0;
   let scheduleError = null;
   let plan = reference;
-  try { plan = validateDriveSchedulerReference(reference); } catch (error) { scheduleError = error.message; }
+  try { plan = validateSchedulerReference(reference); } catch (error) { scheduleError = error.message; }
   const installed = existsSync(plan.plistPath);
   let definitionMatches = false;
   if (installed && !scheduleError) {
@@ -968,17 +1043,19 @@ export function statusDriveScheduler(manifestPath, options = {}) {
   };
 }
 
-export function removeDriveScheduler(manifestPath, options = {}) {
-  // Removal must remain reachable after the operator disables Drive or deletes
-  // its schedule. Requiring the declaration that they are trying to turn off
-  // would strand the already-loaded LaunchAgent.
-  const plan = buildDriveSchedulerReference(manifestPath, options);
+export const statusDriveScheduler = statusScheduler;
+
+export function removeScheduler(manifestPath, options = {}) {
+  // Removal must remain reachable after the operator disables the connector
+  // or deletes its schedule. Requiring the declaration that they are trying
+  // to turn off would strand the already-loaded LaunchAgent.
+  const plan = buildSchedulerReference(manifestPath, options);
   const launchctl = options.launchctl || defaultLaunchctl;
   const probe = launchctl(["print", plan.service]);
   const wasLoaded = probe?.status === 0;
   if (wasLoaded) {
     const stopped = launchctl(["bootout", plan.service]);
-    if (stopped?.status !== 0) throw launchctlError("stopping the Drive scheduler", stopped);
+    if (stopped?.status !== 0) throw launchctlError(`stopping the ${plan.spec.schedulerNoun}`, stopped);
   }
   // The service is stopped, so cap its final output before preserving the
   // audit trail. Histories stay beside the active logs and are never globbed.
@@ -995,6 +1072,8 @@ export function removeDriveScheduler(manifestPath, options = {}) {
     ),
   };
 }
+
+export const removeDriveScheduler = removeScheduler;
 
 const SAFE_INGEST_ENV = new Set([
   "HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "TMP", "TEMP", "LANG", "SHELL",
@@ -1043,24 +1122,20 @@ export function resolveScheduledAdminKey(manifest, options = {}) {
   return key;
 }
 
-export function runDriveIngest(manifestPath, options = {}) {
-  const plan = buildDriveSchedulerPlan(manifestPath, options);
+export function runScheduledIngest(manifestPath, options = {}) {
+  const plan = buildSchedulerPlan(manifestPath, options);
   if (options.expectedConfigHash && options.expectedConfigHash !== plan.configHash) {
-    throw new Error(
-      "the manifest's scheduled Drive configuration changed after this LaunchAgent was installed; reinstall the scheduler before it may read credentials"
-    );
+    throw new Error(plan.spec.configChangedError);
   }
   const spawn = options.spawn || spawnSync;
   const startedAt = new Date().toISOString();
   assertSchedulerLockDirectory(plan);
   preparePrivateLockFile(plan.lockPath);
   const sourceEnvironment = options.env || process.env;
-  const childEnvironment = safeIngestEnvironment(sourceEnvironment);
-  if (plan.googleTokenStore === "auto") delete childEnvironment.BRAIN_GOOGLE_TOKEN_STORE;
-  else childEnvironment.BRAIN_GOOGLE_TOKEN_STORE = plan.googleTokenStore;
+  const childEnvironment = plan.spec.childEnvironmentOf(plan, sourceEnvironment);
   const result = spawn(
     LOCKF_PATH,
-    ["-k", "-s", "-t", "0", plan.lockPath, plan.nodePath, plan.brainPath, "ingest", plan.path, "--from", "drive"],
+    ["-k", "-s", "-t", "0", plan.lockPath, plan.nodePath, plan.brainPath, ...plan.spec.childArgumentsOf(plan)],
     {
       cwd: dirname(plan.path),
       env: childEnvironment,
@@ -1074,7 +1149,7 @@ export function runDriveIngest(manifestPath, options = {}) {
   if (result?.status === LOCK_BUSY_EXIT) {
     // Another process owns the ingest lock and is still writing these files.
     // Leave its active logs untouched; that owner caps them when it exits.
-    return { ...plan, status: "skipped", code: 0, reason: "Drive ingest is already running" };
+    return { ...plan, status: "skipped", code: 0, reason: plan.spec.busyReason };
   }
   // The lock-holding child has exited, so no scheduled ingest is writing now.
   // This catches a single unusually noisy parser or network failure immediately.
@@ -1089,6 +1164,8 @@ export function runDriveIngest(manifestPath, options = {}) {
     finishedAt: new Date().toISOString(),
   };
 }
+
+export const runDriveIngest = runScheduledIngest;
 
 function optionValue(args, name) {
   const index = args.indexOf(name);
@@ -1120,13 +1197,17 @@ function cliSummary(result) {
 }
 
 /** Record wrapper failures that happen before the child brain CLI can run. */
-export function recordDriveSchedulerFailure(_error, { action = "run", journalOptions = {} } = {}) {
+export function recordDriveSchedulerFailure(_error, {
+  action = "run",
+  journalOptions = {},
+  productRelativeLocation = "operations/drive-scheduler.mjs#main",
+} = {}) {
   try {
     const event = recordSupportEvent({
       command: "schedule",
       source: "scheduler",
       errorCode: action === "install" ? "SCHEDULE_INSTALL_FAILED" : "SCHEDULE_RUN_FAILED",
-      productRelativeLocation: "operations/drive-scheduler.mjs#main",
+      productRelativeLocation,
     }, journalOptions);
     return event.event_id;
   } catch {
