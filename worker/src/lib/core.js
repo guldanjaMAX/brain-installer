@@ -61,31 +61,121 @@ const CAP_TABLE = `CREATE TABLE IF NOT EXISTS llm_call_log (
 
 let capCache = { day: null, micros: 0, checkedAt: 0 };
 
-async function ensureLogTable(env) {
-  if (!env.DB) return;
-  try {
-    await env.DB.exec(CAP_TABLE.replace(/\s+/g, " "));
-  } catch {
-    /* table probably exists */
+// What THIS isolate has charged today. Written by this process on every billed
+// call, so no database can lose it. It is the floor under every budget
+// decision, and it is the whole reason a broken ledger cannot mean zero spend.
+let isolateLedger = { day: null, micros: 0 };
+
+// Why the guard is degraded, when it is. Kept so the refusal can name its cause
+// and so a health route can surface it, rather than leaving a silent hole where
+// a cap used to be.
+let guardState = { degraded: false, reason: null, since: null };
+
+// The share of the day's budget a degraded guard is still allowed to spend.
+// Small on purpose: enough to ride out a D1 blip, nowhere near enough for a
+// runaway loop to matter.
+const DEGRADED_BUDGET_FRACTION = 0.1;
+
+// ...and never more than this in absolute terms, however large the configured
+// cap is. A client running a $500/day cap has the appetite for it; a broken
+// ledger is still not a licence to spend at that rate unsupervised.
+const DEGRADED_BUDGET_CEILING_USD = 5;
+
+const degradedBudgetUsd = (capUsd) =>
+  Math.min(capUsd * DEGRADED_BUDGET_FRACTION, DEGRADED_BUDGET_CEILING_USD);
+
+const utcDay = () => new Date().toISOString().slice(0, 10);
+
+/**
+ * The configured cap, in dollars.
+ *
+ * A garbled value falls back to the default rather than to NaN. `spent >= NaN`
+ * is false, so a typo in DAILY_LLM_CAP_USD would otherwise remove the cap
+ * entirely and look like a working config while doing so.
+ */
+function capUsdFor(env) {
+  const raw = env.DAILY_LLM_CAP_USD;
+  const n = raw === undefined || raw === null || raw === "" ? 10 : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 10;
+}
+
+/** Record a billed call against this isolate, resetting on UTC day rollover. */
+function chargeIsolate(micros) {
+  const day = utcDay();
+  if (isolateLedger.day !== day) isolateLedger = { day, micros: 0 };
+  isolateLedger.micros += Math.max(0, Number(micros) || 0);
+}
+
+function markDegraded(reason) {
+  if (!guardState.degraded || guardState.reason !== reason) {
+    console.warn(`[spend-guard] DEGRADED: ${reason}. Falling back to a reduced per-instance allowance.`);
+    guardState = { degraded: true, reason, since: new Date().toISOString() };
   }
+}
+
+function markHealthy() {
+  if (guardState.degraded) {
+    console.warn("[spend-guard] recovered: the spend ledger is readable again; the full cap is back in force.");
+    guardState = { degraded: false, reason: null, since: null };
+  }
+}
+
+/** Read-only view of the guard, for health reporting and tests. */
+export function spendGuardStatus() {
+  return {
+    degraded: guardState.degraded,
+    reason: guardState.reason,
+    since: guardState.since,
+    isolate_day: isolateLedger.day,
+    isolate_spent_micros: isolateLedger.micros,
+  };
 }
 
 /**
  * Per-UTC-day spend guard.
  *
  * Exists because a runaway loop is a billing incident, not a bug you notice
- * next month. The cost of the call in flight is folded into the cache
- * immediately, so a tight loop is caught inside the cache window rather than
- * after it expires.
+ * next month. The cost of the call in flight is folded in immediately, so a
+ * tight loop is caught inside the cache window rather than after it expires.
  *
- * Fails OPEN if the query itself errors: the guard must never be the reason a
- * legitimate call fails. It fails CLOSED only once positively over budget.
+ * It does NOT fail open. It used to: the catch returned 0, which reported zero
+ * spend and un-bound the cap for as long as D1 was unhappy. A cap that fails
+ * open is not a cap. On a client-owned install the payment method behind it is
+ * the client's, so the failure mode was somebody else's bill.
+ *
+ * It does not fail fully closed either. Refusing every answer because a logging
+ * table hiccuped is its own kind of broken, and to the client it looks like the
+ * brain is down. So the guard degrades: it falls back to what THIS isolate
+ * knows it has spent and holds that against a small fraction of the day's
+ * budget. Answers keep flowing through a blip; a loop hits the floor fast and
+ * stops. Unbounded spend is unreachable in every branch, because the isolate
+ * ledger only ever grows and is never replaced by a zero.
+ *
+ * The honest limit, stated rather than glossed: the degraded bound is per
+ * isolate, not global. A runaway loop lives in one isolate and is bounded
+ * exactly. Broad fan-out across many isolates while D1 is down is bounded only
+ * by (isolates x reduced allowance), which is far tighter than "no cap" but is
+ * not a single global number.
  */
-async function spentTodayMicros(env) {
-  const day = new Date().toISOString().slice(0, 10);
+async function readSpend(env) {
+  const day = utcDay();
   const now = Date.now();
-  if (capCache.day === day && now - capCache.checkedAt < 60_000) return capCache.micros;
-  if (!env.DB) return 0;
+  if (isolateLedger.day !== day) isolateLedger = { day, micros: 0 };
+  const floor = isolateLedger.micros;
+
+  if (!env.DB) {
+    // No binding means no ledger exists to read, which is the same hole as a
+    // failing query: nothing outside this process could ever bind the cap.
+    markDegraded("no D1 binding, so no spend ledger exists to read");
+    return { micros: floor, degraded: true };
+  }
+
+  // While degraded, skip the cache window and retry every call, so the full cap
+  // comes back the moment D1 does.
+  if (!guardState.degraded && capCache.day === day && now - capCache.checkedAt < 60_000) {
+    return { micros: Math.max(capCache.micros, floor), degraded: false };
+  }
+
   try {
     const row = await env.DB.prepare(
       "SELECT COALESCE(SUM(est_cost_usd_micros),0) AS m FROM llm_call_log WHERE day = ? AND status != 'blocked'"
@@ -93,9 +183,22 @@ async function spentTodayMicros(env) {
       .bind(day)
       .first();
     capCache = { day, micros: Number(row?.m || 0), checkedAt: now };
-    return capCache.micros;
+    markHealthy();
+    // The stored sum can under-report: logCall swallows its own failures. Take
+    // whichever ledger is higher so a lost write cannot buy extra budget.
+    return { micros: Math.max(capCache.micros, floor), degraded: false };
+  } catch (err) {
+    markDegraded(`spend ledger query failed: ${err?.message || err}`);
+    return { micros: floor, degraded: true };
+  }
+}
+
+async function ensureLogTable(env) {
+  if (!env.DB) return;
+  try {
+    await env.DB.exec(CAP_TABLE.replace(/\s+/g, " "));
   } catch {
-    return 0; // fail open
+    /* table probably exists */
   }
 }
 
@@ -123,12 +226,23 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
 
   await ensureLogTable(env);
 
-  const capUsd = Number(env.DAILY_LLM_CAP_USD || 10);
-  const spent = await spentTodayMicros(env);
-  if (spent >= capUsd * 1_000_000) {
+  const capUsd = capUsdFor(env);
+  const { micros: spent, degraded } = await readSpend(env);
+  const budgetUsd = degraded ? degradedBudgetUsd(capUsd) : capUsd;
+  if (spent >= budgetUsd * 1_000_000) {
     await logCall(env, { label, model, status: "blocked", micros: 0 });
-    const e = new Error(`daily LLM spend cap of $${capUsd} reached`);
+    const e = new Error(
+      degraded
+        ? `LLM spend guard is degraded (${guardState.reason}); the reduced ` +
+          `allowance of $${budgetUsd} for this instance is already spent. ` +
+          `Refusing rather than spending without a working cap.`
+        : `daily LLM spend cap of $${capUsd} reached`,
+    );
     e.llm_cap_exceeded = true;
+    if (degraded) {
+      e.spend_guard_degraded = true;
+      console.warn(`[spend-guard] BLOCKED a call while degraded: ${guardState.reason}`);
+    }
     throw e;
   }
 
@@ -161,7 +275,7 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
       // llama-3.3-70b-fp8-fast: $0.293/M input and $2.25/M output.
       // Keep the estimate conservative enough for the guard to remain useful.
       const micros = Math.ceil(inTok * 0.293 + outTok * 2.25);
-      capCache.micros += micros;
+      chargeIsolate(micros);
       await logCall(env, { label, model: workersModel, status: "ok", micros });
       return {
         content: [{ type: "text", text }],
@@ -210,7 +324,7 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
   const inTok = data?.usage?.input_tokens || 0;
   const outTok = data?.usage?.output_tokens || 0;
   const micros = Math.round(inTok * 3 + outTok * 15);
-  capCache.micros += micros;
+  chargeIsolate(micros);
   await logCall(env, { label, model: data?.model || anthropicModel, status: "ok", micros });
   return data;
 }
