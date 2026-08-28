@@ -316,6 +316,21 @@ function textPdf() {
   for await (const group of stream) rest.push(group);
   check("the async source is consumed exactly once", produced === 6 && first.value.length + rest.flat().length === 6,
     `produced=${produced} emitted=${first.value.length + rest.flat().length}`);
+
+  // The streaming path is the one Drive and Gmail actually use, and it is
+  // where the second live 413 came from: the statement ceiling landed in
+  // batches() first while this loop kept packing chunky documents blind.
+  const chunkyStream = batchStream(
+    Array.from({ length: 50 }, (_, i) => ({ id: `c${i}` })),
+    async (file) => ({ hash: `h-${file.id}`, rel: file.id, envelope: { source_id: file.id, content: "x".repeat(40_000) } }),
+    { maxBytes: 1e9 },
+  );
+  const chunkyBatches = [];
+  for await (const group of chunkyStream) chunkyBatches.push(group);
+  check("the stream splits on estimated D1 statements", chunkyBatches.length >= 5, String(chunkyBatches.length));
+  check("no streamed batch exceeds the statement ceiling",
+    chunkyBatches.every((b) => b.reduce((n, x) => n + estimatedStatements(x.envelope), 0) <= 810));
+  check("nothing is lost across streamed statement splits", chunkyBatches.flat().length === 50);
 }
 
 /* ---- state ---- */
