@@ -1,4 +1,4 @@
--- 0017_chunk_token_fit — make "is this chunk fully searchable" a stored fact.
+-- 0021_chunk_token_fit — make "is this chunk fully searchable" a stored fact.
 --
 -- WHY A COLUMN AND NOT A CALCULATION
 --
