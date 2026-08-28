@@ -491,7 +491,10 @@ try {
   const deep = displayPathForTesting("/private/tmp/a/b/c/x.json", "/Users/j/One/Two/Three/Four");
   assertStrict.ok(!deep.includes("../.."),
     `a far-outside manifest must not print a ladder of dot-dots, got: ${deep}`);
-  assertStrict.equal(displayPathForTesting("/tmp/work/sub/x.json", "/tmp/work"), "sub/x.json",
+  // Compared with separators normalised: Windows returns `sub\\x.json` here and
+  // that is correct on Windows, which is the whole point of the check.
+  const below = displayPathForTesting("/tmp/work/sub/x.json", "/tmp/work").replace(/\\/g, "/");
+  assertStrict.equal(below, "sub/x.json",
     "a manifest below the working directory keeps the short relative form");
   console.log("display path: absolute when far outside, relative when close");
 }
