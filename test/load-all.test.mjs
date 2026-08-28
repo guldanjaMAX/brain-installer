@@ -598,6 +598,27 @@ try {
       reportSection(run.text, "NOT LOADED — skipped"));
   }
 
+  /* --------- a source that cannot size itself in advance says so, never 0 or undefined */
+  {
+    // The message captures (iMessage, WhatsApp, iPhone backup) return dry_run
+    // without a would_send. Printing that as "undefined document(s)" or
+    // silently as 0 lets an operator previewing a job in front of a client
+    // under-read what those sources actually hold.
+    const unsized = describeLoadResult({ dry_run: true });
+    check("a dry-run source with no advance count never renders the literal undefined",
+      !/undefined/.test(unsized.text), unsized.text);
+    check("and it is not reported as zero either, because zero is a claim",
+      unsized.wouldSend === null && unsized.volumeUnknown === true,
+      JSON.stringify({ wouldSend: unsized.wouldSend, volumeUnknown: unsized.volumeUnknown }));
+    check("and it says plainly that the count is unknown rather than absent",
+      /unknown, not zero/.test(unsized.text), unsized.text);
+
+    const sized = describeLoadResult({ dry_run: true, would_send: 412, unchanged: 8 });
+    check("a source that DOES report an advance count is unchanged by that rule",
+      sized.wouldSend === 412 && !sized.volumeUnknown && /412 document\(s\) WOULD be sent/.test(sized.text),
+      sized.text);
+  }
+
   console.log(fail ? `\n${fail} FAILURES` : `\nload-all: all ${ran} tests passed`);
 } finally {
   rmSync(sandbox, { recursive: true, force: true });

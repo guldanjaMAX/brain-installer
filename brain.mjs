@@ -6839,12 +6839,21 @@ export async function planLoad({ m, manifestPath, flags = {}, registry, probes, 
 export function describeLoadResult(result) {
   if (result && typeof result === "object") {
     if (result.dry_run) {
+      // A connector that does not report would_send has NOT reported zero. The
+      // message captures are in exactly that position, and printing their
+      // volume as 0 (or as the literal "undefined") would let an operator
+      // sizing a job in front of a client under-read what those sources hold.
+      // Same rule as the final branch: unknown is the truth, a zero is a claim.
+      const wouldSendKnown = Number.isFinite(Number(result.would_send));
       return {
         known: true,
         dryRun: true,
         counts: null,
-        wouldSend: Number(result.would_send) || 0,
-        text: `${result.would_send} document(s) WOULD be sent, ${result.unchanged ?? 0} unchanged`,
+        wouldSend: wouldSendKnown ? Number(result.would_send) : null,
+        volumeUnknown: !wouldSendKnown,
+        text: wouldSendKnown
+          ? `${Number(result.would_send)} document(s) WOULD be sent, ${result.unchanged ?? 0} unchanged`
+          : "would be read, but this source does not report a count in advance (unknown, not zero)",
       };
     }
     // calendar: { result, sent, removed }
@@ -7065,6 +7074,7 @@ export async function cmdLoad(manifestPath, options = {}) {
     entry.countsKnown = legResults.length > 0 && legResults.every((r) => r.known);
     entry.documents = legResults.reduce((n, r) => n + (Number.isFinite(r.documents) ? r.documents : 0), 0);
     entry.wouldSend = legResults.reduce((n, r) => n + (Number.isFinite(r.wouldSend) ? r.wouldSend : 0), 0);
+    entry.volumeUnknown = legResults.some((r) => r?.volumeUnknown);
 
     if (legFailures.length && !legResults.length) {
       entry.status = review ? "review" : "failed";
@@ -7096,8 +7106,10 @@ export async function cmdLoad(manifestPath, options = {}) {
   let unknownCounts = 0;
   let conversationDocs = 0;
   let wouldSend = 0;
+  let unknownVolume = 0;
   for (const entry of done) {
     if (!entry.countsKnown) unknownCounts++;
+    if (entry.volumeUnknown) unknownVolume++;
     wouldSend += entry.wouldSend || 0;
     for (const counts of entry.counts || []) {
       totalsAccumulator.created += counts.created;
@@ -7110,8 +7122,12 @@ export async function cmdLoad(manifestPath, options = {}) {
   // Totals never quietly absorb an unknown into a zero. If a source could not
   // report its counts, the totals line says how many did not, so the number
   // beside it is understood as a floor rather than a full accounting.
+  // A dry-run total is a FLOOR when any source could not size itself in
+  // advance. Saying so is the difference between an operator previewing a job
+  // accurately and one who under-reads it while a client watches.
   const documentParts = dryRun
-    ? [`${wouldSend} document(s) WOULD be sent`]
+    ? [`at least ${wouldSend} document(s) WOULD be sent`
+       + (unknownVolume ? `, plus ${unknownVolume} source(s) that cannot size themselves in advance` : "")]
     : [
       `${totalsAccumulator.created} created`,
       `${totalsAccumulator.updated} updated`,
