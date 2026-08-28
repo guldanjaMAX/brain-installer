@@ -229,16 +229,28 @@ export async function handleOwnerAuth(env, request, url, path) {
       return jsonResponse({ error: RECOVERY_UNAVAILABLE, unrecoverable: false }, 503);
     }
     const brake = await recoveryThrottle(env);
-    if (brake.locked) {
-      return jsonResponse({
-        error: `Too many failed recovery attempts (${brake.failures} in the last hour). ` +
-          "Wait an hour and try again, or use your admin key from the handoff notes to mint a fresh enrollment link.",
-        retry_after_ms: brake.retry_after_ms,
-      }, 429);
-    }
+    const brakeResponse = () => jsonResponse({
+      error: `Too many failed recovery attempts (${brake.failures} in the last hour). ` +
+        "Wait an hour and try again, or use your admin key from the handoff notes to mint a fresh enrollment link.",
+      retry_after_ms: brake.retry_after_ms,
+    }, 429);
 
     if (path === "/auth/recover/options") {
-      if (!code || !(await peekRecoveryCode(env, code))) {
+      // The code is peeked BEFORE the brake is consulted, and the order is the
+      // whole point. Checking the brake first meant ten garbage POSTs from
+      // anyone on the internet shut the recovery lane for an hour, and
+      // clearRecoveryFailures, which exists precisely so a live code reopens
+      // it, sat unreachable behind the lock. The person that stranded is the
+      // one holding a real card, at the moment they have already lost their
+      // phone, and the card is supposed to BE the non-technical way back.
+      //
+      // Brute force is not helped by this. A wrong guess still records a
+      // failure and still meets the lock below, so guessing is throttled
+      // exactly as before; only a caller who already holds a live code walks
+      // past, and that caller has, by definition, finished guessing.
+      const live = code ? await peekRecoveryCode(env, code) : false;
+      if (!live) {
+        if (brake.locked) return brakeResponse();
         await recordRecoveryFailure(env);
         const { unused } = await recoveryCodeStatus(env);
         return jsonResponse({
@@ -257,6 +269,11 @@ export async function handleOwnerAuth(env, request, url, path) {
         user_name: env.BRAIN_OWNER || "owner",
       });
     }
+
+    // The verify leg keeps the brake ahead of everything: reaching it requires
+    // having already passed options with a live code, so a locked brake here
+    // means repeated failures AFTER that, which is worth stopping.
+    if (brake.locked) return brakeResponse();
 
     if (!payload) return jsonResponse({ error: "invalid body" }, 400);
     const challenge = challengeFromClientData(payload.clientDataJSON);

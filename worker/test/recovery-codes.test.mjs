@@ -279,10 +279,25 @@ test("guessing is braked, and the brake clears for whoever holds a real code", a
   for (let attempt = 0; attempt < RECOVERY_FAIL_LIMIT; attempt++) {
     await worker.fetch(post("/auth/recover/options", { code: "ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ" }), testEnv);
   }
-  const [locked, lockedBody] = await json(await worker.fetch(post("/auth/recover/options", { code: codes[0] }), testEnv));
-  assert.equal(locked, 429, "the brake holds even against a valid code");
-  assert.match(lockedBody.error, /Too many failed recovery attempts/);
-  assert.ok(lockedBody.retry_after_ms > 0);
+
+  // A WRONG code during lockout is refused, which is what the brake is for.
+  const [wrongLocked, wrongBody] = await json(
+    await worker.fetch(post("/auth/recover/options", { code: "YYYYY-YYYYY-YYYYY-YYYYY" }), testEnv));
+  assert.equal(wrongLocked, 429, "guessing stays throttled");
+  assert.match(wrongBody.error, /Too many failed recovery attempts/);
+  assert.ok(wrongBody.retry_after_ms > 0);
+
+  // A RIGHT code during that same lockout still works. The brake is set by
+  // anyone who can reach the URL, so letting it block a live card would let a
+  // stranger shut the owner's only non-technical way back in, indefinitely and
+  // for free, at the moment they have already lost their phone.
+  const [rightDuringLock] = await json(
+    await worker.fetch(post("/auth/recover/options", { code: codes[0] }), testEnv));
+  assert.equal(rightDuringLock, 200, "a live card is never blocked by someone else's guesses");
+  assert.equal(
+    db.raw.prepare("SELECT count(*) AS n FROM recovery_attempts").get().n, 0,
+    "and it clears the brake it just walked past",
+  );
 });
 
 /* ------------------------------------------- what we deliberately cannot do */

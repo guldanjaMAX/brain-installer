@@ -37,10 +37,12 @@ Do not take my word for any of the above. All three are checkable in about five 
 1. **Cloudflare.** Log in, go to **My Profile, then API Tokens**. The token named `[TOKEN NAME]` should not be listed. If it is, delete it now and tell me.
 2. **Google.** Open the sharing settings on the folders you granted, or the service account list at [LOCATION]. My access should not appear.
 3. **Your admin key.** You rotated it during our session. I was not shown the new value and it exists only in your own store.
-After all three, run `node brain.mjs test <manifest>` yourself. If the brain
+4. **Your recovery card.** Print a fresh one now, from your own signed-in session, at **Settings, then Print a new recovery card**. Doing that destroys every code on the card that existed during the install, including the copy that was on screen while I was in the room. Keep the new card and shred the old one. This is the only step here that does not merely CHECK something I did; it takes something out of my reach that I could not take out of my own reach for you. Until you do it, the codes printed at setup are still live, and a code is a way into your brain.
+
+After all four, run `node brain.mjs test <manifest>` yourself. If the brain
 still answers, the remaining credentials and Cloudflare AI binding are working.
 
-If any of those three does not check out, that is a real problem and I want to hear about it the same day.
+If any of those four does not check out, that is a real problem and I want to hear about it the same day.
 
 ---
 
@@ -202,7 +204,8 @@ Complete list. Nothing omitted.
 | A copy of your manifest | Resource names and IDs. **No secrets.** Every credential in it is a reference to a store, never a value | Until you ask me to delete it |
 | Our email and message history | Whatever we wrote to each other | Normal business records |
 
-I also hold **no recovery code**. The card was printed by your own brain, into
+I also hold **no recovery code** once you have done step 4 above, and that step
+is how you make it true rather than take my word for it. The card was printed by your own brain, into
 your own hands, and only the hashes of those codes exist anywhere — inside your
 own database. If I kept a copy it would be a standing key to your business,
 which is the exact thing this whole arrangement exists to avoid.
