@@ -132,7 +132,14 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
     throw e;
   }
 
-  if (!apiKey) {
+  // Route by the CONFIGURED MODEL, never by which key happens to be present.
+  // A manifest that selects a Cloudflare model must reach Cloudflare, even on an
+  // install that also carries an Anthropic key for reranking. Branching on the
+  // key alone silently promoted Anthropic from "reranking only" to "every
+  // answer", so a client's document text reached a provider their own manifest
+  // did not name. That is a custody claim, not a preference.
+  const modelIsCloudflare = !model || String(model).startsWith("@cf/");
+  if (!apiKey || (modelIsCloudflare && env.AI)) {
     const workersModel = String(model || "").startsWith("@cf/")
       ? model
       : env.WORKERS_AI_ANSWER_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
@@ -168,9 +175,19 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
     }
   }
 
-  const anthropicModel = String(model || "").startsWith("@cf/")
-    ? env.ANTHROPIC_ANSWER_MODEL || "claude-sonnet-4-5"
-    : model;
+  if (modelIsCloudflare) {
+    // A Cloudflare model is configured but this worker has no AI binding to
+    // serve it. Quietly answering from Anthropic instead would move client
+    // document text to a provider the manifest does not name. Refuse and say so.
+    const e = new Error(
+      `the configured answer model ${model || "(default)"} is a Cloudflare model, ` +
+        "but this worker has no AI binding. Refusing to answer from a different " +
+        "provider than the manifest names.",
+    );
+    e.provider_mismatch = true;
+    throw e;
+  }
+  const anthropicModel = model;
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
