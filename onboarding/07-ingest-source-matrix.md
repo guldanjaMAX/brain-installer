@@ -19,7 +19,7 @@ I would rather lose a sale to an honest table than win one and spend week three 
 | Text messages (Android, and Google Voice) | **Built, as an export.** SMS Backup & Restore's .xml export, or a Google Voice Takeout, dropped in a folder you already ingest |
 | iMessage (Mac) | **Built, Mac-only, live.** `brain connect imessage`: Full Disk Access verified by a real read, full history loaded, then scheduler-tick capture (a new message lands within about a minute, not instantly). **Apple only exposes message history on a Mac; there is no path on Windows** |
 | Facebook Messenger | Not built as a product |
-| Zoom | Not built as a connector. **Zero-build v0 available today**, see below |
+| Zoom | **Built.** `brain connect zoom`: a webhook on your own worker loads each cloud-recording transcript automatically. **Needs a paid (Licensed) Zoom seat** — the free tier cannot cloud record at all. New recordings only, no backfill. Not yet run against a real Zoom account |
 | Slack | Not built. Priced separately when it is |
 | Notion | Not built |
 | Microsoft 365, Outlook, SharePoint, OneDrive | Not built |
@@ -116,7 +116,7 @@ Same publishing consideration as the rest of your Google connection: on Workspac
 
 **No connector needed, because Google already writes the transcript where your brain already looks.** Turn on Gemini notes for a Meet call (or take notes yourself and save them), and the transcript lands as a document in your Drive. Drive ingest reads it like anything else. Nothing to connect, nothing to authorize beyond what Drive already has.
 
-If your meetings are on Zoom instead, see the Zoom entry below — the same zero-build pattern (transcript into Drive) works there too, it just takes one setting change on your account rather than being automatic.
+If your meetings are on Zoom instead, there is a connector for that — see the Zoom entry below. It needs a paid Zoom seat and about ten minutes of setup, and the same zero-build pattern (save the transcript into Drive) works there too if you would rather not set anything up.
 
 ### WhatsApp
 
@@ -153,6 +153,27 @@ What it captures, and what it does not:
 - **Tapbacks, reactions and attachment-only messages are skipped and counted** — the run report says how many — so a thread in the brain is thinner than the same thread on your phone, and that difference is stated rather than hidden.
 
 The load is the named source `imessage`: `brain sources` shows its freshness against the once-a-minute expectation, and `brain forget <manifest> --source imessage` removes every captured conversation. `brain disconnect imessage <manifest>` stops and removes the capture agent, flushes still-open conversations so they remain searchable, and leaves already-captured history in the brain unless you forget it explicitly.
+
+### Zoom
+
+**Built, and not yet run against a real Zoom account.** Every part of it is tested — the webhook's signature checks, the transcript parsing, the setup command, and the handshake between the two — but the tests use fixtures, not Zoom. Nobody has yet pointed this at a live paid Zoom account and watched a real meeting become a document. Treat it as built and unproven rather than proven, and expect the first live run to be the one that finds anything the fixtures could not.
+
+**A paid (Licensed) Zoom seat is required, and that is not a soft requirement.** Zoom's free Basic tier has no cloud recording at all. No cloud recording means no transcript, which means there is nothing here to read. `brain connect zoom <manifest>` checks the plan while it runs and refuses to connect a Basic account, so you find out during setup rather than after the first call you wanted read. That check needs one extra read-only permission; if you leave it off, the command says the plan could not be confirmed instead of assuming it is fine.
+
+**How it works.** You create a Server-to-Server OAuth app in **your own** Zoom account and copy four values it shows you. `brain connect zoom` checks them against Zoom for real, writes them as secrets on **your own** Cloudflare worker, then runs Zoom's own validation challenge against your worker to prove the endpoint will pass before you paste its URL into Zoom. After that, Zoom notifies your worker each time a recording's transcript is ready, and your worker fetches that one transcript and stores it. We hold none of it: not the Zoom app, not the four credentials, not the recordings.
+
+**What lands, and what does not:**
+
+- **New recordings only. There is no backfill.** Meetings recorded before you connect stay where they are; nothing sweeps your Zoom account for past recordings. To bring old calls in, use the manual path below.
+- **Cloud recording with audio transcript must be on** in your Zoom recording settings, for the meetings you want read. A meeting that was not cloud recorded produces nothing, and a recording with transcription turned off produces nothing.
+- **The transcript only.** Not the audio, not the video, not a summary, and no analysis of the call. One meeting becomes one searchable document.
+- **Speaker labels come from Zoom**, so people appear under whatever display name they joined with.
+- **It arrives when Zoom says it is ready**, which is typically several minutes after the call ends and can be longer for a long meeting. This is Zoom's own transcription lag, not a delay we add.
+- **Nothing about who attended.** Participant lists are a different Zoom permission and are not requested.
+
+The load is the named source `zoom`, so `brain sources` shows it and `brain forget <manifest> --source zoom` removes every transcript it loaded. `brain disconnect zoom <manifest>` deletes the four secrets from your worker, which makes the webhook refuse every further delivery; removing the subscription inside your Zoom app is yours to do, and the command tells you where.
+
+**The zero-build alternative still works, and is the way to load old calls.** Save a recording's transcript (the `.vtt` file, or run Otter) into a Drive folder you already ingest, and Drive reads it like any other document — exactly the way Google Meet's own Gemini notes already do with no setup at all.
 
 ---
 
@@ -191,12 +212,6 @@ If your business runs on Microsoft rather than Google, **this product is not rea
 ### Facebook Messenger
 
 **Not built,** as a product, in any form — no export parser, no capture path, live or otherwise.
-
-### Zoom
-
-**Not built as a connector, but there is a zero-build path that works today.** Turn on cloud recording with an audio transcript for your Zoom account, and save the transcript (the `.vtt` file, or run Otter) into a Drive folder you already ingest. Drive reads it like any other document, exactly the way Google Meet's own Gemini notes already do with no setup at all. This covers "what did we discuss on that call" from day one.
-
-The real connector — a webhook on your own Cloudflare worker that fetches each transcript automatically the moment a recording finishes, no manual save — is planned and requires your Zoom account to be on a paid plan with cloud recording. Until then, the manual save above is the honest v0.
 
 ---
 

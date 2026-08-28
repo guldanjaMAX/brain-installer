@@ -91,6 +91,13 @@
           "properties": {
             "enabled": { "type": "boolean", "default": false }
           }
+        },
+        "zoom": {
+          "type": "object",
+          "description": "Zoom cloud-recording transcripts, enforced by brain connect zoom. Requires a paid (Licensed) Zoom seat: the free Basic tier cannot cloud record at all, so it can never produce a transcript, and connect refuses it. The client creates a Server-to-Server OAuth app in their OWN Zoom account with the cloud_recording:read:admin scope; its four values are written as secrets on the client's own worker. Delivery is webhook-driven (recording.transcript_completed) for NEW recordings only; there is no backfill of recordings made before connecting.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false }
+          }
         }
       }
     },

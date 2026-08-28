@@ -207,7 +207,8 @@ function supportSourceForCommand(command = "") {
     return "local";
   }
   if (command === "connect" || command === "disconnect") {
-    if (String(process.argv[3] || "").toLowerCase() === "imessage") return "imessage";
+    const which = String(process.argv[3] || "").toLowerCase();
+    if (which === "imessage" || which === "zoom") return which;
     return "installer";
   }
   if (SUPPORT_REMOTE_COMMANDS.has(command)) return "cloudflare";
@@ -6752,11 +6753,13 @@ async function cmdConnect(target) {
   const flags = parseFlags(process.argv.slice(3));
   const which = (target || "").toLowerCase();
   if (which === "imessage") return cmdConnectImessage(process.argv[4], flags);
+  if (which === "zoom") return cmdConnectZoom(process.argv[4], flags);
   if (which !== "google") {
     die(
-      "brain connect supports google and imessage.\n" +
+      "brain connect supports google, imessage and zoom.\n" +
         "  Usage: brain connect google --scopes drive,gmail,calendar\n" +
-        "         brain connect imessage <manifest>"
+        "         brain connect imessage <manifest>\n" +
+        "         brain connect zoom <manifest>"
     );
   }
 
@@ -6893,6 +6896,145 @@ export async function cmdConnectImessage(manifestPath, flags = {}, options = {})
 }
 
 /**
+ * brain connect zoom <manifest> — Zoom cloud-recording transcripts.
+ *
+ * The step ORDER here is the design, not a formality. Saving a webhook URL in
+ * the Zoom Marketplace is itself the validation request: Zoom immediately POSTs
+ * a challenge to whatever URL was typed and refuses to save an endpoint that
+ * answers wrongly. So the client cannot be sent to paste that URL until their
+ * worker is deployed, routing the webhook, and holding the Secret Token. Every
+ * step below exists to make that true before the last one prints the URL:
+ *
+ *   1. Credentials from the environment, never argv, or print what to create.
+ *   2. Probe Zoom for real. A Basic plan cannot cloud record, so it can never
+ *      produce a transcript — that is a refusal here, not a surprise later.
+ *   3. Write the four secrets to the CLIENT'S worker.
+ *   4. Run Zoom's own handshake against the live worker, holding the same
+ *      Secret Token Zoom will hold. This is the check Zoom is about to run.
+ *   5. Only now, print the URL and the event to subscribe to.
+ */
+export async function cmdConnectZoom(manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die("usage: brain connect zoom <manifest>");
+  }
+  const { m } = loadManifest(manifestPath);
+  if (m.corpora?.zoom?.enabled !== true) {
+    die(
+      "corpora.zoom.enabled is not true in this manifest.\n" +
+        '      Add  "zoom": { "enabled": true }  under "corpora" first, so the install\n' +
+        "      record says this brain reads Zoom transcripts before the machinery exists."
+    );
+  }
+
+  const zoom = options.zoom ?? await import("./connectors/zoom.mjs");
+  const env = options.env ?? process.env;
+
+  // Step 1: credentials, from the environment only.
+  const { values, missing, complete } = zoom.readZoomCredentialsFromEnv(env);
+  if (!complete) {
+    console.log("");
+    for (const line of zoom.zoomAppCreationSteps()) console.log(`  ${line}`);
+    console.log("");
+    die(`not set yet: ${missing.join(", ")}. Nothing was created or changed.`);
+  }
+
+  // Step 2: prove the credentials against Zoom before writing anything.
+  info("checking these credentials against Zoom");
+  let probe;
+  try {
+    probe = await zoom.probeZoomAccount(values, options.probeOptions || {});
+  } catch (error) {
+    die(`${String(error?.message || error)}\n      Nothing was written.`);
+  }
+  const verdict = zoom.summarizeZoomProbe(probe);
+  for (const note of verdict.notes) info(note);
+  if (!verdict.ok) {
+    die(verdict.blockers.join("\n      "));
+  }
+  ok("Zoom credentials verified, and the recording scope is granted");
+
+  // Step 3: the four secrets, onto the client's own worker.
+  const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
+  const resolveAcct = options.resolveAccount ?? resolveAccount;
+  const acct = await resolveAcct(m);
+  const putSecret = options.putWorkerSecret ?? ((account, script, name, text) =>
+    cf(`/accounts/${account.id}/workers/scripts/${script}/secrets`, {
+      method: "PUT",
+      body: { name, text, type: "secret_text" },
+    }));
+  for (const name of zoom.ZOOM_CREDENTIAL_ENV) {
+    try {
+      await putSecret(acct, scriptName, name, values[name]);
+    } catch (e) {
+      // A secret is set ON a script, so the script has to exist first. Zoom's
+      // own error for this arrives much later and says nothing useful.
+      if (/does not exist/i.test(e.message) || /\(404\)/.test(e.message)) {
+        die(
+          `the worker "${scriptName}" has not been deployed yet, so there is nothing to set secrets on.\n` +
+            "      Run `brain deploy <manifest>` first, then rerun this command. Any Zoom secrets\n" +
+            "      already written are unchanged and will be overwritten on the retry."
+        );
+      }
+      die(`the Zoom secret ${name} could not be written to the worker: ${e.message}`);
+    }
+  }
+  ok(`four Zoom secrets written to ${scriptName} in the client's own Cloudflare account`);
+
+  // Step 4: run the exact handshake Zoom is about to run.
+  const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+  const base = await resolveBase(m, acct);
+  const webhookUrl = zoom.zoomWebhookUrl(base);
+  // A secret written seconds ago does not always reach every running isolate
+  // instantly. Checking once would occasionally tell a client their Secret
+  // Token is wrong when it is right, which sends them back to Zoom to re-copy
+  // a correct value — the worst possible false negative here. A few short
+  // retries cost nothing and remove that whole class of confusion.
+  const sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const attempts = Math.max(1, Number(options.verifyAttempts ?? 3));
+  let live = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    live = await zoom.verifyLiveWebhookEndpoint(
+      webhookUrl, values.ZOOM_WEBHOOK_SECRET_TOKEN, options.verifyOptions || {},
+    );
+    if (live.ok || attempt === attempts) break;
+    info(`the brain has not answered the validation challenge yet; retrying (${attempt} of ${attempts - 1})`);
+    await sleep(2000);
+  }
+  if (!live.ok) {
+    die(
+      `${live.reason}\n` +
+        "      The secrets were written, but do NOT paste the URL into Zoom yet: Zoom validates it\n" +
+        "      on save and would refuse it. Fix the above and rerun this command."
+    );
+  }
+  ok("the brain answered Zoom's validation challenge correctly. The URL will save.");
+
+  // Step 5: register the named source, so it is visible and undoable before a
+  // single call has happened. No refresh expectation: Zoom pushes when a
+  // meeting happens, so a quiet week is not a broken connector.
+  try {
+    const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
+    const adminKey = resolveKey(manifestPath);
+    if (!adminKey) throw new Error("no admin key is available");
+    const postExpectation = options.postSourceExpectation ?? postSourceExpectation;
+    await postExpectation(base, adminKey, {
+      source: "zoom", kind: "zoom", expected_refresh_seconds: null,
+    });
+  } catch (error) {
+    warn(
+      `Zoom is connected, but the named source could not be registered up front: ${String(error?.message || error).slice(0, 160)}\n` +
+        "      Harmless: the first transcript that arrives registers it."
+    );
+  }
+
+  console.log("");
+  for (const line of zoom.zoomEventSubscriptionSteps(webhookUrl)) console.log(`  ${line}`);
+  console.log("");
+  info(`to remove this later: brain disconnect zoom ${manifestPath}`);
+  return { webhookUrl, scriptName, plan: probe.plan };
+}
+
+/**
  * brain disconnect — the first disconnect verb in this CLI.
  *
  * Same posture as removeDriveScheduler: removal must remain reachable even
@@ -6903,8 +7045,13 @@ export async function cmdConnectImessage(manifestPath, flags = {}, options = {})
 async function cmdDisconnect(target) {
   const flags = parseFlags(process.argv.slice(3));
   const which = (target || "").toLowerCase();
+  if (which === "zoom") return cmdDisconnectZoom(process.argv[4], flags);
   if (which !== "imessage") {
-    die("only `brain disconnect imessage <manifest>` exists today.");
+    die(
+      "brain disconnect supports imessage and zoom.\n" +
+        "  Usage: brain disconnect imessage <manifest>\n" +
+        "         brain disconnect zoom <manifest>"
+    );
   }
   return cmdDisconnectImessage(process.argv[4], flags);
 }
@@ -6955,6 +7102,79 @@ export async function cmdDisconnectImessage(manifestPath, flags = {}, options = 
   }
   info("captured conversations remain in the brain; remove them with: brain forget " + manifestPath + " --source imessage");
   return removed;
+}
+
+/**
+ * brain disconnect zoom <manifest> — stop reading Zoom transcripts.
+ *
+ * Deleting ZOOM_WEBHOOK_SECRET_TOKEN is what actually turns this off: the route
+ * fails closed without it, so a delivery that arrives after this point is
+ * refused rather than quietly ingested. That is why the secret removal is the
+ * step that must succeed, and the two housekeeping steps after it are
+ * best-effort — a brain that is unreachable right now must never make
+ * disconnecting unreachable too.
+ *
+ * The Event Subscription itself lives in the client's Zoom app and is theirs to
+ * remove. We say so plainly rather than pretending this reaches into Zoom.
+ */
+export async function cmdDisconnectZoom(manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die("usage: brain disconnect zoom <manifest>");
+  }
+  const { m } = loadManifest(manifestPath);
+  const zoom = options.zoom ?? await import("./connectors/zoom.mjs");
+  const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
+  const resolveAcct = options.resolveAccount ?? resolveAccount;
+  const acct = await resolveAcct(m);
+  const deleteSecret = options.deleteWorkerSecret ?? ((account, script, name) =>
+    cf(`/accounts/${account.id}/workers/scripts/${script}/secrets/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }));
+
+  const removed = [];
+  const kept = [];
+  for (const name of zoom.ZOOM_CREDENTIAL_ENV) {
+    try {
+      await deleteSecret(acct, scriptName, name);
+      removed.push(name);
+    } catch (e) {
+      // Already gone is the desired state, not a failure.
+      if (/does not exist/i.test(e.message) || /\(404\)/.test(e.message)) continue;
+      kept.push(`${name} (${e.message.slice(0, 100)})`);
+    }
+  }
+  if (kept.length) {
+    die(
+      `these Zoom secrets could not be removed from ${scriptName}: ${kept.join(", ")}\n` +
+        "      Zoom may still be able to deliver transcripts. Fix Cloudflare access and rerun."
+    );
+  }
+  ok(removed.length
+    ? `Zoom secrets removed from ${scriptName}; the webhook now refuses every delivery`
+    : "no Zoom secrets were set on this worker; nothing to remove");
+
+  // Best-effort from here. Removal must stay reachable even when the brain is not.
+  try {
+    const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
+    const adminKey = resolveKey(manifestPath);
+    if (!adminKey) throw new Error("no admin key is available");
+    const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+    const base = await resolveBase(m, acct);
+    const postExpectation = options.postSourceExpectation ?? postSourceExpectation;
+    await postExpectation(base, adminKey, {
+      source: "zoom", kind: "zoom", expected_refresh_seconds: null,
+    });
+  } catch (error) {
+    warn(`Zoom is disconnected, but its source record could not be updated: ${String(error?.message || error).slice(0, 160)}`);
+  }
+
+  console.log("");
+  console.log("  Also remove it on the Zoom side, which is yours and not reachable from here:");
+  console.log("    marketplace.zoom.us > Manage > your Server-to-Server OAuth app > Feature");
+  console.log("    Remove the Event Subscription, or deactivate the app entirely.");
+  console.log("");
+  info("transcripts already loaded remain in the brain; remove them with: brain forget " + manifestPath + " --source zoom");
+  return { removed, scriptName };
 }
 
 /** The token provider for a stored Google connection, or a clear refusal. */
@@ -10162,6 +10382,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail,calendar  authorise the client's own Google account
     brain connect imessage <manifest>      verify Full Disk Access, load history, capture live (Mac only)
+    brain connect zoom     <manifest>      Zoom cloud-recording transcripts (needs a paid Zoom seat)
     brain ingest     <manifest> --path <dir>  load a folder into the brain
     brain ingest     <manifest> --from drive  load from a connected remote source
     brain ingest     <manifest> --from calendar  sync Google Calendar (--dry-run to preview)
@@ -10184,6 +10405,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain schedule   <manifest>            inspect unattended Drive refresh
     brain schedule   <manifest> --remove   remove it and preserve its logs
     brain disconnect imessage <manifest>   stop live capture, flush open sessions, remove the agent
+    brain disconnect zoom     <manifest>   remove the Zoom secrets so the webhook refuses deliveries
     brain support    --clear --yes         clear private local issue notes
 
   brain ingest takes --source <name>, --limit <n>, --dry-run, and --reset. It is

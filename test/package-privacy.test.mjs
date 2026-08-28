@@ -84,6 +84,7 @@ const expected = [
   "connectors/google-calendar.mjs",
   "connectors/google-drive.mjs",
   "connectors/keychain-write.exp",
+  "connectors/zoom.mjs",
   "docs/ARCHITECTURE.md",
   "docs/COMPETITIVE-BENCHMARK.md",
   "docs/ENGINEERING-STANDARDS.md",
@@ -178,6 +179,7 @@ const expected = [
   "worker/src/lib/store-d1.js",
   "worker/src/lib/store.js",
   "worker/src/lib/supabase.js",
+  "worker/src/lib/zoom.js",
 ];
 const allowed = new Set(expected);
 const missing = expected.filter((path) => !files.includes(path));
