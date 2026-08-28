@@ -575,16 +575,22 @@ A bad import being one command instead of a support call is the reason you can a
 
 ## Things that look like failures and are not
 
-### Drive cleanup says `review required`
+### Cleanup says `review required`
 
-This is an intentional safety stop, not an installer crash. The proposed Drive
-cleanup crossed 100 documents or 10% of the stored Drive corpus. Nothing in the
-plan was removed, and the Drive cursor was not advanced.
+This is an intentional safety stop, not an installer crash. The proposed cleanup
+crossed 100 documents or 10% of what that source had loaded. Nothing in the plan
+was removed, and the source cursor was not advanced.
 
 Review the aggregate reason counts in the message. If the change is expected,
 rerun with the exact `--approve-removals <fingerprint>` value it printed. If the
-change is surprising, do not approve it. Check the Drive connection and source
-policy, then rerun so a fresh source comparison produces a new plan. The local
+change is surprising, do not approve it. Check the connection and source policy,
+then rerun so a fresh source comparison produces a new plan.
+
+**On a watched local folder this most often means the folder was not there.** A
+cloud folder that had not finished syncing, an external drive that was not
+mounted, a path that moved: all three look exactly like every file being
+deleted. Confirm the folder really does hold what you expect before approving
+anything. The local
 issue note records only `SAFETY_REVIEW_REQUIRED`; it does not retain the
 fingerprint, document identifiers, filenames, or message text.
 

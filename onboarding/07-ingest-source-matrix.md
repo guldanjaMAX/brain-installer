@@ -12,11 +12,12 @@ I would rather lose a sale to an honest table than win one and spend week three 
 |---|---|
 | Google Drive | **Built.** In production |
 | Direct upload and API push | **Built.** The fallback for anything with no connector |
+| A watched folder on your own machine | **Built, Mac-only for the schedule.** Name one folder in your manifest and it reloads itself on a schedule: new files load, edited files reload, deleted files are removed. This is what makes "drop it in a folder you already ingest" true for a folder that is not inside Google Drive. On Windows and Linux the same load runs, by hand |
 | Gmail | Built: `brain connect google --scopes gmail`, then `brain ingest --from gmail`. Incremental via historyId; bulk mail excluded by default. Not yet run against a real mailbox |
 | Google Calendar | Built and wired: `brain connect google --scopes calendar`, then `brain ingest --from calendar`. Incremental via Google's own sync token; cancelled events are removed, not left behind. Not yet run against a real calendar |
 | Meetings (Google Meet) | **Built, with no extra work.** Meet's own Gemini notes land as a transcript document in Drive, which is already read |
-| WhatsApp | **Built two ways.** The safe one: your phone's own "Export chat" .txt, dropped in a folder you already ingest, no daemon and no account risk. The other: `brain connect whatsapp --accept-risk`, live capture through a paired linked device, Mac-only, off unless you turn it on, and carrying a real terms-of-service risk described below. **Never yet run against a real WhatsApp account** |
-| Text messages (Android, and Google Voice) | **Built, as an export.** SMS Backup & Restore's .xml export, or a Google Voice Takeout, dropped in a folder you already ingest |
+| WhatsApp | **Built two ways.** The safe one: your phone's own "Export chat" .txt, dropped in a folder that is ingested (a Drive folder, or the watched folder above), no daemon and no account risk. The other: `brain connect whatsapp --accept-risk`, live capture through a paired linked device, Mac-only, off unless you turn it on, and carrying a real terms-of-service risk described below. **Never yet run against a real WhatsApp account** |
+| Text messages (Android, and Google Voice) | **Built, as an export.** SMS Backup & Restore's .xml export, or a Google Voice Takeout, dropped in a folder that is ingested |
 | iMessage (Mac) | **Built, Mac-only, live.** `brain connect imessage`: Full Disk Access verified by a real read, full history loaded, then scheduler-tick capture (a new message lands within about a minute, not instantly). **Apple only exposes message history on a Mac; there is no path on Windows** |
 | iPhone messages, no Mac (Windows too) | **Built, as a one-time history load.** `brain ingest --from iphone-backup` reads an **unencrypted** local iPhone backup and loads the iMessage and SMS history inside it. A point-in-time snapshot, **not** live capture: nothing new arrives afterwards. Runs on Windows and macOS. Never yet run against a backup Apple wrote |
 | Facebook Messenger | Not built as a product |
@@ -46,7 +47,11 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 | Google Slides | Text from the slides |
 | PDF | Text layer |
 | Word (.docx), PowerPoint (.pptx), Excel (.xlsx) | Full text |
+| Rich text (.rtf) | Text only; font tables, styles and embedded pictures are dropped |
 | Plain text, Markdown, JSON, XML, YAML | As written |
+| Meeting transcripts and subtitles (.vtt, .srt) | Speaker-tagged text; cue numbers, timings and positioning removed |
+| Mail archives (.mbox) | Split into individual messages, each one its own document with its own date |
+| Calendar exports (.ics) | Each event with its date, attendees, location and description |
 
 **What it does not read, and why:**
 
@@ -121,7 +126,7 @@ If your meetings are on Zoom instead, there is a connector for that — see the 
 
 ### WhatsApp
 
-**Built, as an export — not a live connection.** WhatsApp's own per-chat "Export chat" produces a `.txt` file (choose "without media"). Drop it in a folder you already ingest with `brain ingest <manifest> --path <folder>`; it is detected automatically by its content, not by asking you to say what it is, and loaded as sessionized conversation documents rather than one giant wall of text.
+**Built, as an export — not a live connection.** WhatsApp's own per-chat "Export chat" produces a `.txt` file (choose "without media"). Drop it in a folder that is ingested — run `brain ingest <manifest> --path <folder>` yourself, or put it in the watched folder so the next scheduled tick picks it up; it is detected automatically by its content, not by asking you to say what it is, and loaded as sessionized conversation documents rather than one giant wall of text.
 
 **Also built, and deliberately hard to turn on: live capture.** `brain connect whatsapp <manifest> --accept-risk` pairs this machine with your WhatsApp account as a linked device, the same way WhatsApp Web does, and from then on captures new messages continuously into the brain. It is off unless you ask for it twice: the manifest has to declare `corpora.whatsapp.enabled`, and the command needs `--accept-risk` on top of that. Leave both alone and nothing about your install changes.
 
@@ -142,7 +147,7 @@ If your meetings are on Zoom instead, there is a connector for that — see the 
 - **Android:** the SMS Backup & Restore app (free, on the Play Store) exports your whole message history as one `.xml` file, covering every conversation, not just one.
 - **Google Voice:** a standard Google Takeout export of your Voice data includes one page per conversation.
 
-Either one, dropped in a folder you already ingest, is detected automatically and loaded the same sessionized way WhatsApp is. Unlike WhatsApp, neither format has a locale-dependent date to get wrong: both write an exact, unambiguous timestamp, so there is no disambiguation step here, only correct reading of it.
+Either one, dropped in a folder that is ingested, is detected automatically and loaded the same sessionized way WhatsApp is. Unlike WhatsApp, neither format has a locale-dependent date to get wrong: both write an exact, unambiguous timestamp, so there is no disambiguation step here, only correct reading of it.
 
 **iPhone note:** this Android path does not apply to you if you carry an iPhone. With a Mac, your texts arrive through the iMessage connector (see above) — turn on Text Message Forwarding and SMS rides in for free alongside iMessage. Without a Mac, the iPhone backup load below is the way in, and it is history only. There is no live SMS path for an iPhone without a Mac in the loop, and there is not going to be one.
 
@@ -182,7 +187,9 @@ The load is the named source `imessage`: `brain sources` shows its freshness aga
 
 The load is the named source `zoom`, so `brain sources` shows it and `brain forget <manifest> --source zoom` removes every transcript it loaded. `brain disconnect zoom <manifest>` deletes the four secrets from your worker, which makes the webhook refuse every further delivery; removing the subscription inside your Zoom app is yours to do, and the command tells you where.
 
-**The zero-build alternative still works, and is the way to load old calls.** Save a recording's transcript (the `.vtt` file, or run Otter) into a Drive folder you already ingest, and Drive reads it like any other document — exactly the way Google Meet's own Gemini notes already do with no setup at all.
+**The zero-build alternative is the way to load old calls, and it now actually works.** Save a recording's transcript — the `.vtt` file Zoom writes, an `.srt`, or an Otter export — into any folder that is ingested, and it is read as a speaker-tagged transcript like any other document, exactly the way Google Meet's own Gemini notes already do with no setup at all. That folder can be inside Google Drive, or it can be the watched folder on your own machine described at the end of this document.
+
+Being honest about the history here: until this version there was no `.vtt` reader, so a transcript dropped in a folder was silently skipped for having no extractor, and this paragraph described something that did not happen. It reads them now, through the same converter the live Zoom connector uses.
 
 ### iPhone messages without a Mac, from a local backup (Windows or macOS)
 
@@ -218,6 +225,45 @@ With no `--backup`, it looks in the usual place for your operating system — `L
 The load is the named source `iphone-backup` (or whatever you pass to `--source`, if you would rather name it by date). `brain forget <manifest> --source iphone-backup` removes every conversation it loaded and nothing else. `brain sources` lists it as its own kind, so a finished snapshot is never presented as live capture that has gone stale.
 
 **The honest boundary:** this has been proven end to end against a synthetic backup built in the test suite — the file index, the property lists, the write-ahead-log sidecar, the encrypted refusal and the message extraction all have tests. It has **not** yet been run against a backup Apple itself wrote, and it has not been run on a real Windows machine; the Windows path handling is proven by construction rather than by a Windows run. Expect the first real backup to surface something, and tell me what it says rather than working around it.
+
+### A watched folder on your own machine
+
+**Built. The schedule is Mac-only; the load itself runs anywhere.**
+
+Several parts of this document tell you to drop a file into "a folder you already ingest": a WhatsApp export, an SMS backup, a Google Voice takeout, a saved meeting transcript, a mail archive. That sentence used to be true only if the folder happened to live inside Google Drive, because Drive was the only source that refreshed itself. Anywhere else, "already ingest" quietly meant "remember to run a command by hand, forever" — and the day you stop, your brain stops matching your world while still answering confidently from what it has.
+
+So you can now name one folder and have it reload itself:
+
+```json
+"corpora": {
+  "local_folder": { "enabled": true, "path": "/Users/you/Brain Dropbox", "source": "documents" }
+},
+"operations": { "folder_ingest_cron": "0 * * * *" }
+```
+
+```
+brain schedule <manifest> --install --folder    install it (macOS)
+brain schedule <manifest> --folder              is it installed, did the last run work
+brain schedule <manifest> --remove --folder     remove it, keep its logs
+```
+
+**What each run does:**
+
+- **A file you added since last time is loaded.**
+- **A file you edited is reloaded**, and only that file. Sameness is judged by the file's contents, not its timestamp, so a sync or a backup restore touching every file does not cause a re-index of everything.
+- **A file you did not touch costs one read** and is not sent again.
+- **A file you deleted is removed from your brain.** That is what makes the folder a mirror of your intent rather than a pile that only ever grows. Removals are counted and capped: a run that would remove more than 100 documents, or more than a tenth of what that source loaded, stops and asks you first, printing counts and an approval code but never a filename. A cloud folder that failed to sync looks exactly like you deleting everything in it, and that difference is worth one deliberate confirmation.
+- **An interrupted run resumes.** Progress is saved continuously, so a closed lid costs one file, not the whole pass.
+
+**The honest limits:**
+
+- **The schedule needs macOS**, because it installs as a per-user LaunchAgent. On Windows and Linux the same load runs, you just start it yourself: `brain ingest <manifest> --path <folder> --source documents`.
+- **It is hourly by default**, not instant. It is a place to drop exports, not a live feed.
+- **The path must be absolute.** A scheduled job does not run from your shell, so a relative path would point somewhere neither of us intended.
+- **The folder must exist when you install the schedule.** Pointing at a folder that is not there would load nothing and report success forever, so it is refused at install time instead.
+- **`_Private` prefixes still apply**, exactly as everywhere else.
+
+The load is the named source you chose, so `brain sources` shows it and `brain forget <manifest> --source documents` removes exactly what it loaded.
 
 ---
 

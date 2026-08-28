@@ -60,7 +60,7 @@ the same packaging caution as private evaluation data.
 | D1 schema | `migrations/d1/` | Append-only schema and data migrations |
 | Extraction | `ingest/` | File walking, format extraction, quality checks, dates, splitting, batching, resume state |
 | Google sources | `connectors/google-auth.mjs`, `google-drive.mjs`, `gmail.mjs`, `google-calendar.mjs` | OAuth storage and source-specific listing, cursor, export, and envelope logic |
-| Local operations | `operations/` | Admin-key persistence and macOS Drive scheduling |
+| Local operations | `operations/` | Admin-key persistence and macOS unattended scheduling (Drive, iMessage capture, watched folder) |
 | MCP | `components/brain-mcp.mjs`, `brain-mcp-runtime.mjs` | Tool surface and runtime resolution of the current durable admin key |
 | Acceptance and eval | `acceptance.mjs`, `eval/`, `report*.mjs` | Install checks, retrieval measurement, regression comparison, owner-facing reports |
 | Migration | `migration/` | One-time Supabase corpus and message-session import |
@@ -210,8 +210,10 @@ changed plan requires a new decision without exposing source identifiers.
 The macOS Drive scheduler installs a per-user LaunchAgent. Its definition has no
 credentials. It resolves the declared durable admin key at runtime, uses Google
 OAuth from its chosen store, takes an owner-only lock, and rotates owner-only
-logs after the lock-holding ingest exits. Windows and Linux do not yet have an
-equivalent unattended source scheduler.
+logs after the lock-holding ingest exits. The iMessage capture lane and the
+watched local folder lane are the same machinery with a different connector
+spec, so all three share that hardening rather than each re-deriving it.
+Windows and Linux do not yet have an equivalent unattended source scheduler.
 
 ## D1, FTS5, Vectorize, and the outbox
 
@@ -408,6 +410,6 @@ remain not observable until a richer read-only snapshot exists.
 | Add a connector | Connector module, OAuth scopes and storage, cursor and deletion rules, ingest dispatcher, source receipts, manifest and source matrix |
 | Change manifest fields | Schema, template, setup defaults, every reader, examples, package and contract tests |
 | Change credentials | Persistence modules, minimal child environments, rotation/readback tests, handoff and failure runbooks |
-| Change scheduling | `operations/drive-scheduler.mjs`, launchd tests, freshness expectations, private log and lock behavior |
+| Change scheduling | `operations/drive-scheduler.mjs` and its connector specs (`imessage-scheduler.mjs`, `folder-scheduler.mjs`), launchd tests, freshness expectations, private log and lock behavior |
 | Add an issue category | Support schema, typed classification, privacy tests, error-path test, troubleshooting remedy |
 | Cut a release | Package and lock versions, template version, current-version test, changelog, pack inspection, six CI jobs, release tag |

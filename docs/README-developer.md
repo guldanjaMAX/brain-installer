@@ -187,8 +187,27 @@ with a reason, grouped at the end of the run and kept in the state file. A brain
 that quietly omits 12,000 documents is confidently ignorant of them, which is
 the exact failure this product exists to avoid.
 
-**Formats today:** `.pdf .docx .xlsx .xlsm .xls .pptx .eml .csv .tsv .json .txt
-.md .markdown .text .log .rst .adoc .html .htm .xhtml .xml`
+**Formats today:** `.pdf .docx .xlsx .xlsm .xls .pptx .rtf .eml .mbox .vtt .srt
+.ics .csv .tsv .json .txt .md .markdown .text .log .rst .adoc .html .htm .xhtml
+.xml`
+
+Five of those carry no dependency at all. `.vtt` and `.srt` run through
+`worker/src/lib/vtt.js`, the SAME function the Zoom connector uses on the
+transcripts Zoom delivers — a second transcript parser would drift from the
+first invisibly, both still producing text while one slowly got worse. `.ics`
+is converted into the shape `renderEvent` in `connectors/google-calendar.mjs`
+already accepts and rendered by it, so an event reads identically whether it
+arrived through the calendar connector or as an exported file. `.rtf` is a
+hand-written state machine (`ingest/rtf.mjs`) rather than a fifth dependency:
+the format is control words and braces, and the hard part is discarding the
+font, style and embedded-picture destinations, not parsing.
+
+`.mbox` is the one that is not a document. `ingest/run.mjs` splits it and loads
+each message separately, through the same `parseEmailMessage` the `.eml` path
+uses, so one archive becomes many citable documents with their own subjects and
+Date headers. The registry also holds a single-document `.mbox` reader for
+callers that cannot express one-file-many-documents (Drive), rendering every
+message through that same reader: coarser, never different.
 
 Four dependencies carry the binary formats: `unpdf`, `fflate`, `@e965/xlsx` and
 `postal-mime`. 11 MB total, pure JavaScript, no node-gyp, no postinstall scripts,
@@ -214,6 +233,11 @@ CSV and TSV are rendered row-wise as `Header: value` rather than as a bare grid,
 because `15234.11` on its own is unretrievable while `Balance: 15234.11` answers
 a question about a balance.
 
+A local-folder run also reconciles DELETIONS: a file this source loaded before
+and can no longer find is removed, through the same aggregate removal plan and
+the same safety limits Drive uses. Suppressed under `--limit`, where an
+unexamined file is not a deleted one.
+
 **`safety.private_path_prefixes` is enforced on local-folder and Google Drive
 ingest**, per path segment. Drive also enforces `corpora.google_drive` exact
 file-id, path-prefix and filename-part exclusions before downloading content.
@@ -221,8 +245,8 @@ An excluded document already present in the brain is removed rather than left
 stranded. Gmail has no folder path and does not use these rules.
 
 Flags: `--dry-run`, `--source <name>`, `--limit <n>`, `--reset`, and the
-exact-plan acknowledgement `--approve-removals <fingerprint>` when a Drive
-cleanup exceeds its routine safety limits.
+exact-plan acknowledgement `--approve-removals <fingerprint>` when a cleanup —
+Drive's, or a local folder's — exceeds its routine safety limits.
 
 ---
 
@@ -389,6 +413,47 @@ not rotate another writer's logs. A currently running noisy or hung process can
 exceed that cap until it exits, so stale-run monitoring still matters. Rotation
 refuses links, hard links, foreign-owned files, and paths outside the per-user
 `.brain` runtime.
+
+### Unattended watched-folder refresh on macOS
+
+The third consumer of the same generalized scheduler, after Drive and iMessage.
+`operations/folder-scheduler.mjs` supplies only a `SCHEDULER_SPEC`; every piece
+of hardening above — atomic plist staging with rollback, the native advisory
+lock, bounded symlink-refusing log rotation, the config-hash guard against a
+stale agent reading credentials for an edited manifest — is the same code.
+
+```bash
+node brain.mjs schedule ./acme.manifest.json --install --folder
+node brain.mjs schedule ./acme.manifest.json --folder
+node brain.mjs schedule ./acme.manifest.json --remove --folder
+```
+
+It reads `corpora.local_folder` (`enabled`, `path`, `source`) and
+`operations.folder_ingest_cron`, hourly by default. The tick runs
+`brain ingest <manifest> --path <folder> --source <name>` — the ORDINARY local
+ingest, not a new code path — so it inherits that command's content-hash resume
+state exactly: new file loads, changed file re-sends, unchanged file costs one
+read, interrupted run resumes. The folder and source name are bound into the
+config hash, so an installed agent cannot be repointed at another tree by
+editing the manifest afterwards.
+
+`validateExtras` refuses a relative path (launchd's working directory is not the
+client's shell), a folder that does not currently exist (a schedule pointing at
+nothing loads nothing and reports success forever), and a source name outside
+`^[a-z0-9][a-z0-9_-]*$` (the name is the deletion scope). Status and remove stay
+reachable when the folder is later deleted, so a loaded agent is never stranded.
+
+**Deletions.** The local ingest lane now reconciles files that are gone, through
+the same `buildDriveRemovalPlan` / `assertDriveRemovalPlanSafe` aggregate guard
+the Drive lane uses, with the same 100-document and 10% limits and the same
+`--approve-removals <fingerprint>` acknowledgement. `removedSinceLastRun` in
+`ingest/run.mjs` computes the candidates from the resume state and the set of
+paths the walk saw — including paths it SKIPPED, so a file skipped this run for
+being empty, oversized or private is not mistaken for a deleted one. It is
+suppressed entirely under `--limit`, where an unexamined file is not a deleted
+file, and an incomplete walk already aborts the run before this point. That
+matters most unattended: a cloud folder that failed to materialize is
+indistinguishable from an owner deleting everything in it.
 
 ### Legacy curated collections during migration
 
