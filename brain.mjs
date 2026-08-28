@@ -11764,12 +11764,32 @@ async function cmdSchedule(manifestPath) {
 }
 
 /** The account this manifest provisions into, for the per-account token store. */
+/**
+ * The account this manifest provisions into, for the per-account token store.
+ *
+ * This used to swallow a failed manifest load and return null, on the reasoning
+ * that the command's own load would report the real problem. It does not: the
+ * token ceremony runs FIRST, so an unreadable manifest surfaced as "no
+ * Cloudflare token is available" and sent the operator hunting a credential
+ * that was sitting in their keychain the whole time. Found running setup from a
+ * git worktree, where instance files legitimately do not exist.
+ *
+ * Failing here also means a run that cannot possibly work never asks anyone for
+ * a credential.
+ */
 function manifestAccountId(manifestPath) {
+  let manifest;
   try {
-    return loadManifest(manifestPath).m?.infrastructure?.cloudflare?.account_id || null;
-  } catch {
-    return null; // the command's own manifest load reports the real problem
+    manifest = loadManifest(manifestPath).m;
+  } catch (error) {
+    die(
+      `could not read the install manifest at ${manifestPath || "brain.manifest.json"}: ${error?.message || error}\n` +
+        "      Every provisioning command needs it, and nothing has been changed.\n" +
+        "      If you are working in a git worktree, instance files live only in the main checkout:\n" +
+        "      pass the full path to the manifest there."
+    );
   }
+  return manifest?.infrastructure?.cloudflare?.account_id || null;
 }
 
 async function cmdSetupInteractive(manifestPath) {

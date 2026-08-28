@@ -21,6 +21,10 @@
  */
 
 import { confidenceLine } from "./confidence.js";
+// The same rule the owner's app obeys: a search that did not complete must
+// never be reported as an absence. retrieval-status.js names an MCP server as
+// a consumer that has to defend itself, and this is the remote one.
+import { answerText, confidenceText, unavailableSearch } from "./answer-render.js";
 
 const PROTOCOLS = new Set(["2025-06-18", "2025-03-26", "2024-11-05"]);
 const MAX_FETCH_CHARS = 60_000;
@@ -83,7 +87,15 @@ async function runAsk(deps, args) {
   if (thought.answer === null && thought.answer_error) {
     return toolError(`the brain could not answer: ${thought.answer_error}`);
   }
-  const lines = [thought.answer || "The documents do not answer the question."];
+  // An incomplete search reaching a client's phone as "the documents do not
+  // answer the question" is the worst error this product can make: a confident
+  // absence claim about their own records. It is likeliest on install day,
+  // while the index is still projecting and they are asking their first
+  // questions from the Claude app.
+  if (unavailableSearch(thought)) {
+    return text([answerText(thought), "", confidenceText(thought)].join("\n"));
+  }
+  const lines = [answerText(thought)];
   const trust = confidenceLine(thought.confidence, {
     refused: /^The documents do not answer/i.test(thought.answer || ""),
   });
@@ -102,6 +114,12 @@ async function runSearch(deps, args, origin) {
   const query = String(args?.query || "").trim();
   if (!query) return toolError("a query is required");
   const found = await deps.search({ q: query, limit: 10 });
+  // An empty result list is indistinguishable from "your corpus has nothing"
+  // to the model reading it, so an incomplete search has to say so in band
+  // rather than return a bare empty array.
+  if (unavailableSearch(found)) {
+    return text(JSON.stringify({ results: [], note: answerText(found) }));
+  }
   const results = (found.results || []).map((r) => ({
     id: resultId(r),
     title: r.title || "untitled",

@@ -173,7 +173,13 @@ test("the full connector journey, register through revocation", async () => {
   const searched = await (await worker.fetch(jsonPost("/mcp", {
     jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "search", arguments: { query: "anything" } },
   }, bearer), testEnv)).json();
-  assert.deepEqual(JSON.parse(searched.result.content[0].text), { results: [] });
+  // This fixture has no Vectorize binding, so the search genuinely IS
+  // degraded. The empty list therefore arrives with a note saying the search
+  // did not complete, rather than as a bare array the model would read as
+  // "this corpus holds nothing".
+  const searchedBody = JSON.parse(searched.result.content[0].text);
+  assert.deepEqual(searchedBody.results, []);
+  assert.match(searchedBody.note || "", /could not be completed/i);
 
   db.tables.documents.set("drive:doc-1", { title: "Fixture doc", uri: null });
   db.tables.chunks.push({ doc_uid: "drive:doc-1", text: "the fixture body" });
@@ -196,6 +202,42 @@ test("the full connector journey, register through revocation", async () => {
   db.tables.state.session_generation = 2;
   const afterBump = await worker.fetch(jsonPost("/mcp", { jsonrpc: "2.0", id: 6, method: "ping" }, bearer), testEnv);
   assert.equal(afterBump.status, 401, "one revocation story: generation bump ends connectors");
+});
+
+test("a degraded search never reaches a phone as an absence claim", async () => {
+  // The failure this guards is the worst one the product can make: telling an
+  // owner their own records hold nothing when the search never ran. It is
+  // likeliest on install day, while the index is still projecting and they are
+  // asking their first questions from the Claude app. The body here is the one
+  // handleThink really builds for that case, not a hand-written fixture.
+  const { emptyRetrievalDisclosure } = await import("../src/lib/retrieval-status.js");
+  const { handleMcp } = await import("../src/lib/mcp-endpoint.js");
+  const disclosure = emptyRetrievalDisclosure("vector");
+  const degraded = {
+    ...disclosure, answer: null, citations: [], results: [],
+    // An older worker would also send a confidence rubric here. Rendering it
+    // would put a percentage on an absence nobody measured.
+    confidence: { percent: 58, band: "moderate", basis: ["vector index not fully query-ready"] },
+  };
+  const deps = { think: async () => degraded, search: async () => degraded };
+  const url = new URL(ORIGIN + "/mcp");
+
+  const asked = await (await handleMcp({ BRAIN_NAME: "fixture" }, jsonPost("/mcp", {
+    jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "ask", arguments: { question: "anything" } },
+  }), url, deps)).json();
+  const askText = asked.result.content[0].text;
+  assert.ok(!/do not answer the question/i.test(askText),
+    `an incomplete search must not assert absence, got: ${askText.slice(0, 160)}`);
+  assert.match(askText, /could not be completed/i);
+  assert.ok(!/\b58%/.test(askText), "no confidence percentage for a search that never ran");
+
+  const searched = await (await handleMcp({ BRAIN_NAME: "fixture" }, jsonPost("/mcp", {
+    jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "search", arguments: { query: "anything" } },
+  }), url, deps)).json();
+  const body = JSON.parse(searched.result.content[0].text);
+  assert.deepEqual(body.results, []);
+  assert.match(body.note || "", /could not be completed/i,
+    "a bare empty array reads as 'your corpus has nothing' to the model consuming it");
 });
 
 test("a connector token can never reach past the read-only class", async () => {
