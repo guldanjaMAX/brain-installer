@@ -3123,18 +3123,55 @@ export async function listSourceFamilies(env, { source = null, cursor = "", limi
   };
 }
 
+/** True when `uid` is the base itself or one of its oversized `#part` slices. */
+const isStructuralFamilyMember = (uid, base) => uid === base || uid.startsWith(`${base}#part`);
+
 /**
- * Remove stale members of a split-document family after every replacement part
- * has landed. This covers all three transitions: one-to-many, many-to-one and
- * a changed part count. Exact keep ids make it impossible for cleanup to remove
- * the new revision it is reconciling.
+ * Remove stale members of a document family after every replacement part has
+ * landed. This covers all three transitions: one-to-many, many-to-one and a
+ * changed part count.
+ *
+ * WHAT A FAMILY IS. Two different producers put many documents under one base:
+ *
+ *   STRUCTURAL. splitOversized slices one oversized document into
+ *   `<base>#part1of3`. The base is a literal prefix of every member, so
+ *   membership is readable from the name alone.
+ *
+ *   DECLARED. A message export (WhatsApp .txt, SMS Backup & Restore .xml,
+ *   Google Voice Takeout) is one file that becomes many conversation-session
+ *   documents. Those keep their own `message:<first message id>` identity so a
+ *   citation still points at the conversation, which means NOTHING in their
+ *   names points back at the file. They say so instead: each row carries
+ *   `meta.family_of` holding the fully qualified uid of the file it came from.
+ *   Fully qualified deliberately, so no source-prefixing rule has to be
+ *   re-derived here and mis-derived (`listSourceFamilies` has to guess at that
+ *   for the older bare `part_of` values, and this format removes the guess).
+ *
+ * THE INVARIANT THIS ENFORCES, and why it is at least as strong as the exact
+ * `#part` prefix test it replaces:
+ *
+ *   Every keep_doc_uid must belong to the family named by base_doc_uid, proven
+ *   either structurally OR by the stored row's own declaration.
+ *
+ * The delete set is (everything in the family) minus (the keep list). A keep
+ * uid that is not in the family protects nothing, so a caller whose family
+ * model is wrong does not merely no-op: its keep list is inert while the scope
+ * is real, and cleanup deletes the very revision it was called to reconcile.
+ * The old prefix test was a syntactic PROXY for "inside the scope", correct
+ * only while every family was structural. It now measures the real thing:
+ * anything the old test rejected is still rejected unless the stored document
+ * itself declares membership, which is stronger evidence than a matching name.
+ *
+ * Refusing is also the only honest option, because a wrong family key cannot be
+ * repaired here: the scope is derived from the base alone, so an accepted-but
+ * wrong base silently reaches no member at all.
  */
 export async function forgetFamilies(env, { families = [], dryRun = true } = {}) {
   const normalized = [];
   for (const family of families || []) {
     const base = String(family?.base_doc_uid || "");
     const keep = [...new Set((family?.keep_doc_uids || []).map(String))];
-    if (!base || keep.some((uid) => uid !== base && !uid.startsWith(`${base}#part`))) {
+    if (!base) {
       throw new Error("each document family needs a base_doc_uid and any keep_doc_uids must belong to it");
     }
     normalized.push({ base, keep });
@@ -3152,16 +3189,47 @@ export async function forgetFamilies(env, { families = [], dryRun = true } = {})
       // exceed that before the literal "#part" suffix is added, so a pattern
       // query cannot be used here. Comparing the exact leading substring keeps
       // %, _ and \\ literal and cannot include a similarly prefixed base id.
+      // The declared arm is a plain equality on a fully qualified uid, so it
+      // has neither problem. Neither arm adds a scan the substr did not already
+      // force, and json_valid() guards a row whose meta is not JSON.
       clauses.push(
-        `(doc_uid = ?${n + 1} OR substr(doc_uid, 1, length(?${n + 1} || '#part')) = ?${n + 1} || '#part')`
+        `(doc_uid = ?${n + 1}` +
+        ` OR substr(doc_uid, 1, length(?${n + 1} || '#part')) = ?${n + 1} || '#part'` +
+        ` OR (json_valid(meta) AND json_type(meta,'$.family_of') = 'text'` +
+        `     AND json_extract(meta,'$.family_of') = ?${n + 1}))`
       );
       binds.push(family.base);
     }
     const { results } = await env.DB.prepare(
-      `SELECT doc_uid FROM documents WHERE ${clauses.join(" OR ")}`
+      `SELECT doc_uid,
+              CASE WHEN json_valid(meta) AND json_type(meta,'$.family_of') = 'text'
+                   THEN json_extract(meta,'$.family_of') END AS family_of
+         FROM documents WHERE ${clauses.join(" OR ")}`
     ).bind(...binds).all();
+    const rows = (results || []).map((row) => ({
+      uid: String(row.doc_uid),
+      declaredFamily: row.family_of == null ? null : String(row.family_of),
+    }));
+
+    // Validate against what the family actually contains, one family at a
+    // time, BEFORE anything is deleted. forget() below is the only mutation in
+    // this function, so a refusal here leaves every group untouched.
+    for (const family of group) {
+      const members = new Set(
+        rows.filter((row) => row.declaredFamily === family.base).map((row) => row.uid)
+      );
+      const stray = family.keep.filter(
+        (uid) => !isStructuralFamilyMember(uid, family.base) && !members.has(uid)
+      );
+      if (stray.length) {
+        // Deliberately no uid in the message: this reaches an HTTP response,
+        // and a doc_uid carries a file path.
+        throw new Error("each document family needs a base_doc_uid and any keep_doc_uids must belong to it");
+      }
+    }
+
     const keep = new Set(group.flatMap((family) => family.keep));
-    stale.push(...(results || []).map((row) => row.doc_uid).filter((uid) => !keep.has(uid)));
+    stale.push(...rows.map((row) => row.uid).filter((uid) => !keep.has(uid)));
   }
   return forget(env, { docUids: [...new Set(stale)], dryRun });
 }
