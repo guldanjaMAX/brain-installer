@@ -1476,7 +1476,12 @@ export default {
     // gate — their auth is the ceremony itself, or the session cookie a
     // ceremony earned. Nothing routed there reaches past the read-only
     // privilege class (see owner-auth.mjs).
-    if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/")) {
+    // /brand/* is deliberately public and unauthenticated: it is the link
+    // preview image, and the scraper that fetches it holds no credential.
+    // It sat behind the key gate at first, so every shared invite would have
+    // previewed as a 401 instead of an image.
+    if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/") ||
+        path.startsWith("/brand/")) {
       return handleOwnerAuth(env, request, url, path);
     }
 

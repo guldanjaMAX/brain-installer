@@ -283,6 +283,11 @@ const SCHEMA_16_TABLES = Object.freeze([
   "bank_feed_link_sessions",
 ]);
 
+// Declared with SCHEMA_15/16 rather than beside SCHEMA_14 further down:
+// AGGREGATE_FIELDS below is built at module load, so a const declared after
+// it is in the temporal dead zone and every import of this module throws.
+const SCHEMA_17_TABLES = Object.freeze(["oauth_clients", "oauth_codes", "oauth_tokens"]);
+
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
     table,
@@ -1046,7 +1051,6 @@ function assertSameRecoveryCorpus(left, right, code = "RECOVERY_D1_SNAPSHOT_MISM
 }
 
 const SCHEMA_14_TABLES = Object.freeze(["owner_passkeys", "auth_challenges", "enrollment_codes"]);
-const SCHEMA_17_TABLES = Object.freeze(["oauth_clients", "oauth_codes", "oauth_tokens"]);
 
 function expectedRecoveryTables(migrations) {
   const latest = migrations?.at(-1)?.version || RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION;

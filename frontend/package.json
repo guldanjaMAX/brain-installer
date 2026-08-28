@@ -1,0 +1,28 @@
+{
+  "name": "brain-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "_comment": [
+    "The owner-facing app for a client's brain. Built here, then folded into a",
+    "single Worker module by build-to-worker.mjs so an install ships one more",
+    "reviewed module and the client never runs a build. Deliberately mirrors the",
+    "meeting-notes frontend (React 19, Tailwind 4, Vite) so both are one habit."
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && node build-to-worker.mjs",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.1",
+    "@vitejs/plugin-react": "^6.0.1",
+    "tailwindcss": "^4.3.1",
+    "vite": "^8.0.12",
+    "vitest": "^4.1.8"
+  }
+}

@@ -25,7 +25,7 @@ import {
   listPasskeys, renamePasskey, revokePasskey,
   sessionGeneration, bumpSessionGeneration,
 } from "./auth-store.js";
-import { appPageHtml } from "./app-page.js";
+import { appPageHtml, brandOgSvg } from "./app-page.js";
 
 const APP_HEADER = "X-Brain-App";
 
@@ -82,8 +82,20 @@ export async function handleAdminDevices(env, request, path) {
 /* ------------------------------------------------------------ owner plane */
 
 export async function handleOwnerAuth(env, request, url, path) {
+  // The link-preview image. Public and cacheable by design: a scraper fetching
+  // it must never need a credential, and it contains only the brain's own name.
+  if (path === "/brand/og.svg" && request.method === "GET") {
+    return new Response(brandOgSvg(env), {
+      headers: {
+        "Content-Type": "image/svg+xml; charset=utf-8",
+        "Cache-Control": "public, max-age=3600",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }
   if (path === "/app" && request.method === "GET") {
-    return new Response(appPageHtml(env), {
+    // Absolute URLs: a link scraper resolves og:image against nothing.
+    return new Response(appPageHtml(env, url.origin), {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         // The page is self-contained by construction; the CSP makes that a
