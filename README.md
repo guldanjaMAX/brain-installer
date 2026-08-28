@@ -162,13 +162,16 @@ brain will not know.
 Then drop `--dry-run` to load it for real. Large loads are resumable: if it is
 interrupted, run the same command again and it continues from where it stopped.
 
-A Drive refresh may discover files that were deleted, newly excluded, or no
-longer readable. It combines every removal reason into one plan. Up to 100
-documents and 10% of the stored Drive corpus can be reconciled as routine
-source changes. A plan crossing either limit stops before deleting anything or
-advancing the Drive cursor. It prints aggregate counts and an opaque approval
-fingerprint, never filenames or document IDs. Review the cause, then add the
-exact `--approve-removals <fingerprint>` value only when the plan is expected.
+A refresh may discover files that were deleted, newly excluded, or no longer
+readable. It combines every removal reason into one plan. Up to 100 documents
+and 10% of what that source loaded can be reconciled as routine source changes.
+A plan crossing either limit stops before deleting anything or advancing the
+source cursor. It prints aggregate counts and an opaque approval fingerprint,
+never filenames or document IDs. Review the cause, then add the exact
+`--approve-removals <fingerprint>` value only when the plan is expected.
+
+The same plan and the same limits now cover a local folder, because a folder
+that failed to mount looks exactly like a client who deleted everything in it.
 
 Ask directly in the terminal, even if you do not have Claude Code or Codex:
 
@@ -184,7 +187,20 @@ do not cover. The second answer matters as much as the first.
 
 ## What it reads
 
-PDF, Word, Excel, PowerPoint, email, CSV, HTML, Markdown, JSON and plain text.
+PDF, Word, Excel, PowerPoint, rich text, email, mail archives, meeting
+transcripts and subtitles, calendar exports, CSV, HTML, Markdown, JSON and
+plain text.
+
+**A file with many things in it becomes many documents.** A `.mbox` mail
+archive is a mail folder, not a document: indexed whole it would be one
+enormous blob dated by whichever message came first, and every citation into it
+would point at a filename. It is split, so a citation points at one message.
+
+**Transcripts keep their speakers.** A `.vtt` or `.srt` is read as
+`Name: what they said`, because "who agreed to that" is unanswerable from an
+undifferentiated wall of sentences. It is the same converter the live Zoom
+connector uses, so a call saved by hand and a call delivered by webhook read
+identically.
 
 **Scanned PDFs are refused, not faked.** A scan is a picture of a page with no
 text in it. Rather than index an empty document and let your brain claim it
@@ -207,7 +223,10 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
 
 - **No OCR yet**, so scanned PDFs are reported rather than read.
 - **Outlook .msg and PST are not supported.** Export to .eml or .mbox and load
-  the folder.
+  the folder. Both of those are read: an `.eml` is one document, and an `.mbox`
+  is split into its individual messages, each keeping its own subject, sender
+  and date. (Before this version half that sentence was false — there was no
+  `.mbox` reader and the archive was silently skipped.)
 - **Google Drive OAuth and resumable partial real-account ingest are verified.**
   A complete no-limit first sweep and the live add, edit, refuse, recover,
   trash, and incremental-refresh cycle remain field gates. Gmail is covered by
@@ -217,9 +236,21 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
 - **Google Drive can refresh itself on macOS.** Its schedule is declared in the
   manifest and installed as a per-user LaunchAgent. Windows and Linux still
   require manually re-running the Drive refresh.
+- **One local folder can refresh itself too, also macOS only.** Name it in the
+  manifest and `brain schedule <manifest> --install --folder` reloads it on a
+  schedule: new files load, edited files reload, deleted files are removed. It
+  is what makes "export it into this folder and forget about it" true for a
+  folder that is not inside Google Drive. Hourly by default, so it is a drop
+  box, not a live feed. Elsewhere, run the same load yourself.
 - **One key, all access.** Anyone with the admin key can ask anything. There are
   no per-person permissions yet.
-- **Slack, Notion and meeting transcripts** do not exist as connectors.
+- **Slack and Notion** do not exist as connectors.
+- **Meeting transcripts arrive two ways, neither of them a transcription
+  service.** Zoom cloud recordings deliver themselves to a webhook on your own
+  worker (new recordings only, no backfill, paid Zoom seat required), and a
+  transcript you save by hand as `.vtt` or `.srt` is read from any folder that
+  is ingested. Nothing here transcribes audio; there is no speech recognition
+  in this product.
 
 ---
 

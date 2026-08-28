@@ -26,6 +26,7 @@ import { unzipSync, strFromU8 } from "fflate";
 import * as XLSX from "@e965/xlsx";
 import PostalMime from "postal-mime";
 import { register, renderTable } from "./extract.mjs";
+import { splitMbox } from "./mbox.mjs";
 import { stripMarkup } from "./quality.mjs";
 
 /**
@@ -340,11 +341,18 @@ for (const ext of [".xlsx", ".xlsm", ".xls"]) register(ext, (buf, { name } = {})
 /* -------------------------------------------------------------------- email */
 
 /**
+ * One RFC 822 message, read once, in one place.
+ *
  * Replaces the hand-rolled .eml reader. Correspondence is where intent lives,
- * and the hand-rolled version could not decode RFC 2047 encoded subjects, which
- * is exactly where names and clients appear.
+ * and the hand-rolled version could not decode RFC 2047 encoded subjects,
+ * which is exactly where names and clients appear.
+ *
+ * Returns the rendered text AND the few headers a caller needs to give the
+ * message an identity and a date of its own. The mbox path needs those, and a
+ * second mail parser next to this one is how two parts of the product start
+ * disagreeing about what a message says.
  */
-register(".eml", async (buf) => {
+export async function parseEmailMessage(buf) {
   const mail = await new PostalMime().parse(buf);
   const head = [
     mail.from ? `From: ${mail.from.name || ""} <${mail.from.address || ""}>`.trim() : null,
@@ -357,5 +365,59 @@ register(".eml", async (buf) => {
   if (!head.length && !body) return { text: null, error: "the message had no readable headers or body" };
   const names = (mail.attachments || []).map((a) => a.filename).filter(Boolean);
   if (names.length) head.push(`Attachments: ${names.join(", ")}`);
-  return { text: [...head, "", body].join("\n") };
+  const date = mail.date ? new Date(mail.date) : null;
+  return {
+    text: [...head, "", body].join("\n"),
+    subject: mail.subject || null,
+    from: mail.from?.name || mail.from?.address || null,
+    messageId: mail.messageId || null,
+    occurredAt: date && Number.isFinite(date.getTime()) ? date.toISOString() : null,
+  };
+}
+
+register(".eml", async (buf) => {
+  const parsed = await parseEmailMessage(buf);
+  return parsed.error ? { text: null, error: parsed.error } : { text: parsed.text };
 }, "email");
+
+/* ---------------------------------------------------------- mail archives */
+
+/**
+ * A mail archive, for a caller that can only hold one document per file.
+ *
+ * The local folder walk does NOT come through here: it splits the archive and
+ * loads each message as its own document, which is the only way a citation
+ * points at something a person can act on. This registration exists so that a
+ * `.mbox` sitting in a synced Drive folder is READ rather than skipped for
+ * having no extractor, and it renders every message through the same reader
+ * the split path uses. Coarser, never different.
+ */
+register(".mbox", async (buf) => {
+  const raw = Buffer.from(buf).toString("utf-8");
+  const messages = splitMbox(raw);
+  if (!messages.length) {
+    return { text: null, error: "this .mbox file has no message separator line in it, so it is not a mail archive" };
+  }
+  const rendered = [];
+  let unreadable = 0;
+  for (const message of messages) {
+    let parsed;
+    try {
+      parsed = await parseEmailMessage(Buffer.from(message, "utf-8"));
+    } catch {
+      unreadable++;
+      continue;
+    }
+    if (parsed.error || !parsed.text?.trim()) unreadable++;
+    else rendered.push(parsed.text.trim());
+  }
+  if (!rendered.length) {
+    return { text: null, error: `none of the ${messages.length} message(s) in this archive could be read` };
+  }
+  return {
+    text: rendered.join("\n\n----\n\n"),
+    note: `${rendered.length} message(s) from one mail archive` +
+      (unreadable ? `; ${unreadable} could not be read` : "") +
+      "; loaded through a local folder they would each become their own document",
+  };
+}, "mail archive");

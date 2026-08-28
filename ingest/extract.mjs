@@ -13,6 +13,10 @@
  */
 
 import { stripMarkup, utf16Encoding } from "./quality.mjs";
+// The one transcript reader in this product. It lives beside the client
+// worker because the Zoom connector runs inside that worker and uses the same
+// function; a second copy here would drift from it silently.
+import { vttToPlainTranscript, srtToPlainTranscript, hasTimedCues } from "../worker/src/lib/vtt.js";
 
 const registry = new Map();
 
@@ -155,6 +159,86 @@ register(".json", (buf) => {
   walk(parsed, "");
   return lines.join("\n");
 }, "json");
+
+/* ------------------------------------------------------------ transcripts */
+
+/**
+ * Meeting transcripts and subtitles.
+ *
+ * The onboarding documentation has been telling clients that the way to bring
+ * an old call in is to save its `.vtt` transcript into a folder that is
+ * already ingested. Until this registration existed that was false: the file
+ * was skipped for having no extractor, and the client's Zoom backfill silently
+ * never happened. Registering it here, in the dependency-free core, is what
+ * makes the sentence true — and makes it true for the Drive door too, which
+ * decides what to fetch from this same registry.
+ *
+ * The conversion is `worker/src/lib/vtt.js`, the SAME function the Zoom
+ * connector uses on the transcripts Zoom delivers, so a call saved by hand and
+ * a call delivered by webhook read identically.
+ */
+for (const [ext, toText, label] of [
+  [".vtt", vttToPlainTranscript, "transcript"],
+  [".srt", srtToPlainTranscript, "subtitles"],
+]) {
+  register(ext, (buf) => {
+    const raw = dec(buf);
+    if (!hasTimedCues(raw)) {
+      return {
+        text: null,
+        error: `this ${ext} file contains no timed captions, so it is not a transcript this can read`,
+      };
+    }
+    const text = toText(raw);
+    if (!text.trim()) {
+      return { text: null, error: `the ${ext} file has caption timings but no caption text` };
+    }
+    return { text };
+  }, label);
+}
+
+/* -------------------------------------------------------------- calendars */
+
+/**
+ * A calendar export, rendered by the calendar connector's own renderer.
+ *
+ * Imported lazily so a folder with no .ics in it never loads the connector.
+ */
+register(".ics", async (buf, { name } = {}) => {
+  const raw = dec(buf);
+  const { parseIcs, MAX_EVENTS } = await import("./ics.mjs");
+  const { isCalendar, events, malformed, calendarName } = parseIcs(raw);
+  if (!isCalendar) return { text: null, error: "this .ics file is not an iCalendar document (no BEGIN:VCALENDAR)" };
+  if (!events.length) {
+    return {
+      text: null,
+      error: malformed
+        ? `no readable events: ${malformed} calendar entr${malformed === 1 ? "y is" : "ies are"} missing a start time or truncated`
+        : "this calendar has no events in it (it may hold only tasks, free/busy blocks or timezone definitions)",
+    };
+  }
+  const { renderEvent } = await import("../connectors/google-calendar.mjs");
+  const label = calendarName || name || "calendar";
+  const shown = events.slice(0, MAX_EVENTS);
+  const rendered = shown.map(({ event }) => renderEvent(event, { calendar: { id: label, key: label, label } }));
+  const notes = [];
+  if (events.length > shown.length) notes.push(`${events.length - shown.length} further event(s) were not indexed; this export exceeds the ${MAX_EVENTS} event limit`);
+  if (malformed) notes.push(`${malformed} calendar entr${malformed === 1 ? "y" : "ies"} could not be read and ${malformed === 1 ? "was" : "were"} left out`);
+  return {
+    text: `Calendar export: ${label}\n\n${rendered.join("\n\n")}`,
+    note: notes.length ? notes.join("; ") : undefined,
+  };
+}, "calendar");
+
+/* ------------------------------------------------------------------- rtf */
+
+register(".rtf", async (buf) => {
+  const { rtfToText } = await import("./rtf.mjs");
+  const text = rtfToText(dec(buf));
+  if (text === null) return { text: null, error: "this .rtf file does not begin with an RTF header, so it is not rich text" };
+  if (!text.trim()) return { text: null, error: "the .rtf file held no text outside its font, style and image tables" };
+  return { text };
+}, "rich text");
 
 /* -------------------------------------------------------------------- eml */
 

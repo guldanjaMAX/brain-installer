@@ -1,0 +1,38 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Corp//Calendar Export//EN
+X-WR-CALNAME:Operations calendar
+BEGIN:VTIMEZONE
+TZID:America/Phoenix
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:event-one@example.test
+DTSTART;TZID=America/Phoenix:20260612T090000
+DTEND;TZID=America/Phoenix:20260612T100000
+SUMMARY:Renewal review with the operations team
+LOCATION:Suite 400
+ORGANIZER;CN=Alex Rivera:mailto:alex@example.test
+ATTENDEE;CN=Priya Nair;PARTSTAT=ACCEPTED:mailto:priya@example.test
+ATTENDEE;CN=Sam Osei;PARTSTAT=DECLINED:mailto:sam@example.test
+ATTENDEE;CN=Meeting Room 2;CUTYPE=ROOM:mailto:room2@example.test
+RRULE:FREQ=MONTHLY;BYDAY=2FR
+DESCRIPTION:Walk the renewal numbers line by line.\nBring the signed noti
+ ce-period amendment.
+BEGIN:VALARM
+ACTION:DISPLAY
+DESCRIPTION:Reminder
+TRIGGER:-PT15M
+END:VALARM
+END:VEVENT
+BEGIN:VEVENT
+UID:event-two@example.test
+DTSTART;VALUE=DATE:20260701
+DTEND;VALUE=DATE:20260702
+SUMMARY:Warehouse handover
+DESCRIPTION:Morgan Diaz collects the keys.
+END:VEVENT
+BEGIN:VTODO
+UID:task-one@example.test
+SUMMARY:This is a task and must not be read as a meeting
+END:VTODO
+END:VCALENDAR

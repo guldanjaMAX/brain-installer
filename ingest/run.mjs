@@ -41,6 +41,11 @@ import {
   detectGoogleVoiceTakeout, parseGoogleVoiceTakeout, deriveVoiceThreadTitle,
 } from "./sms-backup.mjs";
 import { MessageSessionizer } from "./message-session.mjs";
+import { splitMbox, mboxMessageKey } from "./mbox.mjs";
+// The one mail reader. Imported by name rather than reached through the
+// registry because an archive's messages need their own subjects and dates,
+// and a second parser beside the first is how the two start disagreeing.
+import { parseEmailMessage } from "./formats.mjs";
 
 // Preserve the original ingest/run.mjs API while letting migration-only code
 // import the dependency-free boundary directly.
@@ -63,7 +68,24 @@ const JUNK_FILES = new Set(["thumbs.db", "desktop.ini", "icon\r", ".ds_store", "
 /** A single file larger than this is a database or a media asset, not a document. */
 export const MAX_FILE_BYTES = 8 * 1024 * 1024;
 
-export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES } = {}) {
+/**
+ * The same ceiling for a file that is not one document.
+ *
+ * A mail archive is a folder of hundreds of messages, and a real one is
+ * routinely tens of megabytes. Judging it by the single-document limit would
+ * skip the common case of the very thing the README tells clients to export,
+ * which is how a limit turns into a false promise. It still has a ceiling:
+ * the whole archive is read into memory to be split.
+ */
+export const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
+
+/** Extensions that hold many documents, and get the archive ceiling. */
+const ARCHIVE_EXTENSIONS = new Set([".mbox"]);
+
+export const fileSizeLimitFor = (name, maxBytes, archiveBytes) =>
+  (ARCHIVE_EXTENSIONS.has(extensionOf(name)) ? archiveBytes : maxBytes);
+
+export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES, archiveBytes = MAX_ARCHIVE_BYTES } = {}) {
   const files = [];
   const skipped = [];
   let complete = true;
@@ -114,8 +136,9 @@ export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES } =
         continue;
       }
       if (st.size === 0) { skipped.push({ path: rel, reason: "file is empty" }); continue; }
-      if (st.size > maxBytes) {
-        skipped.push({ path: rel, reason: `file is ${(st.size / 1048576).toFixed(1)}MB, over the ${(maxBytes / 1048576).toFixed(0)}MB limit` });
+      const sizeLimit = fileSizeLimitFor(e.name, maxBytes, archiveBytes);
+      if (st.size > sizeLimit) {
+        skipped.push({ path: rel, reason: `file is ${(st.size / 1048576).toFixed(1)}MB, over the ${(sizeLimit / 1048576).toFixed(0)}MB limit` });
         continue;
       }
       files.push({ full, rel, name: e.name, size: st.size });
@@ -236,6 +259,109 @@ function prepareGoogleVoiceTakeout(file, buf, hash, { sourceName }) {
 }
 
 /**
+ * One mail archive, many documents.
+ *
+ * An mbox indexed whole is one enormous document dated by whichever message
+ * happened to come first, and every citation into it points at a filename
+ * instead of a message. Splitting it is what makes "export to .mbox and load
+ * the folder" a real answer rather than a shape of one.
+ *
+ * Every message goes through the SAME `.eml` reader the single-message path
+ * uses, so nothing about MIME, encoded subjects or multipart bodies is decided
+ * twice.
+ */
+async function prepareMboxArchive(file, buf, hash, { sourceName }) {
+  const messages = splitMbox(buf.toString("utf-8"));
+  if (!messages.length) {
+    return {
+      hash,
+      skip: {
+        path: file.rel,
+        reason: "this .mbox file has no message separator line in it, so it is not a mail archive",
+      },
+    };
+  }
+
+  const relPath = file.rel.split(sep).join("/");
+  const envelopes = [];
+  let unreadable = 0;
+  for (let index = 0; index < messages.length; index++) {
+    let parsed;
+    try {
+      parsed = await parseEmailMessage(Buffer.from(messages[index], "utf-8"));
+    } catch {
+      unreadable++;
+      continue;
+    }
+    const text = parsed.error ? "" : String(parsed.text || "").trim();
+    // The same floor every other document clears. A message that is only
+    // headers is not worth an embedding and would dilute the ones that are.
+    if (!textQuality(text).ok) {
+      unreadable++;
+      continue;
+    }
+    const key = mboxMessageKey(relPath, parsed.messageId, index + 1);
+    envelopes.push({
+      source_type: sourceName,
+      source_id: key,
+      title: parsed.subject || `Message ${index + 1} from ${basename(file.name)}`,
+      content: text,
+      // The message's own Date header, which is the one date about an email
+      // that is neither a guess nor a filesystem artefact.
+      occurred_at: parsed.occurredAt,
+      date_source: parsed.occurredAt ? "mbox:date_header" : "none",
+      date_reliable: !!parsed.occurredAt,
+      uri: key,
+      metadata: {
+        category: sourceName,
+        extracted_as: "email",
+        archive: relPath,
+        message_number: index + 1,
+        ...(parsed.from ? { sender: parsed.from } : {}),
+      },
+    });
+  }
+
+  if (!envelopes.length) {
+    return {
+      hash,
+      skip: {
+        path: file.rel,
+        reason: `none of the ${messages.length} message(s) in this mail archive could be read`,
+      },
+    };
+  }
+  return {
+    hash,
+    envelopes,
+    note: unreadable
+      ? `${envelopes.length} message(s) loaded from this archive; ${unreadable} could not be read`
+      : `${envelopes.length} message(s) loaded from this archive`,
+  };
+}
+
+/**
+ * What this source loaded before and can no longer find.
+ *
+ * A scheduled folder lane has to answer for deletions or it is not a mirror of
+ * the folder, it is an append-only pile that quietly disagrees with the client
+ * about what exists. Kept as a pure function of two sets so the decision can
+ * be tested without a network, and so the caller can put the result through
+ * the same removal-plan guard every other source's deletions go through.
+ *
+ * `present` must include files the walk SKIPPED as well as the ones it
+ * accepted. A file that is still on disk but was skipped this run for being
+ * empty, oversized or private has not vanished, and removing its document
+ * because a reason changed is a different decision with a different name.
+ */
+export function removedSinceLastRun(knownKeys, present) {
+  const here = present instanceof Set ? present : new Set(present || []);
+  return [...(knownKeys instanceof Set ? knownKeys : new Set(knownKeys || []))]
+    .filter((key) => !here.has(key))
+    .sort();
+}
+
+/**
  * Read one file and turn it into an ingest envelope, or into a reasoned skip.
  */
 export async function prepare(file, { sourceName }) {
@@ -269,6 +395,12 @@ export async function prepare(file, { sourceName }) {
     if (detectGoogleVoiceTakeout(peek)) {
       return prepareGoogleVoiceTakeout(file, buf, hash, { sourceName });
     }
+  }
+
+  // One file, many documents: the archive is split before the single-document
+  // path can flatten it into one.
+  if (ext === ".mbox") {
+    return prepareMboxArchive(file, buf, hash, { sourceName });
   }
 
   if (!canExtract(file.name)) {
