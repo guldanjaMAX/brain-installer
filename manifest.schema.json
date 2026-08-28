@@ -84,6 +84,13 @@
               "description": "Optional local JSON exclusion list, resolved relative to the manifest. It may also be a completed Supabase migration receipt."
             }
           }
+        },
+        "imessage": {
+          "type": "object",
+          "description": "Mac-only live message capture from Messages.app (chat.db), enforced by brain connect imessage and brain ingest --from imessage. Requires a Full Disk Access grant on the capturing Mac; SMS arrives alongside iMessage when Text Message Forwarding is on and is tagged sms. The capture schedule knob is operations.imessage_capture_cron (default: every minute).",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false }
+          }
         }
       }
     },

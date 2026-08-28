@@ -203,8 +203,12 @@ function supportSourceForCommand(command = "") {
   if (command === "ingest") {
     const index = process.argv.indexOf("--from");
     const remote = index >= 0 ? process.argv[index + 1] : null;
-    if (["calendar", "drive", "gmail"].includes(remote)) return remote;
+    if (["calendar", "drive", "gmail", "imessage"].includes(remote)) return remote;
     return "local";
+  }
+  if (command === "connect" || command === "disconnect") {
+    if (String(process.argv[3] || "").toLowerCase() === "imessage") return "imessage";
+    return "installer";
   }
   if (SUPPORT_REMOTE_COMMANDS.has(command)) return "cloudflare";
   return "installer";
@@ -4939,6 +4943,7 @@ async function cmdIngest(manifestPath) {
   // its own complete sync-then-send pipeline, so it has its own command
   // rather than being forced through machinery built for files.
   if (String(flags.from).toLowerCase() === "calendar") return cmdIngestCalendar(m, manifestPath, flags);
+  if (String(flags.from).toLowerCase() === "imessage") return cmdIngestImessage(m, manifestPath, flags);
   if (flags.from) return cmdIngestRemote(m, manifestPath, flags);
   if (flags["approve-removals"] !== undefined) {
     die("--approve-removals is only valid with --from drive.");
@@ -5826,6 +5831,178 @@ export async function cmdIngestCalendar(m, manifestPath, flags, options = {}) {
 }
 
 /**
+ * `brain ingest <manifest> --from imessage`.
+ *
+ * One incremental capture pass over the Mac's Messages database: read every
+ * row after the watermark, sessionize through the same message-session.mjs
+ * every other chat platform uses, and push the closed conversation documents
+ * through the shared batch endpoint — which means the worker's credential
+ * gate runs on every document exactly as it does for Drive and Gmail.
+ *
+ * This is both the manual command an operator runs for the initial history
+ * load AND the child every scheduled LaunchAgent tick spawns, so the two can
+ * never drift apart. Mac-only, stated rather than discovered: chat.db exists
+ * on macOS and nowhere else.
+ *
+ * Like calendar, deliberately its own function rather than a branch inside
+ * cmdIngestRemote: the capture core carries its own watermark+snapshot
+ * resume state (a different shape from the file-hash state the local walker
+ * keeps), and forcing it through batchStream's family-plan machinery built
+ * for files would risk the proven Drive/Gmail paths for no gain.
+ */
+export async function cmdIngestImessage(m, manifestPath, flags, options = {}) {
+  if ((options.platform ?? process.platform) !== "darwin") {
+    die(
+      "iMessage capture reads ~/Library/Messages/chat.db, which exists only on macOS.\n" +
+        "      There is no Windows or Linux path to live iMessage capture; a one-time load\n" +
+        "      from an iPhone backup is the planned route for Mac-less installs."
+    );
+  }
+  const imessage = options.imessage ?? await import("./connectors/imessage.mjs");
+  const { batches, splitOversized } = await ingestLib();
+  const sourceName = assertSourceName(flags.source === true || !flags.source ? "imessage" : flags.source);
+  const dry = !!flags["dry-run"];
+  const flushOnly = !!flags["flush-sessions"];
+  const chatDbPath = flags["chat-db"] && flags["chat-db"] !== true
+    ? resolve(String(flags["chat-db"]))
+    : imessage.defaultChatDbPath();
+
+  // Verify access BEFORE resolving credentials, so the walkthrough for a
+  // denied Full Disk Access grant is the first thing an operator sees, named
+  // as itself — never disguised as a credential or network problem. A
+  // flush-only pass reads no chat.db and skips the probe.
+  if (!flushOnly) {
+    const probe = imessage.probeChatDb(chatDbPath);
+    if (!probe.ok) {
+      if (probe.reason === "full_disk_access_denied") {
+        die(`${probe.message}\n      ${imessage.fdaRemediationSteps().join("\n      ")}`);
+      }
+      die(probe.message);
+    }
+  }
+
+  const resolveIngestAccount = options.resolveAccount ?? resolveAccount;
+  const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+  const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
+  const acct = dry ? null : m.brain?.domain ? null : await resolveIngestAccount(m);
+  const base = dry ? null : await resolveBase(m, acct);
+  const adminKey = dry ? null : resolveKey(manifestPath);
+  if (!adminKey && !dry) {
+    die(
+      "no durable admin key was found. Re-run `brain setup <manifest>` to generate and persist one; " +
+        "do not paste the key into a shell command."
+    );
+  }
+
+  const postReceipt = options.postSourceReceipt ?? postSourceReceipt;
+  const sendBatch = options.requestIngestBatch ?? requestIngestBatch;
+  const statePath = join(dirname(resolve(manifestPath)), `.brain-ingest-${sourceName}.json`);
+
+  const tally = { created: 0, updated: 0, unchanged: 0, refused: 0, failed: 0 };
+  const sendEnvelopes = async (envelopes) => {
+    const docs = envelopes
+      // The session envelope's generic "message" source_type becomes THIS
+      // load's name, so `brain forget --source imessage` scopes to exactly
+      // these documents and `brain sources` counts them under their source.
+      .map((envelope) => ({ ...envelope, source_type: sourceName }))
+      .flatMap((envelope) => splitOversized(envelope))
+      .map((envelope) => ({ envelope }));
+    for (const group of batches(docs)) {
+      const { res, raw } = await sendBatch({ base, adminKey, docs: group.map((g) => g.envelope) });
+      let body = null;
+      try { body = JSON.parse(raw); } catch { /* validated below */ }
+      if (!res.ok || !body) {
+        throw new Error(`the ingest batch failed with ${res.status}: ${String(raw).slice(0, 200)}`);
+      }
+      const results = validateBatchReceipt(body, group);
+      for (const r of results) {
+        tally[r.status]++;
+        if (r.status === "failed") {
+          throw new Error(`the brain reported a document failure for ${r.source_id}: ${r.error || "unknown"}`);
+        }
+      }
+    }
+  };
+
+  const runId = `sync_${randomBytes(16).toString("hex")}`;
+  const startedAt = new Date().toISOString();
+  let receiptOpened = false;
+  if (!dry) {
+    await postReceipt(base, adminKey, {
+      source: sourceName, kind: "imessage", status: "indexing",
+      run_id: runId, lane: "manual", started_at: startedAt,
+      detail: flushOnly ? "iMessage open-session flush started" : "iMessage capture pass started",
+    });
+    receiptOpened = true;
+  }
+
+  let result;
+  try {
+    result = await imessage.captureOnce({
+      chatDbPath,
+      statePath,
+      sendEnvelopes,
+      ownerLabel: m.client?.display_name || "Owner",
+      groupingTimezone: m.client?.timezone || "UTC",
+      maxRows: flags.limit ? parseInt(flags.limit, 10) : Infinity,
+      flushOnly,
+      dryRun: dry,
+      reset: !!flags.reset,
+      onPage: ({ page, rows, watermark }) => {
+        process.stdout.write(`\r  page ${page}: ${rows} row(s), watermark ${watermark}   `);
+      },
+    });
+  } catch (error) {
+    if (receiptOpened) {
+      try {
+        await postReceipt(base, adminKey, {
+          source: sourceName, kind: "imessage", status: "error", run_id: runId,
+          lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
+          error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
+          detail: "iMessage capture aborted; the watermark stayed at the last durable page",
+        });
+      } catch (receiptError) {
+        warn(`the capture failed and its error receipt could not be recorded: ${String(receiptError?.message || receiptError).slice(0, 160)}`);
+      }
+    }
+    if (error?.reason === "full_disk_access_denied") {
+      die(`${error.message}\n      ${imessage.fdaRemediationSteps().join("\n      ")}`);
+    }
+    if (error?.reason === "chat_db_missing" || error?.reason === "chat_db_unreadable") die(error.message);
+    throw error;
+  }
+  if (result.pages) process.stdout.write("\n");
+
+  const skipped = result.rows_skipped;
+  const summary =
+    `${result.rows_seen} new row(s) read in ${result.pages} page(s); ${result.rows_pushed} sessionized; ` +
+    `${skipped.no_text} without text (tapbacks/attachments), ${skipped.no_timestamp + skipped.no_guid} unusable; ` +
+    `${result.documents_sent} conversation document(s) sent; ${result.sessions_open} session(s) still open; ` +
+    `watermark ${result.watermark}`;
+
+  if (dry) {
+    info(summary);
+    ok("dry run, nothing was sent and no state was saved");
+    return result;
+  }
+
+  await postReceipt(base, adminKey, {
+    source: sourceName, kind: "imessage", status: "ready",
+    run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
+    docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
+    detail: `iMessage capture: ${summary}`,
+  });
+
+  info(summary);
+  ok(`${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged`);
+  if (tally.refused) {
+    warn(`${tally.refused} conversation document(s) refused by the credential gate (a live credential was texted)`);
+  }
+  info(`progress saved to ${relative(process.cwd(), statePath)}`);
+  return result;
+}
+
+/**
  * Ingest from a connected remote source.
  *
  * Deliberately shares sendBatches() with the local walker, so a Drive document
@@ -6574,8 +6751,13 @@ async function resolveBaseUrl(m, acct) {
 async function cmdConnect(target) {
   const flags = parseFlags(process.argv.slice(3));
   const which = (target || "").toLowerCase();
+  if (which === "imessage") return cmdConnectImessage(process.argv[4], flags);
   if (which !== "google") {
-    die("only `brain connect google` exists today.\n  Usage: brain connect google --scopes drive,gmail,calendar");
+    die(
+      "brain connect supports google and imessage.\n" +
+        "  Usage: brain connect google --scopes drive,gmail,calendar\n" +
+        "         brain connect imessage <manifest>"
+    );
   }
 
   const names = String(flags.scopes === true || !flags.scopes ? "drive" : flags.scopes).split(",").map((x) => x.trim()).filter(Boolean);
@@ -6622,6 +6804,157 @@ async function cmdConnect(target) {
   saveTokens(store);
   ok(`connected. Token stored in ${tokenStorageDescription()} (on this machine only)`);
   info(`now run: brain ingest <manifest> --from ${names[0]}`);
+}
+
+/**
+ * brain connect imessage <manifest> — Mac-only live message capture.
+ *
+ * The order is deliberate: verify Full Disk Access FIRST with a real read
+ * attempt (reporting honestly, by name, when it is denied), run the initial
+ * history load in the foreground so its counts are seen rather than hidden
+ * in a LaunchAgent log, and only then install the every-minute capture
+ * agent — so the agent's first tick starts from a caught-up watermark
+ * instead of racing a foreground backfill for the same pages.
+ */
+export async function cmdConnectImessage(manifestPath, flags = {}, options = {}) {
+  if ((options.platform ?? process.platform) !== "darwin") {
+    die(
+      "iMessage capture requires a Mac: Apple only exposes message history through\n" +
+        "      ~/Library/Messages/chat.db, which exists on macOS and nowhere else."
+    );
+  }
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die("usage: brain connect imessage <manifest> [--no-initial-load]");
+  }
+  const { m } = loadManifest(manifestPath);
+  if (m.corpora?.imessage?.enabled !== true) {
+    die(
+      "corpora.imessage.enabled is not true in this manifest.\n" +
+        '      Add  "imessage": { "enabled": true }  under "corpora" first, so the install\n' +
+        "      record says this machine captures messages before the machinery exists."
+    );
+  }
+
+  const imessage = options.imessage ?? await import("./connectors/imessage.mjs");
+  const scheduler = options.imessageScheduler ?? await import("./operations/imessage-scheduler.mjs");
+
+  // Step 1: the Full Disk Access verification — an actual read, not a guess.
+  const chatDbPath = imessage.defaultChatDbPath();
+  const probe = imessage.probeChatDb(chatDbPath);
+  if (!probe.ok) {
+    if (probe.reason === "full_disk_access_denied") {
+      console.log("");
+      for (const line of imessage.fdaRemediationSteps()) console.log(`  ${line}`);
+      console.log("");
+      die(
+        "Full Disk Access is not granted yet, so nothing was installed. Follow the steps\n" +
+          "      above, then re-run this same command — it verifies the grant by reading the\n" +
+          "      database for real before anything is scheduled."
+      );
+    }
+    die(probe.message);
+  }
+  ok(`Full Disk Access verified: ${chatDbPath} is readable`);
+
+  // The scheduled child posts freshness receipts with the admin key it
+  // resolves itself, so require the durable key now, exactly like
+  // `brain schedule --install` does, rather than installing an agent whose
+  // every tick would fail on a missing credential.
+  const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
+  const adminKey = resolveKey(manifestPath);
+  if (!adminKey) {
+    die("no admin key found, so iMessage capture cannot be reflected in source freshness. Run `brain setup <manifest>` first.");
+  }
+  const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+  const base = await resolveBase(m, null);
+
+  // Step 2: the initial history load, in the foreground, with counts.
+  if (!flags["no-initial-load"]) {
+    info("running the initial history load (safe to interrupt; it resumes where it stopped)");
+    await cmdIngestImessage(m, manifestPath, {}, options);
+  } else {
+    info("skipping the initial history load; the first scheduled tick will begin it");
+  }
+
+  // Step 3: the every-minute LaunchAgent, plus the freshness expectation that
+  // makes `brain sources` honest about whether capture is actually running.
+  const installed = scheduler.installImessageScheduler(manifestPath, options.schedulerOptions || {});
+  for (const warning of installed.warnings || []) warn(warning);
+  const postExpectation = options.postSourceExpectation ?? postSourceExpectation;
+  await postExpectation(base, adminKey, {
+    source: "imessage", kind: "imessage", expected_refresh_seconds: installed.expectedRefreshSeconds,
+  });
+  ok(`iMessage capture installed for ${installed.cron} (a new message appears within about a minute)`);
+  ok(`freshness expectation set to ${installed.expectedRefreshSeconds} seconds`);
+  info(`definition: ${installed.plistPath}`);
+  info(`logs: ${installed.stdoutPath} and ${installed.stderrPath}`);
+  info(`to stop and remove capture later: brain disconnect imessage ${manifestPath}`);
+  return installed;
+}
+
+/**
+ * brain disconnect — the first disconnect verb in this CLI.
+ *
+ * Same posture as removeDriveScheduler: removal must remain reachable even
+ * when the manifest's corpus flag is already off or missing, because
+ * requiring the operator to first declare the thing they are turning off
+ * would strand the already-loaded LaunchAgent.
+ */
+async function cmdDisconnect(target) {
+  const flags = parseFlags(process.argv.slice(3));
+  const which = (target || "").toLowerCase();
+  if (which !== "imessage") {
+    die("only `brain disconnect imessage <manifest>` exists today.");
+  }
+  return cmdDisconnectImessage(process.argv[4], flags);
+}
+
+export async function cmdDisconnectImessage(manifestPath, flags = {}, options = {}) {
+  if ((options.platform ?? process.platform) !== "darwin") {
+    die("the iMessage capture LaunchAgent only exists on macOS, so there is nothing to disconnect here.");
+  }
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die("usage: brain disconnect imessage <manifest>");
+  }
+  const { m } = loadManifest(manifestPath);
+  const scheduler = options.imessageScheduler ?? await import("./operations/imessage-scheduler.mjs");
+
+  // Step 1: stop the agent first, so no tick races the final flush below.
+  const removed = scheduler.removeImessageScheduler(manifestPath, options.schedulerOptions || {});
+  ok(removed.removed || removed.loaded ? "iMessage capture removed" : "iMessage capture was not installed");
+  info(`logs preserved at ${removed.stdoutPath} and ${removed.stderrPath}`);
+
+  // Step 2: flush still-open sessions so the last conversations become
+  // searchable instead of sitting in the state snapshot forever. Best-effort:
+  // a missing key or unreachable brain must not make removal unreachable.
+  try {
+    await cmdIngestImessage(m, manifestPath, { "flush-sessions": true }, options);
+  } catch (error) {
+    warn(
+      "capture is stopped, but the final open-session flush did not complete: " +
+        `${String(error?.message || error).slice(0, 200)}\n` +
+        "      Nothing is lost; re-run `brain ingest " + manifestPath + " --from imessage --flush-sessions` when the brain is reachable."
+    );
+  }
+
+  // Step 3: clear the freshness expectation, so a deliberately disconnected
+  // source is not forever reported as stale. Also best-effort, same reason.
+  try {
+    const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
+    const adminKey = resolveKey(manifestPath);
+    if (!adminKey) throw new Error("no admin key is available");
+    const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+    const base = await resolveBase(m, null);
+    const postExpectation = options.postSourceExpectation ?? postSourceExpectation;
+    await postExpectation(base, adminKey, {
+      source: "imessage", kind: "imessage", expected_refresh_seconds: null,
+    });
+    ok("iMessage freshness expectation cleared");
+  } catch (error) {
+    warn(`capture is removed, but its remote freshness expectation could not be cleared: ${String(error?.message || error).slice(0, 160)}`);
+  }
+  info("captured conversations remain in the brain; remove them with: brain forget " + manifestPath + " --source imessage");
+  return removed;
 }
 
 /** The token provider for a stored Google connection, or a clear refusal. */
@@ -9787,6 +10120,7 @@ const commands = {
   migrate: cmdMigrate,
   ingest: cmdIngest,
   connect: cmdConnect,
+  disconnect: cmdDisconnect,
   status: cmdStatus,
   sources: cmdSources,
   forget: cmdForget,
@@ -9827,9 +10161,11 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain devices    <manifest>            enrolled passkeys; --revoke <credential id> removes one
     brain test       <manifest>            full acceptance suite (5 tiers)
     brain connect google --scopes drive,gmail,calendar  authorise the client's own Google account
+    brain connect imessage <manifest>      verify Full Disk Access, load history, capture live (Mac only)
     brain ingest     <manifest> --path <dir>  load a folder into the brain
     brain ingest     <manifest> --from drive  load from a connected remote source
     brain ingest     <manifest> --from calendar  sync Google Calendar (--dry-run to preview)
+    brain ingest     <manifest> --from imessage  one incremental Messages capture pass (Mac only)
     brain mcp-config <manifest>            config to connect the client's AI tools
     brain schedule   <manifest> --install  install unattended Drive refresh on macOS
     brain support    [--preview|--export <file>]  inspect private local issue notes
@@ -9847,6 +10183,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain rollback   <manifest> <bookmark> preview D1-only restore (--yes performs it)
     brain schedule   <manifest>            inspect unattended Drive refresh
     brain schedule   <manifest> --remove   remove it and preserve its logs
+    brain disconnect imessage <manifest>   stop live capture, flush open sessions, remove the agent
     brain support    --clear --yes         clear private local issue notes
 
   brain ingest takes --source <name>, --limit <n>, --dry-run, and --reset. It is

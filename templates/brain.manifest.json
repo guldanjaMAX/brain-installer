@@ -89,6 +89,17 @@
       "enabled": false,
       "oauth_secret": "secret://GCAL_OAUTH"
     },
+    "imessage": {
+      "_comment": [
+        "Mac-only live message capture from Messages.app (chat.db); there is no",
+        "Windows or Linux path. `brain connect imessage` verifies the Full Disk",
+        "Access grant with a real read, runs the initial history load, then",
+        "installs an every-minute capture LaunchAgent (override the tick with",
+        "operations.imessage_capture_cron). SMS rides in when Text Message",
+        "Forwarding is on and is tagged sms. `brain disconnect imessage` undoes it."
+      ],
+      "enabled": false
+    },
     "slack": {
       "enabled": false,
       "bot_token_secret": "secret://SLACK_BOT_TOKEN"
