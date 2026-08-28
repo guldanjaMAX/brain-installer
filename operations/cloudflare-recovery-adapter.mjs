@@ -147,6 +147,16 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "bank_feed_items",
   "bank_feed_backfill",
   "bank_feed_link_sessions",
+  // Schema 19: the owner's recovery card. `recovery_codes` is DURABLE and is
+  // exported, for the same reason `owner_passkeys` is: a recovered brain that
+  // came back without it would silently kill the card sitting in the owner's
+  // safe, and they would only find out on the day every device was gone. Only
+  // SHA-256 hashes of ~99-bit codes are in there, so the export carries nothing
+  // guessable. `recovery_attempts` is the throttle's short window of live
+  // security state and is deliberately NOT exported below, exactly like
+  // auth_challenges: a recovered brain starts its hour clean.
+  "recovery_codes",
+  "recovery_attempts",
 ]);
 
 /**
@@ -163,6 +173,7 @@ export const RECOVERY_EXPORT_TABLES = Object.freeze(
       // recovered brain re-issues challenges and invites from scratch, and an
       // abandoned bank-authorisation session is the same kind of thing.
       table !== "auth_challenges" && table !== "enrollment_codes" &&
+      table !== "recovery_attempts" &&
       table !== "bank_feed_link_sessions"),
 );
 
@@ -244,14 +255,15 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   "session_generation",
 ]);
 // Schema 15 added the additive financial-ledger tables, 17 added the chunk
-// token-fit columns, and 18 added two provenance COLUMNS to `documents`
+// token-fit columns, 18 added two provenance COLUMNS to `documents`
 // (text_source, text_reliable) so an OCR'd document is distinguishable from one
-// read from a text layer. No new table in 17 or 18, and the vector protocol is
-// unchanged, but the recovery contract tracks the EXACT current schema by
-// design: a drill against a database one migration behind would export a column
-// set that does not match the reviewed list, and refusing is the whole point of
-// pinning it. Bumping this is a required step of shipping any migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 18;
+// read from a text layer, and 19 added the two recovery-card tables. The vector
+// protocol is unchanged throughout, but the recovery contract tracks the EXACT
+// current schema by design: a drill against a database one migration behind
+// would export a column set that does not match the reviewed list, and refusing
+// is the whole point of pinning it. Bumping this is a required step of shipping
+// any migration.
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 19;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -287,6 +299,12 @@ const SCHEMA_16_TABLES = Object.freeze([
   "bank_feed_link_sessions",
 ]);
 
+// Schema 19: the owner's recovery card and the brake on guessing at it.
+const SCHEMA_19_TABLES = Object.freeze([
+  "recovery_codes",
+  "recovery_attempts",
+]);
+
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
     table,
@@ -299,7 +317,7 @@ const AGGREGATE_FIELDS = Object.freeze([
     // not have fails the whole snapshot. Ledger restoration correctness is
     // proven by the exported content, which these tables are fully part of.
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
-     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES].includes(table)
+     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_19_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1058,7 +1076,8 @@ function expectedRecoveryTables(migrations) {
     (latest >= 13 || table !== "vector_bootstrap_batches") &&
     (latest >= 14 || !SCHEMA_14_TABLES.includes(table)) &&
     (latest >= 15 || !SCHEMA_15_TABLES.includes(table)) &&
-    (latest >= 16 || !SCHEMA_16_TABLES.includes(table)));
+    (latest >= 16 || !SCHEMA_16_TABLES.includes(table)) &&
+    (latest >= 19 || !SCHEMA_19_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {
