@@ -907,7 +907,7 @@ export async function assertAdoptable(acctId, db, dbName, slug, query = d1Query)
   }
 }
 
-async function cmdProvision(manifestPath) {
+async function cmdProvision(manifestPath, { nextSteps = true } = {}) {
   const { path, m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
   info(`provisioning into "${acct.name}" (${acct.id})`);
@@ -1105,7 +1105,19 @@ async function cmdProvision(manifestPath) {
   // safe to run without secrets (it carries keep_bindings, so a later deploy
   // preserves them), which makes deploy-then-secrets the only order that works
   // from nothing.
-  info("next: brain migrate <manifest>, then deploy, then secrets, then health");
+  // Printed only when a person ran `brain provision` directly. Setup runs this
+  // same step and then keeps going, so the hint there is noise mid-install.
+  //
+  // The order was right and the hint was still a dead end (bench, 2026-08-28).
+  // It names four commands and the fourth stops, because nothing in that list
+  // creates an admin key: only `brain setup` generates and persists one.
+  if (nextSteps) {
+    info(
+      "next: brain migrate <manifest>, then deploy, then secrets, then health.\n" +
+        "        Those four finish only on a brain that already has an admin key. Nothing in\n" +
+        "        that list creates one; `brain setup <manifest>` creates it and runs all four."
+    );
+  }
 }
 
 function collectWorkerFiles(root) {
@@ -1306,7 +1318,14 @@ export async function cmdDeploy(manifestPath, options = {}) {
       );
     }
   }
-  info("next: brain secrets <manifest>, then brain health <manifest>");
+  // Same reasoning as provision: suppressed when setup drives the step.
+  if (options.nextSteps !== false) {
+    info(
+      "next: brain secrets <manifest>, then brain health <manifest>.\n" +
+        "        `brain secrets` applies this brain's admin key and never creates one. If this\n" +
+        "        brain has no key yet, `brain setup <manifest>` creates it and finishes the install."
+    );
+  }
 }
 
 export const WORKER_PROVIDER_SECRET_NAMES = Object.freeze([
@@ -6826,7 +6845,7 @@ export async function cmdSetup(manifestPath, options = {}) {
   /* --- 3. the install sequence, in the ONLY order that works --- */
   console.log(`\n  ${c.bold("Step 3 of 6")}  creating the brain in your Cloudflare account\n`);
   await (options.cmdVerify ?? cmdVerify)(target);
-  await (options.cmdProvision ?? cmdProvision)(target);
+  await (options.cmdProvision ?? cmdProvision)(target, { nextSteps: false });
   const migrateSetup = options.cmdMigrate ?? cmdMigrate;
   const deploySetup = options.cmdDeploy ?? cmdDeploy;
   const healthSetup = options.cmdHealth ?? cmdHealth;
@@ -6938,13 +6957,13 @@ export async function cmdSetup(manifestPath, options = {}) {
       }
       throw error;
     }
-    await deploySetup(target);
+    await deploySetup(target, { nextSteps: false });
   } else if (!setupOriginalPin.manifest.brain?.domain) {
     // The compatibility deploys use the immutable execution copy and suppress
     // local writes. A rare legacy manifest with no saved route gets one final
     // ordinary active deploy solely to persist its token-free URL.
     revalidateUpdateManifest(setupOriginalPin, "setup domain persistence");
-    await deploySetup(target, { pauseVectorDrainForUpgrade: false });
+    await deploySetup(target, { pauseVectorDrainForUpgrade: false, nextSteps: false });
   }
   // Provision and deploy write resource IDs and the token-free live address.
   // Everything below must use the committed manifest, not setup's old template.
