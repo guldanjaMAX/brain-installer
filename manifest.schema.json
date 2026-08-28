@@ -333,6 +333,27 @@
         "daily_llm_spend_cap_usd": {
           "type": "number",
           "minimum": 0
+        },
+        "ocr": {
+          "type": "object",
+          "description": "Read scanned PDFs by sending each page image to a vision model through THIS brain's own Workers AI binding. Off by default because it costs money on the client's own Cloudflare account, once per scanned page, and every page still passes the daily spend cap.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "model": {
+              "type": "string",
+              "default": "@cf/google/gemma-4-26b-a4b-it",
+              "description": "Must be a Cloudflare @cf/ model. OCR refuses any other, because a page of a scanned document may only reach the provider the manifest names."
+            },
+            "max_pages_per_document": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 40,
+              "description": "Ceiling on pages read per document. One model call per page, so this bounds both the wait and the spend on a single oversized scan."
+            }
+          }
         }
       }
     },

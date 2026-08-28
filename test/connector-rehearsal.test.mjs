@@ -293,26 +293,66 @@ try {
     !!gvDoc && gvDoc.content !== smsInvoiceDoc?.content, JSON.stringify(gvDocs.map((d) => d.title)));
 
   /* ================================================================ *
-   * 8. One fixture bank statement, native and scanned -- NOT DONE.
-   *    WP-11 (OCR) and WP-14 (the structured financial ledger) are Wave 2
-   *    scope. Nothing in this codebase can classify a document as
-   *    financial, OCR a scan, or write a fin_* row: there is no ledger
-   *    schema, no extraction pass, and no bank-statement fixture. Per this
-   *    task's own instruction, this is stated plainly rather than faked.
+   * 8. One fixture bank statement, scanned. The OCR half of this step is
+   *    now real: a synthetic image-only PDF goes through the SHIPPED
+   *    extractor with a stubbed model, and comes out as a marked, indexed
+   *    document. The model is stubbed because a real one needs a live
+   *    Cloudflare account; everything between the PDF bytes and the stored
+   *    envelope is production code.
+   *
+   *    The LEDGER half stays not-done. See the note under it.
    * ================================================================ */
+  {
+    const { scanPdf, textPdf } = await import("./fixtures/scan-pdf.mjs");
+    const { extract } = await import("../ingest/extract.mjs");
+    await import("../ingest/formats.mjs");
+
+    const statementPage = [
+      "RIVER ROAD COMMUNITY BANK    Statement period 01 Mar to 31 Mar",
+      "Account ending 4417          Opening balance 2,410.55",
+      "01 Mar  Card purchase HARDWARE SUPPLY   -142.10   2,268.45",
+      "04 Mar  Deposit                        1,000.00   3,268.45",
+      "09 Mar  Card purchase FUEL               -68.40   3,200.05",
+      "18 Mar  Cheque 1042                     -450.00   2,750.05",
+      "Closing balance 2,750.05",
+    ].join("\n");
+
+    const modelPages = [];
+    const stub = Object.assign(async (image, meta) => {
+      modelPages.push({ page: meta.page, bytes: image.png_base64.length });
+      return { text: statementPage };
+    }, { model: "@cf/google/gemma-4-26b-a4b-it", maxPages: 40 });
+
+    const scanned = await extract(scanPdf(), "march-statement.pdf", { ocr: stub });
+    check("fixture bank statement, scanned: OCR read it instead of refusing it",
+      typeof scanned.text === "string" && !scanned.error, String(scanned.error));
+    check("the shipped rasteriser handed the model a real page image, with no native module",
+      modelPages.length === 1 && modelPages[0].bytes > 50, JSON.stringify(modelPages));
+    check("the transcription is in the document and the figures survived",
+      /2,750\.05/.test(scanned.text) && /HARDWARE SUPPLY/.test(scanned.text), scanned.text?.slice(0, 120));
+    check("and it is MARKED as OCR, so a citation from it is not mistaken for real text",
+      scanned.provenance?.text_source === "ocr" && scanned.provenance?.text_reliable === false,
+      JSON.stringify(scanned.provenance));
+
+    /* The control, in the same breath: a text-layer PDF must not be OCR'd. */
+    const untouched = [];
+    const watchdog = Object.assign(async (image, meta) => {
+      untouched.push(meta.page);
+      return { text: "should never be called" };
+    }, { model: "@cf/x", maxPages: 40 });
+    const native = await extract(textPdf(), "notes.pdf", { ocr: watchdog });
+    check("a PDF that already has a text layer is never sent to the model",
+      untouched.length === 0 && /text layer/.test(native.text || ""), JSON.stringify({ untouched, text: native.text?.slice(0, 80) }));
+  }
   notDone(
     "fixture bank statement, native PDF, ingested and answered",
-    "WP-11 (OCR) and WP-14 (structured ledger) are Wave 2 and do not exist in this repo yet: " +
-    "no fin_* migration, no extraction pass, nothing to ingest a statement INTO beyond plain " +
-    "text retrieval (which a native-text PDF would already get via the existing extractor -- " +
-    "but there is no fixture built for it, and proving that would not exercise anything WP-14 " +
-    "specific, so it was not fabricated here).",
-  );
-  notDone(
-    "fixture bank statement, scanned, OCR'd and answered",
-    "same reason: WP-11's OCR-via-Workers-AI path is not built. A no-text-layer PDF is still " +
-    "correctly refused by today's extractor (proven in test/ingest-run.test.mjs), which is the " +
-    "true Wave 0 behavior -- 'refused, not faked' -- not the Wave 2 OCR behavior this step asks for.",
+    "WP-14 (the structured financial ledger for EXTRACTED statements) is still Wave 2: there is " +
+    "no statement-to-rows extraction pass, so a native-text statement PDF would only get plain " +
+    "text retrieval here, which proves nothing WP-14 specific. Measured this build: OCR output " +
+    "cannot reach the ledger either -- ingest/bank-export.mjs requires a delimited file with a " +
+    "named date column and a sign convention established from the file itself, and it correctly " +
+    "refuses OCR prose with 'no column is named as a date'. That refusal is the right behaviour " +
+    "and the reason this stays not-done rather than being faked.",
   );
 
   /* ================================================================ *

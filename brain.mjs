@@ -76,6 +76,13 @@ async function ingestLib() {
     throw e;
   }
 }
+/**
+ * The OCR policy module, loaded the same lazy way and for the same reason: it
+ * imports the PDF format reader for the one constant it shares with it.
+ */
+async function ingestOcrLib() {
+  return await import("./ingest/ocr.mjs");
+}
 import { authorize, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
 import {
   redact as redactConfirmedSecrets,
@@ -1193,6 +1200,20 @@ export async function cmdDeploy(manifestPath, options = {}) {
         type: "plain_text",
         name: "CREDENTIAL_SCANNER",
         text: m.safety?.credential_scanner?.enabled === false ? "off" : "on",
+      },
+      // OFF unless the manifest says otherwise. An upgrade that quietly
+      // switched on a per-page charge against the client's own account would
+      // be a bill they never agreed to, so the default is the one that spends
+      // nothing.
+      {
+        type: "plain_text",
+        name: "OCR_ENABLED",
+        text: m.safety?.ocr?.enabled === true ? "1" : "0",
+      },
+      {
+        type: "plain_text",
+        name: "OCR_MODEL",
+        text: String(m.safety?.ocr?.model || "@cf/google/gemma-4-26b-a4b-it"),
       },
     ],
     // Without this, every secret set by `brain secrets` is wiped on the next
@@ -3984,13 +4005,108 @@ export function commitCredentialScannerProgress(state, fingerprint) {
   return state;
 }
 
-export function drivePolicyFingerprint(config = {}, scannerEnabled = true) {
+export function drivePolicyFingerprint(config = {}, scannerEnabled = true, ocrEnabled = false) {
   const normalized = {};
   for (const key of ["excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
     normalized[key] = [...new Set((config[key] || []).map((value) => String(value)))].sort();
   }
   normalized.credentialScanner = credentialScannerFingerprint(scannerEnabled);
+  // Turning OCR on changes what Drive is ALLOWED TO READ, so it belongs in the
+  // source policy. Without it, a scanned PDF refused a month ago never
+  // reappears: once a change token exists the incremental feed only returns
+  // files that CHANGED, and a document sitting untouched in a folder has not.
+  // A fingerprint mismatch forces one full comparison, which looks at every
+  // file again exactly once.
+  //
+  // Deliberately NOT added to credentialScannerFingerprint, which looks
+  // interchangeable and is not: that flag also arms a refusal when a
+  // previously indexed file is missing, a refusal on --limit, and a re-send
+  // and re-embed of the whole corpus. Wrong blast radius by a wide margin.
+  normalized.ocr = ocrEnabled === true;
   return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+
+
+/* ------------------------------------------------------------------- ocr */
+
+/**
+ * OCR settings from the manifest, with the safe answer as the default.
+ *
+ * OFF unless the manifest says otherwise. Turning OCR on changes ingest from a
+ * free local operation into a metered one that bills the owner's own
+ * Cloudflare account once per scanned page, and an upgrade must never quietly
+ * start spending on someone's behalf.
+ */
+export function ocrPolicy(manifest = {}) {
+  const cfg = manifest?.safety?.ocr || {};
+  return {
+    enabled: cfg.enabled === true,
+    model: typeof cfg.model === "string" && cfg.model.trim() ? cfg.model.trim() : "@cf/google/gemma-4-26b-a4b-it",
+    maxPages: Number.isFinite(cfg.max_pages_per_document) && cfg.max_pages_per_document > 0
+      ? Math.floor(cfg.max_pages_per_document)
+      : 40,
+  };
+}
+
+/**
+ * The callback `extractPdf` calls once per page of a scanned document.
+ *
+ * It posts to the brain's OWN worker rather than to Cloudflare's REST API, so
+ * every page passes the daily spend cap, lands in `llm_call_log` under the
+ * label `ocr`, and runs on the client's own AI binding with the admin key the
+ * installer already holds. No Cloudflare control-plane token is involved in
+ * routine ingest.
+ *
+ * A cap hit, a provider refusal or a transport failure is marked `fatal` and
+ * rethrown, because none of them says anything about the DOCUMENT. Recording
+ * "unreadable" for a document that was never looked at writes a permanently
+ * wrong reason into resume state, and the source cursor must stay retryable
+ * instead.
+ */
+export function makeOcrCallback({ base, adminKey, model, maxPages, onPage = () => {} , httpImpl = http }) {
+  const call = async (image, { page, totalPages } = {}) => {
+    const { OCR_SYSTEM_PROMPT } = await ingestOcrLib();
+    let res;
+    try {
+      res = await httpImpl(`${base}/api/admin/brain/ocr`, {
+        method: "POST",
+        headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+        body: JSON.stringify({ image_base64: image.png_base64, page, prompt: OCR_SYSTEM_PROMPT }),
+      }, { what: "the OCR request" });
+    } catch (error) {
+      const e = new Error(`OCR could not reach the brain: ${error.message}`);
+      e.fatal = true;
+      throw e;
+    }
+
+    let body = {};
+    try { body = await res.json(); } catch { /* handled by status below */ }
+
+    if (res.status === 429 || body?.llm_cap_exceeded) {
+      const e = new Error(
+        `OCR stopped because the daily spend cap was reached. ${body?.detail || ""}`.trim() +
+        " No document was marked unreadable; re-run once the cap resets or raise safety.daily_llm_spend_cap_usd.",
+      );
+      e.fatal = true;
+      e.llm_cap_exceeded = true;
+      throw e;
+    }
+    if (body?.provider_mismatch || res.status === 409) {
+      const e = new Error(`OCR refused: ${body?.detail || body?.error || "the brain would not run it"}`);
+      e.fatal = true;
+      throw e;
+    }
+    if (!res.ok) {
+      // A 5xx from the model is about THIS page, not about the run, so it is a
+      // page-level error the assembler can count and report inline.
+      return { error: `page ${page}: ${String(body?.detail || body?.error || `HTTP ${res.status}`).slice(0, 160)}` };
+    }
+    onPage({ page, totalPages });
+    return { text: body?.text ?? "" };
+  };
+  call.model = model;
+  call.maxPages = maxPages;
+  return call;
 }
 
 export const DRIVE_FULL_SWEEP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -5100,6 +5216,32 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   const alreadyDone = Object.keys(state.done).length;
   if (alreadyDone && !flags.reset) info(`resuming: ${alreadyDone} file(s) already loaded`);
 
+
+  // OCR, and what it will cost, decided ONCE per run and stated out loud
+  // before the first page is sent. The estimate lands while the owner can
+  // still say no; a bill that appears afterwards is not a choice they were
+  // offered. A dry run never gets a callback, so the safest command in the
+  // tool stays the cheapest one.
+  const ocrCfg = ocrPolicy(m);
+  let ocrPages = 0;
+  const ocrCallback = dry || !ocrCfg.enabled ? null : makeOcrCallback({
+    base, adminKey, model: ocrCfg.model, maxPages: ocrCfg.maxPages,
+    onPage: ({ page, totalPages }) => {
+      ocrPages++;
+      // Per PAGE, not per file. A forty-page scan is forty model calls and
+      // over a minute of waiting; without this the run looks hung and the
+      // first client to see it kills it.
+      info(`  OCR page ${page}${totalPages ? ` of ${totalPages}` : ""} (${ocrPages} page(s) read so far this run)`);
+    },
+  });
+  if (ocrCfg.enabled && !dry) {
+    const { estimateOcrCost, describeOcrCost } = await ingestOcrLib();
+    info(`OCR is ON, model ${ocrCfg.model}, up to ${ocrCfg.maxPages} page(s) per document.`);
+    info(`  cost per 100 scanned pages: ${describeOcrCost(estimateOcrCost(100))}`);
+  } else if (ocrCfg.enabled && dry) {
+    info("OCR is ON, but a dry run never sends a page to a model and never spends anything.");
+  }
+
   const privatePrefixes = m.safety?.private_path_prefixes || [];
   info(`walking ${root}`);
   const { files, skipped: walkSkips, complete: walkComplete } = walk(root, { privatePrefixes });
@@ -5181,7 +5323,7 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   // a raw V8 abort no handler can catch, and an interrupt during that silent
   // phase threw away every minute of extraction. Peak memory here is one batch.
   const prepareOne = async (f) => {
-    const r = await prepare(f, { sourceName });
+    const r = await prepare(f, { sourceName, ocr: ocrCallback });
     if (r.note) notes.push({ path: f.rel, note: r.note });
 
     // A multi-document producer (a WhatsApp export, an SMS Backup & Restore
@@ -7340,6 +7482,31 @@ async function cmdIngestRemote(m, manifestPath, flags) {
 
   const { batchStream, splitOversized, loadState, saveState } = await ingestLib();
   const getToken = googleAuth(which === "gmail" ? "gmail" : "drive");
+  // OCR, and what it will cost, decided ONCE per run and stated out loud
+  // before the first page is sent. The estimate lands while the owner can
+  // still say no; a bill that appears afterwards is not a choice they were
+  // offered. A dry run never gets a callback, so the safest command in the
+  // tool stays the cheapest one.
+  const ocrCfg = ocrPolicy(m);
+  let ocrPages = 0;
+  const ocrCallback = dry || !ocrCfg.enabled ? null : makeOcrCallback({
+    base, adminKey, model: ocrCfg.model, maxPages: ocrCfg.maxPages,
+    onPage: ({ page, totalPages }) => {
+      ocrPages++;
+      // Per PAGE, not per file. A forty-page scan is forty model calls and
+      // over a minute of waiting; without this the run looks hung and the
+      // first client to see it kills it.
+      info(`  OCR page ${page}${totalPages ? ` of ${totalPages}` : ""} (${ocrPages} page(s) read so far this run)`);
+    },
+  });
+  if (ocrCfg.enabled && !dry) {
+    const { estimateOcrCost, describeOcrCost } = await ingestOcrLib();
+    info(`OCR is ON, model ${ocrCfg.model}, up to ${ocrCfg.maxPages} page(s) per document.`);
+    info(`  cost per 100 scanned pages: ${describeOcrCost(estimateOcrCost(100))}`);
+  } else if (ocrCfg.enabled && dry) {
+    info("OCR is ON, but a dry run never sends a page to a model and never spends anything.");
+  }
+
   const statePath = join(dirname(resolve(manifestPath)), `.brain-ingest-${sourceName}.json`);
   const state = flags.reset ? { version: 1, done: {}, skipped: {} } : loadState(statePath);
   const scannerOn = m.safety?.credential_scanner?.enabled !== false;
@@ -7356,7 +7523,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     } catch (error) {
       die(error.message);
     }
-    policyFingerprint = drivePolicyFingerprint(sourcePolicy, scannerOn);
+    policyFingerprint = drivePolicyFingerprint(sourcePolicy, scannerOn, ocrCfg.enabled);
     driveDecision = driveSyncDecision({
       reset: !!flags.reset,
       syncToken: state.sync_token,
@@ -7595,7 +7762,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         return { unchanged: true };
       }
 
-      const r = await drive.toEnvelope(getToken, f, { sourceName, pathOf });
+      const r = await drive.toEnvelope(getToken, f, { sourceName, pathOf, ocr: ocrCallback });
       if (!r) return null;
       if (r.skip) {
         state.skipped[key] = r.skip.reason;

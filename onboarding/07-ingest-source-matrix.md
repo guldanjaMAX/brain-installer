@@ -47,7 +47,7 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 | Google Docs | Full text |
 | Google Sheets | Cell contents as rows |
 | Google Slides | Text from the slides |
-| PDF | Text layer |
+| PDF | Text layer. A scanned PDF with no text layer can be read by OCR, if you turn OCR on |
 | Word (.docx), PowerPoint (.pptx), Excel (.xlsx) | Full text |
 | Rich text (.rtf) | Text only; font tables, styles and embedded pictures are dropped |
 | Plain text, Markdown, JSON, XML, YAML | As written |
@@ -60,7 +60,8 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 | Type | Why not |
 |---|---|
 | Images, video, audio | No text to read. There is no transcription step |
-| Scanned PDFs with no text layer | **There is no text recognition.** A scanned contract is a picture of a contract to this system |
+| Scanned PDFs, when OCR is OFF | Off is the default. A scan is a picture of a page, and without OCR this system cannot read it. Turn it on with `safety.ocr.enabled` |
+| Scanned PDFs whose reading came back unusable | Reported, never indexed on a guess. If the model described the page instead of transcribing it, repeated itself, or produced too little to be a page, the file is refused with the reason |
 | Code, stylesheets, build output, lockfiles | Matches a lot of questions and answers almost none of them. Left out deliberately, because it crowds real documents out of your results |
 | Database dumps and backups | Same reason, larger. One dump can flood an index and make everything else harder to find |
 | Anything in a folder whose name starts with `_Private` | Owner-only by convention. Never read, enforced in two independent places |

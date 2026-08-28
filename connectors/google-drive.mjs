@@ -401,7 +401,7 @@ export async function fetchContent(getAccessToken, file, plan, opts = {}) {
  * Deliberately mirrors ingest/run.mjs prepare() so a Drive document and a local
  * one are judged by exactly the same rules.
  */
-export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYPE, pathOf = () => "" } = {}, opts = {}) {
+export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYPE, pathOf = () => "", ocr = null } = {}, opts = {}) {
   const plan = triage(file);
   if (plan.folder) return null;
   if (plan.skip) return { skip: { path: file.name, id: file.id, reason: plan.skip } };
@@ -422,7 +422,11 @@ export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYP
     return { skip: { path: file.name, id: file.id, reason: "the file is binary, not text" } };
   }
 
-  const got = await extract(buf, name);
+  // Extractor options were never passed on this path, so a Drive PDF has been
+  // judged by different rules than a local one despite the comment above
+  // promising otherwise. OCR is threaded through explicitly here, because
+  // Drive is where a client's scanned filing cabinet actually lives.
+  const got = await extract(buf, name, ocr ? { ocr } : {});
   if (got.error || got.text == null) {
     return { skip: { path: file.name, id: file.id, reason: got.error || "extraction produced nothing" } };
   }
@@ -451,6 +455,9 @@ export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYP
       date_source: dd.value ? dd.source : Number.isFinite(created) ? "drive_created" : "none",
       date_reliable: dd.value ? dd.reliable : false,
       uri: file.webViewLink || null,
+      ...(got.provenance
+        ? { text_source: got.provenance.text_source, text_reliable: got.provenance.text_reliable }
+        : {}),
       metadata: {
         extracted_as: got.how,
         drive_id: file.id,
@@ -461,6 +468,7 @@ export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYP
         top_folder: pathSegments(folder)[0] || null,
         folder: folder || null,
         ...(got.note ? { extraction_note: got.note } : {}),
+        ...(got.provenance ? { ocr: got.provenance } : {}),
       },
     },
     // Drive's own change signal. Cheaper than hashing content we already have,

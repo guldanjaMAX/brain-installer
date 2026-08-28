@@ -99,6 +99,22 @@ export function computeAnswerConfidence({ approvedDocs = [], gaps = [], degraded
     basis.push("cited evidence is undated");
   }
 
+  // Evidence a machine read off a picture of a page. The rubric does not judge
+  // how well it read; it prices the fact that a reading step stands between the
+  // page and the sentence, which a text layer does not have. A partial read is
+  // worse than a whole one because some page of that document is missing from
+  // the evidence entirely, and the answer cannot know which.
+  const ocrDocs = approvedDocs.filter((doc) => doc.text_source === "ocr" || doc.text_source === "ocr_partial");
+  if (ocrDocs.length) {
+    const partial = ocrDocs.some((doc) => doc.text_source === "ocr_partial");
+    const all = ocrDocs.length === approvedDocs.length;
+    score -= partial ? 18 : 12;
+    basis.push(
+      `${all ? "every" : `${ocrDocs.length} of ${approvedDocs.length}`} cited document was read by OCR from a scanned image` +
+      (partial ? ", and at least one has pages that could not be read" : ""),
+    );
+  }
+
   const adjust = gapAdjustments(gaps, degraded);
   score += adjust.delta;
   basis.push(...adjust.basis);
