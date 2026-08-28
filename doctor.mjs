@@ -1236,7 +1236,22 @@ export function summarizePreinstall(checks) {
 
 /** Non-zero only for things actually known to be broken. */
 export function preinstallExitCode(checks) {
-  return summarizePreinstall(checks).fatal ? 1 : 0;
+  const s = summarizePreinstall(checks);
+  // Three outcomes, not two, because the shell has to be able to tell the same
+  // three apart that the screen does. The printed report already distinguishes
+  // CANNOT CHECK from PASS, but `brain preinstall && <do the install>` reads
+  // only this number, and returning 0 while items went unverified is exactly
+  // the "a check that could not run looked like a check that passed" defect
+  // this command exists to prevent, moved from the screen to the exit code.
+  //   0  nothing failed and nothing went unchecked
+  //   1  a real blocker: do not travel to this install
+  //   2  no blocker found, but something could not be verified from here
+  // Two is deliberately not zero: on a real pre-install machine the Edit
+  // permission and the paid plan are never verifiable, so 2 is the BEST
+  // obtainable result and a caller that wants to proceed on it must say so.
+  if (s.fatal) return 1;
+  if (s.unchecked) return 2;
+  return 0;
 }
 
 /**

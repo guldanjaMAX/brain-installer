@@ -360,11 +360,20 @@ const byName = (checks, name) => checks.find((x) => x.name === name);
     /could NOT be checked from this machine/.test(v.headline), v.headline);
   check("and it refuses to be read as a green light",
     /This is not a green light/.test(v.note), v.note);
-  check("an unchecked item does not by itself fail the exit code", preinstallExitCode(unchecked) === 0);
+  // The screen already distinguishes CANNOT CHECK from PASS. The exit code has
+  // to as well, because `brain preinstall && <install>` reads only the number,
+  // and a 0 there would move the exact defect this command prevents from the
+  // screen to the shell.
+  check("an unchecked item is not a blocker, so it is not exit 1",
+    preinstallExitCode(unchecked) !== 1, String(preinstallExitCode(unchecked)));
+  check("but it is not exit 0 either, because a script must not read it as a green light",
+    preinstallExitCode(unchecked) === 2, String(preinstallExitCode(unchecked)));
 
   const clean = preinstallVerdict([{ name: "A", status: OK, detail: "" }]);
   check("ready is reserved for a run with nothing failed and nothing unchecked", clean.ready === true, JSON.stringify(clean));
   check("and it says nothing was skipped or assumed", /Nothing here was skipped/.test(clean.note), clean.note);
+  check("a genuinely clean run is the only thing that exits 0",
+    preinstallExitCode([{ name: "A", status: OK, detail: "" }]) === 0);
 
   const broken = [{ name: "A", status: FAIL, detail: "", fix: "f" }, { name: "B", status: CANNOT_CHECK, detail: "", manual: "m" }];
   check("a blocker outranks an unchecked item in the headline",
