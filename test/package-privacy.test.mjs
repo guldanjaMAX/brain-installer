@@ -161,6 +161,7 @@ const expected = [
   "operations/admin-key-file.mjs",
   "operations/admin-key-persistence.mjs",
   "operations/cloudflare-token-store.mjs",
+  "operations/credential-store-probe.mjs",
   "operations/session-signing-key.mjs",
   "operations/rag-proxy-key.mjs",
   "operations/curated-dual-sync.mjs",
