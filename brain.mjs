@@ -7844,6 +7844,33 @@ function crash(err) {
  */
 const HTTP_TIMEOUT_MS = 60_000;
 
+/**
+ * A response body fit to print to a person.
+ *
+ * A clean install once ended with a Cloudflare error page pasted into the
+ * terminal, opening `<!DOCTYPE html>` and three IE conditional comments
+ * (bench, 2026-08-28). The install was fine. Nothing in that output told the
+ * owner so, and nothing in it was actionable. A body that is not JSON is not
+ * from the brain, so say what it is and keep the bytes for the issue note.
+ */
+/** How many times a fresh deploy 404 is treated as route warm-up, not failure. */
+const DRAIN_ROUTE_WARMUP_ATTEMPTS = 5;
+
+export function summariseResponseBody(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return "the response had no body";
+  try {
+    const parsed = JSON.parse(text);
+    const message = parsed?.error || parsed?.message || parsed?.errors?.[0]?.message;
+    return message ? String(message).slice(0, 200) : text.slice(0, 200);
+  } catch { /* not JSON: fall through */ }
+  if (/^\s*<(?:!doctype|html|head|body)\b/i.test(text)) {
+    return "the reply was a web page, not this brain. That usually means the address " +
+      "is not serving the worker yet, or a proxy answered instead of it";
+  }
+  return text.replace(/\s+/g, " ").slice(0, 160);
+}
+
 function translatedHttpFailure(error, url, { timeoutMs = HTTP_TIMEOUT_MS, what = "the request" } = {}) {
   let host = "the server";
   try {
@@ -8694,6 +8721,7 @@ async function cmdDrain(manifestPath, options = {}) {
   const started = now();
   const deadline = started + maxDurationMs;
   let drained = 0;
+  let routeWarmups = 0;
   let submitted = 0;
   let remaining = null;
   let rounds = 0;
@@ -8726,7 +8754,25 @@ async function cmdDrain(manifestPath, options = {}) {
       await wait(delayMs);
       continue;
     }
-    if (!res.ok) die(`drain failed (${res.status}): ${raw.slice(0, 200)}`);
+    // A worker deployed seconds ago can 404 because its workers.dev route is not
+    // live yet, which made a completely healthy clean install exit 1 (bench,
+    // 2026-08-28). /health returned ok moments later. Give the route a short
+    // warm-up before believing a 404, bounded so a genuinely wrong address still
+    // fails promptly rather than spinning until the deadline.
+    if (res.status === 404 && routeWarmups < DRAIN_ROUTE_WARMUP_ATTEMPTS) {
+      const delayMs = Math.min(2_000 * 2 ** routeWarmups, Math.max(0, deadline - now()));
+      if (delayMs > 0) {
+        routeWarmups += 1;
+        info(
+          `the brain's address is not answering yet (404). This is normal just after a ` +
+          `deploy. Retrying ${routeWarmups}/${DRAIN_ROUTE_WARMUP_ATTEMPTS} in ` +
+          `${Math.ceil(delayMs / 1_000)} second(s).`
+        );
+        await wait(delayMs);
+        continue;
+      }
+    }
+    if (!res.ok) die(`drain failed (${res.status}): ${summariseResponseBody(raw)}`);
     const receipt = validateDrainReceipt(body);
     drained += receipt.drained;
     submitted += receipt.submitted;
