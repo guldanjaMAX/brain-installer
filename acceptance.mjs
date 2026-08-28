@@ -34,6 +34,7 @@
  */
 
 import { fetchBrainWithAdminKey } from "./components/brain-http.mjs";
+import { describeFailures, responseIncomplete } from "./worker/src/lib/failure.js";
 
 const PASS = "pass";
 const FAIL = "fail";
@@ -319,15 +320,32 @@ export class Acceptance {
   async tierReach() {
     const t = 1;
     try {
+      // Deliberately unauthenticated: this tier proves the worker is REACHABLE,
+      // and a probe that carried a key could not tell a live brain apart from
+      // one that only answers its owner.
       const h = await this.get("/health", { auth: false });
       if (!h.ok) return this.record(t, "health responds", FAIL, `HTTP ${h.status}`);
-      const observedVersion = h.json?.version ?? null;
+
+      // The version is no longer public, and that is the point of issue 13: the
+      // slug and the exact version are the pair an unauthenticated prober wants
+      // first. So the version assertion moves to an authenticated read. This
+      // suite already holds the admin key, so nothing is lost by asking properly.
+      // `identified: false` is how a current worker says it is withholding;
+      // a worker older than that split still puts the version in the open body,
+      // and reading it there keeps this check working against both.
+      let observedVersion = h.json?.version ?? null;
+      let versionSource = "the public probe";
+      if (h.json?.identified === false) {
+        const detail = await this.get("/health");
+        observedVersion = detail.json?.version ?? null;
+        versionSource = "the authenticated probe";
+      }
       if (this.expectVersion && observedVersion !== this.expectVersion) {
         return this.record(
           t,
           "health responds",
           FAIL,
-          `expected version ${this.expectVersion}, received ${observedVersion || "none"}`,
+          `expected version ${this.expectVersion}, ${versionSource} reported ${observedVersion || "none"}`,
         );
       }
       this.record(t, "health responds", PASS, `version ${observedVersion ?? "?"}`);
@@ -359,7 +377,13 @@ export class Acceptance {
     );
 
     const good = await this.get("/api/admin/brain/documents");
-    this.record(t, "correct key is accepted", good.ok ? PASS : FAIL, `HTTP ${good.status}`);
+    // This check is about the CREDENTIAL, so it judges the credential and
+    // nothing else. `/documents` now answers 503 when a subsystem it reads
+    // could not be queried, and scoring that as "correct key is rejected" would
+    // point whoever is reading this report at the wrong problem entirely. The
+    // subsystem failure is a real finding, and tier 2 below is where it lands.
+    const keyRejected = good.status === 401 || good.status === 403;
+    this.record(t, "correct key is accepted", keyRejected ? FAIL : PASS, `HTTP ${good.status}`);
   }
 
   /* -------------------------------------------------------- tier 2: data */
@@ -367,7 +391,18 @@ export class Acceptance {
   async tierData() {
     const t = 2;
     const docs = await this.get("/api/admin/brain/documents");
-    if (!docs.ok) return this.record(t, "corpus summary", FAIL, `HTTP ${docs.status}`);
+    // Name the subsystem rather than the status code. On a half-migrated brain
+    // the named failure is the missing column, which is the single most useful
+    // sentence this suite can print. `responseIncomplete` also catches a worker
+    // older than the envelope, where the same failure arrives as a 200 with the
+    // error nested in the body and `docs.ok` is true.
+    if (!docs.ok || responseIncomplete(docs.json)) {
+      const named = describeFailures(docs.json);
+      return this.record(
+        t, "corpus summary", FAIL,
+        named ? `HTTP ${docs.status}; ${named}` : `HTTP ${docs.status}`,
+      );
+    }
 
     const rows = docs.json?.rows || [];
     const total = rows.reduce((a, r) => a + Number(r.total || 0), 0);

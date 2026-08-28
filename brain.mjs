@@ -116,6 +116,11 @@ import { deriveSessionSigningKey } from "./operations/session-signing-key.mjs";
 import { guardBrainAdminFetch } from "./components/brain-http.mjs";
 import { confidenceLine } from "./worker/src/lib/confidence.js";
 import { retrievalUnavailable, unavailableNotice } from "./worker/src/lib/retrieval-status.js";
+// The one predicate this CLI uses to decide whether a 2xx body is the whole
+// answer. Shared with the worker rather than reimplemented so the two halves of
+// the contract cannot drift, and tolerant of a worker older than the contract:
+// a client machine is routinely newer than the brain it is pointed at.
+import { describeFailures, responseIncomplete } from "./worker/src/lib/failure.js";
 import {
   adminKeyPersistencePlan,
   parseAdminKeySecretReference,
@@ -1739,10 +1744,20 @@ async function cmdHealth(manifestPath, {
   // reads as "the release is broken", which is the worst possible wrong
   // conclusion to hand someone mid-deploy. Same lag class as secret
   // propagation, and as a deleted worker still answering 200.
+  // /health no longer tells an anonymous caller WHICH brain this is or what it
+  // runs: that pair, readable by anyone who found the URL, is not something a
+  // product sold on client-owned data should hand out. The liveness and paused
+  // facts are still public, so a reach-only probe needs no credential; the
+  // version and drain-mode assertions below do, and the key is resolved
+  // opportunistically here rather than demanded, so a probe that only needs
+  // reach still works on a machine that holds no key.
+  const probeKey = resolveAdminKey(manifestPath, { ignoreEnvironment: durableAdminKeyOnly });
+  const probeHeaders = probeKey ? { headers: { "X-Admin-Key": probeKey } } : {};
+
   let res, body;
   const healthAttempts = 6;
   for (let i = 1; i <= healthAttempts; i++) {
-    res = await http(`${base}/health?cb=${i}`, {}, { timeoutMs: 20_000, what: "the health check" });
+    res = await http(`${base}/health?cb=${i}`, probeHeaders, { timeoutMs: 20_000, what: "the health check" });
     body = await res.text();
     // A 200 is NOT proof the new build is live. Cloudflare keeps serving the
     // PREVIOUS worker for a few seconds after a deploy, so breaking on the first
@@ -1762,11 +1777,25 @@ async function cmdHealth(manifestPath, {
     if (res.ok && (expectVersion || expectDrainMode)) {
       let live = null;
       let liveDrainMode = null;
+      let withheld = false;
       try {
         const parsed = JSON.parse(body);
         live = parsed?.version || null;
         liveDrainMode = parsed?.vector_drain_mode || null;
+        // The worker answered, and said in so many words that it is withholding
+        // its identity because the probe carried no key. Retrying cannot change
+        // that, and calling it "the deploy is not live" would be a false
+        // diagnosis of a working brain.
+        withheld = parsed?.identified === false;
       } catch { /* not JSON */ }
+      if (withheld) {
+        die(
+          "this brain does not disclose its version or drain mode to an unauthenticated probe," + "\n" +
+            "      so this deploy could not be verified. The brain itself answered normally." + "\n" +
+            "      Repair the durable admin-key storage this manifest declares, then re-run the" + "\n" +
+            "      same command. Do not paste the key into a shell command."
+        );
+      }
       if (verdict === "retry") {
         const expectation = [
           expectVersion ? `version ${expectVersion}` : null,
@@ -1932,6 +1961,21 @@ async function cmdHealth(manifestPath, {
       die(
         `documents endpoint is still unauthorized after ${attempts} attempts.` + "\n" +
           "      Health cannot pass until the local admin key matches the deployed secret."
+      );
+    }
+    // A named subsystem failure arrives as a 503 carrying the reason. Say the
+    // reason. This used to be a 200 whose nested error most callers never read,
+    // and on a half-migrated install the nested errors are the exact missing
+    // columns, which is the most actionable sentence health can produce.
+    let docsBody = null;
+    try { docsBody = JSON.parse(dbody); } catch { /* handled by the generic message */ }
+    const named = describeFailures(docsBody);
+    if (named) {
+      die(
+        `the documents endpoint could not read part of this brain: ${named}` + "\n" +
+          "      Health cannot pass, because nothing here proves semantic indexing is complete." + "\n" +
+          "      A missing column means the schema is behind the deployed Worker: run" + "\n" +
+          `      \`brain update ${relative(process.cwd(), manifestPath || "./brain.manifest.json")}\` and re-run health.`
       );
     }
     die(
@@ -10034,9 +10078,18 @@ export async function cmdSetup(manifestPath, options = {}) {
 
   closePrompts();
   const countBacklog = options.backlogCount ?? backlogCount;
-  const outstanding = await countBacklog(target).catch(() => 0);
+  // null means the backlog could not be read, which is NOT the same as zero and
+  // must not be printed as one. Closing setup with a bare "Your brain is live."
+  // over an unread backlog is the reassurance this product exists to not give.
+  const outstanding = await countBacklog(target).catch(() => null);
   console.log(`\n  ${c.green(c.bold("Your brain is live."))}\n`);
-  if (outstanding > 0) {
+  if (outstanding === null) {
+    console.log(
+      `  ${c.yellow("One thing was not verified:")} this brain did not report how much of your\n` +
+        `  material is still embedding, so whether meaning-based search is complete is\n` +
+        `  unknown rather than confirmed. Check it with:\n    brain health ${shownTarget}\n`
+    );
+  } else if (outstanding > 0) {
     console.log(
       `  ${c.yellow("Keyword search works now.")} ${outstanding} chunk(s) are still embedding, so\n` +
         `  meaning-based search is incomplete until they finish. Run:\n    brain drain ${shownTarget}\n`
@@ -11070,17 +11123,36 @@ currentSupportCommand = String(cmd || "");
  * a message had promised minutes. Understating this is a first-impression risk,
  * so the number is read from the install rather than guessed at.
  */
-/** Chunks still awaiting embedding, or 0 if it cannot be determined. */
+/**
+ * Chunks still awaiting embedding, or NULL when that could not be determined.
+ *
+ * This function used to return 0 for both "nothing is queued" and "the question
+ * could not be answered", and its own doc comment said so. That is the whole of
+ * issue 6 in one line: setup's closing message reads this number, and a brain
+ * whose backlog query had failed printed the unqualified "Your brain is live."
+ * A caller cannot distinguish a real zero from a swallowed error, so it must not
+ * be handed one value for both. Null is unmistakable and forces the decision at
+ * the point of use.
+ *
+ * `res.ok` alone is not the test. A worker on this contract answers 503 when the
+ * backlog query failed, but a worker deployed before it answers 200 with the D1
+ * error nested in `vector_backlog.error`, and the client machine running this
+ * CLI is routinely newer than the brain it points at. `responseIncomplete`
+ * recognises both.
+ */
 async function backlogCount(manifestPath) {
   const { m } = loadManifest(manifestPath);
   const acct = m.brain?.domain ? null : await resolveAccount(m);
   const base = await resolveBaseUrl(m, acct);
   const adminKey = resolveAdminKey(manifestPath);
-  if (!adminKey) return 0;
+  if (!adminKey) return null;
   const res = await http(`${base}/api/admin/brain/documents`, { headers: { "X-Admin-Key": adminKey } },
     { timeoutMs: 30_000, what: "the backlog check" });
-  if (!res.ok) return 0;
-  return Number((await res.json())?.vector_backlog?.pending || 0);
+  if (!res.ok) return null;
+  const body = await res.json().catch(() => null);
+  if (responseIncomplete(body)) return null;
+  const pending = Number(body?.vector_backlog?.pending);
+  return Number.isFinite(pending) ? pending : null;
 }
 
 async function reportBacklog(manifestPath) {
@@ -11092,8 +11164,21 @@ async function reportBacklog(manifestPath) {
     if (!adminKey) return;
     const res = await http(`${base}/api/admin/brain/documents`, { headers: { "X-Admin-Key": adminKey } },
       { timeoutMs: 30_000, what: "the backlog check" });
-    if (!res.ok) return;
-    const body = await res.json();
+    const body = await res.json().catch(() => null);
+    const rel0 = relative(process.cwd(), manifestPath || "./brain.manifest.json");
+    // A failed read is its own outcome, and naming it beats both alternatives:
+    // staying silent (the old `!res.ok` return) and the "Vectorize has not
+    // proven the same corpus" line below, which is a claim about Vectorize that
+    // this code has no evidence for when the query never answered.
+    if (!res.ok || responseIncomplete(body)) {
+      const named = describeFailures(body);
+      warn(
+        `the backlog could not be read${named ? `: ${named}` : ` (HTTP ${res.status})`}` + "\n" +
+          "        Whether semantic search is complete is UNKNOWN, not confirmed." + "\n" +
+          `        Check it now:  brain health ${rel0}`
+      );
+      return;
+    }
     const pending = Number(body?.vector_backlog?.pending || 0);
     const readiness = body?.vector_readiness;
     if (!pending && readiness?.ready === true &&

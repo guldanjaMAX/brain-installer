@@ -38,6 +38,7 @@ import {
 import {
   retrievalUnavailable, unavailableGap, unavailableNotice,
 } from "../worker/src/lib/retrieval-status.js";
+import { describeFailures, responseIncomplete } from "../worker/src/lib/failure.js";
 
 const SERVER_VERSION = "0.1.0";
 const DEFAULT_PROTOCOL = "2025-06-18";
@@ -405,8 +406,29 @@ case "brain_remember": {
         ...(v.warnings.length ? { warnings: v.warnings } : {}),
       };
     }
-    case "brain_health":
-      return await call("/api/admin/brain/documents");
+    case "brain_health": {
+      // A worker on the response contract answers 503 here when a subsystem it
+      // reads could not be queried, and `call` already throws on that, so the
+      // model is told rather than misled. A worker deployed BEFORE the contract
+      // reports the identical failure as a 200 with the error nested in the
+      // body, and this tool would hand the model row counts that read as a
+      // healthy brain. The client machine running this server is routinely
+      // newer than the brain it points at, so it defends itself.
+      const d = await call("/api/admin/brain/documents");
+      if (responseIncomplete(d)) {
+        return {
+          ...d,
+          health_status: "incomplete",
+          health_note:
+            "This brain could not report part of its own state (" +
+            (describeFailures(d) || "reason not given") +
+            "). The counts above are partial. Do NOT report this brain as healthy, " +
+            "and do not treat a low or zero count here as evidence that something " +
+            "is absent from the owner's records.",
+        };
+      }
+      return d;
+    }
     default:
       throw new Error(`unknown tool: ${name}`);
   }

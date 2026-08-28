@@ -3,7 +3,8 @@
  *
  * Extracted from a single-tenant brain and genericized. Five routes:
  *
- *   GET  /health                        open
+ *   GET  /health                        open liveness; identity only with a key
+ *   GET  /api/admin/brain/health        the same body, named as an admin route
  *   POST /api/rag/unified               ranked excerpts (private JSON body)
  *   POST /api/rag/think                 cited answer + explicit gaps
  *   POST /api/admin/brain/ingest        write path, credential-gated
@@ -11,7 +12,13 @@
  *   POST /api/admin/brain/source-families read-only private inventory paging
  *   GET  /api/admin/brain/documents     per-source counts and freshness
  *
- * Everything except /health requires X-Admin-Key.
+ * Everything except /health requires X-Admin-Key. /health answers without one
+ * but withholds the client slug and the version until it sees one.
+ *
+ * RESPONSE CONTRACT: `response.ok` is not sufficient. Every route sets a
+ * top-level `complete` boolean, and `complete: false` carries a `failures` list
+ * naming each subsystem that could not be produced. See worker/src/lib/failure.js
+ * for why some routes must keep answering 200 while incomplete.
  *
  * WHAT WAS DELIBERATELY LEFT OUT of v1: the CRM, pipeline, email tracking,
  * meeting filing, GHL sync, Stripe webhooks, OAuth sessions, and the knowledge
@@ -33,7 +40,8 @@ import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, 
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
-import { emptyRetrievalDisclosure } from "./lib/retrieval-status.js";
+import { emptyRetrievalDisclosure, degradedCause } from "./lib/retrieval-status.js";
+import { subsystemFailure, withCompleteness } from "./lib/failure.js";
 import {
   handleOwnerAuth, handleAdminInvite, handleAdminDevices, validateOwnerSession,
 } from "./lib/owner-auth.js";
@@ -413,9 +421,22 @@ async function handleUnified(env, request) {
     ? { status: disclosure.status, notice: disclosure.notice }
     : {});
 
+  // A degraded search read only part of the corpus, so these excerpts are not
+  // the whole answer even when some came back. The STATUS stays 200 here on
+  // purpose: the disclosure is the payload, and a 4xx/5xx would make every
+  // ok-checking client discard the sentence that explains what did not run and
+  // print a bare status code instead. `complete: false` is what makes it
+  // mechanical without throwing the explanation away.
+  const retrievalFailures = degraded
+    ? [subsystemFailure("retrieval", disclosure.cause || `retrieval reported "${degraded}"`)]
+    : [];
+
   if (degraded === "fts") {
     const rows = retrieved.slice(0, limit);
-    return jsonResponse({ mode: "unified", degraded, ...unavailable(rows), ...ignored, results: rows });
+    return jsonResponse(withCompleteness(
+      { mode: "unified", degraded, ...unavailable(rows), ...ignored, results: rows },
+      retrievalFailures,
+    ));
   }
 
   let matches = retrieved;
@@ -425,11 +446,11 @@ async function handleUnified(env, request) {
   }
   if (Array.isArray(matches)) matches = matches.slice(0, limit);
 
-  return jsonResponse({
+  return jsonResponse(withCompleteness({
     mode: "unified", reranked: doRerank,
     degraded: degraded || undefined, ...unavailable(Array.isArray(matches) ? matches : []),
     ...ignored, results: matches,
-  });
+  }, retrievalFailures));
 }
 
 async function handleThink(env, request) {
@@ -450,7 +471,12 @@ async function handleThink(env, request) {
     // knows nothing about the corpus, so its gap must forbid the absence claim
     // rather than issue it. See worker/src/lib/retrieval-status.js.
     const disclosure = emptyRetrievalDisclosure(degraded);
-    return jsonResponse({
+    // 200 on purpose, and `complete: false` beside it. A search that could not
+    // run is a failure, but the notice and the gap ARE the response: turning
+    // this into a non-2xx would make an ok-checking client throw away the one
+    // sentence that stops a model claiming the corpus is empty, which is the
+    // exact defect the disclosure exists to prevent.
+    return jsonResponse(withCompleteness({
       mode: "think",
       degraded: degraded || undefined,
       status: disclosure.unavailable ? disclosure.status : undefined,
@@ -469,7 +495,9 @@ async function handleThink(env, request) {
       confidence: disclosure.unavailable
         ? undefined
         : refusalConfidence({ gaps: disclosure.gaps, degraded, resultCount: 0 }),
-    });
+    }, disclosure.unavailable
+      ? [subsystemFailure("retrieval", disclosure.cause || `retrieval reported "${degraded}"`)]
+      : []));
   }
 
   const gaps = computeGaps(results);
@@ -769,7 +797,18 @@ async function handleThink(env, request) {
         })
       : computeAnswerConfidence({ approvedDocs, gaps, degraded });
 
-  return jsonResponse({
+  // An answer this route could not produce, or produced from a partial read of
+  // the corpus, is not a complete response. `answer_error` and `degraded` have
+  // both ridden the wire for a while; `complete: false` is what lets a caller
+  // branch on either without knowing this route's private vocabulary.
+  const answerFailures = [
+    ...(answerError ? [subsystemFailure("answer", answerError)] : []),
+    ...(degraded
+      ? [subsystemFailure("retrieval", degradedCause(degraded))]
+      : []),
+  ];
+
+  return jsonResponse(withCompleteness({
     mode: "think",
     degraded: degraded || undefined,
     answer,
@@ -787,7 +826,7 @@ async function handleThink(env, request) {
       text_source: d.text_source, text_reliable: d.text_reliable,
     })),
     results: results.slice(0, limit),
-  });
+  }, answerFailures));
 }
 
 async function handleIngest(env, request) {
@@ -1079,7 +1118,15 @@ async function handleIngestBatch(env, request) {
     }
   }
 
-  return jsonResponse({ ...tally, total: docs.length, results });
+  // 200 with per-document receipts is the contract here, and it is the right
+  // one: 49 of 50 documents genuinely landed and the caller must be able to
+  // advance past them. What was missing is a top-level way to notice the other
+  // one. A connector that reads `complete` cannot advance a source cursor over
+  // a batch that did not fully store, which is the failure this envelope is for.
+  const batchFailures = [];
+  if (tally.failed) batchFailures.push(subsystemFailure("documents", `${tally.failed} document(s) failed to store`));
+  if (tally.refused) batchFailures.push(subsystemFailure("documents", `${tally.refused} document(s) were refused`));
+  return jsonResponse(withCompleteness({ ...tally, total: docs.length, results }, batchFailures));
 }
 
 const SOURCE_RECEIPT_STATUSES = new Set(["indexing", "ready", "error"]);
@@ -1262,12 +1309,18 @@ async function handleSourceReceipt(env, request) {
 
   await env.DB.batch(statements);
 
-  return jsonResponse({
+  // `error` here is the connector's OWN reported failure, faithfully recorded.
+  // The route did exactly what it was asked to do, so it declares itself
+  // complete. Without that, a consumer branching on the presence of an `error`
+  // key would read a successfully filed failure receipt as a broken API call,
+  // which is the ambiguity this envelope exists to remove. The recorded status
+  // travels in `status`, where it always has.
+  return jsonResponse(withCompleteness({
     source, kind, status, documents, logical_documents: documents,
     stored_documents: storedDocuments, completed_at: completedAt,
     ...(runId ? { run_id: runId } : {}),
     ...(errorReason ? { error: errorReason } : {}),
-  });
+  }));
 }
 
 /**
@@ -1398,6 +1451,7 @@ async function handleSourceFamilies(env, request) {
 async function handleDocuments(env) {
   const { rows } = await storeFor(env).stats(env);
   const out = { backend: backendOf(env), rows: rows || [] };
+  const failures = [];
   if (backendOf(env) === D1) {
     // How far the vector index trails the text. A brain whose outbox is not
     // draining still answers keyword queries, which is exactly why the number
@@ -1406,6 +1460,7 @@ async function handleDocuments(env) {
       out.vector_backlog = await outboxDepth(env);
     } catch (e) {
       out.vector_backlog = { error: e.message };
+      failures.push(subsystemFailure("vector_backlog", e));
     }
     // Queue depth proves work is durable; readiness proves accepted async
     // mutations are actually visible to Vectorize queries. Both are required.
@@ -1413,9 +1468,18 @@ async function handleDocuments(env) {
       out.vector_readiness = await vectorReadiness(env);
     } catch (e) {
       out.vector_readiness = { ready: false, error: e.message };
+      failures.push(subsystemFailure("vector_readiness", e));
     }
   }
-  return jsonResponse(out);
+  // 503, not 200. This route is only ever asked a health question, and every
+  // one of its consumers — `brain health`, the acceptance suite, the installer's
+  // backlog reader, the MCP brain_health tool — reads it to decide whether the
+  // brain is sound. A field probe of a half-migrated install got 200 here with
+  // two D1 "no such column" errors nested in the body, and the ok-checking
+  // consumers reported a healthy brain with an empty queue. The rows and the
+  // named failures both stay in the body, so nothing is lost by refusing to
+  // dress this up as a success.
+  return jsonResponse(withCompleteness(out, failures), failures.length ? 503 : 200);
 }
 
 /* -------------------------------------------------------------- router */
@@ -1447,38 +1511,109 @@ function corpusWritesPaused(env, path, method) {
     method === "POST" && PAUSED_CORPUS_MUTATION_PATHS.has(path);
 }
 
+/* -------------------------------------------------------------- health */
+
+/**
+ * What /health says, in two tiers.
+ *
+ * TIER 1, no credential: is this worker up, and can it do its job. `ok`,
+ * `status`, `accepting_documents` and `reason` are all here. They have to be:
+ * the client-facing runbook's ten-second triage is a bare `curl` with no key at
+ * all, and it exists precisely to tell a bot-protection block apart from a
+ * refused credential. `brain doctor`'s stuck-upgrade probe reads
+ * `accepting_documents` and also runs without one. Moving the honesty behind a
+ * key would blind both of them, so the paused truth stays public.
+ *
+ * TIER 2, admin key: WHICH brain this is and what it runs. The slug names the
+ * owner of the deployment and the version says what it is running, and that
+ * pair, handed to anyone who finds the URL, is what an unauthenticated probe
+ * has no business disclosing about a product sold on the client owning their
+ * own data. Nothing unauthenticated in this repo needs either field.
+ *
+ * Same route rather than two, deliberately: a separate path would 404 on every
+ * worker deployed before it, and the callers that need the detail already know
+ * this URL. `GET /api/admin/brain/health` is registered inside the key gate as
+ * a named alias for scripts that prefer an explicit admin route.
+ */
+function healthBody(env, { identified }) {
+  const paused = env.VECTOR_DRAIN_MODE === "paused-for-upgrade";
+  return {
+    // ok reports whether this brain can do its job, not whether the Worker is
+    // running. A paused install returns 503 on nine write paths including
+    // ingest, so it cannot accept a document. Reporting ok:true through that
+    // turned one failed update into eight silent days in the field: the owner
+    // dropped nothing in, and no monitor watching this route had any reason to
+    // say otherwise.
+    ok: !paused,
+    status: paused ? "paused-for-upgrade" : "ok",
+    ...(paused
+      ? {
+        reason: "This brain cannot accept documents right now. An update " +
+          "paused its corpus writes and did not finish. Anything added " +
+          "while it is paused is refused rather than stored.",
+        accepting_documents: false,
+      }
+      : { accepting_documents: true }),
+    // Present so a caller can tell "this worker withholds identity unless you
+    // authenticate" from "this worker is too old to have identity fields".
+    identified,
+    ...(identified
+      ? {
+        brain: env.BRAIN_NAME || "brain",
+        version: env.BRAIN_VERSION || "0.1.0",
+        vector_writer_protocol: "lease-v1",
+        vector_drain_mode: paused ? "paused-for-upgrade" : "active",
+      }
+      : {}),
+    ts: new Date().toISOString(),
+  };
+}
+
+/**
+ * Slow a single-source scan of the public probe.
+ *
+ * HONEST ABOUT WHAT THIS IS: an in-memory bucket inside one Worker isolate.
+ * Cloudflare runs many isolates in many locations, so this slows one scanner
+ * hammering one colo and cannot bound a distributed one. It is not a global
+ * rate limit and must never be described as one. It is worth having anyway
+ * because the cost is a Map and the alternative is nothing at all.
+ *
+ * Only the unauthenticated tier is throttled. A request with no
+ * CF-Connecting-IP is not throttled: outside Cloudflare there is no client to
+ * key on, and inventing one shared bucket would throttle every caller as if
+ * they were the same machine.
+ */
+const HEALTH_PROBE_WINDOW_MS = 60_000;
+const HEALTH_PROBE_LIMIT = 60;
+const healthProbeBuckets = new Map();
+
+function healthProbeThrottled(request, now = Date.now()) {
+  const ip = request.headers.get("CF-Connecting-IP");
+  if (!ip) return false;
+  if (healthProbeBuckets.size > 5000) healthProbeBuckets.clear();
+  const bucket = healthProbeBuckets.get(ip);
+  if (!bucket || now - bucket.since >= HEALTH_PROBE_WINDOW_MS) {
+    healthProbeBuckets.set(ip, { since: now, count: 1 });
+    return false;
+  }
+  bucket.count += 1;
+  return bucket.count > HEALTH_PROBE_LIMIT;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
     if (path === "/health") {
-      // ok reports whether this brain can do its job, not whether the Worker
-      // is running. A paused install returns 503 on eight write paths
-      // including ingest, so it cannot accept a document. Reporting ok:true
-      // through that turned one failed update into eight silent days in the
-      // field: the owner dropped nothing in, and no monitor watching this
-      // route had any reason to say otherwise. The HTTP status stays 200 on
-      // purpose, because update's own paused-mode probe has to succeed while
-      // the pause is deliberately in force.
-      const paused = env.VECTOR_DRAIN_MODE === "paused-for-upgrade";
-      return jsonResponse({
-        ok: !paused,
-        status: paused ? "paused-for-upgrade" : "ok",
-        ...(paused
-          ? {
-            reason: "This brain cannot accept documents right now. An update " +
-              "paused its corpus writes and did not finish. Anything added " +
-              "while it is paused is refused rather than stored.",
-            accepting_documents: false,
-          }
-          : { accepting_documents: true }),
-        brain: env.BRAIN_NAME || "brain",
-        version: env.BRAIN_VERSION || "0.1.0",
-        vector_writer_protocol: "lease-v1",
-        vector_drain_mode: paused ? "paused-for-upgrade" : "active",
-        ts: new Date().toISOString(),
-      });
+      // The HTTP status stays 200 even while paused, on purpose: update's own
+      // paused-mode probe has to succeed while the pause is deliberately in
+      // force. Only the body tells the truth about accepting documents.
+      const identified = validateAdminKey(request, env);
+      if (!identified && healthProbeThrottled(request)) {
+        return jsonResponse({ error: "too many health probes" }, 429);
+      }
+      return jsonResponse(healthBody(env, { identified }));
     }
 
     // Owner surface: /app and the passkey ceremonies sit in FRONT of the key
@@ -1573,6 +1708,12 @@ export default {
         return privateNoStore(jsonResponse({
           error: "source-family inventory must use a JSON POST body so private cursors never enter URLs",
         }, 405));
+      }
+      // The identity-carrying half of /health under an explicit admin path, for
+      // scripts that would rather name what they are asking for than rely on a
+      // header changing what a public route returns. Same body, same source.
+      if (path === "/api/admin/brain/health" && request.method === "GET") {
+        return privateNoStore(jsonResponse(healthBody(env, { identified: true })));
       }
       if (path === "/api/admin/brain/documents" && request.method === "GET") {
         return privateNoStore(await handleDocuments(env));
@@ -1733,16 +1874,27 @@ export default {
           }, 409);
         }
         const readiness = await vectorReadiness(env);
-        return jsonResponse({
+        // The drain's own failure count and reasons used to be computed and
+        // then dropped on the floor here: a round that poisoned chunks returned
+        // 200 carrying no trace of it, and the operator learned only that the
+        // queue would not empty. Carrying them is additive, so an older CLI
+        // reading this receipt is unaffected.
+        const failed = Number(r.failed || 0);
+        return jsonResponse(withCompleteness({
           drained: r.drained,
           submitted: r.submitted,
           waiting: r.waiting,
           remaining: r.remaining,
+          failed,
+          errors: Array.isArray(r.errors) ? r.errors : [],
           vector_ready: readiness.ready,
           readiness_reason: readiness.reason,
           expected_vectors: readiness.expected_vectors,
           actual_vectors: readiness.actual_vectors,
-        });
+        }, failed
+          ? [subsystemFailure("vector_drain",
+              `${failed} vector operation(s) failed: ${(r.errors || []).slice(0, 3).join("; ") || "no reason recorded"}`)]
+          : []));
       }
       return jsonResponse({ error: "not found" }, 404);
     } catch (e) {

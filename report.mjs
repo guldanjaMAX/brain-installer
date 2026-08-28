@@ -19,6 +19,7 @@
 
 import { Acceptance, renderSearchability } from "./acceptance.mjs";
 import { fetchBrainWithAdminKey } from "./components/brain-http.mjs";
+import { responseIncomplete } from "./worker/src/lib/failure.js";
 
 const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
 const capitalise = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
@@ -59,7 +60,14 @@ export async function buildReport({ base, adminKey, manifest, installState, upgr
     {},
     () => adminKey,
   );
-  const docs = docsRes.ok ? await docsRes.json() : { rows: [] };
+  // A failed read produced `{ rows: [] }` here, and the report then stated the
+  // brain holds 0 items. Reporting an unread corpus as an empty one is the
+  // failure mode this whole report exists to prevent, so the two are separated:
+  // a body that arrives is used even when it is a 503 (the rows survive the
+  // failure and are still worth showing), and whether it was WHOLE is carried
+  // separately so the count can be qualified rather than quietly invented.
+  const docs = (await docsRes.json().catch(() => null)) || { rows: [] };
+  const corpusUnreadable = !docsRes.ok || responseIncomplete(docs);
   const rows = docs.rows || [];
   const total = rows.reduce((a, r) => a + Number(r.total || 0), 0);
   const embedded = rows.reduce((a, r) => a + Number(r.embedded || 0), 0);
@@ -87,7 +95,17 @@ export async function buildReport({ base, adminKey, manifest, installState, upgr
   /* ------------------------------------------------------------ what is in it */
   L.push("## What your brain knows");
   L.push("");
-  L.push(`It currently holds **${num(total)} items**.`);
+  if (corpusUnreadable) {
+    // Same discipline as the searchability section below: an unmeasured thing
+    // is reported as unmeasured, never as a clean zero and never as fine.
+    L.push(
+      "**This month's count could not be read from your brain.** That is not the same as it " +
+      "being empty: any figure below is partial, and this report cannot tell you how much " +
+      "your brain currently holds."
+    );
+    L.push("");
+  }
+  L.push(`It ${corpusUnreadable ? "reported" : "currently holds"} **${num(total)} items**${corpusUnreadable ? ", which may be incomplete" : ""}.`);
   L.push("");
   if (rows.length) {
     L.push("| Kind | How many | Searchable |");
