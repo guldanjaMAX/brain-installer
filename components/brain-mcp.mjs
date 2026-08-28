@@ -31,6 +31,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readAdminKeyFromKeychain } from "../operations/admin-key-persistence.mjs";
+import { describeBotProtection } from "./brain-http.mjs";
 import {
   createBrainCredentialResolver,
   fetchWithBrainCredential,
@@ -127,8 +128,19 @@ async function call(path, { method = "GET", body } = {}) {
     }, CREDENTIALS);
     const text = CREDENTIALS.redact(await res.text());
     if (!res.ok) {
-      const hint = text.includes("1010")
-        ? " (a bot-protection rule rejected the request; the User-Agent header is the usual cause)"
+      // Recognised through the one shared classifier, so this and the CLI
+      // cannot drift into describing the same refusal differently. Matching on
+      // "1010" alone missed the challenge pages that carry no code at all.
+      const blocked = describeBotProtection({
+        status: res.status, headers: res.headers, body: text, url: BASE + path,
+      });
+      const hint = blocked
+        // This server already sends a browser User-Agent, so being refused
+        // anyway means the rule is matching on something else. Saying which is
+        // the difference between a lead and a wild goose chase.
+        ? ` (refused before it reached the brain by a bot-protection rule${blocked.errorCode ? `, error code ${blocked.errorCode}` : ""};` +
+          " this server already sends a browser User-Agent, so the rule is matching on something else." +
+          " See onboarding/06-runbook-top-ten-failures.md entry 1b. The credential was never read)"
         : res.status === 401 || res.status === 403
           ? " (the credential was rejected; check it has not expired or been rotated)"
           : "";

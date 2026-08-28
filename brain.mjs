@@ -116,7 +116,11 @@ import {
 } from "./operations/cloudflare-token-store.mjs";
 import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
 import { deriveSessionSigningKey } from "./operations/session-signing-key.mjs";
-import { guardBrainAdminFetch } from "./components/brain-http.mjs";
+import {
+  RESET_MAY_BE_BOT_PROTECTION,
+  describeBotProtection,
+  guardBrainAdminFetch,
+} from "./components/brain-http.mjs";
 import { confidenceLine } from "./worker/src/lib/confidence.js";
 import { retrievalUnavailable, unavailableNotice } from "./worker/src/lib/retrieval-status.js";
 // The one predicate this CLI uses to decide whether a 2xx body is the whole
@@ -1858,7 +1862,17 @@ async function cmdHealth(manifestPath, {
     }
     break;
   }
-  if (!res.ok) die(`/health returned ${res.status} after ${healthAttempts} attempts: ${body.slice(0, 200)}`);
+  if (!res.ok) {
+    // Named before the generic message, because a refusal that never reached
+    // the brain sends an operator to the wrong half of the system: they rotate
+    // a key that was never read, or hunt an outage that never happened.
+    const blocked = describeBotProtection({
+      status: res.status, headers: res.headers, body, url: `${base}/health`,
+    });
+    die(blocked
+      ? `/health returned ${res.status} after ${healthAttempts} attempts, and ${blocked.message}`
+      : `/health returned ${res.status} after ${healthAttempts} attempts: ${body.slice(0, 200)}`);
+  }
   ok(`/health ${res.status} ${body.slice(0, 160)}`);
   if (reachOnly) return;
 
@@ -2055,7 +2069,12 @@ export async function cmdAsk(manifestPath, options = {}) {
   let body;
   try { body = JSON.parse(raw); } catch { /* validated below */ }
   if (!response.ok || !body || typeof body !== "object") {
-    die(`the Brain could not answer (HTTP ${response.status}). Run \`brain support --preview\` for the safe issue note.`);
+    const blocked = describeBotProtection({
+      status: response.status, headers: response.headers, body: raw, url: `${base}/api/rag/think`,
+    });
+    die(blocked
+      ? `the Brain never saw this question: ${blocked.message}`
+      : `the Brain could not answer (HTTP ${response.status}). Run \`brain support --preview\` for the safe issue note.`);
   }
 
   // An empty result from a search that could not run is not an absence, and
@@ -11309,7 +11328,7 @@ function translatedHttpFailure(error, url, { timeoutMs = HTTP_TIMEOUT_MS, what =
     /^UND_ERR_.*TIMEOUT$/.test(code)
   ) {
     retryable = true;
-    message = `the connection to ${host} failed (${code}). This is usually a network blip; re-running the command is safe.`;
+    message = `the connection to ${host} failed (${code}). This is usually a network blip; re-running the command is safe.\n      ${RESET_MAY_BE_BOT_PROTECTION}`;
   } else if (/certificate|self-signed|CERT_/i.test(`${code} ${String(error?.message || "")}`)) {
     message =
       `the TLS certificate for ${host} was rejected.\n` +
