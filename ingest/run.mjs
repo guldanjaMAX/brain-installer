@@ -36,6 +36,10 @@ import "./formats.mjs";
 import { textQuality, isLikelyBinary, utf16Encoding } from "./quality.mjs";
 import { documentDate } from "./doc-date.mjs";
 import { detectWhatsAppExport, parseWhatsAppExport, deriveThreadTitle } from "./whatsapp-export.mjs";
+import {
+  detectSmsBackupXml, parseSmsBackupXml,
+  detectGoogleVoiceTakeout, parseGoogleVoiceTakeout, deriveVoiceThreadTitle,
+} from "./sms-backup.mjs";
 import { MessageSessionizer } from "./message-session.mjs";
 
 // Preserve the original ingest/run.mjs API while letting migration-only code
@@ -178,6 +182,60 @@ async function prepareWhatsAppExport(file, buf, hash, { sourceName }) {
 }
 
 /**
+ * One SMS Backup & Restore .xml file, many documents. Unlike a WhatsApp
+ * export, one file here usually holds EVERY conversation, not just one;
+ * message-session.mjs's per-thread session tracking handles the interleaved
+ * result correctly as long as rows arrive in overall chronological order,
+ * which parseSmsBackupXml already guarantees by sorting.
+ */
+function prepareSmsBackupXml(file, buf, hash, { sourceName }) {
+  const text = decodeText(buf);
+  const parsed = parseSmsBackupXml(text, { sourceLabel: sourceName });
+
+  if (!parsed.rows.length) {
+    return {
+      hash,
+      skip: {
+        path: file.rel,
+        reason: `no addressable SMS messages found (${parsed.skippedEmpty} empty/unreadable, ` +
+          `${parsed.skippedMms} MMS entries not parsed by this version)`,
+      },
+    };
+  }
+
+  const sessionizer = new MessageSessionizer({ groupingTimezone: "UTC" });
+  const envelopes = [];
+  for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
+  envelopes.push(...sessionizer.finish());
+  return { hash, envelopes };
+}
+
+/** One Google Voice Takeout conversation page, many documents. */
+function prepareGoogleVoiceTakeout(file, buf, hash, { sourceName }) {
+  const text = decodeText(buf);
+  const threadId = `${sourceName}:${file.rel.split(sep).join("/")}`;
+  const threadTitle = deriveVoiceThreadTitle(file.name);
+  const parsed = parseGoogleVoiceTakeout(text, { threadId, threadTitle });
+
+  if (!parsed.rows.length) {
+    return {
+      hash,
+      skip: {
+        path: file.rel,
+        reason: "no message text found in this Takeout page (likely a call or voicemail " +
+          "record sharing the same export template, not a text conversation)",
+      },
+    };
+  }
+
+  const sessionizer = new MessageSessionizer({ groupingTimezone: "UTC" });
+  const envelopes = [];
+  for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
+  envelopes.push(...sessionizer.finish());
+  return { hash, envelopes };
+}
+
+/**
  * Read one file and turn it into an ingest envelope, or into a reasoned skip.
  */
 export async function prepare(file, { sourceName }) {
@@ -188,14 +246,28 @@ export async function prepare(file, { sourceName }) {
     return { skip: { path: file.rel, reason: `could not read the file: ${e.code || e.message}` } };
   }
   const hash = sha(buf);
+  const ext = extensionOf(file.name);
 
-  // Content-sniffed, not extension-alone: most .txt files are not a WhatsApp
-  // export, and the ordinary plain-text extractor below is exactly right for
-  // them. Only a file that actually looks like one export routes here.
-  if (extensionOf(file.name) === ".txt" && !isLikelyBinary(buf)) {
+  // Content-sniffed, not extension-alone: most files with these extensions
+  // are not a message export, and the ordinary extractor below is exactly
+  // right for them. Only a file that actually looks like one of these three
+  // shapes routes to its own sessionizing parser.
+  if (ext === ".txt" && !isLikelyBinary(buf)) {
     const peek = decodeText(buf);
     if (detectWhatsAppExport(peek)) {
       return prepareWhatsAppExport(file, buf, hash, { sourceName });
+    }
+  }
+  if (ext === ".xml" && !isLikelyBinary(buf)) {
+    const peek = decodeText(buf);
+    if (detectSmsBackupXml(peek)) {
+      return prepareSmsBackupXml(file, buf, hash, { sourceName });
+    }
+  }
+  if ((ext === ".html" || ext === ".htm") && !isLikelyBinary(buf)) {
+    const peek = decodeText(buf);
+    if (detectGoogleVoiceTakeout(peek)) {
+      return prepareGoogleVoiceTakeout(file, buf, hash, { sourceName });
     }
   }
 
