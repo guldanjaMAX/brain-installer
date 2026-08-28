@@ -85,6 +85,7 @@ export const SUPPORT_SOURCES = Object.freeze([
   "scheduler",
   "supabase",
   "zoom",
+  "whatsapp",
 ]);
 
 export const SUPPORT_ERROR_CODES = Object.freeze([

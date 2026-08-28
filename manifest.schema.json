@@ -4,29 +4,54 @@
   "title": "brain install manifest",
   "description": "One manifest per client install. The ONLY thing that differs between installs. Fields marked NOT YET WIRED are read by nothing today; they are kept because they describe intent, but do not tell a client they take effect.",
   "type": "object",
-  "required": ["manifest_version", "client", "brain", "infrastructure"],
+  "required": [
+    "manifest_version",
+    "client",
+    "brain",
+    "infrastructure"
+  ],
   "properties": {
-    "manifest_version": { "const": 1 },
+    "manifest_version": {
+      "const": 1
+    },
     "client": {
       "type": "object",
-      "required": ["slug", "display_name"],
+      "required": [
+        "slug",
+        "display_name"
+      ],
       "properties": {
         "slug": {
           "type": "string",
           "pattern": "^[a-z0-9][a-z0-9-]{1,40}$",
           "description": "Lowercase. Used to name the worker, the D1 database and the Vectorize index, so it cannot contain spaces or capitals."
         },
-        "display_name": { "type": "string", "minLength": 1 },
-        "primary_contact": { "type": "string", "format": "email" },
-        "timezone": { "type": "string" }
+        "display_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "primary_contact": {
+          "type": "string",
+          "format": "email"
+        },
+        "timezone": {
+          "type": "string"
+        }
       }
     },
     "brain": {
       "type": "object",
-      "required": ["version"],
+      "required": [
+        "version"
+      ],
       "properties": {
-        "version": { "type": "string" },
-        "worker_name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,60}$" },
+        "version": {
+          "type": "string"
+        },
+        "worker_name": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{1,60}$"
+        },
         "domain": {
           "type": "string",
           "description": "NOT YET WIRED as provisioning. Nothing creates this route; health and test will PROBE it if set, so leave it out until the DNS and route exist or every command will fail against a hostname that does not resolve."
@@ -35,35 +60,69 @@
     },
     "infrastructure": {
       "type": "object",
-      "required": ["cloudflare"],
+      "required": [
+        "cloudflare"
+      ],
       "properties": {
         "cloudflare": {
           "type": "object",
-          "required": ["account_id"],
+          "required": [
+            "account_id"
+          ],
           "properties": {
-            "account_id": { "type": "string", "minLength": 8 },
+            "account_id": {
+              "type": "string",
+              "minLength": 8
+            },
             "storage": {
-              "enum": ["d1", "supabase"],
+              "enum": [
+                "d1",
+                "supabase"
+              ],
               "default": "d1",
               "description": "d1 keeps the entire brain inside the client's own Cloudflare account and is the standard backend at every corpus size. supabase exists only for migration or an explicitly measured retrieval limitation."
             },
-            "d1_database_name": { "type": "string", "description": "Must be scoped to the client, e.g. acme-brain. A bare \"brain\" is refused at provision: it may already exist in the account and belong to something else." },
-            "d1_database_id": { "type": "string" },
+            "d1_database_name": {
+              "type": "string",
+              "description": "Must be scoped to the client, e.g. acme-brain. A bare \"brain\" is refused at provision: it may already exist in the account and belong to something else."
+            },
+            "d1_database_id": {
+              "type": "string"
+            },
             "vectorize_index": {
               "type": "string",
               "description": "Created by provision at 768 dimensions, cosine. Those are the output shape of @cf/baai/bge-base-en-v1.5 and are not free choices. Free can create this index, but Paid is the supported production baseline because Free has prototype-scale vector, daily-write, and Worker CPU limits."
             },
-            "drain_cron": { "type": "string", "default": "*/5 * * * *" },
-            "r2_bucket": { "type": "string", "description": "Created by provision, but NOT YET WIRED: nothing binds or reads it." },
-            "kv_namespace": { "type": "string", "description": "NOT YET WIRED. Never created, never bound." },
-            "kv_namespace_id": { "type": "string" }
+            "drain_cron": {
+              "type": "string",
+              "default": "*/5 * * * *"
+            },
+            "r2_bucket": {
+              "type": "string",
+              "description": "Created by provision, but NOT YET WIRED: nothing binds or reads it."
+            },
+            "kv_namespace": {
+              "type": "string",
+              "description": "NOT YET WIRED. Never created, never bound."
+            },
+            "kv_namespace_id": {
+              "type": "string"
+            }
           }
         },
         "supabase": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean", "default": false },
-            "project_ref": { "type": ["string", "null"] }
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "project_ref": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         }
       }
@@ -75,12 +134,36 @@
         "google_drive": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean", "default": false },
-            "exclude_paths": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-            "exclude_name_parts": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-            "exclude_file_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "exclude_paths": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "exclude_name_parts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "exclude_file_ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
             "exclude_file_ids_file": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Optional local JSON exclusion list, resolved relative to the manifest. It may also be a completed Supabase migration receipt."
             }
           }
@@ -89,14 +172,30 @@
           "type": "object",
           "description": "Mac-only live message capture from Messages.app (chat.db), enforced by brain connect imessage and brain ingest --from imessage. Requires a Full Disk Access grant on the capturing Mac; SMS arrives alongside iMessage when Text Message Forwarding is on and is tagged sms. The capture schedule knob is operations.imessage_capture_cron (default: every minute).",
           "properties": {
-            "enabled": { "type": "boolean", "default": false }
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            }
           }
         },
         "zoom": {
           "type": "object",
           "description": "Zoom cloud-recording transcripts, enforced by brain connect zoom. Requires a paid (Licensed) Zoom seat: the free Basic tier cannot cloud record at all, so it can never produce a transcript, and connect refuses it. The client creates a Server-to-Server OAuth app in their OWN Zoom account with the cloud_recording:read:admin scope; its four values are written as secrets on the client's own worker. Delivery is webhook-driven (recording.transcript_completed) for NEW recordings only; there is no backfill of recordings made before connecting.",
           "properties": {
-            "enabled": { "type": "boolean", "default": false }
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        "whatsapp": {
+          "type": "object",
+          "description": "Live WhatsApp capture through a paired linked device, enforced by brain connect whatsapp (which additionally requires the --accept-risk acknowledgement) and drained by brain ingest --from whatsapp. Opt-in by design while the default posture is undecided: pairing joins the account with an unofficial client, a terms-of-service gray area carrying a small but real ban risk, and link-time history depth is only what the phone chooses to transfer. Installing the capture daemon needs macOS; Windows service supervision is not built. Knobs: operations.whatsapp_drain_cron (default: every minute), operations.whatsapp_daemon_path, operations.whatsapp_data_dir.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            }
           }
         }
       }
@@ -105,13 +204,35 @@
       "type": "object",
       "description": "chunk_size, chunk_overlap and answer_model are deployed as Worker configuration. The standard answer model runs through the client-owned Cloudflare Workers AI binding. Other fields remain descriptive until their runtime wiring is documented.",
       "properties": {
-        "embed_model": { "const": "@cf/baai/bge-base-en-v1.5" },
-        "embed_dimensions": { "const": 768 },
-        "chunk_size": { "type": "integer", "minimum": 256, "maximum": 1800, "default": 1500 },
-        "chunk_overlap": { "type": "integer", "minimum": 0, "maximum": 900, "default": 300 },
-        "default_result_limit": { "type": "integer", "minimum": 1, "maximum": 50 },
-        "answer_model": { "type": "string" },
-        "rerank": { "type": "boolean" }
+        "embed_model": {
+          "const": "@cf/baai/bge-base-en-v1.5"
+        },
+        "embed_dimensions": {
+          "const": 768
+        },
+        "chunk_size": {
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 1800,
+          "default": 1500
+        },
+        "chunk_overlap": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 900,
+          "default": 300
+        },
+        "default_result_limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        },
+        "answer_model": {
+          "type": "string"
+        },
+        "rerank": {
+          "type": "boolean"
+        }
       }
     },
     "safety": {
@@ -120,17 +241,32 @@
         "credential_scanner": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean", "default": true },
-            "gate_version": { "type": "integer" },
-            "mode": { "enum": ["refuse", "flag_only"] }
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "gate_version": {
+              "type": "integer"
+            },
+            "mode": {
+              "enum": [
+                "refuse",
+                "flag_only"
+              ]
+            }
           }
         },
         "private_path_prefixes": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Enforced per path segment on local-folder and Google Drive ingest. Gmail has no folder path and does not use this rule."
         },
-        "daily_llm_spend_cap_usd": { "type": "number", "minimum": 0 }
+        "daily_llm_spend_cap_usd": {
+          "type": "number",
+          "minimum": 0
+        }
       }
     },
     "operations": {
@@ -143,26 +279,58 @@
           "description": "Numeric five-field cron schedule for unattended Google Drive ingest. Installed as a per-user macOS LaunchAgent; calendar times use the Mac's local timezone. brain.domain must also be set so refresh needs no Cloudflare deployment credential."
         },
         "admin_key_secret": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^keychain://[^/]+/.+$",
           "description": "Optional non-secret macOS Keychain locator, keychain://<service>/<account>, for the brain admin key used by unattended ingest. Standard setup fills a deterministic locator automatically on macOS when no legacy adjacent .brain-admin-key exists. Windows keeps the adjacent key under DPAPI CurrentUser; Linux uses an owner-only adjacent file. brain secrets exactly verifies durable desired state before applying it to the Worker. A failed remote write can be retried with no ADMIN_KEY export. The secret value never enters the manifest or plist."
         },
         "recovery_field_gate": {
           "type": "object",
           "description": "Short-lived, manually reviewed isolation evidence for a disposable recovery target. Never add this to a production manifest. The adapter binds distinct immutable paused and active Worker versions plus their shared script hash, and requires both route lists to be empty before it can use the disposable target key.",
-          "required": ["paused_worker_version_id", "active_worker_version_id", "worker_script_etag", "routes", "custom_domains", "reviewed_at"],
+          "required": [
+            "paused_worker_version_id",
+            "active_worker_version_id",
+            "worker_script_etag",
+            "routes",
+            "custom_domains",
+            "reviewed_at"
+          ],
           "properties": {
-            "paused_worker_version_id": { "type": "string", "minLength": 1 },
-            "active_worker_version_id": { "type": "string", "minLength": 1 },
-            "worker_script_etag": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-            "routes": { "type": "array", "maxItems": 0 },
-            "custom_domains": { "type": "array", "maxItems": 0 },
-            "reviewed_at": { "type": "string", "format": "date-time" }
+            "paused_worker_version_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "active_worker_version_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "worker_script_etag": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "routes": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "custom_domains": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "reviewed_at": {
+              "type": "string",
+              "format": "date-time"
+            }
           },
           "additionalProperties": false
         },
         "google_token_store": {
-          "enum": ["auto", "keychain", "file"],
+          "enum": [
+            "auto",
+            "keychain",
+            "file"
+          ],
           "default": "auto",
           "description": "Durable Google OAuth token-store choice for unattended ingest. auto uses macOS Keychain; file preserves an explicit BRAIN_GOOGLE_TOKEN_STORE=file connection choice across sparse LaunchAgent environments."
         },
@@ -178,29 +346,67 @@
         "alert_webhook_secret": {
           "type": "string",
           "description": "NOT YET WIRED. No alert webhook is called today."
+        },
+        "whatsapp_drain_cron": {
+          "type": "string",
+          "minLength": 9,
+          "description": "Numeric five-field cron schedule for draining the WhatsApp capture outbox into the brain. Installed as a per-user macOS LaunchAgent alongside the resident capture daemon. Defaults to every minute when absent."
+        },
+        "whatsapp_daemon_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local path to the built WhatsApp capture daemon binary. Not a secret and not a credential; there is no download-on-connect yet, so the binary is either built from daemons/whatsapp or supplied here. Overridden by --daemon and by BRAIN_WHATSAPP_DAEMON."
+        },
+        "whatsapp_data_dir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local directory holding the WhatsApp linked-device session store and the capture outbox. Both the daemon and the drain read this same value; the default is ~/.brain/whatsapp/<client.slug>."
         }
       }
     },
     "testing": {
       "type": "object",
       "properties": {
-        "probe_questions": { "type": "array", "items": { "type": "string" } },
-        "things_only_they_know": { "type": "array", "items": { "type": "string" } },
-        "expected_to_fail": { "type": "array", "items": { "type": "string" } }
+        "probe_questions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "things_only_they_know": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "expected_to_fail": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
       }
     },
-    "ingest": { "type": "object" },
+    "ingest": {
+      "type": "object"
+    },
     "access": {
       "type": "object",
       "properties": {
-        "model": { "const": "single_tenant_all_access" },
+        "model": {
+          "const": "single_tenant_all_access"
+        },
         "authorized_emails": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "NOT YET WIRED. Read by nothing. Auth is a single admin key: anyone holding it sees everything."
         }
       }
     },
-    "handoff": { "type": "object" }
+    "handoff": {
+      "type": "object"
+    }
   }
 }

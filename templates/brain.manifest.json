@@ -125,6 +125,20 @@
     "upload": {
       "_comment": "Manual drop zone. Always on: it is the fallback for anything with no connector.",
       "enabled": true
+    },
+    "whatsapp": {
+      "_comment": [
+        "Live capture through a paired linked device, and OPT-IN twice over:",
+        "this flag, plus --accept-risk on `brain connect whatsapp <manifest>`.",
+        "Pairing uses an unofficial client, which is a terms-of-service gray area",
+        "with a small but real ban risk, and the history it collects at link time",
+        "is only what the phone chooses to transfer. Installing it needs macOS;",
+        "Windows supervision is not built. The per-chat Export chat path needs no",
+        "flag, no daemon and carries no such risk. `brain disconnect whatsapp`",
+        "undoes it. Knobs: operations.whatsapp_drain_cron, whatsapp_daemon_path,",
+        "whatsapp_data_dir."
+      ],
+      "enabled": false
     }
   },
   "retrieval": {
