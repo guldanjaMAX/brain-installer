@@ -1,3 +1,35 @@
+// WHAT THIS FILE COVERS, PLAINLY: it npm-packs the repo (`npm pack --dry-run`)
+// and checks the resulting file LIST against a reviewed allowlist (`expected`,
+// below), plus a private-identity text scan (`privateIdentityRules`) run only
+// over those same `expected` (npm-shipped) files. That scan exists to stop a
+// real name from reaching every future `npm install` of this public package.
+//
+// WHAT THIS FILE DOES NOT COVER: this repo (guldanjaMAX/brain-installer) is a
+// PUBLIC GitHub repo, and its full git history — every commit, on every
+// branch, including files npm never ships — is publicly readable regardless
+// of what `npm pack` includes. This file does NOT scan `test/`, `evidence/`,
+// `docs/release-evidence/`, `planning/` (though planning/ is gitignored), or
+// any other non-shipped path for the same real-name leak. A name landing in
+// ANY committed file is a real exposure the moment it is pushed, not only a
+// name that ships via npm install.
+//
+// Why the scan was not widened to cover test/+evidence/ when this comment was
+// added (2026-08-27, see evidence/WP-00-closeout.md): `privateIdentityRules`
+// already matches collaborator names (Jay, Bhakta) that appear intentionally
+// and by design in dozens of already-committed test/evidence files describing
+// real product usage (Jay Bhakta co-owns this venture and his own install is
+// a running example throughout the suite) — at last count, 33+ lines across
+// 10+ files outside `expected`. Applying the same denylist to test/+evidence/
+// as-is would fail the whole suite on those pre-existing, accepted mentions,
+// not on anything this pass introduced. Fixing that correctly needs either a
+// second, narrower denylist (only truly-private third-party names, e.g. an
+// end client's name like the one this pass just scrubbed) with its own
+// allowlist for legitimate collaborator mentions, or a per-file review pass —
+// both real design decisions, not a mechanical extension of this test. That
+// is left for a human to decide and scope deliberately, not bundled into an
+// unrelated fix. Until then: treat every commit to test/, evidence/, and any
+// other non-shipped path as needing the SAME manual "does this name a real
+// third party" check this pass just did by hand, before it is pushed.
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -189,6 +221,7 @@ const privateIdentityRules = [
   ["owner email", /\bjames@jamesguldan\.com\b/i],
   ["collaborator first name", /\bJay(?:'s)?\b/i],
   ["collaborator surname", /\bBhakta(?:'s)?\b/i],
+  ["collaborator client first name", /\bChet(?:'s)?\b/i],
 ];
 const privateTextMatches = expected.flatMap((path) => {
   const text = readFileSync(resolve(ROOT, path), "utf8");

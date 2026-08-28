@@ -1,8 +1,9 @@
 // WP-03: SMS backup parser (Android SMS Backup & Restore, and Google Voice
 // Takeout), platform `sms`.
 //
-// Built regardless of what WP-05 found about Chet's phone (unconfirmed —
-// see planning notes), because it is real capability for the next Android
+// Built regardless of what WP-05 found about Devon's phone ("Devon" is an
+// invented placeholder for the real pilot client, unconfirmed — see planning
+// notes), because it is real capability for the next Android
 // client either way. Unlike WP-02's WhatsApp export, neither format here has
 // a locale-dependent date to disambiguate: SMS Backup & Restore writes a
 // Unix epoch in milliseconds, and Google Voice Takeout writes a full
