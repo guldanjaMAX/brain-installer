@@ -5364,14 +5364,15 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
         },
       });
     } catch (error) {
-      const touched = [...new Map(group.filter((item) => item.familyPlan)
-        .map((item) => [item.familyPlan.stateKey, item.familyPlan])).values()];
-      if (touched.length) {
-        await reconcileDocumentFamilies({
-          families: touched.map((plan) => ({ base_doc_uid: plan.base_doc_uid, keep_doc_uids: [] })),
-          base, adminKey,
-        });
-      }
+      // A storage failure PRESERVES the prior family and its retry. This used
+      // to send an empty keep list for every family the failed batch touched,
+      // which is not a cleanup instruction, it is "delete this whole family".
+      // That was inert while a message-export base matched nothing, and became
+      // destructive the moment families were keyed correctly: one failed
+      // session could take every already-stored conversation from that file
+      // with it. remoteFamilySettlement states the correct rule and the remote
+      // path follows it; the local path now agrees. The cursor is not advanced
+      // on this path, so the retry re-sends and reconciles for real.
       throw error;
     }
     for (const k of Object.keys(tally)) tally[k] += t[k] || 0;
@@ -5380,10 +5381,13 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
       if (key) sentFamilyParts.set(key, (sentFamilyParts.get(key) || 0) + 1);
     }
     const outcome = remoteFamilyOutcomes(familyPlans.values(), sentFamilyParts, acceptedFamilyParts);
-    const reconciliation = [
-      ...outcome.completed.map((plan) => ({ base_doc_uid: plan.base_doc_uid, keep_doc_uids: plan.keep_doc_uids })),
-      ...outcome.incomplete.map((plan) => ({ base_doc_uid: plan.base_doc_uid, keep_doc_uids: [] })),
-    ];
+    // Only a FULLY ACCEPTED replacement may remove obsolete family members.
+    // An incomplete family is a storage failure, not a deletion instruction:
+    // emitting an empty keep list for it would delete every part that DID
+    // land. Its state key is cleared below, so the next run re-sends it.
+    const reconciliation = outcome.completed.map(
+      (plan) => ({ base_doc_uid: plan.base_doc_uid, keep_doc_uids: plan.keep_doc_uids }),
+    );
     if (reconciliation.length) await reconcileDocumentFamilies({ families: reconciliation, base, adminKey });
     for (const plan of outcome.completed) {
       recordAcceptedDocumentState(state, { ...plan, protectedSkipKeys: protectedLocalSkipKeys });

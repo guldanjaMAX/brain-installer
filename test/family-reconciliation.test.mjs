@@ -538,11 +538,18 @@ const failed = runIngest({
   env: { BRAIN_FAMILY_REPRO_FAIL_ALL: "1" },
 });
 const failedFamilies = (failed.evidence?.forgetRequests || []).flat();
-check("when the ingest FAILS, reconciliation is still accepted (empty keep list)",
-  failedFamilies.length > 0 &&
-    failedFamilies.every((f) => Array.isArray(f.keep_doc_uids) && f.keep_doc_uids.length === 0) &&
-    (failed.evidence?.forgetRejections || []).length === 0,
-  JSON.stringify(failed.evidence?.forgetRejections || failedFamilies));
+// A storage failure must PRESERVE the prior family and its retry, which is the
+// rule remoteFamilySettlement states and the remote path already followed. An
+// empty keep list is not a cleanup, it is "delete this whole family". That was
+// harmless while a message-export base matched nothing, and became destructive
+// the moment families were keyed correctly: one failed session could take every
+// already-stored conversation from that file with it.
+check("a FAILED ingest sends no delete-this-family instruction at all",
+  failedFamilies.every((f) => !Array.isArray(f.keep_doc_uids) || f.keep_doc_uids.length > 0),
+  JSON.stringify(failedFamilies));
+check("and nothing is deleted as a result of the failure",
+  (failed.evidence?.forgetResults || []).every((r) => Number(r.documents) === 0),
+  JSON.stringify(failed.evidence?.forgetResults));
 check("the failed ingest still exits non-zero for its own reason",
   failed.code === 1, failed.out.slice(-300));
 
