@@ -161,6 +161,55 @@ try {
     check("plist XML escapes paths instead of breaking on ampersands", plist.includes("home &amp; logs") && plist.includes("client &amp; manifest"));
     check("the plist contains no admin key or Cloudflare credential material",
       !plist.includes("admin-secret") && !plist.includes("CLOUDFLARE") && !plist.includes("keychain://"));
+
+    // A daily calendar time on a laptop that is off at that hour is a schedule
+    // that never fires and never catches up: the source silently stops
+    // updating and the brain keeps answering from whatever it last saw.
+    check("the LaunchAgent catches up at load, so a missed firing is not lost forever",
+      /<key>RunAtLoad<\/key>\s*<true\/>/.test(plist), plist);
+    check("and the definition says why, beside the bytes that do it",
+      /powered off or the owner is logged out/.test(plist));
+    check("catch-up does not cost the single-instance guarantee",
+      plan.programArguments[0] === resolve("/opt/node/bin/node") &&
+      /<key>ThrottleInterval<\/key>/.test(plist), plist);
+  }
+
+  /* ========== the interpreter baked into the plist can be upgraded away ========== */
+  {
+    // Version managers put the Node version inside the interpreter path, so a
+    // routine `nvm install` deletes the exact binary every scheduled run
+    // depends on. launchd then fails to spawn forever, with no symptom other
+    // than a source that quietly stops refreshing.
+    const pinned = buildDriveSchedulerPlan(manifestPath, opts({
+      nodePath: "/Users/fixture/.nvm/versions/node/v22.5.0/bin/node",
+    }));
+    check("a version-pinned interpreter is named at install time, not discovered months later",
+      pinned.warnings.some((w) => /contains a Node version/.test(w)), pinned.warnings.join("; "));
+    check("and the warning says what to do after a Node upgrade",
+      pinned.warnings.some((w) => /reinstall the schedule/i.test(w)), pinned.warnings.join("; "));
+    check("a stable interpreter path is not warned about, so the warning keeps its meaning",
+      buildDriveSchedulerPlan(manifestPath, opts({ nodePath: "/usr/local/bin/node" })).warnings.length === 0);
+
+    const goneHome = join(directory, "interpreter-gone-home");
+    const gonePath = join(directory, "interpreter-gone", "brain.manifest.json");
+    writeManifest(baseManifest, gonePath);
+    const status = statusDriveScheduler(gonePath, opts({
+      home: goneHome,
+      nodePath: "/Users/fixture/.nvm/versions/node/v22.5.0/bin/node",
+      launchctl: () => ({ status: 0, stdout: "state = waiting\nruns = 40\nlast exit code = 0\n" }),
+    }));
+    check("status reports an interpreter that no longer exists as absent",
+      status.interpreterPresent === false && status.interpreterVersionPinned === true,
+      JSON.stringify({ p: status.interpreterPath, present: status.interpreterPresent }));
+    check("and says every scheduled run is failing to start, rather than reporting it loaded and healthy",
+      status.warnings.some((w) => /no longer exists/.test(w) && /failing to start/.test(w)),
+      status.warnings.join("; "));
+    check("a present interpreter produces no such warning",
+      statusDriveScheduler(gonePath, opts({
+        home: goneHome,
+        nodePath: process.execPath,
+        launchctl: () => ({ status: 0, stdout: "state = waiting\n" }),
+      })).warnings.every((w) => !/no longer exists/.test(w)));
   }
   {
     const mismatched = buildDriveSchedulerPlan(manifestPath, opts({ localTimeZone: "America/New_York" }));
