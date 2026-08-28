@@ -10,3 +10,4 @@ code it governs.
 
 - [001: Standardize new Brain installs on Cloudflare](001-cloudflare-native-standard.md)
 - [002: Accelerate exact legacy projection bootstrap only behind the paused barrier](002-paused-bootstrap-acceleration.md)
+- [003: Code rollback and data restore are separate operations, and only one of them may ever be automatic](003-upgrade-rollback-scope.md)

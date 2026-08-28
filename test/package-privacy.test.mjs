@@ -101,6 +101,7 @@ const expected = [
   "docs/decisions/000-template.md",
   "docs/decisions/001-cloudflare-native-standard.md",
   "docs/decisions/002-paused-bootstrap-acceleration.md",
+  "docs/decisions/003-upgrade-rollback-scope.md",
   "docs/decisions/README.md",
   "doctor.mjs",
   "eval/brain-client.mjs",
