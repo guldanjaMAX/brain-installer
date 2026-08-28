@@ -421,6 +421,14 @@ fail  upgrade failed: <reason>
 
 **Why:** anything can fail mid-update. What matters is what the system did about it. A snapshot was taken **before** anything was touched, the failure was recorded, and **the recorded version was not advanced**, so your install correctly still reports the version it is actually running rather than the one it tried to become.
 
+**A specific version of this is worth naming on its own: the update died AFTER pausing your corpus for the schema migration, and never reached the step that resumes writes.** If so, `brain health <manifest>` reports `accepting_documents: false`, and ingest, forget, and reindex all return 503 until it is fixed. This is deliberate (writing over a half-migrated schema is worse than staying paused) but it used to be silent: nothing told the operator this had happened, and the only way back was reconstructing "run brain update again" from the failure message by hand. It no longer is:
+
+```
+node brain.mjs doctor <manifest>
+```
+
+now checks the DEPLOYED brain's own live state, not just this machine's, as one more line in its output. A paused install shows up as a `FAIL` for "upgrade state" with the exact stage it stopped at, how long it has been stuck, and the D1 recovery bookmark, instead of silently reporting "ready to install" while your brain sits unable to accept a document.
+
 **Fix, in order:**
 
 1. Read what happened.
@@ -431,13 +439,27 @@ node brain.mjs status <manifest>
 
 That prints your current version and the recent update history, including the failures. A line marked `rolled_back` is one that was reverted, and it is deliberately marked so it can never become the starting point for the next update.
 
-2. Fix the underlying cause (usually one of items 1 through 6 above), then run the update again.
+2. Diagnose precisely, then resume. This replays the same verified update path from wherever it stopped, which is safe because every stage of it is already restart-safe by design:
 
 ```
-node brain.mjs upgrade <manifest>
+node brain.mjs doctor <manifest> --repair
 ```
 
-3. **Only if step 2 cannot work**, preview the snapshot restore:
+Previews only — nothing changes yet. It prints the exact stage, elapsed time, and bookmark. Once that looks right, confirm it:
+
+```
+node brain.mjs doctor <manifest> --repair --yes
+```
+
+This is equivalent to fixing the underlying cause (usually one of items 1 through 6 above) and running `node brain.mjs upgrade <manifest>` again by hand; `--repair` exists so that reconstructing the right command is not something you have to do while your brain cannot accept documents.
+
+3. **Only if step 2 cannot work**, preview the snapshot restore. `--rollback` reads the exact bookmark straight out of the failed run instead of requiring you to have copied it down:
+
+```
+node brain.mjs doctor <manifest> --rollback
+```
+
+Confirm it the same way, with `--yes`, once the previewed bookmark is the right one. Or, with the bookmark already in hand from the failure message or `brain status`, the original manual path still works unchanged:
 
 ```
 node brain.mjs rollback <manifest> <bookmark>

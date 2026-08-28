@@ -4935,7 +4935,10 @@ async function cmdIngest(manifestPath) {
   const flags = parseFlags(process.argv.slice(4));
   // Remote sources reuse everything below the envelope: splitting, batching,
   // the credential gate, resume state and the skip report. Only the producer
-  // differs.
+  // differs. Calendar is the one exception: its connector already carries
+  // its own complete sync-then-send pipeline, so it has its own command
+  // rather than being forced through machinery built for files.
+  if (String(flags.from).toLowerCase() === "calendar") return cmdIngestCalendar(m, manifestPath, flags);
   if (flags.from) return cmdIngestRemote(m, manifestPath, flags);
   if (flags["approve-removals"] !== undefined) {
     die("--approve-removals is only valid with --from drive.");
@@ -5656,6 +5659,171 @@ export async function postSourceExpectation(base, adminKey, {
   return body;
 }
 
+
+/**
+ * Calendar's local sync-token state, one small JSON object keyed by calendar.
+ *
+ * Deliberately NOT ingest/run.mjs's loadState/saveState: that pair's loader
+ * resets to the local-folder shape ({version, done, skipped}) whenever the
+ * loaded object has no `.done` key, which every calendar state file would
+ * trip on every single run. A calendar sync token is a different shape
+ * entirely (per-calendar {syncToken, paramFingerprint, ...}), so it gets its
+ * own tiny, equally atomic reader/writer rather than forcing a shape it does
+ * not have through a loader built for a different shape.
+ */
+function loadCalendarState(path) {
+  if (!existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    // A corrupt state file must not abort a sync. Starting over (full resync
+    // of every configured calendar) costs time; refusing to run costs the
+    // whole load.
+    return {};
+  }
+}
+
+function saveCalendarState(path, state) {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+    renameSync(tmp, path);
+    chmodSync(path, 0o600);
+  } catch (error) {
+    try { rmSync(tmp, { force: true }); } catch { /* original error wins */ }
+    throw error;
+  }
+}
+
+/**
+ * `brain ingest <manifest> --from calendar`.
+ *
+ * WHY THIS EXISTS: connectors/google-calendar.mjs was fully built and
+ * covered by 223 tests of its own internal functions, but nothing anywhere
+ * in this file ever called syncAll() or ingestEnvelopes() — there was no
+ * command that could actually run it. `brain connect google --scopes
+ * calendar` could request the OAuth scope, but the next step did not exist.
+ * Found during the WP-04 matrix truth pass (2026-08-27): the source matrix
+ * said "designed, not written", which was ALSO wrong, just in the opposite
+ * direction — the code was written and tested, it was simply never wired to
+ * a runnable command. Neither status was true; this closes that gap.
+ *
+ * Deliberately its own function rather than a third branch inside
+ * cmdIngestRemote: the calendar connector already carries its own complete
+ * sync-then-send pipeline (syncAll returns finished envelopes AND deletions;
+ * ingestEnvelopes sends them, one at a time, so a single refused event never
+ * aborts the rest). Bolting that onto cmdIngestRemote's batchStream/
+ * family-plan machinery, built for a very different shape (files that must
+ * be split and batched), would risk the well-tested Drive and Gmail paths
+ * for no real gain. Reuse where it fits (postSourceReceipt for `brain
+ * sources` visibility, applyDriveRemovals for cancelled-event cleanup);
+ * write new code only for what is actually new (the sync-token state file).
+ */
+export async function cmdIngestCalendar(m, manifestPath, flags, options = {}) {
+  const sourceName = assertSourceName(flags.source === true || !flags.source ? "calendar" : flags.source);
+  const dry = !!flags["dry-run"];
+  const resolveIngestAccount = options.resolveAccount ?? resolveAccount;
+  const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+  const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
+  const acct = dry ? null : m.brain?.domain ? null : await resolveIngestAccount(m);
+  const base = dry ? null : await resolveBase(m, acct);
+  const adminKey = dry ? null : resolveKey(manifestPath);
+  if (!adminKey && !dry) {
+    die(
+      "no durable admin key was found. Re-run `brain setup <manifest>` to generate and persist one; " +
+        "do not paste the key into a shell command."
+    );
+  }
+
+  const { syncAll, ingestEnvelopes } = options.googleCalendar ?? await import("./connectors/google-calendar.mjs");
+  const getToken = options.getAccessToken ?? googleAuth("calendar");
+  const postReceipt = options.postSourceReceipt ?? postSourceReceipt;
+  const removeDocs = options.applyDriveRemovals ?? applyDriveRemovals;
+  const loadState = options.loadCalendarState ?? loadCalendarState;
+  const saveState = options.saveCalendarState ?? saveCalendarState;
+  const statePath = join(dirname(resolve(manifestPath)), `.brain-ingest-${sourceName}.json`);
+  const state = flags.reset ? {} : loadState(statePath);
+
+  const config = m.calendar || {};
+  const calendarLabel = (config.calendars?.length ? config.calendars : ["primary"])
+    .map((c) => (typeof c === "string" ? c : c.id)).join(", ");
+  info(`syncing calendar(s): ${calendarLabel}`);
+
+  const result = await syncAll({
+    config, state, getAccessToken: getToken,
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+  });
+
+  info(
+    `${result.summary.events_seen} event(s) seen across ${result.summary.calendars_ok}/${result.calendars.length} calendar(s); ` +
+      `${result.documents.length} to upsert, ${result.deletions.length} cancelled, ${result.summary.skipped} skipped`
+  );
+  for (const cal of result.calendars) {
+    if (cal.error) warn(`${cal.calendar_key}: ${cal.error.message}`);
+  }
+  if (result.summary.needs_reconsent) {
+    warn(
+      "Google refused the calendar refresh token (it is dead: revoked, expired from six months of " +
+        "non-use, or the OAuth app is still in Testing and issued a seven-day token). Reconnect with " +
+        "`brain connect google --scopes drive,gmail,calendar` before running this again. " +
+        "Calendars synced before the failure were still saved below."
+    );
+  }
+
+  if (dry) {
+    ok(`dry run: ${result.documents.length} event(s) would be sent, ${result.deletions.length} cancellation(s) would be removed`);
+    if (result.documents.length) {
+      console.log("\n  first few that WOULD be sent:");
+      for (const envelope of result.documents.slice(0, 5)) {
+        console.log(`    ${envelope.title}  (${envelope.occurred_at || "no date"})`);
+      }
+    }
+    return result;
+  }
+
+  const runId = `sync_${randomBytes(16).toString("hex")}`;
+  const startedAt = new Date().toISOString();
+  await postReceipt(base, adminKey, {
+    source: sourceName, kind: "calendar", status: "indexing",
+    run_id: runId, lane: "manual", started_at: startedAt,
+    detail: `calendar sync started: ${calendarLabel}`,
+  });
+
+  const sent = await ingestEnvelopes({ baseUrl: base, adminKey, envelopes: result.documents });
+
+  let removed = 0;
+  if (result.deletions.length) {
+    const uids = result.deletions.map((d) => `calendar_event:${d.source_id}`);
+    const removal = await removeDocs({
+      uids, base, adminKey, state: { done: {}, removed: {} }, dryRun: false, label: "calendar cancellation",
+    });
+    removed = removal.applied;
+  }
+
+  // The state save happens even if calendars partially failed (needs_reconsent):
+  // every calendar that DID sync successfully keeps its progress rather than
+  // being forced to resync in full on the next run just because a sibling
+  // calendar's token died.
+  saveState(statePath, result.state);
+
+  const finalStatus = sent.errors.length ? "error" : "ready";
+  await postReceipt(base, adminKey, {
+    source: sourceName, kind: "calendar", status: finalStatus,
+    run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
+    docs_added: sent.created, docs_updated: sent.updated, docs_unchanged: sent.unchanged,
+    detail: `calendar sync: ${sent.created} created, ${sent.updated} updated, ${sent.unchanged} unchanged, ` +
+      `${sent.refused.length} refused, ${sent.errors.length} failed, ${removed} removed`,
+  });
+
+  ok(`${sent.created} created, ${sent.updated} updated, ${sent.unchanged} unchanged, ${removed} cancellation(s) removed`);
+  if (sent.refused.length) {
+    warn(`${sent.refused.length} event(s) refused by the credential gate (a live credential was pasted into an event)`);
+  }
+  if (sent.errors.length) warn(`${sent.errors.length} event(s) failed to send and will be retried on the next run`);
+  return { result, sent, removed };
+}
 
 /**
  * Ingest from a connected remote source.
@@ -9376,9 +9544,10 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain invite     <manifest>            one-tap passkey enrollment link for the owner (Face ID, 15 min)
     brain devices    <manifest>            enrolled passkeys; --revoke <credential id> removes one
     brain test       <manifest>            full acceptance suite (5 tiers)
-    brain connect google --scopes drive,gmail  authorise the client's own Google account
+    brain connect google --scopes drive,gmail,calendar  authorise the client's own Google account
     brain ingest     <manifest> --path <dir>  load a folder into the brain
     brain ingest     <manifest> --from drive  load from a connected remote source
+    brain ingest     <manifest> --from calendar  sync Google Calendar (--dry-run to preview)
     brain mcp-config <manifest>            config to connect the client's AI tools
     brain schedule   <manifest> --install  install unattended Drive refresh on macOS
     brain support    [--preview|--export <file>]  inspect private local issue notes

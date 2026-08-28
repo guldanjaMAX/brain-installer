@@ -29,6 +29,51 @@ the brain, not for whoever built it: what changed for them, and what to check.
 - Both are previews without `--yes`: they print what they would do and
   change nothing until you confirm.
 
+**Google Calendar is now actually reachable, not just built.** The connector
+and its 223 tests have existed since mid-August, but nothing anywhere ever
+called it — there was no command to run. Now there is:
+
+```
+brain connect google --scopes drive,gmail,calendar
+brain ingest <manifest> --from calendar
+```
+
+Later runs are incremental through Google's own sync token, and a cancelled
+meeting is removed from your index rather than left behind as a stale
+document. `--dry-run` previews what would be sent. Same honest boundary as
+Gmail: built and tested (223 connector tests, 15 more on the command that
+drives it), not yet run against a real calendar.
+
+**WhatsApp and text messages (Android, and Google Voice) are ingestible
+now, as exports.** No daemon, no live capture, no third-party app risk:
+
+- WhatsApp's own "Export chat" (`.txt`, choose "without media")
+- Android's SMS Backup & Restore app (`.xml`, your whole message history at
+  once)
+- A Google Voice Takeout (one page per conversation)
+
+Drop any of these in a folder you already `brain ingest --path`; each is
+detected automatically by its content and loaded as real conversations, not
+one giant wall of text. WhatsApp's export date is written in whatever order
+your phone's regional setting uses with no marker saying which ("3/4/26" is
+two different days depending on the phone), and that is resolved
+automatically from the fact that a chat is chronological — a genuinely
+ambiguous export is refused rather than silently mis-dated, and you would
+see that refusal named in the skip report. SMS Backup & Restore and Google
+Voice both write an exact timestamp, so there is nothing to disambiguate
+there, only to read correctly.
+
+Live capture (a message appearing the moment it is sent, not at your next
+export) is not part of this. That is real code in my own personal stack for
+WhatsApp already, but it carries a ToS gray-area risk worth an explicit
+conversation before it is on by default for a client.
+
+The source matrix (`onboarding/07-ingest-source-matrix.md`) and the "update
+failed partway through" runbook entry are both updated to match every one
+of the above, including an explicit statement that iMessage live capture
+requires a Mac in the loop with no way around it, and that Google Meet
+transcripts already land in Drive today with no connector needed at all.
+
 ## 0.1.19
 
 **Your brain now has its own app, and your face is the key.**

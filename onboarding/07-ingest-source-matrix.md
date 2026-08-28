@@ -12,8 +12,14 @@ I would rather lose a sale to an honest table than win one and spend week three 
 |---|---|
 | Google Drive | **Built.** In production |
 | Direct upload and API push | **Built.** The fallback for anything with no connector |
-| Google Calendar | **Specified, not built.** Next in the queue |
 | Gmail | Built: `brain connect google --scopes gmail`, then `brain ingest --from gmail`. Incremental via historyId; bulk mail excluded by default. Not yet run against a real mailbox |
+| Google Calendar | Built and wired: `brain connect google --scopes calendar`, then `brain ingest --from calendar`. Incremental via Google's own sync token; cancelled events are removed, not left behind. Not yet run against a real calendar |
+| Meetings (Google Meet) | **Built, with no extra work.** Meet's own Gemini notes land as a transcript document in Drive, which is already read |
+| WhatsApp | **Built, as an export.** Your phone's own "Export chat" .txt, dropped in a folder you already ingest. No live capture, no daemon, no third-party app risk |
+| Text messages (Android, and Google Voice) | **Built, as an export.** SMS Backup & Restore's .xml export, or a Google Voice Takeout, dropped in a folder you already ingest |
+| iMessage (Mac) | Not built yet. **Apple only exposes message history on a Mac; there is no path on Windows.** Sprint 1 |
+| Facebook Messenger | Not built as a product |
+| Zoom | Not built as a connector. **Zero-build v0 available today**, see below |
 | Slack | Not built. Priced separately when it is |
 | Notion | Not built |
 | Microsoft 365, Outlook, SharePoint, OneDrive | Not built |
@@ -21,7 +27,6 @@ I would rather lose a sale to an honest table than win one and spend week three 
 | QuickBooks | Not built |
 | HubSpot and other CRMs | Not built |
 | Airtable | Not built |
-| Text messages, WhatsApp, Messenger | Not built as a product |
 
 ---
 
@@ -90,19 +95,47 @@ This matters more than it sounds. The import most worth doing is usually the big
 
 `node brain.mjs sources <manifest>` lists every named load with its status and when it last ran.
 
----
-
-## Specified, not built
-
 ### Google Calendar
 
-**Status: designed, not written. One to two days of work, and it is next.**
+Your brain already holds transcripts and email threads, and until this was built it was **inferring** who works with whom from how often names appear together. Calendar hands that over directly: who met, when, how often, for how long, and with whom.
 
-Why it is next: your brain already holds transcripts and email threads, and it is currently **inferring** who works with whom from how often names appear together. Calendar hands that over directly. Who met, when, how often, for how long, and with whom.
+It rides the Google permission you already grant, so it costs no additional setup on your side beyond a checkbox. Connect it and load it:
 
-It rides the Google permission you already grant, so it costs no additional setup on your side beyond a checkbox.
+```
+node brain.mjs connect google --scopes drive,gmail,calendar
+node brain.mjs ingest <manifest> --from calendar
+```
+
+Later runs are incremental through Google's own sync token, same idea as Gmail's historyId. A cancelled meeting is removed from your index, not left behind as a stale document. By default it reads your primary calendar; more than one calendar, or a shared one, is a manifest setting.
+
+**The honest production boundary, same shape as Gmail's:** the connector and the command that runs it have both passed the product test suite (223 tests on the connector's own logic, 15 more on the command that drives it against a scripted fake calendar), but neither has completed a real-calendar production run yet. Treat it as built but not yet production-proven.
 
 Same publishing consideration as the rest of your Google connection: on Workspace it registers inside your own organization and simply works. On a personal gmail.com address the app must be published, or access is revoked every seven days.
+
+### Meetings (Google Meet)
+
+**No connector needed, because Google already writes the transcript where your brain already looks.** Turn on Gemini notes for a Meet call (or take notes yourself and save them), and the transcript lands as a document in your Drive. Drive ingest reads it like anything else. Nothing to connect, nothing to authorize beyond what Drive already has.
+
+If your meetings are on Zoom instead, see the Zoom entry below — the same zero-build pattern (transcript into Drive) works there too, it just takes one setting change on your account rather than being automatic.
+
+### WhatsApp
+
+**Built, as an export — not a live connection.** WhatsApp's own per-chat "Export chat" produces a `.txt` file (choose "without media"). Drop it in a folder you already ingest with `brain ingest <manifest> --path <folder>`; it is detected automatically by its content, not by asking you to say what it is, and loaded as sessionized conversation documents rather than one giant wall of text.
+
+**What it does not do:** there is no live capture. A new message sent after you exported does not appear until you export again. Pairing WhatsApp as a linked device for continuous capture is real, tested code in my own personal stack, sits in a WhatsApp terms-of-service gray area with a real (if small) account-ban risk, and is not part of what is installed for you today. If continuous WhatsApp capture matters enough to be worth that risk, ask, and we can talk about it explicitly, disclosure included, rather than it happening by default.
+
+**The one real gotcha, handled rather than ignored:** WhatsApp writes its export date in whatever order your phone's regional setting uses, with no marker saying which. "3/4/26" is March 4th on a US phone and April 3rd on nearly every other phone in the world. This is resolved automatically from the fact that a chat is chronological — every date in the file is checked for a reading that stays in order start to finish — and on the rare export too short or too regular to tell, it is refused rather than guessed, so you never end up with a chat silently misdated by weeks. You would see that refusal named in the ingest skip report if it happens.
+
+### Text messages (Android, and Google Voice)
+
+**Built, as an export, same posture as WhatsApp above.** Two sources:
+
+- **Android:** the SMS Backup & Restore app (free, on the Play Store) exports your whole message history as one `.xml` file, covering every conversation, not just one.
+- **Google Voice:** a standard Google Takeout export of your Voice data includes one page per conversation.
+
+Either one, dropped in a folder you already ingest, is detected automatically and loaded the same sessionized way WhatsApp is. Unlike WhatsApp, neither format has a locale-dependent date to get wrong: both write an exact, unambiguous timestamp, so there is no disambiguation step here, only correct reading of it.
+
+**iPhone note:** this Android path does not apply to you if you carry an iPhone. Your texts arrive through the iMessage connector instead, once it exists (see below) — turn on Text Message Forwarding and SMS rides in for free alongside iMessage. There is no live SMS-only path for an iPhone without a Mac in the loop.
 
 ---
 
@@ -138,9 +171,19 @@ If your business runs on Microsoft rather than Google, **this product is not rea
 
 **Not built.** Both are straightforward when the demand justifies them. Airtable in particular needs the meaning of your tables mapped by hand, so it gets quoted as configuration work rather than a connection.
 
-### Text messages, WhatsApp, Messenger
+### iMessage, and Facebook Messenger
 
-**Not built as a product.** Personal messaging capture exists in my own brain. It is not part of what I install for you, and I am not going to pretend otherwise because it works on my machine.
+**Not built as an installed product yet.** WhatsApp and SMS both have a built export path today (see Built, above); iMessage and Messenger do not.
+
+**iMessage live capture requires a Mac in the loop, and there is no way around that.** Apple only exposes your message history to a local app through `chat.db`, which exists on macOS and nowhere else. If your business runs entirely on Windows, this connector, when it exists, will not help you directly — it needs a Mac physically present to run on, even if the rest of your install is elsewhere. A one-time history load from an encrypted iPhone backup (no Mac needed for that specific path) is planned separately for exactly this reason. Personal messaging capture of this kind exists in my own brain today; it is not yet part of what is installed for a client, and I am not going to pretend otherwise because it works on my machine.
+
+Facebook Messenger has no export or capture path built at all yet, live or otherwise.
+
+### Zoom
+
+**Not built as a connector, but there is a zero-build path that works today.** Turn on cloud recording with an audio transcript for your Zoom account, and save the transcript (the `.vtt` file, or run Otter) into a Drive folder you already ingest. Drive reads it like any other document, exactly the way Google Meet's own Gemini notes already do with no setup at all. This covers "what did we discuss on that call" from day one.
+
+The real connector — a webhook on your own Cloudflare worker that fetches each transcript automatically the moment a recording finishes, no manual save — is planned and requires your Zoom account to be on a paid plan with cloud recording. Until then, the manual save above is the honest v0.
 
 ---
 
