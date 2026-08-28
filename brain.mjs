@@ -4964,8 +4964,14 @@ async function cmdIngest(manifestPath) {
     return cmdIngestIphoneBackup(m, manifestPath, flags);
   }
   if (flags.from) return cmdIngestRemote(m, manifestPath, flags);
-  if (flags["approve-removals"] !== undefined) {
-    die("--approve-removals is only valid with --from drive.");
+  // A local folder now reconciles its own deletions, so it has the same
+  // approval gate Drive does. It stays invalid on every OTHER remote source,
+  // which is checked in cmdIngestRemote.
+  const localRemovalApproval = flags["approve-removals"] === undefined
+    ? undefined
+    : String(flags["approve-removals"] || "").trim().toLowerCase();
+  if (localRemovalApproval !== undefined && !/^[0-9a-f]{64}$/.test(localRemovalApproval)) {
+    die("--approve-removals needs the exact 64-character fingerprint the refusal printed.");
   }
 
   const root = flags.path;
@@ -4977,7 +4983,7 @@ async function cmdIngest(manifestPath) {
     );
   }
   if (!existsSync(root)) die(`no such folder: ${root}`);
-  const { walk, prepare, batchStream, splitOversized, loadState, saveState } = await ingestLib();
+  const { walk, prepare, batchStream, splitOversized, loadState, saveState, removedSinceLastRun } = await ingestLib();
 
   const sourceName = assertSourceName(flags.source === true ? null : flags.source || "upload");
   // A dry run sends nothing, so it must not demand credentials it will never
@@ -5065,6 +5071,18 @@ async function cmdIngest(manifestPath) {
   }
   addLocalPathAliases(candidateLocalKeys, walkSkips, "path");
   const protectedLocalSkipKeys = candidateLocalKeys;
+  // Files this source loaded before and can no longer find.
+  //
+  // Only computed for a whole, complete walk. Under --limit the run has
+  // deliberately not looked at most of the folder, and an unexamined file is
+  // not a deleted one; a walk that could not be read completely already
+  // stopped the run above. Getting this wrong in the other direction is what
+  // an unattended lane must never do: a folder that mounted empty would
+  // otherwise read as "the client deleted everything".
+  const vanishedRemovalKeys = flags.limit
+    ? []
+    : removedSinceLastRun(previouslyKnownKeys, protectedLocalSkipKeys)
+      .filter((key) => !privateRemovalSet.has(key));
   const scannerRescanSkips = [];
   let unchanged = 0;
   let split = 0;
@@ -5194,6 +5212,10 @@ async function cmdIngest(manifestPath) {
       uids: [...new Set([...privateRemovalKeys, ...intentionalRemovalKeys])].map((key) => `${sourceName}:${key}`),
       base, adminKey, state, dryRun: true, label: "local source truth",
     });
+    await applyDriveRemovals({
+      uids: vanishedRemovalKeys.map((key) => `${sourceName}:${key}`),
+      base, adminKey, state, dryRun: true, label: "Drive deletion",
+    });
     info(`${scanned} document(s) would be sent; ${unchanged} unchanged; ${skips.length} skipped`);
     reportNotes(notes);
     console.log("");
@@ -5313,6 +5335,29 @@ async function cmdIngest(manifestPath) {
   process.stdout.write("\n");
   reportNotes(notes);
 
+  // ONE decision covering every reason this source has to remove something,
+  // through the SAME aggregate guard the Drive lane uses. No removal call is
+  // allowed above this assertion.
+  //
+  // The stored set is this source's own resume state, which is exactly the set
+  // these keys are removed from, so the ratio the guard reasons about is the
+  // real one. This matters most for the unattended folder lane: a cloud folder
+  // that failed to materialize is indistinguishable from a client deleting
+  // everything in it, and that difference is worth one deliberate approval.
+  const localRemovalPlan = buildDriveRemovalPlan({
+    storedFamilies: [...previouslyKnownKeys].map((key) => `${sourceName}:${key}`),
+    activeFamilies: [...protectedLocalSkipKeys].map((key) => `${sourceName}:${key}`),
+    policyCandidates: privateRemovalKeys.map((key) => `${sourceName}:${key}`),
+    vanishedCandidates: vanishedRemovalKeys.map((key) => `${sourceName}:${key}`),
+    intentionalCandidates: [...intentionalRemovalKeys].map((key) => `${sourceName}:${key}`),
+  });
+  assertDriveRemovalPlanSafe(localRemovalPlan, localRemovalApproval);
+  if (localRemovalPlan.total) {
+    const percent = (localRemovalPlan.ratio * 100).toFixed(1);
+    const disposition = localRemovalPlan.tooLarge ? "approved" : "within the unattended safety limits";
+    info(`folder cleanup plan ${disposition}: ${localRemovalPlan.total} of ${localRemovalPlan.stored} loaded documents (${percent}%)`);
+  }
+
   const localRemovalKeys = [...new Set([...privateRemovalKeys, ...intentionalRemovalKeys])];
   const localRemoval = await applyDriveRemovals({
     uids: localRemovalKeys.map((key) => `${sourceName}:${key}`),
@@ -5321,6 +5366,16 @@ async function cmdIngest(manifestPath) {
   saveState(statePath, state);
   assertNoPendingRemovals(localRemoval, "local source truth removal");
   for (const key of localRemovalKeys) delete state.done[key];
+
+  const vanishedTargets = localRemovalPlan.targets.source_deleted;
+  if (vanishedTargets.length) {
+    const vanishedRemoval = await applyDriveRemovals({
+      uids: vanishedTargets, base, adminKey, state, dryRun: false, label: "Drive deletion",
+    });
+    saveState(statePath, state);
+    assertNoPendingRemovals(vanishedRemoval, "deleted local file removal");
+    if (vanishedRemoval.applied) ok(`${vanishedRemoval.applied} document(s) removed because their file is gone from the folder`);
+  }
 
   if (scannerRescanSkips.length) {
     saveState(statePath, state);
@@ -10639,10 +10694,82 @@ async function cmdSupport() {
   console.log("  Export for a private support issue: brain support --export <file>\n");
 }
 
+/**
+ * Install, inspect, or remove the watched local folder scheduler.
+ *
+ * Deliberately the same command, the same three actions and the same freshness
+ * bookkeeping as the Drive lane. A client should not have to learn a second
+ * vocabulary because the folder they are watching happens to live outside
+ * Google Drive.
+ */
+async function cmdScheduleFolder(m, manifestPath, action) {
+  const source = String(m?.corpora?.local_folder?.source || "documents");
+  let dataPlane = null;
+  if (action === "install") {
+    const adminKey = resolveAdminKey(manifestPath);
+    if (!adminKey) {
+      die("no admin key found, so the watched folder schedule cannot be reflected in source freshness.");
+    }
+    dataPlane = { base: await resolveBaseUrl(m, null), adminKey };
+  }
+  const {
+    installFolderScheduler,
+    statusFolderScheduler,
+    removeFolderScheduler,
+  } = await import("./operations/folder-scheduler.mjs");
+
+  const result = action === "install"
+    ? installFolderScheduler(manifestPath)
+    : action === "remove"
+      ? removeFolderScheduler(manifestPath)
+      : statusFolderScheduler(manifestPath);
+
+  for (const warning of result.warnings || []) warn(warning);
+  if (action === "install") {
+    await postSourceExpectation(dataPlane.base, dataPlane.adminKey, {
+      source, kind: "upload", expected_refresh_seconds: result.expectedRefreshSeconds,
+    });
+    ok(`watched folder refresh installed for ${result.cron}`);
+    info(`folder: ${result.folderPath}`);
+    info(`loaded under the source name "${source}"`);
+    ok(`${source} freshness expectation set to ${result.expectedRefreshSeconds} seconds`);
+    info(`definition: ${result.plistPath}`);
+    info(`logs: ${result.stdoutPath} and ${result.stderrPath}`);
+    return result;
+  }
+  if (action === "remove") {
+    ok(result.removed || result.loaded ? "watched folder refresh removed" : "watched folder refresh was not installed");
+    try {
+      const adminKey = resolveAdminKey(manifestPath);
+      if (!adminKey) throw new Error("no admin key is available");
+      const base = await resolveBaseUrl(m, null);
+      await postSourceExpectation(base, adminKey, { source, kind: "upload", expected_refresh_seconds: null });
+      ok(`${source} freshness expectation cleared`);
+    } catch (error) {
+      warn(`the local scheduler is removed, but its remote freshness expectation could not be cleared: ${String(error?.message || error).slice(0, 160)}`);
+    }
+    info(`logs preserved at ${result.stdoutPath} and ${result.stderrPath}`);
+    return result;
+  }
+
+  if (!result.installed) warn("watched folder refresh is not installed on this Mac");
+  else if (!result.loaded) warn("watched folder refresh has a definition but is not loaded by launchd");
+  else if (result.definitionDrift) warn("the installed watched folder refresh does not match the current manifest; reinstall it");
+  else ok(`watched folder refresh is installed for ${result.cron}`);
+  if (result.folderPath) info(`folder: ${result.folderPath}`);
+  if (result.running) info(`a folder ingest is running as pid ${result.pid}`);
+  else if (result.lastRunSucceeded === false) warn(`the last scheduled run failed with exit code ${result.lastExitCode}`);
+  else if (result.lastRunSucceeded === true) ok(`the last scheduled run succeeded (${result.runs ?? 0} run(s) recorded)`);
+  if (result.scheduleError) warn(result.scheduleError);
+  info(`stdout: ${result.stdoutPath}`);
+  info(`stderr: ${result.stderrPath}`);
+  return result;
+}
+
 /** Install, inspect, or remove the standard per-client Drive scheduler. */
 async function cmdSchedule(manifestPath) {
   if (!manifestPath) {
-    die("usage: brain schedule <manifest> [--install|--status|--remove]");
+    die("usage: brain schedule <manifest> [--install|--status|--remove] [--folder]");
   }
   const flags = parseFlags(process.argv.slice(4));
   const requested = ["install", "status", "remove"].filter((name) => flags[name]);
@@ -10651,6 +10778,10 @@ async function cmdSchedule(manifestPath) {
   }
   const action = requested[0] || "status";
   const { m } = loadManifest(manifestPath);
+  // The watched local folder is a second lane on the same command, because it
+  // is the same question ("what refreshes itself on this Mac") asked about a
+  // different source.
+  if (flags.folder) return cmdScheduleFolder(m, manifestPath, action);
   let dataPlane = null;
   if (action === "install") {
     const adminKey = resolveAdminKey(manifestPath);
@@ -10987,6 +11118,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
                                            local iPhone backup; a snapshot, not live capture (any OS)
     brain mcp-config <manifest>            config to connect the client's AI tools
     brain schedule   <manifest> --install  install unattended Drive refresh on macOS
+    brain schedule   <manifest> --install --folder  install unattended refresh of the watched
+                                           local folder declared in corpora.local_folder (macOS)
     brain support    [--preview|--export <file>]  inspect private local issue notes
 
   operate
@@ -11002,6 +11135,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain rollback   <manifest> <bookmark> preview D1-only restore (--yes performs it)
     brain schedule   <manifest>            inspect unattended Drive refresh
     brain schedule   <manifest> --remove   remove it and preserve its logs
+    brain schedule   <manifest> --folder   inspect (or --install/--remove) the watched folder lane
     brain disconnect imessage <manifest>   stop live capture, flush open sessions, remove the agent
     brain disconnect whatsapp <manifest>   stop the capture daemon and its drain, flush, remove both agents
     brain disconnect zoom     <manifest>   remove the Zoom secrets so the webhook refuses deliveries

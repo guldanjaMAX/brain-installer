@@ -1,0 +1,5 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:half-written@example.test
+SUMMARY:This event was cut off mid-export

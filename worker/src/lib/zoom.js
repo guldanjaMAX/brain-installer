@@ -31,6 +31,7 @@ import {
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./secret-scan.js";
 import { storeFor, backendOf, D1 } from "./store.js";
+import { vttToPlainTranscript } from "./vtt.js";
 
 /** The one Zoom scope this connector needs. Anything more is over-asking. */
 export const ZOOM_REQUIRED_SCOPE = "cloud_recording:read:admin";
@@ -139,103 +140,14 @@ export async function verifyZoomSignature({ secret, rawBody, signature, timestam
 
 /* ---------------------------------------------------------------- vtt */
 
-const VTT_TIMESTAMP = /\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[.,]\d{3}/;
-
 /**
- * WebVTT to plain speaker-tagged transcript.
- *
- * Ported from the reference implementation's `vttToPlainTranscript`, NOT from
- * the parser that is actually live on its ingest path — that one never strips
- * WebVTT cue-number lines, so a bare "12" before each cue is appended into the
- * transcript text and every Zoom transcript in that index carries stray digits.
- * A fresh port is the only cheap moment to not inherit a bug, so it is fixed
- * here, along with three others found while porting. Each is deliberate and has
- * its own fixture in worker/test/zoom.test.mjs:
- *
- *   1. Cue-number lines (`^\d+$`) are skipped. The named bug.
- *   2. The header block (`WEBVTT` through the first blank line) is skipped
- *      whole. The reference skipped only the WEBVTT line itself, so a
- *      "Kind: captions" or "Language: en-US" metadata line became a SPEAKER
- *      called "Kind" with the rest of the transcript attributed to it.
- *   3. A speaker prefix is only recognised on the FIRST line of a cue. The
- *      reference matched `^([^:]+):` on every line, so a wrapped continuation
- *      line reading "meet at 3:30 tomorrow" invented a speaker named "meet at 3".
- *   4. Text in a cue with no speaker prefix is emitted unattributed instead of
- *      being dropped. The reference only flushed its buffer when a speaker was
- *      known, so a transcript with no speaker attribution at all parsed to the
- *      empty string — silent, total data loss with no error anywhere.
- *
- * NOTE blocks are skipped as the WebVTT spec defines them.
+ * The transcript parser moved to ./vtt.js so the local ingest path can use the
+ * SAME one for a `.vtt` a client saved out of a meeting tool by hand. It is
+ * re-exported here because this module's own tests and every existing caller
+ * import it from `zoom.js`, and because there must be exactly one answer to
+ * "how does this product turn captions into text".
  */
-export function vttToPlainTranscript(vttBody) {
-  if (!vttBody) return "";
-  const lines = String(vttBody).split(/\r?\n/);
-  const out = [];
-  let speaker = null;
-  let buffer = [];
-  // A speaker prefix is only meaningful at the start of a cue. Everything after
-  // that is continuation text, colons and all.
-  let atCueStart = false;
-  let index = 0;
-
-  const flush = () => {
-    if (!buffer.length) return;
-    const text = buffer.join(" ").trim();
-    if (text) out.push(speaker ? `${speaker}: ${text}` : text);
-    buffer = [];
-    speaker = null;
-  };
-
-  // The header block: WEBVTT plus any metadata lines, through the first blank
-  // line. Skipped whole rather than one line deep.
-  if (lines[0] && /^﻿?WEBVTT/i.test(lines[0])) {
-    index = 1;
-    while (index < lines.length && lines[index].trim()) index++;
-  }
-
-  for (; index < lines.length; index++) {
-    const line = lines[index];
-    const trimmed = line.trim();
-
-    if (!trimmed) {
-      flush();
-      atCueStart = false;
-      continue;
-    }
-    // A NOTE comment runs to the next blank line and is never transcript text.
-    if (/^NOTE(\s|$)/.test(trimmed)) {
-      flush();
-      while (index + 1 < lines.length && lines[index + 1].trim()) index++;
-      atCueStart = false;
-      continue;
-    }
-    if (/^\d+$/.test(trimmed)) continue;          // cue number
-    if (VTT_TIMESTAMP.test(trimmed)) {            // cue timing
-      atCueStart = true;
-      continue;
-    }
-
-    if (atCueStart) {
-      const speakerMatch = trimmed.match(/^([^:]+):\s*(.*)$/);
-      if (speakerMatch) {
-        // A cue that names a speaker ends whatever turn was open. Ordinary
-        // Zoom output already separates cues with a blank line, so this only
-        // matters for a file whose cues run together.
-        flush();
-        speaker = speakerMatch[1].trim();
-        const tail = speakerMatch[2].trim();
-        if (tail) buffer.push(tail);
-      } else {
-        buffer.push(trimmed);
-      }
-      atCueStart = false;
-      continue;
-    }
-    buffer.push(trimmed);
-  }
-  flush();
-  return out.join("\n");
-}
+export { vttToPlainTranscript } from "./vtt.js";
 
 /* ---------------------------------------------------------- zoom api */
 

@@ -197,6 +197,30 @@
               "default": false
             }
           }
+        },
+        "local_folder": {
+          "type": "object",
+          "description": "A local folder that reloads itself on a schedule, enforced by brain schedule <manifest> --install --folder and run by brain ingest <manifest> --path. This is what makes \"drop it in a folder you already ingest\" true for a folder that is not inside Google Drive. Each tick reuses the local ingest's content-hash resume state, so a new file is added, a changed file is re-sent, an unchanged file costs one read, and a file that is gone is removed through the same aggregate removal plan every other source uses. The schedule knob is operations.folder_ingest_cron (default: hourly). macOS only today: it installs as a per-user LaunchAgent.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Absolute path to the folder to watch, or null until one is chosen. A relative path is refused: a LaunchAgent's working directory is not the client's shell, so it would resolve somewhere neither party intended."
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]*$",
+              "maxLength": 64,
+              "default": "documents",
+              "description": "The named source this folder loads under, which is also the undo: brain forget <manifest> --source <name> removes exactly what it loaded."
+            }
+          }
         }
       }
     },
@@ -361,6 +385,11 @@
           "type": "string",
           "minLength": 1,
           "description": "Absolute local directory holding the WhatsApp linked-device session store and the capture outbox. Both the daemon and the drain read this same value; the default is ~/.brain/whatsapp/<client.slug>."
+        },
+        "folder_ingest_cron": {
+          "type": "string",
+          "minLength": 9,
+          "description": "Numeric five-field cron schedule for the watched local folder in corpora.local_folder. Installed as a per-user macOS LaunchAgent; calendar times use the Mac's local timezone. Defaults to hourly when absent. brain.domain must also be set so refresh needs no Cloudflare deployment credential."
         }
       }
     },

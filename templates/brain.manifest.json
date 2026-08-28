@@ -126,6 +126,25 @@
       "_comment": "Manual drop zone. Always on: it is the fallback for anything with no connector.",
       "enabled": true
     },
+    "local_folder": {
+      "_comment": [
+        "A folder on this Mac that reloads itself on a schedule, so 'export it",
+        "into this folder and forget about it' is actually true for a folder",
+        "that is not inside Google Drive. Point it at wherever the client drops",
+        "things: a WhatsApp or SMS export, a saved .vtt meeting transcript, a",
+        "mail archive, scanned paperwork.",
+        "",
+        "Install it with `brain schedule <manifest> --install --folder`. Each",
+        "tick runs the ordinary local ingest, so it reuses that command's",
+        "content-hash resume state: a new file is added, a changed file is",
+        "re-sent, an unchanged file costs one read, and a file that is gone is",
+        "removed through the same aggregate removal plan Drive uses. The path",
+        "must be absolute. Tick with operations.folder_ingest_cron."
+      ],
+      "enabled": false,
+      "path": null,
+      "source": "documents"
+    },
     "whatsapp": {
       "_comment": [
         "Live capture through a paired linked device, and OPT-IN twice over:",
@@ -179,6 +198,7 @@
       "google_token_store persists auto, keychain or file for unattended runs."
     ],
     "ingest_cron": "0 9 * * *",
+    "folder_ingest_cron": "0 * * * *",
     "admin_key_secret": null,
     "google_token_store": "auto",
     "health_cron": "0 13 * * *",

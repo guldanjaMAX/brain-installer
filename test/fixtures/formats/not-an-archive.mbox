@@ -1,0 +1,4 @@
+Subject: This looks like a message but the archive separator is missing
+
+Priya, this file was renamed to .mbox by hand and has no From_ delimiter line
+anywhere in it, so nothing can tell where one message stops and the next starts.
