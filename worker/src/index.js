@@ -32,6 +32,7 @@ import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js"
 import {
   handleOwnerAuth, handleAdminInvite, handleAdminDevices, validateOwnerSession,
 } from "./lib/owner-auth.js";
+import { handleZoomWebhook } from "./lib/zoom.js";
 
 /* ------------------------------------------------------------ retrieval */
 
@@ -1045,7 +1046,7 @@ async function handleIngestBatch(env, request) {
 
 const SOURCE_RECEIPT_STATUSES = new Set(["indexing", "ready", "error"]);
 const SOURCE_RUN_LANES = new Set(["incremental", "sweep", "manual"]);
-const SOURCE_KINDS = new Set(["drive", "gmail", "calendar", "imessage", "slack", "notion", "upload"]);
+const SOURCE_KINDS = new Set(["drive", "gmail", "calendar", "imessage", "zoom", "slack", "notion", "upload"]);
 
 function receiptTimeMs(value, fallback = Date.now()) {
   if (value === null || value === undefined || value === "") return fallback;
@@ -1437,6 +1438,16 @@ export default {
     // privilege class (see owner-auth.mjs).
     if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/")) {
       return handleOwnerAuth(env, request, url, path);
+    }
+
+    // The Zoom webhook sits in FRONT of the key gate because Zoom cannot send
+    // the brain's admin key. Its authentication is the HMAC signature over the
+    // raw body, verified in constant time inside the handler, which also fails
+    // closed when the client's own webhook secret is not set. Nothing else in
+    // this worker is reachable without a key.
+    if (path === "/api/webhooks/zoom") {
+      if (request.method !== "POST") return jsonResponse({ error: "not found" }, 404);
+      return handleZoomWebhook(env, request, ctx);
     }
 
     const readRoute = path === "/api/rag/unified" || path === "/api/rag/think";
