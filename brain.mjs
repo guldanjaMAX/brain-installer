@@ -941,7 +941,19 @@ async function cmdProvision(manifestPath) {
 
   // Vectorize, when the manifest asks for the Cloudflare-only storage path.
   if ((cfg.storage || "d1") === "d1") {
-    const idxName = cfg.vectorize_index || `${m.client?.slug || "client"}-brain`;
+    // The template ships `vectorize_index: "filled_in_by_provisioner"`, which
+    // reads like a value the provisioner replaces. It does not: this name is
+    // the index name. Because the placeholder is a truthy string, it used to
+    // sail straight through and create a real Vectorize index literally called
+    // "filled_in_by_provisioner" (observed on a clean install, 2026-08-28).
+    // Worse, a SECOND install in the same account then adopts that same index
+    // and two clients share one vector store. Treat the placeholder as unset.
+    const PLACEHOLDER_INDEX_NAME = "filled_in_by_provisioner";
+    const configuredIndex =
+      cfg.vectorize_index && cfg.vectorize_index !== PLACEHOLDER_INDEX_NAME
+        ? cfg.vectorize_index
+        : null;
+    const idxName = configuredIndex || `${m.client?.slug || "client"}-brain`;
     // 768 and cosine are NOT free choices. They are the output shape of
     // @cf/baai/bge-base-en-v1.5, the model the worker embeds with. An index
     // built at other dimensions rejects every vector, and one built with a

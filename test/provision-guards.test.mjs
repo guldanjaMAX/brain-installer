@@ -614,6 +614,19 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   check("the Vectorize remedy exists in exactly one place", (doctor.match(/export const VECTORIZE_REMEDY/g) || []).length === 1);
   check("and brain.mjs uses that constant rather than its own copy", /VECTORIZE_REMEDY/.test(brain));
   check("the token scope list is a shared constant too", /export const CF_TOKEN_SCOPES/.test(doctor));
+
+  // A clean install on 2026-08-28 created a real Vectorize index literally
+  // named "filled_in_by_provisioner", because the template ships that string
+  // and a truthy string sails past the `||` default. The danger is not the
+  // ugly name: a SECOND install in the same account adopts the same index and
+  // two clients end up sharing one vector store.
+  check("provision treats the vectorize placeholder as unset, not as a name",
+    /PLACEHOLDER_INDEX_NAME\s*=\s*"filled_in_by_provisioner"/.test(brain) &&
+      /cfg\.vectorize_index\s*!==\s*PLACEHOLDER_INDEX_NAME/.test(brain),
+    "brain.mjs would create an index named after the placeholder");
+  check("and it still falls back to a per-client name",
+    /\$\{m\.client\?\.slug \|\| "client"\}-brain/.test(brain),
+    "the derived <slug>-brain fallback went missing");
   check("deploy sends the manifest chunk size to every Worker", /name: "CHUNK_SIZE"[\s\S]{0,160}m\.retrieval\?\.chunk_size/.test(brain));
   check("deploy sends the manifest overlap to every Worker", /name: "CHUNK_OVERLAP"[\s\S]{0,160}m\.retrieval\?\.chunk_overlap/.test(brain));
 }
