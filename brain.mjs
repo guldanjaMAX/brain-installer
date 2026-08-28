@@ -84,6 +84,9 @@ async function ingestOcrLib() {
   return await import("./ingest/ocr.mjs");
 }
 import { authorize, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
+// Dependency-free on purpose: the Drive connector itself pulls the PDF and
+// Office readers, so the scope rule lives apart from it and both import it.
+import { describeDriveScope, isUnderRoots, normalizeIncludeRootIds } from "./connectors/drive-scope.mjs";
 import {
   redact as redactConfirmedSecrets,
   scanEnvelope as scanEnvelopeSecrets,
@@ -4027,6 +4030,9 @@ export function driveConnectorConfig(m, manifestPath, read = (path) => readFileS
     fileIds = [...new Set([...fileIds, ...driveExclusionIdsOf(parsed)])].sort();
   }
   return {
+    // The only setting here that bounds what Google is ASKED for. Everything
+    // else on this object is a refusal applied to metadata already fetched.
+    includeRootIds: normalizeIncludeRootIds(declared.include_root_ids || []),
     excludeFileIds: fileIds,
     excludePaths: Array.isArray(declared.exclude_paths) ? declared.exclude_paths.map(String) : [],
     excludeNameParts: Array.isArray(declared.exclude_name_parts) ? declared.exclude_name_parts.map(String) : [],
@@ -4088,7 +4094,11 @@ export function commitCredentialScannerProgress(state, fingerprint) {
 
 export function drivePolicyFingerprint(config = {}, scannerEnabled = true, ocrEnabled = false) {
   const normalized = {};
-  for (const key of ["excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
+  // includeRootIds is in here for the same reason OCR is: it changes what Drive
+  // is ALLOWED TO READ. Widening the allowlist must force one full comparison,
+  // or the newly-permitted folders stay invisible until something in them
+  // happens to change.
+  for (const key of ["includeRootIds", "excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
     normalized[key] = [...new Set((config[key] || []).map((value) => String(value)))].sort();
   }
   normalized.credentialScanner = credentialScannerFingerprint(scannerEnabled);
@@ -7772,6 +7782,11 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     const drive = await import("./connectors/google-drive.mjs");
     const sourceDeletedUids = [];
     if (!incremental && state.sync_token) info(`${driveDecision.reason}; using a full Drive comparison`);
+    // The scope line comes FIRST and is printed on every run, including the run
+    // that has no allowlist. "Connect Drive" without one means the whole Drive,
+    // and an operator should have to read that rather than infer it from
+    // silence.
+    info(`Drive scope: ${describeDriveScope(sourcePolicy.includeRootIds)}`);
     if (sourcePolicy.excludeFileIds.length) info(`${sourcePolicy.excludeFileIds.length} reviewed Drive file-id exclusion(s) enforced`);
     if (sourcePolicy.excludePaths.length) info(`${sourcePolicy.excludePaths.length} Drive path exclusion(s) enforced`);
     if (sourcePolicy.privatePrefixes.length) info(`private path prefixes enforced in Drive: ${sourcePolicy.privatePrefixes.join(", ")}`);
@@ -7819,16 +7834,40 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       }
     }
     if (!incremental) {
-      info("full walk of Drive");
-      for await (const f of drive.listFiles(getToken)) {
-        files.push(f);
-        if (files.length >= limit) break;
+      if (sourcePolicy.includeRootIds.length) {
+        info(`full walk of ${sourcePolicy.includeRootIds.length} allowlisted Drive root(s)`);
+        for await (const f of drive.listFilesUnderRoots(getToken, sourcePolicy.includeRootIds)) {
+          files.push(f);
+          if (files.length >= limit) break;
+        }
+      } else {
+        info("full walk of Drive");
+        for await (const f of drive.listFiles(getToken)) {
+          files.push(f);
+          if (files.length >= limit) break;
+        }
       }
     }
 
     // Resolve paths only after the complete page set has been seen. Drive does
     // not return parents before children, and API order must not decide policy.
     state.drive_folders = drive.updateFolderIndex(files, incremental ? (state.drive_folders || {}) : {});
+
+    // Drive's changes feed is account-wide and takes no subtree filter, so an
+    // allowlisted install still RECEIVES changes for files outside its scope.
+    // They are dropped here, after their metadata arrived and before anything
+    // is fetched or stored. This is the weaker of the two gates and it only
+    // applies to the incremental lane; the full walk never asks in the first
+    // place. Folders are kept: the index they build is what resolves ancestry.
+    if (incremental && sourcePolicy.includeRootIds.length) {
+      const before = files.length;
+      files = files.filter((file) =>
+        file?.mimeType === "application/vnd.google-apps.folder" ||
+        isUnderRoots(file, state.drive_folders, sourcePolicy.includeRootIds));
+      const dropped = before - files.length;
+      if (dropped) info(`${dropped} change(s) outside the Drive root allowlist were refused on arrival`);
+    }
+
     const pathOf = (file) => drive.folderPathFor(file, state.drive_folders);
     const excludedUids = [];
 

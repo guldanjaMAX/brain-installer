@@ -84,6 +84,7 @@ const expected = [
   "connectors/iphone-backup.mjs",
   "connectors/google-auth.mjs",
   "connectors/google-calendar.mjs",
+  "connectors/drive-scope.mjs",
   "connectors/google-drive.mjs",
   "connectors/keychain-write.exp",
   "connectors/zoom.mjs",

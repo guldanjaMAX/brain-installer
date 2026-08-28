@@ -417,7 +417,7 @@ node brain.mjs sources <manifest>
 
 **c. Is the file type readable at all?** Images, video, audio, and scanned PDFs with no text layer are not read. There is no text recognition on scanned documents. See `07-ingest-source-matrix.md` for the full list of what is and is not read.
 
-**d. Is it in an excluded folder?** Anything you excluded at intake was excluded at the source and was never read.
+**d. Is it in an excluded folder?** Anything you excluded at intake was refused before its content was read and nothing about it was stored. If your Drive is scoped by a root allowlist, a file outside those roots was never requested from Google at all, so it will not appear in any skip list either. See `07-ingest-source-matrix.md` for exactly where each kind of exclusion is enforced.
 
 **Fix:** depends which of the four it is, and (a) is the one to check first because it is the most common and takes ten seconds.
 

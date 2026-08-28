@@ -29,6 +29,11 @@ import "../ingest/formats.mjs";
 import { textQuality, isLikelyBinary } from "../ingest/quality.mjs";
 import { documentDate } from "../ingest/doc-date.mjs";
 import { isBinaryFormat } from "../ingest/extract.mjs";
+import { normalizeIncludeRootIds } from "./drive-scope.mjs";
+
+// Re-exported so a caller that already has the connector open does not need a
+// second import to reason about the same allowlist.
+export { describeDriveScope, isUnderRoots, normalizeIncludeRootIds } from "./drive-scope.mjs";
 
 export const API = "https://www.googleapis.com/drive/v3";
 export const SOURCE_TYPE = "drive";
@@ -217,6 +222,75 @@ export async function* listFiles(getAccessToken, { pageSize = 1000, query, opts 
     for (const f of page.files || []) yield f;
     pageToken = page.nextPageToken;
   } while (pageToken);
+}
+
+/**
+ * Walk ONLY the named roots and their descendants.
+ *
+ * This is the deny-by-default half, and it is deny-by-default in the place that
+ * matters: Google is never asked for anything outside the allowlist, so the
+ * name, path, size and id of an excluded file are never fetched, never enter
+ * this process, and never reach a log. That is a stronger claim than
+ * `exclusionReason`, which can only refuse a file whose metadata has already
+ * been retrieved.
+ *
+ * It costs one listing request per folder instead of one per thousand files,
+ * which is the price of the guarantee. Descent is breadth-first with a visited
+ * set, because Drive lets a folder have several parents and a naive walk on
+ * that graph does not terminate.
+ *
+ * Folders are yielded as well as files. The caller builds its path index from
+ * the same stream, exactly as it does for the whole-Drive walk.
+ */
+export async function* listFilesUnderRoots(getAccessToken, rootIds, { pageSize = 1000, opts = {} } = {}) {
+  const roots = normalizeIncludeRootIds(rootIds);
+  if (!roots.length) {
+    throw new DriveError(
+      "a Drive root allowlist was requested with no usable root ids",
+      400,
+      "emptyRootAllowlist",
+    );
+  }
+  const seen = new Set(roots);
+  const queue = [...roots];
+  while (queue.length) {
+    const folderId = queue.shift();
+    let pageToken;
+    do {
+      const page = await api(getAccessToken, "/files", {
+        search: {
+          pageSize,
+          pageToken,
+          fields: FIELDS,
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+          corpora: "allDrives",
+          q: `'${folderId}' in parents and trashed = false`,
+          orderBy: "modifiedTime desc",
+        },
+        ...opts,
+      });
+      // Same rule as the whole-Drive walk: a page that admits it did not search
+      // everything cannot be used as proof that anything is absent.
+      if (page.incompleteSearch === true) {
+        throw new DriveError(
+          "Google Drive reported an incomplete all-drives search; no full-sweep deletion was attempted",
+          200,
+          "incompleteSearch",
+        );
+      }
+      for (const f of page.files || []) {
+        if (f?.mimeType === FOLDER_MIME) {
+          if (f.id && !seen.has(f.id)) {
+            seen.add(f.id);
+            queue.push(f.id);
+          }
+        }
+        yield f;
+      }
+      pageToken = page.nextPageToken;
+    } while (pageToken);
+  }
 }
 
 /** The token that makes the NEXT run incremental. Fetch before the first walk. */
