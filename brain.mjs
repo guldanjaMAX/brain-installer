@@ -6793,8 +6793,9 @@ function printStuckUpgradeDiagnosis(diagnosis) {
  * die()s, both already proven under test — so repair does not reimplement
  * that logic. It gives the stuck case its own named, precise entry point
  * instead of leaving an operator to reconstruct "run brain update again" out
- * of a wall of error text, which is exactly the gap that left Jay's install
- * paused for nine days with nothing telling him what to do about it.
+ * of a wall of error text, which is exactly the gap that left a field
+ * install paused for nine days with nothing telling the operator what to
+ * do about it.
  *
  * Rollback is the other safe path: restore D1 to the exact bookmark this
  * stuck run itself captured before it touched the schema. Previously the
