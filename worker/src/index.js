@@ -20,6 +20,7 @@
 
 import { jsonResponse, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
 import { handleBankFeed } from "./lib/bank-feed.js";
+import { handleBankExportImport, BANK_IMPORT_PATH } from "./lib/fin-upload.js";
 import {
   hasSensitiveTransportIdentity,
   scanEnvelope as scanEnvelopeSecrets,
@@ -1421,6 +1422,10 @@ const PAUSED_CORPUS_MUTATION_PATHS = new Set([
   "/api/admin/brain/forget",
   "/api/admin/brain/reindex",
   "/api/admin/brain/drain",
+  // The ledger is not the corpus, but a paused upgrade means a migration is in
+  // flight, and financial rows written against a half-migrated schema are the
+  // last thing anyone wants to unpick. It refuses with the same 503.
+  BANK_IMPORT_PATH,
 ]);
 
 function corpusWritesPaused(env, path, method) {
@@ -1435,7 +1440,7 @@ export default {
 
     if (path === "/health") {
       // ok reports whether this brain can do its job, not whether the Worker
-      // is running. A paused install returns 503 on seven write paths
+      // is running. A paused install returns 503 on eight write paths
       // including ingest, so it cannot accept a document. Reporting ok:true
       // through that turned one failed update into eight silent days in the
       // field: the owner dropped nothing in, and no monitor watching this
@@ -1520,6 +1525,14 @@ export default {
       }
       if (path.startsWith("/api/admin/auth/devices")) {
         return handleAdminDevices(env, request, path);
+      }
+      // A bank export the owner downloaded, landing as ledger rows rather than
+      // as prose. Operator-only and INSIDE the key gate, unlike the hosted
+      // feed's owner pages: this one writes figures on the owner's behalf from
+      // a file they handed over, so it is the operator's action and the admin
+      // key is the right authority for it.
+      if (path === BANK_IMPORT_PATH) {
+        return await handleBankExportImport(env, request);
       }
       if (path === "/api/admin/brain/ingest" && request.method === "POST") {
         return await handleIngest(env, request);

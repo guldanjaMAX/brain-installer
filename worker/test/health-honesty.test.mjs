@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import worker from "../src/index.js";
 
-/* A paused brain refuses ingest on seven write paths. Reporting ok:true through
-   that is what turned Jay's failed update into eight days of silence: he added
-   nothing, and nothing told him anything was wrong. These tests exist so that
+/* A paused brain refuses ingest on eight write paths. Reporting ok:true through
+   that is what turned one client's failed update into eight days of silence: they
+   added nothing, and nothing told them anything was wrong. These tests exist so that
    cannot come back. */
 
 const base = { BRAIN_NAME: "fixture-client", BRAIN_VERSION: "0.1.18" };

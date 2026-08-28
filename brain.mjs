@@ -3889,6 +3889,9 @@ export const VALUE_FLAGS = new Set([
   "path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark", "export", "backup",
   "golden", "profile", "k", "repeat", "baseline", "save", "artifacts",
   "corpus-contract", "approve-removals", "only", "skip",
+  // brain import bank. `--file` with no value must die saying so rather than
+  // being read as a boolean and then reported as "needs --file".
+  "file", "format", "account", "account-kind", "institution", "currency", "entity", "entity-label",
 ]);
 
 /** Read an exact Drive-id exclusion list from either its portable shape or a migration receipt. */
@@ -11956,6 +11959,232 @@ async function dispatchDoctor(manifestPath) {
   return cmdDoctor(manifestPath);
 }
 
+/* ------------------------------------------------- brain import bank ----- */
+
+/**
+ * `brain import bank <manifest> --file <export>` — the operator's way in.
+ *
+ * WHY A COMMAND OF ITS OWN, AND NOT A FILE EXTENSION
+ *
+ * `.ofx` and `.qfx` are registered as document formats, which means a bank
+ * export dropped into a watched folder is read for its PROSE. That is the right
+ * behaviour for a corpus and it is not an import: the figures went nowhere, and
+ * until this command existed there was no route by which they could.
+ *
+ * `.csv` is deliberately NOT registered as a bank export and must not be. Most
+ * CSVs are not bank exports, and a registry that guessed would start pulling
+ * price lists and mailing lists into a financial ledger. So the operator SAYS
+ * so, by naming this command, and the ordinary spreadsheet path is untouched
+ * for every other .csv in the folder.
+ *
+ * WHY IT PARSES HERE AND WRITES THERE
+ *
+ * The reading — including every refusal — happens on the machine holding the
+ * file, so the person who can act on "your CSV has no column that says which
+ * way money moved" is the person who sees it. What crosses the wire is figures
+ * with an explicit direction, which the brain's own route rechecks for internal
+ * consistency before handing them to `importBankExport`, the single ledger
+ * write boundary the hosted feed already uses. There is no second writer.
+ */
+export async function cmdImportBank(m, manifestPath, flags = {}, options = {}) {
+  const filePath = flags.file;
+  const usage =
+    "usage: brain import bank <manifest> --file <statement.ofx|.qfx|.csv>\n" +
+    "  Optional: --dry-run to see what WOULD land and send nothing,\n" +
+    "            --format ofx|qfx|csv when the file's extension does not say,\n" +
+    "            --entity <slug> to file it under a business other than \"primary\",\n" +
+    "            --account <slug> --institution <name> --account-kind <checking|savings|card|...>\n" +
+    "            --currency <ISO code> for a CSV, which carries none of that itself";
+  if (!filePath || filePath === true) die(`brain import bank needs --file <path>.\n      ${usage}`);
+  if (!existsSync(filePath)) die(`no such file: ${filePath}`);
+
+  const extension = String(filePath).slice(String(filePath).lastIndexOf(".")).toLowerCase();
+  const declared = flags.format === true ? null : (flags.format ? String(flags.format).toLowerCase() : null);
+  if (declared && !["ofx", "qfx", "csv"].includes(declared)) {
+    die(`--format takes ofx, qfx or csv, not "${String(flags.format).slice(0, 24)}"`);
+  }
+  const format = declared || ({ ".ofx": "ofx", ".qfx": "qfx", ".csv": "csv", ".tsv": "csv" })[extension] || null;
+  if (!format) {
+    die(
+      `"${basename(filePath)}" does not end in .ofx, .qfx or .csv, so what it is cannot be read from its name.\n` +
+      "      Say what it is with --format ofx|qfx|csv, or re-export it with the right extension."
+    );
+  }
+
+  // A CSV says nothing about which account it belongs to, so the owner does. An
+  // account kind nobody stated stays `other`, which the ledger records as
+  // holding neither an asset nor a liability — an account is never counted as
+  // cash on the strength of a default.
+  const accountKind = flags["account-kind"] === true ? null : (flags["account-kind"] || null);
+  if (accountKind && !LEDGER_ACCOUNT_KINDS.has(accountKind)) {
+    die(`--account-kind takes one of: ${[...LEDGER_ACCOUNT_KINDS].join(", ")}`);
+  }
+  const accountSlug = flags.account === true ? null : (flags.account || null);
+  if (accountSlug && !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(accountSlug)) {
+    die("--account takes a short lowercase name: letters, digits, - and _, up to 64 characters");
+  }
+  const currency = flags.currency === true ? null : (flags.currency ? String(flags.currency).toUpperCase() : null);
+  if (currency && !/^[A-Z]{3}$/.test(currency)) die("--currency takes a three-letter code such as USD");
+  if (format !== "csv" && (accountSlug || accountKind || flags.institution)) {
+    warn("an OFX or QFX file names its own account, so --account, --institution and --account-kind are ignored for it");
+  }
+
+  const { readBankExport, formatMinor } = await import("./ingest/bank-export.mjs");
+  const envelope = readBankExport(readFileSync(filePath), {
+    name: basename(filePath),
+    format,
+    currency: currency || "USD",
+    accountHint: format === "csv" && (accountSlug || accountKind || flags.institution)
+      ? {
+        accountKey: accountSlug,
+        institution: flags.institution === true ? null : (flags.institution || null),
+        accountKind: accountKind || "other",
+      }
+      : null,
+  });
+
+  // The refusal is the product here, not an error page. It names what could not
+  // be established and what to re-export, and nothing is sent.
+  if (!envelope.ok) {
+    die(
+      `this file was not imported, because ${envelope.refusal}\n\n` +
+      `      Nothing was sent and nothing in the ledger changed.`
+    );
+  }
+
+  const dry = !!flags["dry-run"];
+  info(`read ${basename(filePath)}: ${envelope.format.toUpperCase()} bank export`);
+  info(`sign convention: ${envelope.signConvention}`);
+  let totalReadable = 0;
+  let totalUnread = 0;
+  for (const account of envelope.accounts) {
+    const readable = account.transactions.filter((txn) => !txn.unparsedReason);
+    const unread = account.transactions.length - readable.length;
+    totalReadable += readable.length;
+    totalUnread += unread;
+    const sum = (direction) => readable
+      .filter((txn) => txn.direction === direction)
+      .reduce((total, txn) => total + txn.amountMinor, 0);
+    const inflows = readable.filter((txn) => txn.direction === "inflow").length;
+    const outflows = readable.length - inflows;
+    const named = [
+      account.accountKind,
+      account.mask ? `ending ${account.mask}` : null,
+      account.currency,
+    ].filter(Boolean).join(", ");
+    console.log(`      ${account.accountKey}  (${named})`);
+    if (account.periodStart && account.periodEnd) {
+      console.log(`        period ${account.periodStart} to ${account.periodEnd}`);
+    }
+    console.log(
+      `        ${readable.length} line(s) ${dry ? "would land" : "landed"}: ` +
+      `${inflows} in ${formatMinor(sum("inflow"), account.currency)}, ` +
+      `${outflows} out ${formatMinor(sum("outflow"), account.currency)}`,
+    );
+    // Said whether it is zero or not, because "0 unread" is information and a
+    // silent absence is not.
+    console.log(
+      unread
+        ? `        ${unread} line(s) could not be read and ${dry ? "would land" : "landed"} as unread, each with its reason`
+        : `        0 line(s) could not be read`,
+    );
+    if (account.ledgerBalanceMinor !== null && account.balanceAsOf) {
+      console.log(`        statement balance ${formatMinor(account.ledgerBalanceMinor, account.currency)} as of ${account.balanceAsOf}`);
+    }
+    // NEVER a bare "ok". A direction taken on trust and a direction checked
+    // against a balance must not read the same way.
+    if (account.directionBasis === "verified") {
+      console.log(`        direction: VERIFIED against this statement's own balances`);
+    } else if (account.directionBasis === "stated") {
+      console.log(`        direction: stated by the file itself, row by row`);
+    } else {
+      console.log(`        direction: taken ON TRUST from the ${envelope.format.toUpperCase()} specification, not verified`);
+      if (account.directionNote) console.log(`                   ${account.directionNote}`);
+    }
+  }
+
+  if (dry) {
+    console.log("");
+    ok("dry run, nothing was sent");
+    return {
+      dry_run: true,
+      format: envelope.format,
+      accounts: envelope.accounts.length,
+      would_import: totalReadable,
+      unread_lines: totalUnread,
+    };
+  }
+
+  const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
+  const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+  const adminKey = resolveKey(manifestPath);
+  if (!adminKey) {
+    die(
+      "no durable admin key was found. Re-run `brain setup <manifest>` to generate and persist one; " +
+        "do not paste the key into a shell command."
+    );
+  }
+  const base = await resolveBase(m, m.brain?.domain ? null : await (options.resolveAccount ?? resolveAccount)(m));
+  const { BANK_IMPORT_PATH } = await import("./worker/src/lib/fin-upload.js");
+  const res = await http(`${base}${BANK_IMPORT_PATH}`, {
+    method: "POST",
+    headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      envelope,
+      entity_slug: flags.entity === true ? undefined : flags.entity,
+      entity_label: flags["entity-label"] === true ? undefined : flags["entity-label"],
+    }),
+  }, { fetchImpl: options.fetchImpl ?? fetch, what: "the bank import" });
+
+  let receipt = null;
+  try {
+    receipt = await res.json();
+  } catch {
+    die(`the brain answered the import with something that was not JSON (HTTP ${res.status}). Nothing is known to have landed.`);
+  }
+  if (!res.ok || receipt?.imported !== true) {
+    die(
+      `the brain refused this import (HTTP ${res.status}): ${receipt?.reason || receipt?.error || "no reason given"}\n` +
+      "      Nothing in the ledger changed."
+    );
+  }
+
+  console.log("");
+  ok(`imported into the ledger under entity "${receipt.entity_slug}"`);
+  info(
+    `${receipt.accounts} account(s) · ${receipt.transactions} transaction(s) · ` +
+    `${receipt.unread_lines} unread line(s) · ${receipt.statements} statement(s) · ` +
+    `${receipt.balance_snapshots} balance snapshot(s)`
+  );
+  // The identity property, said out loud, because the alternative is an
+  // operator who is afraid to re-run a command that is safe to re-run.
+  info("importing this same file again updates those rows in place; it does not add a second copy");
+  info(`the searchable copy of this file is a separate job: brain ingest ${manifestPath} --path <folder>`);
+  return receipt;
+}
+
+/** The account kinds migration 0015 accepts. Kept beside the flag that sets one. */
+const LEDGER_ACCOUNT_KINDS = new Set([
+  "checking", "savings", "card", "loan", "line_of_credit", "investment",
+  "retirement", "merchant", "point_of_sale", "escrow", "other",
+]);
+
+async function cmdImport(target) {
+  const which = String(target || "").toLowerCase();
+  if (which !== "bank") {
+    die(
+      "brain import supports bank.\n" +
+      "  Usage: brain import bank <manifest> --file <statement.ofx|.qfx|.csv> [--dry-run]"
+    );
+  }
+  const manifestPath = process.argv[4];
+  if (!manifestPath || manifestPath.startsWith("--")) {
+    die("usage: brain import bank <manifest> --file <statement.ofx|.qfx|.csv> [--dry-run]");
+  }
+  const { m } = loadManifest(manifestPath);
+  return cmdImportBank(m, manifestPath, parseFlags(process.argv.slice(4)));
+}
+
 const commands = {
   setup: cmdSetupInteractive,
   ask: cmdAsk,
@@ -11970,6 +12199,7 @@ const commands = {
   "mcp-config": cmdMcpConfig,
   migrate: cmdMigrate,
   ingest: cmdIngest,
+  import: cmdImport,
   load: cmdLoad,
   connect: cmdConnect,
   disconnect: cmdDisconnect,
@@ -12025,6 +12255,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain ingest     <manifest> --from whatsapp  one drain of the WhatsApp capture outbox
     brain ingest     <manifest> --from iphone-backup  one-time message history from an unencrypted
                                            local iPhone backup; a snapshot, not live capture (any OS)
+    brain import bank <manifest> --file <statement.ofx|.qfx|.csv>  a bank export the owner
+                                           downloaded, into the structured ledger (--dry-run previews)
     brain mcp-config <manifest>            config to connect the client's AI tools
     brain schedule   <manifest> --install  install unattended Drive refresh on macOS
     brain schedule   <manifest> --install --folder  install unattended refresh of the watched
@@ -12064,6 +12296,14 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
   --skip <a,b> to rerun one source after fixing it, and --limit <n>, which marks
   everything it touches as an incomplete load. Zoom is always skipped: it pushes
   new transcripts to the brain's webhook, so there is nothing for a sweep to pull.
+
+  brain import bank reads the file on THIS machine and sends figures, never the
+  file and never a full account number. A .csv is only a bank export when you say
+  so with this command; every other .csv stays an ordinary document. It refuses a
+  file whose direction of money cannot be established, naming the column or the
+  balance that would have settled it, and it says per account whether the
+  direction was verified against a balance or taken on trust from the format.
+  Re-importing the same file updates the same rows rather than adding a copy.
 
   brain sources takes --add <name> [--kind <drive|gmail|calendar|upload>] to register one,
   and --source <name> --refresh <hourly|daily|weekly|monthly|never> to say how often it

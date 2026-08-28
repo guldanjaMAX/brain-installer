@@ -185,6 +185,7 @@ const expected = [
   "worker/src/lib/core.js",
   "worker/src/lib/fin-d1.js",
   "worker/src/lib/fin-import.js",
+  "worker/src/lib/fin-upload.js",
   "worker/src/lib/owner-auth.js",
   "worker/src/lib/sessions.js",
   "worker/src/lib/webauthn.js",
