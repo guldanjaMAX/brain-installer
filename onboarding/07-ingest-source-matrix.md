@@ -16,6 +16,7 @@ I would rather lose a sale to an honest table than win one and spend week three 
 | Direct upload and API push | **Built.** The fallback for anything with no connector |
 | A watched folder on your own machine | **Built, Mac-only for the schedule.** Name one folder in your manifest and it reloads itself on a schedule: new files load, edited files reload, deleted files are removed. This is what makes "drop it in a folder you already ingest" true for a folder that is not inside Google Drive. On Windows and Linux the same load runs, by hand |
 | Gmail | Built: `brain connect google --scopes gmail`, then `brain ingest --from gmail`. Incremental via historyId; bulk mail excluded by default. Not yet run against a real mailbox |
+| Any other mailbox, over IMAP (Yahoo, Fastmail, iCloud, a host) | Built: `brain connect imap`, then `brain ingest --from imap`. Read-only, so nothing is marked read. Inbox and Sent by default; Junk, Trash and Drafts skipped; **an Archive folder is NOT read**, and a folder whose role cannot be identified is not read either. Every folder is named in the run with the true reason it was or was not read. Incremental via UIDVALIDITY plus a per-folder UID watermark. Bulk mail is filtered locally on headers, which is weaker than Gmail's. **Never yet run against a real mailbox** |
 | Google Calendar | Built and wired: `brain connect google --scopes calendar`, then `brain ingest --from calendar`. Incremental via Google's own sync token; cancelled events are removed, not left behind. Not yet run against a real calendar |
 | Meetings (Google Meet) | **Built, with no extra work.** Meet's own Gemini notes land as a transcript document in Drive, which is already read |
 | WhatsApp | **Built two ways.** The safe one: your phone's own "Export chat" .txt, dropped in a folder that is ingested (a Drive folder, or the watched folder above), no daemon and no account risk. The other: `brain connect whatsapp --accept-risk`, live capture through a paired linked device, Mac-only, off unless you turn it on, and carrying a real terms-of-service risk described below. **Never yet run against a real WhatsApp account** |
@@ -26,7 +27,7 @@ I would rather lose a sale to an honest table than win one and spend week three 
 | Zoom | **Built.** `brain connect zoom`: a webhook on your own worker loads each cloud-recording transcript automatically. **Needs a paid (Licensed) Zoom seat** — the free tier cannot cloud record at all. New recordings only, no backfill. Not yet run against a real Zoom account |
 | Slack | Not built. Priced separately when it is |
 | Notion | Not built |
-| Microsoft 365, Outlook, SharePoint, OneDrive | Not built |
+| Microsoft 365, Outlook, SharePoint, OneDrive | Not built. Microsoft has disabled basic IMAP authentication for these accounts, so the IMAP connector above does **not** reach them either |
 | Dropbox | Not built |
 | QuickBooks | Not built |
 | HubSpot and other CRMs | Not built |
@@ -79,6 +80,33 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 Built as a connector. Connect your Google account with the Gmail scope, then run the normal Gmail ingest command. Later runs are incremental through Gmail's history cursor, and bulk mail is excluded by default.
 
 **The honest production boundary:** the connector has passed the product test suite but has not yet completed a real-mailbox production run. The packaged unattended scheduler currently covers Drive and iMessage, not Gmail, so Gmail refresh is manual until it is extended. Treat Gmail as built but not yet production-proven.
+
+#### If you are not on Gmail
+
+Most mailboxes are not Gmail, and email is a financial record for about half the people reading this, so there is a second door. `brain connect imap` reads any mailbox that speaks IMAP: Yahoo, Fastmail, iCloud, a mailbox your web host gave you.
+
+```
+node brain.mjs connect imap <manifest> --host imap.mail.yahoo.com --user you@yahoo.com
+node brain.mjs ingest  <manifest> --from imap
+```
+
+Most providers, Yahoo included, need an **app password** rather than your normal password, and generating one usually requires two-step verification to be switched on first. You type it once, hidden, and it is stored in your own Mac Keychain or Windows credential store under an item named for IMAP. It is never accepted as a command flag and never put in an environment variable.
+
+What it reads, and what it deliberately does not:
+
+- **Inbox and Sent**, because half of what you promised anybody is in Sent.
+- **Junk, Trash, Drafts and an "All Mail" folder are skipped.** On Yahoo the spam folder is called "Bulk Mail", which is handled.
+- **An Archive folder is not read either.** It is identified, and it is named in the run as identified-but-not-read, because only inbox and sent are read by default. If you archive aggressively, most of your mail is in there and this is the limit that will matter most to you. Including it needs a rule that does not exist yet.
+- **A folder whose purpose it cannot identify is reported and left unread**, rather than guessed at. Folder naming is localized and differs per provider, and reading your spam folder because it was named in Spanish is a worse outcome than telling you a folder was skipped.
+- **Nothing is marked as read.** It opens every folder read-only at the protocol level, so it cannot change what your unread count says.
+
+Three limits worth knowing before you rely on it:
+
+1. **Bulk mail filtering is weaker here than on Gmail, and the mechanism is different.** Gmail excludes newsletters with a server-side query against Google's own classifier. IMAP has no such thing, so this reads the mail and then filters on message headers, requiring two independent signals before it drops anything. It will keep some newsletters Gmail would have dropped. Everything it did drop is listed at the end of the run with the reason.
+2. **Deletions are not propagated.** Mail you delete in your mailbox stays in your brain until a full re-read. Gmail's connector has the same gap. Google Drive does not, and the difference is real.
+3. **Very short messages are dropped**, the same floor every document clears. A one-line "approved, go ahead" is usually below it, which matters more for correspondence than for documents.
+
+**The honest production boundary:** this connector has passed the product test suite, driven end to end against a scripted IMAP server. **It has never been run against a real mailbox**, on Yahoo or anywhere else, so provider-specific behavior is documented from the specification rather than observed. The packaged unattended scheduler does not cover it, so refresh is manual, exactly as with Gmail.
 
 Shared mailboxes and group threads contain messages from people who never agreed to be indexed. Your material stays in your own accounts throughout, which handles most of the exposure, but a business indexing a shared inbox should have a written note about it. Cheap to write now, expensive to retrofit after an employee asks.
 

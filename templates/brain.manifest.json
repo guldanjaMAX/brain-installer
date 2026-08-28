@@ -89,6 +89,31 @@
       "enabled": false,
       "oauth_secret": "secret://GCAL_OAUTH"
     },
+    "imap": {
+      "_comment": [
+        "Any mailbox that speaks IMAP: Yahoo, Fastmail, iCloud, a mailbox your",
+        "host gave you. `brain connect imap <manifest> --host <h> --user <you>`",
+        "asks for the password hidden and stores it in YOUR OWN Keychain or",
+        "Windows DPAPI store, under an item named for IMAP, not for Google. Most",
+        "providers need an APP PASSWORD rather than the account password.",
+        "",
+        "Read-only at the protocol level, so nothing is marked as read. Inbox",
+        "and Sent are read; Junk, Trash, Drafts, All Mail and Archive are not;",
+        "a folder whose purpose cannot be identified is left alone too. Every",
+        "folder is named in the run with the true reason it was or was not read.",
+        "Incremental through UIDVALIDITY plus a per-folder UID watermark; when",
+        "the server changes UIDVALIDITY you are told and the folder is re-read.",
+        "",
+        "Bulk mail is filtered LOCALLY on message headers, needing two",
+        "independent signals. That is weaker than Gmail's server-side category",
+        "classifier and is not the same thing. Deletions in the mailbox are NOT",
+        "propagated. `brain disconnect imap` forgets the password."
+      ],
+      "enabled": false,
+      "host": null,
+      "port": 993,
+      "username": null
+    },
     "imessage": {
       "_comment": [
         "Mac-only live message capture from Messages.app (chat.db); there is no",
