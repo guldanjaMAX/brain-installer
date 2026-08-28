@@ -41,6 +41,12 @@ function gapAdjustments(gaps, degraded) {
   if (degraded === "vector") {
     delta -= 15;
     basis.push("vector index not fully query-ready");
+  } else if (degraded) {
+    // Any other degradation is still half the search missing. Scoring only the
+    // one named mode let "no-embedding" and "fts" price in at full confidence,
+    // which is the same conflation retrieval-status.js exists to end.
+    delta -= 12;
+    basis.push(`retrieval degraded: ${String(degraded).slice(0, 40)}`);
   }
   if (types.has("filter_not_applied")) {
     delta -= 10;

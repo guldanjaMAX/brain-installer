@@ -13,7 +13,12 @@
  * SHAPE CONTRACT, honoured by both backends:
  *
  *   search()  -> { results: [{ chunk_uid, source, title, snippet, ts, score }],
- *                  degraded: string|null }
+ *                  degraded: string|null, degraded_reason: string|null }
+ *
+ * `degraded` is load-bearing in the same way `ts` is. It is the ONLY field that
+ * separates "the corpus holds nothing" from "part of the search never ran", and
+ * a zero-result response that drops it lets a consumer state an absence it
+ * cannot verify. See worker/src/lib/retrieval-status.js.
  *   ingest()  -> { doc_uid, action: created|unchanged|updated, chunks, queued }
  *   stats()   -> { rows: [{ source_type, total, embedded, last_ingested }] }
  *
@@ -392,6 +397,7 @@ const d1Backend = {
         };
       }),
       degraded: r.degraded,
+      degraded_reason: r.degraded_reason ?? null,
       ignored_filters: r.ignored_filters,
       counts: r.counts,
     };
@@ -764,7 +770,7 @@ const supabaseBackend = {
           client: r.client_name || null, category: r.category || null,
           top_folder: r.top_folder || null, platform: r.platform || null,
         })),
-        degraded: "fts", ignored_filters: [],
+        degraded: "fts", degraded_reason: "keyword-search-unavailable", ignored_filters: [],
       };
     }
     const matches = await supabaseRpc(env, "notes_unified_hybrid_search", {
@@ -784,7 +790,7 @@ const supabaseBackend = {
         client: r.client || null, category: r.category || null,
         top_folder: r.top_folder || null, platform: r.platform || null,
       })),
-      degraded: null, ignored_filters: [],
+      degraded: null, degraded_reason: null, ignored_filters: [],
     };
   },
 

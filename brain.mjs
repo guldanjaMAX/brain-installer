@@ -107,6 +107,7 @@ import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
 import { deriveSessionSigningKey } from "./operations/session-signing-key.mjs";
 import { guardBrainAdminFetch } from "./components/brain-http.mjs";
 import { confidenceLine } from "./worker/src/lib/confidence.js";
+import { retrievalUnavailable, unavailableNotice } from "./worker/src/lib/retrieval-status.js";
 import {
   adminKeyPersistencePlan,
   parseAdminKeySecretReference,
@@ -1928,14 +1929,24 @@ export async function cmdAsk(manifestPath, options = {}) {
     die(`the Brain could not answer (HTTP ${response.status}). Run \`brain support --preview\` for the safe issue note.`);
   }
 
+  // An empty result from a search that could not run is not an absence, and
+  // the canonical refusal sentence would state one. The owner reads this line
+  // and nothing else, so the distinction has to survive to here.
+  const unavailable = retrievalUnavailable(body);
   const answer = typeof body.answer === "string" && body.answer.trim()
     ? body.answer.trim()
-    : "The documents do not answer the question.";
+    : unavailable
+      ? (typeof body.notice === "string" && body.notice.trim()
+        ? body.notice.trim()
+        : unavailableNotice(body.degraded))
+      : "The documents do not answer the question.";
   console.log(`\n${answer}\n`);
   // Trust metadata is a separate line by design: the answer string is a
   // verbatim contract (the refusal scorer reads every clause of it), so the
-  // rubric score rides beside it rather than inside it.
-  const trust = confidenceLine(body.confidence, {
+  // rubric score rides beside it rather than inside it. There is no rubric for
+  // an unavailable search: "how sure are we that nothing is recorded" has no
+  // answer when nothing was read.
+  const trust = unavailable ? null : confidenceLine(body.confidence, {
     refused: /^The documents do not answer/i.test(answer),
   });
   if (trust) console.log(`  ${c.dim(trust)}\n`);

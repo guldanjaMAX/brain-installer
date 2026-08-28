@@ -481,14 +481,26 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
   // Both empty is a real answer (nothing matched). Only ONE empty when both
   // were attempted means a subsystem is down, and a caller that cannot tell
   // those apart will report a degraded brain as an empty one.
-  const degraded =
-    embedding && projection?.ready !== true
-      ? "vector"
-      : embedding && vec.length === 0 && kw.length > 0
-      ? "vector"
-      : !embedding
-        ? "no-embedding"
-        : null;
+  //
+  // The first branch fires on every freshly installed brain while its index is
+  // still projecting, which is exactly when the owner asks their first
+  // questions, so this is the ordinary state of a new install rather than a
+  // rare fault. `degraded_reason` names WHICH of the two it was, because "still
+  // building, ask again shortly" and "the vector query failed" call for
+  // different sentences downstream. `degraded` keeps its existing values: it is
+  // a wire field older clients already read.
+  let degraded = null;
+  let degradedReason = null;
+  if (embedding && projection?.ready !== true) {
+    degraded = "vector";
+    degradedReason = "projection-incomplete";
+  } else if (embedding && vec.length === 0 && kw.length > 0) {
+    degraded = "vector";
+    degradedReason = "vector-query-failed";
+  } else if (!embedding) {
+    degraded = "no-embedding";
+    degradedReason = "embedding-unavailable";
+  }
 
   // Collapse BEFORE assigning rank positions. Otherwise ten chunks from one
   // file consume ten ranks, and keyword evidence in one chunk cannot combine
@@ -605,6 +617,7 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
   return {
     results: documents.slice(0, limit),
     degraded,
+    degraded_reason: degradedReason,
     ignored_filters: unsupportedFilters(filters),
     counts: { keyword: kw.length, vector: vec.length },
   };

@@ -35,6 +35,9 @@ import {
   createBrainCredentialResolver,
   fetchWithBrainCredential,
 } from "./brain-mcp-runtime.mjs";
+import {
+  retrievalUnavailable, unavailableGap, unavailableNotice,
+} from "../worker/src/lib/retrieval-status.js";
 
 const SERVER_VERSION = "0.1.0";
 const DEFAULT_PROTOCOL = "2025-06-18";
@@ -230,7 +233,7 @@ const TOOLS = [
   {
     name: "brain_think",
     description:
-      "START HERE for any question about this organisation's people, clients, decisions, commitments, projects or history. Searches every connected source and returns a CITED answer plus an explicit list of what the brain is missing. The gaps array is the point: relay it whenever it affects confidence.",
+      "START HERE for any question about this organisation's people, clients, decisions, commitments, projects or history. Searches every connected source and returns a CITED answer plus an explicit list of what the brain is missing. The gaps array is the point: relay it whenever it affects confidence. If search_status is \"search_unavailable\", the search did not run and an empty result proves nothing about the corpus: never report it as the brain having nothing.",
     inputSchema: {
       type: "object",
       properties: {
@@ -244,7 +247,7 @@ const TOOLS = [
   {
     name: "brain_search",
     description:
-      "Raw ranked excerpts instead of a written answer. Use when you want to skim source material yourself, need more hits than an answer would cite, or brain_think returned nothing.",
+      "Raw ranked excerpts instead of a written answer. Use when you want to skim source material yourself, need more hits than an answer would cite, or brain_think returned nothing. A zero count with search_status \"search_unavailable\" means the search did not run, not that the corpus is empty.",
     inputSchema: {
       type: "object",
       properties: {
@@ -289,9 +292,16 @@ async function runTool(name, args = {}) {
         method: "POST",
         body: { q: args.q, limit: args.limit ?? 8, source: args.source },
       });
+      // A degraded search is the ONLY thing separating "the brain holds
+      // nothing" from "the brain was not fully read", so it rides out on every
+      // response that has it, answered or not. Without it this tool hands the
+      // model an empty result and no way to tell the two apart.
+      const unavailable = retrievalUnavailable(d);
       const out = {
         answer: d.answer ?? null,
         answer_error: d.answer_error ?? undefined,
+        degraded: d.degraded ?? undefined,
+        search_status: unavailable ? "search_unavailable" : undefined,
         gaps: d.gaps ?? [],
         citations: d.citations ?? [],
       };
@@ -302,7 +312,19 @@ async function runTool(name, args = {}) {
           snippet: String(r.snippet ?? "").slice(0, 700),
         }));
       }
-      if (!out.citations.length && !out.results?.length) {
+      if (unavailable) {
+        // Deliberately rewritten rather than appended. A brain deployed before
+        // the worker learned this distinction still sends the old no_results
+        // gap, whose text instructs the model to state an absence — the exact
+        // false negative this guards against. Replacing it means an older
+        // worker plus a current MCP is safe.
+        out.gaps = [
+          unavailableGap(d.degraded),
+          ...out.gaps.filter((gap) => gap?.type !== "no_results"),
+        ];
+        out.note = unavailableNotice(d.degraded) +
+          " Do NOT report this as the brain having nothing on the question. Report that the search could not be completed, name the cause, and offer to retry.";
+      } else if (!out.citations.length && !out.results?.length) {
         out.note =
           "The brain has nothing on this. Report that as the finding, in those terms. Do not substitute inference.";
       }
@@ -319,8 +341,14 @@ async function runTool(name, args = {}) {
         },
       });
       const rows = d.results ?? [];
+      // Same hazard on the raw-excerpt tool: zero rows out of a half-run search
+      // is not evidence of an empty corpus, and this note is what the model
+      // acts on.
+      const unavailable = retrievalUnavailable({ ...d, results: rows });
       return {
         count: rows.length,
+        degraded: d.degraded ?? undefined,
+        search_status: unavailable ? "search_unavailable" : undefined,
         results: rows.map((r) => ({
           source: r.source,
           title: r.title,
@@ -328,9 +356,14 @@ async function runTool(name, args = {}) {
           ts: r.ts,
           snippet: String(r.snippet ?? "").slice(0, 900),
         })),
-        ...(rows.length
-          ? {}
-          : { note: 'No hits. Report "nothing recorded on this" rather than inferring.' }),
+        ...(unavailable
+          ? {
+            note: unavailableNotice(d.degraded) +
+              ' Do NOT report "nothing recorded on this". Report that the search could not be completed.',
+          }
+          : rows.length
+            ? {}
+            : { note: 'No hits. Report "nothing recorded on this" rather than inferring.' }),
       };
     }
 case "brain_remember": {
@@ -388,6 +421,8 @@ const INSTRUCTIONS = `This server is ${OWNER}'s private knowledge record: their 
 Do NOT state a fact about a named person, client, deal, contract, commitment or figure in their world from your own knowledge. Your training data does not contain any of it, and a plausible reconstruction is indistinguishable from a real answer to the person reading it. Call brain_think first.
 
 When the brain returns nothing, "nothing recorded on this" IS the answer. Say it in those words. Do not fill the gap with inference and do not silently drop the point.
+
+EXCEPT when the response carries search_status "search_unavailable" or a degraded field. Then the search did not complete, nothing is known about the corpus, and "nothing recorded on this" would be a false statement about the owner's own records. Say the search could not be completed, name the cause from the note, and offer to retry. This is common in the first hours of a new brain while its index is still building.
 
 Relay the gaps array from brain_think whenever it affects confidence. A cited answer with its gaps stated is worth more than a confident one without them.
 

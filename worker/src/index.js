@@ -29,6 +29,7 @@ import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, 
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
+import { emptyRetrievalDisclosure } from "./lib/retrieval-status.js";
 import {
   handleOwnerAuth, handleAdminInvite, handleAdminDevices, validateOwnerSession,
 } from "./lib/owner-auth.js";
@@ -399,8 +400,18 @@ async function handleUnified(env, request) {
 
   const { matches: retrieved, degraded, ignoredFilters } = await unifiedRetrieve(env, url, { limit });
   const ignored = ignoredFilters.length ? { ignored_filters: ignoredFilters } : {};
+  // Zero rows out of a search that could not run is not "no hits". /unified is
+  // the raw-excerpt route, so it has no gaps array to carry the warning; it
+  // carries the same status and sentence as /think instead, and a client that
+  // skims `count === 0` still has the truth in front of it.
+  const disclosure = emptyRetrievalDisclosure(degraded);
+  const unavailable = (rows) => (rows.length === 0 && disclosure.unavailable
+    ? { status: disclosure.status, notice: disclosure.notice }
+    : {});
+
   if (degraded === "fts") {
-    return jsonResponse({ mode: "unified", degraded, ...ignored, results: retrieved.slice(0, limit) });
+    const rows = retrieved.slice(0, limit);
+    return jsonResponse({ mode: "unified", degraded, ...unavailable(rows), ...ignored, results: rows });
   }
 
   let matches = retrieved;
@@ -412,7 +423,8 @@ async function handleUnified(env, request) {
 
   return jsonResponse({
     mode: "unified", reranked: doRerank,
-    degraded: degraded || undefined, ...ignored, results: matches,
+    degraded: degraded || undefined, ...unavailable(Array.isArray(matches) ? matches : []),
+    ...ignored, results: matches,
   });
 }
 
@@ -428,20 +440,31 @@ async function handleThink(env, request) {
   const results = Array.isArray(matches) ? matches : [];
 
   if (results.length === 0) {
-    const emptyGaps = [
-      {
-        type: "no_results",
-        detail: "The brain has nothing on this query. Say so plainly rather than inferring.",
-      },
-    ];
+    // Zero results has two causes that look identical from here, and only one
+    // of them licenses an absence claim. A healthy search that matched nothing
+    // keeps the honest refusal below, unchanged. A search that could not run
+    // knows nothing about the corpus, so its gap must forbid the absence claim
+    // rather than issue it. See worker/src/lib/retrieval-status.js.
+    const disclosure = emptyRetrievalDisclosure(degraded);
     return jsonResponse({
       mode: "think",
       degraded: degraded || undefined,
+      status: disclosure.unavailable ? disclosure.status : undefined,
+      // The sentence a human sees in place of an answer. Present only when the
+      // search failed, so /app and the CLI cannot render the refusal wording by
+      // reaching for a field that is always there.
+      notice: disclosure.unavailable ? disclosure.notice : undefined,
       answer: null,
       citations: [],
       results: [],
-      gaps: emptyGaps,
-      confidence: refusalConfidence({ gaps: emptyGaps, degraded, resultCount: 0 }),
+      gaps: disclosure.gaps,
+      // A refusal confidence answers "how sure are we that nothing is
+      // recorded". When the search did not complete that question has no
+      // answer, and putting a percentage on it would dress the failure up as a
+      // finding. The notice and the gap carry the truth instead.
+      confidence: disclosure.unavailable
+        ? undefined
+        : refusalConfidence({ gaps: disclosure.gaps, degraded, resultCount: 0 }),
     });
   }
 

@@ -11,8 +11,14 @@
  * to the SameSite=Strict session cookie.
  */
 
+import { SEARCH_UNAVAILABLE, unavailableNotice } from "./retrieval-status.js";
+
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// Fallback only. The worker sends `notice` with the response; this covers a
+// cached page talking to a worker that did not.
+const GENERIC_UNAVAILABLE_NOTICE = unavailableNotice("unknown");
 
 export function appPageHtml(env) {
   const brainName = esc(env.BRAIN_NAME || "Your brain");
@@ -207,6 +213,34 @@ export function appPageHtml(env) {
     }
   };
 
+  /* render-contract:start
+     Pure, DOM-free, and fenced by these sentinels so the offline test can lift
+     these three functions out of the served page and exercise the REAL shipped
+     source. A test that greps this file for a pattern would pass whether or not
+     the branch is live; these are the behaviour. */
+  function unavailableSearch(r) {
+    // An incomplete search must never render as "the documents do not answer
+    // the question". On this page that sentence is all the owner sees, and
+    // during the first hours of a new brain the index is still building, so
+    // this is the likeliest empty result they will ever get.
+    return r.status === ${JSON.stringify(SEARCH_UNAVAILABLE)} ||
+      (!!r.degraded && !r.answer && !(r.citations || []).length && !(r.results || []).length);
+  }
+  function answerText(r) {
+    if (unavailableSearch(r)) return r.notice || ${JSON.stringify(GENERIC_UNAVAILABLE_NOTICE)};
+    return r.answer || (r.answer_error ? "No answer: " + r.answer_error : "The documents do not answer the question.");
+  }
+  function confidenceText(r) {
+    // No rubric for a search that never ran: "how sure are we nothing is
+    // recorded" has no answer when nothing was read.
+    if (unavailableSearch(r)) return "Search incomplete. This is not a statement about what your brain holds.";
+    const conf = r.confidence;
+    if (!conf) return "";
+    return (r.answer && !/^The documents do not answer/.test(r.answer || "") ? "Confidence" : "Confidence nothing is recorded") +
+      ": " + conf.percent + "% (" + conf.band + ") — " + conf.basis.join("; ") + ".";
+  }
+  /* render-contract:end */
+
   $("ask").onclick = async () => {
     const q = $("q").value.trim();
     if (!q) return;
@@ -215,12 +249,8 @@ export function appPageHtml(env) {
     $("out").hidden = true;
     try {
       const r = await api("/api/rag/think", { q, limit: 12 });
-      $("answer").textContent = r.answer || (r.answer_error ? "No answer: " + r.answer_error : "The documents do not answer the question.");
-      const conf = r.confidence;
-      $("confidence").textContent = conf
-        ? (r.answer && !/^The documents do not answer/.test(r.answer || "") ? "Confidence" : "Confidence nothing is recorded") +
-          ": " + conf.percent + "% (" + conf.band + ") — " + conf.basis.join("; ") + "."
-        : "";
+      $("answer").textContent = answerText(r);
+      $("confidence").textContent = confidenceText(r);
       const sources = $("sources");
       sources.textContent = "";
       for (const c of r.citations || []) {

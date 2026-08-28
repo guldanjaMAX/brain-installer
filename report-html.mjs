@@ -462,7 +462,11 @@ function buildGaps({ seeds, corpus, manifest }) {
       const detail = String(g?.detail || "").trim();
       if (!detail || seen.has(detail)) continue;
       seen.add(detail);
-      items.push({ tone: "warn", title: gapTitle(g?.type), detail });
+      // A search that could not run outranks every housekeeping note in this
+      // list. It is the one gap that means an answer on this page may be
+      // absent rather than merely thin.
+      const tone = g?.type === "search_unavailable" ? "fail" : "warn";
+      items.push({ tone, title: gapTitle(g?.type), detail });
     }
   }
 
@@ -517,6 +521,9 @@ const GAP_TITLES = {
   thin_coverage: "Very few matching sources",
   single_corpus: "Everything came from one place",
   no_results: "Nothing matched",
+  // Not the same thing as "nothing matched", and the report must not let a
+  // reader collapse the two.
+  search_unavailable: "The search could not be completed",
 };
 const gapTitle = (type) => GAP_TITLES[type] || "Worth knowing";
 

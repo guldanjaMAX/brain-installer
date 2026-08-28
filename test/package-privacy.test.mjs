@@ -179,6 +179,7 @@ const expected = [
   "worker/src/lib/sessions.js",
   "worker/src/lib/webauthn.js",
   "worker/src/lib/query-intent.js",
+  "worker/src/lib/retrieval-status.js",
   "worker/src/lib/secret-scan.js",
   "worker/src/lib/store-d1.js",
   "worker/src/lib/store.js",
