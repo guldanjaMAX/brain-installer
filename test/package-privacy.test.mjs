@@ -79,6 +79,7 @@ const expected = [
   "components/brain-mcp-runtime.mjs",
   "components/brain-http.mjs",
   "connectors/gmail.mjs",
+  "connectors/imap.mjs",
   "connectors/imessage.mjs",
   "connectors/iphone-backup.mjs",
   "connectors/google-auth.mjs",

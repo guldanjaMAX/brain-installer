@@ -270,7 +270,7 @@ and restart it after a rotation.
 
 ---
 
-## Remote sources: Google Drive and Gmail
+## Remote sources: Google Drive, Gmail and IMAP
 
 ```bash
 node brain.mjs connect google --scopes drive,gmail
@@ -278,6 +278,52 @@ node brain.mjs ingest ./acme.manifest.json --from drive --dry-run
 node brain.mjs ingest ./acme.manifest.json --from drive
 node brain.mjs ingest ./acme.manifest.json --from gmail
 ```
+
+For a mailbox that is not Gmail:
+
+```bash
+node brain.mjs connect imap ./acme.manifest.json --host imap.mail.yahoo.com --user owner@example.test
+node brain.mjs ingest  ./acme.manifest.json --from imap --dry-run
+node brain.mjs ingest  ./acme.manifest.json --from imap
+node brain.mjs disconnect imap ./acme.manifest.json
+```
+
+`connectors/imap.mjs` speaks the read-only subset of RFC 3501 directly on
+`node:tls` and adds no dependency; the doctrine and its reason are in
+`ingest/extract.mjs`. It uses `EXAMINE`, never `SELECT`, so it cannot set
+`\Seen`. Raw `BODY.PEEK[]` octets go through the same postal-mime `.eml` reader
+the Gmail connector and the mbox splitter use, so one message renders
+identically whichever door it came through.
+
+Incremental sync is `UIDVALIDITY` plus a per-folder highest-accepted UID, and
+the two traps are handled explicitly: `UID SEARCH n:*` always returns the
+highest existing UID (RFC 3501 6.4.8) so the result is floored client-side, and
+a `UIDVALIDITY` change re-searches the folder with `ALL` rather than resuming
+from a number that no longer means anything. The document id is the message's
+own `Message-ID` (or a content hash when absent), not `<folder>:<uid>`, so a
+`UIDVALIDITY` roll resolves to `unchanged` per message instead of silently
+duplicating the mailbox. Per-folder positions are merged, never assigned, and a
+new `UIDVALIDITY` is only ever written together with the watermark it covers.
+
+The mailbox app password is entered hidden and stored through the SAME storage
+code as the Google record, under its own item: service `brain-installer.imap`,
+account `imap-<source name>`, file fallback `~/.brain/imap-credentials.json`,
+backend selected by `BRAIN_IMAP_CREDENTIAL_STORE`. It is never a flag and never
+an environment variable. Entry goes through `readHiddenInput` in `brain.mjs`,
+the single raw-mode reader that `readHiddenCloudflareToken` also uses; the
+prompt, the acceptable bytes and the finaliser are the only per-caller
+differences, and a space is legal in a mailbox password precisely because
+providers display app passwords in groups of four.
+
+Folders are sorted into five outcomes and each is reported with its own true
+reason: read, skipped by policy, identified but not read (an `Archive` folder is
+the real case), unidentified, and `\Noselect` containers that are not mail
+folders at all. Collapsing the middle three into one "could not be classified"
+message is a false statement about a folder that was in fact identified.
+
+**The connector has never been run against a real mailbox**;
+`test/imap-connector.test.mjs` drives it against a scripted IMAP server on a
+plain TCP socket, which does not exercise TLS.
 
 **The client registers their own Google OAuth client, and we never hold it.**
 Not only a custody preference: every Drive and Gmail read scope is *restricted*,
