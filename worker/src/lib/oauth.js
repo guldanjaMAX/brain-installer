@@ -191,10 +191,7 @@ export async function handleAuthorizePage(env, url) {
 <link rel="stylesheet" href="/app/assets/app.css">
 <body class="min-h-dvh flex items-center justify-center p-5">
 <main class="w-full max-w-md">
-  <div class="flex items-center gap-2.5 text-accent mb-6">
-    <svg viewBox="6 24 88 52" class="w-9 h-9" aria-hidden><path d="M50 50 C50 30 16 30 16 50 C16 70 50 70 50 50 C50 30 84 30 84 50 C84 70 50 70 50 50 Z" fill="none" stroke="currentColor" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    <span class="font-display text-[15px] tracking-tight text-ink-soft">${brain}</span>
-  </div>
+  <div class="mb-6 text-[15px] text-ink-soft">${brain}</div>
 
   <div class="bg-card border border-line rounded-2xl p-7 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
     <h1 class="text-[24px] leading-tight tracking-tight font-semibold">Connect ${name}?</h1>
@@ -202,20 +199,10 @@ export async function handleAuthorizePage(env, url) {
       ${name} is asking to reach ${brain}. Here is exactly what that allows.
     </p>
 
-    <ul class="mt-6 space-y-2.5">
-      <li class="flex gap-2.5 text-[15px]">
-        <span class="text-accent font-bold leading-6">✓</span>
-        <span class="leading-6">Ask questions and read the answers</span>
-      </li>
-      <li class="flex gap-2.5 text-[15px]">
-        <span class="text-ink-soft font-bold leading-6">✕</span>
-        <span class="leading-6 text-ink-soft">Add, change or delete anything — never</span>
-      </li>
-      <li class="flex gap-2.5 text-[15px]">
-        <span class="text-ink-soft font-bold leading-6">✕</span>
-        <span class="leading-6 text-ink-soft">Reach any setting or admin function — never</span>
-      </li>
-    </ul>
+    <p class="mt-4 text-ink-soft leading-relaxed">
+      This grant currently allows reading only: ${name} can ask questions and
+      read the answers. It cannot reach settings or administration.
+    </p>
 
     <button id="approve"
       class="mt-7 w-full rounded-xl bg-accent px-5 py-3.5 text-white font-semibold disabled:opacity-55 transition-opacity">

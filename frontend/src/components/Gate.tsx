@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { Mark } from "./Mark";
 import { enroll, signIn, passkeysSupported } from "../lib/passkey";
 
 /**
@@ -45,12 +44,7 @@ export function Gate({ owner, inviteCode, onIn }: {
   return (
     <div className="min-h-dvh flex items-center justify-center p-5">
       <div className="w-full max-w-md">
-        <div className="flex items-center gap-2.5 text-accent mb-6">
-          <Mark className="w-9 h-9" />
-          <span className="font-display text-[15px] tracking-tight text-ink-soft">
-            {possessive} brain
-          </span>
-        </div>
+        <div className="mb-6 text-[15px] text-ink-soft">{possessive} brain</div>
 
         <div className="bg-card border border-line rounded-2xl p-7 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
           <h1 className="text-[26px] leading-tight tracking-tight font-semibold">

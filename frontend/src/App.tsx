@@ -3,7 +3,6 @@ import { api, type Me } from "./lib/api";
 import { Gate } from "./components/Gate";
 import { Ask } from "./components/Ask";
 import { Settings } from "./components/Settings";
-import { Mark } from "./components/Mark";
 
 // The invite arrives as /app#enroll=<code>. It lives in the fragment on
 // purpose: a fragment is never sent to the server in a request line and never
@@ -47,11 +46,8 @@ export function App() {
   return (
     <div className="min-h-dvh">
       <header className="px-5 lg:px-8 py-4 border-b border-line bg-card/70 backdrop-blur sticky top-0 z-10">
-        <div className="max-w-2xl mx-auto flex items-center gap-2.5 text-accent">
-          <Mark className="w-7 h-7" />
-          <span className="font-display text-[14.5px] tracking-tight text-ink-soft">
-            {possessive} brain
-          </span>
+        <div className="max-w-2xl mx-auto text-[14.5px] text-ink-soft">
+          {possessive} brain
         </div>
       </header>
       <main className="max-w-2xl mx-auto px-5 lg:px-8 py-8 pb-24">

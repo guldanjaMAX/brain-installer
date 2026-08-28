@@ -36,12 +36,6 @@ export function brandOgSvg(env) {
   <rect width="1200" height="630" fill="#12141a"/>
   <circle cx="960" cy="140" r="300" fill="#3b5bdb" opacity="0.14"/>
   <circle cx="200" cy="560" r="240" fill="#3b5bdb" opacity="0.10"/>
-  <g transform="translate(96,150)">
-    <svg viewBox="6 24 88 52" width="132" height="78">
-      <path d="M50 50 C50 30 16 30 16 50 C16 70 50 70 50 50 C50 30 84 30 84 50 C84 70 50 70 50 50 Z"
-            fill="none" stroke="#7d94f5" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
-  </g>
   <text x="96" y="330" fill="#ffffff" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="76" font-weight="600" letter-spacing="-2">${possessive} brain</text>
   <text x="96" y="404" fill="#aab3c5" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="34">Everything you have written, decided and been told.</text>
   <text x="96" y="452" fill="#aab3c5" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="34">Ask it anything. It answers with its sources.</text>
@@ -51,9 +45,8 @@ export function brandOgSvg(env) {
 
 // Inline so the tab icon needs no second request and no route of its own.
 export const FAVICON = "data:image/svg+xml," + encodeURIComponent(
-  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="6 24 88 52">' +
-  '<path d="M50 50 C50 30 16 30 16 50 C16 70 50 70 50 50 C50 30 84 30 84 50 C84 70 50 70 50 50 Z" ' +
-  'fill="none" stroke="#3b5bdb" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/></svg>');
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">' +
+  '<circle cx="16" cy="16" r="11" fill="#3b5bdb"/></svg>');
 
 export function appPageHtml(env, origin = "") {
   const brainName = esc(env.BRAIN_NAME || "Your brain");
