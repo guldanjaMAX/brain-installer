@@ -40,6 +40,7 @@
 
 import { Acceptance } from "./acceptance.mjs";
 import { fetchBrainWithAdminKey } from "./components/brain-http.mjs";
+import { responseIncomplete } from "./worker/src/lib/failure.js";
 
 /* ------------------------------------------------------------- escaping */
 
@@ -595,6 +596,12 @@ function renderCoverage(corpus, manifest) {
   if (!rows.length) {
     return `<p class="empty">No corpus summary was available when this report ran, so what is indexed could not be listed.</p>`;
   }
+  // A partial read renders its rows AND says they are partial. Showing the
+  // table bare would let a half-read corpus pass for a fully counted one.
+  const partial = corpus?._partial
+    ? `<p class="empty">Part of this summary could not be read from your brain when this report ran. ` +
+      `The figures below are what it did report, and they may be incomplete.</p>`
+    : "";
 
   const total = rows.reduce((a, r) => a + Number(r.total || 0), 0);
   const embedded = rows.reduce((a, r) => a + Number(r.embedded || 0), 0);
@@ -635,6 +642,7 @@ function renderCoverage(corpus, manifest) {
     : "";
 
   return (
+    partial +
     `<p class="big-number">${h(num(total))} <span>${plural(total, "item", "items")} indexed</span></p>` +
     connected +
     `<div class="table-wrap"><table><thead><tr><th>Kind</th><th class="n">How many</th><th class="n">Searchable</th><th>Last update</th></tr></thead>` +
@@ -1031,7 +1039,16 @@ export async function collectReportData({
       {},
       () => adminKey,
     );
-    if (res.ok) corpus = await res.json();
+    // Keep the body even on a 503: the rows survive a subsystem failure and are
+    // worth showing. What must NOT survive is the impression that they are the
+    // whole picture, so the incompleteness is stamped onto the object the
+    // renderer reads. `responseIncomplete` also catches the version-skew case,
+    // where an older worker reports the same failure as a 200 with the error
+    // nested in the body and `res.ok` is true.
+    const parsed = await res.json().catch(() => null);
+    if (parsed && typeof parsed === "object") {
+      corpus = { ...parsed, _partial: !res.ok || responseIncomplete(parsed) };
+    }
   } catch {
     // A missing corpus summary is reported as a blank section, never as a
     // crash. The rest of the document is still worth handing over.

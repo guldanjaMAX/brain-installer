@@ -1810,10 +1810,28 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
     AI: { run: forbid },
     VECTORIZE: { upsert: forbid, deleteByIds: forbid },
   };
-  const health = await (await worker.fetch(new Request("https://b.example/health"), env, {})).json();
+  // The writer protocol and the exact version are operator detail, and /health
+  // withholds them from an unauthenticated caller: they name what this
+  // deployment runs, to anyone who finds the URL. Whoever is verifying a paused
+  // cutover is holding the admin key by definition, so this asks with it.
+  const health = await (await worker.fetch(new Request("https://b.example/health", {
+    headers: { "X-Admin-Key": "k" },
+  }), env, {})).json();
   check("paused compatibility health proves the leased writer protocol and mode",
     health.version === "fixture-version" && health.vector_writer_protocol === "lease-v1" &&
       health.vector_drain_mode === "paused-for-upgrade", JSON.stringify(health));
+
+  // The other half, and the one that must never be traded away for the privacy
+  // fix: the PAUSE itself stays visible with no credential at all. A monitor or
+  // a client-facing runbook curl has no key, and this barrier going silent for
+  // them is what cost one install eight days.
+  const anonymous = await (await worker.fetch(new Request("https://b.example/health"), env, {})).json();
+  check("the paused barrier is still visible without any credential",
+    anonymous.ok === false && anonymous.status === "paused-for-upgrade" &&
+      anonymous.accepting_documents === false, JSON.stringify(anonymous));
+  check("...while the same anonymous body names neither the install nor its version",
+    anonymous.brain === undefined && anonymous.version === undefined &&
+      anonymous.vector_drain_mode === undefined, JSON.stringify(anonymous));
 
   const manual = await post(env, "/api/admin/brain/drain", {});
   const manualBody = await manual.json();
