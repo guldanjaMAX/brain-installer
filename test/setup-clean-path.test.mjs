@@ -477,3 +477,21 @@ try {
 } finally {
   rmSync(sandbox, { recursive: true, force: true });
 }
+
+/* ---------------------------------------------------------------------------
+ * The success screen is the last thing a client reads, and it rendered the
+ * manifest path as `../../../../../../../private/tmp/...` whenever the manifest
+ * sat outside the working directory (bench, 2026-08-28). Seven levels of `..`
+ * in a command someone is told to retype reads as broken software.
+ */
+{
+  const { displayPathForTesting } = await import("../brain.mjs");
+  const { default: assertStrict } = await import("node:assert/strict");
+
+  const deep = displayPathForTesting("/private/tmp/a/b/c/x.json", "/Users/j/One/Two/Three/Four");
+  assertStrict.ok(!deep.includes("../.."),
+    `a far-outside manifest must not print a ladder of dot-dots, got: ${deep}`);
+  assertStrict.equal(displayPathForTesting("/tmp/work/sub/x.json", "/tmp/work"), "sub/x.json",
+    "a manifest below the working directory keeps the short relative form");
+  console.log("display path: absolute when far outside, relative when close");
+}
