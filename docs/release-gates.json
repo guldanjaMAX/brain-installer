@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "what_this_is": [
+    "The claim half of the release-honesty pair. docs/release-evidence/ is the proof half.",
+    "A release may record only the label its evidence supports. test/release-state.test.mjs",
+    "recomputes every label below from the files actually present in docs/release-evidence/",
+    "and fails when a recorded label is larger than its evidence. Raising a label therefore",
+    "requires adding an evidence file, never editing a sentence.",
+    "Labels: internal (no gate evidence), preview (some, a blocking gate still open),",
+    "production (every blocking gate has evidence for that exact version)."
+  ],
+  "gates": [
+    {
+      "id": "CI-MATRIX",
+      "title": "Six green CI jobs on the exact tagged commit",
+      "detail": "Windows, macOS and Linux on Node 22 and 24. Local success on one platform is not evidence for the other five.",
+      "blocking": true,
+      "evidence": "v<version>-ci-matrix.json"
+    },
+    {
+      "id": "ARTIFACT-DIGEST",
+      "title": "One immutable published asset whose digest matches the locally packed tarball",
+      "detail": "The published asset is downloaded independently and its SHA-256 compared with the tarball the gates were run against, so the install links cannot point at code nobody tested.",
+      "blocking": true,
+      "evidence": "v<version>-release-artifact.json"
+    },
+    {
+      "id": "FIELD-DISPOSABLE",
+      "title": "Disposable real-provider field gate",
+      "detail": "Ingest, embedding, retrieval, diagnosis and cleanup against real Cloudflare services in a throwaway account, on synthetic material only. Proves provider behaviour that mocks cannot.",
+      "blocking": true,
+      "evidence": "v<version>-cloudflare-field-gate.json"
+    },
+    {
+      "id": "RECOVERY-DRILL",
+      "title": "Recovery drill on the candidate code",
+      "detail": "Export, restore, index rebuild and paused-to-active promotion, driven to completion through forced interruptions. A brain that cannot be recovered is not a brain a client should hold their only copy in.",
+      "blocking": true,
+      "evidence": "v<version>-cloudflare-recovery-gate.json"
+    },
+    {
+      "id": "WINDOWS-INSTALL",
+      "title": "A clean Windows install of the published asset",
+      "detail": "The install command from the README, run on a Windows machine that has never held this product, through to the CLI printing its usage. Named separately from CI because the CI matrix runs the test suite, not the documented install path.",
+      "blocking": true,
+      "evidence": "v<version>-windows-install.json"
+    },
+    {
+      "id": "PRIVATE-EVAL",
+      "title": "The install's own private release evaluation",
+      "detail": "Retrieval and refusal behaviour measured against that install's promised corpus.",
+      "blocking": false,
+      "why_not_blocking": "It cannot be completed by whoever cuts the release. It is per-install and runs against private client material that must never leave the client's own account, so no maintainer-side artifact can ever satisfy it and treating it as blocking would make every release permanently ungated. It is listed here so it is not mistaken for something the release covers: a green release label says nothing about any particular install's answers.",
+      "evidence": "v<version>-private-eval.json"
+    }
+  ],
+  "releases": {
+    "0.1.12": {
+      "evidence_label": "preview",
+      "gates_met": [
+        "FIELD-DISPOSABLE"
+      ],
+      "published_as": "production",
+      "overclaim_note": "Published as an ordinary immutable GitHub release with one asset and no pre-release marker, which is what an operator reads as production. Only the disposable field gate had evidence."
+    },
+    "0.1.13": {
+      "evidence_label": "preview",
+      "gates_met": [
+        "FIELD-DISPOSABLE",
+        "RECOVERY-DRILL"
+      ],
+      "published_as": null
+    },
+    "0.1.14": {
+      "evidence_label": "internal",
+      "gates_met": [],
+      "published_as": null
+    },
+    "0.1.15": {
+      "evidence_label": "preview",
+      "gates_met": [
+        "RECOVERY-DRILL"
+      ],
+      "published_as": "production",
+      "overclaim_note": "Published as an ordinary immutable GitHub release. Only the recovery drill had evidence for this exact version; the disposable field gate evidence stops at 0.1.13."
+    },
+    "0.1.16": {
+      "evidence_label": "internal",
+      "gates_met": [],
+      "published_as": "production",
+      "overclaim_note": "Published as an ordinary immutable GitHub release with no evidence artifact of any kind for this version. This is the mismatch the release-honesty report named, and it cannot be corrected retroactively: an immutable release cannot be relabelled. It is recorded here so the record is complete and so the same gap cannot recur silently."
+    },
+    "0.1.17": {
+      "evidence_label": "internal",
+      "gates_met": [],
+      "published_as": "production",
+      "overclaim_note": "Published as an ordinary immutable GitHub release with no evidence artifact of any kind for this version."
+    },
+    "0.1.18": {
+      "evidence_label": "internal",
+      "gates_met": [],
+      "published_as": "production",
+      "overclaim_note": "Published as an ordinary immutable GitHub release with no evidence artifact of any kind for this version."
+    },
+    "0.1.19": {
+      "evidence_label": "internal",
+      "gates_met": [],
+      "published_as": "production",
+      "overclaim_note": "Published as an ordinary immutable GitHub release with no evidence artifact of any kind for this version. It is the newest published release, so it is the one the install pages served while this was true."
+    },
+    "0.1.20": {
+      "evidence_label": "internal",
+      "gates_met": [],
+      "published_as": null
+    },
+    "0.1.21": {
+      "evidence_label": "internal",
+      "gates_met": [],
+      "published_as": null
+    },
+    "0.1.22": {
+      "evidence_label": "internal",
+      "gates_met": [],
+      "published_as": null
+    }
+  },
+  "notes": [
+    "Releases before 0.1.12 predate this register and are not recorded. Their absence here is not a claim that they met anything.",
+    "published_as null means the version was never published as a GitHub release. 0.1.13, 0.1.14, 0.1.20 and 0.1.21 were tagged code lines only; 0.1.22 is the current candidate.",
+    "docs/release-evidence/ is not in the package allowlist, so an installed CLI reads the recorded label and cannot recompute it. Anything that prints it must present it as a recorded claim, not a fresh measurement."
+  ]
+}

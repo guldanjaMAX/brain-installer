@@ -96,6 +96,7 @@ import {
 import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mjs";
 import { runAll as doctorRunAll, summarize as doctorSummarize, checkBankFeedRedirect, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
 import { runPreinstall, formatPreinstallReport, preinstallExitCode, platformLabel } from "./doctor.mjs";
+import { recordedReleaseState, releaseStateBanner } from "./operations/release-state.mjs";
 import {
   SUPPORT_MAX_AGE_DAYS,
   SUPPORT_MAX_BYTES,
@@ -11580,8 +11581,28 @@ export async function requestIngestBatch({
  * they are running against what is installed, because "am I on the new one" is
  * the first question an upgrade raises.
  */
-async function cmdWhatsnew(manifestPath) {
+export async function cmdWhatsnew(manifestPath, options = {}) {
   console.log("");
+  // Said before the changelog, not after it: the changelog describes what the
+  // release contains, and this describes how much of it has been proven. A
+  // client reading a release labelled anything other than production is
+  // entitled to know that before they read the feature list, not instead of it.
+  //
+  // This repeats a claim recorded at release time. docs/release-evidence/ is
+  // not in the package allowlist, so nothing here measures anything, and the
+  // wording must never imply that it did.
+  const gatesPath = options.gatesPath ?? join(HERE, "docs", "release-gates.json");
+  try {
+    const banner = releaseStateBanner(
+      recordedReleaseState(JSON.parse(readFileSync(gatesPath, "utf-8")), PRODUCT_VERSION),
+    );
+    if (banner) { warn(banner); console.log(""); }
+  } catch {
+    // An unreadable or invalid gate manifest is itself worth saying out loud.
+    // Silence here would render exactly like a production release.
+    warn(`the release gate record shipped with ${PRODUCT_VERSION} could not be read, so nothing here can say which gates it met.`);
+    console.log("");
+  }
   let installed = null;
   if (manifestPath && existsSync(manifestPath)) {
     try {

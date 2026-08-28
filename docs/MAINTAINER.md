@@ -1,7 +1,9 @@
 # Shared Brain maintainer guide
 
+**Applies to release 0.1.22.**
+
 This is the operating guide for engineers who maintain the shared installer.
-It describes the 0.1.16 product line, how to change and release it safely, and
+It describes the current product line, how to change and release it safely, and
 how to update an owner's existing Brain. It is not an instance handoff. Never
 put an owner's manifest, resource identifiers, source details, private golden
 set, support export, or credentials in this repository.
@@ -40,7 +42,7 @@ Then read these files before changing their area:
 Preserve a dirty working tree. Identify who owns each existing change before
 editing the same file, and never discard unrelated work to make a test pass.
 
-## The 0.1.16 architecture
+## The current architecture
 
 There is one product and many isolated installs:
 
@@ -75,7 +77,7 @@ owner's Cloudflare Worker
   retrieval, ingest, health, evaluation, drain, and reindex use the deployed
   Brain and its separately stored admin key.
 
-The 0.1.16 candidate keeps the 0.1.14 current-status and message-replay
+The current candidate keeps the 0.1.14 current-status and message-replay
 guarantees while making exact legacy projection upgrades practical for large
 corpora. It replaces a rough trigger-amplified D1 change count with exact
 chunk-to-vector mapping readback during accelerated bootstrap. The previous
@@ -152,16 +154,39 @@ source checkout against a protected checkpoint. Its final readback requires
 exact D1 document/family counts and `vector_readiness` before it records a
 completion receipt.
 
-Do not describe 0.1.16 as live or recovery-verified merely because these files
-or deterministic tests exist. The exact candidate still requires its disposable
-provider field gate, recovery drill evidence, six-job CI matrix, immutable
-release artifact verification, and each install's private release evaluation.
+Do not describe the current line as live or recovery-verified merely because
+these files or deterministic tests exist. The exact candidate still requires the
+gates declared in `docs/release-gates.json`.
 
-The code line is not a release merely because `package.json` says `0.1.16`. A
+The code line is not a release merely because `package.json` names a version. A
 release exists only when its exact reviewed commit is tagged, all six CI jobs
 pass, required live field gates have evidence, GitHub publishes one immutable
 asset with the verified digest, and the public install and update pages point
 to that exact asset.
+
+### The label a release is allowed to claim
+
+Those gates used to live only in this paragraph, which meant a release could be
+published as an ordinary immutable GitHub asset — the thing an operator reads as
+production — while this same repository still listed the gates it had never
+completed. Four of them were: 0.1.16 through 0.1.19 shipped with no evidence
+artifact of any kind. An immutable release cannot be relabelled afterwards, so
+that record stands; what changed is that it can no longer happen quietly.
+
+`docs/release-gates.json` now carries each gate, whether it blocks, and — for a
+gate that does not block — why not, in writing, beside it. It also records the
+label of every release from 0.1.12 onward. `test/release-state.test.mjs`
+recomputes each of those labels from the files actually in
+`docs/release-evidence/` and fails when a recorded label is larger than its
+evidence. A label is therefore raised by adding an evidence file and by no other
+means. Before publishing, run the suite and confirm the candidate's recorded
+label is the one you intend to hand an operator.
+
+Every document that describes a release carries the exact line
+`**Applies to release <version>.**` near its top, and `test/current-version.test.mjs`
+fails when one of them names a version other than the package's. That is what
+stops the developer and maintainer guides from sitting at 0.1.16 while the
+install links say something else, which is how they sat for six releases.
 
 ## Make a product change safely
 
@@ -430,8 +455,9 @@ There is no shared master credential and no support backdoor.
 
 Recognized command failures already create immutable, sanitized local issue
 events under the current user's private Brain support directory. This is
-automatic local collection, not telemetry. Version 0.1.14 has no automatic
-upload and no network path in the journal module.
+automatic local collection, not telemetry. The journal module has no automatic
+upload and no network path, verified at 0.1.22 by the absence of any fetch,
+URL, or socket call in `support-journal.mjs`.
 
 An event can contain the product version, command, platform, architecture, Node
 major, connector class, typed failure code, timestamp, random event ID, and an
