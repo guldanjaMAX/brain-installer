@@ -1,6 +1,6 @@
 // WP-00: stranded-upgrade recovery.
 //
-// Jay's own install has been unable to accept a document since 2026-08-18
+// the reporter's own install has been unable to accept a document since 2026-08-18
 // because an upgrade died at the migrate step. 0.1.19 made that state VISIBLE
 // (/health honestly reports accepting_documents: false while paused), but
 // nothing on the CLI side ever read that field, and there was no dedicated
@@ -119,7 +119,7 @@ try {
     check("an active brain never touches D1 for enrichment it does not need", diagnosis.paused === false && d1Calls === 0, JSON.stringify({ diagnosis, d1Calls }));
   }
   {
-    const startedAt = new Date(Date.now() - 9 * 24 * 60 * 60 * 1000).toISOString(); // 9 days ago, like Jay's
+    const startedAt = new Date(Date.now() - 9 * 24 * 60 * 60 * 1000).toISOString(); // 9 days ago, like the reporter's
     const calls = [];
     const diagnosis = await diagnoseStuckUpgrade(manifestPath, {
       http: fakeHttpOk(healthBody({ ok: false, vector_drain_mode: "paused-for-upgrade", accepting_documents: false })),
@@ -264,7 +264,7 @@ try {
   {
     // A minimal fake deployed brain: paused, mid-migration, with a corpus that
     // must survive the whole exercise untouched. This stands in for the exact
-    // shape of Jay's stuck install without touching any real Cloudflare
+    // shape of the reporter's stuck install without touching any real Cloudflare
     // account, matching how upgrade-verify.test.mjs already proves cmdUpgrade
     // itself via full dependency injection.
     const fakeBrain = {

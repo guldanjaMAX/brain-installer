@@ -31,9 +31,9 @@
 // other non-shipped path as needing the SAME manual "does this name a real
 // third party" check this pass just did by hand, before it is pushed.
 import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -254,7 +254,45 @@ const privateIdentityRules = [
   ["collaborator surname", /\bBhakta(?:'s)?\b/i],
   ["collaborator client first name", /\bChet(?:'s)?\b/i],
 ];
-const privateTextMatches = expected.flatMap((path) => {
+// The scan covers the SHIPPED package AND the test trees. Until now it read
+// only `expected`, the npm packlist, on the reasoning that those are the files
+// a client receives. That reasoning is wrong for this repo: it is PUBLIC on
+// GitHub, so every committed file is readable by anyone whether npm ships it or
+// not. The gap was not theoretical. A real person's name sat in
+// worker/test/routes.test.mjs beside a fabricated financing figure, and three
+// separate identity leaks were found by hand in a single night because nothing
+// automated was looking here.
+//
+// This file is excluded from its own scan for the obvious reason: it defines
+// the patterns, so it necessarily contains them.
+const SCANNED_TEST_DIRECTORIES = ["test", "worker/test"];
+const SELF = "test/package-privacy.test.mjs";
+
+function testTreeFiles() {
+  const found = [];
+  for (const dir of SCANNED_TEST_DIRECTORIES) {
+    const root = resolve(ROOT, dir);
+    if (!existsSync(root)) continue;
+    const stack = [root];
+    while (stack.length) {
+      const current = stack.pop();
+      for (const entry of readdirSync(current, { withFileTypes: true })) {
+        const full = join(current, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name !== "node_modules") stack.push(full);
+          continue;
+        }
+        if (!/\.(mjs|js|json|md|txt|xml|html)$/.test(entry.name)) continue;
+        const rel = relative(ROOT, full).split(sep).join("/");
+        if (rel !== SELF) found.push(rel);
+      }
+    }
+  }
+  return found;
+}
+
+const privateScanPaths = [...new Set([...expected, ...testTreeFiles()])];
+const privateTextMatches = privateScanPaths.flatMap((path) => {
   const text = readFileSync(resolve(ROOT, path), "utf8");
   return privateIdentityRules
     .filter(([, pattern]) => pattern.test(text))

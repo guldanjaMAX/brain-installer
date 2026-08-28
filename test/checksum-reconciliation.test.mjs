@@ -17,7 +17,7 @@
 // operator exactly what differs, require explicit confirmation, then update
 // the STORED checksum to match the current file, without re-running any SQL.
 //
-// This file proves, per Jay's own ask in issue #2: the tool detects a
+// This file proves, per the reporter's own ask in issue #2: the tool detects a
 // checksum mismatch on an already-applied migration and reports it clearly
 // (including a positive line-ending diagnosis when that is exactly and only
 // what changed, his own stated hypothesis); it refuses to act without

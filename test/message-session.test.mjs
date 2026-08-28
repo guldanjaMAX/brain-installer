@@ -36,27 +36,27 @@ const row = (overrides = {}) => ({
 const confirmedReconcile = async (plans) => ({ families: plans.length, documents: 0 });
 
 {
-  const envelope = emailEnvelope(row({ id: "e1", platform: "email", direction: "out", body: "The proposal is attached." }), { ownerLabel: "James" });
+  const envelope = emailEnvelope(row({ id: "e1", platform: "email", direction: "out", body: "The proposal is attached." }), { ownerLabel: "Morgan Diaz" });
   check("email keeps the original message identity", envelope.source_id === "e1", JSON.stringify(envelope));
-  check("email stays one coherent document", /Email thread: Taylor/.test(envelope.content) && /From: James/.test(envelope.content));
+  check("email stays one coherent document", /Email thread: Taylor/.test(envelope.content) && /From: Morgan Diaz/.test(envelope.content));
   check("email date and thread metadata survive", envelope.date_reliable === true && envelope.metadata.thread_id === "t1");
 }
 
 {
-  const s = new MessageSessionizer({ ownerLabel: "James" });
+  const s = new MessageSessionizer({ ownerLabel: "Morgan Diaz" });
   check("the first chat message stays pending across a page", s.push(row()).length === 0);
   check("a nearby reply joins the same pending session", s.push(row({ id: "m2", direction: "out", sender_name: "", ts: "2026-08-23T10:05:00Z", body: "My reply" })).length === 0);
   const [envelope] = s.finish();
   check("one thread becomes one session document", envelope.metadata.message_count === 2, JSON.stringify(envelope));
-  check("speaker and direction context become searchable", /Taylor: First note/.test(envelope.content) && /James: My reply/.test(envelope.content));
+  check("speaker and direction context become searchable", /Taylor: First note/.test(envelope.content) && /Morgan Diaz: My reply/.test(envelope.content));
   check("the session citation is stable at its first message", envelope.source_id === "m1" && envelope.metadata.last_message_id === "m2");
 }
 
 {
-  const a = new MessageSessionizer({ ownerLabel: "James" });
+  const a = new MessageSessionizer({ ownerLabel: "Morgan Diaz" });
   a.push(row());
   const snapshot = a.snapshot();
-  const b = new MessageSessionizer({ ownerLabel: "James", active: snapshot });
+  const b = new MessageSessionizer({ ownerLabel: "Morgan Diaz", active: snapshot });
   b.push(row({ id: "m2", ts: "2026-08-23T10:10:00Z", body: "After restart" }));
   const [envelope] = b.finish();
   check("serialized pending state resumes without splitting the session", envelope.metadata.message_count === 2 && /After restart/.test(envelope.content));

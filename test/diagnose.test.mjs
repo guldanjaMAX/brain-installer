@@ -104,7 +104,7 @@ const find = (r, id) => (r.findings || []).find((f) => f.id === id);
   check("and says the two stores agree", find(r, "store_agreement")?.severity === "ok");
 }
 
-/* ---- THE ONE THAT WOULD HAVE CAUGHT JAY'S STALL ---- */
+/* ---- THE ONE THAT WOULD HAVE CAUGHT THE FIELD STALL ---- */
 {
   const env = makeEnv({ vectorCount: 100 });   // Vectorize holds 100
   source(env._db, "documents");

@@ -685,7 +685,7 @@ const call = (env, path) => {
     return mkEnv(rows, {
     vectorIds: [],
     extra: {
-      BRAIN_OWNER: "James Guldan",
+      BRAIN_OWNER: "Morgan Diaz",
       AI: {
         run: async (model, input) => {
           if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
@@ -701,11 +701,11 @@ const call = (env, path) => {
   check("an unrelated newsletter cannot answer an unnamed term sheet question", unrelated.answer === "The documents do not answer the question." && unrelated.evidence_gate?.supported === false, JSON.stringify(unrelated));
   check("the owner-link refusal states the structural reason", /no explicit link/.test(unrelated.evidence_gate?.reason || ""), JSON.stringify(unrelated.evidence_gate));
 
-  const ownerOnly = { ...newsletter, chunk_uid: "owner-profile#0", doc_uid: "owner-profile", source_id: "owner-profile", title: "James Guldan profile", text: "James Guldan owns this brain. No financing terms appear here." };
+  const ownerOnly = { ...newsletter, chunk_uid: "owner-profile#0", doc_uid: "owner-profile", source_id: "owner-profile", title: "Morgan Diaz profile", text: "Morgan Diaz owns this brain. No financing terms appear here." };
   const split = await (await call(answerEnv([newsletter, ownerOnly]), "/api/rag/think?q=What+valuation+was+on+the+Series+A+term+sheet%3F")).json();
   check("owner identity and the high-risk fact cannot come from different documents", split.answer === "The documents do not answer the question." && split.evidence_gate?.supported === false, JSON.stringify(split));
 
-  const owned = { ...newsletter, chunk_uid: "owned-term-sheet#0", doc_uid: "owned-term-sheet", source_id: "owned-term-sheet", title: "James's Series A Term Sheet", text: "James's Series A term sheet states a $150M valuation." };
+  const owned = { ...newsletter, chunk_uid: "owned-term-sheet#0", doc_uid: "owned-term-sheet", source_id: "owned-term-sheet", title: "Morgan's Series A Term Sheet", text: "Morgan's Series A term sheet states a $150M valuation." };
   const linked = await (await call(answerEnv(owned), "/api/rag/think?q=What+valuation+was+on+the+Series+A+term+sheet%3F")).json();
   check("an explicitly owner-linked term sheet can still answer", linked.answer === "The Series A valuation was $150M [1]." && linked.evidence_gate?.supported === true, JSON.stringify(linked));
 }
@@ -726,7 +726,7 @@ const call = (env, path) => {
   const { env } = mkEnv(rows, {
     vectorIds: [],
     extra: {
-      BRAIN_OWNER: "James Guldan",
+      BRAIN_OWNER: "Morgan Diaz",
       AI: {
         run: async (model, input) => {
           if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };

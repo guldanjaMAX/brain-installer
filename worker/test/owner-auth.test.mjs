@@ -106,7 +106,7 @@ test("invite -> enroll -> sign in -> settings, end to end", async () => {
   const credential = await makeCredential({ rpId: RP });
   const verify = await worker.fetch(post("/auth/register/verify", {
     code,
-    nickname: "James's phone",
+    nickname: "Morgan's phone",
     credentialId: credential.credentialId,
     attestationObject: attestationObject(credential.authData),
     clientDataJSON: clientData("webauthn.create", options.challenge, ORIGIN),
@@ -147,7 +147,7 @@ test("invite -> enroll -> sign in -> settings, end to end", async () => {
   // Settings: devices are listed; the last passkey cannot be revoked.
   const me = await (await worker.fetch(post("/api/app/me", {}, { Cookie: cookie, "X-Brain-App": "1" }), testEnv)).json();
   assert.equal(me.devices.length, 1);
-  assert.equal(me.devices[0].nickname, "James's phone");
+  assert.equal(me.devices[0].nickname, "Morgan's phone");
   const lastRevoke = await (await worker.fetch(post("/api/app/devices/revoke", {
     credential_id: credential.credentialId,
   }, { Cookie: cookie, "X-Brain-App": "1" }), testEnv)).json();

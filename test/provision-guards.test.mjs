@@ -1,4 +1,4 @@
-// Guards from Jay's field test, 2026-08-18.
+// Guards from a field test, 2026-08-18.
 //
 // Two of his findings were about provisioning reaching something that is not
 // ours, and both are tested here by CALLING the real functions, not by grepping
@@ -497,12 +497,12 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
 
 /* ---- the name must never be one that could belong to somebody else ---- */
 {
-  check("a slug-scoped name is accepted", chooseDbName({ d1_database_name: "bhakta-brain" }, "bhakta") === "bhakta-brain");
-  check("no name falls back to <slug>-brain", chooseDbName({}, "bhakta") === "bhakta-brain");
+  check("a slug-scoped name is accepted", chooseDbName({ d1_database_name: "rivera-brain" }, "rivera") === "rivera-brain");
+  check("no name falls back to <slug>-brain", chooseDbName({}, "rivera") === "rivera-brain");
 
-  const bare = await throws(() => chooseDbName({ d1_database_name: "brain" }, "bhakta"));
+  const bare = await throws(() => chooseDbName({ d1_database_name: "brain" }, "rivera"));
   check("the bare name \"brain\" is REFUSED", bare !== null, "it was accepted");
-  check("and the refusal says what to use instead", /bhakta-brain/.test(bare || ""), bare);
+  check("and the refusal says what to use instead", /rivera-brain/.test(bare || ""), bare);
 
   check("the shipped placeholder is refused", (await throws(() => chooseDbName({ d1_database_name: "REPLACE-WITH-slug-brain" }, "x"))) !== null);
   check("no slug and no name is refused rather than defaulted", (await throws(() => chooseDbName({}, undefined))) !== null);
@@ -517,23 +517,23 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
       : { results: slug === undefined ? [] : [{ client_slug: slug }] };
 
   check("an EMPTY database is adoptable (a normal provision re-run)",
-    (await throws(() => assertAdoptable("a", db, "n", "bhakta", q([])))) === null);
+    (await throws(() => assertAdoptable("a", db, "n", "rivera", q([])))) === null);
 
   check("OUR OWN brain is adoptable",
-    (await throws(() => assertAdoptable("a", db, "n", "bhakta", q(["install_state", "chunks"], "bhakta")))) === null);
+    (await throws(() => assertAdoptable("a", db, "n", "rivera", q(["install_state", "chunks"], "rivera")))) === null);
 
-  // Jay's actual case: a production D1 that merely shares the name.
-  const stranger = await throws(() => assertAdoptable("a", db, "brain", "bhakta", q(["ledger", "accounts", "postings"])));
+  // the reporter's actual case: a production D1 that merely shares the name.
+  const stranger = await throws(() => assertAdoptable("a", db, "brain", "rivera", q(["ledger", "accounts", "postings"])));
   check("a STRANGER's database is refused", stranger !== null, "it was adopted");
   check("and the refusal names what it found, so the operator can tell", /ledger/.test(stranger || ""), stranger);
   check("and says nothing was changed", /Nothing has been changed/.test(stranger || ""), stranger);
 
   // Worse than co-tenancy: migrate's client_slug upsert would relabel their install.
-  const other = await throws(() => assertAdoptable("a", db, "n", "bhakta", q(["install_state"], "someone-else")));
+  const other = await throws(() => assertAdoptable("a", db, "n", "rivera", q(["install_state"], "someone-else")));
   check("ANOTHER CLIENT's brain is refused", other !== null, "it was adopted");
   check("and the refusal names the real owner", /someone-else/.test(other || ""), other);
 
-  const blind = await throws(() => assertAdoptable("a", db, "n", "bhakta", async () => { throw new Error("no access"); }));
+  const blind = await throws(() => assertAdoptable("a", db, "n", "rivera", async () => { throw new Error("no access"); }));
   check("an UNREADABLE database is refused rather than adopted blind", blind !== null, "it was adopted");
 }
 

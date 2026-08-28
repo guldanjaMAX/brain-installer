@@ -90,14 +90,14 @@ const check = (name, condition, detail = "") => {
 
   const drive = rowToEnvelope("drive", {
     cursor_id: "f1", drive_file_id: "f1", drive_file_path: "Provider Records/Health.html",
-    top_folder: "Provider Records", category: "medical", client_id: "James",
+    top_folder: "Provider Records", category: "medical", client_id: "Morgan Diaz",
     document_date: "2025-02-03T00:00:00Z", document_date_reliable: true,
     chunks: [{ chunk_index: 0, text: "readable medical record" }], source_chunks: 1,
   });
   check("Drive preserves the stable file id", drive.source_type === "drive" && drive.source_id === "f1", JSON.stringify(drive));
   check("Drive filter metadata reaches the product envelope",
     drive.metadata.top_folder === "Provider Records" && drive.metadata.category === "medical" &&
-      drive.metadata.client === "James" && drive.metadata.platform === "drive", JSON.stringify(drive.metadata));
+      drive.metadata.client === "Morgan Diaz" && drive.metadata.platform === "drive", JSON.stringify(drive.metadata));
 
   const message = rowToEnvelope("messages", {
     cursor_id: "r1", source_id: "m1", thread_id: "t1", platform: "imessage",
