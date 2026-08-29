@@ -610,5 +610,42 @@ function ingestExitCli(scenario) {
   check("and says nothing was marked as loaded", /Nothing was marked as loaded/.test(body));
 }
 
+/* ---------------------------------------------------------------------------
+ * A refused Cloudflare credential is the client's most likely install-day
+ * mistake and the one thing the tool must not call its own bug. `brain verify`
+ * used to route it to the unexpected-error handler, which says "This is a bug
+ * in the installer, not something you did wrong" (bench, 2026-08-28).
+ */
+{
+  const { isCredentialRejection, CF_TOKEN_REJECTED_REMEDY } = await import("../doctor.mjs");
+
+  for (const refusal of [
+    new Error("GET /accounts failed (403): 9109: Invalid access token"),
+    new Error("GET /accounts/x/d1/database failed (403): 10000: Authentication error"),
+    new Error("the token has expired"),
+  ]) {
+    check("a refused credential is classified as the owner's to fix: " + refusal.message.slice(0, 40),
+      isCredentialRejection(refusal) === true, refusal.message);
+  }
+
+  for (const other of [
+    new Error("connect ETIMEDOUT 1.2.3.4:443"),
+    new Error("drain failed (500): the reply was a web page, not this brain"),
+    new Error("D1 is not reachable"),
+  ]) {
+    check("an ordinary failure is not mistaken for a credential problem: " + other.message.slice(0, 40),
+      isCredentialRejection(other) === false, other.message);
+  }
+
+  check("the remedy names the variable, the dashboard path and the scopes",
+    /CLOUDFLARE_API_TOKEN/.test(CF_TOKEN_REJECTED_REMEDY) &&
+      /My Profile > API Tokens/.test(CF_TOKEN_REJECTED_REMEDY) &&
+      /Workers Scripts: Edit/.test(CF_TOKEN_REJECTED_REMEDY),
+    CF_TOKEN_REJECTED_REMEDY);
+
+  check("the remedy never tells the owner it is our bug",
+    !/bug in the installer/i.test(CF_TOKEN_REJECTED_REMEDY), CF_TOKEN_REJECTED_REMEDY);
+}
+
 console.log(fail ? `\n${fail} FAILURES` : `\nerrors: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);

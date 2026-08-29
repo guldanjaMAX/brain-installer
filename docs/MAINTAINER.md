@@ -1,7 +1,7 @@
 # Shared Brain maintainer guide
 
 This is the operating guide for engineers who maintain the shared installer.
-It describes the 0.1.16 product line, how to change and release it safely, and
+It describes the current 0.2.x product line, how to change and release it safely, and
 how to update an owner's existing Brain. It is not an instance handoff. Never
 put an owner's manifest, resource identifiers, source details, private golden
 set, support export, or credentials in this repository.
@@ -40,7 +40,7 @@ Then read these files before changing their area:
 Preserve a dirty working tree. Identify who owns each existing change before
 editing the same file, and never discard unrelated work to make a test pass.
 
-## The 0.1.16 architecture
+## The current architecture
 
 There is one product and many isolated installs:
 
@@ -75,7 +75,7 @@ owner's Cloudflare Worker
   retrieval, ingest, health, evaluation, drain, and reindex use the deployed
   Brain and its separately stored admin key.
 
-The 0.1.16 candidate keeps the 0.1.14 current-status and message-replay
+The current candidate keeps the 0.1.14 current-status and message-replay
 guarantees while making exact legacy projection upgrades practical for large
 corpora. It replaces a rough trigger-amplified D1 change count with exact
 chunk-to-vector mapping readback during accelerated bootstrap. The previous
@@ -106,6 +106,14 @@ Four append-only migrations make the D1-to-Vectorize protocol durable:
   write barrier is active, disjoint 1,000-row batches may be submitted through
   a bounded in-flight window. Exact-generation `getByIds` readback must confirm
   every row before its batch and outbox receipts can be cleared.
+
+Later append-only migrations extend the product without replacing those
+storage rules. `0019` adds authoritative document entity scope plus owner
+uploads, approvals, period close, append-only activity, targets, preferences,
+and durable request replay. `0020` adds exact-document grants, scoped sessions,
+and aggregate passkey timing. Install order is fixed: 0019 must complete before
+0020. The restart-safe migration adapter is the acceptance path for interrupted
+column additions; raw statement replay is not a substitute.
 
 `brain update` deploys a paused compatibility Worker and verifies its exact
 version/writer mode, waits one complete supported lease window, runs these
@@ -152,12 +160,12 @@ source checkout against a protected checkpoint. Its final readback requires
 exact D1 document/family counts and `vector_readiness` before it records a
 completion receipt.
 
-Do not describe 0.1.16 as live or recovery-verified merely because these files
+Do not describe the current candidate as live or recovery-verified merely because these files
 or deterministic tests exist. The exact candidate still requires its disposable
 provider field gate, recovery drill evidence, six-job CI matrix, immutable
 release artifact verification, and each install's private release evaluation.
 
-The code line is not a release merely because `package.json` says `0.1.16`. A
+The code line is not a release merely because `package.json` names a version. A
 release exists only when its exact reviewed commit is tagged, all six CI jobs
 pass, required live field gates have evidence, GitHub publishes one immutable
 asset with the verified digest, and the public install and update pages point
@@ -417,10 +425,12 @@ history, a support note, a log, or a shared message. Low-level automation must
 use an approved secret-manager-backed launcher that resolves the secret only
 at execution time and passes a minimal environment to the child process.
 
-The Brain admin key is a different credential. It grants access to the whole
-Brain and lives only in the install's declared durable store. Routine commands
-resolve it at runtime. Do not copy it into an MCP configuration, release job,
-maintainer password manager, or Cloudflare token store.
+The Brain admin key is a different credential. It grants operator access to the
+whole Brain and lives only in the install's declared durable store. Routine
+commands resolve it at runtime. Owner and scoped-user access instead use
+passkey sessions and D1 authorization. Do not copy the admin key into an MCP
+configuration, release job, maintainer password manager, or Cloudflare token
+store.
 
 Repository permission grants no Cloudflare or corpus permission. A maintainer
 needs a fresh, owner-approved scoped token only for a specific live operation.

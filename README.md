@@ -19,7 +19,7 @@ asset and installs into a folder owned by your user account, so it needs no Git,
 Mac or Linux:
 
 ```bash
-npm install --global --ignore-scripts --no-audit --no-fund --prefix "$HOME/.financial-brain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.22/brain-installer-0.1.22.tgz"
+npm install --global --ignore-scripts --no-audit --no-fund --prefix "$HOME/.financial-brain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.2.0/brain-installer-0.2.0.tgz"
 # Optional: makes the shorter `brain` examples work in this Terminal window.
 export PATH="$HOME/.financial-brain/bin:$PATH"
 ```
@@ -27,7 +27,7 @@ export PATH="$HOME/.financial-brain/bin:$PATH"
 Windows PowerShell:
 
 ```powershell
-npm.cmd install --global --ignore-scripts --no-audit --no-fund --prefix "$env:LOCALAPPDATA\FinancialBrain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.1.22/brain-installer-0.1.22.tgz"
+npm.cmd install --global --ignore-scripts --no-audit --no-fund --prefix "$env:LOCALAPPDATA\FinancialBrain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.2.0/brain-installer-0.2.0.tgz"
 # Optional: makes the shorter `brain` examples work in this PowerShell window.
 $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
 ```
@@ -258,8 +258,12 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
   is what makes "export it into this folder and forget about it" true for a
   folder that is not inside Google Drive. Hourly by default, so it is a drop
   box, not a live feed. Elsewhere, run the same load yourself.
-- **One key, all access.** Anyone with the admin key can ask anything. There are
-  no per-person permissions yet.
+- **The admin key is operator-only; people use passkeys.** An owner passkey has
+  the owner's full workspace. A scoped person sees only exact documents granted
+  to that session, and an unknown or unavailable grant fails closed. These
+  contracts pass locally against the real Worker and migration code. A physical
+  passkey ceremony on the final customer domain and devices remains a required
+  field test before calling this production-proven.
 - **Slack and Notion** do not exist as connectors.
 - **Meeting transcripts arrive two ways, neither of them a transcription
   service.** Zoom cloud recordings deliver themselves to a webhook on your own

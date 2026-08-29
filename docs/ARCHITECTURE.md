@@ -339,7 +339,9 @@ so a result list by itself is not proof that the corpus answers the question.
 retrieved evidence, requires citation discipline for claims, and reports gaps
 such as thin coverage, staleness, undated sources, or a single-corpus result.
 The optional read-only proxy key is accepted only on retrieval routes. The full
-admin key protects ingest and every administrative route.
+admin key protects ingest and operator administration. The app uses passkey
+sessions plus the companion app header, and D1 applies exact owned-entity or
+exact-document scope before returning evidence.
 
 ## Local state and privacy boundaries
 
@@ -369,11 +371,13 @@ and answer generation inside that account. An external answer or rerank provider
 is used only when the manifest explicitly selects it and its Worker secret is
 allowed.
 
-One install has one authorization boundary. Folders, source names, categories,
-and metadata can narrow retrieval, but they do not create separate permissions.
-Anyone holding that install's admin key can reach every corpus in it. Material
-that must not share readers needs a separate install until document-level access
-control exists.
+One install has one operator boundary and multiple app principals. Anyone
+holding the install's admin key has whole-install authority. Owner passkeys can
+reach the owned workspace. Scoped sessions can reach only exact documents named
+by active grants, and new documents are owner-only until granted. Folder names,
+source names, categories, and ordinary metadata can narrow retrieval but never
+create permission. If D1 grant or entity authority is unavailable, retrieval
+fails closed rather than reporting an empty corpus.
 
 ## Support journal
 

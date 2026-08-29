@@ -8,7 +8,11 @@ import {
   hasStoredCloudflareToken,
   storedTokenReference,
 } from "../operations/cloudflare-token-store.mjs";
-import { withCloudflareToken } from "../brain.mjs";
+import {
+  cloudflareTokenAvailable,
+  withAvailableCloudflareToken,
+  withCloudflareToken,
+} from "../brain.mjs";
 
 // Synthetic fixtures. The account id keeps Cloudflare's 32-hex-character
 // shape so the scoping assertions below still exercise a realistic value; it
@@ -83,6 +87,35 @@ test("withCloudflareToken prefers the stored token and never prompts when it exi
   });
   assert.equal(ran, true);
   assert.equal(prompted, false, "a stored token makes provisioning non-interactive");
+});
+
+test("doctor-style token use reads remembered state without prompting", async () => {
+  let loaded = 0;
+  let availableInside = false;
+  await withAvailableCloudflareToken(async () => {
+    availableInside = cloudflareTokenAvailable();
+  }, {
+    accountId: ACCOUNT,
+    loadStoredCloudflareToken: () => {
+      loaded++;
+      return Buffer.from(TOKEN);
+    },
+  });
+  assert.equal(loaded, 1);
+  assert.equal(availableInside, true);
+  assert.equal(cloudflareTokenAvailable(), false, "the remembered token is cleared after the diagnostic");
+});
+
+test("doctor-style token use stays non-interactive when no remembered token exists", async () => {
+  let ran = false;
+  await withAvailableCloudflareToken(async () => {
+    ran = true;
+    assert.equal(cloudflareTokenAvailable(), false);
+  }, {
+    accountId: ACCOUNT,
+    loadStoredCloudflareToken: () => null,
+  });
+  assert.equal(ran, true);
 });
 
 test("after a manual prompt the token is offered for storage, and declining is honored", async () => {

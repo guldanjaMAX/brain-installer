@@ -477,3 +477,30 @@ try {
 } finally {
   rmSync(sandbox, { recursive: true, force: true });
 }
+
+/* ---------------------------------------------------------------------------
+ * The success screen is the last thing a client reads, and it rendered the
+ * manifest path as `../../../../../../../private/tmp/...` whenever the manifest
+ * sat outside the working directory (bench, 2026-08-28). Seven levels of `..`
+ * in a command someone is told to retype reads as broken software.
+ */
+{
+  const { displayPathForTesting, shouldSkipSetupConnections } = await import("../brain.mjs");
+  const { default: assertStrict } = await import("node:assert/strict");
+
+  const deep = displayPathForTesting("/private/tmp/a/b/c/x.json", "/Users/j/One/Two/Three/Four");
+  assertStrict.ok(!deep.includes("../.."),
+    `a far-outside manifest must not print a ladder of dot-dots, got: ${deep}`);
+  // Compared with separators normalised: Windows returns `sub\\x.json` here and
+  // that is correct on Windows, which is the whole point of the check.
+  const below = displayPathForTesting("/tmp/work/sub/x.json", "/tmp/work").replace(/\\/g, "/");
+  assertStrict.equal(below, "sub/x.json",
+    "a manifest below the working directory keeps the short relative form");
+  assertStrict.equal(shouldSkipSetupConnections({ "no-connect": true }), true,
+    "--no-connect must prevent setup from editing this machine's AI-tool configuration");
+  assertStrict.equal(shouldSkipSetupConnections({}, { connectAgents: false }), true,
+    "injected setup runs can request the same custody-safe behavior without process arguments");
+  assertStrict.equal(shouldSkipSetupConnections({}), false,
+    "ordinary owner setup still connects the owner's own AI tools");
+  console.log("display path: absolute when far outside, relative when close");
+}

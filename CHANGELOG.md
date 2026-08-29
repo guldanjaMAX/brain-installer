@@ -4,6 +4,60 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.2.0
+
+**Your brain now has an owner workspace, scoped sharing, and financial actions,
+without weakening the ingestion and deletion rules underneath them.**
+
+- Owners can sign in with a passkey, upload a text document, record an approval,
+  accept or reopen a period close, review append-only activity, and maintain
+  targets and preferences. Retrying the same action after a lost response does
+  not duplicate the change or its activity event.
+- Explore can be locked to one owned business entity. Invited people can be
+  granted up to 100 exact documents, and new documents are owner-only by
+  default. Missing or unavailable authorization fails closed rather than
+  appearing as an empty answer.
+- Bank exports and hosted-feed rows share one normalized ledger boundary, and
+  every imported row retains source-document provenance. OCR for scanned PDFs
+  is built but remains off by default and explicitly marks low-confidence text.
+- Install-day checks now verify the Cloudflare token instead of trusting that a
+  value exists, open the stored Google credential instead of trusting its file
+  header, refuse the shared Vectorize placeholder name, skip R2 when it was not
+  requested, and tolerate the short route and secret warm-up after a fresh
+  deploy. `brain setup --no-connect` leaves the operator's AI-tool settings
+  untouched when installing on someone else's behalf.
+- The vector drain now runs every minute by default. It still embeds only after
+  the previous batch is confirmed, so extra ticks are no-ops rather than extra
+  model work.
+
+The complete offline release suite exercises these contracts on synthetic and
+scripted boundaries. It does not prove a real customer corpus, a physical
+passkey on the final domain, or any provider connector that has not completed
+its named field gate. Run `brain doctor`, then use the weekend acceptance guide
+before calling an install production-ready.
+
+## 0.1.23
+
+**A new brain becomes searchable in about a day instead of about four.**
+
+After a first load, chunks live in the database immediately and become
+searchable only once they reach the vector index. Until then the brain answers
+keyword questions and quietly misses the ones that need meaning, while every
+health check passes and nothing on any screen says why.
+
+That drain advances roughly one batch per confirmation from the vector index,
+not per scheduled run, so how often it runs sets the ceiling. It was running
+every five minutes. On a real install that sustained about 20 items a minute,
+which is more than four days for a first load of 125,000 chunks. It now runs
+every minute, which measured at about 59.
+
+This does not cost more. A run that arrives before the index has confirmed the
+previous batch returns immediately having done nothing, so the extra runs are
+free and the work per confirmation is unchanged. What changes is only how long
+a new install spends looking empty.
+
+`brain health` reads the remaining backlog if you want to watch it.
+
 ## 0.1.22
 
 **Your brain can now read your texts — live, if you have a Mac.**

@@ -95,7 +95,7 @@
             },
             "drain_cron": {
               "type": "string",
-              "default": "*/5 * * * *"
+              "default": "* * * * *"
             },
             "r2_bucket": {
               "type": "string",

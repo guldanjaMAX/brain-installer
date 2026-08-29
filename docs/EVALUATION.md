@@ -48,16 +48,19 @@ and token or cost totals. The support journal remains a separate, stricter
 contract and receives only sanitized category and count metadata. Evaluation
 artifacts are never uploaded automatically.
 
-The current product has one admin-key authorization boundary per install.
-`actor`, `owner_scope`, and forbidden-owner fields are evaluation labels and
-synthetic attack fixtures. They do not create document-level access control.
-Material that must have different readers still requires a separate install
-until the product has enforceable document-level authorization.
+The operator admin key still has whole-install authority, but the owner app now
+has enforceable passkey sessions, exact owned-entity scope, and exact-document
+grants for scoped people. `actor`, `owner_scope`, and forbidden-owner fields are
+therefore both evaluation labels and security regression inputs. New documents
+are owner-only by default. Scoped retrieval must use D1 authority before ranking
+and report explicit vector degradation instead of filtering an unauthorized
+top-K list into a healthy empty answer.
 
-The current installer also refuses scanned PDFs without a usable text layer.
-The v2 schema can describe `ocr_text` and `ocr_table` cases for documents that
-were OCRed before ingest and for a future extractor. That schema support is not
-a claim that built-in OCR exists today.
+The current installer has built-in scanned-PDF OCR, off by default. The v2
+schema can describe `ocr_text` and `ocr_table` cases, but schema coverage and
+fixture tests are not field proof. Release evidence must still distinguish
+typed scans, one-bit fax or photocopy pages, handwriting, low-confidence text,
+and refusal, with exact page and citation provenance.
 
 ## The four contracts
 

@@ -65,6 +65,7 @@ import {
 const RUNNING_VERSION = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"),
 ).version;
+const NEWER_VERSION = `${Number(RUNNING_VERSION.split(".")[0]) + 1}.0.0`;
 
 // Production waits the full cutover grace. Unit tests inject a zero-time
 // waiter while still asserting the exact duration requested by cmdUpgrade.
@@ -1184,7 +1185,7 @@ const bootstrapCompletion = () => ({
   const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-upgrade-downgrade-")));
   try {
     const manifestPath = join(sandbox, "brain.manifest.json");
-    writeFileSync(manifestPath, JSON.stringify(manifestFixture("0.2.0")));
+    writeFileSync(manifestPath, JSON.stringify(manifestFixture(NEWER_VERSION)));
     let mutations = 0;
     let error = null;
     try {
@@ -1192,7 +1193,7 @@ const bootstrapCompletion = () => ({
         resolveAccount: async () => ({ id: "fixture-account" }),
         d1Query: async (_account, _database, sql) => /sqlite_master/i.test(sql)
           ? { results: [{ name: "install_state" }] }
-          : { results: [{ client_slug: "fixture", product_version: "0.2.0" }] },
+          : { results: [{ client_slug: "fixture", product_version: NEWER_VERSION }] },
         cf: async () => { mutations++; return { bookmark: "must-not-exist" }; },
         cmdMigrate: async () => { mutations++; },
         cmdDeploy: async () => { mutations++; },
@@ -1209,7 +1210,7 @@ const bootstrapCompletion = () => ({
     );
 
     const localNewerPath = join(sandbox, "local-newer.manifest.json");
-    writeFileSync(localNewerPath, JSON.stringify(manifestFixture("0.2.0")));
+    writeFileSync(localNewerPath, JSON.stringify(manifestFixture(NEWER_VERSION)));
     let localNewerError = null;
     try {
       await cmdUpgrade(localNewerPath, {

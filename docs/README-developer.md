@@ -5,16 +5,15 @@ keyword search live in D1, vectors live in Vectorize, and the Worker fuses them.
 Nothing runs on our infrastructure, and nothing but a scoped token is held during
 the engagement.
 
-**Status: 0.1.16.** Provisioning, retrieval, resumable folder ingest, deletion,
-upgrade rollback, and `brain setup` are verified end to end against real
-Cloudflare on macOS. Google Drive OAuth and a bounded real-account ingest have
-also been verified. The complete Drive baseline, the schema-13 disposable
-recovery drill, and completion of the corrected accelerated bootstrap on a
-large live corpus are the remaining production field gates for this release. Gmail uses
-the same tested cursor and storage
-pipeline but has not completed a real-account production run. The full suite and
-packed CLI pass on Windows in CI, but no real-account Windows install has been
-completed. See "What is not built" before promising anything to anyone.
+**Status: 0.2.0 release candidate.** Provisioning, retrieval, resumable ingest,
+guarded deletion, owner actions, exact entity scope, document grants, passkey
+observability, financial imports, and restart-safe migrations are covered by
+the complete local product and contract suites. Earlier releases have real
+Cloudflare synthetic-service proof, and Google Drive has partial real-data
+proof. A fresh 0.2.0 Cloudflare field gate, the physical passkey ceremony on the
+final domain, the named connector lifecycle tests, and a real-account Windows
+install are still outside proof. See "What is not built" and
+`CONNECTOR-BACKLOG.md` before promising anything to anyone.
 
 Engineering changes follow [the code, test, documentation, and tracking
 standard](./ENGINEERING-STANDARDS.md). Architecturally significant choices are
@@ -704,7 +703,18 @@ must never reuse a brain admin key or a client's Cloudflare token.
 
 Read this before scoping an engagement.
 
-- **No interface.** curl plus an admin key. A non-technical owner cannot use it.
+- **No owner-facing corpus deletion workflow.** The owner workspace can upload,
+  approve, close periods, explore, manage targets and preferences, and use
+  document grants. Corpus forget remains an operator-only, preview-first admin
+  command until a separate deletion contract is reviewed.
+- **The owner workspace is not field-proven by its local suite.** Passkey,
+  entity-scope, and document-grant contracts run against the real Worker code
+  with an in-memory D1-shaped adapter. The final domain and physical devices
+  still need the weekend ceremony and access-control gate.
+- **Long-tail provider APIs remain absent.** Slack, Notion, Microsoft 365,
+  Dropbox, QuickBooks, Plaid, and CRM APIs are not product connectors. Manual
+  exports, a watched folder, or Drive are first-class custody plans, not a
+  pretend API integration.
 - **Some manifest declarations are still inert.** Google Drive source policy
   and the macOS `operations.ingest_cron` scheduler are wired. Other undeveloped
   corpora, health/report/webhook operations, most of `retrieval`,

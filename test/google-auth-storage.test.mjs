@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   saveTokens, loadTokens, tokenStorageDescription, tokenStorageStatus,
+  verifyTokenStorageReadable,
   googleAuthChildEnvironment, openBrowser,
   GOOGLE_KEYCHAIN_SERVICE, GOOGLE_KEYCHAIN_ACCOUNT,
 } from "../connectors/google-auth.mjs";
@@ -363,6 +364,42 @@ try {
       encryptedStatus.exists && encryptedStatus.backend === "file" &&
       encryptedStatus.encrypted === true && encryptedStatus.migrationPending === false &&
       /DPAPI CurrentUser encrypted file/i.test(encryptedStatus.description));
+
+    // Status stops at the header, by design and by the test above. That leaves
+    // a real gap on Windows, because the header is 29 plaintext bytes: a blob
+    // written by another Windows user carries a perfect one. The verifier is
+    // the opt-in counterpart that actually opens the record.
+    const callsBefore = dpapi.calls.length;
+    const opened = verifyTokenStorageReadable(options);
+    const unprotectAttempts = dpapi.calls.slice(callsBefore).filter((c) => c.unprotect);
+    check("verifying readability actually decrypts, unlike status",
+      opened.checked === true && opened.readable === true && unprotectAttempts.length === 1,
+      JSON.stringify({ opened, unprotectAttempts: unprotectAttempts.length }));
+    check("verifying readability returns no credential material, only a verdict",
+      Object.keys(opened).every((k) => ["checked", "readable", "reason"].includes(k)) &&
+      !JSON.stringify(opened).includes(record.google.refresh_token) &&
+      !JSON.stringify(opened).includes(record.google.client_secret),
+      JSON.stringify(opened));
+
+    const undecryptable = verifyTokenStorageReadable({
+      ...options,
+      runPowerShell: (command, args) => (args.includes("unprotect")
+        ? { status: 1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }
+        : dpapi.runPowerShell(command, args, { input: Buffer.alloc(0) })),
+    });
+    check("a credential that cannot be decrypted reports unreadable rather than present",
+      undecryptable.checked === true && undecryptable.readable === false &&
+      typeof undecryptable.reason === "string" && undecryptable.reason.length > 0,
+      JSON.stringify(undecryptable));
+    check("the unreadable reason quotes no credential value",
+      !undecryptable.reason.includes(record.google.refresh_token) &&
+      !undecryptable.reason.includes(record.google.client_secret),
+      undecryptable.reason);
+
+    const bytesAfter = readFileSync(path);
+    check("verifying readability never rewrites the store it is diagnosing",
+      bytesAfter.equals(migrated), "the verifier must be read-only");
+
     for (const { descriptor } of acl.retainedHandles) closeSync(descriptor);
   }
 

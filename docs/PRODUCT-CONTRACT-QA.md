@@ -38,7 +38,7 @@ reason to weaken the tests.
 | Exact-document grants | `security-contract.test.mjs` | New documents are owner-only by default. A grant contains at most 100 exact document ids, rejects cross-entity documents, and persists one idempotent grant/event/request. |
 | Top-K crowd-out | `security-contract.test.mjs` | Higher-ranked unauthorized results cannot crowd out a lower-ranked authorized document. Scoped retrieval uses authoritative D1 prefiltering, skips unscoped Vectorize, and reports `scoped-vector` degradation. |
 | Revocation and unavailable D1 | `security-contract.test.mjs` | Revocation is idempotent and auditable; the old scoped session fails closed. Unavailable grant authority returns 503 rather than empty results. |
-| Passkey observability | `security-contract.test.mjs` | Status groups `rp_id`, ceremony, stage, outcome, reason, count, and `timing_ms` min/average/max while excluding ceremony and credential secrets. Unavailable telemetry is explicit. |
+| Passkey observability | `security-contract.test.mjs` | Status groups `rp_id`, ceremony, stage, outcome, count, and `timing_ms` min/average/max while excluding reason codes, ceremony payloads, and credential secrets. Unavailable telemetry is explicit. |
 | Stale sources and failed drain | Existing `test/freshness.test.mjs` and `test/vector-delete-outbox.test.mjs`, plus upload/deletion assertions above | Stale, manual, never-synced, pending, failed, and confirmed states remain distinct. A failed vector operation stays retryable and never becomes a healthy complete state. |
 
 ## Expected baseline failures
