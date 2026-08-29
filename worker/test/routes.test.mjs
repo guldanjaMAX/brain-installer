@@ -2086,5 +2086,80 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   }
 }
 
+/* ---------------------------------------------------------------------------
+ * A grant credential is a third way in, and it must be exactly as narrow as
+ * the grant says. These drive the real worker fetch, so a capability check
+ * that never reached the request path fails here rather than passing quietly.
+ */
+{
+  const { hashToken } = await import("../src/lib/grants.js");
+  const bookkeeperToken = "bookkeeper-token-value";
+  const bookkeeperHash = await hashToken(bookkeeperToken);
+
+  const grantEnv = (row) => ({
+    STORAGE: "d1",
+    ADMIN_KEY: "owner-key",
+    DB: {
+      prepare(sql) {
+        return {
+          bind: (...b) => ({
+            async first() {
+              if (/FROM grant_credentials/.test(sql)) return b[0] === bookkeeperHash ? row : null;
+              return null;
+            },
+            async all() { return { results: [] }; },
+            async run() { return { meta: { changes: 0 } }; },
+          }),
+          async first() { return null; },
+          async all() { return { results: [] }; },
+          async run() { return { meta: { changes: 0 } }; },
+        };
+      },
+    },
+  });
+
+  const liveBookkeeper = {
+    grant_id: "g-book", display_name: "Marla", capabilities: '["ask","file"]',
+    expires_at: null, revoked_at: null, credential_revoked_at: null,
+  };
+
+  const call = (env, path, token) => worker.fetch(new Request(
+    `https://b.example${path}`,
+    { method: "POST", body: "{}", headers: token ? { "X-Admin-Key": token } : {} },
+  ), env, { waitUntil() {} });
+
+  const denied = await call(grantEnv(liveBookkeeper), "/api/admin/brain/forget", bookkeeperToken);
+  check("a grant without `destroy` cannot reach a destroy route",
+    denied.status === 401, String(denied.status));
+
+  const deniedBody = await denied.json();
+  check("refusing on capability is indistinguishable from refusing on identity",
+    deniedBody.error === "unauthorized", JSON.stringify(deniedBody));
+
+  const unknown = await call(grantEnv(liveBookkeeper), "/api/admin/brain/forget", "not-a-real-token");
+  check("an unrecognised credential is refused the same way",
+    unknown.status === 401, String(unknown.status));
+
+  const revoked = await call(
+    grantEnv({ ...liveBookkeeper, revoked_at: 1 }), "/api/rag/think", bookkeeperToken);
+  check("a revoked grant cannot ask questions either",
+    revoked.status === 401, String(revoked.status));
+
+  const unclassified = await call(
+    grantEnv(liveBookkeeper), "/api/admin/brain/some-route-invented-later", bookkeeperToken);
+  check("a route nobody classified is owner-only, so a grant cannot reach it",
+    unclassified.status === 401, String(unclassified.status));
+
+  // Every check above is a refusal, and refusals also pass when the credential
+  // was never recognised at all. This one proves the grant genuinely
+  // authenticates: the same token, on a route its capabilities DO cover, must
+  // get past the gate. Anything other than 401 means it was let through.
+  const allowed = await call(grantEnv(liveBookkeeper), "/api/admin/brain/ingest", bookkeeperToken);
+  check("a grant WITH `file` is actually let through to a file route",
+    allowed.status !== 401,
+    `got ${allowed.status}; a 401 here means grants never authenticate and the refusals above prove nothing`);
+}
+
 console.log(fail ? `\n${fail} FAILURES` : `\nroutes: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);
+

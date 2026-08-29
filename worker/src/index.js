@@ -19,6 +19,8 @@
  */
 
 import { jsonResponse, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
+import { resolvePrincipal, principalMay } from "./lib/grants.js";
+import { findGrantByCredentialHash } from "./lib/auth-store.js";
 import {
   hasSensitiveTransportIdentity,
   scanEnvelope as scanEnvelopeSecrets,
@@ -1442,7 +1444,29 @@ export default {
     const readRoute = path === "/api/rag/unified" || path === "/api/rag/think";
     const keyAuthorized = readRoute ? validateReadKey(request, env) : validateAdminKey(request, env);
     // A passkey session is accepted exactly where the read-only proxy key is.
-    if (!keyAuthorized && !(readRoute && await validateOwnerSession(request, env))) {
+    let authorized = keyAuthorized || (readRoute && await validateOwnerSession(request, env));
+
+    // A named person, holding a grant credential rather than one of the two
+    // env keys. Consulted only when the shipped checks already said no, so the
+    // owner and proxy paths keep their exact behaviour and never touch the
+    // database to authenticate.
+    //
+    // The capability check lives here, in front of dispatch, for the same
+    // reason the key check does: a route nobody classified requires
+    // `administer`, so a path added later is owner-only until somebody decides
+    // otherwise, and an unknown path still answers 401 rather than 404, which
+    // keeps the route list unenumerable.
+    if (!authorized) {
+      const principal = await resolvePrincipal(request, env, {
+        lookupCredential: (hash) => findGrantByCredentialHash(env, hash),
+      });
+      if (principal && principalMay(principal, path)) authorized = true;
+    }
+
+    if (!authorized) {
+      // Deliberately the same body and status for "who are you" and "not
+      // allowed". A distinguishable 403 would let a scoped caller map the
+      // route table, and twelve assertions pin this exact response.
       return jsonResponse({ error: "unauthorized" }, 401);
     }
 
