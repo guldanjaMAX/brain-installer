@@ -5836,7 +5836,10 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   if (!existsSync(root)) die(`no such folder: ${root}`);
   const { walk, prepare, batchStream, splitOversized, loadState, saveState, removedSinceLastRun } = await ingestLib();
 
+  const sourceExplicit = typeof flags.source === "string" && flags.source.trim() !== "";
   const sourceName = assertSourceName(flags.source === true ? null : flags.source || "upload");
+  // What the content sniffer recognised, so the run can say so at the end.
+  const messageExportsSeen = new Set();
   // A dry run sends nothing, so it must not demand credentials it will never
   // use. Requiring a Cloudflare token to preview what WOULD be loaded turns the
   // safest command in the tool into one of the hardest to reach.
@@ -5972,6 +5975,7 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   const prepareOne = async (f) => {
     const r = await prepare(f, { sourceName, ocr: ocrCallback });
     if (r.note) notes.push({ path: f.rel, note: r.note });
+    if (r.messageExport) messageExportsSeen.add(r.messageExport);
 
     // A multi-document producer (a WhatsApp export, an SMS Backup & Restore
     // .xml, a Google Voice Takeout page, each sessionized into many
@@ -6353,6 +6357,22 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   if (tally.failed) info(summary);
   else ok(summary);
   if (tally.refused) warn(`${tally.refused} file(s) refused for carrying live credentials. They were NOT indexed.`);
+  if (messageExportsSeen.size) {
+    // A zone is a sensitivity boundary. A file format is not. One WhatsApp
+    // export routinely holds an accountant and an oncologist in the same file,
+    // so filing it as one source guarantees a wrong zone whichever way it is
+    // set. Nothing here guesses: it says what was recognised, says where it
+    // went, and leaves the split to the person who knows who is in it.
+    const found = [...messageExportsSeen].sort().join(", ");
+    info(`recognised and loaded as conversations: ${found}`);
+    info(`  filed under source "${sourceName}"${sourceExplicit ? "" : " (the default; --source names it)"}`);
+    warn(
+      "a message export usually spans more than one sensitivity zone, so one source\n" +
+      "  name may be the wrong unit for it. Splitting the export, or ingesting it under\n" +
+      "  its own --source, is what makes it zonable. Nothing was zoned automatically.\n" +
+      `  See what is unzoned: brain zone ${displayPath(manifestPath)}`,
+    );
+  }
   await reportSkips(skips);
 
   info(`progress saved to ${relative(process.cwd(), statePath)}`);

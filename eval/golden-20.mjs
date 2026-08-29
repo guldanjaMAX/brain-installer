@@ -183,7 +183,32 @@ function parsePicks(text, max) {
   return picks.length ? picks : null;
 }
 
-async function captureEvidence({ kind, question, client, askFn, log }) {
+/**
+ * How many chunks are still waiting to reach the vector index.
+ *
+ * The evidence step below asks the brain to find the document that answers a
+ * question the owner just wrote. Mid-load that question is unanswerable for a
+ * reason that has nothing to do with the brain's knowledge: the document is in
+ * D1 and has not been vectorised yet. Retrieval returns an empty list, exactly
+ * as it would for a document that does not exist, and the owner is sitting
+ * there watching their own lease fail to appear.
+ *
+ * Reading the backlog is what lets the session tell those two apart. It is
+ * fail-soft on purpose: a health endpoint that is slow or missing must never
+ * take down a session with a person in it, so an unreadable backlog reports
+ * null and the session proceeds exactly as it did before.
+ */
+async function readVectorBacklog(client) {
+  try {
+    const health = await client.health();
+    const depth = Number(health?.vector_backlog);
+    return Number.isFinite(depth) && depth >= 0 ? depth : null;
+  } catch {
+    return null;
+  }
+}
+
+async function captureEvidence({ kind, question, client, askFn, log, backlog = null }) {
   let results = [];
   try {
     results = dedupeByDocument(await client.retrieve(question, { limit: 10 }));
@@ -197,6 +222,12 @@ async function captureEvidence({ kind, question, client, askFn, log }) {
       const title = String(r.title || r.ref_key || "untitled").slice(0, 96);
       log(`    ${i + 1}. [${r.source || "unknown"}] ${title}`);
     });
+  } else if (backlog) {
+    // Do not let a still-loading index masquerade as an absent document.
+    log(`  The brain returned nothing, and ${backlog.toLocaleString()} chunks are still`);
+    log("  loading, so this is very likely too early rather than genuinely missing.");
+    log("  Name the document yourself if you know it, or leave it and re-run");
+    log("  --golden-20 once the load settles.");
   } else {
     log("  The brain returned nothing for this question.");
   }
@@ -265,6 +296,19 @@ export async function runGolden20Session({
   log("  while reading a document borrows its wording and flatters the score.");
   log("  A blank question skips the slot; re-run --golden-20 later to finish.");
 
+  // Checked once, before the first question, because the honest thing to do
+  // about a still-loading index is warn up front rather than let someone draw
+  // twenty wrong conclusions one at a time.
+  const backlog = await readVectorBacklog(client);
+  if (backlog) {
+    log("");
+    log(`  NOTE: ${backlog.toLocaleString()} chunks have not reached the search index yet.`);
+    log("  Writing the questions now is fine and is the best use of this time.");
+    log("  Attaching the right documents to them is not: the brain will come up");
+    log("  empty for things it already holds, which looks like a gap and is not.");
+    log("  Finish the wording now and re-run --golden-20 after the load settles.");
+  }
+
   let added = 0;
   let skipped = 0;
   for (const slot of slots) {
@@ -291,7 +335,7 @@ export async function runGolden20Session({
           log("  (could not run the live refusal check; the eval will still test it)");
         }
       } else {
-        const evidence = await captureEvidence({ kind: slot.kind, question, client, askFn, log });
+        const evidence = await captureEvidence({ kind: slot.kind, question, client, askFn, log, backlog });
         if (evidence === "skip") {
           skipped++;
           continue;
