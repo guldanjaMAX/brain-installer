@@ -1611,8 +1611,10 @@ for (const reportedChanges of [0, 9]) {
     embed: async () => { throw new Error("busy bootstrap embedded"); },
     embedBatch: async () => { throw new Error("busy bootstrap embedded"); },
   });
+  // 15, not 60: a busy receipt hands back a poll-again-in hint, capped at
+  // DRAIN_BUSY_RETRY_HINT_MAX_MS, never the whole remaining lease TTL.
   check("accelerated bootstrap exposes an aggregate bounded busy receipt",
-    held.acquired === true && busy.busy === true && busy.retry_after_seconds === 60 &&
+    held.acquired === true && busy.busy === true && busy.retry_after_seconds === 15 &&
       busy.in_flight_batches === 0 && upsertBatches.length === 0 &&
       !JSON.stringify(busy).includes("accelerated-busy-owner"),
     JSON.stringify(busy));

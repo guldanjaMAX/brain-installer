@@ -3543,7 +3543,7 @@ export async function cmdUpgrade(manifestPath, options = {}) {
         // steady-state outbox work that arrived before the paused boundary and
         // independently verifies normal post-upgrade operation.
         await runStage("vector projection convergence", () =>
-          drainProjection(executionPin.target));
+          drainProjection(executionPin.target, { requireComplete: true }));
       }
       await runStage("exact-version health verification", () =>
         verifyHealth(executionPin.target, {
@@ -10860,7 +10860,7 @@ export async function cmdSetup(manifestPath, options = {}) {
     // must exist before this HTTPS-only command can resume the bounded,
     // cursor-backed bootstrap. If setup is interrupted, rerunning it continues
     // from D1 rather than rebuilding an invocation-local queue.
-    await drainSetup(target);
+    await drainSetup(target, { requireComplete: true });
   }
   // Prove that Step 4 actually committed durable desired state. A shell key is
   // still preserved for the caller, but setup health must not depend on it.
@@ -12650,7 +12650,7 @@ async function cmdRefit(manifestPath) {
   ok(renderSearchability(done?.coverage || before));
   if (done?.chunks_queued_for_embedding) {
     info(`${done.chunks_queued_for_embedding} chunk(s) are queued for embedding.`);
-    return cmdDrain(manifestPath);
+    return cmdDrain(manifestPath, { requireComplete: true });
   }
   return done || plan;
 }
@@ -12702,10 +12702,119 @@ async function cmdReindex(manifestPath) {
   if (!done.queued) {
     info("everything was already queued; draining what is there.");
   }
-  return cmdDrain(manifestPath);
+  return cmdDrain(manifestPath, { requireComplete: true });
 }
 
 export const MANUAL_DRAIN_MAX_MS = 20 * 60 * 1000;
+
+/**
+ * How long a manual drain keeps trying to slot in behind the lease holder.
+ *
+ * The server's retry hint is derived from the lease EXPIRY, which is a 20
+ * minute safety TTL, not an estimate of when the holder will finish. A
+ * scheduled drain releases the lease at the end of its own bounded invocation,
+ * usually seconds to a couple of minutes, so the honest move is to ask again
+ * soon rather than to sleep through the hint. Sleeping through it is what made
+ * the escape hatch useless: one 409 consumed the manual run's entire budget,
+ * and the condition that makes a human run this by hand, a large backlog, is
+ * exactly the condition that keeps the scheduled drain holding the lease.
+ *
+ * Two minutes of polling covers a normal scheduled invocation ending. Past
+ * that, waiting longer tells the operator nothing new, so say so and stop.
+ */
+export const DRAIN_BUSY_YIELD_MS = 120_000;
+/** Never hammer the lease faster than this while blocked. */
+export const DRAIN_BUSY_POLL_MIN_MS = 3_000;
+/** Never sleep longer than this on a hint that is a TTL rather than an ETA. */
+export const DRAIN_BUSY_POLL_MAX_MS = 15_000;
+/**
+ * Holding the lease and moving nothing for this long is a stall, not patience.
+ *
+ * Vectorize confirms asynchronously, so some waiting is normal. Five minutes
+ * of literally zero movement in confirmed, accepted AND queued is not waiting;
+ * it is a fault, and burning the remaining fifteen minutes discovers nothing.
+ */
+export const DRAIN_STALL_MS = 5 * 60 * 1000;
+
+/**
+ * One progress line, written so that standing still cannot look like moving.
+ *
+ * The original line computed its rate as total-confirmed over total-elapsed.
+ * That number DECAYS toward zero whenever progress is zero, and the projected
+ * time left grows to match, so the display was at its most reassuring exactly
+ * when the run was achieving least. A real operator watched 131,359 sit
+ * unchanged while the line slid from ~115/min to ~94/min and the estimate grew
+ * from 1143 to 1398 minutes, and reasonably read that as slow progress.
+ *
+ * Two rules fix it. The rate is measured only over the window since progress
+ * was last SEEN to change, so stalled time cannot deflate it into a gentler
+ * lie. And a round that moved nothing prints the stall in words, with no rate
+ * and no estimate at all, because there is no rate.
+ */
+export function renderDrainProgress({
+  drained = 0,
+  submitted = 0,
+  remaining = 0,
+  progressed = true,
+  blocked = false,
+  holderDrained = 0,
+  stalledMs = 0,
+  windowMs = 0,
+  windowDrained = 0,
+} = {}) {
+  const seconds = Math.max(1, Math.round(Number(stalledMs) / 1_000));
+  if (blocked) {
+    if (holderDrained > 0) {
+      return `${remaining} to go. Another vector drain holds the writer lease and is draining it ` +
+        `(${holderDrained} fewer in ${seconds}s). This run has written nothing; waiting for a gap.`;
+    }
+    return `${remaining} to go. No progress for ${seconds}s: another vector drain holds the ` +
+      "writer lease, so this run has drained nothing. Waiting for a gap.";
+  }
+  const head = `${drained} query-visible, ${submitted} accepted, ${remaining} to go`;
+  // Not moving and not-yet-measurable are different states and must not share a
+  // line. Only the first one is a stall; the second is an ordinary early round.
+  if (!progressed) {
+    return `${head}. No progress for ${seconds}s: nothing confirmed, nothing accepted, ` +
+      "and the queue has not moved. There is no rate to show.";
+  }
+  const mins = Number(windowMs) / 60_000;
+  const rate = windowMs > 3_000 && windowDrained > 0 ? Math.round(windowDrained / mins) : null;
+  if (!rate) return head;
+  if (!remaining) return `${head}, ~${rate}/min`;
+  return `${head}, ~${rate}/min, about ${Math.max(1, Math.ceil(remaining / rate))} min left`;
+}
+
+/**
+ * The closing line for a run that never got a turn at the writer lease.
+ *
+ * Deliberately not phrased like success and deliberately not phrased like a
+ * failure, because it is neither: nothing was written, nothing was claimed,
+ * and the queue is exactly as it was found.
+ */
+export function drainYieldNotice({ remaining = 0, waitedMs = 0, holderDrained = 0 } = {}) {
+  const seconds = Math.max(1, Math.round(Number(waitedMs) / 1_000));
+  const head = `nothing was drained by this run. Another vector drain held the writer lease ` +
+    `for the whole ${seconds}s it waited, and only one drain may write vectors at a time.`;
+  const holder = holderDrained > 0
+    ? `\n        That drain is working: ${holderDrained} fewer operation(s) queued while this run waited.`
+    : "\n        That drain moved nothing while this run waited, so it may be finishing a slow batch.";
+  return `${head}${holder}\n` +
+    `        ${remaining} vector operation(s) are still queued and are safe.\n` +
+    "        Nothing was changed here. Re-run `brain drain <manifest>` to take the next gap.";
+}
+
+/** The closing line for a run that held the lease and still moved nothing. */
+export function drainStalledFailure({ drained = 0, submitted = 0, remaining = 0, stalledMs = 0 } = {}) {
+  const minutes = Math.max(1, Math.round(Number(stalledMs) / 60_000));
+  return (
+    `the drain held the writer lease for ${minutes} minute(s) without moving a single operation.\n` +
+    `      ${drained} confirmed and ${submitted} accepted in total, with ${remaining} still queued,\n` +
+    "      and none of those three numbers changed in that window. This is a stall, not slow\n" +
+    "      progress, so the run stopped rather than spend its remaining window discovering the\n" +
+    "      same thing. Completed chunks are safe. Run `brain diagnose <manifest>` for the reason."
+  );
+}
 
 /** Validate the lease-busy retry contract without exposing its owner token. */
 export function validateDrainBusyReceipt(body) {
@@ -12724,31 +12833,58 @@ export function validateDrainBusyReceipt(body) {
   return { remaining, retryAfterSeconds };
 }
 
-async function cmdDrain(manifestPath, options = {}) {
-  const { m } = loadManifest(manifestPath);
-  // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker
-  // over plain HTTPS with the admin key, so it must keep working after our token
-  // is revoked at handoff. A command that proves the brain works, but only while
-  // we still hold a key to the client's account, proves the wrong thing.
-  const acct = m.brain?.domain ? null : await resolveAccount(m);
-  const base = await resolveBaseUrl(m, acct);
-  const adminKey = resolveAdminKey(manifestPath);
-  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
-
-  const now = typeof options.now === "function" ? options.now : Date.now;
-  const wait = options.sleep ?? ((milliseconds) =>
+/**
+ * The manual drain loop, with every dependency injected.
+ *
+ * Split out of cmdDrain so the standoff it exists to survive can be exercised
+ * without a manifest, a Cloudflare account or a live brain.
+ *
+ * The single-writer guarantee is untouched by anything in here. This loop only
+ * ever asks the worker to drain; the worker still refuses with 409 whenever the
+ * D1 lease is held, and every actual Vectorize write still sits behind the same
+ * single-row compare-and-swap (claim on `owner IS NULL OR expires_at <= now`,
+ * re-prove ownership immediately before each mutation, release by owner token).
+ * Asking more often can only produce more 409s. It cannot produce a second
+ * writer, because acquisition, not politeness, is what admits a writer.
+ */
+export async function runDrainLoop({
+  base,
+  adminKey,
+  http: callHttp = http,
+  now = Date.now,
+  sleep,
+  log = { info, warn, ok },
+  maxDurationMs = MANUAL_DRAIN_MAX_MS,
+  busyYieldMs = DRAIN_BUSY_YIELD_MS,
+  stallMs = DRAIN_STALL_MS,
+  maxRounds = 400,
+  requireComplete = false,
+} = {}) {
+  const wait = sleep ?? ((milliseconds) =>
     new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds)));
-  const callHttp = options.http ?? http;
-  const maxDurationMs = Number.isSafeInteger(options.maxDurationMs)
-    ? Math.min(MANUAL_DRAIN_MAX_MS, Math.max(1_000, options.maxDurationMs))
-    : MANUAL_DRAIN_MAX_MS;
   const started = now();
   const deadline = started + maxDurationMs;
+  const yieldAfterMs = Math.max(1_000, Math.min(busyYieldMs, maxDurationMs));
+
   let drained = 0;
   let submitted = 0;
   let remaining = null;
   let rounds = 0;
-  const maxRounds = 400;
+
+  // Rate bookkeeping. The window is re-anchored on every round that moves
+  // nothing, so stalled time is EXCLUDED from the rate rather than quietly
+  // deflating it. See renderDrainProgress for why that matters.
+  let windowStart = started;
+  let windowDrained = 0;
+  let lastChangeAt = started;
+
+  // Blocked-streak bookkeeping, reset the moment this run gets a turn.
+  let everAcquired = false;
+  let blockedSince = null;
+  let blockedStartRemaining = null;
+  let holderDrained = 0;
+  let stalled = false;
+
   for (let round = 1; round <= maxRounds; round++) {
     if (now() >= deadline) break;
     rounds = round;
@@ -12760,7 +12896,7 @@ async function cmdDrain(manifestPath, options = {}) {
       what: "the drain",
     }), {
       shouldRetry: (error) => error?.retryable === true,
-      onRetry: (error, attempt, attempts) => info(
+      onRetry: (error, attempt, attempts) => log.info(
         `the drain request hit a network error (${String(error?.message || error).split("\n", 1)[0]}). ` +
         `Retrying ${attempt}/${attempts - 1}; completed chunks are already safe.`
       ),
@@ -12768,28 +12904,66 @@ async function cmdDrain(manifestPath, options = {}) {
     const raw = await res.text();
     let body = null;
     try { body = JSON.parse(raw); } catch { /* validated below */ }
+
     if (res.status === 409) {
       const busy = validateDrainBusyReceipt(body);
+      const at = now();
+      if (blockedSince === null) {
+        blockedSince = at;
+        blockedStartRemaining = busy.remaining;
+      }
+      if (remaining !== null && busy.remaining !== remaining) lastChangeAt = at;
       remaining = busy.remaining;
-      const delayMs = Math.min(busy.retryAfterSeconds * 1_000, Math.max(0, deadline - now()));
+      holderDrained = Math.max(0, blockedStartRemaining - busy.remaining);
+      const blockedMs = at - blockedSince;
+      log.info(renderDrainProgress({
+        drained, submitted, remaining, blocked: true, holderDrained, stalledMs: blockedMs,
+      }));
+      // Stop waiting once the holder has plainly not finished within a normal
+      // scheduled invocation. Sleeping on the server's TTL-shaped hint instead
+      // is what burned the whole twenty minutes and drained nothing.
+      if (blockedMs >= yieldAfterMs) break;
+      const hintMs = Math.min(busy.retryAfterSeconds * 1_000, DRAIN_BUSY_POLL_MAX_MS);
+      const delayMs = Math.min(
+        Math.max(DRAIN_BUSY_POLL_MIN_MS, hintMs),
+        Math.max(0, deadline - now()),
+        Math.max(0, blockedSince + yieldAfterMs - now()),
+      );
       if (delayMs <= 0) break;
-      info(`another vector drain is finishing; retrying in ${Math.ceil(delayMs / 1_000)} second(s)`);
       await wait(delayMs);
       continue;
     }
+
     if (!res.ok) die(`drain failed (${res.status}): ${raw.slice(0, 200)}`);
     const receipt = validateDrainReceipt(body);
+    everAcquired = true;
+    blockedSince = null;
+    blockedStartRemaining = null;
+    holderDrained = 0;
+    const moved = receipt.drained > 0 || receipt.submitted > 0 || receipt.remaining !== remaining;
     drained += receipt.drained;
     submitted += receipt.submitted;
     remaining = receipt.remaining;
-    const mins = (now() - started) / 60000;
-    const rate = mins > 0.05 ? Math.round(drained / mins) : null;
-    info(
-      `${drained} query-visible, ${submitted} accepted, ${remaining} to go` +
-        (rate ? `, ~${rate}/min` : "") +
-        (rate && remaining ? `, about ${Math.max(1, Math.ceil(remaining / rate))} min left` : "")
-    );
+    const at = now();
+    if (moved) {
+      lastChangeAt = at;
+    } else {
+      // Re-anchor: time spent achieving nothing must not be averaged into the
+      // rate, and it must not be presented as a gentler rate either.
+      windowStart = at;
+      windowDrained = drained;
+    }
+    log.info(renderDrainProgress({
+      drained,
+      submitted,
+      remaining,
+      progressed: moved,
+      stalledMs: at - lastChangeAt,
+      windowMs: at - windowStart,
+      windowDrained: drained - windowDrained,
+    }));
     if (remaining === 0) break;
+    if (!moved && at - lastChangeAt >= stallMs) { stalled = true; break; }
     if (receipt.waiting > 0) {
       // Vectorize V2 processes changesets asynchronously. Poll slowly enough to
       // remain Free-plan friendly, but keep the existing 400-round/20-minute
@@ -12799,16 +12973,76 @@ async function cmdDrain(manifestPath, options = {}) {
       await wait(delayMs);
     }
   }
-  if (remaining !== 0 && now() >= deadline) {
+
+  if (remaining === 0) {
+    assertDrainComplete({ remaining, rounds, maxRounds });
+    // A run that drained nothing must not read like one that drained something,
+    // even when both end query-ready.
+    log.ok(drained
+      ? `vector index is query-ready (${drained} confirmed)`
+      : "vector index is query-ready; this run had nothing to drain");
+    return { drained, submitted, remaining, rounds, outcome: "complete" };
+  }
+
+  if (stalled) {
+    die(drainStalledFailure({ drained, submitted, remaining, stalledMs: now() - lastChangeAt }));
+  }
+
+  // Never got a turn: nothing written, nothing claimed, nothing left unproven.
+  if (!everAcquired && drained === 0 && submitted === 0 && blockedSince !== null) {
+    const notice = drainYieldNotice({
+      remaining,
+      waitedMs: now() - blockedSince,
+      holderDrained,
+    });
+    // Callers that GATE on a complete drain still fail. Only the hand-run
+    // escape hatch is allowed to treat a held lease as a non-event.
+    if (requireComplete) die(notice);
+    log.warn(notice);
+    return { drained, submitted, remaining, rounds, outcome: "yielded" };
+  }
+
+  if (requireComplete) {
     die(
       `the drain reached its ${Math.ceil(maxDurationMs / 60_000)}-minute wall-clock safety limit with ` +
         `${remaining ?? "unknown"} vector operation(s) still queued.\n` +
         "      Completed chunks are safe. Re-run `brain drain` to resume from the durable queue.",
     );
   }
-  assertDrainComplete({ remaining, rounds, maxRounds });
-  ok(`vector index is query-ready (${drained} confirmed)`);
-  return { drained, submitted, remaining };
+  log.warn(
+    `not finished: ${drained} operation(s) confirmed and ${submitted} accepted, ` +
+      `${remaining ?? "an unknown number of"} still queued.\n` +
+      `        This run stopped at its ${Math.ceil(maxDurationMs / 60_000)}-minute safety limit, which a large\n` +
+      "        backlog is expected to reach. Everything confirmed is durable and nothing is\n" +
+      "        repeated. Re-run `brain drain <manifest>` to continue from the durable queue.",
+  );
+  return { drained, submitted, remaining, rounds, outcome: "partial" };
+}
+
+async function cmdDrain(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  // Cloudflare is OPTIONAL here, deliberately. This command talks to the worker
+  // over plain HTTPS with the admin key, so it must keep working after our token
+  // is revoked at handoff. A command that proves the brain works, but only while
+  // we still hold a key to the client's account, proves the wrong thing.
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
+
+  return runDrainLoop({
+    base,
+    adminKey,
+    http: options.http ?? http,
+    now: typeof options.now === "function" ? options.now : Date.now,
+    sleep: options.sleep,
+    maxDurationMs: Number.isSafeInteger(options.maxDurationMs)
+      ? Math.min(MANUAL_DRAIN_MAX_MS, Math.max(1_000, options.maxDurationMs))
+      : MANUAL_DRAIN_MAX_MS,
+    // `brain drain` run by hand is an escape hatch and reports honestly. Every
+    // caller that GATES on a query-ready index passes requireComplete.
+    requireComplete: options.requireComplete === true,
+  });
 }
 
 function supportCommandOperation(label, operation) {

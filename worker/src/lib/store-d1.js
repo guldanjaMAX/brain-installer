@@ -871,6 +871,11 @@ const DELETE_BATCH = 100;
 // that can remain held forever.
 export const DRAIN_LEASE_TTL_MS = 20 * 60 * 1000;
 
+// The longest a busy receipt may ever tell a caller to wait. The lease TTL
+// above is a safety envelope; this is an ETA-shaped hint. They are different
+// numbers on purpose, and conflating them is what stranded manual drains.
+export const DRAIN_BUSY_RETRY_HINT_MAX_MS = 15 * 1000;
+
 // Cloudflare counts every statement submitted through D1, including each
 // statement inside DB.batch(), toward the documented 1,000-query Worker
 // invocation limit. Keep the drain below a stricter internal budget so its
@@ -962,10 +967,22 @@ export async function acquireDrainLease(env, {
   if (!state || Number(state.schema_ready) !== 1 || Number(state.held) !== 1) {
     throw new Error("vector drain lease state is unavailable");
   }
+  // A POLL-AGAIN-IN hint, not a lease-expiry disclosure.
+  //
+  // This used to return the whole time left on the lease, and the lease TTL is
+  // a twenty minute SAFETY envelope sized for the longest possible invocation,
+  // not an estimate of when the holder will finish. A holder normally releases
+  // within its own bounded invocation, seconds to a couple of minutes. Handing
+  // out "retry in 941 seconds" told a manual drain to sleep through its entire
+  // budget for a lease that was free again almost immediately, so the escape
+  // hatch drained nothing and then failed. Capping the hint at one short poll
+  // interval lets any client, old or new, slot into the gap the moment it
+  // opens. It costs one cheap D1 read per poll and cannot admit a second
+  // writer: only a successful compare-and-swap does that.
   const observedExpiry = Number(state.expires_at);
   const retryAfterMs = Number.isSafeInteger(observedExpiry)
-    ? Math.max(1_000, Math.min(DRAIN_LEASE_TTL_MS, observedExpiry - now))
-    : DRAIN_LEASE_TTL_MS;
+    ? Math.max(1_000, Math.min(DRAIN_BUSY_RETRY_HINT_MAX_MS, observedExpiry - now))
+    : DRAIN_BUSY_RETRY_HINT_MAX_MS;
   return {
     acquired: false,
     retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1_000)),
