@@ -123,6 +123,11 @@ import {
 } from "./operations/cloudflare-token-store.mjs";
 import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
 import { deriveSessionSigningKey } from "./operations/session-signing-key.mjs";
+import {
+  renderTechnicianPlan,
+  runTechnicianStep,
+  technicianPlan,
+} from "./operations/technician-setup.mjs";
 import { guardBrainAdminFetch } from "./components/brain-http.mjs";
 import { confidenceLine } from "./worker/src/lib/confidence.js";
 import { retrievalUnavailable, unavailableNotice } from "./worker/src/lib/retrieval-status.js";
@@ -4068,7 +4073,7 @@ function assertSourceName(name) {
  * filename", which is intended.
  */
 export const VALUE_FLAGS = new Set([
-  "path", "source", "limit", "from", "manifest", "scopes", "port", "kind", "add", "bookmark", "export", "backup",
+  "path", "source", "limit", "from", "manifest", "scopes", "port", "host", "user", "run", "confirm-host", "kind", "add", "bookmark", "export", "backup",
   "golden", "profile", "k", "repeat", "baseline", "save", "artifacts",
   "corpus-contract", "approve-removals", "only", "skip",
   // brain import bank. `--file` with no value must die saying so rather than
@@ -12821,6 +12826,61 @@ async function cmdUpgradeInteractive(manifestPath) {
   return withCloudflareToken(() => cmdUpgrade(manifestPath), { accountId: manifestAccountId(manifestPath) });
 }
 
+/**
+ * Guide one install-day account ceremony at a time without becoming a second
+ * credential store. The default is a read-only plan. A selected step launches
+ * the existing reviewed command in a short-lived child with an allowlisted
+ * environment, so agent shells never need to receive credentials.
+ */
+export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
+  assertKnownFlags(
+    flags,
+    ["json", "run", "host", "user", "port", "source", "scopes", "confirm-host"],
+    "brain technician",
+  );
+  const plan = technicianPlan(manifestPath, options.manifestDeps || {});
+  const step = flags.run ? String(flags.run).trim().toLowerCase() : null;
+  if (!step) {
+    if (flags.json) console.log(JSON.stringify(plan, null, 2));
+    else console.log(renderTechnicianPlan(plan));
+    return plan;
+  }
+  if (flags.json) die("--json is read-only and cannot be combined with --run");
+
+  const readHidden = options.readHidden || (({ prompt, noun, optional }) => readHiddenInput({
+    prompt,
+    noun,
+    maxBytes: 2048,
+    accepts: (byte) => byte >= 0x21 && byte <= 0x7e,
+    finalize: (bytes) => {
+      if (!optional && bytes.length === 0) throw new Error(`${noun} cannot be empty`);
+      return Buffer.from(bytes);
+    },
+  }));
+  try {
+    const receipt = await runTechnicianStep({
+      step,
+      manifestPath,
+      flags,
+      scriptPath: options.scriptPath || fileURLToPath(import.meta.url),
+      readHidden,
+      baseEnv: options.baseEnv || process.env,
+      spawn: options.spawn || spawnSync,
+      nodePath: options.nodePath || process.execPath,
+      manifestDeps: options.manifestDeps || {},
+    });
+    ok(`${step} technician step completed`);
+    info("rerun `brain technician <manifest>` to see the full plan; live proof still comes from the final field checklist");
+    return receipt;
+  } catch (error) {
+    die(String(error?.message || error));
+  }
+}
+
+async function cmdTechnicianInteractive(manifestPath) {
+  return cmdTechnician(manifestPath, parseFlags(process.argv.slice(3)));
+}
+
 /** Mint a one-time passkey enrollment link for the brain's owner. */
 async function cmdInvite(manifestPath) {
   const { m } = loadManifest(manifestPath);
@@ -13275,6 +13335,7 @@ const commands = {
   rollback: dispatchRollback,
   schedule: cmdSchedule,
   support: cmdSupport,
+  technician: cmdTechnicianInteractive,
 };
 
 if (IS_MAIN && (!cmd || !commands[cmd])) {
@@ -13297,6 +13358,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it
     brain token      <manifest>            is a Cloudflare token remembered on this Mac? --forget removes it
+    brain technician <manifest>            read-only account setup plan; --run <step> launches one safe ceremony
     brain invite     <manifest>            one-tap passkey enrollment link for the owner (Face ID, 15 min)
     brain devices    <manifest>            enrolled passkeys; --revoke <credential id> removes one
     brain test       <manifest>            full acceptance suite (5 tiers)

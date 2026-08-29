@@ -9,6 +9,13 @@ the brain, not for whoever built it: what changed for them, and what to check.
 **Your brain now has an owner workspace, scoped sharing, and financial actions,
 without weakening the ingestion and deletion rules underneath them.**
 
+- A new `brain technician` guide turns install day into six reviewed steps for
+  Cloudflare, Google, Zoom, IMAP, the first passkey, and final verification.
+  Its plan is safe for a local coding agent to read, but tokens and secrets stay
+  in hidden terminal prompts and the owner still handles login, 2FA, consent,
+  billing, and the physical passkey gesture. From a source checkout,
+  `npm run rehearse:onboarding` opens the real owner workspace with synthetic
+  data so every important screen can be tried before any account is connected.
 - Owners can sign in with a passkey, upload a text document, record an approval,
   accept or reopen a period close, review append-only activity, and maintain
   targets and preferences. Retrying the same action after a lost response does

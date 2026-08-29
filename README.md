@@ -57,6 +57,19 @@ Windows PowerShell:
 
 ## Set it up
 
+Want to see the owner experience before connecting anything? From a source
+checkout, run `npm run rehearse:onboarding`. It opens the real owner-workspace
+bundle with synthetic data and an unmistakable local-only banner. No account,
+credential, manifest, or deployment is used.
+
+For an install day, `brain technician <manifest>` prints the six-step read-only
+plan. Add `--json` when a local coding agent is guiding the session. Run one
+reviewed step at a time with `--run cloudflare`, `google`, `zoom`, `imap`,
+`passkey`, or `verify`. The owner still handles login, 2FA, OAuth consent, and
+the physical passkey gesture. Tokens and app secrets go only into hidden
+terminal prompts, never into agent chat. The complete guide is
+[onboarding/09-technician-setup-and-rehearsal.md](onboarding/09-technician-setup-and-rehearsal.md).
+
 You need two things first. `brain doctor` checks the technical access and tells
 you what to do about anything missing. Cloudflare does not expose the account's
 plan through the scoped install token, so you must confirm **Workers and Pages,

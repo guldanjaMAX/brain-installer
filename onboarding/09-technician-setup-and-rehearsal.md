@@ -1,0 +1,165 @@
+# Technician setup and local rehearsal
+
+The owner should not have to understand OAuth, webhook validation, terminal
+environment variables, or passkey relying-party rules. The technician workflow
+turns those details into six small ceremonies. It does not hide the parts only
+the account owner can do.
+
+## Try the owner experience with no accounts
+
+From a source checkout:
+
+```bash
+npm run rehearse:onboarding
+```
+
+The command installs only the local UI test dependencies when needed, builds
+the real owner-workspace bundle, starts a loopback-only fixture, and opens a
+safety page. Every screen says `LOCAL REHEARSAL`, uses invented data, and keeps
+the following states one click away:
+
+- populated owner workspace
+- first passkey screen
+- healthy empty Brain
+- partial and unavailable reads
+- conflict and lost-response retry
+- exact-document guest access
+- guest search with the scoped vector gap stated explicitly
+
+Stop it with Control-C. Nothing is deployed, no manifest or credential store is
+read, and no account is contacted.
+
+This proves local layout, navigation, API response handling, access-surface
+separation, and empty-versus-unavailable language. It does not prove Cloudflare,
+Google consent, a real mailbox, Zoom delivery, or a physical passkey ceremony.
+
+## The one technician command
+
+After installing the released CLI, start with the read-only plan:
+
+```bash
+brain technician "$HOME/Financial Brain/brain.manifest.json"
+```
+
+For a local coding agent, use the JSON form:
+
+```bash
+brain technician "$HOME/Financial Brain/brain.manifest.json" --json
+```
+
+The JSON contains workflow state, dashboard links, proof boundaries, and the
+next reviewed command. It contains no credentials. An agent may guide the
+browser and explain each page, but the owner enters every token or secret into
+the hidden terminal prompt. Do not paste one into agent chat.
+
+## Six steps
+
+### 1. Cloudflare install
+
+```bash
+brain technician "$HOME/Financial Brain/brain.manifest.json" --run cloudflare
+```
+
+The owner signs in, confirms Workers Paid, creates the scoped installation
+token, and enters it into the hidden prompt. The existing setup command performs
+the account check, provisioning, migrations, deploy, key persistence, and
+health proof. It is safe to rerun after an interruption.
+
+### 2. Google
+
+Enable `google_drive`, `gmail`, and `calendar` in the manifest, then run:
+
+```bash
+brain technician "$HOME/Financial Brain/brain.manifest.json" --run google
+```
+
+The owner creates a Desktop OAuth client in their Google Cloud project. The
+client ID and optional client secret are entered at hidden prompts. Google
+consent stays in the owner's browser. The launcher passes the values only to the
+short-lived connector process and clears its input buffers afterward.
+
+### 3. Zoom
+
+Enable `zoom` in the manifest. A paid Zoom seat with cloud recording is
+required. Then run:
+
+```bash
+brain technician "$HOME/Financial Brain/brain.manifest.json" --run zoom
+```
+
+The Zoom admin creates a Server-to-Server OAuth app with
+`cloud_recording:read:admin`. `user:read:admin` is used only to prove the plan.
+The event subscription is `recording.transcript_completed`. The command probes
+the account, writes the four Worker secrets, and proves the live validation
+challenge before it prints the webhook URL to save in Zoom.
+
+### 4. IMAP
+
+Enable `imap` in the manifest. Use the provider's IMAP host and an app password,
+not the normal mailbox password:
+
+```bash
+brain technician "$HOME/Financial Brain/brain.manifest.json" --run imap \
+  --host imap.example.com --user owner@example.com
+```
+
+The app password is requested by the connector's hidden prompt. It is stored
+only after a real mailbox read succeeds.
+
+### 5. Owner passkey
+
+Settle the final Brain hostname first. With the owner and intended device
+present, run:
+
+```bash
+brain technician "$HOME/Financial Brain/brain.manifest.json" --run passkey \
+  --confirm-host brain.example.com
+```
+
+The confirmation must exactly match `brain.domain`. The command creates one
+single-use link that expires in 15 minutes. The owner opens it on their device
+and completes Face ID, fingerprint, or device PIN. This is the first point where
+a physical passkey becomes proven.
+
+### 6. Handoff checks
+
+```bash
+brain technician "$HOME/Financial Brain/brain.manifest.json" --run verify
+```
+
+This runs doctor, health, source freshness, and enrolled-device checks in order.
+It stops on the first failure and does not mark anything complete. Record a
+connector as live-proven only after its exact acceptance event occurs.
+
+## What the owner does and what the technician does
+
+| Action | Owner | Technician or agent |
+|---|---:|---:|
+| Sign in, 2FA, consent, billing | Yes | Guide only |
+| Create a persistent token or OAuth app | Final click | Explain and verify fields |
+| Read or retain a credential | No chat sharing | Never |
+| Enter a credential | Hidden terminal or provider UI | Never type or echo it |
+| Run installer and connector checks | May observe | Yes |
+| Complete passkey gesture | Yes, on their device | Observe result only |
+| Record proof and unresolved gaps | Confirm result | Yes |
+
+## Live acceptance events
+
+The following are the shortest honest field gates:
+
+- Cloudflare: fresh install, exact-version health, and one synthetic document
+  survives a retry.
+- Google Drive: complete first sweep, add, edit, trash, refuse, and incremental
+  refresh against a test folder.
+- Gmail: one known received message and one sent message appear with provenance,
+  then an incremental rerun adds no duplicate.
+- Calendar: one event with attendees and one cancellation appear; an unreadable
+  calendar produces a partial result rather than a false empty result.
+- Zoom: one new paid-seat cloud recording produces a transcript after the
+  `recording.transcript_completed` event.
+- IMAP: Inbox and Sent read successfully, excluded folders are named, and a
+  second sync resumes from the UID watermarks.
+- Passkey: enroll, sign out, sign back in, add a second device, revoke it, and
+  confirm the owner-facing telemetry contains no credential or ceremony secret.
+
+Fixture tests make these trials safer. They do not replace them.

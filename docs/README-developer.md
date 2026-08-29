@@ -788,6 +788,29 @@ architecture change.
 
 ## Tests
 
+### Local owner-onboarding rehearsal
+
+`npm run rehearse:onboarding` builds the current React owner workspace without
+rewriting the committed Worker asset module, starts the existing synthetic API
+fixture on loopback, and proxies it through a local safety page. The proxy adds
+a persistent rehearsal banner and exposes populated, sign-in, empty, partial,
+degraded, conflict, replay, owner, and exact-document grant states. It reads no
+manifest or credential store and makes no live service call.
+
+`test/onboarding-sandbox.test.mjs` protects the safety labeling, state menu,
+scenario routing, and absence of credential fields. This is browser-contract
+and layout evidence only. Cloudflare install, provider OAuth, webhook delivery,
+mailbox access, and physical WebAuthn remain field gates.
+
+`brain technician <manifest>` is the matching install-day coordinator. Its
+default and `--json` forms are read-only. A selected `--run` step launches the
+existing command in a child process with an allowlisted environment. Google and
+Zoom values are collected by the shared hidden-input primitive, never placed in
+argv, and cleared from the coordinator's buffers and child environment object
+after the command exits. Tests assert ordering, rerun behavior, ambient-secret
+scrubbing, exact hostname confirmation before invite creation, and stop-on-fail
+verification.
+
 Current connector proof levels and the ranked acceptance backlog are maintained
 in [CONNECTOR-BACKLOG.md](./CONNECTOR-BACKLOG.md). Fixture coverage is never a
 substitute for the named real-system field gate.
