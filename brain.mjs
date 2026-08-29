@@ -95,6 +95,7 @@ import {
 } from "./worker/src/lib/secret-scan.js";
 import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mjs";
 import { runAll as doctorRunAll, summarize as doctorSummarize, checkBankFeedRedirect, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
+import { CANNOT_CHECK as D_CANNOT_CHECK, checkSignInAddress, normalizeHostname, upgradePauseRecurrence } from "./doctor.mjs";
 import { runPreinstall, formatPreinstallReport, preinstallExitCode, platformLabel } from "./doctor.mjs";
 import { recordedReleaseState, releaseStateBanner } from "./operations/release-state.mjs";
 import {
@@ -9686,16 +9687,21 @@ export async function diagnoseStuckUpgrade(manifestPath, options = {}) {
   const queryDatabase = options.d1Query ?? d1Query;
 
   let lastRun = null;
+  let pauseRuns = [];
   let installRow = null;
   let detailError = null;
   if (dbId) {
     try {
       const acct = await resolveDiagnoseAccount(m);
+      // LIMIT 25, not 1. The newest run is what --repair acts on, and the ones
+      // behind it are what tell an operator whether this is a bad day or a
+      // broken upgrade path. Same single query either way.
       const runs = await queryDatabase(
         acct.id, dbId,
-        "SELECT started_at, finished_at, from_version, to_version, status, d1_bookmark, detail FROM upgrade_runs ORDER BY started_at DESC LIMIT 1",
+        "SELECT started_at, finished_at, from_version, to_version, status, d1_bookmark, detail FROM upgrade_runs ORDER BY started_at DESC LIMIT 25",
       );
-      lastRun = runs?.results?.[0] || null;
+      pauseRuns = runs?.results || [];
+      lastRun = pauseRuns[0] || null;
       const state = await queryDatabase(acct.id, dbId, "SELECT * FROM install_state WHERE id = 1");
       installRow = state?.results?.[0] || null;
     } catch (error) {
@@ -9711,7 +9717,7 @@ export async function diagnoseStuckUpgrade(manifestPath, options = {}) {
   const pausedSinceMs = lastRun?.started_at ? Date.parse(lastRun.started_at) : null;
   const pausedForMs = Number.isFinite(pausedSinceMs) ? Date.now() - pausedSinceMs : null;
 
-  return { ...probe, lastRun, installRow, stage, pausedSinceMs, pausedForMs, detailError };
+  return { ...probe, lastRun, pauseRuns, installRow, stage, pausedSinceMs, pausedForMs, detailError };
 }
 
 function humanDuration(ms) {
@@ -9744,6 +9750,13 @@ function printStuckUpgradeDiagnosis(diagnosis) {
   }
   if (diagnosis.lastRun?.d1_bookmark) console.log(`    D1 recovery bookmark: ${diagnosis.lastRun.d1_bookmark}`);
   if (diagnosis.detailError) console.log(`    (could not read the full upgrade_runs detail: ${diagnosis.detailError})`);
+  // Whether this has happened before changes what the operator should do next,
+  // and it is the one fact the live state can never carry.
+  const recurrence = upgradePauseRecurrence(diagnosis.pauseRuns || [], { currentlyPaused: true });
+  if (recurrence.note) {
+    console.log("");
+    console.log(`  ${recurrence.note.split("\n").join("\n  ")}`);
+  }
   console.log("");
 }
 
@@ -10037,6 +10050,118 @@ export async function cmdRepairChecksum(manifestPath, options = {}) {
   return { ...result, drift: diagnosis.drift };
 }
 
+/**
+ * Every hostname the client's account routes to this brain's worker.
+ *
+ * WHY THIS IS A CLOUDFLARE READ AND NOT AN HTTP PROBE
+ *
+ * The trap is a SECOND address, and the second address cannot be guessed from
+ * the first: given a custom domain there is no way to derive the workers.dev
+ * name without knowing the account's subdomain, and given the workers.dev name
+ * there is no way to derive a custom domain at all. Only the account knows. So
+ * this asks the account, which means it needs the Cloudflare token that
+ * `brain doctor` may or may not still have.
+ *
+ * Tolerant on every failure, exactly like probeUpgradePause above: a missing
+ * token, a revoked token or a Cloudflare outage returns `checked: false` with
+ * the reason, and the doctor line reports CANNOT CHECK with the dashboard page
+ * to open by hand. It must never be the reason `brain doctor` itself dies, and
+ * it must never report "one address" when the truth is "could not list them",
+ * which is why a partial listing is also `checked: false`.
+ */
+export async function probeBrainHostnames(manifestPath, options = {}) {
+  let m;
+  try {
+    ({ m } = (options.loadManifest ?? loadManifest)(manifestPath));
+  } catch (error) {
+    return { checked: false, reason: `manifest could not be read: ${String(error?.message || error).slice(0, 160)}` };
+  }
+
+  const manifestHost = normalizeHostname(m.brain?.domain || "");
+  const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
+
+  let acct;
+  try {
+    acct = await (options.resolveAccount ?? resolveAccount)(m);
+  } catch (error) {
+    return { checked: false, manifestHost, reason: `no Cloudflare access from here: ${String(error?.message || error).slice(0, 160)}` };
+  }
+
+  const api = options.cf ?? cf;
+  const hosts = [];
+  try {
+    // Custom Domains attached to this script. Zone-level route patterns are a
+    // third way in and are NOT listed here; checkSignInAddress says so rather
+    // than implying this list is exhaustive.
+    const domains = await api(
+      `/accounts/${acct.id}/workers/domains?service=${encodeURIComponent(scriptName)}&environment=production`,
+    );
+    for (const entry of Array.isArray(domains) ? domains : []) {
+      const host = normalizeHostname(entry?.hostname || "");
+      if (host) hosts.push({ host, kind: "custom domain" });
+    }
+  } catch (error) {
+    return { checked: false, manifestHost, reason: `could not list this worker's custom domains: ${String(error?.message || error).slice(0, 160)}` };
+  }
+
+  try {
+    const route = await api(`/accounts/${acct.id}/workers/scripts/${encodeURIComponent(scriptName)}/subdomain`);
+    if (route?.enabled === true) {
+      const sub = await api(`/accounts/${acct.id}/workers/subdomain`);
+      const label = typeof sub?.subdomain === "string" ? sub.subdomain.trim() : "";
+      if (!label) {
+        return { checked: false, manifestHost, reason: "the workers.dev route is on, but Cloudflare did not return the account subdomain" };
+      }
+      hosts.push({ host: normalizeHostname(`${scriptName}.${label}.workers.dev`), kind: "workers.dev, enabled by deploy" });
+    }
+  } catch (error) {
+    return { checked: false, manifestHost, reason: `could not read this worker's workers.dev route: ${String(error?.message || error).slice(0, 160)}` };
+  }
+
+  return { checked: true, manifestHost, hosts, scriptName, accountId: acct.id };
+}
+
+/** The doctor line for it. Same shape as every other check in this file. */
+async function buildSignInAddressCheck(manifestPath, options = {}) {
+  let probe;
+  try {
+    probe = await (options.probeBrainHostnames ?? probeBrainHostnames)(manifestPath, options);
+  } catch (error) {
+    probe = { checked: false, reason: String(error?.message || error).slice(0, 160) };
+  }
+  return checkSignInAddress(probe);
+}
+
+/**
+ * Upgrade runs that never finished, newest first.
+ *
+ * Separate from diagnoseStuckUpgrade on purpose: that one returns early unless
+ * the brain is paused RIGHT NOW, and the case this exists for is the opposite
+ * one. A brain that stranded twice today and is healthy between the two reports
+ * nothing at all through the current-state path, which is exactly how two
+ * events read as two unrelated surprises.
+ */
+export async function readUpgradePauseHistory(manifestPath, options = {}) {
+  let m;
+  try {
+    ({ m } = (options.loadManifest ?? loadManifest)(manifestPath));
+  } catch (error) {
+    return { checked: false, runs: [], reason: `manifest could not be read: ${String(error?.message || error).slice(0, 160)}` };
+  }
+  const dbId = m.infrastructure?.cloudflare?.d1_database_id;
+  if (!dbId) return { checked: false, runs: [], reason: "the manifest has no d1_database_id" };
+  try {
+    const acct = await (options.resolveAccount ?? resolveAccount)(m);
+    const rows = await (options.d1Query ?? d1Query)(
+      acct.id, dbId,
+      "SELECT started_at, finished_at, from_version, to_version, status, detail FROM upgrade_runs ORDER BY started_at DESC LIMIT 25",
+    );
+    return { checked: true, runs: rows?.results || [] };
+  } catch (error) {
+    return { checked: false, runs: [], reason: String(error?.message || error).slice(0, 160) };
+  }
+}
+
 /** The one extra doctor check that reads a DEPLOYED brain instead of this machine. */
 async function buildUpgradePauseCheck(manifestPath, options = {}) {
   let probe;
@@ -10045,18 +10170,51 @@ async function buildUpgradePauseCheck(manifestPath, options = {}) {
   } catch (error) {
     probe = { checked: false, reason: String(error?.message || error).slice(0, 160) };
   }
+
+  // Recurrence is read whatever the live state turns out to be, because the case
+  // this is here for is a brain that is healthy NOW and has stranded twice
+  // already. Tolerant like everything else on this path: no token, no history,
+  // and the current-state answer is unaffected.
+  let history;
+  try {
+    history = await (options.readUpgradePauseHistory ?? readUpgradePauseHistory)(manifestPath, options);
+  } catch (error) {
+    history = { checked: false, runs: [], reason: String(error?.message || error).slice(0, 160) };
+  }
+  const recurrence = upgradePauseRecurrence(history.checked ? history.runs : [], {
+    currentlyPaused: probe.checked === true && probe.paused === true,
+  });
+
   if (!probe.checked) {
-    return { name: "upgrade state", status: D_WARN, detail: `not checked: ${probe.reason}` };
+    const base = { name: "upgrade state", status: D_WARN, detail: `not checked: ${probe.reason}` };
+    return recurrence.note
+      ? { ...base, detail: `${base.detail}; ${recurrence.previous} earlier pause(s) on record`, fix: recurrence.note }
+      : base;
   }
   if (probe.paused) {
+    const fix =
+      "Diagnose exactly where it stopped: brain doctor <manifest> --repair\n" +
+      "  That resumes the same verified upgrade path once you confirm with --yes.\n" +
+      "  To restore the pre-migration snapshot instead: brain doctor <manifest> --rollback";
     return {
       name: "upgrade state",
       status: D_FAIL,
-      detail: "paused for an upgrade; this brain cannot accept documents",
-      fix:
-        "Diagnose exactly where it stopped: brain doctor <manifest> --repair\n" +
-        "  That resumes the same verified upgrade path once you confirm with --yes.\n" +
-        "  To restore the pre-migration snapshot instead: brain doctor <manifest> --rollback",
+      detail: recurrence.note
+        ? `paused for an upgrade; this brain cannot accept documents (pause number ${recurrence.total})`
+        : "paused for an upgrade; this brain cannot accept documents",
+      fix: recurrence.note ? `${fix}\n\n  ${recurrence.note}` : fix,
+    };
+  }
+  // Healthy right now is not the same as healthy. A brain with earlier pauses on
+  // record gets a WARN rather than a green line, because doctor only prints the
+  // remedy text for checks that are not ok, and this is the one an operator has
+  // to see: it is the state the install sat in between two strandings.
+  if (recurrence.note) {
+    return {
+      name: "upgrade state",
+      status: D_WARN,
+      detail: `accepting documents, but this brain has paused mid-upgrade ${recurrence.total} time(s)`,
+      fix: recurrence.note,
     };
   }
   return { name: "upgrade state", status: D_OK, detail: "accepting documents" };
@@ -10144,15 +10302,24 @@ async function cmdDoctor(manifestPath) {
   info("checking your machine. The Cloudflare checks download a tool on first run,");
   info("so the first time can take a couple of minutes. Each line appears as it finishes.\n");
 
+  // Four outcomes, four marks. A check that could not run is NOT a failure and
+  // must not be painted red: doctor used to render anything that was not ok or
+  // warn as FAIL, which would have turned every honest "no token here, look in
+  // the dashboard" into a blocker on the screen.
+  const line = (x) => {
+    const mark = x.status === D_OK ? c.green("ok  ")
+      : x.status === D_WARN ? c.yellow("warn")
+        : x.status === D_CANNOT_CHECK ? c.dim("n/a ")
+          : c.red("FAIL");
+    console.log(`  ${mark}  ${x.name.padEnd(18)}  ${x.detail}`);
+  };
+
   // Printed as each check completes, not collected and dumped at the end.
   // Otherwise a first run sits silent for minutes while npx fetches wrangler,
   // and silence is indistinguishable from a hang to the person watching.
   const checks = await doctorRunAll({
     accountId,
-    onResult: (x) => {
-      const mark = x.status === D_OK ? c.green("ok  ") : x.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
-      console.log(`  ${mark}  ${x.name.padEnd(18)}  ${x.detail}`);
-    },
+    onResult: (x) => line(x),
   });
 
   // An install-state check, not a machine-readiness check: only meaningful
@@ -10160,13 +10327,18 @@ async function cmdDoctor(manifestPath) {
   if (manifestPath && existsSync(manifestPath)) {
     const upgradeCheck = await buildUpgradePauseCheck(manifestPath);
     checks.push(upgradeCheck);
-    const mark = upgradeCheck.status === D_OK ? c.green("ok  ") : upgradeCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
-    console.log(`  ${mark}  ${upgradeCheck.name.padEnd(18)}  ${upgradeCheck.detail}`);
+    line(upgradeCheck);
 
     const checksumCheck = await buildChecksumDriftCheck(manifestPath);
     checks.push(checksumCheck);
-    const checksumMark = checksumCheck.status === D_OK ? c.green("ok  ") : checksumCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
-    console.log(`  ${checksumMark}  ${checksumCheck.name.padEnd(18)}  ${checksumCheck.detail}`);
+    line(checksumCheck);
+
+    // Cheap, and the one problem on this page whose cost is paid entirely later:
+    // a passkey enrolled on the wrong one of two live hostnames has to be
+    // enrolled again, on every device, with a person on each end.
+    const addressCheck = await buildSignInAddressCheck(manifestPath);
+    checks.push(addressCheck);
+    line(addressCheck);
 
     // Offline and cheap, so it runs here rather than at connect time. The one
     // bank-feed failure that is unrecoverable in front of a client is a return
@@ -10181,12 +10353,18 @@ async function cmdDoctor(manifestPath) {
 
   const s = doctorSummarize(checks);
   console.log("");
-  const needFix = checks.filter((x) => x.status !== D_OK && x.fix);
+  // A CANNOT CHECK carries its next step in `manual` rather than `fix`, and
+  // reading only `fix` would drop it silently, which is the exact failure the
+  // fourth status exists to prevent.
+  const needFix = checks.filter((x) => x.status !== D_OK && (x.fix || x.manual));
   if (needFix.length) {
     console.log(`  ${c.bold("What to do")}\n`);
     for (const x of needFix) {
-      console.log(`  ${x.status === D_FAIL ? c.red(x.name) : c.yellow(x.name)}`);
-      console.log(`    ${x.fix.split("\n").join("\n    ")}\n`);
+      const label = x.status === D_FAIL ? c.red(x.name)
+        : x.status === D_CANNOT_CHECK ? c.dim(`${x.name} (nobody can check this from here)`)
+          : c.yellow(x.name);
+      console.log(`  ${label}`);
+      console.log(`    ${String(x.fix || x.manual).split("\n").join("\n    ")}\n`);
     }
   }
 

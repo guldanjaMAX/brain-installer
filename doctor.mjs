@@ -1318,6 +1318,18 @@ export const INSTALL_STATE_CHECKS = Object.freeze([
     why: "Detects a brain stuck part-way through an upgrade, and an applied migration whose file has since changed.",
   }),
   Object.freeze({
+    name: "Sign-in address",
+    needs: "a deployed brain with its routes in place",
+    afterwards: "brain doctor <manifest>",
+    why: "A brain can end up answering on TWO hostnames: its custom domain, and the workers.dev\n" +
+      "  address `brain deploy` enables so a deploy can be verified. Both serve the identical\n" +
+      "  route set, and a passkey works on only one of them, because it is bound to the exact\n" +
+      "  hostname it was enrolled on.\n" +
+      "  Decide WITH THE CLIENT, now, which single address their brain lives at, and put that\n" +
+      "  in brain.domain before anybody enrols a device. Deciding now is a dashboard click.\n" +
+      "  Deciding later means re-enrolling every device, one at a time, with a person on each end.",
+  }),
+  Object.freeze({
     name: "Live brain health",
     needs: "a deployed worker",
     afterwards: "brain health <manifest>",
@@ -1333,6 +1345,245 @@ export function checkInstallStateChecks(hasManifest = false) {
     `${item.why}\n  Not a problem now, and not something to skip later. Run this the moment the\n` +
       `  install exists, before the client session:\n      ${item.afterwards}`,
   ));
+}
+
+/* ============================================================================ */
+/* ONE BRAIN, TWO FRONT DOORS                                                   */
+/* ============================================================================ */
+
+/**
+ * A brain can answer on two hostnames at once, and a passkey only ever works on
+ * one of them.
+ *
+ * WHAT WAS MEASURED, on a live install on 2026-08-28
+ *
+ * `brain deploy` always enables the workers.dev route, because a deploy with no
+ * URL cannot be verified. Adding a custom domain later does not remove that
+ * route, so the worker keeps answering on BOTH addresses, with the identical
+ * route set: /api/admin/*, /app and /auth/* all reply on each one.
+ *
+ * That is harmless for reading and fatal for signing in. WebAuthn binds a
+ * credential to a Relying Party ID, and worker/src/lib/owner-auth.js sets
+ * `const rpId = url.hostname`, so the hostname the enrolment happened on IS the
+ * credential's identity. A browser holding a key for one address treats the
+ * other as an unrelated website: it does not offer the key, and it does not say
+ * why. There is no error to read and nothing to click.
+ *
+ * The CLI turns that into a trap rather than a curiosity. `m.brain.domain` from
+ * the manifest is the base for every link this tool prints, `brain invite`
+ * included. An owner whose manifest still names the workers.dev address will
+ * send an enrolment link on THAT hostname, enrol there, then open the custom
+ * domain they actually use and be shown a sign-in button their key cannot
+ * satisfy. That was the exact state of one real install: manifest on
+ * workers.dev, human on the custom domain.
+ *
+ * WHY THIS IS A WARNING AND NOT A FAILURE
+ *
+ * Nothing is broken at the moment it is detected. Both addresses work; the
+ * brain is healthy; the cost is entirely in the future and entirely avoidable.
+ * That is precisely WARN: it works, and there is a consequence the owner has to
+ * hear. Making it a blocker would stop installs that are fine, and a check that
+ * cries wolf gets switched off.
+ *
+ * WHAT IT CANNOT SEE, and says so rather than passing: this reads the worker's
+ * custom domains and its workers.dev route through the Cloudflare API. A
+ * zone-level Worker route (a wildcard pattern on a zone, rather than a Custom
+ * Domain attached to the script) is a third way to reach the same worker, and
+ * enumerating those needs per-zone access an install token has no reason to
+ * carry. So a clean result here means "no second address among the ones this
+ * check can list", never "there is definitely only one".
+ */
+
+/** Strip scheme, path, port and trailing dot so two spellings compare equal. */
+export function normalizeHostname(value) {
+  if (typeof value !== "string") return "";
+  return value
+    .trim()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
+    .replace(/[/?#].*$/, "")
+    .replace(/:\d+$/, "")
+    .replace(/\.$/, "")
+    .toLowerCase();
+}
+
+/** The sentence this whole check exists to deliver, in one place. */
+export const PASSKEY_HOSTNAME_RULE =
+  "A passkey is bound to the hostname it was created on. A key enrolled at one of\n" +
+  "  these addresses cannot sign in at the other, and the browser gives no explanation:\n" +
+  "  it simply offers no key.";
+
+/** What to look at by hand when the API cannot be reached from here. */
+export const SIGN_IN_ADDRESS_MANUAL =
+  "A brain can answer on two hostnames at once: a custom domain, and the workers.dev\n" +
+  "  address `brain deploy` enables so a deploy can be verified. Adding the first does\n" +
+  "  not remove the second.\n" +
+  `  ${PASSKEY_HOSTNAME_RULE}\n` +
+  "  Look once, in the CLIENT'S OWN account, before anybody enrols a device:\n" +
+  "      dash.cloudflare.com > Workers & Pages > the brain worker > Settings > Domains & Routes\n" +
+  "  If more than one hostname is listed there, decide which one the brain lives on and\n" +
+  "  remove the other BEFORE enrolling. Re-enrolling afterwards means every device again,\n" +
+  "  one at a time, with a person on each end.";
+
+/**
+ * The finding, as a pure function, so every branch is testable without a network.
+ *
+ * `hosts` is what the account actually routes to this worker, each entry
+ * `{ host, kind }` where kind is a human label ("custom domain",
+ * "workers.dev"). `manifestHost` is what brain.domain names, which is the
+ * address every link this CLI prints will use.
+ */
+export function checkSignInAddress({ checked = false, reason = "", manifestHost = "", hosts = [] } = {}) {
+  const name = "sign-in address";
+
+  if (!checked) {
+    return cannotCheck(
+      name,
+      `not checked: ${reason || "the hostnames this brain answers on could not be listed"}`,
+      SIGN_IN_ADDRESS_MANUAL,
+    );
+  }
+
+  const manifest = normalizeHostname(manifestHost);
+  const live = [];
+  for (const entry of Array.isArray(hosts) ? hosts : []) {
+    const host = normalizeHostname(entry?.host ?? entry);
+    if (!host || live.some((x) => x.host === host)) continue;
+    live.push({ host, kind: String(entry?.kind || "route").trim() || "route" });
+  }
+
+  if (!manifest) {
+    return cannotCheck(
+      name,
+      "not checked: this manifest names no address for the brain yet",
+      "Run `brain deploy <manifest>` first. It saves the live address, and this check can\n" +
+        "  then compare it against every hostname Cloudflare routes to the worker.\n" +
+        `  ${PASSKEY_HOSTNAME_RULE}`,
+    );
+  }
+  if (!live.length) {
+    return cannotCheck(
+      name,
+      "not checked: Cloudflare listed no public hostname for this worker",
+      "Either the worker has no route yet, or the routes it does have are zone-level\n" +
+        "  patterns this check cannot enumerate.\n" +
+        SIGN_IN_ADDRESS_MANUAL.split("\n").slice(3).join("\n"),
+    );
+  }
+
+  const others = live.filter((x) => x.host !== manifest);
+  const manifestEntry = live.find((x) => x.host === manifest);
+
+  if (!others.length) {
+    return check(
+      name,
+      OK,
+      `only ${manifest} answers for this brain, and the manifest names it`,
+    );
+  }
+
+  const width = Math.max(...live.map((x) => x.host.length), manifest.length);
+  const row = (host, kind, tail) => `      https://${host.padEnd(width)}   ${kind}${tail}`;
+  const listed = [
+    manifestEntry
+      ? row(manifest, manifestEntry.kind, "  <- the manifest names this one")
+      : row(manifest, "named by the manifest", "  <- not among the routes this check can see"),
+    ...others.map((x) => row(x.host, x.kind, "")),
+  ].join("\n");
+
+  const keepManifest =
+    `  To keep ${manifest}, which is what every link this CLI prints already uses:\n` +
+    "      Remove the other hostname from the worker in the client's own account\n" +
+    "      (Workers & Pages > the brain worker > Settings > Domains & Routes).\n" +
+    "      Disabling the workers.dev route there is the usual answer.\n" +
+    `  To keep ${others[0].host} instead:\n` +
+    `      Set brain.domain to "${others[0].host}" in the manifest, run \`brain deploy <manifest>\`,\n` +
+    "      and remove the other hostname. Then every invite link points where people actually go.";
+
+  const orphaned = manifestEntry
+    ? ""
+    : "\n\n  Worse than a duplicate: the address the manifest names is NOT among the routes this\n" +
+      "  check can see, so the links this CLI prints may lead nowhere at all. Settle that first.";
+
+  return check(
+    name,
+    WARN,
+    `${live.length} hostnames answer for this brain; a passkey works on only one of them`,
+    "Cloudflare routes all of these to the same brain, and a browser treats them as\n" +
+      "  unrelated websites:\n\n" +
+      listed + "\n\n" +
+      `  ${PASSKEY_HOSTNAME_RULE}\n\n` +
+      "  Settle on ONE address BEFORE anyone enrols a device. That is the cheap moment, and\n" +
+      "  it costs a dashboard click. Afterwards every device has to enrol again on the\n" +
+      "  surviving address, one at a time, with a person on each end.\n\n" +
+      keepManifest +
+      orphaned,
+  );
+}
+
+/* ============================================================================ */
+/* A PAUSE THAT KEEPS COMING BACK                                               */
+/* ============================================================================ */
+
+/**
+ * Recurrence, which the current-state report cannot show.
+ *
+ * /health answers honestly about the pause happening NOW, and `brain doctor`
+ * reads it. Both are about this instant. One install stranded mid-upgrade twice
+ * in a single day and reported healthy in between, so the operator met two
+ * separate first-time surprises rather than one repeating fault.
+ *
+ * Those are different problems. A pause that happened once is a bad day. A pause
+ * that recurs is a broken upgrade path, and the next one lands on a client who
+ * paid. The only place the difference is written down is the upgrade_runs table,
+ * which nobody reads unless they already suspect something.
+ *
+ * QUIET AT ZERO, deliberately. A brain that has never stranded gets no extra
+ * line, because a check that comments on every healthy install is one an
+ * operator learns to scroll past.
+ *
+ * WHAT COUNTS AS A PAUSE: any upgrade run that did not reach `verified`.
+ * migrations/d1/0001_install_state.sql defines the states as
+ * started | verified | failed | rolled_back, so `verified` is the only one that
+ * finished the job. A run still marked `started` days later did not finish, it
+ * stopped.
+ */
+export const UPGRADE_RUN_COMPLETED = "verified";
+
+export function upgradePauseRecurrence(runs, { currentlyPaused = false, limit = 10 } = {}) {
+  const rows = (Array.isArray(runs) ? runs : []).filter((r) => r && typeof r === "object");
+  const stranded = rows.filter(
+    (r) => String(r.status || "").trim().toLowerCase() !== UPGRADE_RUN_COMPLETED,
+  );
+  const total = stranded.length;
+  // The pause being reported right now is not news; the ones before it are.
+  const previous = Math.max(0, currentlyPaused ? total - 1 : total);
+  if (!total || !previous) return { total, previous, note: "" };
+
+  const width = Math.max(...stranded.map((r) => String(r.started_at || "").length), 12);
+  const lines = stranded.slice(0, limit).map((r) => {
+    const stage = /^stage:/.test(String(r.detail || "")) ? `  ${String(r.detail).trim()}` : "";
+    return `      ${String(r.started_at || "(no start time)").padEnd(width)}  ` +
+      `${r.from_version || "?"} -> ${r.to_version || "?"}  ${String(r.status || "?")}${stage}`;
+  });
+  const more = total > lines.length ? `      ... and ${total - lines.length} older\n` : "";
+
+  const headline = currentlyPaused
+    ? `This is pause number ${total} on this brain. It is not the first.`
+    : `This brain is not paused now, but it has stranded mid-upgrade ${total} time(s) before.`;
+
+  return {
+    total,
+    previous,
+    note:
+      `${headline}\n\n` +
+      "  Every upgrade run on record that did not finish:\n" +
+      lines.join("\n") + "\n" + more + "\n" +
+      "  It reported itself healthy between these, which is why each one arrives looking\n" +
+      "  like the first. A pause that recurs is a broken upgrade path rather than a bad\n" +
+      "  day, and the next one lands on whoever is using this brain at the time.\n" +
+      "  Full history, and nothing here deletes it:\n" +
+      "      SELECT * FROM upgrade_runs ORDER BY started_at DESC;",
+  };
 }
 
 /* ----------------------------------------------------------- the runner */
