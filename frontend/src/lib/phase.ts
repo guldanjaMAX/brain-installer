@@ -43,13 +43,13 @@ export function phraseFor(phase: BrainPhase, s: SystemStatus | null): string {
   const pct = s?.vectors?.percent_visible;
   switch (phase) {
     case "unreachable":
-      return "Your brain could not be reached just now, so nothing on this page is a statement about what it holds.";
+      return "The brain's document and source status could not be reached. Financial sections below still say whether their own reads succeeded.";
     case "paused":
       return "Your brain is not accepting new documents right now. An update paused it and did not finish. Nothing has been lost, and asking questions still works.";
     case "unknown":
       return "Your brain would not say whether it is accepting documents. Reading still works. This is worth reporting.";
     case "empty":
-      return "Your brain has not read anything yet. Add your first documents and it will start being able to answer.";
+      return "Your brain has not read anything yet. Once records are loaded, it can begin answering from them.";
     case "indexing":
       return pct === null || pct === undefined
         ? "Your brain is still working through what it has been given. Answers will be incomplete until it finishes."

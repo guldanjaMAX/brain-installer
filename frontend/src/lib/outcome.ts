@@ -1,6 +1,6 @@
 /** The five words this product is allowed to say about a thing's state.
  *
- *  Adopted from Jay's prototype. The value is not the words themselves, it is
+ *  Adopted from the reference prototype. The value is not the words themselves, it is
  *  that the set is CLOSED and each member carries a glyph:
  *
  *   - Closed, so a screen cannot invent a sixth state that means almost the
@@ -35,6 +35,18 @@ export type Tone = "wait" | "act" | "done" | "good" | "bad";
  *  in words.ts. */
 export const UNTRANSLATED_STATES = new Set<string>();
 
+/** A source's cadence is not its health. Manual and unscheduled sources carry
+ *  useful context, but neither is a problem or proof that the source is
+ *  current. The UI therefore shows no health chip for those two states. */
+export function sourceOutcome(state: string): OutcomeKey | null {
+  if (state === "manual" || state === "unscheduled") return null;
+  if (state === "ok") return "CURRENT";
+  if (state === "indexing") return "WORKING";
+  if (state === "broken" || state === "stale" || state === "never_synced") return "PROBLEM";
+  if (state) UNTRANSLATED_STATES.add(`source:${state}`);
+  return "PROBLEM";
+}
+
 export function outcomeFor(key: string | null | undefined) {
   const found = key && OUTCOME[key as OutcomeKey];
   if (found) return found;
@@ -44,7 +56,7 @@ export function outcomeFor(key: string | null | undefined) {
 }
 
 /** Whose move is this? An owner should be able to tell at a glance what is
- *  waiting on THEM versus what someone else owes them. Jay tracks this per row
+ *  waiting on THEM versus what someone else owes them. The reference design tracks this per row
  *  and then counts it in a summary sentence; the counting is what makes the
  *  distinction usable rather than decorative. */
 export type MoveOwner = "yours" | "installer" | "waiting";

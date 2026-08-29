@@ -92,6 +92,239 @@ export type Me = {
   connections: Connection[];
 };
 
+/** One financial scope. The slug is a transport identity only. Every visible
+ *  surface uses `label`, and a missing label is handled without printing it. */
+export type FinEntity = {
+  entity_slug: string;
+  legal_name: string;
+  label: string;
+  kind: string;
+  status: string;
+  relationship: string;
+  counterparty: boolean;
+  fixed: boolean;
+};
+
+export type FinAccount = {
+  account_slug: string;
+  entity_slug: string;
+  institution: string | null;
+  label: string;
+  account_kind: string;
+  balance_role: string;
+  mask: string | null;
+  currency: string;
+  feed_mode: string;
+  expected_cadence: string | null;
+  status: string;
+  coverage_status: string | null;
+  covered_from: string | null;
+  covered_to: string | null;
+  coverage_note: string | null;
+  coverage_computed_at: string | null;
+  basis_state: string;
+};
+
+export type FinDocument = {
+  fin_doc_uid: string;
+  entity_slug: string | null;
+  account_slug: string | null;
+  doc_kind: string;
+  title: string;
+  tax_year: number | null;
+  period_start: string | null;
+  period_end: string | null;
+  custody_class: string;
+  availability: string;
+  available_from: string | null;
+  available_within_days: number | null;
+  filed_at: string | null;
+  reconciled_through: string | null;
+  received_from: string | null;
+  received_at: string | null;
+  in_corpus: boolean;
+  readable: boolean;
+  unreadable_reason: string | null;
+  restricted: boolean;
+  basis_state: string;
+};
+
+export type FinStatement = {
+  statement_uid: string;
+  account_slug: string;
+  period_start: string;
+  period_end: string;
+  opening_balance_minor: number | null;
+  closing_balance_minor: number | null;
+  currency: string;
+  line_count_stated: number | null;
+  parse_state: string;
+  received_at: string | null;
+  parsed_at: string | null;
+  basis_state: string;
+};
+
+export type FinReconciliationClaim = {
+  claim_uid: string;
+  label: string;
+  amount_minor: number | null;
+  currency: string;
+  as_of: string;
+  basis_state: string;
+};
+
+export type FinReconciliation = {
+  reconciliation_uid: string;
+  entity_slug: string | null;
+  account_slug: string | null;
+  period_start: string | null;
+  period_end: string | null;
+  measure: string;
+  state: string;
+  delta_minor: number | null;
+  tolerance_minor: number;
+  currency: string;
+  ruled_claim_uid: string | null;
+  ruled_at: string | null;
+  ruled_by_party: string | null;
+  ruling_note: string | null;
+  ruling_consumed: boolean;
+  claims: FinReconciliationClaim[];
+};
+
+export type FinOpenItem = {
+  code: string;
+  entity_slug: string | null;
+  question: string;
+  routed_role: string | null;
+  routed_name: string | null;
+  status: string;
+  due_date: string | null;
+  citations: string[];
+  not_included: string[];
+  answer: string | null;
+  answered_at: string | null;
+  basis_state: string;
+};
+
+export type FinUnsortedSpending = {
+  account_slug: string;
+  currency: string;
+  outflow_minor: number;
+  counted_lines: number;
+  unreadable_lines: number;
+};
+
+export type FinDeadline = {
+  deadline_uid: string;
+  entity_slug: string | null;
+  item: string;
+  due_date: string | null;
+  owner_party: string;
+  status: string;
+  urgency: string;
+  consequence: string | null;
+  waiting_on: string | null;
+  basis_note: string | null;
+  basis_state: string;
+};
+
+export type FinException = {
+  exception_uid: string;
+  entity_slug: string | null;
+  issue: string;
+  detail: string | null;
+  amount_minor: number | null;
+  currency: string;
+  first_seen: string;
+  waiting_on: string | null;
+  proposal: string | null;
+  proposal_confidence_bp: number | null;
+  basis_state: string;
+};
+
+export type FinObligation = {
+  obligation_uid: string;
+  entity_slug: string;
+  kind: string;
+  counterparty: string | null;
+  label: string | null;
+  balance_minor: number | null;
+  balance_as_of: string | null;
+  currency: string;
+  renews_on: string | null;
+  personal_guarantee: boolean;
+  personal_guarantee_state: string;
+};
+
+export type FinCash = {
+  as_of: string | null;
+  total_minor: number | null;
+  currency: string | null;
+  mixed_currency?: boolean;
+  covered: Array<{
+    account_slug: string;
+    label: string;
+    amount_minor: number;
+    currency: string;
+    as_of: string;
+  }>;
+  missing: Array<{
+    account_slug: string;
+    reason: string;
+    covered_to: string | null;
+    last_confirmed_as_of: string | null;
+  }>;
+  excluded: Array<{
+    account_slug: string;
+    reason: string;
+  }>;
+  accounts_covered: number;
+  accounts_considered: number;
+  complete: boolean;
+};
+
+export type FinSnapshot = {
+  ledger_installed: boolean;
+  missing_tables: string[];
+  unavailable: boolean;
+  entity_scope: string | null;
+  sections_returned?: string[];
+  sections_unavailable?: string[];
+  entities?: FinEntity[];
+  accounts?: FinAccount[];
+  documents?: FinDocument[];
+  statements?: FinStatement[];
+  deadlines?: FinDeadline[];
+  exceptions?: FinException[];
+  open_items?: FinOpenItem[];
+  reconciliations?: FinReconciliation[];
+  obligations?: FinObligation[];
+  unsorted_spending?: FinUnsortedSpending[];
+  obligation_exposure?: {
+    balance_minor: number | null;
+    currency: string | null;
+    obligations_with_balance: number;
+    obligations_total: number;
+    guaranteed: number;
+    guarantee_none_found: number;
+    guarantee_not_examined: number;
+    guarantee_unreadable: number;
+    covers_all_obligations: boolean;
+  };
+  cash?: FinCash;
+  truncated?: Record<string, boolean>;
+};
+
+export type FinDocumentsResponse = {
+  ledger_installed: boolean;
+  missing_tables: string[];
+  unavailable: boolean;
+  entity_scope: string | null;
+  documents?: FinDocument[];
+  truncated?: boolean;
+};
+
 /** GET companion to `api`. The bank feed answers status on GET; the same
  *  X-Brain-App header still marks the request as coming from this app. */
 export async function apiGet<T = unknown>(path: string): Promise<T> {

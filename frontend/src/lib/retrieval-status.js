@@ -48,20 +48,20 @@ export const NO_RESULTS_GAP = Object.freeze({
  */
 const CAUSES = {
   vector: {
-    cause: "the vector index is still building, so the semantic half of this brain was never queried",
-    remedy: "Try again once `brain drain` reports the projection complete.",
+    cause: "part of the search index is still being prepared",
+    remedy: "Try again later. If it does not recover, ask your installer to check search.",
   },
   "no-embedding": {
-    cause: "the embedding model did not answer, so only keyword search ran and anything phrased differently to the source text was never reachable",
-    remedy: "Try again in a moment. Run `brain health` if it keeps happening.",
+    cause: "meaning-based search did not answer, so only exact-word search ran",
+    remedy: "Try again in a moment. If it keeps happening, ask your installer to check search.",
   },
   fts: {
-    cause: "keyword search is unavailable, so only the semantic index was queried",
-    remedy: "Run `brain health` to see which subsystem is down.",
+    cause: "exact-word search did not answer, so only meaning-based search ran",
+    remedy: "Try again. If it keeps happening, ask your installer to check search.",
   },
 };
 
-const UNKNOWN_REMEDY = "Run `brain health` to see which subsystem is down.";
+const UNKNOWN_REMEDY = "Try again. If it keeps happening, ask your installer to check search.";
 
 /** Normalise whatever the store reported into a short, safe token. */
 function degradedToken(degraded) {
@@ -80,8 +80,7 @@ function degradedToken(degraded) {
 export function degradedCause(degraded) {
   const token = degradedToken(degraded);
   if (!token) return null;
-  return CAUSES[token]?.cause ||
-    `a retrieval subsystem reported "${token}" and did not answer`;
+  return CAUSES[token]?.cause || "one part of search did not answer";
 }
 
 /** What the owner can do about it. */

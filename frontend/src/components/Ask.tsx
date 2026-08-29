@@ -4,6 +4,8 @@ import { api, type Answer } from "../lib/api";
 // as an absence is a product rule, not a rendering detail, so both surfaces
 // derive it from one module instead of each writing their own.
 import { answerText, confidenceText, unavailableSearch } from "../lib/answer-render.js";
+import { TruthNote } from "./ui";
+import { useFinanceScope } from "./FinanceScope";
 
 /** How sure the brain is, and why. The basis is shown rather than summarised:
  *  a bare percentage is a number to argue with, a percentage with its reasons
@@ -44,6 +46,7 @@ function Trust({ answer }: { answer: Answer }) {
 }
 
 export function Ask() {
+  const { activeLabel, scope } = useFinanceScope();
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState<Answer | null>(null);
   const [busy, setBusy] = useState(false);
@@ -66,11 +69,27 @@ export function Ask() {
 
   return (
     <section>
+      <header className="max-w-2xl mb-6">
+        <p className="eyebrow">Cited answers</p>
+        <h1 className="page-title">Ask &amp; Explore</h1>
+        <p className="page-intro">
+          Ask a question in plain language. The answer keeps its sources beside it and names what the records do not cover.
+        </p>
+      </header>
+      {scope && (
+        <div className="max-w-3xl mb-5">
+          <TruthNote>
+            {activeLabel} stays selected on the financial screens. Questions here still search all evidence because business-level answer scoping is not enforced yet.
+          </TruthNote>
+        </div>
+      )}
+      <div className="max-w-3xl">
       <textarea
         value={question}
         onChange={(e) => setQuestion(e.target.value)}
         onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) ask(); }}
         placeholder="Ask your brain anything…"
+        aria-label="Ask your brain anything"
         rows={3}
         className="w-full rounded-xl border border-line bg-card p-4 text-[16px] leading-relaxed
                    outline-none focus:border-accent resize-y"
@@ -110,6 +129,7 @@ export function Ask() {
           )}
         </article>
       )}
+      </div>
     </section>
   );
 }

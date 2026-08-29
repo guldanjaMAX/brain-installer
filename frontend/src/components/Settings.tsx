@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, apiGet, type Device, type Connection, type BankStatus } from "../lib/api";
 import { enroll } from "../lib/passkey";
-import { Section, Row, Note, Empty, Badge, Confirm, EditableName, ago, agoISO } from "./ui";
+import { Section, Row, Note, Empty, Badge, Chip, Confirm, EditableName, ago, agoISO } from "./ui";
 
 /** Who and what can open this brain.
  *
@@ -45,6 +45,13 @@ export function Settings({ devices, connections, onChange }: {
 
   return (
     <div>
+      <header className="max-w-2xl mb-7">
+        <p className="eyebrow">People, devices, and apps</p>
+        <h1 className="page-title">Access</h1>
+        <p className="page-intro">
+          See every owner device and connected app this brain can verify, and remove access in place.
+        </p>
+      </header>
       {error && (
         <p className="mb-5 text-[14px] text-red-700 bg-red-50 border border-red-200 rounded-xl px-4 py-3">
           {error}
@@ -148,7 +155,7 @@ export function Settings({ devices, connections, onChange }: {
               <span className="min-w-0">
                 <span className="text-[14.5px] flex items-center gap-2 flex-wrap">
                   {bank.institution_label || "a bank"}
-                  {attention.has(bank.item_ref) && <Badge tone="warn">Needs attention</Badge>}
+                  {attention.has(bank.item_ref) && <Chip state="PROBLEM" />}
                 </span>
                 <span className="block text-[13px] text-ink-soft mt-0.5">
                   {bank.last_synced_at ? `Last checked ${agoISO(bank.last_synced_at)}` : "Not checked yet"}

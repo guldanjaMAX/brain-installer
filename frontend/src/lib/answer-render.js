@@ -52,5 +52,5 @@ export function confidenceText(r) {
   const conf = r.confidence;
   if (!conf) return "";
   return (r.answer && !/^The documents do not answer/.test(r.answer || "") ? "Confidence" : "Confidence nothing is recorded") +
-    ": " + conf.percent + "% (" + conf.band + ") — " + conf.basis.join("; ") + ".";
+    ": " + conf.percent + "% (" + conf.band + "). " + conf.basis.join("; ") + ".";
 }

@@ -18,7 +18,7 @@ const SOURCE_LABELS: Record<string, string> = {
 
 /** Server words that arrived with no translation.
  *
- *  Adopted from Jay's adapter, whose rule is "the mapping is total or it says
+ *  Adopted from the reference adapter, whose rule is "the mapping is total or it says
  *  so". A silent fallback to "Another source" hides the fact that the backend
  *  grew a source this UI has never been taught. Recording it turns an
  *  invisible gap into a countable one. */
