@@ -13,6 +13,7 @@
  * the SameSite=Strict cookie. Both are set only by the app page itself.
  */
 
+import { listConnections, revokeConnection } from "./connections.js";
 import { jsonResponse } from "./core.js";
 import { verifyRegistration, verifyAssertion, b64uDecode } from "./webauthn.js";
 import {
@@ -28,7 +29,9 @@ import {
   normalizeRecoveryCode, recoveryThrottle, recordRecoveryFailure, clearRecoveryFailures,
   RECOVERY_FAIL_LIMIT, RECOVERY_UNAVAILABLE,
 } from "./auth-store.js";
-import { appPageHtml } from "./app-page.js";
+import { appPageHtml, brandOgSvg } from "./app-page.js";
+import { recoveryPageHtml } from "./recovery-page.js";
+import { APP_JS, APP_CSS } from "./app-assets.js";
 
 const APP_HEADER = "X-Brain-App";
 
@@ -130,14 +133,64 @@ export async function handleAdminDevices(env, request, path) {
 /* ------------------------------------------------------------ owner plane */
 
 export async function handleOwnerAuth(env, request, url, path) {
-  if (path === "/app" && request.method === "GET") {
-    return new Response(appPageHtml(env), {
+  // The link-preview image. Public and cacheable by design: a scraper fetching
+  // it must never need a credential, and it contains only the brain's own name.
+  if (path === "/brand/og.svg" && request.method === "GET") {
+    return new Response(brandOgSvg(env), {
+      headers: {
+        "Content-Type": "image/svg+xml; charset=utf-8",
+        "Cache-Control": "public, max-age=3600",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }
+  if (path === "/app/assets/app.js" || path === "/app/assets/app.css") {
+    if (request.method !== "GET") return jsonResponse({ error: "not found" }, 404);
+    const isJs = path.endsWith(".js");
+    return new Response(isJs ? APP_JS : APP_CSS, {
+      headers: {
+        "Content-Type": isJs ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8",
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }
+  // The escape hatch for an owner with no working device. It is a separate
+  // route because the React app at /app has no recovery screen and cannot get
+  // one without a frontend build; see worker/src/lib/recovery-page.js. Its CSP
+  // is the one the page was reviewed under — a single inline script, no
+  // network origin but this one — and NOT the stricter /app policy below,
+  // which assumes an external bundle this page deliberately does not have.
+  if (path === "/app/recover" && request.method === "GET") {
+    return new Response(recoveryPageHtml(env), {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
-        // The page is self-contained by construction; the CSP makes that a
-        // promise instead of a habit. Inline script is the page itself.
         "Content-Security-Policy":
           "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'",
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }
+  if (path === "/app" && request.method === "GET") {
+    // Absolute URLs: a link scraper resolves og:image against nothing.
+    return new Response(appPageHtml(env, url.origin), {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        // The shell must never be cached. It carries the per-install owner
+        // name and the bundle id that cache-busts the app, so a stale copy
+        // survives an upgrade and quietly serves the previous build's
+        // identity. It is under a kilobyte; caching it saves nothing and
+        // costs correctness. The bundle itself stays immutable.
+        "Cache-Control": "no-store",
+        // The page is self-contained by construction; the CSP makes that a
+        // promise instead of a habit. Inline script is the page itself.
+        // Stronger than the inline page it replaced: with the app served from
+        // this origin, 'unsafe-inline' is gone from both script and style.
+        "Content-Security-Policy":
+          "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; " +
+          "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
       },
@@ -382,6 +435,9 @@ export async function handleOwnerAuth(env, request, url, path) {
       owner: env.BRAIN_OWNER || "owner",
       devices: await listPasskeys(env),
       recovery: await recoveryCodeStatus(env),
+      // Apps reaching the brain over the connector, so one call answers the
+      // whole of "who has access" rather than two that can disagree.
+      connections: await listConnections(env),
     });
   }
   if (path === "/api/app/recovery-codes") {
@@ -403,6 +459,12 @@ export async function handleOwnerAuth(env, request, url, path) {
     const payload = await body(request);
     if (!payload?.credential_id) return jsonResponse({ error: "credential_id required" }, 400);
     return jsonResponse(await revokePasskey(env, String(payload.credential_id)));
+  }
+  if (path === "/api/app/connections/revoke") {
+    const payload = await body(request);
+    if (!payload?.client_id) return jsonResponse({ error: "client_id required" }, 400);
+    const outcome = await revokeConnection(env, payload.client_id);
+    return jsonResponse({ ...outcome, connections: await listConnections(env) });
   }
   if (path === "/api/app/signout") {
     return withCookie(jsonResponse({ signed_out: true }), clearSessionCookie());

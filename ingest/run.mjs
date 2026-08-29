@@ -521,9 +521,10 @@ export async function prepare(file, { sourceName, ocr = null }) {
  * Streaming fixes both: peak memory is one batch, progress is continuous
  * instead of a long silence, and an interrupt costs at most one batch.
  */
-export async function* batchStream(files, prepareOne, { maxDocs = 50, maxBytes = 900_000, onSkip, onProgress } = {}) {
+export async function* batchStream(files, prepareOne, { maxDocs = 50, maxBytes = 900_000, maxStatements = 810, onSkip, onProgress } = {}) {
   let cur = [];
   let bytes = 0;
+  let statements = 0;
   let scanned = 0;
 
   // `for await` also accepts ordinary arrays. Remote connectors can therefore
@@ -547,16 +548,24 @@ export async function* batchStream(files, prepareOne, { maxDocs = 50, maxBytes =
     const { envelope: _envelope, envelopes: _envelopes, unchanged: _unchanged, skip: _skip, ...context } = r;
     for (const envelope of envelopes) {
       const n = envelopeBytes(envelope);
-      if (cur.length && (cur.length >= maxDocs || bytes + n > maxBytes)) {
+      // Same statement ceiling as batches(): the worker refuses any batch
+      // whose conservative D1 estimate exceeds its budget, and chunk weight
+      // is invisible to document count and bytes. This loop is the one the
+      // Drive and Gmail connectors stream through — the first fix landed
+      // only in batches() and the very next Drive catch-up refused again.
+      const stmts = estimatedStatements(envelope);
+      if (cur.length && (cur.length >= maxDocs || bytes + n > maxBytes || statements + stmts > maxStatements)) {
         yield cur;
         cur = [];
         bytes = 0;
+        statements = 0;
       }
       // Preserve connector bookkeeping such as stateKey, deferState and the
       // family plan. The previous fixed three-field wrapper silently discarded
       // those fields, which made the streaming helper unsafe for remote resume.
       cur.push({ ...context, envelope });
       bytes += n;
+      statements += stmts;
     }
   }
   if (cur.length) yield cur;

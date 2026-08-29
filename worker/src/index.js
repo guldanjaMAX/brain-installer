@@ -47,6 +47,11 @@ import {
   validateOwnerSession,
 } from "./lib/owner-auth.js";
 import { handleZoomWebhook, sweepZoomDeliveries } from "./lib/zoom.js";
+import {
+  handleOAuthMetadata, handleProtectedResourceMetadata, handleRegister,
+  handleAuthorizePage, handleAuthorizeDecision, handleToken, validateConnectorToken,
+} from "./lib/oauth.js";
+import { handleMcp } from "./lib/mcp-endpoint.js";
 
 /* ------------------------------------------------------------ retrieval */
 
@@ -1621,7 +1626,13 @@ export default {
     // gate — their auth is the ceremony itself, or the session cookie a
     // ceremony earned. Nothing routed there reaches past the read-only
     // privilege class (see owner-auth.mjs).
-    if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/")) {
+    // /brand/* is deliberately public and unauthenticated: it is the link
+    // preview image, and the scraper that fetches it holds no credential.
+    // It sat behind the key gate at first, so every shared invite would have
+    // previewed as a 401 instead of an image.
+    if (path === "/app" || path === "/app/recover" || path.startsWith("/auth/") ||
+        path.startsWith("/api/app/") ||
+        path.startsWith("/brand/") || path.startsWith("/app/assets/")) {
       return handleOwnerAuth(env, request, url, path);
     }
 
@@ -1643,6 +1654,48 @@ export default {
     if (path === "/api/webhooks/zoom") {
       if (request.method !== "POST") return jsonResponse({ error: "not found" }, 404);
       return handleZoomWebhook(env, request, ctx);
+    }
+
+    // Remote connectors (the Claude apps, ChatGPT): OAuth discovery and
+    // ceremonies in front of the gate, and the MCP endpoint guarded by the
+    // bearer token those ceremonies earn — exactly the read-only class.
+    if (path === "/.well-known/oauth-authorization-server") return handleOAuthMetadata(url);
+    if (path === "/.well-known/oauth-protected-resource") return handleProtectedResourceMetadata(url);
+    if (path === "/oauth/register" && request.method === "POST") return handleRegister(env, request);
+    if (path === "/oauth/authorize" && request.method === "GET") return handleAuthorizePage(env, url);
+    if (path === "/oauth/authorize/decision" && request.method === "POST") return handleAuthorizeDecision(env, request, url);
+    if (path === "/oauth/token" && request.method === "POST") return handleToken(env, request);
+    if (path === "/mcp") {
+      const grant = await validateConnectorToken(request, env);
+      if (!grant) {
+        return new Response(JSON.stringify({ error: "unauthorized" }), {
+          status: 401,
+          headers: {
+            "Content-Type": "application/json",
+            // RFC 9728: tells an MCP client where its OAuth discovery starts.
+            "WWW-Authenticate": `Bearer resource_metadata="${url.origin}/.well-known/oauth-protected-resource"`,
+          },
+        });
+      }
+      const internalJson = (targetPath, body) =>
+        new Request(url.origin + targetPath, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      return handleMcp(env, request, url, {
+        grant,
+        think: async (body) => (await handleThink(env, internalJson("/api/rag/think", body))).json(),
+        search: async (body) => (await handleUnified(env, internalJson("/api/rag/unified", body))).json(),
+        // Writes take the ordinary ingest door rather than a private one, so
+        // the credential scanner, the statement budget and every other guard
+        // apply to a connector exactly as they do to a folder or a Drive sync.
+        write: async (envelope) => (await handleIngest(env, internalJson("/api/admin/brain/ingest", envelope))).json(),
+        // Deletes PREVIEW by default. dryRun is only lifted when the caller
+        // passes confirm, so a model acting on text it read cannot remove a
+        // client's records in one step.
+        forget: async ({ docUids, confirm }) => forget(env, { docUids, dryRun: !confirm }),
+      });
     }
 
     const readRoute = path === "/api/rag/unified" || path === "/api/rag/think";
