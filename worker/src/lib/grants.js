@@ -92,6 +92,28 @@ export async function hashToken(token) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * Turn the stored scope columns into the shape scopeSql expects.
+ *
+ * Anything unreadable becomes the empty scope, which reads NOTHING. A corrupt
+ * scope must never widen to everything, and "no zones" is the safe reading of
+ * "we do not know what this person may see".
+ */
+export function parseScope(row) {
+  let include;
+  try {
+    include = typeof row?.scope_include === "string" ? JSON.parse(row.scope_include) : row?.scope_include;
+  } catch { return { zones: [] }; }
+  if (include?.all === true) return { all: true };
+  const zones = Array.isArray(include?.zones) ? include.zones.filter((z) => typeof z === "string") : [];
+  let exclude = [];
+  try {
+    const raw = typeof row?.scope_exclude === "string" ? JSON.parse(row.scope_exclude) : row?.scope_exclude;
+    if (Array.isArray(raw)) exclude = raw.filter((z) => typeof z === "string");
+  } catch { return { zones: [] }; }
+  return { zones, exclude };
+}
+
 /** A grant row is usable only while it is neither revoked nor expired. */
 export function grantIsLive(row, now = Date.now()) {
   if (!row) return false;
@@ -112,19 +134,24 @@ export async function resolvePrincipal(request, env, { lookupCredential } = {}, 
   const presented = request.headers.get("X-Admin-Key");
 
   if (presented && env.ADMIN_KEY && constantTimeEquals(presented, env.ADMIN_KEY)) {
-    return { kind: "owner", grantId: null, capabilities: new Set(OWNER_CAPABILITIES) };
+    return { kind: "owner", grantId: null, capabilities: new Set(OWNER_CAPABILITIES), scope: { all: true } };
   }
   if (presented && env.RAG_PROXY_KEY && constantTimeEquals(presented, env.RAG_PROXY_KEY)) {
     // Unchanged from the shipped contract: the proxy key answers questions and
     // does nothing else.
-    return { kind: "proxy", grantId: null, capabilities: new Set(["ask"]) };
+    return { kind: "proxy", grantId: null, capabilities: new Set(["ask"]), scope: { all: true } };
   }
   if (presented && typeof lookupCredential === "function") {
     const row = await lookupCredential(await hashToken(presented));
     if (grantIsLive(row, now) && !row.credential_revoked_at) {
       const capabilities = parseCapabilities(row.capabilities);
       if (capabilities) {
-        return { kind: "grant", grantId: row.grant_id, capabilities: new Set(capabilities) };
+        return {
+          kind: "grant",
+          grantId: row.grant_id,
+          capabilities: new Set(capabilities),
+          scope: parseScope(row),
+        };
       }
     }
   }

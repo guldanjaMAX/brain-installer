@@ -2234,6 +2234,52 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
     !/zone/.test(ownerKw || ""), String(ownerKw));
 }
 
+
+/* ---- end to end: a scoped grant's zone must reach the SQL via the real route ---- */
+{
+  const { hashToken } = await import("../src/lib/grants.js");
+  const token = "scoped-reader-token";
+  const hash = await hashToken(token);
+
+  const base = mkEnv([ROW], { vectorIds: ["meeting:123#0"] });
+  const seen = base.seen;
+  const grantRow = {
+    grant_id: "g-books", capabilities: '["ask"]',
+    expires_at: null, revoked_at: null, credential_revoked_at: null,
+    scope_include: '{"zones":["books"]}', scope_exclude: '[]',
+  };
+  // Wrap the recording DB so the credential lookup resolves, while every other
+  // query still lands in the same `seen` log.
+  const env = { ...base.env, DB: {
+    prepare(sql) {
+      const stmt = base.env.DB.prepare(sql);
+      if (!/FROM grant_credentials/.test(sql)) return stmt;
+      return { bind: (...b) => ({
+        async first() { return b[0] === hash ? grantRow : null; },
+        async all() { return { results: [] }; },
+        async run() { return { meta: { changes: 0 } }; },
+      }) };
+    },
+  } };
+
+  globalThis.__ZONE_DEBUG = 1;
+  const res = await worker.fetch(new Request("https://b.example/api/rag/think", {
+    method: "POST",
+    headers: { "X-Admin-Key": token, "Content-Type": "application/json" },
+    body: JSON.stringify({ q: "retainer" }),
+  }), env, { waitUntil() {} });
+
+  check("a scoped grant is admitted to the ask route", res.status !== 401, String(res.status));
+
+  const kw = seen.sql.find((sql) => /chunks_fts MATCH/.test(sql));
+  check("and its zone reaches the keyword SQL through the real request path",
+    /c\.zone IN \(/.test(kw || ""), String(kw));
+
+  const bound = seen.binds.find((b) => b.includes("books"));
+  check("and the zone from the GRANT ROW is what gets bound",
+    !!bound, JSON.stringify(seen.binds));
+}
+
 console.log(fail ? `\n${fail} FAILURES` : `\nroutes: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);
 

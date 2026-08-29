@@ -146,6 +146,7 @@ export async function findGrantByCredentialHash(env, tokenHash) {
   try {
     return await env.DB.prepare(
       `SELECT g.grant_id, g.display_name, g.capabilities, g.expires_at, g.revoked_at,
+              g.scope_include, g.scope_exclude,
               c.revoked_at AS credential_revoked_at
          FROM grant_credentials c
          JOIN grants g ON g.grant_id = c.grant_id

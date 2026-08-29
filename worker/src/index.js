@@ -109,7 +109,7 @@ function normalizeRetrievedDocuments(results) {
   return demoteScaffolding([...byKey.values()]);
 }
 
-async function unifiedRetrieve(env, url, { limit }) {
+async function unifiedRetrieve(env, url, { limit, scope = { all: true } }) {
   const q = url.searchParams.get("q");
   const rrfK = Math.min(Math.max(parseInt(url.searchParams.get("rrf_k")) || 60, 1), 1e3);
 
@@ -124,6 +124,9 @@ async function unifiedRetrieve(env, url, { limit }) {
     limit: ROUTE_RANKING_DEPTH,
     rrfK,
     filters: filtersFrom(url),
+    // A separate argument, never merged into filters, so nothing a caller puts
+    // in the request body can widen it.
+    scope,
     weights: {
       curated: requestWeight(url.searchParams.get("weight_curated")),
       drive: requestWeight(url.searchParams.get("weight_drive")),
@@ -387,7 +390,7 @@ function hasMatchingAsOfDate(sentence, docs) {
 
 /* -------------------------------------------------------------- routes */
 
-async function handleUnified(env, request) {
+async function handleUnified(env, request, scope = { all: true }) {
   const url = await privateRagParameters(request);
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
   const q = url.searchParams.get("q");
@@ -398,7 +401,7 @@ async function handleUnified(env, request) {
   // not make /unified diverge from the deterministic order consumed by /think.
   const doRerank = explicitlyEnabled(url.searchParams.get("rerank")) && !!env.ANTHROPIC_API_KEY;
 
-  const { matches: retrieved, degraded, ignoredFilters } = await unifiedRetrieve(env, url, { limit });
+  const { matches: retrieved, degraded, ignoredFilters } = await unifiedRetrieve(env, url, { limit, scope });
   const ignored = ignoredFilters.length ? { ignored_filters: ignoredFilters } : {};
   if (degraded === "fts") {
     return jsonResponse({ mode: "unified", degraded, ...ignored, results: retrieved.slice(0, limit) });
@@ -417,7 +420,7 @@ async function handleUnified(env, request) {
   });
 }
 
-async function handleThink(env, request) {
+async function handleThink(env, request, scope = { all: true }) {
   const unsupportedAnswer = "The documents do not answer the question.";
   const url = await privateRagParameters(request);
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
@@ -425,7 +428,7 @@ async function handleThink(env, request) {
   if (!q) return jsonResponse({ error: "Missing q" }, 400);
   const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit")) || 8, 1), 20);
 
-  const { matches, degraded, ignoredFilters } = await unifiedRetrieve(env, url, { limit });
+  const { matches, degraded, ignoredFilters } = await unifiedRetrieve(env, url, { limit, scope });
   const results = Array.isArray(matches) ? matches : [];
 
   if (results.length === 0) {
@@ -1456,11 +1459,17 @@ export default {
     // `administer`, so a path added later is owner-only until somebody decides
     // otherwise, and an unknown path still answers 401 rather than 404, which
     // keeps the route list unenumerable.
+    // Unscoped by default: the owner key and the proxy key both read
+    // everything, exactly as they did before zones existed.
+    let scope = { all: true };
     if (!authorized) {
       const principal = await resolvePrincipal(request, env, {
         lookupCredential: (hash) => findGrantByCredentialHash(env, hash),
       });
-      if (principal && principalMay(principal, path)) authorized = true;
+      if (principal && principalMay(principal, path)) {
+        authorized = true;
+        scope = principal.scope || { zones: [] };
+      }
     }
 
     if (!authorized) {
@@ -1483,10 +1492,10 @@ export default {
         }, 405));
       }
       if (path === "/api/rag/unified" && request.method === "POST") {
-        return privateNoStore(await handleUnified(env, request));
+        return privateNoStore(await handleUnified(env, request, scope));
       }
       if (path === "/api/rag/think" && request.method === "POST") {
-        return privateNoStore(await handleThink(env, request));
+        return privateNoStore(await handleThink(env, request, scope));
       }
       if (path === "/api/admin/auth/invite" && request.method === "POST") {
         return handleAdminInvite(env, url);
