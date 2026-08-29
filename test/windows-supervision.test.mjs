@@ -47,7 +47,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import {
   WINDOWS_MECHANISMS,
@@ -281,7 +281,7 @@ try {
       WINDOWS_WHATSAPP_DAEMON_LANE.executionTimeLimit === "PT0S",
       WINDOWS_WHATSAPP_DRAIN_LANE.executionTimeLimit);
     check("the drain task invokes the supervision runner with a configuration binding",
-      drain.commandArguments[0] === "/opt/brain installer/operations/windows-supervision.mjs" &&
+      drain.commandArguments[0] === resolve("/opt/brain installer/operations/windows-supervision.mjs") &&
       drain.commandArguments[1] === "run" &&
       drain.commandArguments.includes("--config-hash") &&
       /^[a-f0-9]{64}$/.test(drain.configHash),
@@ -659,7 +659,7 @@ try {
       kind: "whatsapp-drain", spawn, expectedConfigHash: plan.configHash,
     }));
     check("the tick runs the real CLI verb, so the credential gate applies to it too",
-      seen.command === "/opt/node/node.exe" &&
+      seen.command === resolve("/opt/node/node.exe") &&
       JSON.stringify(seen.args.slice(1)) === JSON.stringify(["ingest", manifestPath, "--from", "whatsapp"]),
       JSON.stringify(seen.args));
     check("the child gets a scrubbed Windows environment, not the interactive one Task Scheduler hands over",
