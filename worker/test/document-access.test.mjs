@@ -16,7 +16,7 @@ import { consumeEnrollmentCode } from "../src/lib/auth-store.js";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS = join(HERE, "..", "..", "migrations", "d1");
 const ORIGIN = "https://brain.example.com";
-const ENTITY = "guldan-family";
+const ENTITY = "fixture-family";
 
 function d1(db) {
   return {
