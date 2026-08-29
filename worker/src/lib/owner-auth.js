@@ -13,6 +13,7 @@
  * the SameSite=Strict cookie. Both are set only by the app page itself.
  */
 
+import { listConnections, revokeConnection } from "./connections.js";
 import { jsonResponse } from "./core.js";
 import { verifyRegistration, verifyAssertion, b64uDecode } from "./webauthn.js";
 import {
@@ -230,6 +231,9 @@ export async function handleOwnerAuth(env, request, url, path) {
       brain: env.BRAIN_NAME || "brain",
       owner: env.BRAIN_OWNER || "owner",
       devices: await listPasskeys(env),
+      // Apps reaching the brain over the connector, so one call answers the
+      // whole of "who has access" rather than two that can disagree.
+      connections: await listConnections(env),
     });
   }
   if (path === "/api/app/devices/rename") {
@@ -242,6 +246,12 @@ export async function handleOwnerAuth(env, request, url, path) {
     const payload = await body(request);
     if (!payload?.credential_id) return jsonResponse({ error: "credential_id required" }, 400);
     return jsonResponse(await revokePasskey(env, String(payload.credential_id)));
+  }
+  if (path === "/api/app/connections/revoke") {
+    const payload = await body(request);
+    if (!payload?.client_id) return jsonResponse({ error: "client_id required" }, 400);
+    const outcome = await revokeConnection(env, payload.client_id);
+    return jsonResponse({ ...outcome, connections: await listConnections(env) });
   }
   if (path === "/api/app/signout") {
     return withCookie(jsonResponse({ signed_out: true }), clearSessionCookie());
