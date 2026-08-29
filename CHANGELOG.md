@@ -4,62 +4,55 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
-## 0.1.21
-
-**A migration whose file changed after it ran can now be reconciled, without
-guessing and without touching your schema.**
-
-0.1.20 gave a stuck-mid-upgrade brain a way out with `--repair`/`--rollback`.
-That fixes a migration that died partway through. It does NOT fix a
-different, rarer problem: an already-applied migration whose FILE bytes
-later changed, most commonly from a line-ending change made by a different
-git client or editor. `brain migrate` refuses to run anything at all once it
-sees that — on purpose, so two installs never silently end up on different
-schemas under the same version number — and until now there was no way past
-that refusal short of hand-editing the database yourself. Running
-`--repair` against this specific problem does not help either: it retries
-the same migration step, which hits the identical refusal again.
-
-- New: `brain doctor <manifest>` now also checks every applied migration's
-  file against what was recorded when it ran, and fails loudly with the
-  exact migration name if any of them no longer match — before you ever run
-  `brain update` and get stuck by it.
-- New: `brain doctor <manifest> --repair-checksum` shows you precisely what
-  changed for each mismatched migration — when it was applied, both
-  checksums, and, when the difference really is only line endings, an exact
-  confirmation of that (not a guess). It previews with no changes until you
-  add `--yes`, at which point it updates only the recorded checksum to match
-  your current file. It never re-runs the migration's SQL and never touches
-  anything else — the schema is presumably already in the state your file
-  describes, and re-running it blindly risks a different kind of damage on
-  top of whatever caused the mismatch.
-- Migration files are now pinned to LF line endings in `.gitattributes`, so
-  this specific cause can't reintroduce itself through git.
-
 ## 0.1.20
 
-**A brain stuck mid-upgrade now tells you, and now has a way out.**
+**A brain stuck mid-upgrade now has a way out, and a migration whose file
+changed after it ran can be reconciled without touching your schema.**
 
-- 0.1.19 made a stalled upgrade honest: `/health` reports
-  `accepting_documents: false` while paused instead of a false `ok: true`.
-  But nothing that reads that field back to a person existed yet — an
-  install could sit paused for days with no command saying so. Now
-  `brain doctor <manifest>` checks the deployed brain's own live state, not
-  only this machine's, and fails loudly with an exact next step if it is
+If your brain has been unable to accept a document since an upgrade stopped
+partway, this is the release that recovers it. Two different failures are
+fixed here, and they are genuinely different problems.
+
+**A stuck upgrade.** 0.1.19 made a stalled upgrade honest: `/health` reports
+`accepting_documents: false` while paused instead of a false `ok: true`. But
+nothing read that field back to a person, so an install could sit paused for
+days with no command saying so.
+
+- `brain doctor <manifest>` now checks the deployed brain's own live state,
+  not only this machine's, and fails loudly with an exact next step if it is
   paused.
-- New: `brain doctor <manifest> --repair` diagnoses a stuck upgrade
-  precisely — which stage it stopped at, how long ago, and the exact D1
-  recovery bookmark captured just before the migration ran — then resumes it
-  safely once you add `--yes`. Resuming replays the same verified upgrade
-  path (`brain update`), which was already idempotent and restart-safe; this
-  just gives the stuck case its own clear entry point instead of leaving you
-  to reconstruct "run it again" out of an error message.
+- New: `brain doctor <manifest> --repair` diagnoses a stuck upgrade precisely,
+  which stage it stopped at, how long ago, and the exact D1 recovery bookmark
+  captured just before the migration ran, then resumes it safely once you add
+  `--yes`.
 - New: `brain doctor <manifest> --rollback` does the same diagnosis, then
-  restores D1 to that exact bookmark once you add `--yes` — no more copying
-  a bookmark out of a die() message by hand. If no bookmark can be found, it
-  refuses rather than guessing.
-- Both are previews without `--yes`: they print what they would do and
-  change nothing until you confirm.
+  restores D1 to that exact bookmark once you add `--yes`. If no bookmark can
+  be found, it refuses rather than guessing.
+
+**An applied migration whose file later changed.** This is the rarer one, and
+`--repair` does not fix it: `--repair` replays the upgrade, which hits the
+identical refusal again. The usual cause is a line-ending change made by a
+different git client or editor. `brain migrate` refuses to run anything at
+all once it sees this, on purpose, so two installs never silently end up on
+different schemas under the same version number.
+
+- `brain doctor <manifest>` now also checks every applied migration's file
+  against what was recorded when it ran, and names the exact migration if any
+  no longer match, before you run `brain update` and get stuck by it.
+- New: `brain doctor <manifest> --repair-checksum` shows precisely what
+  changed for each mismatched migration, and when the difference really is
+  only line endings, confirms that exactly rather than guessing. It previews
+  and changes nothing until you add `--yes`, at which point it updates only
+  the recorded checksum. It never re-runs the migration's SQL.
+- Migration files are now pinned to LF in `.gitattributes`, so this cause
+  cannot reintroduce itself through git.
+
+**An option this release does not have now fails loudly.** Running
+`brain doctor --repair-checksum` against a release without it used to print
+ordinary doctor output and exit 0, which is indistinguishable from the repair
+running and finding nothing to fix. `brain doctor` now rejects any option it
+does not recognise, exits nonzero, suggests the nearest real flag, and lists
+what it does accept.
 
 ## 0.1.19
 

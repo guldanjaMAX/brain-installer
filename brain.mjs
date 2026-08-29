@@ -4462,6 +4462,44 @@ function editDistance(a, b) {
   return prev[b.length];
 }
 
+/**
+ * Refuse a flag the command does not know, instead of running as if it were
+ * never typed.
+ *
+ * parseFlags is deliberately permissive: it turns any `--word` into a key so
+ * that every command can read whatever it likes without registering anything.
+ * The cost is that a flag nobody reads is indistinguishable from a flag that
+ * worked. That is tolerable for a flag that only adds output. It is not
+ * tolerable for a recovery flag: a real install ran
+ * `brain doctor <manifest> --repair-checksum` against a release that did not
+ * contain it, got ordinary doctor output and exit 0, and reasonably concluded
+ * the repair had run and found nothing to fix. Nothing had run at all.
+ *
+ * So a command that can change data validates its own flags and exits nonzero
+ * on one it does not recognise.
+ */
+export function assertKnownFlags(flags, known, command) {
+  const allowed = new Set(known);
+  const unknown = Object.keys(flags).filter((key) => !allowed.has(key));
+  if (unknown.length === 0) return;
+
+  const listed = [...allowed].sort().map((f) => `--${f}`).join(", ");
+  const lines = unknown.map((key) => {
+    const near = [...allowed]
+      .map((candidate) => [candidate, editDistance(key, candidate)])
+      .filter(([, distance]) => distance <= 3)
+      .sort((a, b) => a[1] - b[1])[0];
+    return near ? `unknown option --${key} for \`${command}\`. Did you mean --${near[0]}?` : `unknown option --${key} for \`${command}\`.`;
+  });
+
+  die(
+    `${lines.join("\n")}\n` +
+      `\n  This exits nonzero rather than continuing, because a flag that is silently\n` +
+      `  ignored looks exactly like a flag that ran and had nothing to do.\n` +
+      `\n  Options ${command} accepts: ${listed}`,
+  );
+}
+
 async function resolveBase(m, acct) {
   if (m.brain?.domain) return `https://${m.brain.domain}`;
   const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
@@ -6650,8 +6688,8 @@ function printStuckUpgradeDiagnosis(diagnosis) {
  * die()s, both already proven under test — so repair does not reimplement
  * that logic. It gives the stuck case its own named, precise entry point
  * instead of leaving an operator to reconstruct "run brain update again" out
- * of a wall of error text, which is exactly the gap that left Jay's install
- * paused for nine days with nothing telling him what to do about it.
+ * of a wall of error text, which is exactly the gap that left a real install
+ * paused for nine days with nothing telling its owner what to do about it.
  *
  * Rollback is the other safe path: restore D1 to the exact bookmark this
  * stuck run itself captured before it touched the schema. Previously the
@@ -9689,6 +9727,10 @@ async function dispatchRollback(manifestPath) {
   return cmdRollbackInteractive(manifestPath, bookmark, { confirmed: flags.yes === true });
 }
 
+/** Every option `brain doctor` reads. Anything else is a typo or a flag from a
+ * release this one is not. */
+const DOCTOR_FLAGS = ["repair", "rollback", "repair-checksum", "yes"];
+
 /**
  * `brain doctor [manifest]` with no flags stays the existing pure preflight.
  * `brain doctor <manifest> --repair|--rollback [--yes]` is the stuck-upgrade
@@ -9702,6 +9744,7 @@ async function dispatchRollback(manifestPath) {
  */
 async function dispatchDoctor(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
+  assertKnownFlags(flags, DOCTOR_FLAGS, "brain doctor");
   const repairRequested = flags.repair === true;
   const rollbackRequested = flags.rollback === true;
   const repairChecksumRequested = flags["repair-checksum"] === true;
