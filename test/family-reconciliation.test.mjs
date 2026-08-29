@@ -62,6 +62,7 @@ const CLI = join(HERE, "..", "brain.mjs");
 const FETCH = pathToFileURL(join(HERE, "fixtures", "family-reconciliation-fetch.mjs")).href;
 const WHATSAPP_FIXTURE = join(HERE, "fixtures", "whatsapp", "ios-unambiguous.txt");
 const EXPORT_NAME = "WhatsApp Chat with Alex Rivera.txt";
+const MBOX_FIXTURE = join(HERE, "fixtures", "formats", "three-messages.mbox");
 
 let fail = 0, ran = 0;
 const check = (name, condition, detail = "") => {
@@ -530,6 +531,56 @@ check("re-loading the same export duplicates no documents",
 check("and re-loading deletes none of them either",
   (reload.evidence?.forgetResults || []).every((r) => Number(r.documents) === 0),
   JSON.stringify(reload.evidence?.forgetResults));
+
+/* ---- 6b. a .mbox ARCHIVE, the producer this file's own guard missed ---- */
+//
+// THE BUG. `prepareMboxArchive` was the ONLY multi-document producer in
+// ingest/run.mjs that did not call declareFamily(). Every other one does. That
+// is not cosmetic: cmdIngestLocal hard-throws when a multi-envelope result
+// carries no family declaration, so ONE .mbox anywhere under an ingested folder
+// aborted the ENTIRE run, dry run included, and took every unrelated file in
+// that folder down with it. A client with a mail archive in their documents
+// folder would have seen their whole first ingest fail.
+//
+// WHY NO TEST SAW IT. Every other mbox test calls prepare() directly and never
+// goes through the ingest command, so the throw sits in a seam none of them
+// cross. This section crosses it, which is the only reason it is here rather
+// than in the mbox tests.
+//
+// The ordinary note is not decoration. It is the "took everything with it"
+// half of the bug, and it is what fails if someone reintroduces the abort.
+{
+  const mboxDir = mkdtempSync(join(tmpdir(), "brain-family-mbox-"));
+  const mboxDb = join(mboxDir, "brain.sqlite");
+  const archive = runIngest({
+    label: "mbox",
+    files: {
+      "archive.mbox": (path) => copyFileSync(MBOX_FIXTURE, path),
+      "note.txt": (path) => writeFileSync(path, "An ordinary note that must survive the archive beside it.\n"),
+    },
+    dbPath: mboxDb,
+  });
+
+  check("a folder containing a .mbox ingests at all",
+    archive.code === 0,
+    `exit ${archive.code}; ${archive.out.slice(-500)}`);
+  check("and it does not abort on an undeclared family",
+    !/do not agree on one family/i.test(archive.out),
+    archive.out.slice(-400));
+
+  const stored = archive.evidence?.storedDocUids || [];
+  check("the archive's messages became separate documents",
+    stored.length > 2, JSON.stringify(stored));
+  check("the ordinary file beside the archive was ingested too",
+    stored.some((uid) => /note/.test(uid)),
+    JSON.stringify(stored));
+  check("the worker never rejected the archive's reconciliation",
+    (archive.evidence?.forgetRejections || []).length === 0,
+    JSON.stringify(archive.evidence?.forgetRejections));
+  check("a first, complete archive load removes nothing",
+    (archive.evidence?.forgetResults || []).every((r) => Number(r.documents) === 0),
+    JSON.stringify(archive.evidence?.forgetResults));
+}
 
 /* ---- 7. the control: the SAME file, every part failed ---- */
 const failed = runIngest({

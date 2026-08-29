@@ -367,7 +367,12 @@ async function prepareMboxArchive(file, buf, hash, { sourceName }) {
   }
   return {
     hash,
-    envelopes,
+    // Every OTHER multi-document producer stamps its family here, and this one
+    // did not. That is not a cosmetic omission: cmdIngestLocal hard-throws when
+    // a multi-envelope result carries no declaration, so a single .mbox
+    // anywhere under an ingested folder aborted the WHOLE run, dry run
+    // included, and took every unrelated file in that folder with it.
+    envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)),
     note: unreadable
       ? `${envelopes.length} message(s) loaded from this archive; ${unreadable} could not be read`
       : `${envelopes.length} message(s) loaded from this archive`,
