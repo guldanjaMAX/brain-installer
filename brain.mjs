@@ -9339,6 +9339,10 @@ export async function cmdConnectWhatsapp(manifestPath, flags = {}, options = {})
       env: options.env ?? process.env,
       manifest: m,
       platform: options.platform ?? process.platform,
+      // Same injection seam resolveDaemonBinary already exposes. A test that
+      // simulates darwin on a Windows runner cannot rely on the host honouring
+      // chmod +x, so it supplies the stat instead of the filesystem.
+      ...(options.statFile ? { statFile: options.statFile } : {}),
     });
   } catch (error) {
     if (error?.reason === "daemon_binary_missing") die(error.message);

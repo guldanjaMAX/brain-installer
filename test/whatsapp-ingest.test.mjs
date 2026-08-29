@@ -15,7 +15,7 @@
 // that a phone can scan the QR or that WhatsApp transfers any history. That
 // needs a real account and is named as unproven in evidence/WP-07-cli.md.
 
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, existsSync } from "node:fs";
+import { statSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
@@ -79,6 +79,15 @@ function makeBrainFakes() {
     receipts, batches, expectations,
     options: {
       platform: "darwin",
+      // These fakes simulate darwin. On a Windows runner chmod does not set the
+      // 0o111 bits, so the real statSync reports a non-executable stub and the
+      // darwin branch correctly refuses it — failing for a host reason rather
+      // than a product one. Supplying the stat keeps darwin cases testing
+      // darwin on every platform.
+      statFile: (path) => {
+        const st = statSync(path);
+        return { ...st, isFile: () => st.isFile(), mode: st.isFile() ? 0o100755 : st.mode };
+      },
       dataDir,
       resolveAdminKey: () => "fixture-admin-key",
       resolveBaseUrl: async () => "https://brain.acme-example.test",
