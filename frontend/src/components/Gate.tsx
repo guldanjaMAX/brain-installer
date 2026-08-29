@@ -6,9 +6,10 @@ import { enroll, signIn, passkeysSupported } from "../lib/passkey";
  * message. It has to answer "what is this and why should I tap" before it
  * asks for anything, which is why the copy leads and the button follows.
  */
-export function Gate({ owner, inviteCode, onIn }: {
+export function Gate({ owner, inviteCode, notice, onIn }: {
   owner: string;
   inviteCode: string | null;
+  notice?: string | null;
   onIn: () => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -57,6 +58,12 @@ export function Gate({ owner, inviteCode, onIn }: {
               ? "Everything you have written, decided and been told, in one place that belongs to you. Ask it anything and it answers with its sources."
               : "Sign in to ask your brain a question."}
           </p>
+
+          {notice && (
+            <p role="status" className="mt-4 text-[14px] text-amber-900 bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-3 leading-relaxed">
+              {notice}
+            </p>
+          )}
 
           {enrolling && (
             <ul className="mt-6 space-y-2.5">

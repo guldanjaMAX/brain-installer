@@ -88,6 +88,35 @@ const systemStatus = {
   unavailable: [],
 };
 
+const ownerActivity = [
+  { event_id: "event-access", event_type: "document_grant_created", entity_slug: "mesa-coffee", subject_kind: "document_grant", subject_id: "grant", display_label: "External reviewer document access", occurred_at: "2026-08-29T17:00:00Z" },
+  { event_id: "event-target", event_type: "target_set", entity_slug: "mesa-coffee", subject_kind: "target", subject_id: "monthly-revenue", display_label: "Monthly revenue target", occurred_at: "2026-08-29T16:00:00Z" },
+  { event_id: "event-upload", event_type: "upload_completed", entity_slug: "mesa-coffee", subject_kind: "document", subject_id: "document", display_label: "July close notes", occurred_at: "2026-08-28T12:00:00Z" },
+  { event_id: "event-close", event_type: "period_close_accepted", entity_slug: "household", subject_kind: "period_close", subject_id: "close", display_label: "July 2026 close", occurred_at: "2026-08-27T12:00:00Z" },
+];
+
+const ownerTargets = [
+  { target_id: "monthly-revenue", entity_slug: "mesa-coffee", label: "Monthly revenue", metric: "revenue", target_minor: 2630000, currency: "USD", period_start: "2026-08-01", period_end: "2026-08-31", note: "Owner-set for August", status: "active", created_at: "2026-08-20T00:00:00Z", updated_at: "2026-08-29T16:00:00Z", archived_at: null },
+];
+
+const ownerPreferences = [
+  { entity_slug: null, preference_key: "activity_window_days", value: 30, updated_at: "2026-08-29T16:00:00Z" },
+];
+
+const ownerPeriodCloses = [
+  { period_close_id: "close-july", entity_slug: "mesa-coffee", period_start: "2026-07-01", period_end: "2026-07-31", status: "accepted", evidence_state: "owner_acknowledged_incomplete", acknowledged_incomplete: true, note: "Accepted while two lines remained unreadable.", accepted_at: "2026-08-20T00:00:00Z", reopened_at: null, updated_at: "2026-08-20T00:00:00Z" },
+];
+
+const uploadCapabilities = {
+  supported_media_types: ["text/plain", "text/markdown"],
+  supported_extensions: [".txt", ".md", ".markdown"],
+  media_type_extensions: { "text/plain": [".txt"], "text/markdown": [".md", ".markdown"] },
+  max_content_bytes: 1000000,
+  content_encoding: "utf-8",
+  empty_media_type_supported: false,
+  normalization: "decode UTF-8 strictly, remove one leading UTF-8 BOM if present, preserve all remaining text exactly",
+};
+
 function scenarioFor(request) {
   try {
     return new URL(request.headers.referer || `http://127.0.0.1:${PORT}/`).searchParams.get("state") || "populated";
@@ -168,16 +197,140 @@ const server = createServer(async (request, response) => {
   }
 
   if (url.pathname === "/api/app/me") {
+    if (scenario === "grant-forbidden" || scenario === "grant-empty") {
+      return sendJson(response, { error: "forbidden", code: scenario === "grant-empty" ? "document_grant_empty" : "document_grant_inactive", signed_in: false, clear_session: true, recovery: "Ask the owner to create new document access and send a new enrollment link." }, 403);
+    }
+    if (scenario.startsWith("grant")) {
+      return sendJson(response, {
+        signed_in: true,
+        brain: "Financial Brain",
+        principal: { kind: "grant", grant_id: "dg_fixture", entity_slug: "mesa-coffee", document_count: 2, capabilities: ["documents:read", "ask"] },
+        workspace: { home: false, documents: true, ask: true, add_review: false, access: false, bank: false, targets: false, preferences: false },
+      });
+    }
     return sendJson(response, {
       signed_in: true, owner: "Owner", brain: "Financial Brain",
+      principal: { kind: "owner", grant_id: null },
       devices: [{ credential_id: "device", nickname: "Primary device", created_at: Date.now() - 86400000 * 20, last_used_at: Date.now() - 60000 }],
       connections: [{ client_id: "app", name: "Claude", can_write: false, connected_at: Date.now() - 86400000 * 4, last_used_at: Date.now() - 3600000 }],
+    });
+  }
+  if (url.pathname === "/api/app/document-access/documents") {
+    if (scenario === "grant-unavailable") return sendJson(response, { error: "unavailable", code: "document_access_unavailable" }, 503);
+    return sendJson(response, {
+      status: "ready",
+      principal: { kind: "grant", grant_id: "dg_fixture", entity_slug: "mesa-coffee" },
+      scope_rule: "exact_document_ids_only",
+      documents: [
+        { document_id: "private-one", title: "July operating statement", source: "drive", document_date: Date.parse("2026-07-31T00:00:00Z"), date_source: "document", date_reliable: true, text_source: "native", text_reliable: true },
+        { document_id: "private-two", title: "Equipment receipt scan", source: "upload", document_date: Date.parse("2026-07-22T00:00:00Z"), date_source: "ocr", date_reliable: false, text_source: "ocr", text_reliable: false },
+      ],
+    });
+  }
+  if (url.pathname === "/api/app/document-access/status") {
+    if (scenario === "degraded") return sendJson(response, { error: "unavailable", code: "document_access_unavailable" }, 503);
+    return sendJson(response, {
+      status: "ready", scope_rule: "exact_document_ids_only", default_access: "owner_only",
+      grants: scenario === "empty" ? [] : [{
+        grant_id: "dg_fixture", subject_label: "External reviewer", entity_slug: "mesa-coffee", state: "active",
+        expires_at: null, created_at: Date.now() - 86400000 * 3, revoked_at: null,
+        documents: [{ document_id: "private-one", entity_slug: "mesa-coffee", granted_at: Date.now() - 86400000 * 3, revoked_at: null }],
+      }],
+    });
+  }
+  if (url.pathname === "/api/app/document-access/create") {
+    const body = await jsonBody(request);
+    if (scenario === "conflict") return sendJson(response, { error: "conflict", code: "idempotency_conflict", detail: "request id conflict" }, 409);
+    if (scenario === "forbidden") return sendJson(response, { error: "forbidden", code: "owner_required" }, 403);
+    return sendJson(response, {
+      status: "active", grant_id: "dg_created", subject_label: body.subject_label, entity_slug: body.entity_slug,
+      document_ids: body.document_ids, expires_at: null, created_at: Date.now(), invite_state: "active",
+      enrollment_url: "http://127.0.0.1/app#enroll=fixture-private", enrollment_expires_at: Date.now() + 900000,
+      scope_rule: "exact_document_ids_only", replayed: scenario === "idempotent",
+    });
+  }
+  if (url.pathname === "/api/app/document-access/reissue") {
+    const body = await jsonBody(request);
+    if (scenario === "conflict") return sendJson(response, { error: "conflict", code: "idempotency_conflict" }, 409);
+    if (scenario === "forbidden") return sendJson(response, { error: "forbidden", code: "owner_required" }, 403);
+    return sendJson(response, { status: "active", grant_id: body.grant_id, invite_state: "active", enrollment_url: "http://127.0.0.1/app#enroll=fixture-reissued", enrollment_expires_at: Date.now() + 900000, replayed: scenario === "idempotent" });
+  }
+  if (url.pathname === "/api/app/document-access/revoke") {
+    const body = await jsonBody(request);
+    if (scenario === "conflict") return sendJson(response, { error: "conflict", code: "idempotency_conflict" }, 409);
+    if (scenario === "forbidden") return sendJson(response, { error: "forbidden", code: "owner_required" }, 403);
+    return sendJson(response, { status: "revoked", grant_id: body.grant_id, revoked_at: Date.now(), changed: true, replayed: scenario === "idempotent" });
+  }
+  if (url.pathname === "/api/app/passkeys/status") {
+    if (scenario === "degraded") return sendJson(response, { error: "unavailable", code: "passkey_observability_unavailable" }, 503);
+    return sendJson(response, {
+      status: "ready", rp_id: "brain.example.test",
+      proof: { configured: true, locally_verified: true, live_proven: false },
+      devices: { owner: scenario === "empty" ? 0 : 1, grant: scenario === "empty" ? 0 : 1 },
+      ceremonies: scenario === "empty" ? [] : [{ ceremony: "session_use", stage: "verification", outcome: "succeeded", rp_id: "brain.example.test", count: 4, last_at: Date.now() - 60000, timing_ms: { min: 18, average: 23.5, max: 31 } }],
+      privacy: "No credential ids, challenges, assertions, public keys, IP addresses, user agents, questions, answers, or document content are recorded here.",
     });
   }
   if (url.pathname === "/api/app/system") {
     if (scenario === "degraded") return sendJson(response, { ...systemStatus, documents: undefined, problems: undefined, sources: undefined, unavailable: ["diagnose", "sources"] });
     if (scenario === "empty") return sendJson(response, { ...systemStatus, documents: 0, chunks: 0, problems: [], problem_counts: { crit: 0, warn: 0, info: 0 }, sources: [], vectors: { ready: true, expected: 0, visible: 0, pending: 0, percent_visible: null } });
     return sendJson(response, systemStatus);
+  }
+  if (url.pathname === "/api/owner/uploads/capabilities") {
+    if (scenario === "forbidden") return sendJson(response, { error: "forbidden", code: "owner_required" }, 403);
+    return sendJson(response, uploadCapabilities);
+  }
+  if (url.pathname === "/api/owner/activity") {
+    const body = await jsonBody(request);
+    if (scenario === "degraded") return sendJson(response, { error: "unavailable", unavailable: true, sections_unavailable: ["activity_events"] }, 503);
+    const rows = scenario === "empty" ? [] : filterRows(ownerActivity, body.entity_slug || null);
+    return sendJson(response, { entity_scope: { entity_slug: body.entity_slug || null }, activity_events: rows, truncated: scenario === "partial", next_cursor: scenario === "partial" ? "next" : null, unavailable: false });
+  }
+  if (url.pathname === "/api/owner/preferences/read") {
+    if (scenario === "degraded") return sendJson(response, { error: "unavailable", sections_unavailable: ["preferences"] }, 503);
+    return sendJson(response, { entity_scope: { entity_slug: null }, preferences: scenario === "empty" ? [] : ownerPreferences, unavailable: false });
+  }
+  if (url.pathname === "/api/owner/preferences/set") {
+    const body = await jsonBody(request);
+    if (scenario === "conflict") return sendJson(response, { error: "conflict", code: "request_id_conflict" }, 409);
+    if (scenario === "forbidden") return sendJson(response, { error: "forbidden", code: "owner_required" }, 403);
+    return sendJson(response, { request_id: body.request_id, entity_scope: { entity_slug: body.entity_slug || null }, changed: true, preference: { entity_slug: body.entity_slug || null, preference_key: body.preference_key, value: body.value }, activity_event_id: "event-preference", replayed: scenario === "idempotent" });
+  }
+  if (url.pathname === "/api/owner/targets/read") {
+    const body = await jsonBody(request);
+    if (scenario === "degraded") return sendJson(response, { error: "unavailable", sections_unavailable: ["targets"] }, 503);
+    return sendJson(response, { entity_scope: { entity_slug: body.entity_slug || null }, targets: scenario === "empty" ? [] : filterRows(ownerTargets, body.entity_slug || null), unavailable: false });
+  }
+  if (url.pathname === "/api/owner/targets/upsert" || url.pathname === "/api/owner/targets/archive") {
+    const body = await jsonBody(request);
+    if (scenario === "conflict") return sendJson(response, { error: "conflict", code: "request_id_conflict" }, 409);
+    if (scenario === "forbidden") return sendJson(response, { error: "forbidden", code: "owner_required" }, 403);
+    return sendJson(response, { request_id: body.request_id, entity_scope: { entity_slug: body.entity_slug }, changed: true, target: { ...ownerTargets[0], target_id: body.target_id, entity_slug: body.entity_slug }, activity_event_id: "event-target", replayed: scenario === "idempotent" });
+  }
+  if (url.pathname === "/api/owner/approvals") {
+    const body = await jsonBody(request);
+    if (scenario === "conflict") return sendJson(response, { error: "conflict", code: "decision_changed" }, 409);
+    if (scenario === "forbidden") return sendJson(response, { error: "forbidden", code: "owner_required" }, 403);
+    return sendJson(response, { request_id: body.request_id, entity_scope: { entity_slug: body.entity_slug }, changed: true, approval: { approval_type: body.approval_type, subject_uid: body.subject_uid }, activity_event_id: "event-approval", replayed: scenario === "idempotent" });
+  }
+  if (url.pathname === "/api/owner/period-closes/read") {
+    const body = await jsonBody(request);
+    if (scenario === "degraded") return sendJson(response, { error: "unavailable", unavailable: true, sections_unavailable: ["period_closes"] }, 503);
+    return sendJson(response, { entity_scope: { entity_slug: body.entity_slug }, period_closes: scenario === "empty" ? [] : filterRows(ownerPeriodCloses, body.entity_slug), unavailable: false });
+  }
+  if (url.pathname === "/api/owner/period-closes/accept" || url.pathname === "/api/owner/period-closes/reopen") {
+    const body = await jsonBody(request);
+    if (scenario === "conflict" && !body.acknowledge_incomplete) return sendJson(response, { error: "conflict", code: "incomplete_evidence" }, 409);
+    if (scenario === "forbidden") return sendJson(response, { error: "forbidden", code: "owner_required" }, 403);
+    const accepted = url.pathname.endsWith("/accept");
+    return sendJson(response, { request_id: body.request_id, entity_scope: { entity_slug: body.entity_slug }, changed: true, period_close: { period_close_id: "close-fixture", entity_slug: body.entity_slug, period_start: body.period_start, period_end: body.period_end, status: accepted ? "accepted" : "reopened", evidence_state: body.acknowledge_incomplete ? "owner_acknowledged_incomplete" : "complete", acknowledged_incomplete: Boolean(body.acknowledge_incomplete), accepted_at: accepted ? "2026-08-29T00:00:00Z" : null, reopened_at: accepted ? null : "2026-08-29T00:00:00Z" }, activity_event_id: "event-close", replayed: scenario === "idempotent" }, 200);
+  }
+  if (url.pathname === "/api/owner/uploads") {
+    const body = await jsonBody(request);
+    if (scenario === "validation") return sendJson(response, { uploaded: false, error: "refused", code: "content_refused" }, 422);
+    if (scenario === "conflict") return sendJson(response, { error: "conflict", code: "request_id_conflict" }, 409);
+    if (scenario === "forbidden") return sendJson(response, { error: "forbidden", code: "owner_required" }, 403);
+    return sendJson(response, { uploaded: true, request_id: body.request_id, document_id: body.document_id, entity_scope: { entity_slug: body.entity_slug }, media_type: body.media_type, file_name: body.file_name, document: { doc_uid: "private", action: scenario === "idempotent" ? "unchanged" : "created", chunks: 1, queued: 1 }, changed: scenario !== "idempotent", activity_event_id: scenario === "idempotent" ? null : "event-upload", replayed: scenario === "idempotent" }, scenario === "idempotent" ? 200 : 201);
   }
   if (url.pathname === "/api/fin/snapshot") {
     const body = await jsonBody(request);
@@ -192,14 +345,31 @@ const server = createServer(async (request, response) => {
     return sendJson(response, { configured: true, connections: [{ item_ref: "bank", institution_label: "Desert Bank", status: "healthy", connected_at: "2026-07-01T00:00:00Z", last_synced_at: "2026-08-29T06:00:00Z" }], needs_attention: [] });
   }
   if (url.pathname === "/api/rag/unified") {
+    const body = await jsonBody(request);
+    if (scenario.startsWith("grant")) {
+      return sendJson(response, scenario === "grant-unavailable"
+        ? { status: "search_unavailable", notice: "Exact-document search is unavailable.", results: [], retrieval_scope: "exact_document_ids", degraded: "scoped-vector", degraded_reason: "document-scope-keyword-only", access: { principal: "grant", grant_id: "dg_fixture", entity_slug: "mesa-coffee", document_count: 2 } }
+        : { results: [{ doc_uid: "private-one", chunk_uid: "shared-chunk", title: "July operating statement", snippet: "The closing balance was supported by the July statement.", source: "drive", ts: "2026-07-31", date_reliable: true }], retrieval_scope: "exact_document_ids", degraded: "scoped-vector", degraded_reason: "document-scope-keyword-only", access: { principal: "grant", grant_id: "dg_fixture", entity_slug: "mesa-coffee", document_count: 2 } });
+    }
     return sendJson(response, scenario === "degraded"
       ? { status: "unavailable", degraded: "vector" }
-      : { results: scenario === "empty" ? [] : [{ doc_uid: "doc", chunk_uid: "chunk", title: "Mesa Coffee checking, July 2026", snippet: "The closing balance was supported by the July statement.", source: "drive", ts: "2026-07-31", date_reliable: true }] });
+      : scenario === "scope-mismatch"
+        ? { results: [], entity_scope: { entity_slug: null, applied: false }, filter_not_applied: true }
+        : { entity_scope: { entity_slug: body.entity_slug || null, applied: Boolean(body.entity_slug) }, degraded: body.entity_slug ? "vector" : undefined, degraded_reason: body.entity_slug ? "entity-vector-authority-unindexed" : undefined, results: scenario === "empty" ? [] : [{ doc_uid: "doc", chunk_uid: "chunk", title: "Mesa Coffee checking, July 2026", snippet: "The closing balance was supported by the July statement.", source: "drive", ts: "2026-07-31", date_reliable: true }] });
   }
   if (url.pathname === "/api/rag/think") {
+    const body = await jsonBody(request);
+    if (scenario.startsWith("grant")) {
+      const access = { principal: "grant", grant_id: "dg_fixture", entity_slug: "mesa-coffee", document_count: 2 };
+      return sendJson(response, scenario === "grant-unavailable"
+        ? { answer: null, status: "search_unavailable", notice: "Exact-document search is unavailable. This is not proof that nothing is recorded.", citations: [], results: [], gaps: [{ type: "scoped_vector_unavailable" }], retrieval_scope: "exact_document_ids", degraded: "scoped-vector", degraded_reason: "document-scope-keyword-only", access }
+        : { answer: "The shared statement records a July closing balance. [1]", citations: [{ n: 1, title: "July operating statement", source: "drive", ts: "2026-07-31" }], results: [{ doc_uid: "private-one" }], gaps: [{ type: "scoped_vector_unavailable" }], confidence: { percent: 82, band: "high", basis: ["One exact shared document supports the answer"] }, retrieval_scope: "exact_document_ids", degraded: "scoped-vector", degraded_reason: "document-scope-keyword-only", access });
+    }
     return sendJson(response, scenario === "degraded"
       ? { answer: null, answer_error: "search unavailable", status: "unavailable", degraded: "vector" }
-      : { answer: "Mesa Coffee has one confirmed cash figure as of July 31. [1] The rental account is not included because no confirmed figure is recorded.", confidence: { percent: 86, band: "high", basis: ["One dated statement supports the figure", "One known account is explicitly missing"] }, citations: [{ n: 1, title: "Mesa Coffee checking, July 2026", source: "drive", ts: "2026-07-31" }] });
+      : scenario === "scope-mismatch"
+        ? { answer: "This answer was not safely narrowed.", entity_scope: { entity_slug: null, applied: false }, filter_not_applied: true }
+        : { answer: "Mesa Coffee has one confirmed cash figure as of July 31. [1] The rental account is not included because no confirmed figure is recorded.", entity_scope: { entity_slug: body.entity_slug || null, applied: Boolean(body.entity_slug) }, degraded: body.entity_slug ? "vector" : undefined, degraded_reason: body.entity_slug ? "entity-vector-authority-unindexed" : undefined, confidence: { percent: 86, band: "high", basis: ["One dated statement supports the figure", "One known account is explicitly missing"] }, citations: [{ n: 1, title: "Mesa Coffee checking, July 2026", source: "drive", ts: "2026-07-31" }] });
   }
 
   const requested = url.pathname === "/" || url.pathname === "/app" ? "index.html" : url.pathname.replace(/^\//, "");

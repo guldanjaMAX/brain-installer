@@ -1,17 +1,23 @@
 import { useEffect, useState } from "react";
-import { api, type FinSnapshot } from "../lib/api";
+import {
+  api, ownerError, type FinException, type FinReconciliation, type FinSnapshot, type OwnerWriteReceipt,
+} from "../lib/api";
 import {
   accountLabel, dateLabel, documentDetail, entityLabel, moneyLabel,
 } from "../lib/finance";
 import { Attention, Chip, NextStep, Note, Row, Section, TruthNote } from "./ui";
 import { FinanceScopeBar, useFinanceScope } from "./FinanceScope";
+import { OwnerUpload } from "./OwnerUpload";
+import { useActionRequests } from "./useActionRequests";
+import { confirmedOwnerWrite } from "../lib/owner";
 
-const SECTIONS = ["accounts", "documents", "statements", "reconciliations", "unsorted_spending"];
+const SECTIONS = ["accounts", "documents", "statements", "reconciliations", "exceptions", "unsorted_spending"];
 const SECTION_LABELS: Record<string, string> = {
   accounts: "accounts",
   documents: "document records",
   statements: "statement processing",
   reconciliations: "record comparisons",
+  exceptions: "open decisions",
   unsorted_spending: "uncategorized spending",
 };
 
@@ -24,6 +30,7 @@ export function AddReview() {
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [revision, setRevision] = useState(0);
 
   useEffect(() => {
     let current = true;
@@ -47,7 +54,7 @@ export function AddReview() {
       if (current) setBusy(false);
     });
     return () => { current = false; };
-  }, [scope]);
+  }, [scope, revision]);
 
   const unavailable = snapshot?.sections_unavailable || [];
 
@@ -62,11 +69,7 @@ export function AddReview() {
         </p>
       </header>
 
-      <div className="mt-5 max-w-3xl">
-        <TruthNote>
-          This page is read-only today. It can show what the records need, but adding files and approving changes from an owner session are not available yet.
-        </TruthNote>
-      </div>
+      <div className="mt-7 max-w-3xl"><OwnerUpload onStored={() => setRevision((value) => value + 1)} /></div>
 
       {!loaded && <p className="sr-only">Reading the review queue.</p>}
       {error && <div className="mt-5 max-w-3xl"><Attention>{error}</Attention></div>}
@@ -95,7 +98,8 @@ export function AddReview() {
             <UnsortedReview snapshot={snapshot} />
           </div>
           <div>
-            <ConflictReview snapshot={snapshot} entities={entities} />
+            <ConflictReview snapshot={snapshot} entities={entities} scope={scope} onSaved={() => setRevision((value) => value + 1)} />
+            <DecisionReview snapshot={snapshot} entities={entities} scope={scope} onSaved={() => setRevision((value) => value + 1)} />
             <AccountReview snapshot={snapshot} entities={entities} scopeName={activeLabel} />
           </div>
         </div>
@@ -162,9 +166,11 @@ function StatementReview({ snapshot }: { snapshot: FinSnapshot }) {
   );
 }
 
-function ConflictReview({ snapshot, entities }: {
+function ConflictReview({ snapshot, entities, scope, onSaved }: {
   snapshot: FinSnapshot;
   entities: Parameters<typeof entityLabel>[0];
+  scope: string | null;
+  onSaved: () => void;
 }) {
   if (!("reconciliations" in snapshot)) return null;
   const rows = snapshot.reconciliations!.filter((item) => item.state === "mismatched");
@@ -192,11 +198,151 @@ function ConflictReview({ snapshot, entities }: {
                   : "Your ruling is recorded beside both figures. Nothing uses it yet."
                 : "Answers use neither figure until you rule."}
             </NextStep>
+            {scope === item.entity_slug ? (
+              <ReconciliationApproval item={item} scope={scope} onSaved={onSaved} />
+            ) : (
+              <NextStep>Select this business above to record a ruling.</NextStep>
+            )}
           </span>
           <Chip state={item.ruled_claim_uid ? "WORKING" : "NEEDS"} />
         </Row>
       ))}
     </Section>
+  );
+}
+
+function ReconciliationApproval({ item, scope, onSaved }: {
+  item: FinReconciliation;
+  scope: string;
+  onSaved: () => void;
+}) {
+  const [claim, setClaim] = useState(item.ruled_claim_uid || item.claims[0]?.claim_uid || "");
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const requests = useActionRequests("approval");
+
+  async function save() {
+    if (!claim || busy) return;
+    const body = {
+      entity_slug: scope,
+      approval_type: "reconciliation_ruling",
+      subject_uid: item.reconciliation_uid,
+      selected_claim_uid: claim,
+      ...(note.trim() ? { note: note.trim() } : {}),
+    };
+    const actionKey = JSON.stringify(body);
+    const id = requests.forAction(actionKey);
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const receipt = await api<OwnerWriteReceipt>("/api/owner/approvals", {
+        request_id: id,
+        ...body,
+      });
+      if (!receipt.approval || !confirmedOwnerWrite(receipt, id, scope)) throw new Error("The ruling was not confirmed by an approval and activity receipt.");
+      requests.confirmed(actionKey);
+      setMessage(receipt.replayed ? "This exact ruling was already recorded." : "Ruling recorded beside both claims. It is not marked in use yet.");
+      onSaved();
+    } catch (next) {
+      setError(ownerError(next).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 p-3 rounded-xl border border-line bg-paper/60">
+      <label className="text-[12.5px] text-ink-soft">Record the claim you accept
+        <select value={claim} onChange={(event) => setClaim(event.target.value)} className="field mt-1" disabled={busy}>
+          {item.claims.map((row) => <option key={row.claim_uid} value={row.claim_uid}>{row.label}</option>)}
+        </select>
+      </label>
+      <label className="block text-[12.5px] text-ink-soft mt-2">Note, optional
+        <input value={note} onChange={(event) => setNote(event.target.value)} className="field mt-1" />
+      </label>
+      {error && <div className="mt-2"><Attention>{error}</Attention></div>}
+      {message && <p className="mt-2 text-[12.5px] text-ink-soft">{message}</p>}
+      <button onClick={save} disabled={busy || !claim} className="mt-2 rounded-lg bg-accent text-white px-3 py-2 text-[13px] disabled:opacity-50">{busy ? "Recording" : item.ruled_claim_uid ? "Record a new ruling" : "Record ruling"}</button>
+    </div>
+  );
+}
+
+function DecisionReview({ snapshot, entities, scope, onSaved }: {
+  snapshot: FinSnapshot;
+  entities: Parameters<typeof entityLabel>[0];
+  scope: string | null;
+  onSaved: () => void;
+}) {
+  if (!("exceptions" in snapshot)) return null;
+  const rows = snapshot.exceptions!;
+  return (
+    <Section title="Open decisions" blurb="Resolve an exception without changing the source transaction behind it.">
+      {rows.length === 0 ? (
+        <Note>No open exception is recorded in this scope.</Note>
+      ) : rows.map((item) => (
+        <Row key={item.exception_uid}>
+          <span className="min-w-0 flex-1">
+            <span className="text-[14.5px] font-medium">{item.issue}</span>
+            <span className="block text-[13px] text-ink-soft mt-0.5">{entityLabel(entities, item.entity_slug)}</span>
+            {scope === item.entity_slug ? (
+              <ExceptionApproval item={item} scope={scope} onSaved={onSaved} />
+            ) : <NextStep>Select this business above to resolve the exception.</NextStep>}
+          </span>
+          <Chip state="NEEDS" />
+        </Row>
+      ))}
+    </Section>
+  );
+}
+
+function ExceptionApproval({ item, scope, onSaved }: {
+  item: FinException;
+  scope: string;
+  onSaved: () => void;
+}) {
+  const [resolution, setResolution] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const requests = useActionRequests("approval");
+
+  async function save() {
+    if (!resolution.trim() || busy) return;
+    const body = {
+      entity_slug: scope,
+      approval_type: "exception_resolution",
+      subject_uid: item.exception_uid,
+      resolution: resolution.trim(),
+    };
+    const actionKey = JSON.stringify(body);
+    const id = requests.forAction(actionKey);
+    setBusy(true);
+    setError(null);
+    try {
+      const receipt = await api<OwnerWriteReceipt>("/api/owner/approvals", {
+        request_id: id,
+        ...body,
+      });
+      if (!receipt.approval || !confirmedOwnerWrite(receipt, id, scope)) throw new Error("The resolution was not confirmed by an approval and activity receipt.");
+      requests.confirmed(actionKey);
+      onSaved();
+    } catch (next) {
+      setError(ownerError(next).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 p-3 rounded-xl border border-line bg-paper/60">
+      <label className="text-[12.5px] text-ink-soft">How this was resolved
+        <textarea value={resolution} onChange={(event) => setResolution(event.target.value)} rows={2} className="field mt-1 resize-y" />
+      </label>
+      {error && <div className="mt-2"><Attention>{error}</Attention></div>}
+      <button onClick={save} disabled={busy || !resolution.trim()} className="mt-2 rounded-lg bg-accent text-white px-3 py-2 text-[13px] disabled:opacity-50">{busy ? "Recording" : "Record resolution"}</button>
+    </div>
   );
 }
 

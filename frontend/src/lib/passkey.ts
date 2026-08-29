@@ -2,10 +2,12 @@ import { api } from "./api";
 
 // WebAuthn speaks ArrayBuffers; the wire speaks base64url. These two are the
 // whole translation layer.
-const toBytes = (value: string): Uint8Array => {
+const toBytes = (value: string): Uint8Array<ArrayBuffer> => {
   const padded = value.replace(/-/g, "+").replace(/_/g, "/");
   const binary = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
-  return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
 };
 const toB64u = (buffer: ArrayBuffer): string =>
   btoa(String.fromCharCode(...new Uint8Array(buffer)))

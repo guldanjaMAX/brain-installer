@@ -8,6 +8,8 @@ import {
 } from "../lib/finance";
 import { Attention, Badge, Chip, NextStep, Note, Row, Section, TruthNote } from "./ui";
 import { FinanceScopeBar, useFinanceScope } from "./FinanceScope";
+import { OwnerTargets } from "./OwnerTargets";
+import { OwnerPeriodClose } from "./OwnerPeriodClose";
 
 const SECTIONS = [
   "accounts", "deadlines", "exceptions", "obligations", "cash",
@@ -96,16 +98,17 @@ export function ThisYear() {
           <EmptyState scopeName={scopeName} />
         </div>
       ) : snapshot?.ledger_installed ? (
-        <YearContents snapshot={snapshot} entities={entities} scopeName={scopeName} />
+        <YearContents snapshot={snapshot} entities={entities} scopeName={scopeName} scope={scope} />
       ) : null}
     </div>
   );
 }
 
-function YearContents({ snapshot, entities, scopeName }: {
+function YearContents({ snapshot, entities, scopeName, scope }: {
   snapshot: FinSnapshot;
   entities: FinEntity[];
   scopeName: string;
+  scope: string | null;
 }) {
   const deadlines = snapshot.deadlines;
   const next = deadlines ? nextDatedDeadline(deadlines) : null;
@@ -120,12 +123,13 @@ function YearContents({ snapshot, entities, scopeName }: {
       {next && <DeadlineHero deadline={next} entities={entities} count={deadlines!.length} />}
 
       <CashSection snapshot={snapshot} />
+      <OwnerTargets />
       <DecisionSection snapshot={snapshot} entities={entities} scopeName={scopeName} />
       <ConflictSection snapshot={snapshot} entities={entities} />
       <ObligationSection snapshot={snapshot} entities={entities} scopeName={scopeName} />
       <DeadlineSection snapshot={snapshot} entities={entities} scopeName={scopeName} />
       <CoverageSection snapshot={snapshot} entities={entities} scopeName={scopeName} />
-      <CloseSection snapshot={snapshot} />
+      <CloseSection snapshot={snapshot} scope={scope} />
       <ProfessionalSection snapshot={snapshot} entities={entities} scopeName={scopeName} />
     </div>
   );
@@ -385,7 +389,7 @@ function CoverageSection({ snapshot, entities, scopeName }: {
   );
 }
 
-function CloseSection({ snapshot }: { snapshot: FinSnapshot }) {
+function CloseSection({ snapshot, scope }: { snapshot: FinSnapshot; scope: string | null }) {
   if (!("statements" in snapshot) || !("reconciliations" in snapshot)
     || !("unsorted_spending" in snapshot) || !("accounts" in snapshot)) return null;
   const statements = snapshot.statements!;
@@ -434,9 +438,7 @@ function CloseSection({ snapshot }: { snapshot: FinSnapshot }) {
         </span>
         <Chip state={unreadableLines ? "PROBLEM" : unsorted ? "NEEDS" : "CURRENT"} />
       </Row>
-      <Note>
-        Owner acceptance of a period close is not recorded by this product yet. The evidence above cannot honestly turn that final step into a checkmark.
-      </Note>
+      <OwnerPeriodClose scope={scope} statements={statements} />
     </Section>
   );
 }

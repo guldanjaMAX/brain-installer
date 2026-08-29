@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import { api, apiGet, type Device, type Connection, type BankStatus } from "../lib/api";
 import { enroll } from "../lib/passkey";
 import { Section, Row, Note, Empty, Badge, Chip, Confirm, EditableName, ago, agoISO } from "./ui";
+import { OwnerPreferences } from "./OwnerPreferences";
+import { DocumentAccess } from "./DocumentAccess";
+import { PasskeyDiagnostics } from "./PasskeyDiagnostics";
 
 /** Who and what can open this brain.
  *
@@ -49,7 +52,7 @@ export function Settings({ devices, connections, onChange }: {
         <p className="eyebrow">People, devices, and apps</p>
         <h1 className="page-title">Access</h1>
         <p className="page-intro">
-          See every owner device and connected app this brain can verify, and remove access in place.
+          See owner devices, connected apps, exact-document access, and passkey proof at the level this brain can verify.
         </p>
       </header>
       {error && (
@@ -57,6 +60,12 @@ export function Settings({ devices, connections, onChange }: {
           {error}
         </p>
       )}
+
+      <OwnerPreferences />
+
+      <DocumentAccess />
+
+      <PasskeyDiagnostics />
 
       <Section
         title="Your devices"

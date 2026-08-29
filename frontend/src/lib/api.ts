@@ -2,19 +2,54 @@
 // SameSite=Strict session cookie: the cookie proves who, this header proves
 // the request came from this app rather than from a page that merely sits in
 // the same browser.
+export class ApiError extends Error {
+  status: number;
+  body: Record<string, unknown>;
+
+  constructor(status: number, body: Record<string, unknown>, fallback: string) {
+    super(typeof body.error === "string" ? body.error : fallback);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
 export async function api<T = unknown>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Brain-App": "1" },
     body: JSON.stringify(body ?? {}),
   });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error((data as { error?: string }).error || `HTTP ${response.status}`);
+  const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (!response.ok) throw new ApiError(response.status, data, `HTTP ${response.status}`);
   return data as T;
+}
+
+export function requestId(prefix = "owner"): string {
+  const random = typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID().replace(/-/g, "")
+    : Math.random().toString(36).slice(2) + Date.now().toString(36);
+  return `${prefix}_${random}`.slice(0, 128);
+}
+
+export function ownerError(error: unknown): { status: number | null; message: string } {
+  if (error instanceof ApiError) {
+    if (error.status === 409) return { status: 409, message: "The records changed before this decision was saved. Read the current state and decide again." };
+    if ([400, 404, 413].includes(error.status) && typeof error.body.detail === "string") {
+      return { status: error.status, message: error.body.detail };
+    }
+    if (error.status === 415) return { status: 415, message: typeof error.body.reason === "string" ? error.body.reason : "This file type is not supported for owner upload." };
+    if (error.status === 422) return { status: 422, message: "The brain refused this content, so nothing was added." };
+    if (error.status === 403) return { status: 403, message: "This session is not allowed to do that." };
+    if (error.status === 503) return { status: 503, message: "This part of the brain is unavailable right now. Nothing was treated as empty or saved." };
+    return { status: error.status, message: error.message };
+  }
+  return { status: null, message: error instanceof Error ? error.message : String(error) };
 }
 
 export type Citation = { n: number; title: string; source?: string; ts?: string | null };
 export type Confidence = { percent: number; band: string; basis: string[] };
+export type EntityScopeEcho = { entity_slug: string | null; applied: boolean };
 export type Answer = {
   answer: string | null;
   answer_error?: string;
@@ -26,6 +61,11 @@ export type Answer = {
   results?: unknown[];
   confidence?: Confidence;
   citations?: Citation[];
+  entity_scope?: EntityScopeEcho;
+  filter_not_applied?: boolean;
+  retrieval_scope?: "owner" | "exact_document_ids" | string;
+  degraded_reason?: string;
+  access?: RetrievalAccess;
 };
 export type Device = {
   credential_id: string;
@@ -84,12 +124,206 @@ export type SystemStatus = {
   unavailable: string[];
 };
 
+export type OwnerPrincipal = { kind: "owner"; grant_id: null };
+export type GrantPrincipal = {
+  kind: "grant";
+  grant_id: string;
+  entity_slug: string | null;
+  document_count: number;
+  capabilities: Array<"documents:read" | "ask">;
+};
+export type WorkspaceAllowlist = {
+  home: boolean;
+  documents: boolean;
+  ask: boolean;
+  add_review: boolean;
+  access: boolean;
+  bank: boolean;
+  targets: boolean;
+  preferences: boolean;
+};
+export type RetrievalAccess = {
+  principal: "owner" | "grant";
+  grant_id?: string;
+  entity_slug?: string | null;
+  document_count?: number;
+};
+
 export type Me = {
   signed_in: boolean;
-  owner: string;
+  owner?: string;
   brain: string;
-  devices: Device[];
-  connections: Connection[];
+  principal?: OwnerPrincipal | GrantPrincipal;
+  workspace?: WorkspaceAllowlist;
+  devices?: Device[];
+  connections?: Connection[];
+};
+
+export type GrantedDocument = {
+  document_id: string;
+  title: string;
+  source: string;
+  document_date: number | null;
+  date_source: string | null;
+  date_reliable: boolean;
+  text_source: string;
+  text_reliable: boolean;
+};
+
+export type GrantedDocumentsResponse = {
+  status: "ready";
+  principal: Pick<GrantPrincipal, "kind" | "grant_id" | "entity_slug">;
+  scope_rule: "exact_document_ids_only";
+  documents: GrantedDocument[];
+};
+
+export type DocumentGrantDocument = {
+  document_id: string;
+  entity_slug: string;
+  granted_at: number;
+  revoked_at: number | null;
+};
+export type DocumentGrant = {
+  grant_id: string;
+  subject_label: string;
+  entity_slug: string;
+  state: "active" | "revoked" | "expired";
+  expires_at: number | null;
+  created_at: number;
+  revoked_at: number | null;
+  documents: DocumentGrantDocument[];
+};
+export type DocumentAccessStatus = {
+  status: "ready";
+  scope_rule: "exact_document_ids_only";
+  default_access: "owner_only";
+  grants: DocumentGrant[];
+};
+export type DocumentGrantReceipt = {
+  status: "active" | "revoked";
+  grant_id: string;
+  subject_label?: string;
+  entity_slug?: string;
+  document_ids?: string[];
+  expires_at?: number | null;
+  created_at?: number;
+  revoked_at?: number;
+  changed?: boolean;
+  replayed: boolean;
+  invite_state?: "active" | "consumed" | "expired";
+  enrollment_url?: string | null;
+  enrollment_expires_at?: number;
+  scope_rule?: "exact_document_ids_only";
+};
+
+export type PasskeyCeremony = {
+  ceremony: string;
+  stage: string;
+  outcome: string;
+  rp_id: string;
+  count: number;
+  last_at: number;
+  timing_ms: { min: number | null; average: number | null; max: number | null };
+};
+export type PasskeyStatus = {
+  status: "ready";
+  rp_id: string;
+  proof: { configured: boolean; locally_verified: boolean; live_proven: false };
+  devices: { owner: number; grant: number };
+  ceremonies: PasskeyCeremony[];
+  privacy: string;
+};
+
+export type OwnerActivityEvent = {
+  event_id: string;
+  event_type: "upload_completed" | "approval_recorded" | "period_close_accepted" | "period_close_reopened" | "target_set" | "target_archived" | "preference_set"
+    | "document_grant_created" | "document_grant_invite_reissued" | "document_grant_revoked"
+    | "passkey_added" | "passkey_renamed" | "passkey_revoked" | "sessions_revoked";
+  entity_slug: string | null;
+  subject_kind: string;
+  subject_id: string;
+  display_label: string;
+  occurred_at: string;
+};
+
+export type OwnerActivityResponse = {
+  entity_scope?: { entity_slug: string | null };
+  activity_events?: OwnerActivityEvent[];
+  truncated?: boolean;
+  next_cursor?: string | null;
+  unavailable?: boolean;
+  sections_unavailable?: string[];
+};
+
+export type OwnerTarget = {
+  target_id: string;
+  entity_slug: string;
+  label: string;
+  metric: "revenue" | "cash_reserve" | "spending_limit" | "debt_reduction" | "other";
+  target_minor: number;
+  currency: string;
+  period_start: string | null;
+  period_end: string | null;
+  note: string | null;
+  archived_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type OwnerTargetsResponse = { entity_scope?: { entity_slug: string | null }; targets?: OwnerTarget[]; unavailable?: boolean };
+
+export type OwnerPreference = {
+  preference_key: "default_entity" | "display_currency" | "fiscal_year_start_month" | "activity_window_days";
+  entity_slug: string | null;
+  value: string | number;
+  updated_at?: string | null;
+};
+
+export type OwnerPreferencesResponse = { entity_scope?: { entity_slug: string | null }; preferences?: OwnerPreference[]; unavailable?: boolean };
+
+export type OwnerPeriodClose = {
+  period_close_id: string;
+  entity_slug: string;
+  period_start: string;
+  period_end: string;
+  status: "accepted" | "reopened";
+  evidence_state: "complete" | "owner_acknowledged_incomplete";
+  acknowledged_incomplete?: boolean;
+  accepted_at?: string | null;
+  reopened_at?: string | null;
+  updated_at?: string | null;
+  note?: string | null;
+};
+
+export type OwnerPeriodCloseResponse = {
+  entity_scope?: { entity_slug: string | null };
+  period_closes?: OwnerPeriodClose[];
+  unavailable?: boolean;
+};
+
+export type OwnerWriteReceipt = {
+  request_id?: string;
+  entity_scope?: { entity_slug: string | null };
+  changed?: boolean;
+  replayed?: boolean;
+  activity_event_id?: string | null;
+  uploaded?: boolean;
+  document_id?: string;
+  document?: Record<string, unknown>;
+  upload?: Record<string, unknown>;
+  approval?: Record<string, unknown>;
+  period_close?: OwnerPeriodClose;
+  target?: OwnerTarget;
+  preference?: OwnerPreference;
+};
+
+export type OwnerUploadCapabilities = {
+  supported_media_types: string[];
+  supported_extensions: string[];
+  media_type_extensions: Record<string, string[]>;
+  max_content_bytes: number;
+  content_encoding: "utf-8";
+  empty_media_type_supported: false;
+  normalization: string;
 };
 
 /** One financial scope. The slug is a transport identity only. Every visible
@@ -329,7 +563,7 @@ export type FinDocumentsResponse = {
  *  X-Brain-App header still marks the request as coming from this app. */
 export async function apiGet<T = unknown>(path: string): Promise<T> {
   const response = await fetch(path, { headers: { "X-Brain-App": "1" } });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error((data as { error?: string }).error || `HTTP ${response.status}`);
+  const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (!response.ok) throw new ApiError(response.status, data, `HTTP ${response.status}`);
   return data as T;
 }

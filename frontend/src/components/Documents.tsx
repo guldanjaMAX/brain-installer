@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, type FinDocumentsResponse } from "../lib/api";
+import { api, type EntityScopeEcho, type FinDocumentsResponse } from "../lib/api";
 import {
   dateLabel as financialDateLabel, documentDetail, documentOutcome, entityLabel,
 } from "../lib/finance";
@@ -13,7 +13,7 @@ type Hit = {
   source: string; ts: string | null; date_reliable?: boolean;
   client?: string | null; category?: string | null;
 };
-type UnifiedBody = { results?: Hit[]; degraded?: string; status?: string };
+type UnifiedBody = { results?: Hit[]; degraded?: string; degraded_reason?: string; status?: string; entity_scope?: EntityScopeEcho; filter_not_applied?: boolean };
 type Mode = "register" | "evidence";
 type RegisterFilter = "all" | "attention" | "current" | "filed";
 
@@ -27,12 +27,12 @@ export function Documents() {
   const [mode, setMode] = useState<Mode>("register");
   return (
     <div>
-      {mode === "register" && <FinanceScopeBar />}
+      <FinanceScopeBar />
       <header className="max-w-2xl">
         <p className="eyebrow">Evidence and custody</p>
         <h1 className="page-title">Documents</h1>
         <p className="page-intro">
-          Check which financial records are present and readable, or search the evidence inside everything your brain holds.
+          Check which financial records are present and readable, or search evidence inside the selected business or your whole brain.
         </p>
       </header>
       <div className="mt-5 inline-flex rounded-xl bg-card border border-line p-1" role="tablist" aria-label="Document view">
@@ -174,7 +174,7 @@ function DocumentRegister() {
           {documents.some((document) => document.restricted) && (
             <div className="mt-4 max-w-3xl">
               <TruthNote>
-                Some records carry a restriction note. This product has one access tier, so that note is visible but is not an enforced document-level permission.
+                Some records carry a restriction note. Exact-document grants are enforced separately in Access; this register note does not create or remove permission.
               </TruthNote>
             </div>
           )}
@@ -214,11 +214,13 @@ function DocumentRegister() {
 }
 
 function EvidenceSearch() {
+  const { scope, activeLabel } = useFinanceScope();
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<Hit[] | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [searched, setSearched] = useState("");
+  const [searchedScope, setSearchedScope] = useState("");
 
   async function search() {
     const q = query.trim();
@@ -226,12 +228,23 @@ function EvidenceSearch() {
     setBusy(true);
     setNotice(null);
     try {
-      const body = await api<UnifiedBody>("/api/rag/unified", { q, limit: 25 });
+      const body = await api<UnifiedBody>("/api/rag/unified", {
+        q,
+        limit: 25,
+        ...(scope ? { entity_slug: scope } : {}),
+      });
       if (retrievalUnavailable(body)) {
         setHits(null);
         setNotice(unavailableNotice(body.degraded));
+      } else if (scope && (body.filter_not_applied || body.entity_scope?.applied !== true || body.entity_scope.entity_slug !== scope)) {
+        setHits(null);
+        setNotice(`The brain could not prove that this search was narrowed to ${activeLabel}. No whole-brain results are being shown as business-scoped.`);
       } else {
         setHits(body.results || []);
+        setSearchedScope(scope ? `${activeLabel} only` : "whole brain · all evidence");
+        if (scope && body.degraded === "vector" && body.degraded_reason === "entity-vector-authority-unindexed") {
+          setNotice(`Exact business filtering was applied for ${activeLabel}, but meaning-based business search is still being indexed. These keyword results may miss differently phrased evidence.`);
+        }
       }
       setSearched(q);
     } catch {
@@ -244,9 +257,6 @@ function EvidenceSearch() {
 
   return (
     <section className="mt-6 max-w-3xl">
-      <TruthNote>
-        Evidence search covers every document this brain can search. The business scope used by the financial register does not narrow this search yet.
-      </TruthNote>
       <h2 className="text-[15px] font-semibold tracking-tight">Search what your brain has read</h2>
       <p className="mt-1.5 text-[14px] text-ink-soft leading-relaxed">
         This looks inside documents, not just at their names, so a phrase from the middle of a page can find it.
@@ -276,8 +286,9 @@ function EvidenceSearch() {
         <div className="mt-5">
           <p className="text-[13px] text-ink-soft">
             {hits.length === 0
-              ? `Nothing matched "${searched}". Your brain searched what it holds and found no match, which is different from not having looked.`
+              ? `Nothing matched "${searched}" in the selected evidence scope. Search completed, which is different from not having looked.`
               : `${hits.length} result${hits.length === 1 ? "" : "s"} for "${searched}"`}
+            {` · ${searchedScope}`}
           </p>
           <div className="mt-3 bg-card border border-line rounded-2xl overflow-hidden">
             {hits.map((hit) => (

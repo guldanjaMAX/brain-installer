@@ -7,6 +7,7 @@
 
 const SOURCE_LABELS: Record<string, string> = {
   curated: "Files you uploaded",
+  upload: "Files you uploaded",
   drive: "Google Drive",
   message: "Messages",
   email: "Email",

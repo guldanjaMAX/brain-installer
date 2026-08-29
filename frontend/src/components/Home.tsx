@@ -10,6 +10,7 @@ import {
   Attention, Chip, Critical, NextStep, Note, Row, Section, TruthNote,
 } from "./ui";
 import { FinanceScopeBar, useFinanceScope } from "./FinanceScope";
+import { OwnerActivity } from "./OwnerActivity";
 
 const FIN_SECTIONS = [
   "accounts", "documents", "deadlines", "exceptions", "reconciliations", "obligations", "cash",
@@ -123,6 +124,10 @@ export function Home() {
         </div>
       )}
 
+      <div className="mt-7 max-w-3xl">
+        <OwnerActivity />
+      </div>
+
       {finance?.ledger_installed && !financeIsEmpty && (
         <div className="mt-7 grid gap-7 lg:grid-cols-[minmax(0,1.35fr)_minmax(19rem,0.85fr)] lg:items-start">
           <div>
@@ -132,11 +137,6 @@ export function Home() {
           <div>
             <Glance snapshot={finance} scopeName={activeLabel} />
             <Blindspots snapshot={finance} status={status} scopeName={activeLabel} />
-            <Section title="What changed" blurb="What is different since your last visit.">
-              <Note>
-                A visit-to-visit change history is not available yet. This page can show the current supported state, but it cannot prove what changed since you last looked.
-              </Note>
-            </Section>
           </div>
         </div>
       )}

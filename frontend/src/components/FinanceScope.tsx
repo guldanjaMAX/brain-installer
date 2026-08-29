@@ -2,8 +2,9 @@ import {
   createContext, useCallback, useContext, useEffect, useMemo, useRef, useState,
   type ReactNode,
 } from "react";
-import { api, type FinEntity, type FinSnapshot } from "../lib/api";
+import { api, type FinEntity, type FinSnapshot, type OwnerPreferencesResponse } from "../lib/api";
 import { activeScopeLabel } from "../lib/finance";
+import { defaultEntityScope } from "../lib/owner";
 import { Attention } from "./ui";
 import { ScopeBar } from "./ScopeBar";
 
@@ -65,6 +66,18 @@ export function FinanceScopeProvider({ children }: { children: ReactNode }) {
       const currentScope = scopeRef.current;
       if (currentScope && !snapshot.entities.some((entity) => entity.entity_slug === currentScope)) {
         setScope(null);
+      } else if (!currentScope) {
+        // A saved session choice wins. The default is consulted only when
+        // this visit has not selected a scope yet.
+        try {
+          const preferences = await api<OwnerPreferencesResponse>("/api/owner/preferences/read", {});
+          const preferredSlug = defaultEntityScope(snapshot.entities, preferences.preferences || []);
+          if (preferredSlug) {
+            setScope(preferredSlug);
+          }
+        } catch {
+          // The financial list remains usable without a saved default.
+        }
       }
     } catch {
       setEntities([]);
