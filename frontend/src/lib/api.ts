@@ -56,6 +56,34 @@ export type BankStatus = {
   connections?: BankConnection[];
   needs_attention?: BankConnection[];
 };
+/** One problem the installer owns. `fix_owner` is always "installer" today:
+ *  every diagnose remedy is a CLI command the owner cannot run. */
+export type Problem = {
+  id: string; area: string; severity: "crit" | "warn";
+  count: number; title: string; detail?: string; fix_owner: string;
+};
+export type SourceRow = {
+  label: string; kind: string; state: string; documents: number;
+  days_since_ingest: number | null; reason: string | null; automatable: boolean;
+};
+/** Keys are ABSENT when their read failed — never zero, never []. Anything
+ *  optional here is optional because its absence is meaningful. */
+export type SystemStatus = {
+  accepting_documents: boolean | null;
+  status: string | null;
+  drain_mode: string | null;
+  documents?: number;
+  chunks?: number;
+  problems?: Problem[];
+  problem_counts?: { crit: number; warn: number; info: number };
+  sources?: SourceRow[];
+  vectors?: {
+    ready: boolean; expected: number; visible: number;
+    pending: number; percent_visible: number | null;
+  };
+  unavailable: string[];
+};
+
 export type Me = {
   signed_in: boolean;
   owner: string;

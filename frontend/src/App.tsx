@@ -3,6 +3,7 @@ import { api, type Me } from "./lib/api";
 import { Gate } from "./components/Gate";
 import { Ask } from "./components/Ask";
 import { Settings } from "./components/Settings";
+import { Home } from "./components/Home";
 
 // The invite arrives as /app#enroll=<code>. It lives in the fragment on
 // purpose: a fragment is never sent to the server in a request line and never
@@ -15,11 +16,11 @@ const inviteCode = (location.hash.match(/enroll=([A-Za-z0-9_-]+)/) || [])[1] || 
 const root = document.getElementById("root");
 const shellOwner = root?.dataset.owner || "";
 
-type View = "ask" | "settings";
+type View = "home" | "ask" | "settings";
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
-  const [view, setView] = useState<View>("ask");
+  const [view, setView] = useState<View>("home");
   const [ready, setReady] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -51,12 +52,13 @@ export function App() {
       <header className="px-5 lg:px-8 py-4 border-b border-line bg-card/70 backdrop-blur sticky top-0 z-10">
         <div className="max-w-2xl mx-auto flex items-center justify-between gap-4">
           <button
-            onClick={() => setView("ask")}
+            onClick={() => setView("home")}
             className="text-[14.5px] text-ink-soft hover:text-ink"
           >
             {possessive} brain
           </button>
           <nav className="flex items-center gap-1 text-[13.5px]">
+            <Tab now={view} go={setView} to="home">Home</Tab>
             <Tab now={view} go={setView} to="ask">Ask</Tab>
             <Tab now={view} go={setView} to="settings">Settings</Tab>
           </nav>
@@ -66,6 +68,7 @@ export function App() {
         {/* Ask stays mounted across a visit to Settings: losing an answer you
             were reading because you checked who had access is a small betrayal
             of a page whose whole subject is trust. */}
+        {view === "home" && <Home />}
         <div className={view === "ask" ? "" : "hidden"}>
           <Ask />
         </div>
