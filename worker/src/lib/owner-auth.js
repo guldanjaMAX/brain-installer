@@ -610,6 +610,18 @@ export async function handleOwnerAuth(env, request, url, path) {
     }, 403), clearSessionCookie());
   }
 
+  // Device management is caller-scoped. A scoped passkey may see, rename, or
+  // revoke only credentials issued to the same grant. Owner credentials carry
+  // neither grant column, while the two supported grant systems deliberately
+  // use separate columns so their identifiers cannot be confused.
+  const isOwner = ownerRequired(principal);
+  const deviceGrantId = (device) => device?.document_grant_id ?? device?.grant_id ?? null;
+  const ownsDevice = async (credentialId) => {
+    if (isOwner) return true;
+    const device = await findPasskey(env, credentialId);
+    return !!device && deviceGrantId(device) === principal.grantId;
+  };
+
   if (path === "/api/app/me") {
     if (!ownerRequired(principal)) {
       if (principal.grantType === "capability") {
@@ -632,6 +644,9 @@ export async function handleOwnerAuth(env, request, url, path) {
             targets: false,
             preferences: false,
           },
+          devices: (await listPasskeys(env)).filter(
+            (device) => deviceGrantId(device) === principal.grantId,
+          ),
         });
       }
       return jsonResponse({
@@ -654,6 +669,9 @@ export async function handleOwnerAuth(env, request, url, path) {
           targets: false,
           preferences: false,
         },
+        devices: (await listPasskeys(env)).filter(
+          (device) => deviceGrantId(device) === principal.grantId,
+        ),
       });
     }
     return jsonResponse({
@@ -684,6 +702,22 @@ export async function handleOwnerAuth(env, request, url, path) {
       if (error instanceof DocumentAccessError) return documentAccessErrorResponse(error);
       return unavailable("document_access_unavailable");
     }
+  }
+  if (path === "/api/app/devices/rename") {
+    const payload = await body(request);
+    if (!payload?.credential_id) return jsonResponse({ error: "credential_id required" }, 400);
+    if (!(await ownsDevice(String(payload.credential_id)))) {
+      return jsonResponse({ error: "that is not one of your devices" }, 403);
+    }
+    return jsonResponse(await renamePasskey(env, String(payload.credential_id), payload.nickname));
+  }
+  if (path === "/api/app/devices/revoke") {
+    const payload = await body(request);
+    if (!payload?.credential_id) return jsonResponse({ error: "credential_id required" }, 400);
+    if (!(await ownsDevice(String(payload.credential_id)))) {
+      return jsonResponse({ error: "that is not one of your devices" }, 403);
+    }
+    return jsonResponse(await revokePasskey(env, String(payload.credential_id)));
   }
 
   // Everything below changes owner state or exposes owner-wide diagnostics.
@@ -752,16 +786,6 @@ export async function handleOwnerAuth(env, request, url, path) {
       return unavailable("passkey_observability_unavailable");
     }
   }
-  if (path === "/api/app/devices/rename") {
-    const payload = await body(request);
-    if (!payload?.credential_id) return jsonResponse({ error: "credential_id required" }, 400);
-    return jsonResponse(await renamePasskey(env, String(payload.credential_id), payload.nickname));
-  }
-  if (path === "/api/app/devices/revoke") {
-    const payload = await body(request);
-    if (!payload?.credential_id) return jsonResponse({ error: "credential_id required" }, 400);
-    return jsonResponse(await revokePasskey(env, String(payload.credential_id)));
-  }
   if (path === "/api/app/connections/revoke") {
     const payload = await body(request);
     if (!payload?.client_id) return jsonResponse({ error: "client_id required" }, 400);
@@ -769,6 +793,8 @@ export async function handleOwnerAuth(env, request, url, path) {
     return jsonResponse({ ...outcome, connections: await listConnections(env) });
   }
   if (path === "/api/app/signout-all") {
+    // Signing out EVERYONE is the owner's lever. A scoped person signing out
+    // their own device uses /signout, which needs no privilege at all.
     await bumpSessionGeneration(env);
     return withCookie(jsonResponse({ signed_out_everywhere: true }), clearSessionCookie());
   }
