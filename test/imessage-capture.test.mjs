@@ -236,12 +236,32 @@ try {
       !missing.ok && missing.reason === "chat_db_missing" && /Messages\.app has never been signed in/.test(missing.message),
       JSON.stringify(missing));
 
-    if (process.getuid && process.getuid() === 0) {
-      check("an unreadable chat.db is named full_disk_access_denied (skipped: running as root, EACCES cannot be simulated)", true);
+    // The locked directory is created either way, because a later check probes
+    // this same path expecting it to be readable. Only the chmod dance is
+    // conditional.
+    const lockedDir = join(sandbox, "locked");
+    mkdirSync(lockedDir);
+    writeFileSync(join(lockedDir, "chat.db"), "not really a db");
+
+    // Two environments cannot simulate a permission denial at all, and both
+    // must SAY they skipped rather than assert something they did not observe:
+    //
+    //   root    EACCES does not apply to uid 0.
+    //   Windows POSIX mode bits are not enforced, so chmod(0o000) is a no-op,
+    //           the read SUCCEEDS, and the assertion fails for a reason that
+    //           has nothing to do with the product. This is also why it is
+    //           only a portability defect: iMessage capture is macOS-only and
+    //           refuses to install anywhere else, so there is no Windows
+    //           behaviour here to be wrong about.
+    const cannotSimulateDenial =
+      (process.getuid && process.getuid() === 0) || process.platform === "win32";
+
+    if (cannotSimulateDenial) {
+      const why = process.platform === "win32"
+        ? "POSIX mode bits are not enforced on Windows, and iMessage capture is macOS-only"
+        : "running as root, EACCES cannot be simulated";
+      check(`an unreadable chat.db is named full_disk_access_denied (skipped: ${why})`, true);
     } else {
-      const lockedDir = join(sandbox, "locked");
-      mkdirSync(lockedDir);
-      writeFileSync(join(lockedDir, "chat.db"), "not really a db");
       chmodSync(lockedDir, 0o000);
       const denied = probeChatDb(join(lockedDir, "chat.db"));
       chmodSync(lockedDir, 0o700);
