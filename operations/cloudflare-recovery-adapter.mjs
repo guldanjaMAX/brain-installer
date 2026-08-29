@@ -126,6 +126,10 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   // bookkeeper's credential no longer worked.
   "grants",
   "grant_credentials",
+  // Schema 16: the zone vocabulary. Durable because a recovered brain that
+  // forgot its zones would silently widen every scoped grant to nothing (the
+  // predicate excludes unknown zones), locking people out rather than leaking.
+  "zones",
 ]);
 
 /**
@@ -216,7 +220,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // passkey and enrollment tables. As with 14 the vector protocol itself is
 // unchanged, but the recovery contract tracks the EXACT current schema by
 // design, so the version moves with every migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 15;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 16;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -232,7 +236,7 @@ const AGGREGATE_FIELDS = Object.freeze([
     // referencing tables they do not have. Passkey restoration correctness is
     // proven by the export content itself, not by the corpus aggregate.
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
-      "grants", "grant_credentials"].includes(table)
+      "grants", "grant_credentials", "zones"].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -987,13 +991,17 @@ const SCHEMA_14_TABLES = Object.freeze(["owner_passkeys", "auth_challenges", "en
 // for them: the inventory check is an exact set comparison, so an ungated new
 // table makes every pre-15 install fail recovery rather than the reverse.
 const SCHEMA_15_TABLES = Object.freeze(["grants", "grant_credentials"]);
+// 16 adds only the zones lookup; the zone itself lives as columns on tables
+// that already existed, so nothing else moves.
+const SCHEMA_16_TABLES = Object.freeze(["zones"]);
 
 function expectedRecoveryTables(migrations) {
   const latest = migrations?.at(-1)?.version || RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION;
   return RECOVERY_DURABLE_TABLES.filter((table) =>
     (latest >= 13 || table !== "vector_bootstrap_batches") &&
     (latest >= 14 || !SCHEMA_14_TABLES.includes(table)) &&
-    (latest >= 15 || !SCHEMA_15_TABLES.includes(table)));
+    (latest >= 15 || !SCHEMA_15_TABLES.includes(table)) &&
+    (latest >= 16 || !SCHEMA_16_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {

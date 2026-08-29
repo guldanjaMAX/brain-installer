@@ -2160,6 +2160,80 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
     `got ${allowed.status}; a 401 here means grants never authenticate and the refusals above prove nothing`);
 }
 
+
+/* ---------------------------------------------------------------------------
+ * Zones. The claim being tested is narrow and is the whole feature: the zone
+ * predicate must reach the SAME query that reads chunk text, because that is
+ * where a snippet comes from. A scope that is merely honoured "somewhere"
+ * would still leak through snippets.
+ */
+{
+  const { scopeSql } = await import("../src/lib/store-d1.js");
+
+  const owner = scopeSql(null, "c", 1);
+  check("an unscoped principal gets no predicate at all",
+    owner.clause === "" && owner.params.length === 0, JSON.stringify(owner));
+
+  const all = scopeSql({ all: true }, "c", 1);
+  check("an explicit all-zones scope is also unrestricted",
+    all.clause === "" && all.params.length === 0, JSON.stringify(all));
+
+  const books = scopeSql({ zones: ["books"] }, "c", 1);
+  check("a scoped principal is restricted on the chunk row itself",
+    books.clause === " AND c.zone IN (?1)" && books.params[0] === "books", JSON.stringify(books));
+
+  const minusMedical = scopeSql({ zones: ["books", "legal"], exclude: ["medical"] }, "c", 1);
+  check("exclusion is expressed as well as inclusion",
+    /zone IN \(\?1,\?2\)/.test(minusMedical.clause) && /zone NOT IN \(\?3\)/.test(minusMedical.clause),
+    minusMedical.clause);
+
+  // The most dangerous possible bug in this function.
+  const empty = scopeSql({ zones: [] }, "c", 1);
+  check("a scope naming no zones reads NOTHING, rather than everything",
+    empty.clause === " AND 1 = 0", JSON.stringify(empty));
+
+  const unknown = scopeSql({ zones: ["books"] }, "c", 1);
+  check("unzoned rows fall outside every scope by SQL semantics",
+    /zone IN/.test(unknown.clause) && !/IS NULL/.test(unknown.clause),
+    "NULL zone must not match an IN list, and must not be special-cased back in");
+}
+
+
+
+/* ---- the zone predicate must reach the query that reads the TEXT ---- */
+{
+  const { search } = await import("../src/lib/store-d1.js");
+  const { env, seen } = mkEnv([ROW], { vectorIds: ["meeting:123#0"] });
+
+  await search(env, {
+    query: "retainer",
+    embedding: [0.1, 0.2],
+    limit: 5,
+    filters: {},
+    scope: { zones: ["books"] },
+  }).catch(() => {});
+
+  const kw = seen.sql.find((sql) => /chunks_fts MATCH/.test(sql));
+  check("a scoped read narrows the keyword query",
+    /c\.zone IN \(/.test(kw || ""), String(kw));
+
+  const hydration = seen.sql.find(
+    (sql) => /FROM chunks c JOIN documents d/.test(sql) && /c\.chunk_uid IN/.test(sql));
+  check("and narrows the hydration query, which is where snippet text comes from",
+    /c\.zone IN \(/.test(hydration || ""), String(hydration));
+
+  const bound = seen.binds.find((b) => b.includes("books"));
+  check("and the zone value is actually bound, not just written into the SQL",
+    !!bound, JSON.stringify(seen.binds));
+
+  // The owner must not pay for any of this.
+  const { env: ownerEnv, seen: ownerSeen } = mkEnv([ROW], { vectorIds: ["meeting:123#0"] });
+  await search(ownerEnv, { query: "retainer", embedding: [0.1], limit: 5, filters: {} }).catch(() => {});
+  const ownerKw = ownerSeen.sql.find((sql) => /chunks_fts MATCH/.test(sql));
+  check("an unscoped read carries no zone predicate at all",
+    !/zone/.test(ownerKw || ""), String(ownerKw));
+}
+
 console.log(fail ? `\n${fail} FAILURES` : `\nroutes: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);
 
