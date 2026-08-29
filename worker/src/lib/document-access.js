@@ -1,6 +1,7 @@
 /** Exact-document authorization for scoped passkey sessions. */
 
 import { randomToken, sha256Hex } from "./auth-store.js";
+import { ownerActivityStatement } from "./owner-activity.js";
 
 export const DOCUMENT_GRANT_MAX_DOCUMENTS = 100;
 const REQUEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
@@ -221,6 +222,15 @@ export async function createDocumentGrant(env, input) {
          (request_id, action, request_fingerprint, response_json, created_at)
          VALUES (?, 'create', ?, ?, ?)`,
       ).bind(normalized.requestId, fingerprint, JSON.stringify(response), createdAt),
+      ownerActivityStatement(env, {
+        eventId: `activity:document-grant-created:${grantId}`,
+        eventType: "document_grant_created",
+        entitySlug: normalized.entitySlug,
+        subjectKind: "document_access_grant",
+        subjectId: grantId,
+        displayLabel: normalized.subjectLabel,
+        occurredAt: new Date(createdAt).toISOString(),
+      }),
     ];
     await env.DB.batch(statements);
     return {
@@ -264,7 +274,7 @@ export async function reissueDocumentGrantInvite(env, input) {
     if (prior) return { ...prior, ...await inviteReceipt(env, requestId, grantId), replayed: true };
 
     const grant = await env.DB.prepare(
-      "SELECT entity_slug, revoked_at, expires_at FROM document_access_grants WHERE grant_id = ?",
+      "SELECT entity_slug, subject_label, revoked_at, expires_at FROM document_access_grants WHERE grant_id = ?",
     ).bind(grantId).first();
     if (!grant) throw new DocumentAccessError("grant not found", 404, "grant_not_found");
     if (grant.revoked_at || (grant.expires_at && Number(grant.expires_at) <= Date.now())) {
@@ -305,6 +315,15 @@ export async function reissueDocumentGrantInvite(env, input) {
          (request_id, action, request_fingerprint, response_json, created_at)
          VALUES (?, 'reissue', ?, ?, ?)`,
       ).bind(requestId, fingerprint, JSON.stringify(response), issuedAt),
+      ownerActivityStatement(env, {
+        eventId: `activity:${requestId}:document-grant-invite-reissued`,
+        eventType: "document_grant_invite_reissued",
+        entitySlug: grant.entity_slug,
+        subjectKind: "document_access_grant",
+        subjectId: grantId,
+        displayLabel: grant.subject_label || "Shared document access",
+        occurredAt: new Date(issuedAt).toISOString(),
+      }),
     ]);
     return { ...response, enrollment_code: code, replayed: false };
   } catch (error) {
@@ -327,7 +346,7 @@ export async function revokeDocumentGrant(env, input) {
     const prior = await priorRequest(env, requestId, "revoke", fingerprint);
     if (prior) return { ...prior, replayed: true };
     const grant = await env.DB.prepare(
-      "SELECT grant_id, entity_slug, revoked_at FROM document_access_grants WHERE grant_id = ?",
+      "SELECT grant_id, entity_slug, subject_label, revoked_at FROM document_access_grants WHERE grant_id = ?",
     ).bind(grantId).first();
     if (!grant) throw new DocumentAccessError("grant not found", 404, "grant_not_found");
     const revokedAt = Number(grant.revoked_at || 0) || Date.now();
@@ -363,6 +382,15 @@ export async function revokeDocumentGrant(env, input) {
          (request_id, action, request_fingerprint, response_json, created_at)
          VALUES (?, 'revoke', ?, ?, ?)`,
       ).bind(requestId, fingerprint, JSON.stringify(response), revokedAt),
+      ownerActivityStatement(env, {
+        eventId: `activity:${requestId}:document-grant-revoked`,
+        eventType: "document_grant_revoked",
+        entitySlug: grant.entity_slug,
+        subjectKind: "document_access_grant",
+        subjectId: grantId,
+        displayLabel: grant.subject_label || "Shared document access",
+        occurredAt: new Date(revokedAt).toISOString(),
+      }),
     ]);
     return { ...response, replayed: false };
   } catch (error) {

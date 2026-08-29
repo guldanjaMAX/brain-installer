@@ -9,7 +9,8 @@ import worker from "../src/index.js";
 import { splitStatements } from "../../brain.mjs";
 import { mintSessionCookie } from "../src/lib/sessions.js";
 import {
-  createDocumentGrant, revokeDocumentGrant, DocumentAccessUnavailableError,
+  createDocumentGrant, reissueDocumentGrantInvite, revokeDocumentGrant,
+  DocumentAccessUnavailableError,
 } from "../src/lib/document-access.js";
 import { consumeEnrollmentCode } from "../src/lib/auth-store.js";
 
@@ -139,6 +140,10 @@ test("100 exact documents plus every public filter stay authoritative and skip u
   const receipt = JSON.parse(createdText);
   assert.equal(receipt.document_ids.length, 100);
   assert.equal(receipt.invite_state, "active");
+  assert.equal(
+    db.prepare("SELECT count(*) AS n FROM owner_activity_events WHERE event_type='document_grant_created'").get().n,
+    1,
+  );
   const tooLarge = await worker.fetch(post("/api/app/document-access/create", {
     request_id: "grant-max-boundary-0002",
     subject_label: "Contract reviewer",
@@ -302,10 +307,19 @@ test("revocation immediately closes reads and scoped sessions cannot reach owner
     assert.equal(response.status, 403, `${path} returned ${response.status}`);
   }
 
+  await reissueDocumentGrantInvite(env, {
+    request_id: "revoke-and-owner-only-reissue-0001",
+    grant_id: grant.grant_id,
+  });
   await revokeDocumentGrant(env, {
     request_id: "revoke-and-owner-only-0002",
     grant_id: grant.grant_id,
   });
+  assert.deepEqual(
+    db.prepare("SELECT event_type FROM owner_activity_events ORDER BY occurred_at, event_id").all()
+      .map((event) => event.event_type).sort(),
+    ["document_grant_created", "document_grant_invite_reissued", "document_grant_revoked"].sort(),
+  );
   const denied = await worker.fetch(post("/api/rag/unified", { q: "needle" }, scopedCookie), env, {});
   assert.equal(denied.status, 403);
   assert.equal((await denied.json()).code, "document_grant_inactive");

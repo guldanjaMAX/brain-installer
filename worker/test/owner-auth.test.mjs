@@ -15,7 +15,10 @@ const RP = "brain.example.com";
 
 /** A tiny stateful D1 speaking exactly the SQL auth-store uses. */
 function authDb() {
-  const tables = { challenges: new Map(), codes: new Map(), passkeys: new Map(), state: { session_generation: 1 } };
+  const tables = {
+    challenges: new Map(), codes: new Map(), passkeys: new Map(), activity: [],
+    state: { session_generation: 1 },
+  };
   return {
     tables,
     prepare(sql) {
@@ -57,6 +60,11 @@ function authDb() {
             if (row) row.nickname = bound[0];
           } else if (/DELETE FROM owner_passkeys/.test(sql)) tables.passkeys.delete(bound[0]);
           else if (/UPDATE install_state SET session_generation/.test(sql)) tables.state.session_generation += 1;
+          else if (/INSERT OR IGNORE INTO owner_activity_events/.test(sql)) {
+            if (!tables.activity.some((event) => event.event_id === bound[0])) {
+              tables.activity.push({ event_id: bound[0], event_type: bound[3], display_label: bound[7] });
+            }
+          }
           return {};
         },
       };
@@ -151,6 +159,14 @@ test("invite -> enroll -> sign in -> settings, end to end", async () => {
   const me = await (await worker.fetch(post("/api/app/me", {}, { Cookie: cookie, "X-Brain-App": "1" }), testEnv)).json();
   assert.equal(me.devices.length, 1);
   assert.equal(me.devices[0].nickname, "Morgan's phone");
+  const rename = await (await worker.fetch(post("/api/app/devices/rename", {
+    credential_id: credential.credentialId, nickname: "Morgan's primary phone",
+  }, { Cookie: cookie, "X-Brain-App": "1" }), testEnv)).json();
+  assert.deepEqual(rename, { renamed: true, changed: true });
+  const renameReplay = await (await worker.fetch(post("/api/app/devices/rename", {
+    credential_id: credential.credentialId, nickname: "Morgan's primary phone",
+  }, { Cookie: cookie, "X-Brain-App": "1" }), testEnv)).json();
+  assert.deepEqual(renameReplay, { renamed: true, changed: false });
   const lastRevoke = await (await worker.fetch(post("/api/app/devices/revoke", {
     credential_id: credential.credentialId,
   }, { Cookie: cookie, "X-Brain-App": "1" }), testEnv)).json();
@@ -161,6 +177,11 @@ test("invite -> enroll -> sign in -> settings, end to end", async () => {
   assert.equal(signoutAll.status, 200);
   const afterBump = await worker.fetch(post("/api/app/me", {}, { Cookie: cookie, "X-Brain-App": "1" }), testEnv);
   assert.equal(afterBump.status, 401, "generation bump kills old sessions");
+  assert.deepEqual(
+    db.tables.activity.map((event) => event.event_type),
+    ["passkey_added", "passkey_renamed", "sessions_revoked"],
+    "human-visible security changes are recorded once without low-level ceremony telemetry",
+  );
 });
 
 test("an expired or foreign enrollment code never enrolls", async () => {

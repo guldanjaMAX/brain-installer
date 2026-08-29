@@ -12,6 +12,8 @@
  * throw SQL noise at an owner's sign-in screen.
  */
 
+import { ownerActivityStatement } from "./owner-activity.js";
+
 const MIGRATION_HINT = "passkey tables are missing; run `brain setup <manifest>` to apply migration 0014";
 
 function guard(error) {
@@ -112,13 +114,30 @@ export async function consumeEnrollmentCode(env, code) {
 /* ---------------------------------------------------------------- passkeys */
 
 export async function storePasskey(env, {
-  credentialId, jwk, alg, signCount, nickname, documentGrantId = null, securityEvent = null,
+  credentialId, jwk, alg, signCount, nickname, documentGrantId = null,
+  securityEvent = null, ownerActivity = null,
 }) {
   try {
+    const createdAt = Date.now();
+    const safeNickname = String(nickname || "").slice(0, 60);
     const insert = env.DB.prepare(
       "INSERT INTO owner_passkeys (credential_id, public_key_jwk, alg, sign_count, nickname, created_at, document_grant_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    ).bind(credentialId, JSON.stringify(jwk), alg, signCount, nickname || null, Date.now(), documentGrantId);
-    if (securityEvent) await env.DB.batch([insert, passkeyEventStatement(env, securityEvent)]);
+    ).bind(credentialId, JSON.stringify(jwk), alg, signCount, safeNickname || null, createdAt, documentGrantId);
+    const statements = [insert];
+    if (securityEvent) statements.push(passkeyEventStatement(env, securityEvent));
+    if (ownerActivity) {
+      const passkeyKey = (await sha256Hex(credentialId)).slice(0, 24);
+      statements.push(ownerActivityStatement(env, {
+        eventId: `activity:passkey-added:${passkeyKey}`,
+        eventType: "passkey_added",
+        entitySlug: ownerActivity.entitySlug || null,
+        subjectKind: "passkey",
+        subjectId: `passkey:${passkeyKey}`,
+        displayLabel: safeNickname || ownerActivity.displayLabel || "Passkey device",
+        occurredAt: new Date(createdAt).toISOString(),
+      }));
+    }
+    if (statements.length > 1) await env.DB.batch(statements);
     else await insert.run();
   } catch (error) {
     guard(error);
@@ -162,9 +181,29 @@ export async function listPasskeys(env) {
 
 export async function renamePasskey(env, credentialId, nickname) {
   try {
-    await env.DB.prepare(
-      "UPDATE owner_passkeys SET nickname = ? WHERE credential_id = ?",
-    ).bind(String(nickname || "").slice(0, 60), credentialId).run();
+    const row = await env.DB.prepare(
+      "SELECT credential_id, nickname FROM owner_passkeys WHERE credential_id = ?",
+    ).bind(credentialId).first();
+    if (!row) return { renamed: false, changed: false };
+    const nextNickname = String(nickname || "").slice(0, 60);
+    if (String(row.nickname || "") === nextNickname) return { renamed: true, changed: false };
+    const passkeyKey = (await sha256Hex(credentialId)).slice(0, 24);
+    const nicknameKey = (await sha256Hex(nextNickname)).slice(0, 16);
+    const occurredAt = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE owner_passkeys SET nickname = ? WHERE credential_id = ?",
+      ).bind(nextNickname, credentialId),
+      ownerActivityStatement(env, {
+        eventId: `activity:passkey-renamed:${passkeyKey}:${nicknameKey}`,
+        eventType: "passkey_renamed",
+        subjectKind: "passkey",
+        subjectId: `passkey:${passkeyKey}`,
+        displayLabel: nextNickname || "Passkey device",
+        occurredAt,
+      }),
+    ]);
+    return { renamed: true, changed: true };
   } catch (error) {
     guard(error);
   }
@@ -181,7 +220,23 @@ export async function revokePasskey(env, credentialId) {
     if (Number(count?.n || 0) <= 1) {
       return { removed: false, reason: "refusing to remove the last passkey; enroll another device or mint a new invite first" };
     }
-    await env.DB.prepare("DELETE FROM owner_passkeys WHERE credential_id = ?").bind(credentialId).run();
+    const row = await env.DB.prepare(
+      "SELECT credential_id, nickname, document_grant_id FROM owner_passkeys WHERE credential_id = ?",
+    ).bind(credentialId).first();
+    if (!row) return { removed: false, reason: "passkey not found" };
+    const passkeyKey = (await sha256Hex(credentialId)).slice(0, 24);
+    const occurredAt = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM owner_passkeys WHERE credential_id = ?").bind(credentialId),
+      ownerActivityStatement(env, {
+        eventId: `activity:passkey-revoked:${passkeyKey}`,
+        eventType: "passkey_revoked",
+        subjectKind: "passkey",
+        subjectId: `passkey:${passkeyKey}`,
+        displayLabel: row.nickname || (row.document_grant_id ? "Shared access passkey" : "Passkey device"),
+        occurredAt,
+      }),
+    ]);
     return { removed: true };
   } catch (error) {
     guard(error);
@@ -202,10 +257,22 @@ export async function sessionGeneration(env) {
 
 export async function bumpSessionGeneration(env) {
   try {
-    await env.DB.prepare(
-      "UPDATE install_state SET session_generation = COALESCE(session_generation, 1) + 1",
-    ).run();
-    return sessionGeneration(env);
+    const nextGeneration = (await sessionGeneration(env)) + 1;
+    const occurredAt = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE install_state SET session_generation = COALESCE(session_generation, 1) + 1",
+      ),
+      ownerActivityStatement(env, {
+        eventId: `activity:sessions-revoked:${nextGeneration}`,
+        eventType: "sessions_revoked",
+        subjectKind: "sessions",
+        subjectId: `generation:${nextGeneration}`,
+        displayLabel: "Signed out everywhere",
+        occurredAt,
+      }),
+    ]);
+    return nextGeneration;
   } catch (error) {
     guard(error);
   }

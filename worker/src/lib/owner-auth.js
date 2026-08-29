@@ -283,6 +283,7 @@ export async function handleOwnerAuth(env, request, url, path) {
       }
     }
     const grantId = viaSession?.grantId ?? invitation?.documentGrantId ?? null;
+    let grantEntitySlug = null;
     if (grantId) {
       let scoped;
       try {
@@ -298,6 +299,7 @@ export async function handleOwnerAuth(env, request, url, path) {
         if (telemetryError) return telemetryError;
         return scopedForbidden();
       }
+      grantEntitySlug = scoped.entitySlug || null;
     }
     let verified;
     try {
@@ -326,6 +328,10 @@ export async function handleOwnerAuth(env, request, url, path) {
           rpId, ceremony: "registration", stage: "verify", outcome: "succeeded",
           reasonCode: "passkey_added", durationMs: Date.now() - requestStartedAt,
           principalKind: grantId ? "grant" : "owner", grantId,
+        },
+        ownerActivity: {
+          entitySlug: grantEntitySlug,
+          displayLabel: grantId ? "Shared access passkey" : "Passkey device",
         },
       });
     } catch {
@@ -608,8 +614,7 @@ export async function handleOwnerAuth(env, request, url, path) {
   if (path === "/api/app/devices/rename") {
     const payload = await body(request);
     if (!payload?.credential_id) return jsonResponse({ error: "credential_id required" }, 400);
-    await renamePasskey(env, String(payload.credential_id), payload.nickname);
-    return jsonResponse({ renamed: true });
+    return jsonResponse(await renamePasskey(env, String(payload.credential_id), payload.nickname));
   }
   if (path === "/api/app/devices/revoke") {
     const payload = await body(request);
