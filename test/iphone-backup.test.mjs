@@ -44,6 +44,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, win32 as pathWin32 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 
 import {
   BACKUP_REFUSAL_REASONS,
@@ -77,7 +78,7 @@ const check = (name, condition, detail = "") => {
 };
 
 const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-iphone-backup-")));
-const REPO = new URL("..", import.meta.url).pathname;
+const REPO = fileURLToPath(new URL("..", import.meta.url));
 
 /* ==================================================================== */
 /* Fixture builders                                                      */
