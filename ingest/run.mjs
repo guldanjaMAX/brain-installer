@@ -255,19 +255,19 @@ export async function prepare(file, { sourceName }) {
   if (ext === ".txt" && !isLikelyBinary(buf)) {
     const peek = decodeText(buf);
     if (detectWhatsAppExport(peek)) {
-      return prepareWhatsAppExport(file, buf, hash, { sourceName });
+      return { ...(await prepareWhatsAppExport(file, buf, hash, { sourceName })), messageExport: "WhatsApp export" };
     }
   }
   if (ext === ".xml" && !isLikelyBinary(buf)) {
     const peek = decodeText(buf);
     if (detectSmsBackupXml(peek)) {
-      return prepareSmsBackupXml(file, buf, hash, { sourceName });
+      return { ...prepareSmsBackupXml(file, buf, hash, { sourceName }), messageExport: "SMS Backup & Restore export" };
     }
   }
   if ((ext === ".html" || ext === ".htm") && !isLikelyBinary(buf)) {
     const peek = decodeText(buf);
     if (detectGoogleVoiceTakeout(peek)) {
-      return prepareGoogleVoiceTakeout(file, buf, hash, { sourceName });
+      return { ...prepareGoogleVoiceTakeout(file, buf, hash, { sourceName }), messageExport: "Google Voice Takeout export" };
     }
   }
 
