@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from "react";
+import { outcomeFor, MOVE_LABEL, type MoveOwner } from "../lib/outcome";
 
 /** "today" / "yesterday" / "12 days ago" / "Mar 3". Null means never. */
 export function ago(ms: number | null | undefined): string | null {
@@ -68,6 +69,75 @@ export function Badge({ tone, children }: {
     <span className={`text-[11.5px] font-medium px-2 py-0.5 rounded-full whitespace-nowrap ${styles}`}>
       {children}
     </span>
+  );
+}
+
+/** A state chip from the closed five-word vocabulary.
+ *
+ *  Every chip carries a glyph, and the glyph is not decoration: it is what
+ *  makes the state legible in grayscale, in print, and to someone who cannot
+ *  distinguish the colours. Colour here only reinforces what the glyph and the
+ *  word already say, so nothing is lost when it is absent.
+ *
+ *  Prefer this over Badge for anything that is a STATE. Badge is for labels
+ *  that carry no status meaning, like a source name. */
+export function Chip({ state }: { state: string }) {
+  const o = outcomeFor(state);
+  const styles: Record<string, string> = {
+    good: "bg-emerald-50 text-emerald-800 border-emerald-200",
+    done: "bg-paper text-ink-soft border-line",
+    wait: "bg-sky-50 text-sky-800 border-sky-200",
+    act: "bg-amber-50 text-amber-900 border-amber-200",
+    bad: "bg-red-50 text-red-800 border-red-200",
+  };
+  return (
+    <span
+      className={`text-[11.5px] font-medium px-2 py-0.5 rounded-full whitespace-nowrap border inline-flex items-center gap-1 ${styles[o.tone]}`}
+    >
+      <span aria-hidden="true">{o.glyph}</span>
+      {o.label}
+    </span>
+  );
+}
+
+/** The move under a row. Deliberately NOT colour-coded: it is the sentence
+ *  that tells someone what to do, and it has to survive grayscale on its own. */
+export function NextStep({ owner, children }: { owner?: MoveOwner; children: ReactNode }) {
+  return (
+    <span className="block text-[13px] text-ink-soft mt-1.5 pl-2.5 border-l-2 border-line">
+      {owner && <span className="font-medium">{MOVE_LABEL[owner]}. </span>}
+      {children}
+    </span>
+  );
+}
+
+/** The severity ladder, three rungs, graded by CONSEQUENCE not by machine
+ *  state. Critical is the heaviest object on any screen and sits outside every
+ *  action cap; nothing else may compete with it visually. */
+export function Critical({ children }: { children: ReactNode }) {
+  return (
+    <div role="alert" className="flex gap-3 border-[1.5px] border-red-300 bg-red-50 rounded-2xl px-4 py-3.5 mb-4">
+      <span aria-hidden="true" className="text-red-700 font-semibold">!</span>
+      <div className="text-[14.5px] text-red-900 leading-relaxed min-w-0">{children}</div>
+    </div>
+  );
+}
+
+export function Attention({ children }: { children: ReactNode }) {
+  return (
+    <div role="status" className="flex gap-3 border border-amber-200 bg-amber-50 rounded-2xl px-4 py-3.5 mb-4">
+      <span aria-hidden="true" className="text-amber-800">!</span>
+      <div className="text-[14.5px] text-amber-900 leading-relaxed min-w-0">{children}</div>
+    </div>
+  );
+}
+
+/** The quietest rung: something true and worth saying that is not a problem. */
+export function TruthNote({ children }: { children: ReactNode }) {
+  return (
+    <div className="border border-line bg-card rounded-2xl px-4 py-3.5 mb-4">
+      <div className="text-[14px] text-ink-soft leading-relaxed">{children}</div>
+    </div>
   );
 }
 

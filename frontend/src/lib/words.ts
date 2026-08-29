@@ -16,9 +16,23 @@ const SOURCE_LABELS: Record<string, string> = {
   zoom: "Meeting recordings",
 };
 
-/** Never returns the slug. An unrecognised source is described, not named. */
-export const sourceLabel = (slug: string | null | undefined): string =>
-  (slug && SOURCE_LABELS[slug]) || "Another source";
+/** Server words that arrived with no translation.
+ *
+ *  Adopted from Jay's adapter, whose rule is "the mapping is total or it says
+ *  so". A silent fallback to "Another source" hides the fact that the backend
+ *  grew a source this UI has never been taught. Recording it turns an
+ *  invisible gap into a countable one. */
+export const unmappedWords = new Set<string>();
+
+/** Never returns the slug. An unrecognised source is described, not named,
+ *  and recorded so the omission can be found rather than guessed at. */
+export function sourceLabel(slug: string | null | undefined): string {
+  if (!slug) return "Another source";
+  const known = SOURCE_LABELS[slug];
+  if (known) return known;
+  unmappedWords.add("source:" + slug);
+  return "Another source";
+}
 
 /** A date the brain is unsure of must not be shown as if it were certain.
  *  `date_reliable` is false when the date was inferred rather than read. */
