@@ -391,8 +391,13 @@ test("the operator can print a card at install, and only with the admin key", as
 
 /* ------------------------------------------------ the owner-facing surface */
 
+// /app is the React app and has no recovery screen, so the ceremony lives at
+// /app/recover. The assertions below are unchanged from when it was served at
+// /app: the page is the same bytes, only the route moved. If a future frontend
+// folds recovery into React, move these assertions rather than deleting them —
+// they are the only proof a locked-out owner has a way back in.
 test("the page carries the escape hatch and the honest limits, and its script parses", async () => {
-  const page = await worker.fetch(new Request(ORIGIN + "/app"), env(realDb()));
+  const page = await worker.fetch(new Request(ORIGIN + "/app/recover"), env(realDb()));
   const html = await page.text();
   assert.equal(page.status, 200);
   assert.match(html, /Lost the device you sign in with\?/);

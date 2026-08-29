@@ -290,6 +290,46 @@ const find = (r, id) => (r.findings || []).find((f) => f.id === id);
   const f = find(r, "backlog");
   check("a backlog older than 30 minutes is CRITICAL, not informational", f?.severity === "crit", JSON.stringify(f));
   check("and it names brain drain", /brain drain/.test(f?.action || ""), f?.action);
+  check("a stalled queue says the drain is NOT running", /NOT running/.test(f?.detail || ""), f?.detail);
+}
+
+/* ---- behind is not stalled: the distinction a bulk backfill exposed ----
+   The drain ran on its trigger the whole time while this check told the
+   operator it was not running. The lease dates the last pass; the newest
+   queued row shows whether a producer is still feeding the queue. */
+{
+  const leaseTakenMinutesAgo = (m) => Date.now() - m * 60000 + 20 * 60 * 1000;
+  const seedBacklog = (env, { newestMinutesAgo }) => {
+    source(env._db, "documents");
+    doc(env._db, "d1"); chunk(env._db, "d1#0", "d1");
+    doc(env._db, "d2"); chunk(env._db, "d2#0", "d2");
+    env._db.prepare("INSERT INTO vector_outbox (chunk_uid, op, queued_at, attempts) VALUES (?,?,?,?)")
+      .run("d1#0", "upsert", Date.now() - 90 * 60000, 0);
+    env._db.prepare("INSERT INTO vector_outbox (chunk_uid, op, queued_at, attempts) VALUES (?,?,?,?)")
+      .run("d2#0", "upsert", Date.now() - newestMinutesAgo * 60000, 0);
+    env._db.prepare("UPDATE install_state SET vector_drain_lease_expires_at = ? WHERE id = 1")
+      .run(leaseTakenMinutesAgo(2));
+  };
+
+  const loading = makeEnv({ vectorCount: 1 });
+  seedBacklog(loading, { newestMinutesAgo: 1 });
+  const whileLoading = find(await diagnose(loading), "backlog");
+  check("a running drain with documents still arriving is BEHIND, not stalled",
+    whileLoading?.severity === "warn" && /behind rather than stalled/.test(whileLoading?.detail || ""),
+    JSON.stringify(whileLoading));
+  check("and it never claims the drain is not running",
+    !/NOT running/.test(whileLoading?.detail || ""), whileLoading?.detail);
+  check("and it says to let the load finish first",
+    /Let the load finish/.test(whileLoading?.action || ""), whileLoading?.action);
+
+  const catchingUp = makeEnv({ vectorCount: 1 });
+  seedBacklog(catchingUp, { newestMinutesAgo: 45 });
+  const afterLoad = find(await diagnose(catchingUp), "backlog");
+  check("a running drain with nothing arriving is working through the backlog",
+    afterLoad?.severity === "warn" && /working through this backlog/.test(afterLoad?.detail || ""),
+    JSON.stringify(afterLoad));
+  check("and every one of these reports dates the last drain pass",
+    /last pass \d+ min ago/.test(afterLoad?.detail || ""), afterLoad?.detail);
 }
 
 /* ---- chunks that failed to embed and were set aside ---- */

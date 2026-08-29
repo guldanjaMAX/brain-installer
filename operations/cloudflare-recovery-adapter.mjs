@@ -147,6 +147,12 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "bank_feed_items",
   "bank_feed_backfill",
   "bank_feed_link_sessions",
+  // Schema 17: connector OAuth state is entirely live security material.
+  // A recovered brain simply has its connectors re-authorize (dynamic
+  // registration makes that automatic), so none of it is exported.
+  "oauth_clients",
+  "oauth_codes",
+  "oauth_tokens",
   // Schema 19: the owner's recovery card. `recovery_codes` is DURABLE and is
   // exported, for the same reason `owner_passkeys` is: a recovered brain that
   // came back without it would silently kill the card sitting in the owner's
@@ -175,11 +181,12 @@ export const RECOVERY_EXPORT_TABLES = Object.freeze(
     table !== "vector_outbox" && table !== "vector_bootstrap_batches" &&
       table !== "install_state" &&
       // Live single-use auth material never enters a resumable artifact: a
-      // recovered brain re-issues challenges and invites from scratch, and an
-      // abandoned bank-authorisation session is the same kind of thing.
+      // recovered brain re-issues challenges, invites, connector grants and
+      // bank-authorisation sessions from scratch.
       table !== "auth_challenges" && table !== "enrollment_codes" &&
       table !== "recovery_attempts" &&
-      table !== "bank_feed_link_sessions"),
+      table !== "bank_feed_link_sessions" &&
+      table !== "oauth_clients" && table !== "oauth_codes" && table !== "oauth_tokens"),
 );
 
 const SAFE_WRANGLER_PREFIXES = Object.freeze([
@@ -259,17 +266,24 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   // Owners re-sign-in with their passkey; that is a tap, not a loss.
   "session_generation",
 ]);
-// Schema 15 added the additive financial-ledger tables, 17 added the chunk
-// token-fit columns, 18 added two provenance COLUMNS to `documents`
+// Schema 15 added the additive financial-ledger tables, 16 the bank feed, 17
+// the three connector-OAuth tables, 18 two provenance COLUMNS on `documents`
 // (text_source, text_reliable) so an OCR'd document is distinguishable from one
-// read from a text layer, 19 added the two recovery-card tables, and 20 added
-// the Zoom delivery ledger. The vector
+// read from a text layer, 19 the two recovery-card tables, 20 the Zoom delivery
+// ledger, and 21 the chunk token-fit columns. The vector
 // protocol is unchanged throughout, but the recovery contract tracks the EXACT
 // current schema by design: a drill against a database one migration behind
 // would export a column set that does not match the reviewed list, and refusing
 // is the whole point of pinning it. Bumping this is a required step of shipping
 // any migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 20;
+//
+// 17 is the connector-OAuth migration and not the chunk token-fit one because
+// two lines both shipped a 0017 and the field settled it: installs already
+// record version 17 with the connector-OAuth checksum. Renumbering to match a
+// deployed database is the cheap correction; renumbering the deployed database
+// is not. Token-fit moved to 21, which is why the refit COLUMN gate below reads
+// 21 while the table gates for 17, 19 and 20 read their own numbers.
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 21;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -305,6 +319,13 @@ const SCHEMA_16_TABLES = Object.freeze([
   "bank_feed_link_sessions",
 ]);
 
+// Schema 17: the connector-OAuth tables.
+// Declared with SCHEMA_15/16 rather than beside SCHEMA_14 further down:
+// AGGREGATE_FIELDS below is built at module load, so a const declared after
+// it is in the temporal dead zone and every import of this module throws.
+// The same ordering constraint applies to SCHEMA_19 and SCHEMA_20.
+const SCHEMA_17_TABLES = Object.freeze(["oauth_clients", "oauth_codes", "oauth_tokens"]);
+
 // Schema 19: the owner's recovery card and the brake on guessing at it.
 const SCHEMA_19_TABLES = Object.freeze([
   "recovery_codes",
@@ -329,8 +350,8 @@ const AGGREGATE_FIELDS = Object.freeze([
     // not have fails the whole snapshot. Ledger restoration correctness is
     // proven by the exported content, which these tables are fully part of.
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
-     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_19_TABLES,
-     ...SCHEMA_20_TABLES].includes(table)
+     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES,
+     ...SCHEMA_19_TABLES, ...SCHEMA_20_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -861,7 +882,10 @@ function expectedInstallStateColumns(migrations) {
     ...(latest >= 12 ? INSTALL_STATE_PROJECTION_COLUMNS : []),
     ...(latest >= 13 ? INSTALL_STATE_BOOTSTRAP_V2_COLUMNS : []),
     ...(latest >= 14 ? ["session_generation"] : []),
-    ...(latest >= 17 ? INSTALL_STATE_REFIT_COLUMNS : []),
+    // 21, not 17: the chunk token-fit migration moved when the field-applied
+    // connector-OAuth migration kept 17. This gate follows the FILE, not the
+    // number it was born with.
+    ...(latest >= 21 ? INSTALL_STATE_REFIT_COLUMNS : []),
   ]);
 }
 
@@ -1090,6 +1114,7 @@ function expectedRecoveryTables(migrations) {
     (latest >= 14 || !SCHEMA_14_TABLES.includes(table)) &&
     (latest >= 15 || !SCHEMA_15_TABLES.includes(table)) &&
     (latest >= 16 || !SCHEMA_16_TABLES.includes(table)) &&
+    (latest >= 17 || !SCHEMA_17_TABLES.includes(table)) &&
     (latest >= 19 || !SCHEMA_19_TABLES.includes(table)) &&
     (latest >= 20 || !SCHEMA_20_TABLES.includes(table)));
 }

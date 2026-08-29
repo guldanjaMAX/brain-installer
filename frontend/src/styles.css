@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+/* The brain's own palette. Warm paper, deep ink, one accent — chosen to feel
+   like a private notebook rather than a dashboard, because the first thing a
+   client does here is hand over their documents. */
+@theme {
+  --color-paper: #faf9f6;
+  --color-card: #ffffff;
+  --color-ink: #1a1a1a;
+  --color-ink-soft: #5c6472;
+  --color-line: #e6e2da;
+  --color-accent: #3b5bdb;
+  --color-accent-soft: #eef1fd;
+  --font-display: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+html { -webkit-text-size-adjust: 100%; }
+body { background: var(--color-paper); color: var(--color-ink); }

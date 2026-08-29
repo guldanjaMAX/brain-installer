@@ -2114,20 +2114,51 @@ export async function diagnose(env, {
 
   await safe("backlog", async () => {
     const row = await q1(env,
-      `SELECT count(*) n, min(queued_at) oldest,
+      `SELECT count(*) n, min(queued_at) oldest, max(queued_at) newest,
               sum(CASE WHEN op = 'upsert' THEN 1 ELSE 0 END) upserts,
               sum(CASE WHEN op = 'delete' THEN 1 ELSE 0 END) deletes
        FROM vector_outbox`);
     const n = Number(row?.n || 0);
     if (!n) return;
-    const mins = row?.oldest ? Math.floor((Date.now() - Number(row.oldest)) / 60000) : null;
-    const stalled = mins !== null && mins > 30;
+    const now = Date.now();
+    const mins = row?.oldest ? Math.floor((now - Number(row.oldest)) / 60000) : null;
+
+    // An old queue head alone cannot tell a STALLED drain from one that is
+    // merely BEHIND, and the difference decides what the reader should do.
+    // Found in the field on a bulk backfill: the drain was running on its
+    // five-minute trigger the whole time, and this check told the operator it
+    // was not running. Two pieces of evidence separate the cases:
+    //
+    //   every drain pass takes the lease, so the lease expiry dates the last
+    //   pass (a lease taken at T expires at T + DRAIN_LEASE_TTL_MS);
+    //
+    //   a queue whose NEWEST row is seconds old still has a producer feeding
+    //   it, which is what outruns a periodic drain during a backfill.
+    const lease = await q1(env,
+      "SELECT vector_drain_lease_expires_at expires FROM install_state WHERE id = 1");
+    const lastPassAt = lease?.expires ? Number(lease.expires) - DRAIN_LEASE_TTL_MS : null;
+    const minsSincePass = lastPassAt === null ? null : Math.floor((now - lastPassAt) / 60000);
+    const draining = minsSincePass !== null && minsSincePass <= 30;
+    const arriving = row?.newest ? (now - Number(row.newest)) <= 15 * 60 * 1000 : false;
+    const stalled = mins !== null && mins > 30 && !draining;
+    const passAge = minsSincePass === null
+      ? "no recorded drain pass"
+      : `last pass ${minsSincePass} min ago`;
+
     add({ id: "backlog", area: "integrity", severity: stalled ? "crit" : "warn", count: n,
       title: `${n} vector operation(s) are waiting (${Number(row?.upserts || 0)} upsert, ${Number(row?.deletes || 0)} delete)${mins !== null ? `, oldest ${mins} min ago` : ""}`,
       detail: stalled
-        ? "Older than 30 minutes means the drain is not running. Upserts remain keyword-only; deletes leave stale vectors competing for candidates."
-        : "Normal right after a load.",
-      action: "Clear it now with `brain drain <manifest>`." });
+        ? `The drain is NOT running: ${passAge}, and the queue head is ${mins} min old. Upserts remain keyword-only; deletes leave stale vectors competing for candidates.`
+        : draining && arriving
+          ? `The drain IS running (${passAge}) and documents are still arriving, so the queue is behind rather than stalled. What is queued stays keyword-only until it clears.`
+          : draining
+            ? `The drain IS running (${passAge}) and is working through this backlog. What is queued stays keyword-only until it clears.`
+            : "Normal right after a load.",
+      action: stalled
+        ? "Clear it now with `brain drain <manifest>`. If it fills again with no pass, the scheduled trigger is not firing: check this Worker's cron trigger."
+        : arriving
+          ? "Let the load finish, then clear the remainder with `brain drain <manifest>`."
+          : "Clear it now with `brain drain <manifest>`." });
   });
 
   await safe("quarantined", async () => {
