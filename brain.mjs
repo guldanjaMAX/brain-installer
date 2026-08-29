@@ -13009,6 +13009,117 @@ export async function cmdLocalTools(options = {}) {
 }
 
 /** Mint a one-time passkey enrollment link for the brain's owner. */
+async function cmdGrant(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  const flags = parseFlags(process.argv.slice(4));
+  const displayName = typeof flags.name === "string" ? flags.name.trim() : "";
+  const capabilities = typeof flags.can === "string"
+    ? flags.can.split(",").map((value) => value.trim()).filter(Boolean)
+    : [];
+  if (!displayName || !capabilities.length) {
+    die(
+      "usage: brain grant <manifest> --name \"Their name\" --can ask,file [--zones books,legal] [--until YYYY-MM-DD]\n" +
+      "      capabilities: ask, file, diagnose, destroy",
+    );
+  }
+  const zones = typeof flags.zones === "string" && flags.zones.trim()
+    ? flags.zones.split(",").map((value) => value.trim()).filter(Boolean)
+    : null;
+  let expiresAt = null;
+  if (typeof flags.until === "string" && flags.until.trim()) {
+    expiresAt = Date.parse(`${flags.until.trim()}T23:59:59Z`);
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      die(`could not use --until ${flags.until}. Choose a future date in YYYY-MM-DD form.`);
+    }
+  }
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no durable admin key was found. Run `brain setup <manifest>` first.");
+  const response = await http(`${base}/api/admin/auth/grants`, {
+    method: "POST",
+    headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      display_name: displayName,
+      relationship: typeof flags.as === "string" ? flags.as : null,
+      capabilities,
+      zones,
+      expires_at: expiresAt,
+    }),
+  }, { timeoutMs: 30_000, what: "the access grant" });
+  if (!response.ok) die(`grant failed (${response.status}): ${summariseResponseBody(await response.text())}`);
+  const grant = await response.json();
+  ok(`access granted to ${grant.display_name}: ${grant.capabilities.join(", ")}`);
+  console.log(`\n  ${grant.token}\n`);
+  console.log(
+    "  This token is shown once. Share it over a channel you trust. If it is lost,\n" +
+    `  create a replacement and revoke this one with: brain grants ${displayPath(manifestPath)} --revoke ${grant.grant_id}\n`,
+  );
+  return grant;
+}
+
+async function cmdGrants(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  const flags = parseFlags(process.argv.slice(4));
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no durable admin key was found. Run `brain setup <manifest>` first.");
+  if (typeof flags.revoke === "string" && flags.revoke.trim()) {
+    const response = await http(`${base}/api/admin/auth/grants/revoke`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ grant_id: flags.revoke.trim() }),
+    }, { timeoutMs: 30_000, what: "the access revocation" });
+    if (!response.ok) die(`revoke failed (${response.status}): ${summariseResponseBody(await response.text())}`);
+    const result = await response.json();
+    if (result.revoked) ok(`${result.grant_id} was revoked.`);
+    else info(`${result.grant_id} was already inactive or was not found.`);
+    return result;
+  }
+  const response = await http(`${base}/api/admin/auth/grants`, {
+    method: "GET", headers: { "X-Admin-Key": adminKey },
+  }, { timeoutMs: 30_000, what: "the access list" });
+  if (!response.ok) die(`could not read access (${response.status}): ${summariseResponseBody(await response.text())}`);
+  const result = await response.json();
+  if (!result.grants?.length) info("Nobody but the owner has a named capability grant.");
+  for (const grant of result.grants || []) {
+    const state = grant.revoked_at ? "revoked" : grant.expires_at && Number(grant.expires_at) <= Date.now() ? "expired" : "active";
+    let capabilities = grant.capabilities;
+    try { capabilities = JSON.parse(grant.capabilities).join(", "); } catch { /* display stored value */ }
+    console.log(`  ${state}  ${grant.display_name}  ${capabilities}  ${grant.grant_id}`);
+  }
+  return result;
+}
+
+async function cmdZone(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  const flags = parseFlags(process.argv.slice(4));
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no durable admin key was found. Run `brain setup <manifest>` first.");
+  const source = typeof flags.source === "string" ? flags.source.trim() : "";
+  const zone = typeof flags.zone === "string" ? flags.zone.trim() : "";
+  const response = await http(`${base}/api/admin/brain/zones`, {
+    method: source || zone ? "POST" : "GET",
+    headers: {
+      "X-Admin-Key": adminKey,
+      ...(source || zone ? { "Content-Type": "application/json" } : {}),
+    },
+    ...(source || zone ? { body: JSON.stringify({ source, zone }) } : {}),
+  }, { timeoutMs: 60_000, what: "the zone assignment" });
+  if (!response.ok) die(`zone command failed (${response.status}): ${summariseResponseBody(await response.text())}`);
+  const result = await response.json();
+  if (result.zones) {
+    if (!result.zones.length) info("Nothing is loaded yet, so there are no zones.");
+    for (const row of result.zones) console.log(`  ${row.zone}  ${row.chunks} chunk(s) from ${row.sources} source(s)`);
+  } else {
+    ok(`"${result.source}" is now in zone "${result.zone}" (${result.documents} document(s), ${result.chunks} chunk(s))`);
+  }
+  return result;
+}
+
 async function cmdInvite(manifestPath) {
   const { m } = loadManifest(manifestPath);
   // Cloudflare is OPTIONAL here, deliberately: inviting a new device must
@@ -13454,6 +13565,9 @@ const commands = {
   reindex: cmdReindex,
   diagnose: cmdDiagnose,
   eval: cmdEval,
+  grant: cmdGrant,
+  grants: cmdGrants,
+  zone: cmdZone,
   invite: cmdInvite,
   devices: cmdDevices,
   token: cmdToken,
@@ -13488,6 +13602,9 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it
     brain token      <manifest>            is a Cloudflare token remembered on this Mac? --forget removes it
     brain technician <manifest>            read-only account setup plan; --run <step> launches one safe ceremony
+    brain grant      <manifest> --name "X" --can ask,file   give one person scoped access; prints the token once
+    brain grants     <manifest>            who has access; --revoke <id> ends one
+    brain zone       <manifest>            what is in which zone; --source X --zone Y to set one
     brain invite     <manifest>            one-tap passkey enrollment link for the owner (Face ID, 15 min)
     brain devices    <manifest>            enrolled passkeys; --revoke <credential id> removes one
     brain test       <manifest>            full acceptance suite (5 tiers)

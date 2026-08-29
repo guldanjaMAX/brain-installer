@@ -289,6 +289,24 @@ export function documentAccessSql(access, chunkAlias = "c", documentAlias = "d",
   };
 }
 
+/** A coarse capability grant's zone boundary, applied where chunk text is read. */
+export function scopeSql(scope, alias = "c", nextParam = 1) {
+  if (!scope || scope.all === true) return { clause: "", params: [], nextParam };
+  const include = Array.isArray(scope.zones) ? scope.zones.filter(Boolean) : [];
+  const exclude = Array.isArray(scope.exclude) ? scope.exclude.filter(Boolean) : [];
+  if (!include.length) return { clause: " AND 1 = 0", params: [], nextParam };
+  const params = [];
+  const inList = include.map(() => `?${nextParam++}`).join(",");
+  params.push(...include);
+  let clause = ` AND ${alias}.source IN (SELECT name FROM sources WHERE zone IN (${inList}))`;
+  if (exclude.length) {
+    const outList = exclude.map(() => `?${nextParam++}`).join(",");
+    params.push(...exclude);
+    clause += ` AND ${alias}.source NOT IN (SELECT name FROM sources WHERE zone IN (${outList}))`;
+  }
+  return { clause, params, nextParam };
+}
+
 /** Which requested filters this backend cannot honour. */
 export function unsupportedFilters(filters = {}) {
   return D1_UNSUPPORTED.filter((k) => filters[k]);
@@ -367,7 +385,7 @@ const FTS_STOPWORDS = new Set([
   "say", "says", "should", "some", "tell", "than", "very",
 ]);
 
-export async function searchKeyword(env, query, { limit, filters = {}, access = null } = {}) {
+export async function searchKeyword(env, query, { limit, filters = {}, access = null, scope = null } = {}) {
   // FTS5 treats bare punctuation as syntax. A user question with an apostrophe
   // or a hyphen is not a query language expression, so it is quoted as a
   // phrase-free bag of terms rather than passed through raw.
@@ -399,7 +417,8 @@ export async function searchKeyword(env, query, { limit, filters = {}, access = 
   if (!terms) return [];
 
   const f = filterSql(filters, "c", 3);
-  const a = documentAccessSql(access, "c", "d", f.nextParam);
+  const sc = scopeSql(scope, "c", f.nextParam);
+  const a = documentAccessSql(access, "c", "d", sc.nextParam);
   const sql = `
     SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
            c.client, c.category, c.top_folder, c.platform,
@@ -409,16 +428,18 @@ export async function searchKeyword(env, query, { limit, filters = {}, access = 
     FROM chunks_fts
     JOIN chunks c ON c.id = chunks_fts.rowid
     JOIN documents d ON d.doc_uid = c.doc_uid
-    WHERE chunks_fts MATCH ?1${f.clause}${a.clause}
+    WHERE chunks_fts MATCH ?1${f.clause}${sc.clause}${a.clause}
     ORDER BY bm25(chunks_fts)
     LIMIT ?2`;
 
-  const { results } = await env.DB.prepare(sql).bind(terms, limit, ...f.params, ...a.params).all();
+  const { results } = await env.DB.prepare(sql).bind(
+    terms, limit, ...f.params, ...sc.params, ...a.params,
+  ).all();
   return results || [];
 }
 
 /** Vector search over Vectorize, hydrated and filtered in D1. */
-export async function searchVector(env, embedding, { limit, filters = {} } = {}) {
+export async function searchVector(env, embedding, { limit, filters = {}, scope = null } = {}) {
   const topK = Math.min(limit, VECTOR_TOPK_MAX);
   const vectorFilter = await vectorFilterFor(filters);
   const hasFilter = Object.keys(vectorFilter).length > 0;
@@ -467,22 +488,24 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
   // contains 100 ids, so adding even one exact-authority filter used to make
   // hydration fail and search silently degrade to keyword-only. Partition ids
   // after reserving bind slots for every filter, then restore Vectorize order.
-  const filterParameterCount = filterSql(filters, "c", 1).params.length;
+  const f0 = filterSql(filters, "c", 1);
+  const filterParameterCount = f0.params.length + scopeSql(scope, "c", f0.nextParam).params.length;
   const hydrationBatchSize = Math.max(1, D1_QUERY_BIND_LIMIT - filterParameterCount);
   const results = [];
   for (let start = 0; start < resolved.length; start += hydrationBatchSize) {
     const batch = resolved.slice(start, start + hydrationBatchSize);
     const placeholders = batch.map((_, i) => "?" + (i + 1)).join(",");
     const f = filterSql(filters, "c", batch.length + 1);
+    const sc = scopeSql(scope, "c", f.nextParam);
     const { results: hydrated } = await env.DB.prepare(
       `SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
               c.client, c.category, c.top_folder, c.platform,
               d.source_id, d.uri, d.entity_slug, d.content_hash, d.date_source, d.date_reliable,
               d.text_source, d.text_reliable
        FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid
-       WHERE c.chunk_uid IN (${placeholders})${f.clause}`
+       WHERE c.chunk_uid IN (${placeholders})${f.clause}${sc.clause}`
     )
-      .bind(...batch, ...f.params)
+      .bind(...batch, ...f.params, ...sc.params)
       .all();
     results.push(...(hydrated || []));
   }
@@ -500,22 +523,22 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
  * only promote a document that appears in one of the lists.
  */
 export async function search(env, {
-  query, embedding, limit = 10, filters = {}, weights = {}, rrfK = RRF_K, access = null,
+  query, embedding, limit = 10, filters = {}, weights = {}, rrfK = RRF_K, access = null, scope = null,
 }) {
   const pool = RETRIEVAL_CANDIDATE_DEPTH;
   const fusionK = Math.min(Math.max(Number(rrfK) || RRF_K, 1), 1e3);
 
   const [kw, vec, projection] = await Promise.all([
-    searchKeyword(env, query, { limit: pool, filters, access }).catch(() => []),
-    embedding && access?.kind !== "grant"
-      ? searchVector(env, embedding, { limit: pool, filters }).catch(() => [])
+    searchKeyword(env, query, { limit: pool, filters, access, scope }).catch(() => []),
+    embedding && access?.kind !== "grant" && (!scope || scope.all === true)
+      ? searchVector(env, embedding, { limit: pool, filters, scope }).catch(() => [])
       : Promise.resolve([]),
     // Vectorize may return some old/current candidates while a newer accepted
     // changeset is still processing. Non-empty semantic results therefore do
     // not prove the complete D1 corpus is query-visible. Reuse the exact
     // readiness contract that gates health and acceptance so every answer
     // advertises partial projection instead of looking fully healthy.
-    embedding && access?.kind !== "grant"
+    embedding && access?.kind !== "grant" && (!scope || scope.all === true)
       ? vectorReadiness(env).catch(() => ({ ready: false }))
       : Promise.resolve(null),
   ]);
@@ -536,6 +559,9 @@ export async function search(env, {
   if (access?.kind === "grant") {
     degraded = "scoped-vector";
     degradedReason = "document-scope-keyword-only";
+  } else if (scope && scope.all !== true) {
+    degraded = "scoped-vector";
+    degradedReason = "zone-scope-keyword-only";
   } else if (embedding && projection?.ready !== true) {
     degraded = "vector";
     degradedReason = "projection-incomplete";
@@ -546,7 +572,7 @@ export async function search(env, {
     degraded = "no-embedding";
     degradedReason = "embedding-unavailable";
   }
-  if (filters.entity_slug) {
+  if (filters.entity_slug && access?.kind !== "grant" && (!scope || scope.all === true)) {
     degraded = "vector";
     degradedReason = "entity-vector-authority-unindexed";
   }

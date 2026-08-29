@@ -68,12 +68,16 @@ export async function consumeChallenge(env, challenge, purpose) {
 export async function issueEnrollmentCode(env, options = {}) {
   const normalized = typeof options === "number" ? { ttlMs: options } : options || {};
   const ttlMs = normalized.ttlMs ?? 15 * 60 * 1000;
+  const grantId = normalized.grantId ?? null;
   const documentGrantId = normalized.documentGrantId ?? null;
+  if (grantId !== null && documentGrantId !== null) {
+    throw new Error("an enrollment code cannot widen across two grant types");
+  }
   const code = normalized.code || randomToken(24);
   try {
     await env.DB.prepare(
-      "INSERT INTO enrollment_codes (code_hash, expires_at, document_grant_id) VALUES (?, ?, ?)",
-    ).bind(await sha256Hex(code), Date.now() + ttlMs, documentGrantId).run();
+      "INSERT INTO enrollment_codes (code_hash, expires_at, grant_id, document_grant_id) VALUES (?, ?, ?, ?)",
+    ).bind(await sha256Hex(code), Date.now() + ttlMs, grantId, documentGrantId).run();
   } catch (error) {
     guard(error);
   }
@@ -85,10 +89,10 @@ export async function issueEnrollmentCode(env, options = {}) {
 export async function peekEnrollmentCode(env, code) {
   try {
     const row = await env.DB.prepare(
-      "SELECT expires_at, used_at, document_grant_id FROM enrollment_codes WHERE code_hash = ?",
+      "SELECT expires_at, used_at, grant_id, document_grant_id FROM enrollment_codes WHERE code_hash = ?",
     ).bind(await sha256Hex(code)).first();
     return row && !row.used_at && Number(row.expires_at) > Date.now()
-      ? { documentGrantId: row.document_grant_id ?? null }
+      ? { grantId: row.grant_id ?? null, documentGrantId: row.document_grant_id ?? null }
       : null;
   } catch (error) {
     guard(error);
@@ -99,13 +103,13 @@ export async function consumeEnrollmentCode(env, code) {
   try {
     const hash = await sha256Hex(code);
     const row = await env.DB.prepare(
-      "SELECT expires_at, used_at, document_grant_id FROM enrollment_codes WHERE code_hash = ?",
+      "SELECT expires_at, used_at, grant_id, document_grant_id FROM enrollment_codes WHERE code_hash = ?",
     ).bind(hash).first();
     if (!row || row.used_at || Number(row.expires_at) <= Date.now()) return false;
     await env.DB.prepare(
       "UPDATE enrollment_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL",
     ).bind(Date.now(), hash).run();
-    return { documentGrantId: row.document_grant_id ?? null };
+    return { grantId: row.grant_id ?? null, documentGrantId: row.document_grant_id ?? null };
   } catch (error) {
     guard(error);
   }
@@ -114,15 +118,18 @@ export async function consumeEnrollmentCode(env, code) {
 /* ---------------------------------------------------------------- passkeys */
 
 export async function storePasskey(env, {
-  credentialId, jwk, alg, signCount, nickname, documentGrantId = null,
+  credentialId, jwk, alg, signCount, nickname, grantId = null, documentGrantId = null,
   securityEvent = null, ownerActivity = null,
 }) {
+  if (grantId !== null && documentGrantId !== null) {
+    throw new Error("a passkey cannot widen across two grant types");
+  }
   try {
     const createdAt = Date.now();
     const safeNickname = String(nickname || "").slice(0, 60);
     const insert = env.DB.prepare(
-      "INSERT INTO owner_passkeys (credential_id, public_key_jwk, alg, sign_count, nickname, created_at, document_grant_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    ).bind(credentialId, JSON.stringify(jwk), alg, signCount, safeNickname || null, createdAt, documentGrantId);
+      "INSERT INTO owner_passkeys (credential_id, public_key_jwk, alg, sign_count, nickname, created_at, grant_id, document_grant_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).bind(credentialId, JSON.stringify(jwk), alg, signCount, safeNickname || null, createdAt, grantId, documentGrantId);
     const statements = [insert];
     if (securityEvent) statements.push(passkeyEventStatement(env, securityEvent));
     if (ownerActivity) {
@@ -144,10 +151,91 @@ export async function storePasskey(env, {
   }
 }
 
+/* ------------------------------------------------------- capability grants */
+
+export async function findGrantByCredentialHash(env, tokenHash) {
+  try {
+    return await env.DB.prepare(
+      `SELECT g.grant_id, g.display_name, g.capabilities, g.expires_at, g.revoked_at,
+              g.scope_include, g.scope_exclude,
+              c.revoked_at AS credential_revoked_at
+         FROM grant_credentials c
+         JOIN grants g ON g.grant_id = c.grant_id
+        WHERE c.token_hash = ?`,
+    ).bind(tokenHash).first();
+  } catch (error) {
+    guard(error);
+  }
+}
+
+export async function createGrant(env, {
+  grantId, displayName, relationship, capabilities, expiresAt, createdBy,
+  scopeInclude = '{"all":true}', scopeExclude = "[]",
+}) {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO grants (grant_id, display_name, relationship, capabilities, expires_at, created_at, created_by,
+                           scope_include, scope_exclude)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      grantId, displayName, relationship || null, JSON.stringify(capabilities),
+      expiresAt ?? null, Date.now(), createdBy, scopeInclude, scopeExclude,
+    ).run();
+  } catch (error) {
+    guard(error);
+  }
+}
+
+export async function addGrantCredential(env, { tokenHash, grantId }) {
+  try {
+    await env.DB.prepare(
+      "INSERT INTO grant_credentials (token_hash, grant_id, created_at) VALUES (?, ?, ?)",
+    ).bind(tokenHash, grantId, Date.now()).run();
+  } catch (error) {
+    guard(error);
+  }
+}
+
+export async function listGrants(env) {
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT grant_id, display_name, relationship, capabilities, expires_at,
+              created_at, revoked_at, last_used_at
+         FROM grants ORDER BY created_at DESC`,
+    ).all();
+    return results || [];
+  } catch (error) {
+    guard(error);
+  }
+}
+
+export async function revokeGrant(env, grantId) {
+  try {
+    const result = await env.DB.prepare(
+      "UPDATE grants SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
+    ).bind(Date.now(), grantId).run();
+    return Boolean(result?.meta?.changes);
+  } catch (error) {
+    guard(error);
+  }
+}
+
+export async function findGrantById(env, grantId) {
+  try {
+    return await env.DB.prepare(
+      `SELECT grant_id, display_name, capabilities, expires_at, revoked_at,
+              scope_include, scope_exclude
+         FROM grants WHERE grant_id = ?`,
+    ).bind(grantId).first();
+  } catch (error) {
+    guard(error);
+  }
+}
+
 export async function findPasskey(env, credentialId) {
   try {
     const row = await env.DB.prepare(
-      "SELECT credential_id, public_key_jwk, alg, sign_count, nickname, document_grant_id FROM owner_passkeys WHERE credential_id = ?",
+      "SELECT credential_id, public_key_jwk, alg, sign_count, nickname, grant_id, document_grant_id FROM owner_passkeys WHERE credential_id = ?",
     ).bind(credentialId).first();
     if (!row) return null;
     return { ...row, jwk: JSON.parse(row.public_key_jwk) };
@@ -171,7 +259,7 @@ export async function recordPasskeyUse(env, credentialId, signCount, securityEve
 export async function listPasskeys(env) {
   try {
     const rows = await env.DB.prepare(
-      "SELECT credential_id, alg, nickname, created_at, last_used_at FROM owner_passkeys ORDER BY created_at",
+      "SELECT credential_id, alg, nickname, grant_id, document_grant_id, created_at, last_used_at FROM owner_passkeys ORDER BY created_at",
     ).all();
     return rows?.results || [];
   } catch (error) {
@@ -221,7 +309,7 @@ export async function revokePasskey(env, credentialId) {
       return { removed: false, reason: "refusing to remove the last passkey; enroll another device or mint a new invite first" };
     }
     const row = await env.DB.prepare(
-      "SELECT credential_id, nickname, document_grant_id FROM owner_passkeys WHERE credential_id = ?",
+      "SELECT credential_id, nickname, grant_id, document_grant_id FROM owner_passkeys WHERE credential_id = ?",
     ).bind(credentialId).first();
     if (!row) return { removed: false, reason: "passkey not found" };
     const passkeyKey = (await sha256Hex(credentialId)).slice(0, 24);
@@ -233,7 +321,7 @@ export async function revokePasskey(env, credentialId) {
         eventType: "passkey_revoked",
         subjectKind: "passkey",
         subjectId: `passkey:${passkeyKey}`,
-        displayLabel: row.nickname || (row.document_grant_id ? "Shared access passkey" : "Passkey device"),
+        displayLabel: row.nickname || (row.document_grant_id || row.grant_id ? "Shared access passkey" : "Passkey device"),
         occurredAt,
       }),
     ]);
@@ -314,7 +402,7 @@ export async function passkeySecurityStatus(env, rpId) {
   try {
     const [deviceRows, eventRows] = await Promise.all([
       env.DB.prepare(
-        `SELECT CASE WHEN document_grant_id IS NULL THEN 'owner' ELSE 'grant' END principal_kind,
+        `SELECT CASE WHEN document_grant_id IS NULL AND grant_id IS NULL THEN 'owner' ELSE 'grant' END principal_kind,
                 count(*) count
          FROM owner_passkeys GROUP BY principal_kind`,
       ).all(),
@@ -354,6 +442,70 @@ export async function passkeySecurityStatus(env, rpId) {
       })),
       privacy: "No credential ids, challenges, assertions, public keys, IP addresses, user agents, questions, answers, or document content are recorded here.",
     };
+  } catch (error) {
+    guard(error);
+  }
+}
+
+/* --------------------------------------------------------------- zones */
+
+export async function assignZone(env, { source, zone }) {
+  try {
+    const now = Date.now();
+    await env.DB.prepare(
+      "INSERT INTO zones (zone, label, created_at) VALUES (?, ?, ?) ON CONFLICT(zone) DO NOTHING",
+    ).bind(zone, zone, now).run();
+    await env.DB.prepare("UPDATE sources SET zone = ? WHERE name = ?").bind(zone, source).run();
+    const docs = await env.DB.prepare("UPDATE documents SET zone = ? WHERE source = ?")
+      .bind(zone, source).run();
+    const chunks = await env.DB.prepare("UPDATE chunks SET zone = ? WHERE source = ?")
+      .bind(zone, source).run();
+    return {
+      source,
+      zone,
+      documents: docs?.meta?.changes ?? 0,
+      chunks: chunks?.meta?.changes ?? 0,
+    };
+  } catch (error) {
+    guard(error);
+  }
+}
+
+export async function listZones(env) {
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT COALESCE(c.zone, '(unzoned)') AS zone, COUNT(*) AS chunks,
+              COUNT(DISTINCT c.source) AS sources
+         FROM chunks c GROUP BY COALESCE(c.zone, '(unzoned)') ORDER BY chunks DESC`,
+    ).all();
+    return results || [];
+  } catch (error) {
+    guard(error);
+  }
+}
+
+export async function sourcesInScope(env, scope) {
+  if (!scope || scope.all === true) {
+    try {
+      const { results } = await env.DB.prepare("SELECT name FROM sources").all();
+      return (results || []).map((row) => row.name);
+    } catch (error) {
+      guard(error);
+    }
+  }
+  const include = Array.isArray(scope.zones) ? scope.zones.filter(Boolean) : [];
+  if (!include.length) return [];
+  const exclude = Array.isArray(scope.exclude) ? scope.exclude.filter(Boolean) : [];
+  try {
+    const inList = include.map(() => "?").join(",");
+    let sql = `SELECT name FROM sources WHERE zone IN (${inList})`;
+    const binds = [...include];
+    if (exclude.length) {
+      sql += ` AND zone NOT IN (${exclude.map(() => "?").join(",")})`;
+      binds.push(...exclude);
+    }
+    const { results } = await env.DB.prepare(sql).bind(...binds).all();
+    return (results || []).map((row) => row.name);
   } catch (error) {
     guard(error);
   }

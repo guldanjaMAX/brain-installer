@@ -58,7 +58,7 @@ function realDb() {
   db.prepare(
     `INSERT INTO install_state
      (id, client_slug, product_version, schema_version, gate_version, installed_at, ring, session_generation)
-     VALUES (1, 'fixture', '0.0.0', 20, 0, '2026-08-29T00:00:00Z', 'test', 1)`,
+     VALUES (1, 'fixture', '0.0.0', 22, 0, '2026-08-29T00:00:00Z', 'test', 1)`,
   ).run();
   return db;
 }
@@ -112,7 +112,7 @@ const post = (path, payload, cookie) => new Request(ORIGIN + path, {
 
 test("0021 backfills only unambiguous existing corpus authority before 0022", () => {
   const db = new DatabaseSync(":memory:");
-  applyMigrationRange(db, 1, 18);
+  applyMigrationRange(db, 1, 20);
   const addDocument = db.prepare(
     `INSERT INTO documents
        (doc_uid,source,source_id,title,client,ingested_at,content_hash,meta)
@@ -133,7 +133,7 @@ test("0021 backfills only unambiguous existing corpus authority before 0022", ()
   addFinancialDocument.run("fin-ambiguous-a", ENTITY, "Ambiguous A", "drive:ambiguous");
   addFinancialDocument.run("fin-ambiguous-b", "other-entity", "Ambiguous B", "drive:ambiguous");
 
-  applyMigrationRange(db, 19, 20);
+  applyMigrationRange(db, 21, 22);
   const authority = Object.fromEntries(db.prepare(
     "SELECT doc_uid,entity_slug FROM documents ORDER BY doc_uid",
   ).all().map((row) => [row.doc_uid, row.entity_slug]));

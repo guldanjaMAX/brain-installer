@@ -2103,5 +2103,272 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   }
 }
 
+/* ---------------------------------------------------------------------------
+ * A grant credential is a third way in, and it must be exactly as narrow as
+ * the grant says. These drive the real worker fetch, so a capability check
+ * that never reached the request path fails here rather than passing quietly.
+ */
+{
+  const { hashToken } = await import("../src/lib/grants.js");
+  const bookkeeperToken = "bookkeeper-token-value";
+  const bookkeeperHash = await hashToken(bookkeeperToken);
+
+  const grantEnv = (row) => ({
+    STORAGE: "d1",
+    ADMIN_KEY: "owner-key",
+    DB: {
+      prepare(sql) {
+        return {
+          bind: (...b) => ({
+            async first() {
+              if (/FROM grant_credentials/.test(sql)) return b[0] === bookkeeperHash ? row : null;
+              return null;
+            },
+            async all() { return { results: [] }; },
+            async run() { return { meta: { changes: 0 } }; },
+          }),
+          async first() { return null; },
+          async all() { return { results: [] }; },
+          async run() { return { meta: { changes: 0 } }; },
+        };
+      },
+    },
+  });
+
+  const liveBookkeeper = {
+    grant_id: "g-book", display_name: "Marla", capabilities: '["ask","file"]',
+    expires_at: null, revoked_at: null, credential_revoked_at: null,
+  };
+
+  const call = (env, path, token) => worker.fetch(new Request(
+    `https://b.example${path}`,
+    { method: "POST", body: "{}", headers: token ? { "X-Admin-Key": token } : {} },
+  ), env, { waitUntil() {} });
+
+  const denied = await call(grantEnv(liveBookkeeper), "/api/admin/brain/forget", bookkeeperToken);
+  check("a grant without `destroy` cannot reach a destroy route",
+    denied.status === 401, String(denied.status));
+
+  const deniedBody = await denied.json();
+  check("refusing on capability is indistinguishable from refusing on identity",
+    deniedBody.error === "unauthorized", JSON.stringify(deniedBody));
+
+  const unknown = await call(grantEnv(liveBookkeeper), "/api/admin/brain/forget", "not-a-real-token");
+  check("an unrecognised credential is refused the same way",
+    unknown.status === 401, String(unknown.status));
+
+  const revoked = await call(
+    grantEnv({ ...liveBookkeeper, revoked_at: 1 }), "/api/rag/think", bookkeeperToken);
+  check("a revoked grant cannot ask questions either",
+    revoked.status === 401, String(revoked.status));
+
+  const unclassified = await call(
+    grantEnv(liveBookkeeper), "/api/admin/brain/some-route-invented-later", bookkeeperToken);
+  check("a route nobody classified is owner-only, so a grant cannot reach it",
+    unclassified.status === 401, String(unclassified.status));
+
+  // Every check above is a refusal, and refusals also pass when the credential
+  // was never recognised at all. This one proves the grant genuinely
+  // authenticates: the same token, on a route its capabilities DO cover, must
+  // get past the gate. Anything other than 401 means it was let through.
+  const allowed = await call(grantEnv(liveBookkeeper), "/api/admin/brain/ingest", bookkeeperToken);
+  check("a grant WITH `file` is actually let through to a file route",
+    allowed.status !== 401,
+    `got ${allowed.status}; a 401 here means grants never authenticate and the refusals above prove nothing`);
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Zones. The claim being tested is narrow and is the whole feature: the zone
+ * predicate must reach the SAME query that reads chunk text, because that is
+ * where a snippet comes from. A scope that is merely honoured "somewhere"
+ * would still leak through snippets.
+ */
+{
+  const { scopeSql } = await import("../src/lib/store-d1.js");
+
+  const owner = scopeSql(null, "c", 1);
+  check("an unscoped principal gets no predicate at all",
+    owner.clause === "" && owner.params.length === 0, JSON.stringify(owner));
+
+  const all = scopeSql({ all: true }, "c", 1);
+  check("an explicit all-zones scope is also unrestricted",
+    all.clause === "" && all.params.length === 0, JSON.stringify(all));
+
+  const books = scopeSql({ zones: ["books"] }, "c", 1);
+  check("a scoped principal is restricted through its source's zone",
+    /c\.source IN \(SELECT name FROM sources WHERE zone IN \(\?1\)\)/.test(books.clause)
+      && books.params[0] === "books", JSON.stringify(books));
+
+  const minusMedical = scopeSql({ zones: ["books", "legal"], exclude: ["medical"] }, "c", 1);
+  check("exclusion is expressed as well as inclusion",
+    /source IN \(SELECT name FROM sources WHERE zone IN \(\?1,\?2\)\)/.test(minusMedical.clause)
+      && /source NOT IN \(SELECT name FROM sources WHERE zone IN \(\?3\)\)/.test(minusMedical.clause),
+    minusMedical.clause);
+
+  // The most dangerous possible bug in this function.
+  const empty = scopeSql({ zones: [] }, "c", 1);
+  check("a scope naming no zones reads NOTHING, rather than everything",
+    empty.clause === " AND 1 = 0", JSON.stringify(empty));
+
+  const unknown = scopeSql({ zones: ["books"] }, "c", 1);
+  check("a source with no zone falls outside every scope by SQL semantics",
+    /zone IN/.test(unknown.clause) && !/IS NULL/.test(unknown.clause),
+    "an unzoned source must not match an IN list, and must not be special-cased back in");
+}
+
+
+
+/* ---- the zone predicate must reach the query that reads the TEXT ---- */
+{
+  const { search } = await import("../src/lib/store-d1.js");
+  const { env, seen } = mkEnv([ROW], { vectorIds: ["meeting:123#0"] });
+
+  const scoped = await search(env, {
+    query: "retainer",
+    embedding: [0.1, 0.2],
+    limit: 5,
+    filters: {},
+    scope: { zones: ["books"] },
+  }).catch(() => {});
+
+  const kw = seen.sql.find((sql) => /chunks_fts MATCH/.test(sql));
+  check("a scoped read narrows the keyword query",
+    /c\.source IN \(SELECT name FROM sources/.test(kw || ""), String(kw));
+
+  const hydration = seen.sql.find(
+    (sql) => /FROM chunks c JOIN documents d/.test(sql) && /c\.chunk_uid IN/.test(sql));
+  check("a scoped read never spends top-K on unauthorized vector candidates",
+    seen.vectorQueries.length === 0 && hydration === undefined,
+    JSON.stringify({ vectorQueries: seen.vectorQueries, hydration }));
+
+  check("the unavailable scoped-vector path is explicit instead of looking healthy",
+    scoped?.degraded === "scoped-vector"
+      && scoped?.degraded_reason === "zone-scope-keyword-only",
+    JSON.stringify(scoped));
+
+  const bound = seen.binds.find((b) => b.includes("books"));
+  check("and the zone value is actually bound, not just written into the SQL",
+    !!bound, JSON.stringify(seen.binds));
+
+  // The owner must not pay for any of this.
+  const { env: ownerEnv, seen: ownerSeen } = mkEnv([ROW], { vectorIds: ["meeting:123#0"] });
+  await search(ownerEnv, { query: "retainer", embedding: [0.1], limit: 5, filters: {} }).catch(() => {});
+  const ownerKw = ownerSeen.sql.find((sql) => /chunks_fts MATCH/.test(sql));
+  check("an unscoped read carries no zone predicate at all",
+    !/zone/.test(ownerKw || ""), String(ownerKw));
+}
+
+
+/* ---- end to end: a scoped grant's zone must reach the SQL via the real route ---- */
+{
+  const { hashToken } = await import("../src/lib/grants.js");
+  const token = "scoped-reader-token";
+  const hash = await hashToken(token);
+
+  const base = mkEnv([ROW], { vectorIds: ["meeting:123#0"] });
+  const seen = base.seen;
+  const grantRow = {
+    grant_id: "g-books", capabilities: '["ask"]',
+    expires_at: null, revoked_at: null, credential_revoked_at: null,
+    scope_include: '{"zones":["books"]}', scope_exclude: '[]',
+  };
+  // Wrap the recording DB so the credential lookup resolves, while every other
+  // query still lands in the same `seen` log.
+  const env = { ...base.env, DB: {
+    prepare(sql) {
+      const stmt = base.env.DB.prepare(sql);
+      if (!/FROM grant_credentials/.test(sql)) return stmt;
+      return { bind: (...b) => ({
+        async first() { return b[0] === hash ? grantRow : null; },
+        async all() { return { results: [] }; },
+        async run() { return { meta: { changes: 0 } }; },
+      }) };
+    },
+  } };
+
+  globalThis.__ZONE_DEBUG = 1;
+  const res = await worker.fetch(new Request("https://b.example/api/rag/think", {
+    method: "POST",
+    headers: { "X-Admin-Key": token, "Content-Type": "application/json" },
+    body: JSON.stringify({ q: "retainer" }),
+  }), env, { waitUntil() {} });
+
+  check("a scoped grant is admitted to the ask route", res.status !== 401, String(res.status));
+
+  const kw = seen.sql.find((sql) => /chunks_fts MATCH/.test(sql));
+  check("and its zone reaches the keyword SQL through the real request path",
+    /c\.source IN \(SELECT name FROM sources/.test(kw || ""), String(kw));
+
+  const bound = seen.binds.find((b) => b.includes("books"));
+  check("and the zone from the GRANT ROW is what gets bound",
+    !!bound, JSON.stringify(seen.binds));
+}
+
+
+/* ---- scoped WRITES: the two holes an adversarial review found ---- */
+{
+  const { hashToken } = await import("../src/lib/grants.js");
+  const token = "scoped-filer-token";
+  const hash = await hashToken(token);
+  const grantRow = {
+    grant_id: "g-books", capabilities: '["file","destroy"]',
+    expires_at: null, revoked_at: null, credential_revoked_at: null,
+    scope_include: '{"zones":["books"]}', scope_exclude: '[]',
+  };
+
+  // `books` is in the grant's zone; `medical` is not.
+  const scopedEnv = () => {
+    const base = mkEnv([ROW], { vectorIds: [] });
+    return { ...base.env, DB: {
+      prepare(sql) {
+        if (/FROM grant_credentials/.test(sql)) {
+          return { bind: (...b) => ({ async first() { return b[0] === hash ? grantRow : null; },
+            async all() { return { results: [] }; }, async run() { return { meta: { changes: 0 } }; } }) };
+        }
+        if (/FROM sources WHERE zone IN/.test(sql)) {
+          return { bind: () => ({ async all() { return { results: [{ name: "books" }] }; },
+            async first() { return null; }, async run() { return { meta: { changes: 0 } }; } }) };
+        }
+        return base.env.DB.prepare(sql);
+      },
+    } };
+  };
+
+  const post = (path, payload) => worker.fetch(new Request(`https://b.example${path}`, {
+    method: "POST",
+    headers: { "X-Admin-Key": token, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }), scopedEnv(), { waitUntil() {} });
+
+  // The reconnaissance hole: forget's DRY RUN is the default and returned the
+  // full doc_uid list of any source, which is real file ids and paths.
+  const recon = await post("/api/admin/brain/forget", { source: "medical" });
+  check("a scoped destroy cannot dry-run another zone's source for its doc_uids",
+    recon.status === 403, String(recon.status));
+
+  const reconBody = await recon.json();
+  check("and the refusal returns no targets at all",
+    !("targets" in reconBody), JSON.stringify(reconBody).slice(0, 200));
+
+  const del = await post("/api/admin/brain/forget", { source: "medical", confirm: true });
+  check("nor delete it", del.status === 403, String(del.status));
+
+  const own = await post("/api/admin/brain/forget", { source: "books" });
+  check("but its OWN zone is still reachable, so the check is a boundary not a wall",
+    own.status !== 403, String(own.status));
+
+  // The write hole: source_type is caller-chosen and decides the zone.
+  const plant = await post("/api/admin/brain/ingest",
+    { source_type: "medical", source_id: "x", content: "planted" });
+  check("a scoped filer cannot write into a source in another zone",
+    plant.status === 403, String(plant.status));
+
+  const unknown = await post("/api/admin/brain/ingest",
+    { source_type: "brand-new-source", source_id: "x", content: "hello" });
+  check("nor invent a new source, whose documents would be born unzoned",
+    unknown.status === 403, String(unknown.status));
+}
+
 console.log(fail ? `\n${fail} FAILURES` : `\nroutes: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);

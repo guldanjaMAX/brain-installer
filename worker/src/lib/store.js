@@ -394,16 +394,16 @@ const d1Backend = {
     };
   },
 
-  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60, access = null }) {
+  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60, access = null, scope = null }) {
     let embedding = null;
-    if (access?.kind !== "grant") {
+    if (access?.kind !== "grant" && (!scope || scope.all === true)) {
       try {
         embedding = await embedText(env, query);
       } catch {
         // Degrade to keyword rather than fail. store-d1 reports which side answered.
       }
     }
-    const r = await d1.search(env, { query, embedding, limit, filters, weights, rrfK, access });
+    const r = await d1.search(env, { query, embedding, limit, filters, weights, rrfK, access, scope });
     return {
       results: r.results.map((x) => {
         const sourceId = x.source_id || (
@@ -807,12 +807,14 @@ const d1Backend = {
 /* ----------------------------------------------------------- Supabase backend */
 
 const supabaseBackend = {
-  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60, access = null }) {
-    if (access?.kind === "grant") {
+  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60, access = null, scope = null }) {
+    if (access?.kind === "grant" || (scope && scope.all !== true)) {
       return {
         results: [],
         degraded: "document-access-unavailable",
-        degraded_reason: "exact-document-scope-requires-d1",
+        degraded_reason: access?.kind === "grant"
+          ? "exact-document-scope-requires-d1"
+          : "zone-scope-requires-d1",
         ignored_filters: [],
       };
     }

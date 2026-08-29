@@ -28,7 +28,12 @@ import {
   listPasskeys, renamePasskey, revokePasskey,
   sessionGeneration, bumpSessionGeneration,
   recordPasskeySecurityEvent, passkeySecurityStatus,
+  randomToken, createGrant, addGrantCredential, listGrants, revokeGrant,
+  assignZone, listZones, findGrantById,
 } from "./auth-store.js";
+import {
+  CAPABILITIES, OWNER_CAPABILITIES, parseCapabilities, parseScope, grantIsLive, hashToken,
+} from "./grants.js";
 import {
   createDocumentGrant, revokeDocumentGrant, reissueDocumentGrantInvite,
   listDocumentGrants, listGrantedDocuments, documentGrantPrincipal,
@@ -76,11 +81,46 @@ export async function ownerSessionPrincipal(request, env) {
   if (!appRequest(request)) return null;
   const session = await readSessionCookie(request, env, await sessionGeneration(env));
   if (!session) return null;
-  if (session.grantId === null) return { kind: "owner", grantId: null };
-  const principal = await documentGrantPrincipal(env, session.grantId);
-  return principal.denied
-    ? { kind: "grant", grantId: session.grantId, denied: true, code: principal.code }
-    : principal;
+  if (session.grantId === null) {
+    return {
+      kind: "owner",
+      grantId: null,
+      capabilities: new Set(OWNER_CAPABILITIES),
+      scope: { all: true },
+    };
+  }
+  return grantSubjectPrincipal(env, session.grantId);
+}
+
+async function grantSubjectPrincipal(env, grantId) {
+  if (String(grantId).startsWith("dg_")) {
+    const principal = await documentGrantPrincipal(env, grantId);
+    return principal.denied
+      ? { kind: "grant", grantType: "document", grantId, denied: true, code: principal.code }
+      : { ...principal, grantType: "document" };
+  }
+  const row = await findGrantById(env, grantId);
+  if (!grantIsLive(row)) {
+    return { kind: "grant", grantType: "capability", grantId, denied: true, code: "grant_inactive" };
+  }
+  const capabilities = parseCapabilities(row.capabilities);
+  if (!capabilities) {
+    return { kind: "grant", grantType: "capability", grantId, denied: true, code: "grant_invalid" };
+  }
+  return {
+    kind: "grant",
+    grantType: "capability",
+    grantId: row.grant_id,
+    capabilities: new Set(capabilities),
+    scope: parseScope(row),
+  };
+}
+
+function grantStorage(grantId) {
+  if (!grantId) return { grantId: null, documentGrantId: null };
+  return String(grantId).startsWith("dg_")
+    ? { grantId: null, documentGrantId: grantId }
+    : { grantId, documentGrantId: null };
 }
 
 function ownerRequired(principal) {
@@ -131,6 +171,85 @@ export async function handleAdminInvite(env, url) {
     rp_id: url.hostname,
     note: "single use. Passkeys bind to this exact domain; changing the brain's domain later requires re-enrollment.",
   });
+}
+
+export async function handleAdminGrants(env, request, path) {
+  if (path.endsWith("/revoke") && request.method === "POST") {
+    const payload = await body(request);
+    if (!payload?.grant_id) return jsonResponse({ error: "grant_id required" }, 400);
+    const revoked = await revokeGrant(env, String(payload.grant_id));
+    return jsonResponse({ revoked, grant_id: String(payload.grant_id) });
+  }
+  if (request.method === "POST") {
+    const payload = await body(request);
+    const displayName = String(payload?.display_name || "").trim();
+    if (!displayName) return jsonResponse({ error: "display_name required" }, 400);
+    const capabilities = parseCapabilities(payload?.capabilities);
+    if (!capabilities) {
+      return jsonResponse({
+        error: `capabilities must be a non-empty subset of: ${CAPABILITIES.join(", ")}`,
+      }, 400);
+    }
+    if (capabilities.includes("administer")) {
+      return jsonResponse({
+        error: "administer cannot be granted because it would let this person manage other people's access",
+      }, 400);
+    }
+    const expiresAt = payload?.expires_at === undefined || payload?.expires_at === null
+      ? null
+      : Number(payload.expires_at);
+    if (expiresAt !== null && (!Number.isFinite(expiresAt) || expiresAt <= Date.now())) {
+      return jsonResponse({ error: "expires_at must be a future unix ms timestamp, or null" }, 400);
+    }
+    const zones = Array.isArray(payload?.zones)
+      ? payload.zones.map((zone) => String(zone).trim()).filter(Boolean)
+      : null;
+    const exclude = Array.isArray(payload?.exclude_zones)
+      ? payload.exclude_zones.map((zone) => String(zone).trim()).filter(Boolean)
+      : [];
+    if (zones && zones.length === 0) {
+      return jsonResponse({ error: "zones was given but empty; omit it to mean every zone" }, 400);
+    }
+    const grantId = `g_${randomToken(8)}`.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+    const token = randomToken(32);
+    await createGrant(env, {
+      grantId,
+      displayName: displayName.slice(0, 120),
+      relationship: payload?.relationship ? String(payload.relationship).slice(0, 120) : null,
+      capabilities,
+      expiresAt,
+      createdBy: "owner",
+      scopeInclude: zones ? JSON.stringify({ zones }) : '{"all":true}',
+      scopeExclude: JSON.stringify(exclude),
+    });
+    await addGrantCredential(env, { tokenHash: await hashToken(token), grantId });
+    return jsonResponse({
+      grant_id: grantId,
+      display_name: displayName,
+      capabilities,
+      expires_at: expiresAt,
+      zones: zones || "all",
+      token,
+      note: "This token is shown once and is not recoverable. Share it over a channel you trust.",
+    });
+  }
+  return jsonResponse({ grants: await listGrants(env) });
+}
+
+export async function handleZones(env, request) {
+  if (request.method === "POST") {
+    const payload = await body(request);
+    const source = String(payload?.source || "").trim();
+    const zone = String(payload?.zone || "").trim();
+    if (!source || !zone) return jsonResponse({ error: "source and zone are both required" }, 400);
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(zone)) {
+      return jsonResponse({
+        error: "a zone name uses lowercase letters, digits, dashes or underscores, up to 64 characters",
+      }, 400);
+    }
+    return jsonResponse(await assignZone(env, { source, zone }));
+  }
+  return jsonResponse({ zones: await listZones(env) });
 }
 
 /** GET /api/admin/auth/devices + POST .../revoke — the CLI's device view. */
@@ -225,7 +344,7 @@ export async function handleOwnerAuth(env, request, url, path) {
         return jsonResponse({ error: "a valid enrollment link is required" }, 403);
       }
     }
-    const grantId = viaSession?.grantId ?? invitation?.documentGrantId ?? null;
+    const grantId = viaSession?.grantId ?? invitation?.documentGrantId ?? invitation?.grantId ?? null;
     const telemetryError = await observePasskey(env, {
       rpId, ceremony: "registration", stage: "options", outcome: "started",
       reasonCode: "challenge_issued", durationMs: Date.now() - requestStartedAt,
@@ -282,14 +401,14 @@ export async function handleOwnerAuth(env, request, url, path) {
         return jsonResponse({ error: "the enrollment link is invalid, expired, or already used" }, 403);
       }
     }
-    const grantId = viaSession?.grantId ?? invitation?.documentGrantId ?? null;
+    const grantId = viaSession?.grantId ?? invitation?.documentGrantId ?? invitation?.grantId ?? null;
     let grantEntitySlug = null;
     if (grantId) {
       let scoped;
       try {
-        scoped = await documentGrantPrincipal(env, grantId);
+        scoped = await grantSubjectPrincipal(env, grantId);
       } catch {
-        return unavailable("document_access_unavailable");
+        return unavailable("grant_access_unavailable");
       }
       if (scoped.denied) {
         const telemetryError = await observePasskey(env, {
@@ -299,7 +418,7 @@ export async function handleOwnerAuth(env, request, url, path) {
         if (telemetryError) return telemetryError;
         return scopedForbidden();
       }
-      grantEntitySlug = scoped.entitySlug || null;
+      grantEntitySlug = scoped.grantType === "document" ? scoped.entitySlug || null : null;
     }
     let verified;
     try {
@@ -323,7 +442,7 @@ export async function handleOwnerAuth(env, request, url, path) {
       await storePasskey(env, {
         ...verified,
         nickname: String(payload.nickname || "").slice(0, 60),
-        documentGrantId: grantId,
+        ...grantStorage(grantId),
         securityEvent: {
           rpId, ceremony: "registration", stage: "verify", outcome: "succeeded",
           reasonCode: "passkey_added", durationMs: Date.now() - requestStartedAt,
@@ -377,13 +496,13 @@ export async function handleOwnerAuth(env, request, url, path) {
       if (telemetryError) return telemetryError;
       return jsonResponse({ error: "unknown passkey" }, 403);
     }
-    const grantId = credential.document_grant_id ?? null;
+    const grantId = credential.document_grant_id ?? credential.grant_id ?? null;
     if (grantId) {
       let scoped;
       try {
-        scoped = await documentGrantPrincipal(env, grantId);
+        scoped = await grantSubjectPrincipal(env, grantId);
       } catch {
-        return unavailable("document_access_unavailable");
+        return unavailable("grant_access_unavailable");
       }
       if (scoped.denied) {
         const telemetryError = await observePasskey(env, {
@@ -493,6 +612,28 @@ export async function handleOwnerAuth(env, request, url, path) {
 
   if (path === "/api/app/me") {
     if (!ownerRequired(principal)) {
+      if (principal.grantType === "capability") {
+        return jsonResponse({
+          signed_in: true,
+          brain: env.BRAIN_NAME || "brain",
+          principal: {
+            kind: "grant",
+            grant_id: principal.grantId,
+            capabilities: [...principal.capabilities],
+            scope: principal.scope,
+          },
+          workspace: {
+            home: false,
+            documents: false,
+            ask: principal.capabilities.has("ask"),
+            add_review: false,
+            access: false,
+            bank: false,
+            targets: false,
+            preferences: false,
+          },
+        });
+      }
       return jsonResponse({
         signed_in: true,
         brain: env.BRAIN_NAME || "brain",
@@ -530,7 +671,7 @@ export async function handleOwnerAuth(env, request, url, path) {
     return withCookie(jsonResponse({ signed_out: true }), clearSessionCookie());
   }
   if (path === "/api/app/document-access/documents") {
-    if (ownerRequired(principal)) {
+    if (ownerRequired(principal) || principal.grantType !== "document") {
       return jsonResponse({
         error: "invalid_request",
         code: "scoped_principal_required",

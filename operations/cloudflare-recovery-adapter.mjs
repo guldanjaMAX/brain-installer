@@ -120,7 +120,11 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "owner_passkeys",
   "auth_challenges",
   "enrollment_codes",
-  // Schema 15: the structured financial ledger. Every one of these is durable
+  // Schemas 15 and 16: named capability grants and their zone vocabulary.
+  "grants",
+  "grant_credentials",
+  "zones",
+  // Schema 17: the structured financial ledger. Every one of these is durable
   // and every one is exported. A recovered brain that came back with its
   // documents and without its ledger would answer a question about money from
   // prose alone, silently, which is the exact failure the ledger exists to end.
@@ -137,7 +141,7 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "fin_open_items",
   "fin_reconciliations",
   "fin_reconciliation_claims",
-  // Schema 16: hosted bank-feed connector state. `bank_feed_items` holds the
+  // Schema 18: hosted bank-feed connector state. `bank_feed_items` holds the
   // ENCRYPTED read-only access reference, and a recovered brain that came back
   // without it would look connected and silently read nothing further. The
   // backfill queue comes with it so an interrupted history load resumes rather
@@ -147,13 +151,13 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "bank_feed_items",
   "bank_feed_backfill",
   "bank_feed_link_sessions",
-  // Schema 17: connector OAuth state is entirely live security material.
+  // Schema 19: connector OAuth state is entirely live security material.
   // A recovered brain simply has its connectors re-authorize (dynamic
   // registration makes that automatic), so none of it is exported.
   "oauth_clients",
   "oauth_codes",
   "oauth_tokens",
-  // Schema 19: owner decisions, settings, idempotency receipts, and the one
+  // Schema 21: owner decisions, settings, idempotency receipts, and the one
   // human-readable activity history are durable product state.
   "owner_action_requests",
   "owner_activity_events",
@@ -161,7 +165,7 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "fin_period_closes",
   "owner_targets",
   "owner_preferences",
-  // Schema 20: exact document grants, their immutable audit trail, persistent
+  // Schema 22: exact document grants, their immutable audit trail, persistent
   // idempotency receipts, and privacy-safe passkey telemetry are durable
   // security state. Restoring owner passkeys without their grant authority
   // would either lock scoped users out or risk widening them to owner access.
@@ -259,13 +263,13 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   // Owners re-sign-in with their passkey; that is a tap, not a loss.
   "session_generation",
 ]);
-// Schemas 14 through 20 add owner passkeys, the financial ledger, bank feeds,
+// Schemas 14 through 22 add owner passkeys, capability grants, zones, the financial ledger, bank feeds,
 // connector OAuth, extraction provenance, owner workspace state, and exact
 // document security. The vector protocol itself is unchanged, but the recovery
 // contract tracks the EXACT current schema by design: a drill against a
 // database one migration behind would export a table or column set that does
 // not match the reviewed list. Bumping this is required for every migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 20;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 22;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -274,10 +278,13 @@ function quoteIdentifier(value) {
   return `"${value}"`;
 }
 
-// Schema 15: the structured financial ledger, added as one additive migration.
+const SCHEMA_15_TABLES = Object.freeze(["grants", "grant_credentials"]);
+const SCHEMA_16_TABLES = Object.freeze(["zones"]);
+
+// Schema 17: the structured financial ledger, added as one additive migration.
 // Listed once and consumed twice, by the aggregate projection and by the
 // expected-table gate, so the two cannot drift apart.
-const SCHEMA_15_TABLES = Object.freeze([
+const SCHEMA_17_TABLES = Object.freeze([
   "fin_entities",
   "fin_accounts",
   "fin_account_coverage",
@@ -293,19 +300,19 @@ const SCHEMA_15_TABLES = Object.freeze([
   "fin_reconciliation_claims",
 ]);
 
-// Schema 16: the hosted bank-feed connector's own tables, listed for the same
+// Schema 18: the hosted bank-feed connector's own tables, listed for the same
 // two reasons and consumed the same two ways.
-const SCHEMA_16_TABLES = Object.freeze([
+const SCHEMA_18_TABLES = Object.freeze([
   "bank_feed_items",
   "bank_feed_backfill",
   "bank_feed_link_sessions",
 ]);
 
-// Declared with SCHEMA_15/16 rather than beside SCHEMA_14 further down:
+// Declared here rather than beside SCHEMA_14 further down:
 // AGGREGATE_FIELDS below is built at module load, so a const declared after
 // it is in the temporal dead zone and every import of this module throws.
-const SCHEMA_17_TABLES = Object.freeze(["oauth_clients", "oauth_codes", "oauth_tokens"]);
-const SCHEMA_19_TABLES = Object.freeze([
+const SCHEMA_19_TABLES = Object.freeze(["oauth_clients", "oauth_codes", "oauth_tokens"]);
+const SCHEMA_21_TABLES = Object.freeze([
   "owner_action_requests",
   "owner_activity_events",
   "owner_approvals",
@@ -313,7 +320,7 @@ const SCHEMA_19_TABLES = Object.freeze([
   "owner_targets",
   "owner_preferences",
 ]);
-const SCHEMA_20_TABLES = Object.freeze([
+const SCHEMA_22_TABLES = Object.freeze([
   "document_access_grants",
   "document_access_documents",
   "document_access_requests",
@@ -327,14 +334,14 @@ const AGGREGATE_FIELDS = Object.freeze([
     // Literal zeros keep older migration prefixes queryable without
     // referencing tables they do not have. Passkey restoration correctness is
     // proven by the export content itself, not by the corpus aggregate.
-    // Literal zeros also cover the schema-15 ledger tables, for the same reason
+    // Literal zeros also cover migration-owned durable tables, for the same reason
     // the passkey tables take one: this aggregate is queried against databases
     // at several migration prefixes, and a COUNT against a table a prefix does
     // not have fails the whole snapshot. Ledger restoration correctness is
     // proven by the exported content, which these tables are fully part of.
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
-     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES,
-     ...SCHEMA_19_TABLES, ...SCHEMA_20_TABLES].includes(table)
+     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES, ...SCHEMA_18_TABLES,
+     ...SCHEMA_19_TABLES, ...SCHEMA_21_TABLES, ...SCHEMA_22_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1094,8 +1101,10 @@ function expectedRecoveryTables(migrations) {
     (latest >= 15 || !SCHEMA_15_TABLES.includes(table)) &&
     (latest >= 16 || !SCHEMA_16_TABLES.includes(table)) &&
     (latest >= 17 || !SCHEMA_17_TABLES.includes(table)) &&
+    (latest >= 18 || !SCHEMA_18_TABLES.includes(table)) &&
     (latest >= 19 || !SCHEMA_19_TABLES.includes(table)) &&
-    (latest >= 20 || !SCHEMA_20_TABLES.includes(table)));
+    (latest >= 21 || !SCHEMA_21_TABLES.includes(table)) &&
+    (latest >= 22 || !SCHEMA_22_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {

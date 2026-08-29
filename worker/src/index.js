@@ -20,6 +20,7 @@
  */
 
 import { jsonResponse, privateNoStore, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
+import { resolvePrincipal, principalMay } from "./lib/grants.js";
 import { handleBankFeed } from "./lib/bank-feed.js";
 import { handleBankExportImport, BANK_IMPORT_PATH } from "./lib/fin-upload.js";
 import { handleFinApi, FIN_PATH_PREFIX } from "./lib/fin-api.js";
@@ -39,12 +40,15 @@ import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-int
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
 import { emptyRetrievalDisclosure } from "./lib/retrieval-status.js";
 import {
-  handleOwnerAuth, handleAdminInvite, handleAdminDevices, ownerSessionPrincipal,
+  handleOwnerAuth, handleAdminInvite, handleAdminDevices, handleAdminGrants, handleZones,
+  ownerSessionPrincipal,
 } from "./lib/owner-auth.js";
 import {
   recordDocumentAccessDecision, DocumentAccessUnavailableError,
 } from "./lib/document-access.js";
-import { recordPasskeySecurityEvent } from "./lib/auth-store.js";
+import {
+  findGrantByCredentialHash, recordPasskeySecurityEvent, sourcesInScope,
+} from "./lib/auth-store.js";
 import { handleZoomWebhook } from "./lib/zoom.js";
 import {
   handleOAuthMetadata, handleProtectedResourceMetadata, handleRegister,
@@ -141,7 +145,7 @@ function normalizeRetrievedDocuments(results) {
   return demoteScaffolding([...byKey.values()]);
 }
 
-async function unifiedRetrieve(env, url, { limit, access = null }) {
+async function unifiedRetrieve(env, url, { limit, access = null, scope = { all: true } }) {
   const q = url.searchParams.get("q");
   const rrfK = Math.min(Math.max(parseInt(url.searchParams.get("rrf_k")) || 60, 1), 1e3);
 
@@ -162,13 +166,18 @@ async function unifiedRetrieve(env, url, { limit, access = null }) {
       message: requestWeight(url.searchParams.get("weight_message")),
     },
     access,
+    scope,
   });
 
   return {
     matches: normalizeRetrievedDocuments(r.results),
     degraded: r.degraded,
     degradedReason: r.degraded_reason || null,
-    retrievalScope: access?.kind === "grant" ? "exact_document_ids" : "owner",
+    retrievalScope: access?.kind === "grant"
+      ? "exact_document_ids"
+      : scope && scope.all !== true
+        ? "zones"
+        : "owner",
     access: access?.kind === "grant"
       ? {
         principal: "grant",
@@ -176,7 +185,9 @@ async function unifiedRetrieve(env, url, { limit, access = null }) {
         entity_slug: access.entitySlug,
         document_count: access.documentCount,
       }
-      : { principal: "owner" },
+      : scope && scope.all !== true
+        ? { principal: "grant", scope: "zones" }
+        : { principal: "owner" },
     // A filter the backend cannot apply is surfaced, never dropped. Silently
     // ignoring `client=` returns every client's documents while looking narrowed,
     // which is a confidently wrong answer rather than a missing one.
@@ -430,7 +441,7 @@ function hasMatchingAsOfDate(sentence, docs) {
 
 /* -------------------------------------------------------------- routes */
 
-async function handleUnified(env, request, access = null) {
+async function handleUnified(env, request, access = null, grantScope = { all: true }) {
   const url = await privateRagParameters(request);
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
   const q = url.searchParams.get("q");
@@ -446,7 +457,7 @@ async function handleUnified(env, request, access = null) {
 
   const {
     matches: retrieved, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
-  } = await unifiedRetrieve(env, url, { limit, access });
+  } = await unifiedRetrieve(env, url, { limit, access, scope: grantScope });
   const accessStatus = {
     retrieval_scope: retrievalScope,
     degraded_reason: degradedReason || undefined,
@@ -481,7 +492,7 @@ async function handleUnified(env, request, access = null) {
   });
 }
 
-async function handleThink(env, request, access = null) {
+async function handleThink(env, request, access = null, grantScope = { all: true }) {
   const unsupportedAnswer = "The documents do not answer the question.";
   const url = await privateRagParameters(request);
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
@@ -494,7 +505,7 @@ async function handleThink(env, request, access = null) {
 
   const {
     matches, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
-  } = await unifiedRetrieve(env, url, { limit, access });
+  } = await unifiedRetrieve(env, url, { limit, access, scope: grantScope });
   const results = Array.isArray(matches) ? matches : [];
 
   if (results.length === 0) {
@@ -854,7 +865,7 @@ async function handleThink(env, request, access = null) {
   });
 }
 
-async function handleIngest(env, request) {
+async function handleIngest(env, request, scope = { all: true }) {
   // Checked BEFORE the body is read. The batch route documents exactly this
   // hazard and guards against it; this route, which is the one a client reaches
   // for when testing by hand, had no guard at all. A 40MB document becomes
@@ -910,6 +921,15 @@ async function handleIngest(env, request) {
     return jsonResponse({ error: "source_type, source_id and content (string) are required" }, 400);
   }
 
+  if (scope && scope.all !== true) {
+    const allowed = await sourcesInScope(env, scope);
+    if (!allowed.includes(String(source_type))) {
+      return jsonResponse({
+        error: `"${source_type}" is not a source in a zone you have access to. Ask the owner to place it in your zone first.`,
+      }, 403);
+    }
+  }
+
   // THE GATE. Nothing carrying a live provider credential enters the index,
   // whichever door it arrives through. Named, never quoted: the refusal must
   // be actionable without becoming its own leak.
@@ -961,7 +981,7 @@ async function handleIngest(env, request) {
 const BATCH_MAX_DOCS = 50;
 const BATCH_MAX_BYTES = 1_000_000;
 
-async function handleIngestBatch(env, request) {
+async function handleIngestBatch(env, request, scope = { all: true }) {
   let body;
   try {
     body = await request.json();
@@ -977,6 +997,15 @@ async function handleIngestBatch(env, request) {
       { error: `too many documents: ${docs.length} (max ${BATCH_MAX_DOCS})`, max_docs: BATCH_MAX_DOCS },
       413
     );
+  }
+
+  if (scope && scope.all !== true) {
+    const allowed = new Set(await sourcesInScope(env, scope));
+    if (docs.some((doc) => !allowed.has(String(doc?.source_type || "")))) {
+      return jsonResponse({
+        error: "one or more documents target a source outside this grant's zones. Ask the owner to place each source in an allowed zone first.",
+      }, 403);
+    }
   }
 
   // BYTES, not characters. String.length undercounts by 3x on CJK and by 2x on
@@ -1643,55 +1672,80 @@ export default {
 
     const readRoute = path === "/api/rag/unified" || path === "/api/rag/think";
     const keyAuthorized = readRoute ? validateReadKey(request, env) : validateAdminKey(request, env);
+    let authorized = keyAuthorized;
     let readAccess = null;
-    // A passkey session is accepted exactly where the read-only proxy key is,
-    // but it keeps its identity. Flattening this to a boolean would turn every
-    // scoped passkey back into the owner.
-    if (!keyAuthorized && readRoute) {
-      let principal;
+    let scope = { all: true };
+    if (!authorized && readRoute) {
+      let sessionPrincipal;
       try {
-        principal = await ownerSessionPrincipal(request, env);
+        sessionPrincipal = await ownerSessionPrincipal(request, env);
       } catch (error) {
         const code = error instanceof DocumentAccessUnavailableError
           ? error.code
           : "owner_auth_unavailable";
         return privateNoStore(jsonResponse({ error: "unavailable", code }, 503));
       }
-      if (!principal) {
-        return privateNoStore(jsonResponse({ error: "unauthorized", code: "session_required" }, 401));
-      }
-      if (principal.denied) {
+      if (sessionPrincipal?.denied) {
         return privateNoStore(jsonResponse({
-          error: "forbidden", code: principal.code || "document_access_forbidden",
+          error: "forbidden", code: sessionPrincipal.code || "grant_inactive",
         }, 403));
       }
-      try {
-        await recordPasskeySecurityEvent(env, {
-          rpId: url.hostname,
-          ceremony: "session_use",
-          stage: path === "/api/rag/think" ? "ask" : "search",
-          outcome: "succeeded",
-          reasonCode: "authenticated_read",
-          durationMs: Date.now() - requestStartedAt,
-          principalKind: principal.kind,
-          grantId: principal.grantId,
-        });
-        if (principal.kind === "grant") {
-          await recordDocumentAccessDecision(env, principal, {
-            route: path,
-            decision: "allow",
-            reasonCode: "exact_document_grant",
-            documentCount: principal.documentCount,
-          });
-          readAccess = principal;
+      if (sessionPrincipal) {
+        if (sessionPrincipal.grantType === "document") {
+          authorized = true;
+          readAccess = sessionPrincipal;
+        } else if (principalMay(sessionPrincipal, path)) {
+          authorized = true;
+          scope = sessionPrincipal.scope || { zones: [] };
         }
-      } catch {
-        return privateNoStore(jsonResponse({
-          error: "unavailable", code: "security_audit_unavailable",
-        }, 503));
+        if (authorized) {
+          try {
+            await recordPasskeySecurityEvent(env, {
+              rpId: url.hostname,
+              ceremony: "session_use",
+              stage: path === "/api/rag/think" ? "ask" : "search",
+              outcome: "succeeded",
+              reasonCode: "authenticated_read",
+              durationMs: Date.now() - requestStartedAt,
+              principalKind: sessionPrincipal.kind,
+              grantId: sessionPrincipal.grantId,
+            });
+            if (sessionPrincipal.grantType === "document") {
+              await recordDocumentAccessDecision(env, sessionPrincipal, {
+                route: path,
+                decision: "allow",
+                reasonCode: "exact_document_grant",
+                documentCount: sessionPrincipal.documentCount,
+              });
+            }
+          } catch {
+            return privateNoStore(jsonResponse({
+              error: "unavailable", code: "security_audit_unavailable",
+            }, 503));
+          }
+        }
       }
-    } else if (!keyAuthorized) {
-      return jsonResponse({ error: "unauthorized" }, 401);
+    }
+
+    if (!authorized) {
+      let principal = null;
+      try {
+        principal = await resolvePrincipal(request, env, {
+          lookupCredential: (hash) => findGrantByCredentialHash(env, hash),
+        });
+      } catch {
+        principal = null;
+      }
+      if (principal && principalMay(principal, path)) {
+        authorized = true;
+        scope = principal.scope || { zones: [] };
+      }
+    }
+
+    if (!authorized) {
+      return readRoute
+        ? privateNoStore(jsonResponse({ error: "unauthorized", code: "session_required" }, 401))
+        : jsonResponse({ error: "unauthorized" }, 401);
     }
 
     try {
@@ -1707,16 +1761,22 @@ export default {
         }, 405));
       }
       if (path === "/api/rag/unified" && request.method === "POST") {
-        return privateNoStore(await handleUnified(env, request, readAccess));
+        return privateNoStore(await handleUnified(env, request, readAccess, scope));
       }
       if (path === "/api/rag/think" && request.method === "POST") {
-        return privateNoStore(await handleThink(env, request, readAccess));
+        return privateNoStore(await handleThink(env, request, readAccess, scope));
       }
       if (path === "/api/admin/auth/invite" && request.method === "POST") {
         return handleAdminInvite(env, url);
       }
       if (path.startsWith("/api/admin/auth/devices")) {
         return handleAdminDevices(env, request, path);
+      }
+      if (path.startsWith("/api/admin/auth/grants")) {
+        return handleAdminGrants(env, request, path);
+      }
+      if (path === "/api/admin/brain/zones") {
+        return handleZones(env, request);
       }
       // A bank export the owner downloaded, landing as ledger rows rather than
       // as prose. Operator-only and INSIDE the key gate, unlike the hosted
@@ -1733,10 +1793,10 @@ export default {
         return await handleOcr(env, request);
       }
       if (path === "/api/admin/brain/ingest" && request.method === "POST") {
-        return await handleIngest(env, request);
+        return await handleIngest(env, request, scope);
       }
       if (path === "/api/admin/brain/ingest/batch" && request.method === "POST") {
-        return await handleIngestBatch(env, request);
+        return await handleIngestBatch(env, request, scope);
       }
       if (path === "/api/admin/brain/source-receipt" && request.method === "POST") {
         return await handleSourceReceipt(env, request);
@@ -1790,6 +1850,16 @@ export default {
         const source = body?.source ? String(body.source) : null;
         if (!docUids.length && !families.length && !source) {
           return jsonResponse({ error: "pass doc_uids: [...], families: [...], or source: \"name\"" }, 400);
+        }
+        if (scope && scope.all !== true) {
+          const allowed = await sourcesInScope(env, scope);
+          if (!source || !allowed.includes(source)) {
+            return jsonResponse({
+              error: docUids.length || families.length
+                ? "forgetting by document id or family needs access to every zone. Ask the owner."
+                : `"${source}" is not in a zone you have access to.`,
+            }, 403);
+          }
         }
         // Destructive and irreversible, so it must be asked for explicitly.
         const confirm = body?.confirm === true;
