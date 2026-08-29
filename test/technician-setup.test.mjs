@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { cmdLocalTools } from "../brain.mjs";
 
@@ -18,6 +18,10 @@ import {
 
 const sandbox = mkdtempSync(join(tmpdir(), "brain-technician-test-"));
 const manifestPath = join(sandbox, "brain.manifest.json");
+const fixtureScriptPath = resolve("/fixture/brain.mjs");
+const fixtureNodePath = resolve("/fixture/node");
+const safeBrainPath = resolve("/safe/lib/brain.mjs");
+const safeNodePath = resolve("/safe/bin/node");
 writeFileSync(manifestPath, JSON.stringify({
   client: { slug: "fixture" },
   brain: { domain: "brain.fixture.test" },
@@ -57,13 +61,13 @@ test("setup can create an owner-only Claude workspace guide with locators but no
   const manifest = join(workspace, "brain.manifest.json");
   writeFileSync(manifest, "{}");
   const first = writeClaudeWorkspaceGuide(manifest, {
-    brainCliPath: "/safe/lib/brain.mjs",
-    nodePath: "/safe/bin/node",
+    brainCliPath: safeBrainPath,
+    nodePath: safeNodePath,
   });
   const content = readFileSync(first.path, "utf8");
   assert.equal(first.status, "written");
   assert.ok(content.startsWith(CLAUDE_WORKSPACE_MARKER));
-  assert.match(content, /"\/safe\/bin\/node" "\/safe\/lib\/brain\.mjs"/);
+  assert.ok(content.includes(`${JSON.stringify(safeNodePath)} ${JSON.stringify(safeBrainPath)}`));
   assert.match(content, /claude --add-dir <approved-folder>/);
   assert.match(content, /npx wrangler@4/);
   assert.match(content, /never use a permission-bypass mode/i);
@@ -71,8 +75,8 @@ test("setup can create an owner-only Claude workspace guide with locators but no
   assert.equal(statSync(first.path).mode & 0o777, 0o600);
   assert.equal(
     writeClaudeWorkspaceGuide(manifest, {
-      brainCliPath: "/safe/lib/brain.mjs",
-      nodePath: "/safe/bin/node",
+      brainCliPath: safeBrainPath,
+      nodePath: safeNodePath,
     }).status,
     "verified",
   );
@@ -108,13 +112,13 @@ test("the first technician step verifies local tools before any manifest or acco
   const receipt = await runTechnicianStep({
     step: "tools",
     manifestPath: join(sandbox, "not-created.json"),
-    scriptPath: "/fixture/brain.mjs",
-    nodePath: "/fixture/node",
+    scriptPath: fixtureScriptPath,
+    nodePath: fixtureNodePath,
     baseEnv: { PATH: "/safe/bin", CLOUDFLARE_API_TOKEN: "ambient-secret" },
     spawn: (node, args, options) => { call = { node, args, options }; return { status: 0 }; },
   });
   assert.deepEqual(receipt, { step: "tools", completed: true, commands_run: 1 });
-  assert.deepEqual(call.args, ["/fixture/brain.mjs", "tools"]);
+  assert.deepEqual(call.args, [fixtureScriptPath, "tools"]);
   assert.equal(call.options.env.CLOUDFLARE_API_TOKEN, undefined);
 });
 
@@ -143,8 +147,8 @@ test("Google credentials cross only the child environment, never argv, and input
     step: "google",
     manifestPath,
     flags: {},
-    scriptPath: "/fixture/brain.mjs",
-    nodePath: "/fixture/node",
+    scriptPath: fixtureScriptPath,
+    nodePath: fixtureNodePath,
     baseEnv: { PATH: "/safe/bin", CLOUDFLARE_API_TOKEN: "ambient-secret" },
     readHidden: async () => entered.shift(),
     spawn: (node, args, options) => {
@@ -156,7 +160,7 @@ test("Google credentials cross only the child environment, never argv, and input
     },
   });
   assert.deepEqual(receipt, { step: "google", completed: true, commands_run: 1 });
-  assert.deepEqual(calls[0].args, ["/fixture/brain.mjs", "connect", "google", "--scopes", "drive,gmail,calendar"]);
+  assert.deepEqual(calls[0].args, [fixtureScriptPath, "connect", "google", "--scopes", "drive,gmail,calendar"]);
   assert.doesNotMatch(calls[0].args.join(" "), /fixture-google/);
   assert.equal(calls[0].options.env.GOOGLE_CLIENT_ID, "");
   assert.equal(calls[0].options.env.GOOGLE_CLIENT_SECRET, "");
@@ -176,8 +180,8 @@ test("Zoom collects the exact S2S values, strips ambient secrets, and zeroes eve
   await runTechnicianStep({
     step: "zoom",
     manifestPath,
-    scriptPath: "/fixture/brain.mjs",
-    nodePath: "/fixture/node",
+    scriptPath: fixtureScriptPath,
+    nodePath: fixtureNodePath,
     baseEnv: { PATH: "/safe/bin", BANK_FEED_SECRET: "ambient-bank-secret" },
     readHidden: async () => values.shift(),
     spawn: (node, args, options) => {
@@ -190,7 +194,7 @@ test("Zoom collects the exact S2S values, strips ambient secrets, and zeroes eve
       return { status: 0 };
     },
   });
-  assert.deepEqual(call.args, ["/fixture/brain.mjs", "connect", "zoom", manifestPath]);
+  assert.deepEqual(call.args, [fixtureScriptPath, "connect", "zoom", manifestPath]);
   assert.doesNotMatch(call.args.join(" "), /fixture-account|fixture-client|fixture-webhook/);
   for (const key of ["ZOOM_ACCOUNT_ID", "ZOOM_CLIENT_ID", "ZOOM_CLIENT_SECRET", "ZOOM_WEBHOOK_SECRET_TOKEN"]) {
     assert.equal(call.options.env[key], "");
@@ -204,13 +208,13 @@ test("IMAP passes only non-secret routing values and leaves app-password prompti
     step: "imap",
     manifestPath,
     flags: { host: "imap.example.test", user: "owner@example.test", port: "993", source: "owner-mail" },
-    scriptPath: "/fixture/brain.mjs",
-    nodePath: "/fixture/node",
+    scriptPath: fixtureScriptPath,
+    nodePath: fixtureNodePath,
     baseEnv: { PATH: "/safe/bin", IMAP_PASSWORD: "ambient-secret" },
     spawn: (node, args, options) => { call = { node, args, options }; return { status: 0 }; },
   });
   assert.deepEqual(call.args, [
-    "/fixture/brain.mjs", "connect", "imap", manifestPath,
+    fixtureScriptPath, "connect", "imap", manifestPath,
     "--host", "imap.example.test", "--user", "owner@example.test",
     "--port", "993", "--source", "owner-mail",
   ]);
@@ -223,8 +227,8 @@ test("passkey enrollment refuses before mutation unless the exact final hostname
   const common = {
     step: "passkey",
     manifestPath,
-    scriptPath: "/fixture/brain.mjs",
-    nodePath: "/fixture/node",
+    scriptPath: fixtureScriptPath,
+    nodePath: fixtureNodePath,
     spawn: () => { calls++; return { status: 0 }; },
   };
   await assert.rejects(
@@ -242,8 +246,8 @@ test("verification is ordered and stops at the first failed proof", async () => 
     runTechnicianStep({
       step: "verify",
       manifestPath,
-      scriptPath: "/fixture/brain.mjs",
-      nodePath: "/fixture/node",
+      scriptPath: fixtureScriptPath,
+      nodePath: fixtureNodePath,
       spawn: (_node, args) => {
         commands.push(args[1]);
         return { status: args[1] === "health" ? 1 : 0 };
