@@ -14,6 +14,8 @@
  */
 
 import { listConnections, revokeConnection } from "./connections.js";
+import { ownerSystemStatus } from "./system-status.js";
+import { diagnose, freshnessReport, vectorReadiness } from "./store-d1.js";
 import { jsonResponse } from "./core.js";
 import { verifyRegistration, verifyAssertion, b64uDecode } from "./webauthn.js";
 import {
@@ -246,6 +248,22 @@ export async function handleOwnerAuth(env, request, url, path) {
     const payload = await body(request);
     if (!payload?.credential_id) return jsonResponse({ error: "credential_id required" }, 400);
     return jsonResponse(await revokePasskey(env, String(payload.credential_id)));
+  }
+  if (path === "/api/app/system") {
+    // The owner's own view of their brain's condition, composed from reads
+    // whose admin routes they deliberately cannot reach. See system-status.js
+    // for what is withheld and why.
+    return jsonResponse(await ownerSystemStatus(env, {
+      health: (e) => {
+        const paused = e.VECTOR_DRAIN_MODE === "paused-for-upgrade";
+        return {
+          status: paused ? "paused-for-upgrade" : "ok",
+          accepting_documents: !paused,
+          vector_drain_mode: paused ? "paused-for-upgrade" : "active",
+        };
+      },
+      diagnose, freshness: freshnessReport, vectorReadiness,
+    }));
   }
   if (path === "/api/app/connections/revoke") {
     const payload = await body(request);
