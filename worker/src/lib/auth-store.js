@@ -252,11 +252,11 @@ export async function passkeySecurityStatus(env, rpId) {
          FROM owner_passkeys GROUP BY principal_kind`,
       ).all(),
       env.DB.prepare(
-        `SELECT ceremony, stage, outcome, reason_code, rp_id, count(*) count,
+        `SELECT ceremony, stage, outcome, rp_id, count(*) count,
                 min(duration_ms) min_duration_ms, avg(duration_ms) avg_duration_ms,
                 max(duration_ms) max_duration_ms, max(occurred_at) last_at
          FROM passkey_security_events
-         GROUP BY ceremony, stage, outcome, reason_code, rp_id
+         GROUP BY ceremony, stage, outcome, rp_id
          ORDER BY last_at DESC LIMIT 100`,
       ).all(),
     ]);
@@ -276,7 +276,6 @@ export async function passkeySecurityStatus(env, rpId) {
         ceremony: event.ceremony,
         stage: event.stage,
         outcome: event.outcome,
-        reason_code: event.reason_code,
         rp_id: event.rp_id,
         count: Number(event.count || 0),
         last_at: Number(event.last_at || 0),
