@@ -1567,11 +1567,31 @@ export default {
       // and every failure this product has had lived in the gap between those.
       if (path === "/api/admin/brain/diagnose" && request.method === "GET") {
         if (backendOf(env) !== D1) return jsonResponse({ error: "diagnose applies to the d1 backend only" }, 400);
+        // Owner-only until its findings can be scoped. Several of them carry
+        // `samples`: document titles, URIs, chunk ids, and up to 90 characters
+        // of the provider's raw error text. For a scoped reader that is a
+        // catalogue of the zones they cannot read, delivered by the health
+        // endpoint. Refusing is honest; filtering findings one shape at a time
+        // and getting one wrong is not.
+        if (scope && scope.all !== true) {
+          return jsonResponse({
+            error: "diagnose reports on the whole corpus, including zones you cannot read. Ask the owner to run it.",
+          }, 403);
+        }
         return jsonResponse(await diagnose(env));
       }
       if (path === "/api/admin/brain/freshness" && request.method === "GET") {
         if (backendOf(env) !== D1) return jsonResponse({ error: "freshness applies to the d1 backend only" }, 400);
-        return jsonResponse(await freshnessReport(env));
+        const report = await freshnessReport(env);
+        // One row per source, and a source IS the zone boundary, so an
+        // unfiltered report names every source in the brain and hands over
+        // `reason`, which is the raw connector error verbatim and routinely
+        // contains paths and ids. Narrow it to what this caller can read.
+        if (scope && scope.all !== true && Array.isArray(report?.sources)) {
+          const allowed = new Set(await sourcesInScope(env, scope));
+          return jsonResponse({ ...report, sources: report.sources.filter((r) => allowed.has(r.source ?? r.name)) });
+        }
+        return jsonResponse(report);
       }
       /**
        * Remove documents. DRY RUN BY DEFAULT.

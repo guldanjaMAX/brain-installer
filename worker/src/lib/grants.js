@@ -55,7 +55,17 @@ export const ROUTE_CAPABILITY = Object.freeze({
   "/api/admin/brain/ingest/batch": "file",
   "/api/admin/brain/freshness": "diagnose",
   "/api/admin/brain/diagnose": "diagnose",
-  "/api/admin/brain/drain": "file",
+  // Drain is deliberately NOT grantable, despite reading like a filing step.
+  //
+  // It walks the whole outbox: every queued chunk's text, in every zone, and
+  // hands it to the embedding provider. No text returns to the caller, so it
+  // is not a read in the ordinary sense, but a person scoped to one zone
+  // should not be able to push another zone's documents to a third party on
+  // demand. It also holds a single global lease, so a scoped caller could
+  // stall embedding for the whole brain.
+  //
+  // The cron drains on its own, so nobody is blocked by this. It falls through
+  // to the owner-only default.
   "/api/admin/brain/reindex": "administer",
   "/api/admin/brain/forget": "destroy",
   // Entries for routes that do not exist were removed rather than left as

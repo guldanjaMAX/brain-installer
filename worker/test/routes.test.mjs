@@ -2347,6 +2347,46 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
     unknown.status === 403, String(unknown.status));
 }
 
+
+/* ---- the leaks that carry no document text, and still tell you too much ---- */
+{
+  const { capabilityForRoute } = await import("../src/lib/grants.js");
+
+  check("drain is not grantable: it pushes every zone's text to the embedder",
+    capabilityForRoute("/api/admin/brain/drain") === "administer",
+    capabilityForRoute("/api/admin/brain/drain"));
+
+  const { hashToken } = await import("../src/lib/grants.js");
+  const token = "scoped-diagnoser";
+  const hash = await hashToken(token);
+  const row = {
+    grant_id: "g-books", capabilities: '["ask","diagnose"]',
+    expires_at: null, revoked_at: null, credential_revoked_at: null,
+    scope_include: '{"zones":["books"]}', scope_exclude: '[]',
+  };
+  const base = mkEnv([ROW], { vectorIds: [] });
+  const env = { ...base.env, DB: {
+    prepare(sql) {
+      if (/FROM grant_credentials/.test(sql)) {
+        return { bind: (...b) => ({ async first() { return b[0] === hash ? row : null; },
+          async all() { return { results: [] }; }, async run() { return { meta: { changes: 0 } }; } }) };
+      }
+      return base.env.DB.prepare(sql);
+    },
+  } };
+
+  const diag = await worker.fetch(new Request("https://b.example/api/admin/brain/diagnose", {
+    method: "GET", headers: { "X-Admin-Key": token },
+  }), env, { waitUntil() {} });
+  check("a scoped diagnose grant cannot pull the whole-corpus report",
+    diag.status === 403, String(diag.status));
+
+  const diagBody = await diag.json();
+  check("and the refusal carries no findings, samples or titles",
+    !("findings" in diagBody) && !("samples" in diagBody),
+    JSON.stringify(diagBody).slice(0, 160));
+}
+
 console.log(fail ? `\n${fail} FAILURES` : `\nroutes: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);
 
