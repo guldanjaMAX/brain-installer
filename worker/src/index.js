@@ -21,6 +21,7 @@
 import { jsonResponse, privateNoStore, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
 import { handleBankFeed } from "./lib/bank-feed.js";
 import { handleBankExportImport, BANK_IMPORT_PATH } from "./lib/fin-upload.js";
+import { handleFinApi, FIN_PATH_PREFIX } from "./lib/fin-api.js";
 import {
   hasSensitiveTransportIdentity,
   scanEnvelope as scanEnvelopeSecrets,
@@ -1484,6 +1485,17 @@ export default {
     // admin key; nothing here widens the key gate.
     if (path === "/app/connect/bank" || path.startsWith("/api/bank-feed/")) {
       return handleBankFeed(env, request, url, path, ctx);
+    }
+
+    // The ledger's read routes sit in FRONT of the key gate for the same
+    // reason the bank feed does: the account holder's passkey session IS the
+    // authorisation. Financial position is the most sensitive material in the
+    // product, and asking a client to paste the admin key to see their own
+    // money would train them to hand out a credential that can purge and
+    // reindex. The handler still accepts the admin key as a second tier, so an
+    // operator can see what the client sees without a screen share.
+    if (path.startsWith(FIN_PATH_PREFIX)) {
+      return handleFinApi(env, request, url, path);
     }
 
     // The Zoom webhook sits in FRONT of the key gate because Zoom cannot send
