@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { mintSessionCookie, validateSessionCookie, clearSessionCookie, SESSION_COOKIE } from "../src/lib/sessions.js";
+import {
+  mintSessionCookie, validateSessionCookie, readSessionCookie, clearSessionCookie, SESSION_COOKIE,
+} from "../src/lib/sessions.js";
 
 const env = { SESSION_SIGNING_KEY: "f".repeat(64) };
 const requestWith = (cookie) => new Request("https://brain.example.com/api/app/me", {
@@ -18,6 +20,7 @@ test("a minted session validates for its generation and only its generation", as
   assert.match(setCookie, /Secure/);
   assert.match(setCookie, /SameSite=Strict/);
   assert.equal(await validateSessionCookie(requestWith(cookieValue(setCookie)), env, 1), true);
+  assert.deepEqual(await readSessionCookie(requestWith(cookieValue(setCookie)), env, 1), { grantId: null });
   assert.equal(await validateSessionCookie(requestWith(cookieValue(setCookie)), env, 2), false,
     "bumping the generation is sign-out-everywhere");
 });

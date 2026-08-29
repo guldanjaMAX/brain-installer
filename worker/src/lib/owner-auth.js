@@ -19,7 +19,7 @@ import { diagnose, freshnessReport, vectorReadiness } from "./store-d1.js";
 import { jsonResponse, validateAdminKey } from "./core.js";
 import { verifyRegistration, verifyAssertion, b64uDecode } from "./webauthn.js";
 import {
-  mintSessionCookie, validateSessionCookie, clearSessionCookie,
+  mintSessionCookie, readSessionCookie, clearSessionCookie,
 } from "./sessions.js";
 import {
   issueChallenge, consumeChallenge,
@@ -56,8 +56,22 @@ function challengeFromClientData(clientDataJSON) {
 
 /** Session check used by the read-route gate and every /api/app route. */
 export async function validateOwnerSession(request, env) {
-  if (!appRequest(request)) return false;
-  return validateSessionCookie(request, env, await sessionGeneration(env));
+  return (await ownerSessionPrincipal(request, env)) !== null;
+}
+
+/**
+ * Resolve who is behind the passkey session instead of flattening identity to
+ * a boolean. Owner-write routes must use this function and require kind=owner
+ * plus grantId=null. That positive check remains fail-closed when scoped
+ * passkeys are added later.
+ */
+export async function ownerSessionPrincipal(request, env) {
+  if (!appRequest(request)) return null;
+  const session = await readSessionCookie(request, env, await sessionGeneration(env));
+  if (!session) return null;
+  return session.grantId === null
+    ? { kind: "owner", grantId: null }
+    : { kind: "grant", grantId: session.grantId };
 }
 
 /* ------------------------------------------------------------ admin plane */

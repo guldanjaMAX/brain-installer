@@ -48,19 +48,30 @@ export async function mintSessionCookie(env, generation, now = Date.now()) {
   return `${SESSION_COOKIE}=${value}; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}; HttpOnly; Secure; SameSite=Strict`;
 }
 
-/** True when the request carries a valid, unexpired, current-generation session. */
-export async function validateSessionCookie(request, env, currentGeneration, now = Date.now()) {
-  if (!env.SESSION_SIGNING_KEY) return false;
+/**
+ * Read the principal carried by a valid session.
+ *
+ * Every v1 cookie predates scoped passkeys, so it positively identifies the
+ * owner. Returning a principal instead of a boolean gives owner-write routes a
+ * seam that remains safe when a later cookie version can name somebody else.
+ */
+export async function readSessionCookie(request, env, currentGeneration, now = Date.now()) {
+  if (!env.SESSION_SIGNING_KEY) return null;
   const cookies = request.headers.get("Cookie") || "";
   const match = cookies.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]+)`));
-  if (!match) return false;
+  if (!match) return null;
   const parts = match[1].split(".");
-  if (parts.length !== 4 || parts[0] !== "v1") return false;
+  if (parts.length !== 4 || parts[0] !== "v1") return null;
   const [, expires, generation, signature] = parts;
-  if (!/^\d+$/.test(expires) || Number(expires) <= now) return false;
-  if (String(generation) !== String(currentGeneration)) return false;
+  if (!/^\d+$/.test(expires) || Number(expires) <= now) return null;
+  if (String(generation) !== String(currentGeneration)) return null;
   const expected = await hmac(env.SESSION_SIGNING_KEY, `${expires}.${generation}`);
-  return constantTimeEquals(signature, expected);
+  return constantTimeEquals(signature, expected) ? { grantId: null } : null;
+}
+
+/** True when the request carries a valid, unexpired, current-generation session. */
+export async function validateSessionCookie(request, env, currentGeneration, now = Date.now()) {
+  return (await readSessionCookie(request, env, currentGeneration, now)) !== null;
 }
 
 /** The clearing cookie for sign-out. */
