@@ -311,13 +311,22 @@ export async function ledgerDocuments(
 /** Statement periods for an account, newest first. */
 export async function ledgerStatements(
   env,
-  { tenantId = DEFAULT_TENANT, accountSlug = null, from = null, to = null, limit = 200 } = {},
+  { tenantId = DEFAULT_TENANT, accountSlug = null, entitySlug = null, from = null, to = null, limit = 200 } = {},
 ) {
   const binds = [tenantId];
   let where = "tenant_id = ?";
   if (accountSlug) {
     where += " AND account_slug = ?";
     binds.push(accountSlug);
+  }
+  if (entitySlug) {
+    // Narrowing by entity happens in SQL, not after the read: the LIMIT is
+    // applied first, so filtering afterwards would return an arbitrary subset
+    // of one page with no honest way to say so.
+    where += ` AND account_slug IN (
+      SELECT account_slug FROM fin_accounts
+       WHERE tenant_id = ? AND entity_slug = ? AND ${LIVE})`;
+    binds.push(tenantId, entitySlug);
   }
   if (from) {
     where += " AND period_end >= ?";
@@ -421,8 +430,11 @@ export async function ledgerCashPosition(
     }));
 
   const figures = new Map();
+  let balanceUnavailable = false;
   for (const account of considered) {
-    figures.set(account.account_slug, await confirmedBalanceFor(env, tenantId, account.account_slug));
+    const read = await confirmedBalanceFor(env, tenantId, account.account_slug);
+    balanceUnavailable = balanceUnavailable || read.unavailable;
+    figures.set(account.account_slug, read.figure);
   }
 
   // ISO dates sort chronologically as text, which is why every date in this
@@ -439,11 +451,13 @@ export async function ledgerCashPosition(
         account_slug: account.account_slug,
         // Distinguishing never-connected from connected-but-unread matters: one
         // is a setup step and the other is a waiting statement.
-        reason: account.status === "never_connected"
-          ? "never_connected"
-          : account.coverage_status === "missing"
-            ? "no_records_loaded"
-            : "no_confirmed_figure",
+        reason: balanceUnavailable
+          ? "records_unreachable"
+          : account.status === "never_connected"
+            ? "never_connected"
+            : account.coverage_status === "missing"
+              ? "no_records_loaded"
+              : "no_confirmed_figure",
         coverage_status: account.coverage_status,
         covered_to: account.covered_to,
         last_confirmed_as_of: null,
@@ -476,7 +490,7 @@ export async function ledgerCashPosition(
   const currencies = new Set(covered.map((c) => c.currency));
   const mixed = currencies.size > 1;
   return {
-    unavailable: false,
+    unavailable: balanceUnavailable,
     // The one day every summed figure is true of. Null when nothing is summed.
     as_of: covered.length ? positionAsOf : null,
     // Null rather than a number whenever a number would mean something false.
@@ -503,7 +517,7 @@ export async function ledgerCashPosition(
  * eligible: a figure the extractor was unsure of is not a balance.
  */
 async function confirmedBalanceFor(env, tenantId, accountSlug) {
-  const { results } = await safeAll(
+  const { results, unavailable } = await safeAll(
     env,
     `SELECT period_end AS as_of, closing_balance_minor AS amount_minor, currency,
             'statement' AS figure_source, source_doc_uid, source_feed
@@ -522,14 +536,21 @@ async function confirmedBalanceFor(env, tenantId, accountSlug) {
     [tenantId, accountSlug, tenantId, accountSlug],
   );
   const row = results[0];
-  if (!row) return null;
+  // The flag rides alongside the figure rather than being dropped. Without it
+  // a failed read is indistinguishable from an account that genuinely has no
+  // confirmed figure, and the position reports a coverage gap when the truth
+  // is an outage.
+  if (!row) return { figure: null, unavailable };
   return {
-    as_of: row.as_of,
-    amount_minor: Number(row.amount_minor),
-    currency: row.currency,
-    figure_source: row.figure_source,
-    source_doc_uid: row.source_doc_uid || null,
-    source_feed: row.source_feed || null,
+    unavailable,
+    figure: {
+      as_of: row.as_of,
+      amount_minor: Number(row.amount_minor),
+      currency: row.currency,
+      figure_source: row.figure_source,
+      source_doc_uid: row.source_doc_uid || null,
+      source_feed: row.source_feed || null,
+    },
   };
 }
 
@@ -545,13 +566,22 @@ async function confirmedBalanceFor(env, tenantId, accountSlug) {
  */
 export async function ledgerUnsortedSpending(
   env,
-  { tenantId = DEFAULT_TENANT, accountSlug = null, from = null, to = null } = {},
+  { tenantId = DEFAULT_TENANT, accountSlug = null, entitySlug = null, from = null, to = null } = {},
 ) {
   const binds = [tenantId];
   let where = "tenant_id = ? AND category IS NULL AND removed_at IS NULL AND pending = 0";
   if (accountSlug) {
     where += " AND account_slug = ?";
     binds.push(accountSlug);
+  }
+  if (entitySlug) {
+    // Narrowing by entity happens in SQL, not after the read: the LIMIT is
+    // applied first, so filtering afterwards would return an arbitrary subset
+    // of one page with no honest way to say so.
+    where += ` AND account_slug IN (
+      SELECT account_slug FROM fin_accounts
+       WHERE tenant_id = ? AND entity_slug = ? AND ${LIVE})`;
+    binds.push(tenantId, entitySlug);
   }
   if (from) {
     where += " AND posted_on >= ?";
@@ -960,14 +990,14 @@ export async function ledgerSnapshot(env, { tenantId = DEFAULT_TENANT, entitySlu
     ledgerEntities(env, { tenantId }),
     ledgerAccounts(env, { tenantId, entitySlug }),
     ledgerDocuments(env, { tenantId, entitySlug }),
-    ledgerStatements(env, { tenantId }),
+    ledgerStatements(env, { tenantId, entitySlug }),
     ledgerExceptions(env, { tenantId, entitySlug }),
     ledgerDeadlines(env, { tenantId, entitySlug }),
     ledgerOpenItems(env, { tenantId, entitySlug }),
     ledgerReconciliations(env, { tenantId, entitySlug }),
     ledgerObligations(env, { tenantId, entitySlug }),
     ledgerCashPosition(env, { tenantId, entitySlug }),
-    ledgerUnsortedSpending(env, { tenantId }),
+    ledgerUnsortedSpending(env, { tenantId, entitySlug }),
   ]);
 
   const parts = [entities, accounts, documents, statements, exceptions, deadlines,

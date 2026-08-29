@@ -25,6 +25,21 @@ function constantTimeEquals(a, b) {
   return diff === 0;
 }
 
+/** Prevent browser, proxy, and edge caches from retaining private answers.
+ *
+ *  Lives here rather than in index.js because lib modules serve private data
+ *  too, and a second copy is how two cache policies drift apart. */
+export function privateNoStore(response) {
+  const headers = new Headers(response.headers);
+  headers.set("Cache-Control", "private, no-store, max-age=0");
+  headers.set("Pragma", "no-cache");
+  // Session-authenticated routes vary on the cookie as well. The no-store
+  // above already settles it; this keeps the header honest for any
+  // intermediary that heeds Vary and ignores Cache-Control.
+  headers.set("Vary", "X-Admin-Key, Cookie");
+  return new Response(response.body, { status: response.status, headers });
+}
+
 export function validateAdminKey(request, env) {
   // Secrets belong in headers. Query-string credentials leak too easily into
   // browser history, proxy/access logs, analytics, screenshots and referrers.

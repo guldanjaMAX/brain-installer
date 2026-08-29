@@ -18,7 +18,7 @@
  * entire users/sessions stack, which is the single largest simplification.
  */
 
-import { jsonResponse, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
+import { jsonResponse, privateNoStore, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
 import { handleBankFeed } from "./lib/bank-feed.js";
 import { handleBankExportImport, BANK_IMPORT_PATH } from "./lib/fin-upload.js";
 import {
@@ -84,15 +84,6 @@ async function privateRagParameters(request) {
     searchParams.set(key, String(value));
   }
   return { searchParams };
-}
-
-/** Prevent browser, proxy, and edge caches from retaining private answers. */
-function privateNoStore(response) {
-  const headers = new Headers(response.headers);
-  headers.set("Cache-Control", "private, no-store, max-age=0");
-  headers.set("Pragma", "no-cache");
-  headers.set("Vary", "X-Admin-Key");
-  return new Response(response.body, { status: response.status, headers });
 }
 
 const ROUTE_RANKING_DEPTH = 50;
