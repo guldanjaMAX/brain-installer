@@ -219,19 +219,20 @@ export function checkNode() {
   );
 }
 
-export function checkWrangler() {
-  const r = run("npx", ["wrangler@4", "--version"], {
+export function checkWrangler(runCommand = run) {
+  const r = runCommand("npx", ["wrangler@4", "--version"], {
     timeout: 120_000,
     inheritEnv: false,
     env: localToolEnvironment(),
   });
-  if (r.ok && /\d+\.\d+/.test(r.out)) {
-    return check("wrangler", OK, (r.out.match(/\d+\.\d+\.\d+/) || ["present"])[0]);
+  const version = r.out.match(/\b(\d+)\.(\d+)\.(\d+)\b/);
+  if (r.ok && version && Number(version[1]) === 4) {
+    return check("wrangler", OK, version[0]);
   }
   return check(
     "wrangler",
     FAIL,
-    "could not be run",
+    r.ok && version ? `returned ${version[0]}, but major version 4 is required` : "could not be run",
     "wrangler is fetched on demand by npx, so this usually means no network or a blocked npm registry.\n  Test with: npx wrangler@4 --version"
   );
 }
@@ -358,18 +359,40 @@ export function checkVectorize(accountId) {
   );
 }
 
-export function checkClaudeCode() {
-  const r = run("claude", ["--version"], {
+export function checkClaudeCode({
+  runCommand = run,
+  required = true,
+  platformName = process.platform,
+} = {}) {
+  const r = runCommand("claude", ["--version"], {
     timeout: 30_000,
     inheritEnv: false,
     env: localToolEnvironment(),
   });
-  if (r.ok) return check("Claude Code", OK, (r.out.trim().split("\n")[0] || "present").slice(0, 40));
+  if (r.ok) {
+    const version = (r.out.trim().split("\n")[0] || "present").slice(0, 40);
+    const auth = runCommand("claude", ["auth", "status"], {
+      timeout: 30_000,
+      inheritEnv: false,
+      env: localToolEnvironment(),
+    });
+    if (auth.ok) return check("Claude Code", OK, `${version}; signed in`);
+    return check(
+      "Claude Code",
+      required ? FAIL : WARN,
+      `${version}; installed but not signed in`,
+      "Run `claude auth login` in an interactive terminal and approve the browser sign-in.\n" +
+        "  Then run `claude auth status`, `claude doctor`, and `brain doctor` again."
+    );
+  }
+  const install = platformName === "win32"
+    ? "In PowerShell run: irm https://claude.ai/install.ps1 | iex\n  Close and reopen PowerShell, then run: claude --version\n  Finally run `claude doctor` in that interactive terminal."
+    : "Run: curl -fsSL https://claude.ai/install.sh | bash\n  Close and reopen Terminal, then run: claude --version\n  Finally run `claude doctor` in that interactive terminal.";
   return check(
     "Claude Code",
-    WARN,
-    "not found on PATH",
-    "Optional, but it is how most people will actually use the brain.\n  Install from claude.com/claude-code, then re-run `brain doctor`."
+    required ? FAIL : WARN,
+    required ? "required, but not found on PATH" : "not found on PATH",
+    `${install}\n  Do not use sudo or a permission-bypass mode. Then re-run \`brain doctor\`.`
   );
 }
 
@@ -605,7 +628,14 @@ export async function checkNetwork() {
 }
 
 /** Every check, in the order a person should fix them. */
-export async function runAll({ accountId, onResult, googleStorageStatus, cloudflareToken } = {}) {
+export async function runAll({
+  accountId,
+  onResult,
+  googleStorageStatus,
+  cloudflareToken,
+  requireClaudeCode = true,
+  localRun = run,
+} = {}) {
   const out = [];
   // Each result is handed to the caller the moment it exists, so a slow check
   // shows the ones before it rather than holding the whole report hostage.
@@ -615,11 +645,12 @@ export async function runAll({ accountId, onResult, googleStorageStatus, cloudfl
     return x;
   };
   push(checkNode());
+  push(checkWrangler(localRun));
   push(await checkNetwork());
   out.push(await checkCfToken(cloudflareToken));
   out.push(await checkVectorizeApi(accountId, cloudflareToken));
   out.push(checkAnthropicKey());
-  out.push(checkClaudeCode());
+  out.push(checkClaudeCode({ runCommand: localRun, required: requireClaudeCode }));
   out.push(checkCodex());
   out.push(checkGoogleConnection(googleStorageStatus));
   return out;

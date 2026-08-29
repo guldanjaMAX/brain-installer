@@ -13,11 +13,33 @@ account alone.
 
 | # | Thing | Time | Why |
 |---|---|---|---|
-| 1 | A Cloudflare account | 5 min | Everything lives here. Theirs, not ours |
-| 2 | **Workers Paid plan on it** | 2 min | 5 USD/month minimum. The Free plan is prototype-scale, not a supported production home for a real corpus |
-| 3 | An account-scoped, expiring API token | 5 min | One token drives every Cloudflare step |
+| 1 | Claude Code plus an eligible Claude account | 5 min | Claude Code is part of the owner handoff and is connected directly to the Brain |
+| 2 | Node.js 22 or newer | 5 min | Runs the Brain CLI and the pinned Wrangler 4 command |
+| 3 | A Cloudflare account | 5 min | Everything lives here. Theirs, not ours |
+| 4 | **Workers Paid plan on it** | 2 min | 5 USD/month minimum. The Free plan is prototype-scale, not a supported production home for a real corpus |
+| 5 | An account-scoped, expiring API token | 5 min | One token drives every Cloudflare step |
 
-Nothing else. No Supabase, no second AI vendor, no database password.
+No Supabase, database password, or separate answer-model API key is required.
+The Claude account is for the owner's Claude Code client, not for Worker answers.
+
+## Local tools before Cloudflare
+
+Install Claude Code only from Anthropic's official installer. The owner signs in
+in their own browser. Do not use `sudo`, a permission-bypass mode, or a copied
+Claude credential. Then run:
+
+```bash
+brain tools
+```
+
+The automated part proves the Claude version, `claude auth status`, and
+`npx wrangler@4 --version` in a credential-scrubbed child environment. In a real
+terminal it also opens `claude doctor`, which owns an interactive terminal UI
+and therefore cannot be truthfully replaced by a headless fixture.
+
+Wrangler is fetched on demand at pinned major version 4. It is not installed
+globally and it does not receive ambient Brain, Google, Zoom, bank, or mail
+credentials just to print its version.
 
 ---
 

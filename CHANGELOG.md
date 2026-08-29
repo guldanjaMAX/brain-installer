@@ -9,8 +9,9 @@ the brain, not for whoever built it: what changed for them, and what to check.
 **Your brain now has an owner workspace, scoped sharing, and financial actions,
 without weakening the ingestion and deletion rules underneath them.**
 
-- A new `brain technician` guide turns install day into six reviewed steps for
-  Cloudflare, Google, Zoom, IMAP, the first passkey, and final verification.
+- A new `brain technician` guide turns install day into seven reviewed steps for
+  Claude Code and Wrangler, Cloudflare, Google, Zoom, IMAP, the first passkey,
+  and final verification.
   Its plan is safe for a local coding agent to read, but tokens and secrets stay
   in hidden terminal prompts and the owner still handles login, 2FA, consent,
   billing, and the physical passkey gesture. From a source checkout,
@@ -37,6 +38,13 @@ without weakening the ingestion and deletion rules underneath them.**
   requested, and tolerate the short route and secret warm-up after a fresh
   deploy. `brain setup --no-connect` leaves the operator's AI-tool settings
   untouched when installing on someone else's behalf.
+- Owner installs now require a signed-in Claude Code CLI and a runnable pinned
+  Wrangler 4 before Cloudflare work starts. `brain tools` adds Anthropic's
+  interactive installation doctor to those automated checks. Successful Claude
+  wiring also writes an owner-only `CLAUDE.md` beside the manifest with exact
+  Brain commands, approved-folder discovery rules, and explicit refusal of
+  permission bypass, whole-drive crawling, credential copying, or unapproved
+  direct Cloudflare mutations. An unrelated existing `CLAUDE.md` is preserved.
 - The vector drain now runs every minute by default. It still embeds only after
   the previous batch is confirmed, so extra ticks are no-ops rather than extra
   model work.

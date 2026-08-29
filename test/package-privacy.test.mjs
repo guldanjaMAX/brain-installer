@@ -441,6 +441,7 @@ const expected = [
   "onboarding/09-technician-setup-and-rehearsal.md",
   "operations/admin-key-file.mjs",
   "operations/admin-key-persistence.mjs",
+  "operations/claude-workspace.mjs",
   "operations/cloudflare-token-store.mjs",
   "operations/session-signing-key.mjs",
   "operations/technician-setup.mjs",

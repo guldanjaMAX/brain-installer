@@ -5,8 +5,9 @@ citations, and that tells you plainly when your documents do not contain the
 answer.
 
 It lives entirely inside your own Cloudflare account. Your files, your search
-index, your keys. It connects itself to Claude Code and Codex so you can ask it
-questions from any folder on your machine.
+index, your keys. Claude Code is included in the owner setup commitment, and
+Codex remains an optional second client. The installer connects the Brain to
+whichever supported clients are present without placing a key in their config.
 
 ---
 
@@ -62,24 +63,28 @@ checkout, run `npm run rehearse:onboarding`. It opens the real owner-workspace
 bundle with synthetic data and an unmistakable local-only banner. No account,
 credential, manifest, or deployment is used.
 
-For an install day, `brain technician <manifest>` prints the six-step read-only
+For an install day, `brain technician <manifest>` prints the seven-step read-only
 plan. Add `--json` when a local coding agent is guiding the session. Run one
-reviewed step at a time with `--run cloudflare`, `google`, `zoom`, `imap`,
-`passkey`, or `verify`. The owner still handles login, 2FA, OAuth consent, and
+reviewed step at a time with `--run tools`, `cloudflare`, `google`, `zoom`,
+`imap`, `passkey`, or `verify`. The owner still handles login, 2FA, OAuth consent, and
 the physical passkey gesture. Tokens and app secrets go only into hidden
 terminal prompts, never into agent chat. The complete guide is
 [onboarding/09-technician-setup-and-rehearsal.md](onboarding/09-technician-setup-and-rehearsal.md).
 
-You need two things first. `brain doctor` checks the technical access and tells
+You need three things first. `brain doctor` checks the technical access and tells
 you what to do about anything missing. Cloudflare does not expose the account's
 plan through the scoped install token, so you must confirm **Workers and Pages,
 Plans: Paid** in the dashboard yourself before a production install.
 
-1. **A Cloudflare account on the Workers Paid plan.** 5 USD a month minimum.
+1. **Claude Code and an eligible Claude account.** Install the current native
+   CLI from Anthropic, sign in with `claude auth login`, then run `brain tools`.
+   The command proves the version, sign-in, Anthropic installation doctor, and
+   pinned Wrangler 4. Claude Code's normal approval prompts stay enabled.
+2. **A Cloudflare account on the Workers Paid plan.** 5 USD a month minimum.
    Cloudflare now lets Free accounts create the meaning-search index, but Free
    has prototype-scale vector, daily database-write, and Worker CPU limits. Paid
    is the supported production baseline so a real corpus does not hard-stop.
-2. **A Cloudflare API token**, created in your own account, with exactly four
+3. **A Cloudflare API token**, created in your own account, with exactly four
    permissions: Workers Scripts Edit, D1 Edit, Vectorize Edit and Workers AI
    Read. The token can be limited to your account and given an expiry.
 
@@ -103,8 +108,11 @@ Windows PowerShell:
 
 It asks three short questions and does everything else itself: creates the
 database and search index in your account, deploys the worker, generates and
-saves your key, checks it is alive, and connects the brain to your Claude Code
-and Codex. On macOS a standard setup declares and verifies a login-Keychain
+saves your key, checks it is alive, and connects the brain to Claude Code plus
+an installed Codex client. Successful Claude wiring writes an owner-only
+`CLAUDE.md` beside the manifest. It gives Claude the exact Brain CLI and
+manifest paths, but it does not grant whole-disk access, permission bypass, or
+unapproved Cloudflare changes. On macOS a standard setup declares and verifies a login-Keychain
 item before generating the key. Windows stores only DPAPI CurrentUser
 ciphertext; Linux uses an owner-only adjacent file. An existing legacy Mac
 `.brain-admin-key` remains authoritative instead of being silently moved.

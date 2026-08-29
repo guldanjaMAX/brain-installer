@@ -86,7 +86,10 @@ try {
   await cmdSetup(target, {
     setupWorkerScriptExists: async () => false,
     ask: prompt,
-    doctorRunAll: async () => [],
+    doctorRunAll: async (options) => {
+      assert.equal(options.requireClaudeCode, true);
+      return [];
+    },
     listCloudflareAccounts: async () => [oneAccount],
     configureStandardAdminKeyStorage: () => ({ changed: false }),
     prepareSetupAdminKey: async () => ({ source: "generated", value: key, plan: { backend: "file" } }),
@@ -124,12 +127,19 @@ try {
       events.push("wire");
       assert.equal(manifest.infrastructure.cloudflare.d1_database_id, "fixture-d1");
       assert.equal(manifest.brain.domain, "clean-brain.owner-subdomain.workers.dev");
-      return { wired: [], failures: [], skipped: [] };
+      return { wired: ["Claude Code"], failures: [], skipped: [] };
+    },
+    writeClaudeWorkspaceGuide: (path, options) => {
+      events.push("claude-guide");
+      assert.equal(path, target);
+      assert.ok(options.brainCliPath);
+      assert.ok(options.nodePath);
+      return { path: join(sandbox, "Financial Brain", "CLAUDE.md"), status: "written" };
     },
     backlogCount: async () => 0,
     installedManifestOptions,
   });
-  assert.deepEqual(events, ["verify", "provision", "migrate", "deploy", "secrets", "drain", "health", "wire"]);
+  assert.deepEqual(events, ["verify", "provision", "migrate", "deploy", "secrets", "drain", "health", "wire", "claude-guide"]);
   const saved = JSON.parse(readFileSync(target, "utf8"));
   assert.equal(saved.infrastructure.cloudflare.account_id, oneAccount.id);
   assert.equal(saved.brain.domain, "clean-brain.owner-subdomain.workers.dev");

@@ -1,5 +1,6 @@
 import { run, localToolEnvironment, cloudflareCliEnvironment,
          checkNode, checkClaudeCode, checkCodex, checkAnthropicKey, checkGoogleConnection,
+         checkWrangler,
          checkWranglerLogin, checkVectorize, checkVectorizeApi, checkCfToken, CF_TOKEN_SCOPES,
          summarize, runAll, OK, WARN, FAIL } from "../doctor.mjs";
 let fail = 0, ran = 0;
@@ -11,7 +12,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     accountId: "0000",
     googleStorageStatus: { exists: false, description: "fixture secure storage" },
   });
-  check("doctor runs every check without throwing", all.length >= 7, String(all.length));
+  check("doctor runs every check without throwing", all.length >= 8, String(all.length));
   const bad = all.filter((x) => x.status !== OK && !x.fix);
   check("every non-ok check carries remediation text", bad.length === 0, JSON.stringify(bad.map((b) => b.name)));
   check("each check names itself and reports a status", all.every((x) => x.name && [OK, WARN, FAIL].includes(x.status)));
@@ -22,9 +23,25 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 {
   const node = checkNode();
   check("Node on this machine passes", node.status === OK, JSON.stringify(node));
-  // Claude Code and Codex are how people USE the brain, but an install completes
-  // without them, so they must never block one.
-  check("Claude Code is never fatal", checkClaudeCode().status !== FAIL);
+  const missingTool = () => ({ ok: false, out: "not found", missing: true });
+  const healthyTool = (_command, args) => ({
+    ok: true,
+    out: args.includes("wrangler@4") ? "wrangler 4.34.0" :
+      args.includes("status") ? "" : "2.1.63 (Claude Code)",
+  });
+  check("Claude Code is a blocking owner-install requirement",
+    checkClaudeCode({ runCommand: missingTool }).status === FAIL);
+  check("the explicit technician-machine exception can keep Claude advisory",
+    checkClaudeCode({ runCommand: missingTool, required: false }).status === WARN);
+  check("a present Claude Code CLI passes",
+    checkClaudeCode({ runCommand: healthyTool }).status === OK);
+  const signedOutTool = (_command, args) => args.includes("status")
+    ? { ok: false, out: "signed out" }
+    : { ok: true, out: "2.1.63 (Claude Code)" };
+  check("an installed but signed-out Claude Code is not a false green",
+    checkClaudeCode({ runCommand: signedOutTool }).status === FAIL);
+  check("Wrangler 4 is a blocking requirement and is pinned through npx",
+    checkWrangler(healthyTool).status === OK);
   check("Codex is never fatal", checkCodex().status !== FAIL);
   check("a missing Anthropic key is not a blocker", checkAnthropicKey().status !== FAIL);
   check("a missing Google connection is a warning",

@@ -89,9 +89,9 @@ The brain runs entirely inside accounts you own. I never hold a copy of your dat
 
 **5.5** Do you have a domain you would like this to live on? Something like brain.yourcompany.com.
 
-**5.6** What computer will you run the install from: Windows or Mac? And do you already use **Claude Code** or **Codex** on it? Either works, both is fine, and the brain will be wired into whichever you have.
+**5.6** What computer will you run the install from: Windows or Mac? Which eligible Claude account will the owner use for **Claude Code**? Claude Code is part of the delivered setup, not an optional add-on. Codex can also be connected when the owner already uses it.
 
-**5.7** Before our session, run the preflight on that machine and send me what it prints. It takes two minutes and checks Node, your Cloudflare sign-in, Vectorize access, and your AI tools. The Paid-plan proof is the dashboard screenshot from 5.3. The exact commands are in the setup sheet I will send with the installer; the last line should say "ready to install".
+**5.7** Before our session, run `brain tools`, then the full preflight on that machine and send me what it prints. The first command checks Claude Code, Claude sign-in, Anthropic's interactive doctor, and Wrangler 4. The full preflight checks Node, Cloudflare access, Vectorize, and local clients. The Paid-plan proof is the dashboard screenshot from 5.3. The last line should say "ready to install".
 
 > Why I ask: every answer above can also be checked by the preflight, and the preflight does not misremember. When 5.7 comes back green, the install session is boring, which is the goal.
 

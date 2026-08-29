@@ -96,6 +96,8 @@ import {
   runAll as doctorRunAll,
   summarize as doctorSummarize,
   checkBankFeedRedirect,
+  checkClaudeCode,
+  checkWrangler,
   OK as D_OK,
   WARN as D_WARN,
   FAIL as D_FAIL,
@@ -114,6 +116,7 @@ import {
   recordSupportEvent,
 } from "./support-journal.mjs";
 import { readAdminKeyFile, validateAdminKeyValue } from "./operations/admin-key-file.mjs";
+import { writeClaudeWorkspaceGuide } from "./operations/claude-workspace.mjs";
 import {
   loadStoredCloudflareToken,
   storeCloudflareToken,
@@ -10473,6 +10476,7 @@ export async function captureSetupD1Bookmark(manifestPath, options = {}) {
 export async function cmdSetup(manifestPath, options = {}) {
   const flags = options.flags ?? parseFlags(process.argv.slice(3));
   assertKnownFlags(flags, ["manifest", "path", "no-connect"], "brain setup");
+  const skipConnect = shouldSkipSetupConnections(flags, options);
   const prompt = options.ask ?? ask;
   console.log(`\n  ${c.bold("brain setup")}  ${c.dim("nothing to a working brain")}\n`);
 
@@ -10482,6 +10486,11 @@ export async function cmdSetup(manifestPath, options = {}) {
   const checks = await runDoctorChecks({
     accountId: undefined,
     cloudflareToken: activeCloudflareToken(),
+    // A setup performed on the owner's machine includes Claude Code as a
+    // delivered capability. --no-connect is the explicit technician-machine
+    // exception and must not force the client's local assistant onto the
+    // technician's laptop.
+    requireClaudeCode: !skipConnect,
   });
   for (const x of checks) {
     const mark = x.status === D_OK ? c.green("ok  ") : x.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
@@ -10721,7 +10730,6 @@ export async function cmdSetup(manifestPath, options = {}) {
   // own laptop, every install silently leaves an MCP server pointing at that
   // client's brain behind, with no uninstall, which contradicts revoking access
   // at handoff. `--no-connect` is the way to say "not this machine".
-  const skipConnect = shouldSkipSetupConnections(flags, options);
   let wiring = { wired: [], failures: [] };
   if (skipConnect) {
     console.log(`\n  ${c.bold("Step 5 of 6")}  connecting it to your AI tools\n`);
@@ -10743,6 +10751,26 @@ export async function cmdSetup(manifestPath, options = {}) {
         "  but setup will not claim the connection works. Rerun setup or use `brain mcp-config <manifest>`;\n" +
         "  no credential needs to be copied into a command."
     );
+  }
+  if (wired.includes("Claude Code")) {
+    try {
+      const writeGuide = options.writeClaudeWorkspaceGuide ?? writeClaudeWorkspaceGuide;
+      const guide = writeGuide(target, {
+        brainCliPath: options.brainCliPath || fileURLToPath(import.meta.url),
+        nodePath: options.nodePath || process.execPath,
+      });
+      if (guide.status === "written" || guide.status === "verified") {
+        ok(`Claude Code owner workspace ready at ${guide.path}`);
+      } else {
+        warn(`preserved the existing CLAUDE.md at ${guide.path}; add the Financial Brain safety guide manually`);
+      }
+    } catch {
+      closePrompts();
+      die(
+        "the Brain is connected to Claude Code, but its owner workspace guide could not be written safely. " +
+          "No existing CLAUDE.md was replaced. Fix the manifest folder and rerun setup."
+      );
+    }
   }
 
   /* --- 6. the first thing worth looking at --- */
@@ -10786,8 +10814,12 @@ export async function cmdSetup(manifestPath, options = {}) {
   if (wired.length) {
     console.log(`  It is connected to: ${wired.join(", ")}.`);
     console.log(`  ${c.dim("Restart them, then ask a question about your own material.")}\n`);
+  } else if (skipConnect) {
+    console.log(`  Owner handoff still requires Claude Code connection on the owner's machine:`);
+    console.log(`    brain mcp-config ${shownTarget}\n`);
   } else {
-    console.log(`  Optional: connect it to Claude Code or Codex with:\n    brain mcp-config ${shownTarget}\n`);
+    console.log(`  No AI tool registration was reported. Verify Claude Code with \`brain tools\`, then run:`);
+    console.log(`    brain mcp-config ${shownTarget}\n`);
   }
 }
 
@@ -12881,6 +12913,58 @@ async function cmdTechnicianInteractive(manifestPath) {
   return cmdTechnician(manifestPath, parseFlags(process.argv.slice(3)));
 }
 
+/**
+ * Verify the owner-facing local toolchain without touching Cloudflare.
+ *
+ * Version and sign-in checks are non-interactive and safe to automate.
+ * `claude doctor` owns a full-screen terminal UI, so it is run only when the
+ * caller really has a TTY. This keeps release tests deterministic while still
+ * giving the owner Anthropic's own installation diagnosis on install day.
+ */
+export async function cmdLocalTools(options = {}) {
+  const runCommand = options.runCommand ?? run;
+  const claude = checkClaudeCode({ runCommand, required: true });
+  const wrangler = checkWrangler(runCommand);
+  console.log(`\n  ${c.bold("Financial Brain local tools")}\n`);
+  for (const item of [claude, wrangler]) {
+    const mark = item.status === D_OK ? c.green("ok  ") : c.red("FAIL");
+    console.log(`  ${mark}  ${item.name.padEnd(18)}  ${item.detail}`);
+  }
+  const failed = [claude, wrangler].filter((item) => item.status === D_FAIL);
+  if (failed.length) {
+    console.log(`\n  ${c.bold("What to do")}\n`);
+    for (const item of failed) {
+      console.log(`  ${c.red(item.name)}\n    ${item.fix.split("\n").join("\n    ")}\n`);
+    }
+    die("the required local tools are not ready. Fix those items and rerun `brain tools`.");
+  }
+
+  const hasTty = options.isTTY ?? (process.stdin.isTTY === true && process.stdout.isTTY === true);
+  if (!hasTty) {
+    warn("Claude Code's full installation doctor needs an interactive terminal and was not run here.");
+    info("Run `claude doctor` in Terminal before the owner handoff.");
+    return { claude: "ready", wrangler: "ready", claude_doctor: "requires_interactive_terminal" };
+  }
+
+  console.log(`\n  ${c.bold("Claude Code installation doctor")}\n`);
+  const runClaudeDoctor = options.runClaudeDoctor ?? (() => spawnSync(
+    "claude",
+    ["doctor"],
+    {
+      stdio: "inherit",
+      env: localToolEnvironment(),
+      shell: process.platform === "win32",
+      windowsHide: true,
+    },
+  ));
+  const result = await runClaudeDoctor();
+  if (result?.error || result?.status !== 0) {
+    die("`claude doctor` did not complete cleanly. Fix its message and rerun `brain tools`.");
+  }
+  ok("Claude Code, sign-in, and Wrangler 4 are ready");
+  return { claude: "ready", wrangler: "ready", claude_doctor: "passed" };
+}
+
 /** Mint a one-time passkey enrollment link for the brain's owner. */
 async function cmdInvite(manifestPath) {
   const { m } = loadManifest(manifestPath);
@@ -13335,6 +13419,7 @@ const commands = {
   rollback: dispatchRollback,
   schedule: cmdSchedule,
   support: cmdSupport,
+  tools: cmdLocalTools,
   technician: cmdTechnicianInteractive,
 };
 
@@ -13346,6 +13431,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain setup      [manifest] --no-connect  same, without touching THIS computer's AI tool config
     brain ask        <manifest>            ask a private question in this terminal
     brain doctor     [manifest]            check this machine has everything it needs
+    brain tools                            verify Claude Code sign-in and Wrangler 4 locally
     brain verify     <manifest>            check the token and resolve the account
     brain provision  <manifest>            create D1 (and R2), write IDs back
     brain secrets    <manifest>            set secrets and durably rotate ADMIN_KEY

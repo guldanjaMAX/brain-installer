@@ -17,6 +17,13 @@ import { resolve } from "node:path";
 
 export const TECHNICIAN_STEPS = Object.freeze([
   Object.freeze({
+    id: "tools",
+    title: "Install and verify Claude Code, the Brain CLI, and Wrangler",
+    dashboard_url: "https://financialbrain.ai/install",
+    human_boundary: "The owner signs in to Claude in their browser. The technician runs Anthropic's interactive doctor and never enables permission bypass.",
+    automated_proof: "The installer verifies the Claude CLI version and sign-in, runs claude doctor in a real terminal, and runs the pinned Wrangler 4 CLI with a credential-scrubbed environment.",
+  }),
+  Object.freeze({
     id: "cloudflare",
     title: "Install the private Brain",
     dashboard_url: "https://dash.cloudflare.com/profile/api-tokens",
@@ -115,7 +122,7 @@ export function technicianPlan(manifestPath, deps = {}) {
   }
   const manifest = readManifestSummary(manifestPath, deps);
   return {
-    schema_version: 1,
+    schema_version: 2,
     mode: "read_only_plan",
     proof_level: "workflow_only",
     manifest,
@@ -128,7 +135,8 @@ export function technicianPlan(manifestPath, deps = {}) {
     ],
     steps: TECHNICIAN_STEPS.map((step, index) => {
       let state = "not_checked";
-      if (step.id === "cloudflare" && !manifest.exists) state = "ready_to_start";
+      if (step.id === "tools") state = "ready_to_start";
+      if (step.id === "cloudflare" && !manifest.exists) state = "ready_after_local_tools";
       if (["google", "zoom", "imap", "passkey", "verify"].includes(step.id) && !manifest.exists) {
         state = "blocked_until_install_record_exists";
       }
@@ -192,6 +200,7 @@ function childCommands(step, manifestPath, flags, scriptPath) {
   const path = resolve(manifestPath);
   const command = (...args) => [scriptPath, ...args];
   switch (step) {
+    case "tools": return [command("tools")];
     case "cloudflare": return [command("setup", path)];
     case "google": return [command("connect", "google", "--scopes", String(flags.scopes || "drive,gmail,calendar"))];
     case "zoom": return [command("connect", "zoom", path)];
@@ -253,7 +262,7 @@ export async function runTechnicianStep({
   }
   if (!manifestPath || !scriptPath) throw new Error("the technician step needs a manifest and installer path");
   const summary = readManifestSummary(manifestPath, manifestDeps);
-  if (step !== "cloudflare" && !summary.exists) {
+  if (!["tools", "cloudflare"].includes(step) && !summary.exists) {
     throw new Error("the install manifest does not exist yet. Run the cloudflare step first.");
   }
   if (step === "google") {

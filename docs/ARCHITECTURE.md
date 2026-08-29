@@ -60,7 +60,7 @@ the same packaging caution as private evaluation data.
 | D1 schema | `migrations/d1/` | Append-only schema and data migrations |
 | Extraction | `ingest/` | File walking, format extraction, quality checks, dates, splitting, batching, resume state |
 | Google sources | `connectors/google-auth.mjs`, `google-drive.mjs`, `gmail.mjs`, `google-calendar.mjs` | OAuth storage and source-specific listing, cursor, export, and envelope logic |
-| Local operations | `operations/` | Admin-key persistence and macOS unattended scheduling (Drive, iMessage capture, watched folder) |
+| Local operations | `operations/` | Admin-key persistence, Claude owner-workspace guidance, and macOS unattended scheduling (Drive, iMessage capture, watched folder) |
 | MCP | `components/brain-mcp.mjs`, `brain-mcp-runtime.mjs` | Tool surface and runtime resolution of the current durable admin key |
 | Acceptance and eval | `acceptance.mjs`, `eval/`, `report*.mjs` | Install checks, retrieval measurement, regression comparison, owner-facing reports |
 | Migration | `migration/` | One-time Supabase corpus and message-session import |
@@ -76,7 +76,9 @@ live path.
 
 `brain setup` is intentionally ordered:
 
-1. Run local preflight checks.
+1. Run local preflight checks, including a signed-in Claude Code CLI for an
+   owner-machine install and pinned Wrangler 4. A deliberate `--no-connect`
+   technician-machine install keeps Claude advisory on that machine.
 2. Create or resume the manifest, declare durable admin-key storage, and
    prepare the exact desired key before remote changes.
 3. Verify the scoped token and account, then provision D1 and Vectorize. A new
@@ -85,7 +87,9 @@ live path.
    deploys and verifies the paused compatibility Worker, waits the declared
    20-minute old-invocation window, migrates, and deploys active mode.
 4. Persist and read back the admin key, set Worker secrets, and verify health.
-5. Register locator-only MCP entries for supported AI tools.
+5. Register locator-only MCP entries for supported AI tools. When Claude Code
+   is connected, write an owner-only `CLAUDE.md` beside the manifest with exact
+   locators and safe approved-folder rules. Preserve an unrelated existing file.
 6. Optionally ingest the first folder and report the vector backlog.
 
 Deploy must happen before Worker secrets because Cloudflare attaches secrets to

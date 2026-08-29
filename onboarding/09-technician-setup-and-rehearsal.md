@@ -2,7 +2,7 @@
 
 The owner should not have to understand OAuth, webhook validation, terminal
 environment variables, or passkey relying-party rules. The technician workflow
-turns those details into six small ceremonies. It does not hide the parts only
+turns those details into seven small ceremonies. It does not hide the parts only
 the account owner can do.
 
 ## Try the owner experience with no accounts
@@ -52,9 +52,21 @@ next reviewed command. It contains no credentials. An agent may guide the
 browser and explain each page, but the owner enters every token or secret into
 the hidden terminal prompt. Do not paste one into agent chat.
 
-## Six steps
+## Seven steps
 
-### 1. Cloudflare install
+### 1. Local tools
+
+Use the owner-facing `/install` page to install Node.js, Claude Code, and the
+released Brain CLI. The owner signs in to Claude in their own browser. Then run:
+
+```bash
+brain technician "$HOME/Financial Brain/brain.manifest.json" --run tools
+```
+
+This proves the Claude CLI version and sign-in, runs Anthropic's interactive
+doctor, and verifies pinned Wrangler 4. It never enables permission bypass.
+
+### 2. Cloudflare install
 
 ```bash
 brain technician "$HOME/Financial Brain/brain.manifest.json" --run cloudflare
@@ -65,7 +77,7 @@ token, and enters it into the hidden prompt. The existing setup command performs
 the account check, provisioning, migrations, deploy, key persistence, and
 health proof. It is safe to rerun after an interruption.
 
-### 2. Google
+### 3. Google
 
 Enable `google_drive`, `gmail`, and `calendar` in the manifest, then run:
 
@@ -78,7 +90,7 @@ client ID and optional client secret are entered at hidden prompts. Google
 consent stays in the owner's browser. The launcher passes the values only to the
 short-lived connector process and clears its input buffers afterward.
 
-### 3. Zoom
+### 4. Zoom
 
 Enable `zoom` in the manifest. A paid Zoom seat with cloud recording is
 required. Then run:
@@ -93,7 +105,7 @@ The event subscription is `recording.transcript_completed`. The command probes
 the account, writes the four Worker secrets, and proves the live validation
 challenge before it prints the webhook URL to save in Zoom.
 
-### 4. IMAP
+### 5. IMAP
 
 Enable `imap` in the manifest. Use the provider's IMAP host and an app password,
 not the normal mailbox password:
@@ -106,7 +118,7 @@ brain technician "$HOME/Financial Brain/brain.manifest.json" --run imap \
 The app password is requested by the connector's hidden prompt. It is stored
 only after a real mailbox read succeeds.
 
-### 5. Owner passkey
+### 6. Owner passkey
 
 Settle the final Brain hostname first. With the owner and intended device
 present, run:
@@ -121,7 +133,7 @@ single-use link that expires in 15 minutes. The owner opens it on their device
 and completes Face ID, fingerprint, or device PIN. This is the first point where
 a physical passkey becomes proven.
 
-### 6. Handoff checks
+### 7. Handoff checks
 
 ```bash
 brain technician "$HOME/Financial Brain/brain.manifest.json" --run verify
@@ -141,6 +153,7 @@ connector as live-proven only after its exact acceptance event occurs.
 | Enter a credential | Hidden terminal or provider UI | Never type or echo it |
 | Run installer and connector checks | May observe | Yes |
 | Complete passkey gesture | Yes, on their device | Observe result only |
+| Approve a named folder for Claude | Yes | Preview files read-only; never assume whole-drive access |
 | Record proof and unresolved gaps | Confirm result | Yes |
 
 ## Live acceptance events

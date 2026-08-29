@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { cmdLocalTools } from "../brain.mjs";
 
 import {
   TECHNICIAN_RUN_STEPS,
@@ -10,6 +11,10 @@ import {
   technicianChildEnvironment,
   technicianPlan,
 } from "../operations/technician-setup.mjs";
+import {
+  CLAUDE_WORKSPACE_MARKER,
+  writeClaudeWorkspaceGuide,
+} from "../operations/claude-workspace.mjs";
 
 const sandbox = mkdtempSync(join(tmpdir(), "brain-technician-test-"));
 const manifestPath = join(sandbox, "brain.manifest.json");
@@ -27,6 +32,64 @@ writeFileSync(manifestPath, JSON.stringify({
 
 test.after(() => rmSync(sandbox, { recursive: true, force: true }));
 
+test("local tool readiness proves Claude sign-in, pinned Wrangler, and the interactive Claude doctor", async () => {
+  const calls = [];
+  const receipt = await cmdLocalTools({
+    isTTY: true,
+    runCommand: (command, args, options) => {
+      calls.push({ command, args, options });
+      if (command === "npx") return { ok: true, out: "wrangler 4.34.0" };
+      if (args[0] === "--version") return { ok: true, out: "2.1.63 (Claude Code)" };
+      if (args.join(" ") === "auth status") return { ok: true, out: "fixture status intentionally hidden" };
+      return { ok: false, out: "unexpected fixture command" };
+    },
+    runClaudeDoctor: async () => ({ status: 0 }),
+  });
+  assert.deepEqual(receipt, { claude: "ready", wrangler: "ready", claude_doctor: "passed" });
+  assert.ok(calls.some((call) => call.command === "claude" && call.args.join(" ") === "auth status"));
+  assert.ok(calls.some((call) => call.command === "npx" && call.args.join(" ") === "wrangler@4 --version"));
+  assert.ok(calls.every((call) => call.options.inheritEnv === false));
+});
+
+test("setup can create an owner-only Claude workspace guide with locators but no credentials", () => {
+  const workspace = join(sandbox, "claude-workspace");
+  mkdirSync(workspace);
+  const manifest = join(workspace, "brain.manifest.json");
+  writeFileSync(manifest, "{}");
+  const first = writeClaudeWorkspaceGuide(manifest, {
+    brainCliPath: "/safe/lib/brain.mjs",
+    nodePath: "/safe/bin/node",
+  });
+  const content = readFileSync(first.path, "utf8");
+  assert.equal(first.status, "written");
+  assert.ok(content.startsWith(CLAUDE_WORKSPACE_MARKER));
+  assert.match(content, /"\/safe\/bin\/node" "\/safe\/lib\/brain\.mjs"/);
+  assert.match(content, /claude --add-dir <approved-folder>/);
+  assert.match(content, /npx wrangler@4/);
+  assert.match(content, /never use a permission-bypass mode/i);
+  assert.doesNotMatch(content, /CLOUDFLARE_API_TOKEN|ADMIN_KEY|client_secret|app_password/);
+  assert.equal(statSync(first.path).mode & 0o777, 0o600);
+  assert.equal(
+    writeClaudeWorkspaceGuide(manifest, {
+      brainCliPath: "/safe/lib/brain.mjs",
+      nodePath: "/safe/bin/node",
+    }).status,
+    "verified",
+  );
+});
+
+test("an unrelated Claude workspace guide is preserved byte-for-byte", () => {
+  const workspace = join(sandbox, "existing-claude-workspace");
+  mkdirSync(workspace);
+  const manifest = join(workspace, "brain.manifest.json");
+  const target = join(workspace, "CLAUDE.md");
+  writeFileSync(manifest, "{}");
+  writeFileSync(target, "owner instructions\n");
+  const result = writeClaudeWorkspaceGuide(manifest, { brainCliPath: "/safe/bin/brain" });
+  assert.equal(result.status, "preserved_unrelated_existing_file");
+  assert.equal(readFileSync(target, "utf8"), "owner instructions\n");
+});
+
 test("the plan is read-only, ordered, honest about proof, and agent-readable", () => {
   const missing = join(sandbox, "not-created.json");
   const plan = technicianPlan(missing);
@@ -34,9 +97,25 @@ test("the plan is read-only, ordered, honest about proof, and agent-readable", (
   assert.equal(plan.proof_level, "workflow_only");
   assert.deepEqual(plan.steps.map((step) => step.id), TECHNICIAN_RUN_STEPS);
   assert.equal(plan.steps[0].state, "ready_to_start");
+  assert.equal(plan.steps[1].state, "ready_after_local_tools");
   assert.match(plan.warning, /No account.*proven/i);
   assert.match(JSON.stringify(plan), /never paste/i);
   assert.doesNotMatch(JSON.stringify(plan), /client_secret|app_password|api_token/i);
+});
+
+test("the first technician step verifies local tools before any manifest or account exists", async () => {
+  let call;
+  const receipt = await runTechnicianStep({
+    step: "tools",
+    manifestPath: join(sandbox, "not-created.json"),
+    scriptPath: "/fixture/brain.mjs",
+    nodePath: "/fixture/node",
+    baseEnv: { PATH: "/safe/bin", CLOUDFLARE_API_TOKEN: "ambient-secret" },
+    spawn: (node, args, options) => { call = { node, args, options }; return { status: 0 }; },
+  });
+  assert.deepEqual(receipt, { step: "tools", completed: true, commands_run: 1 });
+  assert.deepEqual(call.args, ["/fixture/brain.mjs", "tools"]);
+  assert.equal(call.options.env.CLOUDFLARE_API_TOKEN, undefined);
 });
 
 test("the child environment strips ambient credentials and unrelated application state", () => {
