@@ -94,7 +94,7 @@ import {
   GATE_VERSION as CREDENTIAL_GATE_VERSION,
 } from "./worker/src/lib/secret-scan.js";
 import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mjs";
-import { runAll as doctorRunAll, summarize as doctorSummarize, checkBankFeedRedirect, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY } from "./doctor.mjs";
+import { runAll as doctorRunAll, summarize as doctorSummarize, checkBankFeedRedirect, OK as D_OK, WARN as D_WARN, FAIL as D_FAIL, VECTORIZE_REMEDY, CF_TOKEN_REJECTED_REMEDY, isCredentialRejection } from "./doctor.mjs";
 import { CANNOT_CHECK as D_CANNOT_CHECK, checkSignInAddress, normalizeHostname, upgradePauseRecurrence } from "./doctor.mjs";
 import { runPreinstall, formatPreinstallReport, preinstallExitCode, platformLabel } from "./doctor.mjs";
 import { recordedReleaseState, releaseStateBanner } from "./operations/release-state.mjs";
@@ -595,6 +595,34 @@ function saveManifest(path, m) {
   writeFileSync(path, JSON.stringify(m, null, 2) + "\n");
 }
 
+/**
+ * The shortest path a person can retype, which is not always the relative one.
+ *
+ * The success screen is the last thing a client reads, and it rendered the
+ * manifest as `../../../../../../../private/tmp/...` because the manifest sat
+ * outside the working directory (bench, 2026-08-28). Seven levels of `..` in
+ * the command they are told to run looks broken. Prefer relative only when it
+ * is genuinely shorter and does not climb out of sight.
+ */
+function displayPath(target) {
+  const absolute = resolve(target);
+  const rel = relative(process.cwd(), absolute);
+  if (!rel) return absolute;
+  const climbs = (rel.match(/(^|[/\\])\.\.($|[/\\])/g) || []).length;
+  if (climbs > 1 || rel.length >= absolute.length) return absolute;
+  return rel;
+}
+
+/** Exported only so a test can pin the display rule without a real install. */
+export function displayPathForTesting(target, cwd) {
+  const absolute = resolve(target);
+  const rel = relative(cwd, absolute);
+  if (!rel) return absolute;
+  const climbs = (rel.match(/(^|[/\\])\.\.($|[/\\])/g) || []).length;
+  if (climbs > 1 || rel.length >= absolute.length) return absolute;
+  return rel;
+}
+
 function commandPath(value) {
   const text = String(value).replace(/[\r\n"]/g, "");
   return /^[a-z0-9_./:\\-]+$/i.test(text) ? text : `"${text}"`;
@@ -696,14 +724,32 @@ export async function chooseSetupAccount(prompt, options = {}) {
 
 /* ------------------------------------------------------------- commands */
 
+/**
+ * The bucket this manifest asks for, or null when it asks for none.
+ *
+ * Verify and provision have to agree about whether R2 is in play, and they did
+ * not. A blank name is not a request.
+ */
+export function r2BucketRequested(cfg) {
+  const name = String(cfg?.r2_bucket ?? "").trim();
+  return name || null;
+}
+
 async function cmdVerify(manifestPath) {
   const { m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
   ok(`token valid, account "${acct.name}" (${acct.id})`);
 
   // R2 needs separate activation and a card on file, even for the free tier.
-  // It is the most common mid-install surprise, so it is checked up front.
-  try {
+  // It is the most common mid-install surprise, so it is checked up front, but
+  // ONLY when the manifest names a bucket. Provision skipped its R2 step in
+  // silence for a manifest with no bucket while verify probed R2 anyway and
+  // told the owner to add a payment method for storage this brain never
+  // touches (bench, 2026-08-28, F-09). One predicate, read by both.
+  const r2Bucket = r2BucketRequested(m.infrastructure?.cloudflare);
+  if (!r2Bucket) {
+    info("this install does not use R2 file storage, so it is not checked");
+  } else try {
     await cf(`/accounts/${acct.id}/r2/buckets`);
     ok("R2 is enabled");
   } catch (e) {
@@ -953,7 +999,7 @@ export async function assertAdoptable(acctId, db, dbName, slug, query = d1Query)
   }
 }
 
-async function cmdProvision(manifestPath) {
+async function cmdProvision(manifestPath, { nextSteps = true } = {}) {
   const { path, m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
   info(`provisioning into "${acct.name}" (${acct.id})`);
@@ -985,7 +1031,8 @@ async function cmdProvision(manifestPath) {
   cfg.d1_database_id = db.uuid;
 
   // R2, optional. A failure here is not fatal: the brain runs without it.
-  if (cfg.r2_bucket) {
+  // Same predicate verify uses, so the two can never disagree again.
+  if (r2BucketRequested(cfg)) {
     try {
       const buckets = await cf(`/accounts/${acct.id}/r2/buckets`);
       const found = (buckets.buckets || []).find((b) => b.name === cfg.r2_bucket);
@@ -1005,7 +1052,19 @@ async function cmdProvision(manifestPath) {
 
   // Vectorize, when the manifest asks for the Cloudflare-only storage path.
   if ((cfg.storage || "d1") === "d1") {
-    const idxName = cfg.vectorize_index || `${m.client?.slug || "client"}-brain`;
+    // The template ships `vectorize_index: "filled_in_by_provisioner"`, which
+    // reads like a value the provisioner replaces. It does not: this name is
+    // the index name. Because the placeholder is a truthy string, it used to
+    // sail straight through and create a real Vectorize index literally called
+    // "filled_in_by_provisioner" (observed on a clean install, 2026-08-28).
+    // Worse, a SECOND install in the same account then adopts that same index
+    // and two clients share one vector store. Treat the placeholder as unset.
+    const PLACEHOLDER_INDEX_NAME = "filled_in_by_provisioner";
+    const configuredIndex =
+      cfg.vectorize_index && cfg.vectorize_index !== PLACEHOLDER_INDEX_NAME
+        ? cfg.vectorize_index
+        : null;
+    const idxName = configuredIndex || `${m.client?.slug || "client"}-brain`;
     // 768 and cosine are NOT free choices. They are the output shape of
     // @cf/baai/bge-base-en-v1.5, the model the worker embeds with. An index
     // built at other dimensions rejects every vector, and one built with a
@@ -1138,7 +1197,19 @@ async function cmdProvision(manifestPath) {
   // safe to run without secrets (it carries keep_bindings, so a later deploy
   // preserves them), which makes deploy-then-secrets the only order that works
   // from nothing.
-  info("next: brain migrate <manifest>, then deploy, then secrets, then health");
+  // Printed only when a person ran `brain provision` directly. Setup runs this
+  // same step and then keeps going, so the hint there is noise mid-install.
+  //
+  // The order was right and the hint was still a dead end (bench, 2026-08-28).
+  // It names four commands and the fourth stops, because nothing in that list
+  // creates an admin key: only `brain setup` generates and persists one.
+  if (nextSteps) {
+    info(
+      "next: brain migrate <manifest>, then deploy, then secrets, then health.\n" +
+        "        Those four finish only on a brain that already has an admin key. Nothing in\n" +
+        "        that list creates one; `brain setup <manifest>` creates it and runs all four."
+    );
+  }
 }
 
 function collectWorkerFiles(root) {
@@ -1527,7 +1598,14 @@ export async function cmdDeploy(manifestPath, options = {}) {
       );
     }
   }
-  info("next: brain secrets <manifest>, then brain health <manifest>");
+  // Same reasoning as provision: suppressed when setup drives the step.
+  if (options.nextSteps !== false) {
+    info(
+      "next: brain secrets <manifest>, then brain health <manifest>.\n" +
+        "        `brain secrets` applies this brain's admin key and never creates one. If this\n" +
+        "        brain has no key yet, `brain setup <manifest>` creates it and finishes the install."
+    );
+  }
 }
 
 /**
@@ -5109,6 +5187,44 @@ function editDistance(a, b) {
     }
   }
   return prev[b.length];
+}
+
+/**
+ * Refuse a flag the command does not know, instead of running as if it were
+ * never typed.
+ *
+ * parseFlags is deliberately permissive: it turns any `--word` into a key so
+ * that every command can read whatever it likes without registering anything.
+ * The cost is that a flag nobody reads is indistinguishable from a flag that
+ * worked. That is tolerable for a flag that only adds output. It is not
+ * tolerable for a recovery flag: a real install ran
+ * `brain doctor <manifest> --repair-checksum` against a release that did not
+ * contain it, got ordinary doctor output and exit 0, and reasonably concluded
+ * the repair had run and found nothing to fix. Nothing had run at all.
+ *
+ * So a command that can change data validates its own flags and exits nonzero
+ * on one it does not recognise.
+ */
+export function assertKnownFlags(flags, known, command) {
+  const allowed = new Set(known);
+  const unknown = Object.keys(flags).filter((key) => !allowed.has(key));
+  if (unknown.length === 0) return;
+
+  const listed = [...allowed].sort().map((f) => `--${f}`).join(", ");
+  const lines = unknown.map((key) => {
+    const near = [...allowed]
+      .map((candidate) => [candidate, editDistance(key, candidate)])
+      .filter(([, distance]) => distance <= 3)
+      .sort((a, b) => a[1] - b[1])[0];
+    return near ? `unknown option --${key} for \`${command}\`. Did you mean --${near[0]}?` : `unknown option --${key} for \`${command}\`.`;
+  });
+
+  die(
+    `${lines.join("\n")}\n` +
+      `\n  This exits nonzero rather than continuing, because a flag that is silently\n` +
+      `  ignored looks exactly like a flag that ran and had nothing to do.\n` +
+      `\n  Options ${command} accepts: ${listed}`,
+  );
 }
 
 async function resolveBase(m, acct) {
@@ -10932,7 +11048,7 @@ export async function cmdSetup(manifestPath, options = {}) {
 
   /* --- 2. the manifest, asked for once --- */
   const target = manifestPath || flags.manifest || "./brain.manifest.json";
-  const shownTarget = commandPath(relative(process.cwd(), target));
+  const shownTarget = commandPath(displayPath(target));
   let m;
   if (existsSync(target)) {
     m = loadManifest(target).m;
@@ -10987,7 +11103,7 @@ export async function cmdSetup(manifestPath, options = {}) {
   /* --- 3. the install sequence, in the ONLY order that works --- */
   console.log(`\n  ${c.bold("Step 3 of 6")}  creating the brain in your Cloudflare account\n`);
   await (options.cmdVerify ?? cmdVerify)(target);
-  await (options.cmdProvision ?? cmdProvision)(target);
+  await (options.cmdProvision ?? cmdProvision)(target, { nextSteps: false });
   const migrateSetup = options.cmdMigrate ?? cmdMigrate;
   const deploySetup = options.cmdDeploy ?? cmdDeploy;
   const healthSetup = options.cmdHealth ?? cmdHealth;
@@ -11099,13 +11215,13 @@ export async function cmdSetup(manifestPath, options = {}) {
       }
       throw error;
     }
-    await deploySetup(target);
+    await deploySetup(target, { nextSteps: false });
   } else if (!setupOriginalPin.manifest.brain?.domain) {
     // The compatibility deploys use the immutable execution copy and suppress
     // local writes. A rare legacy manifest with no saved route gets one final
     // ordinary active deploy solely to persist its token-free URL.
     revalidateUpdateManifest(setupOriginalPin, "setup domain persistence");
-    await deploySetup(target, { pauseVectorDrainForUpgrade: false });
+    await deploySetup(target, { pauseVectorDrainForUpgrade: false, nextSteps: false });
   }
   // Provision and deploy write resource IDs and the token-free live address.
   // Everything below must use the committed manifest, not setup's old template.
@@ -11149,12 +11265,27 @@ export async function cmdSetup(manifestPath, options = {}) {
   });
 
   /* --- 5. wire it into the tools people actually use --- */
-  console.log(`\n  ${c.bold("Step 5 of 6")}  connecting it to your AI tools\n`);
-  const connectAgents = options.wireAgents ?? wireAgents;
-  const wiring = await connectAgents(m, target, {
-    ...(options.agentOptions || {}),
-    existingOnly: false,
-  });
+  //
+  // Skippable, because this step edits config files belonging to WHOEVER RAN
+  // the command, not to the brain. When the owner installs their own brain that
+  // is the whole point. When someone installs on a client's behalf from their
+  // own laptop, every install silently leaves an MCP server pointing at that
+  // client's brain behind, with no uninstall, which contradicts revoking access
+  // at handoff. `--no-connect` is the way to say "not this machine".
+  const skipConnect = process.argv.includes("--no-connect") || options.connectAgents === false;
+  let wiring = { wired: [], failures: [] };
+  if (skipConnect) {
+    console.log(`\n  ${c.bold("Step 5 of 6")}  connecting it to your AI tools\n`);
+    info("skipped (--no-connect). Nothing on this computer was changed.");
+    info(`connect a machine later with: brain mcp-config ${shownTarget}`);
+  } else {
+    console.log(`\n  ${c.bold("Step 5 of 6")}  connecting it to your AI tools\n`);
+    const connectAgents = options.wireAgents ?? wireAgents;
+    wiring = await connectAgents(m, target, {
+      ...(options.agentOptions || {}),
+      existingOnly: false,
+    });
+  }
   const wired = Array.isArray(wiring) ? wiring : (wiring?.wired || []);
   const wiringFailures = Array.isArray(wiring) ? [] : (wiring?.failures || []);
   if (wiringFailures.length) {
@@ -11973,6 +12104,17 @@ export function resolveAdminKey(manifestPath, {
 function crash(err) {
   const msg = err && err.message ? err.message : String(err);
   const supportEventId = recordSupportFailure(err, { unexpected: true });
+  // A refused credential is not a bug in this tool, and saying so is worse than
+  // saying nothing: a mistyped or expired token is the single most likely
+  // install-day mistake, and "not something you did wrong" is the one sentence
+  // that stops the owner from fixing it (bench, 2026-08-28).
+  if (isCredentialRejection(err)) {
+    console.error(`\n${c.red("fail")}  Cloudflare refused the credential: ${msg}`);
+    console.error("  " + CF_TOKEN_REJECTED_REMEDY.split("\n").join("\n  "));
+    console.error("\n  Nothing was created or half-written. Re-run once the token is right.");
+    printSupportReceipt(supportEventId, (line) => console.error(line));
+    process.exit(1);
+  }
   console.error(`\n${c.red("unexpected error")}  ${msg}`);
   console.error("  This is a bug in the installer, not something you did wrong.");
   console.error("  Every command here is safe to run again: nothing is left half-written that");
@@ -11994,6 +12136,35 @@ function crash(err) {
  * now either answers, fails with a reason, or gives up out loud.
  */
 const HTTP_TIMEOUT_MS = 60_000;
+
+/**
+ * A response body fit to print to a person.
+ *
+ * A clean install once ended with a Cloudflare error page pasted into the
+ * terminal, opening `<!DOCTYPE html>` and three IE conditional comments
+ * (bench, 2026-08-28). The install was fine. Nothing in that output told the
+ * owner so, and nothing in it was actionable. A body that is not JSON is not
+ * from the brain, so say what it is and keep the bytes for the issue note.
+ */
+/** How many times a fresh deploy 404 is treated as route warm-up, not failure. */
+const DRAIN_ROUTE_WARMUP_ATTEMPTS = 10;
+/** Individual warm-up delays stop doubling here, so the wait stays legible. */
+const DRAIN_ROUTE_WARMUP_MAX_DELAY_MS = 30_000;
+
+export function summariseResponseBody(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return "the response had no body";
+  try {
+    const parsed = JSON.parse(text);
+    const message = parsed?.error || parsed?.message || parsed?.errors?.[0]?.message;
+    return message ? String(message).slice(0, 200) : text.slice(0, 200);
+  } catch { /* not JSON: fall through */ }
+  if (/^\s*<(?:!doctype|html|head|body)\b/i.test(text)) {
+    return "the reply was a web page, not this brain. That usually means the address " +
+      "is not serving the worker yet, or a proxy answered instead of it";
+  }
+  return text.replace(/\s+/g, " ").slice(0, 160);
+}
 
 function translatedHttpFailure(error, url, { timeoutMs = HTTP_TIMEOUT_MS, what = "the request" } = {}) {
   let host = "the server";
@@ -13144,6 +13315,7 @@ export async function runDrainLoop({
   const yieldAfterMs = Math.max(1_000, Math.min(busyYieldMs, maxDurationMs));
 
   let drained = 0;
+  let routeWarmups = 0;
   let submitted = 0;
   let remaining = null;
   let rounds = 0;
@@ -13210,8 +13382,52 @@ export async function runDrainLoop({
       await wait(delayMs);
       continue;
     }
-
-    if (!res.ok) die(`drain failed (${res.status}): ${raw.slice(0, 200)}`);
+    // A worker deployed seconds ago can 404 because its workers.dev route is not
+    // live yet, which made a completely healthy clean install exit 1 (bench,
+    // 2026-08-28). /health returned ok moments later. Give the route a short
+    // warm-up before believing a 404, bounded so a genuinely wrong address still
+    // fails promptly rather than spinning until the deadline.
+    // 404: the workers.dev route is not live yet. 401: the secrets were set
+    // seconds ago and this worker instance has not picked them up. Both are a
+    // brand-new install being asked a question before it can answer, both were
+    // observed ending a perfectly healthy setup with exit 1 (bench, 2026-08-28),
+    // and both clear on their own within a minute or two.
+    if ((res.status === 404 || res.status === 401) && routeWarmups < DRAIN_ROUTE_WARMUP_ATTEMPTS) {
+      const delayMs = Math.min(
+        2_000 * 2 ** routeWarmups,
+        DRAIN_ROUTE_WARMUP_MAX_DELAY_MS,
+        Math.max(0, deadline - now())
+      );
+      if (delayMs > 0) {
+        routeWarmups += 1;
+        info(
+          (res.status === 401
+            ? "the brain is not accepting this key yet (401). Secrets set seconds ago take a moment to reach it. "
+            : "the brain's address is not answering yet (404). This is normal just after a deploy. ") +
+          `Retrying ${routeWarmups}/${DRAIN_ROUTE_WARMUP_ATTEMPTS} in ` +
+          `${Math.ceil(delayMs / 1_000)} second(s).`
+        );
+        await wait(delayMs);
+        continue;
+      }
+    }
+    if (!res.ok) {
+      // Everything before drain has already succeeded by this point, so a
+      // failure here is "the brain is built but not finished embedding", not
+      // "the install failed". Say which, and give the one command that resumes.
+      const detail = summariseResponseBody(raw);
+      if ((res.status === 404 || res.status === 401) && routeWarmups >= DRAIN_ROUTE_WARMUP_ATTEMPTS) {
+        die(
+          `the brain is built, but it did not start answering in time (${res.status}).\n` +
+          `  Nothing is wrong with what was created: everything up to this point succeeded.\n` +
+          `  A new address can take a few minutes to go live. Check it with:\n` +
+          `    curl ${base}/health\n` +
+          `  then finish the embedding with:\n` +
+          `    brain drain <manifest>`
+        );
+      }
+      die(`drain failed (${res.status}): ${detail}`);
+    }
     const receipt = validateDrainReceipt(body);
     everAcquired = true;
     blockedSince = null;
@@ -13753,6 +13969,10 @@ async function dispatchRollback(manifestPath) {
   return cmdRollbackInteractive(manifestPath, bookmark, { confirmed: flags.yes === true });
 }
 
+/** Every option `brain doctor` reads. Anything else is a typo or a flag from a
+ * release this one is not. */
+const DOCTOR_FLAGS = ["repair", "rollback", "repair-checksum", "yes", "preinstall"];
+
 /**
  * `brain doctor [manifest]` with no flags stays the existing pure preflight.
  * `brain doctor <manifest> --repair|--rollback [--yes]` is the stuck-upgrade
@@ -13766,6 +13986,7 @@ async function dispatchRollback(manifestPath) {
  */
 async function dispatchDoctor(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
+  assertKnownFlags(flags, DOCTOR_FLAGS, "brain doctor");
   const repairRequested = flags.repair === true;
   const rollbackRequested = flags.rollback === true;
   const repairChecksumRequested = flags["repair-checksum"] === true;
@@ -14063,6 +14284,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
 
   install
     brain setup      [manifest]            nothing to a working brain, one command
+    brain setup      [manifest] --no-connect  same, without touching THIS computer's AI tool config
     brain ask        <manifest>            ask a private question in this terminal
     brain preinstall                       BEFORE install day, on the CLIENT's machine: every
                                            blocker, plus what cannot be checked from here

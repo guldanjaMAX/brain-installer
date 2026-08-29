@@ -25,7 +25,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tokenStorageStatus } from "./connectors/google-auth.mjs";
+import {
+  tokenStorageStatus,
+  verifyTokenStorageReadable,
+} from "./connectors/google-auth.mjs";
 import {
   credentialStoreDescription,
   probeCredentialStore,
@@ -57,18 +60,49 @@ export const FAIL = "fail";
  *     created a 768-dimensional index and all six metadata indexes through the
  *     API. Wrangler login is therefore a fallback, not a prerequisite.
  */
+/**
+ * Plan and limits. Shared, because both the "no token yet" and the "token
+ * cannot reach Vectorize" paths need it and only one of them should also be
+ * told to RECREATE a token it does not have yet.
+ */
+export const CF_PLAN_NOTE =
+  "  Workers Paid (5 USD monthly minimum) is the supported production baseline.\n" +
+  "  Free can create Vectorize, but its vector, daily-write, and CPU limits are\n" +
+  "  prototype-scale and can hard-stop a real corpus.";
+
 export const VECTORIZE_REMEDY =
   "  Recreate the account-scoped token with Vectorize: Edit. That is the standard\n" +
   "  path and has been verified for index and metadata-index creation.\n" +
   "  Temporary fallback: run `npx wrangler@4 login` in the account owner's browser.\n" +
   "  Provision can use that session for Vectorize while the API token drives the\n" +
   "  remaining steps.\n" +
-  "  Workers Paid (5 USD monthly minimum) is the supported production baseline.\n" +
-  "  Free can create Vectorize, but its vector, daily-write, and CPU limits are\n" +
-  "  prototype-scale and can hard-stop a real corpus.";
+  CF_PLAN_NOTE;
 
 /** The token scopes, in one place, for the same reason. */
 export const CF_TOKEN_SCOPES = ["Workers Scripts: Edit", "D1: Edit", "Vectorize: Edit", "Workers AI: Read"];
+
+/**
+ * What to do when Cloudflare rejects the credential.
+ *
+ * One copy, because two commands used to disagree about whose fault it is.
+ * `brain verify` routed a rejected token to the unexpected-error handler and
+ * told the owner "This is a bug in the installer, not something you did wrong"
+ * (bench, 2026-08-28), which is false and is the one sentence that stops a
+ * person from fixing the most common install-day mistake there is.
+ */
+export const CF_TOKEN_REJECTED_REMEDY =
+  "The value in CLOUDFLARE_API_TOKEN is not a token Cloudflare will accept.\n" +
+  "  Check it was copied whole, with no leading or trailing spaces, and that it\n" +
+  "  has not expired or been deleted: dash.cloudflare.com > My Profile > API Tokens.\n" +
+  `  Scopes: ${CF_TOKEN_SCOPES.join(", ")}.\n` +
+  "  Then run `brain setup` or `brain update` in an interactive terminal; it asks for the token without echo.";
+
+/** Does this failure mean the credential was refused, rather than the tool misbehaving? */
+export function isCredentialRejection(error) {
+  const text = String(error?.message ?? error ?? "");
+  if (/\b(9109|10000)\b/.test(text) && /\b40[13]\b/.test(text)) return true;
+  return /invalid access token|authentication error|unauthori[sz]ed|token has expired/i.test(text);
+}
 
 const IS_WIN = platform() === "win32";
 
@@ -450,7 +484,7 @@ export function checkAnthropicKey() {
   );
 }
 
-export function checkGoogleConnection(storageStatus) {
+export function checkGoogleConnection(storageStatus, verify = verifyTokenStorageReadable) {
   const stored = storageStatus ?? tokenStorageStatus();
   if (stored.exists && (stored.migrationPending || stored.backend === "legacy-file")) {
     const windowsLegacy = stored.migrationPending === true || /Windows|DPAPI/i.test(stored.description || "");
@@ -463,7 +497,26 @@ export function checkGoogleConnection(storageStatus) {
         : "The next Drive, Gmail, or Calendar use migrates a still-valid token to this Mac's login Keychain. If Google rejects the old token, reconnect with `brain connect google`."
     );
   }
-  if (stored.exists) return check("Google connection", OK, `token stored in ${stored.description}`);
+  if (stored.exists) {
+    // A file being present is not the same as a credential being readable. On
+    // Windows the DPAPI envelope header is 29 plaintext bytes, so a blob
+    // written by another Windows user, or one whose master key no longer
+    // resolves, looks perfect to a header check and fails on first real use.
+    // Open it here, where it is cheap to fix, rather than mid-ingest on
+    // install day. No credential value is read back or printed.
+    const opened = verify ? verify() : { checked: false, readable: true };
+    if (opened.checked && !opened.readable) {
+      return check(
+        "Google connection",
+        FAIL,
+        `a credential is stored in ${stored.description} but cannot be opened`,
+        `${opened.reason}\n  No credential value was read or printed.\n` +
+          "  This usually means the record belongs to a different user or machine than the one running now.\n" +
+          "  Fix it with: brain connect google --scopes drive,gmail",
+      );
+    }
+    return check("Google connection", OK, `token stored in ${stored.description}`);
+  }
   if (stored.error) {
     return check(
       "Google connection",
@@ -484,23 +537,58 @@ export function checkGoogleConnection(storageStatus) {
  * The scoped API token drives every Cloudflare step. Wrangler login is only a
  * fallback for an older or incorrectly scoped token.
  */
-export function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_TOKEN) {
-  // Presence, and only presence. This says nothing about whether Cloudflare
-  // accepts the token or whether it carries the scopes the install needs, so it
-  // must not be worded as if it did. `brain preinstall` proves both.
-  if (cloudflareToken) return check("Cloudflare token", OK,
-    "present in this environment (not yet proven against Cloudflare; run `brain preinstall`)");
+export async function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_TOKEN) {
+  if (cloudflareToken) {
+    // Presence is not validity. A typo'd, revoked, or expired token used to
+    // report "ok  ready to install" and then fail deep inside provisioning,
+    // which is the worst place to learn it. One cheap call settles it here.
+    try {
+      const res = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+        headers: { authorization: `Bearer ${cloudflareToken}` },
+        signal: AbortSignal.timeout(15_000),
+      });
+      let payload = null;
+      try { payload = await res.json(); } catch { /* status below is enough */ }
+      if (res.ok && payload?.success && payload?.result?.status === "active") {
+        return check("Cloudflare token", OK, "verified and active");
+      }
+      const detail = (payload?.errors || []).map((x) => x.message).filter(Boolean).join("; ")
+        || `HTTP ${res.status}`;
+      const expired = /expired/i.test(detail) || payload?.result?.status === "expired";
+      return check(
+        "Cloudflare token",
+        FAIL,
+        expired ? "the token has expired" : `Cloudflare rejected this token: ${detail.slice(0, 120)}`,
+        "The value in CLOUDFLARE_API_TOKEN is not a token Cloudflare will accept.\n" +
+          "  Check it was copied whole, with no leading or trailing spaces, and that it\n" +
+          "  has not expired or been deleted: dash.cloudflare.com > My Profile > API Tokens.\n" +
+          `  Scopes: ${CF_TOKEN_SCOPES.join(", ")}.\n` +
+          "  Then run `brain setup` or `brain update` in an interactive terminal; it asks for the token without echo.\n" +
+          CF_PLAN_NOTE
+      );
+    } catch (e) {
+      // Offline or blocked. Do not claim the token is bad, and do not claim it is good.
+      return check(
+        "Cloudflare token",
+        WARN,
+        `set, but could not be verified (${String(e.message).slice(0, 60)})`,
+        "The token is present but this machine could not reach api.cloudflare.com to check it.\n" +
+          "  Re-run `brain doctor` once the network is back. A VPN or corporate filter can\n" +
+          "  also block it: Cloudflare WARP in particular breaks this call from inside a VM."
+      );
+    }
+  }
   return check(
     "Cloudflare token",
     FAIL,
     "CLOUDFLARE_API_TOKEN is not set",
-    "Create one in the CLIENT's account: dash.cloudflare.com > My Profile > API Tokens.\n" +
+    "Create one in the Cloudflare account that will own this brain: dash.cloudflare.com > My Profile > API Tokens.\n" +
       `  Scopes: ${CF_TOKEN_SCOPES.join(", ")}.
 ` +
       "  Set \'Expires on\' to tomorrow. Nothing here needs to outlive the install.\n" +
       "  Then run `brain setup` or `brain update` in an interactive terminal; it asks for the token without echo.\n" +
       "  Low-level automation must inject it through an approved secret manager, never a pasted shell command.\n" +
-      VECTORIZE_REMEDY
+      CF_PLAN_NOTE
   );
 }
 
@@ -631,7 +719,7 @@ export async function runAll({ accountId, onResult, googleStorageStatus, cloudfl
   push(checkNode());
   push(checkCredentialStore());
   push(await checkNetwork());
-  push(checkCfToken(cloudflareToken));
+  push(await checkCfToken(cloudflareToken));
   push(await checkVectorizeApi(account, cloudflareToken));
   push(checkAnthropicKey());
   push(checkClaudeCode());

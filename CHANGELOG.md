@@ -4,174 +4,167 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.2.0
+
+**Your brain can now read your messages, your meetings, and your money.**
+This is the largest release so far. Until now a brain could read your
+Drive and your Gmail. It can now take in the places most of your working
+life actually happens, and it is worth being precise about what each one
+costs you and what it cannot do.
+
+**Your texts, live, if you have a Mac.** `brain connect imessage` first
+verifies the one macOS permission this needs, by actually reading the
+Messages database rather than trusting a setting. If the grant is
+missing it prints the exact steps and installs nothing, instead of
+installing something that fails quietly every minute. Then it loads your
+history in front of you, with counts, and only then schedules ongoing
+capture, which is a short pass about once a minute. A new text appears
+within about a minute. A sleeping Mac captures nothing until it wakes,
+and `brain sources` says so rather than implying freshness. SMS rides
+along when your iPhone's Text Message Forwarding is on, tagged
+separately. Honest limits: this needs a Mac, full stop, because Apple
+exposes message history nowhere else. People appear as a phone number or
+email, not a Contacts name. Tapbacks and attachment-only messages are
+counted and skipped, so a thread here is thinner than on your phone.
+
+**WhatsApp, on Windows as well as Mac.** `brain connect whatsapp` pairs
+as a linked device and captures onward. On Windows it installs the
+supervision the machine actually allows, and tells you which rung it
+got, rather than claiming a level of reliability it does not have. If
+nothing supervises the capture, the source is labelled unscheduled, not
+manual, because a source that only runs when you remember is not a
+schedule. The export path is still there and still needs no pairing.
+
+**Zoom, with the debt written down.** A transcript Zoom announces but
+does not deliver becomes a recorded debt, retried on a tick this install
+already runs, and cleared when it lands. A recovered brain comes back
+still knowing which transcripts it owes. You are told what happens when
+a transcript does not load, instead of it silently never arriving.
+
+**Email beyond Gmail.** An IMAP connector reads the mailbox of everyone
+who is not on Google.
+
+**An iPhone backup** can be loaded directly, for history that predates
+any connector.
+
+**Your money, as structured records rather than text.** Bank data comes
+in from export files or a hosted feed into a real ledger, so a question
+about a number is answered from the number, not from a sentence that
+happens to mention it. Scanned PDFs are read by OCR, and every document
+that went through OCR is marked as such, so you always know which
+answers rest on a machine's reading of an image.
+
+**A way back into your own brain when every device is gone.** Recovery
+codes, printed at setup, shown on the screen of the person who is locked
+out rather than buried in documentation. A live recovery card is never
+blocked by a stranger's failed guesses.
+
+**AI apps are now visible and revocable.** You can see which apps hold a
+grant and end one. Claude and other assistants can correct the brain,
+not only read it.
+
+**Things that used to fail quietly, now loud.** A failed search is
+reported as a failure rather than as an absence of results, which is the
+difference between "there is nothing" and "I could not look." A stalled
+drain is told apart from one that is merely behind. A release may claim
+only the label its evidence supports. Migrations are checked for
+arrangement before a single statement runs, and a deploy can no longer
+erase a pause that was protecting a stranded upgrade.
+
+**Upgrading to this release:** nothing is required of you beyond the
+usual `brain update`. New connectors are opt-in — none of them start
+reading anything until you run its `connect` command.
+
 ## 0.1.22
 
-**Your brain can now read your texts — live, if you have a Mac.**
+**`brain doctor` now opens your Google credential instead of checking that a
+file is there.**
 
-Until now, messages only entered your brain as exports: WhatsApp's
-per-chat .txt, or Android's SMS backup file. This release adds the first
-LIVE message connector, for iMessage, and it is worth being precise about
-what that means.
+A stored credential that cannot actually be read looked identical to a healthy
+one. On Windows in particular, the marker at the top of the encrypted file is
+plain text, so a credential belonging to a different Windows user, or one whose
+encryption key no longer resolves after a profile rebuild, still looked correct
+from the outside. Doctor reported a healthy Google connection and the first real
+Drive or Gmail load was what discovered otherwise, usually on the install day
+itself.
 
-- New: `brain connect imessage <manifest>` on a Mac. It first verifies the
-  one macOS permission this needs (Full Disk Access for the exact program
-  that reads the Messages database) by actually reading the database — if
-  the grant is missing it prints the exact steps and installs nothing,
-  rather than installing something that fails silently every minute. Then
-  it loads your full message history in front of you, with counts, and
-  only then schedules ongoing capture.
-- Ongoing capture is a short scheduled pass about once a minute, not an
-  always-running program. A new text appears in your brain within about a
-  minute. A sleeping or closed Mac captures nothing until it wakes, and
-  `brain sources` will say so honestly instead of pretending freshness.
-- SMS text messages ride in alongside iMessage when your iPhone's Text
-  Message Forwarding is on, and are tagged separately so the two stay
-  distinguishable.
-- Honest limits, stated up front: this requires a Mac, full stop — Apple
-  exposes message history nowhere else. People appear as their phone
-  number or email, not their Contacts name. Tapbacks and attachment-only
-  messages are counted and skipped, so a thread here is thinner than the
-  same thread on your phone. Conversations are grouped into bounded
-  per-day sessions, the same shape WhatsApp exports produce.
-- New: `brain disconnect imessage <manifest>` — the first disconnect
-  command in this tool. It stops and removes the capture schedule, saves
-  any conversations still in progress so they stay searchable, and leaves
-  your already-captured history in the brain. Removing the history too is
-  one explicit command: `brain forget <manifest> --source imessage`.
-- Everything captured passes the same credential gate as every other
-  source: a text containing a live password or API key is refused, named,
-  and never stored.
+Doctor now performs one real read. If the credential cannot be opened it says
+so, says it is stored but unopenable rather than missing, and gives you the
+command that fixes it. No part of the credential is read back, printed, or
+included in the message.
 
-What to check after updating: nothing changes until you run
-`brain connect imessage` yourself. If you do, run `brain sources` the next
-day and confirm the imessage row is fresh.
+The check is read-only and never rewrites the record it is diagnosing.
 
 ## 0.1.21
 
-**A migration whose file changed after it ran can now be reconciled, without
-guessing and without touching your schema.**
+**Your text messages and WhatsApp conversations can now be loaded, from exports
+you already have.**
 
-0.1.20 gave a stuck-mid-upgrade brain a way out with `--repair`/`--rollback`.
-That fixes a migration that died partway through. It does NOT fix a
-different, rarer problem: an already-applied migration whose FILE bytes
-later changed, most commonly from a line-ending change made by a different
-git client or editor. `brain migrate` refuses to run anything at all once it
-sees that — on purpose, so two installs never silently end up on different
-schemas under the same version number — and until now there was no way past
-that refusal short of hand-editing the database yourself. Running
-`--repair` against this specific problem does not help either: it retries
-the same migration step, which hits the identical refusal again.
+Decisions, approvals and prices often live in a message thread rather than a
+document, and until now there was no way to get them in. Two readers, both
+working from a file you export yourself. Nothing connects to Meta, Google or
+Apple, and no account is linked. A parser reads a file on your own machine.
 
-- New: `brain doctor <manifest>` now also checks every applied migration's
-  file against what was recorded when it ran, and fails loudly with the
-  exact migration name if any of them no longer match — before you ever run
-  `brain update` and get stuck by it.
-- New: `brain doctor <manifest> --repair-checksum` shows you precisely what
-  changed for each mismatched migration — when it was applied, both
-  checksums, and, when the difference really is only line endings, an exact
-  confirmation of that (not a guess). It previews with no changes until you
-  add `--yes`, at which point it updates only the recorded checksum to match
-  your current file. It never re-runs the migration's SQL and never touches
-  anything else — the schema is presumably already in the state your file
-  describes, and re-running it blindly risks a different kind of damage on
-  top of whatever caused the mismatch.
-- Migration files are now pinned to LF line endings in `.gitattributes`, so
-  this specific cause can't reintroduce itself through git.
+- **WhatsApp.** Export a chat from your own phone and load the `.txt`. Both the
+  iOS and Android export layouts are understood. If the day and month order
+  genuinely cannot be resolved from the conversation's own chronology, it loads
+  nothing and tells you, rather than guessing and silently dating a year of
+  messages wrong.
+- **Android texts.** Two formats: SMS Backup & Restore `.xml`, and Google Voice
+  from a Takeout export.
+
+Both are one-time history loads. Nothing runs in the background, nothing stays
+connected, and nothing is sent anywhere.
 
 ## 0.1.20
 
-**A brain stuck mid-upgrade now tells you, and now has a way out.**
+**A brain stuck mid-upgrade now has a way out, and a migration whose file
+changed after it ran can be reconciled without touching your schema.**
 
-- 0.1.19 made a stalled upgrade honest: `/health` reports
-  `accepting_documents: false` while paused instead of a false `ok: true`.
-  But nothing that reads that field back to a person existed yet — an
-  install could sit paused for days with no command saying so. Now
-  `brain doctor <manifest>` checks the deployed brain's own live state, not
-  only this machine's, and fails loudly with an exact next step if it is
+If your brain has been unable to accept a document since an upgrade stopped
+partway, this is the release that recovers it. Two different failures are
+fixed here, and they are genuinely different problems.
+
+**A stuck upgrade.** 0.1.19 made a stalled upgrade honest: `/health` reports
+`accepting_documents: false` while paused instead of a false `ok: true`. But
+nothing read that field back to a person, so an install could sit paused for
+days with no command saying so.
+
+- `brain doctor <manifest>` now checks the deployed brain's own live state,
+  not only this machine's, and fails loudly with an exact next step if it is
   paused.
-- New: `brain doctor <manifest> --repair` diagnoses a stuck upgrade
-  precisely — which stage it stopped at, how long ago, and the exact D1
-  recovery bookmark captured just before the migration ran — then resumes it
-  safely once you add `--yes`. Resuming replays the same verified upgrade
-  path (`brain update`), which was already idempotent and restart-safe; this
-  just gives the stuck case its own clear entry point instead of leaving you
-  to reconstruct "run it again" out of an error message.
+- New: `brain doctor <manifest> --repair` diagnoses a stuck upgrade precisely,
+  which stage it stopped at, how long ago, and the exact D1 recovery bookmark
+  captured just before the migration ran, then resumes it safely once you add
+  `--yes`.
 - New: `brain doctor <manifest> --rollback` does the same diagnosis, then
-  restores D1 to that exact bookmark once you add `--yes` — no more copying
-  a bookmark out of a die() message by hand. If no bookmark can be found, it
-  refuses rather than guessing.
-- Both are previews without `--yes`: they print what they would do and
-  change nothing until you confirm.
+  restores D1 to that exact bookmark once you add `--yes`. If no bookmark can
+  be found, it refuses rather than guessing.
 
-**Google Calendar is now actually reachable, not just built.** The connector
-and its 223 tests have existed since mid-August, but nothing anywhere ever
-called it — there was no command to run. Now there is:
+**An applied migration whose file later changed.** This is the rarer one, and
+`--repair` does not fix it: `--repair` replays the upgrade, which hits the
+identical refusal again. The usual cause is a line-ending change made by a
+different git client or editor. `brain migrate` refuses to run anything at
+all once it sees this, on purpose, so two installs never silently end up on
+different schemas under the same version number.
 
-```
-brain connect google --scopes drive,gmail,calendar
-brain ingest <manifest> --from calendar
-```
+- `brain doctor <manifest>` now also checks every applied migration's file
+  against what was recorded when it ran, and names the exact migration if any
+  no longer match, before you run `brain update` and get stuck by it.
+- New: `brain doctor <manifest> --repair-checksum` shows precisely what
+  changed for each mismatched migration, and when the difference really is
+  only line endings, confirms that exactly rather than guessing. It previews
+  and changes nothing until you add `--yes`, at which point it updates only
+  the recorded checksum. It never re-runs the migration's SQL.
+- Migration files are now pinned to LF in `.gitattributes`, so this cause
+  cannot reintroduce itself through git.
 
-Later runs are incremental through Google's own sync token, and a cancelled
-meeting is removed from your index rather than left behind as a stale
-document. `--dry-run` previews what would be sent. Same honest boundary as
-Gmail: built and tested (223 connector tests, 15 more on the command that
-drives it), not yet run against a real calendar.
-
-**WhatsApp and text messages (Android, and Google Voice) are ingestible
-now, as exports.** No daemon, no live capture, no third-party app risk:
-
-- WhatsApp's own "Export chat" (`.txt`, choose "without media")
-- Android's SMS Backup & Restore app (`.xml`, your whole message history at
-  once)
-- A Google Voice Takeout (one page per conversation)
-
-Drop any of these in a folder you already `brain ingest --path`; each is
-detected automatically by its content and loaded as real conversations, not
-one giant wall of text. WhatsApp's export date is written in whatever order
-your phone's regional setting uses with no marker saying which ("3/4/26" is
-two different days depending on the phone), and that is resolved
-automatically from the fact that a chat is chronological — a genuinely
-ambiguous export is refused rather than silently mis-dated, and you would
-see that refusal named in the skip report. SMS Backup & Restore and Google
-Voice both write an exact timestamp, so there is nothing to disambiguate
-there, only to read correctly.
-
-Live capture (a message appearing the moment it is sent, not at your next
-export) is not part of this. That is real code in my own personal stack for
-WhatsApp already, but it carries a ToS gray-area risk worth an explicit
-conversation before it is on by default for a client.
-
-The source matrix (`onboarding/07-ingest-source-matrix.md`) and the "update
-failed partway through" runbook entry are both updated to match every one
-of the above, including an explicit statement that iMessage live capture
-requires a Mac in the loop with no way around it, and that Google Meet
-transcripts already land in Drive today with no connector needed at all.
-**Your brain is now a connector: it appears inside the Claude apps and
-ChatGPT, on your phone, with nothing to install.**
-
-- In Claude (Settings, Connectors) or ChatGPT (Settings, Connectors), add a
-  custom connector and paste one URL: `https://<your brain's address>/mcp`.
-  Your browser opens your brain's own approval page and you approve with
-  your passkey — the same face or fingerprint that opens the app.
-- What a connector can do is exactly what the app can: ask questions and
-  read cited answers with their confidence percentages, search your
-  documents, and read one document at a time. It can never add, change, or
-  delete anything, whatever happens to its token.
-- Connector access is yours to end at any moment: every approval is
-  individually revocable, tokens expire on their own after thirty days, and
-  Sign out everywhere ends every connector along with every device — one
-  revocation story, no special cases.
-- No outside login service is involved. The approval flow, the tokens, and
-  their storage all live inside your own Cloudflare account, like everything
-  else about your brain.
-- Also in this release: large ingests no longer stall against the database
-  write budget — batches now pack themselves to fit it, found live when a
-  two-day catch-up was refused in one over-full call.
-
-After updating, run `brain setup <manifest>` (applies migration 0015), then
-`brain mcp-config <manifest>` to see your connector URL and the exact
-click-path for each app.
+**An option this release does not have now fails loudly.** Running
+`brain doctor --repair-checksum` against a release without it used to print
+ordinary doctor output and exit 0, which is indistinguishable from the repair
+running and finding nothing to fix. `brain doctor` now rejects any option it
+does not recognise, exits nonzero, suggests the nearest real flag, and lists
+what it does accept.
 
 ## 0.1.19
 

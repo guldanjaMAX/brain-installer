@@ -183,10 +183,25 @@ const byName = (checks, name) => checks.find((x) => x.name === name);
     CF_SCOPE_PROBES.every((p) => byName(checks, p.name)?.status === CANNOT_CHECK),
     JSON.stringify(CF_SCOPE_PROBES.map((p) => [p.name, byName(checks, p.name)?.status])));
 
-  // The old behaviour, kept honest at its source.
-  check("the presence-only token check no longer claims the token works",
-    !/available for this command/.test(checkCfToken("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").detail),
-    checkCfToken("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").detail);
+  // The old behaviour, kept honest at its source. checkCfToken now really asks
+  // Cloudflare, so fetch is stubbed here: this assertion is about the wording it
+  // returns, and a test must not depend on this machine having a network.
+  {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 401,
+      json: async () => ({ success: false, errors: [{ message: "Invalid API Token" }] }),
+    });
+    let detail;
+    try {
+      detail = (await checkCfToken("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).detail;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    check("the presence-only token check no longer claims the token works",
+      !/available for this command/.test(detail), detail);
+  }
 }
 
 /* ---- a token that can see several accounts blocks, but is not a failure ---- */
