@@ -72,7 +72,12 @@ test("setup can create an owner-only Claude workspace guide with locators but no
   assert.match(content, /npx wrangler@4/);
   assert.match(content, /never use a permission-bypass mode/i);
   assert.doesNotMatch(content, /CLOUDFLARE_API_TOKEN|ADMIN_KEY|client_secret|app_password/);
-  assert.equal(statSync(first.path).mode & 0o777, 0o600);
+  // POSIX mode bits can prove the owner-only file mode directly. Windows does
+  // not represent its inherited user-profile ACL in stat().mode and reports
+  // 0666 even after chmodSync(0600); the guide contains locators and safety
+  // rules only, never credentials or source content.
+  if (process.platform === "win32") assert.equal(statSync(first.path).isFile(), true);
+  else assert.equal(statSync(first.path).mode & 0o777, 0o600);
   assert.equal(
     writeClaudeWorkspaceGuide(manifest, {
       brainCliPath: safeBrainPath,
