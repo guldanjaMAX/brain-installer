@@ -384,7 +384,10 @@ const VERSION_PINNED_INTERPRETER =
   /(?:\/\.nvm\/versions\/node\/|\/\.fnm\/|\/\.volta\/|\/\.asdf\/|\/n\/versions\/node\/|\/node[@-]?v?\d+(?:\.\d+)*\/)/;
 
 export function isVersionPinnedInterpreter(nodePath) {
-  return VERSION_PINNED_INTERPRETER.test(String(nodePath || ""));
+  // Scheduler plans can be inspected on Windows even though launchd installs
+  // only on macOS. Normalize separators so the same pinned-version warning is
+  // preserved in cross-platform tests and support tooling.
+  return VERSION_PINNED_INTERPRETER.test(String(nodePath || "").replace(/\\/g, "/"));
 }
 
 function versionPinnedInterpreterWarning(nodePath, spec = DRIVE_SCHEDULER_SPEC) {
