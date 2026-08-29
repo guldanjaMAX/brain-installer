@@ -49,8 +49,11 @@ test("every classified route names a capability that actually exists", () => {
 
 test("destroying the corpus is its own capability, separate from writing to it", () => {
   assert.equal(capabilityForRoute("/api/admin/brain/forget"), "destroy");
-  assert.equal(capabilityForRoute("/api/admin/brain/purge"), "destroy");
   assert.equal(capabilityForRoute("/api/admin/brain/ingest"), "file");
+  // /purge does not exist. It was once classified as `destroy` in advance,
+  // which would have handed a grantable unscoped delete to whoever added the
+  // route later. It now falls through to owner-only like anything unlisted.
+  assert.equal(capabilityForRoute("/api/admin/brain/purge"), "administer");
   // The bookkeeper case, stated as a test: file receipts, never purge.
   const bookkeeper = { kind: "grant", grantId: "g1", capabilities: new Set(["ask", "file"]) };
   assert.ok(principalMay(bookkeeper, "/api/admin/brain/ingest"));
@@ -122,4 +125,14 @@ test("the token is never stored, only its hash", async () => {
   assert.notEqual(hash, "grant-token-abc");
   assert.equal(hash, await hashToken("grant-token-abc"), "hashing is stable");
   assert.notEqual(hash, await hashToken("grant-token-abd"));
+});
+
+test("the route map names no route that does not exist", async () => {
+  const { readFileSync } = await import("node:fs");
+  const source = readFileSync(new URL("../src/index.js", import.meta.url), "utf8");
+  for (const path of Object.keys(ROUTE_CAPABILITY)) {
+    assert.ok(source.includes(path),
+      `${path} is classified but no route serves it. A capability pinned to a ` +
+      `route that does not exist is inherited, unscoped, by whoever adds it later.`);
+  }
 });

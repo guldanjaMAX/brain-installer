@@ -344,3 +344,40 @@ export async function listZones(env) {
     guard(error);
   }
 }
+
+/** One grant by id, for resolving a passkey session's subject. */
+export async function findGrantById(env, grantId) {
+  try {
+    return await env.DB.prepare(
+      `SELECT grant_id, display_name, capabilities, expires_at, revoked_at,
+              scope_include, scope_exclude
+         FROM grants WHERE grant_id = ?`,
+    ).bind(grantId).first();
+  } catch (error) {
+    guard(error);
+  }
+}
+
+/** The source names a scope can reach. The one place that mapping is computed. */
+export async function sourcesInScope(env, scope) {
+  if (!scope || scope.all === true) {
+    try {
+      const { results } = await env.DB.prepare("SELECT name FROM sources").all();
+      return (results || []).map((r) => r.name);
+    } catch (error) { guard(error); }
+  }
+  const include = Array.isArray(scope.zones) ? scope.zones.filter(Boolean) : [];
+  if (!include.length) return [];
+  const exclude = Array.isArray(scope.exclude) ? scope.exclude.filter(Boolean) : [];
+  try {
+    const inList = include.map(() => "?").join(",");
+    let sql = `SELECT name FROM sources WHERE zone IN (${inList})`;
+    const binds = [...include];
+    if (exclude.length) {
+      sql += ` AND zone NOT IN (${exclude.map(() => "?").join(",")})`;
+      binds.push(...exclude);
+    }
+    const { results } = await env.DB.prepare(sql).bind(...binds).all();
+    return (results || []).map((r) => r.name);
+  } catch (error) { guard(error); }
+}

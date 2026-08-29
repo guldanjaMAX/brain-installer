@@ -285,14 +285,26 @@ export function scopeSql(scope, alias = "c", nextParam = 1) {
   // this function could make, so it emits an always-false predicate instead.
   if (!include.length) return { clause: " AND 1 = 0", params: [], nextParam };
 
+  // Resolved through the SOURCE, not through a zone copied onto the row.
+  //
+  // The first version compared a denormalised `zone` column on chunks. That
+  // column is written by nobody: re-ingesting a document DELETEs its chunks and
+  // re-INSERTs them without it, so a zone assigned yesterday silently vanished
+  // on the next load and the scoped reader quietly lost the document. A trigger
+  // to maintain it corrupts the FTS index, because updating `chunks` from a
+  // trigger on `chunks` re-fires the FTS5 sync.
+  //
+  // A source's zone is the authority instead. There is nothing to copy, so
+  // nothing to strip, and re-assigning a zone takes effect everywhere at once
+  // rather than needing a backfill.
   const params = [];
   const inList = include.map(() => "?" + nextParam++).join(",");
   params.push(...include);
-  let clause = ` AND ${alias}.zone IN (${inList})`;
+  let clause = ` AND ${alias}.source IN (SELECT name FROM sources WHERE zone IN (${inList}))`;
   if (exclude.length) {
     const outList = exclude.map(() => "?" + nextParam++).join(",");
     params.push(...exclude);
-    clause += ` AND ${alias}.zone NOT IN (${outList})`;
+    clause += ` AND ${alias}.source NOT IN (SELECT name FROM sources WHERE zone IN (${outList}))`;
   }
   return { clause, params, nextParam };
 }

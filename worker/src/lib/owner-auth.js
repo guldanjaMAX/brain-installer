@@ -25,9 +25,11 @@ import {
   listPasskeys, renamePasskey, revokePasskey,
   sessionGeneration, bumpSessionGeneration,
   randomToken, createGrant, addGrantCredential, listGrants, revokeGrant,
-  assignZone, listZones,
+  assignZone, listZones, findGrantById,
 } from "./auth-store.js";
-import { CAPABILITIES, parseCapabilities, hashToken } from "./grants.js";
+import {
+  CAPABILITIES, OWNER_CAPABILITIES, parseCapabilities, parseScope, grantIsLive, hashToken,
+} from "./grants.js";
 import { appPageHtml } from "./app-page.js";
 
 const APP_HEADER = "X-Brain-App";
@@ -57,6 +59,39 @@ function challengeFromClientData(clientDataJSON) {
 export async function validateOwnerSession(request, env) {
   if (!appRequest(request)) return false;
   return validateSessionCookie(request, env, await sessionGeneration(env));
+}
+
+/**
+ * The principal behind a passkey session, not merely "is there one".
+ *
+ * The cookie has carried its subject since schema 15, and the gate was reading
+ * it through a boolean, so a person signed in with a SCOPED passkey was served
+ * as the unscoped owner. Reads were correctly scoped for the same person using
+ * a token and unscoped for them using their face, which is the worst possible
+ * combination: the guarantee looked true wherever it was tested.
+ *
+ * Returns null when there is no valid session. A session naming no grant is
+ * the owner, and that is safe here for a reason that will stop being true if
+ * anyone changes it: v1 cookies predate anybody but the owner being able to
+ * sign in at all.
+ */
+export async function ownerSessionPrincipal(request, env) {
+  if (!appRequest(request)) return null;
+  const session = await readSessionCookie(request, env, await sessionGeneration(env));
+  if (!session) return null;
+  if (session.grantId === null) {
+    return { kind: "owner", grantId: null, capabilities: new Set(OWNER_CAPABILITIES), scope: { all: true } };
+  }
+  const row = await findGrantById(env, session.grantId);
+  if (!grantIsLive(row)) return null;
+  const capabilities = parseCapabilities(row.capabilities);
+  if (!capabilities) return null;
+  return {
+    kind: "grant",
+    grantId: row.grant_id,
+    capabilities: new Set(capabilities),
+    scope: parseScope(row),
+  };
 }
 
 /* ------------------------------------------------------------ admin plane */

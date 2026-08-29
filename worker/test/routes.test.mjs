@@ -2179,12 +2179,14 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
     all.clause === "" && all.params.length === 0, JSON.stringify(all));
 
   const books = scopeSql({ zones: ["books"] }, "c", 1);
-  check("a scoped principal is restricted on the chunk row itself",
-    books.clause === " AND c.zone IN (?1)" && books.params[0] === "books", JSON.stringify(books));
+  check("a scoped principal is restricted through its source's zone",
+    /c\.source IN \(SELECT name FROM sources WHERE zone IN \(\?1\)\)/.test(books.clause)
+      && books.params[0] === "books", JSON.stringify(books));
 
   const minusMedical = scopeSql({ zones: ["books", "legal"], exclude: ["medical"] }, "c", 1);
   check("exclusion is expressed as well as inclusion",
-    /zone IN \(\?1,\?2\)/.test(minusMedical.clause) && /zone NOT IN \(\?3\)/.test(minusMedical.clause),
+    /source IN \(SELECT name FROM sources WHERE zone IN \(\?1,\?2\)\)/.test(minusMedical.clause)
+      && /source NOT IN \(SELECT name FROM sources WHERE zone IN \(\?3\)\)/.test(minusMedical.clause),
     minusMedical.clause);
 
   // The most dangerous possible bug in this function.
@@ -2193,9 +2195,9 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
     empty.clause === " AND 1 = 0", JSON.stringify(empty));
 
   const unknown = scopeSql({ zones: ["books"] }, "c", 1);
-  check("unzoned rows fall outside every scope by SQL semantics",
+  check("a source with no zone falls outside every scope by SQL semantics",
     /zone IN/.test(unknown.clause) && !/IS NULL/.test(unknown.clause),
-    "NULL zone must not match an IN list, and must not be special-cased back in");
+    "an unzoned source must not match an IN list, and must not be special-cased back in");
 }
 
 
@@ -2215,12 +2217,12 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
 
   const kw = seen.sql.find((sql) => /chunks_fts MATCH/.test(sql));
   check("a scoped read narrows the keyword query",
-    /c\.zone IN \(/.test(kw || ""), String(kw));
+    /c\.source IN \(SELECT name FROM sources/.test(kw || ""), String(kw));
 
   const hydration = seen.sql.find(
     (sql) => /FROM chunks c JOIN documents d/.test(sql) && /c\.chunk_uid IN/.test(sql));
   check("and narrows the hydration query, which is where snippet text comes from",
-    /c\.zone IN \(/.test(hydration || ""), String(hydration));
+    /c\.source IN \(SELECT name FROM sources/.test(hydration || ""), String(hydration));
 
   const bound = seen.binds.find((b) => b.includes("books"));
   check("and the zone value is actually bound, not just written into the SQL",
@@ -2273,11 +2275,76 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
 
   const kw = seen.sql.find((sql) => /chunks_fts MATCH/.test(sql));
   check("and its zone reaches the keyword SQL through the real request path",
-    /c\.zone IN \(/.test(kw || ""), String(kw));
+    /c\.source IN \(SELECT name FROM sources/.test(kw || ""), String(kw));
 
   const bound = seen.binds.find((b) => b.includes("books"));
   check("and the zone from the GRANT ROW is what gets bound",
     !!bound, JSON.stringify(seen.binds));
+}
+
+
+/* ---- scoped WRITES: the two holes an adversarial review found ---- */
+{
+  const { hashToken } = await import("../src/lib/grants.js");
+  const token = "scoped-filer-token";
+  const hash = await hashToken(token);
+  const grantRow = {
+    grant_id: "g-books", capabilities: '["file","destroy"]',
+    expires_at: null, revoked_at: null, credential_revoked_at: null,
+    scope_include: '{"zones":["books"]}', scope_exclude: '[]',
+  };
+
+  // `books` is in the grant's zone; `medical` is not.
+  const scopedEnv = () => {
+    const base = mkEnv([ROW], { vectorIds: [] });
+    return { ...base.env, DB: {
+      prepare(sql) {
+        if (/FROM grant_credentials/.test(sql)) {
+          return { bind: (...b) => ({ async first() { return b[0] === hash ? grantRow : null; },
+            async all() { return { results: [] }; }, async run() { return { meta: { changes: 0 } }; } }) };
+        }
+        if (/FROM sources WHERE zone IN/.test(sql)) {
+          return { bind: () => ({ async all() { return { results: [{ name: "books" }] }; },
+            async first() { return null; }, async run() { return { meta: { changes: 0 } }; } }) };
+        }
+        return base.env.DB.prepare(sql);
+      },
+    } };
+  };
+
+  const post = (path, payload) => worker.fetch(new Request(`https://b.example${path}`, {
+    method: "POST",
+    headers: { "X-Admin-Key": token, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }), scopedEnv(), { waitUntil() {} });
+
+  // The reconnaissance hole: forget's DRY RUN is the default and returned the
+  // full doc_uid list of any source, which is real file ids and paths.
+  const recon = await post("/api/admin/brain/forget", { source: "medical" });
+  check("a scoped destroy cannot dry-run another zone's source for its doc_uids",
+    recon.status === 403, String(recon.status));
+
+  const reconBody = await recon.json();
+  check("and the refusal returns no targets at all",
+    !("targets" in reconBody), JSON.stringify(reconBody).slice(0, 200));
+
+  const del = await post("/api/admin/brain/forget", { source: "medical", confirm: true });
+  check("nor delete it", del.status === 403, String(del.status));
+
+  const own = await post("/api/admin/brain/forget", { source: "books" });
+  check("but its OWN zone is still reachable, so the check is a boundary not a wall",
+    own.status !== 403, String(own.status));
+
+  // The write hole: source_type is caller-chosen and decides the zone.
+  const plant = await post("/api/admin/brain/ingest",
+    { source_type: "medical", source_id: "x", content: "planted" });
+  check("a scoped filer cannot write into a source in another zone",
+    plant.status === 403, String(plant.status));
+
+  const unknown = await post("/api/admin/brain/ingest",
+    { source_type: "brand-new-source", source_id: "x", content: "hello" });
+  check("nor invent a new source, whose documents would be born unzoned",
+    unknown.status === 403, String(unknown.status));
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nroutes: all ${ran} tests passed`);

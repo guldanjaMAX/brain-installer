@@ -20,7 +20,7 @@
 
 import { jsonResponse, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
 import { resolvePrincipal, principalMay } from "./lib/grants.js";
-import { findGrantByCredentialHash } from "./lib/auth-store.js";
+import { findGrantByCredentialHash, sourcesInScope } from "./lib/auth-store.js";
 import {
   hasSensitiveTransportIdentity,
   scanEnvelope as scanEnvelopeSecrets,
@@ -32,7 +32,7 @@ import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
 import {
-  handleOwnerAuth, handleAdminInvite, handleAdminDevices, handleAdminGrants, handleZones, validateOwnerSession,
+  handleOwnerAuth, handleAdminInvite, handleAdminDevices, handleAdminGrants, handleZones, validateOwnerSession, ownerSessionPrincipal,
 } from "./lib/owner-auth.js";
 
 /* ------------------------------------------------------------ retrieval */
@@ -756,7 +756,7 @@ async function handleThink(env, request, scope = { all: true }) {
   });
 }
 
-async function handleIngest(env, request) {
+async function handleIngest(env, request, scope = { all: true }) {
   // Checked BEFORE the body is read. The batch route documents exactly this
   // hazard and guards against it; this route, which is the one a client reaches
   // for when testing by hand, had no guard at all. A 40MB document becomes
@@ -810,6 +810,25 @@ async function handleIngest(env, request) {
   const { source_type, source_id, content } = envelope || {};
   if (!source_type || !source_id || typeof content !== "string") {
     return jsonResponse({ error: "source_type, source_id and content (string) are required" }, 400);
+  }
+
+  // Which source a document lands in decides which zone it lands in, and
+  // source_type is chosen entirely by the caller. Unchecked, a filer scoped to
+  // `books` could name a source in the medical zone and overwrite documents
+  // there, or plant new ones the owner would later read and cite.
+  //
+  // A scoped filer may write only into a source it can already reach. Naming a
+  // source that does not exist yet is refused too: a new source has no zone,
+  // so its documents would be born invisible to every scoped reader and would
+  // be swept into whichever zone the owner assigned to that name later.
+  if (scope && scope.all !== true) {
+    const allowed = await sourcesInScope(env, scope);
+    if (!allowed.includes(String(source_type))) {
+      return jsonResponse({
+        error: `"${source_type}" is not a source in a zone you have access to. ` +
+          "Ask the owner to create it and put it in your zone first.",
+      }, 403);
+    }
   }
 
   // THE GATE. Nothing carrying a live provider credential enters the index,
@@ -1447,7 +1466,15 @@ export default {
     const readRoute = path === "/api/rag/unified" || path === "/api/rag/think";
     const keyAuthorized = readRoute ? validateReadKey(request, env) : validateAdminKey(request, env);
     // A passkey session is accepted exactly where the read-only proxy key is.
-    let authorized = keyAuthorized || (readRoute && await validateOwnerSession(request, env));
+    // It resolves to a PRINCIPAL, not a boolean: the cookie has named its
+    // subject since schema 15, and reading it as "is somebody signed in" served
+    // a scoped person as the unscoped owner.
+    let authorized = keyAuthorized;
+    let sessionPrincipal = null;
+    if (!authorized && readRoute) {
+      sessionPrincipal = await ownerSessionPrincipal(request, env);
+      if (sessionPrincipal && principalMay(sessionPrincipal, path)) authorized = true;
+    }
 
     // A named person, holding a grant credential rather than one of the two
     // env keys. Consulted only when the shipped checks already said no, so the
@@ -1461,7 +1488,7 @@ export default {
     // keeps the route list unenumerable.
     // Unscoped by default: the owner key and the proxy key both read
     // everything, exactly as they did before zones existed.
-    let scope = { all: true };
+    let scope = sessionPrincipal ? (sessionPrincipal.scope || { zones: [] }) : { all: true };
     if (!authorized) {
       const principal = await resolvePrincipal(request, env, {
         lookupCredential: (hash) => findGrantByCredentialHash(env, hash),
@@ -1510,7 +1537,7 @@ export default {
         return handleZones(env, request);
       }
       if (path === "/api/admin/brain/ingest" && request.method === "POST") {
-        return await handleIngest(env, request);
+        return await handleIngest(env, request, scope);
       }
       if (path === "/api/admin/brain/ingest/batch" && request.method === "POST") {
         return await handleIngestBatch(env, request);
@@ -1567,6 +1594,27 @@ export default {
         const source = body?.source ? String(body.source) : null;
         if (!docUids.length && !families.length && !source) {
           return jsonResponse({ error: "pass doc_uids: [...], families: [...], or source: \"name\"" }, 400);
+        }
+        // A scoped principal may only forget inside its own zones, and this is
+        // checked before anything is read, not just before anything is deleted.
+        //
+        // The dry run is the dangerous half. It is the DEFAULT (no confirm), it
+        // returns the complete list of doc_uids in the named source, and
+        // doc_uid is `${source_type}:${source_id}` — real Drive file ids, real
+        // message ids, real paths. So the safe-looking half of a destructive
+        // command was a free directory listing of any zone, indistinguishable
+        // from an in-scope call and leaving no trace.
+        if (scope && scope.all !== true) {
+          const allowed = await sourcesInScope(env, scope);
+          const targets = source ? [source] : [];
+          const outside = targets.filter((name) => !allowed.includes(name));
+          if (!source || outside.length) {
+            return jsonResponse({
+              error: docUids.length || families.length
+                ? "forgetting by doc_uid or family needs access to every zone. Ask the owner."
+                : `\"${source}\" is not in a zone you have access to.`,
+            }, 403);
+          }
         }
         // Destructive and irreversible, so it must be asked for explicitly.
         const confirm = body?.confirm === true;

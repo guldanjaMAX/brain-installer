@@ -53,14 +53,16 @@ export const ROUTE_CAPABILITY = Object.freeze({
   "/api/rag/think": "ask",
   "/api/admin/brain/ingest": "file",
   "/api/admin/brain/ingest/batch": "file",
-  "/api/admin/brain/health": "diagnose",
   "/api/admin/brain/freshness": "diagnose",
-  "/api/admin/brain/sources": "diagnose",
   "/api/admin/brain/diagnose": "diagnose",
   "/api/admin/brain/drain": "file",
   "/api/admin/brain/reindex": "administer",
   "/api/admin/brain/forget": "destroy",
-  "/api/admin/brain/purge": "destroy",
+  // Entries for routes that do not exist were removed rather than left as
+  // documentation. "/api/admin/brain/purge" was pre-classified as `destroy`,
+  // so whoever added that route would have inherited a grantable, unscoped
+  // delete on the day they added it, without ever deciding to. Falling through
+  // to the owner-only default is the safer way to be wrong.
 });
 
 /** The capability a path requires. Unlisted means owner-only, on purpose. */
