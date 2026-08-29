@@ -449,5 +449,9 @@ const byName = (checks, name) => checks.find((x) => x.name === name);
     engines === `>=${REQUIRED_NODE_MAJOR}`, `engines.node=${engines}, REQUIRED_NODE_MAJOR=${REQUIRED_NODE_MAJOR}`);
 }
 
+const thisTestSource = readFileSync(new URL(import.meta.url), "utf-8");
+check("the suite leaves native async handles to close before process exit",
+  !thisTestSource.includes("process." + "exit("), "found an immediate process exit");
+
 console.log(fail ? `\n${fail} FAILURES` : `\npreinstall: all ${ran} tests passed`);
-process.exit(fail ? 1 : 0);
+process.exitCode = fail ? 1 : 0;
