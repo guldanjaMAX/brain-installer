@@ -16,6 +16,14 @@ The guided path is at `financialbrain.ai/install`. It uses one immutable release
 asset and installs into a folder owned by your user account, so it needs no Git,
 `sudo`, or administrator access.
 
+> **The version below is the CANDIDATE, and it is not published yet.** These
+> commands will 404 until it is released. This is deliberate: the pinned version
+> tracks `package.json` so the two can never silently disagree, which means it
+> names an unpublished candidate for the window between a version bump and its
+> release. To install today, use the current published release from
+> [the releases page](https://github.com/guldanjaMAX/brain-installer/releases/latest),
+> or the guided path above, which always serves a published asset.
+
 Mac or Linux:
 
 ```bash
