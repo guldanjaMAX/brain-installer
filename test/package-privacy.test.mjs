@@ -481,6 +481,7 @@ const expected = [
   "worker/src/lib/ocr.js",
   "worker/src/lib/owner-auth.js",
   "worker/src/lib/owner-actions.js",
+  "worker/src/lib/owner-activity.js",
   "worker/src/lib/sessions.js",
   "worker/src/lib/webauthn.js",
   "worker/src/lib/query-intent.js",

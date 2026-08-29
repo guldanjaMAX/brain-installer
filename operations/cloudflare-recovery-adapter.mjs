@@ -161,6 +161,15 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "fin_period_closes",
   "owner_targets",
   "owner_preferences",
+  // Schema 20: exact document grants, their immutable audit trail, persistent
+  // idempotency receipts, and privacy-safe passkey telemetry are durable
+  // security state. Restoring owner passkeys without their grant authority
+  // would either lock scoped users out or risk widening them to owner access.
+  "document_access_grants",
+  "document_access_documents",
+  "document_access_requests",
+  "document_access_events",
+  "passkey_security_events",
 ]);
 
 /**
@@ -250,14 +259,13 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   // Owners re-sign-in with their passkey; that is a tap, not a loss.
   "session_generation",
 ]);
-// Schemas 14 through 17 added owner passkeys, the financial ledger, the bank
-// feed, and connector OAuth. Schema 18 adds extraction-provenance columns so
-// OCR evidence stays distinguishable from a native text layer. The vector
-// protocol itself is unchanged, but the recovery contract tracks the EXACT
-// current schema by design: a drill against a database one migration behind
-// would export a table or column set that does not match the reviewed list.
-// Bumping this is a required step of shipping any migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 19;
+// Schemas 14 through 20 add owner passkeys, the financial ledger, bank feeds,
+// connector OAuth, extraction provenance, owner workspace state, and exact
+// document security. The vector protocol itself is unchanged, but the recovery
+// contract tracks the EXACT current schema by design: a drill against a
+// database one migration behind would export a table or column set that does
+// not match the reviewed list. Bumping this is required for every migration.
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 20;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -305,6 +313,13 @@ const SCHEMA_19_TABLES = Object.freeze([
   "owner_targets",
   "owner_preferences",
 ]);
+const SCHEMA_20_TABLES = Object.freeze([
+  "document_access_grants",
+  "document_access_documents",
+  "document_access_requests",
+  "document_access_events",
+  "passkey_security_events",
+]);
 
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
@@ -318,7 +333,8 @@ const AGGREGATE_FIELDS = Object.freeze([
     // not have fails the whole snapshot. Ledger restoration correctness is
     // proven by the exported content, which these tables are fully part of.
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
-     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES, ...SCHEMA_19_TABLES].includes(table)
+     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES,
+     ...SCHEMA_19_TABLES, ...SCHEMA_20_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1078,7 +1094,8 @@ function expectedRecoveryTables(migrations) {
     (latest >= 15 || !SCHEMA_15_TABLES.includes(table)) &&
     (latest >= 16 || !SCHEMA_16_TABLES.includes(table)) &&
     (latest >= 17 || !SCHEMA_17_TABLES.includes(table)) &&
-    (latest >= 19 || !SCHEMA_19_TABLES.includes(table)));
+    (latest >= 19 || !SCHEMA_19_TABLES.includes(table)) &&
+    (latest >= 20 || !SCHEMA_20_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {
