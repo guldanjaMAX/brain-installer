@@ -33,4 +33,42 @@ export type Device = {
   created_at: number;
   last_used_at: number | null;
 };
-export type Me = { signed_in: boolean; owner: string; brain: string; devices: Device[] };
+/** One app holding a live grant. Rows are per app, not per token: a connector
+ *  refreshes routinely and an owner is asking about apps. */
+export type Connection = {
+  client_id: string;
+  name: string;
+  can_write: boolean;
+  connected_at: number | null;
+  last_used_at: number | null;
+};
+/** A bank the owner linked. Timestamps here are ISO strings, not epoch ms. */
+export type BankConnection = {
+  item_ref: string;
+  institution_label: string | null;
+  status: string;
+  status_detail?: string | null;
+  connected_at?: string | null;
+  last_synced_at?: string | null;
+};
+export type BankStatus = {
+  configured?: boolean;
+  connections?: BankConnection[];
+  needs_attention?: BankConnection[];
+};
+export type Me = {
+  signed_in: boolean;
+  owner: string;
+  brain: string;
+  devices: Device[];
+  connections: Connection[];
+};
+
+/** GET companion to `api`. The bank feed answers status on GET; the same
+ *  X-Brain-App header still marks the request as coming from this app. */
+export async function apiGet<T = unknown>(path: string): Promise<T> {
+  const response = await fetch(path, { headers: { "X-Brain-App": "1" } });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error((data as { error?: string }).error || `HTTP ${response.status}`);
+  return data as T;
+}
