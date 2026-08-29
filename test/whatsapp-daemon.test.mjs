@@ -198,7 +198,7 @@ try {
     check("an every-minute drain derives a one-minute freshness expectation",
       plan.expectedRefreshSeconds === 60, String(plan.expectedRefreshSeconds));
     check("the drain LaunchAgent invokes the shared scheduler runner with a configuration binding",
-      plan.programArguments[1].endsWith("operations/whatsapp-drain-scheduler.mjs") &&
+      plan.programArguments[1] === resolve("operations/whatsapp-drain-scheduler.mjs") &&
       JSON.stringify(plan.programArguments.slice(2, 7)) === JSON.stringify([
         "run", manifestPath, "--brain", resolve("/opt/brain installer/brain.mjs"), "--config-hash",
       ]) && /^[a-f0-9]{64}$/.test(plan.configHash),
