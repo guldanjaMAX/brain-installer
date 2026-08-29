@@ -4,6 +4,27 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.21
+
+**Your text messages and WhatsApp conversations can now be loaded, from exports
+you already have.**
+
+Decisions, approvals and prices often live in a message thread rather than a
+document, and until now there was no way to get them in. Two readers, both
+working from a file you export yourself. Nothing connects to Meta, Google or
+Apple, and no account is linked. A parser reads a file on your own machine.
+
+- **WhatsApp.** Export a chat from your own phone and load the `.txt`. Both the
+  iOS and Android export layouts are understood. If the day and month order
+  genuinely cannot be resolved from the conversation's own chronology, it loads
+  nothing and tells you, rather than guessing and silently dating a year of
+  messages wrong.
+- **Android texts.** Two formats: SMS Backup & Restore `.xml`, and Google Voice
+  from a Takeout export.
+
+Both are one-time history loads. Nothing runs in the background, nothing stays
+connected, and nothing is sent anywhere.
+
 ## 0.1.20
 
 **A brain stuck mid-upgrade now has a way out, and a migration whose file

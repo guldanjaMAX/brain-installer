@@ -117,6 +117,8 @@ const expected = [
   "ingest/pdf-child.mjs",
   "ingest/quality.mjs",
   "ingest/run.mjs",
+  "ingest/sms-backup.mjs",
+  "ingest/whatsapp-export.mjs",
   "manifest.schema.json",
   "migrations/d1/0001_install_state.sql",
   "migrations/d1/0002_llm_call_log.sql",
