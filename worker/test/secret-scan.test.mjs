@@ -1,6 +1,15 @@
-// EVERY credential in this file is SYNTHETIC, authored as a fixture. A gate
-// that refuses real secrets cannot be tested without secret-shaped inputs.
-// Verified against the live keychain 2026-08-18: zero matches.
+// EVERY credential, id, host and name below is INVENTED, and must stay that
+// way. A gate that refuses real secrets can only be exercised with
+// secret-SHAPED inputs, which makes this the one file in the repo where
+// pasting a real value feels like the quickest way to get a fixture. Never do
+// it: this repo is public, and fixtures get copied, quoted and grepped far
+// more often than they get read.
+//
+// When a fixture needs to change, keep the SHAPE and invent the value: same
+// prefix, same length, same character class, same casing mix. The assertions
+// here turn on shape (40 chars, 32 hex, uuid segments, provider prefix), not
+// on any particular secret, so a synthetic value proves exactly as much and is
+// worthless if it leaks. People are personas, hosts are *.example.test.
 
 import {
   scan, scanEnvelope, redact, sanitizeEnvelope, sanitizeSensitiveLinks,
@@ -10,10 +19,11 @@ import {
 let fail = 0;
 const chk = (n, c, d = "") => { console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + d)); if (!c) fail++; };
 
-// Must REFUSE. All synthetic.
+// Must REFUSE. Every value in both tables below is invented; see the header.
+// Keep it that way when you edit one: the shape is what is under test.
 for (const [n, t] of [
-  ["classic CF in doc", "| Cloudflare API Token (Read/D1) | m2p5WbHS5ABCC4Hzbo-cY_8M2J0WGimcIuZ4thhr |"],
-  ["CF env token", "CLOUDFLARE_API_TOKEN=m2p5WbHS5ABCC4Hzbo-cY_8M2J0WGimcIuZ4thhr"],
+  ["classic CF in doc", "| Cloudflare API Token (Read/D1) | FIXTURE0CFTOKEN0SYNTHETIC0NOTAREALKEY001 |"],
+  ["CF env token", "CLOUDFLARE_API_TOKEN=FIXTURE0CFTOKEN0SYNTHETIC0NOTAREALKEY001"],
   ["resend inner underscore", "Bearer re_2QKY3kyq_AbCdEfGhIjKlMnOpQrStUvWx"],
   ["postgres dsn", "postgres://postgres.abc:sup3rS3cretPassw0rd@aws-1.pooler.supabase.com:5432/postgres"],
   ["query token", "https://esignatures.io/api/contracts?token=9f2b7c4a1e8d3600bc5a9e2f7d4b1c86"],
@@ -27,16 +37,16 @@ for (const [n, t] of [
 
 // Must stay CLEAN.
 for (const [n, t] of [
-  ["cf account id", "Cloudflare Account ID: bd13f1dff62d4ccbea47440e45b48ec2"],
-  ["zone id row", "| Cloudflare Zone: jamesguldan.com | Zone ID bb1374f8b63ec4b6742a75d1ebd3acd9 |"],
-  ["git sha", "commit 8efed15a4c9b2d7e3f1a6c8b5d4e9f2a7c3b1d60 shipped"],
-  ["d1 uuid", "D1 Database ID | fd4b9d22-06d2-4092-b8ce-4fd0bb8ad05d"],
+  ["cf account id", "Cloudflare Account ID: 0123456789abcdef0123456789abcdef"],
+  ["zone id row", "| Cloudflare Zone: brand.example.test | Zone ID abcdef0123456789abcdef0123456789 |"],
+  ["git sha", "commit 0123456789abcdef0123456789abcdef01234567 shipped"],
+  ["d1 uuid", "D1 Database ID | 11111111-2222-3333-4444-555555555555"],
   ["keychain idiom", 'Bearer $(security find-generic-password -a x -s y -w)'],
   ["placeholder", "Bearer YOUR_API_KEY_HERE_REPLACE"],
   ["tracking link", "https://t.co/aQYR-r8_1uzsfdsFklmnopqrstuvwxyz01"],
   ["underscore words", "the share_link and signature_block and picture_frame"],
-  ["prose", "Megan flagged the TTT launch needs a deposit cohort first."],
-  ["stripe product", "Deep Work Interview | prod_UA44zomaYmhUoY | $67"],
+  ["prose", "Priya Nair flagged the spring workshop needs a waitlist first."],
+  ["stripe product", "Starter Plan | prod_Sy7Fixture0Abc | $19"],
 ]) chk("clean: " + n, scan(t).verdict === CLEAN, JSON.stringify(scan(t).labels));
 
 // lastIndex reuse: global regexes must not skip on repeat calls.
@@ -49,7 +59,7 @@ chk("repeat 3", scan(s).verdict === CONFIRMED);
 const r = redact("k=re_2QKY3kyq_AbCdEfGhIjKlMnOpQrStUvWx done");
 chk("redact removes", !r.includes("2QKY3kyq"), r);
 chk("redact labels", r.includes("[REDACTED:"), r);
-chk("redact keeps public id", redact("zone bb1374f8b63ec4b6742a75d1ebd3acd9") === "zone bb1374f8b63ec4b6742a75d1ebd3acd9");
+chk("redact keeps public id", redact("zone abcdef0123456789abcdef0123456789") === "zone abcdef0123456789abcdef0123456789");
 chk("preview never leaks", !JSON.stringify(scan(s).findings).includes("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"));
 chk("empty", scan("").verdict === CLEAN);
 chk("null", scan(null).verdict === CLEAN);

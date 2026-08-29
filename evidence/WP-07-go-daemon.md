@@ -117,8 +117,8 @@ $ ./build.sh
 == build darwin-arm64 ==
 == build windows-amd64 ==
 == artifacts ==
--rwxr-xr-x@ 1 jamesguldan  staff  19452578 Aug 27 19:18 wa-daemon-darwin-arm64
--rwxr-xr-x@ 1 jamesguldan  staff  20315136 Aug 27 19:18 wa-daemon-windows-amd64.exe
+-rwxr-xr-x@ 1 operator  staff  19452578 Aug 27 19:18 wa-daemon-darwin-arm64
+-rwxr-xr-x@ 1 operator  staff  20315136 Aug 27 19:18 wa-daemon-windows-amd64.exe
 dist/wa-daemon-darwin-arm64:      Mach-O 64-bit executable arm64
 dist/wa-daemon-windows-amd64.exe: PE32+ executable (console) x86-64, for MS Windows
 
@@ -177,7 +177,7 @@ brain-installer-0.1.21.tgz
 ### Privacy grep of the new tree
 
 ```
-$ grep -rniE "jamesguldan|notes\.|supabase|fly\.io|flycast|jg-whatsapp|POSTGRES|transcribe-audio|supavisor" \
+$ grep -rniE "<owner-username>|notes\.|supabase|fly\.io|flycast|jg-whatsapp|POSTGRES|transcribe-audio|supavisor" \
     --include="*.go" --include="*.md" --include="*.sh" --include="*.mod" daemons/whatsapp/
 README.md:58:purpose: the Postgres output layer, the hardcoded personal transcription
 ```
@@ -228,7 +228,7 @@ client can touch changed.
   account (real QR from real WhatsApp servers).
 - **The Windows binary running on Windows.** It cross-compiles and
   `file(1)` confirms a valid PE32+ console executable, but this machine
-  cannot execute it. Jay's PC is tester zero per the plan, in the
+  cannot execute it. The collaborator's PC is tester zero per the plan, in the
   follow-up package.
 - **Behavior under WhatsApp's server-side throttling of history sync**
   (chunk cadence, total depth) is only observable on a real pairing.

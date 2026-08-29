@@ -19,10 +19,9 @@ secret:
     # realistic Anthropic key, Stripe webhook secret, Supabase PAT and others,
     # so the gate can be proven to catch each shape.
     - "worker/test/secret-scan.test.mjs"
-    # Regression tests from the first client field test. The gate was accepting
-    # a real-shaped admin key while refusing source code that merely mentioned
-    # one, so these pin both directions.
-    - "test/jay-field-test.test.mjs"
+    # (A path-ignore for the first field-test regression suite was removed here:
+    # it named a collaborator in the path, and the file it pointed at no longer
+    # exists. If that suite comes back, name it after what it tests.)
 
   ignored-matches:
     # Documented inside the scanner itself, as the example of a hex value that

@@ -75,5 +75,5 @@
     "vector_backlog": 0,
     "status": "pass"
   },
-  "scope_note": "This proves exact synthetic D1 export and restore, FTS recreation, Vectorize rebuild, checkpoint resume behavior, release-profile retrieval, semantic canaries, and unsupported-question refusal on the named candidate commit. It does not certify James's corpus completeness, OCR quality, private answer accuracy, or document-level permissions."
+  "scope_note": "This proves exact synthetic D1 export and restore, FTS recreation, Vectorize rebuild, checkpoint resume behavior, release-profile retrieval, semantic canaries, and unsupported-question refusal on the named candidate commit. It does not certify the owner's corpus completeness, OCR quality, private answer accuracy, or document-level permissions."
 }

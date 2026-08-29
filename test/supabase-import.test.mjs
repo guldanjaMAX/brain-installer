@@ -101,7 +101,7 @@ const check = (name, condition, detail = "") => {
 
   const message = rowToEnvelope("messages", {
     cursor_id: "r1", source_id: "m1", thread_id: "t1", platform: "imessage",
-    category: "personal", client_id: "Easton", ts: "2025-03-04T10:00:00Z", content: "hello",
+    category: "personal", client_id: "Jordan Lee", ts: "2025-03-04T10:00:00Z", content: "hello",
   });
   check("message identity, date and platform are preserved",
     message.source_type === "message" && message.source_id === "m1" &&

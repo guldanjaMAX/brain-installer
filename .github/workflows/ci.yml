@@ -150,9 +150,14 @@ jobs:
             tarball=$(cygpath -u "$tarball")
           fi
           contents=$(tar -tzf "$tarball")
+          # NOTE: this is a FILENAME check on the tarball only; it never opens a file.
+          # It used to grep for the owner's first name, which put a real identity in a
+          # public CI config to catch a real identity. Content-level identity scanning is
+          # test/package-privacy.test.mjs, which scans every tracked file and is the
+          # authority; this step is only a last-ditch check on what npm would ship.
           private_paths=$(
             {
-              printf '%s\n' "$contents" | grep -Ei '(^|/)instances(/|$)|(^|/)eval/baselines(/|$)|james|readiness|\.brain-(migration|ingest)' || true
+              printf '%s\n' "$contents" | grep -Ei '(^|/)instances(/|$)|(^|/)eval/baselines(/|$)|(^|/)shadow|readiness|\.brain-(migration|ingest)' || true
               printf '%s\n' "$contents" | grep -Ei '(^|/)eval/golden/' | grep -Ev '(^|/)eval/golden/TEMPLATE\.golden\.json$' || true
             } | sort -u
           )

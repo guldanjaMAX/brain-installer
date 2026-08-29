@@ -1,6 +1,6 @@
 # Install Test SOP: Mac, Windows, and browsers
 
-Written 2026-08-27. Companion to `planning/03-jay-installer-ux-test-plan.md`
+Written 2026-08-27. Companion to `planning/03-installer-ux-test-plan.md`
 (the narrated human rehearsal method). This document is the standing operating
 procedure: what gets tested, on what machines, how often, and with zero
 client data. Anyone with this repo and the test token can run it.
@@ -360,7 +360,7 @@ running both.
 
 ```
 fail  the manifest declares account 0000...0000, but this token can only see:
-        da7ea4a7...  <account name>
+        a1b2c3d4...  <account name>
       Refusing to provision into a different account than the manifest names.
 ```
 

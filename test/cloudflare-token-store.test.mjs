@@ -10,7 +10,10 @@ import {
 } from "../operations/cloudflare-token-store.mjs";
 import { withCloudflareToken } from "../brain.mjs";
 
-const ACCOUNT = "bd13f1dff62d4ccbea47440e45b48ec2";
+// Synthetic fixtures. The account id keeps Cloudflare's 32-hex-character
+// shape so the scoping assertions below still exercise a realistic value; it
+// identifies no real Cloudflare account.
+const ACCOUNT = "deadbeefdeadbeefdeadbeefdeadbeef";
 const TOKEN = "a".repeat(40);
 
 function fakeRunner(result) {

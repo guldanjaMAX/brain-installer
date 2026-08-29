@@ -69,5 +69,5 @@
     "vector_backlog": 0,
     "status": "pass"
   },
-  "scope_note": "This proves exact schema-13 synthetic D1 export and restore, FTS recreation, resumable accelerated Vectorize rebuild, immutable paused-to-active promotion, health, and release-profile evaluation on the named candidate code. It does not certify James's corpus completeness, OCR quality, private answer accuracy, or document-level permissions."
+  "scope_note": "This proves exact schema-13 synthetic D1 export and restore, FTS recreation, resumable accelerated Vectorize rebuild, immutable paused-to-active promotion, health, and release-profile evaluation on the named candidate code. It does not certify the owner's corpus completeness, OCR quality, private answer accuracy, or document-level permissions."
 }
