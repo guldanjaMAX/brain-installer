@@ -3,7 +3,7 @@
   "release": "0.1.15",
   "candidate_commit": "209948b433433c6e281ba81a29571dff982c96bc",
   "completed_at": "2026-08-26T01:06:58.703Z",
-  "environment": "Jay-owned isolated Cloudflare preview using the same installer and update path",
+  "environment": "Collaborator-owned isolated Cloudflare preview using the same installer and update path",
   "corpus": "10 fictional synthetic documents only",
   "result": "passed",
   "runtime_verification": {
@@ -37,5 +37,5 @@
     "rank_changes_between_repeats": 0,
     "hard_gates_passed": true
   },
-  "scope_note": "This proves that a collaborator-owned Cloudflare install can take the same 0.1.15 update, remain query-ready, and pass the full synthetic release suite. It contains no James, Jay, client, medical, legal, tax, billing, credit, or other real private data. It does not replace a customer's own corpus-specific evaluation."
+  "scope_note": "This proves that a collaborator-owned Cloudflare install can take the same 0.1.15 update, remain query-ready, and pass the full synthetic release suite. It contains no owner, collaborator, client, medical, legal, tax, billing, credit, or other real private data. It does not replace a customer's own corpus-specific evaluation."
 }

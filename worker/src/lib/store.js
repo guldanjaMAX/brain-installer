@@ -129,6 +129,15 @@ async function prepareD1Envelope(env, envelope) {
   const incomingTopFolder = md.top_folder || null;
   const incomingPlatform = md.platform || null;
   const docDate = envelope.occurred_at ? Date.parse(envelope.occurred_at) : null;
+  // How the text was OBTAINED, as opposed to what it says. Absent means the
+  // file carried its own text layer, which is true of every document written
+  // before OCR existed and of every non-PDF format now. Last write wins here,
+  // unlike client/category: a document that has just been re-extracted from a
+  // real text layer must stop being marked as a scan.
+  const textSource = TEXT_SOURCES.has(envelope.text_source) ? envelope.text_source : "native";
+  const textReliable = textSource === "native"
+    ? envelope.text_reliable !== false
+    : envelope.text_reliable === true;
   const geometry = chunkGeometry(env);
   // Geometry is part of storage identity. A deploy that corrects chunk size
   // must re-chunk unchanged documents on their next ingest instead of taking
@@ -150,11 +159,19 @@ async function prepareD1Envelope(env, envelope) {
     incomingCategory,
     incomingTopFolder,
     incomingPlatform,
+    textSource,
+    textReliable,
     docDate,
     geometry,
     hash,
   };
 }
+
+/**
+ * The only three answers to "where did this text come from".
+ * `native` is the default and the state of every pre-OCR document.
+ */
+export const TEXT_SOURCES = new Set(["native", "ocr", "ocr_partial"]);
 
 function jsonValue(raw, fallback = {}) {
   if (raw && typeof raw === "object") return raw;
@@ -241,6 +258,8 @@ function d1PersistedState(prior, prepared) {
     category: prepared.hasCategory ? prepared.incomingCategory : safeCategory ?? null,
     top_folder: prepared.hasTopFolder ? prepared.incomingTopFolder : safeTopFolder ?? null,
     platform: prepared.hasPlatform ? prepared.incomingPlatform : safePlatform ?? null,
+    text_source: prepared.textSource,
+    text_reliable: prepared.textReliable ? 1 : 0,
     meta: targetMeta,
     // Bind a safe prior value only when an omitted incoming field would
     // otherwise preserve an already-stored capability URL.
@@ -274,6 +293,11 @@ function d1MetadataChanged(prior, prepared) {
     target.category !== (prior.category ?? null) ||
     target.top_folder !== (prior.top_folder ?? null) ||
     target.platform !== (prior.platform ?? null) ||
+    // A document that was OCR'd and is now readable from a real text layer (or
+    // the reverse) must rewrite even when its text happens to hash the same,
+    // or the corpus would keep claiming a provenance that is no longer true.
+    target.text_source !== (prior.text_source ?? "native") ||
+    target.text_reliable !== Number(prior.text_reliable ?? 1) ||
     canonicalJson(target.meta) !== canonicalJson(jsonValue(prior.meta))
   );
 }
@@ -393,6 +417,12 @@ const d1Backend = {
           ts: x.document_date ? new Date(Number(x.document_date)).toISOString() : null,
           date_reliable: x.date_reliable === true || x.date_reliable === 1 || x.date_reliable === "1",
           date_source: x.date_source || null,
+          // How this evidence was READ. Travels beside how it was DATED,
+          // because a reader weighing an answer needs both.
+          text_source: x.text_source || "native",
+          text_reliable: x.text_reliable === undefined || x.text_reliable === null
+            ? true
+            : x.text_reliable === true || x.text_reliable === 1 || x.text_reliable === "1",
           score: x.rrf_score,
         };
       }),
@@ -419,7 +449,7 @@ const d1Backend = {
       ? input.prior
       : await env.DB.prepare(
         `SELECT content_hash, title, uri, document_date, date_source, date_reliable,
-                client, category, top_folder, platform, meta
+                client, category, top_folder, platform, text_source, text_reliable, meta
          FROM documents WHERE doc_uid = ?1`
       ).bind(docUid).first();
     // Identical content AND filter identity is a no-op. Folder moves and title
@@ -448,8 +478,9 @@ const d1Backend = {
     const documentStatement = env.DB.prepare(
       `INSERT INTO documents (doc_uid, source, source_id, title, uri, document_date,
                               date_source, date_reliable, client, category,
-                              top_folder, platform, ingested_at, content_hash, meta)
-       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                              top_folder, platform, ingested_at, content_hash, meta,
+                              text_source, text_reliable)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?22,?23)
        ON CONFLICT(doc_uid) DO UPDATE SET
          title=COALESCE(excluded.title, documents.title),
          uri=COALESCE(excluded.uri, documents.uri),
@@ -466,6 +497,11 @@ const d1Backend = {
          top_folder=CASE WHEN ?18 = 1 THEN excluded.top_folder ELSE documents.top_folder END,
          platform=CASE WHEN ?19 = 1 THEN excluded.platform ELSE documents.platform END,
          ingested_at=excluded.ingested_at, content_hash=excluded.content_hash,
+         -- Last write wins, unlike the filter columns above. Provenance
+         -- describes THIS extraction, so preserving an older value would keep
+         -- asserting a reading that has since been redone.
+         text_source=excluded.text_source,
+         text_reliable=excluded.text_reliable,
          meta=CASE WHEN ?21 = 1 THEN excluded.meta
                    ELSE json_patch(COALESCE(documents.meta, '{}'), excluded.meta) END`
     )
@@ -482,7 +518,9 @@ const d1Backend = {
         persisted.writeHasTopFolder ? 1 : 0,
         persisted.writeHasPlatform ? 1 : 0,
         persisted.forceDateSourceSafety ? 1 : 0,
-        persisted.replaceMeta ? 1 : 0
+        persisted.replaceMeta ? 1 : 0,
+        persisted.text_source,
+        persisted.text_reliable
       );
 
     const header = title ? `[${title}]` : "";
@@ -604,7 +642,7 @@ const d1Backend = {
     const prepared = await Promise.all(envelopes.map((envelope) => prepareD1Envelope(env, envelope)));
     const priorResults = await env.DB.batch(prepared.map((input) => env.DB.prepare(
       `SELECT content_hash, title, uri, document_date, date_source, date_reliable,
-              client, category, top_folder, platform, meta
+              client, category, top_folder, platform, text_source, text_reliable, meta
        FROM documents WHERE doc_uid = ?1`
     ).bind(input.docUid)));
 

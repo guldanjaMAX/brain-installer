@@ -222,7 +222,7 @@ try {
         "-k", "-s", "-t", "0", "/dev/fd/3",
         process.execPath,
         "-e",
-        'require("node:fs").writeFileSync(process.argv[1], "ready"); setInterval(() => {}, 1000)',
+        'require("node:fs").writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000)',
         holderReady,
       ],
       { stdio: ["ignore", "ignore", "ignore", holderDescriptor] },
@@ -242,9 +242,33 @@ try {
       assert.equal(contested.status, "skipped");
       assert.equal(contested.code, 0);
     } finally {
+      // Killing lockf alone does not kill the command it launched. That left
+      // one orphaned Node interval behind on every macOS test run. Terminate
+      // the exact fixture child whose PID it wrote before releasing lockf.
+      let holderChildPid = null;
+      try { holderChildPid = Number(readFileSync(holderReady, "utf8")); } catch { /* child never started */ }
+      if (Number.isInteger(holderChildPid) && holderChildPid > 1) {
+        try { process.kill(holderChildPid, "SIGTERM"); } catch (error) {
+          if (error?.code !== "ESRCH") throw error;
+        }
+      }
       holder.kill("SIGTERM");
       if (holder.exitCode === null && holder.signalCode === null) {
         await new Promise((resolveExit) => holder.once("exit", resolveExit));
+      }
+      if (Number.isInteger(holderChildPid) && holderChildPid > 1) {
+        let childStopped = false;
+        const childDeadline = Date.now() + 1_000;
+        while (!childStopped && Date.now() < childDeadline) {
+          try {
+            process.kill(holderChildPid, 0);
+            await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+          } catch (error) {
+            if (error?.code !== "ESRCH") throw error;
+            childStopped = true;
+          }
+        }
+        assert.equal(childStopped, true, "the native lock fixture child exited during cleanup");
       }
     }
   }

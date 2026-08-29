@@ -90,9 +90,10 @@ this" is not the same fact as "this is broken":
 ## Honesty rules, enforced in code
 
 - A skipped source is rendered in the skipped list and never in the loaded list.
-- A connector that returns no counts is described as `loaded, but this connector
-  reported no counts (unknown, not zero)`, and the totals line then says how many
-  sources could not report, so the number beside it reads as a floor.
+- A connector that returns a validated explicit completion but no counts is
+  described as `completed, with counts unknown (not zero)`, and the totals line
+  says how many sources could not report, so the number beside it reads as a
+  floor. Returning nothing is not a completion receipt and fails closed.
 - A source that loaded some legs and failed others is `partly loaded`, in yellow, with
   the failing leg named `NOT loaded` beside the one that worked.
 - The closing warning counts absent and partial separately. Adding them would report a

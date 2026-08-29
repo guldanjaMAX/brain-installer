@@ -14,7 +14,7 @@
 // automated test can do. Those are named in evidence/WP-07-cli.md as
 // unproven, not quietly counted as passing.
 
-import { mkdtempSync, realpathSync, rmSync, readFileSync, writeFileSync, chmodSync, statSync } from "node:fs";
+import { mkdtempSync, realpathSync, readdirSync, rmSync, readFileSync, writeFileSync, chmodSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -379,13 +379,71 @@ try {
   {
     const path = join(sandbox, "state-perm", "state.json");
     saveDrainState(path, { version: 1, last_seq: 7, sessionizer: [] });
-    check("the state file is written owner-only: it holds message text",
-      (statSync(path).mode & 0o077) === 0 && readFileSync(path, "utf-8").includes('"last_seq": 7'),
-      statSync(path).mode.toString(8));
+    if (process.platform === "win32") {
+      // Windows owner-only protection is an ACL, not a POSIX mode. The
+      // injected ACL test below verifies that enforcement without inspecting
+      // or changing the runner account's real permissions.
+      check("the ACL-protected Windows state is durable",
+        readFileSync(path, "utf-8").includes('"last_seq": 7'),
+        statSync(path).mode.toString(8));
+    } else {
+      check("the state file is written owner-only: it holds message text",
+        (statSync(path).mode & 0o077) === 0 && readFileSync(path, "utf-8").includes('"last_seq": 7'),
+        statSync(path).mode.toString(8));
+    }
     writeFileSync(path, "{ this is not json");
     const recovered = loadDrainState(path);
     check("a corrupt state file restarts the drain instead of refusing to run",
       recovered.last_seq === 0 && Array.isArray(recovered.sessionizer), JSON.stringify(recovered));
+
+    const windowsPath = join(sandbox, "state-windows", "state.json");
+    const aclCalls = [];
+    const windowsEnvironment = {
+      SystemRoot: "C:\\Windows",
+      USERNAME: "fixture-user",
+      USERPROFILE: "C:\\Users\\fixture-user",
+      TEMP: "C:\\Users\\fixture-user\\AppData\\Local\\Temp",
+      CLOUDFLARE_API_TOKEN: "ambient-secret-must-not-reach-acl",
+      BRAIN_ADMIN_KEY: "ambient-admin-must-not-reach-acl",
+    };
+    saveDrainState(windowsPath, {
+      version: 1,
+      last_seq: 9,
+      sessionizer: [{ messages: [{ body: "private fixture message" }] }],
+    }, {
+      platform: "win32",
+      environment: windowsEnvironment,
+      runAcl(command, args, child) {
+        aclCalls.push({ command, args: [...args], env: { ...child.env }, bytesAtAcl: readFileSync(args[0]).length });
+        return { status: 0, stdout: Buffer.from("fixture output"), stderr: Buffer.alloc(0) };
+      },
+    });
+    check("Windows applies a current-user ACL while the drain-state staging file is still empty",
+      aclCalls.length === 1 && aclCalls[0].bytesAtAcl === 0 &&
+      aclCalls[0].args.slice(1).join("|") === "/inheritance:r|/grant:r|fixture-user:F",
+      JSON.stringify(aclCalls));
+    check("the Windows ACL child receives no inherited cloud or brain credentials",
+      !Object.hasOwn(aclCalls[0]?.env || {}, "CLOUDFLARE_API_TOKEN") &&
+      !Object.hasOwn(aclCalls[0]?.env || {}, "BRAIN_ADMIN_KEY"),
+      JSON.stringify(Object.keys(aclCalls[0]?.env || {})));
+    check("the ACL-protected Windows state still round-trips the complete snapshot",
+      loadDrainState(windowsPath).last_seq === 9 &&
+      readFileSync(windowsPath, "utf8").includes("private fixture message"));
+
+    const previous = readFileSync(windowsPath);
+    let aclError = null;
+    try {
+      saveDrainState(windowsPath, { version: 1, last_seq: 10, sessionizer: [] }, {
+        platform: "win32",
+        environment: windowsEnvironment,
+        runAcl: () => ({ status: 5, stdout: Buffer.alloc(0), stderr: Buffer.from("fixture refusal") }),
+      });
+    } catch (error) { aclError = error; }
+    check("an ACL failure preserves the previous drain state and leaves no plaintext staging file",
+      /could not restrict.*WhatsApp drain state/i.test(aclError?.message || "") &&
+      readFileSync(windowsPath).equals(previous) &&
+      !readdirSync(join(sandbox, "state-windows")).some((name) => name.includes(".tmp-")),
+      aclError?.message);
   }
 
   /* ====================== outbox absence is named ======================= */
@@ -423,14 +481,25 @@ try {
     const fakeBinary = join(sandbox, "wa-daemon-fake");
     writeFileSync(fakeBinary, "#!/bin/sh\nexit 0\n");
     chmodSync(fakeBinary, 0o755);
-    const found = resolveDaemonBinary({ explicit: fakeBinary, platform: "darwin", arch: "arm64" });
+    // These cases simulate Darwin. On Windows chmod does not create POSIX
+    // executable bits, so provide the stat seam instead of testing the host
+    // filesystem's mode semantics.
+    const asDarwin = (path) => {
+      const info = statSync(path);
+      return {
+        ...info,
+        isFile: () => info.isFile(),
+        mode: info.isFile() && /wa-daemon-fake$/.test(String(path)) ? 0o100755 : 0o100644,
+      };
+    };
+    const found = resolveDaemonBinary({ explicit: fakeBinary, platform: "darwin", arch: "arm64", statFile: asDarwin });
     check("an explicitly supplied binary is used and its source is reported",
       found.path === fakeBinary && found.source === "--daemon", JSON.stringify(found));
-    const viaEnv = resolveDaemonBinary({ env: { BRAIN_WHATSAPP_DAEMON: fakeBinary }, platform: "darwin", arch: "arm64" });
+    const viaEnv = resolveDaemonBinary({ env: { BRAIN_WHATSAPP_DAEMON: fakeBinary }, platform: "darwin", arch: "arm64", statFile: asDarwin });
     check("the environment override is honored the same way",
       viaEnv.path === fakeBinary && viaEnv.source === "BRAIN_WHATSAPP_DAEMON", JSON.stringify(viaEnv));
     const viaManifest = resolveDaemonBinary({
-      manifest: { operations: { whatsapp_daemon_path: fakeBinary } }, platform: "darwin", arch: "arm64",
+      manifest: { operations: { whatsapp_daemon_path: fakeBinary } }, platform: "darwin", arch: "arm64", statFile: asDarwin,
     });
     check("the manifest knob is honored, so an install can pin its own binary",
       viaManifest.source === "operations.whatsapp_daemon_path", JSON.stringify(viaManifest));
@@ -439,7 +508,7 @@ try {
         const plain = join(sandbox, "not-executable");
         writeFileSync(plain, "text");
         chmodSync(plain, 0o644);
-        try { resolveDaemonBinary({ explicit: plain, platform: "darwin", arch: "arm64", installRoot: join(sandbox, "none") }); return false; }
+        try { resolveDaemonBinary({ explicit: plain, platform: "darwin", arch: "arm64", installRoot: join(sandbox, "none"), statFile: asDarwin }); return false; }
         catch (e) { return e instanceof DaemonBinaryMissingError; }
       })());
     check("the Windows binary name is the cross-compiled .exe the build script emits",

@@ -219,15 +219,21 @@ There is deliberately **no optional dependency tier**. An optional extractor
 fails *silently correct*: the run reports 61,000 files ingested and every
 contract is missing because a flag nobody set was not passed.
 
-**Scanned PDFs are detected and refused, not indexed empty.** A scan has no text
-layer, so every extractor "succeeds" on one and returns nothing. Indexed as-is,
-the brain holds a document it can say nothing about while counting it in the
-corpus total. Measured on a random sample of 70 PDFs from a real 4,458-file
-corpus: 79% had a usable text layer, 7% were thin (under 100 characters per
-page, flagged and indexed anyway), and 14% had zero text and are refused with a
-message saying they need OCR. **OCR is not in v1** — that is a decision, not an
-omission: every pure-JS OCR option drags in the native dependency the rest of
-this design exists to avoid.
+**Scanned PDFs are refused unless OCR is explicitly enabled.** A scan has no
+text layer, so indexing the empty extraction would create a document the brain
+counts but cannot answer from. Measured on a random sample of 70 PDFs from a
+real 4,458-file corpus: 79% had a usable text layer, 7% were thin (under 100
+characters per page, flagged and indexed anyway), and 14% had zero text.
+
+`safety.ocr.enabled` is off by default. When enabled, the existing PDF child
+extracts page images without a native dependency and sends each page through
+`POST /api/admin/brain/ocr` to Workers AI in the owner's Cloudflare account.
+The daily spend cap applies to every page. A scan is stored only when the
+transcription clears the normal quality floor; unreadable pages are named
+inline, and a majority-unreadable or descriptive response refuses the whole
+document. `documents.text_source` and `text_reliable` carry the OCR provenance
+through retrieval and citations. Local synthetic scans prove this contract;
+real typed, fax-quality, and handwritten scans remain a private field gate.
 
 CSV and TSV are rendered row-wise as `Header: value` rather than as a bare grid,
 because `15234.11` on its own is unretrievable while `Balance: 15234.11` answers
@@ -235,8 +241,11 @@ a question about a balance.
 
 A local-folder run also reconciles DELETIONS: a file this source loaded before
 and can no longer find is removed, through the same aggregate removal plan and
-the same safety limits Drive uses. Suppressed under `--limit`, where an
-unexamined file is not a deleted one.
+the same safety limits Drive uses. The plan denominator comes from the
+authenticated Worker inventory, not the local resume file, and exact targets
+are read back after deletion before completed source state is recorded. Pending
+deletions re-enter the current plan rather than bypassing it. Suppressed under
+`--limit`, where an unexamined file is not a deleted one.
 
 **`safety.private_path_prefixes` is enforced on local-folder and Google Drive
 ingest**, per path segment. Drive also enforces `corpora.google_drive` exact
@@ -333,6 +342,29 @@ from one document to several parts, changes its part count, or becomes small
 again removes only the obsolete representation after every replacement part is
 accepted. A document-level failure leaves the Drive cursor unadvanced so the
 same change is retried instead of being acknowledged and lost.
+
+Calendar uses the same completion boundary. Its new sync token is saved only
+after every event receipt and cancellation removal is accepted. A failed or
+refused event, or a pending cancellation cleanup, closes the source receipt as
+incomplete and leaves the prior token in place so the same Google window is
+retried idempotently.
+Its dry run returns the same common preview receipt as every other source. If
+any declared calendar cannot be read, the preview reports what it did see and
+then exits nonzero with the reconsent or provider fix instead of presenting a
+zero-event partial read as a successful preview.
+
+Message command adapters use the same result boundary. `documents_sent` means
+the conversation reached the Worker boundary; `documents_accepted` counts only
+created, updated, or unchanged receipts. Credential refusals are returned as a
+`partial` outcome and are excluded from the accepted total, so `brain load`
+cannot promote a submitted-but-refused conversation to completed work. Dry-run
+passes for iMessage, WhatsApp, and iPhone backup report `would_send` from the
+real sessionizer while resolving no admin key, posting no receipt, sending no
+batch, and saving no state. Any explicit `--limit` also makes the command result
+`partial`, even when the available fixture happens to fit inside the bound.
+Non-dry credential refusals persist a redacted `refusal_reason` in the sync run,
+and direct command output stays warning-shaped rather than printing a green
+accepted-count line.
 
 A family is addressed by ONE uid, and there are two ways to belong to it.
 **Structural**: `splitOversized` names each slice `<base>#part1of3`, so the base
@@ -487,6 +519,14 @@ suppressed entirely under `--limit`, where an unexamined file is not a deleted
 file, and an incomplete walk already aborts the run before this point. That
 matters most unattended: a cloud folder that failed to materialize is
 indistinguishable from an owner deleting everything in it.
+
+Candidates are not deletion truth. Before the guard, the lane reads the live
+family set through the authenticated Worker route, including `family_of`
+families produced by message exports, and intersects candidates with that set.
+Only the categorized plan targets reach the forget route. It then inventories
+the source again and leaves a retry marker plus an error receipt if any exact
+target remains. A pending retry goes back through this current plan and cannot
+reuse an earlier denominator or bypass a changed fingerprint.
 
 ### Legacy curated collections during migration
 
@@ -691,6 +731,10 @@ architecture change.
 ---
 
 ## Tests
+
+Current connector proof levels and the ranked acceptance backlog are maintained
+in [CONNECTOR-BACKLOG.md](./CONNECTOR-BACKLOG.md). Fixture coverage is never a
+substitute for the named real-system field gate.
 
 ```bash
 npm test

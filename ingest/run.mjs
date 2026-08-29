@@ -367,7 +367,12 @@ async function prepareMboxArchive(file, buf, hash, { sourceName }) {
   }
   return {
     hash,
-    envelopes,
+    // Every OTHER multi-document producer stamps its family here, and this one
+    // did not. That is not a cosmetic omission: cmdIngestLocal hard-throws when
+    // a multi-envelope result carries no declaration, so a single .mbox
+    // anywhere under an ingested folder aborted the WHOLE run, dry run
+    // included, and took every unrelated file in that folder with it.
+    envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)),
     note: unreadable
       ? `${envelopes.length} message(s) loaded from this archive; ${unreadable} could not be read`
       : `${envelopes.length} message(s) loaded from this archive`,
@@ -398,7 +403,7 @@ export function removedSinceLastRun(knownKeys, present) {
 /**
  * Read one file and turn it into an ingest envelope, or into a reasoned skip.
  */
-export async function prepare(file, { sourceName }) {
+export async function prepare(file, { sourceName, ocr = null }) {
   let buf;
   try {
     buf = readFileSync(file.full);
@@ -457,6 +462,9 @@ export async function prepare(file, { sourceName }) {
     reread: () => {
       try { return readFileSync(file.full); } catch { return null; }
     },
+    // Null on a dry run and whenever OCR is off, so the cheapest command stays
+    // the cheapest command and nothing bills the owner without being asked.
+    ocr,
   });
   if (got.error || got.text == null) {
     return { hash, skip: { path: file.rel, reason: got.error || "extraction produced nothing" } };
@@ -483,7 +491,16 @@ export async function prepare(file, { sourceName }) {
       date_source: dd.source,
       date_reliable: dd.reliable,
       uri: file.rel.split(sep).join("/"),
-      metadata: { category: sourceName, extracted_as: got.how, bytes: file.size, ...(note ? { extraction_note: note } : {}) },
+      // Promoted out of metadata on purpose: these two reach a citation, and a
+      // flag that never reaches the reader is not a flag.
+      ...(got.provenance
+        ? { text_source: got.provenance.text_source, text_reliable: got.provenance.text_reliable }
+        : {}),
+      metadata: {
+        category: sourceName, extracted_as: got.how, bytes: file.size,
+        ...(note ? { extraction_note: note } : {}),
+        ...(got.provenance ? { ocr: got.provenance } : {}),
+      },
     },
     note,
   };

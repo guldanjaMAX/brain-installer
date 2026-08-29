@@ -87,6 +87,18 @@ const goodSeeds = [
 ];
 
 const cleanCorpus = {
+  // The acceptance suite reads `backend` and `vector_readiness` off this same
+  // endpoint. They were absent, so a "healthy" stub reported no backend and no
+  // visibility receipt and two checks failed on a corpus that is fine. A stub
+  // that cannot pass is not a healthy stub.
+  backend: "d1",
+  vector_readiness: {
+    ready: true,
+    expected_vectors: 4102,
+    actual_vectors: 4102,
+    pending: 0,
+    submitted: 0,
+  },
   rows: [
     { source_type: "drive_file", total: 2915, embedded: 2915, last_ingested: new Date().toISOString() },
     { source_type: "message", total: 1187, embedded: 1100, last_ingested: new Date(Date.now() - 40 * 864e5).toISOString() },
@@ -480,6 +492,20 @@ const fetchStub = async (url, init = {}) => {
   if (u.pathname === "/health") return reply(200, { ok: true, version: "0.2.0" });
   if (!authed) return reply(401, { error: "unauthorized" });
   if (u.pathname === "/api/admin/brain/documents") return reply(200, cleanCorpus);
+  // Added when this file was found failing: the acceptance suite calls these two
+  // and the stub's catch-all answered 404, which reads as "the Worker cannot
+  // measure its own corpus" rather than "the test forgot an endpoint".
+  if (u.pathname === "/api/admin/brain/searchability") {
+    return reply(200, { chunks: 4102, over_budget: 0, unmeasured: 0 });
+  }
+  if (u.pathname === "/api/admin/brain/freshness") {
+    return reply(200, {
+      sources: [
+        { name: "drive", state: "ok", expected_refresh_seconds: 86400, last_ingested: new Date().toISOString() },
+        { name: "messages", state: "ok", expected_refresh_seconds: 60, last_ingested: new Date().toISOString() },
+      ],
+    });
+  }
   if (u.pathname === "/api/admin/brain/ingest") {
     return reply(422, {
       error: "refused: content carries live credential(s)",

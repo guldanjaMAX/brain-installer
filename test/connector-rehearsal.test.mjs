@@ -15,14 +15,13 @@
 //
 // Scope. Wave 0 shipped Drive, Gmail (connector code only, never run live —
 // see evidence/WP-01.md), Calendar, the WhatsApp export parser (WP-02), and
-// the SMS Backup & Restore / Google Voice Takeout parsers (WP-03). WP-11
-// (OCR) and WP-14 (the structured financial ledger) are Wave 2 and do not
-// exist in this codebase yet: no fin_* tables, no extraction pass, nothing
-// to ingest a bank statement into. This file tests exactly the five sources
-// Wave 0 shipped and explicitly marks the bank-statement step and the
-// ledger-backed-answer requirement as NOT DONE, with the reason, rather than
-// silently skipping them or faking a pass. Search this file for "N/A" to
-// find every such marker.
+// the SMS Backup & Restore / Google Voice Takeout parsers (WP-03), OCR, and
+// the structured financial ledger. OCR is exercised here. Bank exports have a
+// separate deterministic file-to-ledger test, but no scanned-statement-to-rows
+// extractor exists, and this rehearsal has no ledger-backed answer route. It
+// marks both acceptance steps NOT DONE for those precise reasons instead of
+// claiming the ledger itself is absent. Search this file for "N/A" to find
+// every such marker.
 //
 // No live OAuth. Nothing here performs an interactive Google consent flow —
 // that needs a real browser and a human, which is why WP-01's own evidence
@@ -177,8 +176,10 @@ try {
     });
     check("connect Calendar: the real syncAll() ran against a scripted Google Calendar API and produced one event to upsert",
       outcome.sent.created === 1 && !!calendarDoc, JSON.stringify(outcome.sent));
-    check("the real event content (not a hand-written stand-in) reached the envelope actually sent for ingest",
-      /Q4 renewal holds at the current monthly rate/.test(calendarDoc?.content || ""), calendarDoc?.content);
+    check("the real event content reached the sent envelope under the Calendar receipt namespace",
+      /Q4 renewal holds at the current monthly rate/.test(calendarDoc?.content || "") &&
+        calendarDoc?.source_type === "calendar",
+      JSON.stringify({ source_type: calendarDoc?.source_type, content: calendarDoc?.content }));
   }
 
   /* ================================================================ *
@@ -293,26 +294,66 @@ try {
     !!gvDoc && gvDoc.content !== smsInvoiceDoc?.content, JSON.stringify(gvDocs.map((d) => d.title)));
 
   /* ================================================================ *
-   * 8. One fixture bank statement, native and scanned -- NOT DONE.
-   *    WP-11 (OCR) and WP-14 (the structured financial ledger) are Wave 2
-   *    scope. Nothing in this codebase can classify a document as
-   *    financial, OCR a scan, or write a fin_* row: there is no ledger
-   *    schema, no extraction pass, and no bank-statement fixture. Per this
-   *    task's own instruction, this is stated plainly rather than faked.
+   * 8. One fixture bank statement, scanned. The OCR half of this step is
+   *    now real: a synthetic image-only PDF goes through the SHIPPED
+   *    extractor with a stubbed model, and comes out as a marked, indexed
+   *    document. The model is stubbed because a real one needs a live
+   *    Cloudflare account; everything between the PDF bytes and the stored
+   *    envelope is production code.
+   *
+   *    The LEDGER half stays not-done. See the note under it.
    * ================================================================ */
+  {
+    const { scanPdf, textPdf } = await import("./fixtures/scan-pdf.mjs");
+    const { extract } = await import("../ingest/extract.mjs");
+    await import("../ingest/formats.mjs");
+
+    const statementPage = [
+      "RIVER ROAD COMMUNITY BANK    Statement period 01 Mar to 31 Mar",
+      "Account ending 4417          Opening balance 2,410.55",
+      "01 Mar  Card purchase HARDWARE SUPPLY   -142.10   2,268.45",
+      "04 Mar  Deposit                        1,000.00   3,268.45",
+      "09 Mar  Card purchase FUEL               -68.40   3,200.05",
+      "18 Mar  Cheque 1042                     -450.00   2,750.05",
+      "Closing balance 2,750.05",
+    ].join("\n");
+
+    const modelPages = [];
+    const stub = Object.assign(async (image, meta) => {
+      modelPages.push({ page: meta.page, bytes: image.png_base64.length });
+      return { text: statementPage };
+    }, { model: "@cf/google/gemma-4-26b-a4b-it", maxPages: 40 });
+
+    const scanned = await extract(scanPdf(), "march-statement.pdf", { ocr: stub });
+    check("fixture bank statement, scanned: OCR read it instead of refusing it",
+      typeof scanned.text === "string" && !scanned.error, String(scanned.error));
+    check("the shipped rasteriser handed the model a real page image, with no native module",
+      modelPages.length === 1 && modelPages[0].bytes > 50, JSON.stringify(modelPages));
+    check("the transcription is in the document and the figures survived",
+      /2,750\.05/.test(scanned.text) && /HARDWARE SUPPLY/.test(scanned.text), scanned.text?.slice(0, 120));
+    check("and it is MARKED as OCR, so a citation from it is not mistaken for real text",
+      scanned.provenance?.text_source === "ocr" && scanned.provenance?.text_reliable === false,
+      JSON.stringify(scanned.provenance));
+
+    /* The control, in the same breath: a text-layer PDF must not be OCR'd. */
+    const untouched = [];
+    const watchdog = Object.assign(async (image, meta) => {
+      untouched.push(meta.page);
+      return { text: "should never be called" };
+    }, { model: "@cf/x", maxPages: 40 });
+    const native = await extract(textPdf(), "notes.pdf", { ocr: watchdog });
+    check("a PDF that already has a text layer is never sent to the model",
+      untouched.length === 0 && /text layer/.test(native.text || ""), JSON.stringify({ untouched, text: native.text?.slice(0, 80) }));
+  }
   notDone(
     "fixture bank statement, native PDF, ingested and answered",
-    "WP-11 (OCR) and WP-14 (structured ledger) are Wave 2 and do not exist in this repo yet: " +
-    "no fin_* migration, no extraction pass, nothing to ingest a statement INTO beyond plain " +
-    "text retrieval (which a native-text PDF would already get via the existing extractor -- " +
-    "but there is no fixture built for it, and proving that would not exercise anything WP-14 " +
-    "specific, so it was not fabricated here).",
-  );
-  notDone(
-    "fixture bank statement, scanned, OCR'd and answered",
-    "same reason: WP-11's OCR-via-Workers-AI path is not built. A no-text-layer PDF is still " +
-    "correctly refused by today's extractor (proven in test/ingest-run.test.mjs), which is the " +
-    "true Wave 0 behavior -- 'refused, not faked' -- not the Wave 2 OCR behavior this step asks for.",
+    "WP-14 (the structured financial ledger for EXTRACTED statements) is still Wave 2: there is " +
+    "no statement-to-rows extraction pass, so a native-text statement PDF would only get plain " +
+    "text retrieval here, which proves nothing WP-14 specific. Measured this build: OCR output " +
+    "cannot reach the ledger either -- ingest/bank-export.mjs requires a delimited file with a " +
+    "named date column and a sign convention established from the file itself, and it correctly " +
+    "refuses OCR prose with 'no column is named as a date'. That refusal is the right behaviour " +
+    "and the reason this stays not-done rather than being faked.",
   );
 
   /* ================================================================ *
@@ -349,7 +390,7 @@ try {
     toRow(waDoc, { source: "message", client: CLIENT, topFolder: "Messaging" }),
     toRow(smsInvoiceDoc, { source: "message", client: CLIENT, topFolder: "Messaging" }),
     toRow(gvDoc, { source: "message", client: CLIENT, topFolder: "Messaging" }),
-    toRow(calendarDoc, { source: "calendar_event", client: CLIENT, topFolder: "Calendar" }),
+    toRow(calendarDoc, { client: CLIENT, topFolder: "Calendar" }),
     toRow(driveDoc, { source: "drive", client: CLIENT, topFolder: "Client Files" }),
     toRow(gmailDoc, { source: "email", client: CLIENT, topFolder: "Email" }),
   ];
@@ -357,7 +398,7 @@ try {
     rows.every((r) => typeof r.text === "string" && r.text.length > 0), JSON.stringify(rows.map((r) => r.source)));
   check("every document has a distinct chunk_uid, so co-loading them cannot collide",
     new Set(rows.map((r) => r.chunk_uid)).size === rows.length, JSON.stringify(rows.map((r) => r.chunk_uid)));
-  check("the five new sources are all represented (message x3, calendar_event, drive, email)",
+  check("all six documents use the four intended stored namespaces (message x3, calendar, drive, email)",
     new Set(rows.map((r) => r.source)).size === 4 && rows.filter((r) => r.source === "message").length === 3,
     JSON.stringify(rows.map((r) => r.source)));
 
@@ -533,12 +574,10 @@ try {
    * ================================================================ */
   notDone(
     "at least one golden question answered from the structured ledger (WP-14) rather than text retrieval",
-    "WP-14 does not exist yet (Wave 2, not started): no fin_entities/fin_accounts/fin_transactions/" +
-    "fin_documents/fin_obligations tables, no extraction pass, no provenance column, nothing a " +
-    "structured-ledger-backed answer could be drawn from. Every citation proven above -- including " +
-    "the calendar and Drive ones -- comes from text retrieval over an ingested document, which is " +
-    "the only kind of answer this codebase can currently produce. Faking a ledger row here would " +
-    "misrepresent Wave 0 as having shipped Wave 2 scope.",
+    "The fin_* ledger and bank-export import path exist, but this connector rehearsal does not load " +
+    "a bank export or call a ledger-backed answer route. Every citation proven above comes from text " +
+    "retrieval. Faking a ledger row in this corpus would not prove the file-to-ledger contract; " +
+    "test/bank-import-path.test.mjs owns that proof until a real composed answer path is exercised.",
   );
 
   console.log(

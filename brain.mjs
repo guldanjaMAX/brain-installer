@@ -57,6 +57,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
+import { assertIngestionOutcome, ingestionOutcome } from "./ingest/outcome.mjs";
 // The ingest pipeline is loaded LAZILY, inside the commands that use it. It
 // pulls in the PDF/Office dependencies at import time, so a top-level import
 // meant that on a clone without node_modules the very first command, including
@@ -75,6 +76,13 @@ async function ingestLib() {
     }
     throw e;
   }
+}
+/**
+ * The OCR policy module, loaded the same lazy way and for the same reason: it
+ * imports the PDF format reader for the one constant it shares with it.
+ */
+async function ingestOcrLib() {
+  return await import("./ingest/ocr.mjs");
 }
 import { authorize, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
 import {
@@ -1193,6 +1201,20 @@ export async function cmdDeploy(manifestPath, options = {}) {
         type: "plain_text",
         name: "CREDENTIAL_SCANNER",
         text: m.safety?.credential_scanner?.enabled === false ? "off" : "on",
+      },
+      // OFF unless the manifest says otherwise. An upgrade that quietly
+      // switched on a per-page charge against the client's own account would
+      // be a bill they never agreed to, so the default is the one that spends
+      // nothing.
+      {
+        type: "plain_text",
+        name: "OCR_ENABLED",
+        text: m.safety?.ocr?.enabled === true ? "1" : "0",
+      },
+      {
+        type: "plain_text",
+        name: "OCR_MODEL",
+        text: String(m.safety?.ocr?.model || "@cf/google/gemma-4-26b-a4b-it"),
       },
     ],
     // Without this, every secret set by `brain secrets` is wiped on the next
@@ -3995,13 +4017,108 @@ export function commitCredentialScannerProgress(state, fingerprint) {
   return state;
 }
 
-export function drivePolicyFingerprint(config = {}, scannerEnabled = true) {
+export function drivePolicyFingerprint(config = {}, scannerEnabled = true, ocrEnabled = false) {
   const normalized = {};
   for (const key of ["excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
     normalized[key] = [...new Set((config[key] || []).map((value) => String(value)))].sort();
   }
   normalized.credentialScanner = credentialScannerFingerprint(scannerEnabled);
+  // Turning OCR on changes what Drive is ALLOWED TO READ, so it belongs in the
+  // source policy. Without it, a scanned PDF refused a month ago never
+  // reappears: once a change token exists the incremental feed only returns
+  // files that CHANGED, and a document sitting untouched in a folder has not.
+  // A fingerprint mismatch forces one full comparison, which looks at every
+  // file again exactly once.
+  //
+  // Deliberately NOT added to credentialScannerFingerprint, which looks
+  // interchangeable and is not: that flag also arms a refusal when a
+  // previously indexed file is missing, a refusal on --limit, and a re-send
+  // and re-embed of the whole corpus. Wrong blast radius by a wide margin.
+  normalized.ocr = ocrEnabled === true;
   return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+
+
+/* ------------------------------------------------------------------- ocr */
+
+/**
+ * OCR settings from the manifest, with the safe answer as the default.
+ *
+ * OFF unless the manifest says otherwise. Turning OCR on changes ingest from a
+ * free local operation into a metered one that bills the owner's own
+ * Cloudflare account once per scanned page, and an upgrade must never quietly
+ * start spending on someone's behalf.
+ */
+export function ocrPolicy(manifest = {}) {
+  const cfg = manifest?.safety?.ocr || {};
+  return {
+    enabled: cfg.enabled === true,
+    model: typeof cfg.model === "string" && cfg.model.trim() ? cfg.model.trim() : "@cf/google/gemma-4-26b-a4b-it",
+    maxPages: Number.isFinite(cfg.max_pages_per_document) && cfg.max_pages_per_document > 0
+      ? Math.floor(cfg.max_pages_per_document)
+      : 40,
+  };
+}
+
+/**
+ * The callback `extractPdf` calls once per page of a scanned document.
+ *
+ * It posts to the brain's OWN worker rather than to Cloudflare's REST API, so
+ * every page passes the daily spend cap, lands in `llm_call_log` under the
+ * label `ocr`, and runs on the client's own AI binding with the admin key the
+ * installer already holds. No Cloudflare control-plane token is involved in
+ * routine ingest.
+ *
+ * A cap hit, a provider refusal or a transport failure is marked `fatal` and
+ * rethrown, because none of them says anything about the DOCUMENT. Recording
+ * "unreadable" for a document that was never looked at writes a permanently
+ * wrong reason into resume state, and the source cursor must stay retryable
+ * instead.
+ */
+export function makeOcrCallback({ base, adminKey, model, maxPages, onPage = () => {} , httpImpl = http }) {
+  const call = async (image, { page, totalPages } = {}) => {
+    const { OCR_SYSTEM_PROMPT } = await ingestOcrLib();
+    let res;
+    try {
+      res = await httpImpl(`${base}/api/admin/brain/ocr`, {
+        method: "POST",
+        headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+        body: JSON.stringify({ image_base64: image.png_base64, page, prompt: OCR_SYSTEM_PROMPT }),
+      }, { what: "the OCR request" });
+    } catch (error) {
+      const e = new Error(`OCR could not reach the brain: ${error.message}`);
+      e.fatal = true;
+      throw e;
+    }
+
+    let body = {};
+    try { body = await res.json(); } catch { /* handled by status below */ }
+
+    if (res.status === 429 || body?.llm_cap_exceeded) {
+      const e = new Error(
+        `OCR stopped because the daily spend cap was reached. ${body?.detail || ""}`.trim() +
+        " No document was marked unreadable; re-run once the cap resets or raise safety.daily_llm_spend_cap_usd.",
+      );
+      e.fatal = true;
+      e.llm_cap_exceeded = true;
+      throw e;
+    }
+    if (body?.provider_mismatch || res.status === 409) {
+      const e = new Error(`OCR refused: ${body?.detail || body?.error || "the brain would not run it"}`);
+      e.fatal = true;
+      throw e;
+    }
+    if (!res.ok) {
+      // A 5xx from the model is about THIS page, not about the run, so it is a
+      // page-level error the assembler can count and report inline.
+      return { error: `page ${page}: ${String(body?.detail || body?.error || `HTTP ${res.status}`).slice(0, 160)}` };
+    }
+    onPage({ page, totalPages });
+    return { text: body?.text ?? "" };
+  };
+  call.model = model;
+  call.maxPages = maxPages;
+  return call;
 }
 
 export const DRIVE_FULL_SWEEP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -4235,6 +4352,37 @@ export function assertNoIngestFailures(tally, { noun = "stored part" } = {}) {
     `${failed} ${label} failed, so this ingest is incomplete.\n` +
       "      Progress was saved. Re-run the same command to retry only what did not finish."
   );
+}
+
+/**
+ * Attach the common ingestion outcome to a message-capture command result.
+ *
+ * The capture libraries count documents submitted to the Worker. The Worker
+ * may still refuse one at its credential boundary. Preserve both numbers so a
+ * sweep cannot turn "submitted" into "accepted", and expose that refusal as a
+ * partial outcome even though it is an intentional security-policy result.
+ */
+export function messageIngestionResult(result, tally) {
+  const created = Math.max(0, Math.trunc(Number(tally?.created || 0)));
+  const updated = Math.max(0, Math.trunc(Number(tally?.updated || 0)));
+  const unchanged = Math.max(0, Math.trunc(Number(tally?.unchanged || 0)));
+  const refused = Math.max(0, Math.trunc(Number(tally?.refused || 0)));
+  const partial = refused > 0 || !!result?.truncated || !!result?.bounded;
+  const reasons = [
+    refused ? `${refused} conversation document(s) were refused` : null,
+    result?.truncated || result?.bounded ? "the source was bounded before its full history was read" : null,
+  ].filter(Boolean).join("; ");
+  return {
+    ...result,
+    created,
+    updated,
+    unchanged,
+    refused,
+    documents_accepted: created + updated + unchanged,
+    outcome: ingestionOutcome(partial ? "partial" : "completed", {
+      reason: partial ? reasons : null,
+    }),
+  };
 }
 
 const INGEST_RESULT_STATUSES = new Set(["created", "updated", "unchanged", "refused", "failed"]);
@@ -5111,6 +5259,32 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   const alreadyDone = Object.keys(state.done).length;
   if (alreadyDone && !flags.reset) info(`resuming: ${alreadyDone} file(s) already loaded`);
 
+
+  // OCR, and what it will cost, decided ONCE per run and stated out loud
+  // before the first page is sent. The estimate lands while the owner can
+  // still say no; a bill that appears afterwards is not a choice they were
+  // offered. A dry run never gets a callback, so the safest command in the
+  // tool stays the cheapest one.
+  const ocrCfg = ocrPolicy(m);
+  let ocrPages = 0;
+  const ocrCallback = dry || !ocrCfg.enabled ? null : makeOcrCallback({
+    base, adminKey, model: ocrCfg.model, maxPages: ocrCfg.maxPages,
+    onPage: ({ page, totalPages }) => {
+      ocrPages++;
+      // Per PAGE, not per file. A forty-page scan is forty model calls and
+      // over a minute of waiting; without this the run looks hung and the
+      // first client to see it kills it.
+      info(`  OCR page ${page}${totalPages ? ` of ${totalPages}` : ""} (${ocrPages} page(s) read so far this run)`);
+    },
+  });
+  if (ocrCfg.enabled && !dry) {
+    const { estimateOcrCost, describeOcrCost } = await ingestOcrLib();
+    info(`OCR is ON, model ${ocrCfg.model}, up to ${ocrCfg.maxPages} page(s) per document.`);
+    info(`  cost per 100 scanned pages: ${describeOcrCost(estimateOcrCost(100))}`);
+  } else if (ocrCfg.enabled && dry) {
+    info("OCR is ON, but a dry run never sends a page to a model and never spends anything.");
+  }
+
   const privatePrefixes = m.safety?.private_path_prefixes || [];
   info(`walking ${root}`);
   const { files, skipped: walkSkips, complete: walkComplete } = walk(root, { privatePrefixes });
@@ -5192,7 +5366,7 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   // a raw V8 abort no handler can catch, and an interrupt during that silent
   // phase threw away every minute of extraction. Peak memory here is one batch.
   const prepareOne = async (f) => {
-    const r = await prepare(f, { sourceName });
+    const r = await prepare(f, { sourceName, ocr: ocrCallback });
     if (r.note) notes.push({ path: f.rel, note: r.note });
 
     // A multi-document producer (a WhatsApp export, an SMS Backup & Restore
@@ -5359,16 +5533,8 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   try {
 
   const pendingLocalUids = Object.keys(state.removed || {});
-  if (pendingLocalUids.length) {
-    const retried = await applyDriveRemovals({
-      uids: pendingLocalUids, base, adminKey, state, dryRun: false, label: "pending local source removal",
-    });
-    saveState(statePath, state);
-    assertNoPendingRemovals(retried, "pending local source removal");
-    for (const uid of pendingLocalUids) {
-      if (uid.startsWith(`${sourceName}:`)) delete state.done[uid.slice(sourceName.length + 1)];
-    }
-    saveState(statePath, state);
+  if (pendingLocalUids.some((uid) => !uid.startsWith(`${sourceName}:`))) {
+    throw new Error("the local removal retry state contains a document outside this source");
   }
 
   const familyPlans = new Map();
@@ -5451,16 +5617,26 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   // through the SAME aggregate guard the Drive lane uses. No removal call is
   // allowed above this assertion.
   //
-  // The stored set is this source's own resume state, which is exactly the set
-  // these keys are removed from, so the ratio the guard reasons about is the
-  // real one. This matters most for the unattended folder lane: a cloud folder
-  // that failed to materialize is indistinguishable from a client deleting
-  // everything in it, and that difference is worth one deliberate approval.
+  // The stored set comes from the authenticated Worker, not this machine's
+  // resume file. A restored or copied state file may be stale in either
+  // direction; using it as deletion truth can shrink the denominator or hide
+  // a family that exists in D1. This matters most for the unattended folder
+  // lane, where a missing File Provider mount can otherwise look like the
+  // owner deleted everything.
+  const storedLocalFamilies = await listStoredSourceFamilies({
+    base, adminKey, source: sourceName,
+  });
   const localRemovalPlan = buildDriveRemovalPlan({
-    storedFamilies: [...previouslyKnownKeys].map((key) => `${sourceName}:${key}`),
+    storedFamilies: storedLocalFamilies,
     activeFamilies: [...protectedLocalSkipKeys].map((key) => `${sourceName}:${key}`),
     policyCandidates: privateRemovalKeys.map((key) => `${sourceName}:${key}`),
-    vanishedCandidates: vanishedRemovalKeys.map((key) => `${sourceName}:${key}`),
+    // A lost deletion response is re-planned against current authenticated
+    // truth. Restoration wins for this category, while a still-current policy
+    // or intentional refusal is assigned to its earlier, stronger category.
+    vanishedCandidates: [
+      ...vanishedRemovalKeys.map((key) => `${sourceName}:${key}`),
+      ...pendingLocalUids,
+    ],
     intentionalCandidates: [...intentionalRemovalKeys].map((key) => `${sourceName}:${key}`),
   });
   assertDriveRemovalPlanSafe(localRemovalPlan, localRemovalApproval);
@@ -5470,14 +5646,18 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
     info(`folder cleanup plan ${disposition}: ${localRemovalPlan.total} of ${localRemovalPlan.stored} loaded documents (${percent}%)`);
   }
 
-  const localRemovalKeys = [...new Set([...privateRemovalKeys, ...intentionalRemovalKeys])];
+  // Only the exact targets intersected with authenticated storage and covered
+  // by the approval fingerprint may reach the destructive endpoint.
+  const localTruthTargets = [
+    ...localRemovalPlan.targets.source_policy,
+    ...localRemovalPlan.targets.intentional_skip,
+  ];
   const localRemoval = await applyDriveRemovals({
-    uids: localRemovalKeys.map((key) => `${sourceName}:${key}`),
+    uids: localTruthTargets,
     base, adminKey, state, dryRun: false, label: "local source truth",
   });
   saveState(statePath, state);
   assertNoPendingRemovals(localRemoval, "local source truth removal");
-  for (const key of localRemovalKeys) delete state.done[key];
 
   const vanishedTargets = localRemovalPlan.targets.source_deleted;
   if (vanishedTargets.length) {
@@ -5487,6 +5667,35 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
     saveState(statePath, state);
     assertNoPendingRemovals(vanishedRemoval, "deleted local file removal");
     if (vanishedRemoval.applied) ok(`${vanishedRemoval.applied} document(s) removed because their file is gone from the folder`);
+  }
+
+  // An accepted HTTP receipt is necessary but not sufficient deletion proof.
+  // Read the authenticated inventory again before advancing local resume state.
+  // If a lost or malformed backend write left a family present, preserve a
+  // retry marker and fail the run instead of recording a clean source.
+  const plannedLocalTargets = [...new Set([...localTruthTargets, ...vanishedTargets])];
+  if (plannedLocalTargets.length) {
+    const afterLocalRemoval = await listStoredSourceFamilies({
+      base, adminKey, source: sourceName,
+    });
+    const stillStored = plannedLocalTargets.filter((uid) => afterLocalRemoval.has(uid));
+    if (stillStored.length) {
+      const failedAt = new Date().toISOString();
+      state.removed = {
+        ...(state.removed || {}),
+        ...Object.fromEntries(stillStored.map((uid) => [uid, failedAt])),
+      };
+      saveState(statePath, state);
+      throw new Error(
+        `${stillStored.length} planned local folder removal(s) remained after exact source-inventory readback. ` +
+          "No completed source state was recorded; re-running will retry them through the same approval gate."
+      );
+    }
+    for (const uid of plannedLocalTargets) {
+      delete state.done[uid.slice(sourceName.length + 1)];
+      if (state.removed) delete state.removed[uid];
+    }
+    saveState(statePath, state);
   }
 
   if (scannerRescanSkips.length) {
@@ -5975,14 +6184,31 @@ export async function cmdIngestCalendar(m, manifestPath, flags, options = {}) {
   }
 
   if (dry) {
-    ok(`dry run: ${result.documents.length} event(s) would be sent, ${result.deletions.length} cancellation(s) would be removed`);
+    const previewFailures = result.calendars.filter((calendar) => calendar.error);
+    const previewSummary = `dry run: ${result.documents.length} event(s) would be sent, ${result.deletions.length} cancellation(s) would be removed`;
+    if (previewFailures.length) warn(`Calendar preview incomplete: ${previewSummary}`);
+    else ok(previewSummary);
     if (result.documents.length) {
       console.log("\n  first few that WOULD be sent:");
       for (const envelope of result.documents.slice(0, 5)) {
         console.log(`    ${envelope.title}  (${envelope.occurred_at || "no date"})`);
       }
     }
-    return result;
+    if (previewFailures.length) {
+      die(
+        `Calendar preview incomplete: ${previewFailures.length} of ${result.calendars.length} calendar(s) could not be read. ` +
+          (result.summary.needs_reconsent
+            ? "Reconnect with `brain connect google --scopes drive,gmail,calendar`, then retry the preview."
+            : "Fix the calendar errors printed above, then retry the preview."),
+      );
+    }
+    return {
+      ...result,
+      dry_run: true,
+      would_send: result.documents.length,
+      unchanged: 0,
+      skipped: result.summary.skipped,
+    };
   }
 
   const runId = `sync_${randomBytes(16).toString("hex")}`;
@@ -5993,38 +6219,68 @@ export async function cmdIngestCalendar(m, manifestPath, flags, options = {}) {
     detail: `calendar sync started: ${calendarLabel}`,
   });
 
-  const sent = await ingestEnvelopes({ baseUrl: base, adminKey, envelopes: result.documents });
+  // The connector library uses `calendar_event` when exercised on its own,
+  // but the runnable command owns an operator-selectable source namespace.
+  // Store rows in that namespace so source receipts, freshness counts,
+  // `brain forget --source`, and custom `--source` names all describe the
+  // same documents. Gmail, Drive, and the message commands follow this same
+  // boundary rule.
+  const sourceEnvelopes = result.documents.map((envelope) => ({
+    ...envelope,
+    source_type: sourceName,
+  }));
+  const sent = await ingestEnvelopes({ baseUrl: base, adminKey, envelopes: sourceEnvelopes });
 
   let removed = 0;
+  let removalPending = 0;
   if (result.deletions.length) {
-    const uids = result.deletions.map((d) => `calendar_event:${d.source_id}`);
+    const uids = result.deletions.map((d) => `${sourceName}:${d.source_id}`);
     const removal = await removeDocs({
       uids, base, adminKey, state: { done: {}, removed: {} }, dryRun: false, label: "calendar cancellation",
     });
     removed = removal.applied;
+    removalPending = removal.pending;
   }
 
-  // The state save happens even if calendars partially failed (needs_reconsent):
-  // every calendar that DID sync successfully keeps its progress rather than
-  // being forced to resync in full on the next run just because a sibling
-  // calendar's token died.
-  saveState(statePath, result.state);
+  // Provider-level partial failure is tracked per calendar in result.state, so
+  // successful sibling calendars may keep their progress. A document send,
+  // credential refusal, or cancellation-cleanup failure is different: it
+  // happened AFTER Google issued the new sync token. Saving that token would
+  // permanently skip the unaccepted event or cancellation on the next run.
+  // Withhold the whole state update in that case. Replaying the old window is
+  // idempotent and is the only safe retry boundary.
+  const deliveryIncomplete = sent.errors.length > 0 || sent.refused.length > 0 || removalPending > 0;
+  if (deliveryIncomplete) {
+    warn("Calendar sync state was not advanced because not every event and cancellation was accepted. Re-running retries the same Google window.");
+  } else {
+    saveState(statePath, result.state);
+  }
 
-  const finalStatus = sent.errors.length ? "error" : "ready";
+  const finalStatus = deliveryIncomplete || result.summary.needs_reconsent ? "error" : "ready";
+  const incompleteReason = [
+    sent.errors.length ? `${sent.errors.length} event send(s) failed` : null,
+    sent.refused.length ? `${sent.refused.length} event(s) were refused` : null,
+    removalPending ? `${removalPending} cancellation removal(s) remain pending` : null,
+    result.summary.needs_reconsent ? "one or more calendars need Google reconsent" : null,
+  ].filter(Boolean).join("; ");
   await postReceipt(base, adminKey, {
     source: sourceName, kind: "calendar", status: finalStatus,
     run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
     docs_added: sent.created, docs_updated: sent.updated, docs_unchanged: sent.unchanged,
     detail: `calendar sync: ${sent.created} created, ${sent.updated} updated, ${sent.unchanged} unchanged, ` +
-      `${sent.refused.length} refused, ${sent.errors.length} failed, ${removed} removed`,
+      `${sent.refused.length} refused, ${sent.errors.length} failed, ${removed} removed, ${removalPending} removal(s) pending`,
+    ...(finalStatus === "error" ? { error: incompleteReason || "calendar sync incomplete" } : {}),
   });
 
-  ok(`${sent.created} created, ${sent.updated} updated, ${sent.unchanged} unchanged, ${removed} cancellation(s) removed`);
+  const calendarSummary = `${sent.created} created, ${sent.updated} updated, ${sent.unchanged} unchanged, ${removed} cancellation(s) removed`;
+  if (finalStatus === "ready") ok(calendarSummary);
+  else warn(`Calendar sync incomplete: ${calendarSummary}`);
   if (sent.refused.length) {
     warn(`${sent.refused.length} event(s) refused by the credential gate (a live credential was pasted into an event)`);
   }
   if (sent.errors.length) warn(`${sent.errors.length} event(s) failed to send and will be retried on the next run`);
-  return { result, sent, removed };
+  if (removalPending) warn(`${removalPending} cancellation removal(s) remain pending and will be retried on the next run`);
+  return { result, sent, removed, removalPending };
 }
 
 /**
@@ -6180,23 +6436,29 @@ export async function cmdIngestImessage(m, manifestPath, flags, options = {}) {
   if (dry) {
     info(summary);
     ok("dry run, nothing was sent and no state was saved");
-    return result;
+    return { ...result, bounded: !!flags.limit, would_send: result.documents_would_send };
   }
+
+  const bounded = !!flags.limit;
+  if (bounded) warn(`--limit ${flags.limit} bounded this capture pass, so it is NOT a complete source load`);
 
   await postReceipt(base, adminKey, {
     source: sourceName, kind: "imessage", status: "ready",
     run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
     docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
-    detail: `iMessage capture: ${summary}`,
+    detail: `iMessage capture: ${summary}; ${tally.refused} refused`,
+    ...(tally.refused ? { refusal_reason: `${tally.refused} conversation document(s) refused by the credential gate` } : {}),
   });
 
   info(summary);
-  ok(`${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged`);
+  const acceptedSummary = `${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged`;
+  if (tally.refused || bounded) warn(`iMessage load incomplete: ${acceptedSummary}`);
+  else ok(acceptedSummary);
   if (tally.refused) {
     warn(`${tally.refused} conversation document(s) refused by the credential gate (a live credential was texted)`);
   }
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
-  return result;
+  return messageIngestionResult({ ...result, bounded }, tally);
 }
 
 /**
@@ -6334,18 +6596,24 @@ export async function cmdIngestWhatsapp(m, manifestPath, flags, options = {}) {
   if (dry) {
     info(summary);
     ok("dry run, nothing was sent and no state was saved");
-    return result;
+    return { ...result, bounded: !!flags.limit, would_send: result.documents_would_send };
   }
+
+  const bounded = !!flags.limit;
+  if (bounded) warn(`--limit ${flags.limit} bounded this drain pass, so it is NOT a complete source load`);
 
   await postReceipt(base, adminKey, {
     source: sourceName, kind: "whatsapp", status: "ready",
     run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
     docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
-    detail: `WhatsApp drain: ${summary}`,
+    detail: `WhatsApp drain: ${summary}; ${tally.refused} refused`,
+    ...(tally.refused ? { refusal_reason: `${tally.refused} conversation document(s) refused by the credential gate` } : {}),
   });
 
   info(summary);
-  ok(`${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged`);
+  const acceptedSummary = `${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged`;
+  if (tally.refused || bounded) warn(`WhatsApp load incomplete: ${acceptedSummary}`);
+  else ok(acceptedSummary);
   if (tally.refused) {
     warn(`${tally.refused} conversation document(s) refused by the credential gate (a live credential was messaged)`);
   }
@@ -6361,7 +6629,7 @@ export async function cmdIngestWhatsapp(m, manifestPath, flags, options = {}) {
     warn("the outbox could not be opened for writing, so its drained markers were not updated. The load itself is unaffected; the daemon will keep reporting them as pending.");
   }
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
-  return result;
+  return messageIngestionResult({ ...result, bounded }, tally);
 }
 
 /** Where this install keeps the capture daemon's data, honoring an override. */
@@ -6533,24 +6801,28 @@ export async function cmdIngestIphoneBackup(m, manifestPath, flags, options = {}
   if (dry) {
     info(summary);
     ok("dry run, nothing was sent");
-    return result;
+    return { ...result, bounded: !!flags.limit, would_send: result.documents_would_send };
   }
-  if (result.truncated) warn(`--limit stopped this load early; it is NOT a complete history of the backup`);
+  const bounded = !!flags.limit || !!result.truncated;
+  if (bounded) warn(`--limit stopped or bounded this load; it is NOT a complete history of the backup`);
 
   await postReceipt(base, adminKey, {
     source: sourceName, kind: "iphone-backup", status: "ready",
     run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
     docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
-    detail: `iPhone backup one-time history load (snapshot, not live capture): ${summary}`,
+    detail: `iPhone backup one-time history load (snapshot, not live capture): ${summary}; ${tally.refused} refused`,
+    ...(tally.refused ? { refusal_reason: `${tally.refused} conversation document(s) refused by the credential gate` } : {}),
   });
 
   info(summary);
-  ok(`${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged`);
+  const acceptedSummary = `${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged`;
+  if (tally.refused || bounded) warn(`iPhone backup load incomplete: ${acceptedSummary}`);
+  else ok(acceptedSummary);
   if (tally.refused) {
     warn(`${tally.refused} conversation document(s) refused by the credential gate (a live credential was texted)`);
   }
   info(`remove this load with: brain forget ${manifestPath} --source ${sourceName}`);
-  return result;
+  return messageIngestionResult({ ...result, bounded }, tally);
 }
 
 
@@ -6910,6 +7182,7 @@ export async function planLoad({ m, manifestPath, flags = {}, registry, probes, 
       order: descriptor?.order ?? 900,
       enabled: m.corpora[key]?.enabled === true,
       status: "ready",
+      outcome: null,
       reason: null,
       fix: null,
       legs: [],
@@ -6928,7 +7201,7 @@ export async function planLoad({ m, manifestPath, flags = {}, registry, probes, 
       entry.status = "skipped";
       entry.reason = "not enabled in this manifest, so this client does not use it";
     } else if (!descriptor) {
-      entry.status = "skipped";
+      entry.status = "unavailable";
       entry.reason = `enabled in this manifest, but brain ${PRODUCT_VERSION} has no loader for it`;
       entry.fix = "nothing was loaded from it; put its documents in a folder and load that instead";
     } else if (descriptor.pushOnly) {
@@ -6945,7 +7218,7 @@ export async function planLoad({ m, manifestPath, flags = {}, registry, probes, 
         }
       }
       if (!verdict?.connected) {
-        entry.status = "skipped";
+        entry.status = "unavailable";
         entry.reason = `enabled, but not connected on this machine: ${verdict?.reason || "reason not reported"}`;
         entry.fix = verdict?.fix || null;
       } else {
@@ -6964,13 +7237,16 @@ export async function planLoad({ m, manifestPath, flags = {}, registry, probes, 
           };
         }
         if (legs?.unavailable) {
-          entry.status = "skipped";
+          entry.status = "unavailable";
           entry.reason = legs.unavailable.reason;
           entry.fix = legs.unavailable.fix || null;
         } else {
           entry.legs = legs;
         }
       }
+    }
+    if (entry.status === "unavailable") {
+      entry.outcome = ingestionOutcome("unavailable", { reason: entry.reason });
     }
     entries.push(entry);
   }
@@ -6987,8 +7263,23 @@ export async function planLoad({ m, manifestPath, flags = {}, registry, probes, 
  * zero, because a zero is a claim and unknown is the truth.
  */
 export function describeLoadResult(result) {
+  const declaredOutcome = result && typeof result === "object" && result.outcome != null
+    ? assertIngestionOutcome(result.outcome)
+    : null;
+  const outcomeOf = (kind, options) => {
+    const derived = ingestionOutcome(kind, options);
+    if (declaredOutcome && declaredOutcome.kind !== derived.kind) {
+      throw new Error(
+        `the connector's explicit ${declaredOutcome.kind} outcome contradicts its ${derived.kind} receipt`,
+      );
+    }
+    return declaredOutcome || derived;
+  };
   if (result && typeof result === "object") {
     if (result.dry_run) {
+      if (declaredOutcome) {
+        throw new Error("a dry run returned an ingestion outcome even though it must not accept work");
+      }
       // A connector that does not report would_send has NOT reported zero. The
       // message captures are in exactly that position, and printing their
       // volume as 0 (or as the literal "undefined") would let an operator
@@ -7001,6 +7292,7 @@ export function describeLoadResult(result) {
         counts: null,
         wouldSend: wouldSendKnown ? Number(result.would_send) : null,
         volumeUnknown: !wouldSendKnown,
+        outcome: null,
         text: wouldSendKnown
           ? `${Number(result.would_send)} document(s) WOULD be sent, ${result.unchanged ?? 0} unchanged`
           : "would be read, but this source does not report a count in advance (unknown, not zero)",
@@ -7012,25 +7304,42 @@ export function describeLoadResult(result) {
       const counts = { created: s.created || 0, updated: s.updated || 0, unchanged: s.unchanged || 0 };
       const extra = [];
       if (result.removed) extra.push(`${result.removed} cancellation(s) removed`);
+      if (result.removalPending) extra.push(`${result.removalPending} cancellation removal(s) pending`);
       if (s.refused?.length) extra.push(`${s.refused.length} refused`);
       if (s.errors?.length) extra.push(`${s.errors.length} failed to send`);
       return {
         known: true,
         counts,
-        partial: !!(s.errors?.length || s.refused?.length || result.result?.summary?.needs_reconsent),
+        partial: !!(s.errors?.length || s.refused?.length || result.removalPending || result.result?.summary?.needs_reconsent),
+        outcome: outcomeOf(
+          s.errors?.length || s.refused?.length || result.removalPending || result.result?.summary?.needs_reconsent
+            ? "partial"
+            : "completed"
+        ),
         text: `${counts.created} created, ${counts.updated} updated, ${counts.unchanged} unchanged`
           + (extra.length ? `, ${extra.join(", ")}` : ""),
       };
     }
-    // message captures: { documents_sent, rows_seen, ... }
+    // message captures: documents_sent is what reached the Worker boundary;
+    // documents_accepted is what the Worker actually stored or recognised.
     if (Number.isFinite(result.documents_sent)) {
+      const refused = Math.max(0, Math.trunc(Number(result.refused || 0)));
+      const acceptedKnown = Number.isFinite(result.documents_accepted);
+      const accepted = acceptedKnown ? Number(result.documents_accepted) : Number(result.documents_sent);
+      const partial = !!result.truncated || !!result.bounded || refused > 0;
       return {
         known: true,
         counts: null,
-        documents: result.documents_sent,
-        partial: !!result.truncated,
-        text: `${result.documents_sent} conversation document(s) sent from ${result.rows_seen ?? "unknown"} new row(s)`
-          + (result.truncated ? "; --limit stopped it early, so this is NOT the full history" : ""),
+        documents: accepted,
+        partial,
+        outcome: outcomeOf(partial ? "partial" : "completed"),
+        text: acceptedKnown
+          ? `${accepted} conversation document(s) accepted from ${result.documents_sent} submitted and ${result.rows_seen ?? "unknown"} new row(s)`
+            + (refused ? `; ${refused} refused, NOT indexed` : "")
+            + (result.truncated || result.bounded ? "; --limit bounded it, so this is NOT the full history" : "")
+          : `${result.documents_sent} conversation document(s) sent from ${result.rows_seen ?? "unknown"} new row(s)`
+            + (refused ? `; ${refused} refused, NOT indexed` : "")
+            + (result.truncated || result.bounded ? "; --limit bounded it, so this is NOT the full history" : ""),
       };
     }
     // local folder and remote drive/gmail tallies
@@ -7043,12 +7352,24 @@ export function describeLoadResult(result) {
         known: true,
         counts,
         partial: !!result.refused,
+        outcome: outcomeOf(result.refused ? "partial" : "completed"),
         text: `${counts.created} created, ${counts.updated} updated, ${counts.unchanged} unchanged`
           + (extra.length ? `, ${extra.join(", ")}` : ""),
       };
     }
   }
-  return { known: false, counts: null, text: "loaded, but this connector reported no counts (unknown, not zero)" };
+    if (declaredOutcome && ["completed", "partial"].includes(declaredOutcome.kind)) {
+      return {
+        known: false,
+        counts: null,
+        partial: declaredOutcome.kind === "partial",
+        outcome: declaredOutcome,
+        text: `${declaredOutcome.kind}, with counts unknown (not zero)`,
+      };
+    }
+  throw new Error(
+    "the connector returned no recognized completion receipt. Whether anything landed is unknown; re-running is safe.",
+  );
 }
 
 /** Short human duration. A sweep leg that took 41 minutes should not read "2460000ms". */
@@ -7064,6 +7385,7 @@ const LOAD_STATUS_LABEL = {
   loaded: () => `${c.green("loaded")}`,
   partial: () => `${c.yellow("partly loaded")}`,
   skipped: () => `${c.dim("skipped")}`,
+  unavailable: () => `${c.yellow("unavailable")}`,
   failed: () => `${c.red("FAILED")}`,
   review: () => `${c.yellow("STOPPED for review")}`,
 };
@@ -7079,6 +7401,7 @@ const LOAD_STATUS_LABEL = {
 export function renderLoadReport(entries, { dryRun, totals, log = console.log }) {
   const loaded = entries.filter((e) => e.status === "loaded" || e.status === "partial");
   const skipped = entries.filter((e) => e.status === "skipped");
+  const unavailable = entries.filter((e) => e.status === "unavailable");
   const broken = entries.filter((e) => e.status === "failed" || e.status === "review");
   const pad = (s, n) => String(s).padEnd(n);
   const width = Math.max(12, ...entries.map((e) => e.label.length));
@@ -7107,6 +7430,14 @@ export function renderLoadReport(entries, { dryRun, totals, log = console.log })
   if (!skipped.length) log(`    ${c.dim("none")}`);
   for (const entry of skipped) {
     log(`    ${c.dim("skipped")}  ${pad(entry.label, width)}  ${entry.reason}`);
+    if (entry.fix) log(`             ${c.dim("fix:")} ${entry.fix}`);
+  }
+
+  log("");
+  log(`  ${c.bold(`NOT LOADED — unavailable (${unavailable.length})`)}`);
+  if (!unavailable.length) log(`    ${c.dim("none")}`);
+  for (const entry of unavailable) {
+    log(`    ${LOAD_STATUS_LABEL.unavailable()}  ${pad(entry.label, width)}  ${entry.reason}`);
     if (entry.fix) log(`             ${c.dim("fix:")} ${entry.fix}`);
   }
 
@@ -7229,11 +7560,17 @@ export async function cmdLoad(manifestPath, options = {}) {
     if (legFailures.length && !legResults.length) {
       entry.status = review ? "review" : "failed";
       entry.reason = legFailures.map((f) => f.reason).join(" | ");
+      entry.outcome = ingestionOutcome(review ? "refused" : "retryable", { reason: entry.reason });
       entry.fix = null;
       log(`      ${c.dim("continuing with the remaining sources")}`);
     } else {
       const partial = legFailures.length > 0 || legResults.some((r) => r.partial) || !!flags.limit;
       entry.status = partial ? "partial" : "loaded";
+      entry.outcome = dryRun
+        ? null
+        : ingestionOutcome(partial ? "partial" : "completed", {
+          reason: partial ? "one or more source legs or documents did not complete" : null,
+        });
       entry.summary = legResults.length === 1 && entry.legs.length === 1
         ? legResults[0].text
         : `${legResults.length} of ${entry.legs.length} folder(s) loaded`;
@@ -7249,9 +7586,10 @@ export async function cmdLoad(manifestPath, options = {}) {
 
   const done = entries.filter((e) => e.status === "loaded" || e.status === "partial");
   const skippedCount = entries.filter((e) => e.status === "skipped").length;
+  const unavailableCount = entries.filter((e) => e.status === "unavailable").length;
   const failedCount = entries.filter((e) => e.status === "failed" || e.status === "review").length;
   const partialCount = entries.filter((e) => e.status === "partial").length;
-  const absentCount = skippedCount + failedCount;
+  const absentCount = unavailableCount + failedCount;
   const totalsAccumulator = { created: 0, updated: 0, unchanged: 0 };
   let unknownCounts = 0;
   let conversationDocs = 0;
@@ -7286,7 +7624,7 @@ export async function cmdLoad(manifestPath, options = {}) {
   if (!dryRun && conversationDocs) documentParts.push(`${conversationDocs} conversation document(s) sent`);
   const totals = {
     line: `totals: ${done.length} loaded${partialCount ? ` (${partialCount} only partly)` : ""}, `
-      + `${skippedCount} skipped, ${failedCount} failed, of ${entries.length} declared`,
+      + `${skippedCount} skipped, ${unavailableCount} unavailable, ${failedCount} failed, of ${entries.length} declared`,
     documents: unknownCounts
       ? `${documentParts.join(", ")} — plus ${unknownCounts} source(s) whose counts are UNKNOWN, not zero`
       : documentParts.join(", "),
@@ -7303,7 +7641,16 @@ export async function cmdLoad(manifestPath, options = {}) {
 
   renderLoadReport(entries, { dryRun, totals, log });
 
-  const summary = { entries, totals, dryRun, loaded: done.length, skipped: skippedCount, failed: failedCount };
+  const summary = {
+    entries,
+    totals,
+    dryRun,
+    loaded: done.length,
+    partial: partialCount,
+    skipped: skippedCount,
+    unavailable: unavailableCount,
+    failed: failedCount,
+  };
   if (failedCount) {
     // Non-zero, but only after the whole report has printed. The exit code is
     // for the script; the report above is for the person, and a partial load
@@ -7312,6 +7659,16 @@ export async function cmdLoad(manifestPath, options = {}) {
       `${failedCount} of ${runnable.length} source(s) ${dryRun ? "could not even be previewed" : "did not load"}`
         + (done.length ? `; the other ${done.length} ${dryRun ? "previewed fine" : "did"}.` : ".") + "\n"
         + "      Fix the reported cause, then re-run just that one: brain load <manifest> --only <source>"
+    );
+  }
+  if (unavailableCount || (!dryRun && partialCount)) {
+    const parts = [
+      unavailableCount ? `${unavailableCount} unavailable` : null,
+      !dryRun && partialCount ? `${partialCount} partial` : null,
+    ].filter(Boolean).join(" and ");
+    die(
+      `${parts} source outcome(s) were not complete, so this load is not a successful sweep.\n` +
+        "      The full report is above. Fix or reconnect the named source, then re-run only it with --only <source>."
     );
   }
   return summary;
@@ -7351,6 +7708,31 @@ async function cmdIngestRemote(m, manifestPath, flags) {
 
   const { batchStream, splitOversized, loadState, saveState } = await ingestLib();
   const getToken = googleAuth(which === "gmail" ? "gmail" : "drive");
+  // OCR, and what it will cost, decided ONCE per run and stated out loud
+  // before the first page is sent. The estimate lands while the owner can
+  // still say no; a bill that appears afterwards is not a choice they were
+  // offered. A dry run never gets a callback, so the safest command in the
+  // tool stays the cheapest one.
+  const ocrCfg = ocrPolicy(m);
+  let ocrPages = 0;
+  const ocrCallback = dry || !ocrCfg.enabled ? null : makeOcrCallback({
+    base, adminKey, model: ocrCfg.model, maxPages: ocrCfg.maxPages,
+    onPage: ({ page, totalPages }) => {
+      ocrPages++;
+      // Per PAGE, not per file. A forty-page scan is forty model calls and
+      // over a minute of waiting; without this the run looks hung and the
+      // first client to see it kills it.
+      info(`  OCR page ${page}${totalPages ? ` of ${totalPages}` : ""} (${ocrPages} page(s) read so far this run)`);
+    },
+  });
+  if (ocrCfg.enabled && !dry) {
+    const { estimateOcrCost, describeOcrCost } = await ingestOcrLib();
+    info(`OCR is ON, model ${ocrCfg.model}, up to ${ocrCfg.maxPages} page(s) per document.`);
+    info(`  cost per 100 scanned pages: ${describeOcrCost(estimateOcrCost(100))}`);
+  } else if (ocrCfg.enabled && dry) {
+    info("OCR is ON, but a dry run never sends a page to a model and never spends anything.");
+  }
+
   const statePath = join(dirname(resolve(manifestPath)), `.brain-ingest-${sourceName}.json`);
   const state = flags.reset ? { version: 1, done: {}, skipped: {} } : loadState(statePath);
   const scannerOn = m.safety?.credential_scanner?.enabled !== false;
@@ -7367,7 +7749,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     } catch (error) {
       die(error.message);
     }
-    policyFingerprint = drivePolicyFingerprint(sourcePolicy, scannerOn);
+    policyFingerprint = drivePolicyFingerprint(sourcePolicy, scannerOn, ocrCfg.enabled);
     driveDecision = driveSyncDecision({
       reset: !!flags.reset,
       syncToken: state.sync_token,
@@ -7606,7 +7988,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         return { unchanged: true };
       }
 
-      const r = await drive.toEnvelope(getToken, f, { sourceName, pathOf });
+      const r = await drive.toEnvelope(getToken, f, { sourceName, pathOf, ocr: ocrCallback });
       if (!r) return null;
       if (r.skip) {
         state.skipped[key] = r.skip.reason;
@@ -8289,6 +8671,7 @@ export async function cmdConnectWhatsapp(manifestPath, flags = {}, options = {})
       env: options.env ?? process.env,
       manifest: m,
       platform: options.platform ?? process.platform,
+      ...(options.statFile ? { statFile: options.statFile } : {}),
     });
   } catch (error) {
     if (error?.reason === "daemon_binary_missing") die(error.message);

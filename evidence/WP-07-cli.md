@@ -1,5 +1,17 @@
 # WP-07 — WhatsApp live capture, the CLI and Node half
 
+## 2026-08-29 common-contract hardening
+
+The real WhatsApp drain command now returns submitted, accepted, and refused
+conversation counts plus the shared source outcome. A Worker credential refusal
+is `partial`, never completion-shaped, and only accepted conversations count as
+present in `brain load`. Dry-run sessionization reports the exact would-submit
+document count while resolving no admin key, sending no batch, and writing no
+drain state. An explicit `--limit` or credential refusal remains warning-shaped
+and partial, with a redacted refusal reason on the sync receipt. This remains
+scripted fixture proof; no phone has paired and no real message has reached the
+Brain.
+
 Branch `wave1/wp07-whatsapp-cli`, branched from `wave0/connector-gaps` at
 `cc6602b`. This is the second half of WP-07: the Go capture daemon shipped
 earlier (`evidence/WP-07-go-daemon.md`) and is untouched here. This package

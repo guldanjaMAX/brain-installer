@@ -15,7 +15,7 @@
 // that a phone can scan the QR or that WhatsApp transfers any history. That
 // needs a real account and is named as unproven in evidence/WP-07-cli.md.
 
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, existsSync } from "node:fs";
+import { statSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
@@ -51,8 +51,7 @@ const dataDir = join(sandbox, "wa-data");
 const outboxPath = join(dataDir, "wa-outbox.db");
 mkdirSync(dataDir, { recursive: true });
 
-const db = new DatabaseSync(outboxPath);
-db.exec(`
+const OUTBOX_SCHEMA = `
 CREATE TABLE outbox_messages (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, chat_jid TEXT NOT NULL, message_id TEXT NOT NULL,
   platform TEXT NOT NULL DEFAULT 'whatsapp', ts TEXT NOT NULL,
@@ -60,7 +59,9 @@ CREATE TABLE outbox_messages (
   sender_jid TEXT NOT NULL DEFAULT '', sender_name TEXT NOT NULL DEFAULT '',
   thread_title TEXT NOT NULL DEFAULT '', is_group INTEGER NOT NULL DEFAULT 0,
   source TEXT NOT NULL CHECK (source IN ('live','history_sync')),
-  received_at TEXT NOT NULL, drained_at TEXT, UNIQUE (chat_jid, message_id));`);
+  received_at TEXT NOT NULL, drained_at TEXT, UNIQUE (chat_jid, message_id));`;
+const db = new DatabaseSync(outboxPath);
+db.exec(OUTBOX_SCHEMA);
 const insert = db.prepare(`INSERT INTO outbox_messages
   (chat_jid,message_id,ts,direction,body,sender_jid,sender_name,thread_title,is_group,source,received_at)
   VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
@@ -73,12 +74,16 @@ insert.run(JORDAN, "wi-4", "2026-03-03T09:01:00Z", "in", "[image]", JORDAN, "Jor
 db.close();
 
 /* ------------------------------------------------------- the fake brain */
-function makeBrainFakes() {
+function makeBrainFakes({ script = null } = {}) {
   const receipts = [], batches = [], expectations = [];
   return {
     receipts, batches, expectations,
     options: {
       platform: "darwin",
+      statFile: (path) => {
+        const info = statSync(path);
+        return { ...info, isFile: () => info.isFile(), mode: info.isFile() ? 0o100755 : info.mode };
+      },
       dataDir,
       resolveAdminKey: () => "fixture-admin-key",
       resolveBaseUrl: async () => "https://brain.acme-example.test",
@@ -88,7 +93,10 @@ function makeBrainFakes() {
         batches.push(docs);
         return {
           res: { ok: true, status: 200 },
-          raw: JSON.stringify({ results: docs.map((d) => ({ source_id: d.source_id, status: "created" })) }),
+          raw: JSON.stringify({ results: docs.map((d, i) => ({
+            source_id: d.source_id,
+            status: script ? script(d, i) : "created",
+          })) }),
         };
       },
     },
@@ -175,6 +183,46 @@ try {
     const again = await cmdIngestWhatsapp(manifestWithDataDir, manifestPathWithDataDir, {}, fakes.options);
     check("a second drain through the CLI is incremental: nothing re-read, nothing re-sent",
       again.rows_seen === 0 && fakes.batches.length === 0, JSON.stringify(again));
+  }
+
+  {
+    const fakes = makeBrainFakes();
+    const preview = await cmdIngestWhatsapp(
+      manifestWithDataDir,
+      manifestPathWithDataDir,
+      { source: "whatsapp-preview", "dry-run": true },
+      fakes.options,
+    );
+    check("a WhatsApp preview reports would-send volume without a key, receipt, send, or state write",
+      preview.dry_run === true && preview.would_send === 2 &&
+      fakes.receipts.length === 0 && fakes.batches.length === 0 &&
+      !existsSync(join(sandbox, ".brain-ingest-whatsapp-preview.json")),
+      JSON.stringify(preview));
+  }
+
+  {
+    const refusalDir = join(sandbox, "wa-refusal-data");
+    mkdirSync(refusalDir);
+    const refusalOutbox = join(refusalDir, "wa-outbox.db");
+    const append = new DatabaseSync(refusalOutbox);
+    append.exec(OUTBOX_SCHEMA);
+    append.prepare(`INSERT INTO outbox_messages
+      (chat_jid,message_id,ts,direction,body,sender_jid,sender_name,thread_title,is_group,source,received_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(SAM, "wi-refused", "2026-03-04T10:00:00Z", "in", "credential-shaped fixture", SAM, "Sam Osei", "Sam Osei", 0, "live", "2026-03-04T10:00:01Z");
+    append.close();
+    const refusing = makeBrainFakes({ script: () => "refused" });
+    const result = await cmdIngestWhatsapp(
+      manifestWithDataDir,
+      manifestPathWithDataDir,
+      { source: "whatsapp-refusal" },
+      { ...refusing.options, dataDir: refusalDir },
+    );
+    check("a refused WhatsApp conversation is explicit and never completion-shaped",
+      result.refused === 1 && result.documents_accepted === 0 &&
+      result.outcome?.kind === "partial" && result.outcome?.complete === false &&
+      /credential gate/.test(refusing.receipts.at(-1)?.refusal_reason || ""),
+      JSON.stringify({ result, receipt: refusing.receipts.at(-1) }));
   }
 
   /* ============== an unpaired machine is named, not crashed ============== */

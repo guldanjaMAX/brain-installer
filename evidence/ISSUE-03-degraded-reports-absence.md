@@ -299,9 +299,9 @@ is only as good as that function.
 ## Not fixed, and why
 
 `report-html.mjs` line 191 contains a real first name in an explanatory comment
-(`"Eli does not answer the phone on weekends [4]" is a real cited answer`). It
-predates this branch (commit `a5f5f9c`), it is outside this diff, and the file
-ships in the public package. It is not covered by `privateIdentityRules` in
-`test/package-privacy.test.mjs`, so nothing catches it. Left for a deliberate
-decision rather than folded into an unrelated fix, but it should be changed to
-an invented persona and the rule list extended.
+(`"<a real first name> does not answer the phone on weekends [4]" is a real
+cited answer`). It predates this branch (commit `a5f5f9c`), it is outside this
+diff, and the file ships in the public package. It is not covered by
+`privateIdentityRules` in `test/package-privacy.test.mjs`, so nothing catches
+it. Left for a deliberate decision rather than folded into an unrelated fix,
+but it should be changed to an invented persona and the rule list extended.

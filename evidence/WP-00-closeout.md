@@ -41,28 +41,28 @@ was a formality, but it was still run rather than assumed.
 
 `test/package-privacy.test.mjs`'s `privateIdentityRules` list (owner first
 name, owner surname, owner organization, owner email, collaborator first
-name "Jay", collaborator surname "Bhakta") gained one more entry:
-collaborator client first name, `/\bChet(?:'s)?\b/i`. This closes the
-specific hole covered by this scrub for any FUTURE file that ends up inside
-the npm-shipped `expected` list.
+name, collaborator surname) gained one more entry: the collaborator's own
+client's first name, as a case-insensitive word-boundary pattern. This
+closes the specific hole covered by this scrub for any FUTURE file that ends
+up inside the npm-shipped `expected` list.
 
 **The scan was NOT widened to cover `test/` or `evidence/`, and here is
 exactly why**, verified rather than assumed:
 
 ```
-$ grep -rlniE "\bjames('s)?\b|\bguldan('s)?\b|\balign( growth)?\b" test/ evidence/ worker/test/
+$ grep -rlniE "<owner-first-name>|<owner-surname>|<owner-org>" test/ evidence/ worker/test/
   -> 10 files
-$ grep -rniE "\bjay('s)?\b|\bbhakta('s)?\b" test/ evidence/ worker/test/ | wc -l
+$ grep -rniE "<collaborator-first-name>|<collaborator-surname>" test/ evidence/ worker/test/ | wc -l
   -> 33 lines
 ```
 
-`privateIdentityRules` already matches "Jay" and "Bhakta", and both names
-appear intentionally and by design across dozens of already-committed
-test/evidence lines — Jay Bhakta co-owns the Financial Brain venture this
-installer serves, and his own install is a running example throughout the
-suite (`test/errors.test.mjs`, `test/upgrade-repair.test.mjs`,
-`test/upgrade-verify.test.mjs`, `evidence/WP-00.md`, `evidence/WP-03.md`,
-and more). Applying the SAME denylist to `test/` and `evidence/` mechanically
+`privateIdentityRules` already matches the collaborator's first name and
+surname, and both names appear intentionally and by design across dozens of
+already-committed test/evidence lines — the collaborator co-owns the Financial
+Brain venture this installer serves, and his own install is a running example
+throughout the suite (`test/errors.test.mjs`, `test/upgrade-repair.test.mjs`,
+`test/upgrade-verify.test.mjs`, `evidence/WP-00.md`, `evidence/WP-03.md`, and
+more). Applying the SAME denylist to `test/` and `evidence/` mechanically
 would fail the whole suite on those pre-existing, accepted mentions — not on
 anything this pass introduced. Fixing that correctly needs a real design
 decision (a second, narrower denylist scoped to genuinely-private third-party

@@ -685,7 +685,7 @@ const call = (env, path) => {
     return mkEnv(rows, {
     vectorIds: [],
     extra: {
-      BRAIN_OWNER: "James Guldan",
+      BRAIN_OWNER: "Morgan Diaz",
       AI: {
         run: async (model, input) => {
           if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
@@ -701,11 +701,11 @@ const call = (env, path) => {
   check("an unrelated newsletter cannot answer an unnamed term sheet question", unrelated.answer === "The documents do not answer the question." && unrelated.evidence_gate?.supported === false, JSON.stringify(unrelated));
   check("the owner-link refusal states the structural reason", /no explicit link/.test(unrelated.evidence_gate?.reason || ""), JSON.stringify(unrelated.evidence_gate));
 
-  const ownerOnly = { ...newsletter, chunk_uid: "owner-profile#0", doc_uid: "owner-profile", source_id: "owner-profile", title: "James Guldan profile", text: "James Guldan owns this brain. No financing terms appear here." };
+  const ownerOnly = { ...newsletter, chunk_uid: "owner-profile#0", doc_uid: "owner-profile", source_id: "owner-profile", title: "Morgan Diaz profile", text: "Morgan Diaz owns this brain. No financing terms appear here." };
   const split = await (await call(answerEnv([newsletter, ownerOnly]), "/api/rag/think?q=What+valuation+was+on+the+Series+A+term+sheet%3F")).json();
   check("owner identity and the high-risk fact cannot come from different documents", split.answer === "The documents do not answer the question." && split.evidence_gate?.supported === false, JSON.stringify(split));
 
-  const owned = { ...newsletter, chunk_uid: "owned-term-sheet#0", doc_uid: "owned-term-sheet", source_id: "owned-term-sheet", title: "James's Series A Term Sheet", text: "James's Series A term sheet states a $150M valuation." };
+  const owned = { ...newsletter, chunk_uid: "owned-term-sheet#0", doc_uid: "owned-term-sheet", source_id: "owned-term-sheet", title: "Morgan's Series A Term Sheet", text: "Morgan's Series A term sheet states a $150M valuation." };
   const linked = await (await call(answerEnv(owned), "/api/rag/think?q=What+valuation+was+on+the+Series+A+term+sheet%3F")).json();
   check("an explicitly owner-linked term sheet can still answer", linked.answer === "The Series A valuation was $150M [1]." && linked.evidence_gate?.supported === true, JSON.stringify(linked));
 }
@@ -726,7 +726,7 @@ const call = (env, path) => {
   const { env } = mkEnv(rows, {
     vectorIds: [],
     extra: {
-      BRAIN_OWNER: "James Guldan",
+      BRAIN_OWNER: "Morgan Diaz",
       AI: {
         run: async (model, input) => {
           if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
@@ -796,8 +796,10 @@ const call = (env, path) => {
   }), env, {});
   const body = await response.json();
   check("a bulk importer can record its source receipt", response.status === 200 && body.source === "drive" && body.status === "ready", JSON.stringify(body));
-  check("the receipt derives both logical files and stored split parts",
-    seen.sql.some((sql) => /COUNT\(DISTINCT[\s\S]*part_of[\s\S]*FROM documents WHERE source/i.test(sql)), JSON.stringify(seen.sql));
+  check("the receipt derives both logical families and stored physical rows",
+    seen.sql.some((sql) => /COUNT\(DISTINCT family_doc_uid\)[\s\S]*family_of[\s\S]*part_of[\s\S]*deleted_at IS NULL/i.test(sql)) &&
+      seen.sql.some((sql) => /substr\(family_doc_uid, 1, length\(\?1\) \+ 1\)/.test(sql)),
+    JSON.stringify(seen.sql));
   check("the receipt updates freshness and leaves an audit event", seen.sql.some((sql) => /INSERT INTO sources/.test(sql)) && seen.sql.some((sql) => /INSERT INTO source_events/.test(sql)), JSON.stringify(seen.sql));
 
   const bad = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
@@ -982,22 +984,26 @@ function mkSourceFamilyEnv(documents, extra = {}) {
             seen.binds.push(binds);
             return {
               all: async () => {
-                const sourceScoped = /WHERE source = \?1/.test(sql);
+                const sourceScoped = binds.length === 3;
                 const [source, cursor, limit] = sourceScoped
                   ? binds
                   : [null, binds[0], binds[1]];
                 const familyUids = documents
-                  .filter((row) => (source === null || row.source === source) && row.deleted_at == null)
+                  .filter((row) => row.deleted_at == null)
                   .map((row) => {
                     try {
-                      const partOf = JSON.parse(row.meta || "{}")?.part_of;
+                      const metadata = JSON.parse(row.meta || "{}");
+                      const familyOf = metadata?.family_of;
+                      const partOf = metadata?.part_of;
+                      if (typeof familyOf === "string" && familyOf) return familyOf;
                       return typeof partOf === "string" && partOf
                         ? (partOf.startsWith(`${row.source}:`) ? partOf : `${row.source}:${partOf}`)
                         : row.doc_uid;
                     } catch {
                       return row.doc_uid;
                     }
-                  });
+                  })
+                  .filter((uid) => source === null || uid.startsWith(`${source}:`));
                 const page = [...new Set(familyUids)]
                   .sort()
                   .filter((uid) => uid > cursor)
@@ -1024,6 +1030,8 @@ function mkSourceFamilyEnv(documents, extra = {}) {
     { doc_uid: "drive:d", source: "drive", meta: "not-json", deleted_at: null },
     { doc_uid: "drive:e#part1of1", source: "drive", meta: '{"part_of":"drive:e"}', deleted_at: null },
     { doc_uid: "gmail:a", source: "gmail", meta: "{}", deleted_at: null },
+    { doc_uid: "message:m1", source: "message", meta: '{"family_of":"upload:chat.txt"}', deleted_at: null },
+    { doc_uid: "message:m2", source: "message", meta: '{"family_of":"upload:chat.txt"}', deleted_at: null },
   ];
   const { env, seen } = mkSourceFamilyEnv(docs);
 
@@ -1051,8 +1059,11 @@ function mkSourceFamilyEnv(documents, extra = {}) {
     second.next_cursor === null, JSON.stringify(second));
 
   const sql = seen.sql.find((value) => /SELECT family_doc_uid/.test(value)) || "";
-  check("D1 collapses part_of families and excludes soft-deleted rows before the page limit",
-    /SELECT DISTINCT/.test(sql) && /part_of/.test(sql) && /deleted_at IS NULL/.test(sql), sql);
+  check("D1 collapses structural and declared families before the page limit",
+    /SELECT DISTINCT/.test(sql) && /part_of/.test(sql) && /family_of/.test(sql) && /deleted_at IS NULL/.test(sql), sql);
+  check("D1 filters by the derived family namespace rather than the physical row source",
+    /substr\(family_doc_uid, 1, length\(\?1\) \+ 1\) = \?1 \|\| ':'/.test(sql) &&
+      !/WHERE source = \?1/.test(sql), sql);
   check("D1 applies the lexical cursor before ordering and fetching one lookahead row",
     /family_doc_uid > \?2/.test(sql) && /ORDER BY family_doc_uid ASC/.test(sql) && seen.binds[0]?.[2] === 3,
     `${sql} ${JSON.stringify(seen.binds[0])}`);
@@ -1061,12 +1072,18 @@ function mkSourceFamilyEnv(documents, extra = {}) {
   const global = await globalResponse.json();
   check("the global completeness inventory derives every live source from documents",
     global.source === null &&
-      global.families.join(",") === "drive:a,drive:b,drive:d,drive:e,gmail:a",
+      global.families.join(",") === "drive:a,drive:b,drive:d,drive:e,gmail:a,upload:chat.txt",
     JSON.stringify(global));
   const globalSql = seen.sql.at(-1) || "";
   check("the global source inventory cannot skip a family through corpus-stats drift",
     /FROM documents/.test(globalSql) && !/corpus_stats/.test(globalSql) && seen.binds.at(-1)?.[1] === 1001,
     `${globalSql} ${JSON.stringify(seen.binds.at(-1))}`);
+
+  const uploadResponse = await call(env, "/api/admin/brain/source-families?source=upload&limit=1000");
+  const upload = await uploadResponse.json();
+  check("declared message families are inventoried under their source file namespace",
+    uploadResponse.status === 200 && upload.families.join(",") === "upload:chat.txt",
+    JSON.stringify(upload));
 
   const unauthenticated = await worker.fetch(
     new Request("https://b.example/api/admin/brain/source-families", {

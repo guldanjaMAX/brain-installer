@@ -21,7 +21,7 @@ import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
 import { syncBuiltinESMExports } from "node:module";
 
-import { forgetFamilies } from "../../worker/src/lib/store-d1.js";
+import { forgetFamilies, listSourceFamilies } from "../../worker/src/lib/store-d1.js";
 
 const userRoot = String(process.env.BRAIN_FAMILY_REPRO_USER_ROOT || "");
 const evidencePath = String(process.env.BRAIN_FAMILY_REPRO_EVIDENCE || "");
@@ -118,6 +118,7 @@ const storeDocument = (docUid, source, sourceId, title, metadata) => db.prepare(
 
 const initialEvidence = () => ({
   ingestBatches: 0,
+  inventoryRequests: 0,
   storedDocUids: [],
   forgetRequests: [],
   forgetResults: [],
@@ -185,6 +186,18 @@ globalThis.fetch = async (input, options = {}) => {
       failed: results.filter((r) => r.status === "failed").length,
       results,
     });
+  }
+
+  if (url.pathname === "/api/admin/brain/source-families") {
+    const body = parseBody(options);
+    evidence.inventoryRequests++;
+    const out = await listSourceFamilies(workerEnv, {
+      source: body.source ?? null,
+      cursor: body.cursor || "",
+      limit: Number(body.limit || 500),
+    });
+    save();
+    return json(out);
   }
 
   if (url.pathname === "/api/admin/brain/forget") {

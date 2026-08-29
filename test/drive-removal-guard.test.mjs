@@ -533,4 +533,50 @@ if (/flushIntentionalRemovals/.test(outerCatch)) {
   );
 }
 
+/* Watched-folder deletion uses the same authenticated truth and readback. */
+const localStart = source.indexOf("export async function cmdIngestLocal(");
+const localEnd = source.indexOf("\nexport function validateForgetReceipt", localStart);
+assert.notEqual(localStart, -1, "local folder ingest must exist");
+assert.ok(localEnd > localStart, "local folder ingest must be inspectable");
+const local = source.slice(localStart, localEnd);
+const pendingIndex = local.indexOf("const pendingLocalUids");
+const localInventoryIndex = local.indexOf("const storedLocalFamilies = await listStoredSourceFamilies", pendingIndex);
+const localBuildIndex = local.indexOf("const localRemovalPlan = buildDriveRemovalPlan", localInventoryIndex);
+const localGuardIndex = local.indexOf("assertDriveRemovalPlanSafe(localRemovalPlan", localBuildIndex);
+const localTargetsIndex = local.indexOf("const localTruthTargets", localGuardIndex);
+const localApplyIndex = local.indexOf("uids: localTruthTargets", localTargetsIndex);
+const localReadbackIndex = local.indexOf("const afterLocalRemoval = await listStoredSourceFamilies", localApplyIndex);
+assert.ok(
+  pendingIndex !== -1 && localInventoryIndex > pendingIndex && localBuildIndex > localInventoryIndex,
+  "local removal retries must re-enter a plan built from authenticated stored families",
+);
+assert.doesNotMatch(
+  local.slice(pendingIndex, localBuildIndex),
+  /applyDriveRemovals\s*\(/,
+  "a pending local removal must not bypass the current authenticated plan",
+);
+assert.match(
+  local.slice(localBuildIndex, localGuardIndex),
+  /storedFamilies:\s*storedLocalFamilies/,
+  "local deletion must not use the resume file as its stored-family denominator",
+);
+assert.ok(
+  localGuardIndex > localBuildIndex && localTargetsIndex > localGuardIndex && localApplyIndex > localTargetsIndex,
+  "only guarded local plan targets may reach the destructive endpoint",
+);
+assert.match(
+  local.slice(localTargetsIndex, localApplyIndex),
+  /localRemovalPlan\.targets\.source_policy[\s\S]*localRemovalPlan\.targets\.intentional_skip/,
+  "local source-truth deletion must use the exact categorized plan targets",
+);
+assert.ok(
+  localReadbackIndex > localApplyIndex,
+  "local folder deletion must read authenticated storage back before recording completion",
+);
+assert.match(
+  local.slice(localReadbackIndex),
+  /stillStored[\s\S]*state\.removed[\s\S]*throw new Error/,
+  "a failed local deletion readback must retain retry state and fail the source run",
+);
+
 console.log("drive removal guard: all focused tests passed");

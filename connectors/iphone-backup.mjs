@@ -789,6 +789,7 @@ export async function loadBackupHistory({
     rows_pushed: 0,
     rows_skipped: { no_guid: 0, no_timestamp: 0, no_text: 0 },
     documents_sent: 0,
+    documents_would_send: 0,
     threads: 0,
     earliest: null,
     latest: null,
@@ -798,7 +799,11 @@ export async function loadBackupHistory({
   const threads = new Set();
 
   const dispatch = async (envelopes) => {
-    if (!envelopes.length || dryRun) return;
+    if (!envelopes.length) return;
+    if (dryRun) {
+      counts.documents_would_send += envelopes.length;
+      return;
+    }
     await sendEnvelopes(envelopes);
     counts.documents_sent += envelopes.length;
   };

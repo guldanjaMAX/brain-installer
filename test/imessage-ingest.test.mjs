@@ -127,14 +127,30 @@ try {
     check("a second pass is incremental: zero rows re-read, zero documents re-sent",
       again.rows_seen === 0 && fakes.batches.length === 0, JSON.stringify(again));
   }
+  {
+    const fakes = makeBrainFakes();
+    const preview = await cmdIngestImessage(
+      manifest, manifestPath,
+      { "chat-db": dbPath, source: "imessage-preview", "dry-run": true },
+      fakes.options,
+    );
+    check("an iMessage preview reports would-send volume without a key, receipt, send, or state write",
+      preview.dry_run === true && preview.would_send === 2 &&
+      fakes.receipts.length === 0 && fakes.batches.length === 0 &&
+      !existsSync(join(sandbox, ".brain-ingest-imessage-preview.json")),
+      JSON.stringify(preview));
+  }
 
   /* ================= refusals count; failures stop the watermark ======== */
   {
     addMessage({ guid: "IG-C1", text: "Here is that key: sk-fixture-notreal", ts: "2026-03-04T10:00:00Z" });
     const refusing = makeBrainFakes({ script: () => "refused" });
     const result = await cmdIngestImessage(manifest, manifestPath, { "chat-db": dbPath }, refusing.options);
-    check("a credential-gate refusal is counted and the run still completes",
-      result.watermark === 4 && refusing.receipts[1].status === "ready", JSON.stringify(result));
+    check("a credential-gate refusal is explicit and never completion-shaped",
+      result.watermark === 4 && result.refused === 1 && result.documents_accepted === 0 &&
+      result.outcome?.kind === "partial" && result.outcome?.complete === false &&
+      refusing.receipts[1].status === "ready" && /credential gate/.test(refusing.receipts[1].refusal_reason || ""),
+      JSON.stringify({ result, receipt: refusing.receipts[1] }));
 
     addMessage({ guid: "IG-D1", text: "And one more for the failure case", ts: "2026-03-05T10:00:00Z" });
     const failing = makeBrainFakes({ script: () => "failed" });

@@ -366,6 +366,7 @@ export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
     SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
            c.client, c.category, c.top_folder, c.platform,
            d.source_id, d.uri, d.content_hash, d.date_source, d.date_reliable,
+           d.text_source, d.text_reliable,
            bm25(chunks_fts) AS score
     FROM chunks_fts
     JOIN chunks c ON c.id = chunks_fts.rowid
@@ -438,7 +439,8 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
     const { results: hydrated } = await env.DB.prepare(
       `SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
               c.client, c.category, c.top_folder, c.platform,
-              d.source_id, d.uri, d.content_hash, d.date_source, d.date_reliable
+              d.source_id, d.uri, d.content_hash, d.date_source, d.date_reliable,
+              d.text_source, d.text_reliable
        FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid
        WHERE c.chunk_uid IN (${placeholders})${f.clause}`
     )
@@ -1705,7 +1707,28 @@ export async function diagnose(env, {
       title: `${n} document(s) were indexed but hold no text`,
       detail: "The brain believes it has these and can never answer from them. Almost always a scanned PDF with no text layer, or a format that extracted nothing.",
       samples: rows.map((r) => r.title || r.uri || r.doc_uid),
-      action: "Re-ingest with OCR, or remove them so the document count stops overstating what the brain knows." });
+      action: "If OCR is off, turn it on (safety.ocr.enabled) and re-ingest; these are the documents it exists for. If it is already on, these were refused for a stated reason, so read the ingest report and remove them rather than leaving the document count overstating what the brain knows." });
+  });
+
+  // How much of this corpus was read by a machine off a picture. An owner
+  // reading an answer deserves to know the shape of the evidence underneath it,
+  // and this is the only place that number is visible in aggregate.
+  await safe("ocr_coverage", async () => {
+    const row = await q1(env,
+      // Aliased ocr_full, not full: FULL is a reserved word in SQLite (FULL
+      // OUTER JOIN) and the bare alias is a syntax error.
+      `SELECT SUM(CASE WHEN text_source = 'ocr' THEN 1 ELSE 0 END) ocr_full,
+              SUM(CASE WHEN text_source = 'ocr_partial' THEN 1 ELSE 0 END) ocr_partial
+         FROM documents WHERE deleted_at IS NULL`);
+    const full = Number(row?.ocr_full || 0);
+    const partial = Number(row?.ocr_partial || 0);
+    if (!full && !partial) return;
+    add({ id: "ocr_coverage", area: "coverage", severity: "info", count: full + partial,
+      title: `${full + partial} document(s) were read by OCR rather than from a text layer`,
+      detail: partial
+        ? `${partial} of them had pages that could not be read; those pages are marked inline in the text rather than dropped. Answers resting on any of these are marked and score lower.`
+        : "Answers resting on these are marked as OCR-sourced and score lower, because a machine read them off a picture.",
+      action: "Nothing to fix. Spot-check a few figures against the original paper if the ledger will rely on them." });
   });
 
   await safe("undated", async () => {
@@ -3090,11 +3113,50 @@ export async function forget(env, { docUids = [], source = null, dryRun = true }
   };
 }
 
+/** Count live physical rows and logical families in one derived source namespace. */
+export async function sourceFamilyCounts(env, { source } = {}) {
+  const normalizedSource = String(source || "");
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(normalizedSource)) {
+    throw new TypeError("source family counts need a normalized source name");
+  }
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS stored_documents,
+            COUNT(DISTINCT family_doc_uid) AS logical_documents
+       FROM (
+         SELECT CASE
+           WHEN json_valid(meta)
+            AND json_type(meta,'$.family_of') = 'text'
+            AND length(json_extract(meta,'$.family_of')) > 0
+             THEN json_extract(meta,'$.family_of')
+           WHEN json_valid(meta)
+            AND json_type(meta,'$.part_of') = 'text'
+            AND length(json_extract(meta,'$.part_of')) > 0
+             THEN CASE
+               WHEN substr(json_extract(meta,'$.part_of'), 1, length(source) + 1) = source || ':'
+                 THEN json_extract(meta,'$.part_of')
+               ELSE source || ':' || json_extract(meta,'$.part_of')
+             END
+           ELSE doc_uid
+         END AS family_doc_uid
+           FROM documents
+          WHERE deleted_at IS NULL
+       )
+      WHERE substr(family_doc_uid, 1, length(?1) + 1) = ?1 || ':'`
+  ).bind(normalizedSource).first();
+  return {
+    stored_documents: Number(row?.stored_documents || 0),
+    logical_documents: Number(row?.logical_documents || 0),
+  };
+}
+
 /**
- * Return one uid per live logical source document in stable lexical pages.
- * Large connector documents are stored as several physical rows whose
- * `meta.part_of` points at their base uid. The DISTINCT happens before the
- * cursor and LIMIT so a split file occupies exactly one reconciliation slot.
+ * Return one uid per live logical source family in stable lexical pages.
+ * Large connector documents use `meta.part_of`; multi-document exports use a
+ * fully qualified `meta.family_of`. The latter can deliberately cross the
+ * stored row's source namespace, for example `message:*` rows belonging to an
+ * `upload:*` file. Source filtering therefore applies to the derived family
+ * uid rather than to the physical row. DISTINCT happens before the cursor and
+ * LIMIT so either representation occupies exactly one reconciliation slot.
  */
 export async function listSourceFamilies(env, { source = null, cursor = "", limit = 500 } = {}) {
   // With no source filter this query derives the complete source set from live
@@ -3107,19 +3169,24 @@ export async function listSourceFamilies(env, { source = null, cursor = "", limi
          FROM (
            SELECT DISTINCT CASE
              WHEN json_valid(meta)
+              AND json_type(meta,'$.family_of') = 'text'
+              AND length(json_extract(meta,'$.family_of')) > 0
+               THEN json_extract(meta,'$.family_of')
+             WHEN json_valid(meta)
               AND json_type(meta,'$.part_of') = 'text'
               AND length(json_extract(meta,'$.part_of')) > 0
                THEN CASE
-                 WHEN substr(json_extract(meta,'$.part_of'), 1, length(?1) + 1) = ?1 || ':'
+                 WHEN substr(json_extract(meta,'$.part_of'), 1, length(source) + 1) = source || ':'
                    THEN json_extract(meta,'$.part_of')
-                 ELSE ?1 || ':' || json_extract(meta,'$.part_of')
+                 ELSE source || ':' || json_extract(meta,'$.part_of')
                END
              ELSE doc_uid
            END AS family_doc_uid
              FROM documents
-            WHERE source = ?1 AND deleted_at IS NULL
+            WHERE deleted_at IS NULL
          )
-        WHERE family_doc_uid > ?2
+        WHERE substr(family_doc_uid, 1, length(?1) + 1) = ?1 || ':'
+          AND family_doc_uid > ?2
         ORDER BY family_doc_uid ASC
         LIMIT ?3`
     ).bind(source, cursor, limit + 1)
@@ -3127,6 +3194,10 @@ export async function listSourceFamilies(env, { source = null, cursor = "", limi
       `SELECT family_doc_uid
          FROM (
            SELECT DISTINCT CASE
+             WHEN json_valid(meta)
+              AND json_type(meta,'$.family_of') = 'text'
+              AND length(json_extract(meta,'$.family_of')) > 0
+               THEN json_extract(meta,'$.family_of')
              WHEN json_valid(meta)
               AND json_type(meta,'$.part_of') = 'text'
               AND length(json_extract(meta,'$.part_of')) > 0

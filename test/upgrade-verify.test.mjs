@@ -1,9 +1,9 @@
-// From Jay's second field report, 2026-08-19.
+// From the second field report, 2026-08-19.
 //
 // `brain upgrade` probed /health, got a 200 from the worker it was REPLACING,
 // printed that worker's version, and declared the new one verified:
 //
-//     ok deployed "bhakta-brain"
+//     ok deployed "rivera-brain"
 //     ok /health 200 {"ok":true,"version":"0.1.1", ...}
 //     ok upgrade verified, now at 0.1.2
 //
@@ -157,7 +157,7 @@ const bootstrapCompletion = () => ({
   vector_ready: true,
 });
 
-/* ---- the exact failure Jay saw ---- */
+/* ---- the exact failure the field report saw ---- */
 {
   const v = V({ ok: true, body: body("0.1.1"), expectVersion: "0.1.2", attempt: 1, attempts: 6 });
   check("a 200 from the OLD worker is not accepted as the new one", v !== "accept", `got ${v}`);

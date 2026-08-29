@@ -151,6 +151,23 @@ list or walk
   -> advance a remote cursor only after the run is complete
 ```
 
+`ingest/outcome.mjs` is the shared source-level result contract. Only
+`completed` is success-shaped. `partial`, `unavailable`, `retryable`, and
+`refused` carry distinct flags, and a dry run carries no ingestion outcome.
+`test/ingestion-contract.test.mjs` applies that contract across folders,
+Calendar, message capture, source planning, cursor settlement, document
+families, and deletion planning. It is an automated conformance gate, not a
+real-source acceptance receipt. `brain load` prints the full sweep first, then
+returns non-zero when any enabled source is unavailable, retryable, refused, or
+partial; disabled and push-only sources remain explicit non-error skips.
+The iMessage, WhatsApp, and iPhone-backup command adapters report submitted,
+accepted, and refused conversation counts separately. A refused conversation
+therefore makes the sweep partial instead of being counted as present. Their
+dry runs count the conversation documents they would submit while sending no
+request and writing no resume state. An explicit `--limit` is also partial,
+whether or not the current source had more records beyond the bound. Refusal
+receipts keep a redacted reason for audit without storing the refused content.
+
 Local and remote state is saved adjacent to the manifest as
 `.brain-ingest-<source>.json`. Content hashes and source versions make reruns
 resumable. A failure stays retryable. Drive policy changes and periodic full
@@ -189,12 +206,17 @@ different metadata. Repeated identities in one request deliberately use the
 original sequential path because revision order is part of their correctness
 contract.
 
-Drive removal candidates from policy, source deletion, and intentional quality
-skips are intersected with the current stored-family inventory and approved as
-one deterministic plan. Crossing either the 100-document limit or the 10%
-stored-corpus limit stops before planned deletion and cursor commit. Approval
-binds to an opaque fingerprint of the exact categorized target set, so a
-changed plan requires a new decision without exposing source identifiers.
+Drive and watched-folder removal candidates from policy, source deletion, and
+intentional quality skips are intersected with the current authenticated
+stored-family inventory and approved as one deterministic plan. Stored-family
+inventory derives declared `family_of` relationships as well as structural
+`part_of` families, even when a message row belongs to an upload file's family.
+After a deletion receipt, the client reads that inventory again and refuses to
+record completion while any exact target remains. Crossing either the
+100-document limit or the 10% stored-corpus limit stops before planned deletion
+and cursor or source-state completion. Approval binds to an opaque fingerprint
+of the exact categorized target set, so a changed plan requires a new decision
+without exposing source identifiers.
 
 ### Connector status
 
@@ -203,8 +225,14 @@ changed plan requires a new decision without exposing source identifiers.
 | Local folders, including an Obsidian vault | Built through `--path`; Obsidian is file ingest, not a separate connector |
 | Google Drive | Built, resumable, incremental, deletion-aware, and schedulable on macOS |
 | Gmail | Built with cursor safety; full real-account production validation remains a field gate |
-| Google Calendar | Connector and tests exist, but `brain ingest --from calendar` is not wired as a public source yet |
-| Messages | One-time Supabase message-session migration exists; no standard live refresh connector exists yet |
+| Google Calendar | Built and wired through `brain ingest --from calendar`; row and receipt namespaces match, and event failure, refusal, or pending cancellation cleanup withholds the Google sync token; real-account validation remains a field gate |
+| Local watched folder | Built through the ordinary resumable folder ingest path and schedulable on macOS; multi-cycle field proof remains open |
+| iMessage | Built for incremental local capture on macOS; real-user database and long-lived scheduler proof remain field gates |
+| WhatsApp, SMS, and Google Voice exports | Built as sessionized file imports; real export samples remain acceptance gates |
+| iPhone backup | Built against a synthetic unencrypted backup; an Apple-written backup remains a field gate |
+| Zoom | Built as a transcript webhook; a paid real-account meeting remains a field gate |
+| Bank exports and hosted feed | Built into the shared financial ledger; real-statement and real-feed reconciliation remain field gates |
+| OCR for scanned PDFs | Built, optional, and provenance-marked; local synthetic scans pass and private real scans remain a field gate |
 | Slack, Notion, Microsoft 365, QuickBooks, CRM sources | Not built; use an approved export and local ingest when suitable |
 
 The macOS Drive scheduler installs a per-user LaunchAgent. Its definition has no

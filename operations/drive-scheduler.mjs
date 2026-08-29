@@ -384,7 +384,7 @@ const VERSION_PINNED_INTERPRETER =
   /(?:\/\.nvm\/versions\/node\/|\/\.fnm\/|\/\.volta\/|\/\.asdf\/|\/n\/versions\/node\/|\/node[@-]?v?\d+(?:\.\d+)*\/)/;
 
 export function isVersionPinnedInterpreter(nodePath) {
-  return VERSION_PINNED_INTERPRETER.test(String(nodePath || ""));
+  return VERSION_PINNED_INTERPRETER.test(String(nodePath || "").replace(/\\/g, "/"));
 }
 
 function versionPinnedInterpreterWarning(nodePath, spec = DRIVE_SCHEDULER_SPEC) {

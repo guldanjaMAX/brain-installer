@@ -242,12 +242,14 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   // Owners re-sign-in with their passkey; that is a tap, not a loss.
   "session_generation",
 ]);
-// Schemas 14 through 17 added additive tables: owner passkeys, the financial
-// ledger, the bank feed, and connector OAuth. The vector protocol itself is
-// unchanged, but the recovery contract tracks the EXACT current schema by
-// design: a drill against a database one migration behind would export a table
-// set that does not match the reviewed list, and refusing is the whole point.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 17;
+// Schemas 14 through 17 added owner passkeys, the financial ledger, the bank
+// feed, and connector OAuth. Schema 18 adds extraction-provenance columns so
+// OCR evidence stays distinguishable from a native text layer. The vector
+// protocol itself is unchanged, but the recovery contract tracks the EXACT
+// current schema by design: a drill against a database one migration behind
+// would export a table or column set that does not match the reviewed list.
+// Bumping this is a required step of shipping any migration.
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 18;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {

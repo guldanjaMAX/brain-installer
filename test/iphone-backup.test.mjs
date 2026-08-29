@@ -44,6 +44,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, win32 as pathWin32 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 
 import {
   BACKUP_REFUSAL_REASONS,
@@ -77,7 +78,7 @@ const check = (name, condition, detail = "") => {
 };
 
 const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-iphone-backup-")));
-const REPO = new URL("..", import.meta.url).pathname;
+const REPO = fileURLToPath(new URL("..", import.meta.url));
 
 /* ==================================================================== */
 /* Fixture builders                                                      */
@@ -796,7 +797,8 @@ try {
     ownerLabel: "Morgan Diaz", groupingTimezone: "UTC",
   });
   check("a dry run reads and counts everything but sends nothing",
-    dry.rows_seen === 6 && dry.rows_pushed === 5 && dry.documents_sent === 0 && dryEnvelopes.length === 0,
+    dry.rows_seen === 6 && dry.rows_pushed === 5 && dry.documents_sent === 0 &&
+    dry.documents_would_send === 2 && dryEnvelopes.length === 0,
     JSON.stringify(dry));
   check("a dry run reports itself as one, so its counts are never mistaken for a load",
     dry.dry_run === true);
@@ -920,20 +922,30 @@ let cliDocs = [];
   // --dry-run must not need a key or touch the network at all.
   const dryFakes = makeBrainFakes();
   dryFakes.options.resolveAdminKey = () => { throw new Error("a dry run must not resolve an admin key"); };
-  const { output: dryOutput } = await captureOutput(() => cmdIngestIphoneBackup(
+  const { result: dryResult, output: dryOutput } = await captureOutput(() => cmdIngestIphoneBackup(
     manifest, manifestPath, { backup: backup.directory, "dry-run": true }, dryFakes.options,
   ));
   check("--dry-run previews without a key, without a receipt and without sending anything",
     dryFakes.batches.length === 0 && dryFakes.receipts.length === 0 &&
-    /dry run, nothing was sent/.test(dryOutput), dryOutput.slice(-200));
+    dryResult.would_send === 2 && /dry run, nothing was sent/.test(dryOutput), dryOutput.slice(-200));
 
   // A truncated load must SAY it is truncated.
   const limitFakes = makeBrainFakes();
-  const { output: limitOutput } = await captureOutput(() => cmdIngestIphoneBackup(
+  const { result: limitResult, output: limitOutput } = await captureOutput(() => cmdIngestIphoneBackup(
     manifest, manifestPath, { backup: backup.directory, limit: "2" }, limitFakes.options,
   ));
-  check("a --limit run warns that it is NOT a complete history of the backup",
-    /NOT a complete history/.test(limitOutput), limitOutput.slice(-300));
+  check("a --limit run is partial and warns that it is NOT a complete history of the backup",
+    limitResult.outcome?.kind === "partial" && /NOT a complete history/.test(limitOutput), limitOutput.slice(-300));
+
+  const refusing = makeBrainFakes({ script: () => "refused" });
+  const { result: refused } = await captureOutput(() => cmdIngestIphoneBackup(
+    manifest, manifestPath, { backup: backup.directory }, refusing.options,
+  ));
+  check("a refused backup conversation is explicit and never completion-shaped",
+    refused.refused === 2 && refused.documents_accepted === 0 &&
+    refused.outcome?.kind === "partial" && refused.outcome?.complete === false &&
+    /credential gate/.test(refusing.receipts.at(-1)?.refusal_reason || ""),
+    JSON.stringify({ refused, receipt: refusing.receipts.at(-1) }));
 
   // A failed load closes its receipt as an error instead of leaving the run open.
   const failing = makeBrainFakes({ script: () => "failed" });
@@ -1047,7 +1059,18 @@ let cliDocs = [];
 }
 
 } finally {
-  rmSync(sandbox, { recursive: true, force: true });
+  // Windows can release a just-closed node:sqlite file a few milliseconds
+  // after close() returns. Node's recursive remover only retries EPERM and
+  // EBUSY when maxRetries is non-zero; without this both Windows CI lanes
+  // completed every assertion and then failed while deleting forget-proof.db.
+  try {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (error) {
+    // Some Windows runners retain the disposable SQLite handle beyond the
+    // retry window after every assertion has completed.
+    if (process.platform !== "win32" || !["EBUSY", "EPERM"].includes(error?.code)) throw error;
+    console.warn(`WARN  Windows retained the disposable SQLite sandbox: ${error.code}`);
+  }
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\niphone backup loader: all ${ran} tests passed`);

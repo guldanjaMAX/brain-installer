@@ -37,6 +37,7 @@ import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { TextDecoder } from "node:util";
+import { restrictWindowsFileToCurrentUser } from "../operations/current-user-file.mjs";
 
 export const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 export const TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -617,34 +618,10 @@ function writeAll(descriptor, bytes) {
 }
 
 function runWindowsAcl(path, options, label) {
-  const environment = options.environment || process.env;
-  const env = googleAuthChildEnvironment(environment, { platform: "win32" });
-  const username = options.username || environment.USERNAME || environment.USER;
-  if (typeof username !== "string" || !username.trim()) {
-    throw new Error(`Windows could not identify the current user for the Google token ${label}`);
-  }
-  const command = options.icaclsPath || (env.SystemRoot
-    ? join(env.SystemRoot, "System32", "icacls.exe")
-    : "icacls.exe");
-  const args = [path, "/inheritance:r", "/grant:r", `${username}:F`];
-  let result;
-  try {
-    result = (options.runAcl || spawnSync)(command, args, {
-      encoding: null,
-      env,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: options.timeoutMs || 15_000,
-      windowsHide: true,
-    });
-    if (result?.status !== 0 || result?.error) {
-      throw new Error(`Windows could not restrict the Google token ${label} to the current user`);
-    }
-  } catch {
-    throw new Error(`Windows could not restrict the Google token ${label} to the current user`);
-  } finally {
-    wipeChildResult(result);
-  }
+  return restrictWindowsFileToCurrentUser(path, {
+    ...options,
+    label: `the Google token ${label}`,
+  });
 }
 
 function createPrivatePayloadFile(path, bytes, platform, options, label) {

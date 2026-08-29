@@ -4,7 +4,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 const iso = (v) => (v === null ? null : new Date(v).toISOString().slice(0, 10));
 
 /* ---- the formats real files actually use ---- */
-check("ISO in a filename", iso(parseDateFrom("2026-08-14 Jay install review.md")?.value) === "2026-08-14");
+check("ISO in a filename", iso(parseDateFrom("2026-08-14 the reporter install review.md")?.value) === "2026-08-14");
 check("compact ISO", iso(parseDateFrom("IMG_20240304_note.txt")?.value) === "2024-03-04");
 check("underscored", iso(parseDateFrom("2024_03_04 minutes")?.value) === "2024-03-04");
 check("named month, US order", iso(parseDateFrom("Signed March 4, 2024 by both")?.value) === "2024-03-04");

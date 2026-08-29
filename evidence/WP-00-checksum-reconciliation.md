@@ -4,10 +4,11 @@ Branch: `wave0/wp00-checksum-repair`, worktree `/private/tmp/brain-wp00-checksum
 branched from `wave0/connector-gaps` at commit `b8b2cad` ("Fix two real
 failures the full test chain caught: identity leak, missing allowlist").
 
-**This supersedes the "exact commands for James/Jay" section at the bottom
-of `evidence/WP-00.md`.** That section's step 3 (`brain doctor <manifest>
---repair --yes`) is wrong for the actual failure the real install hit — see
-"Why the earlier fix doesn't work" below. This file has the correct command.
+**This supersedes the "exact commands for the owner/collaborator" section at
+the bottom of `evidence/WP-00.md`.** That section's step 3 (`brain doctor
+<manifest> --repair --yes`) is wrong for the actual failure the real install
+hit — see "Why the earlier fix doesn't work" below. This file has the correct
+command.
 
 ## What this package is, and how it differs from the earlier WP-00 commit
 
@@ -357,18 +358,17 @@ checksum afterward with no data loss":
 - **Detection, reported clearly:** covered by the first block in
   `test/checksum-reconciliation.test.mjs`. The fixture seeds a fake D1 with
   one already-applied migration recorded under an LF-only checksum, then
-  supplies the SAME migration's content with every `\n` rewritten to `\r\n`
-  as "the current file" — the exact bug (a line-ending change), reproduced
+  supplies the SAME migration's content with every `\n` rewritten to `\r\n` as
+  "the current file" — the exact bug (a line-ending change), reproduced
   directly rather than merely described. `diagnoseChecksumDrift` finds it,
   reports both checksums, the applied-at timestamp, and — this is the part
   that goes beyond "detected a mismatch" — POSITIVELY CONFIRMS it as a pure
-  line-ending change with the specific direction (applied-LF, file-CRLF)
-  named in plain language, matching the real install's own stated
-  hypothesis (see Jay's issue #2, referenced in the plan). A second block
-  proves a genuine content change (a real column added, not just line
-  endings) is still detected as drift but is honestly NOT claimed as an
-  explained line-ending change — the tool never fabricates a diff it cannot
-  back up.
+  line-ending change with the specific direction (applied-LF, file-CRLF) named
+  in plain language, matching the real install's own stated hypothesis (see
+  the collaborator's issue #2, referenced in the plan). A second block proves
+  a genuine content change (a real column added, not just line endings) is
+  still detected as drift but is honestly NOT claimed as an explained
+  line-ending change — the tool never fabricates a diff it cannot back up.
 - **Refuses without confirmation:** `cmdRepairChecksum` without `confirmed:
   true` returns `{previewed: "repair-checksum", ...}` and is proven, via the
   fake D1 adapter throwing on any statement it does not expect, to have
@@ -418,10 +418,10 @@ test in this package makes a real network call. The real stranded install was no
 connected to, queried, or mutated in any way by this session — its manifest
 and Cloudflare token are not present on this machine (same finding as
 `evidence/WP-00.md`), and per the plan's explicit instruction, nothing
-should be run against it without James's and the affected operator's
+should be run against it without the owner's and the affected operator's
 explicit go-ahead in the moment regardless.
 
-## The exact live-repair command, for James (or the affected operator) to run themselves
+## The exact live-repair command, for the owner (or the affected operator)
 
 Once this branch is merged and `npm install`/`npx wrangler` picks it up (or
 directly against this worktree with `node brain.mjs ...`), against the real
@@ -470,7 +470,7 @@ will keep hitting the same `die()` until the checksum is reconciled.
   reported its own repair/rollback path: built and tested, not yet
   field-verified, because this machine holds no credential for that
   install and mutating a real client's production D1 without their and
-  James's presence is exactly the class of action these rules reserve for a
+  the owner's presence is exactly the class of action these rules reserve for a
   human.
 - **`buildChecksumDriftCheck` (the plain `brain doctor` health-check line)
   is not unit-tested directly** — see the acceptance section above for why

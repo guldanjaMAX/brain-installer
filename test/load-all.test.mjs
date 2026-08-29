@@ -29,6 +29,7 @@
 //
 // Personas here are invented. Nothing in this file names a real person.
 
+import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,6 +42,7 @@ import {
   describeLoadResult,
   formatLoadElapsed,
 } from "../brain.mjs";
+import { ingestionOutcome } from "../ingest/outcome.mjs";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => {
@@ -133,11 +135,11 @@ try {
     JSON.stringify(uploadFoldersOf({ folders: ["/a", { path: "/b", source: "contracts" }] })) ===
     JSON.stringify([{ path: "/a", source: null }, { path: "/b", source: "contracts" }]));
 
-  check("describeLoadResult reports an absent count as unknown, never as zero",
-    describeLoadResult(undefined).known === false &&
-    /unknown, not zero/.test(describeLoadResult(undefined).text) &&
-    !/\b0\b/.test(describeLoadResult(undefined).text),
-    describeLoadResult(undefined).text);
+  assert.throws(
+    () => describeLoadResult(undefined),
+    /no recognized completion receipt/,
+  );
+  check("describeLoadResult refuses to invent completion from an absent receipt", true);
 
   check("formatLoadElapsed stays readable past a minute",
     formatLoadElapsed(4100) === "4.1s" && formatLoadElapsed(2_460_000) === "41m00s",
@@ -255,6 +257,7 @@ try {
 
     const loadedBlock = reportSection(sweep.text, "IN THE BRAIN");
     const skippedBlock = reportSection(sweep.text, "NOT LOADED — skipped");
+    const unavailableBlock = reportSection(sweep.text, "NOT LOADED — unavailable");
     const failedBlock = reportSection(sweep.text, "NOT LOADED — failed");
 
     check("the failure is reported, in the failed list, with its cause",
@@ -264,39 +267,43 @@ try {
     check("a failed source is NOT listed among what is in the brain",
       !/Gmail/.test(loadedBlock), loadedBlock);
 
-    // A skipped source must never be reported as loaded, whatever the reason.
+    // A source the manifest deliberately does not run is skipped. A source the
+    // manifest wants but cannot reach is unavailable. Neither may look loaded.
     for (const [label, why] of [
-      ["WhatsApp", "not connected"],
       ["Zoom", "push"],
-      ["slack", "no loader"],
       ["notion", "not enabled"],
     ]) {
       check(`a source skipped because it is ${why} appears only in the skipped list`,
         skippedBlock.includes(label) && !loadedBlock.includes(label),
         `${label}: loaded=${loadedBlock.includes(label)} skipped=${skippedBlock.includes(label)}`);
     }
+    for (const [label, why] of [["WhatsApp", "not connected"], ["slack", "no loader"]]) {
+      check(`a source ${why} appears only in the unavailable list`,
+        unavailableBlock.includes(label) && !loadedBlock.includes(label) && !skippedBlock.includes(label),
+        `${label}: loaded=${loadedBlock.includes(label)} skipped=${skippedBlock.includes(label)} unavailable=${unavailableBlock.includes(label)}`);
+    }
 
     check('"this client does not use it" stays a different message from "it is broken"',
       /notion.*not enabled in this manifest/.test(skippedBlock) &&
-      /WhatsApp.*enabled, but not connected/.test(skippedBlock), skippedBlock);
-    check("a source with no loader in this build says so instead of vanishing from the sweep",
-      /slack.*has no loader for it/.test(skippedBlock), skippedBlock);
+      /WhatsApp.*enabled, but not connected/.test(unavailableBlock), `${skippedBlock}\n${unavailableBlock}`);
+    check("a source with no loader in this build is unavailable instead of vanishing from the sweep",
+      /slack.*has no loader for it/.test(unavailableBlock), unavailableBlock);
     check("Zoom is skipped as a push connector, not reported as loaded work",
       /Zoom.*nothing to pull/.test(skippedBlock), skippedBlock);
     check("a manifest _comment key is not treated as a source",
       !/_comment/.test(sweep.text));
 
-    check("the skipped list carries the fix for the one that is merely disconnected",
-      /brain connect whatsapp/.test(skippedBlock), skippedBlock);
+    check("the unavailable list carries the fix for the disconnected source",
+      /brain connect whatsapp/.test(unavailableBlock), unavailableBlock);
 
     check("the totals match what actually happened",
-      /totals: 4 loaded, 4 skipped, 1 failed, of 9 declared/.test(sweep.text),
+      /totals: 4 loaded, 2 skipped, 2 unavailable, 1 failed, of 9 declared/.test(sweep.text),
       sweep.text.split("\n").filter((l) => l.includes("totals:")).join(" | "));
     check("the document totals are the sum of what the producers really reported",
       /943 created, 14 updated, 127 unchanged, 7 conversation document\(s\) sent/.test(sweep.text),
       sweep.text.split("\n").filter((l) => l.includes("created,")).join(" | "));
     check("the report states plainly that not everything is in the brain",
-      /5 of 9 declared source\(s\) are NOT in the brain\./.test(sweep.text),
+      /3 of 9 declared source\(s\) are NOT in the brain\./.test(sweep.text),
       sweep.text.split("\n").filter((l) => l.includes("declared source")).join(" | "));
     check("the sweep exits through the failure path so a script can see it",
       sweep.error && /1 of 5 source\(s\) did not load; the other 4 did\./.test(sweep.error.message),
@@ -313,13 +320,13 @@ try {
     const manifestPath = writeManifest(dir, { calendar: { enabled: true }, gmail: { enabled: true } });
     const { table } = scriptedRegistry({
       calendar: () => ({ sent: { created: 2, updated: 0, unchanged: 0, refused: [], errors: [] } }),
-      gmail: () => undefined,
+      gmail: () => ({ outcome: ingestionOutcome("completed") }),
     });
     const run = await runLoad(manifestPath, {
       flags: {}, registry: table, probes: { calendar: connected, gmail: connected },
     });
-    check("a connector that reports no counts is described as unknown, not as zero",
-      /Gmail.*unknown, not zero/.test(reportSection(run.text, "IN THE BRAIN")),
+    check("an explicitly completed connector may report counts as unknown, never zero",
+      /Gmail.*unknown \(not zero\)/.test(reportSection(run.text, "IN THE BRAIN")),
       reportSection(run.text, "IN THE BRAIN"));
     check("the totals say how many sources could not report, so the number reads as a floor",
       /plus 1 source\(s\) whose counts are UNKNOWN, not zero/.test(run.text),
@@ -337,6 +344,9 @@ try {
     check("a source that loaded some documents and failed others is labelled partly loaded",
       /partly loaded/.test(run.text) && /2 failed to send/.test(run.text) && /1 refused/.test(run.text),
       reportSection(run.text, "IN THE BRAIN"));
+    check("a partial source makes the sweep non-zero after the complete report",
+      /1 partial source outcome/.test(run.error?.message || "") && /load report/.test(run.text),
+      run.error?.message);
   }
 
   /* ------------------------------------------------------ --only and --skip */
@@ -566,7 +576,7 @@ try {
       run.text.split("\n").filter((l) => l.includes("declared source") || l.includes("only in part")).join(" | "));
   }
 
-  /* ---------------- a malformed corpus block skips that source, not the sweep --- */
+  /* ------------ a malformed corpus block is unavailable, not a sweep crash --- */
   {
     const dir = mkdtempSync(join(sandbox, "malformed-"));
     const manifestPath = writeManifest(dir, {
@@ -579,23 +589,25 @@ try {
     const run = await runLoad(manifestPath, {
       flags: {}, registry: table, probes: { calendar: connected },
     });
-    check("a malformed corpus block skips that source with the problem named",
+    check("a malformed corpus block makes that source unavailable with the problem named",
       /could not be read: corpora.upload.folders must be an array/.test(run.text),
-      reportSection(run.text, "NOT LOADED — skipped"));
+      reportSection(run.text, "NOT LOADED — unavailable"));
     check("and the rest of the sweep still runs",
-      JSON.stringify(calls.map((c) => c.key)) === JSON.stringify(["calendar"]) && run.error === null,
+      JSON.stringify(calls.map((c) => c.key)) === JSON.stringify(["calendar"]),
       JSON.stringify(calls.map((c) => c.key)));
+    check("an unavailable source makes the completed sweep report non-zero",
+      /1 unavailable source outcome/.test(run.error?.message || ""), run.error?.message);
   }
 
-  /* ------------------------- a folder-less upload corpus is skipped, not crashed */
+  /* --------------------- a folder-less upload corpus is unavailable, not crashed */
   {
     const dir = mkdtempSync(join(sandbox, "nofolder-"));
     const manifestPath = writeManifest(dir, { upload: { enabled: true } });
     const run = await runLoad(manifestPath, { flags: { "dry-run": true } });
-    check("an enabled upload corpus with no folder declared is skipped with the fix, not run empty",
+    check("an enabled upload corpus with no folder declared is unavailable with the fix, not run empty",
       /the manifest names no folder for it to read/.test(run.text) &&
-      /corpora.upload/.test(run.text) && run.error === null,
-      reportSection(run.text, "NOT LOADED — skipped"));
+      /corpora.upload/.test(run.text) && /1 unavailable source outcome/.test(run.error?.message || ""),
+      reportSection(run.text, "NOT LOADED — unavailable"));
   }
 
   /* --------- a source that cannot size itself in advance says so, never 0 or undefined */

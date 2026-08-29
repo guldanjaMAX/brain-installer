@@ -587,7 +587,7 @@ const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
     title: "Provider record",
     occurred_at: "2025-08-20T12:00:00Z",
     metadata: {
-      client_name: "James", category: "medical",
+      client_name: "Morgan Diaz", category: "medical",
       top_folder: "Provider Records", platform: "drive", migrated_from: "legacy-drive",
     },
   };
@@ -597,10 +597,10 @@ const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
   const docRow = db.prepare("SELECT client, category, top_folder, platform FROM documents").get();
   const chunkRow = db.prepare("SELECT client, category, top_folder, platform FROM chunks LIMIT 1").get();
   check("document metadata carries the complete filter contract",
-    docRow.client === "James" && docRow.category === "medical" &&
+    docRow.client === "Morgan Diaz" && docRow.category === "medical" &&
       docRow.top_folder === "Provider Records" && docRow.platform === "drive", JSON.stringify(docRow));
   check("chunk metadata is denormalized for exact hydration",
-    chunkRow.client === "James" && chunkRow.category === "medical" &&
+    chunkRow.client === "Morgan Diaz" && chunkRow.category === "medical" &&
       chunkRow.top_folder === "Provider Records" && chunkRow.platform === "drive", JSON.stringify(chunkRow));
 
   await drainFully(env, { embed: async () => [0.1] });
@@ -620,10 +620,10 @@ const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
   const movedDoc = db.prepare("SELECT client, category, top_folder, platform, meta FROM documents").get();
   const movedChunk = db.prepare("SELECT client, category, top_folder, platform FROM chunks LIMIT 1").get();
   check("partial connector metadata preserves richer migrated filters",
-    movedDoc.client === "James" && movedDoc.category === "medical" && movedDoc.top_folder === "Current Records",
+    movedDoc.client === "Morgan Diaz" && movedDoc.category === "medical" && movedDoc.top_folder === "Current Records",
     JSON.stringify(movedDoc));
   check("the merged filters reach replacement chunks and vectors",
-    movedChunk.client === "James" && movedChunk.category === "medical" && movedChunk.top_folder === "Current Records",
+    movedChunk.client === "Morgan Diaz" && movedChunk.category === "medical" && movedChunk.top_folder === "Current Records",
     JSON.stringify(movedChunk));
   check("unrelated migration provenance survives the metadata merge", JSON.parse(movedDoc.meta).migrated_from === "legacy-drive", movedDoc.meta);
 

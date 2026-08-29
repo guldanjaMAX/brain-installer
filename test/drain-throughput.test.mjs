@@ -1,4 +1,4 @@
-// Throughput, from Jay's finding 6j: 1,200 chunks/hour while the message said
+// Throughput, from the reporter's finding 6j: 1,200 chunks/hour while the message said
 // "a few minutes". The fix is embedding in groups instead of one call per chunk.
 //
 // The dangerous part of batching is ALIGNMENT: if a batch call returns fewer

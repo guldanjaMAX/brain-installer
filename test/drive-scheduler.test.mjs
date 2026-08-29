@@ -27,6 +27,7 @@ import {
   DRIVE_LOG_MAX_BYTES,
   expectedRefreshSecondsForCron,
   installDriveScheduler,
+  isVersionPinnedInterpreter,
   launchctlChildEnvironment,
   parseAdminKeySecretReference,
   recordDriveSchedulerFailure,
@@ -189,6 +190,8 @@ try {
       pinned.warnings.some((w) => /reinstall the schedule/i.test(w)), pinned.warnings.join("; "));
     check("a stable interpreter path is not warned about, so the warning keeps its meaning",
       buildDriveSchedulerPlan(manifestPath, opts({ nodePath: "/usr/local/bin/node" })).warnings.length === 0);
+    check("a Windows-form pinned interpreter is detected too",
+      isVersionPinnedInterpreter("D:\\Users\\fixture\\.nvm\\versions\\node\\v22.5.0\\bin\\node"));
 
     const goneHome = join(directory, "interpreter-gone-home");
     const gonePath = join(directory, "interpreter-gone", "brain.manifest.json");

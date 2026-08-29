@@ -57,22 +57,26 @@
  */
 
 import {
-  chmodSync,
   constants as fsConstants,
   closeSync,
   existsSync,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   renameSync,
   rmSync,
   statSync,
-  writeFileSync,
+  writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MESSAGE_SESSION_DEFAULTS, MessageSessionizer, messageRowDisposition } from "../ingest/message-session.mjs";
+import { restrictWindowsFileToCurrentUser } from "../operations/current-user-file.mjs";
 // Not a copy, and not a layering accident: the stale-session sweep touches
 // only the sessionizer and knows nothing about Messages.app. It was written
 // for the first tick-based capture connector and is imported here rather than
@@ -317,19 +321,69 @@ export function loadDrainState(path) {
   return FRESH_DRAIN_STATE();
 }
 
-export function saveDrainState(path, state) {
+const sameFile = (left, right) => Boolean(
+  left && right && left.dev === right.dev && left.ino === right.ino
+);
+
+function writeAll(descriptor, bytes) {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const written = writeSync(descriptor, bytes, offset, bytes.length - offset);
+    if (written <= 0) throw new Error("the WhatsApp drain-state write made no progress");
+    offset += written;
+  }
+}
+
+export function saveDrainState(path, state, options = {}) {
   mkdirSync(dirname(path), { recursive: true });
   // The snapshot carries message text from open conversations, so the file is
   // owner-only, and it is replaced atomically so a kill mid-write can never
   // leave half-written JSON that silently restarts the drain from zero.
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  const platform = options.platform || process.platform;
+  const bytes = Buffer.from(JSON.stringify(state, null, 2), "utf8");
+  let descriptor;
   try {
-    writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+    descriptor = openSync(
+      tmp,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL |
+        (fsConstants.O_NOFOLLOW || 0),
+      0o600,
+    );
+    const identity = fstatSync(descriptor);
+    if (!identity.isFile() || identity.nlink !== 1) {
+      throw new Error("the WhatsApp drain state was not created as a private regular file");
+    }
+    if (platform === "win32") {
+      // The file is still empty here. Apply the DACL before message text can
+      // exist on disk, then prove the open handle still names the same file.
+      restrictWindowsFileToCurrentUser(tmp, {
+        ...options,
+        label: "the WhatsApp drain state staging file",
+      });
+    } else {
+      (options.fchmodFile || fchmodSync)(descriptor, 0o600);
+    }
+    const secured = fstatSync(descriptor);
+    const atPath = lstatSync(tmp);
+    if (!sameFile(secured, identity) || !sameFile(atPath, identity) ||
+        !secured.isFile() || secured.nlink !== 1 ||
+        (platform !== "win32" && (secured.mode & 0o777) !== 0o600)) {
+      throw new Error("the WhatsApp drain state identity changed before its payload was written");
+    }
+    writeAll(descriptor, bytes);
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
     renameSync(tmp, path);
-    chmodSync(path, 0o600);
   } catch (error) {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* original error wins */ }
+    }
     try { rmSync(tmp, { force: true }); } catch { /* original error wins */ }
     throw error;
+  } finally {
+    bytes.fill(0);
   }
 }
 
@@ -373,6 +427,7 @@ export async function drainOnce({
     rows_skipped: { media_only: 0, no_text: 0, no_identity: 0, no_timestamp: 0 },
     rows_out_of_order: 0,
     documents_sent: 0,
+    documents_would_send: 0,
     sessions_open: 0,
     watermark: state.last_seq,
     drained_marked: 0,
@@ -382,7 +437,11 @@ export async function drainOnce({
   };
 
   const dispatch = async (envelopes) => {
-    if (!envelopes.length || dryRun) return;
+    if (!envelopes.length) return;
+    if (dryRun) {
+      counts.documents_would_send += envelopes.length;
+      return;
+    }
     await sendEnvelopes(envelopes);
     counts.documents_sent += envelopes.length;
   };

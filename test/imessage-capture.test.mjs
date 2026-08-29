@@ -236,12 +236,20 @@ try {
       !missing.ok && missing.reason === "chat_db_missing" && /Messages\.app has never been signed in/.test(missing.message),
       JSON.stringify(missing));
 
-    if (process.getuid && process.getuid() === 0) {
-      check("an unreadable chat.db is named full_disk_access_denied (skipped: running as root, EACCES cannot be simulated)", true);
+    // Keep the fixture present for the restored-access check below even when
+    // this host cannot model a POSIX permission denial.
+    const lockedDir = join(sandbox, "locked");
+    mkdirSync(lockedDir);
+    writeFileSync(join(lockedDir, "chat.db"), "not really a db");
+
+    const cannotSimulateDenial =
+      (process.getuid && process.getuid() === 0) || process.platform === "win32";
+    if (cannotSimulateDenial) {
+      const why = process.platform === "win32"
+        ? "POSIX mode bits are not enforced on Windows, and iMessage capture is macOS-only"
+        : "running as root, EACCES cannot be simulated";
+      check(`an unreadable chat.db is named full_disk_access_denied (skipped: ${why})`, true);
     } else {
-      const lockedDir = join(sandbox, "locked");
-      mkdirSync(lockedDir);
-      writeFileSync(join(lockedDir, "chat.db"), "not really a db");
       chmodSync(lockedDir, 0o000);
       const denied = probeChatDb(join(lockedDir, "chat.db"));
       chmodSync(lockedDir, 0o700);
@@ -527,7 +535,8 @@ try {
       now: () => Date.parse("2026-03-12T10:00:00Z"),
     });
     check("a dry run sends nothing and leaves the state file untouched",
-      drySender.sent.length === 0 && dry.rows_seen === 1 && readFileSync(statePath, "utf-8") === before,
+      drySender.sent.length === 0 && dry.rows_seen === 1 && dry.documents_would_send === 1 &&
+      readFileSync(statePath, "utf-8") === before,
       JSON.stringify(dry));
   }
 

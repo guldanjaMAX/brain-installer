@@ -12,15 +12,15 @@ I would rather lose a sale to an honest table than win one and spend week three 
 
 | Source | Status |
 |---|---|
-| Google Drive | **Built.** In production |
-| Direct upload and API push | **Built.** The fallback for anything with no connector |
-| A watched folder on your own machine | **Built, Mac-only for the schedule.** Name one folder in your manifest and it reloads itself on a schedule: new files load, edited files reload, deleted files are removed. This is what makes "drop it in a folder you already ingest" true for a folder that is not inside Google Drive. On Windows and Linux the same load runs, by hand |
+| Google Drive | **Built.** One real unbounded walk has partial real-data proof; the full add, edit, resume, delete, and scheduler lifecycle is not yet accepted |
+| Direct upload and API push | **Built.** Live-service smoke proof exists with a synthetic corpus; no authorized real-document receipt is accepted yet |
+| A watched folder on your own machine | **Built, Mac-only for the schedule.** Name one folder in your manifest and it reloads itself on a schedule: new files load, edited files reload, deleted files are removed. This is what makes "drop it in a folder you already ingest" true for a folder that is not inside Google Drive. On Windows and Linux the same load runs by hand. Real multi-tick sleep, wake, and deletion behavior is not yet field-proven |
 | Gmail | Built: `brain connect google --scopes gmail`, then `brain ingest --from gmail`. Incremental via historyId; bulk mail excluded by default. Not yet run against a real mailbox |
 | Google Calendar | Built and wired: `brain connect google --scopes calendar`, then `brain ingest --from calendar`. Incremental via Google's own sync token; cancelled events are removed, not left behind. Not yet run against a real calendar |
 | Meetings (Google Meet) | **Built, with no extra work.** Meet's own Gemini notes land as a transcript document in Drive, which is already read |
 | WhatsApp | **Built two ways.** The safe one: your phone's own "Export chat" .txt, dropped in a folder that is ingested (a Drive folder, or the watched folder above), no daemon and no account risk. The other: `brain connect whatsapp --accept-risk`, live capture through a paired linked device, Mac-only, off unless you turn it on, and carrying a real terms-of-service risk described below. **Never yet run against a real WhatsApp account** |
 | Text messages (Android, and Google Voice) | **Built, as an export.** SMS Backup & Restore's .xml export, or a Google Voice Takeout, dropped in a folder that is ingested |
-| iMessage (Mac) | **Built, Mac-only, live.** `brain connect imessage`: Full Disk Access verified by a real read, full history loaded, then scheduler-tick capture (a new message lands within about a minute, not instantly). **Apple only exposes message history on a Mac; there is no path on Windows** |
+| iMessage (Mac) | **Built, Mac-only live path.** `brain connect imessage` checks Full Disk Access, loads history, then uses scheduler-tick capture. There is no accepted receipt from a real `chat.db` read yet. **Apple only exposes message history on a Mac; there is no path on Windows** |
 | iPhone messages, no Mac (Windows too) | **Built, as a one-time history load.** `brain ingest --from iphone-backup` reads an **unencrypted** local iPhone backup and loads the iMessage and SMS history inside it. A point-in-time snapshot, **not** live capture: nothing new arrives afterwards. Runs on Windows and macOS. Never yet run against a backup Apple wrote |
 | Facebook Messenger | Not built as a product |
 | Zoom | **Built.** `brain connect zoom`: a webhook on your own worker loads each cloud-recording transcript automatically. **Needs a paid (Licensed) Zoom seat** — the free tier cannot cloud record at all. New recordings only, no backfill. Not yet run against a real Zoom account |
@@ -47,7 +47,7 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 | Google Docs | Full text |
 | Google Sheets | Cell contents as rows |
 | Google Slides | Text from the slides |
-| PDF | Text layer |
+| PDF | Text layer. A scanned PDF with no text layer can be read by OCR, if you turn OCR on |
 | Word (.docx), PowerPoint (.pptx), Excel (.xlsx) | Full text |
 | Rich text (.rtf) | Text only; font tables, styles and embedded pictures are dropped |
 | Plain text, Markdown, JSON, XML, YAML | As written |
@@ -60,7 +60,8 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 | Type | Why not |
 |---|---|
 | Images, video, audio | No text to read. There is no transcription step |
-| Scanned PDFs with no text layer | **There is no text recognition.** A scanned contract is a picture of a contract to this system |
+| Scanned PDFs, when OCR is OFF | Off is the default. A scan is a picture of a page, and without OCR this system cannot read it. Turn it on with `safety.ocr.enabled` |
+| Scanned PDFs whose reading came back unusable | Reported, never indexed on a guess. If the model described the page instead of transcribing it, repeated itself, or produced too little to be a page, the file is refused with the reason |
 | Code, stylesheets, build output, lockfiles | Matches a lot of questions and answers almost none of them. Left out deliberately, because it crowds real documents out of your results |
 | Database dumps and backups | Same reason, larger. One dump can flood an index and make everything else harder to find |
 | Anything in a folder whose name starts with `_Private` | Owner-only by convention. Never read, enforced in two independent places |
@@ -83,7 +84,7 @@ Shared mailboxes and group threads contain messages from people who never agreed
 
 ### Direct upload and API push
 
-Anything you can turn into text can be put into your brain directly, one document at a time or in bulk. This is the fallback for every source with no connector, and it always works.
+Anything you can turn into text can be put into your brain directly, one document at a time or in bulk. This is the built fallback for every source with no connector. Its live-service proof uses a synthetic corpus; an authorized real-document receipt is still pending.
 
 Everything arriving this way passes the **credential gate**: if a document contains a live password or API key, it is refused, the kind of credential is named, and its value is never quoted back. Nothing is written. That gate runs on every door into your index, because a gate on one door is not a gate.
 
@@ -101,7 +102,8 @@ It reads your manifest, works out which sources you actually have, runs every on
 
 - **It takes the work from your manifest, not from a list in the code.** If your install does not use WhatsApp, WhatsApp never appears as work. If a new connector is added later and your manifest declares it, it is picked up without anyone editing a list.
 - **One source failing does not stop the others.** A dead Gmail token does not prevent Drive and Calendar from loading. The failure is caught, the sweep carries on, and every failure is listed at the end with what to do about it. This is deliberate: a partial load with an honest list beats an aborted run.
-- **It tells you what is IN and what is NOT**, in three separate lists: what loaded, what was skipped and why, what failed and why. A skipped source is never counted as loaded. If a count is not available it says *unknown*, never zero. If a source loaded in part it says so in those words.
+- **It tells you what is IN and what is NOT**, in four separate lists: what loaded, what was deliberately skipped and why, what is enabled but unavailable, and what failed while running. A skipped or unavailable source is never counted as loaded. If a count is not available it says *unknown*, never zero. If a source loaded in part it says so in those words.
+- **Submitted is not accepted.** For iMessage, WhatsApp, and iPhone-backup loads, the report counts only Worker-accepted conversations as present. A conversation refused by the credential gate is named as not indexed and makes that source partial.
 - **It is resumable.** It keeps no progress file of its own. Every source already remembers where it got to, and re-running the command is how an interrupted load finishes. For that same reason it refuses `--reset`: resetting everything at once is almost never what anyone means. Reset one source deliberately with `brain ingest <manifest> --from drive --reset`.
 - **It runs cheap sources first.** Calendar, then messages, then your folders, then Gmail, then Drive, with a one-time iPhone backup last. You see something working in the first minute rather than after forty silent ones.
 
@@ -116,7 +118,7 @@ It reads your manifest, works out which sources you actually have, runs every on
 
 | Flag | What it does |
 |---|---|
-| `--dry-run` | Reads every source and reports what it holds, and **sends nothing**. Nothing is written, no progress is saved. Run this in front of the client before the first real sweep: they see the exact scope of what is about to be read, before it is read |
+| `--dry-run` | Reads every source and reports what it holds, and **sends nothing**. Nothing is written, no progress is saved. Calendar, iMessage, WhatsApp, and iPhone-backup previews report the exact event or conversation-document count they would submit. Run this in front of the client before the first real sweep: they see the exact scope of what is about to be read, before it is read |
 | `--only <a,b>` | Run only these sources. This is how you rerun one source after fixing it, without redoing the whole sweep |
 | `--skip <a,b>` | Run everything except these |
 | `--limit <n>` | Cap every source. Useful for a fast demo; everything it touches is reported as an incomplete load, because it is |
@@ -126,12 +128,15 @@ Source names are the keys under `corpora` in your manifest, and the obvious shor
 **Reading the report.** The bottom of the output is the part that matters:
 
 ```
-  totals: 4 loaded, 4 skipped, 1 failed, of 9 declared
+  totals: 4 loaded, 2 skipped, 2 unavailable, 1 failed, of 9 declared
   943 created, 14 updated, 127 unchanged, 7 conversation document(s) sent
   5 of 9 declared source(s) are NOT in the brain. The lists above say which, and why.
 ```
 
-If a source failed, the command exits non-zero **after** printing the whole report, so a script can tell, and a person can still read what did work.
+If an enabled source failed, was unavailable, or loaded only in part, the
+command exits non-zero **after** printing the whole report. A script cannot
+mistake an incomplete sweep for success, and a person can still read what did
+work. Deliberately disabled and push-only sources remain stated skips.
 
 ### Every load has a name, and the name is an undo
 
@@ -160,9 +165,11 @@ node brain.mjs connect google --scopes drive,gmail,calendar
 node brain.mjs ingest <manifest> --from calendar
 ```
 
-Later runs are incremental through Google's own sync token, same idea as Gmail's historyId. A cancelled meeting is removed from your index, not left behind as a stale document. By default it reads your primary calendar; more than one calendar, or a shared one, is a manifest setting.
+Later runs are incremental through Google's own sync token, same idea as Gmail's historyId. The token advances only after every event and cancellation is accepted; a failed or refused event is retried from the same Google window rather than silently skipped. A cancelled meeting is removed from your index, not left behind as a stale document. By default it reads your primary calendar; more than one calendar, or a shared one, is a manifest setting.
 
-**The honest production boundary, same shape as Gmail's:** the connector and the command that runs it have both passed the product test suite (223 tests on the connector's own logic, 15 more on the command that drives it against a scripted fake calendar), but neither has completed a real-calendar production run yet. Treat it as built but not yet production-proven.
+A Calendar dry run reports the exact event count it could preview. If any declared calendar cannot be read, it prints the partial scope and exits nonzero with the reconsent or provider fix. An unread calendar is never presented as an empty one.
+
+**The honest production boundary, same shape as Gmail's:** the connector and the command that runs it have both passed the product test suite against scripted Google responses, including custom source namespaces, resume state, and cancellation targets. Neither has completed a real-calendar production run yet. Treat it as built but not yet production-proven.
 
 Same publishing consideration as the rest of your Google connection: on Workspace it registers inside your own organization and simply works. On a personal gmail.com address the app must be published, or access is revoked every seven days.
 
@@ -203,7 +210,7 @@ Either one, dropped in a folder that is ingested, is detected automatically and 
 
 **Built, as live capture on a Mac — and only on a Mac, with no way around that.** Apple only exposes your message history to a local app through `chat.db`, which exists on macOS and nowhere else. If your business runs entirely on Windows, this connector does not help you directly — it needs a Mac physically present and awake to run on, even if the rest of your install is elsewhere. The one thing that does work without a Mac is a **one-time history load from an unencrypted local iPhone backup**, which is a separate thing described below and is a snapshot rather than live capture.
 
-**What `brain connect imessage <manifest>` does, in order:** verifies Full Disk Access by actually reading the database (macOS requires a one-time grant on the exact Node binary; the command prints the precise steps and refuses to install anything until a real read succeeds — it never guesses), runs the full history load in the foreground so you see its counts, then installs a per-user LaunchAgent that runs a short capture tick about once a minute.
+**What `brain connect imessage <manifest>` is designed to do, in order:** verify Full Disk Access by actually reading the database (macOS requires a one-time grant on the exact Node binary; the command prints the precise steps and refuses to install anything until a real read succeeds), run the full history load in the foreground so you see its counts, then install a per-user LaunchAgent that runs a short capture tick about once a minute. The automated suite proves that control flow with fixtures; a reviewed real-database receipt is still pending.
 
 **Capture is scheduler-tick, not instant push.** A new message appears in the brain within about a minute of arriving, when the next tick runs — there is no resident daemon watching the database continuously. A Mac that is asleep or shut does not capture; the next tick after it wakes catches up from exactly where the last one stopped, and `brain sources` reports the staleness honestly in the meantime.
 
@@ -374,7 +381,7 @@ This is a genuine change to how the system is built, not a setting. If your situ
 
 ## How to read this page in six months
 
-I will keep this table current, and the status column is the only thing that matters. If something moves from "not built" to "built", it moved because it was built and tested against real infrastructure, not because it was planned.
+I will keep this table current, but status never replaces the proof boundary. If something moves from "not built" to "built", runnable product code and its named automated gate exist. It moves to production-proven only after the exact real-boundary test has a reviewed receipt.
 
 If you are ever unsure whether a source is connected, do not consult this page. Ask your own brain what it holds:
 

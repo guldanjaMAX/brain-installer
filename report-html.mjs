@@ -188,10 +188,11 @@ const TIER_WHY = {
 // Widened only as far as observed output justifies. Every phrasing here was
 // either sampled from this brain or seen in this session; none was invented,
 // because a refusal detector tuned to imagined language mislabels real language.
-// Anchored to the SUBJECT, because the verb alone is ambiguous. "Eli does not
-// answer the phone on weekends [4]" is a real cited answer, and the earlier
-// unanchored pattern read it as the brain refusing. A refusal is always ABOUT
-// the sources, so the sources have to be the thing doing the not-containing.
+// Anchored to the SUBJECT, because the verb alone is ambiguous. "Alex Rivera
+// does not answer the phone on weekends [4]" is a real cited answer, and the
+// earlier unanchored pattern read it as the brain refusing. A refusal is
+// always ABOUT the sources, so the sources have to be the thing doing the
+// not-containing.
 const REFUSAL_SUBJECTED =
   /\b(documents?|sources?|records?|files?|notes?|transcripts?|materials?|brain|context)\b[^.!?]{0,40}?\bdo(es)? not (?:\w+ly )?(contain|answer|address|specify|mention|state|say|indicate)\b/i;
 
