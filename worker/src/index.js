@@ -32,7 +32,7 @@ import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
 import {
-  handleOwnerAuth, handleAdminInvite, handleAdminDevices, handleAdminGrants, validateOwnerSession,
+  handleOwnerAuth, handleAdminInvite, handleAdminDevices, handleAdminGrants, handleZones, validateOwnerSession,
 } from "./lib/owner-auth.js";
 
 /* ------------------------------------------------------------ retrieval */
@@ -1505,6 +1505,9 @@ export default {
       }
       if (path.startsWith("/api/admin/auth/grants")) {
         return handleAdminGrants(env, request, path);
+      }
+      if (path === "/api/admin/brain/zones") {
+        return handleZones(env, request);
       }
       if (path === "/api/admin/brain/ingest" && request.method === "POST") {
         return await handleIngest(env, request);

@@ -157,14 +157,20 @@ export async function findGrantByCredentialHash(env, tokenHash) {
   }
 }
 
-export async function createGrant(env, { grantId, displayName, relationship, capabilities, expiresAt, createdBy }) {
+export async function createGrant(env, {
+  grantId, displayName, relationship, capabilities, expiresAt, createdBy,
+  // Defaulting to every zone matches what a grant created before zones existed
+  // already had, so this column can never silently narrow an existing person.
+  scopeInclude = '{"all":true}', scopeExclude = "[]",
+}) {
   try {
     await env.DB.prepare(
-      `INSERT INTO grants (grant_id, display_name, relationship, capabilities, expires_at, created_at, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO grants (grant_id, display_name, relationship, capabilities, expires_at, created_at, created_by,
+                           scope_include, scope_exclude)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       grantId, displayName, relationship || null, JSON.stringify(capabilities),
-      expiresAt ?? null, Date.now(), createdBy,
+      expiresAt ?? null, Date.now(), createdBy, scopeInclude, scopeExclude,
     ).run();
   } catch (error) {
     guard(error);
@@ -285,6 +291,55 @@ export async function bumpSessionGeneration(env) {
       "UPDATE install_state SET session_generation = COALESCE(session_generation, 1) + 1",
     ).run();
     return sessionGeneration(env);
+  } catch (error) {
+    guard(error);
+  }
+}
+
+/**
+ * Put a whole source into a zone, including everything already loaded from it.
+ *
+ * Retroactive on purpose. Every brain in the field has documents that predate
+ * zones, and a scoped reader sees none of them because an unzoned row is
+ * outside every scope. If zones could only be set at ingest, the feature would
+ * be unusable for exactly the clients who already paid, and the fix would be a
+ * re-ingest of their whole corpus.
+ *
+ * The zone is written to sources, documents and chunks in one pass, because
+ * chunks is the row the text is read from and a join away is a join some
+ * future query forgets to make.
+ */
+export async function assignZone(env, { source, zone }) {
+  try {
+    const now = Date.now();
+    await env.DB.prepare(
+      "INSERT INTO zones (zone, label, created_at) VALUES (?, ?, ?) ON CONFLICT(zone) DO NOTHING",
+    ).bind(zone, zone, now).run();
+    await env.DB.prepare("UPDATE sources SET zone = ? WHERE name = ?").bind(zone, source).run();
+    const docs = await env.DB.prepare("UPDATE documents SET zone = ? WHERE source = ?")
+      .bind(zone, source).run();
+    const chunks = await env.DB.prepare("UPDATE chunks SET zone = ? WHERE source = ?")
+      .bind(zone, source).run();
+    return {
+      source,
+      zone,
+      documents: docs?.meta?.changes ?? 0,
+      chunks: chunks?.meta?.changes ?? 0,
+    };
+  } catch (error) {
+    guard(error);
+  }
+}
+
+/** Every zone in use, with how much sits in each. */
+export async function listZones(env) {
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT COALESCE(c.zone, '(unzoned)') AS zone, COUNT(*) AS chunks,
+              COUNT(DISTINCT c.source) AS sources
+         FROM chunks c GROUP BY COALESCE(c.zone, '(unzoned)') ORDER BY chunks DESC`,
+    ).all();
+    return results || [];
   } catch (error) {
     guard(error);
   }

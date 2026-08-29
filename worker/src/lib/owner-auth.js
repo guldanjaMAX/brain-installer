@@ -25,6 +25,7 @@ import {
   listPasskeys, renamePasskey, revokePasskey,
   sessionGeneration, bumpSessionGeneration,
   randomToken, createGrant, addGrantCredential, listGrants, revokeGrant,
+  assignZone, listZones,
 } from "./auth-store.js";
 import { CAPABILITIES, parseCapabilities, hashToken } from "./grants.js";
 import { appPageHtml } from "./app-page.js";
@@ -114,6 +115,21 @@ export async function handleAdminGrants(env, request, path) {
       return jsonResponse({ error: "expires_at must be a future unix ms timestamp, or null" }, 400);
     }
 
+    // Scope. Omitting it means every zone, which is what a grant created
+    // before zones existed already had, so the default cannot narrow anyone by
+    // surprise. Naming zones narrows to exactly those.
+    const zones = Array.isArray(payload?.zones)
+      ? payload.zones.map((z) => String(z).trim()).filter(Boolean)
+      : null;
+    const exclude = Array.isArray(payload?.exclude_zones)
+      ? payload.exclude_zones.map((z) => String(z).trim()).filter(Boolean)
+      : [];
+    if (zones && zones.length === 0) {
+      return jsonResponse({ error: "zones was given but empty; omit it to mean every zone" }, 400);
+    }
+    const scopeInclude = zones ? JSON.stringify({ zones }) : '{"all":true}';
+    const scopeExclude = JSON.stringify(exclude);
+
     const grantId = `g_${randomToken(8)}`.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
     const token = randomToken(32);
     await createGrant(env, {
@@ -123,6 +139,8 @@ export async function handleAdminGrants(env, request, path) {
       capabilities,
       expiresAt,
       createdBy: "owner",
+      scopeInclude,
+      scopeExclude,
     });
     await addGrantCredential(env, { tokenHash: await hashToken(token), grantId });
 
@@ -131,12 +149,36 @@ export async function handleAdminGrants(env, request, path) {
       display_name: displayName,
       capabilities,
       expires_at: expiresAt,
+      zones: zones || "all",
       token,
       note: "This token is shown once and is not recoverable. Give it to them over a channel you trust.",
     });
   }
 
   return jsonResponse({ grants: await listGrants(env) });
+}
+
+/**
+ * GET /api/admin/brain/zones lists them; POST puts a source into one.
+ *
+ * Owner-only, by the default-deny rule rather than by anything written here:
+ * deciding what counts as sensitive is the owner's judgement and nobody
+ * else's.
+ */
+export async function handleZones(env, request) {
+  if (request.method === "POST") {
+    const payload = await body(request);
+    const source = String(payload?.source || "").trim();
+    const zone = String(payload?.zone || "").trim();
+    if (!source || !zone) return jsonResponse({ error: "source and zone are both required" }, 400);
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(zone)) {
+      return jsonResponse({
+        error: "a zone name is lowercase letters, digits, dash and underscore, up to 64 characters",
+      }, 400);
+    }
+    return jsonResponse(await assignZone(env, { source, zone }));
+  }
+  return jsonResponse({ zones: await listZones(env) });
 }
 
 /** GET /api/admin/auth/devices + POST .../revoke — the CLI's device view. */

@@ -9648,12 +9648,20 @@ async function cmdGrant(manifestPath) {
   if (!name || !can) {
     die(
       "usage: brain grant <manifest> --name \"Their name\" --can ask,file [--until YYYY-MM-DD] [--as \"bookkeeper\"]\n" +
+      "  --zones books,legal   limit what they can READ; omit for every zone\n" +
       "  capabilities: ask (read and ask questions), file (add documents),\n" +
       "                diagnose (see health and freshness), destroy (forget or purge)\n" +
       "  `administer` cannot be granted: it would let them create other people's access."
     );
   }
   const capabilities = can.split(",").map((x) => x.trim()).filter(Boolean);
+  // --zones narrows what they can READ. Omitting it means every zone, which is
+  // the honest default: a brain whose documents were loaded in one unnamed pass
+  // has one zone, and pretending otherwise would be a promise the corpus cannot
+  // keep.
+  const zones = typeof flags.zones === "string" && flags.zones.trim()
+    ? flags.zones.split(",").map((z) => z.trim()).filter(Boolean)
+    : null;
 
   let expiresAt = null;
   if (typeof flags.until === "string" && flags.until.trim()) {
@@ -9675,13 +9683,15 @@ async function cmdGrant(manifestPath) {
       display_name: name,
       relationship: typeof flags.as === "string" ? flags.as : null,
       capabilities,
+      zones,
       expires_at: expiresAt,
     }),
   }, { timeoutMs: 30_000, what: "the access grant" });
   if (!res.ok) die(`grant failed (${res.status}): ${summariseResponseBody(await res.text())}`);
   const grant = await res.json();
 
-  ok(`access granted to ${grant.display_name}: ${grant.capabilities.join(", ")}`);
+  const where = Array.isArray(grant.zones) ? `in ${grant.zones.join(", ")}` : "across every zone";
+  ok(`access granted to ${grant.display_name}: ${grant.capabilities.join(", ")}, ${where}`);
   console.log(`\n  ${grant.token}\n`);
   console.log(
     "  That token is shown once and cannot be shown again. Give it to them over a\n" +
@@ -9690,6 +9700,60 @@ async function cmdGrant(manifestPath) {
   );
   if (expiresAt) console.log(`  It stops working on ${new Date(expiresAt).toISOString().slice(0, 10)}.\n`);
   return grant;
+}
+
+/**
+ * `brain zone <manifest> --source books --zone books` — put a source, and
+ * everything already loaded from it, into a sensitivity zone.
+ *
+ * Retroactive on purpose: every brain in the field has documents that predate
+ * zones, and an unzoned document is outside every scope, so without this a
+ * scoped person would see nothing at all until the whole corpus was reloaded.
+ */
+async function cmdZone(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  const flags = parseFlags(process.argv.slice(4));
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>`.");
+
+  const source = typeof flags.source === "string" ? flags.source.trim() : "";
+  const zone = typeof flags.zone === "string" ? flags.zone.trim() : "";
+
+  if (!source && !zone) {
+    const res = await http(`${base}/api/admin/brain/zones`, {
+      method: "GET", headers: { "X-Admin-Key": adminKey },
+    }, { timeoutMs: 30_000, what: "the zone list" });
+    if (!res.ok) die(`could not read zones (${res.status}): ${summariseResponseBody(await res.text())}`);
+    const { zones = [] } = await res.json();
+    if (!zones.length) return info("nothing is loaded yet, so there are no zones.");
+    console.log("");
+    for (const z of zones) {
+      const label = z.zone === "(unzoned)" ? c.yellow(z.zone) : c.green(z.zone);
+      console.log(`  ${label}  ${z.chunks} chunk(s) from ${z.sources} source(s)`);
+    }
+    console.log(
+      "\n  Anything (unzoned) is invisible to a scoped person, which is the safe\n" +
+      "  direction but is probably not what you want. Put each source in a zone:\n" +
+      `    brain zone ${displayPath(manifestPath)} --source <name> --zone <zone>\n`
+    );
+    return { zones };
+  }
+
+  if (!source || !zone) {
+    die("usage: brain zone <manifest> --source <name> --zone <zone>\n  or `brain zone <manifest>` alone to see what is where.");
+  }
+
+  const res = await http(`${base}/api/admin/brain/zones`, {
+    method: "POST",
+    headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+    body: JSON.stringify({ source, zone }),
+  }, { timeoutMs: 60_000, what: "the zone assignment" });
+  if (!res.ok) die(`could not set the zone (${res.status}): ${summariseResponseBody(await res.text())}`);
+  const r = await res.json();
+  ok(`"${r.source}" is now in zone "${r.zone}" (${r.documents} document(s), ${r.chunks} chunk(s))`);
+  return r;
 }
 
 /** `brain grants <manifest>` lists who has access; `--revoke <id>` ends one. */
@@ -9945,6 +10009,7 @@ const commands = {
   "mcp-config": cmdMcpConfig,
   grant: cmdGrant,
   grants: cmdGrants,
+  zone: cmdZone,
   migrate: cmdMigrate,
   ingest: cmdIngest,
   connect: cmdConnect,
@@ -9987,6 +10052,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain token      <manifest>            is a Cloudflare token remembered on this Mac? --forget removes it
     brain grant      <manifest> --name "X" --can ask,file   give one person scoped access; prints the token once
     brain grants     <manifest>            who has access; --revoke <id> ends one
+    brain zone       <manifest>            what is in which zone; --source X --zone Y to set one
     brain invite     <manifest>            one-tap passkey enrollment link for the owner (Face ID, 15 min)
     brain devices    <manifest>            enrolled passkeys; --revoke <credential id> removes one
     brain test       <manifest>            full acceptance suite (5 tiers)
