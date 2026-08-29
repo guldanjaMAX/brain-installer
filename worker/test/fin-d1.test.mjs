@@ -25,6 +25,7 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS = join(HERE, "..", "..", "migrations", "d1");
 const LEDGER_MIGRATION = "0015_financial_ledger.sql";
+const OWNER_WORKSPACE_MIGRATION = "0019_owner_workspace.sql";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => {
@@ -39,7 +40,7 @@ const statementsFor = (file) => splitStatements(readFileSync(join(MIGRATIONS, fi
 function freshDb({ throughLedger = true } = {}) {
   const db = new DatabaseSync(":memory:");
   for (const file of migrationFiles) {
-    if (!throughLedger && file === LEDGER_MIGRATION) continue;
+    if (!throughLedger && [LEDGER_MIGRATION, OWNER_WORKSPACE_MIGRATION].includes(file)) continue;
     for (const statement of statementsFor(file)) db.exec(statement);
   }
   return db;

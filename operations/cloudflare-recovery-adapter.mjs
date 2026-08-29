@@ -153,6 +153,14 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "oauth_clients",
   "oauth_codes",
   "oauth_tokens",
+  // Schema 19: owner decisions, settings, idempotency receipts, and the one
+  // human-readable activity history are durable product state.
+  "owner_action_requests",
+  "owner_activity_events",
+  "owner_approvals",
+  "fin_period_closes",
+  "owner_targets",
+  "owner_preferences",
 ]);
 
 /**
@@ -249,7 +257,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // current schema by design: a drill against a database one migration behind
 // would export a table or column set that does not match the reviewed list.
 // Bumping this is a required step of shipping any migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 18;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 19;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -289,6 +297,14 @@ const SCHEMA_16_TABLES = Object.freeze([
 // AGGREGATE_FIELDS below is built at module load, so a const declared after
 // it is in the temporal dead zone and every import of this module throws.
 const SCHEMA_17_TABLES = Object.freeze(["oauth_clients", "oauth_codes", "oauth_tokens"]);
+const SCHEMA_19_TABLES = Object.freeze([
+  "owner_action_requests",
+  "owner_activity_events",
+  "owner_approvals",
+  "fin_period_closes",
+  "owner_targets",
+  "owner_preferences",
+]);
 
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
@@ -302,7 +318,7 @@ const AGGREGATE_FIELDS = Object.freeze([
     // not have fails the whole snapshot. Ledger restoration correctness is
     // proven by the exported content, which these tables are fully part of.
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
-     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES].includes(table)
+     ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES, ...SCHEMA_19_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1061,7 +1077,8 @@ function expectedRecoveryTables(migrations) {
     (latest >= 14 || !SCHEMA_14_TABLES.includes(table)) &&
     (latest >= 15 || !SCHEMA_15_TABLES.includes(table)) &&
     (latest >= 16 || !SCHEMA_16_TABLES.includes(table)) &&
-    (latest >= 17 || !SCHEMA_17_TABLES.includes(table)));
+    (latest >= 17 || !SCHEMA_17_TABLES.includes(table)) &&
+    (latest >= 19 || !SCHEMA_19_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {

@@ -350,7 +350,9 @@ const runImport = (b, flags) => captured(() => cmdImportBank(manifest, manifestP
 /* ============ 10. the ledger has to exist first ============ */
 {
   const db = new DatabaseSync(":memory:");
-  for (const file of migrationFiles.filter((f) => !f.startsWith("0015"))) {
+  // 0019 intentionally depends on the financial ledger introduced by 0015.
+  // This fixture proves the pre-ledger refusal, so omit both migrations.
+  for (const file of migrationFiles.filter((f) => !f.startsWith("0015") && !f.startsWith("0019"))) {
     for (const statement of splitStatements(readFileSync(join(MIGRATIONS, file), "utf-8"))) db.exec(statement);
   }
   const env = { STORAGE: "d1", ADMIN_KEY, DB: d1(db) };

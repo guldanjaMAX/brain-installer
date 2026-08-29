@@ -120,10 +120,13 @@ async function prepareD1Envelope(env, envelope) {
   const docUid = `${source_type}:${source_id}`;
   const md = envelope.metadata || {};
   const owns = (key) => Object.prototype.hasOwnProperty.call(md, key);
+  const hasEntity = owns("entity_slug") && typeof md.entity_slug === "string" &&
+    /^[a-z0-9][a-z0-9_-]{0,63}$/.test(md.entity_slug);
   const hasClient = owns("client_name") || owns("client");
   const hasCategory = owns("category");
   const hasTopFolder = owns("top_folder");
   const hasPlatform = owns("platform");
+  const incomingEntity = hasEntity ? md.entity_slug : null;
   const incomingClient = md.client_name || md.client || null;
   const incomingCategory = md.category || null;
   const incomingTopFolder = md.top_folder || null;
@@ -151,10 +154,12 @@ async function prepareD1Envelope(env, envelope) {
     title,
     docUid,
     md,
+    hasEntity,
     hasClient,
     hasCategory,
     hasTopFolder,
     hasPlatform,
+    incomingEntity,
     incomingClient,
     incomingCategory,
     incomingTopFolder,
@@ -224,6 +229,7 @@ function d1PersistedState(prior, prepared) {
   const safeTitle = safePriorString(current.title);
   const safeUri = safePriorString(current.uri);
   const safeDateSource = safePriorString(current.date_source);
+  const safeEntity = safePriorString(current.entity_slug);
   const safeClient = safePriorString(current.client);
   const safeCategory = safePriorString(current.category);
   const safeTopFolder = safePriorString(current.top_folder);
@@ -241,6 +247,7 @@ function d1PersistedState(prior, prepared) {
     ? safeDateSource
     : replaceDate ? incomingDateSource : current.date_source ?? null;
 
+  const forceEntitySafety = safeEntity !== current.entity_slug;
   const forceClientSafety = safeClient !== current.client;
   const forceCategorySafety = safeCategory !== current.category;
   const forceTopFolderSafety = safeTopFolder !== current.top_folder;
@@ -254,6 +261,7 @@ function d1PersistedState(prior, prepared) {
       : current.document_date ?? null,
     date_source: targetDateSource,
     date_reliable: Math.max(Number(current.date_reliable || 0), prepared.envelope.date_reliable ? 1 : 0),
+    entity_slug: prepared.hasEntity ? prepared.incomingEntity : safeEntity ?? null,
     client: prepared.hasClient ? prepared.incomingClient : safeClient ?? null,
     category: prepared.hasCategory ? prepared.incomingCategory : safeCategory ?? null,
     top_folder: prepared.hasTopFolder ? prepared.incomingTopFolder : safeTopFolder ?? null,
@@ -267,10 +275,12 @@ function d1PersistedState(prior, prepared) {
     writeUri: prepared.envelope.uri != null ? prepared.envelope.uri : safeUri !== current.uri ? safeUri : null,
     writeDateSource: forceDateSourceSafety ? safeDateSource : incomingDateSource,
     forceDateSourceSafety,
+    writeEntity: prepared.hasEntity ? prepared.incomingEntity : safeEntity,
     writeClient: prepared.hasClient ? prepared.incomingClient : safeClient,
     writeCategory: prepared.hasCategory ? prepared.incomingCategory : safeCategory,
     writeTopFolder: prepared.hasTopFolder ? prepared.incomingTopFolder : safeTopFolder,
     writePlatform: prepared.hasPlatform ? prepared.incomingPlatform : safePlatform,
+    writeHasEntity: prepared.hasEntity || forceEntitySafety,
     writeHasClient: prepared.hasClient || forceClientSafety,
     writeHasCategory: prepared.hasCategory || forceCategorySafety,
     writeHasTopFolder: prepared.hasTopFolder || forceTopFolderSafety,
@@ -289,6 +299,7 @@ function d1MetadataChanged(prior, prepared) {
     target.document_date !== (prior.document_date ?? null) ||
     target.date_source !== (prior.date_source ?? null) ||
     target.date_reliable !== Number(prior.date_reliable || 0) ||
+    target.entity_slug !== (prior.entity_slug ?? null) ||
     target.client !== (prior.client ?? null) ||
     target.category !== (prior.category ?? null) ||
     target.top_folder !== (prior.top_folder ?? null) ||
@@ -410,6 +421,7 @@ const d1Backend = {
           title: x.title,
           snippet: x.text,
           uri: x.uri || null,
+          entity_slug: x.entity_slug ?? null,
           client: x.client ?? null,
           category: x.category ?? null,
           top_folder: x.top_folder ?? null,
@@ -440,8 +452,8 @@ const d1Backend = {
     const input = prepared?.envelope === envelope ? prepared : await prepareD1Envelope(env, envelope);
     const {
       source_type, source_id, content, title, docUid, md,
-      hasClient, hasCategory, hasTopFolder, hasPlatform,
-      incomingClient, incomingCategory, incomingTopFolder, incomingPlatform,
+      hasEntity, hasClient, hasCategory, hasTopFolder, hasPlatform,
+      incomingEntity, incomingClient, incomingCategory, incomingTopFolder, incomingPlatform,
       docDate, geometry, hash,
     } = input;
 
@@ -449,7 +461,7 @@ const d1Backend = {
       ? input.prior
       : await env.DB.prepare(
         `SELECT content_hash, title, uri, document_date, date_source, date_reliable,
-                client, category, top_folder, platform, text_source, text_reliable, meta
+                entity_slug, client, category, top_folder, platform, text_source, text_reliable, meta
          FROM documents WHERE doc_uid = ?1`
       ).bind(docUid).first();
     // Identical content AND filter identity is a no-op. Folder moves and title
@@ -479,8 +491,8 @@ const d1Backend = {
       `INSERT INTO documents (doc_uid, source, source_id, title, uri, document_date,
                               date_source, date_reliable, client, category,
                               top_folder, platform, ingested_at, content_hash, meta,
-                              text_source, text_reliable)
-       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?22,?23)
+                              text_source, text_reliable, entity_slug)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?22,?23,?24)
        ON CONFLICT(doc_uid) DO UPDATE SET
          title=COALESCE(excluded.title, documents.title),
          uri=COALESCE(excluded.uri, documents.uri),
@@ -492,6 +504,7 @@ const d1Backend = {
            WHEN excluded.date_reliable = 1 OR documents.document_date IS NULL THEN excluded.date_source
            ELSE documents.date_source END,
          date_reliable=MAX(COALESCE(documents.date_reliable, 0), COALESCE(excluded.date_reliable, 0)),
+         entity_slug=CASE WHEN ?25 = 1 THEN excluded.entity_slug ELSE documents.entity_slug END,
          client=CASE WHEN ?16 = 1 THEN excluded.client ELSE documents.client END,
          category=CASE WHEN ?17 = 1 THEN excluded.category ELSE documents.category END,
          top_folder=CASE WHEN ?18 = 1 THEN excluded.top_folder ELSE documents.top_folder END,
@@ -520,7 +533,9 @@ const d1Backend = {
         persisted.forceDateSourceSafety ? 1 : 0,
         persisted.replaceMeta ? 1 : 0,
         persisted.text_source,
-        persisted.text_reliable
+        persisted.text_reliable,
+        persisted.writeEntity ?? null,
+        persisted.writeHasEntity ? 1 : 0
       );
 
     const header = title ? `[${title}]` : "";
@@ -642,7 +657,7 @@ const d1Backend = {
     const prepared = await Promise.all(envelopes.map((envelope) => prepareD1Envelope(env, envelope)));
     const priorResults = await env.DB.batch(prepared.map((input) => env.DB.prepare(
       `SELECT content_hash, title, uri, document_date, date_source, date_reliable,
-              client, category, top_folder, platform, text_source, text_reliable, meta
+              entity_slug, client, category, top_folder, platform, text_source, text_reliable, meta
        FROM documents WHERE doc_uid = ?1`
     ).bind(input.docUid)));
 

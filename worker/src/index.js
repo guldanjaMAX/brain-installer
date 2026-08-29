@@ -23,6 +23,9 @@ import { jsonResponse, privateNoStore, validateAdminKey, validateReadKey, callLL
 import { handleBankFeed } from "./lib/bank-feed.js";
 import { handleBankExportImport, BANK_IMPORT_PATH } from "./lib/fin-upload.js";
 import { handleFinApi, FIN_PATH_PREFIX } from "./lib/fin-api.js";
+import {
+  handleOwnerActions, OWNER_PATH_PREFIX, validateOwnedEntityScope,
+} from "./lib/owner-actions.js";
 import { handleOcr, OCR_PATH } from "./lib/ocr.js";
 import {
   hasSensitiveTransportIdentity,
@@ -53,7 +56,7 @@ import { handleMcp } from "./lib/mcp-endpoint.js";
  */
 function filtersFrom(url) {
   const f = {};
-  for (const k of ["source", "client", "category", "from", "to", "top_folder", "platform"]) {
+  for (const k of ["source", "entity_slug", "client", "vector_client", "category", "from", "to", "top_folder", "platform"]) {
     const v = url.searchParams.get(k);
     if (v) f[k] = v;
   }
@@ -63,7 +66,7 @@ function filtersFrom(url) {
 const RAG_PARAMETER_KEYS = new Set([
   "q", "limit", "rerank", "graph_boost", "rrf_k",
   "weight_curated", "weight_drive", "weight_message",
-  "source", "client", "category", "from", "to", "top_folder", "platform",
+  "source", "entity_slug", "client", "category", "from", "to", "top_folder", "platform",
 ]);
 
 /**
@@ -87,6 +90,30 @@ async function privateRagParameters(request) {
     searchParams.set(key, String(value));
   }
   return { searchParams };
+}
+
+async function applyBusinessScope(env, url) {
+  const entitySlug = url.searchParams.get("entity_slug");
+  if (!entitySlug) return { ok: true, entityScope: undefined };
+  const askedClient = url.searchParams.get("client");
+  if (askedClient && askedClient !== entitySlug) {
+    return {
+      ok: false,
+      response: jsonResponse({ error: "conflict", code: "conflicting_business_scope" }, 409),
+    };
+  }
+  const scope = await validateOwnedEntityScope(env, entitySlug);
+  if (!scope.ok) return scope;
+  // entity_slug is the exact D1 document authority. The legacy client value is
+  // used only as a Vectorize candidate hint and is deliberately removed from
+  // D1 filters. A proven ledger mapping may point to an older document whose
+  // free-form client label is absent or different.
+  url.searchParams.delete("client");
+  url.searchParams.set("vector_client", entitySlug);
+  return {
+    ok: true,
+    entityScope: { entity_slug: entitySlug, applied: true },
+  };
 }
 
 const ROUTE_RANKING_DEPTH = 50;
@@ -135,6 +162,7 @@ async function unifiedRetrieve(env, url, { limit }) {
   return {
     matches: normalizeRetrievedDocuments(r.results),
     degraded: r.degraded,
+    degradedReason: r.degraded_reason || null,
     // A filter the backend cannot apply is surfaced, never dropped. Silently
     // ignoring `client=` returns every client's documents while looking narrowed,
     // which is a confidently wrong answer rather than a missing one.
@@ -393,13 +421,16 @@ async function handleUnified(env, request) {
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
   const q = url.searchParams.get("q");
   if (!q || !q.trim()) return jsonResponse({ error: "Missing q" }, 400);
+  const scope = await applyBusinessScope(env, url);
+  if (!scope.ok) return scope.response;
+  const entityScope = scope.entityScope;
 
   const limit = Math.min(parseInt(url.searchParams.get("limit")) || 10, 50);
   // Reranking is an explicit variant. Merely configuring a provider key must
   // not make /unified diverge from the deterministic order consumed by /think.
   const doRerank = explicitlyEnabled(url.searchParams.get("rerank")) && !!env.ANTHROPIC_API_KEY;
 
-  const { matches: retrieved, degraded, ignoredFilters } = await unifiedRetrieve(env, url, { limit });
+  const { matches: retrieved, degraded, degradedReason, ignoredFilters } = await unifiedRetrieve(env, url, { limit });
   const ignored = ignoredFilters.length ? { ignored_filters: ignoredFilters } : {};
   // Zero rows out of a search that could not run is not "no hits". /unified is
   // the raw-excerpt route, so it has no gaps array to carry the warning; it
@@ -412,7 +443,7 @@ async function handleUnified(env, request) {
 
   if (degraded === "fts") {
     const rows = retrieved.slice(0, limit);
-    return jsonResponse({ mode: "unified", degraded, ...unavailable(rows), ...ignored, results: rows });
+    return jsonResponse({ mode: "unified", entity_scope: entityScope, degraded, degraded_reason: degradedReason || undefined, ...unavailable(rows), ...ignored, results: rows });
   }
 
   let matches = retrieved;
@@ -423,8 +454,9 @@ async function handleUnified(env, request) {
   if (Array.isArray(matches)) matches = matches.slice(0, limit);
 
   return jsonResponse({
-    mode: "unified", reranked: doRerank,
-    degraded: degraded || undefined, ...unavailable(Array.isArray(matches) ? matches : []),
+    mode: "unified", entity_scope: entityScope, reranked: doRerank,
+    degraded: degraded || undefined, degraded_reason: degradedReason || undefined,
+    ...unavailable(Array.isArray(matches) ? matches : []),
     ...ignored, results: matches,
   });
 }
@@ -435,9 +467,12 @@ async function handleThink(env, request) {
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
   const q = (url.searchParams.get("q") || "").trim();
   if (!q) return jsonResponse({ error: "Missing q" }, 400);
+  const scope = await applyBusinessScope(env, url);
+  if (!scope.ok) return scope.response;
+  const entityScope = scope.entityScope;
   const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit")) || 8, 1), 20);
 
-  const { matches, degraded, ignoredFilters } = await unifiedRetrieve(env, url, { limit });
+  const { matches, degraded, degradedReason, ignoredFilters } = await unifiedRetrieve(env, url, { limit });
   const results = Array.isArray(matches) ? matches : [];
 
   if (results.length === 0) {
@@ -449,7 +484,9 @@ async function handleThink(env, request) {
     const disclosure = emptyRetrievalDisclosure(degraded);
     return jsonResponse({
       mode: "think",
+      entity_scope: entityScope,
       degraded: degraded || undefined,
+      degraded_reason: degradedReason || undefined,
       status: disclosure.unavailable ? disclosure.status : undefined,
       // The sentence a human sees in place of an answer. Present only when the
       // search failed, so /app and the CLI cannot render the refusal wording by
@@ -768,7 +805,9 @@ async function handleThink(env, request) {
 
   return jsonResponse({
     mode: "think",
+    entity_scope: entityScope,
     degraded: degraded || undefined,
+    degraded_reason: degradedReason || undefined,
     answer,
     answer_error: answerError || undefined,
     model: model || undefined,
@@ -1503,6 +1542,21 @@ export default {
     // operator can see what the client sees without a screen share.
     if (path.startsWith(FIN_PATH_PREFIX)) {
       return handleFinApi(env, request, url, path);
+    }
+
+    // Owner writes sit in front of the admin gate because their authority is a
+    // positively identified owner passkey principal. The handler rejects live
+    // scoped principals and has no admin-key fallback.
+    if (path.startsWith(OWNER_PATH_PREFIX)) {
+      const ingestEnvelope = (envelope) => handleIngest(env, new Request(
+        `${url.origin}/api/admin/brain/ingest`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(envelope),
+        },
+      ));
+      return handleOwnerActions(env, request, path, { ingestEnvelope });
     }
 
     // The Zoom webhook sits in FRONT of the key gate because Zoom cannot send

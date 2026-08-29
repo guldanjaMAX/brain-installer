@@ -240,7 +240,7 @@ function composeDocumentEvidence(vectorRow, keywordRow, query) {
  * All public filters have real D1 columns. Dropping a filter is worse than
  * rejecting it: the answer comes back looking narrowed when it never was.
  */
-export const D1_FILTERS = ["source", "client", "category", "top_folder", "platform", "from", "to"];
+export const D1_FILTERS = ["source", "entity_slug", "client", "category", "top_folder", "platform", "from", "to"];
 export const D1_UNSUPPORTED = [];
 
 export function filterSql(filters = {}, alias = "c", nextParam = 3) {
@@ -248,6 +248,12 @@ export function filterSql(filters = {}, alias = "c", nextParam = 3) {
   const params = [];
   const add = (frag, val) => { parts.push(frag.replace("?N", "?" + nextParam++)); params.push(val); };
   if (filters.source) add(`${alias}.source = ?N`, filters.source);
+  // Business scope lives on documents. Both retrieval paths hydrate chunks
+  // through D1, so this exact predicate is the authority even when Vectorize
+  // was queried with the equivalent client pre-filter for candidate recall.
+  if (filters.entity_slug) {
+    add(`EXISTS (SELECT 1 FROM documents scope_d WHERE scope_d.doc_uid = ${alias}.doc_uid AND scope_d.entity_slug = ?N)`, filters.entity_slug);
+  }
   if (filters.client) add(`${alias}.client = ?N`, filters.client);
   if (filters.category) add(`${alias}.category = ?N`, filters.category);
   if (filters.top_folder) add(`${alias}.top_folder = ?N`, filters.top_folder);
@@ -294,6 +300,14 @@ export async function vectorFilterFor(filters = {}) {
   for (const key of VECTOR_STRING_FILTERS) {
     const token = await metadataTokenFor(filters[key]);
     if (token !== null) filter[key] = { $eq: token };
+  }
+  // Entity scope is authoritative only in D1 today. `vector_client` is a
+  // private candidate hint, never a D1 predicate and never accepted from the
+  // public request body. Scoped search remains explicitly degraded until a
+  // canonical entity metadata index is built and reprojected.
+  if (filters.vector_client && !filters.client) {
+    const token = await metadataTokenFor(filters.vector_client);
+    if (token !== null) filter.client = { $eq: token };
   }
   const range = {};
   if (filters.from) {
@@ -365,7 +379,7 @@ export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
   const sql = `
     SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
            c.client, c.category, c.top_folder, c.platform,
-           d.source_id, d.uri, d.content_hash, d.date_source, d.date_reliable,
+           d.source_id, d.uri, d.entity_slug, d.content_hash, d.date_source, d.date_reliable,
            d.text_source, d.text_reliable,
            bm25(chunks_fts) AS score
     FROM chunks_fts
@@ -439,7 +453,7 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
     const { results: hydrated } = await env.DB.prepare(
       `SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
               c.client, c.category, c.top_folder, c.platform,
-              d.source_id, d.uri, d.content_hash, d.date_source, d.date_reliable,
+              d.source_id, d.uri, d.entity_slug, d.content_hash, d.date_source, d.date_reliable,
               d.text_source, d.text_reliable
        FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid
        WHERE c.chunk_uid IN (${placeholders})${f.clause}`
@@ -502,6 +516,10 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
   } else if (!embedding) {
     degraded = "no-embedding";
     degradedReason = "embedding-unavailable";
+  }
+  if (filters.entity_slug) {
+    degraded = "vector";
+    degradedReason = "entity-vector-authority-unindexed";
   }
 
   // Collapse BEFORE assigning rank positions. Otherwise ten chunks from one
