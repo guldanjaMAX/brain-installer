@@ -27,7 +27,13 @@ import {
   storePasskey, findPasskey, recordPasskeyUse,
   listPasskeys, renamePasskey, revokePasskey,
   sessionGeneration, bumpSessionGeneration,
+  recordPasskeySecurityEvent, passkeySecurityStatus,
 } from "./auth-store.js";
+import {
+  createDocumentGrant, revokeDocumentGrant, reissueDocumentGrantInvite,
+  listDocumentGrants, listGrantedDocuments, documentGrantPrincipal,
+  DocumentAccessError, DocumentAccessUnavailableError,
+} from "./document-access.js";
 import { appPageHtml, brandOgSvg } from "./app-page.js";
 import { APP_JS, APP_CSS } from "./app-assets.js";
 
@@ -56,7 +62,8 @@ function challengeFromClientData(clientDataJSON) {
 
 /** Session check used by the read-route gate and every /api/app route. */
 export async function validateOwnerSession(request, env) {
-  return (await ownerSessionPrincipal(request, env)) !== null;
+  const principal = await ownerSessionPrincipal(request, env);
+  return principal !== null && principal.denied !== true;
 }
 
 /**
@@ -69,9 +76,48 @@ export async function ownerSessionPrincipal(request, env) {
   if (!appRequest(request)) return null;
   const session = await readSessionCookie(request, env, await sessionGeneration(env));
   if (!session) return null;
-  return session.grantId === null
-    ? { kind: "owner", grantId: null }
-    : { kind: "grant", grantId: session.grantId };
+  if (session.grantId === null) return { kind: "owner", grantId: null };
+  const principal = await documentGrantPrincipal(env, session.grantId);
+  return principal.denied
+    ? { kind: "grant", grantId: session.grantId, denied: true, code: principal.code }
+    : principal;
+}
+
+function ownerRequired(principal) {
+  return principal?.kind === "owner" && principal.grantId === null;
+}
+
+function scopedForbidden() {
+  return jsonResponse({ error: "forbidden", code: "owner_required" }, 403);
+}
+
+function unavailable(code) {
+  return jsonResponse({ error: "unavailable", code }, 503);
+}
+
+function documentAccessErrorResponse(error) {
+  const labels = {
+    400: "invalid_request",
+    403: "forbidden",
+    404: "not_found",
+    409: "conflict",
+    413: "too_large",
+    503: "unavailable",
+  };
+  return jsonResponse({
+    error: labels[error.status] || "invalid_request",
+    code: error.code,
+    detail: error.message,
+  }, error.status);
+}
+
+async function observePasskey(env, event) {
+  try {
+    await recordPasskeySecurityEvent(env, event);
+    return null;
+  } catch {
+    return unavailable("passkey_observability_unavailable");
+  }
 }
 
 /* ------------------------------------------------------------ admin plane */
@@ -100,6 +146,7 @@ export async function handleAdminDevices(env, request, path) {
 /* ------------------------------------------------------------ owner plane */
 
 export async function handleOwnerAuth(env, request, url, path) {
+  const requestStartedAt = Date.now();
   // The link-preview image. Public and cacheable by design: a scraper fetching
   // it must never need a credential, and it contains only the brain's own name.
   if (path === "/brand/og.svg" && request.method === "GET") {
@@ -154,31 +201,103 @@ export async function handleOwnerAuth(env, request, url, path) {
     const payload = await body(request);
     // Enrollment is authorized by an invite code, or by an existing session
     // (adding one more device from a signed-in one).
-    const viaSession = await validateOwnerSession(request, env);
+    let viaSession;
+    try {
+      viaSession = await ownerSessionPrincipal(request, env);
+    } catch {
+      return unavailable("owner_auth_unavailable");
+    }
+    if (viaSession?.denied) return scopedForbidden();
+    let invitation = null;
     if (!viaSession) {
       const code = String(payload?.code || "");
-      if (!code || !(await peekEnrollmentCode(env, code))) {
+      try {
+        invitation = code ? await peekEnrollmentCode(env, code) : null;
+      } catch {
+        return unavailable("passkey_auth_unavailable");
+      }
+      if (!invitation) {
+        const telemetryError = await observePasskey(env, {
+          rpId, ceremony: "registration", stage: "options", outcome: "forbidden",
+          reasonCode: "enrollment_required", durationMs: Date.now() - requestStartedAt, principalKind: "unknown",
+        });
+        if (telemetryError) return telemetryError;
         return jsonResponse({ error: "a valid enrollment link is required" }, 403);
       }
     }
-    const challenge = await issueChallenge(env, "register");
+    const grantId = viaSession?.grantId ?? invitation?.documentGrantId ?? null;
+    const telemetryError = await observePasskey(env, {
+      rpId, ceremony: "registration", stage: "options", outcome: "started",
+      reasonCode: "challenge_issued", durationMs: Date.now() - requestStartedAt,
+      principalKind: grantId ? "grant" : "owner", grantId,
+    });
+    if (telemetryError) return telemetryError;
+    let challenge;
+    try {
+      challenge = await issueChallenge(env, "register");
+    } catch {
+      return unavailable("passkey_auth_unavailable");
+    }
     return jsonResponse({
       challenge,
       rp: { id: rpId, name: env.BRAIN_NAME || "brain" },
-      user_name: env.BRAIN_OWNER || "owner",
+      user_name: grantId ? "shared document access" : env.BRAIN_OWNER || "owner",
     });
   }
 
   if (path === "/auth/register/verify") {
     const payload = await body(request);
     if (!payload) return jsonResponse({ error: "invalid body" }, 400);
-    const viaSession = await validateOwnerSession(request, env);
+    let viaSession;
+    try {
+      viaSession = await ownerSessionPrincipal(request, env);
+    } catch {
+      return unavailable("owner_auth_unavailable");
+    }
+    if (viaSession?.denied) return scopedForbidden();
     const challenge = challengeFromClientData(payload.clientDataJSON);
     if (!challenge || !(await consumeChallenge(env, challenge, "register"))) {
+      const telemetryError = await observePasskey(env, {
+        rpId, ceremony: "registration", stage: "verify", outcome: "forbidden",
+        reasonCode: "challenge_invalid", durationMs: Date.now() - requestStartedAt,
+        principalKind: viaSession?.kind || "unknown",
+        grantId: viaSession?.grantId || null,
+      });
+      if (telemetryError) return telemetryError;
       return jsonResponse({ error: "unknown or expired challenge" }, 403);
     }
-    if (!viaSession && !(await consumeEnrollmentCode(env, String(payload.code || "")))) {
-      return jsonResponse({ error: "the enrollment link is invalid, expired, or already used" }, 403);
+    let invitation = null;
+    if (!viaSession) {
+      try {
+        invitation = await consumeEnrollmentCode(env, String(payload.code || ""));
+      } catch {
+        return unavailable("passkey_auth_unavailable");
+      }
+      if (!invitation) {
+        const telemetryError = await observePasskey(env, {
+          rpId, ceremony: "registration", stage: "verify", outcome: "forbidden",
+          reasonCode: "enrollment_invalid", durationMs: Date.now() - requestStartedAt, principalKind: "unknown",
+        });
+        if (telemetryError) return telemetryError;
+        return jsonResponse({ error: "the enrollment link is invalid, expired, or already used" }, 403);
+      }
+    }
+    const grantId = viaSession?.grantId ?? invitation?.documentGrantId ?? null;
+    if (grantId) {
+      let scoped;
+      try {
+        scoped = await documentGrantPrincipal(env, grantId);
+      } catch {
+        return unavailable("document_access_unavailable");
+      }
+      if (scoped.denied) {
+        const telemetryError = await observePasskey(env, {
+          rpId, ceremony: "registration", stage: "verify", outcome: "forbidden",
+          reasonCode: scoped.code, durationMs: Date.now() - requestStartedAt, principalKind: "grant", grantId,
+        });
+        if (telemetryError) return telemetryError;
+        return scopedForbidden();
+      }
     }
     let verified;
     try {
@@ -190,15 +309,44 @@ export async function handleOwnerAuth(env, request, url, path) {
         rpId,
       });
     } catch (error) {
+      const telemetryError = await observePasskey(env, {
+        rpId, ceremony: "registration", stage: "verify", outcome: "failed",
+        reasonCode: "webauthn_verification_failed", durationMs: Date.now() - requestStartedAt,
+        principalKind: grantId ? "grant" : "owner", grantId,
+      });
+      if (telemetryError) return telemetryError;
       return jsonResponse({ error: String(error?.message || error) }, 400);
     }
-    await storePasskey(env, { ...verified, nickname: String(payload.nickname || "").slice(0, 60) });
-    const cookie = await mintSessionCookie(env, await sessionGeneration(env));
+    try {
+      await storePasskey(env, {
+        ...verified,
+        nickname: String(payload.nickname || "").slice(0, 60),
+        documentGrantId: grantId,
+        securityEvent: {
+          rpId, ceremony: "registration", stage: "verify", outcome: "succeeded",
+          reasonCode: "passkey_added", durationMs: Date.now() - requestStartedAt,
+          principalKind: grantId ? "grant" : "owner", grantId,
+        },
+      });
+    } catch {
+      return unavailable("passkey_auth_unavailable");
+    }
+    const cookie = await mintSessionCookie(env, await sessionGeneration(env), { grantId });
     return withCookie(jsonResponse({ enrolled: true, credential_id: verified.credentialId }), cookie);
   }
 
   if (path === "/auth/login/options") {
-    const challenge = await issueChallenge(env, "login");
+    const telemetryError = await observePasskey(env, {
+      rpId, ceremony: "authentication", stage: "options", outcome: "started",
+      reasonCode: "challenge_issued", durationMs: Date.now() - requestStartedAt, principalKind: "unknown",
+    });
+    if (telemetryError) return telemetryError;
+    let challenge;
+    try {
+      challenge = await issueChallenge(env, "login");
+    } catch {
+      return unavailable("passkey_auth_unavailable");
+    }
     return jsonResponse({ challenge, rp_id: rpId });
   }
 
@@ -207,10 +355,39 @@ export async function handleOwnerAuth(env, request, url, path) {
     if (!payload) return jsonResponse({ error: "invalid body" }, 400);
     const challenge = challengeFromClientData(payload.clientDataJSON);
     if (!challenge || !(await consumeChallenge(env, challenge, "login"))) {
+      const telemetryError = await observePasskey(env, {
+        rpId, ceremony: "authentication", stage: "verify", outcome: "forbidden",
+        reasonCode: "challenge_invalid", durationMs: Date.now() - requestStartedAt, principalKind: "unknown",
+      });
+      if (telemetryError) return telemetryError;
       return jsonResponse({ error: "unknown or expired challenge" }, 403);
     }
     const credential = await findPasskey(env, String(payload.credentialId || ""));
-    if (!credential) return jsonResponse({ error: "unknown passkey" }, 403);
+    if (!credential) {
+      const telemetryError = await observePasskey(env, {
+        rpId, ceremony: "authentication", stage: "verify", outcome: "forbidden",
+        reasonCode: "passkey_unknown", durationMs: Date.now() - requestStartedAt, principalKind: "unknown",
+      });
+      if (telemetryError) return telemetryError;
+      return jsonResponse({ error: "unknown passkey" }, 403);
+    }
+    const grantId = credential.document_grant_id ?? null;
+    if (grantId) {
+      let scoped;
+      try {
+        scoped = await documentGrantPrincipal(env, grantId);
+      } catch {
+        return unavailable("document_access_unavailable");
+      }
+      if (scoped.denied) {
+        const telemetryError = await observePasskey(env, {
+          rpId, ceremony: "authentication", stage: "verify", outcome: "forbidden",
+          reasonCode: scoped.code, durationMs: Date.now() - requestStartedAt, principalKind: "grant", grantId,
+        });
+        if (telemetryError) return telemetryError;
+        return scopedForbidden();
+      }
+    }
     let verdict;
     try {
       verdict = await verifyAssertion({
@@ -223,16 +400,36 @@ export async function handleOwnerAuth(env, request, url, path) {
         credential,
       });
     } catch (error) {
+      const telemetryError = await observePasskey(env, {
+        rpId, ceremony: "authentication", stage: "verify", outcome: "failed",
+        reasonCode: "webauthn_verification_failed", durationMs: Date.now() - requestStartedAt,
+        principalKind: grantId ? "grant" : "owner", grantId,
+      });
+      if (telemetryError) return telemetryError;
       return jsonResponse({ error: String(error?.message || error) }, 403);
     }
     if (verdict.cloneSuspected) {
       // A counter that failed to advance means two copies of a hardware-bound
       // credential exist. Refuse loudly; the owner revokes it from another
       // device or the operator does via the CLI.
+      const telemetryError = await observePasskey(env, {
+        rpId, ceremony: "authentication", stage: "verify", outcome: "forbidden",
+        reasonCode: "counter_regressed", durationMs: Date.now() - requestStartedAt,
+        principalKind: grantId ? "grant" : "owner", grantId,
+      });
+      if (telemetryError) return telemetryError;
       return jsonResponse({ error: "this passkey looks cloned (its counter went backwards); sign in from another device and revoke it" }, 403);
     }
-    await recordPasskeyUse(env, credential.credential_id, verdict.signCount);
-    const cookie = await mintSessionCookie(env, await sessionGeneration(env));
+    try {
+      await recordPasskeyUse(env, credential.credential_id, verdict.signCount, {
+        rpId, ceremony: "authentication", stage: "verify", outcome: "succeeded",
+        reasonCode: "passkey_used", durationMs: Date.now() - requestStartedAt,
+        principalKind: grantId ? "grant" : "owner", grantId,
+      });
+    } catch {
+      return unavailable("passkey_auth_unavailable");
+    }
+    const cookie = await mintSessionCookie(env, await sessionGeneration(env), { grantId });
     return withCookie(jsonResponse({ signed_in: true }), cookie);
   }
 
@@ -242,7 +439,14 @@ export async function handleOwnerAuth(env, request, url, path) {
     // their own routes. Accepting it lets an operator answering "the client
     // says Home is broken" see exactly what the client sees, without asking
     // them to share a screen.
-    if (!(await validateOwnerSession(request, env)) && !validateAdminKey(request, env)) {
+    let systemPrincipal = null;
+    try {
+      systemPrincipal = await ownerSessionPrincipal(request, env);
+    } catch {
+      return unavailable("owner_auth_unavailable");
+    }
+    if (!ownerRequired(systemPrincipal) && !validateAdminKey(request, env)) {
+      if (systemPrincipal) return scopedForbidden();
       return jsonResponse({ error: "unauthorized" }, 401);
     }
     // The owner's own view of their brain's condition, composed from reads
@@ -262,20 +466,144 @@ export async function handleOwnerAuth(env, request, url, path) {
   }
 
   // Everything below requires a live session.
-  if (!(await validateOwnerSession(request, env))) {
+  let principal;
+  try {
+    principal = await ownerSessionPrincipal(request, env);
+  } catch {
+    return unavailable("owner_auth_unavailable");
+  }
+  if (!principal) {
     return jsonResponse({ error: "unauthorized" }, 401);
+  }
+  if (principal.denied) {
+    return withCookie(jsonResponse({
+      error: "forbidden",
+      code: principal.code || "document_grant_inactive",
+      signed_in: false,
+      clear_session: true,
+      recovery: "Ask the owner to create new document access and send a new enrollment link.",
+    }, 403), clearSessionCookie());
   }
 
   if (path === "/api/app/me") {
+    if (!ownerRequired(principal)) {
+      return jsonResponse({
+        signed_in: true,
+        brain: env.BRAIN_NAME || "brain",
+        principal: {
+          kind: "grant",
+          grant_id: principal.grantId,
+          entity_slug: principal.entitySlug || null,
+          document_count: principal.documentCount || 0,
+          capabilities: ["documents:read", "ask"],
+        },
+        workspace: {
+          home: false,
+          documents: true,
+          ask: true,
+          add_review: false,
+          access: false,
+          bank: false,
+          targets: false,
+          preferences: false,
+        },
+      });
+    }
     return jsonResponse({
       signed_in: true,
       brain: env.BRAIN_NAME || "brain",
       owner: env.BRAIN_OWNER || "owner",
+      principal: { kind: "owner", grant_id: null },
       devices: await listPasskeys(env),
       // Apps reaching the brain over the connector, so one call answers the
       // whole of "who has access" rather than two that can disagree.
       connections: await listConnections(env),
     });
+  }
+  if (path === "/api/app/signout") {
+    return withCookie(jsonResponse({ signed_out: true }), clearSessionCookie());
+  }
+  if (path === "/api/app/document-access/documents") {
+    if (ownerRequired(principal)) {
+      return jsonResponse({
+        error: "invalid_request",
+        code: "scoped_principal_required",
+        detail: "The owner document workspace uses the owner document route.",
+      }, 400);
+    }
+    try {
+      return jsonResponse(await listGrantedDocuments(env, principal));
+    } catch (error) {
+      if (error instanceof DocumentAccessError) return documentAccessErrorResponse(error);
+      return unavailable("document_access_unavailable");
+    }
+  }
+
+  // Everything below changes owner state or exposes owner-wide diagnostics.
+  // A scoped session may read only its exact granted documents and its own
+  // minimal identity above. Unlisted future routes therefore fail owner-only.
+  if (!ownerRequired(principal)) return scopedForbidden();
+
+  if (path === "/api/app/document-access/status") {
+    try {
+      return jsonResponse(await listDocumentGrants(env));
+    } catch (error) {
+      if (error instanceof DocumentAccessUnavailableError) return unavailable(error.code);
+      throw error;
+    }
+  }
+  if (path === "/api/app/document-access/create") {
+    const payload = await body(request);
+    try {
+      const result = await createDocumentGrant(env, payload);
+      const { enrollment_code: code, replayed, ...grant } = result;
+      return jsonResponse({
+        ...grant,
+        replayed,
+        enrollment_url: code ? `${url.origin}/app#enroll=${code}` : null,
+        enrollment_expires_in_minutes: code ? 15 : null,
+        scope_rule: "exact_document_ids_only",
+      });
+    } catch (error) {
+      if (error instanceof DocumentAccessError) {
+        return documentAccessErrorResponse(error);
+      }
+      return unavailable("document_access_unavailable");
+    }
+  }
+  if (path === "/api/app/document-access/reissue") {
+    const payload = await body(request);
+    try {
+      const result = await reissueDocumentGrantInvite(env, payload);
+      const { enrollment_code: code, ...receipt } = result;
+      return jsonResponse({
+        ...receipt,
+        enrollment_url: code ? `${url.origin}/app#enroll=${code}` : null,
+      });
+    } catch (error) {
+      if (error instanceof DocumentAccessError) {
+        return documentAccessErrorResponse(error);
+      }
+      return unavailable("document_access_unavailable");
+    }
+  }
+  if (path === "/api/app/document-access/revoke") {
+    const payload = await body(request);
+    try {
+      return jsonResponse(await revokeDocumentGrant(env, payload));
+    } catch (error) {
+      if (error instanceof DocumentAccessError) {
+        return documentAccessErrorResponse(error);
+      }
+      return unavailable("document_access_unavailable");
+    }
+  }
+  if (path === "/api/app/passkeys/status") {
+    try {
+      return jsonResponse(await passkeySecurityStatus(env, rpId));
+    } catch {
+      return unavailable("passkey_observability_unavailable");
+    }
   }
   if (path === "/api/app/devices/rename") {
     const payload = await body(request);
@@ -293,9 +621,6 @@ export async function handleOwnerAuth(env, request, url, path) {
     if (!payload?.client_id) return jsonResponse({ error: "client_id required" }, 400);
     const outcome = await revokeConnection(env, payload.client_id);
     return jsonResponse({ ...outcome, connections: await listConnections(env) });
-  }
-  if (path === "/api/app/signout") {
-    return withCookie(jsonResponse({ signed_out: true }), clearSessionCookie());
   }
   if (path === "/api/app/signout-all") {
     await bumpSessionGeneration(env);

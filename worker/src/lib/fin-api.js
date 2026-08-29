@@ -39,7 +39,7 @@
  */
 
 import { jsonResponse, privateNoStore, validateAdminKey } from "./core.js";
-import { validateOwnerSession } from "./owner-auth.js";
+import { ownerSessionPrincipal } from "./owner-auth.js";
 import {
   DEFAULT_TENANT, ledgerInstalled, ledgerEntities, ledgerAccounts, ledgerDocuments,
   ledgerStatements, ledgerExceptions, ledgerDeadlines, ledgerOpenItems,
@@ -99,7 +99,8 @@ const envelope = (install, extra = {}) => ({
 
 export async function handleFinApi(env, request, url, path) {
   try {
-    const ownerAuthorised = async () => await validateOwnerSession(request, env);
+    const ownerPrincipal = await ownerSessionPrincipal(request, env);
+    const ownerAuthorised = ownerPrincipal?.kind === "owner" && ownerPrincipal.grantId === null;
     const operatorAuthorised = () => validateAdminKey(request, env);
 
     if (request.method !== "POST") {
@@ -110,8 +111,10 @@ export async function handleFinApi(env, request, url, path) {
     // people to paste it anywhere. It is accepted here because these are
     // reads and an operator answering "the client says this is empty" should
     // not need the client to share their screen.
-    if (!await ownerAuthorised() && !operatorAuthorised()) {
-      return privateNoStore(jsonResponse({ error: "unauthorized" }, 401));
+    if (!ownerAuthorised && !operatorAuthorised()) {
+      return privateNoStore(ownerPrincipal
+        ? jsonResponse({ error: "forbidden", code: "owner_required" }, 403)
+        : jsonResponse({ error: "unauthorized", code: "session_required" }, 401));
     }
 
     const body = await readJson(request);

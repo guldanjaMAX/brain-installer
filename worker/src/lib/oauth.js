@@ -26,7 +26,7 @@
 import { jsonResponse } from "./core.js";
 import { FAVICON } from "./app-page.js";
 import { randomToken, sessionGeneration } from "./auth-store.js";
-import { validateOwnerSession } from "./owner-auth.js";
+import { ownerSessionPrincipal } from "./owner-auth.js";
 
 const CODE_TTL_MS = 5 * 60 * 1000;
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -296,7 +296,16 @@ export async function handleAuthorizePage(env, url) {
 
 /** POST /oauth/authorize/decision — passkey-session-gated approval. */
 export async function handleAuthorizeDecision(env, request, url) {
-  if (!(await validateOwnerSession(request, env))) return jsonResponse({ error: "unauthorized" }, 401);
+  let principal;
+  try {
+    principal = await ownerSessionPrincipal(request, env);
+  } catch {
+    return jsonResponse({ error: "unavailable", code: "owner_auth_unavailable" }, 503);
+  }
+  if (!principal) return jsonResponse({ error: "unauthorized", code: "session_required" }, 401);
+  if (principal.kind !== "owner" || principal.grantId !== null) {
+    return jsonResponse({ error: "forbidden", code: "owner_required" }, 403);
+  }
   const params = authorizeParams(url);
   const client = await loadClient(env, params.client_id);
   if (!client || !client.redirect_uris.includes(params.redirect_uri)) {

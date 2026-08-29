@@ -37,7 +37,9 @@ function authDb() {
         async run() {
           if (/INSERT INTO auth_challenges/.test(sql)) tables.challenges.set(bound[0], { purpose: bound[1], expires_at: bound[2] });
           else if (/DELETE FROM auth_challenges/.test(sql)) tables.challenges.delete(bound[0]);
-          else if (/INSERT INTO enrollment_codes/.test(sql)) tables.codes.set(bound[0], { expires_at: bound[1], used_at: null });
+          else if (/INSERT INTO enrollment_codes/.test(sql)) tables.codes.set(bound[0], {
+            expires_at: bound[1], used_at: null, document_grant_id: bound[2] ?? null,
+          });
           else if (/UPDATE enrollment_codes SET used_at/.test(sql)) {
             const row = tables.codes.get(bound[1]);
             if (row && !row.used_at) row.used_at = bound[0];
@@ -45,6 +47,7 @@ function authDb() {
             tables.passkeys.set(bound[0], {
               credential_id: bound[0], public_key_jwk: bound[1], alg: bound[2],
               sign_count: bound[3], nickname: bound[4], created_at: bound[5], last_used_at: null,
+              document_grant_id: bound[6] ?? null,
             });
           } else if (/UPDATE owner_passkeys SET sign_count/.test(sql)) {
             const row = tables.passkeys.get(bound[2]);
@@ -59,7 +62,7 @@ function authDb() {
       };
       return statement;
     },
-    async batch() {},
+    async batch(statements) { for (const statement of statements) await statement.run(); return statements.map(() => ({})); },
   };
 }
 
@@ -113,7 +116,7 @@ test("invite -> enroll -> sign in -> settings, end to end", async () => {
   }), testEnv);
   assert.equal(verify.status, 200);
   const enrolledCookie = sessionCookie(verify);
-  assert.match(enrolledCookie, /^brain_session=v1\./, "enrollment signs the owner straight in");
+  assert.match(enrolledCookie, /^brain_session=v2\./, "enrollment signs the owner straight in");
 
   // The code is single use.
   const reuse = await worker.fetch(post("/auth/register/options", { code }), testEnv);

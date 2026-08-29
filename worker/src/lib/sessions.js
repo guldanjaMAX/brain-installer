@@ -38,13 +38,24 @@ function constantTimeEquals(a, b) {
   return diff === 0;
 }
 
-/** Mint the Set-Cookie header value for a fresh session. */
-export async function mintSessionCookie(env, generation, now = Date.now()) {
+/**
+ * Mint the Set-Cookie header value for a fresh session.
+ *
+ * v2 names the exact document grant behind a scoped passkey. grantId=null is
+ * the owner. Numeric third arguments remain accepted only as the legacy
+ * owner-session timestamp used by pre-scope tests and callers.
+ */
+export async function mintSessionCookie(env, generation, options = {}) {
   if (!env.SESSION_SIGNING_KEY) throw new Error("SESSION_SIGNING_KEY is not set; run `brain secrets`");
+  const normalized = typeof options === "number" ? { grantId: null, now: options } : options || {};
+  const grantId = normalized.grantId ?? null;
+  const now = normalized.now ?? Date.now();
+  const subject = grantId === null ? "-" : String(grantId);
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(subject)) throw new Error("invalid grant id for a session");
   const expires = now + SESSION_TTL_MS;
-  const payload = `${expires}.${generation}`;
+  const payload = `${expires}.${generation}.${subject}`;
   const signature = await hmac(env.SESSION_SIGNING_KEY, payload);
-  const value = `v1.${payload}.${signature}`;
+  const value = `v2.${payload}.${signature}`;
   return `${SESSION_COOKIE}=${value}; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}; HttpOnly; Secure; SameSite=Strict`;
 }
 
@@ -52,8 +63,7 @@ export async function mintSessionCookie(env, generation, now = Date.now()) {
  * Read the principal carried by a valid session.
  *
  * Every v1 cookie predates scoped passkeys, so it positively identifies the
- * owner. Returning a principal instead of a boolean gives owner-write routes a
- * seam that remains safe when a later cookie version can name somebody else.
+ * owner. v2 positively names either the owner or one immutable document grant.
  */
 export async function readSessionCookie(request, env, currentGeneration, now = Date.now()) {
   if (!env.SESSION_SIGNING_KEY) return null;
@@ -61,12 +71,27 @@ export async function readSessionCookie(request, env, currentGeneration, now = D
   const match = cookies.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]+)`));
   if (!match) return null;
   const parts = match[1].split(".");
-  if (parts.length !== 4 || parts[0] !== "v1") return null;
-  const [, expires, generation, signature] = parts;
-  if (!/^\d+$/.test(expires) || Number(expires) <= now) return null;
-  if (String(generation) !== String(currentGeneration)) return null;
-  const expected = await hmac(env.SESSION_SIGNING_KEY, `${expires}.${generation}`);
-  return constantTimeEquals(signature, expected) ? { grantId: null } : null;
+  if (parts[0] === "v1") {
+    if (parts.length !== 4) return null;
+    const [, expires, generation, signature] = parts;
+    if (!/^\d+$/.test(expires) || Number(expires) <= now) return null;
+    if (String(generation) !== String(currentGeneration)) return null;
+    const expected = await hmac(env.SESSION_SIGNING_KEY, `${expires}.${generation}`);
+    return constantTimeEquals(signature, expected) ? { grantId: null } : null;
+  }
+
+  if (parts[0] === "v2") {
+    if (parts.length !== 5) return null;
+    const [, expires, generation, subject, signature] = parts;
+    if (!/^\d+$/.test(expires) || Number(expires) <= now) return null;
+    if (String(generation) !== String(currentGeneration)) return null;
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(subject)) return null;
+    const expected = await hmac(env.SESSION_SIGNING_KEY, `${expires}.${generation}.${subject}`);
+    if (!constantTimeEquals(signature, expected)) return null;
+    return { grantId: subject === "-" ? null : subject };
+  }
+
+  return null;
 }
 
 /** True when the request carries a valid, unexpired, current-generation session. */

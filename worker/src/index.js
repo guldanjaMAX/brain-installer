@@ -39,8 +39,12 @@ import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-int
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
 import { emptyRetrievalDisclosure } from "./lib/retrieval-status.js";
 import {
-  handleOwnerAuth, handleAdminInvite, handleAdminDevices, validateOwnerSession,
+  handleOwnerAuth, handleAdminInvite, handleAdminDevices, ownerSessionPrincipal,
 } from "./lib/owner-auth.js";
+import {
+  recordDocumentAccessDecision, DocumentAccessUnavailableError,
+} from "./lib/document-access.js";
+import { recordPasskeySecurityEvent } from "./lib/auth-store.js";
 import { handleZoomWebhook } from "./lib/zoom.js";
 import {
   handleOAuthMetadata, handleProtectedResourceMetadata, handleRegister,
@@ -137,7 +141,7 @@ function normalizeRetrievedDocuments(results) {
   return demoteScaffolding([...byKey.values()]);
 }
 
-async function unifiedRetrieve(env, url, { limit }) {
+async function unifiedRetrieve(env, url, { limit, access = null }) {
   const q = url.searchParams.get("q");
   const rrfK = Math.min(Math.max(parseInt(url.searchParams.get("rrf_k")) || 60, 1), 1e3);
 
@@ -157,12 +161,22 @@ async function unifiedRetrieve(env, url, { limit }) {
       drive: requestWeight(url.searchParams.get("weight_drive")),
       message: requestWeight(url.searchParams.get("weight_message")),
     },
+    access,
   });
 
   return {
     matches: normalizeRetrievedDocuments(r.results),
     degraded: r.degraded,
     degradedReason: r.degraded_reason || null,
+    retrievalScope: access?.kind === "grant" ? "exact_document_ids" : "owner",
+    access: access?.kind === "grant"
+      ? {
+        principal: "grant",
+        grant_id: access.grantId,
+        entity_slug: access.entitySlug,
+        document_count: access.documentCount,
+      }
+      : { principal: "owner" },
     // A filter the backend cannot apply is surfaced, never dropped. Silently
     // ignoring `client=` returns every client's documents while looking narrowed,
     // which is a confidently wrong answer rather than a missing one.
@@ -416,7 +430,7 @@ function hasMatchingAsOfDate(sentence, docs) {
 
 /* -------------------------------------------------------------- routes */
 
-async function handleUnified(env, request) {
+async function handleUnified(env, request, access = null) {
   const url = await privateRagParameters(request);
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
   const q = url.searchParams.get("q");
@@ -430,7 +444,14 @@ async function handleUnified(env, request) {
   // not make /unified diverge from the deterministic order consumed by /think.
   const doRerank = explicitlyEnabled(url.searchParams.get("rerank")) && !!env.ANTHROPIC_API_KEY;
 
-  const { matches: retrieved, degraded, degradedReason, ignoredFilters } = await unifiedRetrieve(env, url, { limit });
+  const {
+    matches: retrieved, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
+  } = await unifiedRetrieve(env, url, { limit, access });
+  const accessStatus = {
+    retrieval_scope: retrievalScope,
+    degraded_reason: degradedReason || undefined,
+    access: accessSummary,
+  };
   const ignored = ignoredFilters.length ? { ignored_filters: ignoredFilters } : {};
   // Zero rows out of a search that could not run is not "no hits". /unified is
   // the raw-excerpt route, so it has no gaps array to carry the warning; it
@@ -443,7 +464,7 @@ async function handleUnified(env, request) {
 
   if (degraded === "fts") {
     const rows = retrieved.slice(0, limit);
-    return jsonResponse({ mode: "unified", entity_scope: entityScope, degraded, degraded_reason: degradedReason || undefined, ...unavailable(rows), ...ignored, results: rows });
+    return jsonResponse({ mode: "unified", entity_scope: entityScope, degraded, ...accessStatus, ...unavailable(rows), ...ignored, results: rows });
   }
 
   let matches = retrieved;
@@ -455,13 +476,12 @@ async function handleUnified(env, request) {
 
   return jsonResponse({
     mode: "unified", entity_scope: entityScope, reranked: doRerank,
-    degraded: degraded || undefined, degraded_reason: degradedReason || undefined,
-    ...unavailable(Array.isArray(matches) ? matches : []),
-    ...ignored, results: matches,
+    degraded: degraded || undefined, ...unavailable(Array.isArray(matches) ? matches : []),
+    ...accessStatus, ...ignored, results: matches,
   });
 }
 
-async function handleThink(env, request) {
+async function handleThink(env, request, access = null) {
   const unsupportedAnswer = "The documents do not answer the question.";
   const url = await privateRagParameters(request);
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
@@ -472,7 +492,9 @@ async function handleThink(env, request) {
   const entityScope = scope.entityScope;
   const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit")) || 8, 1), 20);
 
-  const { matches, degraded, degradedReason, ignoredFilters } = await unifiedRetrieve(env, url, { limit });
+  const {
+    matches, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
+  } = await unifiedRetrieve(env, url, { limit, access });
   const results = Array.isArray(matches) ? matches : [];
 
   if (results.length === 0) {
@@ -487,6 +509,8 @@ async function handleThink(env, request) {
       entity_scope: entityScope,
       degraded: degraded || undefined,
       degraded_reason: degradedReason || undefined,
+      retrieval_scope: retrievalScope,
+      access: accessSummary,
       status: disclosure.unavailable ? disclosure.status : undefined,
       // The sentence a human sees in place of an answer. Present only when the
       // search failed, so /app and the CLI cannot render the refusal wording by
@@ -526,10 +550,12 @@ async function handleThink(env, request) {
       detail: `This brain cannot filter by ${ignoredFilters.join(" or ")}, so the results below are NOT narrowed by it.`,
     });
   }
-  if (degraded === "vector") {
+  if (degraded === "vector" || degraded === "scoped-vector") {
     gaps.unshift({
-      type: "vector_unavailable",
-      detail: "The vector index is not fully query-ready. Keyword evidence remains available, but new or differently phrased evidence may be missing until `brain drain` confirms the complete projection.",
+      type: degraded === "scoped-vector" ? "scoped_vector_unavailable" : "vector_unavailable",
+      detail: degraded === "scoped-vector"
+        ? "Exact document authorization was applied in D1. The unscoped semantic index was deliberately not queried, so differently phrased evidence inside the allowed documents may be missing; this is not proof that the allowed documents contain nothing."
+        : "The vector index is not fully query-ready. Keyword evidence remains available, but new or differently phrased evidence may be missing until `brain drain` confirms the complete projection.",
     });
   }
   const docs = results.slice(0, 12).map((r, i) => ({
@@ -808,6 +834,8 @@ async function handleThink(env, request) {
     entity_scope: entityScope,
     degraded: degraded || undefined,
     degraded_reason: degradedReason || undefined,
+    retrieval_scope: retrievalScope,
+    access: accessSummary,
     answer,
     answer_error: answerError || undefined,
     model: model || undefined,
@@ -1478,6 +1506,7 @@ function corpusWritesPaused(env, path, method) {
 
 export default {
   async fetch(request, env, ctx) {
+    const requestStartedAt = Date.now();
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -1520,7 +1549,8 @@ export default {
     // previewed as a 401 instead of an image.
     if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/") ||
         path.startsWith("/brand/") || path.startsWith("/app/assets/")) {
-      return handleOwnerAuth(env, request, url, path);
+      const response = await handleOwnerAuth(env, request, url, path);
+      return path.startsWith("/api/app/") ? privateNoStore(response) : response;
     }
 
     // The bank feed's owner surface sits in FRONT of the key gate for exactly
@@ -1613,8 +1643,54 @@ export default {
 
     const readRoute = path === "/api/rag/unified" || path === "/api/rag/think";
     const keyAuthorized = readRoute ? validateReadKey(request, env) : validateAdminKey(request, env);
-    // A passkey session is accepted exactly where the read-only proxy key is.
-    if (!keyAuthorized && !(readRoute && await validateOwnerSession(request, env))) {
+    let readAccess = null;
+    // A passkey session is accepted exactly where the read-only proxy key is,
+    // but it keeps its identity. Flattening this to a boolean would turn every
+    // scoped passkey back into the owner.
+    if (!keyAuthorized && readRoute) {
+      let principal;
+      try {
+        principal = await ownerSessionPrincipal(request, env);
+      } catch (error) {
+        const code = error instanceof DocumentAccessUnavailableError
+          ? error.code
+          : "owner_auth_unavailable";
+        return privateNoStore(jsonResponse({ error: "unavailable", code }, 503));
+      }
+      if (!principal) {
+        return privateNoStore(jsonResponse({ error: "unauthorized", code: "session_required" }, 401));
+      }
+      if (principal.denied) {
+        return privateNoStore(jsonResponse({
+          error: "forbidden", code: principal.code || "document_access_forbidden",
+        }, 403));
+      }
+      try {
+        await recordPasskeySecurityEvent(env, {
+          rpId: url.hostname,
+          ceremony: "session_use",
+          stage: path === "/api/rag/think" ? "ask" : "search",
+          outcome: "succeeded",
+          reasonCode: "authenticated_read",
+          durationMs: Date.now() - requestStartedAt,
+          principalKind: principal.kind,
+          grantId: principal.grantId,
+        });
+        if (principal.kind === "grant") {
+          await recordDocumentAccessDecision(env, principal, {
+            route: path,
+            decision: "allow",
+            reasonCode: "exact_document_grant",
+            documentCount: principal.documentCount,
+          });
+          readAccess = principal;
+        }
+      } catch {
+        return privateNoStore(jsonResponse({
+          error: "unavailable", code: "security_audit_unavailable",
+        }, 503));
+      }
+    } else if (!keyAuthorized) {
       return jsonResponse({ error: "unauthorized" }, 401);
     }
 
@@ -1631,10 +1707,10 @@ export default {
         }, 405));
       }
       if (path === "/api/rag/unified" && request.method === "POST") {
-        return privateNoStore(await handleUnified(env, request));
+        return privateNoStore(await handleUnified(env, request, readAccess));
       }
       if (path === "/api/rag/think" && request.method === "POST") {
-        return privateNoStore(await handleThink(env, request));
+        return privateNoStore(await handleThink(env, request, readAccess));
       }
       if (path === "/api/admin/auth/invite" && request.method === "POST") {
         return handleAdminInvite(env, url);

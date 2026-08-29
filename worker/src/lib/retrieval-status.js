@@ -59,6 +59,10 @@ const CAUSES = {
     cause: "keyword search is unavailable, so only the semantic index was queried",
     remedy: "Run `brain health` to see which subsystem is down.",
   },
+  "scoped-vector": {
+    cause: "exact document authorization was applied in D1, so the unscoped semantic index was deliberately not queried",
+    remedy: "Keyword evidence is authoritative for this scoped request. Semantic recall remains intentionally unavailable until Vectorize supports an exact document prefilter.",
+  },
 };
 
 const UNKNOWN_REMEDY = "Run `brain health` to see which subsystem is down.";

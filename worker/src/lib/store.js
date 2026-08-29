@@ -394,14 +394,16 @@ const d1Backend = {
     };
   },
 
-  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60 }) {
+  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60, access = null }) {
     let embedding = null;
-    try {
-      embedding = await embedText(env, query);
-    } catch {
-      // Degrade to keyword rather than fail. store-d1 reports which side answered.
+    if (access?.kind !== "grant") {
+      try {
+        embedding = await embedText(env, query);
+      } catch {
+        // Degrade to keyword rather than fail. store-d1 reports which side answered.
+      }
     }
-    const r = await d1.search(env, { query, embedding, limit, filters, weights, rrfK });
+    const r = await d1.search(env, { query, embedding, limit, filters, weights, rrfK, access });
     return {
       results: r.results.map((x) => {
         const sourceId = x.source_id || (
@@ -805,7 +807,15 @@ const d1Backend = {
 /* ----------------------------------------------------------- Supabase backend */
 
 const supabaseBackend = {
-  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60 }) {
+  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60, access = null }) {
+    if (access?.kind === "grant") {
+      return {
+        results: [],
+        degraded: "document-access-unavailable",
+        degraded_reason: "exact-document-scope-requires-d1",
+        ignored_filters: [],
+      };
+    }
     let embedding;
     try {
       embedding = await embedText(env, query);

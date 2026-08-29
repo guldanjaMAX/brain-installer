@@ -42,7 +42,7 @@
  */
 
 import { jsonResponse, validateAdminKey } from "./core.js";
-import { validateOwnerSession } from "./owner-auth.js";
+import { ownerSessionPrincipal } from "./owner-auth.js";
 import { importBankExport, balanceRoleFor } from "./fin-import.js";
 
 /**
@@ -907,13 +907,29 @@ async function readJson(request) {
  * Operator routes take the admin key and no session.
  */
 export async function handleBankFeed(env, request, url, path, ctx) {
-  const ownerAuthorised = async () => await validateOwnerSession(request, env);
+  let ownerPrincipalLoaded = false;
+  let ownerPrincipal = null;
+  const ownerAccess = async () => {
+    if (!ownerPrincipalLoaded) {
+      ownerPrincipal = await ownerSessionPrincipal(request, env);
+      ownerPrincipalLoaded = true;
+    }
+    return {
+      authorised: ownerPrincipal?.kind === "owner" && ownerPrincipal.grantId === null,
+      scoped: Boolean(ownerPrincipal),
+    };
+  };
+  const ownerRefusal = (access) => access.scoped
+    ? jsonResponse({ error: "forbidden", code: "owner_required" }, 403)
+    : jsonResponse({ error: "unauthorized", code: "session_required" }, 401);
   const operatorAuthorised = () => validateAdminKey(request, env);
 
   try {
     if (path === "/app/connect/bank") {
       if (request.method !== "GET") return jsonResponse({ error: "method not allowed" }, 405);
-      if (!await ownerAuthorised()) {
+      const access = await ownerAccess();
+      if (!access.authorised) {
+        if (access.scoped) return new Response("Only the owner can connect a bank.", { status: 403 });
         return new Response("Sign in first at /app, then open this page again.", {
           status: 401, headers: { "Content-Type": "text/plain; charset=utf-8" },
         });
@@ -931,7 +947,8 @@ export async function handleBankFeed(env, request, url, path, ctx) {
     }
 
     if (path === "/api/bank-feed/link-token" && request.method === "POST") {
-      if (!await ownerAuthorised()) return jsonResponse({ error: "unauthorized" }, 401);
+      const access = await ownerAccess();
+      if (!access.authorised) return ownerRefusal(access);
       const body = await readJson(request);
       return jsonResponse(await createLinkToken(env, {
         url: url.href, mode: body.mode === "reauthorise" ? "reauthorise" : "connect", itemRef: body.item_ref || null,
@@ -939,7 +956,8 @@ export async function handleBankFeed(env, request, url, path, ctx) {
     }
 
     if (path === "/api/bank-feed/exchange" && request.method === "POST") {
-      if (!await ownerAuthorised()) return jsonResponse({ error: "unauthorized" }, 401);
+      const access = await ownerAccess();
+      if (!access.authorised) return ownerRefusal(access);
       const body = await readJson(request);
       const result = await exchangePublicToken(env, {
         publicToken: body.public_token,
@@ -953,7 +971,8 @@ export async function handleBankFeed(env, request, url, path, ctx) {
     }
 
     if (path === "/api/bank-feed/status" && request.method === "GET") {
-      if (!await ownerAuthorised() && !operatorAuthorised()) return jsonResponse({ error: "unauthorized" }, 401);
+      const access = await ownerAccess();
+      if (!access.authorised && !operatorAuthorised()) return ownerRefusal(access);
       return jsonResponse(await feedStatus(env));
     }
 
@@ -967,7 +986,8 @@ export async function handleBankFeed(env, request, url, path, ctx) {
     }
 
     if (path === "/api/bank-feed/disconnect" && request.method === "POST") {
-      if (!await ownerAuthorised() && !operatorAuthorised()) return jsonResponse({ error: "unauthorized" }, 401);
+      const access = await ownerAccess();
+      if (!access.authorised && !operatorAuthorised()) return ownerRefusal(access);
       const body = await readJson(request);
       if (!body.item_ref) return jsonResponse({ error: "name the connection to disconnect" }, 400);
       return jsonResponse(await disconnectItem(env, String(body.item_ref)));

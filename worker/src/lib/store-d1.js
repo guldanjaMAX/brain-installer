@@ -266,6 +266,29 @@ export function filterSql(filters = {}, alias = "c", nextParam = 3) {
   return { clause: parts.length ? " AND " + parts.join(" AND ") : "", params, nextParam };
 }
 
+/** Exact D1 authority for a scoped principal. */
+export function documentAccessSql(access, chunkAlias = "c", documentAlias = "d", nextParam = 3) {
+  if (!access || access.kind !== "grant") return { clause: "", params: [], nextParam };
+  if (!access.grantId || !access.entitySlug) {
+    // An unreadable or empty grant is never interpreted as an unscoped read.
+    return { clause: " AND 1 = 0", params: [], nextParam };
+  }
+  const grantParameter = `?${nextParam++}`;
+  const entityParameter = `?${nextParam++}`;
+  return {
+    clause:
+      ` AND ${documentAlias}.entity_slug = ${entityParameter}` +
+      ` AND EXISTS (` +
+      `SELECT 1 FROM document_access_documents access_doc ` +
+      `WHERE access_doc.grant_id = ${grantParameter} ` +
+      `AND access_doc.document_id = ${chunkAlias}.doc_uid ` +
+      `AND access_doc.entity_slug = ${documentAlias}.entity_slug ` +
+      `AND access_doc.revoked_at IS NULL)`,
+    params: [access.grantId, access.entitySlug],
+    nextParam,
+  };
+}
+
 /** Which requested filters this backend cannot honour. */
 export function unsupportedFilters(filters = {}) {
   return D1_UNSUPPORTED.filter((k) => filters[k]);
@@ -344,7 +367,7 @@ const FTS_STOPWORDS = new Set([
   "say", "says", "should", "some", "tell", "than", "very",
 ]);
 
-export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
+export async function searchKeyword(env, query, { limit, filters = {}, access = null } = {}) {
   // FTS5 treats bare punctuation as syntax. A user question with an apostrophe
   // or a hyphen is not a query language expression, so it is quoted as a
   // phrase-free bag of terms rather than passed through raw.
@@ -376,6 +399,7 @@ export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
   if (!terms) return [];
 
   const f = filterSql(filters, "c", 3);
+  const a = documentAccessSql(access, "c", "d", f.nextParam);
   const sql = `
     SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
            c.client, c.category, c.top_folder, c.platform,
@@ -385,11 +409,11 @@ export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
     FROM chunks_fts
     JOIN chunks c ON c.id = chunks_fts.rowid
     JOIN documents d ON d.doc_uid = c.doc_uid
-    WHERE chunks_fts MATCH ?1${f.clause}
+    WHERE chunks_fts MATCH ?1${f.clause}${a.clause}
     ORDER BY bm25(chunks_fts)
     LIMIT ?2`;
 
-  const { results } = await env.DB.prepare(sql).bind(terms, limit, ...f.params).all();
+  const { results } = await env.DB.prepare(sql).bind(terms, limit, ...f.params, ...a.params).all();
   return results || [];
 }
 
@@ -475,13 +499,15 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
  * Pulls a wider candidate pool than the caller asked for, because fusion can
  * only promote a document that appears in one of the lists.
  */
-export async function search(env, { query, embedding, limit = 10, filters = {}, weights = {}, rrfK = RRF_K }) {
+export async function search(env, {
+  query, embedding, limit = 10, filters = {}, weights = {}, rrfK = RRF_K, access = null,
+}) {
   const pool = RETRIEVAL_CANDIDATE_DEPTH;
   const fusionK = Math.min(Math.max(Number(rrfK) || RRF_K, 1), 1e3);
 
   const [kw, vec, projection] = await Promise.all([
-    searchKeyword(env, query, { limit: pool, filters }).catch(() => []),
-    embedding
+    searchKeyword(env, query, { limit: pool, filters, access }).catch(() => []),
+    embedding && access?.kind !== "grant"
       ? searchVector(env, embedding, { limit: pool, filters }).catch(() => [])
       : Promise.resolve([]),
     // Vectorize may return some old/current candidates while a newer accepted
@@ -489,7 +515,7 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
     // not prove the complete D1 corpus is query-visible. Reuse the exact
     // readiness contract that gates health and acceptance so every answer
     // advertises partial projection instead of looking fully healthy.
-    embedding
+    embedding && access?.kind !== "grant"
       ? vectorReadiness(env).catch(() => ({ ready: false }))
       : Promise.resolve(null),
   ]);
@@ -507,7 +533,10 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
   // a wire field older clients already read.
   let degraded = null;
   let degradedReason = null;
-  if (embedding && projection?.ready !== true) {
+  if (access?.kind === "grant") {
+    degraded = "scoped-vector";
+    degradedReason = "document-scope-keyword-only";
+  } else if (embedding && projection?.ready !== true) {
     degraded = "vector";
     degradedReason = "projection-incomplete";
   } else if (embedding && vec.length === 0 && kw.length > 0) {
