@@ -90,7 +90,7 @@ try {
     check("an every-minute schedule derives a one-minute freshness expectation",
       plan.expectedRefreshSeconds === 60, String(plan.expectedRefreshSeconds));
     check("the LaunchAgent invokes the iMessage scheduler runner with a configuration binding",
-      plan.programArguments[1].endsWith("operations/imessage-scheduler.mjs") &&
+      plan.programArguments[1] === resolve("operations/imessage-scheduler.mjs") &&
       JSON.stringify(plan.programArguments.slice(2, 7)) === JSON.stringify([
         "run", manifestPath, "--brain", resolve("/opt/brain installer/brain.mjs"), "--config-hash",
       ]) && plan.programArguments[7] === plan.configHash && /^[a-f0-9]{64}$/.test(plan.configHash),
