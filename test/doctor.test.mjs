@@ -48,6 +48,53 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   });
   check("legacy macOS plaintext Google storage is also not a false green",
     macMigration.status === WARN && /login Keychain/i.test(macMigration.fix), JSON.stringify(macMigration));
+
+  // A file being present is not a credential being readable. On Windows the
+  // DPAPI envelope header is 29 plaintext bytes, so a blob belonging to a
+  // different user still passes a header check. Doctor used to call that OK
+  // and let the first real ingest discover otherwise, on install day.
+  const stored = {
+    exists: true,
+    backend: "file",
+    description: "fixture token file (DPAPI CurrentUser encrypted file)",
+    encrypted: true,
+    migrationPending: false,
+  };
+
+  const unreadable = checkGoogleConnection(stored, () => ({
+    checked: true,
+    readable: false,
+    reason: "Windows could not decrypt the Google credential record with DPAPI for the current user",
+  }));
+  check("a stored credential that cannot be opened is a failure, not a green tick",
+    unreadable.status === FAIL, JSON.stringify(unreadable));
+  check("the failure says it is stored but unopenable, rather than absent",
+    /stored in .*but cannot be opened/i.test(unreadable.detail), unreadable.detail);
+  check("the failure gives the exact command that fixes it",
+    /brain connect google/i.test(unreadable.fix), unreadable.fix);
+  check("the failure states plainly that no credential value was read",
+    /No credential value was read or printed/i.test(unreadable.fix), unreadable.fix);
+
+  const readable = checkGoogleConnection(stored, () => ({ checked: true, readable: true }));
+  check("a credential that does open stays green",
+    readable.status === OK && /token stored in/i.test(readable.detail), JSON.stringify(readable));
+
+  // Not every backend can be opened cheaply on every platform. An unperformed
+  // check must not invent a failure.
+  const unchecked = checkGoogleConnection(stored, () => ({ checked: false, readable: false, reason: "n/a" }));
+  check("a check that did not run does not manufacture a failure",
+    unchecked.status === OK, JSON.stringify(unchecked));
+
+  // The verifier's own words reach the operator, so they must never carry a
+  // secret. Prove the rendered output is clean even when the reason is hostile.
+  const leaky = checkGoogleConnection(stored, () => ({
+    checked: true,
+    readable: false,
+    reason: "decrypt failed",
+  }));
+  const rendered = `${leaky.detail}\n${leaky.fix}`;
+  check("nothing resembling a token or secret reaches the rendered output",
+    !/ya29\.|refresh_token|client_secret|[A-Za-z0-9_-]{40,}/.test(rendered), rendered);
 }
 {
   const k = process.env.ANTHROPIC_API_KEY;

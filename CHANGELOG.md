@@ -4,6 +4,26 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.1.22
+
+**`brain doctor` now opens your Google credential instead of checking that a
+file is there.**
+
+A stored credential that cannot actually be read looked identical to a healthy
+one. On Windows in particular, the marker at the top of the encrypted file is
+plain text, so a credential belonging to a different Windows user, or one whose
+encryption key no longer resolves after a profile rebuild, still looked correct
+from the outside. Doctor reported a healthy Google connection and the first real
+Drive or Gmail load was what discovered otherwise, usually on the install day
+itself.
+
+Doctor now performs one real read. If the credential cannot be opened it says
+so, says it is stored but unopenable rather than missing, and gives you the
+command that fixes it. No part of the credential is read back, printed, or
+included in the message.
+
+The check is read-only and never rewrites the record it is diagnosing.
+
 ## 0.1.21
 
 **Your text messages and WhatsApp conversations can now be loaded, from exports

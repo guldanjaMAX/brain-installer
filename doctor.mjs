@@ -19,7 +19,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { platform } from "node:os";
-import { tokenStorageStatus } from "./connectors/google-auth.mjs";
+import { tokenStorageStatus, verifyTokenStorageReadable } from "./connectors/google-auth.mjs";
 
 export const OK = "ok";
 export const WARN = "warn";
@@ -392,7 +392,7 @@ export function checkAnthropicKey() {
   );
 }
 
-export function checkGoogleConnection(storageStatus) {
+export function checkGoogleConnection(storageStatus, verify = verifyTokenStorageReadable) {
   const stored = storageStatus ?? tokenStorageStatus();
   if (stored.exists && (stored.migrationPending || stored.backend === "legacy-file")) {
     const windowsLegacy = stored.migrationPending === true || /Windows|DPAPI/i.test(stored.description || "");
@@ -405,7 +405,26 @@ export function checkGoogleConnection(storageStatus) {
         : "The next Drive, Gmail, or Calendar use migrates a still-valid token to this Mac's login Keychain. If Google rejects the old token, reconnect with `brain connect google`."
     );
   }
-  if (stored.exists) return check("Google connection", OK, `token stored in ${stored.description}`);
+  if (stored.exists) {
+    // A file being present is not the same as a credential being readable. On
+    // Windows the DPAPI envelope header is 29 plaintext bytes, so a blob
+    // written by another Windows user, or one whose master key no longer
+    // resolves, looks perfect to a header check and fails on first real use.
+    // Open it here, where it is cheap to fix, rather than mid-ingest on
+    // install day. No credential value is read back or printed.
+    const opened = verify ? verify() : { checked: false, readable: true };
+    if (opened.checked && !opened.readable) {
+      return check(
+        "Google connection",
+        FAIL,
+        `a credential is stored in ${stored.description} but cannot be opened`,
+        `${opened.reason}\n  No credential value was read or printed.\n` +
+          "  This usually means the record belongs to a different user or machine than the one running now.\n" +
+          "  Fix it with: brain connect google --scopes drive,gmail",
+      );
+    }
+    return check("Google connection", OK, `token stored in ${stored.description}`);
+  }
   if (stored.error) {
     return check(
       "Google connection",

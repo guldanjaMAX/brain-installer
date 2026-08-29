@@ -1186,6 +1186,58 @@ export function loadTokens(value) {
 }
 
 /** Human-readable storage location for CLI success and support messages. */
+/**
+ * Actually open the credential store, rather than confirming a file is there.
+ *
+ * `tokenStorageStatus` deliberately never decrypts: it is called in cheap,
+ * frequent contexts and has a test holding it to inspecting only the envelope
+ * header. That is the right call for status, and it leaves a real gap, because
+ * on Windows the header is 29 plaintext bytes. A DPAPI blob written by a
+ * different Windows user, or one whose master key no longer resolves after a
+ * profile rebuild, still carries a perfect header and still reports `exists`.
+ * `brain doctor` then prints a healthy Google connection, and the first real
+ * Drive or Gmail ingest is what discovers otherwise, usually on install day.
+ *
+ * So this is the opt-in counterpart: it performs one genuine round trip and
+ * reports whether the stored credential can be read AT ALL. It never returns,
+ * logs, or reveals any part of the credential, only whether it opened.
+ *
+ * Read-only on purpose. It goes through readFileStoreState rather than
+ * loadTokens, because loadTokens migrates a legacy Windows plaintext file to
+ * DPAPI as a side effect, and a diagnostic must not rewrite the thing it is
+ * diagnosing.
+ */
+export function verifyTokenStorageReadable(value) {
+  const options = storageOptions(value);
+  const status = tokenStorageStatus(options);
+  if (!status.exists) {
+    return { checked: false, readable: false, reason: status.error || "no credential is stored" };
+  }
+
+  try {
+    if (storageBackend(options) === "file") {
+      const state = readFileStoreState(filePath(options), {
+        ...options,
+        strict: (options.platform || process.platform) === "win32",
+      });
+      if (!state || !state.store || typeof state.store !== "object") {
+        return { checked: true, readable: false, reason: "the stored credential record could not be decoded" };
+      }
+      return { checked: true, readable: true };
+    }
+
+    const stored = readKeychainStore(options);
+    if (!stored || typeof stored !== "object") {
+      return { checked: true, readable: false, reason: "the stored credential record could not be decoded" };
+    }
+    return { checked: true, readable: true };
+  } catch (error) {
+    // The message is ours, not the credential's. Every throw on this path is
+    // already written to name the failure without quoting a value.
+    return { checked: true, readable: false, reason: error.message };
+  }
+}
+
 export function tokenStorageDescription(value) {
   const options = storageOptions(value);
   if (storageBackend(options) === "file") {
