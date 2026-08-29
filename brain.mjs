@@ -8663,7 +8663,22 @@ export async function cmdConnectWhatsapp(manifestPath, flags = {}, options = {})
   const daemonAgent = options.whatsappDaemon ?? await import("./operations/whatsapp-daemon.mjs");
   const drainScheduler = options.whatsappDrainScheduler ?? await import("./operations/whatsapp-drain-scheduler.mjs");
 
-  // Step 1: the binary, before any promise about pairing.
+  // Step 1: disclose the account risk before requiring infrastructure. A fresh
+  // install has no daemon binary yet; gating this text on a successful binary
+  // lookup would make someone build and install tooling before learning that
+  // pairing uses an unofficial client and can put the WhatsApp account at risk.
+  console.log("");
+  for (const line of whatsapp.WHATSAPP_DISCLOSURE) console.log(line ? `  ${line}` : "");
+  console.log("");
+  if (!flags["accept-risk"]) {
+    die(
+      "nothing was paired. Live WhatsApp capture is opt-in and stays that way until it is\n" +
+        "      decided otherwise. If you have read the two paragraphs above and want it anyway:\n" +
+        `        brain connect whatsapp ${manifestPath} --accept-risk`
+    );
+  }
+
+  // Step 2: resolve the binary before any promise about pairing.
   let binary;
   try {
     binary = whatsapp.resolveDaemonBinary({
@@ -8676,19 +8691,6 @@ export async function cmdConnectWhatsapp(manifestPath, flags = {}, options = {})
   } catch (error) {
     if (error?.reason === "daemon_binary_missing") die(error.message);
     throw error;
-  }
-
-  // Step 2: the disclosure, then the explicit acceptance. Printed every time,
-  // not only the first, because this is the sentence the owner is agreeing to.
-  console.log("");
-  for (const line of whatsapp.WHATSAPP_DISCLOSURE) console.log(line ? `  ${line}` : "");
-  console.log("");
-  if (!flags["accept-risk"]) {
-    die(
-      "nothing was paired. Live WhatsApp capture is opt-in and stays that way until it is\n" +
-        "      decided otherwise. If you have read the two paragraphs above and want it anyway:\n" +
-        `        brain connect whatsapp ${manifestPath} --accept-risk`
-    );
   }
 
   const resolveKey = options.resolveAdminKey ?? resolveAdminKey;

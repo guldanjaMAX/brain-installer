@@ -247,13 +247,20 @@ try {
     const fakes = makeBrainFakes();
     const agents = fakeAgents();
     let error = null;
+    const disclosure = [];
+    const priorLog = console.log;
     try {
+      console.log = (...args) => disclosure.push(args.map(String).join(" "));
       await cmdConnectWhatsapp(manifestPathWithDataDir, { "accept-risk": true }, {
         ...fakes.options, ...agents, env: {},
         // An install root with no dist/ directory, so no candidate resolves.
         whatsapp: { ...await import("../connectors/whatsapp.mjs") },
       });
     } catch (caught) { error = caught; }
+    finally { console.log = priorLog; }
+    check("the account-risk disclosure appears even before a missing-binary refusal",
+      /terms of service/i.test(disclosure.join("\n")) && /ban/i.test(disclosure.join("\n")),
+      disclosure.join(" "));
     check("connect with no daemon binary fails with a readable message, not a stack trace",
       error && /capture daemon binary was not found/.test(String(error.message)), String(error?.message));
     check("that message carries the build command the operator should run",
