@@ -16,7 +16,7 @@
 import { jsonResponse } from "./core.js";
 import { verifyRegistration, verifyAssertion, b64uDecode } from "./webauthn.js";
 import {
-  mintSessionCookie, validateSessionCookie, clearSessionCookie,
+  mintSessionCookie, validateSessionCookie, readSessionCookie, clearSessionCookie,
 } from "./sessions.js";
 import {
   issueChallenge, consumeChallenge,
@@ -104,7 +104,7 @@ export async function handleOwnerAuth(env, request, url, path) {
     const payload = await body(request);
     // Enrollment is authorized by an invite code, or by an existing session
     // (adding one more device from a signed-in one).
-    const viaSession = await validateOwnerSession(request, env);
+    const viaSession = Boolean(await readSessionCookie(request, env, await sessionGeneration(env)));
     if (!viaSession) {
       const code = String(payload?.code || "");
       if (!code || !(await peekEnrollmentCode(env, code))) {
@@ -122,13 +122,32 @@ export async function handleOwnerAuth(env, request, url, path) {
   if (path === "/auth/register/verify") {
     const payload = await body(request);
     if (!payload) return jsonResponse({ error: "invalid body" }, 400);
-    const viaSession = await validateOwnerSession(request, env);
+    // Who is authorizing this device, and therefore whose device it becomes.
+    //
+    // Enrollment is allowed either by an invite code or by an already
+    // signed-in session ("add one more device from this one"). Both paths have
+    // to answer the same question, because a device that ends up belonging to
+    // nobody is read as the owner's, and then anyone holding a scoped passkey
+    // could enroll a second device with no code and walk out with the whole
+    // corpus in three requests.
+    const session = await readSessionCookie(request, env, await sessionGeneration(env));
     const challenge = challengeFromClientData(payload.clientDataJSON);
     if (!challenge || !(await consumeChallenge(env, challenge, "register"))) {
       return jsonResponse({ error: "unknown or expired challenge" }, 403);
     }
-    if (!viaSession && !(await consumeEnrollmentCode(env, String(payload.code || "")))) {
-      return jsonResponse({ error: "the enrollment link is invalid, expired, or already used" }, 403);
+    let grantId;
+    if (session) {
+      // A device added from a signed-in device inherits that session exactly.
+      // It can never widen: an owner session yields an owner device, a scoped
+      // session yields another device with the same grant.
+      grantId = session.grantId;
+    } else {
+      const code = String(payload.code || "");
+      const invite = await consumeEnrollmentCode(env, code);
+      if (!invite) {
+        return jsonResponse({ error: "the enrollment link is invalid, expired, or already used" }, 403);
+      }
+      grantId = invite.grant_id ?? null;
     }
     let verified;
     try {
@@ -142,8 +161,8 @@ export async function handleOwnerAuth(env, request, url, path) {
     } catch (error) {
       return jsonResponse({ error: String(error?.message || error) }, 400);
     }
-    await storePasskey(env, { ...verified, nickname: String(payload.nickname || "").slice(0, 60) });
-    const cookie = await mintSessionCookie(env, await sessionGeneration(env));
+    await storePasskey(env, { ...verified, nickname: String(payload.nickname || "").slice(0, 60), grantId });
+    const cookie = await mintSessionCookie(env, await sessionGeneration(env), { grantId });
     return withCookie(jsonResponse({ enrolled: true, credential_id: verified.credentialId }), cookie);
   }
 
@@ -182,7 +201,9 @@ export async function handleOwnerAuth(env, request, url, path) {
       return jsonResponse({ error: "this passkey looks cloned (its counter went backwards); sign in from another device and revoke it" }, 403);
     }
     await recordPasskeyUse(env, credential.credential_id, verdict.signCount);
-    const cookie = await mintSessionCookie(env, await sessionGeneration(env));
+    // The session is whoever this DEVICE belongs to. A device enrolled against
+    // a grant must never mint an owner session.
+    const cookie = await mintSessionCookie(env, await sessionGeneration(env), { grantId: credential.grant_id ?? null });
     return withCookie(jsonResponse({ signed_in: true }), cookie);
   }
 

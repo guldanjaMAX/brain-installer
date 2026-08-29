@@ -13,7 +13,7 @@ function cookieValue(setCookie) {
 }
 
 test("a minted session validates for its generation and only its generation", async () => {
-  const setCookie = await mintSessionCookie(env, 1);
+  const setCookie = await mintSessionCookie(env, 1, { grantId: null });
   assert.match(setCookie, /HttpOnly/);
   assert.match(setCookie, /Secure/);
   assert.match(setCookie, /SameSite=Strict/);
@@ -24,10 +24,10 @@ test("a minted session validates for its generation and only its generation", as
 
 test("expiry, tampering, and a missing secret all fail closed", async () => {
   const past = Date.now() - 1000;
-  const expired = await mintSessionCookie(env, 1, past - 31 * 24 * 60 * 60 * 1000);
+  const expired = await mintSessionCookie(env, 1, { grantId: null, now: past - 31 * 24 * 60 * 60 * 1000 });
   assert.equal(await validateSessionCookie(requestWith(cookieValue(expired)), env, 1), false);
 
-  const setCookie = cookieValue(await mintSessionCookie(env, 1));
+  const setCookie = cookieValue(await mintSessionCookie(env, 1, { grantId: null }));
   const tampered = setCookie.replace(/\.(\d+)\./, (m, gen) => `.${Number(gen) + 1}.`);
   assert.equal(await validateSessionCookie(requestWith(tampered), env, 2), false,
     "editing the generation without re-signing must fail");
