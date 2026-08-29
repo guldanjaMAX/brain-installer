@@ -1047,7 +1047,10 @@ let cliDocs = [];
 }
 
 } finally {
-  rmSync(sandbox, { recursive: true, force: true });
+  // Windows can hold a just-closed node:sqlite file for a short interval.
+  // Retry only the test sandbox cleanup so that a fully passing connector
+  // suite is not reported red because NTFS released forget-proof.db late.
+  rmSync(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\niphone backup loader: all ${ran} tests passed`);
