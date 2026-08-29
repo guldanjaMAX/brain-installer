@@ -53,7 +53,7 @@
               "type": "string",
               "description": "Created by provision at 768 dimensions, cosine. Those are the output shape of @cf/baai/bge-base-en-v1.5 and are not free choices. Free can create this index, but Paid is the supported production baseline because Free has prototype-scale vector, daily-write, and Worker CPU limits."
             },
-            "drain_cron": { "type": "string", "default": "*/5 * * * *" },
+            "drain_cron": { "type": "string", "default": "* * * * *" },
             "r2_bucket": { "type": "string", "description": "Created by provision, but NOT YET WIRED: nothing binds or reads it." },
             "kv_namespace": { "type": "string", "description": "NOT YET WIRED. Never created, never bound." },
             "kv_namespace_id": { "type": "string" }

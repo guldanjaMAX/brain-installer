@@ -1330,7 +1330,7 @@ export async function cmdDeploy(manifestPath, options = {}) {
   // text that keyword search can find and vector search cannot, forever, and
   // reports itself healthy the whole time because both systems are up.
   if ((cfg.storage || "d1") === "d1") {
-    const schedule = cfg.drain_cron || "*/5 * * * *";
+    const schedule = cfg.drain_cron || "* * * * *";
     try {
       await cf(`/accounts/${acct.id}/workers/scripts/${scriptName}/schedules`, {
         method: "PUT",
