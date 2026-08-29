@@ -645,8 +645,18 @@ export async function handleOwnerAuth(env, request, url, path) {
     });
   }
   if (path === "/api/app/recovery-codes") {
-    // Requires a live session, which requires a passkey. Codes can only be
-    // printed by someone who is already in — never as a step toward getting in.
+    // Owner only, and the comment this replaces shows how it slipped: it said
+    // "requires a live session, which requires a passkey", which was true until
+    // scoped passkeys existed. Now a live session can belong to a bookkeeper.
+    //
+    // This is the sharpest of the three: minting a card also DESTROYS every
+    // unused code the owner already holds, and a scoped person who could mint
+    // one could then use it to enrol a passkey as the OWNER (recovery restores
+    // the owner by design) and take the brain. Printing a card is not a
+    // convenience, it is the owner's lever.
+    if (!isOwner) {
+      return jsonResponse({ error: "only the owner can print recovery codes" }, 403);
+    }
     if (!(await recoveryCodeStatus(env)).available) {
       return jsonResponse({ error: RECOVERY_UNAVAILABLE }, 503);
     }
@@ -671,6 +681,13 @@ export async function handleOwnerAuth(env, request, url, path) {
     return jsonResponse(await revokePasskey(env, String(payload.credential_id)));
   }
   if (path === "/api/app/connections/revoke") {
+    // Owner only for two reasons, and the second is easy to miss: revoking
+    // ends an app the OWNER authorised, and the success response returns the
+    // full connector list, so an unchecked revoke is also a disclosure of
+    // every app the owner has connected.
+    if (!isOwner) {
+      return jsonResponse({ error: "only the owner can revoke a connected app" }, 403);
+    }
     const payload = await body(request);
     if (!payload?.client_id) return jsonResponse({ error: "client_id required" }, 400);
     const outcome = await revokeConnection(env, payload.client_id);

@@ -26,7 +26,7 @@
 import { jsonResponse } from "./core.js";
 import { FAVICON } from "./app-page.js";
 import { randomToken, sessionGeneration } from "./auth-store.js";
-import { validateOwnerSession } from "./owner-auth.js";
+import { ownerSessionPrincipal } from "./owner-auth.js";
 
 const CODE_TTL_MS = 5 * 60 * 1000;
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -296,7 +296,21 @@ export async function handleAuthorizePage(env, url) {
 
 /** POST /oauth/authorize/decision — passkey-session-gated approval. */
 export async function handleAuthorizeDecision(env, request, url) {
-  if (!(await validateOwnerSession(request, env))) return jsonResponse({ error: "unauthorized" }, 401);
+  // APPROVING a connector is the owner's decision, so this asks WHO is signed
+  // in rather than merely whether someone is. validateOwnerSession returns a
+  // boolean and cannot tell an owner from a scoped person, which is the exact
+  // shape ownerSessionPrincipal's own docstring warns about: "the gate was
+  // reading it through a boolean, so a person signed in with a SCOPED passkey
+  // was served as the unscoped owner."
+  //
+  // What it would have cost: a scoped person could mint an authorization code
+  // for an external app against the WHOLE brain, because the code carries the
+  // client's requested scope and never the person's.
+  const principal = await ownerSessionPrincipal(request, env);
+  if (!principal) return jsonResponse({ error: "unauthorized" }, 401);
+  if (principal.grantId !== null) {
+    return jsonResponse({ error: "only the owner can approve a connected app" }, 403);
+  }
   const params = authorizeParams(url);
   const client = await loadClient(env, params.client_id);
   if (!client || !client.redirect_uris.includes(params.redirect_uri)) {
