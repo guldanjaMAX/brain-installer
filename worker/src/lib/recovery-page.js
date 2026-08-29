@@ -18,12 +18,19 @@
  * locked-out owner gets now, which is why the recovery tests can go on
  * asserting against the exact bytes they always did.
  *
- * ONE LIMITATION, STATED PLAINLY
+ * HOW SOMEBODY LOCKED OUT ACTUALLY GETS HERE
  *
- * The React sign-in screen does not yet link here, so this page is reached by
- * URL. It is not a substitute for folding the ceremony into the React app, and
- * whoever owns the frontend should do that and delete this file. Until then the
- * capability exists and is proven, rather than existing in the tests only.
+ * The React sign-in screen links here, under "Trouble signing in on this
+ * device?", which opens by itself when a sign-in has just failed. That link is
+ * asserted by worker/test/recovery-reachable.test.mjs against the SHIPPED
+ * bundle, not against frontend source, so regenerating app-assets.js without
+ * the link fails the suite rather than quietly stranding the next locked-out
+ * owner. Before that link existed this page was reachable only by typing the
+ * URL, which is precisely not something the person who needs it can do.
+ *
+ * STILL OWED: the ceremony itself is this page, not React. Folding it into the
+ * app and deleting this file remains the right end state; the link is what
+ * makes the capability reachable in the meantime.
  */
 
 import { SEARCH_UNAVAILABLE, unavailableNotice } from "./retrieval-status.js";

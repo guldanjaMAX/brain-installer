@@ -13,6 +13,10 @@ export function Gate({ owner, inviteCode, onIn }: {
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The "cannot sign in" help sits closed for the ordinary visitor, who is
+  // almost everyone, and opens by itself the moment a sign-in actually fails,
+  // because the person staring at that error is the one it was written for.
+  const [helpOpen, setHelpOpen] = useState(false);
   const enrolling = Boolean(inviteCode);
   const possessive = owner ? (/s$/i.test(owner) ? `${owner}'` : `${owner}'s`) : "Your";
   // First name in the greeting: a client opening this is being welcomed, not
@@ -36,6 +40,7 @@ export function Gate({ owner, inviteCode, onIn }: {
       // is how someone decides the product is broken rather than that they
       // cancelled a Face ID prompt.
       setError(e instanceof Error ? e.message : String(e));
+      setHelpOpen(true);
     } finally {
       setBusy(false);
     }
@@ -95,6 +100,38 @@ export function Gate({ owner, inviteCode, onIn }: {
             </p>
           )}
           {error && <p className="mt-4 text-[14px] text-red-700">{error}</p>}
+
+          {!enrolling && (
+            <details
+              open={helpOpen}
+              onToggle={(e) => setHelpOpen((e.currentTarget as HTMLDetailsElement).open)}
+              className="mt-6 border-t border-line pt-4"
+            >
+              <summary className="text-[13.5px] text-ink-soft cursor-pointer list-none
+                                  marker:hidden [&::-webkit-details-marker]:hidden">
+                Trouble signing in on this device?
+              </summary>
+              <div className="mt-3 space-y-3 text-[13.5px] leading-relaxed text-ink-soft">
+                <p>
+                  Your passkey usually travels with you. Apple and Google copy it to your
+                  other phones and computers on their own, so the way you signed in before
+                  should still work here.
+                </p>
+                <p>
+                  On a computer you have never used, choose the option to use a phone when
+                  your browser asks, then scan the QR code it shows with the phone you
+                  already sign in with.
+                </p>
+                <p>
+                  If every device you had is gone, the printed recovery card you were given
+                  when this was set up is the way back in.{" "}
+                  <a href="/app/recover" className="text-accent underline underline-offset-2">
+                    Use a recovery code
+                  </a>
+                </p>
+              </div>
+            </details>
+          )}
         </div>
       </div>
     </div>
