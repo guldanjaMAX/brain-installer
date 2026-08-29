@@ -159,7 +159,11 @@ export function buildWhatsappDaemonPlan(manifestPath, options = {}) {
     binaryPath: binary.path,
     binarySource: binary.source,
     programArguments: [binary.path],
-    environment: daemonEnvironment(options.daemonEnv || { HOME: reference.home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" }, reference.dataDir),
+    environment: daemonEnvironment(
+      options.daemonEnv || { HOME: reference.home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+      reference.dataDir,
+      options.platform || process.platform
+    ),
   };
 }
 
