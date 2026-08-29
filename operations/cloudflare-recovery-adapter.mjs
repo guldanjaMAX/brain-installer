@@ -168,6 +168,16 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   // that came back without it would quietly forget every meeting it had not yet
   // stored, which is the exact silent loss the ledger was added to end.
   "zoom_deliveries",
+  // Schema 23: who may do what. Durable for the same reason passkeys are —
+  // losing these on a recovery silently revokes every person the owner had
+  // named, and the brain would come back looking healthy while the
+  // bookkeeper's credential no longer worked.
+  "grants",
+  "grant_credentials",
+  // Schema 24: the zone vocabulary. Durable because a recovered brain that
+  // forgot its zones would silently widen every scoped grant to nothing (the
+  // predicate excludes unknown zones), locking people out rather than leaking.
+  "zones",
 ]);
 
 /**
@@ -279,7 +289,9 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // (text_source, text_reliable) so an OCR'd document is distinguishable from one
 // read from a text layer, 19 the two recovery-card tables, 20 the Zoom delivery
 // ledger, 21 the chunk token-fit columns, and 22 the three durable
-// upgrade-pause COLUMNS on install_state. The vector
+// upgrade-pause COLUMNS on install_state, 23 the two grant tables and 24 the
+// zones lookup (both renumbered up from 15/16, which this line had already
+// shipped and deployed as the ledger and the bank feed). The vector
 // protocol is unchanged throughout, but the recovery contract tracks the EXACT
 // current schema by design: a drill against a database one migration behind
 // would export a column set that does not match the reviewed list, and refusing
@@ -292,7 +304,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // deployed database is the cheap correction; renumbering the deployed database
 // is not. Token-fit moved to 21, which is why the refit COLUMN gate below reads
 // 21 while the table gates for 17, 19 and 20 read their own numbers.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 22;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 24;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -347,6 +359,14 @@ const SCHEMA_20_TABLES = Object.freeze([
   "zoom_deliveries",
 ]);
 
+// A brain still on an older schema does not have these, and must not be asked
+// for them: the inventory check is an exact set comparison, so an ungated new
+// table makes every pre-23 install fail recovery rather than the reverse.
+const SCHEMA_23_TABLES = Object.freeze(["grants", "grant_credentials"]);
+// 24 adds only the zones lookup; the zone itself lives as columns on tables
+// that already existed, so nothing else moves.
+const SCHEMA_24_TABLES = Object.freeze(["zones"]);
+
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
     table,
@@ -360,7 +380,8 @@ const AGGREGATE_FIELDS = Object.freeze([
     // proven by the exported content, which these tables are fully part of.
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
      ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES,
-     ...SCHEMA_19_TABLES, ...SCHEMA_20_TABLES].includes(table)
+     ...SCHEMA_19_TABLES, ...SCHEMA_20_TABLES,
+     ...SCHEMA_23_TABLES, ...SCHEMA_24_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1126,7 +1147,9 @@ function expectedRecoveryTables(migrations) {
     (latest >= 16 || !SCHEMA_16_TABLES.includes(table)) &&
     (latest >= 17 || !SCHEMA_17_TABLES.includes(table)) &&
     (latest >= 19 || !SCHEMA_19_TABLES.includes(table)) &&
-    (latest >= 20 || !SCHEMA_20_TABLES.includes(table)));
+    (latest >= 20 || !SCHEMA_20_TABLES.includes(table)) &&
+    (latest >= 23 || !SCHEMA_23_TABLES.includes(table)) &&
+    (latest >= 24 || !SCHEMA_24_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {

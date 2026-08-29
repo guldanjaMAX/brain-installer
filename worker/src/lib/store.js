@@ -343,14 +343,18 @@ const d1Backend = {
     };
   },
 
-  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60 }) {
+  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60, scope = null }) {
     let embedding = null;
     try {
       embedding = await embedText(env, query);
     } catch {
       // Degrade to keyword rather than fail. store-d1 reports which side answered.
     }
-    const r = await d1.search(env, { query, embedding, limit, filters, weights, rrfK });
+    // scope is a security argument, not a filter. This adapter destructures a
+    // fixed key list, so anything not named here is silently dropped: a scope
+    // that fails to arrive reads as "unrestricted" downstream, which is the
+    // one way this whole feature fails open.
+    const r = await d1.search(env, { query, embedding, limit, filters, weights, rrfK, scope });
     return {
       results: r.results.map((x) => {
         const sourceId = x.source_id || (
@@ -754,7 +758,17 @@ const d1Backend = {
 /* ----------------------------------------------------------- Supabase backend */
 
 const supabaseBackend = {
-  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60 }) {
+  async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60, scope = null }) {
+    // This backend has no zone column and cannot honour a scope. Ignoring one
+    // would hand a scoped reader the whole corpus, so it refuses instead. The
+    // legacy adapter exists for migration checks and temporary rollback, and a
+    // brain with scoped grants has no business running on it.
+    if (scope && scope.all !== true) {
+      throw new Error(
+        "this brain has scoped access grants, which the legacy Supabase backend cannot enforce. " +
+        "Migrate to the D1 backend, or revoke the scoped grants before rolling back.",
+      );
+    }
     let embedding;
     try {
       embedding = await embedText(env, query);

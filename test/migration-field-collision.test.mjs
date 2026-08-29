@@ -243,11 +243,24 @@ const runMigrate = async (db) => {
     refitAtTwentyOne === "exported", refitAtTwentyOne);
 
   // The contract pin must equal the newest migration, or the drill refuses
-  // every database including a correct one. 22 is the durable-drain-pause
-  // migration; bump this alongside RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION
-  // whenever a migration ships.
+  // every database including a correct one.
+  //
+  // Read from the adapter rather than hardcoded. This assertion used to say
+  // `=== 22` with a comment reminding whoever shipped a migration to bump it
+  // by hand, which is the same shape of bug as a fixture that hardcodes the
+  // future: it does not fail when the pin is WRONG, it fails when the pin is
+  // merely NEW, so the person who correctly shipped a migration gets a red
+  // test and edits the number to make it green. Comparing the two real values
+  // means it now fails only when they actually disagree.
+  const pinnedVersion = Number(
+    readFileSync(join(HERE, "..", "operations", "cloudflare-recovery-adapter.mjs"), "utf8")
+      .match(/RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION\s*=\s*(\d+)/)?.[1],
+  );
+  check("the adapter's pinned schema version is readable",
+    Number.isInteger(pinnedVersion), String(pinnedVersion));
   check("the adapter's pinned schema version is the newest migration",
-    numbers.at(-1) === 22, JSON.stringify(numbers.at(-1)));
+    numbers.at(-1) === pinnedVersion,
+    `newest migration ${numbers.at(-1)}, adapter pinned ${pinnedVersion}`);
   db.close();
 }
 

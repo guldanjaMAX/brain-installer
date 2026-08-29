@@ -163,7 +163,14 @@ test("every device is gone: one code from the card puts the owner back in", asyn
   assert.equal(recovered.response.status, 200, JSON.stringify(recovered.body));
   assert.equal(recovered.body.recovered, true);
   assert.equal(recovered.body.codes_remaining, RECOVERY_CODE_COUNT - 1);
-  assert.match(recovered.cookie, /^brain_session=v1\./, "recovery earns the same session a sign-in does");
+  // v2 cookies carry the subject: `-` is the owner, anything else is a grant.
+  // Asserting the subject rather than just the version is the point of this
+  // check — coming back from a recovery code as a SCOPED principal would be a
+  // silent downgrade of the owner's own access, on the one day they have no
+  // other way in, and a version-only assertion would not have noticed.
+  assert.match(recovered.cookie, /^brain_session=v2\./, "recovery earns the same session a sign-in does");
+  assert.equal(recovered.cookie.replace(/^brain_session=/, "").split(".")[3], "-",
+    "recovery must restore the OWNER, not a scoped principal");
 
   // The new device really is enrolled, and is labelled as a recovery.
   const [meStatus, me] = await json(await worker.fetch(post("/api/app/me", {}, app(recovered.cookie)), testEnv));

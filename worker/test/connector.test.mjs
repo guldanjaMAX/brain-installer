@@ -127,7 +127,7 @@ test("the full connector journey, register through revocation", async () => {
   // Approval requires the owner's passkey session.
   const denied = await worker.fetch(jsonPost(`/oauth/authorize/decision?${authorizeQuery}`, {}, { "X-Brain-App": "1" }), testEnv);
   assert.equal(denied.status, 401);
-  const cookie = (await mintSessionCookie(testEnv, 1)).split(";")[0];
+  const cookie = (await mintSessionCookie(testEnv, 1, { grantId: null })).split(";")[0];
   const approved = await (await worker.fetch(jsonPost(`/oauth/authorize/decision?${authorizeQuery}`, {}, {
     Cookie: cookie, "X-Brain-App": "1",
   }), testEnv)).json();
