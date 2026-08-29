@@ -4,6 +4,7 @@ import { Gate } from "./components/Gate";
 import { Ask } from "./components/Ask";
 import { Settings } from "./components/Settings";
 import { Home } from "./components/Home";
+import { Documents } from "./components/Documents";
 
 // The invite arrives as /app#enroll=<code>. It lives in the fragment on
 // purpose: a fragment is never sent to the server in a request line and never
@@ -16,7 +17,7 @@ const inviteCode = (location.hash.match(/enroll=([A-Za-z0-9_-]+)/) || [])[1] || 
 const root = document.getElementById("root");
 const shellOwner = root?.dataset.owner || "";
 
-type View = "home" | "ask" | "settings";
+type View = "home" | "ask" | "documents" | "settings";
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
@@ -60,6 +61,7 @@ export function App() {
           <nav className="flex items-center gap-1 text-[13.5px]">
             <Tab now={view} go={setView} to="home">Home</Tab>
             <Tab now={view} go={setView} to="ask">Ask</Tab>
+            <Tab now={view} go={setView} to="documents">Documents</Tab>
             <Tab now={view} go={setView} to="settings">Settings</Tab>
           </nav>
         </div>
@@ -72,6 +74,7 @@ export function App() {
         <div className={view === "ask" ? "" : "hidden"}>
           <Ask />
         </div>
+        {view === "documents" && <Documents />}
         {view === "settings" && (
           <Settings
             devices={me.devices || []}
