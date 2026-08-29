@@ -222,12 +222,12 @@ function supportSourceForCommand(command = "") {
   if (command === "ingest") {
     const index = process.argv.indexOf("--from");
     const remote = index >= 0 ? process.argv[index + 1] : null;
-    if (["calendar", "drive", "gmail", "imessage", "iphone-backup", "whatsapp"].includes(remote)) return remote;
+    if (["calendar", "drive", "gmail", "imap", "imessage", "iphone-backup", "whatsapp"].includes(remote)) return remote;
     return "local";
   }
   if (command === "connect" || command === "disconnect") {
     const which = String(process.argv[3] || "").toLowerCase();
-    if (which === "imessage" || which === "whatsapp" || which === "zoom") return which;
+    if (which === "imap" || which === "imessage" || which === "whatsapp" || which === "zoom") return which;
     return "installer";
   }
   if (SUPPORT_REMOTE_COMMANDS.has(command)) return "cloudflare";
@@ -370,17 +370,35 @@ function validateCloudflareTokenBytes(value) {
   return bytes;
 }
 
-/** Read a token from a real terminal with echo disabled and restore it on every exit path. */
-export function readHiddenCloudflareToken({ input = process.stdin, output = process.stderr } = {}) {
+/**
+ * Read one secret from a real terminal with echo disabled.
+ *
+ * ONE implementation, and every caller goes through it. The parts that are easy
+ * to get subtly wrong and impossible to notice when they are wrong live here
+ * exactly once: restoring raw mode on every exit path including the throwing
+ * ones, removing the listeners, zeroing the buffer, and refusing outright
+ * rather than falling back to visible entry. A second copy is how a fix lands
+ * in one and not the other, and the one that missed it keeps writing a live
+ * credential into somebody's scrollback.
+ *
+ * What genuinely differs per caller is passed in: the prompt, which bytes may
+ * be typed, and what the collected bytes become. Nothing else.
+ */
+export function readHiddenInput({
+  prompt,
+  input = process.stdin,
+  output = process.stderr,
+  maxBytes = 512,
+  noun = "secret",
+  insecure = "this terminal cannot prompt securely. Rerun from an interactive terminal.",
+  accepts = (byte) => byte >= 0x21 && byte <= 0x7e,
+  finalize = (bytes) => Buffer.from(bytes),
+} = {}) {
   if (!input?.isTTY || !output?.isTTY || typeof input.setRawMode !== "function") {
-    return Promise.reject(new Error(
-      "no Cloudflare token is available and this terminal cannot prompt securely. " +
-      "Rerun from an interactive terminal for hidden entry. For automation, inject " +
-      "CLOUDFLARE_API_TOKEN through an approved secret manager; never paste it into a shell command.",
-    ));
+    return Promise.reject(new Error(insecure));
   }
-  return new Promise((resolveToken, rejectToken) => {
-    const bytes = Buffer.alloc(512);
+  return new Promise((resolveSecret, rejectSecret) => {
+    const bytes = Buffer.alloc(maxBytes);
     let length = 0;
     let settled = false;
     const wasRaw = Boolean(input.isRaw);
@@ -399,36 +417,36 @@ export function readHiddenCloudflareToken({ input = process.stdin, output = proc
       cleanup();
       if (error) {
         bytes.fill(0);
-        rejectToken(error);
+        rejectSecret(error);
         return;
       }
       try {
-        const result = validateCloudflareTokenBytes(bytes.subarray(0, length));
+        const result = finalize(bytes.subarray(0, length));
         bytes.fill(0);
-        resolveToken(result);
+        resolveSecret(result);
       } catch (validationError) {
         bytes.fill(0);
-        rejectToken(validationError);
+        rejectSecret(validationError);
       }
     };
     const onData = (chunk) => {
       const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       for (const byte of incoming) {
-        if (byte === 0x03) return finish(new Error("Cloudflare token entry was cancelled"));
+        if (byte === 0x03) return finish(new Error(`${noun} entry was cancelled`));
         if (byte === 0x0d || byte === 0x0a) return finish();
         if (byte === 0x08 || byte === 0x7f) {
           if (length > 0) bytes[--length] = 0;
           continue;
         }
-        if (byte < 0x21 || byte > 0x7e || length >= bytes.length) {
-          return finish(new Error("the Cloudflare token contains an unsupported character or is too long"));
+        if (!accepts(byte) || length >= bytes.length) {
+          return finish(new Error(`the ${noun} contains an unsupported character or is too long`));
         }
         bytes[length++] = byte;
       }
     };
-    const onEnd = () => finish(new Error("terminal input ended before a Cloudflare token was entered"));
-    const onError = () => finish(new Error("terminal input failed while reading the Cloudflare token"));
-    output.write("  Cloudflare token (hidden): ");
+    const onEnd = () => finish(new Error(`terminal input ended before a ${noun} was entered`));
+    const onError = () => finish(new Error(`terminal input failed while reading the ${noun}`));
+    output.write(prompt);
     input.on("data", onData);
     input.once("end", onEnd);
     input.once("error", onError);
@@ -436,8 +454,26 @@ export function readHiddenCloudflareToken({ input = process.stdin, output = proc
       input.setRawMode(true);
       input.resume();
     } catch {
-      finish(new Error("this terminal could not disable echo for Cloudflare token entry"));
+      finish(new Error(`this terminal could not disable echo for ${noun} entry`));
     }
+  });
+}
+
+/** Read a token from a real terminal with echo disabled and restore it on every exit path. */
+export function readHiddenCloudflareToken({ input = process.stdin, output = process.stderr } = {}) {
+  return readHiddenInput({
+    prompt: "  Cloudflare token (hidden): ",
+    input,
+    output,
+    noun: "Cloudflare token",
+    insecure:
+      "no Cloudflare token is available and this terminal cannot prompt securely. " +
+      "Rerun from an interactive terminal for hidden entry. For automation, inject " +
+      "CLOUDFLARE_API_TOKEN through an approved secret manager; never paste it into a shell command.",
+    // A Cloudflare token is printable ASCII with no spaces, so a space is a
+    // paste accident and is caught at the keystroke rather than at the API.
+    accepts: (byte) => byte >= 0x21 && byte <= 0x7e,
+    finalize: validateCloudflareTokenBytes,
   });
 }
 
@@ -4954,7 +4990,7 @@ async function cmdSources(manifestPath) {
 
   if (!rows.length) {
     warn("no named sources registered in this install.");
-    info(`register one with: brain sources ${manifestPath} --add <name> --kind <drive|gmail|calendar|upload>`);
+    info(`register one with: brain sources ${manifestPath} --add <name> --kind <drive|gmail|imap|calendar|upload>`);
   } else {
     const w = (key, min) => Math.max(min, ...rows.map((r) => String(r[key] || "").length));
     const wName = w("name", 4);
@@ -6122,9 +6158,10 @@ async function reconcileDocumentFamilies({ families, base, adminKey }) {
 export function assertRemoteLimitSafe({ source = "Drive", limit = Infinity, dryRun = false, incremental = false } = {}) {
   if (Number.isFinite(limit) && !dryRun) {
     die(
-      `--limit cannot be used on a real ${incremental ? "incremental" : "full"} ${source} sync. Google issues the next cursor` + "\n" +
-        "      or history marker for the complete result window, so saving it after a client-side limit would permanently" + "\n" +
-        "      skip every remaining file. Remove --limit for the real run. A limited --dry-run is safe."
+      `--limit cannot be used on a real ${incremental ? "incremental" : "full"} ${source} sync. The cursor this saves` + "\n" +
+        "      (a Drive sync token, a Gmail history marker, an IMAP UID watermark) covers the complete result window, so" + "\n" +
+        "      saving it after a client-side limit would permanently skip every remaining item. Remove --limit for the real" + "\n" +
+        "      run. A limited --dry-run is safe."
     );
   }
   return true;
@@ -7834,8 +7871,8 @@ export async function cmdLoad(manifestPath, options = {}) {
  */
 async function cmdIngestRemote(m, manifestPath, flags) {
   const which = String(flags.from).toLowerCase();
-  if (!["drive", "gmail"].includes(which)) {
-    die(`--from ${which} is not a source. Available: drive, gmail.`);
+  if (!["drive", "gmail", "imap"].includes(which)) {
+    die(`--from ${which} is not a source. Available: drive, gmail, imap.`);
   }
 
   const removalApproval = flags["approve-removals"];
@@ -7858,7 +7895,10 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   if (!adminKey && !dry) die("no admin key found: not in the environment, and no .brain-admin-key file next to the manifest.");
 
   const { batchStream, splitOversized, loadState, saveState } = await ingestLib();
-  const getToken = googleAuth(which === "gmail" ? "gmail" : "drive");
+  // IMAP holds its own mailbox credential and never touches the Google store.
+  // Resolving googleAuth unconditionally would refuse an IMAP sync on a machine
+  // that has deliberately never connected Google, which is most of them.
+  const getToken = which === "imap" ? null : googleAuth(which === "gmail" ? "gmail" : "drive");
   // OCR, and what it will cost, decided ONCE per run and stated out loud
   // before the first page is sent. The estimate lands while the owner can
   // still say no; a bill that appears afterwards is not a choice they were
@@ -7909,10 +7949,24 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       lastFullSweepAt: state.drive_last_full_sweep_at,
     });
   }
+  let imapPolicyChanged = false;
+  if (which === "imap") {
+    // The bulk-mail policy decides WHICH mail is kept, so a change to it has to
+    // force a full pass. Applying a new rule only to new mail leaves the old
+    // decisions in the index silently disagreeing with the current filter.
+    const { imapPolicyFingerprint, BULK_POLICY } = await import("./connectors/imap.mjs");
+    policyFingerprint = imapPolicyFingerprint(BULK_POLICY, BULK_POLICY.include_roles);
+    imapPolicyChanged = state.imap_policy_fingerprint !== policyFingerprint;
+  }
   let incremental = which === "drive"
     ? driveDecision.incremental
-    : !flags.reset && !scannerPolicyChanged && Boolean(state.history_id);
-  assertRemoteLimitSafe({ source: which === "drive" ? "Drive" : "Gmail", limit, dryRun: dry, incremental });
+    : which === "imap"
+      ? !flags.reset && !scannerPolicyChanged && !imapPolicyChanged && !!state.imap_folders
+      : !flags.reset && !scannerPolicyChanged && Boolean(state.history_id);
+  assertRemoteLimitSafe({
+    source: which === "drive" ? "Drive" : which === "imap" ? "IMAP" : "Gmail",
+    limit, dryRun: dry, incremental,
+  });
   if (!dry && scannerPolicyChanged) {
     ensureCredentialScannerProgress(state, scannerFingerprint);
     saveState(statePath, state);
@@ -8292,7 +8346,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
           }
         : { credential_scanner_fingerprint: scannerFingerprint },
     };
-  } else {
+  } else if (which === "gmail") {
     const gmail = await import("./connectors/gmail.mjs");
     let nextHistory = null;
     try {
@@ -8364,6 +8418,159 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       key: "history_id",
       value: nextHistory || state.history_id,
       statePatch: { credential_scanner_fingerprint: scannerFingerprint },
+    };
+  } else {
+    const imap = await import("./connectors/imap.mjs");
+    const credentials = imap.loadImapCredentials({ sourceName });
+    if (!credentials) {
+      die(
+        `no mailbox is connected for the source "${sourceName}" on this machine.\n` +
+          `      Run: brain connect imap ${manifestPath} --source ${sourceName}`
+      );
+    }
+
+    const client = new imap.ImapClient({ host: credentials.host, port: credentials.port || imap.DEFAULT_IMAP_PORT });
+    const observed = {};
+    try {
+      await client.connect();
+      await client.login(credentials.username, credentials.password);
+
+      const folders = await client.list();
+      const { included, skipped: skippedRoles, unlisted, unclassified, containers } = imap.partitionFolders(folders);
+
+      // EVERY folder is reported, read or not, and each one is told the TRUE
+      // reason. A folder that was silently never opened produces a brain that is
+      // confidently ignorant of it; a folder told the wrong reason sends the
+      // operator looking for the wrong problem.
+      const mailFolders = folders.length - containers.length;
+      info(`${mailFolders} mail folder(s) on this mailbox; reading ${included.length}: ${included.map((f) => f.name).join(", ") || "none"}`);
+      if (skippedRoles.length) {
+        info(`  not read, by policy: ${skippedRoles.map((f) => `${f.name} (${f.role})`).join(", ")}`);
+      }
+      if (unlisted.length) {
+        // These were identified. Saying they "could not be classified" would be
+        // false, and it is the more alarming of the two readings. An Archive
+        // folder in particular can hold years of a client's real mail.
+        warn(
+          `${unlisted.length} folder(s) were identified but are NOT read, because no rule includes them: ` +
+            `${unlisted.map((f) => `${f.name} (${f.role})`).join(", ")}\n` +
+            "      Only inbox and sent are read by default. If one of these holds mail you need, that needs a rule."
+        );
+      }
+      if (unclassified.length) {
+        // Not guessed at. A name table is localized and provider-specific, and
+        // guessing "junk" on a folder that is really a client's invoice archive
+        // loses it; guessing the other way reads their spam.
+        warn(
+          `${unclassified.length} folder(s) could not be identified and were NOT read: ${unclassified.map((f) => f.name).join(", ")}\n` +
+            "      A folder whose purpose cannot be worked out is left alone rather than guessed at. There is no\n" +
+            "      manifest setting that includes one yet: if one of these holds mail you need, that needs a rule."
+        );
+      }
+      if (containers.length) {
+        // Not mail folders. Reported so the count above adds up, and NOT as a
+        // problem, because they never held a message.
+        info(`  ${containers.length} name(s) are folder containers that hold no mail and cannot be opened: ${containers.map((f) => f.name).join(", ")}`);
+      }
+      if (!included.length) {
+        die("no readable folder was found on this mailbox. Nothing was changed.");
+      }
+
+      for (const folder of included) {
+        const before = await client.examine(folder.name);
+        const saved = (state.imap_folders || {})[folder.name] || null;
+        const decision = imap.folderSyncDecision({
+          storedUidvalidity: saved?.uidvalidity ?? null,
+          currentUidvalidity: before.uidvalidity,
+          lastUid: saved?.last_uid ?? 0,
+          reset: !!flags.reset,
+          policyChanged: imapPolicyChanged,
+        });
+        // Never silent. A resync that just happens is indistinguishable from a
+        // bug, and this is the same posture as the Gmail history-expiry warning.
+        if (decision.resynced) warn(`${folder.name}: ${decision.reason}`);
+        else if (decision.reason) info(`${folder.name}: ${decision.reason}`);
+
+        let highest = decision.resynced ? 0 : (saved?.last_uid ?? 0);
+        const prepareImap = async (message) => {
+          scanned++;
+          if (message.uid > highest) highest = message.uid;
+          const r = await imap.toEnvelope(message, { sourceName, host: credentials.host });
+          if (r.skip) {
+            const key = `${sourceName}:${folder.name}#${message.uid}`;
+            state.skipped[key] = r.skip.reason;
+            return { skip: r.skip };
+          }
+          const key = `${sourceName}:${r.envelope.source_id}`;
+          const scannerResumeAccepted = hasCredentialScannerProgress(state, scannerFingerprint, key, r.version);
+          if ((!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === r.version) {
+            recordAcceptedDocumentState(state, {
+              stateKey: key, hash: r.version, skipKeys: [r.envelope.source_id], legacyPartRoot: r.envelope.source_id,
+            });
+            unchanged++;
+            return { unchanged: true };
+          }
+          const envelope = sanitizeIngestEnvelope(r.envelope);
+          const refusal = credentialRefusalOf(envelope, scannerOn);
+          if (refusal) {
+            // A mailbox is exactly where a person emails themselves their own
+            // app password. The gate names the kind and never quotes the value.
+            const skip = { path: safeIngestDisplay(envelope.title, key), id: key, reason: refusal.reason };
+            state.skipped[key] = refusal.reason;
+            intentionalRemovalUids.push(key);
+            return { skip };
+          }
+          const envelopes = splitOversized(envelope);
+          if (scanned % 200 === 0) process.stdout.write(`\r  fetched ${scanned}...   `);
+          return {
+            hash: r.version, envelopes, rel: key, stateKey: key, deferState: true,
+            familyPlan: {
+              stateKey: key,
+              hash: r.version,
+              expectedParts: envelopes.length,
+              base_doc_uid: key,
+              keep_doc_uids: envelopes.map((one) => `${one.source_type}:${one.source_id}`),
+              skipKeys: [key, ...envelopes.map((one) => one.source_id)],
+              legacyPartRoot: r.envelope.source_id,
+            },
+          };
+        };
+
+        const stream = imap.streamFolder(client, folder.name, {
+          criteria: decision.searchCriteria,
+          floor: decision.floor,
+          uidvalidity: before.uidvalidity,
+        });
+        for await (const group of batchStream(stream, prepareImap, {
+          onSkip: (skip) => skips.push(skip),
+        })) {
+          await consumeGroup(group);
+        }
+
+        // Re-EXAMINE before recording anything. A server may roll UIDVALIDITY
+        // during a long folder (maintenance, a migration), and recording a
+        // watermark measured under the old numbering against the new value is
+        // precisely the silent skip this connector exists not to do.
+        const after = await client.examine(folder.name);
+        imap.assertUidvalidityStable(folder.name, before.uidvalidity, after.uidvalidity);
+        observed[folder.name] = { uidvalidity: before.uidvalidity, last_uid: highest };
+      }
+    } finally {
+      await client.logout().catch(() => {});
+    }
+
+    // ONE object, merged connector-side. Per-folder positions cannot be a
+    // scalar assign, and the new UIDVALIDITY is never written apart from the
+    // watermark it belongs to: a half-finished resync leaves the OLD pair in
+    // place, so the next run detects the mismatch again instead of resuming
+    // from a number that means nothing.
+    pendingCursor = {
+      key: "imap_folders",
+      value: imap.mergeFolderWatermarks(state.imap_folders, observed),
+      statePatch: {
+        imap_policy_fingerprint: policyFingerprint,
+        credential_scanner_fingerprint: scannerFingerprint,
+      },
     };
   }
   process.stdout.write("\r");
@@ -8612,10 +8819,12 @@ async function cmdConnect(target) {
   if (which === "imessage") return cmdConnectImessage(process.argv[4], flags);
   if (which === "whatsapp") return cmdConnectWhatsapp(process.argv[4], flags);
   if (which === "zoom") return cmdConnectZoom(process.argv[4], flags);
+  if (which === "imap") return cmdConnectImap(process.argv[4], flags);
   if (which !== "google") {
     die(
-      "brain connect supports google, imessage, whatsapp and zoom.\n" +
+      "brain connect supports google, imap, imessage, whatsapp and zoom.\n" +
         "  Usage: brain connect google --scopes drive,gmail,calendar\n" +
+        "         brain connect imap <manifest> --host imap.example.com --user you@example.com\n" +
         "         brain connect imessage <manifest>\n" +
         "         brain connect whatsapp <manifest> --accept-risk\n" +
         "         brain connect zoom <manifest>"
@@ -9049,6 +9258,162 @@ export async function cmdConnectZoom(manifestPath, flags = {}, options = {}) {
 }
 
 /**
+ * brain connect imap <manifest> — any mailbox that speaks IMAP.
+ *
+ * THE APP PASSWORD NEVER TOUCHES A SHELL. It is not a flag, not an environment
+ * variable, and not echoed back. It is read from a real terminal with echo
+ * disabled and written straight into the client's own Keychain or DPAPI store,
+ * under an item named for IMAP so they can find and revoke exactly this one.
+ * A flag would put a live mailbox password into shell history and every process
+ * listing on the machine.
+ *
+ * NOTHING IS STORED UNTIL A REAL READ SUCCEEDS. The probe logs in, lists the
+ * folders, EXAMINEs the inbox and reads one message before the credential is
+ * written. A connector that installs cleanly and fails on the first unattended
+ * sync is worse than one that refuses now, because the failure then arrives
+ * when nobody is watching and the client believes their mail is in there.
+ */
+export async function cmdConnectImap(manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die("usage: brain connect imap <manifest> --host <imap.host> --user <address> [--port 993] [--source <name>]");
+  }
+  const { m } = loadManifest(manifestPath);
+  if (m.corpora?.imap?.enabled !== true) {
+    die(
+      "corpora.imap.enabled is not true in this manifest.\n" +
+        '      Add  "imap": { "enabled": true }  under "corpora" first, so the install\n' +
+        "      record says this brain reads a mailbox before the machinery exists."
+    );
+  }
+
+  const imap = options.imap ?? await import("./connectors/imap.mjs");
+  const sourceName = assertSourceName(flags.source === true || !flags.source ? "imap" : flags.source);
+  const host = String(flags.host === true ? "" : flags.host || m.corpora?.imap?.host || "").trim();
+  const username = String(flags.user === true ? "" : flags.user || m.corpora?.imap?.username || "").trim();
+  const port = flags.port ? Number(flags.port) : (m.corpora?.imap?.port || imap.DEFAULT_IMAP_PORT);
+  if (!host || !username) {
+    die(
+      "both --host and --user are required.\n" +
+        "      Example: brain connect imap <manifest> --host imap.mail.yahoo.com --user you@yahoo.com"
+    );
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) die("--port must be a whole number between 1 and 65535.");
+
+  for (const line of imap.providerNotes(host)) console.log(`  ${line}`);
+  if (imap.providerNotes(host).length) console.log("");
+
+  // Read hidden, normalize, never echo.
+  const read = options.readSecret ?? readHiddenSecret;
+  const password = imap.normalizeAppPassword(
+    await read(`  app password for ${username} (hidden): `)
+  );
+  if (!password) die("no password was entered. Nothing was stored.");
+
+  info(`checking these credentials against ${host}:${port}`);
+  let probe;
+  try {
+    probe = await imap.probeMailbox({ host, port, username, password, socketFactory: options.socketFactory ?? null });
+  } catch (error) {
+    die(`${String(error?.message || error).slice(0, 300)}\n      Nothing was stored.`);
+  }
+  if (!probe.ok) {
+    die(`${probe.notes.join("\n      ") || "the mailbox could not be read"}\n      Nothing was stored.`);
+  }
+  for (const note of probe.notes) warn(note);
+  ok(
+    `signed in and read the mailbox: ${probe.folders.length} folder(s), inbox UIDVALIDITY ${probe.uidvalidity}, ` +
+      `${probe.messages} message(s) in ${probe.inbox}` + (probe.readOne ? ", one read back in full" : "")
+  );
+  if (probe.unlisted.length) {
+    warn(`${probe.unlisted.length} folder(s) were identified but will NOT be read, because only inbox and sent are: ${probe.unlisted.join(", ")}`);
+  }
+  if (probe.unclassified.length) {
+    warn(`${probe.unclassified.length} folder(s) could not be identified and will NOT be read: ${probe.unclassified.join(", ")}`);
+  }
+
+  imap.saveImapCredentials({ host, port, username, password }, { sourceName });
+  ok(`mailbox credential stored in ${imap.imapCredentialStorageDescription({ sourceName })} (on this machine only)`);
+
+  // Register the source before a single message has landed, so it is visible
+  // and undoable immediately rather than only after a successful first sync.
+  try {
+    const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
+    const adminKey = resolveKey(manifestPath);
+    if (!adminKey) throw new Error("no admin key is available");
+    const resolveAcct = options.resolveAccount ?? resolveAccount;
+    const acct = m.brain?.domain ? null : await resolveAcct(m);
+    const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+    const base = await resolveBase(m, acct);
+    const postExpectation = options.postSourceExpectation ?? postSourceExpectation;
+    await postExpectation(base, adminKey, { source: sourceName, kind: "imap", expected_refresh_seconds: null });
+  } catch (error) {
+    warn(
+      `the mailbox is connected, but the named source could not be registered up front: ${String(error?.message || error).slice(0, 160)}\n` +
+        "      Harmless: the first sync registers it."
+    );
+  }
+
+  console.log("");
+  info(`now run: brain ingest ${manifestPath} --from imap --source ${sourceName}`);
+  info(`to remove this later: brain disconnect imap ${manifestPath} --source ${sourceName}`);
+  return { host, port, username, sourceName, folders: probe.folders.length };
+}
+
+/**
+ * brain disconnect imap <manifest> — forget the mailbox password.
+ *
+ * Removing the credential is what actually turns this off: the next sync
+ * refuses by name rather than quietly doing nothing. Mail already loaded stays
+ * in the brain and is removed with `brain forget --source`, which is said out
+ * loud because a client who thinks disconnecting deleted their mail, or thinks
+ * it did not, is wrong in a way that matters either direction.
+ */
+export async function cmdDisconnectImap(manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die("usage: brain disconnect imap <manifest> [--source <name>]");
+  }
+  const imap = options.imap ?? await import("./connectors/imap.mjs");
+  const sourceName = assertSourceName(flags.source === true || !flags.source ? "imap" : flags.source);
+  const removed = imap.removeImapCredentials({ sourceName });
+  ok(removed
+    ? `the mailbox app password for "${sourceName}" was removed from ${imap.imapCredentialStorageDescription({ sourceName })}`
+    : `no mailbox credential was stored for "${sourceName}"; nothing to remove`);
+
+  console.log("");
+  console.log("  Also revoke it on the provider's side, which is yours and not reachable from here:");
+  console.log("    delete the app password in your mail account's security settings.");
+  console.log("");
+  info(`mail already loaded remains in the brain; remove it with: brain forget ${manifestPath} --source ${sourceName}`);
+  return { removed, sourceName };
+}
+
+/**
+ * Read one mailbox app password, hidden.
+ *
+ * The same core every other secret prompt uses, with two deliberate
+ * differences. A SPACE is accepted, because providers display an app password
+ * in groups of four and people paste exactly what they see; the spaces are
+ * stripped afterwards by `normalizeAppPassword`. And bytes above ASCII are
+ * accepted, because a password on a mailbox somebody's host set up is not
+ * required to be ASCII, and refusing one at the keystroke would look, to the
+ * person typing, exactly like the provider rejecting them.
+ */
+export function readHiddenSecret(promptText, { input = process.stdin, output = process.stderr, maxBytes = 512 } = {}) {
+  return readHiddenInput({
+    prompt: promptText,
+    input,
+    output,
+    maxBytes,
+    noun: "password",
+    insecure:
+      "this terminal cannot prompt securely, and a mailbox password is never accepted as a flag " +
+      "or an environment variable. Rerun from an interactive terminal.",
+    accepts: (byte) => byte >= 0x20 && byte !== 0x7f,
+    finalize: (bytes) => bytes.toString("utf-8"),
+  });
+}
+
+/**
  * brain disconnect — the first disconnect verb in this CLI.
  *
  * Same posture as removeDriveScheduler: removal must remain reachable even
@@ -9061,10 +9426,12 @@ async function cmdDisconnect(target) {
   const which = (target || "").toLowerCase();
   if (which === "whatsapp") return cmdDisconnectWhatsapp(process.argv[4], flags);
   if (which === "zoom") return cmdDisconnectZoom(process.argv[4], flags);
+  if (which === "imap") return cmdDisconnectImap(process.argv[4], flags);
   if (which !== "imessage") {
     die(
-      "brain disconnect supports imessage, whatsapp and zoom.\n" +
-        "  Usage: brain disconnect imessage <manifest>\n" +
+      "brain disconnect supports imap, imessage, whatsapp and zoom.\n" +
+        "  Usage: brain disconnect imap <manifest>\n" +
+        "         brain disconnect imessage <manifest>\n" +
         "         brain disconnect whatsapp <manifest>\n" +
         "         brain disconnect zoom <manifest>"
     );
@@ -12937,11 +13304,14 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain connect imessage <manifest>      verify Full Disk Access, load history, capture live (Mac only)
     brain connect whatsapp <manifest> --accept-risk  pair a linked device and capture live (Mac only, opt-in)
     brain connect zoom     <manifest>      Zoom cloud-recording transcripts (needs a paid Zoom seat)
+    brain connect imap     <manifest>      any IMAP mailbox (Yahoo, Fastmail, iCloud, a host): app
+                                           password entered hidden, proven by a real read first
     brain load       <manifest>            load EVERYTHING this manifest has: one sweep of every
                                            enabled, connected source, one report at the end
     brain ingest     <manifest> --path <dir>  load a folder into the brain
     brain ingest     <manifest> --from drive  load from a connected remote source
     brain ingest     <manifest> --from calendar  sync Google Calendar (--dry-run to preview)
+    brain ingest     <manifest> --from imap  sync a connected IMAP mailbox (--dry-run to preview)
     brain ingest     <manifest> --from imessage  one incremental Messages capture pass (Mac only)
     brain ingest     <manifest> --from whatsapp  one drain of the WhatsApp capture outbox
     brain ingest     <manifest> --from iphone-backup  one-time message history from an unencrypted
@@ -12971,6 +13341,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain disconnect imessage <manifest>   stop live capture, flush open sessions, remove the agent
     brain disconnect whatsapp <manifest>   stop the capture daemon and its drain, flush, remove both agents
     brain disconnect zoom     <manifest>   remove the Zoom secrets so the webhook refuses deliveries
+    brain disconnect imap     <manifest>   remove the stored mailbox app password from this machine
     brain support    --clear --yes         clear private local issue notes
 
   brain ingest takes --source <name>, --limit <n>, --dry-run, and --reset. It is
@@ -12996,7 +13367,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
   direction was verified against a balance or taken on trust from the format.
   Re-importing the same file updates the same rows rather than adding a copy.
 
-  brain sources takes --add <name> [--kind <drive|gmail|calendar|upload>] to register one,
+  brain sources takes --add <name> [--kind <drive|gmail|imap|calendar|upload>] to register one,
   and --source <name> --refresh <hourly|daily|weekly|monthly|never> to say how often it
   should refresh. A source with no expectation is never reported as stale.
   brain forget needs --source <name>, and --yes before it removes anything. Without

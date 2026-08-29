@@ -40,6 +40,10 @@ import {
   detectSmsBackupXml, parseSmsBackupXml,
   detectGoogleVoiceTakeout, parseGoogleVoiceTakeout, deriveVoiceThreadTitle,
 } from "./sms-backup.mjs";
+import {
+  detectFacebookMessengerExport, isFacebookMessengerExportFilename,
+  parseFacebookMessengerExport,
+} from "./facebook-messenger-export.mjs";
 import { MessageSessionizer } from "./message-session.mjs";
 import { splitMbox, mboxMessageKey } from "./mbox.mjs";
 // The one mail reader. Imported by name rather than reached through the
@@ -83,7 +87,9 @@ export const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
 const ARCHIVE_EXTENSIONS = new Set([".mbox"]);
 
 export const fileSizeLimitFor = (name, maxBytes, archiveBytes) =>
-  (ARCHIVE_EXTENSIONS.has(extensionOf(name)) ? archiveBytes : maxBytes);
+  (ARCHIVE_EXTENSIONS.has(extensionOf(name)) || isFacebookMessengerExportFilename(name)
+    ? archiveBytes
+    : maxBytes);
 
 export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES, archiveBytes = MAX_ARCHIVE_BYTES } = {}) {
   const files = [];
@@ -292,6 +298,37 @@ function prepareGoogleVoiceTakeout(file, buf, hash, { sourceName }) {
   return { hash, envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)) };
 }
 
+/** One Meta Download Your Information thread file, many bounded sessions. */
+function prepareFacebookMessengerExport(file, buf, hash, { sourceName }) {
+  const text = decodeText(buf);
+  const fallbackThreadId = file.rel.split(sep).join("/");
+  const parsed = parseFacebookMessengerExport(text, { sourceLabel: sourceName, fallbackThreadId });
+  if (parsed.error || !parsed.rows.length) {
+    return {
+      hash,
+      skip: {
+        path: file.rel,
+        reason: parsed.error ||
+          `no addressable Messenger text found (${parsed.skippedMedia} attachment-only, ` +
+          `${parsed.skippedUnavailable} unavailable/unsent, ${parsed.skippedMalformed} malformed)`,
+      },
+    };
+  }
+  const sessionizer = new MessageSessionizer({ groupingTimezone: "UTC" });
+  const envelopes = [];
+  for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
+  envelopes.push(...sessionizer.finish());
+  return {
+    hash,
+    envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)),
+    note: [
+      parsed.skippedMedia ? `${parsed.skippedMedia} attachment-only message(s) not represented` : null,
+      parsed.skippedUnavailable ? `${parsed.skippedUnavailable} unavailable or unsent message(s) not represented` : null,
+      parsed.skippedMalformed ? `${parsed.skippedMalformed} malformed message(s) not represented` : null,
+    ].filter(Boolean).join("; ") || null,
+  };
+}
+
 /**
  * One mail archive, many documents.
  *
@@ -433,6 +470,12 @@ export async function prepare(file, { sourceName, ocr = null }) {
     const peek = decodeText(buf);
     if (detectGoogleVoiceTakeout(peek)) {
       return prepareGoogleVoiceTakeout(file, buf, hash, { sourceName });
+    }
+  }
+  if (ext === ".json" && !isLikelyBinary(buf)) {
+    const peek = decodeText(buf);
+    if (detectFacebookMessengerExport(peek)) {
+      return prepareFacebookMessengerExport(file, buf, hash, { sourceName });
     }
   }
 

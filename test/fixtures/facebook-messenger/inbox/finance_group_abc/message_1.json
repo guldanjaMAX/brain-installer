@@ -1,0 +1,48 @@
+{
+  "participants": [
+    { "name": "Owner Example" },
+    { "name": "JosÃ© Rivera" }
+  ],
+  "messages": [
+    {
+      "sender_name": "Owner Example",
+      "timestamp_ms": 1767272400000,
+      "content": "I sent the signed renewal."
+    },
+    {
+      "sender_name": "JosÃ© Rivera",
+      "timestamp_ms": 1767270600000,
+      "photos": [
+        { "uri": "messages/inbox/finance_group_abc/photos/photo_1.jpg" }
+      ]
+    },
+    {
+      "sender_name": "JosÃ© Rivera",
+      "timestamp_ms": 1767268800000,
+      "content": "The renewal is for twelve months."
+    },
+    {
+      "sender_name": "Owner Example",
+      "timestamp_ms": 1767267000000,
+      "content": "Can you confirm the term?"
+    },
+    {
+      "sender_name": "Owner Example",
+      "timestamp_ms": 1767267000000,
+      "content": "Can you confirm the term?"
+    },
+    {
+      "sender_name": "JosÃ© Rivera",
+      "timestamp_ms": 1767265200000,
+      "is_unsent": true
+    },
+    {
+      "sender_name": "",
+      "timestamp_ms": "not-a-number",
+      "content": "malformed"
+    }
+  ],
+  "title": "Finance group",
+  "is_still_participant": true,
+  "thread_path": "inbox/finance_group_abc"
+}

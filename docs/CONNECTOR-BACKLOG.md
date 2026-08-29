@@ -1,6 +1,6 @@
 # Connector readiness and ranked backlog
 
-Current as of 2026-08-29 for `codex/cloudflare-brain-phase2`.
+Current as of 2026-08-29 for the isolated `codex/connector-next-wave` candidate.
 
 This is the engineering proof ledger. The client-facing capability description
 lives in `onboarding/07-ingest-source-matrix.md`. No assertion count promotes a
@@ -47,8 +47,8 @@ a live service smoke test, not proof of a source connector or customer corpus.
 | Financial ledger | Built schema, import, and reads | Scripted I/O | None, synthetic ledgers only | Complete the bank-export gate, then answer one approved question from ledger rows with source-document provenance rather than text retrieval. |
 | Scanned-PDF OCR | Built, off by default | Fixture and scripted I/O | None, no page reached real Workers AI | In a private disposable gate, test a typed scan, a one-bit fax or photocopy, and handwriting; verify exact page coverage, low-confidence marking, refusal, citation provenance, and no ledger claim from OCR text alone. |
 | Human custodian or manual portal export | Operational source type | Watched-folder and Drive paths tested as above | None for an actual delivery cadence | Record who supplies the artifact, cadence, expected format, date coverage, and one missed-delivery test that reports stale or unavailable instead of zero. |
-| IMAP | Absent in this checkout | None here | None | After higher-ranked field gates, integrate the existing read-only line and prove seeded mailbox baseline, UID resume, reconnect, deletion policy, and no unread-state mutation. |
-| Facebook Messenger export | Absent | None | None | Parse one current Takeout fixture, then a reviewed real export; prove exact timestamps, stable thread identity, rerun idempotency, and family deletion. |
+| IMAP | Built, read-only | Scripted real socket, 78 checks; TLS and provider behavior remain outside the harness | None | Use a seeded disposable Yahoo, Fastmail, iCloud, or hosted mailbox to prove TLS, app-password custody, folder inventory, baseline, UID resume, reconnect, no unread-state mutation, and explicit Archive/unclassified-folder reporting. |
+| Facebook Messenger export | Built, export-only | Fixture plus common folder-ingestion path | None | Load one current reviewed Download Your Information JSON export; prove exact timestamps, text repair, stable thread/session identity, attachment/unavailable counts, rerun idempotency, provenance, retrieval, and family deletion. |
 | QuickBooks, Plaid, Slack, Notion, Microsoft 365, Dropbox, and CRM APIs | Absent or product-decision blocked | None in this checkout | None | Do not start until demand, administrator custody, authorization contract, deletion semantics, and a provider test account are named. |
 
 ## Ranked work
@@ -87,9 +87,9 @@ a live service smoke test, not proof of a source connector or customer corpus.
 6. **Prove OCR on private real scans.** The implementation is complete and off.
    The field gate must include typed, one-bit, and handwritten pages and must
    preserve low-confidence and partial states.
-7. **Integrate IMAP only after the proof queue above.** Email export through
-   MBOX is an immediate path. A live connector must remain read-only and
-   custody-safe.
+7. **Field-prove the integrated read-only IMAP line.** Email export through MBOX
+   remains the zero-credential fallback. The live connector must prove TLS,
+   app-password custody, folder truth, UID resume, and no unread-state mutation.
 8. **Defer speculative long-tail APIs.** Treat people, recurring manual exports,
    and portal downloads as first-class source plans. Do not assume every source
    has an API or that the owner controls its credentials.

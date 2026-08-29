@@ -168,6 +168,29 @@
             }
           }
         },
+        "imap": {
+          "type": "object",
+          "description": "Any mailbox that speaks IMAP (Yahoo, Fastmail, iCloud, a hosting provider), enforced by brain connect imap and brain ingest --from imap. Most providers require an APP PASSWORD rather than the account password; it is entered hidden at connect and stored in the client's own macOS Keychain or Windows DPAPI store under an item named for IMAP, never as a flag and never in an environment variable. Read-only at the protocol level (EXAMINE, never SELECT), so nothing is marked read. Inbox and Sent are read by default; Junk, Trash, Drafts and an All Mail folder are skipped; an Archive folder is identified and also NOT read; a folder whose role cannot be identified is NOT read. Every folder is reported with the true reason, and folder containers that hold no mail are named as such rather than as folders that went unread. Incremental through UIDVALIDITY plus a per-folder UID watermark; a UIDVALIDITY change is announced and re-reads the whole folder rather than resuming. Bulk mail is excluded LOCALLY on message headers requiring two independent signals, which is a weaker instrument than Gmail's server-side category classifier and is not equivalent to it. Deletions made in the mailbox are NOT propagated to the brain.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "host": {
+              "type": "string",
+              "description": "IMAP hostname, for example imap.mail.yahoo.com. May also be supplied as --host at connect."
+            },
+            "port": {
+              "type": "integer",
+              "default": 993,
+              "description": "Implicit TLS. 993 unless the provider says otherwise. STARTTLS on 143 is not supported, because a failed upgrade is a silent downgrade."
+            },
+            "username": {
+              "type": "string",
+              "description": "The mailbox address. The password is never stored here."
+            }
+          }
+        },
         "imessage": {
           "type": "object",
           "description": "Mac-only live message capture from Messages.app (chat.db), enforced by brain connect imessage and brain ingest --from imessage. Requires a Full Disk Access grant on the capturing Mac; SMS arrives alongside iMessage when Text Message Forwarding is on and is tagged sms. The capture schedule knob is operations.imessage_capture_cron (default: every minute).",

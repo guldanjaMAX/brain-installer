@@ -20,6 +20,10 @@ without weakening the ingestion and deletion rules underneath them.**
 - Bank exports and hosted-feed rows share one normalized ledger boundary, and
   every imported row retains source-document provenance. OCR for scanned PDFs
   is built but remains off by default and explicitly marks low-confidence text.
+- A read-only IMAP connector now covers non-Gmail mailboxes using provider app
+  passwords stored in the owner's protected credential store. Facebook
+  Messenger has a credential-free JSON export parser through the watched-folder
+  and Drive paths. Both remain real-account acceptance gates.
 - Install-day checks now verify the Cloudflare token instead of trusting that a
   value exists, open the stored Google credential instead of trusting its file
   header, refuse the shared Vectorize placeholder name, skip R2 when it was not

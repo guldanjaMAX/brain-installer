@@ -264,6 +264,10 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
   contracts pass locally against the real Worker and migration code. A physical
   passkey ceremony on the final customer domain and devices remains a required
   field test before calling this production-proven.
+- **Facebook Messenger has an export path, not a live connector.** Select
+  Messages and JSON in Meta's Download Your Information flow, then load the
+  exported `message_*.json` files through Drive or the watched folder. The
+  parser is fixture-tested and has not yet processed a reviewed real export.
 - **Slack and Notion** do not exist as connectors.
 - **Meeting transcripts arrive two ways, neither of them a transcription
   service.** Zoom cloud recordings deliver themselves to a webhook on your own

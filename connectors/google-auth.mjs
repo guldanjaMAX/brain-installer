@@ -290,15 +290,28 @@ function storageOptions(value) {
   return { ...(value || {}) };
 }
 
+/**
+ * Which environment variable selects the backend.
+ *
+ * Google's name is the default and nothing about Google changes. A second
+ * credential class (the IMAP connector's mailbox app password) needs its OWN
+ * name, or BRAIN_GOOGLE_TOKEN_STORE would silently decide where a mailbox
+ * password lives — and the Drive scheduler's `childEnvironmentOf`, which sets
+ * or deletes exactly that variable, would carry Google's semantics onto a
+ * connector it was never about.
+ */
+const storeEnvName = (options = {}) => options.storeEnv || GOOGLE_TOKEN_STORE_ENV;
+
 function storageBackend(options = {}) {
-  const requested = options.backend || options.env?.[GOOGLE_TOKEN_STORE_ENV] || process.env[GOOGLE_TOKEN_STORE_ENV] || "auto";
+  const envName = storeEnvName(options);
+  const requested = options.backend || options.env?.[envName] || process.env[envName] || "auto";
   if (!["auto", "keychain", "file"].includes(requested)) {
-    throw new Error(`${GOOGLE_TOKEN_STORE_ENV} must be "keychain" or "file" (received "${requested}")`);
+    throw new Error(`${envName} must be "keychain" or "file" (received "${requested}")`);
   }
   const platform = options.platform || process.platform;
   const backend = requested === "auto" ? (platform === "darwin" ? "keychain" : "file") : requested;
   if (backend === "keychain" && platform !== "darwin") {
-    throw new Error("macOS Keychain storage was requested on a non-macOS system; use BRAIN_GOOGLE_TOKEN_STORE=file");
+    throw new Error(`macOS Keychain storage was requested on a non-macOS system; use ${envName}=file`);
   }
   return backend;
 }
@@ -961,7 +974,7 @@ function readKeychainValue(options, account, { metadataOnly = false } = {}) {
   if (keychainNotFound(result)) return null;
   throw new Error(
     "macOS Keychain could not be read. Unlock the login keychain and try again, " +
-      `or explicitly use the mode-0600 fallback with ${GOOGLE_TOKEN_STORE_ENV}=file.`
+      `or explicitly use the mode-0600 fallback with ${storeEnvName(options)}=file.`
   );
 }
 
@@ -974,7 +987,10 @@ function writeKeychainValue(options, account, value) {
     "-a", account,
     "-s", keychainService(options),
     "-D", "application password",
-    "-j", "Google OAuth credentials for Brain Installer",
+    // The label a person sees in Keychain Access. It must name the credential
+    // it actually holds: a mailbox password filed under "Google OAuth" defeats
+    // the whole reason these names are explicit.
+    "-j", options.keychainComment || "Google OAuth credentials for Brain Installer",
     // Keeping -w last makes `security` prompt through the private terminal. The
     // value never appears in argv, shell history, process listings, or output.
     "-w",
@@ -982,8 +998,8 @@ function writeKeychainValue(options, account, value) {
   const result = securityPasswordWrite(options, args, value);
   if (result?.status !== 0) {
     throw new Error(
-      "macOS Keychain could not store the Google connection. Unlock the login keychain and try again, " +
-        `or explicitly use the mode-0600 fallback with ${GOOGLE_TOKEN_STORE_ENV}=file.`
+      "macOS Keychain could not store the connection. Unlock the login keychain and try again, " +
+        `or explicitly use the mode-0600 fallback with ${storeEnvName(options)}=file.`
     );
   }
   if (readKeychainValue(options, account) !== value) {

@@ -16,17 +16,18 @@ I would rather lose a sale to an honest table than win one and spend week three 
 | Direct upload and API push | **Built.** Live-service smoke proof exists with a synthetic corpus; no authorized real-document receipt is accepted yet |
 | A watched folder on your own machine | **Built, Mac-only for the schedule.** Name one folder in your manifest and it reloads itself on a schedule: new files load, edited files reload, deleted files are removed. This is what makes "drop it in a folder you already ingest" true for a folder that is not inside Google Drive. On Windows and Linux the same load runs by hand. Real multi-tick sleep, wake, and deletion behavior is not yet field-proven |
 | Gmail | Built: `brain connect google --scopes gmail`, then `brain ingest --from gmail`. Incremental via historyId; bulk mail excluded by default. Not yet run against a real mailbox |
+| Any other mailbox, over IMAP (Yahoo, Fastmail, iCloud, a host) | Built: `brain connect imap`, then `brain ingest --from imap`. Read-only, so nothing is marked read. Inbox and Sent by default; Junk, Trash and Drafts skipped; **an Archive folder is NOT read**, and a folder whose role cannot be identified is not read either. Every folder is named in the run with the true reason it was or was not read. Incremental via UIDVALIDITY plus a per-folder UID watermark. Bulk mail is filtered locally on headers, which is weaker than Gmail's. **Never yet run against a real mailbox** |
 | Google Calendar | Built and wired: `brain connect google --scopes calendar`, then `brain ingest --from calendar`. Incremental via Google's own sync token; cancelled events are removed, not left behind. Not yet run against a real calendar |
 | Meetings (Google Meet) | **Built, with no extra work.** Meet's own Gemini notes land as a transcript document in Drive, which is already read |
 | WhatsApp | **Built two ways.** The safe one: your phone's own "Export chat" .txt, dropped in a folder that is ingested (a Drive folder, or the watched folder above), no daemon and no account risk. The other: `brain connect whatsapp --accept-risk`, live capture through a paired linked device, Mac-only, off unless you turn it on, and carrying a real terms-of-service risk described below. **Never yet run against a real WhatsApp account** |
 | Text messages (Android, and Google Voice) | **Built, as an export.** SMS Backup & Restore's .xml export, or a Google Voice Takeout, dropped in a folder that is ingested |
 | iMessage (Mac) | **Built, Mac-only live path.** `brain connect imessage` checks Full Disk Access, loads history, then uses scheduler-tick capture. There is no accepted receipt from a real `chat.db` read yet. **Apple only exposes message history on a Mac; there is no path on Windows** |
 | iPhone messages, no Mac (Windows too) | **Built, as a one-time history load.** `brain ingest --from iphone-backup` reads an **unencrypted** local iPhone backup and loads the iMessage and SMS history inside it. A point-in-time snapshot, **not** live capture: nothing new arrives afterwards. Runs on Windows and macOS. Never yet run against a backup Apple wrote |
-| Facebook Messenger | Not built as a product |
+| Facebook Messenger export | **Built as an export.** Select Messages and JSON in Meta's Download Your Information flow, then ingest the exported `message_*.json` files through Drive or the watched folder. Exact epoch timestamps, stable thread/session identity, rerun idempotency, explicit attachment-only/unavailable counts, and family deletion are fixture-tested. No current real export has been accepted yet; there is no live Facebook API connector. |
 | Zoom | **Built.** `brain connect zoom`: a webhook on your own worker loads each cloud-recording transcript automatically. **Needs a paid (Licensed) Zoom seat** — the free tier cannot cloud record at all. New recordings only, no backfill. Not yet run against a real Zoom account |
 | Slack | Not built. Priced separately when it is |
 | Notion | Not built |
-| Microsoft 365, Outlook, SharePoint, OneDrive | Not built |
+| Microsoft 365, Outlook, SharePoint, OneDrive | Not built. Microsoft has disabled basic IMAP authentication for these accounts, so the IMAP connector above does **not** reach them either |
 | Dropbox | Not built |
 | QuickBooks | Not built |
 | HubSpot and other CRMs | Not built |
@@ -79,6 +80,33 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 Built as a connector. Connect your Google account with the Gmail scope, then run the normal Gmail ingest command. Later runs are incremental through Gmail's history cursor, and bulk mail is excluded by default.
 
 **The honest production boundary:** the connector has passed the product test suite but has not yet completed a real-mailbox production run. The packaged unattended scheduler currently covers Drive and iMessage, not Gmail, so Gmail refresh is manual until it is extended. Treat Gmail as built but not yet production-proven.
+
+#### If you are not on Gmail
+
+Most mailboxes are not Gmail, and email is a financial record for about half the people reading this, so there is a second door. `brain connect imap` reads any mailbox that speaks IMAP: Yahoo, Fastmail, iCloud, a mailbox your web host gave you.
+
+```
+node brain.mjs connect imap <manifest> --host imap.mail.yahoo.com --user you@yahoo.com
+node brain.mjs ingest  <manifest> --from imap
+```
+
+Most providers, Yahoo included, need an **app password** rather than your normal password, and generating one usually requires two-step verification to be switched on first. You type it once, hidden, and it is stored in your own Mac Keychain or Windows credential store under an item named for IMAP. It is never accepted as a command flag and never put in an environment variable.
+
+What it reads, and what it deliberately does not:
+
+- **Inbox and Sent**, because half of what you promised anybody is in Sent.
+- **Junk, Trash, Drafts and an "All Mail" folder are skipped.** On Yahoo the spam folder is called "Bulk Mail", which is handled.
+- **An Archive folder is not read either.** It is identified, and it is named in the run as identified-but-not-read, because only inbox and sent are read by default. If you archive aggressively, most of your mail is in there and this is the limit that will matter most to you. Including it needs a rule that does not exist yet.
+- **A folder whose purpose it cannot identify is reported and left unread**, rather than guessed at. Folder naming is localized and differs per provider, and reading your spam folder because it was named in Spanish is a worse outcome than telling you a folder was skipped.
+- **Nothing is marked as read.** It opens every folder read-only at the protocol level, so it cannot change what your unread count says.
+
+Three limits worth knowing before you rely on it:
+
+1. **Bulk mail filtering is weaker here than on Gmail, and the mechanism is different.** Gmail excludes newsletters with a server-side query against Google's own classifier. IMAP has no such thing, so this reads the mail and then filters on message headers, requiring two independent signals before it drops anything. It will keep some newsletters Gmail would have dropped. Everything it did drop is listed at the end of the run with the reason.
+2. **Deletions are not propagated.** Mail you delete in your mailbox stays in your brain until a full re-read. Gmail's connector has the same gap. Google Drive does not, and the difference is real.
+3. **Very short messages are dropped**, the same floor every document clears. A one-line "approved, go ahead" is usually below it, which matters more for correspondence than for documents.
+
+**The honest production boundary:** this connector has passed the product test suite, driven end to end against a scripted IMAP server. **It has never been run against a real mailbox**, on Yahoo or anywhere else, so provider-specific behavior is documented from the specification rather than observed. The packaged unattended scheduler does not cover it, so refresh is manual, exactly as with Gmail.
 
 Shared mailboxes and group threads contain messages from people who never agreed to be indexed. Your material stays in your own accounts throughout, which handles most of the exposure, but a business indexing a shared inbox should have a written note about it. Cheap to write now, expensive to retrofit after an employee asks.
 
@@ -322,7 +350,7 @@ The load is the named source you chose, so `brain sources` shows it and `brain f
 
 ---
 
-## Not built
+## Additional export path and not-built providers
 
 Named plainly, with what it would actually take, so you can plan around it rather than wait for it.
 
@@ -356,7 +384,20 @@ If your business runs on Microsoft rather than Google, **this product is not rea
 
 ### Facebook Messenger
 
-**Not built,** as a product, in any form — no export parser, no capture path, live or otherwise.
+**Built as a credential-free export path, not as a live connection.** In Meta's
+Download Your Information flow, select Messages and JSON. Drop the exported
+`message_*.json` files into the watched folder or an approved Drive root. Each
+thread becomes bounded conversation documents through the same sessionizer as
+iMessage, SMS, and WhatsApp. Exact epoch-millisecond timestamps are preserved,
+newest-first exports are reordered chronologically, duplicate same-time messages
+remain distinct, and the export-file family is retained for reconciliation and
+deletion.
+
+Attachment-only, unsent/unavailable, malformed, and empty records are counted
+separately rather than becoming fake message text. The parser repairs Meta's
+known legacy UTF-8 mojibake only when the repair is lossless. It has fixture and
+common-ingestion proof, but no current real Facebook export has been accepted.
+There is no scraping, cookie capture, developer app, or live Messenger API.
 
 ---
 
@@ -364,9 +405,12 @@ If your business runs on Microsoft rather than Google, **this product is not rea
 
 Not "not yet". Not planned.
 
-**Document-level permissions.** Everyone who can ask your brain a question can reach anything it has read. There is one level of access, and there is no version of this where your bookkeeper sees the invoices but not the HR folder.
-
-This is a genuine change to how the system is built, not a setting. If your situation needs it, this product is wrong for you, and I would rather say so before you pay me than discover it in week three. I asked about this at intake for exactly this reason.
+**Unreviewed permission models.** The product now has exact-document grants and
+entity-scoped owner retrieval. New documents are owner-only by default, and a
+scoped user sees only explicitly granted documents. That does not authorize an
+ad hoc role hierarchy, folder inheritance, or a connector-specific permission
+model. Any request beyond the reviewed exact-document and entity boundaries
+needs a separate security contract rather than a manifest toggle.
 
 **Developer tools** (issue trackers, support desks, engineering dashboards). Almost nobody in this business segment runs on them, and building for a customer who does not exist is how a product gets slower for the ones who do.
 
