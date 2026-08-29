@@ -55,17 +55,21 @@ function realDb() {
   for (const file of readdirSync(MIGRATIONS).filter((name) => /^\d{4}_.+\.sql$/.test(name)).sort()) {
     for (const statement of splitStatements(readFileSync(join(MIGRATIONS, file), "utf8"))) db.exec(statement);
   }
-  // Backend migration 0019 owns this column and its evidence-backed backfill.
-  // Until that integration commit lands, this fixture supplies the same final
-  // schema without pretending legacy client labels are entity slugs.
-  const documentColumns = new Set(db.prepare("PRAGMA table_info(documents)").all().map((row) => row.name));
-  if (!documentColumns.has("entity_slug")) db.exec("ALTER TABLE documents ADD COLUMN entity_slug TEXT");
   db.prepare(
     `INSERT INTO install_state
      (id, client_slug, product_version, schema_version, gate_version, installed_at, ring, session_generation)
      VALUES (1, 'fixture', '0.0.0', 20, 0, '2026-08-29T00:00:00Z', 'test', 1)`,
   ).run();
   return db;
+}
+
+function applyMigrationRange(db, minimum, maximum) {
+  const files = readdirSync(MIGRATIONS).filter((name) => /^\d{4}_.+\.sql$/.test(name)).sort();
+  for (const file of files) {
+    const version = Number(file.slice(0, 4));
+    if (version < minimum || version > maximum) continue;
+    for (const statement of splitStatements(readFileSync(join(MIGRATIONS, file), "utf8"))) db.exec(statement);
+  }
 }
 
 function insertDocument(db, id, entitySlug, text, index = 0) {
@@ -104,6 +108,38 @@ const post = (path, payload, cookie) => new Request(ORIGIN + path, {
     ...(cookie ? { Cookie: cookie, "X-Brain-App": "1" } : {}),
   },
   body: JSON.stringify(payload || {}),
+});
+
+test("0019 backfills only unambiguous existing corpus authority before 0020", () => {
+  const db = new DatabaseSync(":memory:");
+  applyMigrationRange(db, 1, 18);
+  const addDocument = db.prepare(
+    `INSERT INTO documents
+       (doc_uid,source,source_id,title,client,ingested_at,content_hash,meta)
+     VALUES (?,'drive',?,?,?,1,?,'{}')`,
+  );
+  addDocument.run("drive:mapped", "mapped", "Mapped", "legacy-label", "a".repeat(64));
+  addDocument.run("drive:unmapped", "unmapped", "Unmapped", ENTITY, "b".repeat(64));
+  addDocument.run("drive:ambiguous", "ambiguous", "Ambiguous", ENTITY, "c".repeat(64));
+
+  const addFinancialDocument = db.prepare(
+    `INSERT INTO fin_documents
+       (tenant_id,fin_doc_uid,entity_slug,doc_kind,title,custody_class,availability,
+        filed_at,corpus_doc_uid,provenance,basis_state,recorded_at)
+     VALUES ('primary',?,?,'other',?,'reference','have_it','2026-08-29',?,
+             'owner_stated','confirmed','2026-08-29T00:00:00Z')`,
+  );
+  addFinancialDocument.run("fin-mapped", ENTITY, "Mapped", "drive:mapped");
+  addFinancialDocument.run("fin-ambiguous-a", ENTITY, "Ambiguous A", "drive:ambiguous");
+  addFinancialDocument.run("fin-ambiguous-b", "other-entity", "Ambiguous B", "drive:ambiguous");
+
+  applyMigrationRange(db, 19, 20);
+  const authority = Object.fromEntries(db.prepare(
+    "SELECT doc_uid,entity_slug FROM documents ORDER BY doc_uid",
+  ).all().map((row) => [row.doc_uid, row.entity_slug]));
+  assert.equal(authority["drive:mapped"], ENTITY);
+  assert.equal(authority["drive:unmapped"], null, "legacy client labels never become authority");
+  assert.equal(authority["drive:ambiguous"], null, "ambiguous financial mappings remain owner-only");
 });
 
 test("100 exact documents plus every public filter stay authoritative and skip unscoped Vectorize", async () => {

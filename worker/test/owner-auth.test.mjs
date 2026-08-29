@@ -62,7 +62,9 @@ function authDb() {
           else if (/UPDATE install_state SET session_generation/.test(sql)) tables.state.session_generation += 1;
           else if (/INSERT OR IGNORE INTO owner_activity_events/.test(sql)) {
             if (!tables.activity.some((event) => event.event_id === bound[0])) {
-              tables.activity.push({ event_id: bound[0], event_type: bound[3], display_label: bound[7] });
+              tables.activity.push({
+                event_id: bound[0], event_type: bound[3], subject_id: bound[6], display_label: bound[7],
+              });
             }
           }
           return {};
@@ -172,6 +174,18 @@ test("invite -> enroll -> sign in -> settings, end to end", async () => {
   }, { Cookie: cookie, "X-Brain-App": "1" }), testEnv)).json();
   assert.equal(lastRevoke.removed, false, "removing the last passkey would be a silent lockout");
 
+  // With a second passkey present, revocation succeeds and its owner-facing
+  // activity uses only a digest-backed subject id, never the credential id.
+  db.tables.passkeys.set("backup-passkey", {
+    credential_id: "backup-passkey", public_key_jwk: "{}", alg: -7,
+    sign_count: 0, nickname: "Backup device", created_at: Date.now(),
+    last_used_at: null, document_grant_id: null,
+  });
+  const removed = await (await worker.fetch(post("/api/app/devices/revoke", {
+    credential_id: credential.credentialId,
+  }, { Cookie: cookie, "X-Brain-App": "1" }), testEnv)).json();
+  assert.equal(removed.removed, true);
+
   // Sign out everywhere invalidates every cookie ever minted.
   const signoutAll = await worker.fetch(post("/api/app/signout-all", {}, { Cookie: cookie, "X-Brain-App": "1" }), testEnv);
   assert.equal(signoutAll.status, 200);
@@ -179,9 +193,10 @@ test("invite -> enroll -> sign in -> settings, end to end", async () => {
   assert.equal(afterBump.status, 401, "generation bump kills old sessions");
   assert.deepEqual(
     db.tables.activity.map((event) => event.event_type),
-    ["passkey_added", "passkey_renamed", "sessions_revoked"],
+    ["passkey_added", "passkey_renamed", "passkey_revoked", "sessions_revoked"],
     "human-visible security changes are recorded once without low-level ceremony telemetry",
   );
+  assert.equal(JSON.stringify(db.tables.activity).includes(credential.credentialId), false);
 });
 
 test("an expired or foreign enrollment code never enrolls", async () => {
