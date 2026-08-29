@@ -226,4 +226,6 @@ check("runAll includes the credential store round trip", () => {
 });
 
 console.log(failures ? `\n${failures} failure(s)` : "\nall credential store probe tests passed");
-process.exit(failures ? 1 : 0);
+// Let platform credential-store child-process handles finish closing. Forcing an
+// immediate exit can race libuv's Windows async-handle teardown.
+process.exitCode = failures ? 1 : 0;
