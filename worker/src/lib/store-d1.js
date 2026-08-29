@@ -260,6 +260,55 @@ export function filterSql(filters = {}, alias = "c", nextParam = 3) {
   return { clause: parts.length ? " AND " + parts.join(" AND ") : "", params, nextParam };
 }
 
+/**
+ * The zone predicate for a principal, or an empty clause for the owner.
+ *
+ * This is a SECURITY control, not a filter, and the difference matters in two
+ * places. It is never built from anything in the request body, so a caller
+ * cannot widen it. And it is applied in the SAME query that reads chunk text,
+ * so an out-of-scope row cannot reach a snippet: `snippet` IS `c.text` from
+ * this select.
+ *
+ * Unzoned rows are excluded from every scoped principal, by plain SQL
+ * semantics rather than by a rule anyone has to remember: `zone IN (...)` is
+ * false for NULL. A brain whose documents predate zones therefore shows a
+ * scoped reader nothing until somebody assigns zones, which is the fail-closed
+ * direction and is stated in the install procedure rather than hidden.
+ */
+export function scopeSql(scope, alias = "c", nextParam = 1) {
+  if (!scope || scope.all === true) return { clause: "", params: [], nextParam };
+  const include = Array.isArray(scope.zones) ? scope.zones.filter(Boolean) : [];
+  const exclude = Array.isArray(scope.exclude) ? scope.exclude.filter(Boolean) : [];
+
+  // A scope naming no zones can read nothing. Returning an empty clause here
+  // would read as "unrestricted", which is the single most dangerous mistake
+  // this function could make, so it emits an always-false predicate instead.
+  if (!include.length) return { clause: " AND 1 = 0", params: [], nextParam };
+
+  // Resolved through the SOURCE, not through a zone copied onto the row.
+  //
+  // The first version compared a denormalised `zone` column on chunks. That
+  // column is written by nobody: re-ingesting a document DELETEs its chunks and
+  // re-INSERTs them without it, so a zone assigned yesterday silently vanished
+  // on the next load and the scoped reader quietly lost the document. A trigger
+  // to maintain it corrupts the FTS index, because updating `chunks` from a
+  // trigger on `chunks` re-fires the FTS5 sync.
+  //
+  // A source's zone is the authority instead. There is nothing to copy, so
+  // nothing to strip, and re-assigning a zone takes effect everywhere at once
+  // rather than needing a backfill.
+  const params = [];
+  const inList = include.map(() => "?" + nextParam++).join(",");
+  params.push(...include);
+  let clause = ` AND ${alias}.source IN (SELECT name FROM sources WHERE zone IN (${inList}))`;
+  if (exclude.length) {
+    const outList = exclude.map(() => "?" + nextParam++).join(",");
+    params.push(...exclude);
+    clause += ` AND ${alias}.source NOT IN (SELECT name FROM sources WHERE zone IN (${outList}))`;
+  }
+  return { clause, params, nextParam };
+}
+
 /** Which requested filters this backend cannot honour. */
 export function unsupportedFilters(filters = {}) {
   return D1_UNSUPPORTED.filter((k) => filters[k]);
@@ -330,7 +379,7 @@ const FTS_STOPWORDS = new Set([
   "say", "says", "should", "some", "tell", "than", "very",
 ]);
 
-export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
+export async function searchKeyword(env, query, { limit, filters = {}, scope = null } = {}) {
   // FTS5 treats bare punctuation as syntax. A user question with an apostrophe
   // or a hyphen is not a query language expression, so it is quoted as a
   // phrase-free bag of terms rather than passed through raw.
@@ -362,6 +411,10 @@ export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
   if (!terms) return [];
 
   const f = filterSql(filters, "c", 3);
+  // The zone predicate continues the same numbering and binds after the
+  // filters, so a scoped reader's keyword hits are cut in the same query that
+  // reads the text rather than afterwards.
+  const sc = scopeSql(scope, "c", f.nextParam);
   const sql = `
     SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
            c.client, c.category, c.top_folder, c.platform,
@@ -370,16 +423,16 @@ export async function searchKeyword(env, query, { limit, filters = {} } = {}) {
     FROM chunks_fts
     JOIN chunks c ON c.id = chunks_fts.rowid
     JOIN documents d ON d.doc_uid = c.doc_uid
-    WHERE chunks_fts MATCH ?1${f.clause}
+    WHERE chunks_fts MATCH ?1${f.clause}${sc.clause}
     ORDER BY bm25(chunks_fts)
     LIMIT ?2`;
 
-  const { results } = await env.DB.prepare(sql).bind(terms, limit, ...f.params).all();
+  const { results } = await env.DB.prepare(sql).bind(terms, limit, ...f.params, ...sc.params).all();
   return results || [];
 }
 
 /** Vector search over Vectorize, hydrated and filtered in D1. */
-export async function searchVector(env, embedding, { limit, filters = {} } = {}) {
+export async function searchVector(env, embedding, { limit, filters = {}, scope = null } = {}) {
   const topK = Math.min(limit, VECTOR_TOPK_MAX);
   const vectorFilter = await vectorFilterFor(filters);
   const hasFilter = Object.keys(vectorFilter).length > 0;
@@ -428,21 +481,27 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
   // contains 100 ids, so adding even one exact-authority filter used to make
   // hydration fail and search silently degrade to keyword-only. Partition ids
   // after reserving bind slots for every filter, then restore Vectorize order.
-  const filterParameterCount = filterSql(filters, "c", 1).params.length;
+  const filterParameterCount = filterSql(filters, "c", 1).params.length
+    + scopeSql(scope, "c", 1).params.length;
   const hydrationBatchSize = Math.max(1, D1_QUERY_BIND_LIMIT - filterParameterCount);
   const results = [];
   for (let start = 0; start < resolved.length; start += hydrationBatchSize) {
     const batch = resolved.slice(start, start + hydrationBatchSize);
     const placeholders = batch.map((_, i) => "?" + (i + 1)).join(",");
     const f = filterSql(filters, "c", batch.length + 1);
+    // This is the one query where a chunk's text leaves the database, so it is
+    // the one place the zone predicate has to hold. Vectorize can return an
+    // out-of-scope id all it likes; it costs a candidate slot and yields no
+    // text, because `snippet` is `c.text` from exactly this select.
+    const sc = scopeSql(scope, "c", f.nextParam);
     const { results: hydrated } = await env.DB.prepare(
       `SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
               c.client, c.category, c.top_folder, c.platform,
               d.source_id, d.uri, d.content_hash, d.date_source, d.date_reliable
        FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid
-       WHERE c.chunk_uid IN (${placeholders})${f.clause}`
+       WHERE c.chunk_uid IN (${placeholders})${f.clause}${sc.clause}`
     )
-      .bind(...batch, ...f.params)
+      .bind(...batch, ...f.params, ...sc.params)
       .all();
     results.push(...(hydrated || []));
   }
@@ -459,14 +518,14 @@ export async function searchVector(env, embedding, { limit, filters = {} } = {})
  * Pulls a wider candidate pool than the caller asked for, because fusion can
  * only promote a document that appears in one of the lists.
  */
-export async function search(env, { query, embedding, limit = 10, filters = {}, weights = {}, rrfK = RRF_K }) {
+export async function search(env, { query, embedding, limit = 10, filters = {}, weights = {}, rrfK = RRF_K, scope = null }) {
   const pool = RETRIEVAL_CANDIDATE_DEPTH;
   const fusionK = Math.min(Math.max(Number(rrfK) || RRF_K, 1), 1e3);
 
   const [kw, vec, projection] = await Promise.all([
-    searchKeyword(env, query, { limit: pool, filters }).catch(() => []),
+    searchKeyword(env, query, { limit: pool, filters, scope }).catch(() => []),
     embedding
-      ? searchVector(env, embedding, { limit: pool, filters }).catch(() => [])
+      ? searchVector(env, embedding, { limit: pool, filters, scope }).catch(() => [])
       : Promise.resolve([]),
     // Vectorize may return some old/current candidates while a newer accepted
     // changeset is still processing. Non-empty semantic results therefore do
@@ -481,10 +540,18 @@ export async function search(env, { query, embedding, limit = 10, filters = {}, 
   // Both empty is a real answer (nothing matched). Only ONE empty when both
   // were attempted means a subsystem is down, and a caller that cannot tell
   // those apart will report a degraded brain as an empty one.
+  // `degraded` says a subsystem is down. For a SCOPED reader an empty vector
+  // list usually means their own scope removed the candidates, and reporting
+  // that as degradation turns the flag into a corpus probe: ask about a
+  // restricted subject, watch the flag flip, and learn that the household holds
+  // a dense cluster of those documents without ever seeing a byte of text.
+  // A genuine outage is still reported, because projection readiness is
+  // independent of who is asking.
+  const scoped = !!(scope && scope.all !== true);
   const degraded =
     embedding && projection?.ready !== true
       ? "vector"
-      : embedding && vec.length === 0 && kw.length > 0
+      : embedding && vec.length === 0 && kw.length > 0 && !scoped
       ? "vector"
       : !embedding
         ? "no-embedding"

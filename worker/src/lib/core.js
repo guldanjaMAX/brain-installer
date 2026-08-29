@@ -17,7 +17,7 @@ export function jsonResponse(data, status = 200) {
 // Constant-time compare. Workers do not expose crypto.timingSafeEqual, so this
 // is the standard XOR-over-bytes fallback. Length mismatch returns immediately
 // because the length itself is not secret.
-function constantTimeEquals(a, b) {
+export function constantTimeEquals(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
   if (a.length !== b.length) return false;
   let diff = 0;

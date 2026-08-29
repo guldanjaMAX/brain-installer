@@ -120,6 +120,16 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "owner_passkeys",
   "auth_challenges",
   "enrollment_codes",
+  // Schema 15: who may do what. Durable for the same reason passkeys are —
+  // losing these on a recovery silently revokes every person the owner had
+  // named, and the brain would come back looking healthy while the
+  // bookkeeper's credential no longer worked.
+  "grants",
+  "grant_credentials",
+  // Schema 16: the zone vocabulary. Durable because a recovered brain that
+  // forgot its zones would silently widen every scoped grant to nothing (the
+  // predicate excludes unknown zones), locking people out rather than leaking.
+  "zones",
 ]);
 
 /**
@@ -206,10 +216,11 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   // Owners re-sign-in with their passkey; that is a tap, not a loss.
   "session_generation",
 ]);
-// Schema 14 added the additive owner-passkey tables and the
-// session_generation column; the vector protocol itself is unchanged, but
-// the recovery contract tracks the EXACT current schema by design.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 14;
+// Schema 15 added the additive grant tables and a grant_id column on the
+// passkey and enrollment tables. As with 14 the vector protocol itself is
+// unchanged, but the recovery contract tracks the EXACT current schema by
+// design, so the version moves with every migration.
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 16;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -224,7 +235,8 @@ const AGGREGATE_FIELDS = Object.freeze([
     // Literal zeros keep older migration prefixes queryable without
     // referencing tables they do not have. Passkey restoration correctness is
     // proven by the export content itself, not by the corpus aggregate.
-    ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes"].includes(table)
+    ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
+      "grants", "grant_credentials", "zones"].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -975,12 +987,21 @@ function assertSameRecoveryCorpus(left, right, code = "RECOVERY_D1_SNAPSHOT_MISM
 }
 
 const SCHEMA_14_TABLES = Object.freeze(["owner_passkeys", "auth_challenges", "enrollment_codes"]);
+// A brain still on an older schema does not have these, and must not be asked
+// for them: the inventory check is an exact set comparison, so an ungated new
+// table makes every pre-15 install fail recovery rather than the reverse.
+const SCHEMA_15_TABLES = Object.freeze(["grants", "grant_credentials"]);
+// 16 adds only the zones lookup; the zone itself lives as columns on tables
+// that already existed, so nothing else moves.
+const SCHEMA_16_TABLES = Object.freeze(["zones"]);
 
 function expectedRecoveryTables(migrations) {
   const latest = migrations?.at(-1)?.version || RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION;
   return RECOVERY_DURABLE_TABLES.filter((table) =>
     (latest >= 13 || table !== "vector_bootstrap_batches") &&
-    (latest >= 14 || !SCHEMA_14_TABLES.includes(table)));
+    (latest >= 14 || !SCHEMA_14_TABLES.includes(table)) &&
+    (latest >= 15 || !SCHEMA_15_TABLES.includes(table)) &&
+    (latest >= 16 || !SCHEMA_16_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {

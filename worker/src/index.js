@@ -19,6 +19,8 @@
  */
 
 import { jsonResponse, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
+import { resolvePrincipal, principalMay } from "./lib/grants.js";
+import { findGrantByCredentialHash, sourcesInScope } from "./lib/auth-store.js";
 import {
   hasSensitiveTransportIdentity,
   scanEnvelope as scanEnvelopeSecrets,
@@ -30,7 +32,7 @@ import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
 import {
-  handleOwnerAuth, handleAdminInvite, handleAdminDevices, validateOwnerSession,
+  handleOwnerAuth, handleAdminInvite, handleAdminDevices, handleAdminGrants, handleZones, validateOwnerSession, ownerSessionPrincipal,
 } from "./lib/owner-auth.js";
 
 /* ------------------------------------------------------------ retrieval */
@@ -107,7 +109,7 @@ function normalizeRetrievedDocuments(results) {
   return demoteScaffolding([...byKey.values()]);
 }
 
-async function unifiedRetrieve(env, url, { limit }) {
+async function unifiedRetrieve(env, url, { limit, scope = { all: true } }) {
   const q = url.searchParams.get("q");
   const rrfK = Math.min(Math.max(parseInt(url.searchParams.get("rrf_k")) || 60, 1), 1e3);
 
@@ -122,6 +124,9 @@ async function unifiedRetrieve(env, url, { limit }) {
     limit: ROUTE_RANKING_DEPTH,
     rrfK,
     filters: filtersFrom(url),
+    // A separate argument, never merged into filters, so nothing a caller puts
+    // in the request body can widen it.
+    scope,
     weights: {
       curated: requestWeight(url.searchParams.get("weight_curated")),
       drive: requestWeight(url.searchParams.get("weight_drive")),
@@ -385,7 +390,7 @@ function hasMatchingAsOfDate(sentence, docs) {
 
 /* -------------------------------------------------------------- routes */
 
-async function handleUnified(env, request) {
+async function handleUnified(env, request, scope = { all: true }) {
   const url = await privateRagParameters(request);
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
   const q = url.searchParams.get("q");
@@ -396,7 +401,7 @@ async function handleUnified(env, request) {
   // not make /unified diverge from the deterministic order consumed by /think.
   const doRerank = explicitlyEnabled(url.searchParams.get("rerank")) && !!env.ANTHROPIC_API_KEY;
 
-  const { matches: retrieved, degraded, ignoredFilters } = await unifiedRetrieve(env, url, { limit });
+  const { matches: retrieved, degraded, ignoredFilters } = await unifiedRetrieve(env, url, { limit, scope });
   const ignored = ignoredFilters.length ? { ignored_filters: ignoredFilters } : {};
   if (degraded === "fts") {
     return jsonResponse({ mode: "unified", degraded, ...ignored, results: retrieved.slice(0, limit) });
@@ -415,7 +420,7 @@ async function handleUnified(env, request) {
   });
 }
 
-async function handleThink(env, request) {
+async function handleThink(env, request, scope = { all: true }) {
   const unsupportedAnswer = "The documents do not answer the question.";
   const url = await privateRagParameters(request);
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
@@ -423,7 +428,7 @@ async function handleThink(env, request) {
   if (!q) return jsonResponse({ error: "Missing q" }, 400);
   const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit")) || 8, 1), 20);
 
-  const { matches, degraded, ignoredFilters } = await unifiedRetrieve(env, url, { limit });
+  const { matches, degraded, ignoredFilters } = await unifiedRetrieve(env, url, { limit, scope });
   const results = Array.isArray(matches) ? matches : [];
 
   if (results.length === 0) {
@@ -751,7 +756,7 @@ async function handleThink(env, request) {
   });
 }
 
-async function handleIngest(env, request) {
+async function handleIngest(env, request, scope = { all: true }) {
   // Checked BEFORE the body is read. The batch route documents exactly this
   // hazard and guards against it; this route, which is the one a client reaches
   // for when testing by hand, had no guard at all. A 40MB document becomes
@@ -805,6 +810,25 @@ async function handleIngest(env, request) {
   const { source_type, source_id, content } = envelope || {};
   if (!source_type || !source_id || typeof content !== "string") {
     return jsonResponse({ error: "source_type, source_id and content (string) are required" }, 400);
+  }
+
+  // Which source a document lands in decides which zone it lands in, and
+  // source_type is chosen entirely by the caller. Unchecked, a filer scoped to
+  // `books` could name a source in the medical zone and overwrite documents
+  // there, or plant new ones the owner would later read and cite.
+  //
+  // A scoped filer may write only into a source it can already reach. Naming a
+  // source that does not exist yet is refused too: a new source has no zone,
+  // so its documents would be born invisible to every scoped reader and would
+  // be swept into whichever zone the owner assigned to that name later.
+  if (scope && scope.all !== true) {
+    const allowed = await sourcesInScope(env, scope);
+    if (!allowed.includes(String(source_type))) {
+      return jsonResponse({
+        error: `"${source_type}" is not a source in a zone you have access to. ` +
+          "Ask the owner to create it and put it in your zone first.",
+      }, 403);
+    }
   }
 
   // THE GATE. Nothing carrying a live provider credential enters the index,
@@ -1442,7 +1466,43 @@ export default {
     const readRoute = path === "/api/rag/unified" || path === "/api/rag/think";
     const keyAuthorized = readRoute ? validateReadKey(request, env) : validateAdminKey(request, env);
     // A passkey session is accepted exactly where the read-only proxy key is.
-    if (!keyAuthorized && !(readRoute && await validateOwnerSession(request, env))) {
+    // It resolves to a PRINCIPAL, not a boolean: the cookie has named its
+    // subject since schema 15, and reading it as "is somebody signed in" served
+    // a scoped person as the unscoped owner.
+    let authorized = keyAuthorized;
+    let sessionPrincipal = null;
+    if (!authorized && readRoute) {
+      sessionPrincipal = await ownerSessionPrincipal(request, env);
+      if (sessionPrincipal && principalMay(sessionPrincipal, path)) authorized = true;
+    }
+
+    // A named person, holding a grant credential rather than one of the two
+    // env keys. Consulted only when the shipped checks already said no, so the
+    // owner and proxy paths keep their exact behaviour and never touch the
+    // database to authenticate.
+    //
+    // The capability check lives here, in front of dispatch, for the same
+    // reason the key check does: a route nobody classified requires
+    // `administer`, so a path added later is owner-only until somebody decides
+    // otherwise, and an unknown path still answers 401 rather than 404, which
+    // keeps the route list unenumerable.
+    // Unscoped by default: the owner key and the proxy key both read
+    // everything, exactly as they did before zones existed.
+    let scope = sessionPrincipal ? (sessionPrincipal.scope || { zones: [] }) : { all: true };
+    if (!authorized) {
+      const principal = await resolvePrincipal(request, env, {
+        lookupCredential: (hash) => findGrantByCredentialHash(env, hash),
+      });
+      if (principal && principalMay(principal, path)) {
+        authorized = true;
+        scope = principal.scope || { zones: [] };
+      }
+    }
+
+    if (!authorized) {
+      // Deliberately the same body and status for "who are you" and "not
+      // allowed". A distinguishable 403 would let a scoped caller map the
+      // route table, and twelve assertions pin this exact response.
       return jsonResponse({ error: "unauthorized" }, 401);
     }
 
@@ -1459,10 +1519,10 @@ export default {
         }, 405));
       }
       if (path === "/api/rag/unified" && request.method === "POST") {
-        return privateNoStore(await handleUnified(env, request));
+        return privateNoStore(await handleUnified(env, request, scope));
       }
       if (path === "/api/rag/think" && request.method === "POST") {
-        return privateNoStore(await handleThink(env, request));
+        return privateNoStore(await handleThink(env, request, scope));
       }
       if (path === "/api/admin/auth/invite" && request.method === "POST") {
         return handleAdminInvite(env, url);
@@ -1470,8 +1530,14 @@ export default {
       if (path.startsWith("/api/admin/auth/devices")) {
         return handleAdminDevices(env, request, path);
       }
+      if (path.startsWith("/api/admin/auth/grants")) {
+        return handleAdminGrants(env, request, path);
+      }
+      if (path === "/api/admin/brain/zones") {
+        return handleZones(env, request);
+      }
       if (path === "/api/admin/brain/ingest" && request.method === "POST") {
-        return await handleIngest(env, request);
+        return await handleIngest(env, request, scope);
       }
       if (path === "/api/admin/brain/ingest/batch" && request.method === "POST") {
         return await handleIngestBatch(env, request);
@@ -1528,6 +1594,27 @@ export default {
         const source = body?.source ? String(body.source) : null;
         if (!docUids.length && !families.length && !source) {
           return jsonResponse({ error: "pass doc_uids: [...], families: [...], or source: \"name\"" }, 400);
+        }
+        // A scoped principal may only forget inside its own zones, and this is
+        // checked before anything is read, not just before anything is deleted.
+        //
+        // The dry run is the dangerous half. It is the DEFAULT (no confirm), it
+        // returns the complete list of doc_uids in the named source, and
+        // doc_uid is `${source_type}:${source_id}` — real Drive file ids, real
+        // message ids, real paths. So the safe-looking half of a destructive
+        // command was a free directory listing of any zone, indistinguishable
+        // from an in-scope call and leaving no trace.
+        if (scope && scope.all !== true) {
+          const allowed = await sourcesInScope(env, scope);
+          const targets = source ? [source] : [];
+          const outside = targets.filter((name) => !allowed.includes(name));
+          if (!source || outside.length) {
+            return jsonResponse({
+              error: docUids.length || families.length
+                ? "forgetting by doc_uid or family needs access to every zone. Ask the owner."
+                : `\"${source}\" is not in a zone you have access to.`,
+            }, 403);
+          }
         }
         // Destructive and irreversible, so it must be asked for explicitly.
         const confirm = body?.confirm === true;

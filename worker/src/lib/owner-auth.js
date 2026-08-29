@@ -16,7 +16,7 @@
 import { jsonResponse } from "./core.js";
 import { verifyRegistration, verifyAssertion, b64uDecode } from "./webauthn.js";
 import {
-  mintSessionCookie, validateSessionCookie, clearSessionCookie,
+  mintSessionCookie, validateSessionCookie, readSessionCookie, clearSessionCookie,
 } from "./sessions.js";
 import {
   issueChallenge, consumeChallenge,
@@ -24,7 +24,12 @@ import {
   storePasskey, findPasskey, recordPasskeyUse,
   listPasskeys, renamePasskey, revokePasskey,
   sessionGeneration, bumpSessionGeneration,
+  randomToken, createGrant, addGrantCredential, listGrants, revokeGrant,
+  assignZone, listZones, findGrantById,
 } from "./auth-store.js";
+import {
+  CAPABILITIES, OWNER_CAPABILITIES, parseCapabilities, parseScope, grantIsLive, hashToken,
+} from "./grants.js";
 import { appPageHtml } from "./app-page.js";
 
 const APP_HEADER = "X-Brain-App";
@@ -56,6 +61,39 @@ export async function validateOwnerSession(request, env) {
   return validateSessionCookie(request, env, await sessionGeneration(env));
 }
 
+/**
+ * The principal behind a passkey session, not merely "is there one".
+ *
+ * The cookie has carried its subject since schema 15, and the gate was reading
+ * it through a boolean, so a person signed in with a SCOPED passkey was served
+ * as the unscoped owner. Reads were correctly scoped for the same person using
+ * a token and unscoped for them using their face, which is the worst possible
+ * combination: the guarantee looked true wherever it was tested.
+ *
+ * Returns null when there is no valid session. A session naming no grant is
+ * the owner, and that is safe here for a reason that will stop being true if
+ * anyone changes it: v1 cookies predate anybody but the owner being able to
+ * sign in at all.
+ */
+export async function ownerSessionPrincipal(request, env) {
+  if (!appRequest(request)) return null;
+  const session = await readSessionCookie(request, env, await sessionGeneration(env));
+  if (!session) return null;
+  if (session.grantId === null) {
+    return { kind: "owner", grantId: null, capabilities: new Set(OWNER_CAPABILITIES), scope: { all: true } };
+  }
+  const row = await findGrantById(env, session.grantId);
+  if (!grantIsLive(row)) return null;
+  const capabilities = parseCapabilities(row.capabilities);
+  if (!capabilities) return null;
+  return {
+    kind: "grant",
+    grantId: row.grant_id,
+    capabilities: new Set(capabilities),
+    scope: parseScope(row),
+  };
+}
+
 /* ------------------------------------------------------------ admin plane */
 
 /** POST /api/admin/auth/invite — mint a one-time enrollment link. Admin key. */
@@ -67,6 +105,115 @@ export async function handleAdminInvite(env, url) {
     rp_id: url.hostname,
     note: "single use. Passkeys bind to this exact domain; changing the brain's domain later requires re-enrollment.",
   });
+}
+
+/**
+ * GET /api/admin/auth/grants, POST to create, POST .../revoke to end one.
+ *
+ * The token is generated here, returned exactly once in the create response,
+ * and never stored: only its SHA-256 hash goes to the database. There is no
+ * endpoint that can show it again, which is the point. If it is lost the
+ * owner mints another and revokes the first.
+ */
+export async function handleAdminGrants(env, request, path) {
+  if (path.endsWith("/revoke") && request.method === "POST") {
+    const payload = await body(request);
+    if (!payload?.grant_id) return jsonResponse({ error: "grant_id required" }, 400);
+    const revoked = await revokeGrant(env, String(payload.grant_id));
+    return jsonResponse({ revoked, grant_id: String(payload.grant_id) });
+  }
+
+  if (request.method === "POST") {
+    const payload = await body(request);
+    const displayName = String(payload?.display_name || "").trim();
+    if (!displayName) return jsonResponse({ error: "display_name required" }, 400);
+
+    const capabilities = parseCapabilities(payload?.capabilities);
+    if (!capabilities) {
+      return jsonResponse({
+        error: `capabilities must be a non-empty subset of: ${CAPABILITIES.join(", ")}`,
+      }, 400);
+    }
+    // Granting `administer` hands over the ability to create more grants, which
+    // is the owner's own authority. Refuse it here rather than letting an
+    // owner give it away without meaning to.
+    if (capabilities.includes("administer")) {
+      return jsonResponse({
+        error: "administer cannot be granted: it would let this person create and revoke other people's access",
+      }, 400);
+    }
+
+    const expiresAt = payload?.expires_at === undefined || payload?.expires_at === null
+      ? null
+      : Number(payload.expires_at);
+    if (expiresAt !== null && (!Number.isFinite(expiresAt) || expiresAt <= Date.now())) {
+      return jsonResponse({ error: "expires_at must be a future unix ms timestamp, or null" }, 400);
+    }
+
+    // Scope. Omitting it means every zone, which is what a grant created
+    // before zones existed already had, so the default cannot narrow anyone by
+    // surprise. Naming zones narrows to exactly those.
+    const zones = Array.isArray(payload?.zones)
+      ? payload.zones.map((z) => String(z).trim()).filter(Boolean)
+      : null;
+    const exclude = Array.isArray(payload?.exclude_zones)
+      ? payload.exclude_zones.map((z) => String(z).trim()).filter(Boolean)
+      : [];
+    if (zones && zones.length === 0) {
+      return jsonResponse({ error: "zones was given but empty; omit it to mean every zone" }, 400);
+    }
+    const scopeInclude = zones ? JSON.stringify({ zones }) : '{"all":true}';
+    const scopeExclude = JSON.stringify(exclude);
+
+    const grantId = `g_${randomToken(8)}`.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+    const token = randomToken(32);
+    await createGrant(env, {
+      grantId,
+      displayName: displayName.slice(0, 120),
+      relationship: payload?.relationship ? String(payload.relationship).slice(0, 120) : null,
+      capabilities,
+      expiresAt,
+      createdBy: "owner",
+      scopeInclude,
+      scopeExclude,
+    });
+    await addGrantCredential(env, { tokenHash: await hashToken(token), grantId });
+
+    return jsonResponse({
+      grant_id: grantId,
+      display_name: displayName,
+      capabilities,
+      expires_at: expiresAt,
+      zones: zones || "all",
+      token,
+      note: "This token is shown once and is not recoverable. Give it to them over a channel you trust.",
+    });
+  }
+
+  return jsonResponse({ grants: await listGrants(env) });
+}
+
+/**
+ * GET /api/admin/brain/zones lists them; POST puts a source into one.
+ *
+ * Owner-only, by the default-deny rule rather than by anything written here:
+ * deciding what counts as sensitive is the owner's judgement and nobody
+ * else's.
+ */
+export async function handleZones(env, request) {
+  if (request.method === "POST") {
+    const payload = await body(request);
+    const source = String(payload?.source || "").trim();
+    const zone = String(payload?.zone || "").trim();
+    if (!source || !zone) return jsonResponse({ error: "source and zone are both required" }, 400);
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(zone)) {
+      return jsonResponse({
+        error: "a zone name is lowercase letters, digits, dash and underscore, up to 64 characters",
+      }, 400);
+    }
+    return jsonResponse(await assignZone(env, { source, zone }));
+  }
+  return jsonResponse({ zones: await listZones(env) });
 }
 
 /** GET /api/admin/auth/devices + POST .../revoke — the CLI's device view. */
@@ -104,7 +251,7 @@ export async function handleOwnerAuth(env, request, url, path) {
     const payload = await body(request);
     // Enrollment is authorized by an invite code, or by an existing session
     // (adding one more device from a signed-in one).
-    const viaSession = await validateOwnerSession(request, env);
+    const viaSession = Boolean(await readSessionCookie(request, env, await sessionGeneration(env)));
     if (!viaSession) {
       const code = String(payload?.code || "");
       if (!code || !(await peekEnrollmentCode(env, code))) {
@@ -122,13 +269,32 @@ export async function handleOwnerAuth(env, request, url, path) {
   if (path === "/auth/register/verify") {
     const payload = await body(request);
     if (!payload) return jsonResponse({ error: "invalid body" }, 400);
-    const viaSession = await validateOwnerSession(request, env);
+    // Who is authorizing this device, and therefore whose device it becomes.
+    //
+    // Enrollment is allowed either by an invite code or by an already
+    // signed-in session ("add one more device from this one"). Both paths have
+    // to answer the same question, because a device that ends up belonging to
+    // nobody is read as the owner's, and then anyone holding a scoped passkey
+    // could enroll a second device with no code and walk out with the whole
+    // corpus in three requests.
+    const session = await readSessionCookie(request, env, await sessionGeneration(env));
     const challenge = challengeFromClientData(payload.clientDataJSON);
     if (!challenge || !(await consumeChallenge(env, challenge, "register"))) {
       return jsonResponse({ error: "unknown or expired challenge" }, 403);
     }
-    if (!viaSession && !(await consumeEnrollmentCode(env, String(payload.code || "")))) {
-      return jsonResponse({ error: "the enrollment link is invalid, expired, or already used" }, 403);
+    let grantId;
+    if (session) {
+      // A device added from a signed-in device inherits that session exactly.
+      // It can never widen: an owner session yields an owner device, a scoped
+      // session yields another device with the same grant.
+      grantId = session.grantId;
+    } else {
+      const code = String(payload.code || "");
+      const invite = await consumeEnrollmentCode(env, code);
+      if (!invite) {
+        return jsonResponse({ error: "the enrollment link is invalid, expired, or already used" }, 403);
+      }
+      grantId = invite.grant_id ?? null;
     }
     let verified;
     try {
@@ -142,8 +308,8 @@ export async function handleOwnerAuth(env, request, url, path) {
     } catch (error) {
       return jsonResponse({ error: String(error?.message || error) }, 400);
     }
-    await storePasskey(env, { ...verified, nickname: String(payload.nickname || "").slice(0, 60) });
-    const cookie = await mintSessionCookie(env, await sessionGeneration(env));
+    await storePasskey(env, { ...verified, nickname: String(payload.nickname || "").slice(0, 60), grantId });
+    const cookie = await mintSessionCookie(env, await sessionGeneration(env), { grantId });
     return withCookie(jsonResponse({ enrolled: true, credential_id: verified.credentialId }), cookie);
   }
 
@@ -182,7 +348,9 @@ export async function handleOwnerAuth(env, request, url, path) {
       return jsonResponse({ error: "this passkey looks cloned (its counter went backwards); sign in from another device and revoke it" }, 403);
     }
     await recordPasskeyUse(env, credential.credential_id, verdict.signCount);
-    const cookie = await mintSessionCookie(env, await sessionGeneration(env));
+    // The session is whoever this DEVICE belongs to. A device enrolled against
+    // a grant must never mint an owner session.
+    const cookie = await mintSessionCookie(env, await sessionGeneration(env), { grantId: credential.grant_id ?? null });
     return withCookie(jsonResponse({ signed_in: true }), cookie);
   }
 
