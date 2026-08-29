@@ -1050,7 +1050,15 @@ let cliDocs = [];
   // Windows can hold a just-closed node:sqlite file for a short interval.
   // Retry only the test sandbox cleanup so that a fully passing connector
   // suite is not reported red because NTFS released forget-proof.db late.
-  rmSync(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  try {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (error) {
+    // Node 22 can retain the handle beyond all retries and Node 24 can return
+    // EPERM before retrying on Windows Server 2025. This is a disposable test
+    // sandbox on an ephemeral runner, after every assertion has completed.
+    if (process.platform !== "win32" || !["EBUSY", "EPERM"].includes(error?.code)) throw error;
+    console.warn(`WARN  Windows retained the disposable SQLite sandbox: ${error.code}`);
+  }
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\niphone backup loader: all ${ran} tests passed`);
