@@ -1480,6 +1480,12 @@ const bootstrapCompletion = () => ({
           actions.push("schema");
           return { results: [{ schema_version: 13 }] };
         }
+        if (/UPDATE install_state SET vector_drain_pause/.test(sql)) {
+          actions.push("pause-record");
+          check("rollback re-records the durable pause on the restored schema",
+            /vector_drain_pause = 'paused-for-upgrade'/.test(sql), sql);
+          return { results: [], meta: { changes: 1 } };
+        }
         if (/UPDATE install_state/.test(sql)) {
           actions.push("invalidate");
           check("rollback clears restored lease ownership before supervised recovery",
@@ -1527,7 +1533,7 @@ const bootstrapCompletion = () => ({
       "explicit confirmation is the only path that performs the restore",
       restored?.confirmed === true && restored?.restored === true &&
         restored?.requiresVectorizeRecreation === true &&
-        actions.join(",") === "account,deploy-paused,health-paused,quiesce,restore,schema,invalidate,reset-batches,reset-receipts,readback,history",
+        actions.join(",") === "account,deploy-paused,health-paused,quiesce,restore,schema,invalidate,reset-batches,reset-receipts,pause-record,readback,history",
       actions.join(","),
     );
     check("rollback never reactivates a Worker against an orphaned provider index",

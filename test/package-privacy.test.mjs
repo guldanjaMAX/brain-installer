@@ -155,6 +155,7 @@ const expected = [
   "migrations/d1/0019_recovery_codes.sql",
   "migrations/d1/0020_zoom_delivery_ledger.sql",
   "migrations/d1/0021_chunk_token_fit.sql",
+  "migrations/d1/0022_durable_drain_pause.sql",
   "onboarding/00-pre-install-interview.md",
   "onboarding/01-intake-RUNBOOK.md",
   "onboarding/01-intake-questionnaire.md",

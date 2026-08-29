@@ -99,6 +99,30 @@ function cloudflareHarness({ routePost = "ok", routeEnabled = true, schedule = "
     if (path === "/client/v4/accounts" && method === "GET") {
       return apiResponse([{ id: "fixture-account", name: "Fixture account" }]);
     }
+    // The stranded-upgrade deploy guard and the durable pause record both read
+    // and write D1. This fixture models a healthy migrated install: no history
+    // row is unfinished and no durable pause is set, so every deploy in this
+    // file behaves as it did before the guard existed. The guard's refusal
+    // paths have their own suite (test/deploy-stranded-upgrade.test.mjs).
+    if (path === "/client/v4/accounts/fixture-account/d1/database/fixture-database/query" && method === "POST") {
+      const sql = (() => {
+        try { return JSON.parse(options.body || "{}").sql || ""; } catch { return ""; }
+      })();
+      if (/FROM upgrade_runs/.test(sql)) {
+        return apiResponse([{ results: [], success: true, meta: {} }]);
+      }
+      if (/SELECT vector_drain_pause/.test(sql)) {
+        return apiResponse([{
+          results: [{ vector_drain_pause: null, vector_drain_paused_at: null, vector_drain_pause_run: null }],
+          success: true,
+          meta: {},
+        }]);
+      }
+      if (/UPDATE install_state SET vector_drain_pause/.test(sql)) {
+        return apiResponse([{ results: [], success: true, meta: { changes: 1 } }]);
+      }
+      return apiResponse(null, { success: false, message: `no D1 fixture for: ${sql.slice(0, 80)}` });
+    }
     if (path.endsWith("/workers/scripts/fixture-brain") && method === "PUT") {
       const rawMetadata = await options.body?.get?.("metadata")?.text?.();
       workerMetadata.push(JSON.parse(rawMetadata));

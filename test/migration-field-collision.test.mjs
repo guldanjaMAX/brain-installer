@@ -158,7 +158,7 @@ const runMigrate = async (db) => {
   check("an install already holding 17 with the connector-OAuth checksum migrates forward",
     outcome.ok, outcome.error);
 
-  check("and it lands on every remaining migration, 18 through 21",
+  check("and it lands on every remaining migration, 18 through the newest",
     JSON.stringify(after) === JSON.stringify(files.map(versionOf)),
     JSON.stringify({ after, expected: files.map(versionOf) }));
 
@@ -243,9 +243,11 @@ const runMigrate = async (db) => {
     refitAtTwentyOne === "exported", refitAtTwentyOne);
 
   // The contract pin must equal the newest migration, or the drill refuses
-  // every database including a correct one.
+  // every database including a correct one. 22 is the durable-drain-pause
+  // migration; bump this alongside RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION
+  // whenever a migration ships.
   check("the adapter's pinned schema version is the newest migration",
-    numbers.at(-1) === 21, JSON.stringify(numbers.at(-1)));
+    numbers.at(-1) === 22, JSON.stringify(numbers.at(-1)));
   db.close();
 }
 

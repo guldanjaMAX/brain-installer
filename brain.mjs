@@ -1179,6 +1179,151 @@ export async function persistWorkersDevDomain(manifestPath, m, acct, scriptName,
   return m.brain.domain;
 }
 
+/**
+ * Deploy safety over stranded upgrades.
+ *
+ * The pause that protects a mid-migration corpus used to live ONLY in a
+ * plain_text binding, and keep_bindings preserves only secret_text, so every
+ * full deploy replaced the pause with whatever the deployer believed. On a
+ * stranded install (new code deployed paused, migration never finished) a
+ * routine `brain deploy` would therefore silently resume corpus writes over a
+ * half-migrated schema — doing implicitly what the failure guidance forbids
+ * by hand. Two records now stop that:
+ *
+ *   1. upgrade_runs: an active-mode deploy is refused while the newest run is
+ *      neither verified nor rolled_back. The verified update path is the one
+ *      caller allowed through (it has just migrated and proven paused health),
+ *      and an operator who knows better can pass --force-active.
+ *   2. install_state (schema 0022): the pause is recorded durably, with the
+ *      run that set it, so a hard-killed update that never wrote its history
+ *      row still leaves a record a deploy cannot rewrite. The env binding
+ *      stays as the fast per-request gate; it is no longer the record of truth.
+ *
+ * Both reads fail CLOSED on anything except the one error that genuinely
+ * means "this record does not exist yet" (a missing table, or a pre-0022
+ * schema missing the columns). An unreadable history is not a clean history.
+ */
+async function assertNoStrandedUpgrade({ acctId, dbId, queryDatabase }) {
+  let newest = null;
+  try {
+    const runs = await queryDatabase(
+      acctId,
+      dbId,
+      "SELECT started_at, from_version, to_version, status, detail FROM upgrade_runs ORDER BY started_at DESC LIMIT 1",
+    );
+    newest = runs?.results?.[0] || null;
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (!/no such table/i.test(message)) {
+      die(
+        `deploy stopped: the upgrade history could not be read: ${message.slice(0, 160)}\n` +
+          "      An unreadable history is not a clean history. Deploying active code without knowing\n" +
+          "      whether an update is mid-flight is how writes resume over a half-migrated schema,\n" +
+          "      so nothing was deployed. Retry when D1 answers."
+      );
+    }
+    // No upgrade_runs table at all: this database has never been migrated, so
+    // no upgrade can be stranded on it.
+  }
+  if (newest && !["verified", "rolled_back"].includes(String(newest.status))) {
+    const stage = typeof newest.detail === "string" && newest.detail.startsWith("stage:")
+      ? ` at ${newest.detail}` : "";
+    die(
+      `deploy refused: the last update of this brain did not finish ` +
+        `(${newest.from_version || "?"} -> ${newest.to_version || "?"}, started ${newest.started_at}, ` +
+        `status ${newest.status}${stage}).\n` +
+        "      An active deploy now would rewrite the worker's bindings and silently resume corpus\n" +
+        "      writes over a schema that update never verified — the exact path that strands\n" +
+        "      installs. Repair it instead:\n" +
+        "          brain doctor <manifest> --repair     what is stuck, since when, and the safe resume\n" +
+        "          brain update <manifest>              replay the verified upgrade path to completion\n" +
+        "      If you are CERTAIN this history row is stale, rerun with --force-active."
+    );
+  }
+
+  let pause = null;
+  try {
+    const state = await queryDatabase(
+      acctId,
+      dbId,
+      "SELECT vector_drain_pause, vector_drain_paused_at, vector_drain_pause_run FROM install_state WHERE id = 1",
+    );
+    pause = state?.results?.[0] || null;
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (!/no such (?:table|column)/i.test(message)) {
+      die(
+        `deploy stopped: the durable pause record could not be read: ${message.slice(0, 160)}\n` +
+          "      An unreadable record is not a clear one. Nothing was deployed; retry when D1 answers."
+      );
+    }
+    // Pre-0022 schema or a never-migrated database: the durable record does
+    // not exist yet, and the upgrade_runs check above still stands guard.
+  }
+  if (pause?.vector_drain_pause) {
+    die(
+      `deploy refused: install_state records that corpus writes were paused for an upgrade\n` +
+        `      (${pause.vector_drain_pause}, since ${pause.vector_drain_paused_at || "an unrecorded time"}, ` +
+        `set by run ${pause.vector_drain_pause_run || "unrecorded"}).\n` +
+        "      This record survives deploys ON PURPOSE: the binding a deploy rewrites is only the\n" +
+        "      fast request gate, and this row is the record of truth. Resuming writes over a\n" +
+        "      possibly half-migrated schema is worse than staying paused. Repair it instead:\n" +
+        "          brain doctor <manifest> --repair     what is stuck, since when, and the safe resume\n" +
+        "          brain update <manifest>              replay the verified upgrade path to completion\n" +
+        "      If you are CERTAIN this record is stale, rerun with --force-active."
+    );
+  }
+}
+
+/**
+ * Record the durable half of the pause. Best-effort by design: the binding
+ * that enforces the pause is already part of this same deploy, and on a
+ * pre-0022 schema (every upgrade pauses BEFORE it migrates) the columns do
+ * not exist yet. What is never allowed is a silent miss — a real write
+ * failure is warned out loud, not swallowed.
+ */
+async function recordDurableDrainPause({ acctId, dbId, queryDatabase, pauseRunId }) {
+  try {
+    await queryDatabase(
+      acctId,
+      dbId,
+      "UPDATE install_state SET vector_drain_pause = 'paused-for-upgrade', vector_drain_paused_at = ?, vector_drain_pause_run = ? WHERE id = 1",
+      [new Date().toISOString(), pauseRunId || null],
+    );
+    ok("corpus pause recorded durably in install_state");
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (/no such (?:table|column)/i.test(message)) {
+      info("this schema predates the durable pause record (0022); the worker binding carries the pause until migration");
+    } else {
+      warn(
+        `the pause is deployed but could NOT be recorded durably in install_state: ${message.slice(0, 160)}\n` +
+          "        The worker binding still enforces it. If this update dies before finishing, the\n" +
+          "        deploy guard falls back to the upgrade history alone."
+      );
+    }
+  }
+}
+
+/** Clear the durable pause once active code is really serving again. */
+async function clearDurableDrainPause({ acctId, dbId, queryDatabase }) {
+  try {
+    await queryDatabase(
+      acctId,
+      dbId,
+      "UPDATE install_state SET vector_drain_pause = NULL, vector_drain_paused_at = NULL, vector_drain_pause_run = NULL WHERE id = 1",
+    );
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (/no such (?:table|column)/i.test(message)) return; // nothing to clear on this schema
+    warn(
+      `deployed active, but the durable pause record could not be cleared: ${message.slice(0, 160)}\n` +
+        "        The next plain `brain deploy` will refuse until it clears. Rerun deploy once D1\n" +
+        "        answers, or let `brain update` clear it on its verified path."
+    );
+  }
+}
+
 export async function cmdDeploy(manifestPath, options = {}) {
   const { m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
@@ -1186,6 +1331,29 @@ export async function cmdDeploy(manifestPath, options = {}) {
   const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
 
   if (!cfg.d1_database_id) die("no d1_database_id in the manifest. Run `brain provision` first.");
+
+  const queryDatabase = options.d1Query ?? d1Query;
+  const pausedDeploy = options.pauseVectorDrainForUpgrade === true;
+  // The CLI override is read only when this process was invoked as `brain
+  // deploy`; a deploy call made from inside another command must not inherit
+  // that command's flags.
+  const cliFlags = process.argv[2] === "deploy" ? parseFlags(process.argv.slice(4)) : {};
+  const forceActive = options.forceActive === true || cliFlags["force-active"] === true;
+  if (!pausedDeploy && !forceActive) {
+    await assertNoStrandedUpgrade({ acctId: acct.id, dbId: cfg.d1_database_id, queryDatabase });
+  }
+  if (pausedDeploy) {
+    // Recorded BEFORE the upload: if the record lands and the upload dies, the
+    // guard refuses the next active deploy, which is the safe direction to
+    // fail in. The reverse order would open a window where the worker is
+    // paused and nothing durable says so.
+    await recordDurableDrainPause({
+      acctId: acct.id,
+      dbId: cfg.d1_database_id,
+      queryDatabase,
+      pauseRunId: options.pauseRunId,
+    });
+  }
 
   const srcRoot = join(HERE, "worker", "src");
   const files = collectWorkerFiles(srcRoot);
@@ -1289,6 +1457,12 @@ export async function cmdDeploy(manifestPath, options = {}) {
     raw: true,
   });
   ok(`deployed "${scriptName}"`);
+
+  // Cleared only AFTER active code is really uploaded. If the upload had
+  // failed, the durable record would still say paused — the correct state.
+  if (!pausedDeploy) {
+    await clearDurableDrainPause({ acctId: acct.id, dbId: cfg.d1_database_id, queryDatabase });
+  }
 
   // A deploy that is not verified is a belief. Enable the workers.dev route so
   // there is always a URL to prove it against, even before a custom domain.
@@ -2127,10 +2301,23 @@ async function d1Query(acctId, dbId, sql, params = []) {
   return Array.isArray(res) ? res[0] : res;
 }
 
-function loadMigrations() {
-  const dir = join(HERE, "migrations", "d1");
+/**
+ * Read the migrations directory, refusing a broken arrangement BEFORE any D1
+ * statement runs.
+ *
+ * The repo has a test that pins migration numbers unique and contiguous, but a
+ * CLIENT MACHINE runs whatever tarball it was handed and never runs the repo's
+ * tests. Three parallel branches once each computed "next number" and all got
+ * 17; each branch passed its own tests in isolation, and only the merged tree
+ * could ever have failed the pin. A package carrying that merge artifact would
+ * happily apply one 17, refuse the other, and die mid-migration on a live
+ * install. So the same invariants are enforced HERE, at runtime, where the
+ * field actually is — and they die naming the files, because "which two files
+ * collided" is the whole repair.
+ */
+export function loadMigrations(dir = join(HERE, "migrations", "d1")) {
   if (!existsSync(dir)) return [];
-  return readdirSync(dir)
+  const migrations = readdirSync(dir)
     .filter((f) => /^\d+_.*\.sql$/.test(f))
     .sort()
     .map((f) => {
@@ -2138,10 +2325,47 @@ function loadMigrations() {
       return {
         version: parseInt(f.split("_")[0], 10),
         name: f.replace(/\.sql$/, ""),
+        file: f,
         sql,
         checksum: createHash("sha256").update(sql).digest("hex").slice(0, 16),
       };
-    });
+    })
+    // Numeric order, not filename order: "017_x.sql" and "0017_x.sql" are the
+    // same version number and must sit next to each other so the duplicate
+    // check below sees them.
+    .sort((a, b) => a.version - b.version || (a.file < b.file ? -1 : 1));
+
+  for (let i = 1; i < migrations.length; i++) {
+    if (migrations[i].version === migrations[i - 1].version) {
+      die(
+        `two migration files claim number ${migrations[i].version}: ` +
+          `${migrations[i - 1].file} and ${migrations[i].file}.\n` +
+          "      A fresh install would apply both and a live install has receipted exactly one of\n" +
+          "      them, so there is no safe way to run this arrangement anywhere. This is the merge\n" +
+          "      artifact that stranded a live install mid-migration (three branches, three 0017s).\n" +
+          "      Nothing was touched: this refusal happens before any D1 statement. Renumber the\n" +
+          "      file the field has NOT applied — schema_migrations on each install records which\n" +
+          "      checksum owns the number."
+      );
+    }
+  }
+  for (let i = 0; i < migrations.length; i++) {
+    if (migrations[i].version !== i + 1) {
+      const after = i === 0
+        ? "counting starts at 1"
+        : `after ${migrations[i - 1].file} (${migrations[i - 1].version})`;
+      die(
+        `migration numbering has a gap: expected ${i + 1} next (${after}) but found ` +
+          `${migrations[i].file} (${migrations[i].version}).\n` +
+          "      Migrations apply strictly in sequence and the recovery contract asserts\n" +
+          "      version === position, so a gap means a file this package was built with is\n" +
+          "      missing — usually a merge that dropped one line's migration while keeping its\n" +
+          "      code. Applying around the hole would receipt a schema no other install has.\n" +
+          "      Nothing was touched: this refusal happens before any D1 statement."
+      );
+    }
+  }
+  return migrations;
 }
 
 /**
@@ -2290,12 +2514,35 @@ export async function runRestartSafeMigrationStatements(
   }
 }
 
+/**
+ * Read the applied-migration ledger without conflating "cannot read" with
+ * "nothing applied".
+ *
+ * The old catch here returned [] on EVERY failure, which made a transient D1
+ * outage indistinguishable from a brand-new database: status printed a
+ * confident "0 applied, N pending" for a fully migrated brain, and the
+ * applied-checksum guard in cmdMigrate — which works by comparing against
+ * these rows — was silently bypassed. That is the same one-direction lie the
+ * spend cap shipped with (its own query error read as "nothing spent"), so
+ * the two cases are now separated: a MISSING TABLE is the one failure that
+ * genuinely means zero applied migrations, and every other error stops the
+ * command instead of impersonating an empty ledger.
+ */
 async function appliedVersions(acctId, dbId, queryDatabase = d1Query) {
   try {
     const r = await queryDatabase(acctId, dbId, "SELECT version, checksum, name FROM schema_migrations");
     return r?.results || [];
-  } catch {
-    return []; // table does not exist yet, so nothing is applied
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (/no such table/i.test(message)) {
+      return []; // the ledger has never been created: a fresh database, honestly empty
+    }
+    die(
+      `the schema_migrations ledger could not be read: ${message.slice(0, 200)}\n` +
+        "      A failed read is not an empty ledger. Treating it as one would make a fully\n" +
+        "      migrated brain look brand new and silently bypass the applied-checksum guard,\n" +
+        "      so nothing proceeds until D1 answers. Nothing was changed; retry when it does."
+    );
   }
 }
 
@@ -2308,7 +2555,7 @@ export async function cmdMigrate(manifestPath, options = {}) {
   const dbId = m.infrastructure?.cloudflare?.d1_database_id;
   if (!dbId) die("no d1_database_id in the manifest. Run `brain provision` first.");
 
-  const all = loadMigrations();
+  const all = (options.loadMigrations ?? loadMigrations)();
   if (!all.length) die("no migrations found.");
   const applied = await appliedVersions(acct.id, dbId, queryDatabase);
   const appliedMap = new Map(applied.map((a) => [a.version, a]));
@@ -3484,6 +3731,10 @@ export async function cmdUpgrade(manifestPath, options = {}) {
         await runStage("paused vector-drain deployment", () => deploy(executionPin.target, {
           persistDomain: false,
           pauseVectorDrainForUpgrade: true,
+          // Recorded into install_state as the run that set the pause. The
+          // upgrade_runs row for this run does not exist until the run ends,
+          // so its started_at — the same key logRun writes — is the handle.
+          pauseRunId: startedAt,
         }));
         corpusPausedByThisRun = true;
         await runStage("paused vector-drain health verification", () =>
@@ -3517,6 +3768,12 @@ export async function cmdUpgrade(manifestPath, options = {}) {
         await runStage("active vector-drain deployment", () => deploy(executionPin.target, {
           persistDomain: false,
           pauseVectorDrainForUpgrade: false,
+          // This is the verified repair path: the migration just completed and
+          // paused health was proven, so the stranded-upgrade guard — which
+          // would otherwise see the PREVIOUS attempt's failed history row —
+          // is the one thing allowed to stand aside. The deploy also clears
+          // the durable pause record this run wrote.
+          forceActive: true,
         }));
         corpusPausedByThisRun = false;
         // Cloudflare can keep routing this client to the paused compatibility
@@ -3531,7 +3788,13 @@ export async function cmdUpgrade(manifestPath, options = {}) {
           }));
       } else {
         await runStage("migration", () => migrate(executionPin.target));
-        await runStage("deployment", () => deploy(executionPin.target, { persistDomain: false }));
+        // Same reasoning as the active vector-drain deployment above: this
+        // run's own migration just completed, and the newest history row it
+        // could trip over is a previous attempt this rerun exists to repair.
+        await runStage("deployment", () => deploy(executionPin.target, {
+          persistDomain: false,
+          forceActive: true,
+        }));
       }
       await runStage("provider-secret reconciliation", ({ manifest, account }) => {
         const scriptName = manifest.brain?.worker_name || `${manifest.client?.slug || "client"}-brain`;
@@ -3654,6 +3917,7 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
     await deployRollbackWorker(pin.target, {
       persistDomain: false,
       pauseVectorDrainForUpgrade: true,
+      pauseRunId: `rollback:${bookmark}`,
     });
     revalidateUpdateManifest(pin, "rollback paused vector-drain deployment");
     await verifyRollbackHealth(pin.target, {
@@ -3721,6 +3985,18 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
           WHERE submitted_mutation_id IS NOT NULL OR submitted_at IS NOT NULL${hasBulkBootstrap ? `
              OR bootstrap_epoch IS NOT NULL OR bootstrap_batch IS NOT NULL` : ""}`,
       );
+      // The time-travel restore rewound install_state, taking the durable
+      // pause record written by this rollback's own paused deploy with it.
+      // The worker must stay paused until supervised recovery, so the record
+      // is re-written on the RESTORED schema (best-effort: a restored schema
+      // older than 0022 has no columns to hold it, and the binding still
+      // enforces the pause there).
+      await recordDurableDrainPause({
+        acctId: acct.id,
+        dbId,
+        queryDatabase,
+        pauseRunId: `rollback:${bookmark}`,
+      });
       const receipt = await queryDatabase(
         acct.id,
         dbId,
@@ -9883,15 +10159,16 @@ export async function diagnoseChecksumDrift(manifestPath, options = {}) {
   }
 
   // Deliberately NOT reusing the shared appliedVersions() helper here: it
-  // swallows every query failure into an empty list ("table does not exist
-  // yet, so nothing is applied" — correct for cmdMigrate, which only cares
-  // whether it is safe to proceed). This check exists to REPORT drift
-  // honestly, so a real query failure must degrade to checked:false, not to
-  // a confident "zero drift found" — the exact "degraded state presented as
-  // a confident negative" the product's honesty rules forbid. A missing
-  // table is the one failure that legitimately does mean zero applied
-  // migrations (a brand new install, never yet migrated), so that specific
-  // case alone is treated as empty rather than as a check failure.
+  // die()s on any read failure other than a missing table, because for
+  // cmdMigrate and cmdStatus an unreadable ledger must stop the command.
+  // This check exists to REPORT drift as one section of a larger diagnosis,
+  // so a real query failure must degrade to checked:false and let the rest
+  // of the report run — never to a confident "zero drift found", the exact
+  // "degraded state presented as a confident negative" the product's honesty
+  // rules forbid. A missing table is the one failure that legitimately does
+  // mean zero applied migrations (a brand new install, never yet migrated),
+  // so that specific case alone is treated as empty rather than as a check
+  // failure.
   const queryDatabase = options.d1Query ?? d1Query;
   let applied;
   try {

@@ -247,11 +247,19 @@ const INSTALL_STATE_REFIT_COLUMNS = Object.freeze([
   "chunk_refit_cursor", "chunk_refit_started_at", "chunk_refit_completed_at",
   "chunk_refit_documents", "chunk_refit_chunks_added",
 ]);
+// The durable upgrade pause (0022). Live deployment coordination like the
+// lease: it describes an upgrade mid-flight on the SOURCE deployment, which is
+// never true of the recovered target, so a recovery normalises it away rather
+// than shipping a refusal-to-deploy into the new environment.
+const INSTALL_STATE_DURABLE_PAUSE_COLUMNS = Object.freeze([
+  "vector_drain_pause", "vector_drain_paused_at", "vector_drain_pause_run",
+]);
 const INSTALL_STATE_NULL_NORMALIZED_COLUMNS = Object.freeze([
   ...INSTALL_STATE_LEASE_COLUMNS,
   "vector_projection_mutation_id", "vector_projection_submitted_at",
   "vector_projection_bootstrap_cursor",
   "vector_projection_bootstrap_protocol",
+  ...INSTALL_STATE_DURABLE_PAUSE_COLUMNS,
 ]);
 const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   // Queue generations belong to the target's derived Vectorize projection.
@@ -270,7 +278,8 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // the three connector-OAuth tables, 18 two provenance COLUMNS on `documents`
 // (text_source, text_reliable) so an OCR'd document is distinguishable from one
 // read from a text layer, 19 the two recovery-card tables, 20 the Zoom delivery
-// ledger, and 21 the chunk token-fit columns. The vector
+// ledger, 21 the chunk token-fit columns, and 22 the three durable
+// upgrade-pause COLUMNS on install_state. The vector
 // protocol is unchanged throughout, but the recovery contract tracks the EXACT
 // current schema by design: a drill against a database one migration behind
 // would export a column set that does not match the reviewed list, and refusing
@@ -283,7 +292,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // deployed database is the cheap correction; renumbering the deployed database
 // is not. Token-fit moved to 21, which is why the refit COLUMN gate below reads
 // 21 while the table gates for 17, 19 and 20 read their own numbers.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 21;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 22;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -886,6 +895,7 @@ function expectedInstallStateColumns(migrations) {
     // connector-OAuth migration kept 17. This gate follows the FILE, not the
     // number it was born with.
     ...(latest >= 21 ? INSTALL_STATE_REFIT_COLUMNS : []),
+    ...(latest >= 22 ? INSTALL_STATE_DURABLE_PAUSE_COLUMNS : []),
   ]);
 }
 

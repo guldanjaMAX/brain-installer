@@ -164,6 +164,9 @@ const installStateColumns = Object.freeze([
   ["chunk_refit_completed_at", "INTEGER"],
   ["chunk_refit_documents", "INTEGER"],
   ["chunk_refit_chunks_added", "INTEGER"],
+  ["vector_drain_pause", "TEXT"],
+  ["vector_drain_paused_at", "TEXT"],
+  ["vector_drain_pause_run", "TEXT"],
 ]);
 const fixtureInstallState = Object.freeze({
   id: 1,
@@ -200,10 +203,16 @@ const fixtureInstallState = Object.freeze({
   chunk_refit_completed_at: null,
   chunk_refit_documents: 3,
   chunk_refit_chunks_added: 7,
+  // The durable upgrade pause is live coordination on the SOURCE deployment.
+  // The fixture holds a real pause so the export is proven to normalise it
+  // away instead of shipping a refusal-to-deploy into the recovered target.
+  vector_drain_pause: "paused-for-upgrade",
+  vector_drain_paused_at: "2026-08-27T09:00:00.000Z",
+  vector_drain_pause_run: "2026-08-27T08:59:00.000Z",
 });
 const normalizedInstallStateSql =
   `INSERT INTO "install_state" (${installStateColumns.map(([name]) => `"${name}"`).join(",")}) VALUES (` +
-  `1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,0,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004',NULL,0,0,'fixture:doc-0002',1756000000000,NULL,3,7);\n`;
+  `1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,0,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004',NULL,0,0,'fixture:doc-0002',1756000000000,NULL,3,7,NULL,NULL,NULL);\n`;
 const schemaRows = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((name) => ({
     type: "table",
@@ -718,6 +727,9 @@ function providerHarness({
         assert.match(sql, /NULL AS "vector_projection_bootstrap_protocol"/);
         assert.match(sql, /0 AS "vector_projection_bootstrap_base_count"/);
         assert.match(sql, /0 AS "session_generation"/);
+        assert.match(sql, /NULL AS "vector_drain_pause"/);
+        assert.match(sql, /NULL AS "vector_drain_paused_at"/);
+        assert.match(sql, /NULL AS "vector_drain_pause_run"/);
         normalizedLeaseSelections++;
         rows = sourceInstallStateMissing ? [] : [{
           ...fixtureInstallState,
@@ -735,6 +747,9 @@ function providerHarness({
           vector_projection_bootstrap_protocol: null,
           vector_projection_bootstrap_base_count: 0,
           session_generation: 0,
+          vector_drain_pause: null,
+          vector_drain_paused_at: null,
+          vector_drain_pause_run: null,
         }];
       } else if (/SELECT name FROM sqlite_schema/.test(sql)) {
         rows = [...RECOVERY_DURABLE_TABLES].sort().map((name) => ({ name }));
