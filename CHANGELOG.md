@@ -31,7 +31,7 @@ counted and skipped, so a thread here is thinner than on your phone.
 as a linked device and captures onward. On Windows it installs the
 supervision the machine actually allows, and tells you which rung it
 got, rather than claiming a level of reliability it does not have. If
-nothing supervises the capture, the source is labelled unscheduled, not
+nothing supervises the capture, the source says unscheduled rather than
 manual, because a source that only runs when you remember is not a
 schedule. The export path is still there and still needs no pairing.
 

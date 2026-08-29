@@ -1,6 +1,6 @@
 # Shared Brain maintainer guide
 
-**Applies to release 0.1.22.**
+**Applies to release 0.2.0.**
 
 This is the operating guide for engineers who maintain the shared installer.
 It describes the current product line, how to change and release it safely, and

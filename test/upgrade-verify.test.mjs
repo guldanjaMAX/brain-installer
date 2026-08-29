@@ -66,6 +66,16 @@ const RUNNING_VERSION = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"),
 ).version;
 
+// A version that is always one minor above whatever this package currently is.
+// The downgrade fixtures below need "newer than the running CLI", and a literal
+// there silently stops testing anything the moment the package catches up to it:
+// 0.2.0 was hardcoded, the package became 0.2.0, and the guard under test simply
+// never fired. Derived, so a release bump can no longer disarm it.
+const NEWER_THAN_RUNNING = (() => {
+  const [major, minor] = RUNNING_VERSION.split(".").map(Number);
+  return `${major}.${minor + 1}.0`;
+})();
+
 // Production waits the full cutover grace. Unit tests inject a zero-time
 // waiter while still asserting the exact duration requested by cmdUpgrade.
 const cmdUpgrade = (manifestPath, options = {}) => cmdUpgradeWithRealQuiescence(
@@ -1184,7 +1194,7 @@ const bootstrapCompletion = () => ({
   const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-upgrade-downgrade-")));
   try {
     const manifestPath = join(sandbox, "brain.manifest.json");
-    writeFileSync(manifestPath, JSON.stringify(manifestFixture("0.2.0")));
+    writeFileSync(manifestPath, JSON.stringify(manifestFixture(NEWER_THAN_RUNNING)));
     let mutations = 0;
     let error = null;
     try {
@@ -1192,7 +1202,7 @@ const bootstrapCompletion = () => ({
         resolveAccount: async () => ({ id: "fixture-account" }),
         d1Query: async (_account, _database, sql) => /sqlite_master/i.test(sql)
           ? { results: [{ name: "install_state" }] }
-          : { results: [{ client_slug: "fixture", product_version: "0.2.0" }] },
+          : { results: [{ client_slug: "fixture", product_version: NEWER_THAN_RUNNING }] },
         cf: async () => { mutations++; return { bookmark: "must-not-exist" }; },
         cmdMigrate: async () => { mutations++; },
         cmdDeploy: async () => { mutations++; },
@@ -1209,7 +1219,7 @@ const bootstrapCompletion = () => ({
     );
 
     const localNewerPath = join(sandbox, "local-newer.manifest.json");
-    writeFileSync(localNewerPath, JSON.stringify(manifestFixture("0.2.0")));
+    writeFileSync(localNewerPath, JSON.stringify(manifestFixture(NEWER_THAN_RUNNING)));
     let localNewerError = null;
     try {
       await cmdUpgrade(localNewerPath, {

@@ -122,6 +122,11 @@
       "evidence_label": "internal",
       "gates_met": [],
       "published_as": null
+    },
+    "0.2.0": {
+      "evidence_label": "internal",
+      "gates_met": [],
+      "published_as": null
     }
   },
   "notes": [

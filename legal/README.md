@@ -1,6 +1,6 @@
 # Client-facing paperwork, and how it is bound to a release
 
-**Applies to release 0.1.22.**
+**Applies to release 0.2.0.**
 
 Nothing in this directory is legal text, legal advice, or a claim that anything
 is legally sufficient. This is a tracking mechanism. A founder writes the
@@ -26,7 +26,7 @@ read their archive.
 So each artifact carries the same visible stamp the maintainer documents use:
 
 ```
-**Applies to release 0.1.22.**
+**Applies to release 0.2.0.**
 ```
 
 `operations/legal-register.mjs` measures the file rather than trusting the

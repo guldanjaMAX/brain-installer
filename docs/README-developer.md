@@ -5,7 +5,7 @@ keyword search live in D1, vectors live in Vectorize, and the Worker fuses them.
 Nothing runs on our infrastructure, and nothing but a scoped token is held during
 the engagement.
 
-**Applies to release 0.1.22.**
+**Applies to release 0.2.0.**
 
 **Label: internal.** The label is not a mood. It is computed in
 `test/release-state.test.mjs` from the evidence files actually present in
