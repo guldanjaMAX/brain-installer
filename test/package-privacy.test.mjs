@@ -134,6 +134,7 @@ const expected = [
   "migrations/d1/0012_vector_visibility_receipts.sql",
   "migrations/d1/0013_accelerated_vector_bootstrap.sql",
   "migrations/d1/0014_owner_passkeys.sql",
+  "migrations/d1/0015_grants.sql",
   "onboarding/01-intake-RUNBOOK.md",
   "onboarding/01-intake-questionnaire.md",
   "onboarding/02-client-effort-and-timeline.md",
