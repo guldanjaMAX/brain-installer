@@ -24,7 +24,9 @@ import {
   storePasskey, findPasskey, recordPasskeyUse,
   listPasskeys, renamePasskey, revokePasskey,
   sessionGeneration, bumpSessionGeneration,
+  randomToken, createGrant, addGrantCredential, listGrants, revokeGrant,
 } from "./auth-store.js";
+import { CAPABILITIES, parseCapabilities, hashToken } from "./grants.js";
 import { appPageHtml } from "./app-page.js";
 
 const APP_HEADER = "X-Brain-App";
@@ -67,6 +69,74 @@ export async function handleAdminInvite(env, url) {
     rp_id: url.hostname,
     note: "single use. Passkeys bind to this exact domain; changing the brain's domain later requires re-enrollment.",
   });
+}
+
+/**
+ * GET /api/admin/auth/grants, POST to create, POST .../revoke to end one.
+ *
+ * The token is generated here, returned exactly once in the create response,
+ * and never stored: only its SHA-256 hash goes to the database. There is no
+ * endpoint that can show it again, which is the point. If it is lost the
+ * owner mints another and revokes the first.
+ */
+export async function handleAdminGrants(env, request, path) {
+  if (path.endsWith("/revoke") && request.method === "POST") {
+    const payload = await body(request);
+    if (!payload?.grant_id) return jsonResponse({ error: "grant_id required" }, 400);
+    const revoked = await revokeGrant(env, String(payload.grant_id));
+    return jsonResponse({ revoked, grant_id: String(payload.grant_id) });
+  }
+
+  if (request.method === "POST") {
+    const payload = await body(request);
+    const displayName = String(payload?.display_name || "").trim();
+    if (!displayName) return jsonResponse({ error: "display_name required" }, 400);
+
+    const capabilities = parseCapabilities(payload?.capabilities);
+    if (!capabilities) {
+      return jsonResponse({
+        error: `capabilities must be a non-empty subset of: ${CAPABILITIES.join(", ")}`,
+      }, 400);
+    }
+    // Granting `administer` hands over the ability to create more grants, which
+    // is the owner's own authority. Refuse it here rather than letting an
+    // owner give it away without meaning to.
+    if (capabilities.includes("administer")) {
+      return jsonResponse({
+        error: "administer cannot be granted: it would let this person create and revoke other people's access",
+      }, 400);
+    }
+
+    const expiresAt = payload?.expires_at === undefined || payload?.expires_at === null
+      ? null
+      : Number(payload.expires_at);
+    if (expiresAt !== null && (!Number.isFinite(expiresAt) || expiresAt <= Date.now())) {
+      return jsonResponse({ error: "expires_at must be a future unix ms timestamp, or null" }, 400);
+    }
+
+    const grantId = `g_${randomToken(8)}`.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+    const token = randomToken(32);
+    await createGrant(env, {
+      grantId,
+      displayName: displayName.slice(0, 120),
+      relationship: payload?.relationship ? String(payload.relationship).slice(0, 120) : null,
+      capabilities,
+      expiresAt,
+      createdBy: "owner",
+    });
+    await addGrantCredential(env, { tokenHash: await hashToken(token), grantId });
+
+    return jsonResponse({
+      grant_id: grantId,
+      display_name: displayName,
+      capabilities,
+      expires_at: expiresAt,
+      token,
+      note: "This token is shown once and is not recoverable. Give it to them over a channel you trust.",
+    });
+  }
+
+  return jsonResponse({ grants: await listGrants(env) });
 }
 
 /** GET /api/admin/auth/devices + POST .../revoke — the CLI's device view. */

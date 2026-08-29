@@ -9631,6 +9631,112 @@ async function cmdUpgradeInteractive(manifestPath) {
 }
 
 /** Mint a one-time passkey enrollment link for the brain's owner. */
+/**
+ * `brain grant <manifest> --name "Marla" --can ask,file [--until 2027-03-31]`
+ *
+ * Prints the token exactly once, to stdout, and nowhere else. It never reaches
+ * argv, a file, or shell history, for the same reason the Cloudflare token
+ * does not: the owner is handing somebody access to their financial records,
+ * and a credential that survives in `history` is a credential they cannot
+ * actually revoke by revoking it.
+ */
+async function cmdGrant(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  const flags = parseFlags(process.argv.slice(4));
+  const name = typeof flags.name === "string" ? flags.name.trim() : "";
+  const can = typeof flags.can === "string" ? flags.can : "";
+  if (!name || !can) {
+    die(
+      "usage: brain grant <manifest> --name \"Their name\" --can ask,file [--until YYYY-MM-DD] [--as \"bookkeeper\"]\n" +
+      "  capabilities: ask (read and ask questions), file (add documents),\n" +
+      "                diagnose (see health and freshness), destroy (forget or purge)\n" +
+      "  `administer` cannot be granted: it would let them create other people's access."
+    );
+  }
+  const capabilities = can.split(",").map((x) => x.trim()).filter(Boolean);
+
+  let expiresAt = null;
+  if (typeof flags.until === "string" && flags.until.trim()) {
+    const parsed = Date.parse(`${flags.until.trim()}T23:59:59Z`);
+    if (!Number.isFinite(parsed)) die(`could not read --until "${flags.until}". Use YYYY-MM-DD.`);
+    if (parsed <= Date.now()) die(`--until ${flags.until} is in the past.`);
+    expiresAt = parsed;
+  }
+
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
+
+  const res = await http(`${base}/api/admin/auth/grants`, {
+    method: "POST",
+    headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      display_name: name,
+      relationship: typeof flags.as === "string" ? flags.as : null,
+      capabilities,
+      expires_at: expiresAt,
+    }),
+  }, { timeoutMs: 30_000, what: "the access grant" });
+  if (!res.ok) die(`grant failed (${res.status}): ${summariseResponseBody(await res.text())}`);
+  const grant = await res.json();
+
+  ok(`access granted to ${grant.display_name}: ${grant.capabilities.join(", ")}`);
+  console.log(`\n  ${grant.token}\n`);
+  console.log(
+    "  That token is shown once and cannot be shown again. Give it to them over a\n" +
+    "  channel you trust. If it is ever lost or shared, mint another and revoke this\n" +
+    `  one with:  brain grants ${displayPath(manifestPath)} --revoke ${grant.grant_id}\n`
+  );
+  if (expiresAt) console.log(`  It stops working on ${new Date(expiresAt).toISOString().slice(0, 10)}.\n`);
+  return grant;
+}
+
+/** `brain grants <manifest>` lists who has access; `--revoke <id>` ends one. */
+async function cmdGrants(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  const flags = parseFlags(process.argv.slice(4));
+  const acct = m.brain?.domain ? null : await resolveAccount(m);
+  const base = await resolveBaseUrl(m, acct);
+  const adminKey = resolveAdminKey(manifestPath);
+  if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
+
+  if (typeof flags.revoke === "string" && flags.revoke.trim()) {
+    const res = await http(`${base}/api/admin/auth/grants/revoke`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ grant_id: flags.revoke.trim() }),
+    }, { timeoutMs: 30_000, what: "the revocation" });
+    if (!res.ok) die(`revoke failed (${res.status}): ${summariseResponseBody(await res.text())}`);
+    const result = await res.json();
+    if (result.revoked) ok(`${result.grant_id} revoked. Their token stops working immediately.`);
+    else warn(`${result.grant_id} was already revoked, or there is no such grant.`);
+    return result;
+  }
+
+  const res = await http(`${base}/api/admin/auth/grants`, {
+    method: "GET",
+    headers: { "X-Admin-Key": adminKey },
+  }, { timeoutMs: 30_000, what: "the access list" });
+  if (!res.ok) die(`could not read the access list (${res.status}): ${summariseResponseBody(await res.text())}`);
+  const { grants = [] } = await res.json();
+  if (!grants.length) {
+    info("nobody but you has access to this brain.");
+    return { grants };
+  }
+  console.log("");
+  for (const g of grants) {
+    const caps = (() => { try { return JSON.parse(g.capabilities).join(", "); } catch { return g.capabilities; } })();
+    const state = g.revoked_at
+      ? "revoked"
+      : g.expires_at && Number(g.expires_at) <= Date.now() ? "expired" : "active";
+    console.log(`  ${state === "active" ? c.green(state) : c.dim(state)}  ${g.display_name}${g.relationship ? ` (${g.relationship})` : ""}`);
+    console.log(`         ${caps}   ${g.grant_id}`);
+  }
+  console.log("");
+  return { grants };
+}
+
 async function cmdInvite(manifestPath) {
   const { m } = loadManifest(manifestPath);
   // Cloudflare is OPTIONAL here, deliberately: inviting a new device must
@@ -9837,6 +9943,8 @@ const commands = {
   health: cmdHealth,
   test: cmdTest,
   "mcp-config": cmdMcpConfig,
+  grant: cmdGrant,
+  grants: cmdGrants,
   migrate: cmdMigrate,
   ingest: cmdIngest,
   connect: cmdConnect,
@@ -9877,6 +9985,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it
     brain token      <manifest>            is a Cloudflare token remembered on this Mac? --forget removes it
+    brain grant      <manifest> --name "X" --can ask,file   give one person scoped access; prints the token once
+    brain grants     <manifest>            who has access; --revoke <id> ends one
     brain invite     <manifest>            one-tap passkey enrollment link for the owner (Face ID, 15 min)
     brain devices    <manifest>            enrolled passkeys; --revoke <credential id> removes one
     brain test       <manifest>            full acceptance suite (5 tiers)
