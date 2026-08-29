@@ -594,10 +594,24 @@ export async function handleOwnerAuth(env, request, url, path) {
     return withCookie(jsonResponse({ signed_in: true }), cookie);
   }
 
-  // Everything below requires a live session.
-  if (!(await validateOwnerSession(request, env))) {
-    return jsonResponse({ error: "unauthorized" }, 401);
-  }
+  // Everything below requires a live session, and needs to know WHOSE.
+  //
+  // These routes used to act on any credential_id a caller named, and /me
+  // listed every device on the brain. So anyone the owner had given a scoped
+  // passkey could enumerate the owner's devices, rename them, revoke them, and
+  // sign the owner out of their own brain. None of that reads a document,
+  // which is why it survived the read-side review.
+  const me = await ownerSessionPrincipal(request, env);
+  if (!me) return jsonResponse({ error: "unauthorized" }, 401);
+  const isOwner = me.kind === "owner";
+  // A device belongs to the caller when it carries the same grant. The owner's
+  // own devices carry no grant, so an unscoped session sees everything and a
+  // scoped session sees only its own.
+  const ownsDevice = async (credentialId) => {
+    if (isOwner) return true;
+    const device = await findPasskey(env, credentialId);
+    return !!device && device.grant_id === me.grantId;
+  };
 
   if (path === "/api/app/me") {
     // The card's state travels with every page load, because an install that
@@ -607,11 +621,27 @@ export async function handleOwnerAuth(env, request, url, path) {
       signed_in: true,
       brain: env.BRAIN_NAME || "brain",
       owner: env.BRAIN_OWNER || "owner",
-      devices: await listPasskeys(env),
-      recovery: await recoveryCodeStatus(env),
-      // Apps reaching the brain over the connector, so one call answers the
-      // whole of "who has access" rather than two that can disagree.
-      connections: await listConnections(env),
+      // Scoped callers see only the devices carrying their own grant. Left
+      // unfiltered this listed every device on the brain, which let anyone
+      // holding a scoped passkey enumerate, rename and revoke the owner's
+      // devices down to the last one.
+      devices: isOwner
+        ? await listPasskeys(env)
+        : (await listPasskeys(env)).filter((d) => d.grant_id === me.grantId),
+      // The same reasoning extends to these two, which carry no document text
+      // and so survived the same review that missed `devices`. How many
+      // recovery codes remain is the state of the OWNER's card, and the
+      // connected apps are the apps the OWNER authorised; neither is a scoped
+      // person's business, and the recovery count in particular tells them how
+      // close the owner is to having no way back in.
+      ...(isOwner
+        ? {
+            recovery: await recoveryCodeStatus(env),
+            // Apps reaching the brain over the connector, so one call answers
+            // the whole of "who has access" rather than two that can disagree.
+            connections: await listConnections(env),
+          }
+        : {}),
     });
   }
   if (path === "/api/app/recovery-codes") {
@@ -626,12 +656,18 @@ export async function handleOwnerAuth(env, request, url, path) {
   if (path === "/api/app/devices/rename") {
     const payload = await body(request);
     if (!payload?.credential_id) return jsonResponse({ error: "credential_id required" }, 400);
+    if (!(await ownsDevice(String(payload.credential_id)))) {
+      return jsonResponse({ error: "that is not one of your devices" }, 403);
+    }
     await renamePasskey(env, String(payload.credential_id), payload.nickname);
     return jsonResponse({ renamed: true });
   }
   if (path === "/api/app/devices/revoke") {
     const payload = await body(request);
     if (!payload?.credential_id) return jsonResponse({ error: "credential_id required" }, 400);
+    if (!(await ownsDevice(String(payload.credential_id)))) {
+      return jsonResponse({ error: "that is not one of your devices" }, 403);
+    }
     return jsonResponse(await revokePasskey(env, String(payload.credential_id)));
   }
   if (path === "/api/app/connections/revoke") {
@@ -644,6 +680,9 @@ export async function handleOwnerAuth(env, request, url, path) {
     return withCookie(jsonResponse({ signed_out: true }), clearSessionCookie());
   }
   if (path === "/api/app/signout-all") {
+    // Signing out EVERYONE is the owner's lever. A scoped person signing out
+    // their own device uses /signout, which needs no privilege at all.
+    if (!isOwner) return jsonResponse({ error: "only the owner can sign every device out" }, 403);
     await bumpSessionGeneration(env);
     return withCookie(jsonResponse({ signed_out_everywhere: true }), clearSessionCookie());
   }
