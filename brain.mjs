@@ -9309,7 +9309,29 @@ export async function cmdConnectWhatsapp(manifestPath, flags = {}, options = {})
     ? (options.windowsSupervision ?? await import("./operations/windows-supervision.mjs"))
     : null;
 
-  // Step 1: the binary, before any promise about pairing.
+  // Step 1: the disclosure, then the explicit acceptance. Printed every time,
+  // not only the first, because this is the sentence the owner is agreeing to.
+  //
+  // BEFORE the binary check, deliberately. This used to run second, which meant
+  // a machine with no daemon binary — that is, every fresh client machine,
+  // since nothing distributes it yet — was refused for a missing file and never
+  // shown the ban-risk paragraphs at all. Someone could go build a toolchain,
+  // compile a Go binary, come back, and only then be told the thing carries a
+  // real risk of losing their WhatsApp account. The disclosure is not a promise
+  // about pairing, it is the information someone needs in order to decide
+  // whether they want to try, so it cannot be gated on infrastructure.
+  console.log("");
+  for (const line of whatsapp.WHATSAPP_DISCLOSURE) console.log(line ? `  ${line}` : "");
+  console.log("");
+  if (!flags["accept-risk"]) {
+    die(
+      "nothing was paired. Live WhatsApp capture is opt-in and stays that way until it is\n" +
+        "      decided otherwise. If you have read the two paragraphs above and want it anyway:\n" +
+        `        brain connect whatsapp ${manifestPath} --accept-risk`
+    );
+  }
+
+  // Step 2: the binary, before any promise about pairing.
   let binary;
   try {
     binary = whatsapp.resolveDaemonBinary({
@@ -9321,19 +9343,6 @@ export async function cmdConnectWhatsapp(manifestPath, flags = {}, options = {})
   } catch (error) {
     if (error?.reason === "daemon_binary_missing") die(error.message);
     throw error;
-  }
-
-  // Step 2: the disclosure, then the explicit acceptance. Printed every time,
-  // not only the first, because this is the sentence the owner is agreeing to.
-  console.log("");
-  for (const line of whatsapp.WHATSAPP_DISCLOSURE) console.log(line ? `  ${line}` : "");
-  console.log("");
-  if (!flags["accept-risk"]) {
-    die(
-      "nothing was paired. Live WhatsApp capture is opt-in and stays that way until it is\n" +
-        "      decided otherwise. If you have read the two paragraphs above and want it anyway:\n" +
-        `        brain connect whatsapp ${manifestPath} --accept-risk`
-    );
   }
 
   const resolveKey = options.resolveAdminKey ?? resolveAdminKey;
