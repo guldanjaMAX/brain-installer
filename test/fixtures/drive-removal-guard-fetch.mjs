@@ -111,6 +111,10 @@ globalThis.fetch = async (input, options = {}) => {
     return json({ startPageToken: "fixture-next-cursor" });
   }
 
+  if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/changes") {
+    throw new Error("root-bound Drive ingest attempted the account-wide change feed");
+  }
+
   if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files") {
     if (!String(url.searchParams.get("q") || "").includes("'fixture-root' in parents")) {
       throw new Error("Drive ingest attempted an unscoped account-wide listing");

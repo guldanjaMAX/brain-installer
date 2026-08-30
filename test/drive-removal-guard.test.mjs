@@ -19,6 +19,7 @@ import {
   DRIVE_REMOVAL_MAX_COUNT,
   DRIVE_REMOVAL_MAX_RATIO,
   drivePolicyFingerprint,
+  driveSyncDecision,
   isTrustedDriveVersion,
   priorAcceptedDriveVersion,
   recordAcceptedDocumentState,
@@ -353,9 +354,12 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
 
 /*
  * The real CLI path must preserve that ordering across process boundaries.
- * This fixture runs a due full sweep against 101 simulated stored families and
- * an empty Drive listing. It also injects one bounded forget failure so the
- * partial-write retry has to build and approve a fresh aggregate plan.
+ * This fixture starts from a recent completed sweep whose saved change token
+ * would ordinarily be eligible for Drive's account-wide change feed. The real
+ * command must still re-walk only the reviewed roots, because a change record
+ * does not prove that its file remains below one of those roots. The fixture
+ * refuses any changes.list request, then injects one bounded forget failure so
+ * the partial-write retry has to build and approve a fresh aggregate plan.
  */
 {
   const directory = mkdtempSync(join(tmpdir(), "brain-drive-removal-guard-"));
@@ -365,7 +369,7 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
   const userRoot = join(directory, "isolated-user-root");
   const tokenRoot = join(userRoot, ".brain");
   const priorCursor = "fixture-prior-cursor";
-  const priorFullSweep = "2000-01-01T00:00:00.000Z";
+  const priorFullSweep = new Date(Date.now() - 1_000).toISOString();
   const scannerFingerprint = credentialScannerFingerprint(true);
   const policyFingerprint = drivePolicyFingerprint({
     rootFolderIds: ["fixture-root"],
@@ -374,6 +378,13 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     excludeNameParts: [],
     privatePrefixes: [],
   }, true);
+  assert.equal(driveSyncDecision({
+    syncToken: priorCursor,
+    policyFingerprint,
+    savedPolicyFingerprint: policyFingerprint,
+    lastFullSweepAt: priorFullSweep,
+    now: Date.now(),
+  }).incremental, true, "fixture precondition: the saved state must qualify for the account-wide change feed");
 
   const stripAnsi = (value) => String(value || "").replace(/\x1b\[[0-9;]*m/g, "");
   const safeDiagnostic = (value) => stripAnsi(value)
