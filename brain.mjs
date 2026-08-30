@@ -6653,7 +6653,8 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
   const acceptedDocuments = tally.created + tally.updated + unchanged + tally.unchanged;
   const finalStoredLocalFamilies = await listStoredFamilies({ base, adminKey, source: sourceName });
   const sourceInventory = finalStoredLocalFamilies.size;
-  const complete = sourceInventory > 0 && acceptedDocuments > 0 &&
+  const emptyReconciled = sourceInventory === 0 && acceptedDocuments === 0 && plannedLocalTargets.length > 0;
+  const complete = ((sourceInventory > 0 && acceptedDocuments > 0) || emptyReconciled) &&
     tally.failed === 0 && tally.refused === 0 &&
     coverageGaps === 0 && incompleteKeys.size === 0;
   const outcomeKind = complete ? "completed" : acceptedDocuments > 0 ? "partial" : "refused";
@@ -6702,10 +6703,11 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
     coverage_gaps: coverageGaps,
     incomplete: incompleteKeys.size,
     source_inventory: sourceInventory,
+    empty_reconciled: emptyReconciled,
     outcome: ingestionOutcome(outcomeKind, {
       reason: complete
         ? null
-        : sourceInventory === 0 && acceptedDocuments === 0
+        : sourceInventory === 0 && acceptedDocuments === 0 && !emptyReconciled
           ? "no document was accepted and the authoritative source inventory is empty"
           : `${tally.refused} refused; ${coverageGaps} coverage gap(s); ${incompleteKeys.size} incomplete extraction(s)`,
     }),
@@ -8531,7 +8533,8 @@ export function describeLoadResult(result) {
       const incomplete = Math.max(0, Math.trunc(Number(result.incomplete || 0)));
       const refused = Math.max(0, Math.trunc(Number(result.refused || 0)));
       const retained = Math.max(0, Math.trunc(Number(result.retained_existing || 0)));
-      const emptyAuthoritativeSource = Number(result.source_inventory) === 0 && accepted === 0;
+      const emptyReconciled = result.empty_reconciled === true;
+      const emptyAuthoritativeSource = Number(result.source_inventory) === 0 && accepted === 0 && !emptyReconciled;
       const extra = [];
       if (refused) extra.push(`${refused} refused, NOT indexed`);
       if (skipped) extra.push(`${skipped} skipped`);
@@ -8540,13 +8543,14 @@ export function describeLoadResult(result) {
         extra.push(`${retained} existing Drive document(s) retained but unverified`);
       }
       if (emptyAuthoritativeSource) extra.push("no document was accepted; authoritative source inventory is empty");
+      if (emptyReconciled) extra.push("source reconciled to an authoritatively empty state");
       const hasGap = refused > 0 || coverageGaps > 0 || incomplete > 0 || retained > 0 || emptyAuthoritativeSource;
       const outcomeKind = hasGap && accepted === 0 ? "refused" : hasGap ? "partial" : "completed";
       return {
         known: true,
         counts,
         partial: outcomeKind === "partial",
-        acceptedWork: accepted > 0 || !hasGap,
+        acceptedWork: accepted > 0 || emptyReconciled || !hasGap,
         outcome: outcomeOf(outcomeKind),
         text: `${counts.created} created, ${counts.updated} updated, ${counts.unchanged} unchanged`
           + (extra.length ? `, ${extra.join(", ")}` : ""),
@@ -9750,8 +9754,9 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   // Every batch landed, so it is now safe to say "we have everything up to
   // here". sendBatches dies rather than returning on a failure, so reaching
   // this line is the proof.
-  const remoteCursorCanAdvance = sourceCursorCanAdvance(tally) && tally.refused === 0 &&
-    coverageGaps === 0 && incompleteKeys.size === 0;
+  const remoteCursorCanAdvance = sourceCursorCanAdvance(tally) && (which === "drive" || (
+    tally.refused === 0 && coverageGaps === 0 && incompleteKeys.size === 0
+  ));
   if (pendingCursor && remoteCursorCanAdvance) {
     state[pendingCursor.key] = pendingCursor.value;
     Object.assign(state, pendingCursor.statePatch || {});

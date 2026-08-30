@@ -497,8 +497,8 @@ const rejection = whatsapp.evidence?.forgetRejections?.[0] || null;
 check("every session document was accepted by the scripted brain",
   (whatsapp.evidence?.storedDocUids || []).length === probed.envelopes.length,
   JSON.stringify(whatsapp.evidence?.storedDocUids));
-check("a fully accepted WhatsApp export ingest exits 0",
-  whatsapp.code === 0,
+check("accepted WhatsApp messages do not hide the export's omitted media",
+  whatsapp.code === 1 && /partial coverage/.test(whatsapp.out),
   `exit ${whatsapp.code}; rejection: ${rejection ? rejection.message : "(none)"}`);
 check("the worker never rejected the reconciliation request",
   (whatsapp.evidence?.forgetRejections || []).length === 0,
@@ -522,8 +522,8 @@ const reload = runIngest({
   dbPath: sharedDb,
 });
 const uidsAfterReload = readback.prepare("SELECT doc_uid FROM documents ORDER BY doc_uid").all().map((r) => r.doc_uid);
-check("re-loading the same export into the same brain exits 0",
-  reload.code === 0 && (reload.evidence?.forgetRejections || []).length === 0,
+check("re-loading preserves the same visible incomplete-export result",
+  reload.code === 1 && /partial coverage/.test(reload.out) && (reload.evidence?.forgetRejections || []).length === 0,
   `exit ${reload.code}; ${JSON.stringify(reload.evidence?.forgetRejections)}; ${reload.out.slice(-500)}`);
 check("re-loading the same export duplicates no documents",
   uidsAfterFirst.length > 1 && sorted(uidsAfterReload) === sorted(uidsAfterFirst),

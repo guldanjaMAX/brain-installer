@@ -654,7 +654,8 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     assert.equal(state.drive_retained_existing["drive:active-migrated"].skip_code, "unsupported_extension");
 
     const completed = run(["--approve-removals", approval]);
-    assert.equal(completed.code, 0, completed.output.slice(-1_200));
+    assert.equal(completed.code, 1, completed.output.slice(-1_200));
+    assert.match(completed.output, /refused coverage|retained but unverified/i);
     assert.match(completed.output, /1 active Drive file\(s\) retain an existing Brain copy/i);
     evidence = readEvidence();
     assert.equal(evidence.forgetRequests, 2, "source deletion and intentional skips were not separated");
@@ -674,7 +675,7 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     assert.match(state.skipped["drive:active-sensitive"], /refused: carries aws_access_key/i);
 
     const noChange = run();
-    assert.equal(noChange.code, 0, noChange.output.slice(-1_200));
+    assert.equal(noChange.code, 1, noChange.output.slice(-1_200));
     evidence = readEvidence();
     assert.equal(evidence.forgetRequests, 2, "a no-change rooted revalidation invented another removal");
     assert.equal(evidence.inventoryReads, 4, "a rooted revalidation did not compare against stored source truth");
