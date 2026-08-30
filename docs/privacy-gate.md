@@ -7,6 +7,11 @@ and fails if any of them contains a name, personal domain, or real
 infrastructure identifier belonging to the owner, a collaborator, or one of
 their clients.
 
+The canonical hashed rules live in `scripts/privacy-identity.mjs` and are used
+by both the current-tree/package gate and the full-history scanner. A failure
+never prints matched bytes. A path whose own name matches a rule is displayed
+only as a stable redacted digest.
+
 The values it looks for are stored as SHA-256 digests, not plaintext, so the
 denylist is not itself a directory of the people it protects. The file's own
 header explains what that does and does not buy.
@@ -22,6 +27,51 @@ The full gate also verifies the npm packlist against its reviewed allowlist and
 builds a real tarball to import a module out of it. `npm test` runs the full
 gate. `--scan-only` is the identity half on its own, which is the half a commit
 can get wrong.
+
+## Public history containment
+
+A clean tip does not remove an older blob from Git history. The repository's
+second gate inventories the reviewed public-ref snapshot and scans every
+reachable text blob, represented path, commit message, tag message, and ref
+name:
+
+```sh
+npm run privacy:history
+```
+
+That command compares the scan with `privacy/history-baseline.json`. The
+baseline contains object IDs, finding categories, and locations only. It has no
+matched values or raw affected paths. Passing means no finding object was added
+or silently removed from the recorded incident set. It does **not** mean the
+history is clean.
+
+Before any new release, the authoritative server-ref scan must be clean:
+
+```sh
+npm run privacy:history:strict
+```
+
+The strict command reads the server's public heads and tags, verifies that the
+local snapshot is exact, refuses shallow history, and fails while any reachable
+privacy or credential-shaped object remains. The repository currently requires
+an approved history-remediation decision before this release gate can pass.
+CI uses `npm run privacy:history:remote` to compare every current server-visible
+head and tag with the same baseline, including refs created after the committed
+offline snapshot.
+
+Credential-shaped findings are kept separate from ordinary privacy findings.
+Except for a rule explicitly labeled as a known revoked credential, a shape
+match is a rotation-review candidate, not evidence that the value was active.
+After authorized private review, an intentionally synthetic source/test object
+may be listed by object ID and category in
+`privacy/credential-dispositions.json`. The strict gate rejects ordinary
+privacy, known-revoked credentials, unreviewed candidates, duplicate approvals,
+and stale approvals. The disposition file never contains a matched value.
+
+The scanner deliberately excludes binary blob bodies and author, committer, and
+tagger header identities. It still inventories those objects, scans text paths
+and messages, and reports the limitation. Counsel should decide separately
+whether intended public contribution metadata needs any action.
 
 ## Installing it as a pre-commit hook
 
@@ -63,7 +113,7 @@ catches the same leaks a moment later, before anything becomes public.
 ## Adding a value to the denylist
 
 Never type the value into a file. Pipe it in and paste the row that comes back
-into `RULES` in `test/package-privacy.test.mjs`:
+into `IDENTITY_RULES` in `scripts/privacy-identity.mjs`:
 
 ```sh
 printf %s 'the value' | node test/package-privacy.test.mjs --hash word ci 'label'

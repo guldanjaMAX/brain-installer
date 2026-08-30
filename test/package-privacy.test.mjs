@@ -44,6 +44,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { IDENTITY_RULES, safeIdentifier } from "../scripts/privacy-identity.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -59,10 +60,10 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // green, so the one file guaranteed to contain private identity was the one
 // file never checked.
 //
-// So the values below are stored as SHA-256 digests of their normalised form.
-// The plaintext is not in this file, not in the repo, and not in git history.
-// This file is no longer excluded from its own scan, and there are no
-// exemptions anywhere in this gate.
+// The canonical values in scripts/privacy-identity.mjs are stored as SHA-256
+// digests of their normalised form. The plaintext is not in that file, this
+// file, or the current repository tip. Neither file is excluded from scanning,
+// and there are no exemptions anywhere in this gate.
 //
 // WHAT HASHING ACTUALLY BUYS, honestly: it defeats reading, grepping, GitHub
 // code search and search-engine indexing. Those are the realistic ways a name
@@ -100,60 +101,10 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 //
 // ADDING OR ROTATING A ROW without ever typing the value into a file:
 //   printf %s 'the value' | node test/package-privacy.test.mjs --hash word ci 'label'
-// It prints the row to paste in. Piping from `printf` keeps the value out of
-// shell history in a way an argument would not. Full notes in
+// It prints the row to paste into IDENTITY_RULES. Piping from `printf` keeps
+// the value out of shell history in a way an argument would not. Full notes in
 // docs/privacy-gate.md.
-const RULES = [
-  { label: "owner first name", mode: "word", cs: false, words: 1, len: 5, fnv: 2953518059,
-    sha: "119c9ae6f9ca741bd0a76f87fba0b22cab5413187afb2906aa2875c38e213603" },
-  { label: "owner surname", mode: "word", cs: false, words: 1, len: 6, fnv: 2611250378,
-    sha: "1afd80c4ad751e1bdd9b76ccd204676c1c02cbeb19764d6f3a04588aac5459d7" },
-  { label: "owner organization", mode: "word", cs: false, words: 2, len: 12, fnv: 1585416513,
-    sha: "b2163a788b89e956a5d1957910896b87ebe23f619a32d1c7b31c82a9073334e0" },
-  // Case-sensitive on purpose: lowercase, this collides with a CSS property
-  // word that appears in five legitimate files. Capitalised, it does not.
-  { label: "owner organization short name", mode: "word", cs: true, words: 1, len: 5, fnv: 99079550,
-    sha: "b1b1b4e5e8d796ce71667cf34f0aa7c824da30757b3ebd41c6aeb0645701d669" },
-  // The bare personal domain. Two words after normalisation, so it is caught
-  // inside `https://sub.domain.tld/path` and inside an email address, neither
-  // of which a word-boundary rule on the first name can see.
-  { label: "owner personal domain", mode: "word", cs: false, words: 2, len: 15, fnv: 4039484157,
-    sha: "371a0afcb0ba24194f53fe3624c9e04fcff01ac03bb0e8871da99e33cfcb8625" },
-  // The host half of that domain, substring mode, so it is caught when glued
-  // into an identifier or a home-directory path with no separator.
-  { label: "owner personal domain host", mode: "any", cs: false, words: 1, len: 11, fnv: 364680288,
-    sha: "6bd3a274516e9e4f240c6b38a1f4f5358afa5d11c1900e916d2eaae61266ea06" },
-  { label: "collaborator first name", mode: "word", cs: false, words: 1, len: 3, fnv: 3572349335,
-    sha: "bfef4adc39f01b033fe749bb5f28f10b581fef319d34445d21a7bc63fe732fa3" },
-  { label: "collaborator surname", mode: "word", cs: false, words: 1, len: 6, fnv: 1854451012,
-    sha: "e22608a909f233011372fd1af99d42faaa8446c083c31881397073f6f362770d" },
-  { label: "collaborator client first name", mode: "word", cs: false, words: 1, len: 4, fnv: 2453857823,
-    sha: "d0faf7d2e765298769fd7647ab532c80e828ff0dc2d8ee527646ef2ca4dacf64" },
-  // Two end clients and one family member, all found in this tree by hand and
-  // scrubbed. They are here so the same names cannot come back unnoticed.
-  { label: "client first name", mode: "word", cs: false, words: 1, len: 3, fnv: 1669880439,
-    sha: "27037fccea3062ee8ebaea07a9e2bf8dcb6511fd860ae993442aee0c512b8bbf" },
-  { label: "client first name", mode: "word", cs: false, words: 1, len: 5, fnv: 3315428391,
-    sha: "68d85a0a124d90d9eea4b9e3b436db429c8223911d52076d70aef4b78d9686c5" },
-  { label: "family member first name", mode: "word", cs: false, words: 1, len: 6, fnv: 995860805,
-    sha: "b675f2f6f1f675bb7be2e6694f55af82c76d063fcdf8c4606839d32bf505ef23" },
-  // Real infrastructure ids that were committed to this repo as fixtures and
-  // have since been replaced by same-shape synthetic values.
-  { label: "cloudflare account id", mode: "any", cs: false, words: 1, len: 32, fnv: 3998430869,
-    sha: "f36e60bbdd043ba7cceb8534ab1abde065257400d5bd16d4b117d120e923006d" },
-  { label: "cloudflare account id prefix", mode: "word", cs: false, words: 1, len: 8, fnv: 577085071,
-    sha: "9f749c653197b82589eeb38e164bcf02354f1d1cb97a764cfda84410a3f1624d" },
-  { label: "cloudflare zone id", mode: "any", cs: false, words: 1, len: 32, fnv: 961214307,
-    sha: "0268d272ca07074c10083014fc191b3d82cc3a2210f3142350e4424da34e47c2" },
-  { label: "d1 database id", mode: "any", cs: false, words: 5, len: 36, fnv: 2969018041,
-    sha: "2c1d79507808d15be2b2c89a21071596d86ebcc4b595a49e85d40a4d9acf1c57" },
-  { label: "revoked cloudflare api token", mode: "any", cs: false, words: 3, len: 40, fnv: 1957343082,
-    sha: "e18efc466b9505d5355d4f575c4429fbd3a4180c9a8a7e8cc7cd5968828e3d88" },
-  { label: "private repo commit sha", mode: "any", cs: false, words: 1, len: 40, fnv: 3046612968,
-    sha: "8df85422477019b95adb54b74b34928beb64b540d3a96180a55c7a8a3bb3761c" },
-  { label: "stripe product id", mode: "any", cs: false, words: 2, len: 19, fnv: 797592518,
-    sha: "d084c80d7e62c37cf62ff21a3cd0588ab9aad710494ff93572a89c7f40142663" },
-];
+const RULES = IDENTITY_RULES.map(({ kind: _kind, ...rule }) => rule);
 
 // Punctuation becomes a separator. Everything downstream depends on this being
 // applied identically to a rule's value and to the text being searched.
@@ -195,7 +146,7 @@ if (process.argv.includes("--hash")) {
     process.exit(2);
   }
   const rule = compileRule(label, mode, sensitivity === "cs", value);
-  console.log(`  { label: ${JSON.stringify(rule.label)}, mode: "${rule.mode}", cs: ${rule.cs}, ` +
+  console.log(`  { label: ${JSON.stringify(rule.label)}, kind: "privacy", mode: "${rule.mode}", cs: ${rule.cs}, ` +
     `words: ${rule.words}, len: ${rule.len}, fnv: ${rule.fnv},\n    sha: "${rule.sha}" },`);
   process.exit(0);
 }
@@ -369,6 +320,7 @@ const expected = [
   "docs/MAINTAINER.md",
   "docs/OWNER-WORKSPACE-API.md",
   "docs/RECOVERY.md",
+  "docs/RELEASE-GOVERNANCE.md",
   "docs/SUPPORT-ACCESS.md",
   "docs/LEGACY-SUPABASE-EXIT.md",
   "docs/README-developer.md",
@@ -588,7 +540,9 @@ const skippedBinary = [];
 const privateTextMatches = [];
 const privatePathMatches = [];
 for (const path of privateScanPaths) {
-  for (const label of scanPath(path)) privatePathMatches.push(`${path} (path names: ${label})`);
+  for (const label of scanPath(path)) {
+    privatePathMatches.push(`${safeIdentifier(path, "redacted-path")} (path names: ${label})`);
+  }
   let buffer;
   try {
     buffer = readFileSync(resolve(ROOT, path));
@@ -605,9 +559,10 @@ for (const path of privateScanPaths) {
   const located = locateLines(text, index, labels);
   for (const label of labels) {
     const lines = located.get(label) || [];
+    const displayPath = safeIdentifier(path, "redacted-path");
     privateTextMatches.push(lines.length
-      ? `${path}:${lines.join(",")} (${label})`
-      : `${path} (${label}, spans a line break)`);
+      ? `${displayPath}:${lines.join(",")} (${label})`
+      : `${displayPath} (${label}, spans a line break)`);
   }
 }
 

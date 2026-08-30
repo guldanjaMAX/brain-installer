@@ -10,12 +10,37 @@
 
 name: ci
 
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
   workflow_dispatch:
 
 jobs:
+  history-privacy:
+    name: public git history privacy baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      # This baseline is containment, not a clean-history claim. It fails if a
+      # new credential/privacy object appears or a public ref stops descending
+      # from the reviewed incident inventory. The strict clean gate remains a
+      # release blocker until the approved remote rewrite completes.
+      - name: reject history regressions against the sanitized incident baseline
+        run: npm run privacy:history:remote
+
   test:
     name: ${{ matrix.os }} / node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
@@ -30,6 +55,8 @@ jobs:
       # Pin third-party actions to reviewed commits. A mutable major tag can
       # change underneath an otherwise identical installer release.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:

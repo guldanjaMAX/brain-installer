@@ -215,6 +215,7 @@ Required offline release checks:
 ```bash
 npm ci --ignore-scripts
 npm test
+npm run privacy:history
 git diff --check
 npm audit --offline
 npm pack --dry-run --json --ignore-scripts
@@ -234,9 +235,19 @@ There are three separate claims:
 
 Never combine those into a broader claim than the evidence supports.
 
+`npm run privacy:history` proves that no new public-history finding was added
+to the sanitized known-incident baseline. It is not a clean-history claim.
+Before any new public tag or release, `npm run privacy:history:strict` must pass
+against the server's exact public heads and tags. Until approved history
+remediation makes that possible, release is blocked even when the package and
+six-platform matrix are green. See `docs/RELEASE-GOVERNANCE.md`.
+
 ## Cut an immutable release
 
 ### 1. Prepare the candidate
+
+Run `npm run privacy:history:strict` first. Do not prepare, tag, or publish a
+candidate while reachable privacy or credential-shaped history remains.
 
 Keep these versions identical:
 

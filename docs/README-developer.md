@@ -21,6 +21,10 @@ recorded in [append-only decision records](./decisions/README.md), beginning
 with the [Cloudflare-native install decision](./decisions/001-cloudflare-native-standard.md).
 The [maintainer guide](./MAINTAINER.md) gives the exact safe change, package,
 release, owner-update, rollback, credential, and issue-evidence workflow.
+The [release-governance plan](./RELEASE-GOVERNANCE.md) defines the public Git
+history, CODEOWNERS, dependency, ruleset, workflow-action, artifact, and
+attestation gates. A known-incident baseline pass is containment, not proof of
+clean public history.
 
 ---
 
