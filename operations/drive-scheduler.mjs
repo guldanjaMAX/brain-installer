@@ -825,6 +825,7 @@ function validateSchedulerReference(reference) {
     programArguments: [
       reference.nodePath,
       reference.schedulerPath,
+      ...(spec.schedulerArgumentsOf ? spec.schedulerArgumentsOf(reference) : []),
       "run",
       reference.path,
       "--brain",
@@ -1155,6 +1156,8 @@ export const removeDriveScheduler = removeScheduler;
 const SAFE_INGEST_ENV = new Set([
   "HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "TMP", "TEMP", "LANG", "SHELL",
   "BRAIN_DEBUG", "BRAIN_GOOGLE_TOKEN_STORE",
+  "BRAIN_QUICKBOOKS_TOKEN_STORE", "BRAIN_SLACK_TOKEN_STORE", "BRAIN_NOTION_TOKEN_STORE",
+  "BRAIN_MICROSOFT_TOKEN_STORE", "BRAIN_DROPBOX_TOKEN_STORE", "BRAIN_HUBSPOT_TOKEN_STORE",
 ]);
 
 export function safeIngestEnvironment(environment = process.env) {

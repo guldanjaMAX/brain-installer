@@ -17,8 +17,8 @@
  * red on the next run.
  *
  * If you are here because this failed: the fix is to add the named file to
- * `scripts.test` in package.json, in a position that matches what it depends
- * on. Do NOT add it to the ignore list below to make this pass — that is the
+ * `scripts.pretest` or `scripts.test` in package.json, in a position that
+ * matches what it depends on. Do NOT add it to the ignore list below to make this pass — that is the
  * same defect this file exists to end, with an extra step.
  */
 import { readFileSync } from "node:fs";
@@ -46,7 +46,8 @@ const check = (name, ok, detail = "") => {
   if (!ok) fail++;
 };
 
-const chain = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).scripts?.test || "";
+const scripts = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).scripts || {};
+const chain = [scripts.pretest, scripts.test].filter(Boolean).join(" && ");
 check("package.json defines a test chain", chain.length > 0);
 
 // Tracked, not on disk: a file someone deleted but left in the chain is a

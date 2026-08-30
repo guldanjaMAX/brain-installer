@@ -146,13 +146,55 @@ const ownerPeriodCloses = [
 ];
 
 const uploadCapabilities = {
-  supported_media_types: ["text/plain", "text/markdown"],
-  supported_extensions: [".txt", ".md", ".markdown"],
-  media_type_extensions: { "text/plain": [".txt"], "text/markdown": [".md", ".markdown"] },
+  supported_media_types: [
+    "text/plain", "text/markdown", "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel", "message/rfc822", "image/png", "image/jpeg",
+  ],
+  text_media_types: ["text/plain", "text/markdown"],
+  binary_media_types: [
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel", "message/rfc822", "image/png", "image/jpeg",
+  ],
+  supported_extensions: [
+    ".txt", ".md", ".markdown", ".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".eml", ".png", ".jpg", ".jpeg",
+  ],
+  media_type_extensions: {
+    "text/plain": [".txt"],
+    "text/markdown": [".md", ".markdown"],
+    "application/pdf": [".pdf"],
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": [".pptx"],
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+    "application/vnd.ms-excel": [".xls"],
+    "message/rfc822": [".eml"],
+    "image/png": [".png"],
+    "image/jpeg": [".jpg", ".jpeg"],
+  },
   max_content_bytes: 1000000,
+  max_binary_bytes: 8 * 1024 * 1024,
+  max_ocr_image_bytes: 3_000_000,
+  media_type_max_bytes: {
+    "text/plain": 1_000_000,
+    "text/markdown": 1_000_000,
+    "application/pdf": 8 * 1024 * 1024,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": 8 * 1024 * 1024,
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": 8 * 1024 * 1024,
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": 8 * 1024 * 1024,
+    "application/vnd.ms-excel": 8 * 1024 * 1024,
+    "message/rfc822": 8 * 1024 * 1024,
+    "image/png": 3_000_000,
+    "image/jpeg": 3_000_000,
+  },
   content_encoding: "utf-8",
   empty_media_type_supported: false,
-  normalization: "decode UTF-8 strictly, remove one leading UTF-8 BOM if present, preserve all remaining text exactly",
+  normalization: "text is decoded as strict UTF-8; documents use bounded native extraction; PNG and JPEG use private OCR",
+  scanned_pdf_ocr_supported: false,
 };
 
 function scenarioFor(request) {

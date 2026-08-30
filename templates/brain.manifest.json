@@ -154,12 +154,59 @@
       "enabled": false
     },
     "slack": {
+      "_comment": [
+        "Read-only conversation history through the owner's own Slack app.",
+        "OAuth credentials stay in the local provider credential store and are",
+        "never placed in this manifest. Optionally restrict the load to exact",
+        "channel_ids. Removed-message authority remains an explicit gap."
+      ],
       "enabled": false,
-      "bot_token_secret": "secret://SLACK_BOT_TOKEN"
+      "channel_ids": [],
+      "include_thread_replies": true
     },
     "notion": {
+      "_comment": [
+        "Read-only pages explicitly shared with the owner's Notion integration.",
+        "OAuth credentials stay in the local provider credential store. Pages",
+        "outside the integration share boundary cannot be inventoried."
+      ],
+      "enabled": false
+    },
+    "quickbooks": {
+      "_comment": [
+        "QuickBooks Online read-only records. Start in the Intuit sandbox.",
+        "OAuth credentials and the selected company id stay in the local",
+        "provider credential store. Hard-deletion truth is not claimed."
+      ],
       "enabled": false,
-      "token_secret": "secret://NOTION_TOKEN"
+      "environment": "sandbox",
+      "entities": [
+        "Account", "Customer", "Vendor", "Invoice", "Payment", "Bill", "Purchase",
+        "JournalEntry", "Deposit", "Transfer", "CreditMemo", "BillPayment", "Estimate",
+        "SalesReceipt", "RefundReceipt"
+      ]
+    },
+    "microsoft": {
+      "_comment": [
+        "Microsoft 365 Outlook plus selected OneDrive or SharePoint drives.",
+        "Graph delta links carry exact message and file tombstones. Add exact",
+        "drive_ids or site_ids after reviewing the tenant selection."
+      ],
+      "enabled": false,
+      "mail_folder_ids": ["inbox"],
+      "drive_ids": [],
+      "site_ids": [],
+      "include_personal_drive": true
+    },
+    "dropbox": {
+      "_comment": "Recursive Dropbox body sync with exact cursor tombstones.",
+      "enabled": false,
+      "root_path": ""
+    },
+    "hubspot": {
+      "_comment": "Read-only contacts, companies, and deals. Hard deletion remains an explicit gap.",
+      "enabled": false,
+      "object_types": ["contacts", "companies", "deals"]
     },
     "upload": {
       "_comment": "Manual drop zone. Always on: it is the fallback for anything with no connector.",
@@ -266,6 +313,22 @@
     ],
     "ingest_cron": "0 9 * * *",
     "folder_ingest_cron": "0 * * * *",
+    "provider_crons": {
+      "quickbooks": "0 2 * * *",
+      "slack": "15 2 * * *",
+      "notion": "30 2 * * *",
+      "microsoft": "0 * * * *",
+      "dropbox": "15 * * * *",
+      "hubspot": "45 2 * * *"
+    },
+    "provider_token_stores": {
+      "quickbooks": "auto",
+      "slack": "auto",
+      "notion": "auto",
+      "microsoft": "auto",
+      "dropbox": "auto",
+      "hubspot": "auto"
+    },
     "admin_key_secret": null,
     "google_token_store": "auto",
     "health_cron": "0 13 * * *",

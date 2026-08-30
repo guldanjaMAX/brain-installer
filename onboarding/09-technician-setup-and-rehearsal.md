@@ -52,6 +52,21 @@ The result names what passed automatically and the exact live field check that
 still remains. Use `npm run rehearse:hiccups -- --list` to see the scenarios or
 `npm run rehearse:hiccups -- --only folder-safety` to repeat one.
 
+Provider expansion has a narrower credential-free rehearsal:
+
+```bash
+brain connectors
+brain connectors --rehearse
+brain connectors --rehearse --provider quickbooks
+```
+
+It runs the real QuickBooks, Slack, Notion, Microsoft 365, Dropbox, and HubSpot
+adapters against invented responses with global network access trapped. It does
+not open a credential store, read a manifest, contact a provider, or prove a
+real account. The catalog also names LinkedIn export and browser-upload proof,
+plus the deliberately absent Salesforce, QuickBooks Desktop, live LinkedIn,
+official Facebook, and official WhatsApp paths.
+
 ## The one technician command
 
 After installing the released CLI, start with the read-only plan:
@@ -181,6 +196,35 @@ brain technician "$HOME/Financial Brain/brain.manifest.json" --run verify
 This runs doctor, health, source freshness, and enrolled-device checks in order.
 It stops on the first failure and does not mark anything complete. Record a
 connector as live-proven only after its exact acceptance event occurs.
+
+## Optional provider connection ceremony
+
+QuickBooks Online, Slack, Notion, Microsoft 365, Dropbox, and HubSpot are
+sandbox-ready but have not completed a real provider acceptance run. For one
+selected provider:
+
+1. Enable its exact `corpora.<provider>` block in the manifest and review its
+   source selection.
+2. In the owner's provider account, create the correct OAuth app and register
+   `http://127.0.0.1:47812`. Slack must be a PKCE public client. Microsoft and
+   Dropbox also use public-client PKCE. QuickBooks, Notion, and HubSpot require
+   a client secret.
+3. Let the approved local launcher inject the provider client ID and, only
+   where required, its secret. Never place either value in the manifest or a
+   command argument.
+4. Run `brain connect <provider> <manifest>`, then
+   `brain ingest <manifest> --from <provider> --dry-run`.
+5. After the dry-run scope is reviewed, run the real ingest and record the
+   provider-specific acceptance receipt. On macOS, install the declared refresh
+   with `brain schedule <manifest> --provider <provider> --install`.
+6. Prove `brain disconnect <provider> <manifest>`. The schedule stops first,
+   local custody is removed only after the supported remote revoke step, and
+   any remaining owner-portal revocation is named. Loaded documents stay until
+   the operator previews and runs `brain forget` for that source.
+
+The exact sandbox gates and deletion limitations live in
+`docs/CONNECTOR-BACKLOG.md`. Do not convert fixture completion into a provider
+proof claim.
 
 ## What the owner does and what the technician does
 

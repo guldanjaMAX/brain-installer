@@ -60,8 +60,10 @@ the same packaging caution as private evaluation data.
 | D1 schema | `migrations/d1/` | Append-only schema and data migrations |
 | Extraction | `ingest/` | File walking, format extraction, quality checks, dates, splitting, batching, resume state |
 | Provider safety | `worker/src/lib/provider-sync.js`, `connectors/provider-sync.mjs`, `ingest/archive.mjs` | Provider deadlines, bounded retries, typed outcomes, cursor progress, streamed response limits, and ZIP expansion limits |
+| Provider expansion | `connectors/provider-oauth.mjs`, `provider-runtime.mjs`, provider adapters, `operations/provider-scheduler.mjs` | Isolated OAuth custody, refresh rotation, normalization, exact delivery and deletion readback, opaque cursors, and macOS schedules for six sandbox-ready providers |
+| Owner document upload | `worker/src/lib/owner-actions.js`, `upload-extract.js`, owner frontend modules | Owner-scoped text and binary upload, bounded extraction, private image OCR, stable payload idempotency, provenance, and lost-response recovery |
 | Google sources | `connectors/google-auth.mjs`, `google-drive.mjs`, `gmail.mjs`, `google-calendar.mjs` | OAuth storage and source-specific listing, cursor, export, and envelope logic |
-| Local operations | `operations/` | Admin-key persistence, Claude owner-workspace guidance, and macOS unattended scheduling (Drive, iMessage capture, watched folder) |
+| Local operations | `operations/` | Admin-key persistence, Claude owner-workspace guidance, and macOS unattended scheduling for Drive, provider refresh, iMessage capture, and watched folders |
 | MCP | `components/brain-mcp.mjs`, `brain-mcp-runtime.mjs` | Tool surface and runtime resolution of the current durable admin key |
 | Acceptance and eval | `acceptance.mjs`, `eval/`, `report*.mjs` | Install checks, retrieval measurement, regression comparison, owner-facing reports |
 | Migration | `migration/` | One-time Supabase corpus and message-session import |
@@ -269,7 +271,13 @@ an exact post-forget inventory proves the family absent.
 | Zoom | Built as a durable transcript delivery queue with bounded missed-webhook reconciliation; a paid real-account meeting remains a field gate |
 | Bank exports and hosted feed | Built into the shared financial ledger; real-statement and real-feed reconciliation remain field gates |
 | OCR for scanned PDFs | Built, optional, and provenance-marked; local synthetic scans pass and private real scans remain a field gate |
-| Slack, Notion, Microsoft 365, QuickBooks, CRM sources | Not built; use an approved export and local ingest when suitable |
+| QuickBooks Online | Sandbox-ready company snapshots with OAuth refresh and common receipts; query deletion truth and live sandbox proof remain open |
+| Slack and Notion | Sandbox-ready read-only snapshots with explicit incomplete deletion authority; no real workspace has crossed either boundary |
+| Microsoft 365 | Sandbox-ready Outlook delta plus OneDrive and SharePoint body extraction; real tenant consent and lifecycle proof remain open |
+| Dropbox | Sandbox-ready cursor sync and bounded body extraction; real account lifecycle proof remains open |
+| HubSpot | Sandbox-ready contacts, companies, deals, and archived tombstones; permanent-deletion truth and live portal proof remain open |
+| LinkedIn | Built as a bounded Download Your Data ZIP path only; live LinkedIn is absent |
+| Browser owner upload | Built for text, PDF text layers, Office, email, PNG, and JPEG with extraction provenance and exact retry recovery; scanned PDF page OCR is absent |
 
 The macOS Drive scheduler installs a per-user LaunchAgent. Its definition has no
 credentials. It resolves the declared durable admin key at runtime, uses Google

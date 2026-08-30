@@ -324,7 +324,7 @@ credential.
 
 ---
 
-## Remote sources: Google Drive, Gmail and IMAP
+## Remote sources: Google Drive, Gmail, provider expansion, and IMAP
 
 ```bash
 node brain.mjs connect google --scopes drive,gmail
@@ -340,6 +340,39 @@ and records the exact authorizing root ids in document metadata. Shared Drive
 queries retain `supportsAllDrives`, `includeItemsFromAllDrives`, and the
 incomplete-search signal. Shortcuts are reported but never followed across the
 boundary.
+
+QuickBooks Online, Slack, Notion, Microsoft 365, Dropbox, and HubSpot use one
+local command shape:
+
+```bash
+node brain.mjs connect quickbooks ./acme.manifest.json
+node brain.mjs ingest ./acme.manifest.json --from quickbooks --dry-run
+node brain.mjs ingest ./acme.manifest.json --from quickbooks
+node brain.mjs schedule ./acme.manifest.json --provider quickbooks --install
+node brain.mjs disconnect quickbooks ./acme.manifest.json
+```
+
+Replace `quickbooks` with the selected provider. Every provider has its own
+Keychain service, protected file fallback, backend selector, refresh record,
+and source cursor. Public clients use PKCE without sending a client secret for
+Slack, Microsoft, and Dropbox. QuickBooks, Notion, and HubSpot require their
+client secret. Token exchanges are never retried because a one-time code or
+rotating refresh token may have been consumed even when the response was lost.
+Ordinary provider reads share bounded deadlines, retry classification,
+`Retry-After`, response-size limits, and redirect refusal.
+
+The adapter cannot commit a cursor. `connectors/provider-runtime.mjs` first
+requires an exact ingest receipt for every normalized document, applies exact
+tombstones, reads the source-family inventory back, then replaces protected
+cursor state. A complete baseline compares its inventory to stored families
+and requires an opaque approval fingerprint before removing anything absent.
+QuickBooks, Slack, Notion, and HubSpot remain partial where the provider cannot
+prove all deletions. Microsoft and Dropbox also become partial and withhold the
+cursor if a configured drive disappears or a file body cannot be extracted.
+
+`brain connectors --rehearse` traps global network access and runs all six real
+adapters against invented responses. It is offline implementation proof, not a
+provider sandbox, OAuth, scheduler, disconnect, or customer-data receipt.
 
 For a mailbox that is not Gmail:
 
@@ -831,8 +864,14 @@ Read this before scoping an engagement.
   entity-scope, and document-grant contracts run against the real Worker code
   with an in-memory D1-shaped adapter. The final domain and physical devices
   still need the weekend ceremony and access-control gate.
-- **Long-tail provider APIs remain absent.** Slack, Notion, Microsoft 365,
-  Dropbox, QuickBooks, and CRM APIs are not product connectors. Manual
+- **Several provider APIs are sandbox-ready but not production-proven.**
+  QuickBooks Online, Slack, Notion, Microsoft 365, Dropbox, and HubSpot have
+  runnable OAuth, refresh, provider read, receipt, scheduling, retry, and
+  disconnect paths backed by invented offline responses. This is not provider
+  sandbox or real-account proof. Their exact deletion and visibility gaps are
+  maintained in `CONNECTOR-BACKLOG.md`. Plaid has a durable offline-tested Link,
+  sync, webhook, reconciliation, and revocation path, but no accepted Sandbox
+  or Production field receipt. Manual
   exports, a watched folder, or Drive are first-class custody plans, not a
   pretend API integration.
 - **No official WhatsApp Business Platform connector.** Safe WhatsApp chat

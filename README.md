@@ -330,7 +330,20 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
   Messages and JSON in Meta's Download Your Information flow, then load the
   exported `message_*.json` files through Drive or the watched folder. The
   parser is fixture-tested and has not yet processed a reviewed real export.
-- **Slack and Notion** do not exist as connectors.
+- **QuickBooks Online, Slack, Notion, Microsoft 365, Dropbox, and HubSpot are
+  sandbox-ready, not live-proven.** Each has local OAuth custody, refresh,
+  bounded provider I/O, common receipts, scheduling, retry, and disconnect.
+  QuickBooks, Slack, Notion, and HubSpot name their incomplete deletion truth.
+  Microsoft and Dropbox withhold opaque cursors when file bodies or source
+  visibility are incomplete. Run `brain connectors --rehearse` for invented
+  offline proof; no provider account, credential, or customer record is used.
+- **LinkedIn has an export path, not a live connector.** A Download Your Data
+  ZIP is safety-checked and its recognized CSVs load through the ordinary
+  folder path. There is no cookie capture, scraping, or live LinkedIn API.
+- **The owner workspace accepts documents, not only pasted text.** PDF text
+  layers, Word, PowerPoint, Excel, `.eml`, PNG, and JPEG use bounded extraction.
+  Image OCR runs only inside the owner's Worker when enabled. Scanned PDF page
+  OCR is not built.
 - **Meeting transcripts arrive two ways, neither of them a transcription
   service.** Zoom cloud recordings deliver themselves to a webhook on your own
   worker. The worker makes each delivery durable before acknowledging it and

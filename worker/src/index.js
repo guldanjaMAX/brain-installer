@@ -1189,7 +1189,7 @@ const SOURCE_KINDS = new Set([
   // refresh expectation, and `brain sources` should never present it as a
   // live capture that has gone stale.
   "iphone-backup",
-  "slack", "notion", "upload",
+  "quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot", "upload",
 ]);function receiptTimeMs(value, fallback = Date.now()) {
   if (value === null || value === undefined || value === "") return fallback;
   if (typeof value === "number" && Number.isFinite(value)) return value;

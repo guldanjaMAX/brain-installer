@@ -44,6 +44,7 @@ import {
   detectFacebookMessengerExport, isFacebookMessengerExportFilename,
   parseFacebookMessengerExport,
 } from "./facebook-messenger-export.mjs";
+import { parseLinkedInArchive } from "./linkedin-export.mjs";
 import { MessageSessionizer } from "./message-session.mjs";
 import { splitMbox, mboxMessageKey } from "./mbox.mjs";
 // The one mail reader. Imported by name rather than reached through the
@@ -84,7 +85,7 @@ export const MAX_FILE_BYTES = 8 * 1024 * 1024;
 export const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
 
 /** Extensions that hold many documents, and get the archive ceiling. */
-const ARCHIVE_EXTENSIONS = new Set([".mbox"]);
+const ARCHIVE_EXTENSIONS = new Set([".mbox", ".zip"]);
 
 export const fileSizeLimitFor = (name, maxBytes, archiveBytes) =>
   (ARCHIVE_EXTENSIONS.has(extensionOf(name)) || isFacebookMessengerExportFilename(name)
@@ -329,6 +330,24 @@ function prepareFacebookMessengerExport(file, buf, hash, { sourceName }) {
   };
 }
 
+/** One LinkedIn account-owner export ZIP, one document per recognized CSV. */
+function prepareLinkedInExport(file, buf, hash, { sourceName }) {
+  const parsed = parseLinkedInArchive(buf, { sourceName, archivePath: file.rel });
+  if (parsed.error || !parsed.envelopes.length) {
+    return {
+      hash,
+      skip: { path: file.rel, reason: parsed.error || "the LinkedIn export contains no readable data rows" },
+    };
+  }
+  return {
+    hash,
+    envelopes: declareFamily(parsed.envelopes, sourceFileFamilyUid(file, sourceName)),
+    note: parsed.skipped.length
+      ? `${parsed.skipped.length} recognized LinkedIn CSV file(s) were empty or unreadable`
+      : null,
+  };
+}
+
 /**
  * One mail archive, many documents.
  *
@@ -477,6 +496,13 @@ export async function prepare(file, { sourceName, ocr = null }) {
     if (detectFacebookMessengerExport(peek)) {
       return prepareFacebookMessengerExport(file, buf, hash, { sourceName });
     }
+  }
+
+  // LinkedIn's supported path is the account owner's Download Your Data ZIP.
+  // Every ZIP is safety-validated here; an unrelated ZIP receives an explicit
+  // "no recognized LinkedIn CSV" outcome rather than a generic binary skip.
+  if (ext === ".zip") {
+    return prepareLinkedInExport(file, buf, hash, { sourceName });
   }
 
   // One file, many documents: the archive is split before the single-document

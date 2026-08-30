@@ -843,7 +843,10 @@ const DIAGNOSTIC_CODES = Object.freeze({
 export function supportSystemProjection(status) {
   const unavailableAllowlist = new Set(["health", "diagnose", "freshness", "vectors", "install_state"]);
   const stateAllowlist = new Set(["ok", "never_synced", "stale", "broken", "indexing", "unknown"]);
-  const kindAllowlist = new Set(["upload", "drive", "message", "email", "calendar"]);
+  const kindAllowlist = new Set([
+    "upload", "drive", "message", "email", "calendar", "quickbooks", "slack",
+    "notion", "microsoft", "dropbox", "hubspot",
+  ]);
   const out = {
     accepting_documents: status.accepting_documents ?? null,
     status: ["ok", "paused-for-upgrade"].includes(status.status) ? status.status : null,
@@ -877,7 +880,8 @@ export function supportSystemProjection(status) {
     out.sources = status.sources.map((source) => ({
       label: [
         "Files you uploaded", "Google Drive", "Messages", "Email", "Calendar",
-        "Meeting recordings", "Another source",
+        "Meeting recordings", "QuickBooks Online", "Slack", "Notion",
+        "Microsoft 365", "Dropbox", "HubSpot", "Another source",
       ].includes(source.label) ? source.label : "Another source",
       kind: kindAllowlist.has(source.kind) ? source.kind : "other",
       state: stateAllowlist.has(source.state) ? source.state : "unknown",

@@ -166,22 +166,30 @@ try {
       ingestLocal: spy("local"),
       ingestRemote: spy("remote"),
       ingestIphoneBackup: spy("iphone"),
+      ingestProvider: spy("provider"),
     });
     const flags = { "dry-run": true, limit: "5" };
     for (const key of ["calendar", "imessage", "whatsapp", "upload", "gmail", "google_drive", "iphone_backup"]) {
       for (const leg of table[key].legs({ m, manifestPath, flags })) await leg.run();
     }
-    check("every source in the real registry is wired to a command",
-      seen.length === 7, JSON.stringify(seen.map((x) => x.name)));
+    for (const key of ["quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot"]) {
+      for (const leg of table[key].legs({ m, manifestPath, flags: { "dry-run": true } })) await leg.run();
+    }
+    check("every pull source in the real registry is wired to a command",
+      seen.length === 13, JSON.stringify(seen.map((x) => x.name)));
     check("the real registry forwards --dry-run to EVERY source, unaltered",
       seen.every((x) => x.flags["dry-run"] === true),
       JSON.stringify(seen.filter((x) => x.flags["dry-run"] !== true).map((x) => x.name)));
     check("the real registry forwards --limit to every source too",
-      seen.every((x) => x.flags.limit === "5"),
+      seen.slice(0, 7).every((x) => x.flags.limit === "5"),
       JSON.stringify(seen.filter((x) => x.flags.limit !== "5").map((x) => x.name)));
+    check("provider sources refuse --limit before running because it could skip a cursor",
+      ["quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot"].every((key) =>
+        /cannot honor --limit/.test(table[key].legs({ m, manifestPath, flags }).unavailable.reason)));
     check("each source is asked for its OWN source, not a neighbour's",
       JSON.stringify(seen.map((x) => x.flags.from)) === JSON.stringify([
         "calendar", "imessage", "whatsapp", undefined, "gmail", "drive", "iphone-backup",
+        "quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot",
       ]), JSON.stringify(seen.map((x) => x.flags.from)));
     check("the folder leg is handed the folder path from the manifest",
       seen[3].flags.path === "/tmp/wiring" && seen[3].flags.source === "upload",
@@ -263,6 +271,11 @@ try {
           reason: "no WhatsApp outbox on this machine; the linked device was never paired",
           fix: "brain connect whatsapp <manifest> --accept-risk",
         }),
+        slack: () => ({
+          connected: false,
+          reason: "no Slack connection is stored on this machine",
+          fix: "brain connect slack <manifest>",
+        }),
       },
     });
     sweep.calls = calls;
@@ -291,23 +304,23 @@ try {
     // manifest wants but cannot reach is unavailable. Neither may look loaded.
     for (const [label, why] of [
       ["Zoom", "push"],
-      ["notion", "not enabled"],
+      ["Notion", "not enabled"],
     ]) {
       check(`a source skipped because it is ${why} appears only in the skipped list`,
         skippedBlock.includes(label) && !loadedBlock.includes(label),
         `${label}: loaded=${loadedBlock.includes(label)} skipped=${skippedBlock.includes(label)}`);
     }
-    for (const [label, why] of [["WhatsApp", "not connected"], ["slack", "no loader"]]) {
+    for (const [label, why] of [["WhatsApp", "not connected"], ["Slack", "not connected"]]) {
       check(`a source ${why} appears only in the unavailable list`,
         unavailableBlock.includes(label) && !loadedBlock.includes(label) && !skippedBlock.includes(label),
         `${label}: loaded=${loadedBlock.includes(label)} skipped=${skippedBlock.includes(label)} unavailable=${unavailableBlock.includes(label)}`);
     }
 
     check('"this client does not use it" stays a different message from "it is broken"',
-      /notion.*not enabled in this manifest/.test(skippedBlock) &&
+      /Notion.*not enabled in this manifest/.test(skippedBlock) &&
       /WhatsApp.*enabled, but not connected/.test(unavailableBlock), `${skippedBlock}\n${unavailableBlock}`);
-    check("a source with no loader in this build is unavailable instead of vanishing from the sweep",
-      /slack.*has no loader for it/.test(unavailableBlock), unavailableBlock);
+    check("a provider without local OAuth custody is unavailable instead of vanishing from the sweep",
+      /Slack.*no Slack connection/.test(unavailableBlock) && /brain connect slack/.test(unavailableBlock), unavailableBlock);
     check("Zoom is skipped as a push connector, not reported as loaded work",
       /Zoom.*nothing to pull/.test(skippedBlock), skippedBlock);
     check("a manifest _comment key is not treated as a source",

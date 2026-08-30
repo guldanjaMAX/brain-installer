@@ -13,7 +13,7 @@ I would rather lose a sale to an honest table than win one and spend week three 
 | Source | Status |
 |---|---|
 | Google Drive | **Built, root-bound, and off by default.** The manifest must name reviewed folder ids. Deterministic tests prove unrelated visible files are excluded. Live root, Shared Drive, move, permission-loss, delete, and scheduler acceptance remains open |
-| Direct upload and API push | **Built.** Live-service smoke proof exists with a synthetic corpus; no authorized real-document receipt is accepted yet |
+| Direct upload and API push | **Built.** The owner workspace accepts text, PDF text layers, Word, PowerPoint, Excel, `.eml`, PNG, and JPEG. Image OCR stays private to the owner's Worker and is off unless configured. Scanned PDF page OCR is not built. All browser formats have local fixture proof only |
 | A watched folder on your own machine | **Built, Mac-only for the schedule.** Name one folder in your manifest and it reloads itself on a schedule: new files load, edited files reload, deleted files are removed. This is what makes "drop it in a folder you already ingest" true for a folder that is not inside Google Drive. On Windows and Linux the same load runs by hand. Real multi-tick sleep, wake, and deletion behavior is not yet field-proven |
 | Gmail | Built: `brain connect google --scopes gmail`, then `brain ingest --from gmail`. Incremental via historyId; bulk mail excluded by default. Not yet run against a real mailbox |
 | Any other mailbox, over IMAP (Yahoo, Fastmail, iCloud, a host) | Built: `brain connect imap`, then `brain ingest --from imap`. Read-only, so nothing is marked read. Inbox and Sent by default; Junk, Trash and Drafts skipped; **an Archive folder is NOT read**, and a folder whose role cannot be identified is not read either. Every folder is named in the run with the true reason it was or was not read. Incremental via UIDVALIDITY plus a per-folder UID watermark. Bulk mail is filtered locally on headers, which is weaker than Gmail's. **Never yet run against a real mailbox** |
@@ -26,12 +26,13 @@ I would rather lose a sale to an honest table than win one and spend week three 
 | Facebook Messenger export | **Built as an export.** Select Messages and JSON in Meta's Download Your Information flow, then ingest the exported `message_*.json` files through Drive or the watched folder. Exact epoch timestamps, stable thread/session identity, rerun idempotency, explicit attachment-only/unavailable counts, and family deletion are fixture-tested. No current real export has been accepted yet; there is no live Facebook API connector. |
 | Zoom | **Built.** `brain connect zoom`: a webhook on your own worker loads each cloud-recording transcript automatically. The worker stores delivery debt before acknowledging Zoom and checks a bounded recent window for missed webhooks. **Needs a paid (Licensed) Zoom seat** because the free tier cannot cloud record at all. Not yet run against a real Zoom account |
 | Plaid bank feed | **Built, read-only, and off by default.** The owner completes Plaid Link. Transactions Sync stages a complete update window before ledger rows and the cursor become visible together. Signed webhooks request reconciliation, scheduled reconciliation remains the fallback, and provider removal must succeed before the encrypted access token is erased. Credential-free fake and real SQLite/D1-compatible tests pass. No Plaid Sandbox, Production, real institution, or primary-bank proof exists yet |
-| Slack | Not built. Priced separately when it is |
-| Notion | Not built |
-| Microsoft 365, Outlook, SharePoint, OneDrive | Not built. Microsoft has disabled basic IMAP authentication for these accounts, so the IMAP connector above does **not** reach them either |
-| Dropbox | Not built |
-| QuickBooks | Not built |
-| HubSpot and other CRMs | Not built |
+| Slack | **Sandbox-ready, not live-proven.** Public-client PKCE, rotating user tokens, channels, direct conversations, messages, threads, surfaced tombstones, scheduling, and disconnect are wired. Slack does not expose complete deletion truth |
+| Notion | **Sandbox-ready, not live-proven.** Pages, properties, recursive blocks, surfaced trash, OAuth refresh, scheduling, and disconnect are wired. Pages not shared with the integration stay invisible, and removal truth is incomplete |
+| Microsoft 365, Outlook, SharePoint, OneDrive | **Sandbox-ready, not live-proven.** Outlook immutable-ID delta and OneDrive or SharePoint file bodies share one Microsoft OAuth connection. Cursors stop on body gaps or lost drive visibility instead of skipping data |
+| Dropbox | **Sandbox-ready, not live-proven.** Recursive baseline, file bodies, opaque cursor resume, surfaced deletions, scheduling, and disconnect are wired. A body extraction gap withholds the cursor |
+| QuickBooks Online | **Sandbox-ready, not live-proven.** Fifteen accounting record types are read as a repeatable company snapshot with provenance. QuickBooks queries do not expose reliable deletion truth, so stale records are not removed automatically |
+| HubSpot CRM | **Sandbox-ready, not live-proven.** Contacts, companies, deals, archived tombstones, OAuth refresh, scheduling, and disconnect are wired. Permanently deleted objects are not exposed by ordinary snapshots |
+| LinkedIn | **Built as an owner export, not a live connector.** Recognized CSVs in Download Your Data ZIPs use the bounded archive path. There is no cookie capture, scraper, or live LinkedIn API |
 | Airtable | Not built |
 
 ---
@@ -129,7 +130,7 @@ Shared mailboxes and group threads contain messages from people who never agreed
 
 ### Direct upload and API push
 
-Anything you can turn into text can be put into your brain directly, one document at a time or in bulk. This is the built fallback for every source with no connector. Its live-service proof uses a synthetic corpus; an authorized real-document receipt is still pending.
+Anything you can turn into text can be put into your brain directly, one document at a time or in bulk. The browser accepts plain text, PDF files with text layers, Word, PowerPoint, Excel, `.eml`, PNG, and JPEG. PNG and JPEG use the private OCR route when OCR is enabled. Scanned PDF page OCR is not available, and a scan without a text layer is refused by name. This is the built fallback for every source with no connector. Its extraction and retry proof is local and synthetic; an authorized real-document receipt is still pending.
 
 Everything arriving this way passes the **credential gate**: if a document contains a live password or API key, it is refused, the kind of credential is named, and its value is never quoted back. Nothing is written. That gate runs on every door into your index, because a gate on one door is not a gate.
 
@@ -369,37 +370,41 @@ The load is the named source you chose, so `brain sources` shows it and `brain f
 
 ---
 
-## Additional export path and not-built providers
+## Additional export path and sandbox-ready providers
 
 Named plainly, with what it would actually take, so you can plan around it rather than wait for it.
 
 ### Slack
 
-**Not built, and it will be priced separately when it is.**
-
-Not an authentication problem, a rate limit one. Since March 2026, apps outside Slack's marketplace are throttled hard enough that reading a history takes months rather than hours. The workable path is you creating an app inside your own workspace, which keeps normal speed but needs admin rights and a guided walkthrough. That is real work and it gets quoted as real work.
+**Sandbox-ready, not proven against a real workspace.** The owner creates a Slack app with PKCE enabled. The desktop flow requests read-only user scopes and stores rotating tokens on the owner's machine. It reads channels, direct conversations, messages, and bounded thread replies. The API can surface some deletion events but cannot prove every message or inaccessible conversation that disappeared, so Slack stays partial by contract and never removes unseen history by guess. `brain disconnect slack` revokes the current token and removes local custody, then tells the owner to remove the underlying Slack app installation.
 
 ### Microsoft 365, Outlook, SharePoint, OneDrive
 
-**Not built.** This is the biggest gap in the list and the most honest thing on this page.
-
-If your business runs on Microsoft rather than Google, **this product is not ready for you today.** That is a disqualification, not a roadmap promise with a date attached. When it is built, it will also require that the person signing the agreement is the global administrator of your Microsoft tenant, because if your IT is outsourced, consent becomes a support ticket at a company I have no relationship with.
+**Sandbox-ready, not proven against a real Entra tenant.** The public-client PKCE flow requests read-only mail, file, and site access. Outlook uses immutable message IDs and Graph delta links. OneDrive, configured drives, and SharePoint site drives download supported file bodies through bounded extraction. A delta link advances only after every body and deletion receipt succeeds. If a previously known drive becomes invisible, its cursor and stored documents are retained and the source becomes partial. Tenant consent may still require the customer's Microsoft administrator.
 
 ### Notion
 
-**Not built.** The usual reason a Notion connection looks broken is under-sharing: the integration can only see pages explicitly shared with it, so it silently returns a fraction of the workspace. When this is built it will report how many pages it can actually see, so that failure is visible on day one instead of week three.
+**Sandbox-ready, not proven against a real workspace.** The connector uses Notion's versioned API, reads shared page properties and recursive blocks, and surfaces archived or trashed pages it can see. Notion only returns pages shared with the integration. Removing access can look like disappearance without a tombstone, so the connector names incomplete removal authority and does not advance a cursor or invent deletions.
 
-### QuickBooks
+### QuickBooks Online
 
-**Not built.** Highest unique value on this list, because it is the only source with ground truth on who paid and what things actually cost. It is also gated behind an Intuit review queue that has to start well before any code is written.
+**Sandbox-ready, not proven against an Intuit sandbox or production company.** The OAuth connection is company-bound and refreshable. Each run reads Accounts, Customers, Vendors, Invoices, Payments, Bills, Purchases, Journal Entries, Deposits, Transfers, Credit Memos, Bill Payments, Estimates, Sales Receipts, and Refund Receipts with stable IDs and provider timestamps. The query API does not provide reliable deletion truth, so each run is an explicitly partial present-record snapshot and never removes an old record merely because it was absent.
 
-### HubSpot and other CRMs
+### HubSpot CRM
 
-**Not built.** When it is, it will be built as a shape (contacts, deals, activities, notes) rather than one vendor, because this is the most fragmented category in the list and no two businesses use the same tool.
+**Sandbox-ready, not proven against a real portal.** Contacts, companies, and deals are read in active and archived passes. Archived objects become exact tombstones. Permanent deletions are not exposed by the ordinary object snapshots, so full deletion authority remains unavailable. OAuth uses HubSpot's versioned 2026-03 token and revoke endpoints.
 
-### Dropbox, Airtable
+### Dropbox
 
-**Not built.** Both are straightforward when the demand justifies them. Airtable in particular needs the meaning of your tables mapped by hand, so it gets quoted as configuration work rather than a connection.
+**Sandbox-ready, not proven against a real account.** Dropbox uses public-client PKCE, offline refresh, recursive list cursors, bounded file-body extraction, surfaced tombstones, and remote token revocation on disconnect. A complete baseline is reconciled against stored families. If any inventoried file body cannot be extracted, the source stays partial and the cursor is withheld so an unchanged file is not skipped forever.
+
+### LinkedIn Download Your Data
+
+**Built as an export only.** Drop the account owner's Download Your Data ZIP into an approved folder. Recognized profile, connection, employment, education, recommendation, message, invitation, skills, project, certification, learning, follow, job, article, comment, and share CSVs become stable documents with archive and row provenance. Every ZIP entry is counted against shared archive safety bounds even when it is not selected. There is no live LinkedIn, browser-cookie, or scraping path.
+
+### Airtable
+
+**Not built.** Airtable needs the meaning of each table mapped explicitly, so it remains configuration work rather than a generic connection.
 
 ### Facebook Messenger
 

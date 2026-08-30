@@ -38,6 +38,12 @@ const SOURCE_LABELS = {
   gmail: "Email",
   calendar: "Calendar",
   zoom: "Meeting recordings",
+  quickbooks: "QuickBooks Online",
+  slack: "Slack",
+  notion: "Notion",
+  microsoft: "Microsoft 365",
+  dropbox: "Dropbox",
+  hubspot: "HubSpot",
 };
 
 /** Kinds are a small closed set and make a better fallback than a slug. */
@@ -47,6 +53,12 @@ const KIND_LABELS = {
   message: "Messages",
   email: "Email",
   calendar: "Calendar",
+  quickbooks: "QuickBooks Online",
+  slack: "Slack",
+  notion: "Notion",
+  microsoft: "Microsoft 365",
+  dropbox: "Dropbox",
+  hubspot: "HubSpot",
 };
 
 function labelFor(source) {

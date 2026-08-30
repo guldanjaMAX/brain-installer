@@ -1,6 +1,6 @@
 # Connector readiness and ranked backlog
 
-Current as of 2026-08-30 for the isolated v0.2.1 release candidates.
+Current as of 2026-08-30 for the integrated v0.2.1 release candidate.
 
 This is the engineering proof ledger. The client-facing capability description
 lives in `onboarding/07-ingest-source-matrix.md`. No assertion count promotes a
@@ -49,7 +49,15 @@ a live service smoke test, not proof of a source connector or customer corpus.
 | Human custodian or manual portal export | Operational source type | Watched-folder and Drive paths tested as above | None for an actual delivery cadence | Record who supplies the artifact, cadence, expected format, date coverage, and one missed-delivery test that reports stale or unavailable instead of zero. |
 | IMAP | Built, read-only | Scripted real socket, 78 checks; TLS and provider behavior remain outside the harness | None | Use a seeded disposable Yahoo, Fastmail, iCloud, or hosted mailbox to prove TLS, app-password custody, folder inventory, baseline, UID resume, reconnect, no unread-state mutation, and explicit Archive/unclassified-folder reporting. |
 | Facebook Messenger export | Built, export-only | Fixture plus common folder-ingestion path | None | Load one current reviewed Download Your Information JSON export; prove exact timestamps, text repair, stable thread/session identity, attachment/unavailable counts, rerun idempotency, provenance, retrieval, and family deletion. |
-| QuickBooks, Slack, Notion, Microsoft 365, Dropbox, and CRM APIs | Absent or product-decision blocked | None in this checkout | None | Do not start until demand, administrator custody, authorization contract, deletion semantics, and a provider test account are named. |
+| Browser owner document and image upload | Built for text, PDF text layers, Word, PowerPoint, Excel, EML, PNG, and JPEG | Extractor fixtures and in-process Worker | None | On a disposable Worker, upload every supported format; prove private OCR, signature and archive refusal, lost-response retry, unchanged retry, retrieval, and exact deletion. Scanned PDF page OCR remains absent. |
+| QuickBooks Online | Sandbox-ready read-only runner | Unit and scripted provider I/O | None | Use an Intuit sandbox company to prove company-bound consent, refresh, all configured entities, pagination, changed records, outage retry, disconnect, and retrieval. Query snapshots cannot prove deletions. |
+| Slack | Sandbox-ready read-only runner | Unit and scripted provider I/O | None | Use a test workspace to prove public-client PKCE, rotating user-token refresh, channel and direct-message pagination, threads, surfaced deletion events, rate limits, exclusions, disconnect, and retrieval. Complete deletion truth remains unavailable. |
+| Notion | Sandbox-ready read-only runner | Unit and scripted provider I/O | None | Use a test workspace to prove shared and unshared pages, recursive blocks, edits, trash, under-sharing visibility, refresh, retry, disconnect, and retrieval. Complete removal truth remains unavailable. |
+| LinkedIn Download Your Data | Built, export-only | Bounded archive and CSV fixtures through common folder ingest | None | Load one current reviewed owner export, reconcile recognized and skipped CSVs, rerun unchanged, retrieve one result, and prove exact source-file family deletion. Live LinkedIn is absent. |
+| Microsoft 365 | Sandbox-ready read-only runner | Unit and scripted provider I/O | None | Use a test Entra tenant to prove consent, refresh, Outlook immutable-ID delta, OneDrive and SharePoint body downloads, cursor expiry reset, lost drive visibility, deletion, disconnect, and retrieval. |
+| Dropbox | Sandbox-ready read-only runner | Unit and scripted provider I/O | None | Use a test account to prove public-client PKCE, refresh, bounded body extraction, cursor resume and reset, an extraction gap, edits, tombstones, disconnect, and retrieval. |
+| HubSpot CRM | Sandbox-ready read-only runner | Unit and scripted provider I/O | None | Use a test portal to prove the 2026-03 OAuth lifecycle, pagination, contacts, companies, deals, archives, retry, revoke, disconnect, and retrieval. Permanent-deletion truth remains unavailable. |
+| Salesforce, QuickBooks Desktop, live LinkedIn, official Facebook, and official WhatsApp | Absent | None | None | Define a policy-compliant product boundary, custody model, deletion semantics, and sandbox acceptance plan before building any of these. |
 
 ## Ranked work
 
@@ -91,7 +99,11 @@ a live service smoke test, not proof of a source connector or customer corpus.
 7. **Field-prove the integrated read-only IMAP line.** Email export through MBOX
    remains the zero-credential fallback. The live connector must prove TLS,
    app-password custody, folder truth, UID resume, and no unread-state mutation.
-8. **Defer speculative long-tail APIs.** Treat people, recurring manual exports,
+8. **Run the six provider sandbox gates and the LinkedIn export gate.** The
+   runners are locally complete enough to test, but no consent, refresh,
+   cursor, deletion, scheduling, disconnect, or retrieval lifecycle has crossed
+   a real provider boundary.
+9. **Defer speculative long-tail APIs.** Treat people, recurring manual exports,
    and portal downloads as first-class source plans. Do not assume every source
    has an API or that the owner controls its credentials.
 

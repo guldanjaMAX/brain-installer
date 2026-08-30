@@ -11,10 +11,14 @@
 import { jsonResponse, privateNoStore } from "./core.js";
 import { ownerSessionPrincipal } from "./owner-auth.js";
 import { backendOf, storeFor, D1 } from "./store.js";
+import {
+  decodeUploadBase64, extractOwnerUpload, OWNER_BINARY_MEDIA,
+  OWNER_BINARY_UPLOAD_MAX_BYTES, OWNER_EXTRACTED_TEXT_MAX_BYTES, OWNER_IMAGE_UPLOAD_MAX_BYTES,
+} from "./upload-extract.js";
 
 export const OWNER_PATH_PREFIX = "/api/owner/";
 export const OWNER_TENANT = "primary";
-export const OWNER_UPLOAD_MAX_CONTENT_BYTES = 1_000_000;
+export const OWNER_UPLOAD_MAX_CONTENT_BYTES = OWNER_EXTRACTED_TEXT_MAX_BYTES;
 
 const OWNER_TABLES = [
   "owner_action_requests",
@@ -44,15 +48,32 @@ const ACTIVITY_TYPES = new Set([
 const MEDIA_TYPE_EXTENSIONS = Object.freeze({
   "text/plain": Object.freeze([".txt"]),
   "text/markdown": Object.freeze([".md", ".markdown"]),
+  ...OWNER_BINARY_MEDIA,
 });
+const TEXT_UPLOAD_MEDIA = Object.freeze(["text/plain", "text/markdown"]);
+const BINARY_UPLOAD_MEDIA = Object.freeze(Object.keys(OWNER_BINARY_MEDIA));
+const MEDIA_TYPE_MAX_BYTES = Object.freeze(Object.fromEntries(
+  Object.keys(MEDIA_TYPE_EXTENSIONS).map((mediaType) => [mediaType,
+    TEXT_UPLOAD_MEDIA.includes(mediaType)
+      ? OWNER_UPLOAD_MAX_CONTENT_BYTES
+      : mediaType === "image/png" || mediaType === "image/jpeg"
+        ? OWNER_IMAGE_UPLOAD_MAX_BYTES
+        : OWNER_BINARY_UPLOAD_MAX_BYTES]),
+));
 const UPLOAD_CAPABILITIES = Object.freeze({
   supported_media_types: Object.freeze(Object.keys(MEDIA_TYPE_EXTENSIONS)),
-  supported_extensions: Object.freeze([".txt", ".md", ".markdown"]),
+  text_media_types: TEXT_UPLOAD_MEDIA,
+  binary_media_types: BINARY_UPLOAD_MEDIA,
+  supported_extensions: Object.freeze(Object.values(MEDIA_TYPE_EXTENSIONS).flat()),
   media_type_extensions: MEDIA_TYPE_EXTENSIONS,
   max_content_bytes: OWNER_UPLOAD_MAX_CONTENT_BYTES,
+  max_binary_bytes: OWNER_BINARY_UPLOAD_MAX_BYTES,
+  max_ocr_image_bytes: OWNER_IMAGE_UPLOAD_MAX_BYTES,
+  media_type_max_bytes: MEDIA_TYPE_MAX_BYTES,
   content_encoding: "utf-8",
   empty_media_type_supported: false,
-  normalization: "decode UTF-8 strictly, remove one leading UTF-8 BOM if present, preserve all remaining text exactly",
+  normalization: "text is decoded as strict UTF-8; documents use bounded native extraction; PNG and JPEG use private OCR",
+  scanned_pdf_ocr_supported: false,
 });
 
 const respond = (body, status = 200) => privateNoStore(jsonResponse(body, status));
@@ -98,6 +119,11 @@ function canonical(value) {
 
 async function sha256(value) {
   const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical(value)));
+  return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Bytes(value) {
+  const bytes = await crypto.subtle.digest("SHA-256", value);
   return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
@@ -298,11 +324,14 @@ function unsupportedMedia(mediaType, reason) {
     supported_media_types: UPLOAD_CAPABILITIES.supported_media_types,
     supported_extensions: UPLOAD_CAPABILITIES.supported_extensions,
     max_content_bytes: OWNER_UPLOAD_MAX_CONTENT_BYTES,
+    max_binary_bytes: OWNER_BINARY_UPLOAD_MAX_BYTES,
+    max_ocr_image_bytes: OWNER_IMAGE_UPLOAD_MAX_BYTES,
+    media_type_max_bytes: MEDIA_TYPE_MAX_BYTES,
     reason,
   }, 415);
 }
 
-async function upload(env, body, ingestEnvelope, afterIngest) {
+async function upload(env, body, ingestEnvelope, afterIngest, extractUpload = extractOwnerUpload) {
   const requestId = requestIdOf(body);
   if (!requestId) return invalid("invalid_request_id", "request_id");
   const entitySlug = String(body.entity_slug || "");
@@ -313,6 +342,7 @@ async function upload(env, body, ingestEnvelope, afterIngest) {
   if (!MEDIA_TYPE_EXTENSIONS[mediaType]) {
     return unsupportedMedia(mediaType, "This media type is not accepted by owner upload.");
   }
+  const binaryUpload = Object.hasOwn(OWNER_BINARY_MEDIA, mediaType);
   let fileName = null;
   if (body.file_name !== undefined && body.file_name !== null) {
     if (typeof body.file_name !== "string" || !body.file_name.trim() || body.file_name.length > 255 || /[\\/]/.test(body.file_name)) {
@@ -326,24 +356,11 @@ async function upload(env, body, ingestEnvelope, afterIngest) {
     }
   }
   const envelope = objectBody(body.envelope);
-  if (!envelope) {
-    return invalid("invalid_upload_envelope", "envelope");
-  }
+  if (!envelope) return invalid("invalid_upload_envelope", "envelope");
   // Storage identity is server-owned. request_id is only the retry receipt and
   // must never turn every new version of one file into a new corpus document.
   if (Object.hasOwn(envelope, "source_type") || Object.hasOwn(envelope, "source_id")) {
     return invalid("server_owned_document_identity", "envelope");
-  }
-  if (typeof envelope.content !== "string") return invalid("invalid_upload_content", "envelope.content");
-  const normalizedContent = envelope.content.startsWith("\uFEFF") ? envelope.content.slice(1) : envelope.content;
-  if (!normalizedContent.trim()) return invalid("empty_upload_content", "envelope.content");
-  if (new TextEncoder().encode(normalizedContent).length > OWNER_UPLOAD_MAX_CONTENT_BYTES) {
-    return respond({
-      uploaded: false,
-      error: "document too large",
-      code: "upload_too_large",
-      max_content_bytes: OWNER_UPLOAD_MAX_CONTENT_BYTES,
-    }, 413);
   }
   const metadata = objectBody(envelope.metadata) || {};
   for (const key of ["entity_slug", "client", "client_name"]) {
@@ -351,25 +368,49 @@ async function upload(env, body, ingestEnvelope, afterIngest) {
       return conflict("conflicting_business_scope");
     }
   }
-  const normalized = {
-    ...envelope,
-    source_type: "upload",
-    source_id: `owner:${entitySlug}:${documentId}`,
-    content: normalizedContent,
-    metadata: { ...metadata, entity_slug: entitySlug, client: entitySlug, client_name: entitySlug },
-  };
-  const requestHash = await sha256({
-    ...body, document_id: documentId, media_type: mediaType, file_name: fileName,
-    envelope: normalized,
+
+  let normalizedContent = null;
+  let binaryBytes = null;
+  let binaryHash = null;
+  if (binaryUpload) {
+    if (Object.hasOwn(envelope, "content")) return invalid("binary_content_must_be_base64", "envelope.content");
+    try { binaryBytes = decodeUploadBase64(body.content_base64); }
+    catch (error) {
+      if (error?.too_large) return respond({
+        uploaded: false, error: "document too large", code: "upload_too_large",
+        max_binary_bytes: OWNER_BINARY_UPLOAD_MAX_BYTES,
+      }, 413);
+      return invalid("invalid_upload_base64", "content_base64");
+    }
+    binaryHash = await sha256Bytes(binaryBytes);
+  } else {
+    if (body.content_base64 !== undefined) return invalid("text_content_must_be_utf8", "content_base64");
+    if (typeof envelope.content !== "string") return invalid("invalid_upload_content", "envelope.content");
+    normalizedContent = envelope.content.startsWith("\uFEFF") ? envelope.content.slice(1) : envelope.content;
+    if (!normalizedContent.trim()) return invalid("empty_upload_content", "envelope.content");
+    if (new TextEncoder().encode(normalizedContent).length > OWNER_UPLOAD_MAX_CONTENT_BYTES) {
+      return respond({
+        uploaded: false, error: "document too large", code: "upload_too_large",
+        max_content_bytes: OWNER_UPLOAD_MAX_CONTENT_BYTES,
+      }, 413);
+    }
+  }
+
+  // Hash caller-controlled bytes and metadata, not extracted OCR text. The
+  // payload hash is stable across request IDs, so an identical re-upload is a
+  // true no-op. The action hash binds that payload to one retry receipt.
+  const payloadHash = await sha256({
+    entity_slug: entitySlug, document_id: documentId,
+    media_type: mediaType, file_name: fileName,
+    envelope: binaryUpload ? envelope : { ...envelope, content: normalizedContent },
+    binary_sha256: binaryHash,
   });
+  const requestHash = await sha256({ request_id: requestId, payload_hash: payloadHash });
   const scope = await validateOwnedEntityScope(env, entitySlug);
   if (!scope.ok) return scope.response;
   if (typeof ingestEnvelope !== "function") return unavailable("owner_upload_unavailable");
 
-  // The intent is durable before common ingest. It contains no content, only
-  // the action hash and the preflight result needed to recover the true action
-  // if ingest commits and the Worker dies before audit finalization.
-  let intent;
+  let intent = null;
   let resumedIntent = false;
   try {
     const existing = await env.DB.prepare(
@@ -384,60 +425,158 @@ async function upload(env, body, ingestEnvelope, afterIngest) {
       if (storedReceipt?.pending !== true) return respond({ ...storedReceipt, replayed: true }, 200);
       intent = storedReceipt;
       resumedIntent = true;
-    } else {
-      const [preflight] = await storeFor(env).preflightIngestBatch(env, [normalized]);
-      if (!preflight?.doc_uid) return unavailable("owner_upload_unavailable");
-      intent = {
-        pending: true,
-        document_id: documentId,
-        doc_uid: preflight.doc_uid,
-        intended_action: preflight.unchanged
-          ? "unchanged"
-          : preflight.prepared?.prior ? "updated" : "created",
-      };
-      await actionReceiptStatement(env, {
-        requestId, actionType: "upload", requestHash, response: intent, status: 202,
-        at: new Date().toISOString(),
-      }).run();
     }
   } catch {
     return unavailable("owner_upload_intent_unavailable");
   }
 
-  let ingestResponse;
-  try {
-    ingestResponse = await ingestEnvelope(normalized);
-  } catch {
-    return unavailable("owner_upload_unavailable");
-  }
-  let stored;
-  try { stored = await ingestResponse.json(); } catch { stored = { error: "ingest failed" }; }
-  if (!ingestResponse.ok) {
+  // If common ingest committed before the response or audit batch was lost,
+  // prove that this exact request owns the stored revision and finalize from
+  // D1. This avoids a second OCR call and never treats doc_uid alone as proof.
+  let stored = null;
+  if (intent) {
     try {
-      await env.DB.prepare(
-        `DELETE FROM owner_action_requests
-          WHERE tenant_id=?1 AND request_id=?2 AND action_type='upload'
-            AND request_hash=?3 AND response_status=202`
-      ).bind(OWNER_TENANT, requestId, requestHash).run();
+      const committed = await env.DB.prepare(
+        `SELECT content_hash,meta FROM documents
+          WHERE doc_uid=?1 AND deleted_at IS NULL AND content_hash NOT LIKE 'pending:%'`
+      ).bind(intent.doc_uid).first();
+      let committedMeta = null;
+      try { committedMeta = JSON.parse(committed?.meta || "null"); } catch {}
+      if (committedMeta?.owner_upload_payload_hash === intent.payload_hash) {
+        const counts = await env.DB.prepare(
+          `SELECT (SELECT count(*) FROM chunks WHERE doc_uid=?1) chunks,
+                  (SELECT count(*) FROM vector_outbox v
+                    JOIN chunks c ON c.chunk_uid=v.chunk_uid
+                   WHERE c.doc_uid=?1 AND v.op='upsert') queued`
+        ).bind(intent.doc_uid).first();
+        stored = { chunks: Number(counts?.chunks || 0), queued: Number(counts?.queued || 0) };
+      }
     } catch {
       return unavailable("owner_upload_intent_unavailable");
     }
-    return respond({ ...stored, uploaded: false }, ingestResponse.status);
   }
-  // Test-only seam: a fixture can throw here to model a committed ingest whose
-  // HTTP response and final audit batch were lost. The pending intent remains.
-  if (typeof afterIngest === "function") {
-    try { await afterIngest({ requestId, documentId, stored }); }
-    catch { return unavailable("owner_upload_finalize_unavailable"); }
+
+  let normalized = null;
+  let extraction = intent?.extraction || null;
+  if (!stored) {
+    let extracted = null;
+    if (binaryUpload) {
+      try {
+        extracted = await extractUpload(env, { mediaType, bytes: binaryBytes, fileName });
+      } catch (error) {
+        if (error?.too_large) return respond({
+          uploaded: false, error: "extracted text too large", code: "extracted_text_too_large",
+          max_content_bytes: OWNER_UPLOAD_MAX_CONTENT_BYTES,
+        }, 413);
+        if (error?.code === "owner_upload_ocr_disabled") {
+          return respond({ uploaded: false, error: "OCR is not enabled", code: error.code }, 409);
+        }
+        if (error?.code === "owner_upload_ocr_spend_cap") {
+          return respond({ uploaded: false, error: "OCR spend limit reached", code: error.code }, 429);
+        }
+        if (error?.code === "owner_upload_ocr_unavailable") {
+          return unavailable(error.code);
+        }
+        if (error?.code === "unsafe_upload_archive") {
+          return respond({ uploaded: false, error: "unsafe archive", code: error.code,
+            archive_code: error.archive_code || null }, 422);
+        }
+        if (error?.code === "owner_upload_pdf_needs_ocr") {
+          return respond({ uploaded: false, error: "scanned PDF OCR is not available", code: error.code }, 422);
+        }
+        return respond({ uploaded: false, error: "file could not be read", code: error?.code || "unreadable_upload" }, 422);
+      }
+      normalizedContent = extracted.content;
+      extraction = {
+        method: extracted.metadata.extraction_method,
+        text_source: extracted.textSource,
+        text_reliable: extracted.textReliable,
+        original_bytes: extracted.metadata.original_bytes,
+        extracted_text_bytes: extracted.metadata.extracted_text_bytes,
+      };
+    } else {
+      extraction = {
+        method: "native", text_source: "native", text_reliable: true,
+        original_bytes: new TextEncoder().encode(normalizedContent).byteLength,
+        extracted_text_bytes: new TextEncoder().encode(normalizedContent).byteLength,
+      };
+    }
+    normalized = {
+      ...envelope,
+      source_type: "upload",
+      source_id: `owner:${entitySlug}:${documentId}`,
+      title: envelope.title || extracted?.title || fileName || null,
+      content: normalizedContent,
+      ...(envelope.occurred_at || !extracted?.occurredAt ? {} : {
+        occurred_at: extracted.occurredAt, date_source: "email_header", date_reliable: true,
+      }),
+      text_source: extracted?.textSource || "native",
+      text_reliable: extracted?.textReliable ?? true,
+      metadata: {
+        ...metadata,
+        ...(extracted?.metadata || {}),
+        entity_slug: entitySlug, client: entitySlug, client_name: entitySlug,
+        owner_upload_payload_hash: payloadHash,
+        ...(binaryHash ? { original_binary_sha256: binaryHash } : {}),
+      },
+    };
+
+    // The intent is durable before common ingest. It contains no document
+    // content, only hashes, provenance, and the preflight action required to
+    // recover the true result after a lost response.
+    if (!intent) {
+      try {
+        const [preflight] = await storeFor(env).preflightIngestBatch(env, [normalized]);
+        if (!preflight?.doc_uid) return unavailable("owner_upload_unavailable");
+        intent = {
+          pending: true,
+          document_id: documentId,
+          doc_uid: preflight.doc_uid,
+          intended_action: preflight.unchanged
+            ? "unchanged"
+            : preflight.prepared?.prior ? "updated" : "created",
+          payload_hash: payloadHash,
+          extraction,
+          ...(binaryHash ? { original_binary_sha256: binaryHash } : {}),
+        };
+        await actionReceiptStatement(env, {
+          requestId, actionType: "upload", requestHash, response: intent, status: 202,
+          at: new Date().toISOString(),
+        }).run();
+      } catch {
+        return unavailable("owner_upload_intent_unavailable");
+      }
+    }
+
+    let ingestResponse;
+    try { ingestResponse = await ingestEnvelope(normalized); }
+    catch { return unavailable("owner_upload_unavailable"); }
+    try { stored = await ingestResponse.json(); } catch { stored = { error: "ingest failed" }; }
+    if (!ingestResponse.ok) {
+      try {
+        await env.DB.prepare(
+          `DELETE FROM owner_action_requests
+            WHERE tenant_id=?1 AND request_id=?2 AND action_type='upload'
+              AND request_hash=?3 AND response_status=202`
+        ).bind(OWNER_TENANT, requestId, requestHash).run();
+      } catch {
+        return unavailable("owner_upload_intent_unavailable");
+      }
+      return respond({ ...stored, uploaded: false }, ingestResponse.status);
+    }
+    // Test-only seam: a fixture can model committed ingest followed by a lost
+    // HTTP response. The pending intent remains for exact recovery.
+    if (typeof afterIngest === "function") {
+      try { await afterIngest({ requestId, documentId, stored }); }
+      catch { return unavailable("owner_upload_finalize_unavailable"); }
+    }
   }
+
   const document = {
     doc_uid: intent.doc_uid,
-    // On a resumed pending intent common ingest correctly says unchanged. The
-    // preflight saved before the first ingest proves whether that first write
-    // was created, updated, or already unchanged.
     action: intent.intended_action,
-    chunks: Number(stored.chunks || 0),
-    queued: Number(stored.queued || 0),
+    chunks: Number(stored?.chunks || 0),
+    queued: Number(stored?.queued || 0),
   };
   const changed = document.action !== "unchanged";
   const at = new Date().toISOString();
@@ -445,14 +584,15 @@ async function upload(env, body, ingestEnvelope, afterIngest) {
   const response = {
     uploaded: true, request_id: requestId, document_id: documentId,
     entity_scope: { entity_slug: entitySlug }, media_type: mediaType,
-    file_name: fileName, document, changed, activity_event_id: eventId, replayed: resumedIntent,
+    file_name: fileName, extraction: intent.extraction || extraction,
+    document, changed, activity_event_id: eventId, replayed: resumedIntent,
   };
   const status = resumedIntent ? 200 : document.action === "created" ? 201 : 200;
   const statements = [];
   if (changed) {
     statements.push(activityStatement(env, {
       eventId, eventType: "upload_completed", entitySlug, subjectKind: "document",
-      subjectId: document.doc_uid, displayLabel: fileName || "Text upload", occurredAt: at,
+      subjectId: document.doc_uid, displayLabel: fileName || "Owner upload", occurredAt: at,
       requestId,
     }));
   }
@@ -1112,7 +1252,7 @@ async function preferenceSet(env, body) {
 }
 
 /** Route dispatcher mounted before the admin-key gate in index.js. */
-export async function handleOwnerActions(env, request, path, { ingestEnvelope, afterIngest } = {}) {
+export async function handleOwnerActions(env, request, path, { ingestEnvelope, afterIngest, extractUpload } = {}) {
   if (request.method !== "POST") return respond({ error: "method not allowed" }, 405);
   const authFailure = await requireOwner(request, env);
   if (authFailure) return authFailure;
@@ -1138,7 +1278,7 @@ export async function handleOwnerActions(env, request, path, { ingestEnvelope, a
   }
 
   try {
-    if (path === "/api/owner/uploads") return await upload(env, body, ingestEnvelope, afterIngest);
+    if (path === "/api/owner/uploads") return await upload(env, body, ingestEnvelope, afterIngest, extractUpload);
     if (path === "/api/owner/approvals") return await approval(env, body);
     if (path === "/api/owner/period-closes/read") return await periodRead(env, body);
     if (path === "/api/owner/period-closes/accept") return await periodWrite(env, body, "accept");

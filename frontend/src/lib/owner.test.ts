@@ -1,28 +1,46 @@
 import { describe, expect, it } from "vitest";
-import type { OwnerUploadCapabilities } from "./api";
+import { ApiError, ownerError, type OwnerUploadCapabilities } from "./api";
 import {
-  activityEventsInWindow, confirmedOwnerWrite, defaultEntityScope, ingestionReceiptAction, logicalDocumentId, majorToMinor, readOwnerTextFile,
+  activityEventsInWindow, confirmedOwnerWrite, defaultEntityScope, ingestionReceiptAction, logicalDocumentId, majorToMinor, readOwnerTextFile, readOwnerUploadFile,
   periodClosePresentation, scopedAnswerLabel, validateOwnerUpload,
   activitySentence,
 } from "./owner";
 
 const capabilities: OwnerUploadCapabilities = {
-  supported_media_types: ["text/plain", "text/markdown"],
-  supported_extensions: [".txt", ".md", ".markdown"],
-  media_type_extensions: { "text/plain": [".txt"], "text/markdown": [".md", ".markdown"] },
+  supported_media_types: ["text/plain", "text/markdown", "application/pdf"],
+  text_media_types: ["text/plain", "text/markdown"],
+  binary_media_types: ["application/pdf"],
+  supported_extensions: [".txt", ".md", ".markdown", ".pdf"],
+  media_type_extensions: { "text/plain": [".txt"], "text/markdown": [".md", ".markdown"], "application/pdf": [".pdf"] },
   max_content_bytes: 1_000_000,
+  max_binary_bytes: 8 * 1024 * 1024,
+  max_ocr_image_bytes: 3_000_000,
+  media_type_max_bytes: {
+    "text/plain": 1_000_000, "text/markdown": 1_000_000,
+    "application/pdf": 8 * 1024 * 1024,
+  },
   content_encoding: "utf-8",
   empty_media_type_supported: false,
   normalization: "strict UTF-8",
+  scanned_pdf_ocr_supported: false,
 };
 
 describe("owner upload boundary", () => {
   it("accepts only an exact backend-declared MIME and extension pair", () => {
     expect(validateOwnerUpload({ name: "notes.md", type: "text/markdown", size: 12 }, capabilities)).toEqual({ supported: true, mediaType: "text/markdown" });
     expect(validateOwnerUpload({ name: "notes.md", type: "text/plain", size: 12 }, capabilities).supported).toBe(false);
-    expect(validateOwnerUpload({ name: "scan.pdf", type: "application/pdf", size: 12 }, capabilities).supported).toBe(false);
+    expect(validateOwnerUpload({ name: "scan.pdf", type: "application/pdf", size: 12 }, capabilities)).toEqual({ supported: true, mediaType: "application/pdf" });
     expect(validateOwnerUpload({ name: "unknown.txt", type: "", size: 12 }, capabilities).supported).toBe(false);
     expect(validateOwnerUpload({ name: "too-big.txt", type: "text/plain", size: 1_000_001 }, capabilities).supported).toBe(false);
+  });
+
+  it("encodes a declared binary document without reading it as text", async () => {
+    const bytes = Uint8Array.from([1, 2, 3, 4]);
+    const file = {
+      name: "evidence.pdf", type: "application/pdf", size: bytes.byteLength,
+      arrayBuffer: async () => bytes.buffer,
+    } as unknown as File;
+    await expect(readOwnerUploadFile(file, capabilities)).resolves.toEqual({ content_base64: "AQIDBA==" });
   });
 
   it("strictly decodes declared text, strips one BOM, and never calls File.text", async () => {
@@ -56,6 +74,11 @@ describe("owner upload boundary", () => {
     expect(await logicalDocumentId("cafe", "monthly notes.md")).toBe(first);
     expect(await logicalDocumentId("rentals", "Monthly Notes.md")).not.toBe(first);
     expect(first).toMatch(/^file_[a-f0-9]{64}$/);
+  });
+
+  it("explains OCR and scanned-PDF gaps instead of mislabeling them as record conflicts", () => {
+    expect(ownerError(new ApiError(409, { code: "owner_upload_ocr_disabled" }, "conflict")).message).toMatch(/OCR is not enabled/);
+    expect(ownerError(new ApiError(422, { code: "owner_upload_pdf_needs_ocr" }, "refused")).message).toMatch(/Scanned PDF page OCR is not available/);
   });
 });
 

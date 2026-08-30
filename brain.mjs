@@ -5608,6 +5608,138 @@ async function cmdForget(manifestPath) {
  * step. Nothing is ever skipped silently; the run ends with a breakdown by
  * reason, and those reasons are kept in the state file.
  */
+export const PROVIDER_CONNECTOR_IDS = Object.freeze([
+  "quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot",
+]);
+
+function providerConfigurationFingerprint(provider, source, configuration) {
+  const canonical = (value) => {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (value && typeof value === "object") {
+      return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+    }
+    return JSON.stringify(value);
+  };
+  return createHash("sha256").update(canonical({ version: 1, provider, source, configuration })).digest("hex");
+}
+
+async function providerSyncImplementation(provider) {
+  if (provider === "quickbooks") return (await import("./connectors/quickbooks-online.mjs")).syncQuickBooksOnline;
+  if (provider === "slack") return (await import("./connectors/slack.mjs")).syncSlack;
+  if (provider === "notion") return (await import("./connectors/notion.mjs")).syncNotion;
+  if (provider === "microsoft") return (await import("./connectors/microsoft-graph.mjs")).syncMicrosoftGraph;
+  if (provider === "dropbox") return (await import("./connectors/dropbox.mjs")).syncDropbox;
+  if (provider === "hubspot") return (await import("./connectors/hubspot.mjs")).syncHubSpot;
+  throw new TypeError(`unsupported provider connector ${provider}`);
+}
+
+function providerAdapterOptions(provider, configuration, connection) {
+  if (provider === "quickbooks") {
+    return {
+      realmId: connection?.provider_metadata?.realm_id,
+      apiBase: configuration.environment === "production"
+        ? "https://quickbooks.api.intuit.com"
+        : "https://sandbox-quickbooks.api.intuit.com",
+      entities: configuration.entities,
+      minorVersion: configuration.minor_version || null,
+    };
+  }
+  if (provider === "slack") return {
+    channelIds: configuration.channel_ids,
+    maxThreadsPerChannel: configuration.include_thread_replies === false ? 0 : 5_000,
+  };
+  if (provider === "microsoft") return {
+    mailFolderIds: configuration.mail_folder_ids,
+    driveIds: configuration.drive_ids,
+    siteIds: configuration.site_ids,
+    includePersonalDrive: configuration.include_personal_drive !== false,
+  };
+  if (provider === "dropbox") return { rootPath: configuration.root_path || "" };
+  if (provider === "hubspot") return { objectTypes: configuration.object_types };
+  return {};
+}
+
+/** Run one OAuth provider through common receipts, retries, tombstones, and cursor custody. */
+export async function cmdIngestProvider(m, manifestPath, flags, options = {}) {
+  const provider = String(flags.from || "").toLowerCase();
+  if (!PROVIDER_CONNECTOR_IDS.includes(provider)) throw new TypeError(`unsupported provider connector ${provider}`);
+  if (flags.limit) die(`--limit is unsafe for ${provider}; it would skip records covered by the provider cursor.`);
+  const configuration = m?.corpora?.[provider] || {};
+  if (configuration.enabled !== true) {
+    die(`corpora.${provider}.enabled is not true in this manifest. Enable it before connecting or ingesting.`);
+  }
+  const sourceName = assertSourceName(
+    flags.source === true || !flags.source ? configuration.source || provider : flags.source,
+  );
+  const fingerprint = providerConfigurationFingerprint(provider, sourceName, configuration);
+  const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
+  const syncImpl = options.sync ?? await providerSyncImplementation(provider);
+  const resolveAccess = () => oauth.providerAccessToken(provider, {
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    ...(options.storage ? { storage: options.storage } : {}),
+  });
+  const loadState = () => oauth.loadProviderSyncState(provider, sourceName, options.storage || {});
+  const saveState = (state) => oauth.saveProviderSyncState(provider, sourceName, state, options.storage || {});
+  const adapter = ({ cursor, access }) => syncImpl({
+    accessToken: access.accessToken,
+    connection: access.connection,
+    cursor,
+    ...providerAdapterOptions(provider, configuration, access.connection),
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+  });
+
+  if (flags["dry-run"]) {
+    const stored = flags.reset ? {} : await loadState();
+    const cursor = stored?.configuration_fingerprint === fingerprint ? stored.cursor ?? null : null;
+    const result = await adapter({ cursor, access: await resolveAccess() });
+    info(`${result.documents.length} document(s) would be sent; ${result.deletions.length} exact tombstone(s) would be applied.`);
+    for (const warning of result.warnings || []) warn(warning);
+    ok("dry run, no brain document, deletion, source receipt, or provider cursor was changed");
+    return { dry_run: true, result };
+  }
+
+  const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+  if (!adminKey) {
+    die("no durable admin key was found. Re-run `brain setup <manifest>` to generate and persist one.");
+  }
+  const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, m.brain?.domain ? null : await (options.resolveAccount ?? resolveAccount)(m));
+  const runtime = options.runtime ?? await import("./connectors/provider-runtime.mjs");
+  let result;
+  try {
+    result = await runtime.runProviderConnector({
+      provider,
+      source: sourceName,
+      kind: provider,
+      configurationFingerprint: fingerprint,
+      sync: async ({ cursor, accessToken, connection }) => adapter({
+        cursor,
+        access: { accessToken, connection },
+      }),
+      resolveAccess,
+      loadState,
+      saveState,
+      sendBatch: options.requestIngestBatch ?? requestIngestBatch,
+      removeDocuments: options.applyDriveRemovals ?? applyDriveRemovals,
+      listStoredFamilies: options.listStoredSourceFamilies ?? listStoredSourceFamilies,
+      postReceipt: options.postSourceReceipt ?? postSourceReceipt,
+      base,
+      adminKey,
+      reset: Boolean(flags.reset),
+      approvedSnapshotFingerprint: flags["approve-removals"] === true || !flags["approve-removals"]
+        ? null
+        : String(flags["approve-removals"]).toLowerCase(),
+    });
+  } catch (error) {
+    if (["provider_snapshot_removal_review_required", "provider_removal_review_required"].includes(error?.code)) die(error.message);
+    throw error;
+  }
+  const tally = result.tally;
+  ok(`${provider} sync: ${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged, ${result.removed} removed`);
+  if (result.outcome.kind !== "completed") warn(result.outcome.reason || `${provider} completed with an explicit coverage gap`);
+  info(result.cursor_advanced ? "the terminal provider cursor was saved" : "no provider cursor was advanced");
+  return result;
+}
+
 async function cmdIngest(manifestPath) {
   const { m } = loadManifest(manifestPath);
   const flags = parseFlags(process.argv.slice(4));
@@ -5624,6 +5756,9 @@ async function cmdIngest(manifestPath) {
   // connectors that all resume from one.
   if (["iphone-backup", "iphone"].includes(String(flags.from).toLowerCase())) {
     return cmdIngestIphoneBackup(m, manifestPath, flags);
+  }
+  if (PROVIDER_CONNECTOR_IDS.includes(String(flags.from).toLowerCase())) {
+    return cmdIngestProvider(m, manifestPath, flags);
   }
   if (flags.from) return cmdIngestRemote(m, manifestPath, flags);
   return cmdIngestLocal(m, manifestPath, flags);
@@ -7397,10 +7532,34 @@ export function defaultLoadProbes() {
     }
     return { connected: true };
   };
+  const provider = (providerId) => async ({ options }) => {
+    try {
+      const oauth = options?.providerOauth ?? await import("./connectors/provider-oauth.mjs");
+      const status = oauth.providerCredentialStatus(providerId, options?.providerStorage || {});
+      if (status.connected) return { connected: true };
+      return {
+        connected: false,
+        reason: status.reason || `no ${oauth.providerOAuthConfig(providerId).label} connection is stored on this machine`,
+        fix: `brain connect ${providerId} <manifest>`,
+      };
+    } catch (error) {
+      return {
+        connected: false,
+        reason: `the stored ${providerId} connection could not be read: ${String(error?.message || error)}`,
+        fix: `brain connect ${providerId} <manifest>`,
+      };
+    }
+  };
   return {
     google_drive: googleScope("drive", "brain connect google --scopes drive,gmail,calendar"),
     gmail: googleScope("gmail", "brain connect google --scopes drive,gmail,calendar"),
     calendar: googleScope("calendar", "brain connect google --scopes drive,gmail,calendar"),
+    quickbooks: provider("quickbooks"),
+    slack: provider("slack"),
+    notion: provider("notion"),
+    microsoft: provider("microsoft"),
+    dropbox: provider("dropbox"),
+    hubspot: provider("hubspot"),
     imessage: async ({ m, platform }) => {
       if (platform !== "darwin") {
         return {
@@ -7468,6 +7627,26 @@ export function loadSourceRegistry(commands = {}) {
   const ingestLocal = commands.ingestLocal || cmdIngestLocal;
   const ingestRemote = commands.ingestRemote || cmdIngestRemote;
   const ingestIphoneBackup = commands.ingestIphoneBackup || cmdIngestIphoneBackup;
+  const ingestProvider = commands.ingestProvider || cmdIngestProvider;
+  const providerEntry = (order, key, label, scope) => ({
+    order,
+    label,
+    scope,
+    legs: ({ m, manifestPath, flags }) => {
+      if (flags.limit) {
+        return {
+          unavailable: {
+            reason: `${label} cannot honor --limit without risking a skipped provider cursor`,
+            fix: `rerun without --limit: brain load <manifest> --only ${key}`,
+          },
+        };
+      }
+      return [{
+        source: key,
+        run: () => ingestProvider(m, manifestPath, { ...flags, from: key }),
+      }];
+    },
+  });
   return {
     calendar: {
       order: 10,
@@ -7581,6 +7760,12 @@ export function loadSourceRegistry(commands = {}) {
       pushOnly: "Zoom posts each new transcript to this brain's webhook on its own, so a sweep has "
         + "nothing to pull. Recordings made before you connected are never backfilled.",
     },
+    quickbooks: providerEntry(90, "quickbooks", "QuickBooks Online", "accounting records from the selected company"),
+    slack: providerEntry(100, "slack", "Slack", "messages and thread replies from authorized conversations"),
+    notion: providerEntry(110, "notion", "Notion", "authorized pages, properties and readable blocks"),
+    microsoft: providerEntry(120, "microsoft", "Microsoft 365", "Outlook mail plus authorized OneDrive and SharePoint files"),
+    dropbox: providerEntry(130, "dropbox", "Dropbox", "authorized files with readable bodies"),
+    hubspot: providerEntry(140, "hubspot", "HubSpot", "contacts, companies and deals"),
   };
 }
 
@@ -9185,6 +9370,63 @@ async function resolveBaseUrl(m, acct) {
 
 
 /**
+ * Connect one installed OAuth provider while keeping every credential in its
+ * provider-specific local store. The CLI names environment variables, never
+ * their values, so an approved launcher can inject secrets without putting
+ * them in argv, the manifest, or terminal history.
+ */
+export async function cmdConnectProvider(provider, manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die(`usage: brain connect ${provider} <manifest> [--port <number>]`);
+  }
+  const { m } = loadManifest(manifestPath);
+  const configuration = m?.corpora?.[provider] || {};
+  if (configuration.enabled !== true) {
+    die(`corpora.${provider}.enabled is not true in this manifest. Enable it before connecting.`);
+  }
+  const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
+  const config = oauth.providerOAuthConfig(provider);
+  const storage = options.storage || {};
+  const prior = oauth.loadProviderCredentials(provider, storage);
+  const prefix = provider.toUpperCase().replace(/-/g, "_");
+  const environment = options.environment || process.env;
+  const clientId = environment[`${prefix}_CLIENT_ID`] || prior?.client_id || null;
+  const clientSecret = environment[`${prefix}_CLIENT_SECRET`] || prior?.client_secret || null;
+  if (!clientId || (config.clientSecretRequired && !clientSecret)) {
+    const required = [`${prefix}_CLIENT_ID`, ...(config.clientSecretRequired ? [`${prefix}_CLIENT_SECRET`] : [])];
+    die(
+      `${required.join(" and ")} ${required.length === 1 ? "is" : "are"} not available.\n` +
+        `      Create the OAuth app in the owner's ${config.label} account, register ` +
+        `${oauth.providerRedirectUri(flags.port ? Number(flags.port) : oauth.PROVIDER_DEFAULT_PORT)}, and inject ` +
+        "the value through the approved local launcher. Do not put it in the manifest or command line."
+    );
+  }
+  if (prior && !environment[`${prefix}_CLIENT_ID`]) {
+    info(`reusing the ${config.label} OAuth client already stored on this machine`);
+  }
+  const port = flags.port ? Number(flags.port) : oauth.PROVIDER_DEFAULT_PORT;
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) die("--port must be an integer from 1024 through 65535");
+  info(`requesting the manifest-enabled ${config.label} connection in the owner's browser`);
+  const connection = await oauth.authorizeProvider(provider, {
+    clientId,
+    clientSecret,
+    port,
+    storage,
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    ...(options.openImpl ? { openImpl: options.openImpl } : {}),
+    ...(options.open === false ? { open: false } : {}),
+    ...(options.log ? { log: options.log } : {}),
+  });
+  if (provider === "quickbooks" && !connection?.provider_metadata?.realm_id) {
+    die("QuickBooks did not return a company identity, so the connection cannot be used safely.");
+  }
+  ok(`connected. Credential stored in ${oauth.providerCredentialDescription(provider, storage)} (on this machine only)`);
+  info(`now run: brain ingest ${manifestPath} --from ${provider} --dry-run`);
+  info(`after review: brain schedule ${manifestPath} --provider ${provider} --install`);
+  return { provider, connected: true, storage: oauth.providerCredentialDescription(provider, storage) };
+}
+
+/**
  * brain connect google — the client authorises their OWN Google account.
  *
  * They register the OAuth client in their own Google Cloud project, and the
@@ -9200,14 +9442,16 @@ async function cmdConnect(target) {
   if (which === "whatsapp") return cmdConnectWhatsapp(process.argv[4], flags);
   if (which === "zoom") return cmdConnectZoom(process.argv[4], flags);
   if (which === "imap") return cmdConnectImap(process.argv[4], flags);
+  if (PROVIDER_CONNECTOR_IDS.includes(which)) return cmdConnectProvider(which, process.argv[4], flags);
   if (which !== "google") {
     die(
-      "brain connect supports google, imap, imessage, whatsapp and zoom.\n" +
+      "brain connect supports google, imap, imessage, whatsapp, zoom, quickbooks, slack, notion, microsoft, dropbox and hubspot.\n" +
         "  Usage: brain connect google --scopes drive,gmail,calendar\n" +
         "         brain connect imap <manifest> --host imap.example.com --user you@example.com\n" +
         "         brain connect imessage <manifest>\n" +
         "         brain connect whatsapp <manifest> --accept-risk\n" +
-        "         brain connect zoom <manifest>"
+        "         brain connect zoom <manifest>\n" +
+        "         brain connect <quickbooks|slack|notion|microsoft|dropbox|hubspot> <manifest>"
     );
   }
 
@@ -9794,6 +10038,56 @@ export function readHiddenSecret(promptText, { input = process.stdin, output = p
 }
 
 /**
+ * Stop one provider's scheduler, revoke its grant where the API supports a
+ * dependable revoke call, and only then remove local token custody. Existing
+ * documents stay addressable through the normal reviewed forget command.
+ */
+export async function cmdDisconnectProvider(provider, manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die(`usage: brain disconnect ${provider} <manifest>`);
+  }
+  const { m } = loadManifest(manifestPath);
+  const configuration = m?.corpora?.[provider] || {};
+  const source = assertSourceName(configuration.source || provider);
+  const scheduler = options.scheduler ?? await import("./operations/provider-scheduler.mjs");
+  try {
+    const removed = scheduler.removeProviderScheduler(provider, manifestPath, options.schedulerOptions || {});
+    ok(removed.removed || removed.loaded
+      ? `${provider} refresh schedule removed`
+      : `${provider} refresh schedule was not installed`);
+  } catch (error) {
+    warn(`the ${provider} schedule could not be inspected or removed: ${String(error?.message || error).slice(0, 180)}`);
+  }
+
+  const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
+  const result = await oauth.disconnectProvider(provider, {
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    storage: options.storage || {},
+  });
+  if (result.already_disconnected) ok(`${oauth.providerOAuthConfig(provider).label} was already disconnected locally`);
+  else if (result.remote_revoked) ok(`${oauth.providerOAuthConfig(provider).label} grant revoked, then local credentials removed`);
+  else ok(`${oauth.providerOAuthConfig(provider).label} local credentials removed`);
+  if (result.remote_revocation_required) {
+    warn(result.remote_revocation_note ||
+      `the provider has no dependable revoke call in this connector; remove the app grant in the owner's ${oauth.providerOAuthConfig(provider).label} account`);
+  }
+
+  try {
+    const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+    if (!adminKey) throw new Error("no admin key is available");
+    const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, null);
+    await (options.postSourceExpectation ?? postSourceExpectation)(base, adminKey, {
+      source, kind: provider, expected_refresh_seconds: null,
+    });
+    ok(`${source} freshness expectation cleared`);
+  } catch (error) {
+    warn(`the provider is disconnected, but its remote freshness expectation could not be cleared: ${String(error?.message || error).slice(0, 160)}`);
+  }
+  info(`documents already loaded remain in the brain; remove them with: brain forget ${manifestPath} --source ${source}`);
+  return result;
+}
+
+/**
  * brain disconnect — the first disconnect verb in this CLI.
  *
  * Same posture as removeDriveScheduler: removal must remain reachable even
@@ -9807,13 +10101,15 @@ async function cmdDisconnect(target) {
   if (which === "whatsapp") return cmdDisconnectWhatsapp(process.argv[4], flags);
   if (which === "zoom") return cmdDisconnectZoom(process.argv[4], flags);
   if (which === "imap") return cmdDisconnectImap(process.argv[4], flags);
+  if (PROVIDER_CONNECTOR_IDS.includes(which)) return cmdDisconnectProvider(which, process.argv[4], flags);
   if (which !== "imessage") {
     die(
-      "brain disconnect supports imap, imessage, whatsapp and zoom.\n" +
+      "brain disconnect supports imap, imessage, whatsapp, zoom, quickbooks, slack, notion, microsoft, dropbox and hubspot.\n" +
         "  Usage: brain disconnect imap <manifest>\n" +
         "         brain disconnect imessage <manifest>\n" +
         "         brain disconnect whatsapp <manifest>\n" +
-        "         brain disconnect zoom <manifest>"
+        "         brain disconnect zoom <manifest>\n" +
+        "         brain disconnect <quickbooks|slack|notion|microsoft|dropbox|hubspot> <manifest>"
     );
   }
   return cmdDisconnectImessage(process.argv[4], flags);
@@ -13122,10 +13418,69 @@ async function cmdScheduleFolder(m, manifestPath, action) {
   return result;
 }
 
+/** Install, inspect, or remove one provider scheduler and freshness contract. */
+async function cmdScheduleProvider(m, manifestPath, action, provider, options = {}) {
+  if (!PROVIDER_CONNECTOR_IDS.includes(provider)) {
+    die(`--provider must be one of: ${PROVIDER_CONNECTOR_IDS.join(", ")}`);
+  }
+  const configuration = m?.corpora?.[provider] || {};
+  const source = assertSourceName(configuration.source || provider);
+  let dataPlane = null;
+  if (action === "install") {
+    const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+    if (!adminKey) die(`no admin key found, so the ${provider} schedule cannot be reflected in source freshness.`);
+    dataPlane = { base: await (options.resolveBaseUrl ?? resolveBaseUrl)(m, null), adminKey };
+  }
+  const scheduler = options.scheduler ?? await import("./operations/provider-scheduler.mjs");
+  const result = action === "install"
+    ? scheduler.installProviderScheduler(provider, manifestPath, options.schedulerOptions || {})
+    : action === "remove"
+      ? scheduler.removeProviderScheduler(provider, manifestPath, options.schedulerOptions || {})
+      : scheduler.statusProviderScheduler(provider, manifestPath, options.schedulerOptions || {});
+  for (const warning of result.warnings || []) warn(warning);
+  if (action === "install") {
+    await (options.postSourceExpectation ?? postSourceExpectation)(dataPlane.base, dataPlane.adminKey, {
+      source, kind: provider, expected_refresh_seconds: result.expectedRefreshSeconds,
+    });
+    ok(`${provider} refresh installed for ${result.cron}`);
+    ok(`${source} freshness expectation set to ${result.expectedRefreshSeconds} seconds`);
+    info(`definition: ${result.plistPath}`);
+    info(`logs: ${result.stdoutPath} and ${result.stderrPath}`);
+    return result;
+  }
+  if (action === "remove") {
+    ok(result.removed || result.loaded ? `${provider} refresh removed` : `${provider} refresh was not installed`);
+    try {
+      const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+      if (!adminKey) throw new Error("no admin key is available");
+      const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, null);
+      await (options.postSourceExpectation ?? postSourceExpectation)(base, adminKey, {
+        source, kind: provider, expected_refresh_seconds: null,
+      });
+      ok(`${source} freshness expectation cleared`);
+    } catch (error) {
+      warn(`the local scheduler is removed, but its remote freshness expectation could not be cleared: ${String(error?.message || error).slice(0, 160)}`);
+    }
+    info(`logs preserved at ${result.stdoutPath} and ${result.stderrPath}`);
+    return result;
+  }
+  if (!result.installed) warn(`${provider} refresh is not installed on this Mac`);
+  else if (!result.loaded) warn(`${provider} refresh has a definition but is not loaded by launchd`);
+  else if (result.definitionDrift) warn(`the installed ${provider} refresh does not match the current manifest; reinstall it`);
+  else ok(`${provider} refresh is installed for ${result.cron}`);
+  if (result.running) info(`a ${provider} sync is running as pid ${result.pid}`);
+  else if (result.lastRunSucceeded === false) warn(`the last scheduled run failed with exit code ${result.lastExitCode}`);
+  else if (result.lastRunSucceeded === true) ok(`the last scheduled run succeeded (${result.runs ?? 0} run(s) recorded)`);
+  if (result.scheduleError) warn(result.scheduleError);
+  info(`stdout: ${result.stdoutPath}`);
+  info(`stderr: ${result.stderrPath}`);
+  return result;
+}
+
 /** Install, inspect, or remove the standard per-client Drive scheduler. */
 async function cmdSchedule(manifestPath) {
   if (!manifestPath) {
-    die("usage: brain schedule <manifest> [--install|--status|--remove] [--folder]");
+    die("usage: brain schedule <manifest> [--install|--status|--remove] [--folder|--provider <id>]");
   }
   const flags = parseFlags(process.argv.slice(4));
   const requested = ["install", "status", "remove"].filter((name) => flags[name]);
@@ -13134,6 +13489,11 @@ async function cmdSchedule(manifestPath) {
   }
   const action = requested[0] || "status";
   const { m } = loadManifest(manifestPath);
+  if (flags.folder && flags.provider) die("choose only one of --folder or --provider");
+  if (flags.provider) {
+    if (flags.provider === true) die(`--provider needs one of: ${PROVIDER_CONNECTOR_IDS.join(", ")}`);
+    return cmdScheduleProvider(m, manifestPath, action, String(flags.provider).toLowerCase());
+  }
   // The watched local folder is a second lane on the same command, because it
   // is the same question ("what refreshes itself on this Mac") asked about a
   // different source.
@@ -13918,6 +14278,42 @@ async function cmdImport(target) {
   return cmdImportBank(m, manifestPath, parseFlags(process.argv.slice(4)));
 }
 
+/** Show the installed connector boundary, with an optional credential-free rehearsal. */
+export async function cmdConnectors(flags = parseFlags(process.argv.slice(3)), options = {}) {
+  const catalog = options.catalog ?? await import("./connectors/catalog.mjs");
+  const provider = flags.provider === true || !flags.provider ? null : String(flags.provider).toLowerCase();
+  let entries;
+  try {
+    entries = catalog.connectorCatalog({ provider });
+  } catch (error) {
+    die(error.message);
+  }
+  console.log(catalog.renderConnectorCatalog(entries));
+  if (!flags.rehearse) return { entries, rehearsal: null };
+
+  const rehearsal = options.rehearsal ?? await import("./connectors/offline-rehearsal.mjs");
+  const originalFetch = globalThis.fetch;
+  let globalFetchAttempts = 0;
+  globalThis.fetch = async () => {
+    globalFetchAttempts += 1;
+    throw Object.assign(new Error("offline rehearsal blocked an un-injected network request"), { code: "GLOBAL_FETCH_BLOCKED" });
+  };
+  let receipt;
+  try {
+    receipt = await rehearsal.runProviderRehearsal({ provider });
+  } catch (error) {
+    die(error.message);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  if (globalFetchAttempts) {
+    receipt = { ...receipt, passed: false, network_used: true };
+  }
+  console.log("\n" + rehearsal.renderProviderRehearsal(receipt));
+  if (!receipt.passed) die("one or more offline connector rehearsals failed");
+  return { entries, rehearsal: receipt };
+}
+
 const commands = {
   setup: cmdSetupInteractive,
   ask: cmdAsk,
@@ -13933,6 +14329,7 @@ const commands = {
   migrate: cmdMigrate,
   ingest: cmdIngest,
   import: cmdImport,
+  connectors: () => cmdConnectors(),
   load: cmdLoad,
   connect: cmdConnect,
   disconnect: cmdDisconnect,
@@ -13992,6 +14389,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain connect zoom     <manifest>      Zoom cloud-recording transcripts (needs a paid Zoom seat)
     brain connect imap     <manifest>      any IMAP mailbox (Yahoo, Fastmail, iCloud, a host): app
                                            password entered hidden, proven by a real read first
+    brain connect <provider> <manifest>    QuickBooks, Slack, Notion, Microsoft, Dropbox or HubSpot OAuth
+    brain connectors [--rehearse]         exact installed boundary and credential-free adapter proof
     brain load       <manifest>            load EVERYTHING this manifest has: one sweep of every
                                            enabled, connected source, one report at the end
     brain ingest     <manifest> --path <dir>  load a folder into the brain
@@ -14000,6 +14399,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain ingest     <manifest> --from imap  sync a connected IMAP mailbox (--dry-run to preview)
     brain ingest     <manifest> --from imessage  one incremental Messages capture pass (Mac only)
     brain ingest     <manifest> --from whatsapp  one drain of the WhatsApp capture outbox
+    brain ingest     <manifest> --from <provider>  sync QuickBooks, Slack, Notion, Microsoft,
+                                           Dropbox or HubSpot through common receipts
     brain ingest     <manifest> --from iphone-backup  one-time message history from an unencrypted
                                            local iPhone backup; a snapshot, not live capture (any OS)
     brain import bank <manifest> --file <statement.ofx|.qfx|.csv>  a bank export the owner
@@ -14008,6 +14409,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain schedule   <manifest> --install  install unattended Drive refresh on macOS
     brain schedule   <manifest> --install --folder  install unattended refresh of the watched
                                            local folder declared in corpora.local_folder (macOS)
+    brain schedule   <manifest> --provider <id> --install  install one provider refresh (macOS)
     brain support    [--preview|--export <file>]  inspect private local issue notes
     brain support    --explain <issue-code>       plain-language recovery for a typed issue
 
@@ -14029,6 +14431,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain disconnect whatsapp <manifest>   stop the capture daemon and its drain, flush, remove both agents
     brain disconnect zoom     <manifest>   remove the Zoom secrets so the webhook refuses deliveries
     brain disconnect imap     <manifest>   remove the stored mailbox app password from this machine
+    brain disconnect <provider> <manifest> stop refresh and remove QuickBooks, Slack, Notion,
+                                           Microsoft, Dropbox or HubSpot local custody
     brain support    --clear --yes         clear private local issue notes
 
   brain ingest takes --source <name>, --limit <n>, --dry-run, and --reset. It is

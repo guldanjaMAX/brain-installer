@@ -129,7 +129,7 @@
     },
     "corpora": {
       "type": "object",
-      "description": "Source declarations. Google Drive policy is enforced by brain ingest --from drive. Other connector declarations may remain descriptive until their command is documented.",
+      "description": "Source declarations. Enabled connectors are enforced by their documented connect, ingest, schedule, disconnect, and forget commands.",
       "properties": {
         "google_drive": {
           "type": "object",
@@ -239,6 +239,74 @@
             "enabled": {
               "type": "boolean",
               "default": false
+            }
+          }
+        },
+        "quickbooks": {
+          "type": "object",
+          "description": "Read-only QuickBooks Online accounting records. The owner authorizes their own Intuit app, and OAuth credentials remain in the local provider credential store. Query snapshots do not prove hard deletion, so the connector reports an explicit deletion gap and reads a complete present-record snapshot on each run.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "environment": { "enum": ["sandbox", "production"], "default": "sandbox" },
+            "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "quickbooks" },
+            "minor_version": { "type": "integer", "minimum": 1, "maximum": 999 },
+            "entities": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "enum": ["Account", "Customer", "Vendor", "Invoice", "Payment", "Bill", "Purchase", "JournalEntry", "Deposit", "Transfer", "CreditMemo", "BillPayment", "Estimate", "SalesReceipt", "RefundReceipt"] }
+            }
+          }
+        },
+        "slack": {
+          "type": "object",
+          "description": "Read-only Slack conversation history using an owner-authorized user token in the local provider credential store. History pagination and bounded thread replies are read, but Slack does not provide an authoritative removal stream for all deleted messages, so deletion authority remains explicit rather than inferred.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "slack" },
+            "channel_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "include_thread_replies": { "type": "boolean", "default": true }
+          }
+        },
+        "notion": {
+          "type": "object",
+          "description": "Read-only Notion pages shared with the owner-authorized integration. Every visible page is paginated and its readable child blocks are recursively materialized. Unshared and hard-deleted pages are outside the integration's inventory, so deletion authority is reported as unavailable.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "notion" }
+          }
+        },
+        "microsoft": {
+          "type": "object",
+          "description": "Read-only Microsoft 365 Outlook, OneDrive, and selected SharePoint drives using Graph delta links. Message and drive tombstones are authoritative, and supported file bodies are downloaded to the owner machine for the common extraction path before a terminal delta link may advance.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "microsoft" },
+            "mail_folder_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 }, "default": ["inbox"] },
+            "drive_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "site_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "include_personal_drive": { "type": "boolean", "default": true }
+          }
+        },
+        "dropbox": {
+          "type": "object",
+          "description": "Read-only Dropbox recursive file sync with opaque cursors, exact deleted-path tombstones, and supported file bodies downloaded to the owner machine for common extraction. An expired cursor triggers a full reconciliation rather than guessing at missed changes.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "dropbox" },
+            "root_path": { "type": "string", "default": "" }
+          }
+        },
+        "hubspot": {
+          "type": "object",
+          "description": "Read-only HubSpot CRM snapshots for selected object types. Active and archived records are enumerated separately, but hard deletion has no complete incremental stream, so every run reports its deletion-authority gap instead of inferring absence.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "hubspot" },
+            "object_types": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "enum": ["contacts", "companies", "deals"] },
+              "default": ["contacts", "companies", "deals"]
             }
           }
         },
@@ -559,6 +627,32 @@
           ],
           "default": "auto",
           "description": "Durable Google OAuth token-store choice for unattended ingest. auto uses macOS Keychain; file preserves an explicit BRAIN_GOOGLE_TOKEN_STORE=file connection choice across sparse LaunchAgent environments."
+        },
+        "provider_crons": {
+          "type": "object",
+          "description": "Five-field cron schedules for locally stored OAuth provider connectors. Incremental Microsoft and Dropbox lanes default to hourly; full-snapshot lanes default to daily. Each installs as its own per-user macOS LaunchAgent.",
+          "properties": {
+            "quickbooks": { "type": "string", "minLength": 9 },
+            "slack": { "type": "string", "minLength": 9 },
+            "notion": { "type": "string", "minLength": 9 },
+            "microsoft": { "type": "string", "minLength": 9 },
+            "dropbox": { "type": "string", "minLength": 9 },
+            "hubspot": { "type": "string", "minLength": 9 }
+          },
+          "additionalProperties": false
+        },
+        "provider_token_stores": {
+          "type": "object",
+          "description": "Durable per-provider OAuth token-store choice for unattended ingest. auto uses macOS Keychain and the platform default elsewhere; file preserves an explicit owner-only file choice.",
+          "properties": {
+            "quickbooks": { "enum": ["auto", "keychain", "file"], "default": "auto" },
+            "slack": { "enum": ["auto", "keychain", "file"], "default": "auto" },
+            "notion": { "enum": ["auto", "keychain", "file"], "default": "auto" },
+            "microsoft": { "enum": ["auto", "keychain", "file"], "default": "auto" },
+            "dropbox": { "enum": ["auto", "keychain", "file"], "default": "auto" },
+            "hubspot": { "enum": ["auto", "keychain", "file"], "default": "auto" }
+          },
+          "additionalProperties": false
         },
         "health_cron": {
           "type": "string",
