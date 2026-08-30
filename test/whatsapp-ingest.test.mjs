@@ -220,7 +220,8 @@ try {
     );
     check("a refused WhatsApp conversation is explicit and never completion-shaped",
       result.refused === 1 && result.documents_accepted === 0 &&
-      result.outcome?.kind === "partial" && result.outcome?.complete === false &&
+      result.outcome?.kind === "refused" && result.outcome?.complete === false &&
+      refusing.receipts.at(-1)?.status === "error" &&
       /credential gate/.test(refusing.receipts.at(-1)?.refusal_reason || ""),
       JSON.stringify({ result, receipt: refusing.receipts.at(-1) }));
   }

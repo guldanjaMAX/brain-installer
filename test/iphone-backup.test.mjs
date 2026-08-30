@@ -943,7 +943,8 @@ let cliDocs = [];
   ));
   check("a refused backup conversation is explicit and never completion-shaped",
     refused.refused === 2 && refused.documents_accepted === 0 &&
-    refused.outcome?.kind === "partial" && refused.outcome?.complete === false &&
+    refused.outcome?.kind === "refused" && refused.outcome?.complete === false &&
+    refusing.receipts.at(-1)?.status === "error" &&
     /credential gate/.test(refusing.receipts.at(-1)?.refusal_reason || ""),
     JSON.stringify({ refused, receipt: refusing.receipts.at(-1) }));
 
