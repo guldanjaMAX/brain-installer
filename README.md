@@ -321,7 +321,12 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
   the folder. Both of those are read: an `.eml` is one document, and an `.mbox`
   is split into its individual messages, each keeping its own subject, sender
   and date. (Before this version half that sentence was false — there was no
-  `.mbox` reader and the archive was silently skipped.)
+  `.mbox` reader and the archive was silently skipped.) A local `.mbox` larger
+  than 64 MiB is no longer rejected wholesale: complete messages ending inside
+  the first 64 MiB load through a bounded stream, and the result says explicitly
+  that later messages were not indexed. One message over 8 MiB is likewise
+  named as omitted rather than exhausting the ingest process. Split a larger
+  export into smaller mail archives when the complete history is required.
 - **Google Drive is root-bound and disabled by default.** To enable it, the
   manifest must name at least one reviewed folder id in
   `corpora.google_drive.root_folder_ids`. Ingest traverses only those folders

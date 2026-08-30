@@ -47,7 +47,7 @@ import {
 } from "./facebook-messenger-export.mjs";
 import { parseLinkedInArchive } from "./linkedin-export.mjs";
 import { MessageSessionizer } from "./message-session.mjs";
-import { splitMbox, mboxMessageKey } from "./mbox.mjs";
+import { MboxStreamSplitter, mboxMessageKey } from "./mbox.mjs";
 // The one mail reader. Imported by name rather than reached through the
 // registry because an archive's messages need their own subjects and dates,
 // and a second parser beside the first is how the two start disagreeing.
@@ -75,23 +75,28 @@ const JUNK_FILES = new Set(["thumbs.db", "desktop.ini", "icon\r", ".ds_store", "
 export const MAX_FILE_BYTES = 8 * 1024 * 1024;
 
 /**
- * The same ceiling for a file that is not one document.
+ * The same in-memory/scan ceiling for a file that is not one document.
  *
  * A mail archive is a folder of hundreds of messages, and a real one is
- * routinely tens of megabytes. Judging it by the single-document limit would
- * skip the common case of the very thing the README tells clients to export,
- * which is how a limit turns into a false promise. It still has a ceiling:
- * the whole archive is read into memory to be split.
+ * routinely larger than this. Local mbox ingest streams the complete file for
+ * a stable content hash and parses only complete messages inside this window;
+ * crossing it is reported as incomplete. Buffered archives such as ZIP still
+ * use it as a hard file ceiling.
  */
 export const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
 
-/** Extensions that hold many documents, and get the archive ceiling. */
-const ARCHIVE_EXTENSIONS = new Set([".mbox", ".zip"]);
+/** One malformed or attachment-heavy email cannot own the whole process. */
+export const MAX_MBOX_MESSAGE_BYTES = MAX_FILE_BYTES;
+
+/** Buffered multi-document containers that still get the hard archive ceiling. */
+const BUFFERED_ARCHIVE_EXTENSIONS = new Set([".zip"]);
 
 export const fileSizeLimitFor = (name, maxBytes, archiveBytes) =>
-  (ARCHIVE_EXTENSIONS.has(extensionOf(name)) || isFacebookMessengerExportFilename(name)
-    ? archiveBytes
-    : maxBytes);
+  extensionOf(name) === ".mbox"
+    ? Number.MAX_SAFE_INTEGER
+    : (BUFFERED_ARCHIVE_EXTENSIONS.has(extensionOf(name)) || isFacebookMessengerExportFilename(name)
+      ? archiveBytes
+      : maxBytes);
 
 class LocalFileSafetyError extends Error {
   constructor(code, message) {
@@ -301,6 +306,91 @@ function readApprovedLocalFile(file, { maxBytes }) {
   }
 }
 
+/**
+ * Stream the same approved regular-file identity while retaining the complete
+ * post-read stability proof used by the bounded reader above.
+ *
+ * The consumer must exhaust this iterator before using any derived result. If
+ * the path, inode, size, mtime, or ctime changes while bytes are being read,
+ * the final iteration throws and the caller discards everything it prepared.
+ */
+function* streamApprovedLocalFile(file) {
+  const fullPath = resolve(String(file?.full || ""));
+  const approval = localReadApproval(file);
+  const pathBefore = inspectRegularPath(fullPath);
+  if (!sameFileIdentity(pathBefore, approval.identity)) {
+    localFileFail("LOCAL_FILE_IDENTITY_CHANGED", "the file changed after the folder was scanned; retry the ingest");
+  }
+  let realBefore;
+  try {
+    realBefore = nativeRealpath(fullPath);
+  } catch (error) {
+    localFileFail("LOCAL_FILE_REALPATH_UNAVAILABLE", `file identity could not be resolved: ${error.code || "unavailable"}`);
+  }
+  if (!pathIsWithin(approval.rootReal, realBefore)) {
+    localFileFail("LOCAL_FILE_OUTSIDE_ROOT", "the file resolves outside the approved ingest root");
+  }
+
+  const fd = openLocalNoFollow(fullPath);
+  try {
+    let before;
+    try {
+      const st = fstatSync(fd, { bigint: true });
+      if (!st.isFile()) localFileFail("LOCAL_FILE_NOT_REGULAR", "the opened path is not a regular file");
+      before = regularFileSnapshot(st);
+    } catch (error) {
+      if (error instanceof LocalFileSafetyError) throw error;
+      localFileFail("LOCAL_FILE_METADATA_UNAVAILABLE", `opened-file metadata could not be read: ${error.code || "unavailable"}`);
+    }
+    if (!sameFileIdentity(before, approval.identity) || !sameFileIdentity(before, pathBefore)) {
+      localFileFail("LOCAL_FILE_IDENTITY_CHANGED", "the file changed while it was being opened; retry the ingest");
+    }
+    if (BigInt(before.size) > BigInt(Number.MAX_SAFE_INTEGER)) {
+      localFileFail("LOCAL_FILE_TOO_LARGE", "the mail archive is too large for this runtime to address safely");
+    }
+
+    let total = 0;
+    while (true) {
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      let count;
+      try {
+        count = readSync(fd, chunk, 0, chunk.length, null);
+      } catch (error) {
+        localFileFail("LOCAL_FILE_READ_FAILED", `the approved file could not be read: ${error.code || "unavailable"}`);
+      }
+      if (count === 0) break;
+      total += count;
+      if (!Number.isSafeInteger(total)) {
+        localFileFail("LOCAL_FILE_TOO_LARGE", "the mail archive is too large for this runtime to address safely");
+      }
+      yield chunk.subarray(0, count);
+    }
+
+    let after;
+    try {
+      after = regularFileSnapshot(fstatSync(fd, { bigint: true }));
+    } catch (error) {
+      localFileFail("LOCAL_FILE_METADATA_UNAVAILABLE", `opened-file metadata could not be rechecked: ${error.code || "unavailable"}`);
+    }
+    if (!sameFileVersion(before, after) || BigInt(after.size) !== BigInt(total)) {
+      localFileFail("LOCAL_FILE_CHANGED_DURING_READ", "the file changed while it was being read; retry the ingest");
+    }
+
+    const pathAfter = inspectRegularPath(fullPath);
+    let realAfter;
+    try {
+      realAfter = nativeRealpath(fullPath);
+    } catch (error) {
+      localFileFail("LOCAL_FILE_REALPATH_UNAVAILABLE", `file identity could not be rechecked: ${error.code || "unavailable"}`);
+    }
+    if (!sameFileIdentity(pathAfter, after) || !pathIsWithin(approval.rootReal, realAfter)) {
+      localFileFail("LOCAL_FILE_IDENTITY_CHANGED", "the file path changed while it was being read; retry the ingest");
+    }
+  } finally {
+    try { closeSync(fd); } catch { /* the safety result above is authoritative */ }
+  }
+}
+
 const localFileSafetyReason = (error) => error instanceof LocalFileSafetyError
   ? error.message
   : `could not safely inspect the local file: ${error?.code || "unavailable"}`;
@@ -390,7 +480,12 @@ export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES, ar
         skipped.push({ path: rel, reason: `file is ${(size / 1048576).toFixed(1)}MB, over the ${(sizeLimit / 1048576).toFixed(0)}MB limit` });
         continue;
       }
-      files.push({ full, rel, name: e.name, size, sizeLimit, _localApproval: approval });
+      files.push({
+        full, rel, name: e.name, size, sizeLimit, _localApproval: approval,
+        // Unlike a ZIP, an mbox can be admitted without buffering its complete
+        // file. Keep the caller's archive bound as its parsing window instead.
+        ...(extensionOf(e.name) === ".mbox" ? { mboxScanBytes: archiveBytes } : {}),
+      });
     }
   };
 
@@ -656,41 +751,41 @@ function prepareLinkedInExport(file, buf, hash, { sourceName }) {
  * uses, so nothing about MIME, encoded subjects or multipart bodies is decided
  * twice.
  */
-async function prepareMboxArchive(file, buf, hash, { sourceName }) {
-  const messages = splitMbox(buf.toString("utf-8"));
-  if (!messages.length) {
-    return {
-      hash,
-      skip: {
-        path: file.rel,
-        reason: "this .mbox file has no message separator line in it, so it is not a mail archive",
-      },
-    };
-  }
-
+async function prepareMboxArchive(file, { sourceName, scanBytes }) {
+  const splitter = new MboxStreamSplitter({
+    maxScanBytes: scanBytes,
+    maxMessageBytes: MAX_MBOX_MESSAGE_BYTES,
+  });
+  const hasher = createHash("sha256");
   const relPath = file.rel.split(sep).join("/");
   const envelopes = [];
   let unreadable = 0;
-  for (let index = 0; index < messages.length; index++) {
+  let oversized = 0;
+
+  const accept = async (item) => {
+    if (item.oversized) {
+      oversized++;
+      return;
+    }
     let parsed;
     try {
-      parsed = await parseEmailMessage(Buffer.from(messages[index], "utf-8"));
+      parsed = await parseEmailMessage(item.message);
     } catch {
       unreadable++;
-      continue;
+      return;
     }
     const text = parsed.error ? "" : String(parsed.text || "").trim();
     // The same floor every other document clears. A message that is only
     // headers is not worth an embedding and would dilute the ones that are.
     if (!textQuality(text).ok) {
       unreadable++;
-      continue;
+      return;
     }
-    const key = mboxMessageKey(relPath, parsed.messageId, index + 1);
+    const key = mboxMessageKey(relPath, parsed.messageId, item.ordinal);
     envelopes.push({
       source_type: sourceName,
       source_id: key,
-      title: parsed.subject || `Message ${index + 1} from ${basename(file.name)}`,
+      title: parsed.subject || `Message ${item.ordinal} from ${basename(file.name)}`,
       content: text,
       // The message's own Date header, which is the one date about an email
       // that is neither a guess nor a filesystem artefact.
@@ -702,21 +797,64 @@ async function prepareMboxArchive(file, buf, hash, { sourceName }) {
         category: sourceName,
         extracted_as: "email",
         archive: relPath,
-        message_number: index + 1,
+        message_number: item.ordinal,
         ...(parsed.from ? { sender: parsed.from } : {}),
       },
     });
+  };
+
+  // Every byte contributes to the resume hash, including bytes beyond the
+  // bounded parsing window. A same-size edit late in a large archive therefore
+  // cannot reuse stale `done` state. The splitter itself retains at most one
+  // bounded message plus the accepted envelopes, never the raw archive.
+  for (const chunk of streamApprovedLocalFile(file)) {
+    hasher.update(chunk);
+    for (const item of splitter.push(chunk)) await accept(item);
   }
+  for (const item of splitter.finish()) await accept(item);
+
+  const hash = hasher.digest("hex");
+  const stats = splitter.stats;
+  const incomplete = unreadable > 0 || oversized > 0 || stats.truncated;
 
   if (!envelopes.length) {
+    let reason;
+    if (stats.truncated) {
+      reason =
+        `no complete readable message was found inside the first ${(scanBytes / 1048576).toFixed(0)}MB ` +
+        "of this mail archive; later bytes were not indexed";
+    } else if (!stats.separatorLines) {
+      reason = "this .mbox file has no message separator line in it, so it is not a mail archive";
+    } else {
+      reason = `none of the ${stats.messageCount} message(s) in this mail archive could be read`;
+    }
     return {
       hash,
       skip: {
         path: file.rel,
-        reason: `none of the ${messages.length} message(s) in this mail archive could be read`,
+        reason,
       },
+      ...(incomplete ? { incomplete: true } : {}),
     };
   }
+
+  const note = [
+    `${envelopes.length} message(s) loaded from this archive`,
+    unreadable ? `${unreadable} complete message(s) could not be read` : null,
+    oversized
+      ? `${oversized} message(s) exceeded the ${(MAX_MBOX_MESSAGE_BYTES / 1048576).toFixed(0)}MB per-message limit`
+      : null,
+    stats.truncated
+      ? `only complete messages ending inside the first ${(scanBytes / 1048576).toFixed(0)}MB were considered; later messages were not indexed`
+      : null,
+  ].filter(Boolean).join("; ");
+
+  const prepared = incomplete
+    ? envelopes.map((envelope) => ({
+      ...envelope,
+      metadata: { ...envelope.metadata, extraction_incomplete: true },
+    }))
+    : envelopes;
   return {
     hash,
     // Every OTHER multi-document producer stamps its family here, and this one
@@ -724,11 +862,9 @@ async function prepareMboxArchive(file, buf, hash, { sourceName }) {
     // a multi-envelope result carries no declaration, so a single .mbox
     // anywhere under an ingested folder aborted the WHOLE run, dry run
     // included, and took every unrelated file in that folder with it.
-    envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)),
-    note: unreadable
-      ? `${envelopes.length} message(s) loaded from this archive; ${unreadable} could not be read`
-      : `${envelopes.length} message(s) loaded from this archive`,
-    ...(unreadable ? { incomplete: true } : {}),
+    envelopes: declareFamily(prepared, sourceFileFamilyUid(file, sourceName)),
+    note,
+    ...(incomplete ? { incomplete: true } : {}),
   };
 }
 
@@ -757,6 +893,23 @@ export function removedSinceLastRun(knownKeys, present) {
  * Read one file and turn it into an ingest envelope, or into a reasoned skip.
  */
 export async function prepare(file, { sourceName, ocr = null }) {
+  const ext = extensionOf(file.name);
+
+  // Local mbox archives are admitted independently of their total size. The
+  // stream reader hashes every byte for resume integrity while the parser keeps
+  // only complete messages inside a bounded window. Do this before the generic
+  // whole-file read, otherwise the old 64MB allocation/refusal path still wins.
+  if (ext === ".mbox") {
+    const scanBytes = Number.isSafeInteger(file?.mboxScanBytes) && file.mboxScanBytes > 0
+      ? file.mboxScanBytes
+      : MAX_ARCHIVE_BYTES;
+    try {
+      return await prepareMboxArchive(file, { sourceName, scanBytes });
+    } catch (error) {
+      return { skip: { path: file.rel, reason: localFileSafetyReason(error) } };
+    }
+  }
+
   let buf;
   const sizeLimit = Number.isSafeInteger(file?.sizeLimit)
     ? file.sizeLimit
@@ -768,7 +921,6 @@ export async function prepare(file, { sourceName, ocr = null }) {
   }
   let hash = sha(buf);
   let actualBytes = buf.length;
-  const ext = extensionOf(file.name);
 
   // Content-sniffed, not extension-alone: most files with these extensions
   // are not a message export, and the ordinary extractor below is exactly
@@ -804,12 +956,6 @@ export async function prepare(file, { sourceName, ocr = null }) {
   // "no recognized LinkedIn CSV" outcome rather than a generic binary skip.
   if (ext === ".zip") {
     return prepareLinkedInExport(file, buf, hash, { sourceName });
-  }
-
-  // One file, many documents: the archive is split before the single-document
-  // path can flatten it into one.
-  if (ext === ".mbox") {
-    return prepareMboxArchive(file, buf, hash, { sourceName });
   }
 
   if (!canExtract(file.name)) {

@@ -12,16 +12,18 @@
 // malformed one by name instead of indexing noise, and it is actually in the
 // registry both the folder walk and the Drive triage consult.
 
-import { readFileSync } from "node:fs";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+  closeSync, mkdtempSync, mkdirSync, openSync, readFileSync, rmSync,
+  truncateSync, writeFileSync, writeSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as XLSX from "@e965/xlsx";
 import { strToU8, zipSync } from "fflate";
 import { extract, canExtract, supported } from "../ingest/extract.mjs";
-import { walk, prepare } from "../ingest/run.mjs";
-import { splitMbox, unquoteFromLine, mboxMessageKey } from "../ingest/mbox.mjs";
+import { MAX_ARCHIVE_BYTES, walk, prepare } from "../ingest/run.mjs";
+import { MboxStreamSplitter, splitMbox, unquoteFromLine, mboxMessageKey } from "../ingest/mbox.mjs";
 import { parseIcs } from "../ingest/ics.mjs";
 import { rtfToText, looksLikeRtf } from "../ingest/rtf.mjs";
 import { vttToPlainTranscript, srtToPlainTranscript } from "../worker/src/lib/vtt.js";
@@ -312,6 +314,10 @@ const read = async (name) => extract(bytes(name), name);
   check("the headers a person searches for are kept in the body",
     /From: Alex Rivera <alex@example\.test>/.test(loaded.envelopes[0].content) &&
     /Subject: Renewal terms/.test(loaded.envelopes[0].content), loaded.envelopes[0].content.slice(0, 200));
+  check("the streaming ingest path also undoes mbox From_ quoting",
+    /\nFrom what I can tell/.test(loaded.envelopes[0].content) &&
+      !/\n>From what I can tell/.test(loaded.envelopes[0].content),
+    loaded.envelopes[0].content.slice(-200));
   check("the run says how many messages it found", /3 message\(s\) loaded/.test(loaded.note || ""), loaded.note);
   check("an informational complete-mbox note does not imply missing content",
     loaded.incomplete !== true, JSON.stringify(loaded));
@@ -333,6 +339,101 @@ const read = async (name) => extract(bytes(name), name);
   const refused = await read("not-an-archive.mbox");
   check("the fallback refuses a non-archive too",
     refused.text === null && /no message separator line/.test(refused.error || ""), JSON.stringify(refused));
+}
+{
+  const first = Buffer.from(
+    "From sender@example.test Sat Jan  1 00:00:00 2026\n" +
+    "Subject: first complete message\n\nsmall body\n\n",
+  );
+  const second = Buffer.from(
+    "From sender@example.test Sat Jan  1 00:00:01 2026\n" +
+    "Subject: second partial message\n\nthis body crosses the window\n",
+  );
+  const raw = Buffer.concat([first, second]);
+  const splitter = new MboxStreamSplitter({
+    maxScanBytes: first.length + second.indexOf(0x0a) + 12,
+    maxMessageBytes: 1_024,
+  });
+  const streamed = [];
+  for (let offset = 0; offset < raw.length; offset += 7) {
+    streamed.push(...splitter.push(raw.subarray(offset, offset + 7)));
+  }
+  streamed.push(...splitter.finish());
+  check("a streaming cap returns only messages that ended before the cap",
+    streamed.length === 1 && /first complete message/.test(streamed[0].message?.toString("utf-8") || ""),
+    JSON.stringify(splitter.stats));
+  check("a streaming cap exposes truncation and a dropped partial message",
+    splitter.stats.truncated === true && splitter.stats.droppedPartialMessage === true,
+    JSON.stringify(splitter.stats));
+}
+{
+  const raw = Buffer.from(
+    "From sender@example.test Sat Jan  1 00:00:00 2026\n" +
+    `Subject: oversized\n\n${"x".repeat(200)}\n\n` +
+    "From sender@example.test Sat Jan  1 00:00:01 2026\n" +
+    "Subject: recovered\n\nsmall body\n",
+  );
+  const splitter = new MboxStreamSplitter({ maxScanBytes: raw.length, maxMessageBytes: 96 });
+  const streamed = [...splitter.push(raw), ...splitter.finish()];
+  check("one oversized message cannot prevent a later bounded message from loading",
+    streamed.length === 2 && streamed[0].oversized === true &&
+      streamed[1].ordinal === 2 && /Subject: recovered/.test(streamed[1].message?.toString("utf-8") || ""),
+    JSON.stringify(splitter.stats));
+}
+{
+  // Sparse tail keeps the fixture quick and proves the real admission boundary
+  // rather than simulating it with a lowered test-only cap. The early messages
+  // are ordinary RFC 822 bytes; no private or customer material is involved.
+  const root = mkdtempSync(join(tmpdir(), "brain-large-mbox-"));
+  const archive = join(root, "takeout.mbox");
+  const noMessageId = Buffer.from(
+    "From sender@example.test Sat Jan  1 00:00:00 2026\n" +
+    "Date: Sat, 1 Jan 2026 00:00:00 +0000\n" +
+    "From: Sender <sender@example.test>\n" +
+    "To: Owner <owner@example.test>\n" +
+    "Subject: Early message without a Message-ID\n\n" +
+    "This early message has enough ordinary text to be useful and searchable.\n\n",
+  );
+  writeFileSync(archive, Buffer.concat([
+    noMessageId,
+    readFileSync(join(FIXTURES, "three-messages.mbox")),
+  ]));
+  truncateSync(archive, MAX_ARCHIVE_BYTES + 1);
+
+  const firstWalk = walk(root, {});
+  const candidate = firstWalk.files.find((file) => file.name === "takeout.mbox");
+  check("an mbox physically larger than 64MB is admitted for bounded streaming",
+    !!candidate && !firstWalk.skipped.some((skip) => skip.path === "takeout.mbox"),
+    JSON.stringify(firstWalk.skipped));
+  const firstPrepared = await prepare(candidate, { sourceName: "documents" });
+  check("a valid early message loads from an over-64MB mbox",
+    firstPrepared.envelopes?.some((envelope) => envelope.title === "Renewal terms for the operations contract"),
+    JSON.stringify(firstPrepared).slice(0, 400));
+  check("a streamed message without Message-ID keeps its ordinal fallback identity",
+    firstPrepared.envelopes?.some((envelope) => envelope.source_id === "takeout.mbox#message-1"),
+    firstPrepared.envelopes?.map((envelope) => envelope.source_id).join(","));
+  check("the unscanned archive tail is machine-visible and human-visible",
+    firstPrepared.incomplete === true &&
+      firstPrepared.envelopes?.every((envelope) => envelope.metadata?.extraction_incomplete === true) &&
+      /later messages were not indexed/.test(firstPrepared.note || ""),
+    firstPrepared.note || JSON.stringify(firstPrepared).slice(0, 300));
+
+  const firstIds = firstPrepared.envelopes.map((envelope) => envelope.source_id).join(",");
+  const firstHash = firstPrepared.hash;
+  const fd = openSync(archive, "r+");
+  try {
+    writeSync(fd, Buffer.from("X"), 0, 1, MAX_ARCHIVE_BYTES);
+  } finally {
+    closeSync(fd);
+  }
+  const secondCandidate = walk(root, {}).files.find((file) => file.name === "takeout.mbox");
+  const secondPrepared = await prepare(secondCandidate, { sourceName: "documents" });
+  check("unscanned bytes still participate in the deterministic resume hash",
+    secondPrepared.hash !== firstHash, `${firstHash} ${secondPrepared.hash}`);
+  check("the same early messages keep stable identities when only the late tail changes",
+    secondPrepared.envelopes.map((envelope) => envelope.source_id).join(",") === firstIds,
+    secondPrepared.envelopes.map((envelope) => envelope.source_id).join(","));
+  rmSync(root, { recursive: true, force: true });
 }
 
 /* ================= calendars (.ics) ================= */

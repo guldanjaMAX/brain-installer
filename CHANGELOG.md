@@ -20,6 +20,10 @@ the brain, not for whoever built it: what changed for them, and what to check.
 - Setup no longer calls a Brain live from document counts or an assumed empty
   backlog. It requires a valid D1 inventory and matching Vectorize readiness
   receipt, and otherwise names the remaining loading or recovery step.
+- Large local `.mbox` exports no longer disappear because the archive itself is
+  over 64 MiB. The Brain streams a bounded set of complete early messages,
+  keeps their subjects, dates, and stable identities, and says plainly when
+  later or individually oversized messages still need a split export.
 - The first-install Claude handoff now launches only from a dedicated
   installer-owned workspace, refuses unrelated instruction files, preserves
   structured command arguments, and renders copyable commands with literal

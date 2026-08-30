@@ -213,6 +213,13 @@ shortcuts never expand authority. Visible trash and visible moves out of scope
 are removal evidence. Permission loss and hard deletion are indistinguishable
 at 403 or 404, so the existing family is preserved and completion is withheld.
 
+Local mbox files are the bounded exception to whole-file extraction. The
+approved no-follow descriptor is streamed through a full-file SHA-256 for
+resume identity, while only complete messages ending inside the declared scan
+window reach the shared email parser. The splitter bounds each message, resumes
+at the next From_ delimiter after an oversized one, and reports scan or message
+truncation as incomplete. It never accepts a partial message at the window edge.
+
 The authenticated HTTP batch route preserves one receipt per input document.
 For D1 it reads prior rows for unique document identities in one batch preflight,
 so an unchanged 50-document safety rescan is one database round trip rather than

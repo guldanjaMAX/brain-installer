@@ -235,7 +235,17 @@ each message separately, through the same `parseEmailMessage` the `.eml` path
 uses, so one archive becomes many citable documents with their own subjects and
 Date headers. The registry also holds a single-document `.mbox` reader for
 callers that cannot express one-file-many-documents (Drive), rendering every
-message through that same reader: coarser, never different.
+message through that same reader: coarser, never different. Local archives are
+admitted even when their file size exceeds 64 MiB. The path-safe reader streams
+the complete file into its SHA-256 resume identity while an incremental From_
+splitter retains only one message at a time and considers complete messages
+ending inside a 64 MiB parsing window. It caps one raw message at 8 MiB, resumes
+at the next delimiter after an oversized message, and marks either limit as
+incomplete in both the source note and prepared-envelope metadata. Bytes beyond
+the parsing window still change the resume hash, so a late same-size edit cannot
+reuse stale state. A complete large-history import currently requires splitting
+the export into smaller mbox files; the Drive fallback remains provider-buffer
+bounded and does not use this local streaming path.
 
 Four dependencies carry the binary formats: `unpdf`, `fflate`, `@e965/xlsx` and
 `postal-mime`. 11 MB total, pure JavaScript, no node-gyp, no postinstall scripts,
