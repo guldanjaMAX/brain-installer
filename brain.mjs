@@ -9508,7 +9508,8 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       if (r.note) notes.push({ path: id, note: r.note });
       if (r.skip) {
         state.skipped[key] = r.skip.reason;
-        intentionalRemovalUids.push(key);
+        if (r.policy_skip === true) policySkipped++;
+        if (r.retain_existing !== true) intentionalRemovalUids.push(key);
         return { skip: r.skip };
       }
       const scannerResumeAccepted = hasCredentialScannerProgress(

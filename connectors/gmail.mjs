@@ -38,6 +38,36 @@ export const DEFAULT_QUERY =
   "-in:chats -in:drafts -in:spam -in:trash " +
   "-category:promotions -category:social -category:forums -category:updates";
 
+export const DEFAULT_EXCLUDED_LABEL_IDS = new Set([
+  "CHAT", "DRAFT", "SPAM", "TRASH",
+  "CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_FORUMS", "CATEGORY_UPDATES",
+]);
+
+/**
+ * History.list cannot apply Gmail's search query. Recheck the labels returned
+ * by messages.get so the incremental lane enforces the exact same policy as a
+ * full list. Missing label evidence is a coverage gap, never permission to
+ * ingest or to advance the history cursor.
+ */
+export function gmailLabelDecision(labelIds) {
+  if (!Array.isArray(labelIds)) {
+    return {
+      allowed: false,
+      policy: false,
+      reason: "Gmail returned no label classification, so this message was not indexed",
+    };
+  }
+  const excluded = labelIds.find((label) => DEFAULT_EXCLUDED_LABEL_IDS.has(String(label).toUpperCase()));
+  if (excluded) {
+    return {
+      allowed: false,
+      policy: true,
+      reason: `Gmail policy excludes messages carrying ${String(excluded).toLowerCase()}`,
+    };
+  }
+  return { allowed: true, policy: false, reason: null };
+}
+
 export async function api(getAccessToken, path, opts = {}) {
   return driveApi(getAccessToken, API + path, opts);
 }
@@ -121,6 +151,16 @@ export async function toEnvelope(getAccessToken, id, { sourceName = SOURCE_TYPE 
     // escape so the sync runner withholds the Gmail history cursor.
     if (!isPermanentMessageFailure(e)) throw e;
     return { skip: { path: id, id, reason: `could not be fetched: ${e.message.slice(0, 120)}` } };
+  }
+  const labelDecision = gmailLabelDecision(msg?.labelIds);
+  if (!labelDecision.allowed) {
+    return {
+      skip: { path: id, id, reason: labelDecision.reason },
+      policy_skip: labelDecision.policy,
+      // An absent classification is an incomplete read, not deletion proof.
+      // Keep a prior accepted revision while the run stays visibly non-green.
+      retain_existing: !labelDecision.policy,
+    };
   }
   if (!msg?.raw) return { skip: { path: id, id, reason: "the message had no content" } };
 

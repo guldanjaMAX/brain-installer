@@ -513,7 +513,22 @@ const gm = await import("../connectors/gmail.mjs");
 }
 {
   const r = await gm.toEnvelope(tok, "M2", {}, { fetchImpl: async () => json({ internalDate: "1" }), sleep: async () => {} });
-  check("a message with no content is a reasoned skip", !!r.skip && /no content/.test(r.skip.reason), r.skip?.reason);
+  check("a message with no label evidence is a coverage gap before its body can be trusted",
+    !!r.skip && /no label classification/.test(r.skip.reason) && r.policy_skip === false && r.retain_existing === true,
+    JSON.stringify(r));
+}
+{
+  const raw = Buffer.from(
+    "From: sender@example.invalid\r\nTo: owner@example.invalid\r\nSubject: Sale\r\n\r\n" +
+    "This invented promotion is deliberately excluded from the customer Brain."
+  ).toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
+  const r = await gm.toEnvelope(tok, "bulk", {}, {
+    fetchImpl: async () => json({ raw, labelIds: ["CATEGORY_PROMOTIONS"], historyId: "H10" }),
+    sleep: async () => {},
+  });
+  check("incremental Gmail applies the same bulk-mail policy as a full query",
+    !!r.skip && r.policy_skip === true && r.retain_existing === false && /policy excludes/.test(r.skip.reason),
+    JSON.stringify(r));
 }
 {
   const r = await gm.toEnvelope(tok, "gone", {}, {
