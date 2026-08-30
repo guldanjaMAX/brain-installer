@@ -1014,7 +1014,9 @@ async function exchangeToken(provider, fields, credentials, {
           error.name = "AbortError";
           reject(error);
         }, timeout);
-        timer.unref?.();
+        // This deadline may be the only active handle while a response body is
+        // stalled. Keep it referenced so the CLI cannot exit with an unsettled
+        // credential mutation before the timeout records its durable fence.
       });
       try {
         ({ response, data } = await Promise.race([
