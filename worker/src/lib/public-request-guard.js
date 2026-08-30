@@ -87,16 +87,6 @@ async function consumeQuota(env, { route, dimension, value, policy, now }) {
   const secret = String(env.SESSION_SIGNING_KEY || "");
   if (!secret) throw new Error("SESSION_SIGNING_KEY is required for privacy-safe public quotas");
   if (!env.DB) throw new Error("D1 is required for public request quotas");
-  await env.DB.exec(
-    `CREATE TABLE IF NOT EXISTS public_request_quotas (
-       key_hash TEXT NOT NULL,
-       route_class TEXT NOT NULL,
-       window_started_at INTEGER NOT NULL,
-       request_count INTEGER NOT NULL DEFAULT 1,
-       expires_at INTEGER NOT NULL,
-       PRIMARY KEY (key_hash, route_class, window_started_at)
-     )`,
-  );
   const windowMs = policy.windowSeconds * 1000;
   const windowStarted = Math.floor(now / windowMs) * windowMs;
   const keyHash = await hmacHex(secret, `${dimension}:${value}`);

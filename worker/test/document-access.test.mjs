@@ -16,6 +16,9 @@ import { consumeEnrollmentCode } from "../src/lib/auth-store.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS = join(HERE, "..", "..", "migrations", "d1");
+const PENDING_RELIABILITY_MIGRATION = join(
+  HERE, "..", "..", "migrations", "pending", "operational_reliability_v021.sql",
+);
 const ORIGIN = "https://brain.example.com";
 const ENTITY = "fixture-family";
 
@@ -55,6 +58,9 @@ function realDb() {
   const db = new DatabaseSync(":memory:");
   for (const file of readdirSync(MIGRATIONS).filter((name) => /^\d{4}_.+\.sql$/.test(name)).sort()) {
     for (const statement of splitStatements(readFileSync(join(MIGRATIONS, file), "utf8"))) db.exec(statement);
+  }
+  for (const statement of splitStatements(readFileSync(PENDING_RELIABILITY_MIGRATION, "utf8"))) {
+    db.exec(statement);
   }
   db.prepare(
     `INSERT INTO install_state

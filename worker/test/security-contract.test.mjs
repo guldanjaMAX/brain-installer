@@ -1,6 +1,7 @@
 /** Exact-document grants, scoped retrieval, and passkey observability acceptance. */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -17,6 +18,14 @@ import { ownerReliabilityAlerts } from "../src/lib/reliability-alerts.js";
 
 const ENTITY = "mesa-coffee";
 const OTHER_ENTITY = "desert-books";
+
+function installPendingReliabilitySchema(fixture) {
+  const source = readFileSync(
+    join(fixture.productRoot, "migrations/pending/operational_reliability_v021.sql"),
+    "utf8",
+  );
+  for (const sql of fixture.splitStatements(source)) fixture.sqlite.exec(sql);
+}
 
 function insertDocument(fixture, {
   docUid, entitySlug, text, title = "Synthetic access document", client = null,
@@ -280,6 +289,7 @@ test("passkey status aggregates bounded timing and excludes ceremony secrets", a
 test("public auth guard bounds streamed bodies and enforces privacy-safe IP and client quotas", async () => {
   const fixture = await createProductFixture();
   try {
+    installPendingReliabilitySchema(fixture);
     const oversized = new Request("https://brain.invalid/auth/login/options", {
       method: "POST",
       headers: { "Content-Type": "application/json", "CF-Connecting-IP": "192.0.2.10" },
@@ -336,16 +346,47 @@ test("public auth guard bounds streamed bodies and enforces privacy-safe IP and 
   }
 });
 
+test("missing quota schema fails closed before auth ceremony and runtime issues no DDL", async () => {
+  const fixture = await createProductFixture();
+  try {
+    const response = await fixture.post(
+      "/auth/login/options",
+      {},
+      { "CF-Connecting-IP": "192.0.2.99" },
+    );
+    const body = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(body.code, "quota_unavailable");
+    assert.equal(
+      fixture.seen.sql.some((sql) => /\bCREATE\s+(?:TABLE|INDEX)\b/i.test(sql)),
+      false,
+      "request runtime must not create or weaken migration-owned schema",
+    );
+    assert.equal(
+      fixture.first("SELECT count(*) AS n FROM auth_challenges").n,
+      0,
+      "the passkey ceremony must not issue a challenge when quota schema is absent",
+    );
+    assert.equal(
+      fixture.first("SELECT count(*) AS n FROM passkey_security_events").n,
+      0,
+      "the owning auth handler must not run before the quota gate",
+    );
+  } finally {
+    fixture.close();
+  }
+});
+
 test("scheduled auth cleanup removes only expired or consumed state after grace", async () => {
   const fixture = await createProductFixture();
   const now = 10 * 24 * 60 * 60 * 1000;
   try {
+    installPendingReliabilitySchema(fixture);
     fixture.raw("INSERT INTO auth_challenges (challenge_hash,purpose,expires_at) VALUES ('old-challenge','login',?)", now - 2 * 60 * 60 * 1000);
     fixture.raw("INSERT INTO auth_challenges (challenge_hash,purpose,expires_at) VALUES ('live-challenge','login',?)", now + 60_000);
     fixture.raw("INSERT INTO enrollment_codes (code_hash,expires_at,used_at) VALUES ('used-code',?,?)", now - 2 * 60 * 60 * 1000, now - 2 * 60 * 60 * 1000);
     fixture.raw("INSERT INTO oauth_codes (code_hash,client_id,redirect_uri,code_challenge,scope,expires_at,used_at) VALUES ('old-oauth','c','https://client.invalid','challenge',NULL,?,NULL)", now - 2 * 60 * 60 * 1000);
     fixture.raw("INSERT INTO oauth_tokens (token_hash,client_id,scope,session_generation,created_at,expires_at,last_used_at,revoked_at) VALUES ('recent-revoked','c',NULL,1,?,?,NULL,?)", now - 1000, now + 1000, now - 1000);
-    await fixture.DB.exec("CREATE TABLE public_request_quotas (key_hash TEXT, route_class TEXT, window_started_at INTEGER, request_count INTEGER, expires_at INTEGER)");
     fixture.raw("INSERT INTO public_request_quotas VALUES (printf('%064d',1),'auth',0,1,?)", now - 1);
 
     const result = await cleanupPublicAuthState(fixture.env, { now, limit: 20 });
@@ -364,6 +405,7 @@ test("owner reliability alerts aggregate stale sources, failed queues, and inter
   const fixture = await createProductFixture();
   const now = Date.parse("2026-08-30T12:00:00Z");
   try {
+    installPendingReliabilitySchema(fixture);
     fixture.raw(
       `INSERT INTO sources
          (name,kind,status,created_at,last_ingest_at,expected_refresh_seconds,stale_reason,document_count)
@@ -377,14 +419,6 @@ test("owner reliability alerts aggregate stale sources, failed queues, and inter
     const generation = fixture.first(
       "SELECT generation FROM vector_outbox WHERE chunk_uid='private-chunk-id'",
     ).generation;
-    await fixture.DB.exec(
-      `CREATE TABLE vector_outbox_retry_state (
-         chunk_uid TEXT NOT NULL, generation INTEGER NOT NULL, attempts INTEGER NOT NULL,
-         next_attempt_at INTEGER NOT NULL, last_attempt_at INTEGER NOT NULL,
-         quarantined_at INTEGER, failure_code TEXT NOT NULL, last_error TEXT,
-         PRIMARY KEY (chunk_uid,generation)
-       )`,
-    );
     fixture.raw(
       `INSERT INTO vector_outbox_retry_state
          (chunk_uid,generation,attempts,next_attempt_at,last_attempt_at,quarantined_at,failure_code,last_error)

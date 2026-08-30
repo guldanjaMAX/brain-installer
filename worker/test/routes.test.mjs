@@ -1915,6 +1915,7 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
             return { meta: { changes: 1 } };
           },
           first: async () => {
+            if (/SELECT 1 FROM vector_outbox_retry_state/.test(sql)) return { installed: 1 };
             if (/SELECT schema_version, vector_projection_status AS status/.test(sql)) {
               return {
                 schema_version: 13,
@@ -1981,6 +1982,7 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
             throw new Error(`unexpected busy bootstrap write: ${sql}`);
           },
           first: async () => {
+            if (/SELECT 1 FROM vector_outbox_retry_state/.test(sql)) return { installed: 1 };
             if (/SELECT schema_version, vector_projection_status AS status/.test(sql)) {
               return {
                 schema_version: 13,

@@ -949,23 +949,14 @@ const DRAIN_BATCH_SIZE_MAX = 100;
 export const VECTOR_RETRY_MAX_ATTEMPTS = 5;
 const VECTOR_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
 
-async function ensureVectorRetryStateTable(env) {
-  if (typeof env?.DB?.exec !== "function") return;
-  await env.DB.exec(
-    `CREATE TABLE IF NOT EXISTS vector_outbox_retry_state (
-       chunk_uid TEXT NOT NULL,
-       generation INTEGER NOT NULL,
-       attempts INTEGER NOT NULL,
-       next_attempt_at INTEGER NOT NULL,
-       last_attempt_at INTEGER NOT NULL,
-       quarantined_at INTEGER,
-       failure_code TEXT NOT NULL,
-       last_error TEXT,
-       PRIMARY KEY (chunk_uid, generation)
-     );
-     CREATE INDEX IF NOT EXISTS idx_vector_outbox_retry_eligible
-       ON vector_outbox_retry_state (quarantined_at, next_attempt_at);`
-  );
+async function requireVectorRetryStateTable(env) {
+  try {
+    await env.DB.prepare("SELECT 1 FROM vector_outbox_retry_state LIMIT 1").first();
+  } catch {
+    throw new Error(
+      "vector retry state schema is unavailable; run `brain migrate <manifest>` before vector operations",
+    );
+  }
 }
 
 async function cleanupVectorRetryState(env, limit = 500) {
@@ -1026,7 +1017,7 @@ async function scheduleVectorFailures(env, rows, {
 
 /** Privacy-safe retry state for owner alerts and operator receipts. */
 export async function vectorRetrySummary(env, now = Date.now()) {
-  await ensureVectorRetryStateTable(env);
+  await requireVectorRetryStateTable(env);
   const row = await env.DB.prepare(
     `SELECT count(*) AS tracked,
             sum(CASE WHEN quarantined_at IS NOT NULL THEN 1 ELSE 0 END) AS quarantined,
@@ -1048,7 +1039,7 @@ export async function vectorRetrySummary(env, now = Date.now()) {
 
 /** Explicit operator preview/confirm for quarantined vector generations. */
 export async function retryQuarantinedVectorOps(env, { confirm = false, limit = 100 } = {}) {
-  await ensureVectorRetryStateTable(env);
+  await requireVectorRetryStateTable(env);
   const bounded = Math.min(Math.max(Number(limit) || 100, 1), 500);
   const total = await env.DB.prepare(
     `SELECT count(*) AS n FROM vector_outbox_retry_state s
@@ -1729,7 +1720,7 @@ export async function drainOutbox(env, options = {}) {
       remaining: 0, errors: [], busy: false, paused: true,
     };
   }
-  await ensureVectorRetryStateTable(env);
+  await requireVectorRetryStateTable(env);
   await cleanupVectorRetryState(env);
   const rawMaxBatches = Number(options.maxBatches ?? 1);
   const maxBatches = Number.isInteger(rawMaxBatches)
@@ -1906,7 +1897,7 @@ export async function diagnose(env, {
   sampleLimit = 10,
   duplicateChunkScanLimit = 100_000,
 } = {}) {
-  await ensureVectorRetryStateTable(env);
+  await requireVectorRetryStateTable(env);
   const findings = [];
   const add = (f) => findings.push(f);
   const safe = async (id, fn) => {
@@ -3134,7 +3125,7 @@ export async function reindex(env, { source = null, dryRun = true, bootstrap = f
 }
 
 export async function outboxDepth(env) {
-  await ensureVectorRetryStateTable(env);
+  await requireVectorRetryStateTable(env);
   const row = await env.DB.prepare(
     `SELECT count(*) AS n, min(o.queued_at) AS oldest,
             sum(CASE WHEN o.op = 'upsert' THEN 1 ELSE 0 END) AS upserts,
@@ -3165,7 +3156,7 @@ export async function outboxDepth(env) {
  * that starts after the D1 read simply starts after this point-in-time check.
  */
 export async function vectorReadiness(env) {
-  await ensureVectorRetryStateTable(env);
+  await requireVectorRetryStateTable(env);
   let description;
   try {
     description = await env.VECTORIZE.describe();

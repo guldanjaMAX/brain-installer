@@ -107,8 +107,10 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 {
   const env = {
     DB: {
-      prepare: (sql) => /vector_projection_mutation_id AS mutation_id/.test(sql)
-        ? ({ first: async () => ({
+      prepare: (sql) => /SELECT 1 FROM vector_outbox_retry_state/.test(sql)
+        ? ({ first: async () => ({ installed: 1 }) })
+        : /vector_projection_mutation_id AS mutation_id/.test(sql)
+          ? ({ first: async () => ({
           schema_version: 12,
           mutation_id: null,
           mutation_submitted_at: null,
@@ -121,8 +123,8 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
           submitted: 0,
           quarantined: 0,
           oldest_queued_at: null,
-        }) })
-        : ({ bind: () => ({ all: async () => ({ results: [] }) }) }),
+          }) })
+          : ({ bind: () => ({ all: async () => ({ results: [] }) }) }),
     },
     VECTORIZE: {
       query: async () => ({ matches: [] }),

@@ -41,6 +41,7 @@ function makeEnv({
   deleteThrows = false,
   enforceD1PatternLimit = false,
   invalidGetByIdsPage = null,
+  installPendingReliabilitySchema = true,
   malformedAcceleratedVectorIdReadback = false,
   rejectUpsertIds = [],
   skipAcceleratedVectorIdUpdate = false,
@@ -49,6 +50,12 @@ function makeEnv({
   const dir = fileURLToPath(new URL("../migrations/d1/", import.meta.url));
   for (const file of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
     db.exec(readFileSync(join(dir, file), "utf-8"));
+  }
+  if (installPendingReliabilitySchema) {
+    db.exec(readFileSync(
+      new URL("../migrations/pending/operational_reliability_v021.sql", import.meta.url),
+      "utf-8",
+    ));
   }
   db.prepare(
     `INSERT INTO install_state
@@ -76,6 +83,7 @@ function makeEnv({
     return { mutationId };
   };
   const d1Queries = { submitted: 0, maxBinds: 0 };
+  const runtimeExecSql = [];
   const prepare = (sql) => {
     const shape = (params = []) => ({
       bind: (...next) => shape(next),
@@ -121,7 +129,7 @@ function makeEnv({
     },
     _pendingVectorMutations: pendingVectorMutations,
     DB: {
-      exec: async (sql) => { db.exec(sql); return { count: 1 }; },
+      exec: async (sql) => { runtimeExecSql.push(sql); db.exec(sql); return { count: 1 }; },
       prepare,
       batch: async (statements) => {
         d1Queries.submitted += statements.length;
@@ -181,7 +189,10 @@ function makeEnv({
       }),
     },
   };
-  return { env, db, deleted, upserted, upsertBatches, visible, d1Queries, getByIdsCalls, control };
+  return {
+    env, db, deleted, upserted, upsertBatches, visible, d1Queries,
+    getByIdsCalls, control, runtimeExecSql,
+  };
 }
 
 const insertDocument = (db, uid, source = "drive") => db.prepare(
@@ -226,6 +237,27 @@ const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
   ).run(receipt.mutationId, submittedAt);
   return receipt.mutationId;
 };
+
+/* Runtime code must never materialize the migration-owned retry table. */
+{
+  const { env, db, runtimeExecSql } = makeEnv({ installPendingReliabilitySchema: false });
+  let providerWrites = 0;
+  env.VECTORIZE.upsert = async () => { providerWrites++; return { mutationId: "forbidden" }; };
+  let missingSchemaError = null;
+  try {
+    await drainOutbox(env);
+  } catch (error) {
+    missingSchemaError = error;
+  }
+  check("missing vector retry schema fails closed before provider work",
+    /vector retry state schema is unavailable.*brain migrate/i.test(missingSchemaError?.message || "") &&
+      providerWrites === 0,
+    missingSchemaError?.message);
+  check("vector runtime issues no CREATE TABLE or CREATE INDEX fallback",
+    runtimeExecSql.length === 0 &&
+      db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name='vector_outbox_retry_state'").get().n === 0,
+    JSON.stringify(runtimeExecSql));
+}
 
 /* Confirmation readback is provider-paged independently from the D1 drain
    batch. Recombining pages must retain exact-generation upserts, absent
@@ -969,7 +1001,7 @@ const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
     drainBatchQueryUpperBound(100) === 212);
   check("a ten-batch request stops before the internal D1 query budget",
     drained.drained === 200 && drained.remaining === 400 &&
-      submitted === 422 && submitted < DRAIN_D1_QUERY_BUDGET,
+      submitted === 423 && submitted < DRAIN_D1_QUERY_BUDGET,
     JSON.stringify({ drained, submitted, budget: DRAIN_D1_QUERY_BUDGET }));
   check("query-budget exhaustion never strands the exclusive drain lease",
     leaseState.owner === null && leaseState.expires === null,
