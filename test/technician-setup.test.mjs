@@ -48,6 +48,7 @@ test("local tool readiness proves Claude sign-in, pinned Wrangler, and the inter
   const calls = [];
   const skillHome = join(sandbox, "local-tools-home");
   const receipt = await cmdLocalTools({
+    platformName: "linux",
     isTTY: true,
     runCommand: (command, args, options) => {
       calls.push({ command, args, options });
