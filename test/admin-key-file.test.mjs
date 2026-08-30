@@ -36,6 +36,7 @@ import {
 } from "../operations/windows-dpapi-session.mjs";
 
 const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "brain-admin-key-file-")));
+const windowsPowerShellFixtureEnvironment = Object.freeze({ SystemRoot: "C:\\Windows" });
 const secretA = "a".repeat(48);
 const secretB = "b-$&()[]{}-HEADER key-0123456789abcdef";
 const cipherA = Buffer.from("simulated-dpapi-ciphertext-a", "utf8");
@@ -97,7 +98,7 @@ try {
     rounds: 3,
     randomBytes: () => Buffer.alloc(32, ++diagnosticIndex),
     runPowerShell: diagnosticDpapi.runPowerShell,
-    environment: {},
+    environment: windowsPowerShellFixtureEnvironment,
   });
   assert.deepEqual(diagnostic, {
     checked: true,
@@ -119,7 +120,7 @@ try {
     rounds: 25,
     randomBytes: () => Buffer.alloc(32, ++deepIndex),
     runPowerShell: deepDpapi.runPowerShell,
-    environment: {},
+    environment: windowsPowerShellFixtureEnvironment,
   });
   assert.deepEqual(deepDiagnostic, {
     checked: true,
@@ -183,7 +184,7 @@ try {
       compile_count: sessionCompiles,
       helper_invocations: sessionCalls.length,
     }),
-    environment: {},
+    environment: windowsPowerShellFixtureEnvironment,
   });
   assert.deepEqual(sessionDiagnostic, {
     checked: true,
@@ -249,7 +250,7 @@ try {
       compile_count: sessionCompiles,
       helper_invocations: sessionCalls.length,
     }),
-    environment: {},
+    environment: windowsPowerShellFixtureEnvironment,
   });
   assert.deepEqual(retainedDiagnostic, {
     checked: true,
@@ -272,7 +273,7 @@ try {
       stdout: Buffer.alloc(0),
       stderr: Buffer.from("BRAIN_DPAPI_STAGE:compile\n", "ascii"),
     }),
-    environment: {},
+    environment: windowsPowerShellFixtureEnvironment,
   });
   assert.deepEqual(stagedFailure, {
     checked: true,

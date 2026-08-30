@@ -70,7 +70,10 @@ function runtime(environment = process.env) {
       // exact constructed path, a regular non-link file, and a bounded size.
       return identity.isFile() && !identity.isSymbolicLink() &&
         identity.size >= 1 && identity.size <= 16 * 1024 * 1024 &&
-        resolve(realpathSync.native(candidate)).toLowerCase() === resolve(candidate).toLowerCase();
+        // The JavaScript resolver still resolves linked ancestors while
+        // retaining a legitimate Windows 8.3 spelling. The native resolver
+        // expands that spelling and can falsely reject the fixed OS path.
+        resolve(realpathSync(candidate)).toLowerCase() === resolve(candidate).toLowerCase();
     } catch {
       return false;
     }
