@@ -55,6 +55,12 @@ const read = (name, options = {}) => readBankExport(bytes(name), { name, ...opti
     /Period: 2026-07-01 to 2026-07-31/.test(got.text) && /8,421\.10 USD/.test(got.text), got.text);
   check("a line the reader could not read is reported, not dropped from the text",
     /not read:/.test(got.text) && /could not be read/.test(got.note || ""), `${got.note} :: ${got.text}`);
+  check("an unread bank line carries a machine-visible incomplete signal",
+    got.incomplete === true, JSON.stringify(got));
+  const fullyParsedQfx = await extract(bytes("card-july.qfx"), "card-july.qfx");
+  check("folder-ingested bank figures remain partial until the structured ledger import runs",
+    fullyParsedQfx.incomplete === true && /not in the ledger/.test(fullyParsedQfx.note || ""),
+    JSON.stringify(fullyParsedQfx));
   check("the corpus text never carries a full account number",
     !/000000004821/.test(got.text) && /ending 4821/.test(got.text), got.text);
 

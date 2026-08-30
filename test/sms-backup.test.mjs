@@ -13,7 +13,8 @@
 // silently mis-parsing it, and feed message-session.mjs identically to
 // every other chat platform.
 
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -21,6 +22,7 @@ import {
   detectGoogleVoiceTakeout, parseGoogleVoiceTakeout, deriveVoiceThreadTitle,
 } from "../ingest/sms-backup.mjs";
 import { MessageSessionizer } from "../ingest/message-session.mjs";
+import { prepare } from "../ingest/run.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const load = (...parts) => readFileSync(join(HERE, "fixtures", ...parts), "utf8");
@@ -57,6 +59,50 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     new Set(r.rows.map((row) => row.thread_id)).size === 2, JSON.stringify([...new Set(r.rows.map((row) => row.thread_id))]));
   check("rows across interleaved threads are still globally chronological",
     r.rows.every((row, i) => i === 0 || row.ts >= r.rows[i - 1].ts), JSON.stringify(r.rows.map((row) => row.ts)));
+  check("the declared export count and closing root are verified",
+    r.declaredCount === 8 && r.entriesSeen === 8 && r.rootClosed && !r.countMismatch && !r.incomplete,
+    JSON.stringify(r));
+
+  const truncated = [
+    '<?xml version="1.0"?>',
+    '<smses count="2">',
+    '<sms address="+15550000001" date="1704067200000" type="1" body="first" />',
+    '<sms address="+15550000002" date="1704067260000" type="1" body="cut off',
+  ].join("\n");
+  const partial = parseSmsBackupXml(truncated, { sourceLabel: "sms-cutoff" });
+  check("a backup cut off after one readable message is never called complete",
+    partial.rows.length === 1 && partial.incomplete && !partial.rootClosed && partial.malformed === 1,
+    JSON.stringify(partial));
+
+  const countMismatch = parseSmsBackupXml(
+    '<smses count="2"><sms address="+15550000001" date="1704067200000" type="1" body="only" /></smses>',
+    { sourceLabel: "sms-mismatch" },
+  );
+  check("a declared-count mismatch is never called complete",
+    countMismatch.rows.length === 1 && countMismatch.countMismatch && countMismatch.incomplete,
+    JSON.stringify(countMismatch));
+}
+
+/* ---- a truncated export keeps readable work but carries an incomplete receipt ---- */
+{
+  const root = mkdtempSync(join(tmpdir(), "brain-sms-truncated-"));
+  try {
+    const xml = [
+      '<smses count="2">',
+      '<sms address="+15550000001" date="1704067200000" type="1" body="first" />',
+      '<sms address="+15550000002" date="1704067260000" type="1" body="cut off',
+    ].join("\n");
+    const full = join(root, "truncated.xml");
+    writeFileSync(full, xml);
+    const prepared = await prepare({
+      full, rel: "truncated.xml", name: "truncated.xml", size: Buffer.byteLength(xml),
+    }, { sourceName: "messages" });
+    check("common preparation preserves readable SMS but refuses a green completion",
+      prepared.envelopes?.length > 0 && prepared.incomplete === true && /ended before/.test(prepared.note || ""),
+      JSON.stringify(prepared));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 /* ---- Google Voice Takeout ---- */
@@ -121,6 +167,59 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("re-parsing the identical export yields identical document ids (idempotent on re-ingest)",
     JSON.stringify(docs.map((d) => d.source_id)) === JSON.stringify(docsAgain.map((d) => d.source_id)),
     JSON.stringify({ first: docs.map((d) => d.source_id), second: docsAgain.map((d) => d.source_id) }));
+}
+
+/* ---- unsupported MMS/empty rows remain visible after common preparation ---- */
+{
+  const root = mkdtempSync(join(tmpdir(), "brain-sms-export-"));
+  try {
+    const xml = load("sms-backup", "sms-backup-restore.xml");
+    const full = join(root, "sms-backup.xml");
+    writeFileSync(full, xml);
+    const prepared = await prepare({
+      full,
+      rel: "sms-backup.xml",
+      name: "sms-backup.xml",
+      size: Buffer.byteLength(xml),
+    }, { sourceName: "messages" });
+    check("SMS and MMS omissions are machine-visible after common folder preparation",
+      prepared.incomplete === true && /MMS/.test(prepared.note || ""),
+      JSON.stringify(prepared));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/* ---- overlapping snapshot files never share document identities ---- */
+{
+  const root = mkdtempSync(join(tmpdir(), "brain-sms-snapshots-"));
+  try {
+    const xml = load("sms-backup", "sms-backup-restore.xml");
+    const firstPath = join(root, "phone-a.xml");
+    const secondPath = join(root, "phone-b.xml");
+    writeFileSync(firstPath, xml);
+    writeFileSync(secondPath, xml);
+    const first = await prepare({
+      full: firstPath, rel: "phone-a.xml", name: "phone-a.xml", size: Buffer.byteLength(xml),
+    }, { sourceName: "messages" });
+    const second = await prepare({
+      full: secondPath, rel: "phone-b.xml", name: "phone-b.xml", size: Buffer.byteLength(xml),
+    }, { sourceName: "messages" });
+    const firstUids = new Set(first.envelopes.map((envelope) => `${envelope.source_type}:${envelope.source_id}`));
+    const secondUids = new Set(second.envelopes.map((envelope) => `${envelope.source_type}:${envelope.source_id}`));
+    check("two overlapping SMS snapshot files have disjoint document identities",
+      [...firstUids].every((uid) => !secondUids.has(uid)),
+      JSON.stringify({ first: [...firstUids], second: [...secondUids] }));
+    check("each SMS snapshot remains bound to its own cleanup family",
+      first.envelopes.every((envelope) => envelope.metadata.family_of === "messages:phone-a.xml") &&
+        second.envelopes.every((envelope) => envelope.metadata.family_of === "messages:phone-b.xml"),
+      JSON.stringify({
+        first: first.envelopes.map((envelope) => envelope.metadata.family_of),
+        second: second.envelopes.map((envelope) => envelope.metadata.family_of),
+      }));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nsms-backup: all ${ran} tests passed`);

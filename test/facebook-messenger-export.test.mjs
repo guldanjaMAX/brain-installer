@@ -87,6 +87,9 @@ check("the resulting document contains the real message text, not the JSON conta
   /renewal is for twelve months/.test(prepared.envelopes?.[0]?.content || "") &&
   !/timestamp_ms/.test(prepared.envelopes?.[0]?.content || ""),
   prepared.envelopes?.[0]?.content);
+check("attachment, unavailable, and malformed omissions stay machine-visible",
+  prepared.incomplete === true && /not represented/.test(prepared.note || ""),
+  JSON.stringify(prepared));
 
 console.log(failures ? `\n${failures} FAILURE(S)` : `\nfacebook-messenger-export: all ${ran} checks passed`);
 process.exit(failures ? 1 : 0);

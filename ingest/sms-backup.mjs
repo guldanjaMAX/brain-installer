@@ -64,16 +64,30 @@ function parseAttrs(attrString) {
 }
 
 /**
- * @returns {{ rows: object[], messageCount: number, skippedEmpty: number, skippedMms: number }}
+ * @returns {{ rows: object[], messageCount: number, skippedEmpty: number, skippedMms: number,
+ *   declaredCount: number|null, entriesSeen: number, malformed: number, rootClosed: boolean,
+ *   countMismatch: boolean, incomplete: boolean }}
  */
 export function parseSmsBackupXml(text, { sourceLabel = "sms-backup" } = {}) {
+  const raw = String(text || "");
   const rows = [];
   let skippedEmpty = 0;
-  const mmsCount = (text.match(/<mms\b/g) || []).length;
+  const mmsCount = (raw.match(/<mms\b/g) || []).length;
+  const smsOpenCount = (raw.match(/<sms\b/g) || []).length;
+  const root = /<smses\b([^>]*)>/i.exec(raw);
+  const rootAttrs = root ? parseAttrs(root[1]) : {};
+  const hasDeclaredCount = Object.hasOwn(rootAttrs, "count");
+  const parsedDeclaredCount = hasDeclaredCount ? Number(rootAttrs.count) : null;
+  const declaredCount = Number.isSafeInteger(parsedDeclaredCount) && parsedDeclaredCount >= 0
+    ? parsedDeclaredCount
+    : null;
+  const rootClosed = /<\/smses\s*>/i.test(raw);
 
   const tagRe = /<sms\b([^>]*)\/>/g;
   let m;
-  while ((m = tagRe.exec(text))) {
+  let completeSmsTags = 0;
+  while ((m = tagRe.exec(raw))) {
+    completeSmsTags++;
     const a = parseAttrs(m[1]);
     const body = String(a.body || "").trim();
     const dateMs = Number(a.date);
@@ -102,7 +116,22 @@ export function parseSmsBackupXml(text, { sourceLabel = "sms-backup" } = {}) {
   }
 
   rows.sort((x, y) => (x.ts < y.ts ? -1 : x.ts > y.ts ? 1 : 0));
-  return { rows, messageCount: rows.length, skippedEmpty, skippedMms: mmsCount };
+  const entriesSeen = smsOpenCount + mmsCount;
+  const malformed = Math.max(0, smsOpenCount - completeSmsTags) +
+    (hasDeclaredCount && declaredCount === null ? 1 : 0);
+  const countMismatch = declaredCount !== null && declaredCount !== entriesSeen;
+  return {
+    rows,
+    messageCount: rows.length,
+    skippedEmpty,
+    skippedMms: mmsCount,
+    declaredCount,
+    entriesSeen,
+    malformed,
+    rootClosed,
+    countMismatch,
+    incomplete: !rootClosed || malformed > 0 || countMismatch,
+  };
 }
 
 /* --------------------------------------------------------- Google Voice Takeout */

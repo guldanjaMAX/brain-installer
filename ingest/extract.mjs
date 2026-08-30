@@ -67,7 +67,12 @@ for (const ext of [".html", ".htm", ".xhtml"]) {
   register(ext, (buf) => stripMarkup(dec(buf)), "html");
 }
 
-register(".xml", (buf) => stripMarkup(dec(buf)), "xml");
+// Generic XML is data, not presentation markup. Stripping tags here used to
+// erase the exact facts many business exports put in element names and
+// attributes (for example customer="Acme" and amount="1200") while still
+// reporting a complete ingest. Preserve it as written. Specialized XML
+// producers such as SMS Backup & Restore are detected earlier by prepare().
+register(".xml", (buf) => dec(buf), "xml");
 
 // YAML is prose-shaped configuration. The product promises to read it "as
 // written", so preserve its keys, indentation and scalar values rather than
@@ -92,6 +97,7 @@ function parseDelimited(text, delim) {
   let row = [];
   let cell = "";
   let quoted = false;
+  let malformed = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (quoted) {
@@ -101,14 +107,23 @@ function parseDelimited(text, delim) {
       } else cell += c;
       continue;
     }
-    if (c === '"') { quoted = true; continue; }
+    if (c === '"') {
+      // A quote inside an already-started unquoted value is not valid CSV.
+      // Continue parsing so the useful prefix can still be indexed, but carry
+      // a structured incomplete signal rather than claiming the file was read
+      // perfectly.
+      if (cell.length) malformed = true;
+      quoted = true;
+      continue;
+    }
     if (c === delim) { row.push(cell); cell = ""; continue; }
     if (c === "\n") { row.push(cell); rows.push(row); row = []; cell = ""; continue; }
     if (c === "\r") continue;
     cell += c;
   }
+  if (quoted) malformed = true;
   if (cell.length || row.length) { row.push(cell); rows.push(row); }
-  return rows;
+  return { rows, malformed };
 }
 
 // Ceiling on rows rendered. A 200,000-row export is a database, not a document,
@@ -126,7 +141,27 @@ const MAX_ROWS = 5000;
 export function renderTableResult(rows, { label = "" } = {}) {
   if (!rows.length) return { text: "", omittedRows: 0, note: null };
   const header = rows[0].map((h) => String(h).trim());
-  const looksLikeHeader = header.some((h) => h && !/^-?[\d.,$%()]+$/.test(h));
+  // Treat row 1 as a header only when it looks like a row of field names and
+  // later rows provide affirmative type evidence. The old "contains any
+  // text" test turned an ordinary headerless transaction such as
+  // `2026-01-01,Coffee,5.00` into column names, silently deleted it, and then
+  // mislabeled the next transaction. Ambiguity must preserve data.
+  const scalarKind = (value) => {
+    const raw = String(value ?? "").trim();
+    if (!raw) return "empty";
+    if (/^[+-]?(?:[$£€]\s*)?\(?\d[\d,]*(?:\.\d+)?\)?%?$/.test(raw)) return "number";
+    if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T\s].*)?$/.test(raw) ||
+        /^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}(?:[T\s].*)?$/.test(raw)) return "date";
+    if (/^(?:true|false|yes|no)$/i.test(raw)) return "boolean";
+    return "text";
+  };
+  const simpleFieldName = (value) => /^[A-Za-z][A-Za-z0-9 _./()-]{0,79}$/.test(String(value ?? "").trim());
+  const later = rows.slice(1, Math.min(rows.length, 26));
+  const hasTypedContrast = header.some((value, index) =>
+    scalarKind(value) === "text" && later.some((candidate) =>
+      ["number", "date", "boolean"].includes(scalarKind(candidate[index]))));
+  const looksLikeHeader = later.length > 0 && header.some((value) => String(value).trim()) &&
+    header.every((value) => !String(value).trim() || simpleFieldName(value)) && hasTypedContrast;
   const body = looksLikeHeader ? rows.slice(1) : rows;
   const out = [];
   if (label) out.push(label);
@@ -157,12 +192,17 @@ export function renderTable(rows, options = {}) {
 }
 
 function extractDelimited(buf, delim, name) {
-  const rendered = renderTableResult(parseDelimited(dec(buf), delim), {
+  const parsed = parseDelimited(dec(buf), delim);
+  const rendered = renderTableResult(parsed.rows, {
     label: name ? `Table: ${name}` : "",
   });
+  const notes = [];
+  if (rendered.note) notes.push(rendered.note);
+  if (parsed.malformed) notes.push("the delimited file contains an unterminated or misplaced quoted field; readable rows were indexed but the result may be incomplete");
+  const note = notes.length ? notes.join("; ") : null;
   return {
     text: rendered.text,
-    ...(rendered.note ? { note: rendered.note, incomplete: true } : {}),
+    ...(note ? { note, incomplete: true } : {}),
   };
 }
 
@@ -180,7 +220,12 @@ const MAX_JSON_VALUES = 20_000;
 register(".json", (buf) => {
   const raw = dec(buf);
   let parsed;
-  try { parsed = JSON.parse(raw); } catch { return raw; }
+  try { parsed = JSON.parse(raw); } catch {
+    return {
+      text: null,
+      error: "the JSON is incomplete or malformed; refusing to index a partially copied structure",
+    };
+  }
   const lines = [];
   const pending = [{ value: parsed, path: "" }];
   while (pending.length && lines.length < MAX_JSON_VALUES) {
@@ -256,13 +301,13 @@ for (const [ext, toText, label] of [
 register(".ics", async (buf, { name } = {}) => {
   const raw = dec(buf);
   const { parseIcs, MAX_EVENTS } = await import("./ics.mjs");
-  const { isCalendar, events, malformed, calendarName } = parseIcs(raw);
+  const { isCalendar, events, malformed, calendarName, calendarClosed } = parseIcs(raw);
   if (!isCalendar) return { text: null, error: "this .ics file is not an iCalendar document (no BEGIN:VCALENDAR)" };
   if (!events.length) {
     return {
       text: null,
-      error: malformed
-        ? `no readable events: ${malformed} calendar entr${malformed === 1 ? "y is" : "ies are"} missing a start time or truncated`
+      error: malformed || !calendarClosed
+        ? `no readable events: the calendar export is truncated or has ${malformed} unreadable entr${malformed === 1 ? "y" : "ies"}`
         : "this calendar has no events in it (it may hold only tasks, free/busy blocks or timezone definitions)",
     };
   }
@@ -273,6 +318,7 @@ register(".ics", async (buf, { name } = {}) => {
   const notes = [];
   if (events.length > shown.length) notes.push(`${events.length - shown.length} further event(s) were not indexed; this export exceeds the ${MAX_EVENTS} event limit`);
   if (malformed) notes.push(`${malformed} calendar entr${malformed === 1 ? "y" : "ies"} could not be read and ${malformed === 1 ? "was" : "were"} left out`);
+  if (!calendarClosed) notes.push("the calendar export ended before END:VCALENDAR and may be truncated");
   return {
     text: `Calendar export: ${label}\n\n${rendered.join("\n\n")}`,
     note: notes.length ? notes.join("; ") : undefined,
@@ -322,7 +368,16 @@ for (const ext of [".ofx", ".qfx"]) {
     if (unreadable) {
       notes.unshift(`${unreadable} line(s) in this export could not be read and are recorded as unread rather than dropped`);
     }
-    return { text, note: notes.join("; ") };
+    return {
+      text,
+      note: notes.join("; "),
+      // The searchable prose did land, but ordinary folder ingestion does not
+      // populate balances or transactions in the structured financial ledger.
+      // Treat that missing product surface as follow-up, even when every OFX
+      // row parsed, so setup cannot imply that dropping a bank export into a
+      // folder completed the financial import.
+      incomplete: true,
+    };
   }, "bank export");
 }
 

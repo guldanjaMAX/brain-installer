@@ -78,8 +78,35 @@ const read = async (name) => extract(bytes(name), name);
     got.error || got.text?.slice(0, 120));
   check("complete JSON is not mislabeled incomplete", got.incomplete !== true, JSON.stringify(got));
 }
+{
+  const truncated = await extract(
+    Buffer.from('{"participants":[{"name":"Fixture"}],"messages":[{"content":"half copied"}'),
+    "message_1.json",
+  );
+  check("a truncated JSON export is refused instead of indexed as complete raw text",
+    truncated.text === null && /incomplete or malformed/.test(truncated.error || ""),
+    JSON.stringify(truncated));
+}
 
 /* ================= bounded tables, without false completeness ================= */
+{
+  const headerless = await extract(
+    Buffer.from("2026-01-01,Coffee,5.00\n2026-01-02,Gas,40.00\n"),
+    "transactions.csv",
+  );
+  check("a headerless mixed date/text/number CSV keeps its first transaction",
+    /2026-01-01 \| Coffee \| 5\.00/.test(headerless.text || "") &&
+      /2026-01-02 \| Gas \| 40\.00/.test(headerless.text || "") &&
+      !/2026-01-01: 2026-01-02/.test(headerless.text || ""),
+    JSON.stringify(headerless));
+  check("a complete headerless CSV stays complete",
+    headerless.incomplete !== true, JSON.stringify(headerless));
+
+  const malformed = await extract(Buffer.from('Name,Note\nAlice,"unterminated\nBob,hidden'), "broken.csv");
+  check("an unterminated quoted CSV field cannot report complete",
+    malformed.incomplete === true && /unterminated|misplaced quoted field/.test(malformed.note || ""),
+    JSON.stringify(malformed));
+}
 {
   const body = Array.from({ length: 5_001 }, (_, index) => `row-${index},${index}`).join("\n");
   const cappedCsv = await extract(Buffer.from(`Name,Value\n${body}\n`), "large.csv");
@@ -105,6 +132,18 @@ const read = async (name) => extract(bytes(name), name);
     prepared.incomplete === true && prepared.envelope?.metadata?.extraction_incomplete === true,
     JSON.stringify(prepared).slice(-400));
   rmSync(root, { recursive: true, force: true });
+}
+
+/* ================= generic XML, preserved as written ================= */
+{
+  const got = await extract(
+    Buffer.from('<invoice customer="Acme" amount="1200"><status>paid</status></invoice>'),
+    "invoice.xml",
+  );
+  check("generic XML retains element names, attributes, and values",
+    got.how === "xml" && got.text?.includes("invoice") && got.text.includes('customer="Acme"') &&
+      got.text.includes('amount="1200"') && got.text.includes("status") && got.text.includes("paid"),
+    JSON.stringify(got));
 }
 
 /* ================= spreadsheets, with exact per-sheet caps ================= */
@@ -307,6 +346,15 @@ const read = async (name) => extract(bytes(name), name);
   check("a calendar with readable and malformed events is explicitly incomplete",
     partial.incomplete === true && /1 calendar entry could not be read/.test(partial.note || "") &&
       /Readable event/.test(partial.text || ""), JSON.stringify(partial));
+
+  const missingCalendarEnd = [
+    "BEGIN:VCALENDAR",
+    "BEGIN:VEVENT", "UID:good-before-cutoff", "DTSTART:20260612T180000Z", "SUMMARY:Readable before cutoff", "END:VEVENT",
+  ].join("\r\n");
+  const cutoff = await extract(Buffer.from(missingCalendarEnd), "missing-calendar-end.ics");
+  check("a readable event cannot hide a missing END:VCALENDAR boundary",
+    cutoff.incomplete === true && /ended before END:VCALENDAR/.test(cutoff.note || "") &&
+      /Readable before cutoff/.test(cutoff.text || ""), JSON.stringify(cutoff));
 
   const events = Array.from({ length: 501 }, (_, index) => [
     "BEGIN:VEVENT", `UID:event-${index}`, "DTSTART:20260612T180000Z", `SUMMARY:Event ${index}`, "END:VEVENT",

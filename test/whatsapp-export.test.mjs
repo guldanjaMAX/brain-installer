@@ -10,7 +10,8 @@
 // whole-file chronological monotonicity, and refuses to guess when it
 // genuinely cannot tell — never silently mis-dating a chat.
 
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -20,6 +21,7 @@ import {
   deriveThreadTitle,
 } from "../ingest/whatsapp-export.mjs";
 import { MessageSessionizer } from "../ingest/message-session.mjs";
+import { prepare } from "../ingest/run.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = join(HERE, "fixtures", "whatsapp");
@@ -168,6 +170,27 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   const docs = [...parsed.rows.flatMap((row) => sessionizer.push(row)), ...sessionizer.finish()];
   check("so zero documents are produced from it, rather than one with a coin-flip date",
     docs.length === 0, String(docs.length));
+}
+
+/* ---- export omissions survive into the common ingest receipt ---- */
+{
+  const root = mkdtempSync(join(tmpdir(), "brain-whatsapp-export-"));
+  try {
+    const text = load("ios-unambiguous.txt");
+    const full = join(root, "WhatsApp Chat with Alex Rivera.txt");
+    writeFileSync(full, text);
+    const prepared = await prepare({
+      full,
+      rel: "WhatsApp Chat with Alex Rivera.txt",
+      name: "WhatsApp Chat with Alex Rivera.txt",
+      size: Buffer.byteLength(text),
+    }, { sourceName: "messages" });
+    check("a media omission is machine-visible after common folder preparation",
+      prepared.incomplete === true && /media or deleted-message/.test(prepared.note || ""),
+      JSON.stringify(prepared));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nwhatsapp-export: all ${ran} tests passed`);

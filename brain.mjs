@@ -4652,12 +4652,28 @@ function skippedPartIndexOf(state) {
  */
 export function recordAcceptedDocumentState(state, {
   stateKey, hash, skipKeys = [], legacyPartRoot = null, protectedSkipKeys = [],
+  extractionIncomplete = undefined,
 } = {}) {
   const key = String(stateKey || "");
   if (!key) throw new Error("accepted document state needs a logical state key");
   if (!state.done || typeof state.done !== "object") state.done = {};
   if (!state.skipped || typeof state.skipped !== "object") state.skipped = {};
   state.done[key] = hash;
+  if (extractionIncomplete !== undefined) {
+    if (!state.extraction_incomplete || typeof state.extraction_incomplete !== "object" ||
+        Array.isArray(state.extraction_incomplete)) {
+      state.extraction_incomplete = {};
+    }
+    if (extractionIncomplete) {
+      // Store only a boolean. The detailed note is printed during the run; a
+      // resume receipt needs to remember the gap without persisting document
+      // content, filenames beyond the existing state key, or parser details.
+      state.extraction_incomplete[key] = true;
+    } else {
+      delete state.extraction_incomplete[key];
+      if (!Object.keys(state.extraction_incomplete).length) delete state.extraction_incomplete;
+    }
+  }
   const exactSkipKeys = [key, ...(skipKeys || [])]
     .filter((skipKey) => skipKey !== null && skipKey !== undefined && String(skipKey) !== "")
     .map(String);
@@ -4772,6 +4788,34 @@ export function localIngestRootFingerprint(root, platform = process.platform) {
     .digest("hex");
 }
 
+/**
+ * A privacy-safe generation marker for one local-folder enumeration. It binds
+ * candidate names to the file identity/version approved by the walker, plus
+ * every explicit skip. A second marker taken before deletion authority is used
+ * can therefore detect a copied or syncing folder that changed during the run.
+ */
+export function localWalkSnapshotFingerprint({ files = [], skipped = [], complete = false } = {}) {
+  const normalizedPath = (value) => String(value || "").replace(/\\/g, "/");
+  const candidates = files.map((file) => {
+    const identity = file?._localApproval?.identity || {};
+    return [
+      normalizedPath(file?.rel),
+      String(identity.dev || ""),
+      String(identity.ino || ""),
+      String(identity.size ?? file?.size ?? ""),
+      String(identity.mtimeNs || ""),
+      String(identity.ctimeNs || ""),
+    ];
+  }).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  const omissions = skipped.map((skip) => [
+    normalizedPath(skip?.path),
+    String(skip?.reason || ""),
+  ]).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  return createHash("sha256")
+    .update(JSON.stringify({ complete: complete === true, candidates, omissions }))
+    .digest("hex");
+}
+
 /** Keep a source's resume receipts bound to one canonical local folder. */
 export function bindLocalIngestRoot(state, rootFingerprint) {
   if (!state || typeof state !== "object" || Array.isArray(state)) {
@@ -4818,6 +4862,9 @@ export function reconcileLocalResumeDone({ state, priorDone, storedFamilies, sou
     }
     missing++;
     if (state.done && typeof state.done === "object") delete state.done[key];
+    if (state.extraction_incomplete && typeof state.extraction_incomplete === "object") {
+      delete state.extraction_incomplete[key];
+    }
   }
   return Object.freeze({ authoritative, missing });
 }
@@ -4828,6 +4875,10 @@ export function recordLocalSkippedDocumentState(state, { stateKey, nativePath, r
   if (!key) throw new Error("skipped document state needs a logical state key");
   if (!state.skipped || typeof state.skipped !== "object") state.skipped = {};
   state.skipped[key] = String(reason || "skipped without a reason");
+  if (state.extraction_incomplete && typeof state.extraction_incomplete === "object") {
+    delete state.extraction_incomplete[key];
+    if (!Object.keys(state.extraction_incomplete).length) delete state.extraction_incomplete;
+  }
   const alias = nativePath === null || nativePath === undefined ? "" : String(nativePath);
   if (alias && alias !== key) delete state.skipped[alias];
   return state;
@@ -4862,14 +4913,25 @@ export function assertNoIngestFailures(tally, { noun = "stored part" } = {}) {
  * sweep cannot turn "submitted" into "accepted", and expose that refusal as a
  * partial outcome even though it is an intentional security-policy result.
  */
+export function unusableMessageRowCount(result) {
+  const skipped = result?.rows_skipped;
+  if (!skipped || typeof skipped !== "object" || Array.isArray(skipped)) return 0;
+  return ["no_guid", "no_identity", "no_timestamp"]
+    .reduce((total, key) => total + Math.max(0, Math.trunc(Number(skipped[key] || 0))), 0);
+}
+
 export function messageIngestionResult(result, tally) {
   const created = Math.max(0, Math.trunc(Number(tally?.created || 0)));
   const updated = Math.max(0, Math.trunc(Number(tally?.updated || 0)));
   const unchanged = Math.max(0, Math.trunc(Number(tally?.unchanged || 0)));
   const refused = Math.max(0, Math.trunc(Number(tally?.refused || 0)));
-  const partial = refused > 0 || !!result?.truncated || !!result?.bounded;
+  const accepted = created + updated + unchanged;
+  const coverageGaps = unusableMessageRowCount(result);
+  const partial = refused > 0 || coverageGaps > 0 || !!result?.truncated || !!result?.bounded;
+  const outcomeKind = partial && accepted === 0 ? "refused" : partial ? "partial" : "completed";
   const reasons = [
     refused ? `${refused} conversation document(s) were refused` : null,
+    coverageGaps ? `${coverageGaps} message row(s) lacked a stable identity or timestamp` : null,
     result?.truncated || result?.bounded ? "the source was bounded before its full history was read" : null,
   ].filter(Boolean).join("; ");
   return {
@@ -4878,8 +4940,9 @@ export function messageIngestionResult(result, tally) {
     updated,
     unchanged,
     refused,
-    documents_accepted: created + updated + unchanged,
-    outcome: ingestionOutcome(partial ? "partial" : "completed", {
+    documents_accepted: accepted,
+    coverage_gaps: coverageGaps,
+    outcome: ingestionOutcome(outcomeKind, {
       reason: partial ? reasons : null,
     }),
   };
@@ -5115,6 +5178,36 @@ function parseFlags(argv) {
     }
   }
   return flags;
+}
+
+/**
+ * Parse the one bounded-ingest limit shape every producer accepts.
+ *
+ * `parseInt()` is deliberately not used. It turns `1.5` into 1, `nope` into
+ * NaN (and therefore an empty successful slice), and `-1` into "everything but
+ * the last item". Refuse all three before a source, credential, or resume file
+ * is touched.
+ */
+export function positiveWholeIngestLimit(value) {
+  if (value === undefined || value === null || value === false) return Infinity;
+  if (value === true) throw new Error("--limit must be followed by a positive whole number.");
+  const raw = String(value).trim();
+  if (!/^[1-9]\d*$/.test(raw)) {
+    throw new Error("--limit must be a positive whole number (1 or greater).");
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error("--limit is too large to represent safely.");
+  }
+  return parsed;
+}
+
+function requirePositiveWholeIngestLimit(value) {
+  try {
+    return positiveWholeIngestLimit(value);
+  } catch (error) {
+    die(error.message);
+  }
 }
 
 /** Levenshtein distance, so a typo gets a suggestion rather than a shrug. */
@@ -5888,27 +5981,42 @@ export async function cmdIngestProvider(m, manifestPath, flags, options = {}) {
 }
 
 async function cmdIngest(manifestPath) {
-  const { m } = loadManifest(manifestPath);
   const flags = parseFlags(process.argv.slice(4));
+  requirePositiveWholeIngestLimit(flags.limit);
+  const { m } = loadManifest(manifestPath);
   // Remote sources reuse everything below the envelope: splitting, batching,
   // the credential gate, resume state and the skip report. Only the producer
   // differs. Calendar is the one exception: its connector already carries
   // its own complete sync-then-send pipeline, so it has its own command
   // rather than being forced through machinery built for files.
-  if (String(flags.from).toLowerCase() === "calendar") return cmdIngestCalendar(m, manifestPath, flags);
-  if (String(flags.from).toLowerCase() === "imessage") return cmdIngestImessage(m, manifestPath, flags);
-  if (String(flags.from).toLowerCase() === "whatsapp") return cmdIngestWhatsapp(m, manifestPath, flags);
+  let result;
+  if (String(flags.from).toLowerCase() === "calendar") result = await cmdIngestCalendar(m, manifestPath, flags);
+  else if (String(flags.from).toLowerCase() === "imessage") result = await cmdIngestImessage(m, manifestPath, flags);
+  else if (String(flags.from).toLowerCase() === "whatsapp") result = await cmdIngestWhatsapp(m, manifestPath, flags);
   // The one-time iPhone backup load: a snapshot producer with no cursor and
   // no live half, so it owns its own command rather than joining the remote
   // connectors that all resume from one.
-  if (["iphone-backup", "iphone"].includes(String(flags.from).toLowerCase())) {
-    return cmdIngestIphoneBackup(m, manifestPath, flags);
+  else if (["iphone-backup", "iphone"].includes(String(flags.from).toLowerCase())) {
+    result = await cmdIngestIphoneBackup(m, manifestPath, flags);
+  } else if (PROVIDER_CONNECTOR_IDS.includes(String(flags.from).toLowerCase())) {
+    result = await cmdIngestProvider(m, manifestPath, flags);
+  } else if (flags.from) result = await cmdIngestRemote(m, manifestPath, flags);
+  else result = await cmdIngestLocal(m, manifestPath, flags);
+
+  // A direct command is what schedulers and support scripts observe. Returning
+  // zero after only part of a source landed converts a visible coverage gap into
+  // a green automation receipt, so derive the same outcome the sweep renders
+  // and stop non-complete real runs. Dry runs remain previews.
+  if (!result?.dry_run) {
+    const described = describeLoadResult(result);
+    if (described.outcome?.kind !== "completed") {
+      die(
+        `the ingest finished with ${described.outcome?.kind || "unknown"} coverage: ${described.text}.\n` +
+          "      Accepted work was kept. Fix the reported gap and rerun the same command; resume is safe."
+      );
+    }
   }
-  if (PROVIDER_CONNECTOR_IDS.includes(String(flags.from).toLowerCase())) {
-    return cmdIngestProvider(m, manifestPath, flags);
-  }
-  if (flags.from) return cmdIngestRemote(m, manifestPath, flags);
-  return cmdIngestLocal(m, manifestPath, flags);
+  return result;
 }
 
 /**
@@ -5923,6 +6031,7 @@ async function cmdIngest(manifestPath) {
  * walker an operator runs by hand rather than a second copy that could drift.
  */
 export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
+  const limit = requirePositiveWholeIngestLimit(flags.limit);
   // A local folder now reconciles its own deletions, so it has the same
   // approval gate Drive does. It stays invalid on every OTHER remote source,
   // which is checked in cmdIngestRemote.
@@ -6009,6 +6118,7 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
   const privatePrefixes = m.safety?.private_path_prefixes || [];
   info(`walking ${root}`);
   const { files, skipped: walkSkips, complete: walkComplete } = walk(root, { privatePrefixes });
+  const initialWalkFingerprint = localWalkSnapshotFingerprint({ files, skipped: walkSkips, complete: walkComplete });
   info(`${files.length} candidate file(s), ${walkSkips.length} skipped during the walk`);
   if (privatePrefixes.length) {
     info(`private prefixes enforced: ${privatePrefixes.join(", ")}`);
@@ -6068,11 +6178,16 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
   const alreadyDone = Object.keys(state.done).length;
   if (alreadyDone && !flags.reset) info(`resuming: ${alreadyDone} file(s) already loaded`);
 
-  const limited = flags.limit ? files.slice(0, parseInt(flags.limit, 10)) : files;
+  const limited = Number.isFinite(limit) ? files.slice(0, limit) : files;
   if (flags.limit) warn(`--limit ${flags.limit}: only the first ${limited.length} file(s) will be considered`);
 
   const skips = [...walkSkips];
   const notes = [];
+  const incompleteKeys = new Set();
+  const policySkipped = walkSkips.filter(
+    (skip) => skip.reason === "matched a private path prefix from the manifest",
+  ).length;
+  const limitedOmissions = Math.max(0, files.length - limited.length);
   const intentionalRemovalKeys = new Set();
   const normalizedPrivatePaths = walkSkips
     .filter((skip) => skip.reason === "matched a private path prefix from the manifest")
@@ -6146,12 +6261,14 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
     if (r.envelopes) {
       const key = String(f.rel).split(sep).join("/");
       if (!dry && !scannerPolicyChanged && r.hash && state.done[key] === r.hash) {
+        if (r.incomplete === true) incompleteKeys.add(key);
         recordAcceptedDocumentState(state, {
           stateKey: key,
           hash: r.hash,
           skipKeys: [f.rel, ...r.envelopes.map((e) => e.source_id)],
           legacyPartRoot: f.rel,
           protectedSkipKeys: protectedLocalSkipKeys,
+          extractionIncomplete: r.incomplete === true,
         });
         unchanged++;
         return { unchanged: true };
@@ -6172,6 +6289,7 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
           return { skip };
         }
       }
+      if (r.incomplete === true) incompleteKeys.add(key);
       return {
         hash: r.hash,
         envelopes: sanitized,
@@ -6192,18 +6310,21 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
           keep_doc_uids: sanitized.map((envelope) => `${envelope.source_type}:${envelope.source_id}`),
           skipKeys: [key, f.rel, ...sanitized.map((envelope) => envelope.source_id)],
           legacyPartRoot: [key, f.rel],
+          extractionIncomplete: r.incomplete === true,
         },
       };
     }
 
     const key = r.envelope ? r.envelope.source_id : String(f.rel).split(sep).join("/");
     if (!dry && !scannerPolicyChanged && r.hash && state.done[key] === r.hash) {
+      if (r.incomplete === true) incompleteKeys.add(key);
       recordAcceptedDocumentState(state, {
         stateKey: key,
         hash: r.hash,
         skipKeys: [r.envelope?.source_id, f.rel],
         legacyPartRoot: [r.envelope?.source_id, f.rel],
         protectedSkipKeys: protectedLocalSkipKeys,
+        extractionIncomplete: r.incomplete === true,
       });
       unchanged++;
       return { unchanged: true };
@@ -6226,6 +6347,7 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
       return { skip };
     }
     const envelopes = splitOversized(envelope);
+    if (r.incomplete === true) incompleteKeys.add(key);
     return {
       hash: r.hash,
       envelopes,
@@ -6240,6 +6362,7 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
         keep_doc_uids: envelopes.map((envelope) => `${sourceName}:${envelope.source_id}`),
         skipKeys: [key, f.rel, ...envelopes.map((envelope) => envelope.source_id)],
         legacyPartRoot: [key, f.rel],
+        extractionIncomplete: r.incomplete === true,
       },
     };
   };
@@ -6256,6 +6379,15 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
       scanned += group.length;
     }
     process.stdout.write("\r");
+    const previewFinalWalk = walk(root, { privatePrefixes });
+    const previewDirectoryChanged = !previewFinalWalk.complete ||
+      localWalkSnapshotFingerprint(previewFinalWalk) !== initialWalkFingerprint;
+    if (previewDirectoryChanged) {
+      skips.push({
+        path: root,
+        reason: "the folder changed while this preview was reading it; rerun after the copy or sync finishes",
+      });
+    }
     await applyDriveRemovals({
       uids: [...new Set([...privateRemovalKeys, ...intentionalRemovalKeys])].map((key) => `${sourceName}:${key}`),
       base, adminKey, state, dryRun: true, label: "local source truth",
@@ -6278,7 +6410,15 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
     }
     // dry_run is stated on the returned shape rather than left to be inferred
     // from a zero, so a sweep reporting this leg can never call a preview a load.
-    return { dry_run: true, would_send: scanned, unchanged, skipped: skips.length };
+    return {
+      dry_run: true,
+      would_send: scanned,
+      unchanged,
+      skipped: skips.length,
+      policy_skipped: policySkipped,
+      coverage_gaps: Math.max(0, skips.length - policySkipped) + limitedOmissions,
+      incomplete: incompleteKeys.size,
+    };
   }
 
   // Routine ingest is a data-plane operation. Once setup has saved the live
@@ -6366,6 +6506,7 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
     }
     for (const plan of outcome.incomplete) {
       delete state.done[plan.stateKey];
+      if (state.extraction_incomplete) delete state.extraction_incomplete[plan.stateKey];
       const statuses = [...new Set(rejectedFamilyParts.get(plan.stateKey) || ["failed"])];
       state.skipped[plan.stateKey] = `logical document was not indexed because part status was ${statuses.join(", ")}`;
     }
@@ -6380,6 +6521,19 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
   }
   process.stdout.write("\n");
   reportNotes(notes);
+
+  // The first walk is the candidate and deletion snapshot. Re-enumerate before
+  // using absence as deletion evidence. A cloud-synced folder can gain or lose
+  // files while extraction runs; accepted documents are safe to keep, but a
+  // moving directory is not authority to remove anything or close as healthy.
+  const finalWalk = walk(root, { privatePrefixes });
+  if (!finalWalk.complete || localWalkSnapshotFingerprint(finalWalk) !== initialWalkFingerprint) {
+    saveState(statePath, state);
+    throw new Error(
+      "the folder changed while it was being read. Accepted documents were kept, no source deletion was attempted, " +
+        "and completion was withheld. Wait for the copy or sync to finish, then rerun the same command.",
+    );
+  }
 
   // ONE decision covering every reason this source has to remove something,
   // through the SAME aggregate guard the Drive lane uses. No removal call is
@@ -6461,6 +6615,7 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
     }
     for (const uid of plannedLocalTargets) {
       delete state.done[uid.slice(sourceName.length + 1)];
+      if (state.extraction_incomplete) delete state.extraction_incomplete[uid.slice(sourceName.length + 1)];
       if (state.removed) delete state.removed[uid];
     }
     saveState(statePath, state);
@@ -6494,7 +6649,15 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
   state.credential_scanner_fingerprint = scannerFingerprint;
   saveState(statePath, state);
 
-  const finalStatus = tally.failed ? "error" : "ready";
+  const coverageGaps = Math.max(0, skips.length - policySkipped) + limitedOmissions;
+  const acceptedDocuments = tally.created + tally.updated + unchanged + tally.unchanged;
+  const finalStoredLocalFamilies = await listStoredFamilies({ base, adminKey, source: sourceName });
+  const sourceInventory = finalStoredLocalFamilies.size;
+  const complete = sourceInventory > 0 && acceptedDocuments > 0 &&
+    tally.failed === 0 && tally.refused === 0 &&
+    coverageGaps === 0 && incompleteKeys.size === 0;
+  const outcomeKind = complete ? "completed" : acceptedDocuments > 0 ? "partial" : "refused";
+  const finalStatus = complete ? "ready" : "error";
   await postSourceReceipt(base, adminKey, {
     source: sourceName,
     kind: "upload",
@@ -6503,13 +6666,16 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
     lane: "manual",
     started_at: sourceRunStartedAt,
     completed_at: new Date().toISOString(),
-    walk_complete: tally.failed === 0,
+    walk_complete: complete,
     files_seen: scanned,
     docs_added: tally.created,
     docs_updated: tally.updated,
     docs_unchanged: unchanged + tally.unchanged,
-    detail: `local folder ingest ${finalStatus === "ready" ? "completed" : "completed with document failures"}; skipped=${skips.length}`,
-    ...(tally.failed ? { error: `${tally.failed} document(s) failed` } : {}),
+    detail: `local folder ingest ${complete ? "completed" : "completed incompletely"}; ` +
+      `source_inventory=${sourceInventory}; skipped=${skips.length}; coverage_gaps=${coverageGaps}; incomplete=${incompleteKeys.size}`,
+    ...(!complete
+      ? { error: `${tally.failed} failed; ${tally.refused} refused; ${coverageGaps} coverage gap(s); ${incompleteKeys.size} incomplete extraction(s)` }
+      : {}),
   });
   sourceRunClosed = true;
 
@@ -6532,6 +6698,17 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
     refused: tally.refused,
     scanned,
     skipped: skips.length,
+    policy_skipped: policySkipped,
+    coverage_gaps: coverageGaps,
+    incomplete: incompleteKeys.size,
+    source_inventory: sourceInventory,
+    outcome: ingestionOutcome(outcomeKind, {
+      reason: complete
+        ? null
+        : sourceInventory === 0 && acceptedDocuments === 0
+          ? "no document was accepted and the authoritative source inventory is empty"
+          : `${tally.refused} refused; ${coverageGaps} coverage gap(s); ${incompleteKeys.size} incomplete extraction(s)`,
+    }),
   };
   } catch (error) {
     // Do not leave a source looking perpetually "indexing" when extraction,
@@ -6698,6 +6875,10 @@ async function applyDriveRemovals({ uids, base, adminKey, state, dryRun, label =
     }
     for (const uid of group) {
       delete state.done[uid];
+      if (state.extraction_incomplete && typeof state.extraction_incomplete === "object") {
+        delete state.extraction_incomplete[uid];
+        if (!Object.keys(state.extraction_incomplete).length) delete state.extraction_incomplete;
+      }
       if (state.removed) delete state.removed[uid];
     }
     applied += Number(out.documents || 0);
@@ -6943,6 +7124,7 @@ export async function cmdIngestCalendar(m, manifestPath, flags, options = {}) {
   for (const cal of result.calendars) {
     if (cal.error) warn(`${cal.calendar_key}: ${cal.error.message}`);
   }
+  const calendarFailures = result.calendars.filter((calendar) => calendar.error);
   if (result.summary.needs_reconsent) {
     warn(
       "Google refused the calendar refresh token (it is dead: revoked, expired from six months of " +
@@ -7025,11 +7207,13 @@ export async function cmdIngestCalendar(m, manifestPath, flags, options = {}) {
     saveState(statePath, result.state);
   }
 
-  const finalStatus = deliveryIncomplete || result.summary.needs_reconsent ? "error" : "ready";
+  const providerIncomplete = calendarFailures.length > 0;
+  const finalStatus = deliveryIncomplete || providerIncomplete || result.summary.needs_reconsent ? "error" : "ready";
   const incompleteReason = [
     sent.errors.length ? `${sent.errors.length} event send(s) failed` : null,
     sent.refused.length ? `${sent.refused.length} event(s) were refused` : null,
     removalPending ? `${removalPending} cancellation removal(s) remain pending` : null,
+    providerIncomplete ? `${calendarFailures.length} of ${result.calendars.length} calendar(s) could not be read` : null,
     result.summary.needs_reconsent ? "one or more calendars need Google reconsent" : null,
   ].filter(Boolean).join("; ");
   await postReceipt(base, adminKey, {
@@ -7073,6 +7257,7 @@ export async function cmdIngestCalendar(m, manifestPath, flags, options = {}) {
  * for files would risk the proven Drive/Gmail paths for no gain.
  */
 export async function cmdIngestImessage(m, manifestPath, flags, options = {}) {
+  const limit = requirePositiveWholeIngestLimit(flags.limit);
   if ((options.platform ?? process.platform) !== "darwin") {
     die(
       "iMessage capture reads ~/Library/Messages/chat.db, which exists only on macOS.\n" +
@@ -7166,7 +7351,7 @@ export async function cmdIngestImessage(m, manifestPath, flags, options = {}) {
       sendEnvelopes,
       ownerLabel: m.client?.display_name || "Owner",
       groupingTimezone: m.client?.timezone || "UTC",
-      maxRows: flags.limit ? parseInt(flags.limit, 10) : Infinity,
+      maxRows: limit,
       flushOnly,
       dryRun: dry,
       reset: !!flags.reset,
@@ -7210,24 +7395,27 @@ export async function cmdIngestImessage(m, manifestPath, flags, options = {}) {
 
   const bounded = !!flags.limit;
   if (bounded) warn(`--limit ${flags.limit} bounded this capture pass, so it is NOT a complete source load`);
+  const ingestResult = messageIngestionResult({ ...result, bounded }, tally);
+  const complete = ingestResult.outcome.kind === "completed";
 
   await postReceipt(base, adminKey, {
-    source: sourceName, kind: "imessage", status: "ready",
+    source: sourceName, kind: "imessage", status: complete ? "ready" : "error",
     run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
     docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
     detail: `iMessage capture: ${summary}; ${tally.refused} refused`,
     ...(tally.refused ? { refusal_reason: `${tally.refused} conversation document(s) refused by the credential gate` } : {}),
+    ...(!complete ? { error: ingestResult.outcome.reason || "the iMessage capture was incomplete" } : {}),
   });
 
   info(summary);
   const acceptedSummary = `${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged`;
-  if (tally.refused || bounded) warn(`iMessage load incomplete: ${acceptedSummary}`);
+  if (!complete) warn(`iMessage load incomplete: ${acceptedSummary}`);
   else ok(acceptedSummary);
   if (tally.refused) {
     warn(`${tally.refused} conversation document(s) refused by the credential gate (a live credential was texted)`);
   }
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
-  return messageIngestionResult({ ...result, bounded }, tally);
+  return ingestResult;
 }
 
 /**
@@ -7248,6 +7436,7 @@ export async function cmdIngestImessage(m, manifestPath, flags, options = {}) {
  * plainly.
  */
 export async function cmdIngestWhatsapp(m, manifestPath, flags, options = {}) {
+  const limit = requirePositiveWholeIngestLimit(flags.limit);
   const whatsapp = options.whatsapp ?? await import("./connectors/whatsapp.mjs");
   const { batches, splitOversized } = await ingestLib();
   const sourceName = assertSourceName(flags.source === true || !flags.source ? "whatsapp" : flags.source);
@@ -7329,7 +7518,7 @@ export async function cmdIngestWhatsapp(m, manifestPath, flags, options = {}) {
       sendEnvelopes,
       ownerLabel: m.client?.display_name || "Owner",
       groupingTimezone: m.client?.timezone || "UTC",
-      maxRows: flags.limit ? parseInt(flags.limit, 10) : Infinity,
+      maxRows: limit,
       flushOnly,
       dryRun: dry,
       reset: !!flags.reset,
@@ -7370,18 +7559,21 @@ export async function cmdIngestWhatsapp(m, manifestPath, flags, options = {}) {
 
   const bounded = !!flags.limit;
   if (bounded) warn(`--limit ${flags.limit} bounded this drain pass, so it is NOT a complete source load`);
+  const ingestResult = messageIngestionResult({ ...result, bounded }, tally);
+  const complete = ingestResult.outcome.kind === "completed";
 
   await postReceipt(base, adminKey, {
-    source: sourceName, kind: "whatsapp", status: "ready",
+    source: sourceName, kind: "whatsapp", status: complete ? "ready" : "error",
     run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
     docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
     detail: `WhatsApp drain: ${summary}; ${tally.refused} refused`,
     ...(tally.refused ? { refusal_reason: `${tally.refused} conversation document(s) refused by the credential gate` } : {}),
+    ...(!complete ? { error: ingestResult.outcome.reason || "the WhatsApp drain was incomplete" } : {}),
   });
 
   info(summary);
   const acceptedSummary = `${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged`;
-  if (tally.refused || bounded) warn(`WhatsApp load incomplete: ${acceptedSummary}`);
+  if (!complete) warn(`WhatsApp load incomplete: ${acceptedSummary}`);
   else ok(acceptedSummary);
   if (tally.refused) {
     warn(`${tally.refused} conversation document(s) refused by the credential gate (a live credential was messaged)`);
@@ -7398,7 +7590,7 @@ export async function cmdIngestWhatsapp(m, manifestPath, flags, options = {}) {
     warn("the outbox could not be opened for writing, so its drained markers were not updated. The load itself is unaffected; the daemon will keep reporting them as pending.");
   }
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
-  return messageIngestionResult({ ...result, bounded }, tally);
+  return ingestResult;
 }
 
 /** Where this install keeps the capture daemon's data, honoring an override. */
@@ -7432,6 +7624,7 @@ function whatsappDataDir(m, options = {}) {
  * recognised as unchanged rather than duplicated.
  */
 export async function cmdIngestIphoneBackup(m, manifestPath, flags, options = {}) {
+  const limit = requirePositiveWholeIngestLimit(flags.limit);
   const backupLib = options.iphoneBackup ?? await import("./connectors/iphone-backup.mjs");
   const { batches, splitOversized } = await ingestLib();
   const sourceName = assertSourceName(
@@ -7533,7 +7726,7 @@ export async function cmdIngestIphoneBackup(m, manifestPath, flags, options = {}
       sendEnvelopes,
       ownerLabel: m.client?.display_name || "Owner",
       groupingTimezone: m.client?.timezone || "UTC",
-      maxRows: flags.limit ? parseInt(flags.limit, 10) : Infinity,
+      maxRows: limit,
       dryRun: dry,
       onPage: ({ page, rows }) => {
         process.stdout.write(`\r  page ${page}: ${rows} message row(s) read   `);
@@ -7574,24 +7767,27 @@ export async function cmdIngestIphoneBackup(m, manifestPath, flags, options = {}
   }
   const bounded = !!flags.limit || !!result.truncated;
   if (bounded) warn(`--limit stopped or bounded this load; it is NOT a complete history of the backup`);
+  const ingestResult = messageIngestionResult({ ...result, bounded }, tally);
+  const complete = ingestResult.outcome.kind === "completed";
 
   await postReceipt(base, adminKey, {
-    source: sourceName, kind: "iphone-backup", status: "ready",
+    source: sourceName, kind: "iphone-backup", status: complete ? "ready" : "error",
     run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
     docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
     detail: `iPhone backup one-time history load (snapshot, not live capture): ${summary}; ${tally.refused} refused`,
     ...(tally.refused ? { refusal_reason: `${tally.refused} conversation document(s) refused by the credential gate` } : {}),
+    ...(!complete ? { error: ingestResult.outcome.reason || "the iPhone backup load was incomplete" } : {}),
   });
 
   info(summary);
   const acceptedSummary = `${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged`;
-  if (tally.refused || bounded) warn(`iPhone backup load incomplete: ${acceptedSummary}`);
+  if (!complete) warn(`iPhone backup load incomplete: ${acceptedSummary}`);
   else ok(acceptedSummary);
   if (tally.refused) {
     warn(`${tally.refused} conversation document(s) refused by the credential gate (a live credential was texted)`);
   }
   info(`remove this load with: brain forget ${manifestPath} --source ${sourceName}`);
-  return messageIngestionResult({ ...result, bounded }, tally);
+  return ingestResult;
 }
 
 
@@ -7757,6 +7953,26 @@ export function defaultLoadProbes() {
     google_drive: googleScope("drive", "brain connect google --scopes drive,gmail,calendar"),
     gmail: googleScope("gmail", "brain connect google --scopes drive,gmail,calendar"),
     calendar: googleScope("calendar", "brain connect google --scopes drive,gmail,calendar"),
+    imap: async ({ m, options }) => {
+      try {
+        const imap = options?.imap ?? await import("./connectors/imap.mjs");
+        const sourceName = assertSourceName(m?.corpora?.imap?.source || "imap");
+        const credentials = imap.loadImapCredentials({ sourceName });
+        return credentials
+          ? { connected: true }
+          : {
+              connected: false,
+              reason: `no mailbox credential is stored for source "${sourceName}" on this machine`,
+              fix: `brain connect imap <manifest> --source ${sourceName}`,
+            };
+      } catch (error) {
+        return {
+          connected: false,
+          reason: `the stored mailbox connection could not be read: ${String(error?.message || error)}`,
+          fix: "brain connect imap <manifest>",
+        };
+      }
+    },
     quickbooks: provider("quickbooks"),
     slack: provider("slack"),
     notion: provider("notion"),
@@ -7845,8 +8061,12 @@ export function loadSourceRegistry(commands = {}) {
         };
       }
       return [{
-        source: key,
-        run: () => ingestProvider(m, manifestPath, { ...flags, from: key }),
+        source: assertSourceName(m?.corpora?.[key]?.source || key),
+        run: () => ingestProvider(m, manifestPath, {
+          ...flags,
+          from: key,
+          source: m?.corpora?.[key]?.source || key,
+        }),
       }];
     },
   });
@@ -7926,6 +8146,37 @@ export function loadSourceRegistry(commands = {}) {
         }));
       },
     },
+    local_folder: {
+      order: 45,
+      label: "Watched folder",
+      scope: "the local drop folder configured to refresh on a schedule",
+      legs: ({ m, manifestPath, flags }) => {
+        const configuration = m?.corpora?.local_folder || {};
+        const folder = typeof configuration.path === "string" ? configuration.path.trim() : "";
+        if (!folder) {
+          return {
+            unavailable: {
+              reason: "enabled, but corpora.local_folder.path names no folder to read",
+              fix: "set an absolute path under corpora.local_folder.path, or disable the watched folder",
+            },
+          };
+        }
+        if (!isAbsolute(folder)) {
+          return {
+            unavailable: {
+              reason: "corpora.local_folder.path must be absolute so a scheduled run cannot resolve it somewhere else",
+              fix: "replace it with the exact absolute folder path",
+            },
+          };
+        }
+        const source = assertSourceName(configuration.source || "documents");
+        return [{
+          source,
+          detail: folder,
+          run: () => ingestLocal(m, manifestPath, { ...flags, path: folder, source }),
+        }];
+      },
+    },
     gmail: {
       order: 50,
       label: "Gmail",
@@ -7934,6 +8185,18 @@ export function loadSourceRegistry(commands = {}) {
         source: "gmail",
         run: () => ingestRemote(m, manifestPath, { ...flags, from: "gmail" }),
       }],
+    },
+    imap: {
+      order: 55,
+      label: "Email via IMAP",
+      scope: "inbox and sent mail from the connected mailbox, with bulk and unknown folders left out visibly",
+      legs: ({ m, manifestPath, flags }) => {
+        const source = assertSourceName(m?.corpora?.imap?.source || "imap");
+        return [{
+          source,
+          run: () => ingestRemote(m, manifestPath, { ...flags, from: "imap", source }),
+        }];
+      },
     },
     google_drive: {
       order: 60,
@@ -7985,6 +8248,55 @@ export function loadSourceRegistry(commands = {}) {
 }
 
 /**
+ * Find manifest-level source names that would share a resume file, D1
+ * namespace, or removal boundary across two enabled corpus owners.
+ */
+export function loadSourceNamespaceCollisions(m) {
+  const ownership = new Map();
+  const add = (corpus, source) => {
+    const name = String(source || "").trim();
+    if (!name || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(name)) return;
+    const owners = ownership.get(name) || new Set();
+    owners.add(corpus);
+    ownership.set(name, owners);
+  };
+  for (const key of Object.keys(m?.corpora || {}).filter((value) => !value.startsWith("_"))) {
+    const configuration = m.corpora[key] || {};
+    if (configuration.enabled !== true) continue;
+    const corpus = normalizeLoadKey(key);
+    if (corpus === "upload") {
+      try {
+        for (const folder of uploadFoldersOf(configuration)) add(corpus, folder.source || "upload");
+      } catch { /* the existing per-corpus validator names malformed configuration */ }
+      continue;
+    }
+    if (corpus === "local_folder") { add(corpus, configuration.source || "documents"); continue; }
+    if (corpus === "imap") { add(corpus, configuration.source || "imap"); continue; }
+    if (PROVIDER_CONNECTOR_IDS.includes(corpus)) { add(corpus, configuration.source || corpus); continue; }
+    const fixed = {
+      calendar: "calendar",
+      imessage: "imessage",
+      whatsapp: "whatsapp",
+      gmail: "gmail",
+      google_drive: "drive",
+      iphone_backup: "iphone-backup",
+    }[corpus];
+    if (fixed) add(corpus, fixed);
+  }
+  const byCorpus = new Map();
+  for (const [source, owners] of ownership) {
+    if (owners.size < 2) continue;
+    const ownerList = [...owners].sort();
+    for (const corpus of ownerList) {
+      const collisions = byCorpus.get(corpus) || [];
+      collisions.push({ source, owners: ownerList });
+      byCorpus.set(corpus, collisions);
+    }
+  }
+  return byCorpus;
+}
+
+/**
  * Turn a manifest into an ordered list of legs, with a stated reason for every
  * one that will not run.
  *
@@ -7998,6 +8310,7 @@ export async function planLoad({ m, manifestPath, flags = {}, registry, probes, 
   const declared = Object.keys(m?.corpora || {}).filter((key) => !key.startsWith("_"));
   const only = flags.only ? String(flags.only).split(",").map(normalizeLoadKey).filter(Boolean) : null;
   const skip = flags.skip ? String(flags.skip).split(",").map(normalizeLoadKey).filter(Boolean) : [];
+  const namespaceCollisions = loadSourceNamespaceCollisions(m);
 
   const known = new Set([...declared.map(normalizeLoadKey), ...Object.keys(table)]);
   for (const [flag, values] of [["--only", only || []], ["--skip", skip]]) {
@@ -8046,6 +8359,12 @@ export async function planLoad({ m, manifestPath, flags = {}, registry, probes, 
       entry.status = "unavailable";
       entry.reason = `enabled in this manifest, but brain ${PRODUCT_VERSION} has no loader for it`;
       entry.fix = "nothing was loaded from it; put its documents in a folder and load that instead";
+    } else if (namespaceCollisions.has(canonical)) {
+      const collisions = namespaceCollisions.get(canonical);
+      entry.status = "unavailable";
+      entry.reason = collisions.map(({ source, owners }) =>
+        `source name "${source}" is shared by enabled ${owners.join(" and ")} corpora`).join("; ");
+      entry.fix = "give each enabled corpus a unique lowercase source name. A source owns one resume file, D1 namespace, forget target, and removal boundary.";
     } else if (descriptor.pushOnly) {
       entry.status = "skipped";
       entry.reason = descriptor.pushOnly;
@@ -8128,6 +8447,12 @@ export function describeLoadResult(result) {
       // sizing a job in front of a client under-read what those sources hold.
       // Same rule as the final branch: unknown is the truth, a zero is a claim.
       const wouldSendKnown = Number.isFinite(Number(result.would_send));
+      const previewGaps = Math.max(0, Math.trunc(Number(result.coverage_gaps || 0)));
+      const previewIncomplete = Math.max(0, Math.trunc(Number(result.incomplete || 0)));
+      const previewSuffix = [
+        previewGaps ? `${previewGaps} coverage gap(s)` : null,
+        previewIncomplete ? `${previewIncomplete} incomplete extraction(s)` : null,
+      ].filter(Boolean).join(", ");
       return {
         known: true,
         dryRun: true,
@@ -8137,6 +8462,7 @@ export function describeLoadResult(result) {
         outcome: null,
         text: wouldSendKnown
           ? `${Number(result.would_send)} document(s) WOULD be sent, ${result.unchanged ?? 0} unchanged`
+            + (previewSuffix ? `; preview found ${previewSuffix}` : "")
           : "would be read, but this source does not report a count in advance (unknown, not zero)",
       };
     }
@@ -8152,9 +8478,11 @@ export function describeLoadResult(result) {
       return {
         known: true,
         counts,
-        partial: !!(s.errors?.length || s.refused?.length || result.removalPending || result.result?.summary?.needs_reconsent),
+        partial: !!(s.errors?.length || s.refused?.length || result.removalPending ||
+          result.result?.summary?.needs_reconsent || result.result?.calendars?.some((calendar) => calendar.error)),
         outcome: outcomeOf(
-          s.errors?.length || s.refused?.length || result.removalPending || result.result?.summary?.needs_reconsent
+          s.errors?.length || s.refused?.length || result.removalPending ||
+            result.result?.summary?.needs_reconsent || result.result?.calendars?.some((calendar) => calendar.error)
             ? "partial"
             : "completed"
         ),
@@ -8168,37 +8496,58 @@ export function describeLoadResult(result) {
       const refused = Math.max(0, Math.trunc(Number(result.refused || 0)));
       const acceptedKnown = Number.isFinite(result.documents_accepted);
       const accepted = acceptedKnown ? Number(result.documents_accepted) : Number(result.documents_sent);
-      const partial = !!result.truncated || !!result.bounded || refused > 0;
+      const coverageGaps = Math.max(0, Math.trunc(Number(
+        result.coverage_gaps ?? unusableMessageRowCount(result),
+      )));
+      const hasGap = !!result.truncated || !!result.bounded || refused > 0 || coverageGaps > 0;
+      const outcomeKind = hasGap && accepted === 0 ? "refused" : hasGap ? "partial" : "completed";
       return {
         known: true,
         counts: null,
         documents: accepted,
-        partial,
-        outcome: outcomeOf(partial ? "partial" : "completed"),
+        partial: outcomeKind === "partial",
+        acceptedWork: accepted > 0,
+        outcome: outcomeOf(outcomeKind),
         text: acceptedKnown
           ? `${accepted} conversation document(s) accepted from ${result.documents_sent} submitted and ${result.rows_seen ?? "unknown"} new row(s)`
             + (refused ? `; ${refused} refused, NOT indexed` : "")
+            + (coverageGaps ? `; ${coverageGaps} unusable row(s) NOT represented` : "")
             + (result.truncated || result.bounded ? "; --limit bounded it, so this is NOT the full history" : "")
           : `${result.documents_sent} conversation document(s) sent from ${result.rows_seen ?? "unknown"} new row(s)`
             + (refused ? `; ${refused} refused, NOT indexed` : "")
+            + (coverageGaps ? `; ${coverageGaps} unusable row(s) NOT represented` : "")
             + (result.truncated || result.bounded ? "; --limit bounded it, so this is NOT the full history" : ""),
       };
     }
     // local folder and remote drive/gmail tallies
     if (Number.isFinite(result.created)) {
       const counts = { created: result.created, updated: result.updated || 0, unchanged: result.unchanged || 0 };
+      const accepted = Number(counts.created) + Number(counts.updated) + Number(counts.unchanged);
+      const skipped = Math.max(0, Math.trunc(Number(result.skipped || 0)));
+      const policySkipped = Math.min(skipped, Math.max(0, Math.trunc(Number(result.policy_skipped || 0))));
+      const coverageGaps = Number.isFinite(Number(result.coverage_gaps))
+        ? Math.max(0, Math.trunc(Number(result.coverage_gaps)))
+        : Math.max(0, skipped - policySkipped);
+      const incomplete = Math.max(0, Math.trunc(Number(result.incomplete || 0)));
+      const refused = Math.max(0, Math.trunc(Number(result.refused || 0)));
+      const retained = Math.max(0, Math.trunc(Number(result.retained_existing || 0)));
+      const emptyAuthoritativeSource = Number(result.source_inventory) === 0 && accepted === 0;
       const extra = [];
-      if (result.refused) extra.push(`${result.refused} refused, NOT indexed`);
-      if (result.skipped) extra.push(`${result.skipped} skipped`);
-      if (result.retained_existing) {
-        extra.push(`${result.retained_existing} existing Drive document(s) retained but unverified`);
+      if (refused) extra.push(`${refused} refused, NOT indexed`);
+      if (skipped) extra.push(`${skipped} skipped`);
+      if (incomplete) extra.push(`${incomplete} incomplete`);
+      if (retained) {
+        extra.push(`${retained} existing Drive document(s) retained but unverified`);
       }
-      const partial = !!result.refused || Number(result.retained_existing || 0) > 0;
+      if (emptyAuthoritativeSource) extra.push("no document was accepted; authoritative source inventory is empty");
+      const hasGap = refused > 0 || coverageGaps > 0 || incomplete > 0 || retained > 0 || emptyAuthoritativeSource;
+      const outcomeKind = hasGap && accepted === 0 ? "refused" : hasGap ? "partial" : "completed";
       return {
         known: true,
         counts,
-        partial,
-        outcome: outcomeOf(partial ? "partial" : "completed"),
+        partial: outcomeKind === "partial",
+        acceptedWork: accepted > 0 || !hasGap,
+        outcome: outcomeOf(outcomeKind),
         text: `${counts.created} created, ${counts.updated} updated, ${counts.unchanged} unchanged`
           + (extra.length ? `, ${extra.join(", ")}` : ""),
       };
@@ -8311,6 +8660,7 @@ export async function cmdLoad(manifestPath, options = {}) {
   const { m } = loadManifest(manifestPath);
   const flags = options.flags || parseFlags(process.argv.slice(4));
   const log = options.log || console.log;
+  requirePositiveWholeIngestLimit(flags.limit);
 
   if (flags.reset) {
     die(
@@ -8403,14 +8753,22 @@ export async function cmdLoad(manifestPath, options = {}) {
     entry.wouldSend = legResults.reduce((n, r) => n + (Number.isFinite(r.wouldSend) ? r.wouldSend : 0), 0);
     entry.volumeUnknown = legResults.some((r) => r?.volumeUnknown);
 
-    if (legFailures.length && !legResults.length) {
+    const noAcceptedLegs = legResults.filter((result) => result.acceptedWork === false);
+    if (!dryRun && !legFailures.length && legResults.length && noAcceptedLegs.length === legResults.length) {
+      entry.status = "failed";
+      entry.reason = "no document was accepted; every source leg was empty, skipped, refused, or incomplete";
+      entry.outcome = ingestionOutcome("refused", { reason: entry.reason });
+      entry.fix = null;
+      log(`${c.red("fail")}  ${entry.label}: ${entry.reason}`);
+    } else if (legFailures.length && !legResults.length) {
       entry.status = review ? "review" : "failed";
       entry.reason = legFailures.map((f) => f.reason).join(" | ");
       entry.outcome = ingestionOutcome(review ? "refused" : "retryable", { reason: entry.reason });
       entry.fix = null;
       log(`      ${c.dim("continuing with the remaining sources")}`);
     } else {
-      const partial = legFailures.length > 0 || legResults.some((r) => r.partial) || !!flags.limit;
+      const partial = legFailures.length > 0 || legResults.some((r) => r.partial) ||
+        noAcceptedLegs.length > 0 || !!flags.limit;
       entry.status = partial ? "partial" : "loaded";
       entry.outcome = dryRun
         ? null
@@ -8528,6 +8886,7 @@ export async function cmdLoad(manifestPath, options = {}) {
  * code. The producers differ; the pipeline does not.
  */
 async function cmdIngestRemote(m, manifestPath, flags) {
+  const limit = requirePositiveWholeIngestLimit(flags.limit);
   const which = String(flags.from).toLowerCase();
   if (!["drive", "gmail", "imap"].includes(which)) {
     die(`--from ${which} is not a source. Available: drive, gmail, imap.`);
@@ -8587,8 +8946,6 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   const scannerOn = m.safety?.credential_scanner?.enabled !== false;
   const scannerFingerprint = credentialScannerFingerprint(scannerOn);
   const scannerPolicyChanged = state.credential_scanner_fingerprint !== scannerFingerprint;
-  const limit = flags.limit ? Number(flags.limit) : Infinity;
-  if (flags.limit && (!Number.isInteger(limit) || limit < 1)) die("--limit must be a positive whole number.");
   let sourcePolicy = null;
   let policyFingerprint = null;
   let driveDecision = null;
@@ -8649,6 +9006,9 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   let runClosed = false;
 
   const skips = [];
+  const notes = [];
+  const incompleteKeys = new Set();
+  let policySkipped = 0;
   let unchanged = 0;
   let scanned = 0;
   let prepared = 0;
@@ -8847,6 +9207,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         const skip = { path: displayPath || f.name || f.id, id: f.id, reason: excluded };
         state.skipped[key] = excluded;
         excludedUids.push(key);
+        policySkipped++;
         return { skip };
       }
 
@@ -8862,8 +9223,10 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         typeof state.drive_retained_existing === "object" &&
         Object.hasOwn(state.drive_retained_existing, key);
       if (!hasRetainedMarker && (!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === listedVersion) {
+        if (state.extraction_incomplete?.[key] === true) incompleteKeys.add(key);
         recordAcceptedDocumentState(state, {
           stateKey: key, hash: listedVersion, skipKeys: [f.id], legacyPartRoot: f.id,
+          extractionIncomplete: state.extraction_incomplete?.[key] === true,
         });
         unchanged++;
         return { unchanged: true };
@@ -8871,6 +9234,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
 
       const r = await drive.toEnvelope(getToken, f, { sourceName, pathOf, ocr: ocrCallback });
       if (!r) return null;
+      if (r.note) notes.push({ path: f.name || f.id, note: r.note });
       if (r.skip) {
         state.skipped[key] = r.skip.reason;
         const classification = classifyActiveDriveSkip({
@@ -8900,6 +9264,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         return { skip };
       }
       const envelopes = splitOversized(envelope);
+      if (r.incomplete === true) incompleteKeys.add(key);
       const familyPlan = {
         stateKey: key,
         hash: r.version,
@@ -8908,6 +9273,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         keep_doc_uids: envelopes.map((envelope) => `${envelope.source_type}:${envelope.source_id}`),
         skipKeys: [key, ...envelopes.map((envelope) => envelope.source_id)],
         legacyPartRoot: f.id,
+        extractionIncomplete: r.incomplete === true,
       };
       if (scanned % 200 === 0) process.stdout.write(`\r  scanned ${scanned}...   `);
       return {
@@ -9135,6 +9501,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       scanned++;
       const key = `${sourceName}:${id}`;
       const r = await gmail.toEnvelope(getToken, id, { sourceName });
+      if (r.note) notes.push({ path: id, note: r.note });
       if (r.skip) {
         state.skipped[key] = r.skip.reason;
         intentionalRemovalUids.push(key);
@@ -9144,8 +9511,10 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         state, scannerFingerprint, key, r.version
       );
       if ((!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === r.version) {
+        if (state.extraction_incomplete?.[key] === true) incompleteKeys.add(key);
         recordAcceptedDocumentState(state, {
           stateKey: key, hash: r.version, skipKeys: [id], legacyPartRoot: id,
+          extractionIncomplete: state.extraction_incomplete?.[key] === true,
         });
         unchanged++;
         return { unchanged: true };
@@ -9159,6 +9528,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         return { skip };
       }
       const envelopes = splitOversized(envelope);
+      if (r.incomplete === true) incompleteKeys.add(key);
       if (scanned % 200 === 0) process.stdout.write(`\r  fetched ${scanned}...   `);
       return {
         hash: r.version, envelopes, rel: id, stateKey: key, deferState: true,
@@ -9170,6 +9540,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
           keep_doc_uids: envelopes.map((envelope) => `${envelope.source_type}:${envelope.source_id}`),
           skipKeys: [key, ...envelopes.map((envelope) => envelope.source_id)],
           legacyPartRoot: id,
+          extractionIncomplete: r.incomplete === true,
         },
       };
     };
@@ -9201,6 +9572,16 @@ async function cmdIngestRemote(m, manifestPath, flags) {
 
       const folders = await client.list();
       const { included, skipped: skippedRoles, unlisted, unclassified, containers } = imap.partitionFolders(folders);
+      for (const folder of skippedRoles) {
+        policySkipped++;
+        skips.push({ path: folder.name, reason: `mailbox folder excluded by policy (${folder.role})` });
+      }
+      for (const folder of unlisted) {
+        skips.push({ path: folder.name, reason: `mailbox folder identified as ${folder.role}, but no rule includes it` });
+      }
+      for (const folder of unclassified) {
+        skips.push({ path: folder.name, reason: "mailbox folder purpose could not be identified, so it was not read" });
+      }
 
       // EVERY folder is reported, read or not, and each one is told the TRUE
       // reason. A folder that was silently never opened produces a brain that is
@@ -9260,16 +9641,20 @@ async function cmdIngestRemote(m, manifestPath, flags) {
           scanned++;
           if (message.uid > highest) highest = message.uid;
           const r = await imap.toEnvelope(message, { sourceName, host: credentials.host });
+          if (r.note) notes.push({ path: `${folder.name}#${message.uid}`, note: r.note });
           if (r.skip) {
             const key = `${sourceName}:${folder.name}#${message.uid}`;
             state.skipped[key] = r.skip.reason;
+            if (/^bulk mail:/i.test(r.skip.reason || "")) policySkipped++;
             return { skip: r.skip };
           }
           const key = `${sourceName}:${r.envelope.source_id}`;
           const scannerResumeAccepted = hasCredentialScannerProgress(state, scannerFingerprint, key, r.version);
           if ((!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === r.version) {
+            if (state.extraction_incomplete?.[key] === true) incompleteKeys.add(key);
             recordAcceptedDocumentState(state, {
               stateKey: key, hash: r.version, skipKeys: [r.envelope.source_id], legacyPartRoot: r.envelope.source_id,
+              extractionIncomplete: state.extraction_incomplete?.[key] === true,
             });
             unchanged++;
             return { unchanged: true };
@@ -9285,6 +9670,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
             return { skip };
           }
           const envelopes = splitOversized(envelope);
+          if (r.incomplete === true) incompleteKeys.add(key);
           if (scanned % 200 === 0) process.stdout.write(`\r  fetched ${scanned}...   `);
           return {
             hash: r.version, envelopes, rel: key, stateKey: key, deferState: true,
@@ -9296,6 +9682,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
               keep_doc_uids: envelopes.map((one) => `${one.source_type}:${one.source_id}`),
               skipKeys: [key, ...envelopes.map((one) => one.source_id)],
               legacyPartRoot: r.envelope.source_id,
+              extractionIncomplete: r.incomplete === true,
             },
           };
         };
@@ -9342,6 +9729,8 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   if (which !== "drive") await flushIntentionalRemovals();
 
   info(`${scanned} scanned; ${prepared} document(s) prepared in ${batchNo} batch(es); ${unchanged} unchanged; ${skips.length} skipped`);
+  reportNotes(notes);
+  const coverageGaps = Math.max(0, skips.length - policySkipped);
 
   if (dry) {
     ok("dry run, nothing was sent");
@@ -9351,6 +9740,9 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       would_send: prepared,
       unchanged,
       skipped: skips.length,
+      policy_skipped: policySkipped,
+      coverage_gaps: coverageGaps,
+      incomplete: incompleteKeys.size,
       ...(which === "drive" ? { retained_candidates: retainedDriveCandidates.size } : {}),
     };
   }
@@ -9358,35 +9750,53 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   // Every batch landed, so it is now safe to say "we have everything up to
   // here". sendBatches dies rather than returning on a failure, so reaching
   // this line is the proof.
-  if (pendingCursor && sourceCursorCanAdvance(tally)) {
+  const remoteCursorCanAdvance = sourceCursorCanAdvance(tally) && tally.refused === 0 &&
+    coverageGaps === 0 && incompleteKeys.size === 0;
+  if (pendingCursor && remoteCursorCanAdvance) {
     state[pendingCursor.key] = pendingCursor.value;
     Object.assign(state, pendingCursor.statePatch || {});
     if (scannerProgressCanCommit) commitCredentialScannerProgress(state, scannerFingerprint);
     saveState(statePath, state);
-  } else if (pendingCursor && tally.failed) {
-    warn(`${tally.failed} document(s) failed, so the source cursor was NOT advanced; the next run will retry them`);
+  } else if (pendingCursor) {
+    warn(
+      `the source cursor was NOT advanced because this run has ${tally.failed} failed, ${tally.refused} refused, ` +
+        `${coverageGaps} coverage gap(s), and ${incompleteKeys.size} incomplete extraction(s); the next run will retry them`,
+    );
   }
   const retainedDriveReason = driveRetainedExisting
     ? `${driveRetainedExisting} active Drive file(s) retained because their current revisions could not be safely re-indexed`
     : null;
-  const finalStatus = tally.failed || retainedDriveReason ? "error" : "ready";
+  const hasRemoteGap = tally.failed > 0 || tally.refused > 0 || coverageGaps > 0 ||
+    incompleteKeys.size > 0 || !!retainedDriveReason;
+  const acceptedDocuments = tally.created + tally.updated + unchanged + tally.unchanged;
+  const outcomeKind = hasRemoteGap
+    ? acceptedDocuments > 0 ? "partial" : "refused"
+    : "completed";
+  const finalStatus = hasRemoteGap ? "error" : "ready";
   await postSourceReceipt(base, adminKey, {
     source: sourceName, kind: which, status: finalStatus, run_id: runId,
     lane, started_at: runStartedAt, completed_at: new Date().toISOString(),
     complete_sweep: which === "drive" && !incremental,
-    walk_complete: tally.failed === 0,
+    walk_complete: !hasRemoteGap,
     files_seen: scanned,
     docs_added: tally.created,
     docs_updated: tally.updated,
     docs_unchanged: unchanged + tally.unchanged,
     detail:
       `${which} ${lane} sync ${finalStatus === "ready" ? "completed" : "completed incompletely"}; ` +
-      `skipped=${skips.length}; retained_existing=${driveRetainedExisting}`,
-    ...(tally.failed
-      ? { error: `${tally.failed} document(s) failed; the source cursor was not advanced` }
-      : retainedDriveReason
-        ? { error: retainedDriveReason }
-        : {}),
+      `skipped=${skips.length}; policy_skipped=${policySkipped}; coverage_gaps=${coverageGaps}; ` +
+      `incomplete=${incompleteKeys.size}; retained_existing=${driveRetainedExisting}`,
+    ...(hasRemoteGap
+      ? {
+          error: [
+            tally.failed ? `${tally.failed} document(s) failed` : null,
+            tally.refused ? `${tally.refused} document(s) refused` : null,
+            coverageGaps ? `${coverageGaps} coverage gap(s)` : null,
+            incompleteKeys.size ? `${incompleteKeys.size} incomplete extraction(s)` : null,
+            retainedDriveReason,
+          ].filter(Boolean).join("; "),
+        }
+      : {}),
   });
   runClosed = true;
 
@@ -9407,6 +9817,14 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     refused: tally.refused,
     scanned,
     skipped: skips.length,
+    policy_skipped: policySkipped,
+    coverage_gaps: coverageGaps,
+    incomplete: incompleteKeys.size,
+    outcome: ingestionOutcome(outcomeKind, {
+      reason: hasRemoteGap
+        ? `${tally.refused} refused; ${coverageGaps} coverage gap(s); ${incompleteKeys.size} incomplete extraction(s); retained_existing=${driveRetainedExisting}`
+        : null,
+    }),
     ...(which === "drive" ? { retained_existing: driveRetainedExisting } : {}),
   };
   } catch (error) {
@@ -12134,7 +12552,9 @@ export async function cmdSetup(manifestPath, options = {}) {
 
   /* --- 6. the first thing worth looking at --- */
   console.log(`\n  ${c.bold("Step 6 of 6")}  loading something in\n`);
-  const folder = flags.path || (await prompt("A folder to load now (blank to skip)", ""));
+  const folder = normalizeSetupFolderInput(
+    flags.path || (await prompt("A folder to load now (blank to skip)", "")),
+  );
   const initialLoadSkipped = !folder;
   let initialLoadReceipt = null;
   if (folder && existsSync(folder)) {
@@ -12148,8 +12568,9 @@ export async function cmdSetup(manifestPath, options = {}) {
     if (!normalizeSetupIngestReceipt(initialLoadReceipt)) {
       closePrompts();
       die(
-        "that folder produced no accepted document. The Brain was not reported as live. " +
-          "Choose a folder with at least one supported readable file, then rerun setup."
+        "that folder produced no accepted document set that was complete. It may be empty, refused, " +
+          "partly unreadable, or have unsupported/skipped files. The Brain was not reported as live. " +
+          "Fix the named files or choose a folder with supported readable material, then rerun setup."
       );
     }
   } else if (folder) {
@@ -12195,7 +12616,12 @@ export async function cmdSetup(manifestPath, options = {}) {
     console.log(`  Complete the fixed public smoke proof before owner handoff:`);
     console.log(`    brain technician ${shownTarget} --run smoke\n`);
   } else if (finalVectorStatus.query_ready) {
-    console.log(`\n  ${c.green(c.bold("Your brain is live."))}\n`);
+    console.log(`\n  ${c.green(c.bold("Your files are stored and the vector index has caught up."))}\n`);
+    console.log(
+      "  Matching storage counts do not prove that search returns the exact document or that an answer cites it.\n" +
+        "  Complete the deployed search, cited-answer, source-freshness, and passkey proof before handoff:\n" +
+        `    brain technician ${shownTarget} --run verify\n`
+    );
   } else {
     console.log(`\n  ${c.yellow(c.bold("Your files are stored. Meaning-based search is still loading."))}\n`);
     console.log(
@@ -12203,11 +12629,10 @@ export async function cmdSetup(manifestPath, options = {}) {
         `  meaning-based search is incomplete until they finish. Run:\n    brain drain ${shownTarget}\n`
     );
   }
-  if (finalVectorStatus?.query_ready) console.log(`  Ask it directly with: brain ask ${shownTarget}`);
   if (wired.length) {
     console.log(`  It is connected to: ${wired.join(", ")}.`);
     if (finalVectorStatus?.query_ready) {
-      console.log(`  ${c.dim("Restart them, then ask a question about your own material.")}\n`);
+      console.log(`  ${c.dim("Restart them after the final deployed verification passes.")}\n`);
     } else if (!initialLoadSkipped) {
       console.log(`  ${c.dim("Finish the vector drain, then restart them and ask your first question.")}\n`);
     } else {
@@ -13323,8 +13748,20 @@ function normalizeSetupIngestReceipt(receipt) {
       !validCount(receipt.refused) || !validCount(receipt.skipped)) {
     return null;
   }
+  for (const field of ["policy_skipped", "coverage_gaps", "incomplete", "source_inventory"]) {
+    if (receipt[field] !== undefined && !validCount(receipt[field])) return null;
+  }
   const accepted = receipt.created + receipt.updated + receipt.unchanged;
-  if (!Number.isSafeInteger(accepted) || receipt.scanned < 1 || accepted < 1) return null;
+  const policySkipped = Math.min(receipt.skipped, receipt.policy_skipped || 0);
+  const coverageGaps = receipt.coverage_gaps ?? Math.max(0, receipt.skipped - policySkipped);
+  const incomplete = receipt.incomplete || 0;
+  let outcome = null;
+  if (receipt.outcome !== undefined) {
+    try { outcome = assertIngestionOutcome(receipt.outcome); } catch { return null; }
+  }
+  if (!Number.isSafeInteger(accepted) || receipt.scanned < 1 || accepted < 1 ||
+      receipt.refused > 0 || coverageGaps > 0 || incomplete > 0 ||
+      (outcome && outcome.kind !== "completed")) return null;
   return Object.freeze({
     scanned: receipt.scanned,
     accepted,
@@ -13333,6 +13770,9 @@ function normalizeSetupIngestReceipt(receipt) {
     unchanged: receipt.unchanged,
     refused: receipt.refused,
     skipped: receipt.skipped,
+    policy_skipped: policySkipped,
+    coverage_gaps: coverageGaps,
+    incomplete,
   });
 }
 
@@ -14413,6 +14853,23 @@ export function setupManifestTarget(manifestPath, flags = {}) {
     : null;
   const flagged = typeof flags.manifest === "string" ? flags.manifest : null;
   return positional || flagged || "./brain.manifest.json";
+}
+
+/** Normalize paths pasted into setup's readline prompt, where no shell helps. */
+export function normalizeSetupFolderInput(value, { home = homedir() } = {}) {
+  let input = String(value ?? "").trim();
+  if (!input) return "";
+  const first = input[0];
+  const last = input[input.length - 1];
+  if (input.length >= 2 && ((first === '"' && last === '"') || (first === "'" && last === "'"))) {
+    input = input.slice(1, -1).trim();
+  }
+  if (input === "~") return String(home);
+  if (/^~[\\/]/.test(input)) {
+    const parts = input.slice(2).split(/[\\/]+/).filter(Boolean);
+    return join(String(home), ...parts);
+  }
+  return input;
 }
 
 async function cmdSetupInteractive(manifestPath) {

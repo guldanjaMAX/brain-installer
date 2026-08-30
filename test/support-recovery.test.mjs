@@ -100,7 +100,17 @@ test("the hiccup lab is offline, credential-scrubbed, and names every remaining 
   assert.equal(plan.live_accounts_contacted, false);
   assert.equal(plan.customer_data_read, false);
   assert.deepEqual(plan.scenarios.map((item) => item.id), HICCUP_SCENARIOS.map((item) => item.id));
-  assert.ok(plan.scenarios.length >= 8);
+  assert.ok(plan.scenarios.length >= 9);
+  const firstMachine = plan.scenarios.find((item) => item.id === "first-customer-machine");
+  assert.ok(firstMachine);
+  assert.match(firstMachine.customer_hiccup, /spaces or Unicode/i);
+  assert.match(firstMachine.automated_proof, /packed tarball/i);
+  assert.match(firstMachine.remaining_field_gate, /physical Windows 11/i);
+  const messyFolder = plan.scenarios.find((item) => item.id === "messy-customer-folder");
+  assert.ok(messyFolder);
+  assert.match(messyFolder.customer_hiccup, /cloud placeholders/i);
+  assert.match(messyFolder.automated_proof, /authoritative stored families/i);
+  assert.match(messyFolder.remaining_field_gate, /on-demand cloud or network volume/i);
   for (const item of plan.scenarios) {
     assert.ok(item.tests.length >= 2);
     assert.ok(item.remaining_field_gate.length >= 40);

@@ -25,7 +25,7 @@ import {
   createTokenProvider,
   syncAll,
 } from "../connectors/google-calendar.mjs";
-import { cmdIngestCalendar } from "../brain.mjs";
+import { cmdIngestCalendar, describeLoadResult } from "../brain.mjs";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
@@ -108,6 +108,65 @@ try {
     check("dry run sends nothing", ingestCalls === 0);
     check("dry run posts no source receipt", fakeReceipts.length === 0);
     check("dry run writes no state file", !(await import("node:fs")).existsSync(join(sandbox, ".brain-ingest-calendar.json")));
+  }
+
+  fakeReceipts.length = 0;
+  fakeRemovals.length = 0;
+
+  /* ---- one failed calendar cannot hide behind a successful sibling ---- */
+  {
+    const mixedManifest = join(sandbox, "mixed-calendar.manifest.json");
+    let saved = null;
+    const mixed = await cmdIngestCalendar(
+      {
+        infrastructure: { cloudflare: {} },
+        calendar: { calendars: ["primary", "shared"] },
+      },
+      mixedManifest,
+      {},
+      {
+        ...commonOptions(),
+        getAccessToken: async () => "fixture-access",
+        loadCalendarState: () => ({}),
+        saveCalendarState: (_path, state) => { saved = state; },
+        googleCalendar: {
+          syncAll: async () => ({
+            documents: [{
+              source_type: "calendar_event",
+              source_id: "gcal:primary:accepted",
+              title: "Accepted fixture event",
+              content: "An invented calendar event used only to verify a mixed result.",
+              occurred_at: "2026-08-30T12:00:00.000Z",
+              metadata: {},
+            }],
+            deletions: [],
+            state: { primary: { sync_token: "TOK_OK" } },
+            calendars: [
+              { calendar_key: "primary", error: null },
+              { calendar_key: "shared", error: { message: "fixture calendar unavailable" } },
+            ],
+            summary: {
+              events_seen: 1,
+              calendars_ok: 1,
+              calendars_failed: 1,
+              skipped: 0,
+              needs_reconsent: false,
+            },
+          }),
+          ingestEnvelopes: async ({ envelopes }) => ({
+            created: envelopes.length, updated: 0, unchanged: 0, refused: [], errors: [], total: envelopes.length,
+          }),
+        },
+      },
+    );
+    const described = describeLoadResult(mixed);
+    check("a successful calendar sibling keeps its accepted state",
+      saved?.primary?.sync_token === "TOK_OK", JSON.stringify(saved));
+    check("a failed calendar sibling closes the whole source as error",
+      fakeReceipts.at(-1)?.receipt.status === "error" && /1 of 2 calendar/.test(fakeReceipts.at(-1)?.receipt.error || ""),
+      JSON.stringify(fakeReceipts.at(-1)?.receipt));
+    check("brain load sees mixed Calendar success as partial rather than complete",
+      described.partial === true && described.outcome.kind === "partial", JSON.stringify(described));
   }
 
   fakeReceipts.length = 0;

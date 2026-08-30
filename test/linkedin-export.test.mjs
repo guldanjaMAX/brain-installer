@@ -61,4 +61,26 @@ check("archive path traversal is refused by the common boundary", /unsafe_entry_
 const bomb = parseLinkedInArchive(zipSync({ "Connections.csv": strToU8("A".repeat(1_000_000)) }, { level: 9 }));
 check("archive compression bombs are refused by the common boundary", /compression_ratio/.test(bomb.error));
 
+const cappedRows = Array.from({ length: 50_001 }, (_, index) =>
+  `Fixture${index},Person${index},https://example.invalid/${index},,Example,Role,2026-08-01`).join("\n");
+const cappedArchive = zipSync({
+  "Connections.csv": strToU8(
+    "First Name,Last Name,URL,Email Address,Company,Position,Connected On\n" + cappedRows + "\n",
+  ),
+});
+const cappedFolder = mkdtempSync(join(tmpdir(), "brain-linkedin-cap-"));
+try {
+  const full = join(cappedFolder, "linkedin-export.zip");
+  writeFileSync(full, cappedArchive);
+  const capped = await prepare({
+    full, rel: "linkedin-export.zip", name: "linkedin-export.zip", size: cappedArchive.length,
+  }, { sourceName: "upload" });
+  check("a LinkedIn CSV beyond its row limit is explicitly incomplete",
+    capped.incomplete === true && /1 LinkedIn row\(s\).*not represented/.test(capped.note || "") &&
+      capped.envelopes[0]?.metadata?.omitted_row_count === 1,
+    JSON.stringify({ incomplete: capped.incomplete, note: capped.note, metadata: capped.envelopes[0]?.metadata }));
+} finally {
+  rmSync(cappedFolder, { recursive: true, force: true });
+}
+
 console.log(`\nlinkedin export: all ${ran} checks passed`);

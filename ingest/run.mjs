@@ -484,7 +484,16 @@ async function prepareWhatsAppExport(file, buf, hash, { sourceName }) {
   for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
   envelopes.push(...sessionizer.finish());
 
-  return { hash, envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)) };
+  return {
+    hash,
+    envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)),
+    ...(parsed.skippedMedia
+      ? {
+          note: `${parsed.skippedMedia} media or deleted-message placeholder(s) were not represented`,
+          incomplete: true,
+        }
+      : {}),
+  };
 }
 
 /**
@@ -496,7 +505,12 @@ async function prepareWhatsAppExport(file, buf, hash, { sourceName }) {
  */
 function prepareSmsBackupXml(file, buf, hash, { sourceName }) {
   const text = decodeText(buf);
-  const parsed = parseSmsBackupXml(text, { sourceLabel: sourceName });
+  // A customer may load several overlapping phone-backup snapshots. Include
+  // the export file identity in every thread id so two files cannot generate
+  // the same document uid and silently overwrite each other's family.
+  const parsed = parseSmsBackupXml(text, {
+    sourceLabel: sourceFileFamilyUid(file, sourceName),
+  });
 
   if (!parsed.rows.length) {
     return {
@@ -513,7 +527,26 @@ function prepareSmsBackupXml(file, buf, hash, { sourceName }) {
   const envelopes = [];
   for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
   envelopes.push(...sessionizer.finish());
-  return { hash, envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)) };
+  const omissions = parsed.skippedEmpty + parsed.skippedMms;
+  const integrityNotes = [
+    !parsed.rootClosed ? "the export ended before </smses>" : null,
+    parsed.malformed ? `${parsed.malformed} malformed SMS entr${parsed.malformed === 1 ? "y was" : "ies were"} detected` : null,
+    parsed.countMismatch
+      ? `the export declared ${parsed.declaredCount} entries but ${parsed.entriesSeen} were present`
+      : null,
+  ].filter(Boolean);
+  return {
+    hash,
+    envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)),
+    ...(omissions || parsed.incomplete
+      ? {
+          note: `${parsed.skippedEmpty} empty or unreadable SMS entr${parsed.skippedEmpty === 1 ? "y" : "ies"} and ` +
+            `${parsed.skippedMms} MMS entr${parsed.skippedMms === 1 ? "y was" : "ies were"} not represented` +
+            (integrityNotes.length ? `; ${integrityNotes.join("; ")}` : ""),
+          incomplete: true,
+        }
+      : {}),
+  };
 }
 
 /** One Google Voice Takeout conversation page, many documents. */
@@ -538,7 +571,16 @@ function prepareGoogleVoiceTakeout(file, buf, hash, { sourceName }) {
   const envelopes = [];
   for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
   envelopes.push(...sessionizer.finish());
-  return { hash, envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)) };
+  return {
+    hash,
+    envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)),
+    ...(parsed.skippedNonMessage
+      ? {
+          note: `${parsed.skippedNonMessage} call, voicemail, empty, or malformed entr${parsed.skippedNonMessage === 1 ? "y was" : "ies were"} not represented`,
+          incomplete: true,
+        }
+      : {}),
+  };
 }
 
 /** One Meta Download Your Information thread file, many bounded sessions. */
@@ -569,6 +611,9 @@ function prepareFacebookMessengerExport(file, buf, hash, { sourceName }) {
       parsed.skippedUnavailable ? `${parsed.skippedUnavailable} unavailable or unsent message(s) not represented` : null,
       parsed.skippedMalformed ? `${parsed.skippedMalformed} malformed message(s) not represented` : null,
     ].filter(Boolean).join("; ") || null,
+    ...(parsed.skippedMedia || parsed.skippedUnavailable || parsed.skippedMalformed
+      ? { incomplete: true }
+      : {}),
   };
 }
 
@@ -581,12 +626,21 @@ function prepareLinkedInExport(file, buf, hash, { sourceName }) {
       skip: { path: file.rel, reason: parsed.error || "the LinkedIn export contains no readable data rows" },
     };
   }
+  const omittedRows = parsed.envelopes.reduce(
+    (total, envelope) => total + Math.max(0, Number(envelope?.metadata?.omitted_row_count || 0)),
+    0,
+  );
+  const notes = [
+    parsed.skipped.length
+      ? `${parsed.skipped.length} recognized LinkedIn CSV file(s) were empty or unreadable`
+      : null,
+    omittedRows ? `${omittedRows} LinkedIn row(s) beyond the per-file limit were not represented` : null,
+  ].filter(Boolean);
   return {
     hash,
     envelopes: declareFamily(parsed.envelopes, sourceFileFamilyUid(file, sourceName)),
-    note: parsed.skipped.length
-      ? `${parsed.skipped.length} recognized LinkedIn CSV file(s) were empty or unreadable`
-      : null,
+    note: notes.join("; ") || null,
+    ...(parsed.skipped.length || omittedRows ? { incomplete: true } : {}),
   };
 }
 

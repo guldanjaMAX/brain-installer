@@ -25,6 +25,22 @@ const scenario = (id, title, customerHiccup, proof, remainingFieldGate, tests) =
 
 export const HICCUP_SCENARIOS = Object.freeze([
   scenario(
+    "first-customer-machine",
+    "The first customer machine is unlike the developer's",
+    "The install path contains spaces or Unicode, the profile is enterprise-qualified, no interactive terminal is attached, or the network never finishes a health response.",
+    "The packed tarball runs from hostile customer paths, private Windows files keep the exact current-user boundary, non-interactive handoff stays human-required, and evaluation health requests time out and retry without credentials.",
+    "A clean physical Windows 11 customer profile still needs the supervised Node 22 and 24 install with its real enterprise identity, security software, proxy, interactive Claude doctor, and passkey gesture.",
+    ["test/packed-fresh-setup.test.mjs", "test/bootstrap-status.test.mjs", "test/google-auth-storage.test.mjs", "test/whatsapp-capture.test.mjs", "eval/brain-client.test.mjs"],
+  ),
+  scenario(
+    "messy-customer-folder",
+    "The customer's real folder is messy, partial, or changes while it is read",
+    "The folder contains links, cloud placeholders, files that move or grow during the scan, deep or oversized structured files, unsupported formats, stale resume state, or two configured folders that claim the same source identity.",
+    "The local ingest path binds reads to the approved root and file identity, bounds bytes and extraction work, reports unsupported or knowingly incomplete material, refuses colliding source identities, and reconciles resume state against authoritative stored families before claiming completion.",
+    "A physical Windows customer folder with reparse points and a real on-demand cloud or network volume still needs a supervised read, interruption, hydration, and resume cycle.",
+    ["test/ingest-run.test.mjs", "test/quality.test.mjs", "test/formats-extra.test.mjs", "test/ingestion-contract.test.mjs", "test/load-all.test.mjs"],
+  ),
+  scenario(
     "setup-retry",
     "An install or update is interrupted",
     "The terminal closes, the network drops, or an update stops between stages.",

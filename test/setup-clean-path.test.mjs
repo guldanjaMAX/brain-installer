@@ -22,6 +22,7 @@ import {
   chooseSetupAccount,
   cmdMigrate,
   cmdSetup,
+  normalizeSetupFolderInput,
   persistWorkersDevDomain,
   setupManifestTarget,
 } from "../brain.mjs";
@@ -36,6 +37,8 @@ assert.equal(setupManifestTarget(undefined, {}), "./brain.manifest.json");
 assert.equal(setupManifestTarget("client.manifest.json", {}), "client.manifest.json");
 assert.equal(setupManifestTarget("--no-connect", { "no-connect": true }), "./brain.manifest.json");
 assert.equal(setupManifestTarget("--manifest", { manifest: "chosen.manifest.json" }), "chosen.manifest.json");
+assert.equal(normalizeSetupFolderInput('"C:\\Users\\Owner\\Brain Files"'), "C:\\Users\\Owner\\Brain Files");
+assert.equal(normalizeSetupFolderInput("~/Brain Files", { home: "/Users/Owner" }), "/Users/Owner/Brain Files");
 
 assert.deepEqual(
   await chooseSetupAccount(async () => { throw new Error("one account needs no prompt"); }, {
@@ -549,6 +552,21 @@ try {
   assert.match(emptyLoadFailure?.message || "", /no accepted document.*not reported as live/i);
   assert.doesNotMatch(emptyLoadFailure?.fixtureOutput || "", /Your brain is live/i);
 
+  let partialLoadFailure;
+  try {
+    await captureSetupOutput(() => cmdSetup(target, setupWithInitialLoad({
+      cmdIngest: async () => ({
+        scanned: 100, created: 1, updated: 0, unchanged: 0, refused: 0,
+        skipped: 99, coverage_gaps: 99,
+      }),
+      vectorStatus: async () => { throw new Error("vector status must not run for a partial first load"); },
+    })));
+  } catch (error) {
+    partialLoadFailure = error;
+  }
+  assert.match(partialLoadFailure?.message || "", /incomplete|not reported as live/i);
+  assert.doesNotMatch(partialLoadFailure?.fixtureOutput || "", /Your brain is live|Ask it directly/i);
+
   let unknownVectorFailure;
   try {
     await captureSetupOutput(() => cmdSetup(target, setupWithInitialLoad({
@@ -585,8 +603,9 @@ try {
   assert.doesNotMatch(loading.output, /Your brain is live|Ask it directly/i);
 
   const readyLoad = await captureSetupOutput(() => cmdSetup(target, setupWithInitialLoad()));
-  assert.match(readyLoad.output, /Your brain is live/i);
-  assert.match(readyLoad.output, /Ask it directly/i);
+  assert.match(readyLoad.output, /files are stored and the vector index has caught up/i);
+  assert.match(readyLoad.output, /brain technician .*--run verify/i);
+  assert.doesNotMatch(readyLoad.output, /Your brain is live|Ask it directly/i);
 
   if (process.platform !== "win32") {
     const { mode } = lstatSync(target);

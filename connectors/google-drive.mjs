@@ -702,6 +702,7 @@ export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYP
         top_folder: pathSegments(folder)[0] || null,
         folder: folder || null,
         ...(got.note ? { extraction_note: got.note } : {}),
+        ...(got.incomplete === true ? { extraction_incomplete: true } : {}),
         ...(got.provenance ? { ocr: got.provenance } : {}),
       },
     },
@@ -709,5 +710,6 @@ export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYP
     // and it is what the changes feed reports against.
     version: driveVersion(file, folder),
     note: got.note || null,
+    incomplete: got.incomplete === true,
   };
 }

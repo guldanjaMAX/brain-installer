@@ -180,6 +180,8 @@ try {
     const dir = mkdtempSync(join(sandbox, "wiring-"));
     const manifestPath = writeManifest(dir, {
       upload: { enabled: true, folders: ["/tmp/wiring"] },
+      local_folder: { enabled: true, path: "/tmp/watched", source: "watched" },
+      imap: { enabled: true, source: "mailbox" },
       google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] },
     });
     const m = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -195,31 +197,35 @@ try {
       ingestProvider: spy("provider"),
     });
     const flags = { "dry-run": true, limit: "5" };
-    for (const key of ["calendar", "imessage", "whatsapp", "upload", "gmail", "google_drive", "iphone_backup"]) {
+    for (const key of ["calendar", "imessage", "whatsapp", "upload", "local_folder", "gmail", "imap", "google_drive", "iphone_backup"]) {
       for (const leg of table[key].legs({ m, manifestPath, flags })) await leg.run();
     }
     for (const key of ["quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot"]) {
       for (const leg of table[key].legs({ m, manifestPath, flags: { "dry-run": true } })) await leg.run();
     }
     check("every pull source in the real registry is wired to a command",
-      seen.length === 13, JSON.stringify(seen.map((x) => x.name)));
+      seen.length === 15, JSON.stringify(seen.map((x) => x.name)));
     check("the real registry forwards --dry-run to EVERY source, unaltered",
       seen.every((x) => x.flags["dry-run"] === true),
       JSON.stringify(seen.filter((x) => x.flags["dry-run"] !== true).map((x) => x.name)));
     check("the real registry forwards --limit to every source too",
-      seen.slice(0, 7).every((x) => x.flags.limit === "5"),
+      seen.slice(0, 9).every((x) => x.flags.limit === "5"),
       JSON.stringify(seen.filter((x) => x.flags.limit !== "5").map((x) => x.name)));
     check("provider sources refuse --limit before running because it could skip a cursor",
       ["quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot"].every((key) =>
         /cannot honor --limit/.test(table[key].legs({ m, manifestPath, flags }).unavailable.reason)));
     check("each source is asked for its OWN source, not a neighbour's",
       JSON.stringify(seen.map((x) => x.flags.from)) === JSON.stringify([
-        "calendar", "imessage", "whatsapp", undefined, "gmail", "drive", "iphone-backup",
+        "calendar", "imessage", "whatsapp", undefined, undefined, "gmail", "imap", "drive", "iphone-backup",
         "quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot",
       ]), JSON.stringify(seen.map((x) => x.flags.from)));
     check("the folder leg is handed the folder path from the manifest",
       seen[3].flags.path === "/tmp/wiring" && seen[3].flags.source === "upload",
       JSON.stringify(seen[3].flags));
+    check("the watched-folder and IMAP legs keep their configured source identities",
+      seen[4].flags.path === "/tmp/watched" && seen[4].flags.source === "watched" &&
+        seen[6].flags.source === "mailbox",
+      JSON.stringify({ watched: seen[4].flags, imap: seen[6].flags }));
     check("no source is ever handed --reset by the sweep",
       seen.every((x) => x.flags.reset === undefined),
       JSON.stringify(seen.filter((x) => x.flags.reset !== undefined).map((x) => x.name)));
@@ -231,20 +237,59 @@ try {
     const manifestPath = writeManifest(dir, {
       google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] }, gmail: { enabled: true }, calendar: { enabled: true },
       imessage: { enabled: true }, upload: { enabled: true, folders: ["/tmp/x"] },
+      local_folder: { enabled: true, path: "/tmp/watched" }, imap: { enabled: true },
       whatsapp: { enabled: true }, iphone_backup: { enabled: true },
     });
     const entries = await planLoad({
       m: JSON.parse(readFileSync(manifestPath, "utf8")),
       manifestPath,
       probes: Object.fromEntries(
-        ["google_drive", "gmail", "calendar", "imessage", "whatsapp", "iphone_backup"].map((k) => [k, connected]),
+        ["google_drive", "gmail", "imap", "calendar", "imessage", "whatsapp", "iphone_backup"].map((k) => [k, connected]),
       ),
     });
     const order = entries.map((e) => e.key);
-    check("the plan is ordered cheap-and-fast first, long bulk last, snapshot dead last",
+    check("the plan includes watched folders and IMAP in the cheap-to-bulk sequence",
       JSON.stringify(order) === JSON.stringify([
-        "calendar", "imessage", "whatsapp", "upload", "gmail", "google_drive", "iphone_backup",
+        "calendar", "imessage", "whatsapp", "upload", "local_folder", "gmail", "imap", "google_drive", "iphone_backup",
       ]), JSON.stringify(order));
+  }
+
+  {
+    const dir = mkdtempSync(join(sandbox, "imap-loader-"));
+    const manifestPath = writeManifest(dir, { imap: { enabled: true, source: "mailbox" } });
+    let seen = null;
+    const entries = await planLoad({
+      m: JSON.parse(readFileSync(manifestPath, "utf8")),
+      manifestPath,
+      probes: { imap: connected },
+      commands: { ingestRemote: async (_m, _path, flags) => { seen = flags; return { outcome: ingestionOutcome("completed") }; } },
+    });
+    const imapEntry = entries.find((entry) => entry.key === "imap");
+    if (imapEntry?.legs?.[0]) await imapEntry.legs[0].run();
+    check("an enabled connected IMAP mailbox is a runnable brain load leg",
+      imapEntry?.status === "ready" && seen?.from === "imap" && seen?.source === "mailbox",
+      JSON.stringify({ entry: imapEntry, seen }));
+  }
+
+  {
+    const dir = mkdtempSync(join(sandbox, "imap-collision-"));
+    const manifestPath = writeManifest(dir, {
+      upload: { enabled: true, folders: [{ path: "/tmp/mail-export", source: "imap" }] },
+      imap: { enabled: true },
+    });
+    let ran = false;
+    const entries = await planLoad({
+      m: JSON.parse(readFileSync(manifestPath, "utf8")),
+      manifestPath,
+      probes: { imap: connected },
+      commands: {
+        ingestLocal: async () => { ran = true; },
+        ingestRemote: async () => { ran = true; },
+      },
+    });
+    check("a folder export cannot share IMAP's resume and D1 namespace",
+      entries.every((entry) => entry.status === "unavailable" && /source name "imap" is shared/.test(entry.reason || "")) && !ran,
+      JSON.stringify(entries));
   }
 
   {
@@ -283,9 +328,15 @@ try {
     const { table, calls } = scriptedRegistry({
       calendar: () => ({ sent: { created: 3, updated: 1, unchanged: 2, refused: [], errors: [] }, removed: 0 }),
       imessage: () => ({ documents_sent: 7, rows_seen: 412 }),
-      upload: () => ({ created: 40, updated: 2, unchanged: 5, refused: 0, skipped: 3 }),
+      upload: () => ({
+        created: 40, updated: 2, unchanged: 5, refused: 0,
+        skipped: 3, policy_skipped: 3,
+      }),
       gmail: () => { throw new Error("Google refused the refresh token (invalid_grant): it is dead"); },
-      google_drive: () => ({ created: 900, updated: 11, unchanged: 120, refused: 0, skipped: 60 }),
+      google_drive: () => ({
+        created: 900, updated: 11, unchanged: 120, refused: 0,
+        skipped: 60, policy_skipped: 60,
+      }),
     });
     sweep = await runLoad(manifestPath, {
       flags: {},
@@ -371,6 +422,41 @@ try {
       sweep.lines.some((l) => /\[1\/5\] Google Calendar.*starting/.test(l)) &&
       sweep.lines.some((l) => /\[5\/5\] Google Drive.*starting/.test(l)),
       sweep.lines.filter((l) => l.includes("starting")).join(" | "));
+  }
+
+  /* ------------------------ skipped files cannot hide behind one accepted file */
+  {
+    const dir = mkdtempSync(join(sandbox, "skipped-gap-"));
+    const manifestPath = writeManifest(dir, {
+      upload: { enabled: true, folders: ["/tmp/fixture-folder"] },
+    });
+    const partlyLoaded = scriptedRegistry({
+      upload: () => ({
+        created: 1, updated: 0, unchanged: 0, refused: 0,
+        skipped: 99, coverage_gaps: 99,
+      }),
+    });
+    const partialRun = await runLoad(manifestPath, {
+      flags: {}, registry: partlyLoaded.table,
+    });
+    check("one accepted file cannot hide 99 files that were not covered",
+      /partly loaded.*99 skipped/i.test(reportSection(partialRun.text, "IN THE BRAIN")) &&
+        /1 partial source outcome/.test(partialRun.error?.message || ""),
+      partialRun.text);
+
+    const allSkipped = scriptedRegistry({
+      upload: () => ({
+        created: 0, updated: 0, unchanged: 0, refused: 0,
+        skipped: 4, coverage_gaps: 4,
+      }),
+    });
+    const emptyRun = await runLoad(manifestPath, {
+      flags: {}, registry: allSkipped.table,
+    });
+    check("an all-skipped source is never listed under IN THE BRAIN",
+      !/Folders on this machine/.test(reportSection(emptyRun.text, "IN THE BRAIN")) &&
+        /Folders on this machine.*no document was accepted/i.test(reportSection(emptyRun.text, "NOT LOADED — failed")),
+      emptyRun.text);
   }
 
   /* ---------------------------------- an unknown count is unknown, never zero */

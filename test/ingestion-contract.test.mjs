@@ -14,7 +14,10 @@ import { DatabaseSync } from "node:sqlite";
 import {
   declaredFamilyUid,
   describeLoadResult,
+  localWalkSnapshotFingerprint,
+  messageIngestionResult,
   planLoad,
+  positiveWholeIngestLimit,
   remoteFamilyOutcomes,
   remoteFamilySettlement,
   sourceCursorCanAdvance,
@@ -24,7 +27,7 @@ import {
   assertIngestionOutcome,
   ingestionOutcome,
 } from "../ingest/outcome.mjs";
-import { prepare } from "../ingest/run.mjs";
+import { prepare, walk } from "../ingest/run.mjs";
 import { buildDriveRemovalPlan } from "../operations/drive-removal-plan.mjs";
 import { sourceFamilyCounts } from "../worker/src/lib/store-d1.js";
 
@@ -34,6 +37,45 @@ const check = (name, condition, detail = "") => {
   assert.ok(condition, `${name}${detail ? `: ${detail}` : ""}`);
   console.log(`PASS  ${name}`);
 };
+
+/* A malformed customer-entered bound must stop before any producer can run. */
+assert.equal(positiveWholeIngestLimit(undefined), Infinity);
+assert.equal(positiveWholeIngestLimit("1"), 1);
+assert.equal(positiveWholeIngestLimit(25), 25);
+for (const invalid of [true, "nope", "-1", "0", "1.5", "1 item", "9007199254740992"]) {
+  assert.throws(() => positiveWholeIngestLimit(invalid), /--limit/);
+}
+check("--limit accepts only a positive safe whole number", true);
+
+{
+  const directory = mkdtempSync(join(tmpdir(), "brain-moving-folder-"));
+  try {
+    writeFileSync(join(directory, "first.txt"), "first stable fixture document");
+    const before = walk(directory);
+    const stableAgain = walk(directory);
+    check("an unchanged local folder keeps one generation fingerprint",
+      localWalkSnapshotFingerprint(before) === localWalkSnapshotFingerprint(stableAgain));
+    writeFileSync(join(directory, "arrived-during-load.txt"), "second fixture document");
+    const after = walk(directory);
+    check("a file arriving during local ingest changes the generation fingerprint",
+      localWalkSnapshotFingerprint(before) !== localWalkSnapshotFingerprint(after));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+const malformedMessageCapture = messageIngestionResult({
+  documents_sent: 1,
+  rows_skipped: { no_guid: 1, no_timestamp: 0, no_text: 4 },
+}, { created: 1, updated: 0, unchanged: 0, refused: 0 });
+check("an accepted message capture with an unusable identity row remains partial",
+  malformedMessageCapture.outcome.kind === "partial" && malformedMessageCapture.coverage_gaps === 1);
+const textOnlyPolicyCapture = messageIngestionResult({
+  documents_sent: 1,
+  rows_skipped: { media_only: 3, no_text: 2, no_identity: 0, no_timestamp: 0 },
+}, { created: 1, updated: 0, unchanged: 0, refused: 0 });
+check("explicit media-only and empty-text policy omissions do not fabricate a data-integrity failure",
+  textOnlyPolicyCapture.outcome.kind === "completed" && textOnlyPolicyCapture.coverage_gaps === 0);
 
 /* The five public states have one canonical, non-overlapping shape. */
 const outcomes = Object.fromEntries(
@@ -60,6 +102,21 @@ check("a forged success-shaped outcome is rejected", true);
 /* Real load-result adapters emit that same contract, not connector folklore. */
 const folderComplete = describeLoadResult({ created: 2, updated: 0, unchanged: 1, refused: 0 });
 const folderPartial = describeLoadResult({ created: 1, updated: 0, unchanged: 0, refused: 1 });
+const folderSkipped = describeLoadResult({
+  created: 1, updated: 0, unchanged: 0, refused: 0, skipped: 9,
+});
+const folderPolicySkipped = describeLoadResult({
+  created: 1, updated: 0, unchanged: 0, refused: 0, skipped: 2, policy_skipped: 2,
+});
+const folderIncompleteExtraction = describeLoadResult({
+  created: 1, updated: 0, unchanged: 0, refused: 0, skipped: 0, incomplete: 1,
+});
+const folderAllSkipped = describeLoadResult({
+  created: 0, updated: 0, unchanged: 0, refused: 0, skipped: 4,
+});
+const folderActuallyEmpty = describeLoadResult({
+  created: 0, updated: 0, unchanged: 0, refused: 0, skipped: 0, scanned: 0, source_inventory: 0,
+});
 const calendarPartial = describeLoadResult({
   sent: { created: 1, updated: 0, unchanged: 0, refused: [], errors: [{}] },
 });
@@ -83,6 +140,19 @@ check("folder completion uses the completed contract",
   folderComplete.outcome.kind === "completed" && folderComplete.partial === false);
 check("folder refusal makes the source partial, never complete",
   folderPartial.outcome.kind === "partial" && folderPartial.outcome.ok === false);
+check("ordinary skipped files make a partly loaded folder explicit",
+  folderSkipped.outcome.kind === "partial" && folderSkipped.partial === true &&
+  /9 skipped/.test(folderSkipped.text));
+check("an explicit owner policy exclusion remains complete within that policy",
+  folderPolicySkipped.outcome.kind === "completed" && folderPolicySkipped.partial === false);
+check("known extraction truncation makes the source partial even when its document was accepted",
+  folderIncompleteExtraction.outcome.kind === "partial" &&
+  /1 incomplete/.test(folderIncompleteExtraction.text));
+check("an all-skipped folder carries no accepted-work claim",
+  folderAllSkipped.outcome.kind === "refused" && folderAllSkipped.acceptedWork === false);
+check("an authoritatively empty folder is not promoted into the brain",
+  folderActuallyEmpty.outcome.kind === "refused" && folderActuallyEmpty.acceptedWork === false &&
+    /authoritative source inventory is empty/.test(folderActuallyEmpty.text));
 check("Calendar send errors make the source partial",
   calendarPartial.outcome.kind === "partial" && calendarPartial.outcome.complete === false);
 check("Calendar pending cancellation cleanup makes the source partial",
