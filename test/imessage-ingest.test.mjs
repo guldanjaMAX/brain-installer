@@ -148,8 +148,8 @@ try {
     const result = await cmdIngestImessage(manifest, manifestPath, { "chat-db": dbPath }, refusing.options);
     check("a credential-gate refusal is explicit and never completion-shaped",
       result.watermark === 4 && result.refused === 1 && result.documents_accepted === 0 &&
-      result.outcome?.kind === "partial" && result.outcome?.complete === false &&
-      refusing.receipts[1].status === "ready" && /credential gate/.test(refusing.receipts[1].refusal_reason || ""),
+      result.outcome?.kind === "refused" && result.outcome?.complete === false &&
+      refusing.receipts[1].status === "error" && /credential gate/.test(refusing.receipts[1].refusal_reason || ""),
       JSON.stringify({ result, receipt: refusing.receipts[1] }));
 
     addMessage({ guid: "IG-D1", text: "And one more for the failure case", ts: "2026-03-05T10:00:00Z" });

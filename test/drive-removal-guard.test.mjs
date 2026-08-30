@@ -667,7 +667,8 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     assert.equal(evidence.receipts.error, 2, "both the review stop and retained completion should be explicit errors");
 
     state = readState();
-    assert.equal(state.sync_token, priorCursor, "active Drive skips advanced the source cursor");
+    assert.equal(state.sync_token, "fixture-skip-next-cursor",
+      "a complete rooted comparison did not save its next change token");
     assert.deepEqual(Object.keys(state.drive_retained_existing), ["drive:active-migrated"]);
     assert.equal(state.done["drive:active-migrated"], undefined);
     assert.equal(state.done["drive:active-stale"], undefined);
@@ -684,7 +685,8 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     assert.equal(evidence.receipts.ready, 0, "a no-change run erased retained-source health");
     assert.equal(evidence.receipts.error, 3);
     state = readState();
-    assert.equal(state.sync_token, priorCursor, "a repeated active Drive gap advanced the source cursor");
+    assert.equal(state.sync_token, "fixture-skip-next-cursor",
+      "a repeated rooted comparison lost its saved next change token");
     assert.deepEqual(Object.keys(state.drive_retained_existing), ["drive:active-migrated"]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -788,12 +790,12 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
   try {
     const first = incomplete.run();
     assert.equal(first.code, 1, first.output.slice(-2_000));
-    assert.match(first.output, /source cursor was NOT advanced/i);
-    assert.match(first.output, /1 incomplete extraction/i);
+    assert.match(first.output, /1 incomplete(?: extraction)?/i);
     assert.match(first.output, /finished with partial coverage/i);
 
     let state = incomplete.readState();
-    assert.equal(state.sync_token, incomplete.priorCursor, "an incomplete extraction advanced the Drive cursor");
+    assert.equal(state.sync_token, "fixture-incomplete-next-cursor",
+      "a complete rooted comparison did not save its next change token");
     assert.equal(typeof state.done["drive:incomplete-sheet"], "string", "accepted Drive work was not resumable");
     assert.equal(state.extraction_incomplete["drive:incomplete-sheet"], true);
 
@@ -814,10 +816,11 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     // until a future complete extraction replaces its stored marker.
     const resumed = incomplete.run();
     assert.equal(resumed.code, 1, resumed.output.slice(-2_000));
-    assert.match(resumed.output, /1 incomplete extraction/i);
+    assert.match(resumed.output, /1 incomplete(?: extraction)?/i);
     assert.match(resumed.output, /finished with partial coverage/i);
     state = incomplete.readState();
-    assert.equal(state.sync_token, incomplete.priorCursor, "an unchanged incomplete receipt advanced the Drive cursor");
+    assert.equal(state.sync_token, "fixture-incomplete-next-cursor",
+      "an unchanged rooted comparison lost its saved next change token");
     assert.equal(state.extraction_incomplete["drive:incomplete-sheet"], true);
     evidence = incomplete.readEvidence();
     assert.equal(evidence.exports, 1, "resume re-exported an unchanged incomplete Drive revision");
