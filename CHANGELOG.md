@@ -6,6 +6,20 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## 0.2.1
 
+- A first load no longer turns partial evidence into a green setup. Corrupt or
+  truncated exports, unreadable files, parser limits, partial provider pages,
+  mixed Calendar failures, and incomplete Drive visibility keep both the direct
+  command and `brain load` non-green while preserving any safely accepted work
+  for a retry. Deliberate policy exclusions remain distinct from accidental
+  coverage gaps.
+- Local-folder refresh now verifies its saved identities against D1, rechecks
+  the complete folder snapshot before approving removals, rejects overlapping
+  source names, and distinguishes a truly empty first source from a previously
+  loaded source that was safely reconciled to empty. `brain load` now includes
+  configured IMAP and watched-folder sources instead of leaving them behind.
+- Setup no longer calls a Brain live from document counts or an assumed empty
+  backlog. It requires a valid D1 inventory and matching Vectorize readiness
+  receipt, and otherwise names the remaining loading or recovery step.
 - The first-install Claude handoff now launches only from a dedicated
   installer-owned workspace, refuses unrelated instruction files, preserves
   structured command arguments, and renders copyable commands with literal

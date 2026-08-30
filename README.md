@@ -233,6 +233,10 @@ brain will not know.
 
 Then drop `--dry-run` to load it for real. Large loads are resumable: if it is
 interrupted, run the same command again and it continues from where it stopped.
+Successfully accepted files remain saved when another file is corrupt,
+truncated, unreadable, or beyond a safety limit, but the command still exits
+non-zero and names the gap. It is safe to repair or split that export and run
+the same command again. A partial load never becomes a green setup receipt.
 
 A refresh may discover files that were deleted, newly excluded, or no longer
 readable. It combines every removal reason into one plan. Up to 100 documents
@@ -244,6 +248,9 @@ never filenames or document IDs. Review the cause, then add the exact
 
 The same plan and the same limits now cover a local folder, because a folder
 that failed to mount looks exactly like a client who deleted everything in it.
+The folder is inventoried again immediately before any removal. If a sync tool,
+cloud placeholder, or another process changes it during the run, the refresh
+stops and deletes nothing.
 
 Ask directly in the terminal, even if you do not have Claude Code or Codex:
 

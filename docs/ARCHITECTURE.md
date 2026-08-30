@@ -200,7 +200,13 @@ receipts keep a redacted reason for audit without storing the refused content.
 
 Local and remote state is saved adjacent to the manifest as
 `.brain-ingest-<source>.json`. Content hashes and source versions make reruns
-resumable. A failure stays retryable. Drive requires reviewed
+resumable. Local resume identities are checked against the exact D1 source
+families before an unchanged file is trusted. A local folder is inventoried
+again immediately before any removal; a changed generation aborts the run and
+deletes nothing. An empty first source is refused, while a previously loaded
+source can complete only after its reviewed removals are read back as an exact
+empty D1 family. Source namespaces are unique across provider and local inputs.
+A failure stays retryable. Drive requires reviewed
 `root_folder_ids`, then revalidates only those subtrees on every run. Direct
 parent queries include Shared Drive support, pagination must make progress, and
 shortcuts never expand authority. Visible trash and visible moves out of scope

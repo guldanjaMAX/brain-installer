@@ -117,6 +117,10 @@ const folderAllSkipped = describeLoadResult({
 const folderActuallyEmpty = describeLoadResult({
   created: 0, updated: 0, unchanged: 0, refused: 0, skipped: 0, scanned: 0, source_inventory: 0,
 });
+const folderReconciledEmpty = describeLoadResult({
+  created: 0, updated: 0, unchanged: 0, refused: 0, skipped: 0, scanned: 0,
+  source_inventory: 0, empty_reconciled: true,
+});
 const calendarPartial = describeLoadResult({
   sent: { created: 1, updated: 0, unchanged: 0, refused: [], errors: [{}] },
 });
@@ -153,6 +157,9 @@ check("an all-skipped folder carries no accepted-work claim",
 check("an authoritatively empty folder is not promoted into the brain",
   folderActuallyEmpty.outcome.kind === "refused" && folderActuallyEmpty.acceptedWork === false &&
     /authoritative source inventory is empty/.test(folderActuallyEmpty.text));
+check("a previously loaded folder may complete after its reviewed deletion reconciles it to empty",
+  folderReconciledEmpty.outcome.kind === "completed" && folderReconciledEmpty.acceptedWork === true &&
+    /reconciled to an authoritatively empty state/.test(folderReconciledEmpty.text));
 check("Calendar send errors make the source partial",
   calendarPartial.outcome.kind === "partial" && calendarPartial.outcome.complete === false);
 check("Calendar pending cancellation cleanup makes the source partial",
