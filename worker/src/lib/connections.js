@@ -17,6 +17,7 @@
 // has access", so generation is part of the liveness test, not an afterthought.
 
 import { sessionGeneration } from "./auth-store.js";
+import { profileFromScope, profileHas } from "./agent-authority.js";
 
 /** Apps holding a live grant, most recently active first. */
 export async function listConnections(env) {
@@ -37,15 +38,19 @@ export async function listConnections(env) {
   ).bind(Date.now(), generation).all();
 
   return results.map((row) => {
-    // GROUP_CONCAT can return "read,read write" when an app refreshed across a
-    // scope change. The widest grant is the true answer to what it can do.
-    const canWrite = /write/.test(row.scopes || "");
+    // One token has exactly one profile. An app may have several live tokens
+    // after reconnecting, so Settings reports every live profile instead of
+    // inventing a combined profile that no individual token holds.
+    const profiles = [...new Set(String(row.scopes || "").split(",").map(profileFromScope))].sort();
     return {
       client_id: row.client_id,
       // A client that never sent a name during registration is still a real
       // grant; say so rather than rendering a blank row.
       name: row.client_name || "an unnamed app",
-      can_write: canWrite,
+      profiles,
+      can_write: profiles.some((profile) => profileHas(profile, "curated:write")),
+      can_diagnose: profiles.some((profile) => profileHas(profile, "diagnostics:read")),
+      can_preview_deletion: profiles.some((profile) => profileHas(profile, "corpus:delete:preview")),
       connected_at: row.connected_at ?? null,
       last_used_at: row.last_used_at ?? null,
     };

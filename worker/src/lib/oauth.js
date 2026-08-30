@@ -19,14 +19,19 @@
  *     "Sign out everywhere" bumps the generation and every connector token
  *     dies with the cookies. One revocation story, no special cases.
  *
- * Tokens grant exactly the read-only privilege class. A leaked connector
- * token can ask questions until revoked or expired, and nothing else.
+ * Tokens grant one exact named agent profile. The default librarian is
+ * read-only. Other profiles are explicit, fixed bundles, and none can execute
+ * deletion. A break-glass token can only create a bounded preview receipt that
+ * still requires a fresh owner passkey on the owner-only HTTP surface.
  */
 
 import { jsonResponse } from "./core.js";
 import { FAVICON } from "./app-page.js";
 import { randomToken, sessionGeneration } from "./auth-store.js";
 import { ownerSessionPrincipal } from "./owner-auth.js";
+import {
+  AGENT_PROFILE_NAMES, DEFAULT_AGENT_PROFILE, profileDescription, profileFromScope, profileHas,
+} from "./agent-authority.js";
 
 const CODE_TTL_MS = 5 * 60 * 1000;
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -84,7 +89,7 @@ export function handleOAuthMetadata(url) {
     grant_types_supported: ["authorization_code"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: ["read", "write"],
+    scopes_supported: AGENT_PROFILE_NAMES,
   });
 }
 
@@ -93,7 +98,7 @@ export function handleProtectedResourceMetadata(url) {
     resource: `${url.origin}/mcp`,
     authorization_servers: [url.origin],
     bearer_methods_supported: ["header"],
-    scopes_supported: ["read", "write"],
+    scopes_supported: AGENT_PROFILE_NAMES,
   });
 }
 
@@ -143,17 +148,12 @@ async function loadClient(env, clientId) {
 }
 
 /**
- * Reduce a requested scope string to the subset this brain grants.
- *
- * Read is always included: a connector that cannot read cannot do anything
- * useful, and a token with write alone would be a strictly stranger thing to
- * hold. Unknown scopes are dropped rather than passed through, so a client
- * asking for something this server has never heard of gets a working token
- * with defined powers instead of an error or an accident.
+ * OAuth stores one named agent profile in its existing scope field. More than
+ * one profile, an unknown scope, or the legacy read/write pair all collapse to
+ * librarian. A client cannot combine roles into an unreviewed capability set.
  */
 export function normalizeScope(requested) {
-  const asked = new Set(String(requested || "read").split(/[\s+]+/).filter(Boolean));
-  return asked.has("write") ? "read write" : "read";
+  return profileFromScope(requested || DEFAULT_AGENT_PROFILE);
 }
 
 function authorizeParams(url) {
@@ -189,18 +189,15 @@ export async function handleAuthorizePage(env, url) {
   }
 
   const name = esc(client.client_name || "A connector");
-  const writes = params.scope.includes("write");
-  // Say what the grant actually allows. A client approving write access has to
-  // be told they are approving write access, in a sentence rather than a scope
-  // string, and told what stays out of reach either way.
-  const grantSentence = writes
-    ? `${esc(client.client_name || "A connector")} will be able to ask questions, read the answers, ` +
-      "and add or correct things in your brain. Removing anything shows you what " +
-      "would go first and waits for you to confirm. Everything it writes is marked " +
-      "as coming from it. It cannot reach your settings or administration."
-    : `${esc(client.client_name || "A connector")} will be able to ask questions and read the ` +
-      "answers. It cannot add, change or remove anything, and cannot reach your " +
-      "settings or administration.";
+  const profile = profileDescription(params.scope);
+  const profileSentences = {
+    librarian: "It can ask questions and read documents. It cannot add, diagnose, change, or remove anything.",
+    "structured-contributor": "It can read and add contract-checked curated lessons. It cannot diagnose or remove anything.",
+    technician: "It can read documents and whole-brain diagnostics. It cannot add, change, or remove anything.",
+    "break-glass": "It can read, diagnose, and prepare an exact short-lived deletion preview. It cannot execute a deletion. Execution always requires your fresh passkey in the owner app.",
+  };
+  const grantSentence = `${esc(client.client_name || "A connector")} is requesting the ${profile.label} profile. ` +
+    profileSentences[profile.name];
   const owner = String(env.BRAIN_OWNER || "").trim();
   // "Dana's brain", not "acme-brain-shadow". The consent screen is the
   // second thing a client ever sees and the first that names a third party, so
@@ -368,7 +365,7 @@ export async function handleToken(env, request) {
   try {
     await env.DB.prepare(
       "INSERT INTO oauth_tokens (token_hash, client_id, scope, session_generation, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).bind(await sha256Hex(token), row.client_id, row.scope || "read", generation, Date.now(), Date.now() + TOKEN_TTL_MS).run();
+    ).bind(await sha256Hex(token), row.client_id, row.scope || DEFAULT_AGENT_PROFILE, generation, Date.now(), Date.now() + TOKEN_TTL_MS).run();
   } catch (error) {
     guard(error);
   }
@@ -376,7 +373,7 @@ export async function handleToken(env, request) {
     access_token: token,
     token_type: "Bearer",
     expires_in: Math.floor(TOKEN_TTL_MS / 1000),
-    scope: row.scope || "read",
+    scope: row.scope || DEFAULT_AGENT_PROFILE,
   });
 }
 
@@ -390,7 +387,7 @@ export async function validateConnectorToken(request, env) {
   let row;
   try {
     row = await env.DB.prepare(
-      "SELECT token_hash, scope, session_generation, expires_at, revoked_at FROM oauth_tokens WHERE token_hash = ?",
+      "SELECT token_hash, client_id, scope, session_generation, expires_at, revoked_at FROM oauth_tokens WHERE token_hash = ?",
     ).bind(await sha256Hex(match[1])).first();
   } catch (error) {
     if (/no such table/i.test(String(error?.message || error))) return false;
@@ -400,7 +397,13 @@ export async function validateConnectorToken(request, env) {
   if (Number(row.session_generation) !== (await sessionGeneration(env))) return false;
   await env.DB.prepare("UPDATE oauth_tokens SET last_used_at = ? WHERE token_hash = ?")
     .bind(Date.now(), row.token_hash).run();
-  // Truthy for any valid token, and carries the granted scope so the endpoint
-  // can refuse a write from a read-only grant.
-  return { scope: String(row.scope || "read"), canWrite: String(row.scope || "").includes("write") };
+  const profile = profileFromScope(row.scope);
+  return {
+    scope: profile,
+    profile,
+    clientId: String(row.client_id || ""),
+    tokenHash: String(row.token_hash),
+    // Kept for downstream compatibility while callers move to capabilities.
+    canWrite: profileHas(profile, "curated:write"),
+  };
 }

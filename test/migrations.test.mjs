@@ -707,9 +707,9 @@ check("restart guard refuses an existing migration column with the wrong contrac
        (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='document_access_grants') document_grants_table,
        (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='support_sessions') support_sessions_table`,
   ).get();
-  check("the published schema-16 access release upgrades cleanly through product schema 23",
+  check(`the published schema-16 access release upgrades cleanly through product schema ${LATEST_SCHEMA}`,
     publishedUpgrade?.schema_version === LATEST_SCHEMA &&
-      publishedUpgrade.receipts === 23 &&
+      publishedUpgrade.receipts === files.length &&
       publishedUpgrade.grants_table === 1 &&
       publishedUpgrade.ledger_table === 1 &&
       publishedUpgrade.document_grants_table === 1 &&

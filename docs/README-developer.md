@@ -286,6 +286,25 @@ listing or prints a stored legacy credential. Claude Desktop remains a manual
 config update; replace its entry with the locator-only JSON from `mcp-config`
 and restart it after a rotation.
 
+Every ordinary local and remote MCP connection starts as `librarian`, with
+`corpus:read` only. A local registration may explicitly set
+`BRAIN_AGENT_PROFILE` or `agent_profile`; remote OAuth stores one named profile
+in its scope field. The reviewed profiles are:
+
+| Profile | Capabilities |
+|---|---|
+| `librarian` | Read corpus evidence |
+| `structured-contributor` | Read and add contract-checked curated lessons |
+| `technician` | Read corpus evidence and whole-brain diagnostics |
+| `break-glass` | Read, diagnose, and prepare an exact deletion preview receipt |
+
+Profiles are exact bundles, not additive scopes. Unknown, legacy `read write`,
+or combined profile requests collapse to `librarian`. No profile contains a
+deletion-execution capability. Break-glass can only prepare a short-lived
+receipt; a separate owner session and fresh receipt-bound passkey assertion are
+required to consume it. Configuration and tool output never print a stored
+credential.
+
 ---
 
 ## Remote sources: Google Drive, Gmail and IMAP
@@ -774,10 +793,11 @@ must never reuse a brain admin key or a client's Cloudflare token.
 
 Read this before scoping an engagement.
 
-- **No owner-facing corpus deletion workflow.** The owner workspace can upload,
-  approve, close periods, explore, manage targets and preferences, and use
-  document grants. Corpus forget remains an operator-only, preview-first admin
-  command until a separate deletion contract is reviewed.
+- **The owner deletion backend has no reviewed frontend or field proof.** The
+  backend now creates exact short-lived receipts, requires a receipt-bound fresh
+  owner passkey, checks unchanged D1 scope, and makes exact response-loss retries
+  idempotent. Settings does not yet expose that ceremony, and it has not run on
+  a final customer domain, physical authenticator, or live Cloudflare D1.
 - **The owner workspace is not field-proven by its local suite.** Passkey,
   entity-scope, and document-grant contracts run against the real Worker code
   with an in-memory D1-shaped adapter. The final domain and physical devices

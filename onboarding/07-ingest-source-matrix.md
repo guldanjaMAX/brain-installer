@@ -412,9 +412,12 @@ Not "not yet". Not planned.
 **Unreviewed permission models.** The product now has exact-document grants and
 entity-scoped owner retrieval. New documents are owner-only by default, and a
 scoped user sees only explicitly granted documents. That does not authorize an
-ad hoc role hierarchy, folder inheritance, or a connector-specific permission
-model. Any request beyond the reviewed exact-document and entity boundaries
-needs a separate security contract rather than a manifest toggle.
+ad hoc human role hierarchy, folder inheritance, or a connector-specific
+permission model. Automation uses a separate fixed profile contract:
+librarian, structured-contributor, technician, or break-glass. Those profiles
+do not widen a person's document authority, and no automation profile can
+execute deletion. Any request beyond the reviewed human or automation
+boundaries needs a separate security contract rather than a manifest toggle.
 
 **Developer tools** (issue trackers, support desks, engineering dashboards). Almost nobody in this business segment runs on them, and building for a customer who does not exist is how a product gets slower for the ones who do.
 

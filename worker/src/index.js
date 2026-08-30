@@ -56,6 +56,9 @@ import {
 } from "./lib/oauth.js";
 import { handleMcp } from "./lib/mcp-endpoint.js";
 import { handleSupportAccess } from "./lib/support-access.js";
+import {
+  AGENT_DELETION_PATH_PREFIX, createAgentDeletionPreview, handleAgentDeletion,
+} from "./lib/agent-action-receipts.js";
 
 /* ------------------------------------------------------------ retrieval */
 
@@ -1614,6 +1617,14 @@ export default {
       return handleFinApi(env, request, url, path);
     }
 
+    // Destructive corpus execution is deliberately separate from ordinary
+    // owner actions. Its receipt and fresh passkey ceremony are enforced by a
+    // dedicated state machine before the shared D1-first forget primitive is
+    // reachable.
+    if (path.startsWith(AGENT_DELETION_PATH_PREFIX)) {
+      return handleAgentDeletion(env, request, path, { forget });
+    }
+
     // Owner writes sit in front of the admin gate because their authority is a
     // positively identified owner passkey principal. The handler rejects live
     // scoped principals and has no admin-key fallback.
@@ -1682,10 +1693,14 @@ export default {
         // the credential scanner, the statement budget and every other guard
         // apply to a connector exactly as they do to a folder or a Drive sync.
         write: async (envelope) => (await handleIngest(env, internalJson("/api/admin/brain/ingest", envelope))).json(),
-        // Deletes PREVIEW by default. dryRun is only lifted when the caller
-        // passes confirm, so a model acting on text it read cannot remove a
-        // client's records in one step.
-        forget: async ({ docUids, confirm }) => forget(env, { docUids, dryRun: !confirm }),
+        diagnose: async () => diagnose(env),
+        previewDeletion: async ({ entitySlug, documentIds }) => createAgentDeletionPreview(env, {
+          entitySlug,
+          documentIds,
+          principalKind: "oauth_connector",
+          principalIdHash: grant.tokenHash,
+          agentProfile: grant.profile,
+        }),
       });
     }
 

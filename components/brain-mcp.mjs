@@ -38,6 +38,9 @@ import {
 import {
   retrievalUnavailable, unavailableGap, unavailableNotice,
 } from "../worker/src/lib/retrieval-status.js";
+import {
+  normalizeAgentProfile, profileDescription, profileHas,
+} from "../worker/src/lib/agent-authority.js";
 
 const SERVER_VERSION = "0.1.0";
 const DEFAULT_PROTOCOL = "2025-06-18";
@@ -67,6 +70,7 @@ const CFG = loadConfig();
 const BASE = (process.env.BRAIN_URL || CFG.url || "").replace(/\/+$/, "");
 const NAME = process.env.BRAIN_NAME || CFG.name || "brain";
 const OWNER = CFG.owner || CFG.display_name || "the owner";
+const PROFILE = normalizeAgentProfile(process.env.BRAIN_AGENT_PROFILE || CFG.agent_profile);
 
 if (!BASE) {
   process.stderr.write(
@@ -229,7 +233,7 @@ function renderLesson(v) {
 /* tools                                                               */
 /* ------------------------------------------------------------------ */
 
-const TOOLS = [
+const ALL_TOOLS = [
   {
     name: "brain_think",
     description:
@@ -285,7 +289,19 @@ const TOOLS = [
   },
 ];
 
+const TOOLS = ALL_TOOLS.filter((tool) => {
+  if (tool.name === "brain_remember") return profileHas(PROFILE, "curated:write");
+  if (tool.name === "brain_health") return profileHas(PROFILE, "diagnostics:read");
+  return true;
+});
+
 async function runTool(name, args = {}) {
+  if (name === "brain_remember" && !profileHas(PROFILE, "curated:write")) {
+    throw new Error("the active agent profile cannot write; use structured-contributor");
+  }
+  if (name === "brain_health" && !profileHas(PROFILE, "diagnostics:read")) {
+    throw new Error("the active agent profile cannot read whole-brain diagnostics");
+  }
   switch (name) {
     case "brain_think": {
       const d = await call("/api/rag/think", {
@@ -428,7 +444,11 @@ Relay the gaps array from brain_think whenever it affects confidence. A cited an
 
 Anchor consultation to the artifact, not the moment: whatever you write before acting should name what came back, including anything that argues against the approach you are taking.
 
-Call brain_remember when a session produces a durable lesson. That is how this record improves instead of merely aging.`;
+${profileHas(PROFILE, "curated:write")
+  ? "Call brain_remember when a session produces a durable lesson. That is how this record improves instead of merely aging."
+  : "This connection is read-only. It cannot add, change, or remove records."}
+
+The active agent profile is ${profileDescription(PROFILE).label}. No local MCP profile can execute a deletion.`;
 
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\n");
 const ok = (id, result) => send({ jsonrpc: "2.0", id, result });

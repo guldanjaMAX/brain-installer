@@ -256,15 +256,15 @@ test("a degraded search never reaches a phone as an absence claim", async () => 
     "a bare empty array reads as 'your corpus has nothing' to the model consuming it");
 });
 
-test("write access: correcting the brain is the point, and the contract still applies", async () => {
+test("structured-contributor can correct the brain and the contract still applies", async () => {
   const { handleMcp } = await import("../src/lib/mcp-endpoint.js");
   const written = [];
   const deps = {
-    grant: { scope: "read write", canWrite: true },
+    grant: { scope: "structured-contributor", profile: "structured-contributor", canWrite: true },
     think: async () => ({ answer: null, citations: [], results: [] }),
     search: async () => ({ results: [] }),
     write: async (envelope) => { written.push(envelope); return { ok: true }; },
-    forget: async (body) => ({ documents: body.docUids.length, dryRun: !body.confirm }),
+    previewDeletion: async () => { throw new Error("not reachable"); },
   };
   const url = new URL(ORIGIN + "/mcp");
   const call = async (name, args, id = 1) => (await (await handleMcp(
@@ -277,7 +277,7 @@ test("write access: correcting the brain is the point, and the contract still ap
   const listed = await (await handleMcp({ BRAIN_NAME: "fixture" },
     jsonPost("/mcp", { jsonrpc: "2.0", id: 9, method: "tools/list" }), url, deps)).json();
   assert.deepEqual(listed.result.tools.map((t) => t.name),
-    ["ask", "search", "fetch", "remember", "forget"]);
+    ["ask", "search", "fetch", "remember"]);
 
   // A correction supersedes rather than overwrites, and is marked as written
   // by a connector so the owner can tell it from their own material.
@@ -309,24 +309,20 @@ test("write access: correcting the brain is the point, and the contract still ap
   assert.match(over, /Note:/);
   assert.match(over, /inferred/);
 
-  // A delete previews first. A model acting on text it read must not be able
-  // to remove an owner's records in a single step.
-  const preview = await call("forget", { ids: ["drive:doc-1", "drive:doc-2"] });
-  assert.match(preview, /Nothing has been removed/);
-  assert.match(preview, /WOULD remove 2 document/);
+  // The old one-call deletion surface is inert for every profile.
   const confirmed = await call("forget", { ids: ["drive:doc-1"], confirm: true });
-  assert.match(confirmed, /Removed 1 document/);
+  assert.match(confirmed, /cannot delete/);
 });
 
 test("a read-only grant is neither shown nor allowed the write tools", async () => {
   const { handleMcp } = await import("../src/lib/mcp-endpoint.js");
   let wrote = false;
   const deps = {
-    grant: { scope: "read", canWrite: false },
+    grant: { scope: "librarian", profile: "librarian", canWrite: false },
     think: async () => ({ answer: null, citations: [], results: [] }),
     search: async () => ({ results: [] }),
     write: async () => { wrote = true; return { ok: true }; },
-    forget: async () => { wrote = true; return {}; },
+    previewDeletion: async () => { wrote = true; return {}; },
   };
   const url = new URL(ORIGIN + "/mcp");
   const listed = await (await handleMcp({ BRAIN_NAME: "fixture" },
@@ -340,7 +336,7 @@ test("a read-only grant is neither shown nor allowed the write tools", async () 
         params: { name, arguments: { title: "t", body: "b".repeat(50), confidence: "unverified", ids: ["x"] } } }),
       url, deps)).json();
     assert.equal(attempt.result.isError, true, `${name} must be refused without write scope`);
-    assert.match(attempt.result.content[0].text, /can only read/);
+    assert.match(attempt.result.content[0].text, /cannot write|cannot delete/);
   }
   assert.equal(wrote, false, "a read-only grant must never reach the write path at all");
 });

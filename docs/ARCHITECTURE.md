@@ -400,6 +400,24 @@ invalidates its sessions, while the global D1 generation remains the separate
 sign-out-everywhere control. Challenges, enrollment codes, and OAuth
 authorization codes choose their only winner through conditional D1 mutation.
 
+Agent authority is separate from human grants. MCP OAuth stores one exact named
+profile: librarian, structured-contributor, technician, or break-glass. The
+default is librarian and legacy additive read/write scopes become librarian.
+Structured contributors may add only contract-checked curated lessons;
+technicians may read whole-corpus diagnostics. Break-glass may create a bounded
+deletion preview receipt but has no deletion execution capability.
+
+Migration 0024 stores only the hash of each short-lived receipt plus its exact
+requesting principal, owner entity, sorted document ids, count, current content
+digest, and expiry. Execution is a separate owner-only route. It requires a new
+WebAuthn assertion over a challenge bound to that receipt and digest, claims one
+execution lease, performs D1-first deletion, verifies absence, and appends one
+human activity event. Changed, expired, replayed with different input, partial,
+or unavailable state fails before a broader delete. An exact retry after lost
+response returns the stored result without a second mutation. These receipts
+are live single-use authority state and must not be restored as durable backup
+data.
+
 ## Support journal
 
 Recognized CLI failures attempt to write one immutable event under

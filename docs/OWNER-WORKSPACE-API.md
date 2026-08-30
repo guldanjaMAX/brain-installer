@@ -1,6 +1,7 @@
 # Owner workspace API contract
 
-This document freezes the backend contract introduced by D1 migration 0021.
+This document freezes the owner backend contract introduced by D1 migration
+0021 and the destructive-action receipt extension in migration 0024.
 All routes use JSON `POST`, return `Cache-Control: no-store`, and require both a
 valid passkey session and `X-Brain-App: 1`. The session must resolve positively
 to `{ kind: "owner", grantId: null }`. There is no admin-key fallback.
@@ -159,8 +160,9 @@ The one human history includes upload, approval, close, target, preference,
 document-grant create/invite-reissue/revoke, and passkey/device changes. Shared
 security writers use `document_grant_created`,
 `document_grant_invite_reissued`, `document_grant_revoked`, `passkey_added`,
-`passkey_renamed`, `passkey_revoked`, and `sessions_revoked` only after a
-successful non-replayed state change. The history never contains document
+`passkey_renamed`, `passkey_revoked`, and `sessions_revoked`; receipt deletion
+uses `corpus_deletion_completed`. Each is appended only after a successful
+state change, and an exact retry after completion adds no second event. The history never contains document
 content, questions, answers, credentials, credential IDs, raw errors, IP
 addresses, user agents, or low-level allow/deny telemetry. Security telemetry
 remains separate.
@@ -225,3 +227,56 @@ therefore reports `degraded:"vector"` and
 `degraded_reason:"entity-vector-authority-unindexed"` until the canonical
 metadata index is built and reprojected. A scoped semantic miss cannot appear
 as a healthy empty result.
+
+## Corpus deletion receipts
+
+Corpus deletion is not part of the shared owner-write envelope. It has a
+separate short-lived authorization state machine introduced by migration 0024.
+All three routes require the positively identified owner session described at
+the top of this document. There is no admin-key fallback.
+
+`POST /api/owner/corpus-deletions/preview` accepts exactly:
+
+```json
+{
+  "entity_slug": "owned_entity",
+  "document_ids": ["drive:one", "upload:two"]
+}
+```
+
+The server requires 1 to 50 unique ids, sorts them, validates exact
+`documents.entity_slug` authority, and returns one opaque five-minute receipt.
+The stored hash binds the exact requesting principal, entity, sorted ids,
+document count, chunk count, current content digest, and expiration. Cross-
+entity and missing ids share the same 404 response.
+
+`POST /api/owner/corpus-deletions/passkey/options` accepts only `{receipt}`.
+The server rechecks the exact selection, then creates a short-lived WebAuthn
+challenge whose purpose binds the receipt hash and selection digest.
+
+`POST /api/owner/corpus-deletions/execute` accepts exactly:
+
+```json
+{
+  "receipt": "opaque preview receipt",
+  "request_id": "stable_delete_attempt",
+  "credentialId": "owner credential id",
+  "authenticatorData": "base64url",
+  "clientDataJSON": "base64url",
+  "signature": "base64url"
+}
+```
+
+Caller-supplied `confirm`, entity, document ids, counts, digest, scope, or
+instructions are invalid. The passkey must be an owner credential, not a
+scoped grant. The server atomically consumes the receipt-bound challenge,
+updates the passkey counter, binds the stable request id and request hash, then
+claims one execution. It rechecks the exact current digest before calling the
+D1-first deletion primitive and verifies that every target is absent afterward.
+
+Expired or changed receipts return 410 or 409. A completed receipt with altered
+input returns 409. An exact response-loss retry returns the stored HTTP 200
+result with `replayed:true`, performs no second corpus mutation, and emits no
+second `corpus_deletion_completed` activity event. D1 unavailability returns
+503 and cannot fall through to deletion. Vector cleanup remains enqueue-only
+through the shared outbox and leased drain.

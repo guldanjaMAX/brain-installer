@@ -306,6 +306,11 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
   contracts pass locally against the real Worker and migration code. A physical
   passkey ceremony on the final customer domain and devices remains a required
   field test before calling this production-proven.
+- **MCP is read-only by default.** Local and remote clients start as a
+  `librarian`. Structured contribution, diagnostics, and break-glass preview
+  require one explicit fixed profile. No agent profile can execute a deletion;
+  consuming an exact short-lived preview receipt requires a fresh owner
+  passkey ceremony.
 - **Facebook Messenger has an export path, not a live connector.** Select
   Messages and JSON in Meta's Download Your Information flow, then load the
   exported `message_*.json` files through Drive or the watched folder. The

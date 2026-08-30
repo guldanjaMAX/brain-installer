@@ -92,11 +92,12 @@ const seedState = (e) => e.raw(
 /* ------------------------------------------------------------- the basics */
 {
   const e = env(); seedState(e);
-  grant(e, { name: "An Assistant", scope: "read", used: now - HOUR });
+  grant(e, { name: "An Assistant", scope: "librarian", used: now - HOUR });
   const [one, ...rest] = await listConnections(e);
   check("a live grant is listed", !!one, JSON.stringify(one));
   check("carries the app name", one?.name === "An Assistant", one?.name);
   check("read scope is not write", one?.can_write === false, String(one?.can_write));
+  check("the exact profile is visible", one?.profiles?.join(",") === "librarian", JSON.stringify(one));
   check("only one row", rest.length === 0, String(rest.length));
 }
 
@@ -127,21 +128,22 @@ const seedState = (e) => e.raw(
 /* ------------------------------------------------- one row per app, not token */
 {
   const e = env(); seedState(e);
-  grant(e, { client: "refresher", scope: "read", created: now - 5 * HOUR, hash: "a" });
-  grant(e, { client: "refresher", scope: "read", created: now - 2 * HOUR, used: now, hash: "b" });
+  grant(e, { client: "refresher", scope: "librarian", created: now - 5 * HOUR, hash: "a" });
+  grant(e, { client: "refresher", scope: "librarian", created: now - 2 * HOUR, used: now, hash: "b" });
   const rows = await listConnections(e);
   check("several tokens collapse to one app", rows.length === 1, String(rows.length));
   check("connected_at is the earliest", rows[0]?.connected_at === now - 5 * HOUR);
   check("last_used_at is the most recent", rows[0]?.last_used_at === now);
 }
 {
-  // An app that refreshed across a scope change holds both. The widest grant
-  // is the true answer to what it can do right now.
+  // An app that reconnects with another profile may hold both through separate
+  // tokens. Settings shows both rather than inventing a combined token role.
   const e = env(); seedState(e);
-  grant(e, { client: "upgraded", scope: "read", hash: "a" });
-  grant(e, { client: "upgraded", scope: "read write", hash: "b" });
+  grant(e, { client: "upgraded", scope: "librarian", hash: "a" });
+  grant(e, { client: "upgraded", scope: "structured-contributor", hash: "b" });
   const [row] = await listConnections(e);
-  check("mixed scopes report the widest", row?.can_write === true, JSON.stringify(row));
+  check("separate live profiles are reported", row?.profiles?.join(",") === "librarian,structured-contributor", JSON.stringify(row));
+  check("structured-contributor reports curated write", row?.can_write === true, JSON.stringify(row));
 }
 
 /* ------------------------------------------------------------ presentation */
