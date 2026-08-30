@@ -37,6 +37,13 @@ install in a clean user-owned prefix, and the named field gates. Fixture and CI
 success do not satisfy a provider, physical passkey, browser, or customer-data
 field gate.
 
+Both Windows matrix jobs must also pass
+`node scripts/windows-dpapi-release-gate.mjs`. This is the shipped production
+compile, protect, unprotect, exact-readback, and cleanup path for 25 fresh
+rounds. Its output is limited to stable stage codes and counts. A CI pass does
+not replace the supervised 25-round clean-client field gate, and a named stage
+is diagnostic evidence rather than proof that the underlying failure is fixed.
+
 ## Proposed branch ruleset
 
 Create one active repository ruleset named `main-and-release` with these exact

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -8,6 +8,7 @@ import { cmdConnectProvider, cmdLocalTools, cmdTechnician } from "../brain.mjs";
 
 import {
   TECHNICIAN_RUN_STEPS,
+  technicianStatusFilePath,
   runTechnicianStep,
   technicianChildEnvironment,
   technicianPlan,
@@ -21,7 +22,7 @@ import {
   installClaudeTechnicianSkill,
 } from "../operations/claude-skill.mjs";
 
-const sandbox = mkdtempSync(join(tmpdir(), "brain-technician-test-"));
+const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "brain-technician-test-")));
 const manifestPath = join(sandbox, "brain.manifest.json");
 const fixtureScriptPath = resolve("/fixture/brain.mjs");
 const fixtureNodePath = resolve("/fixture/node");
@@ -69,6 +70,71 @@ test("local tool readiness proves Claude sign-in, pinned Wrangler, and the inter
   assert.ok(calls.every((call) => call.options.inheritEnv === false));
 });
 
+test("Windows bootstrap repairs PATH, runs the 25-round gate, and launches Claude by exact executable", async () => {
+  const workspace = join(sandbox, "windows-bootstrap");
+  const home = join(sandbox, "windows-skill-home");
+  mkdirSync(workspace, { recursive: true });
+  const intendedManifest = join(workspace, "brain.manifest.json");
+  const environment = {
+    USERPROFILE: "C:\\Users\\fixture-owner",
+    SystemRoot: "C:\\Windows",
+    PATH: "C:\\Windows\\System32;C:\\Owner\\ExistingBin",
+    TEMP: "C:\\Users\\fixture-owner\\AppData\\Local\\Temp",
+  };
+  const officialClaude = "C:\\Users\\fixture-owner\\.local\\bin\\claude.exe";
+  const calls = [];
+  let dpapiRounds = 0;
+  let launch = null;
+  const receipt = await cmdLocalTools({
+    platformName: "win32",
+    environment,
+    manifestPath: intendedManifest,
+    brainCliPath: safeBrainPath,
+    nodePath: safeNodePath,
+    writeStatus: true,
+    handoff: true,
+    deepDpapi: true,
+    isTTY: false,
+    existsImpl: (path) => String(path).toLowerCase() === officialClaude.toLowerCase(),
+    runPowerShell: () => ({ status: 0, stdout: "", stderr: "" }),
+    runCommand: (command, args, options) => {
+      calls.push({ command, args, options });
+      if (command === "npx") return { ok: true, out: "wrangler 4.127.1" };
+      if (args[0] === "--version") return { ok: true, out: "2.1.63 (Claude Code)" };
+      if (args.join(" ") === "auth status") return { ok: true, out: "signed in" };
+      return { ok: false, out: "unexpected fixture command" };
+    },
+    dpapiProbe: (options) => {
+      dpapiRounds = options.rounds;
+      return { checked: true, passed: true, rounds: options.rounds, stage: null };
+    },
+    claudeSkillOptions: { home },
+    launchClaude: (command, args, options) => {
+      launch = { command, args, options };
+      return { status: 0 };
+    },
+  });
+  assert.equal(dpapiRounds, 25);
+  assert.equal(receipt.claude_path, "updated");
+  assert.match(environment.PATH, /^C:\\Users\\fixture-owner\\\.local\\bin;/i);
+  assert.match(environment.PATH, /C:\\Owner\\ExistingBin/i);
+  assert.ok(calls.some((call) => call.command === "claude" && call.args.join(" ") === "auth status"));
+  assert.equal(launch.command, officialClaude);
+  assert.equal(launch.options.shell, false);
+  assert.equal(launch.options.cwd, workspace);
+  assert.match(launch.args[0], /financial-brain-technician/);
+  assert.doesNotMatch(launch.args[0], /fixture-admin|api[_-]?token|client_secret/i);
+
+  const bootstrap = JSON.parse(readFileSync(receipt.status_file, "utf8"));
+  assert.equal(bootstrap.issue_code, "BOOTSTRAP_READY_NO_MANIFEST");
+  assert.equal(bootstrap.checks.dpapi_rounds, 25);
+  assert.equal(bootstrap.release.external_test_kit_required, false);
+  assert.equal(bootstrap.cli.command, safeNodePath);
+  assert.deepEqual(bootstrap.cli.args, [safeBrainPath]);
+  assert.equal(bootstrap.manifest.path, intendedManifest);
+  assert.equal(existsSync(intendedManifest), false);
+});
+
 test("the personal Claude technician skill installs exactly, verifies on rerun, and contains no credential", () => {
   const home = join(sandbox, "skill-home");
   const first = installClaudeTechnicianSkill({ home });
@@ -76,7 +142,7 @@ test("the personal Claude technician skill installs exactly, verifies on rerun, 
   const content = readFileSync(first.path, "utf8");
   assert.match(content, new RegExp(CLAUDE_TECHNICIAN_SKILL_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(content, /\/financial-brain-technician/);
-  assert.match(content, /brain technician/);
+  assert.match(content, /brain technician/i);
   assert.doesNotMatch(content, /CLOUDFLARE_API_TOKEN|ADMIN_KEY|client_secret|app_password/);
   if (process.platform === "win32") assert.equal(statSync(first.path).isFile(), true);
   else assert.equal(statSync(first.path).mode & 0o777, 0o600);
@@ -150,7 +216,96 @@ test("the plan is read-only, ordered, honest about proof, and agent-readable", (
   assert.equal(plan.steps[1].state, "ready_after_local_tools");
   assert.match(plan.warning, /Live proof arrives/i);
   assert.match(JSON.stringify(plan), /hidden terminal prompts/i);
+  assert.ok(plan.steps.every((step) => step.command.startsWith("<brain-cli> ")));
+  assert.doesNotMatch(JSON.stringify(plan.steps), /(^|[^<-])\bbrain technician\b/i);
+  for (const name of ["Slack", "Notion", "Microsoft 365", "Dropbox", "HubSpot", "watched-folder"]) {
+    assert.match(JSON.stringify(plan.coverage), new RegExp(name, "i"));
+  }
   assert.doesNotMatch(JSON.stringify(plan), /client_secret|app_password|api_token/i);
+});
+
+test("the package-local JSON plan exposes stable course-correction fields and an exact launcher", () => {
+  const missing = join(sandbox, "adaptive-plan", "brain.manifest.json");
+  mkdirSync(resolve(missing, ".."), { recursive: true });
+  const plan = technicianPlan(missing, {
+    cli: { command: safeNodePath, args: [safeBrainPath] },
+  });
+  assert.equal(plan.status, "plan_refreshed");
+  assert.equal(plan.issue_code, null);
+  assert.equal(plan.retry_safe, true);
+  assert.equal(plan.requires_human, false);
+  assert.equal(plan.manifest.path, missing);
+  assert.deepEqual(plan.cli, { command: safeNodePath, args: [safeBrainPath] });
+  assert.deepEqual(plan.refresh, {
+    command: safeNodePath,
+    args: [safeBrainPath, "technician", missing, "--json"],
+    mutates_external_state: false,
+  });
+  assert.ok(plan.steps.every((step) => step.command.startsWith(JSON.stringify(safeNodePath))));
+  assert.match(plan.next_action, /explicit owner approval/i);
+});
+
+test("every completed technician step writes a private status that requires an exact read-only refresh", async () => {
+  const workspace = join(sandbox, "adaptive-step");
+  mkdirSync(workspace, { recursive: true });
+  const missing = join(workspace, "brain.manifest.json");
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...parts) => logs.push(parts.join(" "));
+  let receipt;
+  try {
+    receipt = await cmdTechnician(missing, { run: "tools" }, {
+      scriptPath: fixtureScriptPath,
+      nodePath: fixtureNodePath,
+      spawn: () => ({ status: 0 }),
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  const path = technicianStatusFilePath(missing);
+  assert.equal(receipt.status_file, path);
+  const status = JSON.parse(readFileSync(path, "utf8"));
+  assert.equal(status.status, "status_refresh_required");
+  assert.equal(status.issue_code, "TECHNICIAN_STATUS_REFRESH_REQUIRED");
+  assert.equal(status.retry_safe, false);
+  assert.equal(status.requires_human, false);
+  assert.equal(status.manifest.path, missing);
+  assert.deepEqual(status.cli, { command: fixtureNodePath, args: [fixtureScriptPath] });
+  assert.deepEqual(status.refresh, {
+    command: fixtureNodePath,
+    args: [fixtureScriptPath, "technician", missing, "--json"],
+    mutates_external_state: false,
+  });
+  assert.match(status.next_action, /Do not continue from this receipt alone/);
+  assert.match(status.proof_warning, /not inferred from its exit code or the manifest/);
+  assert.match(logs.join("\n"), /machine-readable step status/);
+  if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600);
+
+  const refreshed = technicianPlan(missing, {
+    cli: { command: fixtureNodePath, args: [fixtureScriptPath] },
+  });
+  assert.equal(refreshed.last_step.state, "available");
+  assert.equal(refreshed.last_step.step, "tools");
+  assert.equal(refreshed.last_step.proof_level, "command_return_only");
+});
+
+test("a corrupt manifest still leaves a fail-closed machine-readable step receipt", () => {
+  const workspace = join(sandbox, "adaptive-corrupt");
+  mkdirSync(workspace, { recursive: true });
+  const manifest = join(workspace, "brain.manifest.json");
+  writeFileSync(manifest, "{not-json", "utf8");
+  const result = spawnSync(process.execPath, [
+    resolve("brain.mjs"), "technician", manifest, "--run", "tools",
+  ], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: process.env.HOME, NO_COLOR: "1" } });
+  assert.equal(result.status, 1);
+  assert.match(`${result.stdout}${result.stderr}`, /could not read the technician manifest/i);
+  const status = JSON.parse(readFileSync(technicianStatusFilePath(manifest), "utf8"));
+  assert.equal(status.status, "action_required");
+  assert.equal(status.issue_code, "TECHNICIAN_STEP_FAILED");
+  assert.equal(status.retry_safe, false);
+  assert.equal(status.requires_human, true);
+  assert.equal(status.refresh.mutates_external_state, false);
+  assert.match(status.proof_warning, /did not complete/i);
 });
 
 test("the first technician step verifies local tools before any manifest or account exists", async () => {
@@ -164,7 +319,7 @@ test("the first technician step verifies local tools before any manifest or acco
     spawn: (node, args, options) => { call = { node, args, options }; return { status: 0 }; },
   });
   assert.deepEqual(receipt, { step: "tools", completed: true, commands_run: 1 });
-  assert.deepEqual(call.args, [fixtureScriptPath, "tools"]);
+  assert.deepEqual(call.args, [fixtureScriptPath, "tools", resolve(join(sandbox, "not-created.json"))]);
   assert.equal(call.options.env.CLOUDFLARE_API_TOKEN, undefined);
 });
 
@@ -312,6 +467,13 @@ test("QuickBooks technician JSON failures use a stable nonzero exit and recovery
   assert.equal(payload.error_code, "quickbooks_not_enabled");
   assert.match(payload.recovery, /Enable it before connecting/);
   assert.equal(payload.financial_authority, false);
+  assert.equal(typeof payload.status_file, "string");
+  const status = JSON.parse(readFileSync(payload.status_file, "utf8"));
+  assert.equal(status.status, "action_required");
+  assert.equal(status.issue_code, "QUICKBOOKS_NOT_ENABLED");
+  assert.equal(status.retry_safe, true);
+  assert.equal(status.requires_human, true);
+  assert.equal(status.refresh.mutates_external_state, false);
 });
 
 test("QuickBooks uses two hidden prompts, existing OAuth custody, privacy-safe JSON, and exact verification commands", async () => {
@@ -371,8 +533,8 @@ test("QuickBooks uses two hidden prompts, existing OAuth custody, privacy-safe J
     assert.equal(prompts.length, 2);
     assert.ok(prompts.every((prompt) => /hidden/i.test(prompt.prompt)));
     assert.deepEqual(receipt.verification_commands, [
-      `brain ingest ${JSON.stringify(resolve(manifestPath))} --from quickbooks --dry-run`,
-      `brain ingest ${JSON.stringify(resolve(manifestPath))} --from quickbooks`,
+      `<brain-cli> ingest ${JSON.stringify(resolve(manifestPath))} --from quickbooks --dry-run`,
+      `<brain-cli> ingest ${JSON.stringify(resolve(manifestPath))} --from quickbooks`,
     ]);
   } finally {
     console.log = originalLog;

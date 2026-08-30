@@ -20,7 +20,9 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { platform } from "node:os";
+import { win32 as pathWin32 } from "node:path";
 import { tokenStorageStatus, verifyTokenStorageReadable } from "./connectors/google-auth.mjs";
+import { probeWindowsDpapi } from "./operations/admin-key-file.mjs";
 
 export const OK = "ok";
 export const WARN = "warn";
@@ -140,6 +142,86 @@ export function localToolEnvironment(environment = process.env, overrides = {}) 
     else clean[name] = String(value);
   }
   return clean;
+}
+
+const WINDOWS_CLAUDE_PATH_REPAIR_SCRIPT = [
+  "$claudeBin = [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.local\\bin'))",
+  "$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')",
+  "$parts = @($userPath -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })",
+  "$present = @($parts | Where-Object { [string]::Equals($_, $claudeBin, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0",
+  "if (-not $present) { [Environment]::SetEnvironmentVariable('Path', (($parts + $claudeBin) -join ';'), 'User') }",
+  "$env:Path = $claudeBin + ';' + $env:Path",
+].join("; ");
+
+function normalizedWindowsPath(value) {
+  return pathWin32.normalize(String(value || "").trim()).replace(/[\\/]+$/, "").toLowerCase();
+}
+
+/** Identify the official native Windows install without trusting PATH. */
+export function windowsClaudePathState({
+  environment = process.env,
+  existsImpl = existsSync,
+} = {}) {
+  const profile = String(environment?.USERPROFILE || "").trim();
+  if (!pathWin32.isAbsolute(profile)) {
+    return Object.freeze({ installed: false, onPath: false, bin: null, executable: null });
+  }
+  const bin = pathWin32.join(profile, ".local", "bin");
+  const candidates = [pathWin32.join(bin, "claude.exe"), pathWin32.join(bin, "claude.cmd")];
+  const executable = candidates.find((candidate) => {
+    try { return existsImpl(candidate); } catch { return false; }
+  }) || null;
+  const pathValue = String(environment?.PATH || environment?.Path || "");
+  const target = normalizedWindowsPath(bin);
+  const onPath = pathValue.split(";").some((entry) => normalizedWindowsPath(entry) === target);
+  return Object.freeze({ installed: executable !== null, onPath, bin, executable });
+}
+
+/**
+ * Persist only the missing Claude directory in the current user's PATH.
+ * PowerShell's .NET API preserves the full value; setx is deliberately absent
+ * because it can truncate an existing PATH. The current process is updated too.
+ */
+export function persistWindowsClaudePath({
+  platformName = process.platform,
+  environment = process.env,
+  existsImpl = existsSync,
+  runPowerShell = spawnSync,
+} = {}) {
+  if (platformName !== "win32") return Object.freeze({ status: "not_applicable" });
+  const state = windowsClaudePathState({ environment, existsImpl });
+  if (!state.installed) return Object.freeze({ ...state, status: "not_installed" });
+  if (state.onPath) return Object.freeze({ ...state, status: "verified" });
+  const systemRoot = environment.SystemRoot || environment.SYSTEMROOT || environment.WINDIR;
+  if (!pathWin32.isAbsolute(String(systemRoot || ""))) {
+    return Object.freeze({ ...state, status: "failed", issue_code: "CLAUDE_PATH_RUNTIME_UNAVAILABLE" });
+  }
+  const command = pathWin32.join(
+    systemRoot,
+    "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+  );
+  const result = runPowerShell(command, [
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+    "-Command", WINDOWS_CLAUDE_PATH_REPAIR_SCRIPT,
+  ], {
+    encoding: "utf8",
+    env: localToolEnvironment(environment),
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 15_000,
+    windowsHide: true,
+  });
+  if (result?.error || result?.status !== 0) {
+    return Object.freeze({ ...state, status: "failed", issue_code: "CLAUDE_PATH_UPDATE_FAILED" });
+  }
+  const currentPath = String(environment.PATH || environment.Path || "");
+  environment.PATH = [state.bin, currentPath].filter(Boolean).join(";");
+  return Object.freeze({ ...state, onPath: true, status: "updated" });
+}
+
+function windowsClaudePathRepairText() {
+  return "In PowerShell run this non-truncating user PATH repair, then rerun `brain tools`:\n" +
+    `  ${WINDOWS_CLAUDE_PATH_REPAIR_SCRIPT}`;
 }
 
 /** Preserve a chosen/exported account id, but never an ambient API credential. */
@@ -369,18 +451,37 @@ export function checkClaudeCode({
   runCommand = run,
   required = true,
   platformName = process.platform,
+  environment = process.env,
+  existsImpl = existsSync,
 } = {}) {
-  const r = runCommand("claude", ["--version"], {
+  const windowsState = platformName === "win32"
+    ? windowsClaudePathState({ environment, existsImpl })
+    : null;
+  const command = windowsState?.installed && !windowsState.onPath
+    ? windowsState.executable
+    : "claude";
+  const environmentForProbe = localToolEnvironment(environment, windowsState?.installed && !windowsState.onPath
+    ? { PATH: [windowsState.bin, environment.PATH || environment.Path || ""].filter(Boolean).join(";") }
+    : {});
+  const r = runCommand(command, ["--version"], {
     timeout: 30_000,
     inheritEnv: false,
-    env: localToolEnvironment(),
+    env: environmentForProbe,
   });
   if (r.ok) {
     const version = (r.out.trim().split("\n")[0] || "present").slice(0, 40);
-    const auth = runCommand("claude", ["auth", "status"], {
+    if (windowsState?.installed && !windowsState.onPath) {
+      return check(
+        "Claude Code",
+        required ? FAIL : WARN,
+        `${version}; installed at the official per-user location but missing from PATH`,
+        windowsClaudePathRepairText(),
+      );
+    }
+    const auth = runCommand(command, ["auth", "status"], {
       timeout: 30_000,
       inheritEnv: false,
-      env: localToolEnvironment(),
+      env: environmentForProbe,
     });
     if (auth.ok) return check("Claude Code", OK, `${version}; signed in`);
     return check(
@@ -392,7 +493,7 @@ export function checkClaudeCode({
     );
   }
   const install = platformName === "win32"
-    ? "In PowerShell run: irm https://claude.ai/install.ps1 | iex\n  Close and reopen PowerShell, then run: claude --version\n  Finally run `claude doctor` in that interactive terminal."
+    ? "In PowerShell run Anthropic's official installer: irm https://claude.ai/install.ps1 | iex\n  Then rerun `brain tools`; it checks the official per-user binary and safely repairs the user PATH when needed.\n  Finally run `claude doctor` in that interactive terminal."
     : "Run: curl -fsSL https://claude.ai/install.sh | bash\n  Close and reopen Terminal, then run: claude --version\n  Finally run `claude doctor` in that interactive terminal.";
   return check(
     "Claude Code",
@@ -400,6 +501,40 @@ export function checkClaudeCode({
     required ? "required, but not found on PATH" : "not found on PATH",
     `${install}\n  Do not use sudo or a permission-bypass mode. Then re-run \`brain doctor\`.`
   );
+}
+
+export function checkWindowsCredentialProtection({
+  platformName = process.platform,
+  probe = probeWindowsDpapi,
+  probeOptions = {},
+} = {}) {
+  if (platformName !== "win32") {
+    return check("Windows credential protection", OK, "not applicable on this platform");
+  }
+  const result = probe({ platform: "win32", rounds: 3, ...probeOptions });
+  if (result.passed) {
+    return {
+      ...check(
+      "Windows credential protection",
+      OK,
+      `${result.rounds} in-memory DPAPI protect/decrypt round trips passed and temporary helper artifacts were cleaned`,
+      ),
+      rounds: result.rounds,
+      issue_code: null,
+    };
+  }
+  const stage = String(result.stage || "unknown").replaceAll("_", " ");
+  return {
+    ...check(
+      "Windows credential protection",
+      FAIL,
+      `DPAPI failed at the ${stage} stage after ${result.rounds || 0} completed round trips`,
+      `Issue code: ${result.issue_code || "WINDOWS_DPAPI_UNKNOWN"}. ` +
+        "Keep the prior credential in place. Rerun `brain doctor` in the same Windows user profile after resolving that stage; do not copy the credential into chat or a command.",
+    ),
+    rounds: result.rounds || 0,
+    issue_code: result.issue_code || "WINDOWS_DPAPI_UNKNOWN",
+  };
 }
 
 export function checkCodex() {
@@ -490,6 +625,7 @@ export async function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_
         url: `https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens/verify`,
       }] : []),
     ];
+    let activeOwner = null;
     const rejections = [];
     const networkErrors = [];
     for (const endpoint of endpoints) {
@@ -501,7 +637,15 @@ export async function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_
         let payload = null;
         try { payload = await res.json(); } catch { /* status below is enough */ }
         if (res.ok && payload?.success && payload?.result?.status === "active") {
-          return check("Cloudflare token", OK, `verified and active (${endpoint.owner})`);
+          activeOwner = endpoint.owner;
+          if (!accountId) {
+            return check(
+              "Cloudflare token",
+              OK,
+              `verified and active (${endpoint.owner}); account capabilities will be checked after the manifest selects an account`,
+            );
+          }
+          break;
         }
         const detail = (payload?.errors || []).map((x) => x.message).filter(Boolean).join("; ")
           || `HTTP ${res.status}`;
@@ -524,8 +668,57 @@ export async function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_
         "Cloudflare token",
         WARN,
         "the user-owned token endpoint rejected it, but no account id is available to check whether it is an account-owned token",
-        "Run `brain doctor <manifest>` once the manifest names the Cloudflare account. Doctor will then use the account-scoped verification path before deciding whether the token is invalid.",
+        "Run `brain doctor <manifest>` once the manifest names the Cloudflare account. Doctor will then use read-only account capability probes instead of treating this verification response as an invalid-token verdict.",
       );
+    }
+    if (accountId) {
+      const capabilityProbes = [
+        { name: "Workers Scripts: Edit", path: `/accounts/${accountId}/workers/scripts` },
+        { name: "D1: Edit", path: `/accounts/${accountId}/d1/database` },
+        { name: "Vectorize: Edit", path: `/accounts/${accountId}/vectorize/v2/indexes` },
+        { name: "Workers AI: Read", path: `/accounts/${accountId}/ai/models/search?per_page=1` },
+      ];
+      const confirmed = [];
+      const unavailable = [];
+      const probeNetworkErrors = [];
+      for (const capability of capabilityProbes) {
+        try {
+          const res = await fetchImpl(`https://api.cloudflare.com/client/v4${capability.path}`, {
+            headers: { authorization: `Bearer ${cloudflareToken}` },
+            signal: AbortSignal.timeout(timeoutMs),
+          });
+          let payload = null;
+          try { payload = await res.json(); } catch { /* status below is enough */ }
+          if (res.ok && payload?.success !== false) {
+            confirmed.push(capability.name);
+          } else {
+            const detail = (payload?.errors || []).map((x) => x.message).filter(Boolean).join("; ")
+              || `HTTP ${res.status}`;
+            unavailable.push(`${capability.name} (${detail.slice(0, 60)})`);
+          }
+        } catch (error) {
+          probeNetworkErrors.push(`${capability.name} (${String(error?.message || error).slice(0, 50)})`);
+        }
+      }
+      if (confirmed.length === capabilityProbes.length) {
+        return check(
+          "Cloudflare token",
+          OK,
+          `all four required account surfaces are reachable through read-only probes${activeOwner ? `; token is active (${activeOwner})` : "; token verification endpoints were not used as the verdict"}. Edit authority remains fail-closed until the provisioning operation that needs it`,
+        );
+      }
+      if (unavailable.length) {
+        return check(
+          "Cloudflare token",
+          FAIL,
+          `required account capabilities are unavailable: ${unavailable.join("; ").slice(0, 180)}`,
+          "The token was not declared invalid from a verification endpoint. Review the selected Cloudflare account and ensure the token summary includes exactly these required capabilities: " +
+            `${CF_TOKEN_SCOPES.join(", ")}. Then rerun ` + "`brain doctor <manifest>`.",
+        );
+      }
+      if (probeNetworkErrors.length) {
+        networkErrors.push(...probeNetworkErrors);
+      }
     }
     if (networkErrors.length) {
       // Offline or blocked. Do not claim the token is bad, and do not claim it is good.
@@ -540,9 +733,9 @@ export async function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_
     }
     return check(
       "Cloudflare token",
-      FAIL,
-      `Cloudflare rejected this token on every applicable verification path: ${rejections.join("; ").slice(0, 140)}`,
-      `${CF_TOKEN_REJECTED_REMEDY}\n${CF_PLAN_NOTE}`,
+      WARN,
+      `verification endpoints did not confirm this token, and required account capabilities could not be proven: ${rejections.join("; ").slice(0, 140)}`,
+      "Do not treat this response alone as proof that the token is invalid. Rerun `brain doctor <manifest>` with the exact account id so its read-only Workers, D1, Vectorize, and Workers AI capability checks can decide readiness.",
     );
   }
   return check(
@@ -712,6 +905,7 @@ export async function runAll({
   }
   push(checkAnthropicKey());
   push(checkClaudeCode({ runCommand: localRun, required: requireClaudeCode }));
+  if (process.platform === "win32") push(checkWindowsCredentialProtection());
   push(checkCodex());
   push(checkGoogleConnection(googleStorageStatus));
   return out;

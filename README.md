@@ -83,6 +83,15 @@ the physical passkey gesture. Tokens and app secrets go only into hidden
 terminal prompts or provider pages. The complete guide is
 [onboarding/09-technician-setup-and-rehearsal.md](onboarding/09-technician-setup-and-rehearsal.md).
 
+The deterministic owner handoff starts with `brain tools <manifest> --handoff`.
+On Windows, add `--deep-dpapi` for the 25-round credential-protection
+diagnostic. The command writes a private package-local bootstrap status beside
+the intended manifest and opens Claude with those exact paths. Every selected
+technician step then writes `.financial-brain-technician-status.json` with a
+stable status, issue code, retry boundary, exact manifest, and exact
+package-local refresh launcher. Claude must run that credential-free refresh
+before continuing. A child exit code or a static manifest is not live proof.
+
 The optional Plaid profile is read-only, disabled by default, and still requires
 a client-owned Plaid account plus the account holder's own Link ceremony. Its
 offline rehearsal, opt-in live Sandbox runner, custody rules, and remaining
@@ -93,8 +102,12 @@ you what to do about anything missing. Cloudflare does not expose the account's
 plan through the scoped install token, so confirm **Workers and Pages,
 Plans: Paid** in the dashboard yourself before a production install.
 
-1. **Claude Code and an eligible Claude account.** Install the current native
-   CLI from Anthropic, sign in with `claude auth login`, then run `brain tools`.
+1. **Claude Code and a current paid Anthropic plan that includes Claude Code.**
+   Anthropic controls plan eligibility, regional availability, and pricing, so
+   confirm the current terms on Anthropic's official site before the session.
+   Financial Brain does not include or purchase that third-party subscription.
+   Install the current native CLI from Anthropic, sign in with
+   `claude auth login`, then run `brain tools`.
    The command proves the version, sign-in, Anthropic installation doctor, and
    pinned Wrangler 4. It also installs and reads back the personal
    `/financial-brain-technician` skill. Open Claude Code, type `/skills` to

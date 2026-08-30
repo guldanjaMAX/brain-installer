@@ -21,6 +21,28 @@ import {
 } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 
+const STAGE_PREFIX = "BRAIN_DPAPI_STAGE:";
+
+function stageError(stage, operation) {
+  try {
+    return operation();
+  } catch {
+    const error = new Error(`Windows DPAPI stage failed: ${stage}`);
+    error.stage = stage;
+    throw error;
+  }
+}
+
+async function stageErrorAsync(stage, operation) {
+  try {
+    return await operation();
+  } catch {
+    const error = new Error(`Windows DPAPI stage failed: ${stage}`);
+    error.stage = stage;
+    throw error;
+  }
+}
+
 const WINDOWS_RUNTIME_ENV = Object.freeze([
   "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
   "APPDATA", "LOCALAPPDATA", "USERNAME", "USERDOMAIN", "ComSpec",
@@ -249,7 +271,7 @@ function writeAll(descriptor, bytes) {
 }
 
 async function main() {
-  const raw = parseArgs(process.argv.slice(2));
+  const raw = stageError("contract", () => parseArgs(process.argv.slice(2)));
   const expectedLength = Number(raw.length);
   const maxOutput = Number(raw.max);
   const operation = raw.operation;
@@ -257,21 +279,26 @@ async function main() {
       !Number.isSafeInteger(maxOutput) || maxOutput < 1 || maxOutput > 3 * 1024 * 1024 ||
       !new Set(["protect", "unprotect"]).has(operation) ||
       !isAbsolute(raw.source || "") || basename(raw.source).toLowerCase() !== "windows-dpapi.cs") {
-    throw new Error("invalid bridge contract");
+    const error = new Error("invalid bridge contract");
+    error.stage = "contract";
+    throw error;
   }
 
-  assertFixedSource(raw.source);
-  const runtime = windowsRuntime();
+  stageError("source_validation", () => assertFixedSource(raw.source));
+  const runtime = stageError("runtime_discovery", () => windowsRuntime());
   let directory;
   let input;
   let output;
   let operationError;
   try {
     // Compiler and ACL failures happen before this process reads a credential.
-    directory = createPrivateBuildDirectory(runtime);
-    const helper = compileHelper(runtime, raw.source, directory);
-    input = readExact(expectedLength);
-    output = await invoke({ helper, operation, expectedLength, maxOutput, env: runtime.env }, input);
+    directory = stageError("build_acl", () => createPrivateBuildDirectory(runtime));
+    const helper = stageError("compile", () => compileHelper(runtime, raw.source, directory));
+    input = stageError("input", () => readExact(expectedLength));
+    output = await stageErrorAsync(
+      operation === "protect" ? "protect" : "unprotect",
+      () => invoke({ helper, operation, expectedLength, maxOutput, env: runtime.env }, input),
+    );
   } catch (error) {
     operationError = error;
   } finally {
@@ -279,17 +306,21 @@ async function main() {
   }
   let cleanupError;
   try {
-    if (directory) await cleanBuildDirectory(directory);
+    if (directory) await stageErrorAsync("cleanup", () => cleanBuildDirectory(directory));
   } catch (error) {
     cleanupError = error;
   }
   try {
     if (operationError) throw operationError;
     if (cleanupError) throw cleanupError;
-    writeAll(1, output);
+    stageError("output", () => writeAll(1, output));
   } finally {
     if (output) output.fill(0);
   }
 }
 
-main().catch(() => process.exit(1));
+main().catch((error) => {
+  const stage = /^[a-z_]+$/.test(String(error?.stage || "")) ? error.stage : "unknown";
+  try { writeAll(2, Buffer.from(`${STAGE_PREFIX}${stage}\n`, "ascii")); } catch {}
+  process.exit(1);
+});

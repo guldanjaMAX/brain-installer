@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdtempSync,
   mkdirSync,
+  realpathSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -42,7 +43,7 @@ function run(command, args, options = {}) {
 }
 
 test("the packed CLI scaffolds a nonexistent manifest before any manifest-account lookup", () => {
-  const sandbox = mkdtempSync(join(tmpdir(), "brain-packed-fresh-"));
+  const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "brain-packed-fresh-")));
   try {
     const pack = run(IS_WIN ? "npm.cmd" : "npm", [
       "pack", "--json", "--ignore-scripts", "--pack-destination", sandbox,
@@ -98,10 +99,64 @@ test("the packed CLI scaffolds a nonexistent manifest before any manifest-accoun
     mkdirSync(fakeBin, { recursive: true });
     if (IS_WIN) {
       writeFileSync(join(fakeBin, "npx.cmd"), "@echo off\r\necho wrangler 4.127.1\r\n", "utf8");
+      writeFileSync(join(fakeBin, "claude.cmd"), "@echo off\r\nif \"%1\"==\"--version\" echo 2.1.63 (Claude Code)& exit /b 0\r\nif \"%1 %2\"==\"auth status\" echo signed in& exit /b 0\r\nexit /b 1\r\n", "utf8");
     } else {
       const npx = join(fakeBin, "npx");
       writeFileSync(npx, "#!/bin/sh\nprintf '%s\\n' 'wrangler 4.127.1'\n", "utf8");
       chmodSync(npx, 0o755);
+      const claude = join(fakeBin, "claude");
+      writeFileSync(claude, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '2.1.63 (Claude Code)'; exit 0; fi\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then printf '%s\\n' 'signed in'; exit 0; fi\nexit 1\n", "utf8");
+      chmodSync(claude, 0o755);
+    }
+    const toolEnvironment = {
+      ...baseEnvironment,
+      PATH: [fakeBin, dirname(process.execPath), "/usr/bin", "/bin"].join(IS_WIN ? ";" : ":"),
+    };
+    if (!IS_WIN) {
+      const bootstrap = run(wrapper, ["tools", manifestPath, "--json"], {
+        cwd: sandbox,
+        env: toolEnvironment,
+      });
+      assert.equal(bootstrap.status, 0, `${bootstrap.stdout}\n${bootstrap.stderr}`);
+      const bootstrapStatus = JSON.parse(bootstrap.stdout);
+      assert.equal(bootstrapStatus.issue_code, "BOOTSTRAP_READY_NO_MANIFEST");
+      assert.equal(bootstrapStatus.release.external_test_kit_required, false);
+      assert.equal(bootstrapStatus.manifest.state, "not_created");
+      assert.equal(bootstrapStatus.manifest.path, manifestPath);
+      assert.ok(existsSync(bootstrapStatus.status_file), "the packed wrapper did not write its bootstrap status");
+      assert.ok(existsSync(bootstrapStatus.cli.command), "the status did not keep an exact Node locator");
+      assert.ok(existsSync(bootstrapStatus.cli.args[0]), "the status did not keep an exact package-local CLI locator");
+      assert.ok(
+        existsSync(join(privateHome, ".claude", "skills", "financial-brain-technician", "SKILL.md")),
+        "the packed bootstrap did not install its package-local technician skill",
+      );
+      assert.ok(!existsSync(manifestPath), "read-only bootstrap unexpectedly created the intended manifest");
+
+      const normalClientEnvironment = minimalEnvironment({
+        HOME: privateHome,
+        USERPROFILE: privateHome,
+        PATH: [dirname(process.execPath), "/usr/bin", "/bin"].join(":"),
+        NO_COLOR: "1",
+      });
+      const technician = run(bootstrapStatus.cli.command, [
+        ...bootstrapStatus.cli.args,
+        "technician", manifestPath, "--json",
+      ], { cwd: sandbox, env: normalClientEnvironment });
+      assert.equal(technician.status, 0, `${technician.stdout}\n${technician.stderr}`);
+      const plan = JSON.parse(technician.stdout);
+      assert.equal(plan.mode, "read_only_plan");
+      assert.equal(plan.manifest.exists, false);
+      assert.deepEqual(plan.cli, bootstrapStatus.cli);
+      assert.deepEqual(plan.refresh, {
+        command: bootstrapStatus.cli.command,
+        args: [...bootstrapStatus.cli.args, "technician", manifestPath, "--json"],
+        mutates_external_state: false,
+      });
+      assert.ok(plan.steps.every((step) =>
+        step.command.startsWith(JSON.stringify(bootstrapStatus.cli.command)) &&
+        step.command.includes(JSON.stringify(bootstrapStatus.cli.args[0]))));
+      assert.doesNotMatch(JSON.stringify(plan.steps), /(^|[^\w/.-])brain technician\b/i);
+      assert.match(JSON.stringify(plan.coverage), /watched-folder scheduling ceremony/i);
     }
     const accountId = "a".repeat(32);
     const preload = join(sandbox, "offline-cloudflare.mjs");
@@ -133,7 +188,7 @@ globalThis.fetch = async (input, options = {}) => {
       cwd: sandbox,
       env: {
         ...baseEnvironment,
-        PATH: [fakeBin, dirname(process.execPath), "/usr/bin", "/bin"].join(IS_WIN ? ";" : ":"),
+        PATH: toolEnvironment.PATH,
         CLOUDFLARE_API_TOKEN: "fixture-token-for-packed-wrapper",
         ADMIN_KEY: "fixture-admin-key-for-packed-wrapper-0001",
         NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,

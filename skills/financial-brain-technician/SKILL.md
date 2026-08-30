@@ -1,6 +1,6 @@
 ---
 name: financial-brain-technician
-description: Guide a Financial Brain install, update, connector test, passkey ceremony, or owner handoff from the reviewed local CLI and test kit. Use when the owner asks Claude Code to set up or check their Brain.
+description: Guide a Financial Brain install, update, connector test, passkey ceremony, or owner handoff from the reviewed local CLI and its package-local bootstrap status. Use when the owner asks Claude Code to set up or check their Brain.
 ---
 
 <!-- financial-brain-installer:claude-skill:v1 -->
@@ -13,27 +13,51 @@ upload private data, delete anything, revoke access, change billing, or create
 an invite.
 
 Invoke this guide as `/financial-brain-technician`, optionally followed by the
-absolute test-kit and manifest paths.
+absolute bootstrap-status and intended manifest paths. A client-specific test
+kit is an optional supervised-pilot overlay, not a universal prerequisite.
 
 ## Start here
 
-1. Ask for the path to the Financial Brain test kit and the installed
-   `brain.manifest.json` if they were not supplied in `$ARGUMENTS`.
-2. Read `release.json` in the test kit. Stop if `ready_to_send` is not `true`,
-   the installed version or digest differs, or the intended hostname is empty.
-3. Read the start-here, before-starting, accounts-and-permissions,
-   connector-status, and results-template guides from that same kit. Their
-   filenames may include the owner's name; keep that instance detail out of the
-   installed shared skill.
-4. Run the read-only plan:
+1. Read the owner workspace's `CLAUDE.md` and the absolute
+   `.financial-brain-bootstrap-status.json` named in `$ARGUMENTS`. The status
+   file is the package-local source of truth for this handoff and contains no
+   credential. Stop if its schema is unsupported, its CLI locator is absent, or
+   its recorded package version differs from the CLI's own reported version.
+2. Use the exact Brain CLI invocation in `CLAUDE.md`. If that guide is not
+   installer-owned, construct the invocation from `status.cli.command` followed
+   by `status.cli.args`. Never use a bare `brain` command and never broaden PATH
+   to find it.
+3. If the intended `brain.manifest.json` does not exist, do not ask for an
+   installed manifest or an external test kit. Run the read-only plan against
+   the intended path. It will report `BOOTSTRAP_READY_NO_MANIFEST` and the exact
+   reviewed setup step that can create it after owner approval.
+4. Run the read-only plan with the exact CLI launcher:
 
    ```bash
-   brain technician "/absolute/path/to/brain.manifest.json" --json
+   <brain-cli> technician "/absolute/path/to/brain.manifest.json" --json
    ```
 
 5. Explain the next incomplete step in ordinary language. Before running its
    `--run` command, state what will change and ask the owner to approve that
-   exact action.
+   exact action. On a clean machine this is the manifest-creating Cloudflare
+   setup command. The permission pass stays in the terminal's hidden prompt.
+6. After setup creates the manifest, reread the bootstrap status and transition
+   to manifest-bound technician mode. If an explicitly supplied pilot test kit
+   exists, read it as additional acceptance evidence only. A kit with
+   `ready_to_send: false`, a mismatched version, or a hold marker blocks that
+   pilot, but absence of a kit does not block the packaged owner workflow.
+7. The packaged technician plan currently guides Plaid, Google, QuickBooks,
+   Zoom, IMAP, the first passkey, and final verification. Do not imply that it
+   guides Slack, Notion, Microsoft 365, Dropbox, HubSpot, or watched-folder
+   scheduling ceremonies. Treat those as separate connector or backlog work
+   until the plan names and proves them explicitly.
+8. After every `--run` command, whether it reports completion or failure, read
+   the private `.financial-brain-technician-status.json` path printed by the
+   CLI. Require `status`, `issue_code`, `retry_safe`, `requires_human`,
+   `next_action`, `manifest.path`, and the exact `cli` and `refresh` locators.
+   Run `status.refresh.command` with exactly `status.refresh.args` before
+   deciding what to do next. A child exit code, a `completed` field, or a static
+   manifest is not proof that live state matches the plan.
 
 ## Credential boundary
 
@@ -46,7 +70,7 @@ absolute test-kit and manifest paths.
   the owner to paste the value into Claude.
 - Prefer browser-based `wrangler login` or `gh auth login` for optional local
   developer access. Do not create or print a broad Cloudflare or GitHub token.
-- Prefer `brain` commands over direct Wrangler commands because the Brain CLI
+- Prefer the exact `<brain-cli>` launcher over direct Wrangler commands because the Brain CLI
   applies account pinning, migration safety, protected key lookup, and proof
   checks. Use Wrangler directly only for a named diagnostic the owner approves.
 
@@ -71,7 +95,7 @@ absolute test-kit and manifest paths.
   custody.
 - Confirm `corpora.quickbooks.enabled`, the explicit `sandbox` environment, and
   the exact registered localhost callback in the manifest before running
-  `brain technician <manifest> --run quickbooks`.
+  `<brain-cli> technician <manifest> --run quickbooks`.
 - Explain that Intuit's Accounting consent can authorize reads and writes even
   though Financial Brain performs query/read calls only. Keep that broader
   permission visible before the owner consents.
@@ -85,11 +109,11 @@ absolute test-kit and manifest paths.
   different company needs a separate source and cannot silently replace the
   existing one.
 - Explain that disconnect revokes provider access but keeps imported documents.
-  Any removal is a separate reviewed `brain forget` preview and approval.
+  Any removal is a separate reviewed `<brain-cli> forget` preview and approval.
 - Treat a successful connection or ingest only as a loaded accounting-team
   reference. QuickBooks is not financial authority and must be compared with
   bank evidence and other provenance-bearing records.
-- After a reviewed ingest and bank import, use `brain reconcile quickbooks`
+- After a reviewed ingest and bank import, use `<brain-cli> reconcile quickbooks`
   only for one owner-reviewed account pairing, period, and direction. Prefer
   `--json` and preserve its status, citations, `error_code`, and `recovery`.
 - Never treat an exact pair as a ruling, resolve a generated exception, expose
@@ -106,16 +130,21 @@ absolute test-kit and manifest paths.
 ## Recovery and completion
 
 - A failed technician step is ready to retry after its named prerequisite is
-  fixed. Rerun the same step rather than improvising a replacement workflow.
+  fixed only when its durable status says `retry_safe: true`. Always run the
+  credential-free exact `refresh` command first. If it says false, uncertain,
+  or `requires_human: true`, stop for owner review rather than improvising or
+  blindly retrying a provider response.
 - Explain a stable issue code with:
 
   ```bash
-  brain support --explain <ISSUE_CODE>
+  <brain-cli> support --explain <ISSUE_CODE>
   ```
 
-- Finish with the preflight script and results template supplied in the test
-  kit. Record counts, timestamps, proof level, and sanitized evidence. Keep
-  credentials and raw private source content out of that record.
+- Finish with the package-local bootstrap status and manifest-bound verification
+  steps. When a supervised-pilot test kit is supplied, also complete its
+  preflight and results template. Record counts, timestamps, proof level, and
+  sanitized evidence. Keep credentials and raw private source content out of
+  that record.
 - Report anything that still requires Cloudflare, provider, operating-system,
   physical-device, or real-export proof. Fixture success does not close a live
   connector gate.

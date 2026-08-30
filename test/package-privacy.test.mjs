@@ -428,6 +428,7 @@ const expected = [
   "onboarding/client-experience/support-profile.schema.json",
   "operations/admin-key-file.mjs",
   "operations/admin-key-persistence.mjs",
+  "operations/bootstrap-status.mjs",
   "operations/claude-workspace.mjs",
   "operations/claude-skill.mjs",
   "operations/cloudflare-token-store.mjs",

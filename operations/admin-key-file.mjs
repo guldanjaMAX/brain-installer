@@ -265,15 +265,22 @@ function runWindowsDpapi(input, options, operation, secretForMetadataCheck = nul
     windowsHide: true,
   });
   if (result?.error || result?.status !== 0) {
+    const stderr = Buffer.isBuffer(result?.stderr)
+      ? result.stderr.toString("ascii")
+      : String(result?.stderr || "");
+    const stage = stderr.match(/(?:^|\n)BRAIN_DPAPI_STAGE:([a-z_]+)(?:\n|$)/)?.[1] || "unknown";
     // Never include stderr or the child error object: either may retain child
     // process data, and the caller only needs the safe recovery boundary.
     if (Buffer.isBuffer(result?.stdout)) result.stdout.fill(0);
     if (Buffer.isBuffer(result?.stderr)) result.stderr.fill(0);
-    throw new Error(
+    const error = new Error(
       operation === "protect"
-        ? "Windows could not protect the admin key with DPAPI; the prior key was left untouched"
-        : "Windows could not decrypt the admin key with DPAPI for the current user",
+        ? `Windows could not protect the admin key with DPAPI at the ${stage} stage; the prior key was left untouched`
+        : `Windows could not decrypt the admin key with DPAPI at the ${stage} stage for the current user`,
     );
+    error.code = `WINDOWS_DPAPI_${stage.toUpperCase()}`;
+    error.stage = stage;
+    throw error;
   }
   const output = Buffer.isBuffer(result.stdout)
     ? result.stdout
@@ -288,6 +295,64 @@ function runWindowsDpapi(input, options, operation, secretForMetadataCheck = nul
     );
   }
   return output;
+}
+
+/**
+ * Exercise the exact production DPAPI bridge without persisting a credential.
+ * Each round uses fresh random bytes, verifies exact protect/unprotect readback,
+ * wipes every buffer, and relies on the bridge's mandatory private-build cleanup.
+ */
+export function probeWindowsDpapi(options = {}) {
+  const platform = options.platform ?? process.platform;
+  const rounds = options.rounds ?? 3;
+  if (platform !== "win32") {
+    return Object.freeze({ checked: false, passed: true, rounds: 0, stage: null });
+  }
+  if (!Number.isInteger(rounds) || rounds < 2 || rounds > 32) {
+    throw new TypeError("the Windows DPAPI diagnostic needs two to thirty-two rounds");
+  }
+  const random = options.randomBytes ?? randomBytes;
+  let completed = 0;
+  try {
+    for (let index = 0; index < rounds; index++) {
+      const plain = random(32);
+      if (!Buffer.isBuffer(plain) || plain.length !== 32) {
+        if (Buffer.isBuffer(plain)) plain.fill(0);
+        throw Object.assign(new Error("the Windows DPAPI diagnostic random source failed"), {
+          stage: "diagnostic_input",
+          code: "WINDOWS_DPAPI_DIAGNOSTIC_INPUT",
+        });
+      }
+      let protectedBytes;
+      let opened;
+      try {
+        protectedBytes = runWindowsDpapi(plain, options, "protect");
+        opened = runWindowsDpapi(protectedBytes, options, "unprotect");
+        if (!opened.equals(plain)) {
+          throw Object.assign(new Error("the Windows DPAPI diagnostic readback differed"), {
+            stage: "readback",
+            code: "WINDOWS_DPAPI_READBACK",
+          });
+        }
+        completed++;
+      } finally {
+        plain.fill(0);
+        if (protectedBytes) protectedBytes.fill(0);
+        if (opened) opened.fill(0);
+      }
+    }
+    return Object.freeze({ checked: true, passed: true, rounds: completed, stage: null });
+  } catch (error) {
+    return Object.freeze({
+      checked: true,
+      passed: false,
+      rounds: completed,
+      stage: /^[a-z_]+$/.test(String(error?.stage || "")) ? error.stage : "unknown",
+      issue_code: /^WINDOWS_DPAPI_[A-Z_]+$/.test(String(error?.code || ""))
+        ? error.code
+        : "WINDOWS_DPAPI_UNKNOWN",
+    });
+  }
 }
 
 function protectAdminKeyForWindows(secret, options) {

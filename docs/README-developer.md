@@ -515,10 +515,27 @@ written to Keychain and read back exactly. Browser, Keychain, Expect, ACL, and
 DPAPI helper processes receive a small allowlisted environment rather than the
 Terminal's ambient credentials.
 
-Field evidence is deliberately narrow: on 2026-08-30, one matching Windows 11
-field machine completed a DPAPI CurrentUser encrypt/decrypt round trip. That is
-one-machine field proof, not a universal Windows production claim. The Windows
-CI matrix and fresh-user, moved-profile, and recovery checks remain required.
+Windows evidence remains a release blocker. On 2026-08-30, one matching
+Windows 11 field machine completed an initial DPAPI CurrentUser round trip, but
+a later 25-round diagnostic on that machine observed four failed rounds. The
+stable stage codes help recovery; they are not a fix or production proof. CI
+now invokes the exact production bridge for 25 fresh rounds in both Windows
+Node jobs, but that job is not evidence until the candidate commit runs
+remotely. A supervised clean-client 25-round run plus fresh-user,
+moved-profile, and recovery checks remain separate field gates.
+
+The package-local Claude handoff is deliberately adaptive rather than a static
+prompt. `brain tools <manifest> --handoff` writes
+`.financial-brain-bootstrap-status.json` with exact package and manifest
+locators. Each `brain technician <manifest> --run <step>` invocation writes a
+private `.financial-brain-technician-status.json` on both completion and
+failure. That step receipt contains only stable status fields, `issue_code`,
+`retry_safe`, `requires_human`, an exact `next_action`, the manifest path, and
+the package-local CLI and refresh arrays. Its proof level is
+`command_return_only`. The agent must run the credential-free
+`technician <manifest> --json` refresh before choosing another step and must
+not infer live success from exit code or manifest state. Login, 2FA, credential
+entry, deployment, and data mutations remain owner-confirmed boundaries.
 
 Choose OAuth client type **Desktop app**. Desktop clients accept the local
 loopback callback automatically. Google Cloud does not provide, or require, a

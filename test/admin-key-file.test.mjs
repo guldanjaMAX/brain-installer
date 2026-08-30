@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   cleanupAdminKeyFileResidue,
+  probeWindowsDpapi,
   readAdminKeyFile,
   validateAdminKeyValue,
   validateAdminKeyFileDestination,
@@ -78,6 +79,69 @@ function fakeDpapi(pairs) {
 
 try {
   chmodSync(sandbox, 0o700);
+
+  const diagnosticPairs = [1, 2, 3].map((value) => ({
+    secret: Buffer.alloc(32, value).toString("latin1"),
+    cipher: Buffer.from(`fixture-dpapi-diagnostic-${value}`, "utf8"),
+  }));
+  const diagnosticDpapi = fakeDpapi(diagnosticPairs);
+  let diagnosticIndex = 0;
+  const diagnostic = probeWindowsDpapi({
+    platform: "win32",
+    rounds: 3,
+    randomBytes: () => Buffer.alloc(32, ++diagnosticIndex),
+    runPowerShell: diagnosticDpapi.runPowerShell,
+    environment: {},
+  });
+  assert.deepEqual(diagnostic, {
+    checked: true,
+    passed: true,
+    rounds: 3,
+    stage: null,
+  });
+  assert.equal(diagnosticDpapi.calls.length, 6, "three diagnostics require three protect/decrypt round trips");
+  for (const call of diagnosticDpapi.calls) call.input.fill(0);
+
+  const deepPairs = Array.from({ length: 25 }, (_, index) => ({
+    secret: Buffer.alloc(32, index + 1).toString("latin1"),
+    cipher: Buffer.from(`fixture-dpapi-deep-${index + 1}`, "utf8"),
+  }));
+  const deepDpapi = fakeDpapi(deepPairs);
+  let deepIndex = 0;
+  const deepDiagnostic = probeWindowsDpapi({
+    platform: "win32",
+    rounds: 25,
+    randomBytes: () => Buffer.alloc(32, ++deepIndex),
+    runPowerShell: deepDpapi.runPowerShell,
+    environment: {},
+  });
+  assert.deepEqual(deepDiagnostic, {
+    checked: true,
+    passed: true,
+    rounds: 25,
+    stage: null,
+  });
+  assert.equal(deepDpapi.calls.length, 50, "the deep release diagnostic needs 25 cold protect/decrypt round trips");
+  for (const call of deepDpapi.calls) call.input.fill(0);
+
+  const stagedFailure = probeWindowsDpapi({
+    platform: "win32",
+    rounds: 3,
+    randomBytes: () => Buffer.alloc(32, 9),
+    runPowerShell: () => ({
+      status: 1,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.from("BRAIN_DPAPI_STAGE:compile\n", "ascii"),
+    }),
+    environment: {},
+  });
+  assert.deepEqual(stagedFailure, {
+    checked: true,
+    passed: false,
+    rounds: 0,
+    stage: "compile",
+    issue_code: "WINDOWS_DPAPI_COMPILE",
+  });
 
   assert.equal(validateAdminKeyValue(secretB), secretB, "visible ASCII and an internal space are header-safe");
   for (const unsafe of [

@@ -89,7 +89,7 @@ The brain runs entirely inside accounts you own. I never hold a copy of your dat
 
 **5.5** Do you have a domain you would like this to live on? Something like brain.yourcompany.com.
 
-**5.6** What computer will you run the install from: Windows or Mac? Which eligible Claude account will the owner use for **Claude Code**? Claude Code is part of the delivered setup, not an optional add-on. Codex can also be connected when the owner already uses it.
+**5.6** What computer will you run the install from: Windows or Mac? Which owner-controlled Anthropic account with a current paid plan that includes **Claude Code** will be used? Anthropic controls current plan eligibility, availability, and pricing, and Financial Brain does not include that subscription. Claude Code is part of the delivered setup, not an optional add-on. Codex can also be connected when the owner already uses it.
 
 **5.7** Before our session, run `brain tools`, then the full preflight on that machine and send me what it prints. The first command checks Claude Code, Claude sign-in, Anthropic's interactive doctor, and Wrangler 4. The full preflight checks Node, Cloudflare access, Vectorize, and local clients. The Paid-plan proof is the dashboard screenshot from 5.3. The last line should say "ready to install".
 

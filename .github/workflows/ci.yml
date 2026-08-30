@@ -71,12 +71,13 @@ jobs:
       - name: install
         run: npm ci --ignore-scripts
 
-      # Fixed bytes only. This isolates the built-in C# compiler, private helper
-      # staging, Windows profile, stdin framing, and DPAPI availability without
-      # ever putting a credential in CI output.
-      - name: Windows DPAPI stage probe
+      # Fresh random bytes exercise the exact production bridge for 25 cold
+      # compile/protect/unprotect/cleanup rounds. The wrapper emits stable stage
+      # codes and counts only, never input, ciphertext, child output, or a
+      # credential. This is release evidence, not the supervised client gate.
+      - name: Windows DPAPI 25-round release gate
         if: runner.os == 'Windows'
-        run: node test/fixtures/windows-dpapi-probe.mjs
+        run: node scripts/windows-dpapi-release-gate.mjs
 
       - name: unit and integration suite
         run: npm test

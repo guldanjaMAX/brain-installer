@@ -13,9 +13,12 @@
  * without teaching an agent how to hold credentials.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+
+export const TECHNICIAN_STATUS_SCHEMA_VERSION = 1;
+export const TECHNICIAN_STATUS_BASENAME = ".financial-brain-technician-status.json";
 
 export const TECHNICIAN_STEPS = Object.freeze([
   Object.freeze({
@@ -85,6 +88,126 @@ export const TECHNICIAN_STEPS = Object.freeze([
 
 export const TECHNICIAN_RUN_STEPS = Object.freeze(TECHNICIAN_STEPS.map((step) => step.id));
 
+function cliLocator(cli) {
+  if (!cli?.command || !Array.isArray(cli.args)) return null;
+  return Object.freeze({
+    command: resolve(String(cli.command)),
+    args: Object.freeze(cli.args.map((value) => resolve(String(value)))),
+  });
+}
+
+function exactCommand(cli, args) {
+  if (!cli) return null;
+  return [cli.command, ...cli.args, ...args]
+    .map((value) => JSON.stringify(String(value)))
+    .join(" ");
+}
+
+export function technicianStatusFilePath(manifestPath) {
+  return join(dirname(resolve(String(manifestPath || "brain.manifest.json"))), TECHNICIAN_STATUS_BASENAME);
+}
+
+function safeLastStepStatus(manifestPath, deps = {}) {
+  const path = technicianStatusFilePath(manifestPath);
+  const exists = deps.existsSync || existsSync;
+  const lstat = deps.lstatSync || lstatSync;
+  const read = deps.readFileSync || readFileSync;
+  if (!exists(path)) return Object.freeze({ path, state: "not_recorded" });
+  try {
+    const identity = lstat(path);
+    if (!identity.isFile() || identity.isSymbolicLink() || identity.nlink !== 1 || identity.size > 64 * 1024) {
+      return Object.freeze({ path, state: "invalid" });
+    }
+    const parsed = JSON.parse(read(path, "utf8"));
+    if (parsed?.schema_version !== TECHNICIAN_STATUS_SCHEMA_VERSION ||
+        parsed?.command !== "technician.step" ||
+        !TECHNICIAN_RUN_STEPS.includes(parsed?.step) ||
+        !["status_refresh_required", "action_required"].includes(parsed?.status) ||
+        resolve(String(parsed?.manifest?.path || "")) !== resolve(manifestPath)) {
+      return Object.freeze({ path, state: "invalid" });
+    }
+    return Object.freeze({
+      path,
+      state: "available",
+      step: parsed.step,
+      status: parsed.status,
+      issue_code: /^[A-Z][A-Z0-9_]{2,79}$/.test(String(parsed.issue_code || ""))
+        ? parsed.issue_code
+        : null,
+      retry_safe: parsed.retry_safe === true,
+      requires_human: parsed.requires_human === true,
+      proof_level: parsed.proof_level === "command_return_only"
+        ? parsed.proof_level
+        : "not_verified",
+    });
+  } catch {
+    return Object.freeze({ path, state: "invalid" });
+  }
+}
+
+function safeIssueCode(error) {
+  const source = String(error?.code || "TECHNICIAN_STEP_FAILED").toUpperCase();
+  return /^[A-Z][A-Z0-9_]{2,79}$/.test(source) ? source : "TECHNICIAN_STEP_FAILED";
+}
+
+export function buildTechnicianStepStatus({
+  step,
+  manifestPath,
+  cli,
+  succeeded,
+  error = null,
+  statusFile = null,
+} = {}) {
+  if (!TECHNICIAN_RUN_STEPS.includes(step) || !manifestPath) {
+    throw new TypeError("technician status needs a reviewed step and manifest path");
+  }
+  const locator = cliLocator(cli);
+  if (!locator) throw new TypeError("technician status needs the exact package-local CLI locator");
+  const manifest = resolve(manifestPath);
+  const refreshArgs = [...locator.args, "technician", manifest, "--json"];
+  const refreshCommand = exactCommand(
+    Object.freeze({ command: locator.command, args: locator.args }),
+    ["technician", manifest, "--json"],
+  );
+  const uncertain = error?.uncertain === true || error?.code === "oauth_response_uncertain";
+  const retryableCodes = new Set([
+    "MANIFEST_NOT_FOUND",
+    "QUICKBOOKS_NOT_ENABLED",
+    "QUICKBOOKS_ENVIRONMENT_REQUIRED",
+    "QUICKBOOKS_REDIRECT_HOST_INVALID",
+    "OWNER_CANCELED",
+  ]);
+  const issueCode = succeeded ? "TECHNICIAN_STATUS_REFRESH_REQUIRED" : safeIssueCode(error);
+  return Object.freeze({
+    schema_version: TECHNICIAN_STATUS_SCHEMA_VERSION,
+    command: "technician.step",
+    step,
+    status: succeeded ? "status_refresh_required" : "action_required",
+    issue_code: issueCode,
+    retry_safe: succeeded ? false : (!uncertain && retryableCodes.has(issueCode)),
+    requires_human: succeeded ? false : true,
+    next_action: `Run the credential-free read-only status refresh exactly: ${refreshCommand}. Do not continue from this receipt alone.`,
+    manifest: Object.freeze({ path: manifest }),
+    cli: locator,
+    refresh: Object.freeze({
+      command: locator.command,
+      args: Object.freeze(refreshArgs),
+      mutates_external_state: false,
+    }),
+    status_file: statusFile ? resolve(statusFile) : null,
+    proof_level: "command_return_only",
+    proof_warning: succeeded
+      ? "The selected command returned without an error, but live state was not inferred from its exit code or the manifest."
+      : "The selected command did not complete. Review this issue and the refreshed plan before deciding whether the same step is safe to retry.",
+    boundaries: Object.freeze({
+      status_refresh: "agent_safe",
+      credential_or_login: "requires_human",
+      deploy_or_data_change: "explicit_owner_confirmation_required",
+      uncertain_provider_response: "do_not_blindly_retry",
+    }),
+  });
+}
+
 // A child receives enough normal process context to launch a browser, find
 // Node, and reach the user's OS credential store. Everything credential-like is
 // excluded unless this coordinator adds that exact value for the selected step.
@@ -152,12 +275,40 @@ export function technicianPlan(manifestPath, deps = {}) {
     throw new Error("usage: brain technician <manifest> [--json] [--run <step>]");
   }
   const manifest = readManifestSummary(manifestPath, deps);
+  const cli = cliLocator(deps.cli);
+  const refresh = cli
+    ? Object.freeze({
+        command: cli.command,
+        args: Object.freeze([...cli.args, "technician", manifest.path, "--json"]),
+        mutates_external_state: false,
+      })
+    : null;
   return {
     schema_version: 3,
     mode: "read_only_plan",
+    status: "plan_refreshed",
+    issue_code: null,
+    retry_safe: true,
+    requires_human: false,
+    next_action: "Review the next incomplete step and obtain explicit owner approval before any command that logs in, requests a credential, deploys, or changes data.",
     proof_level: "workflow_only",
     manifest,
+    cli,
+    refresh,
+    last_step: safeLastStepStatus(manifest.path, deps),
     warning: "This plan prepares the workflow. Live proof arrives during the account, connector, webhook, mailbox, and physical passkey checks.",
+    coverage: {
+      guided_steps: [...TECHNICIAN_RUN_STEPS],
+      not_guided_in_this_release: [
+        "Slack connector ceremony",
+        "Notion connector ceremony",
+        "Microsoft 365 connector ceremony",
+        "Dropbox connector ceremony",
+        "HubSpot connector ceremony",
+        "watched-folder scheduling ceremony",
+      ],
+      note: "These sources may have separate connector commands or backlog work, but this technician plan does not claim to guide or prove them.",
+    },
     rules: [
       "Run one step at a time and rerun the same step after an interruption.",
       "Keep tokens, client secrets, app passwords, invite codes, and authentication codes in provider pages or hidden terminal prompts.",
@@ -208,7 +359,7 @@ export function technicianPlan(manifestPath, deps = {}) {
       return {
         order: index + 1,
         ...step,
-        command: technicianDisplayCommand(step.id, manifest.path),
+        command: technicianDisplayCommand(step.id, manifest.path, cli),
         state,
         ...(step.id === "quickbooks"
           ? {
@@ -221,12 +372,19 @@ export function technicianPlan(manifestPath, deps = {}) {
   };
 }
 
-export function technicianDisplayCommand(step, manifestPath) {
-  const quoted = JSON.stringify(resolve(manifestPath));
-  if (step === "google") return `brain technician ${quoted} --run google`;
-  if (step === "imap") return `brain technician ${quoted} --run imap --host <imap-host> --user <email-address>`;
-  if (step === "passkey") return `brain technician ${quoted} --run passkey --confirm-host <final-hostname>`;
-  return `brain technician ${quoted} --run ${step}`;
+export function technicianDisplayCommand(step, manifestPath, cli = null) {
+  const path = resolve(manifestPath);
+  if (!cli) {
+    const quoted = JSON.stringify(path);
+    if (step === "google") return `<brain-cli> technician ${quoted} --run google`;
+    if (step === "imap") return `<brain-cli> technician ${quoted} --run imap --host <imap-host> --user <email-address>`;
+    if (step === "passkey") return `<brain-cli> technician ${quoted} --run passkey --confirm-host <final-hostname>`;
+    return `<brain-cli> technician ${quoted} --run ${step}`;
+  }
+  if (step === "google") return exactCommand(cli, ["technician", path, "--run", "google"]);
+  if (step === "imap") return `${exactCommand(cli, ["technician", path, "--run", "imap"])} --host <imap-host> --user <email-address>`;
+  if (step === "passkey") return `${exactCommand(cli, ["technician", path, "--run", "passkey"])} --confirm-host <final-hostname>`;
+  return exactCommand(cli, ["technician", path, "--run", step]);
 }
 
 export function renderTechnicianPlan(plan) {
@@ -241,6 +399,8 @@ export function renderTechnicianPlan(plan) {
     "This screen prepares the visit. Each live check will add its own proof.",
     "The owner handles login, 2FA, consent, billing, and physical passkey prompts.",
     "Sensitive values stay in provider pages or hidden terminal prompts.",
+    "Commands use <brain-cli>; resolve it from the package-local bootstrap status rather than PATH.",
+    `Not guided here: ${plan.coverage.not_guided_in_this_release.join(", ")}.`,
     "",
   ];
   for (const step of plan.steps) {
@@ -258,7 +418,7 @@ function childCommands(step, manifestPath, flags, scriptPath) {
   const path = resolve(manifestPath);
   const command = (...args) => [scriptPath, ...args];
   switch (step) {
-    case "tools": return [command("tools")];
+    case "tools": return [command("tools", path)];
     case "cloudflare": return [command("setup", path)];
     case "plaid": return [command("secrets", path)];
     case "google": return [command("connect", "google", "--scopes", String(flags.scopes || "drive,gmail,calendar"))];
@@ -456,8 +616,8 @@ export async function runTechnicianStep({
         financial_authority: false,
         oauth_permission: "broad_accounting_scope_runtime_read_only",
         verification_commands: [
-          `brain ingest ${quotedManifest} --from quickbooks --dry-run`,
-          `brain ingest ${quotedManifest} --from quickbooks`,
+          `<brain-cli> ingest ${quotedManifest} --from quickbooks --dry-run`,
+          `<brain-cli> ingest ${quotedManifest} --from quickbooks`,
         ],
       };
     }

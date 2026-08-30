@@ -94,7 +94,9 @@ import {
 import {
   cloudflareCliEnvironment,
   localToolEnvironment,
+  persistWindowsClaudePath,
   run,
+  windowsClaudePathState,
   wranglerProfileArgs,
   WRANGLER_PACKAGE,
 } from "./doctor.mjs";
@@ -103,6 +105,8 @@ import {
   summarize as doctorSummarize,
   checkBankFeedRedirect,
   checkClaudeCode,
+  checkNode,
+  checkWindowsCredentialProtection,
   checkWrangler,
   OK as D_OK,
   WARN as D_WARN,
@@ -127,6 +131,12 @@ import { readAdminKeyFile, validateAdminKeyValue } from "./operations/admin-key-
 import { writeClaudeWorkspaceGuide } from "./operations/claude-workspace.mjs";
 import { installClaudeTechnicianSkill } from "./operations/claude-skill.mjs";
 import {
+  bootstrapManifestObservation,
+  bootstrapStatusFilePath,
+  buildBootstrapStatus,
+  writeBootstrapStatusFile,
+} from "./operations/bootstrap-status.mjs";
+import {
   loadStoredCloudflareToken,
   storeCloudflareToken,
   forgetCloudflareToken,
@@ -140,9 +150,11 @@ import {
   validateBankAccessWrappingKey,
 } from "./operations/bank-access-wrapping-key.mjs";
 import {
+  buildTechnicianStepStatus,
   renderTechnicianPlan,
   runTechnicianStep,
   technicianPlan,
+  technicianStatusFilePath,
 } from "./operations/technician-setup.mjs";
 import { guardBrainAdminFetch } from "./components/brain-http.mjs";
 import { confidenceLine } from "./worker/src/lib/confidence.js";
@@ -14127,8 +14139,59 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
     ["json", "run", "host", "user", "port", "source", "scopes", "confirm-host"],
     "brain technician",
   );
-  const plan = technicianPlan(manifestPath, options.manifestDeps || {});
+  const scriptPath = options.scriptPath || fileURLToPath(import.meta.url);
+  const nodePath = options.nodePath || process.execPath;
+  const cli = { command: nodePath, args: [scriptPath] };
   const step = flags.run ? String(flags.run).trim().toLowerCase() : null;
+  const stepStatusPath = technicianStatusFilePath(manifestPath);
+  const persistStepStatus = (succeeded, error = null) => {
+    const status = buildTechnicianStepStatus({
+      step,
+      manifestPath,
+      cli,
+      succeeded,
+      error,
+      statusFile: stepStatusPath,
+    });
+    const writer = options.writeTechnicianStatus || ((path, payload) =>
+      writeBootstrapStatusFile(path, payload, { path: stepStatusPath }));
+    const written = writer(manifestPath, status);
+    return written?.status || status;
+  };
+  let plan;
+  try {
+    plan = technicianPlan(manifestPath, {
+      ...(options.manifestDeps || {}),
+      cli,
+    });
+  } catch (error) {
+    let failureStatus = null;
+    if (step) {
+      try { failureStatus = persistStepStatus(false, error); } catch { /* no safe receipt was possible */ }
+    }
+    if (flags.json && step === "quickbooks") {
+      throw new JsonFatal({
+        schema_version: 1,
+        command: "technician.quickbooks",
+        status: "error",
+        error_code: error?.code || "quickbooks_plan_unavailable",
+        environment: null,
+        custody: "client_local_provider_store",
+        financial_authority: false,
+        oauth_permission: "broad_accounting_scope_runtime_read_only",
+        verification_commands: [],
+        recovery: "The read-only technician plan could not inspect the intended manifest. No provider action started.",
+        status_file: failureStatus?.status_file || null,
+        refresh: failureStatus?.refresh || null,
+        proof_level: failureStatus?.proof_level || "not_recorded",
+      });
+    }
+    if (failureStatus?.status_file) {
+      warn(`machine-readable step status: ${failureStatus.status_file}`);
+      info(failureStatus.next_action);
+    }
+    die(String(error?.message || error));
+  }
   if (!step) {
     if (flags.json) console.log(JSON.stringify(plan, null, 2));
     else console.log(renderTechnicianPlan(plan));
@@ -14161,11 +14224,11 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
       step,
       manifestPath,
       flags,
-      scriptPath: options.scriptPath || fileURLToPath(import.meta.url),
+      scriptPath,
       readHidden,
       baseEnv: options.baseEnv || process.env,
       spawn: options.spawn || spawnSync,
-      nodePath: options.nodePath || process.execPath,
+      nodePath,
       manifestDeps: options.manifestDeps || {},
       connectProvider: options.connectProvider || ((request) => cmdConnectProvider(
         request.provider,
@@ -14178,6 +14241,16 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
         },
       )),
     });
+    let stepStatus;
+    try {
+      stepStatus = persistStepStatus(true);
+    } catch {
+      const statusError = Object.assign(new Error(
+        "The technician command returned, but its private status receipt could not be written and read back. Do not infer success or continue until the local status path is repaired.",
+      ), { code: "technician_status_write_failed" });
+      statusError.statusWriteFailure = true;
+      throw statusError;
+    }
     if (step === "quickbooks") {
       const output = {
         schema_version: 1,
@@ -14190,6 +14263,9 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
         oauth_permission: receipt.oauth_permission,
         verification_commands: receipt.verification_commands,
         recovery: null,
+        status_file: stepStatus.status_file,
+        refresh: stepStatus.refresh,
+        proof_level: stepStatus.proof_level,
       };
       if (flags.json) console.log(JSON.stringify(output, null, 2));
       else {
@@ -14197,13 +14273,26 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
         info(`dry-run verification: ${receipt.verification_commands[0]}`);
         info(`first ingest after review: ${receipt.verification_commands[1]}`);
         info("Connection success means the QuickBooks reference loaded. It does not mean the books are correct.");
+        info(`machine-readable step status: ${stepStatus.status_file}`);
+        info(stepStatus.next_action);
       }
       return output;
     }
     ok(`${step} technician step completed`);
-    info("rerun `brain technician <manifest>` to see the full plan; live proof still comes from the final field checklist");
-    return receipt;
+    info(`machine-readable step status: ${stepStatus.status_file}`);
+    info(stepStatus.next_action);
+    return { ...receipt, status_file: stepStatus.status_file, refresh: stepStatus.refresh };
   } catch (error) {
+    let failureStatus = null;
+    if (error?.statusWriteFailure !== true) {
+      try {
+        failureStatus = persistStepStatus(false, error);
+      } catch {
+        error = Object.assign(new Error(
+          "The technician step failed and its private status receipt could not be written safely. Stop and repair the local status path before retrying any account or data action.",
+        ), { code: "technician_status_write_failed" });
+      }
+    }
     if (flags.json && step === "quickbooks") {
       const code = error?.code || "quickbooks_connection_failed";
       throw new JsonFatal({
@@ -14217,7 +14306,14 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
         oauth_permission: "broad_accounting_scope_runtime_read_only",
         verification_commands: [],
         recovery: String(error?.message || error),
+        status_file: failureStatus?.status_file || null,
+        refresh: failureStatus?.refresh || null,
+        proof_level: failureStatus?.proof_level || "not_recorded",
       });
+    }
+    if (failureStatus?.status_file) {
+      warn(`machine-readable step status: ${failureStatus.status_file}`);
+      info(failureStatus.next_action);
     }
     die(String(error?.message || error));
   }
@@ -14237,19 +14333,77 @@ async function cmdTechnicianInteractive(manifestPath) {
  */
 export async function cmdLocalTools(options = {}) {
   const runCommand = options.runCommand ?? run;
-  const claude = checkClaudeCode({ runCommand, required: true });
+  const platformName = options.platformName ?? process.platform;
+  const environment = options.environment ?? process.env;
+  const json = options.json === true;
+  const handoff = options.handoff === true;
+  const deepDpapi = options.deepDpapi === true;
+  const shouldWriteStatus = options.writeStatus === true;
+  const targetManifest = resolve(options.manifestPath || "./brain.manifest.json");
+  let claudePath = { status: "not_applicable" };
+  if (platformName === "win32") {
+    claudePath = (options.persistClaudePath ?? persistWindowsClaudePath)({
+      platformName,
+      environment,
+      existsImpl: options.existsImpl,
+      runPowerShell: options.runPowerShell,
+    });
+  }
+  const claude = checkClaudeCode({
+    runCommand,
+    required: true,
+    platformName,
+    environment,
+    existsImpl: options.existsImpl,
+  });
+  const node = checkNode();
   const wrangler = checkWrangler(runCommand);
-  console.log(`\n  ${c.bold("Financial Brain local tools")}\n`);
-  for (const item of [claude, wrangler]) {
+  const dpapi = platformName === "win32"
+    ? checkWindowsCredentialProtection({
+        platformName,
+        probe: options.dpapiProbe,
+        probeOptions: { rounds: deepDpapi ? 25 : 3, ...(options.dpapiProbeOptions || {}) },
+      })
+    : { name: "Windows credential protection", status: D_OK, detail: "not applicable", rounds: 0 };
+  const visibleChecks = platformName === "win32"
+    ? [node, claude, wrangler, dpapi]
+    : [node, claude, wrangler];
+  if (!json) console.log(`\n  ${c.bold("Financial Brain local tools")}\n`);
+  for (const item of visibleChecks) {
+    if (json) continue;
     const mark = item.status === D_OK ? c.green("ok  ") : c.red("FAIL");
     console.log(`  ${mark}  ${item.name.padEnd(18)}  ${item.detail}`);
   }
-  const failed = [claude, wrangler].filter((item) => item.status === D_FAIL);
+  const failed = visibleChecks.filter((item) => item.status === D_FAIL);
+  const manifest = bootstrapManifestObservation(targetManifest, options.manifestObservationOptions || {});
+  const intendedStatusPath = bootstrapStatusFilePath(targetManifest);
+  const cli = {
+    command: options.nodePath || process.execPath,
+    args: [options.brainCliPath || fileURLToPath(import.meta.url)],
+  };
+  const makeStatus = (skill, claudeDoctor) => buildBootstrapStatus({
+    productVersion: PRODUCT_VERSION,
+    manifest,
+    cli,
+    checks: { node, claude, claude_path: claudePath, wrangler, dpapi },
+    skill,
+    claudeDoctor,
+    deepDpapi,
+    statusFile: shouldWriteStatus ? intendedStatusPath : null,
+  });
+  const persistStatus = (status) => {
+    if (!shouldWriteStatus) return status;
+    const writer = options.writeBootstrapStatus ?? writeBootstrapStatusFile;
+    return writer(targetManifest, status, options.bootstrapStatusOptions || {}).status;
+  };
   if (failed.length) {
+    const status = persistStatus(makeStatus(null, "not_run"));
+    if (json) throw new JsonFatal(status);
     console.log(`\n  ${c.bold("What to do")}\n`);
     for (const item of failed) {
       console.log(`  ${c.red(item.name)}\n    ${item.fix.split("\n").join("\n    ")}\n`);
     }
+    if (status.status_file) info(`machine-readable recovery: ${status.status_file}`);
     die("the required local tools are not ready. Fix those items and rerun `brain tools`.");
   }
 
@@ -14259,48 +14413,146 @@ export async function cmdLocalTools(options = {}) {
       options.claudeSkillOptions || { environment: process.env },
     );
   } catch (error) {
+    const status = persistStatus(makeStatus({ status: "failed" }, "not_run"));
+    if (json) throw new JsonFatal(status);
     die(
       `Claude Code is ready, but its Financial Brain technician skill could not be installed safely: ${error?.message || error}\n` +
       "      Nothing existing was overwritten. Resolve that path and rerun `brain tools`."
     );
   }
-  ok(`Claude Code skill /financial-brain-technician ${technicianSkill.status}`);
-  info("Open Claude Code and type `/skills` to see it, or `/financial-brain-technician` to begin the guided plan.");
+  if (!json) {
+    ok(`Claude Code skill /financial-brain-technician ${technicianSkill.status}`);
+    info("Open Claude Code and type `/skills` to see it, or `/financial-brain-technician` to begin the guided plan.");
+  }
 
   const hasTty = options.isTTY ?? (process.stdin.isTTY === true && process.stdout.isTTY === true);
-  if (!hasTty) {
-    warn("Claude Code's full installation doctor needs an interactive terminal and was not run here.");
-    info("Run `claude doctor` in Terminal before the owner handoff.");
-    return {
+  let claudeDoctor = "requires_interactive_terminal";
+  if (!hasTty || json) {
+    if (!json) {
+      warn("Claude Code's full installation doctor needs an interactive terminal and was not run here.");
+      info("Run `claude doctor` in Terminal before the owner handoff.");
+    }
+  } else {
+    console.log(`\n  ${c.bold("Claude Code installation doctor")}\n`);
+    const runClaudeDoctor = options.runClaudeDoctor ?? (() => spawnSync(
+      "claude",
+      ["doctor"],
+      {
+        stdio: "inherit",
+        env: localToolEnvironment(environment),
+        shell: process.platform === "win32",
+        windowsHide: true,
+      },
+    ));
+    const result = await runClaudeDoctor();
+    if (result?.error || result?.status !== 0) {
+      const base = makeStatus(technicianSkill, "failed");
+      const status = persistStatus({
+        ...base,
+        status: "action_required",
+        issue_code: "CLAUDE_DOCTOR_FAILED",
+        retry_safe: true,
+        requires_human: true,
+        next_action: "Resolve Claude Code's installation doctor message, then rerun the same bootstrap command.",
+        recovery: "No provisioning action was started.",
+      });
+      if (json) throw new JsonFatal(status);
+      die("`claude doctor` did not complete cleanly. Fix its message and rerun `brain tools`.");
+    }
+    claudeDoctor = "passed";
+    if (!json) ok("Claude Code, sign-in, technician skill, and Wrangler 4 are ready");
+  }
+
+  let bootstrapStatus = persistStatus(makeStatus(technicianSkill, claudeDoctor));
+  if (json) {
+    console.log(JSON.stringify(bootstrapStatus, null, 2));
+    return bootstrapStatus;
+  }
+  if (bootstrapStatus.status_file) info(`machine-readable bootstrap status: ${bootstrapStatus.status_file}`);
+
+  if (handoff) {
+    let guide;
+    try {
+      const writeGuide = options.writeClaudeWorkspaceGuide ?? writeClaudeWorkspaceGuide;
+      guide = writeGuide(targetManifest, {
+        brainCliPath: cli.args[0],
+        nodePath: cli.command,
+        bootstrapStatusPath: bootstrapStatus.status_file,
+      });
+    } catch {
+      const failure = {
+        ...bootstrapStatus,
+        status: "action_required",
+        issue_code: "CLAUDE_WORKSPACE_UNAVAILABLE",
+        retry_safe: true,
+        requires_human: true,
+        next_action: "Resolve the local workspace guide path, then rerun the same bootstrap handoff.",
+        recovery: "No existing CLAUDE.md was replaced and no provisioning action was started.",
+      };
+      bootstrapStatus = persistStatus(failure);
+      die("the Claude owner workspace could not be prepared safely. No existing CLAUDE.md was replaced.");
+    }
+    if (!["written", "verified"].includes(guide.status)) {
+      warn(`preserved the existing CLAUDE.md at ${guide.path}; the explicit bootstrap status remains authoritative for this handoff`);
+    }
+    const windowsClaude = platformName === "win32"
+      ? windowsClaudePathState({ environment, existsImpl: options.existsImpl }).executable
+      : null;
+    const nativeClaude = environment.HOME
+      ? join(environment.HOME, ".local", "bin", "claude")
+      : null;
+    const launcher = options.claudeExecutable || windowsClaude ||
+      (nativeClaude && (options.existsImpl ?? existsSync)(nativeClaude) ? nativeClaude : "claude");
+    const starter =
+      `/financial-brain-technician Read the local bootstrap status at ${JSON.stringify(bootstrapStatus.status_file)} ` +
+      `and use the intended manifest at ${JSON.stringify(targetManifest)}. Begin read-only and keep every credential in a hidden prompt or provider page.`;
+    const launch = options.launchClaude ?? spawnSync;
+    const launched = launch(launcher, [starter], {
+      cwd: dirname(targetManifest),
+      env: localToolEnvironment(environment),
+      shell: false,
+      stdio: "inherit",
+      windowsHide: true,
+    });
+    if (launched?.error || launched?.status !== 0) {
+      bootstrapStatus = persistStatus({
+        ...bootstrapStatus,
+        status: "action_required",
+        issue_code: "CLAUDE_HANDOFF_FAILED",
+        retry_safe: true,
+        requires_human: false,
+        next_action: "Open Claude Code in the Financial Brain workspace and invoke /financial-brain-technician with the local bootstrap status path.",
+        recovery: "The local status and technician skill remain ready; no provisioning action was started.",
+      });
+      die("Claude Code did not open cleanly. Use the machine-readable status path printed above to start the technician skill manually.");
+    }
+  }
+
+  const receipt = {
       claude: "ready",
       wrangler: "ready",
       technician_skill: technicianSkill.status,
-      claude_doctor: "requires_interactive_terminal",
+      claude_doctor: claudeDoctor,
+      ...(platformName === "win32" ? { claude_path: claudePath.status } : {}),
     };
-  }
+  if (shouldWriteStatus) receipt.status_file = bootstrapStatus.status_file;
+  return receipt;
+}
 
-  console.log(`\n  ${c.bold("Claude Code installation doctor")}\n`);
-  const runClaudeDoctor = options.runClaudeDoctor ?? (() => spawnSync(
-    "claude",
-    ["doctor"],
-    {
-      stdio: "inherit",
-      env: localToolEnvironment(),
-      shell: process.platform === "win32",
-      windowsHide: true,
-    },
-  ));
-  const result = await runClaudeDoctor();
-  if (result?.error || result?.status !== 0) {
-    die("`claude doctor` did not complete cleanly. Fix its message and rerun `brain tools`.");
-  }
-  ok("Claude Code, sign-in, technician skill, and Wrangler 4 are ready");
-  return {
-    claude: "ready",
-    wrangler: "ready",
-    technician_skill: technicianSkill.status,
-    claude_doctor: "passed",
-  };
+async function cmdLocalToolsInteractive(manifestPath) {
+  const flags = parseFlags(process.argv.slice(3));
+  assertKnownFlags(flags, ["json", "handoff", "deep-dpapi"], "brain tools");
+  if (flags.json && flags.handoff) die("--json and --handoff are separate bootstrap modes");
+  const target = typeof manifestPath === "string" && !manifestPath.startsWith("--")
+    ? manifestPath
+    : "./brain.manifest.json";
+  return cmdLocalTools({
+    manifestPath: target,
+    json: flags.json === true,
+    handoff: flags.handoff === true,
+    deepDpapi: flags["deep-dpapi"] === true,
+    writeStatus: true,
+  });
 }
 
 /** Mint a one-time passkey enrollment link for the brain's owner. */
@@ -14909,7 +15161,7 @@ const commands = {
   reconcile: cmdReconcile,
   schedule: cmdSchedule,
   support: cmdSupport,
-  tools: cmdLocalTools,
+  tools: cmdLocalToolsInteractive,
   technician: cmdTechnicianInteractive,
 };
 
@@ -14921,7 +15173,10 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain setup      [manifest] --no-connect  same, without touching THIS computer's AI tool config
     brain ask        <manifest>            ask a private question in this terminal
     brain doctor     [manifest]            check this machine has everything it needs
-    brain tools                            verify Claude Code sign-in and Wrangler 4 locally
+    brain tools      [manifest]            verify local tools and write machine-readable bootstrap status
+    brain tools      [manifest] --handoff  open Claude Code in the owner workspace with that status
+    brain tools      [manifest] --json     print the same stable status for an agent or test
+    brain tools      [manifest] --deep-dpapi  run the 25-cold-round Windows release diagnostic
     brain verify     <manifest>            check the token and resolve the account
     brain provision  <manifest>            create D1 (and R2), write IDs back
     brain secrets    <manifest>            set secrets and durably rotate ADMIN_KEY

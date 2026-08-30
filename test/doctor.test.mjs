@@ -1,5 +1,6 @@
 import { run, localToolEnvironment, cloudflareCliEnvironment,
          checkNode, checkClaudeCode, checkCodex, checkAnthropicKey, checkGoogleConnection,
+         checkWindowsCredentialProtection, persistWindowsClaudePath, windowsClaudePathState,
          checkWrangler,
          checkWranglerLogin, checkVectorize, checkVectorizeApi, checkCfToken, CF_TOKEN_SCOPES,
          wranglerProfileArgs, wranglerProfileName, WRANGLER_PACKAGE,
@@ -41,6 +42,70 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     : { ok: true, out: "2.1.63 (Claude Code)" };
   check("an installed but signed-out Claude Code is not a false green",
     checkClaudeCode({ runCommand: signedOutTool }).status === FAIL);
+  const windowsEnvironment = {
+    USERPROFILE: "C:\\Users\\Fixture",
+    SystemRoot: "C:\\Windows",
+    PATH: "C:\\Windows\\System32;C:\\Existing Tools",
+  };
+  const windowsClaude = "C:\\Users\\Fixture\\.local\\bin\\claude.exe";
+  const existsWindowsClaude = (path) => path.toLowerCase() === windowsClaude.toLowerCase();
+  const pathState = windowsClaudePathState({
+    environment: windowsEnvironment,
+    existsImpl: existsWindowsClaude,
+  });
+  check("Windows doctor detects the official Claude binary outside PATH",
+    pathState.installed && !pathState.onPath && pathState.executable === windowsClaude,
+    JSON.stringify(pathState));
+  const offPath = checkClaudeCode({
+    runCommand: healthyTool,
+    platformName: "win32",
+    environment: windowsEnvironment,
+    existsImpl: existsWindowsClaude,
+  });
+  check("an official Windows install outside PATH gets the exact recovery instead of an install loop",
+    offPath.status === FAIL && /official per-user location.*missing from PATH/i.test(offPath.detail),
+    JSON.stringify(offPath));
+  check("the Windows PATH recovery uses the non-truncating user API and never setx",
+    /SetEnvironmentVariable\('Path'.*'User'\)/i.test(offPath.fix) && !/\bsetx\b/i.test(offPath.fix),
+    offPath.fix);
+  let pathRepairCall;
+  const repaired = persistWindowsClaudePath({
+    platformName: "win32",
+    environment: windowsEnvironment,
+    existsImpl: existsWindowsClaude,
+    runPowerShell: (command, args, options) => {
+      pathRepairCall = { command, args, options };
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  check("brain tools can persist the missing Windows Claude directory without discarding PATH",
+    repaired.status === "updated" && windowsEnvironment.PATH.startsWith("C:\\Users\\Fixture\\.local\\bin;") &&
+      windowsEnvironment.PATH.includes("C:\\Existing Tools"), JSON.stringify(repaired));
+  check("the PATH repair child is credential-scrubbed and shell-free",
+    pathRepairCall.options.shell === false && pathRepairCall.options.env.CLOUDFLARE_API_TOKEN === undefined &&
+      /SetEnvironmentVariable/.test(pathRepairCall.args.at(-1)) && !/\bsetx\b/i.test(pathRepairCall.args.at(-1)),
+    JSON.stringify(pathRepairCall?.args));
+  check("the same Windows Claude install passes after current-process PATH recovery",
+    checkClaudeCode({
+      runCommand: healthyTool,
+      platformName: "win32",
+      environment: windowsEnvironment,
+      existsImpl: existsWindowsClaude,
+    }).status === OK);
+  const dpapiPassed = checkWindowsCredentialProtection({
+    platformName: "win32",
+    probe: () => ({ passed: true, rounds: 3, stage: null }),
+  });
+  check("Windows doctor requires several DPAPI round trips without claiming a rate",
+    dpapiPassed.status === OK && /3 in-memory DPAPI/i.test(dpapiPassed.detail) && !/\d+\s*\/\s*\d+/.test(dpapiPassed.detail),
+    JSON.stringify(dpapiPassed));
+  const dpapiFailed = checkWindowsCredentialProtection({
+    platformName: "win32",
+    probe: () => ({ passed: false, rounds: 1, stage: "compile", issue_code: "WINDOWS_DPAPI_COMPILE" }),
+  });
+  check("Windows doctor identifies the failed DPAPI stage with a stable code",
+    dpapiFailed.status === FAIL && /compile stage/i.test(dpapiFailed.detail) && /WINDOWS_DPAPI_COMPILE/.test(dpapiFailed.fix),
+    JSON.stringify(dpapiFailed));
   check("the profile-capable Wrangler release is a blocking requirement and is pinned through npx",
     checkWrangler(healthyTool).status === OK);
   check("Codex is never fatal", checkCodex().status !== FAIL);
@@ -193,7 +258,8 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   });
   check("a valid user-owned token passes through the user-scoped verification path",
     userOwned.status === OK && /user-owned/.test(userOwned.detail) &&
-      userCalls.length === 1 && /\/user\/tokens\/verify$/.test(userCalls[0]),
+      userCalls.length === 5 && /\/user\/tokens\/verify$/.test(userCalls[0]) &&
+      userCalls.slice(1).every((url) => url.includes(`/accounts/${accountId}/`)),
     JSON.stringify({ userOwned, userCalls }));
 
   const accountCalls = [];
@@ -208,8 +274,23 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   });
   check("a valid account-owned token survives the user-endpoint rejection and passes account-scoped verification",
     accountOwned.status === OK && /account-owned/.test(accountOwned.detail) &&
-      accountCalls[1] === `https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens/verify`,
+      accountCalls[1] === `https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens/verify` &&
+      accountCalls.length === 6,
     JSON.stringify({ accountOwned, accountCalls }));
+
+  const capabilityCalls = [];
+  const validAccountToken = await checkCfToken("fixture-valid-account-token", {
+    accountId,
+    fetchImpl: async (url) => {
+      capabilityCalls.push(url);
+      if (/\/tokens\/verify$/.test(url)) return fixtureResponse(403, rejected);
+      return fixtureResponse(200, { success: true, result: [] });
+    },
+  });
+  check("an account token is not falsely rejected when both token-verification endpoints reject it",
+    validAccountToken.status === OK && /four required account surfaces/i.test(validAccountToken.detail) &&
+      capabilityCalls.length === 6,
+    JSON.stringify({ validAccountToken, capabilityCalls }));
 
   const invalidCalls = [];
   const invalid = await checkCfToken("fixture-invalid-token", {
@@ -219,11 +300,11 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
       return fixtureResponse(403, rejected);
     },
   });
-  check("an invalid token fails closed only after both applicable ownership paths reject it",
-    invalid.status === FAIL && invalidCalls.length === 2 && /every applicable verification path/i.test(invalid.detail),
+  check("an unproven token fails closed only after read-only account capability probes",
+    invalid.status === FAIL && invalidCalls.length === 6 && /required account capabilities are unavailable/i.test(invalid.detail),
     JSON.stringify({ invalid, invalidCalls }));
-  check("the invalid-token message says what to actually check",
-    /copied whole|expired|API Tokens/i.test(invalid.fix), invalid.fix);
+  check("a verification rejection alone is never rendered as an invalid-token verdict",
+    /not declared invalid/i.test(invalid.fix) && !/this token.*invalid/i.test(invalid.detail), invalid.fix);
 
   const ownershipUnknown = await checkCfToken("fixture-account-owned-token", {
     fetchImpl: async () => fixtureResponse(403, rejected),

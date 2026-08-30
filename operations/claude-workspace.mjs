@@ -33,12 +33,16 @@ function safeLocator(value, label) {
 export function renderClaudeWorkspaceGuide(manifestPath, {
   brainCliPath = process.argv[1],
   nodePath = null,
+  bootstrapStatusPath = null,
 } = {}) {
   const manifest = safeLocator(manifestPath, "manifest path");
   const brainScript = safeLocator(brainCliPath, "Brain CLI path");
   const brain = nodePath
     ? `${JSON.stringify(safeLocator(nodePath, "Node path"))} ${JSON.stringify(brainScript)}`
     : JSON.stringify(brainScript);
+  const bootstrapStatus = bootstrapStatusPath
+    ? safeLocator(bootstrapStatusPath, "bootstrap status path")
+    : join(dirname(manifest), ".financial-brain-bootstrap-status.json");
   return `${CLAUDE_WORKSPACE_MARKER}
 # Financial Brain owner workspace
 
@@ -59,6 +63,7 @@ registered Financial Brain MCP server before reaching for Cloudflare directly.
 - Guided install and connector skill: \`/financial-brain-technician\`
 - Confirm it is available in Claude Code: \`/skills\`
 - Brain CLI invocation: \`${brain}\`
+- Package-local bootstrap status: \`${bootstrapStatus}\`
 - Manifest: \`${manifest}\`
 - Readiness: \`${brain} doctor ${manifest}\`
 - Source status: \`${brain} sources ${manifest}\`

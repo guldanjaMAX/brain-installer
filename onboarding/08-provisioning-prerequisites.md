@@ -13,7 +13,7 @@ account alone.
 
 | # | Thing | Time | Why |
 |---|---|---|---|
-| 1 | Claude Code plus an eligible Claude account | 5 min | Claude Code is part of the owner handoff and is connected directly to the Brain |
+| 1 | Claude Code plus a current paid Anthropic plan that includes Claude Code | 5 min | Anthropic controls current eligibility, availability, and pricing; Financial Brain does not include that subscription |
 | 2 | Node.js 22 or newer | 5 min | Runs the Brain CLI and the pinned Wrangler 4 command |
 | 3 | A Cloudflare account | 5 min | Everything lives here. Theirs, not ours |
 | 4 | **Workers Paid plan on it** | 2 min | 5 USD/month minimum. The Free plan is prototype-scale, not a supported production home for a real corpus |
@@ -21,6 +21,9 @@ account alone.
 
 No Supabase, database password, or separate answer-model API key is required.
 The Claude account is for the owner's Claude Code client, not for Worker answers.
+Confirm current plan eligibility and cost on Anthropic's official site before the
+session. Do not quote a frozen price or imply that Financial Brain includes the
+third-party subscription.
 
 ## Local tools before Cloudflare
 
