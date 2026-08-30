@@ -19,9 +19,6 @@ let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
 
 const MIG = fileURLToPath(new URL("../migrations/d1/", import.meta.url));
-const RELIABILITY_MIG = fileURLToPath(
-  new URL("../migrations/pending/operational_reliability_v021.sql", import.meta.url),
-);
 
 // A D1-shaped facade over real SQLite, so diagnose() runs unmodified.
 function makeEnv({ vectorCount = null } = {}) {
@@ -29,9 +26,6 @@ function makeEnv({ vectorCount = null } = {}) {
   for (const f of readdirSync(MIG).filter((f) => f.endsWith(".sql")).sort()) {
     db.exec(readFileSync(join(MIG, f), "utf-8"));
   }
-  // This branch deliberately keeps its schema unnumbered until 0023-0028
-  // freeze. Load that exact pending schema for the feature-level diagnostic.
-  db.exec(readFileSync(RELIABILITY_MIG, "utf-8"));
   db.prepare(
     `INSERT INTO install_state
        (id, client_slug, product_version, schema_version, gate_version, installed_at, ring)

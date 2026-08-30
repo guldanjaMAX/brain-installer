@@ -19,12 +19,14 @@ import { ownerReliabilityAlerts } from "../src/lib/reliability-alerts.js";
 const ENTITY = "mesa-coffee";
 const OTHER_ENTITY = "desert-books";
 
-function installPendingReliabilitySchema(fixture) {
-  const source = readFileSync(
-    join(fixture.productRoot, "migrations/pending/operational_reliability_v021.sql"),
-    "utf8",
-  );
-  for (const sql of fixture.splitStatements(source)) fixture.sqlite.exec(sql);
+function installReliabilitySchema(fixture) {
+  for (const file of ["0027_public_request_quotas.sql", "0028_vector_retry_state.sql"]) {
+    const source = readFileSync(
+      join(fixture.productRoot, "migrations/d1", file),
+      "utf8",
+    );
+    for (const sql of fixture.splitStatements(source)) fixture.sqlite.exec(sql);
+  }
 }
 
 function insertDocument(fixture, {
@@ -289,7 +291,7 @@ test("passkey status aggregates bounded timing and excludes ceremony secrets", a
 test("public auth guard bounds streamed bodies and enforces privacy-safe IP and client quotas", async () => {
   const fixture = await createProductFixture();
   try {
-    installPendingReliabilitySchema(fixture);
+    installReliabilitySchema(fixture);
     const oversized = new Request("https://brain.invalid/auth/login/options", {
       method: "POST",
       headers: { "Content-Type": "application/json", "CF-Connecting-IP": "192.0.2.10" },
@@ -349,6 +351,7 @@ test("public auth guard bounds streamed bodies and enforces privacy-safe IP and 
 test("missing quota schema fails closed before auth ceremony and runtime issues no DDL", async () => {
   const fixture = await createProductFixture();
   try {
+    fixture.sqlite.exec("DROP TABLE public_request_quotas");
     const response = await fixture.post(
       "/auth/login/options",
       {},
@@ -381,7 +384,7 @@ test("scheduled auth cleanup removes only expired or consumed state after grace"
   const fixture = await createProductFixture();
   const now = 10 * 24 * 60 * 60 * 1000;
   try {
-    installPendingReliabilitySchema(fixture);
+    installReliabilitySchema(fixture);
     fixture.raw("INSERT INTO auth_challenges (challenge_hash,purpose,expires_at) VALUES ('old-challenge','login',?)", now - 2 * 60 * 60 * 1000);
     fixture.raw("INSERT INTO auth_challenges (challenge_hash,purpose,expires_at) VALUES ('live-challenge','login',?)", now + 60_000);
     fixture.raw("INSERT INTO enrollment_codes (code_hash,expires_at,used_at) VALUES ('used-code',?,?)", now - 2 * 60 * 60 * 1000, now - 2 * 60 * 60 * 1000);
@@ -405,7 +408,7 @@ test("owner reliability alerts aggregate stale sources, failed queues, and inter
   const fixture = await createProductFixture();
   const now = Date.parse("2026-08-30T12:00:00Z");
   try {
-    installPendingReliabilitySchema(fixture);
+    installReliabilitySchema(fixture);
     fixture.raw(
       `INSERT INTO sources
          (name,kind,status,created_at,last_ingest_at,expected_refresh_seconds,stale_reason,document_count)

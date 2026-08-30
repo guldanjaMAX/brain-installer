@@ -200,10 +200,9 @@ provider-specific rows are excluded from the export and recreated empty.
 The normalized row is then hashed together with the remaining durable table
 export, so a retry cannot reuse a recovery artifact poisoned by an
 invocation-local lease, mutation fence, or old provider receipt. Older exact
-migration prefixes remain offline-inspectable, but the live field runner refuses
-a source or restored target below schema 13 because it cannot safely use the
-current lease, visibility, and durable bulk-bootstrap protocol without an
-explicit upgrade.
+migration prefixes remain offline-inspectable, but the live field runner
+requires exact current schema 28 because it cannot safely use the current
+lease, visibility, and durable bulk-bootstrap protocol across a schema drift.
 
 Schema 22 recovery is exact and intentionally asymmetric. Exact-document
 grants, grant membership, durable request receipts, document-access audit
@@ -219,7 +218,10 @@ single-use authority and never enter the artifact. The recovered target must
 read that table as exactly zero rows before and after bank-key reconciliation.
 Time Travel rollback purges the same table and requires an exact zero-row
 readback while the Worker remains paused. Immutable owner activity remains
-durable.
+durable. Schema 26 Plaid webhook receipts, reconciliation debt, and revocation
+debt survive through reviewed projections. Schema 27 quota windows and schema
+28 vector retry bookkeeping are recreated empty because both are live
+operational state rather than corpus authority.
 
 The preview is local only. It reads and fingerprints those files but does not
 invoke Wrangler, read Keychain, or call either Brain:

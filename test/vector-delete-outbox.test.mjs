@@ -41,7 +41,7 @@ function makeEnv({
   deleteThrows = false,
   enforceD1PatternLimit = false,
   invalidGetByIdsPage = null,
-  installPendingReliabilitySchema = true,
+  installRetryStateSchema = true,
   malformedAcceleratedVectorIdReadback = false,
   rejectUpsertIds = [],
   skipAcceleratedVectorIdUpdate = false,
@@ -49,13 +49,8 @@ function makeEnv({
   const db = new DatabaseSync(":memory:");
   const dir = fileURLToPath(new URL("../migrations/d1/", import.meta.url));
   for (const file of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    if (!installRetryStateSchema && file === "0028_vector_retry_state.sql") continue;
     db.exec(readFileSync(join(dir, file), "utf-8"));
-  }
-  if (installPendingReliabilitySchema) {
-    db.exec(readFileSync(
-      new URL("../migrations/pending/operational_reliability_v021.sql", import.meta.url),
-      "utf-8",
-    ));
   }
   db.prepare(
     `INSERT INTO install_state
@@ -240,7 +235,7 @@ const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
 
 /* Runtime code must never materialize the migration-owned retry table. */
 {
-  const { env, db, runtimeExecSql } = makeEnv({ installPendingReliabilitySchema: false });
+  const { env, db, runtimeExecSql } = makeEnv({ installRetryStateSchema: false });
   let providerWrites = 0;
   env.VECTORIZE.upsert = async () => { providerWrites++; return { mutationId: "forbidden" }; };
   let missingSchemaError = null;

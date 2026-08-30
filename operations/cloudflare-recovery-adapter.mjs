@@ -225,6 +225,11 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "plaid_webhook_keys",
   "plaid_reconciliation",
   "plaid_revocation_outbox",
+  // Schemas 27 and 28: request-window counters and vector retry bookkeeping
+  // are live operational state. Their tables must exist after recovery, but
+  // neither rate-limit history nor stale provider retry state crosses brains.
+  "public_request_quotas",
+  "vector_outbox_retry_state",
 ]);
 
 /**
@@ -249,6 +254,7 @@ export const RECOVERY_EXPORT_TABLES = Object.freeze(
       table !== "plaid_link_operations" && table !== "plaid_sync_windows" &&
       table !== "plaid_sync_stage_accounts" && table !== "plaid_sync_stage_transactions" &&
       table !== "plaid_webhook_keys" &&
+      table !== "public_request_quotas" && table !== "vector_outbox_retry_state" &&
       table !== "bank_feed_link_sessions" &&
       table !== "oauth_clients" && table !== "oauth_codes" && table !== "oauth_tokens"),
 );
@@ -319,14 +325,14 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   "outbox_generation",
   "vector_projection_bootstrap_base_count",
 ]);
-// Schemas 14 through 25 add owner passkeys, capability grants, zones, the financial ledger, bank feeds,
+// Schemas 14 through 28 add owner passkeys, capability grants, zones, the financial ledger, bank feeds,
 // connector OAuth, extraction provenance, owner workspace state, exact
 // document security, support authority, agent receipts, and Zoom delivery
 // debt. The vector protocol itself is unchanged, but the recovery
 // contract tracks the EXACT current schema by design: a drill against a
 // database one migration behind would export a table or column set that does
 // not match the reviewed list. Bumping this is required for every migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 26;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 28;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -404,6 +410,8 @@ const SCHEMA_26_TABLES = Object.freeze([
   "plaid_reconciliation",
   "plaid_revocation_outbox",
 ]);
+const SCHEMA_27_TABLES = Object.freeze(["public_request_quotas"]);
+const SCHEMA_28_TABLES = Object.freeze(["vector_outbox_retry_state"]);
 
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
@@ -419,7 +427,8 @@ const AGGREGATE_FIELDS = Object.freeze([
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
      ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES, ...SCHEMA_18_TABLES,
      ...SCHEMA_19_TABLES, ...SCHEMA_21_TABLES, ...SCHEMA_22_TABLES, ...SCHEMA_23_TABLES,
-     ...SCHEMA_24_TABLES, ...SCHEMA_25_TABLES, ...SCHEMA_26_TABLES].includes(table)
+     ...SCHEMA_24_TABLES, ...SCHEMA_25_TABLES, ...SCHEMA_26_TABLES,
+     ...SCHEMA_27_TABLES, ...SCHEMA_28_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1323,7 +1332,9 @@ function expectedRecoveryTables(migrations) {
     (latest >= 23 || !SCHEMA_23_TABLES.includes(table)) &&
     (latest >= 24 || !SCHEMA_24_TABLES.includes(table)) &&
     (latest >= 25 || !SCHEMA_25_TABLES.includes(table)) &&
-    (latest >= 26 || !SCHEMA_26_TABLES.includes(table)));
+    (latest >= 26 || !SCHEMA_26_TABLES.includes(table)) &&
+    (latest >= 27 || !SCHEMA_27_TABLES.includes(table)) &&
+    (latest >= 28 || !SCHEMA_28_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {
