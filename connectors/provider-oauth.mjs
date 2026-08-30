@@ -10,9 +10,10 @@
  */
 
 import { createServer } from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { lstatSync, mkdirSync, rmdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   googleAuthChildEnvironment,
   loadTokens,
@@ -629,7 +630,9 @@ async function exchangeToken(provider, fields, credentials, {
   const refreshSeconds = Number(
     payload.x_refresh_token_expires_in ?? payload.refresh_token_expires_in,
   );
-  const refreshHardSeconds = Number(payload.refresh_token_hard_expires_in);
+  const refreshHardSeconds = Number(
+    payload.x_refresh_token_hard_expires_in ?? payload.refresh_token_hard_expires_in,
+  );
   return {
     access_token: payload.access_token,
     refresh_token: payload.refresh_token || null,
@@ -692,6 +695,75 @@ function refreshStorageIdentity(provider, storage) {
     options.keychainService,
     options.keychainAccount,
   ].join("\0");
+}
+
+export function providerRefreshLockPath(provider, storage = {}) {
+  const options = providerCredentialOptions(provider, storage);
+  const identity = refreshStorageIdentity(provider, storage);
+  const fingerprint = createHash("sha256").update(identity).digest("hex").slice(0, 24);
+  return join(dirname(options.path), `.provider-refresh-${fingerprint}.lock`);
+}
+
+const waitFor = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+/**
+ * Intuit rotates refresh tokens, so one in-memory promise is not enough when a
+ * scheduler and a technician command run in separate processes. An atomic,
+ * owner-local lock serializes the provider exchange before either process can
+ * consume the same token. A stale empty lock can be recovered only after the
+ * QBO token request deadline has safely elapsed.
+ */
+async function withQuickBooksRefreshLock(provider, storage, task, {
+  refreshLockWaitMs = 45_000,
+  refreshLockPollMs = 50,
+  refreshLockStaleMs = 120_000,
+} = {}) {
+  const lockPath = providerRefreshLockPath(provider, storage);
+  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + Math.max(0, Number(refreshLockWaitMs) || 0);
+  let acquired = false;
+  while (!acquired) {
+    try {
+      mkdirSync(lockPath, { mode: 0o700 });
+      acquired = true;
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let state;
+      try {
+        state = lstatSync(lockPath);
+      } catch (readError) {
+        if (readError?.code === "ENOENT") continue;
+        throw readError;
+      }
+      if (!state.isDirectory() || state.isSymbolicLink()) {
+        throw new ProviderOAuthError("quickbooks", "refresh", "the local refresh lock is not a safe directory", {
+          code: "refresh_lock_unsafe",
+        });
+      }
+      if (Date.now() - state.mtimeMs > Math.max(120_000, Number(refreshLockStaleMs) || 0)) {
+        try {
+          rmdirSync(lockPath);
+          continue;
+        } catch (removeError) {
+          if (removeError?.code === "ENOENT") continue;
+        }
+      }
+      if (Date.now() >= deadline) {
+        throw new ProviderOAuthError("quickbooks", "refresh", "another local process is refreshing this connection; retry shortly", {
+          code: "refresh_in_progress",
+        });
+      }
+      await waitFor(Math.max(10, Math.min(1_000, Number(refreshLockPollMs) || 50)));
+    }
+  }
+  try {
+    return await task();
+  } finally {
+    if (acquired) {
+      try { rmdirSync(lockPath); } catch { /* stale recovery handles a crash or external cleanup */ }
+    }
+  }
 }
 
 async function refreshProviderCredentialsOnce(provider, connection, {
@@ -783,7 +855,12 @@ export async function refreshProviderCredentials(provider, connection, options =
   const key = refreshStorageIdentity(config.provider, storage);
   const existing = REFRESH_IN_FLIGHT.get(key);
   if (existing) return existing;
-  const pending = refreshProviderCredentialsOnce(config.provider, connection, options)
+  const pending = withQuickBooksRefreshLock(
+    config.provider,
+    storage,
+    () => refreshProviderCredentialsOnce(config.provider, connection, options),
+    options,
+  )
     .finally(() => {
       if (REFRESH_IN_FLIGHT.get(key) === pending) REFRESH_IN_FLIGHT.delete(key);
     });

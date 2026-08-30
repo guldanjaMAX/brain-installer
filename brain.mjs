@@ -9646,8 +9646,21 @@ export async function cmdReconcileQuickBooks(manifestPath, flags = {}, options =
         ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
         ...(options.storage ? { storage: options.storage } : {}),
       });
+      const sourceName = assertSourceName(configuration.source || "quickbooks");
+      if (typeof oauth.assertQuickBooksSourceBinding !== "function") {
+        throw new Error("the QuickBooks OAuth module cannot verify its company binding");
+      }
+      const binding = oauth.assertQuickBooksSourceBinding(access.connection, {
+        source: sourceName,
+        environment: configuration.environment,
+      });
       const realmId = access.connection?.provider_metadata?.realm_id;
       const companyFingerprint = qbo.quickBooksCompanyFingerprint(realmId);
+      if (binding.qbo_company_fingerprint !== companyFingerprint) {
+        const error = new Fatal("the QuickBooks source binding does not match the authorized company.");
+        error.code = "wrong_realm";
+        throw error;
+      }
       const configured = Array.isArray(configuration.entities) ? configuration.entities : qbo.QBO_DEFAULT_ENTITIES;
       const entities = qbo.QBO_RECONCILIATION_ENTITIES.filter((name) => configured.includes(name));
       if (!entities.length) {
@@ -9663,9 +9676,9 @@ export async function cmdReconcileQuickBooks(manifestPath, flags = {}, options =
           : "https://sandbox-quickbooks.api.intuit.com",
         entities,
         minorVersion: configuration.minor_version || null,
+        expectedCompanyFingerprint: companyFingerprint,
         ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
       });
-      const sourceName = assertSourceName(configuration.source || "quickbooks");
       const lines = [];
       for (const document of snapshot.documents || []) {
         for (const line of document?.metadata?.reconciliation_lines || []) {

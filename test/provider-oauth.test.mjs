@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, rmdirSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,7 @@ import {
   loadProviderSyncState,
   providerAccessToken,
   providerCredentialOptions,
+  providerRefreshLockPath,
   providerOAuthChildEnvironment,
   providerRedirectUri,
   quickBooksSandboxRedirectUri,
@@ -238,7 +239,7 @@ function loopbackGet({ port, host, path }) {
         refresh_token: "refresh",
         expires_in: 3600,
         x_refresh_token_expires_in: 7200,
-        refresh_token_hard_expires_in: 10_800,
+        x_refresh_token_hard_expires_in: 10_800,
       });
     },
   });
@@ -464,6 +465,28 @@ try {
     original.sync_states = { quickbooks: { cursor: { page: "opaque" } } };
     saveProviderCredentials("quickbooks", original, qboStorage);
 
+    const heldRefreshLock = providerRefreshLockPath("quickbooks", qboStorage);
+    mkdirSync(heldRefreshLock, { mode: 0o700 });
+    let lockedNetworkCalls = 0;
+    try {
+      await assert.rejects(
+        refreshProviderCredentials("quickbooks", original, {
+          storage: qboStorage,
+          now: 5_000,
+          refreshLockWaitMs: 0,
+          fetchImpl: async () => {
+            lockedNetworkCalls++;
+            return json({ access_token: "must-not-run", refresh_token: "must-not-run" });
+          },
+        }),
+        (error) => error instanceof ProviderOAuthError && error.code === "refresh_in_progress",
+      );
+    } finally {
+      rmdirSync(heldRefreshLock);
+    }
+    check("a separate process refresh lock prevents reuse of Intuit's rotating token",
+      lockedNetworkCalls === 0);
+
     let releaseResponse;
     const responseGate = new Promise((resolve) => { releaseResponse = resolve; });
     let refreshCalls = 0;
@@ -477,7 +500,7 @@ try {
         refresh_token: "rotated-refresh",
         expires_in: 3600,
         x_refresh_token_expires_in: 7200,
-        refresh_token_hard_expires_in: 10_800,
+        x_refresh_token_hard_expires_in: 10_800,
       });
     };
     const loaded = loadProviderCredentials("quickbooks", qboStorage);

@@ -330,6 +330,8 @@ const scope = {
     json: true,
   };
   let posted;
+  let assertedBinding = null;
+  let expectedCompanyFingerprint = null;
   const logs = [];
   const original = console.log;
   console.log = (...parts) => logs.push(parts.join(" "));
@@ -342,14 +344,20 @@ const scope = {
           accessToken: "fixture-oauth-secret",
           connection: { provider_metadata: { realm_id: "private-realm-id" } },
         }),
+        assertQuickBooksSourceBinding: (_connection, scope) => {
+          assertedBinding = scope;
+          return { qbo_company_fingerprint: QBO_COMPANY };
+        },
       },
       quickbooks: {
         QBO_DEFAULT_ENTITIES: ["Purchase"],
         QBO_RECONCILIATION_ENTITIES: ["Purchase"],
         quickBooksCompanyFingerprint: () => QBO_COMPANY,
-        syncQuickBooksOnline: async () => ({
+        syncQuickBooksOnline: async (options) => {
+          expectedCompanyFingerprint = options.expectedCompanyFingerprint;
+          return {
           documents: [{
-            source_id: "purchase:planted",
+            source_id: `company:${QBO_COMPANY}:purchase:planted`,
             metadata: { reconciliation_lines: [{
               line_uid: "purchase:planted",
               qbo_account_id: "qbo-35",
@@ -360,7 +368,8 @@ const scope = {
               source_locator: "QuickBooks Purchase planted; fields TxnDate, TotalAmt, AccountRef",
             }] },
           }],
-        }),
+          };
+        },
       },
       postReconciliation: async (request) => {
         posted = request;
@@ -377,7 +386,12 @@ const scope = {
       },
     });
     assert.equal(result.status, "mismatched");
-    assert.equal(posted.payload.qbo_lines[0].source_doc_uid, "quickbooks:purchase:planted");
+    assert.deepEqual(assertedBinding, { source: "quickbooks", environment: "sandbox" });
+    assert.equal(expectedCompanyFingerprint, QBO_COMPANY);
+    assert.equal(
+      posted.payload.qbo_lines[0].source_doc_uid,
+      `quickbooks:company:${QBO_COMPANY}:purchase:planted`,
+    );
     assert.equal(posted.payload.qbo_coverage, "present_snapshot_partial");
   } finally {
     console.log = original;
