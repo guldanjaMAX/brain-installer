@@ -304,12 +304,12 @@ export async function completePlaidLink(env, {
 
   const token = plaidLinkCompletion({ mode: row.mode, publicToken }).publicToken;
   const requestFingerprint = await sha256Hex(token);
+  if (row.public_token_fingerprint && row.public_token_fingerprint !== requestFingerprint) {
+    throw new Error("Plaid Link completion does not match this session");
+  }
   if (row.state === "completed" && row.receipt_json) return JSON.parse(row.receipt_json);
   if (!["link_ready", "link_completed", "exchange_started"].includes(row.state)) {
     throw new Error("Plaid Link has not completed its reviewed session");
-  }
-  if (row.public_token_fingerprint && row.public_token_fingerprint !== requestFingerprint) {
-    throw new Error("Plaid Link completion does not match this session");
   }
   if (row.state === "exchange_started") {
     const decision = plaidExchangeDecision({
@@ -319,15 +319,22 @@ export async function completePlaidLink(env, {
     }, requestFingerprint);
     throw unknownOutcomeError(decision.code, decision.reason);
   }
-  await env.DB.prepare(
+  const claim = await env.DB.prepare(
     `UPDATE plaid_link_operations
-        SET state='link_completed',public_token_fingerprint=?,updated_at=?
-      WHERE tenant_id=? AND session_ref=?`,
-  ).bind(requestFingerprint, stamp, tenantId, sessionRef).run();
-  await env.DB.prepare(
-    `UPDATE plaid_link_operations SET state='exchange_started',updated_at=?
-      WHERE tenant_id=? AND session_ref=?`,
-  ).bind(stamp, tenantId, sessionRef).run();
+        SET state='exchange_started',public_token_fingerprint=?,updated_at=?
+      WHERE tenant_id=? AND session_ref=? AND state IN ('link_ready','link_completed')
+        AND (public_token_fingerprint IS NULL OR public_token_fingerprint=?)`,
+  ).bind(requestFingerprint, stamp, tenantId, sessionRef, requestFingerprint).run();
+  if (Number(claim?.meta?.changes ?? claim?.changes ?? 0) !== 1) {
+    const current = await linkRow(env, tenantId, sessionRef);
+    if (current?.public_token_fingerprint && current.public_token_fingerprint !== requestFingerprint) {
+      throw new Error("Plaid Link completion does not match this session");
+    }
+    throw unknownOutcomeError(
+      "PLAID_EXCHANGE_OUTCOME_UNKNOWN",
+      "Another request claimed this one-time Plaid handoff. Retry this same connection session to recover its durable receipt.",
+    );
+  }
   let exchanged;
   try {
     exchanged = await callPlaid(env, "/item/public_token/exchange", {

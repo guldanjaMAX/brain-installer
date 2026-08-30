@@ -61,6 +61,7 @@ class PlaidSandboxFake {
     this.calls = new Map();
     this.mutationRaised = false;
     this.exchangeAvailable = true;
+    this.exchangeDelayMs = 0;
     this.healthAvailable = true;
     this.removeAvailable = false;
     this.publicJwk = null;
@@ -91,6 +92,9 @@ class PlaidSandboxFake {
     }
     if (path === "/item/public_token/exchange") {
       assert.equal(body.public_token, "public-sandbox-once");
+      if (this.exchangeDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.exchangeDelayMs));
+      }
       return this.exchangeAvailable
         ? jsonResponse({ item_id: "item-sandbox-1", access_token: "access-sandbox-secret" })
         : jsonResponse({ error_code: "INTERNAL_SERVER_ERROR" }, 500);
@@ -395,6 +399,59 @@ test("a lost public-token exchange response is single-shot and explicitly recove
       "SELECT state FROM plaid_link_operations WHERE session_ref='lost-exchange-route-0001'",
     ).state, "exchange_started");
     assert.equal(fixture.first("SELECT COUNT(*) AS n FROM bank_feed_items").n, 0);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("concurrent exchange retries atomically claim one single-use public token", async () => {
+  const fixture = await createProductFixture({
+    env: {
+      BANK_FEED_PROVIDER: "plaid",
+      BANK_FEED_ENV: "sandbox",
+      BANK_FEED_CLIENT_ID: "fixture-client-id",
+      BANK_FEED_SECRET: "fixture-secret",
+      BANK_FEED_WRAPPING_KEY_V2: `v2.${"A".repeat(43)}`,
+      BRAIN_NAME: "Sandbox Brain",
+    },
+  });
+  const provider = new PlaidSandboxFake();
+  provider.exchangeDelayMs = 25;
+  const fetchImpl = provider.fetch.bind(provider);
+  const ownerHeaders = await fixture.ownerHeaders();
+  const route = (path, body) => {
+    const url = new URL(`https://brain.invalid${path}`);
+    return handleBankFeed(fixture.env, new Request(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...ownerHeaders },
+      body: JSON.stringify(body),
+    }), url, path, { bankFeedFetchImpl: fetchImpl });
+  };
+  try {
+    const link = await (await route("/api/bank-feed/link-token", {
+      request_id: "concurrent-exchange-0001",
+      mode: "connect",
+    })).json();
+    const exchangeBody = {
+      session_ref: link.session_ref,
+      public_token: "public-sandbox-once",
+    };
+    const responses = await Promise.all([
+      route("/api/bank-feed/exchange", exchangeBody),
+      route("/api/bank-feed/exchange", exchangeBody),
+    ]);
+    assert.deepEqual(responses.map((response) => response.status).sort(), [200, 503]);
+    const bodies = await Promise.all(responses.map((response) => response.json()));
+    const unknown = bodies.find((body) => body.outcome_unknown === true);
+    assert.equal(unknown.code, "PLAID_EXCHANGE_OUTCOME_UNKNOWN");
+    assert.equal(unknown.retry_safe, false);
+    assert.equal(provider.count("/item/public_token/exchange"), 1);
+    assert.equal(fixture.first("SELECT COUNT(*) AS n FROM bank_feed_items").n, 1);
+
+    const durableReplay = await route("/api/bank-feed/exchange", exchangeBody);
+    assert.equal(durableReplay.status, 200);
+    assert.equal((await durableReplay.json()).item_ref, "item-sandbox-1");
+    assert.equal(provider.count("/item/public_token/exchange"), 1);
   } finally {
     fixture.close();
   }
