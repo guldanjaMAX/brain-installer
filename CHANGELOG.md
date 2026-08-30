@@ -4,7 +4,28 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
-## Next release
+## 0.2.1
+
+- The first-install Claude handoff now launches only from a dedicated
+  installer-owned workspace, refuses unrelated instruction files, preserves
+  structured command arguments, and renders copyable commands with literal
+  POSIX or PowerShell quoting. On Windows, every tools preflight requires all 25
+  cold DPAPI round trips, verifies the saved user PATH by readback, and uses the
+  official native Claude executable for the shell-free handoff.
+- The public first-install path now defers Plaid, Google, QuickBooks, Zoom, and
+  IMAP ceremonies until their secure credential custody and real-provider field
+  gates are complete. The technician wrapper never prints a passkey invite.
+  Final verification requires authenticated deployed health, at least one
+  configured source with an explicit freshness verdict, and at least one
+  enrolled device, while storing aggregate counts only.
+- Google Drive now revalidates the selected root folder on every run before it
+  can use the change feed. A moved, deleted, or unauthorized root fails closed
+  instead of silently widening or continuing from stale scope.
+- QuickBooks Sandbox connections bind the authorized company to one explicit
+  source and keep company identifiers out of receipts. Books-to-bank and
+  human-confirmed tax comparisons preserve both sources and never make
+  QuickBooks financial authority. Production OAuth remains unavailable until a
+  client-owned HTTPS callback is implemented and field-tested.
 
 - Plaid bank connections now keep historical loading visibly partial until
   Plaid confirms the historical update, verify update-mode health before saying

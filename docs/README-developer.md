@@ -5,14 +5,17 @@ keyword search live in D1, vectors live in Vectorize, and the Worker fuses them.
 Nothing runs on our infrastructure, and nothing but a scoped token is held during
 the engagement.
 
-**Status: 0.2.0 release candidate.** Provisioning, retrieval, resumable ingest,
+**Status: 0.2.1 local release candidate.** Provisioning, retrieval, resumable ingest,
 guarded deletion, owner actions, exact entity scope, document grants, passkey
 observability, financial imports, and restart-safe migrations are covered by
 the complete local product and contract suites. Earlier releases have real
 Cloudflare synthetic-service proof, and Google Drive has partial real-data
-proof. A fresh 0.2.0 Cloudflare field gate, the physical passkey ceremony on the
-final domain, the named connector lifecycle tests, and a real-account Windows
-install are still outside proof. See "What is not built" and
+proof. A fresh 0.2.1 Cloudflare field gate, a 25-of-25 credential-protection
+gate on the exact Windows machine, the physical passkey ceremony on the final
+domain, the named connector lifecycle tests, and a real-account Windows install
+are still outside proof. The public first-install path deliberately defers
+Plaid, Google, QuickBooks, Zoom, and IMAP ceremonies until their secure custody
+and real-provider gates are complete. See "What is not built" and
 `CONNECTOR-BACKLOG.md` before promising anything to anyone.
 
 Engineering changes follow [the code, test, documentation, and tracking
