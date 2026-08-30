@@ -28,9 +28,12 @@ import { readBankExport } from "../../ingest/bank-export.mjs";
 import { importBankExport, transactionUid, balanceRoleFor } from "../src/lib/fin-import.js";
 import {
   BANK_FEED_SIGN_CONVENTION, REQUESTED_PRODUCTS, FORBIDDEN_PRODUCTS, BACKFILL_DAYS,
+  LEGACY_BANK_ACCESS_KEY_VERSION, BANK_ACCESS_WRAPPING_KEY_VERSION,
+  BANK_ACCESS_WRAPPING_KEY_SECRET, bankAccessWrappingKeyConfigured,
   directionFor, accountKindFor, tenantReference, redirectUriFor, feedScopeKey,
   bankFeedConfig, bankFeedEnabled, normaliseFeedPage, redactFeedText, safeFeedError,
   classifyItemError, encryptAccessReference, decryptAccessReference,
+  rewrapBankAccessReferences,
   createLinkToken, exchangePublicToken, runFeedSlice, syncItemSlice, feedStatus,
   disconnectItem, connectPageHtml, handleBankFeed,
 } from "../src/lib/bank-feed.js";
@@ -72,6 +75,7 @@ function d1(db, extra = {}) {
     },
     SESSION_SIGNING_KEY: "fixture-session-signing-key-0000000000",
     ADMIN_KEY: "fixture-admin-key",
+    [BANK_ACCESS_WRAPPING_KEY_SECRET]: `v2.${Buffer.alloc(32, 7).toString("base64url")}`,
     BRAIN_NAME: "fixture-example-brain",
     BANK_FEED_CLIENT_ID: "fixture-client-id",
     BANK_FEED_SECRET: "fixture-service-secret",
@@ -271,13 +275,18 @@ const refuses = (db, sql, params = []) => {
     (() => { try { bankFeedConfig({}); return false; } catch (e) { return /not configured/.test(e.message); } })(), "");
   check("a non-https provider host is refused",
     (() => {
-      try { bankFeedConfig({ BANK_FEED_CLIENT_ID: "a", BANK_FEED_SECRET: "b", BANK_FEED_API_BASE: "http://x.invalid" }); return false; }
+      try { bankFeedConfig(d1(freshDb(), { BANK_FEED_API_BASE: "http://x.invalid" })); return false; }
       catch (e) { return /must be https/.test(e.message); }
     })(), "");
   check("SANDBOX IS THE DEFAULT, so an install can be rehearsed the same day",
     bankFeedConfig(d1(freshDb())).environment === "sandbox" &&
     bankFeedConfig(d1(freshDb(), { BANK_FEED_ENV: "production" })).environment === "production", "");
   check("bankFeedEnabled is false on a brain that never turned the feed on", !bankFeedEnabled({}), "");
+  check("the current feed contract requires its dedicated versioned wrapping key",
+    bankAccessWrappingKeyConfigured(d1(freshDb())) &&
+    !bankFeedEnabled({
+      BANK_FEED_CLIENT_ID: "a", BANK_FEED_SECRET: "b", BANK_FEED_API_BASE: "https://x.invalid",
+    }), "");
   check("the return address is derived from the brain's own hostname",
     redirectUriFor("https://demo.example.workers.dev/anything?x=1") === "https://demo.example.workers.dev/app/connect/bank",
     redirectUriFor("https://demo.example.workers.dev/anything?x=1"));
@@ -297,10 +306,92 @@ const refuses = (db, sql, params = []) => {
   check("it round-trips exactly", await decryptAccessReference(env, sealed) === reference, "");
   check("two encryptions of the same value differ, so the ciphertext leaks nothing by comparison",
     (await encryptAccessReference(env, reference)).ciphertext !== sealed.ciphertext, "");
-  check("a version is stored with it so the key can be rotated", sealed.keyVersion === 1, String(sealed.keyVersion));
+  check("new rows use the dedicated versioned contract",
+    sealed.keyVersion === BANK_ACCESS_WRAPPING_KEY_VERSION && sealed.keyVersion === 2,
+    String(sealed.keyVersion));
+  const rotatedSigning = {
+    ...env,
+    SESSION_SIGNING_KEY: "a-completely-different-session-signing-key",
+    ADMIN_KEY: "a-completely-different-admin-key",
+  };
+  check("session and admin rotations cannot change the dedicated bank wrapping key",
+    await decryptAccessReference(rotatedSigning, sealed) === reference, "");
   let refused = false;
-  try { await encryptAccessReference({ DB: env.DB }, reference); } catch (e) { refused = /will not be stored/.test(e.message); }
-  check("with no key material available it FAILS CLOSED rather than storing plaintext", refused, "");
+  try {
+    await encryptAccessReference({
+      DB: env.DB,
+      SESSION_SIGNING_KEY: env.SESSION_SIGNING_KEY,
+      ADMIN_KEY: env.ADMIN_KEY,
+    }, reference);
+  } catch (e) {
+    refused = e?.code === "BANK_ACCESS_WRAPPING_KEY_UNAVAILABLE";
+  }
+  check("session/admin material is never a fallback for new bank references", refused, "");
+}
+
+/* ============ legacy rows: resumable rewrap or explicit reauthorisation ============ */
+{
+  const db = freshDb();
+  const env = d1(db);
+  const references = [
+    "access-sandbox-11111111-1111-1111-1111-111111111111",
+    "access-sandbox-22222222-2222-2222-2222-222222222222",
+  ];
+  for (let index = 0; index < references.length; index++) {
+    const sealed = await encryptAccessReference(env, references[index], {
+      keyVersion: LEGACY_BANK_ACCESS_KEY_VERSION,
+    });
+    db.prepare(`INSERT INTO bank_feed_items
+      (tenant_id, item_ref, access_ciphertext, access_iv, key_version, environment, connected_at)
+      VALUES ('primary',?,?,?,?, 'sandbox',?)`)
+      .run(`legacy-${index + 1}`, sealed.ciphertext, sealed.iv, sealed.keyVersion, NOW);
+  }
+
+  let interrupted = false;
+  try {
+    await rewrapBankAccessReferences(env, {
+      mutationBoundary: ({ stage, ordinal }) => {
+        if (stage === "after_rewrap_write" && ordinal === 1) throw new Error("fixture interruption");
+      },
+    });
+  } catch (error) {
+    interrupted = /fixture interruption/.test(error.message);
+  }
+  check("an interruption after the first rewrap leaves one exact committed row",
+    interrupted && db.prepare("SELECT count(*) c FROM bank_feed_items WHERE key_version = 2").get().c === 1,
+    JSON.stringify(db.prepare("SELECT key_version FROM bank_feed_items ORDER BY id").all()));
+
+  const resumed = await rewrapBankAccessReferences(env);
+  const rows = db.prepare(
+    "SELECT item_ref, access_ciphertext, access_iv, key_version FROM bank_feed_items ORDER BY id",
+  ).all();
+  check("rerunning resumes from row state and rewraps only the unfinished row",
+    resumed.rewrapped === 1 && rows.every((row) => row.key_version === 2), JSON.stringify(resumed));
+  check("every rewrapped row still opens to its exact original reference",
+    (await Promise.all(rows.map((row) => decryptAccessReference(env, {
+      ciphertext: row.access_ciphertext,
+      iv: row.access_iv,
+      keyVersion: row.key_version,
+    })))).every((value, index) => value === references[index]), "");
+
+  const strandedDb = freshDb();
+  const oldEnv = d1(strandedDb);
+  const legacy = await encryptAccessReference(oldEnv, references[0], {
+    keyVersion: LEGACY_BANK_ACCESS_KEY_VERSION,
+  });
+  strandedDb.prepare(`INSERT INTO bank_feed_items
+    (tenant_id, item_ref, access_ciphertext, access_iv, key_version, environment, connected_at)
+    VALUES ('primary','legacy-stranded',?,?,?,'sandbox',?)`)
+    .run(legacy.ciphertext, legacy.iv, legacy.keyVersion, NOW);
+  const withoutLegacyKey = { ...oldEnv, SESSION_SIGNING_KEY: undefined, ADMIN_KEY: undefined };
+  const marked = await rewrapBankAccessReferences(withoutLegacyKey, { now: NOW });
+  const stranded = strandedDb.prepare(
+    "SELECT status, status_detail, key_version FROM bank_feed_items WHERE item_ref = 'legacy-stranded'",
+  ).get();
+  check("an unavailable released key becomes explicit reauthorization-required state",
+    marked.reauthorization_required === 1 && stranded.status === "reauth_required" &&
+    /account holder must connect it again/i.test(stranded.status_detail) && stranded.key_version === 1,
+    JSON.stringify({ marked, stranded }));
 }
 
 /* ============ nothing leaks into a message ============ */
@@ -394,9 +485,9 @@ const refuses = (db, sql, params = []) => {
   const env = d1(db);
   const sealed = await encryptAccessReference(env, "access-sandbox-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
   db.prepare(`INSERT INTO bank_feed_items
-    (tenant_id, item_ref, institution_label, access_ciphertext, access_iv, environment, connected_at)
-    VALUES ('primary','item-fixture','Fixture Mutual Bank',?,?,'sandbox',?)`)
-    .run(sealed.ciphertext, sealed.iv, NOW);
+    (tenant_id, item_ref, institution_label, access_ciphertext, access_iv, key_version, environment, connected_at)
+    VALUES ('primary','item-fixture','Fixture Mutual Bank',?,?,?,'sandbox',?)`)
+    .run(sealed.ciphertext, sealed.iv, sealed.keyVersion, NOW);
   db.prepare(`INSERT INTO bank_feed_backfill (tenant_id, item_ref, requested_days, state, queued_at)
     VALUES ('primary','item-fixture',730,'queued',?)`).run(NOW);
 
@@ -473,8 +564,9 @@ const refuses = (db, sql, params = []) => {
   const env = d1(db);
   const sealed = await encryptAccessReference(env, "access-sandbox-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
   db.prepare(`INSERT INTO bank_feed_items
-    (tenant_id, item_ref, institution_label, access_ciphertext, access_iv, environment, connected_at)
-    VALUES ('primary','item-broken','Fixture Mutual Bank',?,?,'sandbox',?)`).run(sealed.ciphertext, sealed.iv, NOW);
+    (tenant_id, item_ref, institution_label, access_ciphertext, access_iv, key_version, environment, connected_at)
+    VALUES ('primary','item-broken','Fixture Mutual Bank',?,?,?,'sandbox',?)`)
+    .run(sealed.ciphertext, sealed.iv, sealed.keyVersion, NOW);
   const provider = async (url) => new Response(JSON.stringify({
     error_code: "ITEM_LOGIN_REQUIRED",
     error_message: "the item access-sandbox-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee needs re-authorisation",
@@ -523,6 +615,34 @@ const refuses = (db, sql, params = []) => {
   const syncUrl = new URL("https://demo.example.workers.dev/api/bank-feed/sync");
   const syncResponse = await handleBankFeed(env, new Request(syncUrl, { method: "POST", body: "{}" }), syncUrl, "/api/bank-feed/sync");
   check("an operator route with no admin key is refused", syncResponse.status === 401, String(syncResponse.status));
+
+  const proofUrl = new URL("https://demo.example.workers.dev/api/bank-feed/recovery-key-proof");
+  const proofRequest = new Request(proofUrl, {
+    method: "POST",
+    headers: { "X-Admin-Key": "fixture-admin-key" },
+  });
+  const proofResponse = await handleBankFeed(
+    env, proofRequest, proofUrl, "/api/bank-feed/recovery-key-proof",
+  );
+  const proof = await proofResponse.json();
+  check("the authenticated recovery proof exposes only a version and high-entropy fingerprint",
+    proofResponse.status === 200 && proof.configured === true && proof.key_version === 2 &&
+    /^[0-9a-f]{64}$/.test(proof.key_fingerprint) &&
+    !JSON.stringify(proof).includes(env[BANK_ACCESS_WRAPPING_KEY_SECRET]), JSON.stringify(proof));
+
+  const reconcileUrl = new URL("https://demo.example.workers.dev/api/bank-feed/reconcile-recovery");
+  const reconcileRequest = new Request(reconcileUrl, {
+    method: "POST",
+    headers: { "X-Admin-Key": "fixture-admin-key" },
+  });
+  const reconcileResponse = await handleBankFeed(
+    env, reconcileRequest, reconcileUrl, "/api/bank-feed/reconcile-recovery",
+  );
+  const reconciliation = await reconcileResponse.json();
+  check("the authenticated recovery reconciliation returns aggregate custody counts only",
+    reconcileResponse.status === 200 && reconciliation.legacy_rewrap_required === 0 &&
+    reconciliation.unsupported_key_versions === 0 &&
+    !JSON.stringify(reconciliation).includes("item_ref"), JSON.stringify(reconciliation));
 
   const unconfigured = { ...d1(freshDb()), BANK_FEED_API_BASE: undefined };
   const statusUrl = new URL("https://demo.example.workers.dev/api/bank-feed/status");

@@ -130,6 +130,10 @@ import {
 import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
 import { deriveSessionSigningKey } from "./operations/session-signing-key.mjs";
 import {
+  BANK_ACCESS_WRAPPING_KEY_SECRET,
+  validateBankAccessWrappingKey,
+} from "./operations/bank-access-wrapping-key.mjs";
+import {
   renderTechnicianPlan,
   runTechnicianStep,
   technicianPlan,
@@ -1499,6 +1503,12 @@ export const WORKER_PROVIDER_SECRET_NAMES = Object.freeze([
   "BANK_FEED_SECRET",
 ]);
 
+// BANK_FEED_WRAPPING_KEY_V2 is deliberately absent from the deletion list.
+// Provider credentials can be removed when a feed is disabled. The wrapping
+// key protects already-stored client authority, so a routine configuration
+// change must never destroy it. An explicit reviewed key rotation rewraps rows
+// first; disconnect destroys each row's ciphertext separately.
+
 export function optionalWorkerSecretNames(m) {
   // Never harvest unrelated credentials merely because they happen to be in
   // the operator's shell. A standard D1 + Workers AI install needs only its
@@ -1509,7 +1519,8 @@ export function optionalWorkerSecretNames(m) {
   const answerModel = String(
     m.retrieval?.answer_model || "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
   );
-  // The bank feed's two service identifiers are eligible exactly when the
+  // The bank feed's two service identifiers and independent wrapping key are
+  // eligible exactly when the
   // manifest turns the feed on. This half is not optional politeness: it is
   // what stops `reconcileWorkerProviderSecrets` from deleting them on the next
   // routine run and disconnecting every bank the client authorised. See the
@@ -1520,7 +1531,11 @@ export function optionalWorkerSecretNames(m) {
     ...(m.retrieval?.rerank === true || !answerModel.startsWith("@cf/")
       ? ["ANTHROPIC_API_KEY"]
       : []),
-    ...(bankFeed ? ["BANK_FEED_CLIENT_ID", "BANK_FEED_SECRET"] : []),
+    ...(bankFeed ? [
+      "BANK_FEED_CLIENT_ID",
+      "BANK_FEED_SECRET",
+      BANK_ACCESS_WRAPPING_KEY_SECRET,
+    ] : []),
   ]);
 }
 
@@ -1590,6 +1605,25 @@ export async function cmdSecrets(manifestPath, options = {}) {
   // it is set, any UI proxy has to carry the admin key, which can drain.
   const needed = ["ADMIN_KEY", "RAG_PROXY_KEY", "SESSION_SIGNING_KEY"];
   const optional = optionalWorkerSecretNames(m);
+  const bankFeed = m.corpora?.bank_feed?.enabled === true;
+  if (bankFeed) {
+    const missingBankSecrets = optional
+      .filter((name) => name.startsWith("BANK_FEED_"))
+      .filter((name) => !process.env[name]);
+    if (missingBankSecrets.length) {
+      die(
+        "the bank feed is enabled, but its complete reviewed secret set is unavailable. " +
+          "Use the approved no-history credential launcher, then rerun `brain secrets`; " +
+          "no Worker secret was changed."
+      );
+    }
+    try { validateBankAccessWrappingKey(process.env[BANK_ACCESS_WRAPPING_KEY_SECRET]); } catch {
+      die(
+        `${BANK_ACCESS_WRAPPING_KEY_SECRET} is not a version-2 independent 32-byte key. ` +
+          "Run the reviewed bank-key ceremony before `brain secrets`; no Worker secret was changed."
+      );
+    }
+  }
   const explicitAdminKey = Object.hasOwn(options, "explicitAdminKey")
     ? options.explicitAdminKey
     : (process.env.ADMIN_KEY || null);
@@ -3663,11 +3697,28 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
         throw new Error("support authority did not read back empty");
       }
     }
+    if (restoredSchemaVersion >= 24) {
+      // Agent-action receipts are live confirmation authority, not audit
+      // history. Time Travel can resurrect previewed, confirmed, or consumed
+      // receipts, so purge and prove the table empty while the Worker remains
+      // paused. Immutable owner_activity_events remain untouched.
+      await queryDatabase(acct.id, dbId, "DELETE FROM agent_action_receipts");
+      const agentAuthorityReceipt = await queryDatabase(
+        acct.id,
+        dbId,
+        "SELECT COUNT(*) AS agent_action_receipts FROM agent_action_receipts",
+      );
+      const agentAuthorityCount = agentAuthorityReceipt?.results?.length === 1
+        ? agentAuthorityReceipt.results[0]?.agent_action_receipts : null;
+      if (!d1UnsignedInteger(agentAuthorityCount) || Number(agentAuthorityCount) !== 0) {
+        throw new Error("agent action authority did not read back empty");
+      }
+    }
   } catch {
     die(
-      "D1 was restored, but temporary support authority could not be verified empty.\n" +
-        "      The compatibility Worker remains paused and support access remains unavailable.\n" +
-        "      Do not return this brain to use until the restored schema is readable and support sessions, invites, challenges, requests, and passkeys all read back empty.",
+      "D1 was restored, but live security authority could not be verified empty.\n" +
+        "      The compatibility Worker remains paused; support and destructive agent actions remain unavailable.\n" +
+        "      Do not return this brain to use until the restored schema is readable and support authority plus agent-action receipts all read back empty.",
     );
   }
   if (usesD1VectorOutbox) {

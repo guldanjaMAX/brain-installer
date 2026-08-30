@@ -4,7 +4,6 @@ import { DatabaseSync } from "node:sqlite";
 import {
   chmodSync,
   existsSync,
-  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -34,6 +33,7 @@ import {
   initializeVerifiedRecovery,
   loadVerifiedRecoveryState,
 } from "../operations/verified-recovery.mjs";
+import { withDecryptedRecoveryArtifact } from "../operations/recovery-artifact-crypto.mjs";
 
 const sandbox = mkdtempSync(join(tmpdir(), "brain-cloudflare-recovery-adapter-"));
 if (process.platform !== "win32") chmodSync(sandbox, 0o700);
@@ -47,6 +47,7 @@ const wrapperPath = join(sandbox, "wrangler-owner-wrapper");
 const goldenPath = join(sandbox, "brain.golden.json");
 const privateSentinel = "fixture-private-question-and-provider-output";
 const fixtureAdminKey = "fixture-private-admin-key-value";
+const fixtureRecoveryArtifactKey = `v1.${Buffer.alloc(32, 19).toString("base64url")}`;
 const wrapperScript = "#!/bin/sh\nexec wrangler \"$@\"\n";
 const sourceWorkerVersionId = "fixture-source-version-id";
 const pausedWorkerVersionId = "fixture-paused-version-id";
@@ -75,6 +76,9 @@ const sourceManifest = {
     embed_model: "@cf/baai/bge-base-en-v1.5",
     embed_dimensions: 768,
   },
+  operations: {
+    admin_key_secret: "keychain://fixture-brain-source/owner",
+  },
 };
 
 const targetManifest = {
@@ -95,6 +99,7 @@ const targetManifest = {
   },
   operations: {
     admin_key_secret: "keychain://fixture-brain-recovery/owner",
+    recovery_artifact_key_secret: "keychain://fixture-brain-recovery/artifact-v1",
     recovery_field_gate: {
       paused_worker_version_id: pausedWorkerVersionId,
       active_worker_version_id: activeWorkerVersionId,
@@ -183,13 +188,13 @@ const fixtureInstallState = Object.freeze({
   // recovery into the target's new index.
   vector_projection_bootstrap_protocol: "bootstrap-v2",
   vector_projection_bootstrap_base_count: 5,
-  // Live owner-session coordination; zero-normalized on export like the
-  // outbox generation, so a recovery never resurrects old session cookies.
+  // Recovery increments this exact source generation so old cookies fail while
+  // the monotonic revocation history continues.
   session_generation: 4,
 });
 const normalizedInstallStateSql =
   `INSERT INTO "install_state" (${installStateColumns.map(([name]) => `"${name}"`).join(",")}) VALUES (` +
-  `1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,0,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004',NULL,0,0);\n`;
+  `1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,0,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004',NULL,0,5);\n`;
 const schemaRows = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((name) => ({
     type: "table",
@@ -250,6 +255,8 @@ const expectedSnapshot = Object.freeze({
 // of making it valid again.
 {
   assert.equal(RECOVERY_EXPORT_TABLES.includes("support_access_events"), true);
+  assert.equal(RECOVERY_DURABLE_TABLES.includes("agent_action_receipts"), true);
+  assert.equal(RECOVERY_EXPORT_TABLES.includes("agent_action_receipts"), false);
   for (const table of [
     "support_sessions",
     "support_access_requests",
@@ -345,6 +352,7 @@ function snapshotForChunkCount(chunkCount) {
             vector_projection_bootstrap_high_water high_water,
             vector_projection_bootstrap_protocol protocol,
             vector_projection_bootstrap_base_count base_count,
+            session_generation session_generation,
             (SELECT count(*) FROM vector_bootstrap_batches) batch_count
        FROM install_state WHERE id=1`,
   ).get() }, {
@@ -359,8 +367,20 @@ function snapshotForChunkCount(chunkCount) {
     high_water: "fixture:chunk#0004",
     protocol: null,
     base_count: 0,
+    session_generation: 2,
     batch_count: 0,
   });
+  source.prepare("UPDATE install_state SET session_generation=? WHERE id=1")
+    .run(Number.MAX_SAFE_INTEGER);
+  await assert.rejects(
+    normalizedInstallStateExport({}, appliedMigrations, readRows),
+    (error) => error.code === "RECOVERY_INSTALL_STATE_INVALID",
+  );
+  source.prepare("UPDATE install_state SET session_generation=-1 WHERE id=1").run();
+  await assert.rejects(
+    normalizedInstallStateExport({}, appliedMigrations, readRows),
+    (error) => error.code === "RECOVERY_INSTALL_STATE_INVALID",
+  );
   source.close();
   destination.close();
 }
@@ -472,6 +492,7 @@ function providerHarness({
   bootstrapBusyOnce = false,
   bootstrapPageSize = 3_000,
   bootstrapReceiptTransform = (receipt) => receipt,
+  bankKeyProofMismatch = false,
   busyReceiptTransform = (receipt) => receipt,
   deploymentChangesDuringEval = false,
   redirectHealth = false,
@@ -484,6 +505,7 @@ function providerHarness({
   healthModeOverride = null,
   healthProtocolOverride = null,
   initialTargetRestored = false,
+  initialAgentActionReceipts = 0,
   initialVectorCount = 0,
   missingVectorCount = false,
   pausedVersionMode = "paused-for-upgrade",
@@ -491,6 +513,7 @@ function providerHarness({
   promotionNoop = false,
   readinessLagAfterBootstrap = false,
   sourceDrainLease = false,
+  sourceWrappingSecret = false,
   // Current-protocol installs report whatever the newest real migration is,
   // so a new additive migration never breaks these fixtures (found 13 -> 14).
   sourceMigrationVersion = appliedMigrations.at(-1).version,
@@ -501,6 +524,7 @@ function providerHarness({
   targetVersionId = pausedWorkerVersionId,
 } = {}) {
   let targetRestored = initialTargetRestored;
+  let agentActionReceipts = initialAgentActionReceipts;
   let vectorCount = initialVectorCount;
   let outbox = 0;
   let bootstrapRequired = initialTargetRestored && initialVectorCount < targetChunkCount;
@@ -638,6 +662,11 @@ function providerHarness({
             },
             { type: "plain_text", name: "CREDENTIAL_SCANNER", text: "on" },
             { type: "secret_text", name: "ADMIN_KEY" },
+            { type: "secret_text", name: "RAG_PROXY_KEY" },
+            { type: "secret_text", name: "SESSION_SIGNING_KEY" },
+            ...(!isSource || sourceWrappingSecret
+              ? [{ type: "secret_text", name: "BANK_FEED_WRAPPING_KEY_V2" }]
+              : []),
             ...(!isSource && targetMode !== null
               ? [{ type: "plain_text", name: "VECTOR_DRAIN_MODE", text: targetMode }]
               : []),
@@ -699,6 +728,8 @@ function providerHarness({
         rows = [{ user_table_count: targetRestored ? RECOVERY_DURABLE_TABLES.length + 1 : 0 }];
       } else if (/pending_outbox/.test(sql)) {
         rows = [{ pending_outbox: outbox, failed_vectors: 0 }];
+      } else if (/COUNT\(\*\) AS agent_action_receipts FROM agent_action_receipts/.test(sql)) {
+        rows = [{ agent_action_receipts: agentActionReceipts }];
       } else if (/integrity-check/.test(sql)) {
         rows = [];
       } else if (/PRAGMA quick_check/.test(sql)) {
@@ -721,7 +752,7 @@ function providerHarness({
         assert.match(sql, /\(SELECT MAX\(chunk_uid\) FROM chunks\) AS "vector_projection_bootstrap_high_water"/);
         assert.match(sql, /NULL AS "vector_projection_bootstrap_protocol"/);
         assert.match(sql, /0 AS "vector_projection_bootstrap_base_count"/);
-        assert.match(sql, /0 AS "session_generation"/);
+        assert.match(sql, /session_generation BETWEEN 0 AND 9007199254740990/);
         normalizedLeaseSelections++;
         rows = sourceInstallStateMissing ? [] : [{
           ...fixtureInstallState,
@@ -738,7 +769,7 @@ function providerHarness({
           vector_projection_bootstrap_high_water: "fixture:chunk#0004",
           vector_projection_bootstrap_protocol: null,
           vector_projection_bootstrap_base_count: 0,
-          session_generation: 0,
+          session_generation: fixtureInstallState.session_generation + 1,
         }];
       } else if (/SELECT name FROM sqlite_schema/.test(sql)) {
         rows = [...RECOVERY_DURABLE_TABLES].sort().map((name) => ({ name }));
@@ -748,6 +779,10 @@ function providerHarness({
         assert.match(
           sql,
           /CAST\(\(SELECT 0\) AS TEXT\) AS "vector_bootstrap_batches"/,
+        );
+        assert.match(
+          sql,
+          /CAST\(\(SELECT 0\) AS TEXT\) AS "agent_action_receipts"/,
         );
         const aggregate = env.CLOUDFLARE_ACCOUNT_ID === targetManifest.infrastructure.cloudflare.account_id &&
             targetRestored
@@ -859,6 +894,30 @@ function providerHarness({
         actual_vectors: visibilityLagged ? Math.max(0, targetChunkCount - 1) : vectorCount,
       }));
     }
+    if (path === "/api/bank-feed/recovery-key-proof") {
+      assert.equal(options.headers["X-Admin-Key"], fixtureAdminKey);
+      const isSource = parsedUrl.hostname === sourceManifest.brain.domain;
+      return response({
+        configured: true,
+        key_version: 2,
+        key_fingerprint: bankKeyProofMismatch && isSource
+          ? "6".repeat(64)
+          : "7".repeat(64),
+      });
+    }
+    if (path === "/api/bank-feed/reconcile-recovery") {
+      assert.equal(options.headers["X-Admin-Key"], fixtureAdminKey);
+      return response({
+        scanned: 0,
+        rewrapped: 0,
+        reauthorization_required: 0,
+        raced: 0,
+        legacy_rewrap_required: 0,
+        protected: 0,
+        reauthorization_required_total: 0,
+        unsupported_key_versions: 0,
+      });
+    }
     if (path === "/api/admin/brain/documents") {
       assert.equal(options.headers["X-Admin-Key"], fixtureAdminKey);
       if (redirectInventory) {
@@ -909,6 +968,7 @@ function providerHarness({
         adminReads++;
         return fixtureAdminKey;
       },
+      readRecoveryArtifactKey: () => fixtureRecoveryArtifactKey,
       verifySqlArtifact: async (path) => {
         const text = readFileSync(path, "utf8");
         assert.match(text, /CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts/);
@@ -998,7 +1058,7 @@ try {
   assert.match(preview.wrapper_approval_fingerprint, /^[0-9a-f]{64}$/);
   assert.equal(preview.golden_approval_fingerprint, hash(readFileSync(goldenPath)));
   assert.deepEqual(RECOVERY_FIELD_GATE_STOP_STAGES, [
-    "export_d1", "restore_d1", "rebuild_vectorize",
+    "export_d1", "restore_d1", "reconcile_security", "rebuild_vectorize",
   ]);
   const approvedAdapterConfig = Object.freeze({
     ...baseConfig,
@@ -1272,7 +1332,7 @@ try {
 
   await runToCheckpoint("rebuild_vectorize", "verify_health", [
     "export_d1", "verify_export", "prove_target_clean", "restore_d1",
-    "verify_d1", "rebuild_vectorize",
+    "verify_d1", "reconcile_security", "rebuild_vectorize",
   ]);
   assert.deepEqual([exportCalls(), drillHarness.importCalls, rebuildCalls()], [1, 1, 0]);
   assert.equal(drillHarness.bootstrapCalls, 1);
@@ -1305,10 +1365,10 @@ try {
   }, harness.dependencies);
   assert.equal(completed.ok, true);
   assert.equal(completed.status.status, "complete");
-  assert.equal(completed.status.completed_stages, 8);
+  assert.equal(completed.status.completed_stages, 9);
   assert.equal(harness.importCalls, 1);
   assert.equal(harness.evalCalls, 1);
-  assert.equal(harness.adminReads, 4);
+  assert.equal(harness.adminReads, 9);
   assert.equal(harness.fetchCalls.every((call) => call.options.redirect === "error"), true);
   assert.equal(harness.fetchCalls.every((call) => call.options.cache === "no-store"), true);
   assert.equal(harness.fetchCalls.every((call) => new URL(call.url).search === ""), true);
@@ -1339,22 +1399,29 @@ try {
   const residueData = join(artifactDirectory, ".brain-recovery-export.sql.tmp-data");
   const residueCombined = join(artifactDirectory, ".brain-recovery-export.sql.tmp-combined");
   writeFileSync(residueData, "synthetic interrupted data partial\n", { mode: 0o600 });
-  linkSync(artifactPath, residueCombined);
+  writeFileSync(residueCombined, "synthetic interrupted combined partial\n", { mode: 0o600 });
   const residueHarness = providerHarness();
   const residueGate = createCloudflareRecoveryFieldGateAdapters(
     approvedAdapterConfig,
     residueHarness.dependencies,
   );
-  const reconciledArtifact = await residueGate.adapters.export_d1({
+  const residueContext = {
     stage: "export_d1",
     attempt: 2,
     planFingerprint: initialized.plan.plan_fingerprint,
     targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
     completed: [],
-  });
+  };
+  await assert.rejects(
+    residueGate.adapters.export_d1(residueContext),
+    (error) => error.code === "RECOVERY_EXPORT_PLAINTEXT_RESIDUE_REVIEW_REQUIRED",
+  );
+  assert.equal(existsSync(residueData), true);
+  assert.equal(existsSync(residueCombined), true);
+  unlinkSync(residueData);
+  unlinkSync(residueCombined);
+  const reconciledArtifact = await residueGate.adapters.export_d1(residueContext);
   assert.equal(reconciledArtifact.artifact_sha256, hash(readFileSync(artifactPath)));
-  assert.equal(existsSync(residueData), false);
-  assert.equal(existsSync(residueCombined), false);
   assert.equal(statSync(artifactPath).nlink, 1);
 
   const ambiguousHarness = providerHarness({ ambiguousSourceD1: true });
@@ -1438,7 +1505,12 @@ try {
     leaseArtifactDirectory,
     leaseInitialized.plan.artifact.relative_name,
   );
-  const leasedArtifactText = readFileSync(leasedArtifactPath, "utf8");
+  const leasedArtifactText = await withDecryptedRecoveryArtifact(
+    leasedArtifactPath,
+    leaseArtifactDirectory,
+    fixtureRecoveryArtifactKey,
+    (path) => readFileSync(path, "utf8"),
+  );
   assert.equal(leasedArtifactText.includes(normalizedInstallStateSql), true);
   assert.equal(leasedArtifactText.includes(leasedSourceHarness.sourceLeaseMarker), false);
   assert.equal(leasedSourceHarness.normalizedLeaseSelections, 1);
@@ -1509,6 +1581,46 @@ try {
     }),
     (error) => error.code === "RECOVERY_WORKER_BINDINGS_INVALID",
   );
+
+  const mismatchedBankKeyHarness = providerHarness({
+    sourceWrappingSecret: true,
+    bankKeyProofMismatch: true,
+  });
+  const mismatchedBankKeyGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    mismatchedBankKeyHarness.dependencies,
+  );
+  await assert.rejects(
+    mismatchedBankKeyGate.adapters.prove_target_clean({
+      stage: "prove_target_clean",
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }),
+    (error) => error.code === "RECOVERY_BANK_KEY_MISMATCH",
+  );
+  assert.equal(mismatchedBankKeyHarness.importCalls, 0);
+
+  const restoredAgentAuthorityHarness = providerHarness({
+    initialTargetRestored: true,
+    initialAgentActionReceipts: 1,
+  });
+  const restoredAgentAuthorityGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    restoredAgentAuthorityHarness.dependencies,
+  );
+  await assert.rejects(
+    restoredAgentAuthorityGate.adapters.reconcile_security({
+      stage: "reconcile_security",
+      attempt: 1,
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [{ id: "verify_d1", evidence: expectedSnapshot }],
+    }),
+    (error) => error.code === "RECOVERY_AGENT_AUTHORITY_NOT_EMPTY",
+  );
+  assert.equal(restoredAgentAuthorityHarness.fetchCalls.some((call) =>
+    new URL(call.url).pathname === "/api/bank-feed/reconcile-recovery"), false);
 
   const extraBindingHarness = providerHarness({ extraTargetBinding: true });
   const extraBindingGate = createCloudflareRecoveryFieldGateAdapters(

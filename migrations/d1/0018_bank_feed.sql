@@ -23,8 +23,11 @@
 -- comes back is a read-only reference for fetching transaction history, and it
 -- lives here, in the client's own database, inside the client's own account.
 --
--- The reference is stored ENCRYPTED (AES-GCM, key derived from a worker secret
--- the database does not contain). A D1 export, a backup, or a careless admin
+-- The reference is stored ENCRYPTED with AES-GCM. Released key_version 1 rows
+-- used the session/admin derivation. New key_version 2 rows use the independent
+-- versioned BANK_FEED_WRAPPING_KEY_V2 secret, which the database does not
+-- contain. Recovery compare-and-swap rewraps version 1 rows or records explicit
+-- reauthorization-required state. A D1 export, a backup, or a careless admin
 -- route therefore cannot hand anyone a working bank connection. The CHECK on
 -- `access_ciphertext` is a structural guard on that promise: ciphertext is
 -- base64 and base64 has no hyphen, so a value carrying one is a plaintext
@@ -48,8 +51,9 @@ CREATE TABLE IF NOT EXISTS bank_feed_items (
   -- returned by any route; never written to a log line or an error field.
   access_ciphertext TEXT NOT NULL,
   access_iv         TEXT NOT NULL,
-  -- Which derived key encrypted it, so the key can be rotated without a
-  -- flag day and without guessing which rows are readable.
+  -- Which key contract encrypted it. Version 1 is the released session/admin
+  -- derivation; version 2 is the dedicated wrapping secret. The declared
+  -- version is always used, so recovery never guesses which key can open a row.
   key_version       INTEGER NOT NULL DEFAULT 1,
   -- `sandbox` exists so an install can be rehearsed the same day, before the
   -- client's production approval lands. A sandbox row must never be mistaken

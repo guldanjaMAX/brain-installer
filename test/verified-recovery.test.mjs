@@ -146,6 +146,19 @@ function evidenceFor(stage, context, override = {}) {
       chunk_count: 5,
       fts_count: 5,
     },
+    reconcile_security: {
+      integrity: "ok",
+      schema_fingerprint: schemaHash,
+      aggregate_fingerprint: aggregateHash,
+      content_fingerprint: contentHash,
+      document_count: 3,
+      chunk_count: 5,
+      fts_count: 5,
+      bank_protected: 0,
+      bank_reauthorization_required: 0,
+      bank_legacy_rewrap_required: 0,
+      bank_unsupported_key_versions: 0,
+    },
     rebuild_vectorize: {
       chunk_count: 5,
       vector_count: 5,
@@ -187,8 +200,8 @@ try {
   assert.equal(plan.created_at, createdAt.toISOString());
   assert.match(plan.plan_fingerprint, /^[0-9a-f]{64}$/);
   assert.deepEqual(plan.stages, VERIFIED_RECOVERY_STAGES);
-  assert.equal(plan.artifact.format, "cloudflare_d1_full_sql");
-  assert.equal(plan.artifact.relative_name, ".brain-recovery-export.sql");
+  assert.equal(plan.artifact.format, "financial_brain_recovery_ciphertext_v1");
+  assert.equal(plan.artifact.relative_name, ".brain-recovery-export.sql.fbrenc");
   assert.equal(plan.artifact.owner_only, true);
   assert.equal(plan.isolation.required_initial_user_tables, 0);
   assert.equal(plan.isolation.required_initial_vectors, 0);
@@ -357,7 +370,7 @@ try {
   );
   assert.equal(checkpointResumed.ok, true);
   assert.deepEqual(checkpointResumeCalls, [
-    "verify_d1", "rebuild_vectorize", "verify_health", "verify_eval",
+    "verify_d1", "reconcile_security", "rebuild_vectorize", "verify_health", "verify_eval",
   ]);
   assert.equal(checkpointedState.status, "complete");
 
@@ -441,7 +454,7 @@ try {
   );
   assert.equal(resumed.ok, true);
   assert.deepEqual(resumedCalls, [
-    "restore_d1", "verify_d1", "rebuild_vectorize", "verify_health", "verify_eval",
+    "restore_d1", "verify_d1", "reconcile_security", "rebuild_vectorize", "verify_health", "verify_eval",
   ]);
 
   let restoreCalls = 0;
@@ -507,7 +520,7 @@ try {
     stage_status: "failed",
     attempt: 1,
     completed_stages: 3,
-    total_stages: 8,
+    total_stages: 9,
     failure_code: "RECOVERY_RESTORE_D1_FAILED",
   });
   const statusText = JSON.stringify(status);

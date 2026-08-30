@@ -3,8 +3,9 @@
  * Verified recovery contract for a Cloudflare-native Brain.
  *
  * D1 is the durable record and Vectorize is derived. Recovery therefore builds
- * one restorable D1 SQL artifact, restores it only into a separately identified
- * empty target, rebuilds every vector from D1, and requires health plus
+ * one authenticated encrypted D1 artifact, opens its SQL only for bounded
+ * verification or import into a separately identified empty target, rebuilds
+ * every vector from D1, and requires health plus
  * release-eval gates before the target can be called usable.
  *
  * `runVerifiedRecovery` remains provider-neutral. The separately reviewed
@@ -53,6 +54,7 @@ export const VERIFIED_RECOVERY_STAGES = Object.freeze([
   Object.freeze({ id: "prove_target_clean", effect: "read_only" }),
   Object.freeze({ id: "restore_d1", effect: "isolated_target_write" }),
   Object.freeze({ id: "verify_d1", effect: "read_only" }),
+  Object.freeze({ id: "reconcile_security", effect: "isolated_target_write" }),
   Object.freeze({ id: "rebuild_vectorize", effect: "isolated_target_write" }),
   Object.freeze({ id: "verify_health", effect: "read_only" }),
   Object.freeze({ id: "verify_eval", effect: "read_only" }),
@@ -290,8 +292,8 @@ export function buildVerifiedRecoveryPlan(sourceManifestPath, targetManifestPath
     target_resource_fingerprint: target.resourceFingerprint,
     runtime_contract_fingerprint: source.runtimeFingerprint,
     artifact: {
-      format: "cloudflare_d1_full_sql",
-      relative_name: ".brain-recovery-export.sql",
+      format: "financial_brain_recovery_ciphertext_v1",
+      relative_name: ".brain-recovery-export.sql.fbrenc",
       digest: "sha256",
       owner_only: true,
       refuse_existing: true,
@@ -359,6 +361,13 @@ export function inspectVerifiedRecoveryManifestBindings(
         loaded.manifest.operations.admin_key_secret,
         "recovery admin-key locator",
       ),
+    recoveryArtifactKeySecret:
+      loaded.manifest.operations?.recovery_artifact_key_secret === undefined
+        ? null
+        : boundedIdentity(
+          loaded.manifest.operations.recovery_artifact_key_secret,
+          "recovery artifact-key locator",
+        ),
     recoveryFieldGate: loaded.manifest.operations?.recovery_field_gate === undefined
       ? null
       : structuredClone(loaded.manifest.operations.recovery_field_gate),
@@ -399,8 +408,9 @@ export function validateVerifiedRecoveryPlan(input) {
   if (!exactKeys(input.artifact, new Set([
     "format", "relative_name", "digest", "owner_only", "refuse_existing",
     "max_single_import_bytes",
-  ])) || input.artifact.format !== "cloudflare_d1_full_sql" ||
-      input.artifact.relative_name !== ".brain-recovery-export.sql" || input.artifact.digest !== "sha256" ||
+  ])) || input.artifact.format !== "financial_brain_recovery_ciphertext_v1" ||
+      input.artifact.relative_name !== ".brain-recovery-export.sql.fbrenc" ||
+      input.artifact.digest !== "sha256" ||
       input.artifact.owner_only !== true || input.artifact.refuse_existing !== true ||
       input.artifact.max_single_import_bytes !== MAX_SINGLE_D1_IMPORT_BYTES) {
     fail("verified recovery export policy is invalid");
@@ -466,6 +476,12 @@ function evidenceKeys(stage) {
     verify_d1: [
       "integrity", "schema_fingerprint", "aggregate_fingerprint",
       "content_fingerprint", "document_count", "chunk_count", "fts_count",
+    ],
+    reconcile_security: [
+      "integrity", "schema_fingerprint", "aggregate_fingerprint",
+      "content_fingerprint", "document_count", "chunk_count", "fts_count",
+      "bank_protected", "bank_reauthorization_required",
+      "bank_legacy_rewrap_required", "bank_unsupported_key_versions",
     ],
     rebuild_vectorize: ["chunk_count", "vector_count", "pending_outbox", "failed_vectors"],
     verify_health: ["status", "failure_count", "vector_backlog"],
@@ -537,7 +553,7 @@ function validateStageEvidence(stage, input, plan, completed) {
       fail("restored D1 did not match the verified export");
     }
   } else if (stage === "rebuild_vectorize") {
-    const restored = completedEvidence(completed, "verify_d1");
+    const restored = completedEvidence(completed, "reconcile_security");
     nonNegativeInteger(evidence.chunk_count, "recovery vector chunk count");
     nonNegativeInteger(evidence.vector_count, "recovery vector count");
     nonNegativeInteger(evidence.pending_outbox, "recovery vector backlog");
@@ -546,6 +562,37 @@ function validateStageEvidence(stage, input, plan, completed) {
         evidence.vector_count !== evidence.chunk_count || evidence.pending_outbox !== 0 ||
         evidence.failed_vectors !== 0) {
       fail("Vectorize rebuild did not converge exactly from restored D1 chunks");
+    }
+  } else if (stage === "reconcile_security") {
+    const restored = completedEvidence(completed, "verify_d1");
+    hashValue(evidence.schema_fingerprint, "reconciled D1 schema");
+    hashValue(evidence.aggregate_fingerprint, "reconciled D1 aggregates");
+    hashValue(evidence.content_fingerprint, "reconciled D1 durable data");
+    nonNegativeInteger(evidence.document_count, "reconciled D1 document count");
+    nonNegativeInteger(evidence.chunk_count, "reconciled D1 chunk count");
+    nonNegativeInteger(evidence.fts_count, "reconciled D1 FTS count");
+    nonNegativeInteger(evidence.bank_protected, "reconciled protected bank references");
+    nonNegativeInteger(
+      evidence.bank_reauthorization_required,
+      "reconciled bank reauthorization count",
+    );
+    nonNegativeInteger(
+      evidence.bank_legacy_rewrap_required,
+      "remaining legacy bank references",
+    );
+    nonNegativeInteger(
+      evidence.bank_unsupported_key_versions,
+      "unsupported bank wrapping-key versions",
+    );
+    if (evidence.integrity !== "ok" || evidence.chunk_count !== evidence.fts_count ||
+        evidence.schema_fingerprint !== restored?.schema_fingerprint ||
+        evidence.aggregate_fingerprint !== restored?.aggregate_fingerprint ||
+        evidence.document_count !== restored?.document_count ||
+        evidence.chunk_count !== restored?.chunk_count ||
+        evidence.fts_count !== restored?.fts_count ||
+        evidence.bank_legacy_rewrap_required !== 0 ||
+        evidence.bank_unsupported_key_versions !== 0) {
+      fail("recovered security state did not reconcile exactly");
     }
   } else if (stage === "verify_health") {
     nonNegativeInteger(evidence.failure_count, "recovery health failure count");

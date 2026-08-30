@@ -1454,6 +1454,7 @@ const bootstrapCompletion = () => ({
       sessions: ["active", "revoked"],
     };
     const retainedSupportHistory = ["created", "revoked"];
+    let agentActionReceipts = ["previewed", "confirmed"];
     const restored = await cmdRollback(manifestPath, "fixture-bookmark", {
       confirmed: true,
       resolveAccount: async () => { actions.push("account"); return { id: "fixture-account" }; },
@@ -1487,7 +1488,7 @@ const bootstrapCompletion = () => ({
       d1Query: async (_account, _database, sql) => {
         if (/SELECT schema_version FROM install_state/.test(sql)) {
           actions.push("schema");
-          return { results: [{ schema_version: 23 }] };
+          return { results: [{ schema_version: 24 }] };
         }
         const supportDelete = sql.match(/^DELETE FROM (support_passkeys|support_enrollment_codes|support_auth_challenges|support_access_requests|support_sessions)$/);
         if (supportDelete) {
@@ -1505,6 +1506,15 @@ const bootstrapCompletion = () => ({
             access_requests: supportAuthority.access_requests.length,
             sessions: supportAuthority.sessions.length,
           }] };
+        }
+        if (sql === "DELETE FROM agent_action_receipts") {
+          actions.push("purge-agent_action_receipts");
+          agentActionReceipts = [];
+          return { results: [], meta: { changes: 2 } };
+        }
+        if (sql === "SELECT COUNT(*) AS agent_action_receipts FROM agent_action_receipts") {
+          actions.push("verify-agent_action_receipts-empty");
+          return { results: [{ agent_action_receipts: agentActionReceipts.length }] };
         }
         if (/UPDATE install_state/.test(sql)) {
           actions.push("invalidate");
@@ -1555,11 +1565,13 @@ const bootstrapCompletion = () => ({
         restored?.requiresVectorizeRecreation === true &&
         actions.join(",") === "account,deploy-paused,health-paused,quiesce,restore,schema," +
           "purge-passkeys,purge-enrollment_codes,purge-auth_challenges,purge-access_requests,purge-sessions," +
-          "verify-support-empty,invalidate,reset-batches,reset-receipts,readback,history",
+          "verify-support-empty,purge-agent_action_receipts,verify-agent_action_receipts-empty," +
+          "invalidate,reset-batches,reset-receipts,readback,history",
       actions.join(","),
     );
     check("rollback removes active and revoked live support authority but retains immutable history",
       Object.values(supportAuthority).every((rows) => rows.length === 0) &&
+        agentActionReceipts.length === 0 &&
         retainedSupportHistory.join(",") === "created,revoked" &&
         !actions.some((action) => /support.*events|owner.*activity/.test(action)),
       JSON.stringify({ supportAuthority, retainedSupportHistory, actions }));
@@ -1602,10 +1614,56 @@ const bootstrapCompletion = () => ({
       console.log = priorPurgeLog;
     }
     check("rollback purge failure leaves the Worker paused and never reports recovery ready",
-      /temporary support authority could not be verified empty.*Worker remains paused/is.test(failedPurgeError?.message || "") &&
+      /live security authority could not be verified empty.*Worker remains paused/is.test(failedPurgeError?.message || "") &&
         failedPurgeActions.join(",") === "deploy-paused,health-paused,quiesce,restore,schema,purge-passkeys,purge-failed" &&
         !failedPurgeOutput.some((line) => /recovery barriers verified/i.test(line)),
       `${failedPurgeError?.message}; ${failedPurgeActions.join(",")}; ${failedPurgeOutput.join(" | ")}`);
+
+    const failedAgentAuthorityActions = [];
+    let failedAgentAuthorityError = null;
+    try {
+      await cmdRollback(manifestPath, "fixture-bookmark", {
+        confirmed: true,
+        resolveAccount: async () => ({ id: "fixture-account" }),
+        cmdDeploy: async () => { failedAgentAuthorityActions.push("deploy-paused"); },
+        cmdHealth: async () => { failedAgentAuthorityActions.push("health-paused"); },
+        waitForVectorDrainQuiescence: async () => { failedAgentAuthorityActions.push("quiesce"); },
+        cf: async () => { failedAgentAuthorityActions.push("restore"); },
+        d1Query: async (_account, _database, sql) => {
+          if (/SELECT schema_version FROM install_state/.test(sql)) {
+            failedAgentAuthorityActions.push("schema");
+            return { results: [{ schema_version: 24 }] };
+          }
+          if (/^DELETE FROM support_/.test(sql)) {
+            failedAgentAuthorityActions.push("purge-support");
+            return { results: [], meta: { changes: 1 } };
+          }
+          if (/SELECT \(SELECT COUNT\(\*\) FROM support_passkeys\)/.test(sql)) {
+            failedAgentAuthorityActions.push("verify-support-empty");
+            return { results: [{
+              passkeys: 0, enrollment_codes: 0, auth_challenges: 0, access_requests: 0, sessions: 0,
+            }] };
+          }
+          if (sql === "DELETE FROM agent_action_receipts") {
+            failedAgentAuthorityActions.push("purge-agent-action-receipts");
+            return { results: [], meta: { changes: 2 } };
+          }
+          if (sql === "SELECT COUNT(*) AS agent_action_receipts FROM agent_action_receipts") {
+            failedAgentAuthorityActions.push("verify-agent-action-receipts-failed");
+            return { results: [{ agent_action_receipts: 1 }] };
+          }
+          failedAgentAuthorityActions.push("UNEXPECTED-AFTER-FAILURE");
+          return { results: [] };
+        },
+      });
+    } catch (caught) {
+      failedAgentAuthorityError = caught;
+    }
+    check("rollback refuses readiness when destructive agent authority does not read back empty",
+      /live security authority could not be verified empty.*Worker remains paused/is.test(failedAgentAuthorityError?.message || "") &&
+        failedAgentAuthorityActions.at(-1) === "verify-agent-action-receipts-failed" &&
+        !failedAgentAuthorityActions.includes("UNEXPECTED-AFTER-FAILURE"),
+      `${failedAgentAuthorityError?.message}; ${failedAgentAuthorityActions.join(",")}`);
 
     const legacyManifest = manifestFixture();
     legacyManifest.infrastructure.cloudflare.storage = "supabase";
@@ -1626,7 +1684,7 @@ const bootstrapCompletion = () => ({
       d1Query: async (_account, _database, sql) => {
         if (/SELECT schema_version FROM install_state/.test(sql)) {
           legacyActions.push("schema");
-          return { results: [{ schema_version: 23 }] };
+          return { results: [{ schema_version: 24 }] };
         }
         const supportDelete = sql.match(/^DELETE FROM (support_passkeys|support_enrollment_codes|support_auth_challenges|support_access_requests|support_sessions)$/);
         if (supportDelete) {
@@ -1638,6 +1696,14 @@ const bootstrapCompletion = () => ({
           return { results: [{
             passkeys: 0, enrollment_codes: 0, auth_challenges: 0, access_requests: 0, sessions: 0,
           }] };
+        }
+        if (sql === "DELETE FROM agent_action_receipts") {
+          legacyActions.push("purge-agent_action_receipts");
+          return { results: [], meta: { changes: 2 } };
+        }
+        if (sql === "SELECT COUNT(*) AS agent_action_receipts FROM agent_action_receipts") {
+          legacyActions.push("verify-agent_action_receipts-empty");
+          return { results: [{ agent_action_receipts: 0 }] };
         }
         if (/UPDATE upgrade_runs SET status = 'rolled_back'/.test(sql)) {
           legacyActions.push("history");
@@ -1652,7 +1718,8 @@ const bootstrapCompletion = () => ({
         legacyActions.join(",") ===
           "deploy-paused,health:paused-for-upgrade,quiesce,restore,schema," +
           "purge-support_passkeys,purge-support_enrollment_codes,purge-support_auth_challenges," +
-          "purge-support_access_requests,purge-support_sessions,verify-support-empty,history" &&
+          "purge-support_access_requests,purge-support_sessions,verify-support-empty," +
+          "purge-agent_action_receipts,verify-agent_action_receipts-empty,history" &&
         !legacyActions.includes("DEPLOY-ACTIVE") && !legacyActions.includes("UNEXPECTED-VECTOR-MUTATION"),
       JSON.stringify({ legacyRestore, legacyActions }));
 
@@ -1705,7 +1772,7 @@ const bootstrapCompletion = () => ({
         malformedError = caught;
       }
       check(`non-D1 rollback rejects a malformed ${name} receipt before success`,
-        /temporary support authority could not be verified empty.*Worker remains paused/is.test(malformedError?.message || "") &&
+        /live security authority could not be verified empty.*Worker remains paused/is.test(malformedError?.message || "") &&
           !malformedActions.includes("UNEXPECTED-AFTER-MALFORMED"),
         `${malformedError?.message}; ${malformedActions.join(",")}`);
     }

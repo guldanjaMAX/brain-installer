@@ -43,7 +43,10 @@ const check = (n, c, d = "") => {
 
 const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-bank-feed-secrets-")));
 const FIXTURE_KEY = `fixture-admin-${"a".repeat(40)}`;
-const FEED_NAMES = ["BANK_FEED_CLIENT_ID", "BANK_FEED_SECRET"];
+const SERVICE_NAMES = ["BANK_FEED_CLIENT_ID", "BANK_FEED_SECRET"];
+const WRAPPING_NAME = "BANK_FEED_WRAPPING_KEY_V2";
+const FEED_NAMES = [...SERVICE_NAMES, WRAPPING_NAME];
+const FIXTURE_WRAPPING_KEY = `v2.${Buffer.alloc(32, 37).toString("base64url")}`;
 
 function manifest({ bankFeed = false } = {}) {
   return {
@@ -125,10 +128,13 @@ const secretsOptions = { explicitAdminKey: FIXTURE_KEY, assertKeyDirSafe: () => 
 try {
   /* ============ both halves of the trap, as constants ============ */
   {
-    check("the feed's two identifiers are MANAGED, so an install that stops using the feed stops carrying them",
-      FEED_NAMES.every((name) => WORKER_PROVIDER_SECRET_NAMES.includes(name)),
+    check("the feed's two provider identifiers are managed, so an install that stops using the feed stops carrying them",
+      SERVICE_NAMES.every((name) => WORKER_PROVIDER_SECRET_NAMES.includes(name)),
       JSON.stringify(WORKER_PROVIDER_SECRET_NAMES));
-    check("and they are ALLOWED when the manifest enables the feed, which is the other half",
+    check("the wrapping key is never in routine provider-secret deletion scope",
+      !WORKER_PROVIDER_SECRET_NAMES.includes(WRAPPING_NAME),
+      JSON.stringify(WORKER_PROVIDER_SECRET_NAMES));
+    check("and the complete set is allowed when the manifest enables the feed",
       FEED_NAMES.every((name) => optionalWorkerSecretNames(manifest({ bankFeed: true })).includes(name)),
       JSON.stringify(optionalWorkerSecretNames(manifest({ bankFeed: true }))));
     check("with the feed off they are managed and NOT allowed, so reconciliation removes them",
@@ -153,6 +159,7 @@ try {
         CLOUDFLARE_API_TOKEN: "fixture-token",
         BANK_FEED_CLIENT_ID: "fixture-client-id",
         BANK_FEED_SECRET: "fixture-service-secret",
+        [WRAPPING_NAME]: FIXTURE_WRAPPING_KEY,
       },
     }, () => cmdSecrets(writeManifest("feed-on", manifest({ bankFeed: true })), secretsOptions));
 
@@ -174,8 +181,9 @@ try {
       env: { CLOUDFLARE_API_TOKEN: "fixture-token" },
     }, () => cmdSecrets(writeManifest("feed-off", manifest()), secretsOptions));
 
-    check("with the feed OFF the same run removes them, which is the behaviour that makes the list worth having",
-      FEED_NAMES.every((name) => events.includes(`delete:${name}`)), JSON.stringify(events));
+    check("with the feed OFF the same run removes provider credentials but preserves the wrapping key",
+      SERVICE_NAMES.every((name) => events.includes(`delete:${name}`)) &&
+      !events.includes(`delete:${WRAPPING_NAME}`), JSON.stringify(events));
     check("and it still never touches a secret name it does not manage",
       !events.includes("delete:UNRELATED_FIXTURE_SECRET"), JSON.stringify(events));
   }
@@ -188,8 +196,8 @@ try {
     const allowed = new Set(optionalWorkerSecretNames(manifest()));
     const wouldDelete = WORKER_PROVIDER_SECRET_NAMES.filter((name) => !allowed.has(name));
     check("the half-done change is exactly what the second half prevents",
-      FEED_NAMES.every((name) => wouldDelete.includes(name)) &&
-      FEED_NAMES.every((name) =>
+      SERVICE_NAMES.every((name) => wouldDelete.includes(name)) &&
+      SERVICE_NAMES.every((name) =>
         !WORKER_PROVIDER_SECRET_NAMES.filter((n) => !new Set(optionalWorkerSecretNames(manifest({ bankFeed: true }))).has(n))
           .includes(name)),
       JSON.stringify(wouldDelete));
@@ -215,6 +223,7 @@ try {
           CLOUDFLARE_API_TOKEN: "fixture-token",
           BANK_FEED_CLIENT_ID: "fixture-client-id",
           BANK_FEED_SECRET: "fixture-service-secret",
+          [WRAPPING_NAME]: FIXTURE_WRAPPING_KEY,
         },
       }, () => cmdSecrets(writeManifest("no-worker", manifest({ bankFeed: true })), secretsOptions));
     } catch (error) {

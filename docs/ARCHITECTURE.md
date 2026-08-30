@@ -125,8 +125,10 @@ reviewed empty route/custom-domain claim. A separate approval binds the exact
 private release golden SHA-256 across every supervised stop and resume. D1
 remains the durable authority. FTS and Vectorize are rebuilt derived state.
 Recovery control files contain
-fingerprints and bounded evidence only; the owner-only SQL export is the sole
-recovery artifact that contains corpus data. The Vectorize drain owner and
+fingerprints and bounded evidence only. The sole durable corpus artifact is an
+owner-only authenticated ciphertext file whose independent key is resolved
+from a non-secret Keychain locator. Plaintext SQL exists only for a bounded
+local verification or import callback, and stale residue stops recovery. The Vectorize drain owner and
 expiry are invocation-local coordination, not recoverable state. Recovery
 therefore excludes `install_state` from the raw provider export, recreates its
 reviewed singleton row with lease and mutation fields forced to SQL `NULL`, a
@@ -134,9 +136,19 @@ corpus-derived bootstrap status/epoch, and the exact `MAX(chunk_uid)` high-water
 then resets the derived outbox generation and bulk-bootstrap base to zero,
 forces the bootstrap protocol to `NULL`, and excludes provider-specific queue
 and batch receipts before hashing the remaining durable data.
+The same normalized row advances `session_generation` from the source value by
+exactly one, so every pre-recovery owner or scoped cookie fails without deleting
+durable passkeys. After a byte-exact D1 restore, a separate paused security
+stage proves the target's reviewed secret-name set, verifies the independent
+version-2 bank wrapping key when the source already has it, and compare-and-swap
+rewraps legacy bank references. Unreadable legacy authority becomes explicit
+reauthorization state before Vectorize rebuild starts. Schema 24 destructive
+agent-action receipts are live single-use authority, so recovery recreates
+their table empty and proves it remains empty on both sides of bank
+reconciliation. The immutable owner activity stream remains durable.
 Exact older migration prefixes remain inspectable by the offline verifier only.
-The field recovery runner requires schema 13 on both source and restored target
-before it can export or invoke the current drain protocol.
+The field recovery runner requires exact current schema 24 on both source and
+restored target before it can export or invoke the current drain protocol.
 
 ## Ingest lifecycle
 

@@ -397,6 +397,14 @@
           "pattern": "^keychain://[^/]+/.+$",
           "description": "Optional non-secret macOS Keychain locator, keychain://<service>/<account>, for the brain admin key used by unattended ingest. Standard setup fills a deterministic locator automatically on macOS when no legacy adjacent .brain-admin-key exists. Windows keeps the adjacent key under DPAPI CurrentUser; Linux uses an owner-only adjacent file. brain secrets exactly verifies durable desired state before applying it to the Worker. A failed remote write can be retried with no ADMIN_KEY export. The secret value never enters the manifest or plist."
         },
+        "recovery_artifact_key_secret": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^keychain://[^/]+/.+$",
+          "description": "Optional non-secret macOS Keychain locator, keychain://<service>/<account>, for the independent key that encrypts durable verified-recovery artifacts. The key value never enters the manifest, plan, state, command line, or artifact directory. The Cloudflare recovery field gate requires this locator on its target manifest."
+        },
         "recovery_field_gate": {
           "type": "object",
           "description": "Short-lived, manually reviewed isolation evidence for a disposable recovery target. Never add this to a production manifest. The adapter binds distinct immutable paused and active Worker versions plus their shared script hash, and requires both route lists to be empty before it can use the disposable target key.",

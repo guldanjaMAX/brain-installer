@@ -24,7 +24,6 @@ import {
   fchmodSync,
   fstatSync,
   fsyncSync,
-  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -50,6 +49,12 @@ import {
   parseAdminKeySecretReference,
   readAdminKeyFromKeychain,
 } from "./admin-key-persistence.mjs";
+import {
+  assertNoRecoveryArtifactResidue,
+  encryptRecoveryArtifact,
+  validateRecoveryArtifactKey,
+  withDecryptedRecoveryArtifact,
+} from "./recovery-artifact-crypto.mjs";
 import {
   VERIFIED_RECOVERY_STAGES,
   inspectVerifiedRecoveryManifestBindings,
@@ -79,6 +84,22 @@ const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const DISPOSABLE_WORKER_RE = /(?:^|-)recovery-gate-([a-z0-9]{8,24})$/;
 const WORKER_VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9-]{1,127}$/;
+const RECOVERY_REQUIRED_SECRET_NAMES = Object.freeze([
+  "ADMIN_KEY",
+  "RAG_PROXY_KEY",
+  "SESSION_SIGNING_KEY",
+]);
+const RECOVERY_OPTIONAL_SECRET_NAMES = Object.freeze([
+  "ANTHROPIC_API_KEY",
+  "BANK_FEED_CLIENT_ID",
+  "BANK_FEED_SECRET",
+  "BANK_FEED_WRAPPING_KEY_V2",
+]);
+const RECOVERY_BANK_PROVIDER_SECRET_NAMES = Object.freeze([
+  "BANK_FEED_CLIENT_ID",
+  "BANK_FEED_SECRET",
+]);
+const RECOVERY_BANK_WRAPPING_SECRET = "BANK_FEED_WRAPPING_KEY_V2";
 
 /**
  * Checkpoint boundaries available to a supervised live drill. Read-only stages
@@ -183,6 +204,10 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "support_auth_challenges",
   "support_passkeys",
   "support_access_events",
+  // Schema 24: receipts for destructive agent actions are live single-use
+  // authority. The table must exist on a recovered target, but no preview,
+  // confirmation, challenge, or idempotency state may cross recovery.
+  "agent_action_receipts",
 ]);
 
 /**
@@ -202,6 +227,7 @@ export const RECOVERY_EXPORT_TABLES = Object.freeze(
       table !== "support_sessions" && table !== "support_access_requests" &&
       table !== "support_enrollment_codes" && table !== "support_auth_challenges" &&
       table !== "support_passkeys" &&
+      table !== "agent_action_receipts" &&
       table !== "bank_feed_link_sessions" &&
       table !== "oauth_clients" && table !== "oauth_codes" && table !== "oauth_tokens"),
 );
@@ -241,6 +267,8 @@ const OUTBOX_SQL =
   "SELECT COUNT(*) AS pending_outbox, " +
   "COALESCE(SUM(CASE WHEN attempts > 0 AND last_error IS NOT NULL THEN 1 ELSE 0 END),0) AS failed_vectors " +
   "FROM vector_outbox";
+const AGENT_ACTION_RECEIPTS_SQL =
+  "SELECT COUNT(*) AS agent_action_receipts FROM agent_action_receipts";
 const INSTALL_STATE_BASE_COLUMNS = Object.freeze([
   "id", "client_slug", "product_version", "schema_version", "gate_version",
   "installed_at", "last_upgraded_at", "ring", "notes",
@@ -269,11 +297,6 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   // queue itself so corpus fingerprints remain stable across safe retries.
   "outbox_generation",
   "vector_projection_bootstrap_base_count",
-  // Owner session state is live coordination, not corpus. A recovered brain
-  // restarts at the default generation (zero reads as 1), so session cookies
-  // validate only against the recovered value — never resurrected exactly.
-  // Owners re-sign-in with their passkey; that is a tap, not a loss.
-  "session_generation",
 ]);
 // Schemas 14 through 22 add owner passkeys, capability grants, zones, the financial ledger, bank feeds,
 // connector OAuth, extraction provenance, owner workspace state, and exact
@@ -281,7 +304,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // contract tracks the EXACT current schema by design: a drill against a
 // database one migration behind would export a table or column set that does
 // not match the reviewed list. Bumping this is required for every migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 23;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 24;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -347,6 +370,7 @@ const SCHEMA_23_TABLES = Object.freeze([
   "support_passkeys",
   "support_access_events",
 ]);
+const SCHEMA_24_TABLES = Object.freeze(["agent_action_receipts"]);
 
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
@@ -361,7 +385,8 @@ const AGGREGATE_FIELDS = Object.freeze([
     // proven by the exported content, which these tables are fully part of.
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
      ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES, ...SCHEMA_18_TABLES,
-     ...SCHEMA_19_TABLES, ...SCHEMA_21_TABLES, ...SCHEMA_22_TABLES, ...SCHEMA_23_TABLES].includes(table)
+     ...SCHEMA_19_TABLES, ...SCHEMA_21_TABLES, ...SCHEMA_22_TABLES, ...SCHEMA_23_TABLES,
+     ...SCHEMA_24_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -726,11 +751,20 @@ function removeKnownPartial(path, artifactDirectory) {
 }
 
 function reconcileExportResidue(artifactPath, dataPartial, combinedPartial, artifactDirectory, maxBytes) {
-  if (!existsSync(artifactPath)) {
-    removeKnownPartial(dataPartial, artifactDirectory);
-    removeKnownPartial(combinedPartial, artifactDirectory);
-    return false;
+  // Both files contain plaintext corpus bytes. An abrupt process exit is not
+  // permission to delete them invisibly or to continue around them. The owner
+  // must review and remove the exact residue before a retry can proceed.
+  if (existsSync(dataPartial) || existsSync(combinedPartial)) {
+    for (const partial of [dataPartial, combinedPartial].filter(existsSync)) {
+      const info = lstatSync(partial);
+      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) {
+        refuse("RECOVERY_EXPORT_PARTIAL_UNSAFE");
+      }
+      assertOwned(info, "RECOVERY_EXPORT_PARTIAL_UNSAFE");
+    }
+    refuse("RECOVERY_EXPORT_PLAINTEXT_RESIDUE_REVIEW_REQUIRED");
   }
+  if (!existsSync(artifactPath)) return false;
   let finalInfo;
   try { finalInfo = lstatSync(artifactPath); } catch {
     refuse("RECOVERY_EXPORT_ARTIFACT_UNSAFE");
@@ -739,23 +773,6 @@ function reconcileExportResidue(artifactPath, dataPartial, combinedPartial, arti
     refuse("RECOVERY_EXPORT_ARTIFACT_UNSAFE");
   }
   assertOwnerOnly(finalInfo, "RECOVERY_EXPORT_ARTIFACT_UNSAFE");
-  if (existsSync(combinedPartial)) {
-    const partialInfo = lstatSync(combinedPartial);
-    if (!partialInfo.isFile() || partialInfo.isSymbolicLink()) {
-      refuse("RECOVERY_EXPORT_PARTIAL_UNSAFE");
-    }
-    assertOwned(partialInfo, "RECOVERY_EXPORT_PARTIAL_UNSAFE");
-    if (partialInfo.dev === finalInfo.dev && partialInfo.ino === finalInfo.ino) {
-      if (partialInfo.nlink !== 2 || finalInfo.nlink !== 2) {
-        refuse("RECOVERY_EXPORT_PARTIAL_UNSAFE");
-      }
-      unlinkSync(combinedPartial);
-      syncDirectory(artifactDirectory);
-    } else {
-      removeKnownPartial(combinedPartial, artifactDirectory);
-    }
-  }
-  removeKnownPartial(dataPartial, artifactDirectory);
   assertArtifactFile(artifactPath, { maxBytes });
   return true;
 }
@@ -932,6 +949,13 @@ export async function normalizedInstallStateExport(binding, migrations, readRows
     return row?.[name];
   };
   const projection = expectedColumns.map((name) => {
+    if (name === "session_generation") {
+      // Preserve the source's monotonic revocation history while making every
+      // pre-recovery cookie invalid. NULL is rejected below, so overflow or a
+      // malformed source value stops before an artifact is created.
+      return `CASE WHEN session_generation BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER - 1} ` +
+        `THEN session_generation + 1 ELSE NULL END AS ${quoteIdentifier(name)}`;
+    }
     if (name === "vector_projection_status") {
       return `CASE WHEN EXISTS (SELECT 1 FROM chunks) THEN 'bootstrap_required' ELSE 'verified' END AS ${quoteIdentifier(name)}`;
     }
@@ -959,6 +983,9 @@ export async function normalizedInstallStateExport(binding, migrations, readRows
       expectedColumns.some((name) => !Object.hasOwn(row, name)) ||
       expectedColumns.some((name) =>
         recoveryValue(name, row) !== row[name]) ||
+      (expectedColumns.includes("session_generation") &&
+        (!Number.isSafeInteger(Number(row.session_generation)) ||
+          Number(row.session_generation) < 1)) ||
       (expectedColumns.includes("vector_projection_status") &&
         (row.vector_projection_status !== (hasCorpus ? "bootstrap_required" : "verified") ||
          Number(row.vector_projection_bootstrap_epoch) !== (hasCorpus ? 1 : 0)))) {
@@ -1125,7 +1152,8 @@ function expectedRecoveryTables(migrations) {
     (latest >= 19 || !SCHEMA_19_TABLES.includes(table)) &&
     (latest >= 21 || !SCHEMA_21_TABLES.includes(table)) &&
     (latest >= 22 || !SCHEMA_22_TABLES.includes(table)) &&
-    (latest >= 23 || !SCHEMA_23_TABLES.includes(table)));
+    (latest >= 23 || !SCHEMA_23_TABLES.includes(table)) &&
+    (latest >= 24 || !SCHEMA_24_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {
@@ -1187,8 +1215,19 @@ export async function verifyRecoverySqlArtifact(artifactPath, {
     await writeToChild(child.stdin, Buffer.from(".bail on\n", "utf8"));
     const input = createReadStream("", { fd: descriptor, autoClose: false });
     for await (const chunk of input) await writeToChild(child.stdin, chunk);
-    const aggregateJsonPairs = AGGREGATE_FIELDS.map(([name]) =>
-      `'${name}',${quoteIdentifier(name)}`).join(",");
+    // SQLite limits one function call to 127 arguments. Every json_object
+    // field consumes two, so a new durable table can otherwise make the local
+    // verifier fail even though the schema is valid. Build bounded objects and
+    // merge them without changing the flat aggregate receipt.
+    const aggregateJsonObjects = [];
+    for (let offset = 0; offset < AGGREGATE_FIELDS.length; offset += 40) {
+      const pairs = AGGREGATE_FIELDS.slice(offset, offset + 40).map(([name]) =>
+        `'${name}',${quoteIdentifier(name)}`).join(",");
+      aggregateJsonObjects.push(`json_object(${pairs})`);
+    }
+    const aggregateJsonExpression = aggregateJsonObjects.reduce(
+      (left, right) => `json_patch(${left},${right})`,
+    );
     const suffix = Buffer.from(
       `\n${FTS_INTEGRITY_SQL};\n.mode list\n` +
       `SELECT json_object('group','quick','rows',json_group_array(json_object('quick_check',quick_check))) ` +
@@ -1205,7 +1244,7 @@ export async function verifyRecoverySqlArtifact(artifactPath, {
         `SELECT type,name,tbl_name,sql FROM sqlite_schema ` +
         `WHERE name NOT LIKE 'sqlite_%' AND name <> '_cf_KV' ` +
         `AND name NOT LIKE 'chunks_fts_%' ORDER BY type,name,tbl_name);\n` +
-      `SELECT json_object('group','aggregate','rows',json_array(json_object(${aggregateJsonPairs}))) ` +
+      `SELECT json_object('group','aggregate','rows',json_array(${aggregateJsonExpression})) ` +
         `FROM (${AGGREGATE_SQL});\n`,
       "utf8",
     );
@@ -1272,6 +1311,23 @@ function createGateLocalPins(config, plan) {
   try { targetAdminLocator = parseAdminKeySecretReference(binding.target.adminKeySecret); } catch {
     refuse("RECOVERY_TARGET_KEYCHAIN_REQUIRED");
   }
+  let sourceAdminLocator = null;
+  if (binding.source.adminKeySecret) {
+    try { sourceAdminLocator = parseAdminKeySecretReference(binding.source.adminKeySecret); } catch {
+      refuse("RECOVERY_SOURCE_KEYCHAIN_REQUIRED");
+    }
+  }
+  if (!binding.target.recoveryArtifactKeySecret) {
+    refuse("RECOVERY_ARTIFACT_KEYCHAIN_REQUIRED");
+  }
+  let recoveryArtifactKeyLocator;
+  try {
+    recoveryArtifactKeyLocator = parseAdminKeySecretReference(
+      binding.target.recoveryArtifactKeySecret,
+    );
+  } catch {
+    refuse("RECOVERY_ARTIFACT_KEYCHAIN_REQUIRED");
+  }
   const wrapper = inspectWrapper(config.wranglerWrapperPath);
   const golden = inspectGolden(config.goldenPath);
   const artifacts = assertPrivateDirectory(config.artifactDirectory);
@@ -1280,7 +1336,9 @@ function createGateLocalPins(config, plan) {
     binding,
     disposable,
     isolation,
+    sourceAdminLocator,
     targetAdminLocator,
+    recoveryArtifactKeyLocator,
     wrapper,
     golden,
     artifacts,
@@ -1433,6 +1491,14 @@ const BOOTSTRAP_RECEIPT_FIELDS = Object.freeze([
 const BOOTSTRAP_BUSY_FIELDS = Object.freeze([
   "protocol", "busy", "remaining", "retry_after_seconds",
 ]);
+const BANK_KEY_PROOF_FIELDS = Object.freeze([
+  "configured", "key_version", "key_fingerprint",
+]);
+const BANK_RECONCILIATION_FIELDS = Object.freeze([
+  "scanned", "rewrapped", "reauthorization_required", "raced",
+  "legacy_rewrap_required", "protected", "reauthorization_required_total",
+  "unsupported_key_versions",
+]);
 
 function exactAggregateReceiptFields(body, expected, code) {
   if (!body || typeof body !== "object" || Array.isArray(body)) refuse(code);
@@ -1443,6 +1509,36 @@ function exactAggregateReceiptFields(body, expected, code) {
     // progress only, so unexpected response material never reaches a terminal.
     refuse(code);
   }
+}
+
+function validateBankKeyProof(body) {
+  const code = "RECOVERY_BANK_KEY_PROOF_INVALID";
+  exactAggregateReceiptFields(body, BANK_KEY_PROOF_FIELDS, code);
+  if (body.key_version !== 2 || typeof body.configured !== "boolean" ||
+      (body.configured
+        ? !SHA256_RE.test(String(body.key_fingerprint || ""))
+        : body.key_fingerprint !== null)) {
+    refuse(code);
+  }
+  return Object.freeze({
+    configured: body.configured,
+    keyVersion: body.key_version,
+    keyFingerprint: body.key_fingerprint,
+  });
+}
+
+function validateBankReconciliation(body) {
+  const code = "RECOVERY_BANK_RECONCILIATION_INVALID";
+  exactAggregateReceiptFields(body, BANK_RECONCILIATION_FIELDS, code);
+  const receipt = {};
+  for (const field of BANK_RECONCILIATION_FIELDS) {
+    receipt[field] = nonNegativeInteger(body[field], code);
+  }
+  if (receipt.scanned > 100 ||
+      receipt.rewrapped + receipt.reauthorization_required + receipt.raced > receipt.scanned) {
+    refuse(code);
+  }
+  return Object.freeze(receipt);
 }
 
 function validateBootstrapReceipt(body, expectedTotal) {
@@ -1579,6 +1675,8 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
   const now = dependencies.now ?? Date.now;
   const verifySqlArtifact = dependencies.verifySqlArtifact ?? verifyRecoverySqlArtifact;
   const readAdminKey = dependencies.readAdminKey ?? ((locator) =>
+    defaultReadAdminKey(locator, config.environment));
+  const readRecoveryArtifactKey = dependencies.readRecoveryArtifactKey ?? ((locator) =>
     defaultReadAdminKey(locator, config.environment));
   const runEval = dependencies.runEval ?? defaultRunEval;
   let wrapperVersionProven = false;
@@ -1788,12 +1886,16 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       .filter((entry) => entry.type === "secret_text")
       .map((entry) => String(entry.name || ""))
       .sort();
-    const allowedSecrets = role === "source"
-      ? new Set(["ADMIN_KEY", "RAG_PROXY_KEY"])
-      : new Set(["ADMIN_KEY"]);
-    if (!secretNames.includes("ADMIN_KEY") ||
+    const allowedSecrets = new Set([
+      ...RECOVERY_REQUIRED_SECRET_NAMES,
+      ...RECOVERY_OPTIONAL_SECRET_NAMES,
+    ]);
+    const bankProviderCount = RECOVERY_BANK_PROVIDER_SECRET_NAMES.filter((name) =>
+      secretNames.includes(name)).length;
+    if (RECOVERY_REQUIRED_SECRET_NAMES.some((name) => !secretNames.includes(name)) ||
         secretNames.some((name) => !allowedSecrets.has(name)) ||
-        (role === "target" && canonical(secretNames) !== canonical(["ADMIN_KEY"]))) {
+        ![0, RECOVERY_BANK_PROVIDER_SECRET_NAMES.length].includes(bankProviderCount) ||
+        (role === "target" && !secretNames.includes(RECOVERY_BANK_WRAPPING_SECRET))) {
       refuse("RECOVERY_WORKER_BINDINGS_INVALID");
     }
     if (role === "target") {
@@ -1819,6 +1921,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         runtime: structuredClone(runtime),
       }),
       scriptEtag,
+      secretNames: Object.freeze([...secretNames]),
     });
   }
 
@@ -1843,7 +1946,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     if (canonical(paused.comparable) !== canonical(active.comparable)) {
       refuse("RECOVERY_WORKER_BINDINGS_INVALID");
     }
-    return true;
+    return paused;
   }
 
   async function assertExactCloudflareResources(binding, role, targetMode = null) {
@@ -1885,8 +1988,12 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       "RECOVERY_WORKER_DEPLOYMENT_AMBIGUOUS",
     );
     if (role === "source") {
-      await inspectWorkerVersion(binding, role, versionId);
-      return Object.freeze({ vectorCount: info.vectorCount, workerVersionId: versionId });
+      const inspected = await inspectWorkerVersion(binding, role, versionId);
+      return Object.freeze({
+        vectorCount: info.vectorCount,
+        workerVersionId: versionId,
+        secretNames: inspected.secretNames,
+      });
     }
     const deployedMode = versionId === pins.isolation.pausedWorkerVersionId
       ? "paused"
@@ -1896,11 +2003,12 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     if (!deployedMode || (targetMode !== "either" && targetMode !== deployedMode)) {
       refuse("RECOVERY_TARGET_EXECUTION_CHANGED");
     }
-    await assertReviewedTargetVersions(binding);
+    const reviewed = await assertReviewedTargetVersions(binding);
     return Object.freeze({
       vectorCount: info.vectorCount,
       workerVersionId: versionId,
       targetMode: deployedMode,
+      secretNames: reviewed.secretNames,
     });
   }
 
@@ -1960,7 +2068,20 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     });
   }
 
+  async function assertTargetAgentAuthorityEmpty() {
+    const rows = await d1Rows(pins.binding.target, AGENT_ACTION_RECEIPTS_SQL);
+    if (rows.length !== 1 ||
+        nonNegativeInteger(
+          rows[0]?.agent_action_receipts,
+          "RECOVERY_AGENT_AUTHORITY_INVALID",
+        ) !== 0) {
+      refuse("RECOVERY_AGENT_AUTHORITY_NOT_EMPTY");
+    }
+    return true;
+  }
+
   function artifactEvidence() {
+    assertNoRecoveryArtifactResidue(pins.artifacts.path);
     return hashStableArtifact(pins.artifactPath, plan.artifact.max_single_import_bytes);
   }
 
@@ -2081,6 +2202,85 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     try { return await operation(key); } finally { revalidate(); }
   }
 
+  async function withRecoveryArtifactKey(operation) {
+    revalidate();
+    let key;
+    try {
+      key = readRecoveryArtifactKey(pins.recoveryArtifactKeyLocator);
+      validateRecoveryArtifactKey(key);
+    } catch {
+      refuse("RECOVERY_ARTIFACT_KEYCHAIN_VALUE_INVALID");
+    }
+    try { return await operation(key); } finally { revalidate(); }
+  }
+
+  async function withSourceKey(operation) {
+    revalidate();
+    if (!pins.sourceAdminLocator) refuse("RECOVERY_SOURCE_KEYCHAIN_REQUIRED");
+    const key = readAdminKey(pins.sourceAdminLocator);
+    if (typeof key !== "string" || !key || key.length > 4096 || /[\r\n\0]/.test(key)) {
+      refuse("RECOVERY_SOURCE_KEYCHAIN_VALUE_INVALID");
+    }
+    try { return await operation(key); } finally { revalidate(); }
+  }
+
+  async function bankKeyProof(binding, key) {
+    const response = await exactFetch(
+      fetchImpl,
+      dataPlaneBase(binding),
+      "/api/bank-feed/recovery-key-proof",
+      { method: "POST", headers: { "X-Admin-Key": key } },
+    );
+    if (!response.ok) refuse("RECOVERY_BANK_KEY_PROOF_FAILED");
+    return validateBankKeyProof(await boundedJsonResponse(response));
+  }
+
+  async function assertRecoverySecretReconciliation(targetMode) {
+    const source = await assertExactCloudflareResources(pins.binding.source, "source");
+    const target = await assertExactCloudflareResources(pins.binding.target, "target", targetMode);
+    const expectedTarget = [...new Set([
+      ...source.secretNames,
+      RECOVERY_BANK_WRAPPING_SECRET,
+    ])].sort();
+    if (canonical(target.secretNames) !== canonical(expectedTarget)) {
+      refuse("RECOVERY_WORKER_SECRET_RECONCILIATION_REQUIRED");
+    }
+    const targetProof = await withTargetKey((key) => bankKeyProof(pins.binding.target, key));
+    if (!targetProof.configured) refuse("RECOVERY_BANK_KEY_PROOF_INVALID");
+    if (source.secretNames.includes(RECOVERY_BANK_WRAPPING_SECRET)) {
+      const sourceProof = await withSourceKey((key) => bankKeyProof(pins.binding.source, key));
+      if (!sourceProof.configured ||
+          sourceProof.keyFingerprint !== targetProof.keyFingerprint) {
+        refuse("RECOVERY_BANK_KEY_MISMATCH");
+      }
+    }
+    return Object.freeze({ source, target, targetProof });
+  }
+
+  async function driveRecoveredBankReconciliation(key) {
+    let previousRemaining = null;
+    for (let attempt = 0; attempt < 10_000; attempt++) {
+      const response = await exactFetch(
+        fetchImpl,
+        dataPlaneBase(pins.binding.target),
+        "/api/bank-feed/reconcile-recovery",
+        { method: "POST", headers: { "X-Admin-Key": key } },
+      );
+      if (!response.ok) refuse("RECOVERY_BANK_RECONCILIATION_FAILED");
+      const receipt = validateBankReconciliation(await boundedJsonResponse(response));
+      if (receipt.unsupported_key_versions !== 0) {
+        refuse("RECOVERY_BANK_KEY_VERSION_UNSUPPORTED");
+      }
+      if (receipt.legacy_rewrap_required === 0) return receipt;
+      if (previousRemaining !== null && receipt.legacy_rewrap_required >= previousRemaining &&
+          receipt.rewrapped === 0 && receipt.reauthorization_required === 0) {
+        refuse("RECOVERY_BANK_RECONCILIATION_STALLED");
+      }
+      previousRemaining = receipt.legacy_rewrap_required;
+    }
+    refuse("RECOVERY_BANK_RECONCILIATION_LIMIT_REACHED");
+  }
+
   async function targetHealth(expectedMode) {
     const response = await exactFetch(
       fetchImpl,
@@ -2180,6 +2380,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
   const adapters = {
     export_d1: async (context) => {
       assertContext(context, "export_d1");
+      assertNoRecoveryArtifactResidue(pins.artifacts.path);
       await assertExactCloudflareResources(pins.binding.source, "source");
       const migrations = await requireCurrentVectorProtocol(
         pins.binding.source,
@@ -2224,8 +2425,12 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         const combined = assertArtifactFile(combinedPartial, {
           maxBytes: plan.artifact.max_single_import_bytes,
         });
-        try { linkSync(combined.path, pins.artifactPath); } catch {
-          refuse("RECOVERY_EXPORT_ARTIFACT_APPEARED");
+        try {
+          await withRecoveryArtifactKey((key) =>
+            encryptRecoveryArtifact(combined.path, pins.artifactPath, key));
+        } catch (error) {
+          if (error instanceof CloudflareRecoveryAdapterError) throw error;
+          refuse("RECOVERY_EXPORT_ENCRYPTION_FAILED");
         }
         unlinkSync(combinedPartial);
         unlinkSync(dataPartial);
@@ -2250,24 +2455,34 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       }
       await assertExactCloudflareResources(pins.binding.source, "source");
       await remoteMigrationContract(pins.binding.source);
-      const local = await verifySqlArtifact(pins.artifactPath, {
-        maxBytes: plan.artifact.max_single_import_bytes,
-      });
+      const inspected = await withRecoveryArtifactKey((key) =>
+        withDecryptedRecoveryArtifact(
+          pins.artifactPath,
+          pins.artifacts.path,
+          key,
+          async (plaintextPath) => Object.freeze({
+            local: await verifySqlArtifact(plaintextPath, {
+              maxBytes: plan.artifact.max_single_import_bytes,
+            }),
+            contentFingerprint: recoveryArtifactDataFingerprint(
+              plaintextPath,
+              plan.artifact.max_single_import_bytes,
+            ),
+          }),
+        ));
+      const local = inspected.local;
       const remote = await remoteDatabaseSnapshot(pins.binding.source);
       assertSameStructuralSnapshot(local, remote, "RECOVERY_EXPORT_SOURCE_MISMATCH");
       return Object.freeze({
         ...artifact,
         ...local,
-        content_fingerprint: recoveryArtifactDataFingerprint(
-          pins.artifactPath,
-          plan.artifact.max_single_import_bytes,
-        ),
+        content_fingerprint: inspected.contentFingerprint,
       });
     },
 
     prove_target_clean: async (context) => {
       assertContext(context, "prove_target_clean");
-      const resources = await assertExactCloudflareResources(pins.binding.target, "target", "paused");
+      const { target: resources } = await assertRecoverySecretReconciliation("paused");
       await targetHealth("paused-for-upgrade");
       const userTableCount = await targetUserTableCount();
       return Object.freeze({
@@ -2287,7 +2502,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
           artifact.artifact_bytes !== exported?.artifact_bytes) {
         refuse("RECOVERY_EXPORT_ARTIFACT_CHANGED");
       }
-      const resources = await assertExactCloudflareResources(pins.binding.target, "target", "paused");
+      const { target: resources } = await assertRecoverySecretReconciliation("paused");
       await targetHealth("paused-for-upgrade");
       const tables = await targetUserTableCount();
       if (tables > 0) {
@@ -2300,10 +2515,16 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       }
       if (resources.vectorCount !== 0) refuse("RECOVERY_TARGET_IMPORT_AMBIGUOUS");
       try {
-        await wrangler(pins.binding.target, [
-          "d1", "execute", pins.binding.target.databaseName,
-          "--remote", "--file", pins.artifactPath, "--yes",
-        ]);
+        await withRecoveryArtifactKey((key) =>
+          withDecryptedRecoveryArtifact(
+            pins.artifactPath,
+            pins.artifacts.path,
+            key,
+            (plaintextPath) => wrangler(pins.binding.target, [
+              "d1", "execute", pins.binding.target.databaseName,
+              "--remote", "--file", plaintextPath, "--yes",
+            ]),
+          ));
       } catch (error) {
         try {
           const reconciled = await targetDatabaseSnapshot();
@@ -2327,13 +2548,44 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       return restored;
     },
 
+    reconcile_security: async (context) => {
+      assertContext(context, "reconcile_security");
+      await assertRecoverySecretReconciliation("paused");
+      const restored = completedEvidence(context, "verify_d1");
+      assertSameSnapshot(
+        await targetDatabaseSnapshot(),
+        restored,
+        "RECOVERY_TARGET_CHANGED_BEFORE_SECURITY_RECONCILIATION",
+      );
+      // Schema 24 receipts can confirm destructive agent actions. Recovery
+      // recreates their table from migration 0024 but never restores a row.
+      // Prove that authority is empty on both sides of the bank-key mutation.
+      await assertTargetAgentAuthorityEmpty();
+      const receipt = await withTargetKey((key) => driveRecoveredBankReconciliation(key));
+      await assertTargetAgentAuthorityEmpty();
+      const reconciled = await targetDatabaseSnapshot();
+      assertSameStructuralSnapshot(
+        reconciled,
+        restored,
+        "RECOVERY_TARGET_CHANGED_DURING_SECURITY_RECONCILIATION",
+      );
+      return Object.freeze({
+        ...reconciled,
+        bank_protected: receipt.protected,
+        bank_reauthorization_required: receipt.reauthorization_required_total,
+        bank_legacy_rewrap_required: receipt.legacy_rewrap_required,
+        bank_unsupported_key_versions: receipt.unsupported_key_versions,
+      });
+    },
+
     rebuild_vectorize: async (context) => {
       assertContext(context, "rebuild_vectorize");
       // Recheck on every resumed rebuild. An old journal checkpoint or an
       // out-of-band target replacement must never route schema-prefix data to
       // the current bulk bootstrap endpoint.
       await requireCurrentVectorProtocol(pins.binding.target);
-      const restored = completedEvidence(context, "verify_d1");
+      const restored = completedEvidence(context, "reconcile_security") ||
+        completedEvidence(context, "verify_d1");
       assertSameRecoveryCorpus(
         await targetDatabaseSnapshot(),
         restored,
@@ -2352,6 +2604,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       if (context.attempt === 1 && resources.vectorCount !== 0) {
         refuse("RECOVERY_VECTORIZE_TARGET_AMBIGUOUS");
       }
+      await assertRecoverySecretReconciliation("either");
 
       if (resources.targetMode === "paused") {
         await targetHealth("paused-for-upgrade");
@@ -2656,7 +2909,7 @@ export function parseCloudflareRecoveryCliArguments(argv) {
 
 function printUsage() {
   console.log("usage: node operations/cloudflare-recovery-adapter.mjs preview --source-manifest <file> --target-manifest <file> --plan <file> --state <file> --artifact-directory <private-dir> --wrangler-wrapper <owner-only-wrapper> --golden <private-release-suite>");
-  console.log("       node operations/cloudflare-recovery-adapter.mjs run <same flags> --approve-plan <fingerprint> --approve-disposable-target <fingerprint> --approve-target-execution <fingerprint> --approve-source-export-blocking <fingerprint> --approve-wrapper <fingerprint> --approve-golden <fingerprint> [--stop-after-stage <export_d1|restore_d1|rebuild_vectorize>]");
+  console.log("       node operations/cloudflare-recovery-adapter.mjs run <same flags> --approve-plan <fingerprint> --approve-disposable-target <fingerprint> --approve-target-execution <fingerprint> --approve-source-export-blocking <fingerprint> --approve-wrapper <fingerprint> --approve-golden <fingerprint> [--stop-after-stage <export_d1|restore_d1|reconcile_security|rebuild_vectorize>]");
 }
 
 async function main(argv = process.argv.slice(2)) {

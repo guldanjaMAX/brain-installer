@@ -63,6 +63,11 @@ checkout, run `npm run rehearse:onboarding`. It opens the real owner-workspace
 bundle with synthetic data and an unmistakable local-only banner. No account,
 credential, manifest, or deployment is used.
 
+For the narrower recovery and bank-custody gate, run
+`npm run test:recovery-bank`. It uses a temporary HOME, inherits no credentials,
+and interrupts every recovery mutation and bank rewrap boundary with synthetic
+fixtures. A pass is offline proof only, not a Cloudflare or bank-provider drill.
+
 Want to see how recovery behaves before install day? Run
 `npm run rehearse:hiccups` from the source checkout. It safely interrupts
 synthetic setup, folder, connector, migration, search, owner-action, access, and

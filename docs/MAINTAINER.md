@@ -112,8 +112,17 @@ storage rules. `0021` adds authoritative document entity scope plus owner
 uploads, approvals, period close, append-only activity, targets, preferences,
 and durable request replay. `0022` adds exact-document grants, scoped sessions,
 and aggregate passkey timing. Install order is fixed: 0021 must complete before
-0022. The restart-safe migration adapter is the acceptance path for interrupted
-column additions; raw statement replay is not a substitute.
+0022. Recovery preserves schema-22 grants, durable access receipts and events,
+passkey telemetry, and owner passkeys, while excluding challenges and one-time
+enrollment codes. It writes the source `session_generation` plus one so no old
+owner or scoped cookie can survive a restore. `0023` adds temporary support
+sessions, but recovery exports only support audit history and recreates every
+live support authority empty. The restart-safe migration adapter is the acceptance path for interrupted
+column additions; raw statement replay is not a substitute. `0024` adds
+single-use receipts for destructive agent actions. Recovery recreates that
+table empty and never exports a receipt. D1 Time Travel rollback also purges
+the table and requires an exact zero-row readback before the paused barrier can
+report success.
 
 `brain update` deploys a paused compatibility Worker and verifies its exact
 version/writer mode, waits one complete supported lease window, runs these

@@ -36,9 +36,11 @@ refused. Instance plans and state are ignored by Git.
 
 The reviewed order is fixed:
 
-1. Build a complete restorable D1 SQL artifact from the reviewed durable tables
-   and the exact checked-in migrations already applied on the source.
-2. Hash the artifact, restore it locally with SQLite safe mode, run database
+1. Build a complete restorable D1 SQL stream from the reviewed durable tables
+   and the exact checked-in migrations already applied on the source, then seal
+   it as an authenticated version-1 recovery artifact.
+2. Hash the ciphertext, open it only in the owner-only artifact directory,
+   restore the plaintext stream locally with SQLite safe mode, run database
    and FTS integrity checks, and record only its schema, aggregate, and exact
    durable-data fingerprints.
 3. Prove the remote restore target is the reviewed, empty D1 and Vectorize pair.
@@ -46,7 +48,14 @@ The reviewed order is fixed:
 5. Export the restored durable tables back from D1 and require integrity,
    schema, aggregate counts, and the exact data SHA-256 to match the source
    artifact.
-6. While the reviewed compatibility Worker is deployed in
+6. Reconcile recovered security state while the target is still paused. The
+   target must carry the complete reviewed secret-name set and the independent
+   `BANK_FEED_WRAPPING_KEY_V2`. If the source already uses that key, an
+   authenticated SHA-256 proof must match the target before import. Legacy bank
+   references are compare-and-swap rewrapped to version 2. A reference that
+   cannot be opened becomes explicit `reauth_required` state. No legacy or
+   unsupported key version may remain connected.
+7. While the reviewed compatibility Worker is deployed in
    `paused-for-upgrade` mode, drive the schema-13 `/api/admin/brain/bootstrap`
    contract until every D1 chunk has one query-visible vector, all durable batch
    receipts are confirmed, the outbox and submitted counts are zero, and no
@@ -54,9 +63,9 @@ The reviewed order is fixed:
    never calls reindex to reset them. After exact inventory and provider-count
    proof, deploy only the pre-reviewed immutable active Worker version and prove
    that exact version and `active` mode before continuing.
-7. Run post-restore health with zero failures and exact `vector_readiness`:
+8. Run post-restore health with zero failures and exact `vector_readiness`:
    `ready=true`, zero pending/submitted work, and equal D1/Vectorize counts.
-8. Run the release evaluation profile with zero critical failures and zero
+9. Run the release evaluation profile with zero critical failures and zero
    unauthorized retrievals.
 
 Every stage is persisted as `running` before its adapter executes. If the
@@ -70,10 +79,15 @@ before and after every adapter call. A changed resource, runtime setting, or
 manifest file therefore leaves the current stage retryable instead of letting a
 credential or write cross the reviewed boundary.
 
-The SQL artifact contains the Brain's text and metadata. It must stay in a
-private owner-only directory and is never a support artifact. The single-file
-import contract refuses exports above 5 GiB; a reviewed split-import procedure
-is required above that boundary.
+The durable `.brain-recovery-export.sql.fbrenc` artifact is authenticated
+AES-256-GCM ciphertext. Its independent version-1 key is resolved only from the
+target manifest's `operations.recovery_artifact_key_secret` Keychain locator.
+The key never enters a manifest, plan, state, command line, or artifact. A
+plaintext SQL file exists only inside the owner-only directory while the local
+verifier or Wrangler import callback owns it, and it is removed afterward. Any
+stale plaintext or encryption temporary is a hard stop for manual review. The
+single-file import contract refuses exports above 5 GiB; a reviewed
+split-import procedure is required above that boundary.
 
 ## Disposable Cloudflare field gate
 
@@ -111,8 +125,12 @@ Before preview, prepare all of these locally and out of band:
   Worker name must end in `recovery-gate-<nonce>` and its hostname must be the
   matching `*.workers.dev` hostname. Production-like names are refused;
 - exact bindings on both Worker versions to the target D1 and Vectorize
-  resources, the reviewed Brain identity and version, and only the `ADMIN_KEY`
-  secret. Their bindings must be identical except that the paused version has
+  resources, the reviewed Brain identity and version, the required
+  `ADMIN_KEY`, `RAG_PROXY_KEY`, and `SESSION_SIGNING_KEY` secrets, the dedicated
+  `BANK_FEED_WRAPPING_KEY_V2`, and only reviewed optional provider secrets.
+  The target secret-name set must equal the source set plus the dedicated bank
+  wrapping key when the released source does not have it yet. Their bindings
+  must be identical except that the paused version has
   exactly `VECTOR_DRAIN_MODE=paused-for-upgrade` and the active version has no
   `VECTOR_DRAIN_MODE` binding;
 - a fresh manual Cloudflare review that the target Worker has no routes and no
@@ -125,12 +143,14 @@ Before preview, prepare all of these locally and out of band:
   because Wrangler does not expose it through this adapter;
 - the target manifest's `operations.admin_key_secret` Keychain locator, with
   the disposable target key already stored there;
+- the target manifest's `operations.recovery_artifact_key_secret` Keychain
+  locator, containing an independent version-1 32-byte recovery artifact key;
 - an executable Wrangler wrapper in an owner-controlled, non-writable-by-others
   directory that reads its Cloudflare token from Keychain at execution time;
-- an owner-only directory for the SQL artifact and a complete private release
+- an owner-only directory for the encrypted recovery artifact and a complete private release
   evaluation golden set.
 
-The SQL artifact never carries live derived-index coordination. The adapter
+The decrypted SQL stream never carries live derived-index coordination. The adapter
 exports the reviewed `install_state` row separately from the raw provider tables
 and forces the ephemeral drain lease owner/expiry and projection mutation
 ID/submission time to `NULL`. It also resets the bulk-bootstrap protocol to
@@ -147,6 +167,22 @@ migration prefixes remain offline-inspectable, but the live field runner refuses
 a source or restored target below schema 13 because it cannot safely use the
 current lease, visibility, and durable bulk-bootstrap protocol without an
 explicit upgrade.
+
+Schema 22 recovery is exact and intentionally asymmetric. Exact-document
+grants, grant membership, durable request receipts, document-access audit
+events, privacy-safe passkey telemetry, and owner passkeys are durable. One-time
+enrollment codes and authentication challenges are not exported. The recovered
+`install_state.session_generation` is the source generation plus one, not zero
+and not an exact copy. That monotonic increment invalidates every old owner or
+scoped cookie while preserving passkeys for a fresh sign-in. Overflow or an
+invalid source generation stops export. Schema 23 support audit events are
+durable, while support sessions, requests, invitations, challenges, and
+passkeys restore empty. Schema 24 destructive agent-action receipts are live
+single-use authority and never enter the artifact. The recovered target must
+read that table as exactly zero rows before and after bank-key reconciliation.
+Time Travel rollback purges the same table and requires an exact zero-row
+readback while the Worker remains paused. Immutable owner activity remains
+durable.
 
 The preview is local only. It reads and fingerprints those files but does not
 invoke Wrangler, read Keychain, or call either Brain:
@@ -196,7 +232,8 @@ node operations/cloudflare-recovery-adapter.mjs run \
 ```
 
 `--stop-after-stage` is an optional supervised drill control. Its only accepted
-values are `export_d1`, `restore_d1`, and `rebuild_vectorize`. The field gate
+values are `export_d1`, `restore_d1`, `reconcile_security`, and
+`rebuild_vectorize`. The field gate
 still requires all six approvals and completes all verification leading to the
 named stage. It then persists that stage's completed evidence, releases the
 field-gate lock, reports only the fixed code
@@ -205,16 +242,19 @@ identical approved command to continue. Because the named stage is already in
 the durable completed prefix, the rerun does not execute its external effect or
 stop there again. Omitting the option runs every remaining stage normally.
 
-One disposable target can exercise all three checkpoint boundaries in order:
+One disposable target can exercise all four checkpoint boundaries in order:
 
 1. Run with `--stop-after-stage export_d1` and require the intentional nonzero
    exit. Confirm status now names `verify_export`.
 2. Re-run with `--stop-after-stage restore_d1`. It resumes after the export,
    completes the verified import, then stops. Confirm status names `verify_d1`.
-3. Re-run with `--stop-after-stage rebuild_vectorize`. It resumes after the
-   import, completes the vector rebuild, then stops. Confirm status names
-   `verify_health`.
-4. Re-run that exact third command. The rebuild is already checkpointed, so the
+3. Re-run with `--stop-after-stage reconcile_security`. It resumes after the
+   import, reconciles bank custody or explicit reauthorization state, then
+   stops. Confirm status names `rebuild_vectorize`.
+4. Re-run with `--stop-after-stage rebuild_vectorize`. It resumes after security
+   reconciliation, completes the vector rebuild, then stops. Confirm status
+   names `verify_health`.
+5. Re-run that exact fourth command. The rebuild is already checkpointed, so the
    run continues through health and release evaluation without rebuilding it.
 
 Changing only this stop boundary does not authorize another resource or write.
@@ -232,8 +272,9 @@ or skill installation paths. Authenticated HTTPS
 requests refuse redirects, contain no private values in URLs, and read the
 target admin key from Keychain only after the target identity is proven.
 Provider diagnostics, credentials, corpus content, and resource names never
-enter the plan, state, or command output. The private SQL artifact is the one
-necessary corpus copy and remains mode `0600` in the owner-only directory.
+enter the plan, state, or command output. The encrypted recovery artifact is
+the one necessary durable corpus copy and remains mode `0600` in the owner-only
+directory.
 
 Interrupted runs resume from the persisted stage. A retry after import accepts
 only an exact completed target or the original empty target. Any partial or
@@ -246,11 +287,22 @@ first rebuild attempt that finds the active version is refused. A leftover
 `.brain-recovery-field-gate.lock` is also fail-closed; inspect the prior process
 and private state before removing that lock manually.
 
+The offline interruption and custody matrix is:
+
+```bash
+npm run test:recovery-bank
+```
+
+It constructs a temporary HOME, inherits no credentials, uses only synthetic
+SQLite and Cloudflare fixtures, interrupts every declared recovery mutation
+before its receipt and after its durable checkpoint, and interrupts all four
+bank row mutation seams. Passing it is scripted proof only.
+
 Passing deterministic tests is not a production recovery claim. The remaining
 live release gate is to provision the disposable resources out of band, refresh
 the manual no-route/no-custom-domain review and both pinned version claims, pause
 source writes for the approved export window, and complete one full run. That
-run must exercise the three deterministic post-checkpoint stops above,
+run must exercise the four deterministic post-checkpoint stops above,
 followed by independent Cloudflare confirmation that source resources and
 production routes did not change. Disposal of the test resources is a separate
 operator action; this adapter has no destroy command.

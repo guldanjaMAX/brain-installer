@@ -148,16 +148,22 @@ Verified recovery uses the provider-neutral state machine in
 `operations/verified-recovery.mjs` and the disposable-only Cloudflare adapter in
 `operations/cloudflare-recovery-adapter.mjs`. The adapter can export the
 reviewed source, restore only an exact empty `recovery-gate-<nonce>` target,
-rebuild Vectorize while a reviewed paused Worker is deployed, promote only its
+advance the recovered session generation, reconcile the exact Worker secret
+names, rewrap released bank access references with the independent version-2
+key or expose explicit reauthorization state, rebuild Vectorize while a
+reviewed paused Worker is deployed, promote only its
 separately reviewed immutable active version to 100 percent, and run health
 plus release evaluation. It cannot create, upload, route, delete, or destroy
 resources. The two versions must have the same reviewed script hash and exact
 bindings except for paused mode. The run requires six previewed approval
 fingerprints, including the blocking source-export window, both pinned target
 Worker versions and manually reviewed empty routes, and exact Keychain-backed
-Wrangler wrapper and private release golden bytes. See
-`docs/RECOVERY.md` for the private artifact rules and remaining live field
-gate.
+Wrangler wrapper and private release golden bytes. The durable corpus artifact
+is authenticated ciphertext under a separate Keychain-resolved key; plaintext
+exists only during a bounded local verify or import callback. Run
+`npm run test:recovery-bank` for the credential-free interruption matrix. See
+`docs/RECOVERY.md` and `docs/RECOVERY-BANK-SAFETY-ACCEPTANCE.md` for the artifact
+rules and remaining live field gate.
 
 Run `node brain.mjs` with no arguments for the full command list.
 
@@ -910,6 +916,12 @@ verification.
 Current connector proof levels and the ranked acceptance backlog are maintained
 in [CONNECTOR-BACKLOG.md](./CONNECTOR-BACKLOG.md). Fixture coverage is never a
 substitute for the named real-system field gate.
+
+`npm run test:recovery-bank` is the credential-free recovery acceptance lane.
+It covers encrypted artifacts, session-generation advancement, independent
+bank wrapping, legacy rewrap or explicit reauthorization, schema-24 empty
+agent authority, and deterministic interruption at every declared mutation
+boundary. It is synthetic proof only, not a live Cloudflare or bank drill.
 
 Every value in `SUPPORT_ERROR_CODES` also has one entry in
 `support-recovery.mjs`. `brain support --explain <code>` renders the human form;
