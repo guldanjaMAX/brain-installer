@@ -228,7 +228,13 @@ try {
     "Attached is the signed engagement letter. Onboarding starts the third Monday in September."
   ).toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
   const gmailResult = await gmailToEnvelope(async () => "at-gmail-1", "gmail-rehearsal-01", {}, {
-    fetchImpl: async () => gmailJson({ raw: rawEmail, internalDate: "1756040400000", threadId: "T-rehearsal", historyId: "H-rehearsal" }),
+    fetchImpl: async () => gmailJson({
+      raw: rawEmail,
+      internalDate: "1756040400000",
+      threadId: "T-rehearsal",
+      historyId: "H-rehearsal",
+      labelIds: ["INBOX"],
+    }),
     sleep: async () => {},
   });
   check("connect Gmail: the real toEnvelope() turned a scripted raw message into an envelope",
