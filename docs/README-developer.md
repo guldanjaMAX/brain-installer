@@ -860,6 +860,20 @@ HTTP requests. The child environment explicitly removes Cloudflare and
 Wrangler credential variables. This proves the local D1 execution boundary; it
 does not prove a physical authenticator or deployed Cloudflare account.
 
+`node test/live/passkey-permanent-hostname-acceptance.mjs --plan` prints the
+separate supervised physical-ceremony protocol. The permanent hostname must be
+frozen before the first enrollment, and an explicit authorization receipt must
+name the reviewed environment by hash before the offline verifier can pass.
+The protocol requires two distinct people and four authenticators: one
+phone/platform authenticator plus one independent security-device path per
+person. It covers enrollment, logout/login, second-device enrollment, exact
+credential listing, revoke plus immediate bound-session denial, lost-device
+recovery, last-owner-credential refusal, and restoration of all four expected
+authenticators. Names, raw hostname, credential ids, cookies, challenges,
+assertions, public keys, IP addresses, user agents, and free text are forbidden
+from its receipt. Prior claims cannot replace the minimal reproduction. The
+script is local-only and performs no ceremony or network call.
+
 ### Local owner-onboarding rehearsal
 
 `npm run rehearse:onboarding` builds the current React owner workspace without
