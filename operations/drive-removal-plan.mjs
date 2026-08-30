@@ -7,6 +7,67 @@ import { createHash } from "node:crypto";
 export const DRIVE_REMOVAL_MAX_COUNT = 100;
 export const DRIVE_REMOVAL_MAX_RATIO = 0.10;
 
+// Only named connector outcomes may turn an active file into a stale-removal
+// candidate. A future or untyped skip defaults to retention, because deleting
+// a migrated D1 document on the strength of a reason this build does not
+// understand is not a fail-closed decision.
+const VERSION_AWARE_DRIVE_SKIP_CODES = new Set([
+  "unsupported_google_type",
+  "non_text_media",
+  "unsupported_extension",
+  "download_limit",
+  "file_unavailable",
+  "binary_content",
+  "extraction_refused",
+  "quality_refused",
+]);
+
+/** True only for the current canonical `driveVersion()` receipt shape. */
+export function isTrustedDriveVersion(value) {
+  if (typeof value !== "string" || !value) return false;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) && parsed.length === 5 && parsed.every((part) => typeof part === "string");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Decide what an active Drive skip means for an already stored document.
+ *
+ * Security refusals always remove the prior copy. Ordinary typed skips remove
+ * it only when two trusted Drive receipts prove the source revision changed.
+ * Missing migration state, an unchanged revision, and unknown skip codes all
+ * preserve the existing D1 family for a later supported reread or an explicit
+ * owner decision.
+ */
+export function classifyActiveDriveSkip({
+  code,
+  currentVersion,
+  priorAcceptedVersion,
+  securityRefusal = false,
+} = {}) {
+  if (securityRefusal) {
+    return { disposition: "remove_sensitive", reasonCode: "security_refusal" };
+  }
+
+  const normalizedCode = String(code || "").trim().toLowerCase();
+  if (!VERSION_AWARE_DRIVE_SKIP_CODES.has(normalizedCode)) {
+    return { disposition: "retain_existing", reasonCode: "unknown_skip" };
+  }
+  if (!isTrustedDriveVersion(priorAcceptedVersion)) {
+    return { disposition: "retain_existing", reasonCode: "untrusted_prior_version" };
+  }
+  if (!isTrustedDriveVersion(currentVersion)) {
+    return { disposition: "retain_existing", reasonCode: "untrusted_current_version" };
+  }
+  if (priorAcceptedVersion !== currentVersion) {
+    return { disposition: "remove_stale", reasonCode: "known_changed_revision" };
+  }
+  return { disposition: "retain_existing", reasonCode: "current_revision_unreadable" };
+}
+
 /** A deliberate owner-review boundary, not an installer crash. */
 export class DriveRemovalReviewRequired extends Error {
   constructor(message) {

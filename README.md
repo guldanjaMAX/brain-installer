@@ -219,8 +219,8 @@ do not cover. The second answer matters as much as the first.
 ## What it reads
 
 PDF, Word, Excel, PowerPoint, rich text, email, mail archives, meeting
-transcripts and subtitles, calendar exports, CSV, HTML, Markdown, JSON and
-plain text.
+transcripts and subtitles, calendar exports, CSV, HTML, Markdown, JSON, YAML,
+and plain text.
 
 **A file with many things in it becomes many documents.** A `.mbox` mail
 archive is a mail folder, not a document: indexed whole it would be one

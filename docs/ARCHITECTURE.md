@@ -222,6 +222,15 @@ and cursor or source-state completion. Approval binds to an opaque fingerprint
 of the exact categorized target set, so a changed plan requires a new decision
 without exposing source identifiers.
 
+Drive also separates an active unreadable file from a source deletion. Typed
+connector skips become removal candidates only when a trusted prior canonical
+Drive version differs from the current one; a credential refusal is removed
+regardless of version. A missing, legacy, unchanged, or unknown receipt keeps
+the authenticated D1 family under a durable `drive_retained_existing` marker.
+That marker removes the ordinary `done` fast path, survives incremental runs,
+and keeps source health incomplete until a replacement is fully accepted or
+an exact post-forget inventory proves the family absent.
+
 ### Connector status
 
 | Source | Current path |

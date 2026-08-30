@@ -188,11 +188,11 @@ the exact failure this product exists to avoid.
 
 **Formats today:** `.pdf .docx .xlsx .xlsm .xls .pptx .rtf .eml .mbox .vtt .srt
 .ics .csv .tsv .json .txt .md .markdown .text .log .rst .adoc .html .htm .xhtml
-.xml`
+.xml .yaml .yml`
 
-Five of those carry no dependency at all. `.vtt` and `.srt` run through
-`worker/src/lib/vtt.js`, the SAME function the Zoom connector uses on the
-transcripts Zoom delivers — a second transcript parser would drift from the
+The five specialized formats below carry no dependency at all. `.vtt` and
+`.srt` run through `worker/src/lib/vtt.js`, the SAME function the Zoom connector
+uses on the transcripts Zoom delivers — a second transcript parser would drift from the
 first invisibly, both still producing text while one slowly got worse. `.ics`
 is converted into the shape `renderEvent` in `connectors/google-calendar.mjs`
 already accepts and rendered by it, so an event reads identically whether it
@@ -381,6 +381,21 @@ plan. A deletion that cannot be applied is kept in the state file and retried
 through the same aggregate gate rather than lost. **Gmail does not report
 deletions**, so a deleted message stays until the source is re-ingested with
 `--reset`.
+
+An active Drive skip is version-aware. Connector skips carry stable codes, and
+only a known code plus two trusted canonical Drive versions may prove that the
+stored family is stale. Credential refusals remain immediate removal
+candidates. Missing or migration-derived prior versions, unchanged versions,
+and unknown codes retain any authenticated D1 family in
+`drive_retained_existing`, remove its `done` receipt, and keep the human reason
+in `skipped`. That retained marker survives no-change incremental runs and
+closes source health as error until a fully accepted reingest or exact
+post-removal inventory clears it. New skipped files with no stored family are
+ordinary reported skips, not retained data. Scanner and policy upgrades are not
+committed while a stored retained family still needs the new scan.
+Extractor support changes also bump the Drive policy fingerprint, forcing one
+complete comparison so unchanged files newly supported by an upgrade are
+reconsidered immediately instead of waiting for the weekly truth sweep.
 
 Oversized Drive documents are reconciled as a family. A revision that changes
 from one document to several parts, changes its part count, or becomes small

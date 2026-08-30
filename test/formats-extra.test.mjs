@@ -1,8 +1,8 @@
 // test/formats-extra.test.mjs
 //
-// The five formats the product's own documentation told clients to use before
-// any of them was registered: meeting transcripts (.vtt), subtitles (.srt),
-// mail archives (.mbox), calendar exports (.ics) and rich text (.rtf).
+// The formats the product's own documentation told clients to use before they
+// were registered: meeting transcripts (.vtt), subtitles (.srt), mail archives
+// (.mbox), calendar exports (.ics), rich text (.rtf), and YAML (.yaml/.yml).
 //
 // Every case runs against a real fixture file on disk, through the SAME
 // `extract()` and `prepare()` entry points the installer uses, because the
@@ -38,10 +38,22 @@ const read = async (name) => extract(bytes(name), name);
 
 /* ================= the registry itself ================= */
 {
-  for (const ext of [".vtt", ".srt", ".mbox", ".ics", ".rtf"]) {
+  for (const ext of [".vtt", ".srt", ".mbox", ".ics", ".rtf", ".yaml", ".yml"]) {
     check(`${ext} is registered, so the walk and Drive triage both stop skipping it`,
       canExtract(`anything${ext}`), supported().join(" "));
   }
+}
+
+/* ================= YAML, preserved as written ================= */
+{
+  const got = await read("client-settings.yaml");
+  check("YAML is read as text exactly as the source matrix promises",
+    got.text?.includes("client: Brightfield Partners") &&
+      got.text.includes("review_every_days: 30") &&
+      got.how === "yaml",
+    JSON.stringify(got));
+  check("YAML indentation is preserved for retrieval context",
+    got.text?.includes("\n  review_every_days: 30\n"), got.text);
 }
 
 /* ================= transcripts (.vtt) ================= */

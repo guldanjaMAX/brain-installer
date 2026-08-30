@@ -268,17 +268,32 @@ export async function listChanges(getAccessToken, pageToken, opts = {}) {
 
 /** Should this file be fetched at all? Decided before spending a request. */
 export function triage(file) {
-  if (file.trashed) return { skip: "the file is in the trash" };
+  if (file.trashed) return { skip: "the file is in the trash", skipCode: "source_deleted" };
   if (file.mimeType === FOLDER_MIME) return { skip: null, folder: true };
   if (file.mimeType?.startsWith("application/vnd.google-apps.")) {
     const e = EXPORTS[file.mimeType];
-    if (!e) return { skip: `Google ${file.mimeType.split(".").pop()} files cannot be exported as text` };
+    if (!e) {
+      return {
+        skip: `Google ${file.mimeType.split(".").pop()} files cannot be exported as text`,
+        skipCode: "unsupported_google_type",
+      };
+    }
     return { export: e };
   }
-  if (SKIP_MIME.test(file.mimeType || "")) return { skip: `${file.mimeType} carries no text` };
-  if (!canExtract(file.name)) return { skip: `no extractor for "${extensionOf(file.name) || "(no extension)"}" files` };
+  if (SKIP_MIME.test(file.mimeType || "")) {
+    return { skip: `${file.mimeType} carries no text`, skipCode: "non_text_media" };
+  }
+  if (!canExtract(file.name)) {
+    return {
+      skip: `no extractor for "${extensionOf(file.name) || "(no extension)"}" files`,
+      skipCode: "unsupported_extension",
+    };
+  }
   if (Number(file.size) > DOWNLOAD_LIMIT) {
-    return { skip: `${(Number(file.size) / 1048576).toFixed(1)}MB, over the ${DOWNLOAD_LIMIT / 1048576}MB limit` };
+    return {
+      skip: `${(Number(file.size) / 1048576).toFixed(1)}MB, over the ${DOWNLOAD_LIMIT / 1048576}MB limit`,
+      skipCode: "download_limit",
+    };
   }
   return { download: true };
 }
@@ -404,7 +419,9 @@ export async function fetchContent(getAccessToken, file, plan, opts = {}) {
 export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYPE, pathOf = () => "", ocr = null } = {}, opts = {}) {
   const plan = triage(file);
   if (plan.folder) return null;
-  if (plan.skip) return { skip: { path: file.name, id: file.id, reason: plan.skip } };
+  if (plan.skip) {
+    return { skip: { path: file.name, id: file.id, reason: plan.skip, code: plan.skipCode || "unknown" } };
+  }
 
   let buf;
   try {
@@ -414,12 +431,21 @@ export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYP
     // server and auth failures must escape to the sync runner so it can record
     // a failure and withhold the source cursor for a retry.
     if (!isPermanentFileFailure(e)) throw e;
-    return { skip: { path: file.name, id: file.id, reason: `could not be fetched: ${e.message.slice(0, 120)}` } };
+    return {
+      skip: {
+        path: file.name,
+        id: file.id,
+        reason: `could not be fetched: ${e.message.slice(0, 120)}`,
+        code: "file_unavailable",
+      },
+    };
   }
 
   const name = plan.export ? file.name + plan.export.ext : file.name;
   if (!isBinaryFormat(name) && isLikelyBinary(buf)) {
-    return { skip: { path: file.name, id: file.id, reason: "the file is binary, not text" } };
+    return {
+      skip: { path: file.name, id: file.id, reason: "the file is binary, not text", code: "binary_content" },
+    };
   }
 
   // Extractor options were never passed on this path, so a Drive PDF has been
@@ -428,10 +454,21 @@ export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYP
   // Drive is where a client's scanned filing cabinet actually lives.
   const got = await extract(buf, name, ocr ? { ocr } : {});
   if (got.error || got.text == null) {
-    return { skip: { path: file.name, id: file.id, reason: got.error || "extraction produced nothing" } };
+    return {
+      skip: {
+        path: file.name,
+        id: file.id,
+        reason: got.error || "extraction produced nothing",
+        code: "extraction_refused",
+      },
+    };
   }
   const q = textQuality(got.text);
-  if (!q.ok) return { skip: { path: file.name, id: file.id, reason: q.reason, metrics: q.metrics } };
+  if (!q.ok) {
+    return {
+      skip: { path: file.name, id: file.id, reason: q.reason, metrics: q.metrics, code: "quality_refused" },
+    };
+  }
 
   // createdTime, never modifiedTime. The filename still wins when it carries a
   // date, because a human naming a file "2026-03 statement" is stating the

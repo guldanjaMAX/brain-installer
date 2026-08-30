@@ -69,6 +69,13 @@ for (const ext of [".html", ".htm", ".xhtml"]) {
 
 register(".xml", (buf) => stripMarkup(dec(buf)), "xml");
 
+// YAML is prose-shaped configuration. The product promises to read it "as
+// written", so preserve its keys, indentation and scalar values rather than
+// flattening it through a parser that could silently reinterpret types.
+for (const ext of [".yaml", ".yml"]) {
+  register(ext, (buf) => dec(buf), "yaml");
+}
+
 /* -------------------------------------------------------------- delimited */
 
 /**

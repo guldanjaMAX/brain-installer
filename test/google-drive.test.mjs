@@ -234,10 +234,17 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   check("a Google Doc is exported, not downloaded", triage({ mimeType: "application/vnd.google-apps.document", name: "x" }).export.mime === "text/plain");
   check("a Sheet exports as CSV, which the extractor renders header-aware", triage({ mimeType: "application/vnd.google-apps.spreadsheet", name: "x" }).export.mime === "text/csv");
   check("a Google Form is skipped with a reason", /cannot be exported/.test(triage({ mimeType: "application/vnd.google-apps.form", name: "f" }).skip));
+  check("an unsupported Google type has a stable skip code",
+    triage({ mimeType: "application/vnd.google-apps.form", name: "f" }).skipCode === "unsupported_google_type");
   check("an image is skipped before spending a request", /carries no text/.test(triage({ mimeType: "image/png", name: "a.png" }).skip));
+  check("a no-text media skip is typed", triage({ mimeType: "image/png", name: "a.png" }).skipCode === "non_text_media");
   check("an unsupported extension is skipped", /no extractor/.test(triage({ mimeType: "application/octet-stream", name: "a.bin" }).skip));
+  check("an unsupported extension skip is typed",
+    triage({ mimeType: "application/octet-stream", name: "a.bin" }).skipCode === "unsupported_extension");
   check("a PDF is downloaded", triage({ mimeType: "application/pdf", name: "a.pdf", size: "1000" }).download === true);
   check("an oversized file is skipped with its size", /over the/.test(triage({ mimeType: "application/pdf", name: "a.pdf", size: String(99 * 1048576) }).skip));
+  check("an oversized-file skip is typed",
+    triage({ mimeType: "application/pdf", name: "a.pdf", size: String(99 * 1048576) }).skipCode === "download_limit");
   check("trashed is skipped", /trash/.test(triage({ trashed: true, name: "a.md" }).skip));
 }
 
@@ -308,6 +315,7 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   const r = await toEnvelope(tok, file, {}, { fetchImpl: async () => bytes("hi"), sleep: async () => {} });
   check("a file with too little text is skipped, not indexed empty", !!r.skip && !r.envelope, JSON.stringify(r));
   check("and the skip carries the Drive id so it can be chased", r.skip.id === "F4");
+  check("a quality refusal carries its stable policy code", r.skip.code === "quality_refused", JSON.stringify(r.skip));
 }
 {
   const file = { id: "F5", name: "locked.pdf", mimeType: "application/pdf", size: "1000", createdTime: "2026-01-01T00:00:00Z" };
@@ -315,6 +323,7 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
     fetchImpl: async () => json({ error: { errors: [{ reason: "insufficientFilePermissions" }], message: "no access" } }, 403), sleep: async () => {},
   });
   check("a permanent per-file permission failure is a reasoned skip", !!r.skip && /could not be fetched/.test(r.skip.reason), r.skip?.reason);
+  check("a permanent per-file permission failure is typed", r.skip.code === "file_unavailable", JSON.stringify(r.skip));
 }
 {
   const file = { id: "F5-export", name: "locked doc", mimeType: "application/vnd.google-apps.document", createdTime: "2026-01-01T00:00:00Z" };

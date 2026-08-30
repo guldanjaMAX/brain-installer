@@ -150,6 +150,8 @@ import {
   DriveRemovalReviewRequired,
   assertDriveRemovalPlanSafe,
   buildDriveRemovalPlan,
+  classifyActiveDriveSkip,
+  isTrustedDriveVersion,
 } from "./operations/drive-removal-plan.mjs";
 import {
   discoverInstalledManifest,
@@ -167,6 +169,8 @@ export {
   DriveRemovalReviewRequired,
   assertDriveRemovalPlanSafe,
   buildDriveRemovalPlan,
+  classifyActiveDriveSkip,
+  isTrustedDriveVersion,
 };
 
 // fileURLToPath, never `new URL(...).pathname`. The latter is percent-encoded,
@@ -4136,6 +4140,12 @@ export function credentialScannerFingerprint(enabled = true, gateVersion = CREDE
   return createHash("sha256").update(JSON.stringify({ enabled: Boolean(enabled), gateVersion })).digest("hex");
 }
 
+// Bump when Drive extraction support changes in a way that should reconsider
+// an unchanged file. The version is deliberately independent of the scanner
+// gate: it forces one full Drive comparison without resending the whole corpus
+// through a new credential-scanner migration.
+export const DRIVE_EXTRACTOR_POLICY_VERSION = 2;
+
 /**
  * Resume receipts for a scanner-policy migration.
  *
@@ -4183,12 +4193,18 @@ export function commitCredentialScannerProgress(state, fingerprint) {
   return state;
 }
 
-export function drivePolicyFingerprint(config = {}, scannerEnabled = true, ocrEnabled = false) {
+export function drivePolicyFingerprint(
+  config = {},
+  scannerEnabled = true,
+  ocrEnabled = false,
+  extractorPolicyVersion = DRIVE_EXTRACTOR_POLICY_VERSION,
+) {
   const normalized = {};
   for (const key of ["excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
     normalized[key] = [...new Set((config[key] || []).map((value) => String(value)))].sort();
   }
   normalized.credentialScanner = credentialScannerFingerprint(scannerEnabled);
+  normalized.extractorPolicyVersion = Number(extractorPolicyVersion);
   // Turning OCR on changes what Drive is ALLOWED TO READ, so it belongs in the
   // source policy. Without it, a scanned PDF refused a month ago never
   // reappears: once a change token exists the incremental feed only returns
@@ -4471,6 +4487,61 @@ export function recordAcceptedDocumentState(state, {
   for (const skipKey of new Set(exactSkipKeys)) {
     delete state.skipped[skipKey];
   }
+  clearRetainedDriveDocumentState(state, key);
+  return state;
+}
+
+/** The accepted Drive revision survives a retained-skip retry outside `done`. */
+export function priorAcceptedDriveVersion(state, stateKey) {
+  const key = String(stateKey || "");
+  const retained = state?.drive_retained_existing;
+  if (retained && typeof retained === "object" && !Array.isArray(retained)) {
+    const record = retained[key];
+    if (record && typeof record === "object" && Object.hasOwn(record, "accepted_version")) {
+      return record.accepted_version;
+    }
+  }
+  return state?.done?.[key] ?? null;
+}
+
+/**
+ * Preserve an already stored active Drive family without calling it current.
+ *
+ * Removing `done` is essential: otherwise the next metadata pass takes the
+ * unchanged fast path and erases the unresolved skip without rereading bytes.
+ */
+export function recordRetainedDriveDocumentState(state, {
+  stateKey,
+  acceptedVersion = null,
+  observedVersion = null,
+  skipCode = "unknown",
+  reason = "current Drive revision could not be safely indexed",
+} = {}) {
+  const key = String(stateKey || "");
+  if (!key) throw new Error("retained Drive state needs a document key");
+  if (!state.done || typeof state.done !== "object") state.done = {};
+  if (!state.skipped || typeof state.skipped !== "object") state.skipped = {};
+  if (!state.drive_retained_existing || typeof state.drive_retained_existing !== "object" ||
+      Array.isArray(state.drive_retained_existing)) {
+    state.drive_retained_existing = {};
+  }
+  state.drive_retained_existing[key] = {
+    accepted_version: isTrustedDriveVersion(acceptedVersion) ? acceptedVersion : null,
+    observed_version: isTrustedDriveVersion(observedVersion) ? observedVersion : null,
+    skip_code: String(skipCode || "unknown").trim().toLowerCase() || "unknown",
+    disposition: "retain_existing",
+  };
+  delete state.done[key];
+  state.skipped[key] = String(reason || "current Drive revision could not be safely indexed");
+  return state;
+}
+
+/** Clear a retained marker only after accepted replacement or verified absence. */
+export function clearRetainedDriveDocumentState(state, stateKey) {
+  const retained = state?.drive_retained_existing;
+  if (!retained || typeof retained !== "object" || Array.isArray(retained)) return state;
+  delete retained[String(stateKey || "")];
+  if (!Object.keys(retained).length) delete state.drive_retained_existing;
   return state;
 }
 
@@ -7553,11 +7624,15 @@ export function describeLoadResult(result) {
       const extra = [];
       if (result.refused) extra.push(`${result.refused} refused, NOT indexed`);
       if (result.skipped) extra.push(`${result.skipped} skipped`);
+      if (result.retained_existing) {
+        extra.push(`${result.retained_existing} existing Drive document(s) retained but unverified`);
+      }
+      const partial = !!result.refused || Number(result.retained_existing || 0) > 0;
       return {
         known: true,
         counts,
-        partial: !!result.refused,
-        outcome: outcomeOf(result.refused ? "partial" : "completed"),
+        partial,
+        outcome: outcomeOf(partial ? "partial" : "completed"),
         text: `${counts.created} created, ${counts.updated} updated, ${counts.unchanged} unchanged`
           + (extra.length ? `, ${extra.join(", ")}` : ""),
       };
@@ -8012,6 +8087,12 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   const acceptedFamilyParts = new Map();
   const rejectedFamilyParts = new Map();
   const intentionalRemovalUids = [];
+  const retainedDriveCandidates = new Map();
+  let driveRetainedExisting = which === "drive" && state.drive_retained_existing &&
+      typeof state.drive_retained_existing === "object" && !Array.isArray(state.drive_retained_existing)
+    ? Object.keys(state.drive_retained_existing).length
+    : 0;
+  let scannerProgressCanCommit = true;
   const tally = { created: 0, updated: 0, unchanged: 0, refused: 0, failed: 0 };
 
   const addTally = (part) => {
@@ -8202,7 +8283,10 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       const scannerResumeAccepted = hasCredentialScannerProgress(
         state, scannerFingerprint, key, listedVersion
       );
-      if ((!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === listedVersion) {
+      const hasRetainedMarker = !!state.drive_retained_existing &&
+        typeof state.drive_retained_existing === "object" &&
+        Object.hasOwn(state.drive_retained_existing, key);
+      if (!hasRetainedMarker && (!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === listedVersion) {
         recordAcceptedDocumentState(state, {
           stateKey: key, hash: listedVersion, skipKeys: [f.id], legacyPartRoot: f.id,
         });
@@ -8214,7 +8298,21 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       if (!r) return null;
       if (r.skip) {
         state.skipped[key] = r.skip.reason;
-        intentionalRemovalUids.push(key);
+        const classification = classifyActiveDriveSkip({
+          code: r.skip.code,
+          currentVersion: listedVersion,
+          priorAcceptedVersion: priorAcceptedDriveVersion(state, key),
+        });
+        if (classification.disposition === "retain_existing") {
+          retainedDriveCandidates.set(key, {
+            acceptedVersion: priorAcceptedDriveVersion(state, key),
+            observedVersion: listedVersion,
+            skipCode: r.skip.code || "unknown",
+            reason: r.skip.reason,
+          });
+        } else {
+          intentionalRemovalUids.push(key);
+        }
         return { skip: r.skip };
       }
       const envelope = sanitizeIngestEnvelope(r.envelope);
@@ -8222,7 +8320,8 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       if (refusal) {
         const skip = { path: safeIngestDisplay(envelope.title, f.name, f.id), id: f.id, reason: refusal.reason };
         state.skipped[key] = refusal.reason;
-        intentionalRemovalUids.push(key);
+        const classification = classifyActiveDriveSkip({ securityRefusal: true });
+        if (classification.disposition === "remove_sensitive") intentionalRemovalUids.push(key);
         return { skip };
       }
       const envelopes = splitOversized(envelope);
@@ -8260,6 +8359,12 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       await applyDriveRemovals({
         uids: intentionalRemovalUids, base, adminKey, state, dryRun: true, label: "intentional source skip",
       });
+      if (retainedDriveCandidates.size) {
+        warn(
+          `${retainedDriveCandidates.size} active Drive file(s) could not be re-read. ` +
+            "Any existing Brain copy would be preserved for review rather than deleted by this preview."
+        );
+      }
       intentionalRemovalUids.length = 0;
     } else {
       // Inventory after every accepted batch, then make one decision covering
@@ -8272,7 +8377,8 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       // should not page through a large corpus merely to prove zero. Full
       // sweeps always inventory because absence itself is a deletion signal.
       const needsStoredInventory = !incremental || excludedUids.length ||
-        explicitlyDeletedUids.length || intentionalRemovalUids.length || pendingDriveUids.length;
+        explicitlyDeletedUids.length || intentionalRemovalUids.length || pendingDriveUids.length ||
+        retainedDriveCandidates.size;
       const storedUids = needsStoredInventory
         ? await listStoredSourceFamilies({ base, adminKey, source: sourceName })
         : new Set();
@@ -8287,8 +8393,28 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         if (!storedUids.has(uid)) {
           delete state.removed[uid];
           delete state.done[uid];
+          clearRetainedDriveDocumentState(state, uid);
+          if (!seenUids.has(uid)) delete state.skipped[uid];
         }
       }
+
+      // Only authenticated D1 inventory can distinguish a migrated document
+      // being preserved from a brand-new unsupported file that was never in
+      // the brain. Both remain visible skips; only the former keeps a durable
+      // unverified-existing marker and prevents a later no-change run from
+      // claiming the source is healthy.
+      for (const [uid, candidate] of retainedDriveCandidates) {
+        if (storedUids.has(uid)) {
+          recordRetainedDriveDocumentState(state, { stateKey: uid, ...candidate });
+        } else {
+          delete state.done[uid];
+          clearRetainedDriveDocumentState(state, uid);
+        }
+      }
+      driveRetainedExisting = state.drive_retained_existing &&
+          typeof state.drive_retained_existing === "object" && !Array.isArray(state.drive_retained_existing)
+        ? Object.keys(state.drive_retained_existing).length
+        : 0;
 
       const driveRemovalPlan = buildDriveRemovalPlan({
         storedFamilies: storedUids,
@@ -8345,9 +8471,27 @@ async function cmdIngestRemote(m, manifestPath, flags) {
               "The source cursor was not advanced; re-running will retry them through the same approval gate."
           );
         }
+        const sourceDeletedTargets = new Set(driveRemovalPlan.targets.source_deleted);
+        for (const uid of plannedTargets) {
+          if (state.removed) delete state.removed[uid];
+          clearRetainedDriveDocumentState(state, uid);
+          if (sourceDeletedTargets.has(uid)) delete state.skipped[uid];
+        }
+        saveState(statePath, state);
       }
       intentionalRemovalUids.length = 0;
     }
+    driveRetainedExisting = state.drive_retained_existing &&
+        typeof state.drive_retained_existing === "object" && !Array.isArray(state.drive_retained_existing)
+      ? Object.keys(state.drive_retained_existing).length
+      : 0;
+    if (driveRetainedExisting) {
+      warn(
+        `${driveRetainedExisting} active Drive file(s) retain an existing Brain copy because ` +
+          "their current revisions could not be safely re-indexed. Drive remains incomplete until they are reread or reviewed."
+      );
+    }
+    scannerProgressCanCommit = !(scannerPolicyChanged && driveRetainedExisting > 0);
     // NOT saved yet. Advancing the cursor before the batches it covers have
     // been accepted means a mid-send failure permanently skips those documents:
     // the next run starts after them and no error is ever raised. It is written
@@ -8357,11 +8501,15 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       value: nextSync,
       statePatch: !incremental
         ? {
-            drive_policy_fingerprint: policyFingerprint,
             drive_last_full_sweep_at: new Date().toISOString(),
-            credential_scanner_fingerprint: scannerFingerprint,
+            ...(scannerProgressCanCommit
+              ? {
+                  drive_policy_fingerprint: policyFingerprint,
+                  credential_scanner_fingerprint: scannerFingerprint,
+                }
+              : {}),
           }
-        : { credential_scanner_fingerprint: scannerFingerprint },
+        : scannerProgressCanCommit ? { credential_scanner_fingerprint: scannerFingerprint } : {},
     };
   } else if (which === "gmail") {
     const gmail = await import("./connectors/gmail.mjs");
@@ -8599,7 +8747,13 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   if (dry) {
     ok("dry run, nothing was sent");
     await reportSkips(skips);
-    return { dry_run: true, would_send: prepared, unchanged, skipped: skips.length };
+    return {
+      dry_run: true,
+      would_send: prepared,
+      unchanged,
+      skipped: skips.length,
+      ...(which === "drive" ? { retained_candidates: retainedDriveCandidates.size } : {}),
+    };
   }
 
   // Every batch landed, so it is now safe to say "we have everything up to
@@ -8608,12 +8762,15 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   if (pendingCursor && sourceCursorCanAdvance(tally)) {
     state[pendingCursor.key] = pendingCursor.value;
     Object.assign(state, pendingCursor.statePatch || {});
-    commitCredentialScannerProgress(state, scannerFingerprint);
+    if (scannerProgressCanCommit) commitCredentialScannerProgress(state, scannerFingerprint);
     saveState(statePath, state);
   } else if (pendingCursor && tally.failed) {
     warn(`${tally.failed} document(s) failed, so the source cursor was NOT advanced; the next run will retry them`);
   }
-  const finalStatus = tally.failed ? "error" : "ready";
+  const retainedDriveReason = driveRetainedExisting
+    ? `${driveRetainedExisting} active Drive file(s) retained because their current revisions could not be safely re-indexed`
+    : null;
+  const finalStatus = tally.failed || retainedDriveReason ? "error" : "ready";
   await postSourceReceipt(base, adminKey, {
     source: sourceName, kind: which, status: finalStatus, run_id: runId,
     lane, started_at: runStartedAt, completed_at: new Date().toISOString(),
@@ -8623,8 +8780,14 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     docs_added: tally.created,
     docs_updated: tally.updated,
     docs_unchanged: unchanged + tally.unchanged,
-    detail: `${which} ${lane} sync ${finalStatus === "ready" ? "completed" : "completed with document failures"}; skipped=${skips.length}`,
-    ...(tally.failed ? { error: `${tally.failed} document(s) failed; the source cursor was not advanced` } : {}),
+    detail:
+      `${which} ${lane} sync ${finalStatus === "ready" ? "completed" : "completed incompletely"}; ` +
+      `skipped=${skips.length}; retained_existing=${driveRetainedExisting}`,
+    ...(tally.failed
+      ? { error: `${tally.failed} document(s) failed; the source cursor was not advanced` }
+      : retainedDriveReason
+        ? { error: retainedDriveReason }
+        : {}),
   });
   runClosed = true;
 
@@ -8645,6 +8808,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     refused: tally.refused,
     scanned,
     skipped: skips.length,
+    ...(which === "drive" ? { retained_existing: driveRetainedExisting } : {}),
   };
   } catch (error) {
     // The cursor is deliberately outside this path: it is written only after

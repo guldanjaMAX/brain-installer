@@ -1,0 +1,4 @@
+client: Brightfield Partners
+retention:
+  review_every_days: 30
+  archive_after_days: 365

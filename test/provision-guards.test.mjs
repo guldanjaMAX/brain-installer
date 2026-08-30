@@ -71,6 +71,16 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   const policyFingerprint = drivePolicyFingerprint(cfg);
   check("credential scanner mode is part of Drive policy identity",
     drivePolicyFingerprint(cfg, true) !== drivePolicyFingerprint(cfg, false));
+  const priorExtractorFingerprint = drivePolicyFingerprint(cfg, true, false, 1);
+  check("the current extractor support is a durable Drive rescan marker",
+    policyFingerprint !== priorExtractorFingerprint);
+  check("an extractor support upgrade forces an immediate complete Drive comparison",
+    driveSyncDecision({
+      syncToken: "cursor",
+      policyFingerprint,
+      savedPolicyFingerprint: priorExtractorFingerprint,
+      lastFullSweepAt: "2026-08-23T00:00:00Z",
+    }).incremental === false);
   check("credential scanner version is a durable rescan marker",
     credentialScannerFingerprint(true, 3) !== credentialScannerFingerprint(true, 4));
   const scannerV2 = credentialScannerFingerprint(true, 2);

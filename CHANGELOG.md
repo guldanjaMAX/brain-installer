@@ -58,6 +58,11 @@ without weakening the ingestion and deletion rules underneath them.**
   paired-device connector, states the account restriction risk clearly, and
   identifies Meta's official Business Platform as a separate connector that is
   not built yet.
+- Google Drive refreshes now retain a previously indexed copy when an active
+  file becomes temporarily unreadable or unsupported instead of treating every
+  active skip as a deletion. YAML files are read as text, and format-support
+  upgrades force one complete Drive comparison so unchanged files are
+  reconsidered immediately.
 - The vector drain now runs every minute by default. It still embeds only after
   the previous batch is confirmed, so extra ticks are no-ops rather than extra
   model work.

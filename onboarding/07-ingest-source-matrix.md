@@ -73,6 +73,8 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 
 **When a file disappears from Drive**, the matching material is removed from your index. That removal is guarded: if the run could not see all of your Drive (a permissions blip or a network failure mid-walk), it cannot complete the comparison. If one cleanup plan is more than 100 documents or more than 10% of the stored Drive corpus, it stops before deleting anything or advancing its cursor. The owner sees aggregate reasons and an opaque plan fingerprint, never file names or IDs, and must approve that exact plan on the rerun. A stale document costs nothing. A wrongly emptied index costs everything.
 
+**An active file that this version cannot read is not the same as a deleted file.** The connector records a typed reason. It removes the prior Brain copy only when a trusted earlier Drive receipt proves that the source revision changed, or when the credential scanner says the old copy is unsafe to keep. A migrated document with no trusted local receipt is preserved and marked unverified instead of being guessed stale. Drive stays visibly incomplete until that file is successfully reread or explicitly reviewed; a later no-change sync cannot turn it green by accident.
+
 **One honest note about how this runs.** Drive is a standard, packaged connector inside the installer, not a private script. You connect your own Google account once, load it with the normal ingest command, and on macOS the installer can schedule unattended refreshes. The Google sign-in still requires the account owner, and the packaged unattended scheduler is not built for Windows or Linux yet.
 
 ### Gmail and email

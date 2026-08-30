@@ -13,18 +13,26 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   assertDriveRemovalPlanSafe,
   buildDriveRemovalPlan,
+  classifyActiveDriveSkip,
+  clearRetainedDriveDocumentState,
   credentialScannerFingerprint,
   DRIVE_REMOVAL_MAX_COUNT,
   DRIVE_REMOVAL_MAX_RATIO,
   drivePolicyFingerprint,
+  isTrustedDriveVersion,
+  priorAcceptedDriveVersion,
+  recordAcceptedDocumentState,
+  recordRetainedDriveDocumentState,
   remoteFamilySettlement,
   VALUE_FLAGS,
 } from "../brain.mjs";
+import { driveVersion } from "../connectors/google-drive.mjs";
 import { previewSupportJournal } from "../support-journal.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = join(HERE, "..", "brain.mjs");
 const DRIVE_GUARD_FETCH = pathToFileURL(join(HERE, "fixtures", "drive-removal-guard-fetch.mjs")).href;
+const DRIVE_ACTIVE_SKIP_FETCH = pathToFileURL(join(HERE, "fixtures", "drive-active-skip-fetch.mjs")).href;
 
 const CATEGORIES = ["source_policy", "source_deleted", "intentional_skip"];
 
@@ -48,6 +56,80 @@ function reportsCount(message, label, count) {
 
 assert.equal(DRIVE_REMOVAL_MAX_COUNT, 100);
 assert.equal(DRIVE_REMOVAL_MAX_RATIO, 0.10);
+
+/* Active Drive skips are version-aware and default to preserving D1. */
+const acceptedDriveVersion = driveVersion({
+  modifiedTime: "2026-08-01T00:00:00Z",
+  md5Checksum: "accepted-bytes",
+  name: "notes.bin",
+  mimeType: "application/octet-stream",
+}, "Records");
+const currentDriveVersion = driveVersion({
+  modifiedTime: "2026-08-02T00:00:00Z",
+  md5Checksum: "changed-bytes",
+  name: "notes.bin",
+  mimeType: "application/octet-stream",
+}, "Records");
+assert.equal(isTrustedDriveVersion(acceptedDriveVersion), true);
+for (const untrusted of [null, "", "legacy-hash", JSON.stringify(["only", "four", "parts", "here"])]) {
+  assert.equal(isTrustedDriveVersion(untrusted), false, `${String(untrusted)} must not authorize deletion`);
+}
+assert.deepEqual(classifyActiveDriveSkip({
+  code: "unsupported_extension",
+  currentVersion: acceptedDriveVersion,
+  priorAcceptedVersion: acceptedDriveVersion,
+}), { disposition: "retain_existing", reasonCode: "current_revision_unreadable" });
+assert.deepEqual(classifyActiveDriveSkip({
+  code: "unsupported_extension",
+  currentVersion: currentDriveVersion,
+  priorAcceptedVersion: "migration-derived-hash",
+}), { disposition: "retain_existing", reasonCode: "untrusted_prior_version" });
+assert.deepEqual(classifyActiveDriveSkip({
+  code: "unsupported_extension",
+  currentVersion: currentDriveVersion,
+  priorAcceptedVersion: acceptedDriveVersion,
+}), { disposition: "remove_stale", reasonCode: "known_changed_revision" });
+assert.deepEqual(classifyActiveDriveSkip({
+  code: "future_unreviewed_skip",
+  currentVersion: currentDriveVersion,
+  priorAcceptedVersion: acceptedDriveVersion,
+}), { disposition: "retain_existing", reasonCode: "unknown_skip" });
+assert.deepEqual(classifyActiveDriveSkip({ securityRefusal: true }), {
+  disposition: "remove_sensitive",
+  reasonCode: "security_refusal",
+});
+
+const retainedState = {
+  done: { "drive:active": acceptedDriveVersion },
+  skipped: {},
+};
+recordRetainedDriveDocumentState(retainedState, {
+  stateKey: "drive:active",
+  acceptedVersion: acceptedDriveVersion,
+  observedVersion: currentDriveVersion,
+  skipCode: "unsupported_extension",
+  reason: "no extractor",
+});
+assert.equal(retainedState.done["drive:active"], undefined, "retained state must not take the unchanged fast path");
+assert.equal(priorAcceptedDriveVersion(retainedState, "drive:active"), acceptedDriveVersion);
+assert.equal(retainedState.drive_retained_existing["drive:active"].observed_version, currentDriveVersion);
+assert.equal(retainedState.skipped["drive:active"], "no extractor");
+recordAcceptedDocumentState(retainedState, {
+  stateKey: "drive:active",
+  hash: currentDriveVersion,
+});
+assert.equal(retainedState.done["drive:active"], currentDriveVersion);
+assert.equal(retainedState.skipped["drive:active"], undefined);
+assert.equal(retainedState.drive_retained_existing, undefined, "an accepted replacement clears retained state");
+recordRetainedDriveDocumentState(retainedState, {
+  stateKey: "drive:active",
+  acceptedVersion: "legacy-hash",
+  observedVersion: currentDriveVersion,
+  skipCode: "unsupported_extension",
+});
+assert.equal(priorAcceptedDriveVersion(retainedState, "drive:active"), null, "an untrusted receipt never becomes deletion proof");
+clearRetainedDriveDocumentState(retainedState, "drive:active");
+assert.equal(retainedState.drive_retained_existing, undefined);
 
 /* Candidate sets are intersected with live stored families and categorized once. */
 const overlapPlan = buildDriveRemovalPlan({
@@ -452,6 +534,140 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     assert.equal(evidence.successfulRemovalFamilies, 101, "exact approvals did not delete the complete oversized plan");
     assert.equal(evidence.ingestBatchWrites, 0);
     assert.equal(evidence.receipts.ready, 1, "only the completed run should close as ready");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+/*
+ * One real CLI sweep distinguishes four source-truth outcomes: a missing
+ * family, an active migrated family with no trusted version, a known-changed
+ * active skip, and a credential refusal. Only the first, third and fourth may
+ * reach the forget route. The migrated family stays marked unverified and the
+ * source closes as error rather than silently healthy.
+ */
+{
+  const directory = mkdtempSync(join(tmpdir(), "brain-drive-active-skip-"));
+  const manifestPath = join(directory, "fixture.manifest.json");
+  const statePath = join(directory, ".brain-ingest-drive.json");
+  const evidencePath = join(directory, "active-skip-evidence.json");
+  const userRoot = join(directory, "isolated-user-root");
+  const tokenRoot = join(userRoot, ".brain");
+  const priorCursor = "fixture-active-skip-prior-cursor";
+  const scannerFingerprint = credentialScannerFingerprint(true);
+  const policyFingerprint = drivePolicyFingerprint({
+    excludeFileIds: [],
+    excludePaths: [],
+    excludeNameParts: [],
+    privatePrefixes: [],
+  }, true);
+  const staleAcceptedVersion = driveVersion({
+    modifiedTime: "2026-08-01T00:00:00Z",
+    md5Checksum: "stale-accepted",
+    name: "changed.bin",
+    mimeType: "application/octet-stream",
+  }, "");
+  const stripAnsi = (value) => String(value || "").replace(/\x1b\[[0-9;]*m/g, "");
+  const approvalFrom = (output) => {
+    const match = /--approve-removals ([0-9a-f]{64})/.exec(output);
+    assert.ok(match, `active-skip review did not print an approval fingerprint:\n${output.slice(-1_200)}`);
+    return match[1];
+  };
+  const readState = () => JSON.parse(readFileSync(statePath, "utf8"));
+  const readEvidence = () => JSON.parse(readFileSync(evidencePath, "utf8"));
+  const environment = {};
+  for (const name of ["PATH", "Path", "PATHEXT", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR"]) {
+    if (process.env[name] !== undefined) environment[name] = process.env[name];
+  }
+  Object.assign(environment, {
+    NO_COLOR: "1",
+    BRAIN_GOOGLE_TOKEN_STORE: "file",
+    BRAIN_DRIVE_SKIP_USER_ROOT: userRoot,
+    BRAIN_DRIVE_SKIP_EVIDENCE: evidencePath,
+    ADMIN_KEY: "fixture-admin",
+  });
+  const run = (extra = []) => {
+    const result = spawnSync(process.execPath, [
+      "--import", DRIVE_ACTIVE_SKIP_FETCH,
+      CLI, "ingest", manifestPath, "--from", "drive", ...extra,
+    ], { encoding: "utf8", env: environment, timeout: 30_000 });
+    assert.equal(result.error, undefined, String(result.error || ""));
+    assert.equal(result.signal, null, `active-skip CLI was terminated by ${result.signal}`);
+    return { code: result.status, output: stripAnsi(`${result.stdout || ""}${result.stderr || ""}`) };
+  };
+
+  try {
+    mkdirSync(tokenRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(manifestPath, JSON.stringify({
+      client: { slug: "fixture" },
+      brain: { domain: "fixture.invalid" },
+      infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
+      safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
+      corpora: { google_drive: {} },
+    }));
+    writeFileSync(join(tokenRoot, "google-tokens.json"), JSON.stringify({
+      google: {
+        client_id: "fixture-client",
+        client_secret: null,
+        refresh_token: "fixture-refresh",
+        scopes: ["drive"],
+      },
+    }), { mode: 0o600 });
+    writeFileSync(statePath, JSON.stringify({
+      version: 1,
+      done: {
+        "drive:active-migrated": "migration-derived-receipt",
+        "drive:active-stale": staleAcceptedVersion,
+      },
+      skipped: {},
+      sync_token: priorCursor,
+      drive_policy_fingerprint: policyFingerprint,
+      credential_scanner_fingerprint: scannerFingerprint,
+      drive_last_full_sweep_at: "2000-01-01T00:00:00.000Z",
+    }), { mode: 0o600 });
+
+    const stopped = run();
+    assert.equal(stopped.code, 1, stopped.output.slice(-1_200));
+    const approval = approvalFrom(stopped.output);
+    let evidence = readEvidence();
+    assert.equal(evidence.forgetRequests, 0, "an unapproved active-skip plan reached forget");
+    assert.equal(evidence.retainedFamilyReachedForget, false);
+    let state = readState();
+    assert.equal(state.sync_token, priorCursor, "the review stop advanced the Drive cursor");
+    assert.equal(state.done["drive:active-migrated"], undefined, "the migrated retained family stayed completion-shaped");
+    assert.equal(state.drive_retained_existing["drive:active-migrated"].accepted_version, null);
+    assert.equal(state.drive_retained_existing["drive:active-migrated"].skip_code, "unsupported_extension");
+
+    const completed = run(["--approve-removals", approval]);
+    assert.equal(completed.code, 0, completed.output.slice(-1_200));
+    assert.match(completed.output, /1 active Drive file\(s\) retain an existing Brain copy/i);
+    evidence = readEvidence();
+    assert.equal(evidence.forgetRequests, 2, "source deletion and intentional skips were not separated");
+    assert.equal(evidence.removedFamilies, 3, "only missing, known-stale and sensitive families should be removed");
+    assert.equal(evidence.retainedFamilyReachedForget, false, "the migrated active family reached forget");
+    assert.equal(evidence.ingestBatchWrites, 0);
+    assert.equal(evidence.receipts.ready, 0, "a retained unverified family closed Drive as ready");
+    assert.equal(evidence.receipts.error, 2, "both the review stop and retained completion should be explicit errors");
+
+    state = readState();
+    assert.equal(state.sync_token, "fixture-skip-next-cursor");
+    assert.deepEqual(Object.keys(state.drive_retained_existing), ["drive:active-migrated"]);
+    assert.equal(state.done["drive:active-migrated"], undefined);
+    assert.equal(state.done["drive:active-stale"], undefined);
+    assert.match(state.skipped["drive:active-migrated"], /no extractor/i);
+    assert.match(state.skipped["drive:active-stale"], /no extractor/i);
+    assert.match(state.skipped["drive:active-sensitive"], /refused: carries aws_access_key/i);
+
+    const noChange = run();
+    assert.equal(noChange.code, 0, noChange.output.slice(-1_200));
+    evidence = readEvidence();
+    assert.equal(evidence.forgetRequests, 2, "a no-change incremental run invented another removal");
+    assert.equal(evidence.inventoryReads, 3, "a no-change run unnecessarily paged the full stored corpus");
+    assert.equal(evidence.receipts.ready, 0, "a no-change run erased retained-source health");
+    assert.equal(evidence.receipts.error, 3);
+    state = readState();
+    assert.equal(state.sync_token, "fixture-skip-no-change-cursor");
+    assert.deepEqual(Object.keys(state.drive_retained_existing), ["drive:active-migrated"]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
