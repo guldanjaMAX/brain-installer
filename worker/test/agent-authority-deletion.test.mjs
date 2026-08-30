@@ -80,6 +80,34 @@ async function assertionFor(fixture, headers, receipt, credential, counter = 1) 
   return { credentialId: credential.credentialId, ...assertion };
 }
 
+function deletePasskeyAfterPreflight(fixture, credentialId) {
+  const DB = fixture.env.DB;
+  let injected = false;
+  fixture.env.DB = {
+    prepare(sql) {
+      let statement = DB.prepare(sql);
+      if (!/FROM owner_passkeys WHERE credential_id/.test(sql)) return statement;
+      const wrapper = {
+        bind(...args) { statement = statement.bind(...args); return wrapper; },
+        async first() {
+          const row = await statement.first();
+          if (!injected) {
+            fixture.raw("DELETE FROM owner_passkeys WHERE credential_id = ?", credentialId);
+            injected = true;
+          }
+          return row;
+        },
+        async all() { return statement.all(); },
+        async run() { return statement.run(); },
+      };
+      return wrapper;
+    },
+    exec: (...args) => DB.exec(...args),
+    batch: (...args) => DB.batch(...args),
+  };
+  return () => { fixture.env.DB = DB; };
+}
+
 test("named agent profiles are exact, least-privilege bundles", () => {
   assert.deepEqual(Object.keys(AGENT_PROFILES), [
     "librarian", "structured-contributor", "technician", "break-glass",
@@ -313,6 +341,33 @@ test("a response lost after D1 deletion resumes without a second mutation or act
   assert.equal(fixture.first(
     "SELECT count(*) AS n FROM owner_activity_events WHERE event_type = 'corpus_deletion_completed'",
   ).n, 1);
+});
+
+test("a passkey removed after preflight cannot leave an executable confirmed receipt", async (t) => {
+  const fixture = await createProductFixture();
+  t.after(() => fixture.close());
+  seedOwnedEntity(fixture);
+  seedDocument(fixture, { docUid: "drive:passkey-race", contentHash: "8".repeat(64) });
+  const credential = await seedOwnerPasskey(fixture);
+  const headers = await fixture.ownerHeaders();
+  const preview = await ownerPreview(fixture, headers, ["drive:passkey-race"]);
+  const assertion = await assertionFor(fixture, headers, preview.body.receipt, credential);
+  const body = {
+    receipt: preview.body.receipt,
+    request_id: "delete-passkey-race",
+    ...assertion,
+  };
+  const restoreDb = deletePasskeyAfterPreflight(fixture, credential.credentialId);
+  const raced = await fixture.post("/api/owner/corpus-deletions/execute", body, headers);
+  restoreDb();
+  assert.equal(raced.status, 409);
+  assert.equal(fixture.first("SELECT state FROM agent_action_receipts").state, "previewed",
+    "a failed passkey CAS must not commit confirmation authority");
+  assert.ok(fixture.first("SELECT doc_uid FROM documents WHERE doc_uid = 'drive:passkey-race'"));
+
+  const retry = await fixture.post("/api/owner/corpus-deletions/execute", body, headers);
+  assert.equal(retry.status, 403, "the stale preflight result cannot be replayed after the passkey is gone");
+  assert.ok(fixture.first("SELECT doc_uid FROM documents WHERE doc_uid = 'drive:passkey-race'"));
 });
 
 test("changed, expired, cross-entity, and unavailable receipts fail before mutation", async (t) => {

@@ -249,10 +249,18 @@ async function confirmReceipt(env, request, receipt, payload, now) {
         WHERE receipt_hash = ? AND tenant_id = ? AND state = 'previewed'
           AND expires_at > ?
           AND EXISTS (
+            SELECT 1 FROM owner_passkeys
+             WHERE credential_id = ? AND sign_count = ?
+               AND grant_id IS NULL AND document_grant_id IS NULL
+          )
+          AND EXISTS (
             SELECT 1 FROM auth_challenges
              WHERE challenge_hash = ? AND purpose = ? AND expires_at > ?
           )`,
-    ).bind(payload.request_id, requestHash, now, receipt.receipt_hash, TENANT_ID, now, challengeHash, purpose, now),
+    ).bind(
+      payload.request_id, requestHash, now, receipt.receipt_hash, TENANT_ID, now,
+      credential.credential_id, Number(credential.sign_count || 0), challengeHash, purpose, now,
+    ),
     env.DB.prepare(
       `UPDATE owner_passkeys
           SET sign_count = ?, last_used_at = ?
