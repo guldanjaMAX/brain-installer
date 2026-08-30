@@ -761,6 +761,11 @@ Read this before scoping an engagement.
   Dropbox, QuickBooks, Plaid, and CRM APIs are not product connectors. Manual
   exports, a watched folder, or Drive are first-class custody plans, not a
   pretend API integration.
+- **No official WhatsApp Business Platform connector.** Safe WhatsApp chat
+  exports are supported. The separate live paired-device connector is
+  unofficial, violates WhatsApp's Terms of Service, is opt-in, and is not
+  real-account proven. A WhatsApp Business App account does not make that
+  connector official.
 - **Some manifest declarations are still inert.** Google Drive source policy
   and the macOS `operations.ingest_cron` scheduler are wired. Other undeveloped
   corpora, health/report/webhook operations, most of `retrieval`,

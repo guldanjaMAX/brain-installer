@@ -66,6 +66,7 @@
     "report.mjs",
     "support-journal.mjs",
     "support-recovery.mjs",
+    "skills/",
     "templates/",
     "worker/src/"
   ],

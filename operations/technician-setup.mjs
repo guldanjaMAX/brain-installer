@@ -21,7 +21,7 @@ export const TECHNICIAN_STEPS = Object.freeze([
     title: "Install and verify Claude Code, the Brain CLI, and Wrangler",
     dashboard_url: "https://financialbrain.ai/install",
     human_boundary: "The owner signs in to Claude in their browser. The technician runs Anthropic's interactive doctor with Claude Code's normal approval prompts enabled.",
-    automated_proof: "The installer verifies the Claude CLI version and sign-in, runs claude doctor in a real terminal, and runs the pinned Wrangler 4 CLI with a credential-scrubbed environment.",
+    automated_proof: "The installer verifies the Claude CLI version and sign-in, installs and reads back the personal /financial-brain-technician skill, runs claude doctor in a real terminal, and runs the pinned Wrangler 4 CLI with a credential-scrubbed environment.",
   }),
   Object.freeze({
     id: "cloudflare",

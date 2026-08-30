@@ -82,9 +82,23 @@ released Brain CLI. The owner signs in to Claude in their own browser. Then run:
 brain technician "$HOME/Financial Brain/brain.manifest.json" --run tools
 ```
 
-This proves the Claude CLI version and sign-in, runs Anthropic's interactive
+This proves the Claude CLI version and sign-in, installs and reads back the
+personal `/financial-brain-technician` skill, runs Anthropic's interactive
 doctor, and verifies pinned Wrangler 4. Claude Code's normal approval prompts
 stay enabled.
+
+Open Claude Code and type `/skills`. Confirm `financial-brain-technician`
+appears, then start the reviewed guide with:
+
+```text
+/financial-brain-technician
+```
+
+If Claude Code was already open before its first personal skill directory was
+created, close and reopen it once. The skill contains no credential and does
+not authorize deployment, account connection, upload, deletion, or access
+changes. It begins by reading the release packet and printing the read-only
+technician plan.
 
 ### 2. Cloudflare install
 

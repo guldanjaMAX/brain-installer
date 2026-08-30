@@ -50,8 +50,9 @@
  *
  * TERMS OF SERVICE. Pairing joins the owner's WhatsApp account as a linked
  * device through a reimplementation of the multi-device protocol, not an
- * official API. That is a gray area with a real, if historically small, ban
- * risk, and it ships behind an explicit opt-in for exactly that reason. The
+ * official API. WhatsApp treats unofficial clients as a Terms of Service
+ * violation that can lead to an account restriction or ban. The connector
+ * ships behind an explicit opt-in for exactly that reason. The
  * disclosure below is the product's voice on it and is printed before anything
  * is paired.
  */
@@ -127,14 +128,18 @@ export const sessionDbPathFor = (dataDir) => join(dataDir, WHATSAPP_SESSION_DB_N
  * corpus AND the operator must pass the acceptance flag.
  */
 export const WHATSAPP_DISCLOSURE = Object.freeze([
-  "Before you pair anything, two things you are owed in plain language:",
+  "A note before you choose live WhatsApp capture:",
   "",
-  "  Terms of service. This works by joining your WhatsApp account as a linked",
-  "  device using a reimplementation of WhatsApp's own protocol, not an official",
-  "  API. WhatsApp's terms do not bless unofficial clients, and accounts using",
-  "  them carry a real, if historically small, risk of being warned or banned.",
-  "  Nobody can quantify that risk for you, and anyone who says it is zero is",
-  "  selling something. If losing this WhatsApp account would hurt, do not pair it.",
+  "  This live connector joins your account as a linked device through an",
+  "  unofficial reimplementation of WhatsApp's protocol, not an official API.",
+  "  WhatsApp treats unofficial clients as a Terms of Service violation and may",
+  "  restrict, temporarily ban, or permanently ban an account that uses one.",
+  "  If keeping this account available matters, the per-chat export is the safer",
+  "  option.",
+  "",
+  "  A WhatsApp Business App account does not make this connector official.",
+  "  Business automation should use Meta's official WhatsApp Business Platform",
+  "  Cloud API. That official connector is not built into this Brain yet.",
   "",
   "  History depth is whatever your phone gives. At link time WhatsApp's servers",
   "  push the history window your phone decides to transfer, typically weeks to a",

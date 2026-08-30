@@ -15,6 +15,10 @@ import {
   CLAUDE_WORKSPACE_MARKER,
   writeClaudeWorkspaceGuide,
 } from "../operations/claude-workspace.mjs";
+import {
+  CLAUDE_TECHNICIAN_SKILL_MARKER,
+  installClaudeTechnicianSkill,
+} from "../operations/claude-skill.mjs";
 
 const sandbox = mkdtempSync(join(tmpdir(), "brain-technician-test-"));
 const manifestPath = join(sandbox, "brain.manifest.json");
@@ -38,6 +42,7 @@ test.after(() => rmSync(sandbox, { recursive: true, force: true }));
 
 test("local tool readiness proves Claude sign-in, pinned Wrangler, and the interactive Claude doctor", async () => {
   const calls = [];
+  const skillHome = join(sandbox, "local-tools-home");
   const receipt = await cmdLocalTools({
     isTTY: true,
     runCommand: (command, args, options) => {
@@ -48,11 +53,44 @@ test("local tool readiness proves Claude sign-in, pinned Wrangler, and the inter
       return { ok: false, out: "unexpected fixture command" };
     },
     runClaudeDoctor: async () => ({ status: 0 }),
+    claudeSkillOptions: { home: skillHome },
   });
-  assert.deepEqual(receipt, { claude: "ready", wrangler: "ready", claude_doctor: "passed" });
+  assert.deepEqual(receipt, {
+    claude: "ready",
+    wrangler: "ready",
+    technician_skill: "installed",
+    claude_doctor: "passed",
+  });
   assert.ok(calls.some((call) => call.command === "claude" && call.args.join(" ") === "auth status"));
   assert.ok(calls.some((call) => call.command === "npx" && call.args.join(" ") === "wrangler@4 --version"));
   assert.ok(calls.every((call) => call.options.inheritEnv === false));
+});
+
+test("the personal Claude technician skill installs exactly, verifies on rerun, and contains no credential", () => {
+  const home = join(sandbox, "skill-home");
+  const first = installClaudeTechnicianSkill({ home });
+  assert.equal(first.status, "installed");
+  const content = readFileSync(first.path, "utf8");
+  assert.match(content, new RegExp(CLAUDE_TECHNICIAN_SKILL_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(content, /\/financial-brain-technician/);
+  assert.match(content, /brain technician/);
+  assert.doesNotMatch(content, /CLOUDFLARE_API_TOKEN|ADMIN_KEY|client_secret|app_password/);
+  if (process.platform === "win32") assert.equal(statSync(first.path).isFile(), true);
+  else assert.equal(statSync(first.path).mode & 0o777, 0o600);
+  assert.deepEqual(installClaudeTechnicianSkill({ home }), {
+    path: first.path,
+    status: "verified",
+    changed: false,
+  });
+});
+
+test("an unrelated personal Claude skill with the same name is preserved byte-for-byte", () => {
+  const home = join(sandbox, "skill-collision-home");
+  const target = join(home, ".claude", "skills", "financial-brain-technician", "SKILL.md");
+  mkdirSync(resolve(target, ".."), { recursive: true });
+  writeFileSync(target, "owner skill\n");
+  assert.throws(() => installClaudeTechnicianSkill({ home }), /different personal skill/);
+  assert.equal(readFileSync(target, "utf8"), "owner skill\n");
 });
 
 test("setup can create an owner-only Claude workspace guide with locators but no credentials", () => {

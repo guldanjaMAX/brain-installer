@@ -46,11 +46,18 @@ without weakening the ingestion and deletion rules underneath them.**
   untouched when installing on someone else's behalf.
 - Owner installs now require a signed-in Claude Code CLI and a runnable pinned
   Wrangler 4 before Cloudflare work starts. `brain tools` adds Anthropic's
-  interactive installation doctor to those automated checks. Successful Claude
+  interactive installation doctor to those automated checks. It also installs
+  and reads back a personal `/financial-brain-technician` skill, which turns the
+  reviewed release packet and read-only technician plan into a reusable Claude
+  prompt without placing a credential in Claude's context. Successful Claude
   wiring also writes an owner-only `CLAUDE.md` beside the manifest with exact
   Brain commands, approved-folder discovery rules, and explicit refusal of
   permission bypass, whole-drive crawling, credential copying, or unapproved
   direct Cloudflare mutations. An unrelated existing `CLAUDE.md` is preserved.
+- WhatsApp guidance now separates the safer per-chat export from the unofficial
+  paired-device connector, states the account restriction risk clearly, and
+  identifies Meta's official Business Platform as a separate connector that is
+  not built yet.
 - The vector drain now runs every minute by default. It still embeds only after
   the previous batch is confirmed, so extra ticks are no-ops rather than extra
   model work.

@@ -85,7 +85,11 @@ Plans: Paid** in the dashboard yourself before a production install.
 1. **Claude Code and an eligible Claude account.** Install the current native
    CLI from Anthropic, sign in with `claude auth login`, then run `brain tools`.
    The command proves the version, sign-in, Anthropic installation doctor, and
-   pinned Wrangler 4. Claude Code's normal approval prompts stay enabled.
+   pinned Wrangler 4. It also installs and reads back the personal
+   `/financial-brain-technician` skill. Open Claude Code, type `/skills` to
+   confirm it appears, then type `/financial-brain-technician` whenever you want
+   the reviewed install, connector, recovery, or handoff guide. Claude Code's
+   normal approval prompts stay enabled.
 2. **A Cloudflare account on the Workers Paid plan.** 5 USD a month minimum.
    Cloudflare now lets Free accounts create the meaning-search index, but Free
    has prototype-scale vector, daily database-write, and Worker CPU limits. Paid
@@ -279,6 +283,10 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
 - **Google Drive can refresh itself on macOS.** Its schedule is declared in the
   manifest and installed as a per-user LaunchAgent. Windows and Linux still
   require manually re-running the Drive refresh.
+- **WhatsApp exports are the safer path.** The separate live paired-device
+  connector is unofficial, violates WhatsApp's Terms of Service, and may lead
+  to an account restriction or ban. Business automation should use Meta's
+  official WhatsApp Business Platform, which is not built into this Brain yet.
 - **One local folder can refresh itself too, also macOS only.** Name it in the
   manifest and `brain schedule <manifest> --install --folder` reloads it on a
   schedule: new files load, edited files reload, deleted files are removed. It

@@ -232,7 +232,8 @@ without exposing source identifiers.
 | Google Calendar | Built and wired through `brain ingest --from calendar`; row and receipt namespaces match, and event failure, refusal, or pending cancellation cleanup withholds the Google sync token; real-account validation remains a field gate |
 | Local watched folder | Built through the ordinary resumable folder ingest path and schedulable on macOS; multi-cycle field proof remains open |
 | iMessage | Built for incremental local capture on macOS; real-user database and long-lived scheduler proof remain field gates |
-| WhatsApp, SMS, and Google Voice exports | Built as sessionized file imports; real export samples remain acceptance gates |
+| WhatsApp | Safe per-chat export ingest is built. Unofficial paired-device live capture is opt-in, violates WhatsApp's Terms of Service, and is not real-account proven. Meta's official WhatsApp Business Platform connector is not built. |
+| SMS and Google Voice exports | Built as sessionized file imports; real export samples remain acceptance gates |
 | iPhone backup | Built against a synthetic unencrypted backup; an Apple-written backup remains a field gate |
 | Zoom | Built as a transcript webhook; a paid real-account meeting remains a field gate |
 | Bank exports and hosted feed | Built into the shared financial ledger; real-statement and real-feed reconciliation remain field gates |

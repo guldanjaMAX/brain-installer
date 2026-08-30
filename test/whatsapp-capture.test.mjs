@@ -532,8 +532,12 @@ try {
   /* ===================== the disclosures are real text ================== */
   {
     const text = WHATSAPP_DISCLOSURE.join(" ");
-    check("the ToS gray-area and ban risk are stated, not hinted at",
-      /terms of service/i.test(text) && /ban/i.test(text), text.slice(0, 200));
+    check("the unofficial-client terms violation and ban risk are stated clearly",
+      /unofficial reimplementation/i.test(text) && /terms of service violation/i.test(text) &&
+      /permanently ban/i.test(text), text.slice(0, 400));
+    check("the export and official Business Platform paths are distinguished",
+      /per-chat export/i.test(text) && /business platform/i.test(text) &&
+      /not built into this brain/i.test(text), text.slice(0, 600));
     check("history depth at link time is disclosed as the phone's choice, not the full archive",
       /history/i.test(text) && /phone/i.test(text), text.slice(0, 300));
   }

@@ -56,6 +56,8 @@ registered Financial Brain MCP server before reaching for Cloudflare directly.
 
 ## Installed commands
 
+- Guided install and connector skill: \`/financial-brain-technician\`
+- Confirm it is available in Claude Code: \`/skills\`
 - Brain CLI invocation: \`${brain}\`
 - Manifest: \`${manifest}\`
 - Readiness: \`${brain} doctor ${manifest}\`

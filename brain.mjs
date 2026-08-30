@@ -119,6 +119,7 @@ import {
 import { renderSupportRecovery, supportRecovery } from "./support-recovery.mjs";
 import { readAdminKeyFile, validateAdminKeyValue } from "./operations/admin-key-file.mjs";
 import { writeClaudeWorkspaceGuide } from "./operations/claude-workspace.mjs";
+import { installClaudeTechnicianSkill } from "./operations/claude-skill.mjs";
 import {
   loadStoredCloudflareToken,
   storeCloudflareToken,
@@ -12957,11 +12958,30 @@ export async function cmdLocalTools(options = {}) {
     die("the required local tools are not ready. Fix those items and rerun `brain tools`.");
   }
 
+  let technicianSkill;
+  try {
+    technicianSkill = (options.installClaudeSkill ?? installClaudeTechnicianSkill)(
+      options.claudeSkillOptions || { environment: process.env },
+    );
+  } catch (error) {
+    die(
+      `Claude Code is ready, but its Financial Brain technician skill could not be installed safely: ${error?.message || error}\n` +
+      "      Nothing existing was overwritten. Resolve that path and rerun `brain tools`."
+    );
+  }
+  ok(`Claude Code skill /financial-brain-technician ${technicianSkill.status}`);
+  info("Open Claude Code and type `/skills` to see it, or `/financial-brain-technician` to begin the guided plan.");
+
   const hasTty = options.isTTY ?? (process.stdin.isTTY === true && process.stdout.isTTY === true);
   if (!hasTty) {
     warn("Claude Code's full installation doctor needs an interactive terminal and was not run here.");
     info("Run `claude doctor` in Terminal before the owner handoff.");
-    return { claude: "ready", wrangler: "ready", claude_doctor: "requires_interactive_terminal" };
+    return {
+      claude: "ready",
+      wrangler: "ready",
+      technician_skill: technicianSkill.status,
+      claude_doctor: "requires_interactive_terminal",
+    };
   }
 
   console.log(`\n  ${c.bold("Claude Code installation doctor")}\n`);
@@ -12979,8 +12999,13 @@ export async function cmdLocalTools(options = {}) {
   if (result?.error || result?.status !== 0) {
     die("`claude doctor` did not complete cleanly. Fix its message and rerun `brain tools`.");
   }
-  ok("Claude Code, sign-in, and Wrangler 4 are ready");
-  return { claude: "ready", wrangler: "ready", claude_doctor: "passed" };
+  ok("Claude Code, sign-in, technician skill, and Wrangler 4 are ready");
+  return {
+    claude: "ready",
+    wrangler: "ready",
+    technician_skill: technicianSkill.status,
+    claude_doctor: "passed",
+  };
 }
 
 /** Mint a one-time passkey enrollment link for the brain's owner. */
