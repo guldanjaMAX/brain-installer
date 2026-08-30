@@ -83,6 +83,14 @@ absolute test-kit and manifest paths.
   `--json` and preserve its status, citations, `error_code`, and `recovery`.
 - Never treat an exact pair as a ruling, resolve a generated exception, expose
   the Intuit realm id, or continue past a company-identity or pairing refusal.
+- The tax-to-QuickBooks bridge is human-confirmed document claim entry only.
+  Never use OCR, retrieval text, bank deposits, transaction aggregation, or an
+  inferred mapping to populate it. Require the private claim file and the
+  separate `--confirm-reviewed-claims` approval after visual verification.
+- Stop on any missing document custody, single-entity scope, tax year, exact
+  period, USD currency, cash/accrual basis, `gross_receipts` measure, complete
+  report coverage, QuickBooks source, or company fingerprint. Equal amounts are
+  still not a tax conclusion.
 
 ## Recovery and completion
 

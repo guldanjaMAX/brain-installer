@@ -200,6 +200,73 @@ the manifest path:
 Guide me through connecting my client-owned QuickBooks Online company to Financial Brain using /absolute/path/to/brain.manifest.json. First read the manifest and confirm corpora.quickbooks.enabled is true and corpora.quickbooks.environment explicitly says sandbox or production. Explain that I own the Intuit app and company authorization, Financial Brain has no shared Intuit account or credential custody, and QuickBooks will remain a reference rather than financial authority. Ask before running brain technician with --run quickbooks --json. Hand the terminal to me for both hidden prompts and never ask me to paste, print, log, or put either app value in a command. Let me complete Intuit consent in the browser. Then show the exact dry-run and first-ingest commands and stop before the real ingest until I approve it. After a reviewed ingest and bank import, ask me to select exactly one Brain account slug, QuickBooks account ID, date range, and inflow or outflow direction. Show brain reconcile quickbooks with those selectors and --json, then ask before running it. Never expose the Intuit realm ID or credential. Explain that matched, mismatched, ambiguous, one-sided, unavailable, and insufficient-evidence results are review states, never financial authority. Preserve both sources, every exact citation, error_code, and recovery instruction. Never resolve an exception or treat a successful comparison as proof that the books are correct.
 ```
 
+#### Optional human-confirmed tax review bridge
+
+This is a manual evidence-recording workflow, not tax extraction. Use it only
+when the exact tax record and exact annual QuickBooks profit-and-loss report are
+already stored, readable, registered in `fin_documents`, and bound to the same
+legal entity and period. The QuickBooks report document itself must come from
+the `quickbooks` source and carry the reviewed company fingerprint.
+
+Prepare a private JSON file outside the source repository and any synced folder.
+Replace every placeholder only after a person has visually checked it:
+
+```json
+{
+  "schema_version": 1,
+  "confirmation": "owner_confirmed_from_document",
+  "scope_kind": "single_entity",
+  "entity_slug": "replace-with-reviewed-entity-slug",
+  "legal_entity": "Replace with exact legal name",
+  "tax_year": 2025,
+  "period_start": "2025-01-01",
+  "period_end": "2025-12-31",
+  "currency": "USD",
+  "tax_accounting_method": "cash",
+  "tax_document": {
+    "doc_uid": "replace-with-stored-tax-document-uid",
+    "form_name": "Replace with exact form name",
+    "form_version": "Replace with exact form version",
+    "page": 1,
+    "line_label": "Replace with exact gross receipts line label",
+    "measure": "gross_receipts",
+    "amount_minor": 0,
+    "source_locator": "Replace with exact form, page, and line locator"
+  },
+  "quickbooks_report": {
+    "doc_uid": "replace-with-stored-qbo-report-document-uid",
+    "company_evidence_doc_uid": "replace-with-stored-qbo-company-document-uid",
+    "report_name": "Profit and Loss",
+    "total_label": "Replace with exact gross receipts total label",
+    "measure": "gross_receipts",
+    "period_start": "2025-01-01",
+    "period_end": "2025-12-31",
+    "accounting_basis": "cash",
+    "currency": "USD",
+    "amount_minor": 0,
+    "source_locator": "Replace with exact report and total locator",
+    "coverage": "complete_exact_report"
+  }
+}
+```
+
+Amounts are integer minor units, so 123.45 USD is `12345`. Zero is valid only
+when the person verified that exact zero on the cited line or total. On macOS or
+Linux, set the file to owner-only mode before running the bridge:
+
+```bash
+chmod 600 /private/path/reviewed-tax-qbo-claim.json
+brain reconcile tax-quickbooks "$HOME/Financial Brain/brain.manifest.json" \
+  --claim-file /private/path/reviewed-tax-qbo-claim.json \
+  --confirm-reviewed-claims --json
+```
+
+For a Claude or Codex-guided review, copy this prompt and replace only the paths:
+
+```text
+Help me prepare a human-confirmed tax-to-QuickBooks review claim for /absolute/path/to/brain.manifest.json and save it only at /private/path/reviewed-tax-qbo-claim.json. Do not use OCR, retrieval snippets, bank deposits, transaction aggregation, or guessed mappings as proof. First verify that one exact tax document and one exact annual QuickBooks profit-and-loss report are already stored, readable, registered to the same single legal entity and exact period, and that the report document itself is QuickBooks-sourced and carries the same company fingerprint as the reviewed QuickBooks company evidence. If any custody, entity, tax year, period, currency, accounting basis, report coverage, company, or source fact is missing or ambiguous, stop and name it. Help me visually locate the tax form name and version, page, exact gross-receipts line label, and amount, then the QuickBooks report name, date range, cash or accrual basis, exact gross-receipts total label, and amount. Convert amounts to integer USD minor units only after I verify each conversion. Use gross_receipts as the measure on both sides only after I confirm those exact document labels are intended to represent that same measure. Write confirmation as owner_confirmed_from_document and scope_kind as single_entity. Keep the JSON file owner-only and never put its private contents in a command argument, chat, summary, log, repository, or synced folder. Open the local file for my private inspection instead of pasting it into chat, ask me to verify every field, then ask separately before running brain reconcile tax-quickbooks with --claim-file, --confirm-reviewed-claims, and --json. Explain that the CLI receipt omits the legal name, amounts, document IDs, and locators; matched, mismatched, and insufficient_evidence are review states; equal amounts prove no tax treatment; and the command never extracts, selects a winner, resolves a tax question, or changes either source document.
+```
+
 ### 6. Zoom
 
 Enable `zoom` in the manifest. A paid Zoom seat with cloud recording is

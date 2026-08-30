@@ -390,6 +390,36 @@ blocked on incomplete QuickBooks coverage rather than becoming authoritative.
 Use the returned `status`, `acceptance_state`, `error_code`, `recovery`, and
 exact source locators as the agent-safe control contract.
 
+The optional tax-to-QuickBooks bridge is human-confirmed only. It does not run
+OCR, parse a tax form, fetch a live QuickBooks report, infer revenue from bank
+deposits, or equate Total Income with a tax line. The operator prepares one
+owner-only JSON claim after visually verifying both already stored documents:
+
+```bash
+chmod 600 ./reviewed-tax-qbo-claim.json
+node brain.mjs reconcile tax-quickbooks ./acme.manifest.json \
+  --claim-file ./reviewed-tax-qbo-claim.json \
+  --confirm-reviewed-claims --json
+```
+
+The claim must say `owner_confirmed_from_document` and bind one legal entity,
+tax year, exact annual period, USD, cash or accrual basis, and the supported
+`gross_receipts` measure on both sides. The tax side requires exact form name
+and version, page, line label, integer minor-unit amount, and locator. The
+QuickBooks side requires an already stored QuickBooks-sourced profit-and-loss
+document with its own company fingerprint, exact report name, date range,
+basis, total label, integer minor-unit amount, complete report coverage, and
+locator. Both documents must already have one live readable `fin_documents`
+record for the same entity and period.
+
+Only exact complete evidence writes. It stores two `owner_stated` claims whose
+labels and locators say `owner_confirmed_from_document`, and records a matched
+or mismatched review candidate without selecting a winner. Incomplete coverage
+returns `insufficient_evidence` and writes nothing. Missing custody, ambiguous
+or consolidated scope, wrong source or company, entity/year/period/currency/
+basis/measure mismatch, foreign prior reconciliation state, and unavailable
+evidence all refuse before a write. Equal amounts are not a tax conclusion.
+
 The adapter cannot commit a cursor. `connectors/provider-runtime.mjs` first
 requires an exact ingest receipt for every normalized document, applies exact
 tombstones, reads the source-family inventory back, then replaces protected

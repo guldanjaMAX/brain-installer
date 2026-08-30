@@ -4254,7 +4254,7 @@ export const VALUE_FLAGS = new Set([
   // brain import bank. `--file` with no value must die saying so rather than
   // being read as a boolean and then reported as "needs --file".
   "file", "format", "account", "account-kind", "institution", "currency", "entity", "entity-label",
-  "qbo-account", "to", "direction",
+  "qbo-account", "to", "direction", "claim-file",
 ]);
 
 /** Read an exact Drive-id exclusion list from either its portable shape or a migration receipt. */
@@ -9632,16 +9632,197 @@ export async function cmdReconcileQuickBooks(manifestPath, flags = {}, options =
   }
 }
 
+function readOwnerOnlyTaxClaim(path) {
+  const absolute = resolve(String(path || ""));
+  let pathBefore;
+  let fd;
+  try {
+    pathBefore = lstatSync(absolute);
+    fd = openSync(absolute, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+  } catch {
+    const error = new Fatal("the tax claim file could not be read");
+    error.code = "tax_claim_file_unavailable";
+    throw error;
+  }
+  try {
+    const before = fstatSync(fd);
+    if (!pathBefore.isFile() || pathBefore.isSymbolicLink() || !before.isFile() ||
+        pathBefore.dev !== before.dev || pathBefore.ino !== before.ino ||
+        before.size < 2 || before.size > 64 * 1024) {
+      const error = new Fatal("the tax claim must be a bounded regular file, not a link");
+      error.code = "tax_claim_file_unsafe";
+      throw error;
+    }
+    if (process.platform !== "win32" &&
+        ((before.mode & 0o777) !== 0o600 || (typeof process.getuid === "function" && before.uid !== process.getuid()))) {
+      const error = new Fatal("the tax claim file must be owned by the current user with mode 0600");
+      error.code = "tax_claim_file_not_owner_only";
+      throw error;
+    }
+    let parsed;
+    try { parsed = JSON.parse(readFileSync(fd, "utf8")); } catch {
+      const error = new Fatal("the tax claim file is not valid JSON");
+      error.code = "tax_claim_file_invalid";
+      throw error;
+    }
+    const after = fstatSync(fd);
+    const pathAfter = lstatSync(absolute);
+    if (!pathAfter.isFile() || pathAfter.isSymbolicLink() || pathAfter.dev !== before.dev ||
+        pathAfter.ino !== before.ino || after.dev !== before.dev || after.ino !== before.ino ||
+        after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+      const error = new Fatal("the tax claim file changed while it was being read");
+      error.code = "tax_claim_file_changed";
+      throw error;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      const error = new Fatal("the tax claim JSON must be one object");
+      error.code = "tax_claim_file_invalid";
+      throw error;
+    }
+    return parsed;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+async function postTaxQuickBooksReconciliation({ base, adminKey, payload, fetchImpl = fetch }) {
+  return retryTransient(async () => {
+    const res = await http(`${base}/api/fin/reconcile/tax-quickbooks`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }, { timeoutMs: 60_000, what: "the human-confirmed tax and QuickBooks comparison", fetchImpl });
+    let raw;
+    try {
+      raw = await res.text();
+    } catch (error) {
+      error.retryable = true;
+      throw error;
+    }
+    let body;
+    try { body = JSON.parse(raw); } catch {
+      const error = new Error("the brain returned an invalid tax comparison response");
+      error.retryable = res.status >= 500;
+      throw error;
+    }
+    if (!res.ok) {
+      const error = new Error(body.recovery || body.error || "the tax comparison was refused");
+      error.code = body.error_code || body.code || "tax_qbo_reconciliation_refused";
+      error.payload = body;
+      error.retryable = false;
+      throw error;
+    }
+    return body;
+  }, {
+    attempts: 3,
+    delayMs: 500,
+    maxDelayMs: 2_000,
+    shouldRetry: (error) => error?.retryable !== false,
+  });
+}
+
+function renderTaxQuickBooksReconciliation(result) {
+  console.log("");
+  console.log(`${c.bold("Human-confirmed tax and QuickBooks review")}\n`);
+  info(`Status: ${result.status}`);
+  if (result.recovery) warn(result.recovery);
+  info("Both values remain human-confirmed document claims. No extraction, tax finding, financial ruling, or source change was made.");
+}
+
+function taxQuickBooksCliReceipt(result = {}) {
+  return {
+    schema_version: 1,
+    command: "reconcile.tax_quickbooks",
+    status: result.status || "error",
+    error_code: result.error_code || null,
+    confirmation: result.confirmation || null,
+    reconciliation_uid: result.reconciliation_uid || null,
+    claim_count: Array.isArray(result.claim_uids) ? result.claim_uids.length : 0,
+    financial_authority: false,
+    ruling_selected: false,
+    wrote_reconciliation: result.wrote_reconciliation === true
+      ? true
+      : result.wrote_reconciliation === false
+        ? false
+        : null,
+    mutated_source_records: false,
+    retry_safe: result.retry_safe === true,
+    recovery: result.recovery || null,
+  };
+}
+
+/** Submit one owner-reviewed private claim file without parsing either document. */
+export async function cmdReconcileTaxQuickBooks(manifestPath, flags = {}, options = {}) {
+  assertKnownFlags(
+    flags,
+    ["claim-file", "confirm-reviewed-claims", "json", "retry"],
+    "brain reconcile tax-quickbooks",
+  );
+  try {
+    if (flags["confirm-reviewed-claims"] !== true) {
+      const error = new Fatal("the owner or technician must add --confirm-reviewed-claims after verifying both exact document locations and amounts");
+      error.code = "tax_qbo_human_confirmation_required";
+      throw error;
+    }
+    if (!options.claim && (!flags["claim-file"] || flags["claim-file"] === true)) {
+      const error = new Fatal("brain reconcile tax-quickbooks needs --claim-file <owner-only-json>");
+      error.code = "tax_claim_file_required";
+      throw error;
+    }
+    const { m } = loadManifest(manifestPath);
+    const configuration = m?.corpora?.quickbooks || {};
+    if (configuration.enabled !== true || !["sandbox", "production"].includes(configuration.environment)) {
+      const error = new Fatal("the manifest must enable QuickBooks and explicitly name sandbox or production before comparing its stored report evidence");
+      error.code = "quickbooks_configuration_required";
+      throw error;
+    }
+    const claim = options.claim || readOwnerOnlyTaxClaim(flags["claim-file"]);
+    const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+    if (!adminKey) {
+      const error = new Fatal("no durable admin key was found for the client-owned Brain");
+      error.code = "admin_key_unavailable";
+      throw error;
+    }
+    const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, null);
+    const post = options.postReconciliation || postTaxQuickBooksReconciliation;
+    const result = await post({ base, adminKey, payload: claim, fetchImpl: options.fetchImpl || fetch });
+    if (flags.json) console.log(JSON.stringify(taxQuickBooksCliReceipt(result), null, 2));
+    else renderTaxQuickBooksReconciliation(result);
+    return result;
+  } catch (error) {
+    if (flags.json) {
+      if (error instanceof JsonFatal) throw error;
+      const payload = error?.payload || {
+        schema_version: 1,
+        command: "reconcile.tax_quickbooks",
+        status: "error",
+        error_code: error?.code || "tax_qbo_reconciliation_failed",
+        recovery: error?.code
+          ? String(error.message || error)
+          : "The comparison failed without a trusted receipt. Verify the local claim file and stored evidence, then retry the exact same command.",
+        financial_authority: false,
+        wrote_reconciliation: false,
+        mutated_source_records: false,
+      };
+      throw new JsonFatal(payload);
+    }
+    die(String(error?.message || error));
+  }
+}
+
 async function cmdReconcile(target) {
   const which = String(target || "").toLowerCase();
-  if (which !== "quickbooks") {
-    die("brain reconcile currently supports quickbooks only");
+  if (!["quickbooks", "tax-quickbooks"].includes(which)) {
+    die("brain reconcile supports quickbooks or tax-quickbooks");
   }
   const path = process.argv[4];
   if (!path || path.startsWith("--")) {
-    die("usage: brain reconcile quickbooks <manifest> --account <slug> --qbo-account <id> --from <date> --to <date> --direction <inflow|outflow> [--json]");
+    die("usage: brain reconcile <quickbooks|tax-quickbooks> <manifest> [reviewed scope flags] [--json]");
   }
-  return cmdReconcileQuickBooks(path, parseFlags(process.argv.slice(4)));
+  const flags = parseFlags(process.argv.slice(4));
+  return which === "quickbooks"
+    ? cmdReconcileQuickBooks(path, flags)
+    : cmdReconcileTaxQuickBooks(path, flags);
 }
 
 /**
@@ -14646,6 +14827,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain drain      <manifest>            finish the vector embedding now, with a live ETA
     brain reindex    <manifest>            rebuild the vector index from D1, no source files needed
     brain reconcile quickbooks <manifest> compare one paired QBO and bank account period; --json for agents
+    brain reconcile tax-quickbooks <manifest> --claim-file <private-json> --confirm-reviewed-claims
     brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it

@@ -474,6 +474,7 @@ const expected = [
   "worker/src/lib/document-access.js",
   "worker/src/lib/fin-api.js",
   "worker/src/lib/qbo-bank-reconciliation.js",
+  "worker/src/lib/tax-qbo-reconciliation.js",
   "worker/src/lib/fin-d1.js",
   "worker/src/lib/fin-import.js",
   "worker/src/lib/fin-upload.js",

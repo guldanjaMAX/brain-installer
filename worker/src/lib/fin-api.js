@@ -50,6 +50,10 @@ import {
   quickBooksBankReconciliationStatus,
   runQuickBooksBankReconciliation,
 } from "./qbo-bank-reconciliation.js";
+import {
+  TaxQuickBooksReconciliationError,
+  runTaxQuickBooksReconciliation,
+} from "./tax-qbo-reconciliation.js";
 
 export const FIN_PATH_PREFIX = "/api/fin/";
 
@@ -104,6 +108,34 @@ const envelope = (install, extra = {}) => ({
 
 export async function handleFinApi(env, request, url, path) {
   try {
+    if (path === "/api/fin/reconcile/tax-quickbooks") {
+      if (request.method !== "POST") {
+        return privateNoStore(jsonResponse({ error: "method not allowed", code: "method_not_allowed" }, 405));
+      }
+      if (!validateAdminKey(request, env)) {
+        return privateNoStore(jsonResponse({ error: "unauthorized", code: "admin_key_required" }, 401));
+      }
+      const body = await readJson(request);
+      try {
+        const result = await runTaxQuickBooksReconciliation(env, body);
+        return privateNoStore(jsonResponse(result, result.status === "unavailable" ? 503 : 200));
+      } catch (error) {
+        if (error instanceof TaxQuickBooksReconciliationError) {
+          return privateNoStore(jsonResponse({
+            schema_version: 1,
+            command: "reconcile.tax_quickbooks",
+            status: "error",
+            error_code: error.code,
+            recovery: error.recovery,
+            financial_authority: false,
+            wrote_reconciliation: false,
+            mutated_source_records: false,
+          }, error.status));
+        }
+        throw error;
+      }
+    }
+
     if (path === "/api/fin/reconcile/quickbooks-bank") {
       if (request.method !== "POST") {
         return privateNoStore(jsonResponse({ error: "method not allowed", code: "method_not_allowed" }, 405));
