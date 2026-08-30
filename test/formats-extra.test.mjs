@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as XLSX from "@e965/xlsx";
+import { strToU8, zipSync } from "fflate";
 import { extract, canExtract, supported } from "../ingest/extract.mjs";
 import { walk, prepare } from "../ingest/run.mjs";
 import { splitMbox, unquoteFromLine, mboxMessageKey } from "../ingest/mbox.mjs";
@@ -165,6 +166,41 @@ const read = async (name) => extract(bytes(name), name);
     XLSX.write(completeWorkbook, { bookType: "xlsx", type: "buffer" }), "complete.xlsx");
   check("a fully rendered workbook is not mislabeled incomplete",
     complete.incomplete !== true && complete.note === undefined, JSON.stringify(complete));
+}
+
+/* ================= PowerPoint, in narrative slide order ================= */
+{
+  const entries = {};
+  for (let slide = 12; slide >= 1; slide--) {
+    const notes = 100 + slide;
+    entries[`ppt/notesSlides/notesSlide${notes}.xml`] = strToU8(
+      `<p:notes xmlns:p="p" xmlns:a="a"><a:p><a:r><a:t>Speaker note ${slide}</a:t></a:r></a:p></p:notes>`);
+    entries[`ppt/slides/_rels/slide${slide}.xml.rels`] = strToU8(
+      `<Relationships><Relationship Id="rIdNotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide${notes}.xml"/></Relationships>`);
+    entries[`ppt/slides/slide${slide}.xml`] = strToU8(
+      `<p:sld xmlns:p="p" xmlns:a="a"><a:p><a:r><a:t>Narrative ${slide}</a:t></a:r></a:p></p:sld>`);
+  }
+  const got = await extract(Buffer.from(zipSync(entries, { level: 0 })), "twelve-slides.pptx");
+  const expected = Array.from({ length: 12 }, (_, index) => index + 1)
+    .flatMap((slide) => [
+      `Slide ${slide}\nNarrative ${slide}`,
+      `Notes for slide ${slide}\nSpeaker note ${slide}`,
+    ])
+    .join("\n\n");
+
+  check("a 12-slide deck preserves natural numeric narrative order",
+    got.text === expected, got.text);
+  check("slide 10 never jumps ahead of slide 2 through lexical filename sorting",
+    got.text.indexOf("Slide 2\n") < got.text.indexOf("Slide 10\n"), got.text);
+  check("each slide's relationship-mapped notes stay immediately after that slide",
+    /Slide 7\nNarrative 7\n\nNotes for slide 7\nSpeaker note 7\n\nSlide 8\n/.test(got.text || ""), got.text);
+
+  const conventional = await extract(Buffer.from(zipSync({
+    "ppt/slides/slide1.xml": strToU8("<p:sld><a:p><a:t>Minimal slide</a:t></a:p></p:sld>"),
+    "ppt/notesSlides/notesSlide1.xml": strToU8("<p:notes><a:p><a:t>Minimal note</a:t></a:p></p:notes>"),
+  }, { level: 0 })), "minimal.pptx");
+  check("same-number notes remain associated when a minimal producer omits relationship files",
+    conventional.text === "Slide 1\nMinimal slide\n\nNotes for slide 1\nMinimal note", conventional.text);
 }
 
 /* ================= transcripts (.vtt) ================= */

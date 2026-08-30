@@ -4,6 +4,7 @@ import { strFromU8 } from "fflate";
 import * as XLSX from "@e965/xlsx";
 import PostalMime from "postal-mime";
 import { extractZipEntries, ArchiveSafetyError } from "../../../ingest/archive.mjs";
+import { isPptxSemanticEntry, renderPptxEntries } from "../../../ingest/pptx.mjs";
 import { handleOcr, MAX_IMAGE_BASE64_BYTES } from "./ocr.js";
 
 export const OWNER_BINARY_UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
@@ -130,11 +131,10 @@ function docx(bytes) {
 function pptx(bytes) {
   const entries = officeEntries(
     bytes,
-    (name) => /^ppt\/(slides\/slide|notesSlides\/notesSlide)\d+\.xml$/.test(name),
+    isPptxSemanticEntry,
     "PowerPoint upload",
   );
-  return clean([...entries.entries()].sort(([a], [b]) => a.localeCompare(b))
-    .map(([, value]) => xmlText(strFromU8(value))).filter(Boolean).join("\n\n"));
+  return clean(renderPptxEntries(entries, xmlText).text);
 }
 
 function workbook(bytes, mediaType) {

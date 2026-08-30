@@ -38,6 +38,9 @@ the brain, not for whoever built it: what changed for them, and what to check.
 - Google Drive now revalidates the selected root folder on every run before it
   can use the change feed. A moved, deleted, or unauthorized root fails closed
   instead of silently widening or continuing from stale scope.
+- PowerPoint files now keep slides in numeric order and place each slide's
+  speaker notes immediately after it. Decks with ten or more slides no longer
+  put slide 10 before slide 2 or separate all notes from their slides.
 - QuickBooks Sandbox connections bind the authorized company to one explicit
   source and keep company identifiers out of receipts. Books-to-bank and
   human-confirmed tax comparisons preserve both sources and never make

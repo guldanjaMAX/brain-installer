@@ -51,15 +51,40 @@ check("oversized base64 is refused before allocating decoded bytes", oversized?.
 }
 
 {
-  const bytes = zipSync({
-    "ppt/slides/slide1.xml": strToU8("<p:sld><a:p><a:r><a:t>Quarterly plan</a:t></a:r></a:p></p:sld>"),
-    "ppt/notesSlides/notesSlide1.xml": strToU8("<p:notes><a:p><a:r><a:t>Owner note</a:t></a:r></a:p></p:notes>"),
-  });
+  const entries = {};
+  for (let slide = 12; slide >= 1; slide--) {
+    const notes = 100 + slide;
+    entries[`ppt/notesSlides/notesSlide${notes}.xml`] = strToU8(
+      `<p:notes><a:p><a:r><a:t>Owner note ${slide}</a:t></a:r></a:p></p:notes>`);
+    entries[`ppt/slides/_rels/slide${slide}.xml.rels`] = strToU8(
+      `<Relationships><Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide${notes}.xml"/></Relationships>`);
+    entries[`ppt/slides/slide${slide}.xml`] = strToU8(
+      `<p:sld><a:p><a:r><a:t>Quarterly plan ${slide}</a:t></a:r></a:p></p:sld>`);
+  }
+  const bytes = zipSync(entries, { level: 0 });
   const result = await extractOwnerUpload({}, {
     mediaType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     bytes, fileName: "plan.pptx",
   });
-  check("PowerPoint upload includes slide and speaker-note text", result.content.includes("Quarterly plan") && result.content.includes("Owner note"));
+  const expected = Array.from({ length: 12 }, (_, index) => index + 1)
+    .flatMap((slide) => [
+      `Slide ${slide}\nQuarterly plan ${slide}`,
+      `Notes for slide ${slide}\nOwner note ${slide}`,
+    ])
+    .join("\n\n");
+  check("PowerPoint upload preserves numeric slide order and slide-local notes",
+    result.content === expected, result.content);
+
+  const conventional = await extractOwnerUpload({}, {
+    mediaType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    bytes: zipSync({
+      "ppt/slides/slide1.xml": strToU8("<p:sld><a:p><a:t>Minimal slide</a:t></a:p></p:sld>"),
+      "ppt/notesSlides/notesSlide1.xml": strToU8("<p:notes><a:p><a:t>Minimal note</a:t></a:p></p:notes>"),
+    }, { level: 0 }),
+    fileName: "minimal.pptx",
+  });
+  check("PowerPoint upload supports conventional notes when relationships are absent",
+    conventional.content === "Slide 1\nMinimal slide\n\nNotes for slide 1\nMinimal note", conventional.content);
 }
 
 {

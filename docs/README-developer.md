@@ -243,6 +243,12 @@ zero advisories. That matters because this installs on the client's own machine
 during a live session, and a native build failing on their Windows box is not a
 problem you want to debug in front of them. Install with `npm ci --ignore-scripts`.
 
+PowerPoint extraction uses numeric slide order rather than ZIP or lexical entry
+order. Each slide receives a stable `Slide N` boundary and its relationship-
+mapped `Notes for slide N` section immediately afterward. The local folder and
+owner-upload paths share this ordering module so their searchable narratives
+cannot drift apart.
+
 ZIP-based Office files are never expanded with an all-at-once unzip. The shared
 `ingest/archive.mjs` path streams every entry, including entries the parser does
 not retain, through compressed-byte, expanded-byte, per-entry, file-count,

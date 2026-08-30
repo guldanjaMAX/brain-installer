@@ -373,6 +373,7 @@ const expected = [
   "ingest/message-session.mjs",
   "ingest/page-image.mjs",
   "ingest/pdf-child.mjs",
+  "ingest/pptx.mjs",
   "ingest/quality.mjs",
   "ingest/rtf.mjs",
   "ingest/run.mjs",

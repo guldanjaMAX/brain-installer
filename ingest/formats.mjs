@@ -28,6 +28,7 @@ import PostalMime from "postal-mime";
 import { extractZipEntries, validateZipArchive } from "./archive.mjs";
 import { register, renderTableResult } from "./extract.mjs";
 import { splitMbox } from "./mbox.mjs";
+import { isPptxSemanticEntry, renderPptxEntries } from "./pptx.mjs";
 import { stripMarkup } from "./quality.mjs";
 
 /**
@@ -382,9 +383,14 @@ register(".docx", (buf) => {
 }, "word", { binary: true });
 
 register(".pptx", (buf) => {
-  const slides = unzipText(buf, (n) => /^ppt\/(slides\/slide|notesSlides\/notesSlide)\d+\.xml$/.test(n));
-  if (!slides.length) return { text: null, error: "no slides found inside the .pptx" };
-  return { text: slides.map(ooxmlToText).join("\n\n").trim() };
+  const { entries } = extractZipEntries(buf, {
+    label: "Office archive",
+    select: isPptxSemanticEntry,
+  });
+  const rendered = renderPptxEntries(entries, ooxmlToText);
+  if (!rendered.slideCount) return { text: null, error: "no slides found inside the .pptx" };
+  if (!rendered.text) return { text: null, error: "the .pptx has no readable slide text" };
+  return { text: rendered.text };
 }, "powerpoint", { binary: true });
 
 /* ------------------------------------------------------------- spreadsheets */
