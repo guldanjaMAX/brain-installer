@@ -244,12 +244,12 @@ There are three separate claims:
 
 Never combine those into a broader claim than the evidence supports.
 
-`npm run privacy:history` proves that no new public-history finding was added
-to the sanitized known-incident baseline. It is not a clean-history claim.
-Before any new public tag or release, `npm run privacy:history:strict` must pass
-against the server's exact public heads and tags. Until approved history
-remediation makes that possible, release is blocked even when the package and
-six-platform matrix are green. See `docs/RELEASE-GOVERNANCE.md`.
+`npm run privacy:history` proves the exact local candidate history has zero
+finding objects. Before any new public tag or release,
+`npm run privacy:history:strict` must also prove zero findings across the
+server's exact public heads and tags plus the checked-out candidate. A missing
+remote object is a hard stop until full history is fetched deliberately. See
+`docs/RELEASE-GOVERNANCE.md`.
 
 ## Cut an immutable release
 

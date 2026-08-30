@@ -26,8 +26,9 @@ The [maintainer guide](./MAINTAINER.md) gives the exact safe change, package,
 release, owner-update, rollback, credential, and issue-evidence workflow.
 The [release-governance plan](./RELEASE-GOVERNANCE.md) defines the public Git
 history, CODEOWNERS, dependency, ruleset, workflow-action, artifact, and
-attestation gates. A known-incident baseline pass is containment, not proof of
-clean public history.
+attestation gates. This clean lineage requires exactly zero history findings;
+the predecessor repository's sanitized incident artifacts remain evidence, not
+an active baseline or exception path.
 
 ---
 

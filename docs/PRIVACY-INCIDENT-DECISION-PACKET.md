@@ -1,5 +1,9 @@
 # Privacy incident decision packet
 
+> Historical predecessor-repository decision record. The clean lineage does
+> not adopt this incident baseline or its public-ref manifest. Its active local
+> and CI policy requires exactly zero finding objects.
+
 Prepared for privacy counsel and repository-owner review. This packet records
 technical facts and decision points. It is not a legal conclusion and contains
 no matched personal data, credential, or raw affected path.

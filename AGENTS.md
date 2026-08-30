@@ -126,10 +126,11 @@ them against a live install or change production state without approval.
 3. Run `npm test`, relevant `node --check` commands, and `git diff --check`.
 4. Run `npm audit --offline` and
    `npm pack --dry-run --json --ignore-scripts`. Inspect the exact pack list.
-5. Run `npm run privacy:history`. This is a known-incident containment gate,
-   not a clean-history claim. Before any new public release, the authoritative
-   server-ref command `npm run privacy:history:strict` must also pass. Do not
-   weaken or refresh the baseline to make a release green.
+5. Run `npm run privacy:history`. This clean lineage requires exactly zero
+   finding objects in the candidate's reachable history. Before any new public
+   release, `npm run privacy:history:strict` must also prove zero findings
+   across every server-visible head and tag plus the checked-out candidate.
+   Do not add a baseline or disposition to make a release green.
 6. Install the packed tarball in a clean test location and prove the `brain`
    executable starts. Do not treat direct `node brain.mjs` execution as the
    package-install test.

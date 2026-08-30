@@ -1,5 +1,9 @@
 # Public Git privacy incident evidence
 
+> Historical predecessor-repository evidence. The clean lineage preserves this
+> sanitized record but does not use its baseline or ref manifest as an active
+> gate. Current package scripts and CI require exactly zero finding objects.
+
 Sanitized local evidence recorded 2026-08-30 from the public `origin` heads and
 tags. No matched value, raw affected path, personal identifier, credential, or
 source content is present in this report.

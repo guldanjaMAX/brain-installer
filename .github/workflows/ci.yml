@@ -20,7 +20,7 @@ on:
 
 jobs:
   history-privacy:
-    name: public git history privacy baseline
+    name: public git history zero findings
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -34,11 +34,11 @@ jobs:
           node-version: '22'
           package-manager-cache: false
 
-      # This baseline is containment, not a clean-history claim. It fails if a
-      # new credential/privacy object appears or a public ref stops descending
-      # from the reviewed incident inventory. The strict clean gate remains a
-      # release blocker until the approved remote rewrite completes.
-      - name: reject history regressions against the sanitized incident baseline
+      # Scan every server-visible head and tag plus the checked-out commit. The
+      # explicit HEAD covers a first push and pull-request merge commits that
+      # are not yet advertised as ordinary origin refs. Zero means zero: this
+      # clean lineage has no incident baseline or finding disposition path.
+      - name: require zero findings in public and candidate history
         run: npm run privacy:history:remote
 
   test:

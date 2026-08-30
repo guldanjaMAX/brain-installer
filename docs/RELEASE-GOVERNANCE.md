@@ -7,23 +7,23 @@ repository owner approves those remote actions.
 
 ## Current hard stop
 
-`npm run privacy:history` is a containment gate against the sanitized known
-incident baseline. `npm run privacy:history:strict` is the clean-history release
-gate. A baseline pass must never be described as a clean-history pass.
+This clean lineage has one policy: exactly zero finding objects.
+`npm run privacy:history` scans the checked-out candidate and supports local
+bootstrap before a remote exists. `npm run privacy:history:strict` scans every
+server-visible head and tag plus that exact checkout. A finding, baseline,
+disposition, missing server object, or shallow checkout blocks release.
 
-No new tag or release is allowed until the strict gate passes against the
-server's exact public heads and tags.
-
-The strict gate accepts a credential-shape candidate only after private review
-records its object ID, category, and synthetic disposition in
-`privacy/credential-dispositions.json`. It never allowlists ordinary privacy or
-a known-revoked credential and it refuses stale dispositions.
+The predecessor repository's sanitized baseline, public-ref manifest, and
+incident packet remain in this tree as historical evidence only. No active
+history gate uses them to decide acceptance. The unit suite validates that the
+preserved evidence stays sanitized; it must not be refreshed or repurposed as
+an exception path for this lineage.
 
 ## Required local and CI gates
 
 Every pull request that can reach a release line must pass:
 
-1. `public git history privacy baseline`;
+1. `public git history zero findings`;
 2. `windows-latest / node 22`;
 3. `windows-latest / node 24`;
 4. `macos-latest / node 22`;
@@ -66,10 +66,9 @@ Normal enforcement:
 - block deletions; and
 - do not allow a standing bypass for ordinary development.
 
-The repository owner is the only temporary bypass actor during an approved
-privacy-history cutover. Add that bypass immediately before the named window,
-use it only for per-ref force-with-lease updates, then remove it and compare the
-ruleset with the saved pre-cutover export.
+Do not configure a privacy-history rewrite bypass on the clean repository. If a
+finding is pushed, stop release work and follow a separately approved incident
+response rather than normalizing the object into a baseline.
 
 Create a second tag ruleset named `version-tags` targeting `v*`:
 
@@ -77,7 +76,7 @@ Create a second tag ruleset named `version-tags` targeting `v*`:
 - restrict updates;
 - restrict deletions;
 - block force pushes; and
-- require a signed annotated tag after history remediation.
+- require a signed annotated tag after every release gate passes.
 
 Immutable release behavior can override tag operations. Do not weaken the tag
 ruleset as a workaround.

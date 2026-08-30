@@ -55,6 +55,37 @@ function isAncestor(repo, ancestor, descendant) {
   throw new Error(`git merge-base failed: ${String(result.stderr || result.error?.message || "unknown error").trim()}`);
 }
 
+function resolveLocalRemoteRevision(repo, localName, objectId) {
+  const local = spawnSync("git", ["rev-parse", "--verify", localName], {
+    cwd: repo,
+    encoding: "utf8",
+    env: childEnvironment(),
+    timeout: 30_000,
+  });
+  if (local.status === 0) {
+    const localObjectId = String(local.stdout).trim();
+    if (localObjectId !== objectId) {
+      throw new Error("the local public-ref snapshot is stale; fetch full history deliberately before scanning");
+    }
+    return localName;
+  }
+
+  // A brand-new repository's first Actions checkout can contain the exact
+  // checked-out object without creating refs/remotes/origin/<branch>. Accept
+  // that object only after exact local readback; missing server objects still
+  // fail closed instead of making the scanner fetch with ambient credentials.
+  const object = spawnSync("git", ["cat-file", "-e", `${objectId}^{object}`], {
+    cwd: repo,
+    encoding: "utf8",
+    env: childEnvironment(),
+    timeout: 30_000,
+  });
+  if (object.status !== 0) {
+    throw new Error("the local checkout is missing a server-visible object; fetch full history deliberately before scanning");
+  }
+  return objectId;
+}
+
 function loadRefManifest(refManifest) {
   if (!refManifest) return null;
   const manifest = JSON.parse(readFileSync(refManifest, "utf8"));
@@ -84,11 +115,8 @@ function publicRefs(repo, prefixes, explicitRefs, remote = null, refManifest = n
       const localName = publicName.startsWith("refs/heads/")
         ? `refs/remotes/${remote}/${publicName.slice("refs/heads/".length)}`
         : publicName;
-      const localObjectId = git(repo, ["rev-parse", "--verify", localName]).trim();
-      if (localObjectId !== objectId) {
-        throw new Error("the local public-ref snapshot is missing or stale; fetch deliberately before scanning");
-      }
-      discovered.set(localName, { objectId, publicName });
+      const revisionName = resolveLocalRemoteRevision(repo, localName, objectId);
+      discovered.set(localName, { objectId, publicName, revisionName });
       serverRefs.set(publicName, { localName, objectId });
     }
     for (const entry of manifestEntries || []) {
@@ -142,16 +170,16 @@ function publicRefs(repo, prefixes, explicitRefs, remote = null, refManifest = n
     }
   }
   const refs = [...discovered].map(([name, value]) => {
-    const { objectId, publicName } = value;
+    const { objectId, publicName, revisionName = name } = value;
     let commitId = null;
     try {
-      commitId = git(repo, ["rev-parse", "--verify", `${name}^{commit}`]).trim();
+      commitId = git(repo, ["rev-parse", "--verify", `${revisionName}^{commit}`]).trim();
     } catch {
       // A public ref can legally point at a non-commit object. It is still
       // inventoried and scanned, but has no commit graph to traverse.
     }
     return {
-      name,
+      name: revisionName,
       display_name: safeIdentifier(publicName, "redacted-ref"),
       object_id: objectId,
       commit_id: commitId,
@@ -549,6 +577,7 @@ function parseArgs(argv) {
     baseline: null,
     recordBaseline: null,
     requireClean: false,
+    requireZeroFindings: false,
     remote: null,
     refManifest: null,
     credentialDispositions: resolve(ROOT, "privacy/credential-dispositions.json"),
@@ -566,8 +595,8 @@ function parseArgs(argv) {
       customRefSelection = true;
       options.refs.push(argv[++index] || "");
     } else if (arg === "--remote") {
-      if (customRefSelection && !options.refManifest) {
-        throw new Error("--remote cannot be combined with --ref or --ref-prefix");
+      if (customRefSelection && options.refPrefixes.length) {
+        throw new Error("--remote cannot be combined with --ref-prefix");
       }
       customRefSelection = true;
       options.refPrefixes = [];
@@ -583,6 +612,7 @@ function parseArgs(argv) {
     else if (arg === "--baseline") options.baseline = resolve(argv[++index] || "");
     else if (arg === "--record-baseline") options.recordBaseline = resolve(argv[++index] || "");
     else if (arg === "--require-clean") options.requireClean = true;
+    else if (arg === "--require-zero-findings") options.requireZeroFindings = true;
     else if (arg === "--credential-dispositions") {
       options.credentialDispositions = resolve(argv[++index] || "");
     }
@@ -593,8 +623,8 @@ function parseArgs(argv) {
   if (options.remote === "" || options.refManifest === "") throw new Error("ref selection cannot be empty");
   if (!options.credentialDispositions) throw new Error("credential disposition path cannot be empty");
   if (!["summary", "json"].includes(options.format)) throw new Error("--format must be summary or json");
-  if ([options.baseline, options.recordBaseline, options.requireClean].filter(Boolean).length > 1) {
-    throw new Error("--baseline, --record-baseline, and --require-clean are mutually exclusive");
+  if ([options.baseline, options.recordBaseline, options.requireClean, options.requireZeroFindings].filter(Boolean).length > 1) {
+    throw new Error("--baseline, --record-baseline, --require-clean, and --require-zero-findings are mutually exclusive");
   }
   return options;
 }
@@ -617,7 +647,7 @@ export function main(argv = process.argv.slice(2)) {
   try {
     options = parseArgs(argv);
     if (options.help) {
-      console.log("usage: node scripts/scan-git-history-privacy.mjs [--repo PATH] [--remote NAME | --ref-manifest FILE | --ref-prefix REF | --ref REF] [--format summary|json] [--baseline FILE | --record-baseline FILE | --require-clean] [--credential-dispositions FILE]");
+      console.log("usage: node scripts/scan-git-history-privacy.mjs [--repo PATH] [--remote NAME] [--ref-manifest FILE | --ref-prefix REF | --ref REF] [--format summary|json] [--baseline FILE | --record-baseline FILE | --require-clean | --require-zero-findings] [--credential-dispositions FILE]");
       return 0;
     }
     const report = scanRepository(options);
@@ -652,6 +682,13 @@ export function main(argv = process.argv.slice(2)) {
       }
       console.log(`PASS  strict release gate found no privacy or revoked-credential objects and exactly ` +
         `${strict.approved_candidate_count} reviewed synthetic credential candidate(s)`);
+    }
+    if (options.requireZeroFindings) {
+      if (report.finding_objects.length !== 0) {
+        console.error(`FAIL  zero-finding history gate found ${report.finding_objects.length} finding object(s)`);
+        return 1;
+      }
+      console.log("PASS  zero-finding history gate found exactly 0 finding objects");
     }
     return 0;
   } catch (error) {

@@ -28,22 +28,19 @@ builds a real tarball to import a module out of it. `npm test` runs the full
 gate. `--scan-only` is the identity half on its own, which is the half a commit
 can get wrong.
 
-## Public history containment
+## Clean-lineage public history
 
 A clean tip does not remove an older blob from Git history. The repository's
-second gate inventories the reviewed public-ref snapshot and scans every
-reachable text blob, represented path, commit message, tag message, and ref
-name:
+second gate scans every reachable text blob, represented path, commit message,
+tag message, and ref name. Local bootstrap scans the exact candidate even
+before a remote exists:
 
 ```sh
 npm run privacy:history
 ```
 
-That command compares the scan with `privacy/history-baseline.json`. The
-baseline contains object IDs, finding categories, and locations only. It has no
-matched values or raw affected paths. Passing means no finding object was added
-or silently removed from the recorded incident set. It does **not** mean the
-history is clean.
+Passing means the candidate's reachable history contains exactly zero finding
+objects. There is no active baseline or finding disposition.
 
 Before any new release, the authoritative server-ref scan must be clean:
 
@@ -51,22 +48,25 @@ Before any new release, the authoritative server-ref scan must be clean:
 npm run privacy:history:strict
 ```
 
-The strict command reads the server's public heads and tags, verifies that the
-local snapshot is exact, refuses shallow history, and fails while any reachable
-privacy or credential-shaped object remains. The repository currently requires
-an approved history-remediation decision before this release gate can pass.
-CI uses `npm run privacy:history:remote` to compare every current server-visible
-head and tag with the same baseline, including refs created after the committed
-offline snapshot.
+The strict command reads the server's public heads and tags, also scans the
+checked-out commit, refuses shallow history, and fails while any reachable
+privacy or credential-shaped object remains. Including the checkout covers a
+first push and pull-request merge commits that may not yet have an ordinary
+server ref. When Actions has the exact server object but no remote-tracking ref,
+the scanner verifies and reads that object directly. It never fetches with
+ambient credentials, and a missing server object fails closed.
 
-Credential-shaped findings are kept separate from ordinary privacy findings.
-Except for a rule explicitly labeled as a known revoked credential, a shape
-match is a rotation-review candidate, not evidence that the value was active.
-After authorized private review, an intentionally synthetic source/test object
-may be listed by object ID and category in
-`privacy/credential-dispositions.json`. The strict gate rejects ordinary
-privacy, known-revoked credentials, unreviewed candidates, duplicate approvals,
-and stale approvals. The disposition file never contains a matched value.
+Credential-shaped findings remain classification candidates rather than proof
+that a value was active, but they still fail this clean repository's mechanical
+zero-finding gate. Compose synthetic fixtures so no static credential-shaped
+value enters history.
+
+`privacy/history-baseline.json`, `privacy/public-refs.json`, and the two
+`PRIVACY-INCIDENT-*` documents preserve sanitized evidence from the predecessor
+repository. No active history gate reads the baseline or manifest to decide
+acceptance in this lineage. The unit suite only verifies that the preserved
+evidence remains sanitized. These files are not release exceptions and must not
+be updated to admit a finding.
 
 The scanner deliberately excludes binary blob bodies and author, committer, and
 tagger header identities. It still inventories those objects, scans text paths

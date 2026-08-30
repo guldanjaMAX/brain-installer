@@ -165,7 +165,28 @@ test("strict release review never allowlists privacy or revoked credentials", ()
   }).passes, false);
 });
 
-test("committed incident metadata contains only the sanitized schema", () => {
+test("zero-finding policy rejects even a reviewable synthetic candidate", () => {
+  const scanner = join(root, "scripts/scan-git-history-privacy.mjs");
+  const blocked = spawnSync(process.execPath, [
+    scanner,
+    "--repo", sandbox,
+    "--ref", "main",
+    "--require-zero-findings",
+  ], { encoding: "utf8" });
+  assert.equal(blocked.status, 1, blocked.stdout || blocked.stderr);
+  assert.match(blocked.stderr, /zero-finding history gate found [1-9][0-9]* finding object/);
+
+  const clean = spawnSync(process.execPath, [
+    scanner,
+    "--repo", sandbox,
+    "--ref", "main~2",
+    "--require-zero-findings",
+  ], { encoding: "utf8" });
+  assert.equal(clean.status, 0, clean.stderr || clean.stdout);
+  assert.match(clean.stdout, /exactly 0 finding objects/);
+});
+
+test("predecessor incident metadata stays sanitized but is not an active gate", () => {
   const baseline = JSON.parse(readFileSync(join(root, "privacy/history-baseline.json"), "utf8"));
   assert.equal(baseline.schema_version, 1);
   assert(baseline.finding_objects.length > 0);
@@ -191,6 +212,78 @@ test("committed incident metadata contains only the sanitized schema", () => {
 
   const dispositions = JSON.parse(readFileSync(join(root, "privacy/credential-dispositions.json"), "utf8"));
   assert.deepEqual(dispositions, { schema_version: 1, approved_candidates: [] });
+
+  const scripts = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).scripts;
+  for (const name of ["privacy:history", "privacy:history:remote", "privacy:history:strict"]) {
+    assert.match(scripts[name], /--require-zero-findings/);
+    assert.doesNotMatch(scripts[name], /history-baseline|public-refs|credential-dispositions/);
+  }
+  assert.match(scripts["privacy:history"], /--ref HEAD/);
+  assert.match(scripts["privacy:history:remote"], /--remote origin/);
+  assert.match(scripts["privacy:history:remote"], /--ref HEAD/);
+});
+
+test("remote scan bootstraps from an exact checked-out object without a tracking ref", () => {
+  const container = mkdtempSync(join(tmpdir(), "brain-history-bootstrap-"));
+  const repository = join(container, "work");
+  const remote = join(container, "origin.git");
+  const publisher = join(container, "publisher");
+  try {
+    mkdirSync(repository);
+    gitAt(container, ["init", "--bare", remote]);
+    gitAt(repository, ["init", "--initial-branch=main"]);
+    gitAt(repository, ["config", "user.name", "History Test"]);
+    gitAt(repository, ["config", "user.email", "history-test@example.test"]);
+    writeFileSync(join(repository, "README.md"), "clean bootstrap history\n");
+    gitAt(repository, ["add", "README.md"]);
+    gitAt(repository, ["commit", "-m", "Create clean bootstrap"]);
+    gitAt(repository, ["remote", "add", "origin", remote]);
+    gitAt(repository, ["push", "origin", "main"]);
+    gitAt(repository, ["update-ref", "-d", "refs/remotes/origin/main"]);
+
+    assert.doesNotThrow(() => scanRepository({
+      repo: repository,
+      refPrefixes: [],
+      refs: ["HEAD"],
+      remote: "origin",
+      identityIndex: buildIdentityIndex([]),
+    }));
+    const cli = spawnSync(process.execPath, [
+      join(root, "scripts/scan-git-history-privacy.mjs"),
+      "--repo", repository,
+      "--remote", "origin",
+      "--ref", "HEAD",
+      "--require-zero-findings",
+    ], { encoding: "utf8" });
+    assert.equal(cli.status, 0, cli.stderr || cli.stdout);
+    assert.match(cli.stdout, /exactly 0 finding objects/);
+    const reverseOrder = spawnSync(process.execPath, [
+      join(root, "scripts/scan-git-history-privacy.mjs"),
+      "--repo", repository,
+      "--ref", "HEAD",
+      "--remote", "origin",
+      "--require-zero-findings",
+    ], { encoding: "utf8" });
+    assert.equal(reverseOrder.status, 0, reverseOrder.stderr || reverseOrder.stdout);
+
+    gitAt(container, ["clone", "--branch", "main", remote, publisher]);
+    gitAt(publisher, ["config", "user.name", "History Test"]);
+    gitAt(publisher, ["config", "user.email", "history-test@example.test"]);
+    writeFileSync(join(publisher, "SECOND.md"), "server object absent from first checkout\n");
+    gitAt(publisher, ["add", "SECOND.md"]);
+    gitAt(publisher, ["commit", "-m", "Add unfetched server object"]);
+    gitAt(publisher, ["push", "origin", "HEAD:refs/heads/unfetched"]);
+
+    assert.throws(() => scanRepository({
+      repo: repository,
+      refPrefixes: [],
+      refs: ["HEAD"],
+      remote: "origin",
+      identityIndex: buildIdentityIndex([]),
+    }), /missing a server-visible object/);
+  } finally {
+    rmSync(container, { recursive: true, force: true });
+  }
 });
 
 test("remote baseline refuses a rewritten reviewed branch", () => {
