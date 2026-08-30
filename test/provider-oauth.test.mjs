@@ -113,6 +113,29 @@ function fakeWindowsAcl() {
   return { calls, runAcl };
 }
 
+// Exercise file-backed provider flows on every CI platform without pretending
+// that Windows exposes POSIX mode bits. Windows fixtures still take the real
+// production DPAPI and ACL branches; only the OS child processes are replaced
+// with deterministic in-memory doubles. Dedicated tests below assert that both
+// branches are invoked before ciphertext is committed.
+function testFileStorage(home, overrides = {}) {
+  if (process.platform !== "win32") {
+    return { backend: "file", platform: "linux", home, ...overrides };
+  }
+  const dpapi = fakeDpapi();
+  const acl = fakeWindowsAcl();
+  return {
+    backend: "file",
+    platform: "win32",
+    home,
+    username: "fixture-user",
+    environment: { SystemRoot: "C:\\Windows", USERNAME: "fixture-user" },
+    runPowerShell: dpapi.runPowerShell,
+    runAcl: acl.runAcl,
+    ...overrides,
+  };
+}
+
 // Tests seed historical or crash-recovery states beneath the production
 // mutation API. Production callers cannot use this path: direct QuickBooks
 // save/clear exports deliberately refuse outside the source-bound lock.
@@ -174,7 +197,7 @@ function loopbackGet({ port, host, path }) {
 
 {
   const folder = mkdtempSync(join(tmpdir(), "brain-qbo-loopback-"));
-  const callbackStorage = { backend: "file", platform: "linux", home: folder };
+  const callbackStorage = testFileStorage(folder);
   try {
     const port = await unusedLoopbackPort();
     let openedUrl = null;
@@ -236,7 +259,7 @@ function loopbackGet({ port, host, path }) {
 
 {
   const folder = mkdtempSync(join(tmpdir(), "brain-qbo-authorize-race-"));
-  const raceStorage = { backend: "file", platform: "linux", home: folder };
+  const raceStorage = testFileStorage(folder);
   try {
     const port = await unusedLoopbackPort();
     let callbackDone = null;
@@ -615,7 +638,7 @@ if (process.platform !== "win32") {
 
 {
   const folder = mkdtempSync(join(tmpdir(), "brain-provider-disconnect-"));
-  const disconnectStorage = { backend: "file", platform: "linux", home: folder };
+  const disconnectStorage = testFileStorage(folder);
   try {
     saveProviderCredentials("dropbox", {
       client_id: "client", access_token: "access", refresh_token: "refresh", expires_at: 10_000,
@@ -846,7 +869,7 @@ if (process.platform !== "win32") {
 }
 
 const folder = mkdtempSync(join(tmpdir(), "brain-provider-oauth-"));
-const storage = { backend: "file", platform: "linux", home: folder };
+const storage = testFileStorage(folder);
 try {
   saveProviderCredentials("slack", {
     client_id: "client", client_secret: "secret", access_token: "old-access",
@@ -891,7 +914,7 @@ try {
 
 {
   const folder = mkdtempSync(join(tmpdir(), "brain-qbo-oauth-hardening-"));
-  const qboStorage = { backend: "file", platform: "linux", home: folder };
+  const qboStorage = testFileStorage(folder);
   try {
     const original = bindQuickBooksConnection({
       candidate: {
@@ -942,7 +965,7 @@ try {
     check("QuickBooks lock identity is byte-identical for explicit and environment-selected file custody",
       providerRefreshLockPath("quickbooks", qboStorage) ===
       providerRefreshLockPath("quickbooks", {
-        platform: "linux",
+        platform: qboStorage.platform,
         home: folder,
         env: { BRAIN_QUICKBOOKS_TOKEN_STORE: "file" },
       }));
@@ -1335,7 +1358,7 @@ try {
 
 {
   const folder = mkdtempSync(join(tmpdir(), "brain-qbo-legacy-disconnect-"));
-  const legacyStorage = { backend: "file", platform: "linux", home: folder };
+  const legacyStorage = testFileStorage(folder);
   try {
     const legacyConnection = {
       provider: "quickbooks",
@@ -1416,7 +1439,7 @@ try {
   let endpoint = "";
   let revokeBody = "";
   const folder = mkdtempSync(join(tmpdir(), "brain-provider-hubspot-disconnect-"));
-  const hubspotStorage = { backend: "file", platform: "linux", home: folder };
+  const hubspotStorage = testFileStorage(folder);
   try {
     saveProviderCredentials("hubspot", {
       client_id: "client", client_secret: "secret", access_token: "access", refresh_token: "refresh",
