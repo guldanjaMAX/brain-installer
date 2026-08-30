@@ -14874,6 +14874,13 @@ export async function runPublicInstallSmoke(manifestPath, options = {}) {
       "the deployed Brain did not accept the fixed public smoke document. No source completion was recorded.",
     );
   }
+  if (accepted.source_type !== PUBLIC_INSTALL_SMOKE_SOURCE ||
+      accepted.doc_uid !== `${PUBLIC_INSTALL_SMOKE_SOURCE}:${PUBLIC_INSTALL_SMOKE_ID}`) {
+    handoffCheckError(
+      "INSTALL_SMOKE_INGEST_UNCONFIRMED",
+      "the deployed smoke ingest receipt did not prove the exact fixed source and document identity. No source completion was recorded.",
+    );
+  }
 
   const now = (options.now ?? (() => new Date()))().toISOString();
   const postReceipt = options.postReceipt ?? ((receipt) => postSourceReceipt(
@@ -14978,12 +14985,13 @@ export async function verifyTechnicianHandoff(manifestPath, options = {}) {
   }
   const smokeSource = freshness.sources.find((source) =>
     String(source?.name || "") === PUBLIC_INSTALL_SMOKE_SOURCE);
-  if (!smokeSource || smokeSource.source_status !== "ready" ||
-      Number(smokeSource.documents || 0) < 1 ||
+  if (!smokeSource || smokeSource.kind !== "upload" ||
+      smokeSource.source_status !== "ready" || smokeSource.fixed_public_smoke !== true ||
+      Number(smokeSource.documents || 0) !== 1 ||
       !["ok", "manual"].includes(String(smokeSource.state || ""))) {
     handoffCheckError(
       "HANDOFF_INSTALL_SMOKE_UNPROVEN",
-      "the deployed Brain does not contain a ready fixed first-install smoke source with at least one stored document. The handoff remains incomplete.",
+      "the deployed Brain does not contain the one exact ready fixed first-install smoke document under its reserved upload source. The handoff remains incomplete.",
     );
   }
   const stateCounts = {};

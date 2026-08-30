@@ -13,11 +13,11 @@ import {
   existsSync,
   fsyncSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
   realpathSync,
-  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -89,11 +89,19 @@ the owner has approved. Credentials stay in provider pages or hidden prompts rat
 `;
 }
 
-function workspaceIdentity(manifestPath) {
-  return createHash("sha256").update(resolve(manifestPath), "utf8").digest("hex").slice(0, 20);
+function workspaceIdentity(manifestPath, guideContent) {
+  // A guide-content change rotates to a new deterministic directory instead
+  // of overwriting an existing CLAUDE.md. This gives upgrades a safe path while
+  // keeping every prior owner workspace recoverable and byte-for-byte intact.
+  return createHash("sha256")
+    .update(resolve(manifestPath), "utf8")
+    .update("\0", "utf8")
+    .update(guideContent, "utf8")
+    .digest("hex")
+    .slice(0, 20);
 }
 
-function workspacePaths(manifestPath, options = {}) {
+function workspacePaths(manifestPath, guideContent, options = {}) {
   const configured = options.workspaceRoot || options.environment?.HOME ||
     options.environment?.USERPROFILE || homedir();
   const root = options.workspaceRoot
@@ -104,7 +112,7 @@ function workspacePaths(manifestPath, options = {}) {
   }
   return Object.freeze({
     trustedRoot: root,
-    workspace: join(root, workspaceIdentity(manifestPath)),
+    workspace: join(root, workspaceIdentity(manifestPath, guideContent)),
   });
 }
 
@@ -195,7 +203,8 @@ function unrelatedAncestorGuide(workspace, target) {
 }
 
 export function writeClaudeWorkspaceGuide(manifestPath, options = {}) {
-  const paths = workspacePaths(manifestPath, options);
+  const content = renderClaudeWorkspaceGuide(manifestPath, options);
+  const paths = workspacePaths(manifestPath, content, options);
   const workspace = ensureCanonicalDirectory(paths.workspace, { trustedRoot: paths.trustedRoot });
   const target = join(workspace, "CLAUDE.md");
   chmodSync(workspace, 0o700);
@@ -203,7 +212,6 @@ export function writeClaudeWorkspaceGuide(manifestPath, options = {}) {
   if (ancestor) {
     return { path: target, workspace, changed: false, status: "blocked_unrelated_ancestor_guide", blocked_by: ancestor };
   }
-  const content = renderClaudeWorkspaceGuide(manifestPath, options);
   if (existsSync(target)) {
     const stat = lstatSync(target);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
@@ -214,26 +222,39 @@ export function writeClaudeWorkspaceGuide(manifestPath, options = {}) {
       return { path: target, workspace, changed: false, status: "preserved_unrelated_existing_file" };
     }
     if (existing === content) return { path: target, workspace, changed: false, status: "verified" };
+    // Portable Node has no atomic compare-and-replace primitive. Never let a
+    // stale managed guide turn into permission to overwrite whatever occupies
+    // the name one syscall later. A changed guide is a visible collision that
+    // the owner can resolve; ordinary identical reruns still verify in place.
+    return { path: target, workspace, changed: false, status: "preserved_stale_managed_file" };
   }
 
   const temporary = `${target}.${process.pid}.tmp`;
   let fd = null;
+  let temporaryCreated = false;
   try {
     fd = openSync(temporary, "wx", 0o600);
+    temporaryCreated = true;
     writeFileSync(fd, content, "utf8");
     fsyncSync(fd);
     closeSync(fd);
     fd = null;
     if (typeof options.beforeWorkspaceRename === "function") options.beforeWorkspaceRename();
-    // Node has no portable directory-relative, no-follow rename primitive.
-    // Revalidating the entire owner-only chain immediately before rename keeps
-    // the remaining race bounded to that final syscall.
+    // Revalidate the entire owner-only chain immediately before no-replace
+    // publication; neither an ancestor swap nor a newly occupied target is
+    // accepted as installer-owned state.
     ensureCanonicalDirectory(workspace, { trustedRoot: paths.trustedRoot });
-    renameSync(temporary, target);
+    // link() is an atomic no-replace publication: if any file appeared at the
+    // target after the absence check, EEXIST preserves it byte-for-byte.
+    linkSync(temporary, target);
     chmodSync(target, 0o600);
+    unlinkSync(temporary);
+    temporaryCreated = false;
   } catch (error) {
     if (fd !== null) closeSync(fd);
-    try { unlinkSync(temporary); } catch { /* no temporary file to remove */ }
+    if (temporaryCreated) {
+      try { unlinkSync(temporary); } catch { /* only this invocation's temporary may be removed */ }
+    }
     throw error;
   }
   return { path: target, workspace, changed: true, status: "written" };

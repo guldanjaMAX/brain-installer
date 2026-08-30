@@ -204,6 +204,65 @@ try {
   }), "DPAPI payload bytes never enter argv or environment");
   for (const call of sessionCalls) call.input.fill(0);
 
+  compiledSession = null;
+  sessionRandomIndex = 0;
+  const retainedDiagnostic = probeWindowsDpapi({
+    platform: "win32",
+    rounds: 2,
+    retainSession: true,
+    randomBytes: () => Buffer.alloc(32, ++sessionRandomIndex),
+    prepareWindowsDpapiSession: () => {
+      sessionPrepares++;
+      if (!compiledSession) {
+        sessionCompiles++;
+        compiledSession = {
+          helper: "C:\\fixture\\windows-dpapi-helper.exe",
+          sha256: "a".repeat(64), size: 1234, dev: "7", ino: "11",
+        };
+      }
+      return compiledSession;
+    },
+    runDpapiBridge: (command, args, options) => {
+      const input = Buffer.from(options.input);
+      const operation = args[args.indexOf("--operation") + 1];
+      sessionCalls.push({ command, args: [...args], env: { ...options.env }, input });
+      if (operation === "protect") {
+        const ciphertext = Buffer.from(`retained-ciphertext-${++sessionSerial}`, "ascii");
+        sessionCiphertexts.set(ciphertext.toString("base64"), Buffer.from(input));
+        return { status: 0, stdout: ciphertext, stderr: Buffer.alloc(0) };
+      }
+      const plain = sessionCiphertexts.get(input.toString("base64"));
+      return plain
+        ? { status: 0, stdout: Buffer.from(plain), stderr: Buffer.alloc(0) }
+        : { status: 1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    },
+    disposeWindowsDpapiSession: () => {
+      sessionDisposals++;
+      return { status: "clean", attempts: 1 };
+    },
+    resetWindowsDpapiSessionMetrics: () => {
+      sessionCompiles = 0;
+      sessionCalls.length = 0;
+    },
+    recordWindowsDpapiHelperInvocation: () => {},
+    readWindowsDpapiSessionMetrics: () => ({
+      compile_count: sessionCompiles,
+      helper_invocations: sessionCalls.length,
+    }),
+    environment: {},
+  });
+  assert.deepEqual(retainedDiagnostic, {
+    checked: true,
+    passed: true,
+    rounds: 2,
+    stage: null,
+    cleanup_status: "retained",
+    compile_count: 1,
+    helper_invocations: 4,
+  });
+  assert.equal(sessionDisposals, 1, "retained probe leaves cleanup to the packed shared-session gate");
+  for (const call of sessionCalls) call.input.fill(0);
+
   const stagedFailure = probeWindowsDpapi({
     platform: "win32",
     rounds: 3,

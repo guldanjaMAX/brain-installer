@@ -460,6 +460,7 @@ const expected = [
   "package.json",
   "report-html.mjs",
   "report.mjs",
+  "scripts/windows-dpapi-release-gate.mjs",
   "skills/financial-brain-technician/SKILL.md",
   "support-journal.mjs",
   "support-recovery.mjs",

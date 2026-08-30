@@ -312,7 +312,7 @@ test("the Claude workspace revalidates its trusted parent on every rerun", { ski
   }
 });
 
-test("the Claude workspace revalidates its full parent chain immediately before rename", { skip: process.platform === "win32" }, () => {
+test("the Claude workspace revalidates its full parent chain immediately before publication", { skip: process.platform === "win32" }, () => {
   const workspaceRoot = join(sandbox, "rename-revalidated-root");
   const manifest = join(sandbox, "rename-revalidated-manifest", "brain.manifest.json");
   mkdirSync(resolve(manifest, ".."), { recursive: true });
@@ -332,6 +332,58 @@ test("the Claude workspace revalidates its full parent chain immediately before 
   } finally {
     chmodSync(workspaceRoot, 0o700);
   }
+});
+
+test("a pre-existing deterministic Claude guide temporary is never deleted", () => {
+  const workspaceRoot = join(sandbox, "preexisting-temp-root");
+  const manifest = join(sandbox, "preexisting-temp-manifest", "brain.manifest.json");
+  mkdirSync(resolve(manifest, ".."), { recursive: true });
+  writeFileSync(manifest, "{}");
+  const first = writeClaudeWorkspaceGuide(manifest, { workspaceRoot });
+  rmSync(first.path);
+  const temporary = `${first.path}.${process.pid}.tmp`;
+  writeFileSync(temporary, "unrelated owner temporary\n");
+  assert.throws(() => writeClaudeWorkspaceGuide(manifest, { workspaceRoot }), /EEXIST/);
+  assert.equal(readFileSync(temporary, "utf8"), "unrelated owner temporary\n");
+  assert.equal(existsSync(first.path), false);
+});
+
+test("a Claude guide created during publication is preserved by atomic no-replace", () => {
+  const workspaceRoot = join(sandbox, "publish-race-root");
+  const manifest = join(sandbox, "publish-race-manifest", "brain.manifest.json");
+  mkdirSync(resolve(manifest, ".."), { recursive: true });
+  writeFileSync(manifest, "{}");
+  const initial = writeClaudeWorkspaceGuide(manifest, { workspaceRoot });
+  rmSync(initial.path);
+  assert.throws(
+    () => writeClaudeWorkspaceGuide(manifest, {
+      workspaceRoot,
+      beforeWorkspaceRename: () => writeFileSync(initial.path, "unrelated owner file\n"),
+    }),
+    /EEXIST/,
+  );
+  assert.equal(readFileSync(initial.path, "utf8"), "unrelated owner file\n");
+  assert.equal(existsSync(`${initial.path}.${process.pid}.tmp`), false);
+});
+
+test("a legitimate managed-guide change rotates to a new deterministic workspace", () => {
+  const workspaceRoot = join(sandbox, "managed-guide-rotation-root");
+  const manifest = join(sandbox, "managed-guide-rotation-manifest", "brain.manifest.json");
+  mkdirSync(resolve(manifest, ".."), { recursive: true });
+  writeFileSync(manifest, "{}");
+  const first = writeClaudeWorkspaceGuide(manifest, {
+    workspaceRoot,
+    brainCliPath: safeBrainPath,
+  });
+  const original = readFileSync(first.path, "utf8");
+  const second = writeClaudeWorkspaceGuide(manifest, {
+    workspaceRoot,
+    brainCliPath: join(sandbox, "upgraded-brain.mjs"),
+  });
+  assert.equal(second.status, "written");
+  assert.notEqual(second.workspace, first.workspace);
+  assert.equal(readFileSync(first.path, "utf8"), original);
+  assert.match(readFileSync(second.path, "utf8"), /upgraded-brain\.mjs/);
 });
 
 test("the plan is read-only, ordered, honest about proof, and agent-readable", () => {
@@ -1017,10 +1069,32 @@ test("the first-install smoke uses one fixed public document and is idempotent a
   assert.equal(requestBody.docs[0].source_id, "public-first-install-v1");
   assert.equal(requestBody.docs[0].metadata.contains_customer_data, false);
 
+  for (const result of [
+    { source_id: "public-first-install-v1", status: "created" },
+    {
+      source_id: "public-first-install-v1", source_type: "wrong-source",
+      doc_uid: "wrong:doc", status: "created",
+    },
+  ]) {
+    await assert.rejects(
+      runPublicInstallSmoke(manifestPath, {
+        ...common,
+        request: async () => response({ results: [result] }),
+        postReceipt: async () => { receiptCalls++; },
+        drain: async () => { throw new Error("must not drain without the exact document identity"); },
+      }),
+      (error) => error.code === "INSTALL_SMOKE_INGEST_UNCONFIRMED",
+    );
+  }
+  assert.equal(receiptCalls, 0);
+
   await assert.rejects(
     runPublicInstallSmoke(manifestPath, {
       ...common,
-      request: async () => response({ results: [{ source_id: "public-first-install-v1", status: "created" }] }),
+      request: async () => response({ results: [{
+        source_id: "public-first-install-v1", source_type: "install-smoke",
+        doc_uid: "install-smoke:public-first-install-v1", status: "created",
+      }] }),
       postReceipt: async () => { throw new Error("fixture lost source-receipt response"); },
       drain: async () => { throw new Error("must not drain after an unconfirmed source receipt"); },
     }),
@@ -1032,7 +1106,10 @@ test("the first-install smoke uses one fixed public document and is idempotent a
     now: () => new Date("2026-08-30T12:00:00.000Z"),
     request: async (_url, request) => {
       requestBody = JSON.parse(request.body);
-      return response({ results: [{ source_id: "public-first-install-v1", status: "unchanged" }] });
+      return response({ results: [{
+        source_id: "public-first-install-v1", source_type: "install-smoke",
+        doc_uid: "install-smoke:public-first-install-v1", status: "unchanged",
+      }] });
     },
   });
   assert.equal(proof.document_status, "unchanged");
@@ -1153,7 +1230,10 @@ test("the deployed handoff verifier refuses empty/unavailable state and returns 
       const path = new URL(typeof input === "string" ? input : input.url).pathname;
       if (path === "/api/admin/brain/freshness") {
         return response({ sources: [
-          { name: "install-smoke", kind: "upload", state: "manual", source_status: "ready", documents: 1 },
+          {
+            name: "install-smoke", kind: "upload", state: "manual",
+            source_status: "ready", documents: 1, fixed_public_smoke: true,
+          },
           { name: "private-source", state: "ok", source_status: "ready", documents: 2 },
         ] });
       }
@@ -1189,6 +1269,8 @@ test("the deployed handoff verifier refuses empty/unavailable state and returns 
     [{ name: "other", state: "manual", source_status: "ready", documents: 1 }],
     [{ name: "install-smoke", state: "manual", source_status: "pending", documents: 1 }],
     [{ name: "install-smoke", state: "manual", source_status: "ready", documents: 0 }],
+    [{ name: "install-smoke", kind: "drive", state: "manual", source_status: "ready", documents: 1, fixed_public_smoke: true }],
+    [{ name: "install-smoke", kind: "upload", state: "manual", source_status: "ready", documents: 1, fixed_public_smoke: false }],
   ]) {
     await assert.rejects(
       verifyTechnicianHandoff(manifestPath, {

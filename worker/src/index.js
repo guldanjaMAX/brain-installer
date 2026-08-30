@@ -35,7 +35,7 @@ import {
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, retryQuarantinedVectorOps, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, fixedPublicSmokeProof, reindex, retryQuarantinedVectorOps, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
@@ -1197,6 +1197,8 @@ const PUBLIC_INSTALL_SMOKE_RUN_ID = "public_install_smoke_v1";
 // without appending a second audit event. Every ordinary source event keeps its
 // original append-only behavior.
 const PUBLIC_INSTALL_SMOKE_EVENT_ID = -2021001;
+const hasPublicInstallSmokeRunDetail = (value) =>
+  String(value || "").split(/\s+/).includes(`run_id=${PUBLIC_INSTALL_SMOKE_RUN_ID}`);
 const SOURCE_KINDS = new Set([
   "drive", "gmail", "calendar", "imessage", "whatsapp", "zoom",
   // A one-time history load out of an iPhone backup. Deliberately its own
@@ -1264,6 +1266,13 @@ async function handleSourceReceipt(env, request) {
   const fixedPublicSmoke = source === PUBLIC_INSTALL_SMOKE_SOURCE &&
     kind === "upload" && status === "ready" && lane === "manual" &&
     runId === PUBLIC_INSTALL_SMOKE_RUN_ID;
+  if ((source === PUBLIC_INSTALL_SMOKE_SOURCE || runId === PUBLIC_INSTALL_SMOKE_RUN_ID) &&
+      !fixedPublicSmoke) {
+    return jsonResponse({
+      error: "install-smoke is reserved for the one fixed public ready receipt",
+      code: "PUBLIC_INSTALL_SMOKE_RECEIPT_RESERVED",
+    }, 409);
+  }
 
   const detailDefault = status === "indexing" ? "sync started" : status === "error" ? "sync failed" : "bulk-load receipt";
   const detail = String(body?.detail || detailDefault).replace(/\s+/g, " ").slice(0, 500);
@@ -1299,16 +1308,10 @@ async function handleSourceReceipt(env, request) {
     return jsonResponse({ source, kind, status, run_id: runId, lane, started_at: startedAt });
   }
 
-  const priorFixedSmoke = fixedPublicSmoke
-    ? await env.DB.prepare(
-        "SELECT at FROM source_events WHERE id=?1 AND source_name=?2 AND event='ingest'"
-      ).bind(PUBLIC_INSTALL_SMOKE_EVENT_ID, PUBLIC_INSTALL_SMOKE_SOURCE).first()
-    : null;
-  const completedAt = priorFixedSmoke?.at || (
-    body?.completed_at && Number.isFinite(Date.parse(body.completed_at))
-      ? new Date(body.completed_at).toISOString()
-      : new Date().toISOString()
-  );
+  const requestedCompletedAt = body?.completed_at && Number.isFinite(Date.parse(body.completed_at))
+    ? new Date(body.completed_at).toISOString()
+    : new Date().toISOString();
+  const completedAt = requestedCompletedAt;
   const completedMs = Date.parse(completedAt);
   const startedMs = receiptTimeMs(body?.started_at, completedMs);
   const countRow = await sourceFamilyCounts(env, { source });
@@ -1318,6 +1321,138 @@ async function handleSourceReceipt(env, request) {
   // false drift for both large files and message exports.
   const documents = Number(countRow?.logical_documents || 0);
   const storedDocuments = Number(countRow?.stored_documents || 0);
+  if (fixedPublicSmoke) {
+    const exactDocument = documents === 1 && storedDocuments === 1 &&
+      await fixedPublicSmokeProof(env).catch(() => false);
+    if (!exactDocument) {
+      return jsonResponse({
+        error: "the fixed public install-smoke document is missing or noncanonical",
+        code: "PUBLIC_INSTALL_SMOKE_DOCUMENT_MISMATCH",
+      }, 409);
+    }
+
+    const [priorEvent, priorRun, priorSource] = await Promise.all([
+      env.DB.prepare("SELECT source_name,event,at,documents,detail FROM source_events WHERE id=?1")
+        .bind(PUBLIC_INSTALL_SMOKE_EVENT_ID).first(),
+      env.DB.prepare("SELECT source,lane,started_at,finished_at,error FROM sync_runs WHERE run_id=?1")
+        .bind(PUBLIC_INSTALL_SMOKE_RUN_ID).first(),
+      env.DB.prepare("SELECT kind,status,last_ingest_at,document_count FROM sources WHERE name=?1")
+        .bind(PUBLIC_INSTALL_SMOKE_SOURCE).first(),
+    ]);
+    const eventCompatible = !priorEvent || (
+      priorEvent.source_name === PUBLIC_INSTALL_SMOKE_SOURCE && priorEvent.event === "ingest" &&
+      Number(priorEvent.documents) === 1 && Number.isFinite(Date.parse(priorEvent.at)) &&
+      hasPublicInstallSmokeRunDetail(priorEvent.detail)
+    );
+    const runCompatible = !priorRun || (
+      priorRun.source === PUBLIC_INSTALL_SMOKE_SOURCE && priorRun.lane === "manual" &&
+      (priorRun.error === null || priorRun.error === undefined || priorRun.error === "")
+    );
+    const sourceCompatible = !priorSource || priorSource.kind === "upload";
+    if (!eventCompatible || !runCompatible || !sourceCompatible) {
+      return jsonResponse({
+        error: "the fixed public install-smoke receipt identity collides with incompatible stored state",
+        code: "PUBLIC_INSTALL_SMOKE_RECEIPT_COLLISION",
+      }, 409);
+    }
+
+    const authoritativeAt = priorEvent?.at || requestedCompletedAt;
+    const authoritativeMs = Date.parse(authoritativeAt);
+    const requestedStartedMs = receiptTimeMs(body?.started_at, authoritativeMs);
+    if (priorEvent) {
+      // Repair only missing or compatible companion rows from the already
+      // authoritative event. This prevents an interrupted older deployment
+      // from trapping every future retry while preserving the original time.
+      await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO sources (name,kind,status,created_at,last_ingest_at,document_count,stale_reason)
+           VALUES (?1,'upload','ready',?2,?2,1,NULL)
+           ON CONFLICT(name) DO UPDATE SET
+             kind='upload',status='ready',last_ingest_at=?2,document_count=1,stale_reason=NULL`
+        ).bind(PUBLIC_INSTALL_SMOKE_SOURCE, authoritativeAt),
+        env.DB.prepare(
+          `INSERT INTO sync_runs
+             (run_id,source,lane,started_at,finished_at,walk_complete,files_seen,
+              docs_added,docs_updated,docs_unchanged,proposed_deletes,error)
+           VALUES (?1,?2,'manual',?3,?4,0,0,0,0,1,0,NULL)
+           ON CONFLICT(run_id) DO UPDATE SET
+             source=excluded.source,lane='manual',finished_at=excluded.finished_at,
+             walk_complete=0,proposed_deletes=0,error=NULL
+           WHERE sync_runs.source=excluded.source AND sync_runs.lane='manual'`
+        ).bind(PUBLIC_INSTALL_SMOKE_RUN_ID, PUBLIC_INSTALL_SMOKE_SOURCE, authoritativeMs, authoritativeMs),
+      ]);
+    } else {
+      const syncValues = [
+        PUBLIC_INSTALL_SMOKE_RUN_ID, PUBLIC_INSTALL_SMOKE_SOURCE, requestedStartedMs, authoritativeMs,
+        receiptCount(body?.files_seen), receiptCount(body?.docs_added),
+        receiptCount(body?.docs_updated), receiptCount(body?.docs_unchanged),
+      ];
+      await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO sources (name,kind,status,created_at,last_ingest_at,document_count,stale_reason)
+           SELECT ?1,'upload','ready',?2,?2,1,NULL
+            WHERE NOT EXISTS (SELECT 1 FROM source_events WHERE id=?3)
+           ON CONFLICT(name) DO UPDATE SET
+             kind='upload',status='ready',last_ingest_at=excluded.last_ingest_at,
+             document_count=1,stale_reason=NULL`
+        ).bind(PUBLIC_INSTALL_SMOKE_SOURCE, authoritativeAt, PUBLIC_INSTALL_SMOKE_EVENT_ID),
+        env.DB.prepare(
+          `INSERT INTO sync_runs
+             (run_id,source,lane,started_at,finished_at,walk_complete,files_seen,
+              docs_added,docs_updated,docs_unchanged,proposed_deletes,error)
+           SELECT ?1,?2,'manual',?3,?4,0,?5,?6,?7,?8,0,NULL
+            WHERE NOT EXISTS (SELECT 1 FROM source_events WHERE id=?9)
+           ON CONFLICT(run_id) DO UPDATE SET
+             source=excluded.source,lane='manual',started_at=excluded.started_at,
+             finished_at=excluded.finished_at,walk_complete=0,files_seen=excluded.files_seen,
+             docs_added=excluded.docs_added,docs_updated=excluded.docs_updated,
+             docs_unchanged=excluded.docs_unchanged,proposed_deletes=0,error=NULL
+           WHERE sync_runs.source=excluded.source AND sync_runs.lane='manual'`
+        ).bind(...syncValues, PUBLIC_INSTALL_SMOKE_EVENT_ID),
+        env.DB.prepare(
+          `INSERT OR IGNORE INTO source_events
+             (id,source_name,event,at,documents,detail)
+           VALUES (?1,?2,'ingest',?3,1,?4)`
+        ).bind(
+          PUBLIC_INSTALL_SMOKE_EVENT_ID,
+          PUBLIC_INSTALL_SMOKE_SOURCE,
+          authoritativeAt,
+          `${detail} run_id=${PUBLIC_INSTALL_SMOKE_RUN_ID}`.slice(0, 500),
+        ),
+      ]);
+    }
+
+    const [storedEvent, storedRun, storedSource] = await Promise.all([
+      env.DB.prepare("SELECT source_name,event,at,documents,detail FROM source_events WHERE id=?1")
+        .bind(PUBLIC_INSTALL_SMOKE_EVENT_ID).first(),
+      env.DB.prepare("SELECT source,lane,started_at,finished_at,error FROM sync_runs WHERE run_id=?1")
+        .bind(PUBLIC_INSTALL_SMOKE_RUN_ID).first(),
+      env.DB.prepare("SELECT kind,status,last_ingest_at,document_count FROM sources WHERE name=?1")
+        .bind(PUBLIC_INSTALL_SMOKE_SOURCE).first(),
+    ]);
+    const storedAt = String(storedEvent?.at || "");
+    const exactStoredState = storedEvent?.source_name === PUBLIC_INSTALL_SMOKE_SOURCE &&
+      storedEvent?.event === "ingest" && Number(storedEvent?.documents) === 1 &&
+      Number.isFinite(Date.parse(storedAt)) &&
+      hasPublicInstallSmokeRunDetail(storedEvent?.detail) &&
+      storedRun?.source === PUBLIC_INSTALL_SMOKE_SOURCE && storedRun?.lane === "manual" &&
+      Number(storedRun?.finished_at) === Date.parse(storedAt) &&
+      (storedRun?.error === null || storedRun?.error === undefined || storedRun?.error === "") &&
+      storedSource?.kind === "upload" && storedSource?.status === "ready" &&
+      Number(storedSource?.document_count) === 1 && storedSource?.last_ingest_at === storedAt;
+    if (!exactStoredState) {
+      return jsonResponse({
+        error: "the fixed public install-smoke receipt did not commit one exact authoritative state",
+        code: "PUBLIC_INSTALL_SMOKE_RECEIPT_INCOMPLETE",
+      }, 409);
+    }
+    return jsonResponse({
+      source, kind, status, documents: 1, logical_documents: 1,
+      stored_documents: 1, completed_at: storedAt,
+      run_id: PUBLIC_INSTALL_SMOKE_RUN_ID,
+      replayed: Boolean(priorEvent) || storedAt !== requestedCompletedAt,
+    });
+  }
   const errorReason = status === "error"
     ? String(body?.error || body?.reason || detail || "sync failed").replace(/\s+/g, " ").slice(0, 500)
     : null;
@@ -1327,30 +1462,14 @@ async function handleSourceReceipt(env, request) {
   const statements = [];
 
   if (status === "ready") {
-    if (fixedPublicSmoke) {
-      statements.push(env.DB.prepare(
-        `INSERT INTO sources (name, kind, status, created_at, last_ingest_at, document_count, last_complete_sweep_at, stale_reason)
-         SELECT ?1,?2,'ready',?3,?3,?4,CASE WHEN ?5 = 1 THEN ?3 ELSE NULL END,NULL
-          WHERE NOT EXISTS (SELECT 1 FROM source_events WHERE id=?6)
-         ON CONFLICT(name) DO UPDATE SET
-           kind=excluded.kind, status='ready', last_ingest_at=excluded.last_ingest_at,
-           document_count=excluded.document_count, stale_reason=NULL,
-           last_complete_sweep_at=CASE WHEN ?5 = 1 THEN excluded.last_ingest_at ELSE sources.last_complete_sweep_at END`
-      ).bind(
-        source, kind, completedAt, documents,
-        body?.complete_sweep === true ? 1 : 0,
-        PUBLIC_INSTALL_SMOKE_EVENT_ID,
-      ));
-    } else {
-      statements.push(env.DB.prepare(
-        `INSERT INTO sources (name, kind, status, created_at, last_ingest_at, document_count, last_complete_sweep_at, stale_reason)
-         VALUES (?1,?2,'ready',?3,?3,?4,CASE WHEN ?5 = 1 THEN ?3 ELSE NULL END,NULL)
-         ON CONFLICT(name) DO UPDATE SET
-           kind=excluded.kind, status='ready', last_ingest_at=excluded.last_ingest_at,
-           document_count=excluded.document_count, stale_reason=NULL,
-           last_complete_sweep_at=CASE WHEN ?5 = 1 THEN excluded.last_ingest_at ELSE sources.last_complete_sweep_at END`
-      ).bind(source, kind, completedAt, documents, body?.complete_sweep === true ? 1 : 0));
-    }
+    statements.push(env.DB.prepare(
+      `INSERT INTO sources (name, kind, status, created_at, last_ingest_at, document_count, last_complete_sweep_at, stale_reason)
+       VALUES (?1,?2,'ready',?3,?3,?4,CASE WHEN ?5 = 1 THEN ?3 ELSE NULL END,NULL)
+       ON CONFLICT(name) DO UPDATE SET
+         kind=excluded.kind, status='ready', last_ingest_at=excluded.last_ingest_at,
+         document_count=excluded.document_count, stale_reason=NULL,
+         last_complete_sweep_at=CASE WHEN ?5 = 1 THEN excluded.last_ingest_at ELSE sources.last_complete_sweep_at END`
+    ).bind(source, kind, completedAt, documents, body?.complete_sweep === true ? 1 : 0));
   } else {
     // A failed attempt does not become the last successful ingest. Advancing
     // last_ingest_at here would make a broken daily sync look current for the
@@ -1375,39 +1494,24 @@ async function handleSourceReceipt(env, request) {
       body?.refusal_reason ? String(body.refusal_reason).slice(0, 500) : null,
       errorReason,
     ];
-    if (fixedPublicSmoke) {
-      statements.push(env.DB.prepare(
-        `INSERT INTO sync_runs
-           (run_id,source,lane,started_at,finished_at,walk_complete,files_seen,
-            docs_added,docs_updated,docs_unchanged,proposed_deletes,delete_action,refusal_reason,error)
-         SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14
-          WHERE NOT EXISTS (SELECT 1 FROM source_events WHERE id=?15)
-         ON CONFLICT(run_id) DO NOTHING`
-      ).bind(...syncValues, PUBLIC_INSTALL_SMOKE_EVENT_ID));
-    } else {
-      statements.push(env.DB.prepare(
-        `INSERT INTO sync_runs
-           (run_id,source,lane,started_at,finished_at,walk_complete,files_seen,
-            docs_added,docs_updated,docs_unchanged,proposed_deletes,delete_action,refusal_reason,error)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
-         ON CONFLICT(run_id) DO UPDATE SET
-           source=excluded.source, lane=excluded.lane, finished_at=excluded.finished_at,
-           walk_complete=excluded.walk_complete, files_seen=excluded.files_seen,
-           docs_added=excluded.docs_added, docs_updated=excluded.docs_updated,
-           docs_unchanged=excluded.docs_unchanged, proposed_deletes=excluded.proposed_deletes,
-           delete_action=excluded.delete_action, refusal_reason=excluded.refusal_reason,
-           error=excluded.error`
-      ).bind(...syncValues));
-    }
+    statements.push(env.DB.prepare(
+      `INSERT INTO sync_runs
+         (run_id,source,lane,started_at,finished_at,walk_complete,files_seen,
+          docs_added,docs_updated,docs_unchanged,proposed_deletes,delete_action,refusal_reason,error)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+       ON CONFLICT(run_id) DO UPDATE SET
+         source=excluded.source, lane=excluded.lane, finished_at=excluded.finished_at,
+         walk_complete=excluded.walk_complete, files_seen=excluded.files_seen,
+         docs_added=excluded.docs_added, docs_updated=excluded.docs_updated,
+         docs_unchanged=excluded.docs_unchanged, proposed_deletes=excluded.proposed_deletes,
+         delete_action=excluded.delete_action, refusal_reason=excluded.refusal_reason,
+         error=excluded.error`
+    ).bind(...syncValues));
   }
   const eventDetail = `${detail}${runId ? ` run_id=${runId}` : ""}`.slice(0, 500);
-  statements.push(fixedPublicSmoke
-    ? env.DB.prepare(
-        "INSERT OR IGNORE INTO source_events (id,source_name,event,at,documents,detail) VALUES (?1,?2,'ingest',?3,?4,?5)"
-      ).bind(PUBLIC_INSTALL_SMOKE_EVENT_ID, source, completedAt, documents, eventDetail)
-    : env.DB.prepare(
-        "INSERT INTO source_events (source_name,event,at,documents,detail) VALUES (?1,?2,?3,?4,?5)"
-      ).bind(source, status === "error" ? "error" : "ingest", completedAt, documents, eventDetail));
+  statements.push(env.DB.prepare(
+    "INSERT INTO source_events (source_name,event,at,documents,detail) VALUES (?1,?2,?3,?4,?5)"
+  ).bind(source, status === "error" ? "error" : "ingest", completedAt, documents, eventDetail));
 
   await env.DB.batch(statements);
 

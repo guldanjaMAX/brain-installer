@@ -2340,6 +2340,7 @@ export async function freshnessReport(env, { now = Date.now() } = {}) {
   }
   // Kinds we can refresh without the client's machine being on.
   const AUTOMATABLE = new Set(["drive", "gmail", "calendar"]);
+  const fixedSmokeProven = await fixedPublicSmokeProof(env).catch(() => false);
   return {
     sources: rows.map((s) => {
       const last = s.last_ingest_at ? Date.parse(s.last_ingest_at) : NaN;
@@ -2368,9 +2369,26 @@ export async function freshnessReport(env, { now = Date.now() } = {}) {
           : Math.floor(operational.indexingMs / 3600000),
         reason,
         automatable,
+        ...(s.name === "install-smoke" ? { fixed_public_smoke: fixedSmokeProven } : {}),
       };
     }),
   };
+}
+
+/** Prove the exact fixed public smoke identity without returning its contents. */
+export async function fixedPublicSmokeProof(env) {
+  const row = await env.DB.prepare(
+    `SELECT doc_uid,source,source_id,content_hash,meta
+       FROM documents
+      WHERE doc_uid='install-smoke:public-first-install-v1' AND deleted_at IS NULL`
+  ).first();
+  if (!row || row.doc_uid !== "install-smoke:public-first-install-v1" ||
+      row.source !== "install-smoke" || row.source_id !== "public-first-install-v1" ||
+      !/^[a-f0-9]{64}$/.test(String(row.content_hash || ""))) return false;
+  let metadata;
+  try { metadata = JSON.parse(String(row.meta || "{}")); } catch { return false; }
+  return metadata?.proof_kind === "public_first_install_smoke" &&
+    metadata?.contains_customer_data === false && Number(metadata?.schema_version) === 1;
 }
 
 // Ninety-nine ids plus the queued_at value exactly fit the installer's shared

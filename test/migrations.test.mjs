@@ -864,6 +864,7 @@ check("restart guard refuses an existing migration column with the wrong contrac
 
 /* ---- source lifecycle SQL is executed, not merely inspected by a mock ---- */
 {
+  let batchTail = Promise.resolve();
   const d1 = {
     prepare(sql) {
       const statement = (params = []) => ({
@@ -878,16 +879,21 @@ check("restart guard refuses an existing migration column with the wrong contrac
       return statement();
     },
     async batch(statements) {
-      db.exec("BEGIN");
-      try {
-        const results = [];
-        for (const statement of statements) results.push(await statement.run());
-        db.exec("COMMIT");
-        return results;
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
+      const execute = async () => {
+        db.exec("BEGIN");
+        try {
+          const results = [];
+          for (const statement of statements) results.push(await statement.run());
+          db.exec("COMMIT");
+          return results;
+        } catch (error) {
+          db.exec("ROLLBACK");
+          throw error;
+        }
+      };
+      const queued = batchTail.then(execute, execute);
+      batchTail = queued.catch(() => {});
+      return queued;
     },
   };
   const env = { STORAGE: "d1", ADMIN_KEY: "k", DB: d1 };
@@ -956,7 +962,122 @@ check("restart guard refuses an existing migration column with the wrong contrac
     started_at: completedAt, completed_at: completedAt,
     docs_added: 1, detail: "fixed public first-install smoke document accepted",
   });
+  const clearSmokeState = () => db.exec(`
+    DELETE FROM vector_outbox WHERE chunk_uid LIKE 'install-smoke:%';
+    DELETE FROM chunks WHERE doc_uid LIKE 'install-smoke:%';
+    DELETE FROM documents WHERE source='install-smoke';
+    DELETE FROM source_events WHERE id=-2021001 OR source_name='install-smoke';
+    DELETE FROM sync_runs WHERE run_id='public_install_smoke_v1' OR source='install-smoke';
+    DELETE FROM sources WHERE name='install-smoke';
+    DELETE FROM corpus_stats WHERE source='install-smoke';
+  `);
 
+  clearSmokeState();
+  const reservedShape = await post({
+    source: "install-smoke", kind: "upload", status: "indexing",
+    run_id: "public_install_smoke_v1", lane: "manual",
+  });
+  check("the install-smoke source rejects every noncanonical lifecycle shape before mutation",
+    reservedShape.status === 409 &&
+      db.prepare("SELECT count(*) AS n FROM sync_runs WHERE run_id='public_install_smoke_v1'").get().n === 0,
+    await reservedShape.text());
+  const reservedRun = await post({
+    source: "wrong-source", kind: "upload", status: "ready",
+    run_id: "public_install_smoke_v1", lane: "manual",
+  });
+  check("the fixed smoke run id is reserved outside its canonical source too",
+    reservedRun.status === 409 &&
+      db.prepare("SELECT count(*) AS n FROM sync_runs WHERE run_id='public_install_smoke_v1'").get().n === 0,
+    await reservedRun.text());
+
+  const missingDocument = await smokeReceipt("2026-08-30T18:00:00.000Z");
+  check("a fixed receipt cannot green a missing exact smoke document",
+    missingDocument.status === 409 &&
+      (await missingDocument.json()).code === "PUBLIC_INSTALL_SMOKE_DOCUMENT_MISMATCH");
+
+  const wrongEnvelope = {
+    ...smokeEnvelope,
+    source_id: "wrong-document",
+  };
+  const wrongIngest = await (await worker.fetch(new Request("https://brain.example/api/admin/brain/ingest/batch", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ docs: [wrongEnvelope] }),
+  }), env, {})).json();
+  const wrongDocument = await smokeReceipt("2026-08-30T18:01:00.000Z");
+  check("a different document under the reserved source cannot satisfy the fixed receipt",
+    wrongIngest.results?.[0]?.status === "created" && wrongDocument.status === 409 &&
+      (await wrongDocument.json()).code === "PUBLIC_INSTALL_SMOKE_DOCUMENT_MISMATCH");
+
+  clearSmokeState();
+  await ingestSmoke();
+  db.exec("UPDATE documents SET deleted_at=1 WHERE doc_uid='install-smoke:public-first-install-v1'");
+  const deletedDocument = await smokeReceipt("2026-08-30T18:02:00.000Z");
+  check("a soft-deleted fixed document cannot satisfy proof",
+    deletedDocument.status === 409 &&
+      (await deletedDocument.json()).code === "PUBLIC_INSTALL_SMOKE_DOCUMENT_MISMATCH");
+
+  clearSmokeState();
+  await ingestSmoke();
+  await worker.fetch(new Request("https://brain.example/api/admin/brain/ingest/batch", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ docs: [wrongEnvelope] }),
+  }), env, {});
+  const extraDocument = await smokeReceipt("2026-08-30T18:03:00.000Z");
+  check("a second noncanonical install-smoke document blocks the one-document proof",
+    extraDocument.status === 409 &&
+      (await extraDocument.json()).code === "PUBLIC_INSTALL_SMOKE_DOCUMENT_MISMATCH");
+
+  clearSmokeState();
+  await ingestSmoke();
+  db.prepare(
+    `INSERT INTO sync_runs (run_id,source,lane,started_at,finished_at)
+     VALUES ('public_install_smoke_v1','wrong-source','manual',1,1)`
+  ).run();
+  const runCollision = await smokeReceipt("2026-08-30T18:04:00.000Z");
+  check("a colliding fixed run id fails before freshness or event mutation",
+    runCollision.status === 409 &&
+      (await runCollision.json()).code === "PUBLIC_INSTALL_SMOKE_RECEIPT_COLLISION" &&
+      db.prepare("SELECT count(*) AS n FROM sources WHERE name='install-smoke'").get().n === 0 &&
+      db.prepare("SELECT count(*) AS n FROM source_events WHERE id=-2021001").get().n === 0);
+
+  clearSmokeState();
+  await ingestSmoke();
+  db.prepare(
+    `INSERT INTO source_events (id,source_name,event,at,documents,detail)
+     VALUES (-2021001,'wrong-source','ingest','2026-08-30T18:05:00.000Z',1,'collision')`
+  ).run();
+  const eventCollision = await smokeReceipt("2026-08-30T18:05:30.000Z");
+  check("a colliding fixed event id fails before source or sync mutation",
+    eventCollision.status === 409 &&
+      (await eventCollision.json()).code === "PUBLIC_INSTALL_SMOKE_RECEIPT_COLLISION" &&
+      db.prepare("SELECT count(*) AS n FROM sources WHERE name='install-smoke'").get().n === 0 &&
+      db.prepare("SELECT count(*) AS n FROM sync_runs WHERE run_id='public_install_smoke_v1'").get().n === 0);
+
+  clearSmokeState();
+  await ingestSmoke();
+  const partialAt = "2026-08-30T18:06:00.000Z";
+  db.prepare(
+    `INSERT INTO source_events (id,source_name,event,at,documents,detail)
+     VALUES (-2021001,'install-smoke','ingest',?,1,'fixed public first-install smoke document accepted run_id=public_install_smoke_v1')`
+  ).run(partialAt);
+  const repairedPartial = await (await smokeReceipt("2026-08-30T18:07:00.000Z")).json();
+  const repairedRun = db.prepare(
+    "SELECT source,lane,finished_at FROM sync_runs WHERE run_id='public_install_smoke_v1'"
+  ).get();
+  const repairedSource = db.prepare(
+    "SELECT kind,status,last_ingest_at,document_count FROM sources WHERE name='install-smoke'"
+  ).get();
+  check("a compatible fixed-event partial resumes without trapping later retries",
+    repairedPartial.replayed === true && repairedPartial.completed_at === partialAt &&
+      repairedRun.source === "install-smoke" && repairedRun.lane === "manual" &&
+      Number(repairedRun.finished_at) === Date.parse(partialAt) &&
+      repairedSource.kind === "upload" && repairedSource.status === "ready" &&
+      repairedSource.last_ingest_at === partialAt && repairedSource.document_count === 1,
+    JSON.stringify({ repairedPartial, repairedRun, repairedSource }));
+
+  clearSmokeState();
   const committedIngest = await (await ingestSmoke()).json();
   const lostResponseAt = "2026-08-30T19:00:00.000Z";
   await smokeReceipt(lostResponseAt); // The mutation committed; the caller lost this response.
@@ -981,8 +1102,43 @@ check("restart guard refuses an existing migration column with the wrong contrac
   check("the fixed smoke receipt is exactly once across committed-response loss and retry",
     smokeRunCount === 1 && smokeEventCount === 1 &&
       smokeSource.status === "ready" && smokeSource.document_count === 1 &&
-      smokeSource.last_ingest_at === lostResponseAt && resumedReceipt.completed_at === lostResponseAt,
+      smokeSource.last_ingest_at === lostResponseAt && resumedReceipt.completed_at === lostResponseAt &&
+      resumedReceipt.replayed === true,
     JSON.stringify({ smokeRunCount, smokeEventCount, smokeSource, resumedReceipt }));
+
+  clearSmokeState();
+  await ingestSmoke();
+  const [concurrentA, concurrentB] = await Promise.all([
+    smokeReceipt("2026-08-30T20:00:00.000Z"),
+    smokeReceipt("2026-08-30T20:01:00.000Z"),
+  ]);
+  const concurrentBodies = await Promise.all([concurrentA.json(), concurrentB.json()]);
+  const concurrentAt = db.prepare("SELECT at FROM source_events WHERE id=-2021001").get().at;
+  check("two concurrent first receipts converge on one authoritative event and run",
+    concurrentA.status === 200 && concurrentB.status === 200 &&
+      concurrentBodies.every((receipt) => receipt.completed_at === concurrentAt) &&
+      concurrentBodies.some((receipt) => receipt.replayed === true) &&
+      db.prepare("SELECT count(*) AS n FROM source_events WHERE id=-2021001").get().n === 1 &&
+      db.prepare("SELECT count(*) AS n FROM sync_runs WHERE run_id='public_install_smoke_v1'").get().n === 1,
+    JSON.stringify({ concurrentBodies, concurrentAt }));
+  const deployedFreshness = await (await worker.fetch(new Request(
+    "https://brain.example/api/admin/brain/freshness",
+    { headers: { "X-Admin-Key": "k" } },
+  ), env, {})).json();
+  const deployedSmoke = deployedFreshness.sources?.find((row) => row.name === "install-smoke");
+  check("deployed freshness exposes only the exact live fixed smoke proof as a boolean",
+    deployedSmoke?.kind === "upload" && deployedSmoke?.documents === 1 &&
+      deployedSmoke?.fixed_public_smoke === true,
+    JSON.stringify(deployedSmoke));
+
+  const ordinaryBody = {
+    source: "ordinary-receipt", kind: "upload", status: "ready", lane: "manual",
+    detail: "ordinary append-only receipt",
+  };
+  await post({ ...ordinaryBody, completed_at: "2026-08-30T21:00:00.000Z" });
+  await post({ ...ordinaryBody, completed_at: "2026-08-30T21:01:00.000Z" });
+  check("ordinary distinct source receipts remain append-only",
+    db.prepare("SELECT count(*) AS n FROM source_events WHERE source_name='ordinary-receipt'").get().n === 2);
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nmigrations: all ${ran} checks passed`);

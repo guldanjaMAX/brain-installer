@@ -384,9 +384,11 @@ export function probeWindowsDpapi(options = {}) {
   }
   let cleanup = Object.freeze({ status: "not_applicable" });
   if (!options.runPowerShell) {
-    cleanup = (options.disposeWindowsDpapiSession ?? disposeWindowsDpapiSession)(
-      options.dpapiDisposeOptions || {},
-    );
+    cleanup = options.retainSession === true
+      ? Object.freeze({ status: "retained" })
+      : (options.disposeWindowsDpapiSession ?? disposeWindowsDpapiSession)(
+          options.dpapiDisposeOptions || {},
+        );
   }
   const metrics = measuredSession
     ? (options.readWindowsDpapiSessionMetrics ?? readWindowsDpapiSessionMetrics)()
@@ -403,7 +405,7 @@ export function probeWindowsDpapi(options = {}) {
       ...(metrics ? metrics : {}),
     });
   }
-  if (cleanup.status !== "not_applicable" && cleanup.status !== "clean") {
+  if (!new Set(["not_applicable", "clean", "retained"]).has(cleanup.status)) {
     return Object.freeze({
       checked: true,
       passed: false,
@@ -419,7 +421,7 @@ export function probeWindowsDpapi(options = {}) {
     passed: true,
     rounds: completed,
     stage: null,
-    ...(cleanup.status === "clean" ? { cleanup_status: "clean" } : {}),
+    ...(["clean", "retained"].includes(cleanup.status) ? { cleanup_status: cleanup.status } : {}),
     ...(metrics ? metrics : {}),
   });
 }
