@@ -16,7 +16,7 @@ const ORIGIN = "https://brain.example.com";
 function connectorDb() {
   const tables = {
     clients: new Map(), codes: new Map(), tokens: new Map(),
-    documents: new Map(), chunks: [],
+    documents: new Map(), chunks: [], passkeys: new Map(),
     state: { session_generation: 1 },
   };
   return {
@@ -26,6 +26,11 @@ function connectorDb() {
       const statement = {
         bind(...args) { bound = args; return statement; },
         async first() {
+          if (/DELETE FROM oauth_codes/.test(sql)) {
+            const row = tables.codes.get(bound[0]) || null;
+            if (row) tables.codes.delete(bound[0]);
+            return row;
+          }
           if (/FROM oauth_clients/.test(sql)) return tables.clients.get(bound[0]) || null;
           if (/FROM oauth_codes/.test(sql)) return tables.codes.get(bound[0]) || null;
           if (/FROM oauth_tokens/.test(sql)) return tables.tokens.get(bound[0]) || null;
@@ -34,6 +39,7 @@ function connectorDb() {
           return null;
         },
         async all() {
+          if (/FROM owner_passkeys ORDER BY/.test(sql)) return { results: [...tables.passkeys.values()] };
           if (/FROM chunks WHERE doc_uid/.test(sql)) {
             return { results: tables.chunks.filter((c) => c.doc_uid === bound[0]) };
           }
@@ -47,8 +53,7 @@ function connectorDb() {
               client_id: bound[1], redirect_uri: bound[2], code_challenge: bound[3],
               scope: bound[4], expires_at: bound[5], used_at: null,
             });
-          } else if (/DELETE FROM oauth_codes/.test(sql)) tables.codes.delete(bound[0]);
-          else if (/INSERT INTO oauth_tokens/.test(sql)) {
+          } else if (/INSERT INTO oauth_tokens/.test(sql)) {
             tables.tokens.set(bound[0], {
               token_hash: bound[0], client_id: bound[1], scope: bound[2],
               session_generation: bound[3], created_at: bound[4], expires_at: bound[5], revoked_at: null,
@@ -84,6 +89,10 @@ const b64u = (buf) => buf.toString("base64").replace(/\+/g, "-").replace(/\//g, 
 test("the full connector journey, register through revocation", async () => {
   const db = connectorDb();
   const testEnv = env(db);
+  db.tables.passkeys.set("connector-owner-passkey", {
+    credential_id: "connector-owner-passkey", alg: -7, nickname: "Connector owner",
+    grant_id: null, document_grant_id: null, created_at: Date.now(), last_used_at: null,
+  });
 
   // Discovery documents exist without any credential.
   const metadata = await (await worker.fetch(new Request(ORIGIN + "/.well-known/oauth-authorization-server"), testEnv)).json();
@@ -127,7 +136,9 @@ test("the full connector journey, register through revocation", async () => {
   // Approval requires the owner's passkey session.
   const denied = await worker.fetch(jsonPost(`/oauth/authorize/decision?${authorizeQuery}`, {}, { "X-Brain-App": "1" }), testEnv);
   assert.equal(denied.status, 401);
-  const cookie = (await mintSessionCookie(testEnv, 1)).split(";")[0];
+  const cookie = (await mintSessionCookie(testEnv, 1, {
+    grantId: null, credentialId: "connector-owner-passkey",
+  })).split(";")[0];
   const approved = await (await worker.fetch(jsonPost(`/oauth/authorize/decision?${authorizeQuery}`, {}, {
     Cookie: cookie, "X-Brain-App": "1",
   }), testEnv)).json();
@@ -145,10 +156,15 @@ test("the full connector journey, register through revocation", async () => {
     Cookie: cookie, "X-Brain-App": "1",
   }), testEnv)).json();
   const freshCode = new URL(secondApproval.redirect).searchParams.get("code");
-  const tokenResponse = await (await worker.fetch(jsonPost("/oauth/token", {
+  const exchanges = await Promise.all(Array.from({ length: 12 }, () => worker.fetch(jsonPost("/oauth/token", {
     grant_type: "authorization_code", code: freshCode, client_id: registered.client_id,
     redirect_uri: "https://claude.ai/api/mcp/auth_callback", code_verifier: verifier,
-  }), testEnv)).json();
+  }), testEnv)));
+  assert.equal(exchanges.filter((response) => response.status === 200).length, 1,
+    "one atomic DELETE RETURNING permits exactly one concurrent code consumer");
+  const successfulExchange = exchanges.find((response) => response.status === 200);
+  assert.match(successfulExchange.headers.get("Cache-Control") || "", /no-store/);
+  const tokenResponse = await successfulExchange.json();
   assert.equal(tokenResponse.token_type, "Bearer");
   const bearer = { Authorization: `Bearer ${tokenResponse.access_token}` };
   const replay = await worker.fetch(jsonPost("/oauth/token", {

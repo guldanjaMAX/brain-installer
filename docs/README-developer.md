@@ -808,6 +808,24 @@ architecture change.
 
 ## Tests
 
+### Auth atomicity acceptance
+
+The focused Worker tests exercise parallel challenge, enrollment-code, OAuth
+authorization-code, and owner-passkey revocation consumers. Each single-use
+decision is one conditional D1 mutation, so a prior read is never treated as
+authority. Registration verifies the WebAuthn ceremony before attempting to
+consume its invite. Session cookies identify their issuing passkey through a
+private HMAC reference, and a passkey lookup is required on every session use.
+Revoking that credential therefore invalidates its existing sessions without a
+new table or migration.
+
+Run `node test/live/auth-d1-atomicity.mjs` for the credential-free acceptance
+harness. It applies the real migration chain to a disposable Wrangler local D1
+binding, launches the production auth modules on loopback, and sends parallel
+HTTP requests. The child environment explicitly removes Cloudflare and
+Wrangler credential variables. This proves the local D1 execution boundary; it
+does not prove a physical authenticator or deployed Cloudflare account.
+
 ### Local owner-onboarding rehearsal
 
 `npm run rehearse:onboarding` builds the current React owner workspace without

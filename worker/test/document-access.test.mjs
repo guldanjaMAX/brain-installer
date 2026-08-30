@@ -89,6 +89,19 @@ function insertDocument(db, id, entitySlug, text, index = 0) {
   ).run(`${id}#0`, id, text, id, Date.parse("2026-08-20T00:00:00Z") + index);
 }
 
+function insertSessionPasskey(db, credentialId, grantId = null) {
+  db.prepare(
+    `INSERT INTO owner_passkeys
+       (credential_id, public_key_jwk, alg, sign_count, nickname, created_at,
+        grant_id, document_grant_id)
+     VALUES (?, '{}', -7, 0, 'Fixture session', ?, ?, ?)`,
+  ).run(
+    credentialId, Date.now(),
+    grantId && !String(grantId).startsWith("dg_") ? grantId : null,
+    grantId && String(grantId).startsWith("dg_") ? grantId : null,
+  );
+}
+
 const envFor = (db, vectorCalls = { count: 0 }) => ({
   STORAGE: "d1",
   DB: d1(db),
@@ -164,7 +177,10 @@ test("100 exact documents plus every public filter stay authoritative and skip u
 
   const vectorCalls = { count: 0 };
   const env = envFor(db, vectorCalls);
-  const ownerCookie = (await mintSessionCookie(env, 1, { grantId: null })).split(";")[0];
+  insertSessionPasskey(db, "fixture-owner-passkey");
+  const ownerCookie = (await mintSessionCookie(env, 1, {
+    grantId: null, credentialId: "fixture-owner-passkey",
+  })).split(";")[0];
   const created = await worker.fetch(post("/api/app/document-access/create", {
     request_id: "grant-max-boundary-0001",
     subject_label: "Contract reviewer",
@@ -193,7 +209,10 @@ test("100 exact documents plus every public filter stay authoritative and skip u
     detail: "at most 100 document_ids may be granted at once",
   });
 
-  const scopedCookie = (await mintSessionCookie(env, 1, { grantId: receipt.grant_id })).split(";")[0];
+  insertSessionPasskey(db, "fixture-scoped-passkey", receipt.grant_id);
+  const scopedCookie = (await mintSessionCookie(env, 1, {
+    grantId: receipt.grant_id, credentialId: "fixture-scoped-passkey",
+  })).split(";")[0];
   const request = {
     q: "needle",
     limit: 10,
@@ -304,7 +323,9 @@ test("revocation immediately closes reads and scoped sessions cannot reach owner
         grant_id, document_grant_id)
      VALUES (?, '{}', -7, 0, ?, ?, NULL, NULL, NULL)`,
   ).run("owner-device", "Owner device", Date.now() + 1);
-  const scopedCookie = (await mintSessionCookie(env, 1, { grantId: grant.grant_id })).split(";")[0];
+  const scopedCookie = (await mintSessionCookie(env, 1, {
+    grantId: grant.grant_id, credentialId: "scoped-device",
+  })).split(";")[0];
 
   const me = await worker.fetch(post("/api/app/me", {}, scopedCookie), env, {});
   const meBody = await me.json();
@@ -336,7 +357,9 @@ test("revocation immediately closes reads and scoped sessions cannot reach owner
 
   const allowedRead = await worker.fetch(post("/api/rag/unified", { q: "needle" }, scopedCookie), env, {});
   assert.equal(allowedRead.status, 200);
-  const ownerCookie = (await mintSessionCookie(env, 1, { grantId: null })).split(";")[0];
+  const ownerCookie = (await mintSessionCookie(env, 1, {
+    grantId: null, credentialId: "owner-device",
+  })).split(";")[0];
   const statusResponse = await worker.fetch(post("/api/app/passkeys/status", {}, ownerCookie), env, {});
   const status = await statusResponse.json();
   assert.equal(status.status, "ready");

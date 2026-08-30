@@ -49,15 +49,28 @@ export async function issueChallenge(env, purpose, ttlMs = 5 * 60 * 1000) {
   return challenge;
 }
 
-/** Single use: consuming a challenge deletes it, atomically by primary key. */
+/** Read-only preflight before an expensive cryptographic ceremony. */
+export async function peekChallenge(env, challenge, purpose) {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT 1 AS valid FROM auth_challenges
+        WHERE challenge_hash = ? AND purpose = ? AND expires_at > ? AND used_at IS NULL`,
+    ).bind(await sha256Hex(challenge), purpose, Date.now()).first();
+    return Boolean(row);
+  } catch (error) {
+    guard(error);
+  }
+}
+
+/** Single use: the conditional delete is the decision, not a prior read. */
 export async function consumeChallenge(env, challenge, purpose) {
   try {
     const hash = await sha256Hex(challenge);
-    const row = await env.DB.prepare(
-      "SELECT purpose, expires_at FROM auth_challenges WHERE challenge_hash = ?",
-    ).bind(hash).first();
-    await env.DB.prepare("DELETE FROM auth_challenges WHERE challenge_hash = ?").bind(hash).run();
-    return Boolean(row && row.purpose === purpose && Number(row.expires_at) > Date.now());
+    const result = await env.DB.prepare(
+      `DELETE FROM auth_challenges
+        WHERE challenge_hash = ? AND purpose = ? AND expires_at > ? AND used_at IS NULL`,
+    ).bind(hash, purpose, Date.now()).run();
+    return Number(result?.meta?.changes || 0) === 1;
   } catch (error) {
     guard(error);
   }
@@ -102,13 +115,13 @@ export async function peekEnrollmentCode(env, code) {
 export async function consumeEnrollmentCode(env, code) {
   try {
     const hash = await sha256Hex(code);
+    const now = Date.now();
     const row = await env.DB.prepare(
-      "SELECT expires_at, used_at, grant_id, document_grant_id FROM enrollment_codes WHERE code_hash = ?",
-    ).bind(hash).first();
-    if (!row || row.used_at || Number(row.expires_at) <= Date.now()) return false;
-    await env.DB.prepare(
-      "UPDATE enrollment_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL",
-    ).bind(Date.now(), hash).run();
+      `UPDATE enrollment_codes SET used_at = ?
+        WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?
+        RETURNING grant_id, document_grant_id`,
+    ).bind(now, hash, now).first();
+    if (!row) return false;
     return { grantId: row.grant_id ?? null, documentGrantId: row.document_grant_id ?? null };
   } catch (error) {
     guard(error);
@@ -244,13 +257,30 @@ export async function findPasskey(env, credentialId) {
   }
 }
 
-export async function recordPasskeyUse(env, credentialId, signCount, securityEvent = null) {
+export async function recordPasskeyUse(
+  env, credentialId, previousSignCount, signCount, securityEvent = null,
+) {
   try {
+    const lastUsedAt = Date.now();
     const update = env.DB.prepare(
-      "UPDATE owner_passkeys SET sign_count = ?, last_used_at = ? WHERE credential_id = ?",
-    ).bind(signCount, Date.now(), credentialId);
-    if (securityEvent) await env.DB.batch([update, passkeyEventStatement(env, securityEvent)]);
-    else await update.run();
+      `UPDATE owner_passkeys SET sign_count = ?, last_used_at = ?
+        WHERE credential_id = ? AND sign_count = ?`,
+    ).bind(signCount, lastUsedAt, credentialId, previousSignCount);
+    const statements = [update];
+    if (securityEvent) {
+      statements.push(env.DB.prepare(
+        `INSERT INTO passkey_security_events
+         (event_id, occurred_at, rp_id, ceremony, stage, outcome, reason_code, duration_ms,
+          principal_kind, grant_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           FROM owner_passkeys
+          WHERE credential_id = ? AND sign_count = ? AND last_used_at = ?`,
+      ).bind(
+        ...passkeyEventBindings(securityEvent), credentialId, signCount, lastUsedAt,
+      ));
+    }
+    const results = await env.DB.batch(statements);
+    return Number(results?.[0]?.meta?.changes || 0) === 1;
   } catch (error) {
     guard(error);
   }
@@ -304,27 +334,55 @@ export async function renamePasskey(env, credentialId, nickname) {
  */
 export async function revokePasskey(env, credentialId) {
   try {
-    const count = await env.DB.prepare("SELECT count(*) AS n FROM owner_passkeys").first();
-    if (Number(count?.n || 0) <= 1) {
-      return { removed: false, reason: "refusing to remove the last passkey; enroll another device or mint a new invite first" };
-    }
     const row = await env.DB.prepare(
       "SELECT credential_id, nickname, grant_id, document_grant_id FROM owner_passkeys WHERE credential_id = ?",
     ).bind(credentialId).first();
     if (!row) return { removed: false, reason: "passkey not found" };
     const passkeyKey = (await sha256Hex(credentialId)).slice(0, 24);
     const occurredAt = new Date().toISOString();
-    await env.DB.batch([
-      env.DB.prepare("DELETE FROM owner_passkeys WHERE credential_id = ?").bind(credentialId),
-      ownerActivityStatement(env, {
-        eventId: `activity:passkey-revoked:${passkeyKey}`,
-        eventType: "passkey_revoked",
-        subjectKind: "passkey",
-        subjectId: `passkey:${passkeyKey}`,
-        displayLabel: row.nickname || (row.document_grant_id || row.grant_id ? "Shared access passkey" : "Passkey device"),
-        occurredAt,
-      }),
-    ]);
+    // A scoped credential is never an owner lockout safeguard. For an owner
+    // credential, this predicate requires a different unrestricted owner
+    // credential to exist in the same atomic transaction. Two concurrent
+    // revocations can therefore remove at most one of the final two owners.
+    const safePredicate = `(
+      p.grant_id IS NOT NULL OR p.document_grant_id IS NOT NULL OR EXISTS (
+        SELECT 1 FROM owner_passkeys other
+         WHERE other.credential_id <> p.credential_id
+           AND other.grant_id IS NULL AND other.document_grant_id IS NULL
+      )
+    )`;
+    const activity = env.DB.prepare(
+      `INSERT OR IGNORE INTO owner_activity_events
+         (event_id, tenant_id, request_id, event_type, entity_slug,
+          subject_kind, subject_id, display_label, occurred_at)
+       SELECT ?, 'primary', NULL, 'passkey_revoked', NULL,
+              'passkey', ?,
+              COALESCE(NULLIF(p.nickname, ''),
+                CASE WHEN p.grant_id IS NOT NULL OR p.document_grant_id IS NOT NULL
+                     THEN 'Shared access passkey' ELSE 'Passkey device' END), ?
+         FROM owner_passkeys p
+        WHERE p.credential_id = ? AND ${safePredicate}`,
+    ).bind(
+      `activity:passkey-revoked:${passkeyKey}`, `passkey:${passkeyKey}`,
+      occurredAt, credentialId,
+    );
+    const removal = env.DB.prepare(
+      `DELETE FROM owner_passkeys
+        WHERE credential_id = ? AND (
+          grant_id IS NOT NULL OR document_grant_id IS NOT NULL OR EXISTS (
+            SELECT 1 FROM owner_passkeys other
+             WHERE other.credential_id <> owner_passkeys.credential_id
+               AND other.grant_id IS NULL AND other.document_grant_id IS NULL
+          )
+        )`,
+    ).bind(credentialId);
+    const results = await env.DB.batch([activity, removal]);
+    if (Number(results?.[1]?.meta?.changes || 0) !== 1) {
+      return {
+        removed: false,
+        reason: "refusing to remove the last owner passkey; enroll another owner device or mint a new invite first",
+      };
+    }
     return { removed: true };
   } catch (error) {
     guard(error);
@@ -368,21 +426,25 @@ export async function bumpSessionGeneration(env) {
 
 /* --------------------------------------------------- privacy-safe telemetry */
 
-function passkeyEventStatement(env, {
+function passkeyEventBindings({
   rpId, ceremony, stage, outcome, reasonCode, durationMs = null,
   principalKind = "unknown", grantId = null,
 }) {
+  return [
+    `pse_${randomToken(18)}`, Date.now(), String(rpId || "unknown").slice(0, 253),
+    ceremony, stage, outcome, String(reasonCode || "unspecified").slice(0, 80),
+    durationMs === null ? null : Math.max(0, Math.round(Number(durationMs) || 0)),
+    principalKind, grantId,
+  ];
+}
+
+function passkeyEventStatement(env, event) {
   return env.DB.prepare(
     `INSERT INTO passkey_security_events
      (event_id, occurred_at, rp_id, ceremony, stage, outcome, reason_code, duration_ms,
       principal_kind, grant_id)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(
-    `pse_${randomToken(18)}`, Date.now(), String(rpId || "unknown").slice(0, 253),
-    ceremony, stage, outcome, String(reasonCode || "unspecified").slice(0, 80),
-    durationMs === null ? null : Math.max(0, Math.round(Number(durationMs) || 0)),
-    principalKind, grantId,
-  );
+  ).bind(...passkeyEventBindings(event));
 }
 
 export async function recordPasskeySecurityEvent(env, {

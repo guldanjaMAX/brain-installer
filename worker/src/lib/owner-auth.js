@@ -19,10 +19,10 @@ import { diagnose, freshnessReport, vectorReadiness } from "./store-d1.js";
 import { jsonResponse, validateAdminKey } from "./core.js";
 import { verifyRegistration, verifyAssertion, b64uDecode } from "./webauthn.js";
 import {
-  mintSessionCookie, readSessionCookie, clearSessionCookie,
+  mintSessionCookie, readSessionCookie, clearSessionCookie, credentialMatchesSessionRef,
 } from "./sessions.js";
 import {
-  issueChallenge, consumeChallenge,
+  issueChallenge, peekChallenge, consumeChallenge,
   issueEnrollmentCode, peekEnrollmentCode, consumeEnrollmentCode,
   storePasskey, findPasskey, recordPasskeyUse,
   listPasskeys, renamePasskey, revokePasskey,
@@ -85,6 +85,17 @@ export async function ownerSessionPrincipal(request, env) {
   if (!appRequest(request)) return null;
   const session = await readSessionCookie(request, env, await sessionGeneration(env));
   if (!session) return null;
+  const devices = await listPasskeys(env);
+  let sessionDevice = null;
+  for (const device of devices) {
+    if (await credentialMatchesSessionRef(env, device.credential_id, session.credentialRef)) {
+      sessionDevice = device;
+      break;
+    }
+  }
+  if (!sessionDevice) return null;
+  const deviceGrantId = sessionDevice.document_grant_id ?? sessionDevice.grant_id ?? null;
+  if (deviceGrantId !== session.grantId) return null;
   if (session.grantId === null) {
     return {
       kind: "owner",
@@ -390,7 +401,13 @@ export async function handleOwnerAuth(env, request, url, path) {
     }
     if (viaSession?.denied) return scopedForbidden();
     const challenge = challengeFromClientData(payload.clientDataJSON);
-    if (!challenge || !(await consumeChallenge(env, challenge, "register"))) {
+    let challengeLive = false;
+    try {
+      challengeLive = challenge ? await peekChallenge(env, challenge, "register") : false;
+    } catch {
+      return unavailable("passkey_auth_unavailable");
+    }
+    if (!challengeLive) {
       const telemetryError = await observePasskey(env, {
         rpId, ceremony: "registration", stage: "verify", outcome: "forbidden",
         reasonCode: "challenge_invalid", durationMs: Date.now() - requestStartedAt,
@@ -403,7 +420,7 @@ export async function handleOwnerAuth(env, request, url, path) {
     let invitation = null;
     if (!viaSession) {
       try {
-        invitation = await consumeEnrollmentCode(env, String(payload.code || ""));
+        invitation = await peekEnrollmentCode(env, String(payload.code || ""));
       } catch {
         return unavailable("passkey_auth_unavailable");
       }
@@ -453,6 +470,33 @@ export async function handleOwnerAuth(env, request, url, path) {
       if (telemetryError) return telemetryError;
       return jsonResponse({ error: String(error?.message || error) }, 400);
     }
+    // Neither the challenge nor invite is burned by a failed authenticator
+    // gesture. After cryptographic verification, each conditional mutation is
+    // the single-use decision. Concurrent valid ceremonies can reach here,
+    // but exactly one can consume each row.
+    try {
+      if (!(await consumeChallenge(env, challenge, "register"))) {
+        return jsonResponse({ error: "unknown, expired, or already used challenge" }, 403);
+      }
+      if (!viaSession) {
+        const consumed = await consumeEnrollmentCode(env, String(payload.code || ""));
+        if (!consumed) {
+          const telemetryError = await observePasskey(env, {
+            rpId, ceremony: "registration", stage: "verify", outcome: "forbidden",
+            reasonCode: "enrollment_invalid", durationMs: Date.now() - requestStartedAt,
+            principalKind: "unknown",
+          });
+          if (telemetryError) return telemetryError;
+          return jsonResponse({ error: "the enrollment link is invalid, expired, or already used" }, 403);
+        }
+        if (consumed.grantId !== invitation.grantId ||
+            consumed.documentGrantId !== invitation.documentGrantId) {
+          return unavailable("passkey_auth_unavailable");
+        }
+      }
+    } catch {
+      return unavailable("passkey_auth_unavailable");
+    }
     try {
       await storePasskey(env, {
         ...verified,
@@ -471,7 +515,9 @@ export async function handleOwnerAuth(env, request, url, path) {
     } catch {
       return unavailable("passkey_auth_unavailable");
     }
-    const cookie = await mintSessionCookie(env, await sessionGeneration(env), { grantId });
+    const cookie = await mintSessionCookie(env, await sessionGeneration(env), {
+      grantId, credentialId: verified.credentialId,
+    });
     return withCookie(jsonResponse({ enrolled: true, credential_id: verified.credentialId }), cookie);
   }
 
@@ -494,7 +540,13 @@ export async function handleOwnerAuth(env, request, url, path) {
     const payload = await body(request);
     if (!payload) return jsonResponse({ error: "invalid body" }, 400);
     const challenge = challengeFromClientData(payload.clientDataJSON);
-    if (!challenge || !(await consumeChallenge(env, challenge, "login"))) {
+    let challengeLive = false;
+    try {
+      challengeLive = challenge ? await peekChallenge(env, challenge, "login") : false;
+    } catch {
+      return unavailable("passkey_auth_unavailable");
+    }
+    if (!challengeLive) {
       const telemetryError = await observePasskey(env, {
         rpId, ceremony: "authentication", stage: "verify", outcome: "forbidden",
         reasonCode: "challenge_invalid", durationMs: Date.now() - requestStartedAt, principalKind: "unknown",
@@ -561,15 +613,25 @@ export async function handleOwnerAuth(env, request, url, path) {
       return jsonResponse({ error: "this passkey looks cloned (its counter went backwards); sign in from another device and revoke it" }, 403);
     }
     try {
-      await recordPasskeyUse(env, credential.credential_id, verdict.signCount, {
+      if (!(await consumeChallenge(env, challenge, "login"))) {
+        return jsonResponse({ error: "unknown, expired, or already used challenge" }, 403);
+      }
+      const recorded = await recordPasskeyUse(
+        env, credential.credential_id, Number(credential.sign_count || 0), verdict.signCount, {
         rpId, ceremony: "authentication", stage: "verify", outcome: "succeeded",
         reasonCode: "passkey_used", durationMs: Date.now() - requestStartedAt,
         principalKind: grantId ? "grant" : "owner", grantId,
-      });
+        },
+      );
+      if (!recorded) {
+        return jsonResponse({ error: "the passkey changed or was revoked; start sign-in again" }, 403);
+      }
     } catch {
       return unavailable("passkey_auth_unavailable");
     }
-    const cookie = await mintSessionCookie(env, await sessionGeneration(env), { grantId });
+    const cookie = await mintSessionCookie(env, await sessionGeneration(env), {
+      grantId, credentialId: credential.credential_id,
+    });
     return withCookie(jsonResponse({ signed_in: true }), cookie);
   }
 

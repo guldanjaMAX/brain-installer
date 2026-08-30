@@ -393,6 +393,13 @@ source names, categories, and ordinary metadata can narrow retrieval but never
 create permission. If D1 grant or entity authority is unavailable, retrieval
 fails closed rather than reporting an empty corpus.
 
+Passkey sessions are signed but remain bound to the exact D1 credential that
+earned them through a non-disclosing HMAC reference. The Worker resolves that
+reference and its grant class on every request. Deleting a passkey immediately
+invalidates its sessions, while the global D1 generation remains the separate
+sign-out-everywhere control. Challenges, enrollment codes, and OAuth
+authorization codes choose their only winner through conditional D1 mutation.
+
 ## Support journal
 
 Recognized CLI failures attempt to write one immutable event under

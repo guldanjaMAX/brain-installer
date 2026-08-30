@@ -346,14 +346,15 @@ export async function handleToken(env, request) {
   let row;
   try {
     row = await env.DB.prepare(
-      "SELECT client_id, redirect_uri, code_challenge, scope, expires_at, used_at FROM oauth_codes WHERE code_hash = ?",
+      `DELETE FROM oauth_codes WHERE code_hash = ?
+       RETURNING client_id, redirect_uri, code_challenge, scope, expires_at, used_at`,
     ).bind(codeHash).first();
-    // Single use, deleted on sight: a replayed code proves interception and
-    // must not stay replayable while anyone reasons about it.
-    await env.DB.prepare("DELETE FROM oauth_codes WHERE code_hash = ?").bind(codeHash).run();
   } catch (error) {
     guard(error);
   }
+  // The delete itself chooses the only winner. Invalid client, redirect, or
+  // verifier data still burns a presented code on sight, preserving the
+  // interception-safe behavior without a read/delete race.
   if (!row || row.used_at || Number(row.expires_at) <= Date.now() ||
       String(row.client_id) !== String(params.get("client_id") || "") ||
       String(row.redirect_uri) !== String(params.get("redirect_uri") || "")) {

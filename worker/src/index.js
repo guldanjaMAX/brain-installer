@@ -1580,7 +1580,9 @@ export default {
     if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/") ||
         path.startsWith("/brand/") || path.startsWith("/app/assets/")) {
       const response = await handleOwnerAuth(env, request, url, path);
-      return path.startsWith("/api/app/") ? privateNoStore(response) : response;
+      return path.startsWith("/api/app/") || path.startsWith("/auth/")
+        ? privateNoStore(response)
+        : response;
     }
 
     // A technician session is a separate, stateful, read-only principal. Its
@@ -1642,10 +1644,18 @@ export default {
     // bearer token those ceremonies earn — exactly the read-only class.
     if (path === "/.well-known/oauth-authorization-server") return handleOAuthMetadata(url);
     if (path === "/.well-known/oauth-protected-resource") return handleProtectedResourceMetadata(url);
-    if (path === "/oauth/register" && request.method === "POST") return handleRegister(env, request);
-    if (path === "/oauth/authorize" && request.method === "GET") return handleAuthorizePage(env, url);
-    if (path === "/oauth/authorize/decision" && request.method === "POST") return handleAuthorizeDecision(env, request, url);
-    if (path === "/oauth/token" && request.method === "POST") return handleToken(env, request);
+    if (path === "/oauth/register" && request.method === "POST") {
+      return privateNoStore(await handleRegister(env, request));
+    }
+    if (path === "/oauth/authorize" && request.method === "GET") {
+      return privateNoStore(await handleAuthorizePage(env, url));
+    }
+    if (path === "/oauth/authorize/decision" && request.method === "POST") {
+      return privateNoStore(await handleAuthorizeDecision(env, request, url));
+    }
+    if (path === "/oauth/token" && request.method === "POST") {
+      return privateNoStore(await handleToken(env, request));
+    }
     if (path === "/mcp") {
       const grant = await validateConnectorToken(request, env);
       if (!grant) {

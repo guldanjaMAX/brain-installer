@@ -43,7 +43,10 @@ function freshDb({ throughLedger = true } = {}) {
     for (const statement of statementsFor(file)) db.exec(statement);
   }
   db.exec(`INSERT INTO install_state (id, client_slug, product_version, installed_at)
-           VALUES (1, 'fixture', '0.0.0-test', '2020-01-01T00:00:00Z')`);
+           VALUES (1, 'fixture', '0.0.0-test', '2020-01-01T00:00:00Z');
+           INSERT INTO owner_passkeys
+             (credential_id,public_key_jwk,alg,sign_count,nickname,created_at,grant_id,document_grant_id)
+           VALUES ('fixture-owner-passkey','{}',-7,0,'Fixture owner',1,NULL,NULL)`);
   return db;
 }
 
@@ -86,7 +89,9 @@ const post = (path, body, headers = {}) => new Request(`https://brain.invalid${p
 });
 
 async function ownerHeaders(env) {
-  const cookie = await mintSessionCookie(env, 1);
+  const cookie = await mintSessionCookie(env, 1, {
+    grantId: null, credentialId: "fixture-owner-passkey",
+  });
   return { Cookie: cookie.split(";")[0], "X-Brain-App": "1" };
 }
 
