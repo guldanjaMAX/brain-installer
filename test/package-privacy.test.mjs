@@ -505,6 +505,7 @@ const expected = [
   "worker/src/lib/store-d1.js",
   "worker/src/lib/store.js",
   "worker/src/lib/system-status.js",
+  "worker/src/lib/update-status.js",
   "worker/src/lib/supabase.js",
   "worker/src/lib/vtt.js",
   "worker/src/lib/zoom.js",

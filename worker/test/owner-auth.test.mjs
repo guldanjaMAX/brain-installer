@@ -12,6 +12,7 @@ import { mintSessionCookie } from "../src/lib/sessions.js";
 import {
   consumeChallenge, consumeEnrollmentCode, recordPasskeyUse, revokePasskey, sha256Hex,
 } from "../src/lib/auth-store.js";
+import { handleOwnerAuth } from "../src/lib/owner-auth.js";
 import { makeCredential, signAssertion, clientData, attestationObject } from "./webauthn-fixtures.mjs";
 
 const ORIGIN = "https://brain.example.com";
@@ -139,6 +140,7 @@ function env(db) {
   return {
     STORAGE: "d1", DB: db, ADMIN_KEY: "admin-key-fixture-value-000",
     SESSION_SIGNING_KEY: "a".repeat(64), BRAIN_NAME: "fixture", BRAIN_OWNER: "Fixture Owner",
+    BRAIN_VERSION: "0.2.0",
   };
 }
 
@@ -223,6 +225,33 @@ test("invite -> enroll -> sign in -> settings, end to end", async () => {
   const me = await (await worker.fetch(post("/api/app/me", {}, { Cookie: cookie, "X-Brain-App": "1" }), testEnv)).json();
   assert.equal(me.devices.length, 1);
   assert.equal(me.devices[0].nickname, "Morgan's phone");
+
+  const updateRequest = post("/api/app/update-status", {}, { Cookie: cookie, "X-Brain-App": "1" });
+  const updateResponse = await handleOwnerAuth(
+    testEnv, updateRequest, new URL(updateRequest.url), "/api/app/update-status", {
+      fetchImpl: async () => new Response(JSON.stringify({
+        schema_version: 1,
+        channel: "stable",
+        release: "0.3.0",
+        published_at: "2026-08-30",
+        update_url: "https://financialbrain.ai/update",
+        claude_prompt: "Open https://financialbrain.ai/update, read the whole page, and help me safely update my Financial Brain.",
+        installer: {
+          url: "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.3.0/brain-installer-0.3.0.tgz",
+          sha256: "a".repeat(64),
+          bytes: 4_000_000,
+        },
+        changes: ["A reviewed synthetic change."],
+        released_connectors: ["A reviewed synthetic connector."],
+        proof: { automated_release_suite: "passed", live_client_acceptance: "required" },
+      })),
+    },
+  );
+  assert.equal(updateResponse.status, 200);
+  const updateBody = await updateResponse.json();
+  assert.equal(updateBody.status, "update_available");
+  assert.equal(updateBody.installed_version, "0.2.0");
+  assert.equal(updateBody.latest_version, "0.3.0");
   const rename = await (await worker.fetch(post("/api/app/devices/rename", {
     credential_id: credential.credentialId, nickname: "Morgan's primary phone",
   }, { Cookie: cookie, "X-Brain-App": "1" }), testEnv)).json();

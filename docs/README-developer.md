@@ -106,6 +106,16 @@ secrets, requires exact-version health plus the full acceptance suite, commits
 and reads back D1 version state, and atomically commits and reads back the local
 manifest version. Paused mode rejects every corpus and source mutation before
 D1 access.
+
+The owner workspace exposes `POST /api/app/update-status` as a read-only release
+check. The Worker sends an empty GET to the fixed public stable manifest, bounds
+and validates every field, and compares it with `BRAIN_VERSION`. It returns
+`update_available`, `up_to_date`, `ahead`, or an explicit 503 `unavailable`.
+No client payload or installed version is sent to the website, and no browser
+credential reaches the feed. The Settings card links to the reviewed guide and
+copies one fixed Claude Code prompt; it never applies an update. Because the
+feature must already be installed to render, 0.2.0 clients still need one manual
+bootstrap update before Settings can announce later releases.
 The older `brain upgrade` command uses the same engine and cannot
 bypass those gates. Neither path restores D1 automatically because that would
 discard writes made after the bookmark. Direct `brain migrate` refuses a live

@@ -187,6 +187,27 @@ Supported keys are `default_entity`, `display_currency`,
 enforced by the backend. Setting an identical value returns `changed:false` and
 emits no event.
 
+## Software update status
+
+`POST /api/app/update-status` is owner-only and accepts an empty JSON body. The
+Worker reads `https://financialbrain.ai/update/manifest.json` server-to-server.
+The public request contains no client body, identity, files, questions,
+manifest, source list, account details, or installed version.
+
+The Worker treats the release feed as untrusted input. It refuses redirects,
+bounds the response and installer size, validates the exact first-party guide,
+Claude prompt, immutable GitHub asset URL, SHA-256 digest, and proof fields, then
+compares stable semantic versions. A successful response has `status` equal to
+`update_available`, `up_to_date`, or `ahead` and includes `installed_version`,
+`latest_version`, `checked_at`, and `update_url`. An available response also
+includes the reviewed changes, connector list, Claude prompt, and immutable
+installer receipt.
+
+Missing local version truth, an unreachable feed, or any malformed field returns
+HTTP 503 with `status:"unavailable"`. It never falls back to a guessed installed
+version or a healthy current claim. The route is private and no-store like every
+other owner endpoint. It does not perform an update.
+
 ## Entity-scoped Explore and Ask
 
 `POST /api/rag/unified` and `POST /api/rag/think` accept `entity_slug` in the

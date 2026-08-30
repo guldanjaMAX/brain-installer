@@ -4,6 +4,22 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## Next release
+
+- The owner workspace Settings page can check Financial Brain's public stable
+  release channel and show `update available`, `up to date`, `ahead of stable`,
+  or an explicit `unavailable` state. The check sends no client files,
+  questions, manifest, source list, account details, or installed version to the
+  website. An unavailable or malformed feed never becomes a false up-to-date
+  claim.
+- When an update is available, Settings shows the reviewed changes, links to
+  `financialbrain.ai/update`, and provides one exact prompt for Claude Code.
+  It does not silently update the Brain and does not place a Cloudflare token in
+  the browser or prompt.
+- Existing 0.2.0 installs need one manual update before this Settings check can
+  exist on their computer. After a release containing this feature is installed,
+  Settings can announce later stable releases.
+
 ## 0.2.0
 
 **Your brain now has an owner workspace, scoped sharing, and financial actions,

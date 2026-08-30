@@ -436,6 +436,16 @@ matching mutable human wording.
 | `npm test` and CI | Does shared product behavior pass offline on supported operating systems and Node versions? |
 | Live field gates | Does the real connector, scale, scheduler, or account lifecycle work outside mocks? |
 
+The release-status path follows the same evidence boundary. An authenticated
+owner asks their own Worker for `/api/app/update-status`. The Worker makes an
+empty, redirect-refusing GET to the fixed public Financial Brain manifest,
+validates its bounded schema and immutable release receipt, and compares that
+release with `BRAIN_VERSION`. The website receives no client identity, installed
+version, manifest, source inventory, or corpus data. Missing local version truth
+or untrusted remote truth is `unavailable`; neither can become a healthy
+up-to-date answer. The route reports and links only. The existing restart-safe
+`brain update` command remains the mutation boundary.
+
 The eval golden set is per install. It should include answerable single-document
 questions, multi-document questions, hard paraphrases, near-miss entities, and
 questions the corpus genuinely cannot answer. Retrieval is scored with recall at
