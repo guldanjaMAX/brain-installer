@@ -22,6 +22,7 @@ import {
   cmdMigrate,
   cmdSetup,
   persistWorkersDevDomain,
+  setupManifestTarget,
 } from "../brain.mjs";
 import {
   installedManifestPointerPath,
@@ -29,6 +30,11 @@ import {
 } from "../operations/installed-manifest.mjs";
 
 const oneAccount = { id: "a".repeat(32), name: "Owner account" };
+
+assert.equal(setupManifestTarget(undefined, {}), "./brain.manifest.json");
+assert.equal(setupManifestTarget("client.manifest.json", {}), "client.manifest.json");
+assert.equal(setupManifestTarget("--no-connect", { "no-connect": true }), "./brain.manifest.json");
+assert.equal(setupManifestTarget("--manifest", { manifest: "chosen.manifest.json" }), "chosen.manifest.json");
 
 assert.deepEqual(
   await chooseSetupAccount(async () => { throw new Error("one account needs no prompt"); }, {

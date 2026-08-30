@@ -14,10 +14,10 @@ const env = { BRAIN_NAME: "acme-brain", BRAIN_OWNER: "Dana Okonkwo" };
 const meta = (html, prop) =>
   (html.match(new RegExp(`(?:property|name)="${prop}" content="([^"]*)"`)) || [])[1];
 
-test("the preview card names the owner and says what the thing is", () => {
+test("the public preview is useful but generic until authentication", () => {
   const html = appPageHtml(env, ORIGIN);
-  assert.equal(html.match(/<title>(.*?)<\/title>/)[1], "Dana Okonkwo's brain");
-  assert.equal(meta(html, "og:title"), "Dana Okonkwo's brain");
+  assert.equal(html.match(/<title>(.*?)<\/title>/)[1], "Private Financial Brain");
+  assert.equal(meta(html, "og:title"), "Private Financial Brain");
   assert.equal(meta(html, "twitter:card"), "summary_large_image");
   // A description that only names the product tells a client nothing. It has
   // to say what it holds and what it does.
@@ -36,23 +36,20 @@ test("preview URLs are absolute, because a scraper resolves them against nothing
   assert.match(html, /<link rel="apple-touch-icon"/);
 });
 
-test("a name ending in s takes a bare apostrophe", () => {
-  assert.match(appPageHtml({ ...env, BRAIN_OWNER: "Chris" }, ORIGIN), /<title>Chris' brain<\/title>/);
-  assert.match(brandOgSvg({ BRAIN_OWNER: "Chris" }), /Chris' brain/);
-});
-
-test("no owner configured falls back to the brain name, never to a placeholder person", () => {
-  const html = appPageHtml({ BRAIN_NAME: "acme-brain" }, ORIGIN);
-  assert.equal(html.match(/<title>(.*?)<\/title>/)[1], "acme-brain");
-  assert.ok(!/'s brain/.test(html.match(/<title>.*?<\/title>/)[0]));
-});
-
-test("an owner name cannot break out of an attribute or inject markup", () => {
-  const html = appPageHtml({ ...env, BRAIN_OWNER: '"><script>alert(1)</script>' }, ORIGIN);
-  assert.ok(!html.includes("<script>alert(1)</script>"), "raw script tag reached the document");
-  assert.ok(html.includes("&lt;script&gt;"), "the name should appear escaped");
-  const svg = brandOgSvg({ BRAIN_OWNER: '<script>x</script>' });
-  assert.ok(!svg.includes("<script>"), "SVG is served as an image and must carry no markup either");
+test("configured identity is absent from every public shell and preview byte", () => {
+  const hostile = {
+    BRAIN_NAME: 'private-client-brain"><script>brainName()</script>',
+    BRAIN_OWNER: 'Dana Okonkwo"><script>ownerName()</script>',
+  };
+  const html = appPageHtml(hostile, ORIGIN);
+  const svg = brandOgSvg(hostile);
+  for (const privateValue of [
+    "private-client-brain", "Dana Okonkwo", "brainName", "ownerName",
+    "data-owner", "data-brain",
+  ]) {
+    assert.ok(!html.includes(privateValue), `${privateValue} reached the public app shell`);
+    assert.ok(!svg.includes(privateValue), `${privateValue} reached the public preview image`);
+  }
 });
 
 test("the preview image is public: a scraper holds no credential", async () => {
@@ -61,7 +58,9 @@ test("the preview image is public: a scraper holds no credential", async () => {
   assert.match(response.headers.get("Content-Type") || "", /image\/svg\+xml/);
   assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
   const body = await response.text();
-  assert.ok(body.includes("Dana Okonkwo's brain"));
+  assert.ok(body.includes("Private Financial Brain"));
+  assert.ok(!body.includes(env.BRAIN_OWNER));
+  assert.ok(!body.includes(env.BRAIN_NAME));
   assert.match(body, /viewBox="0 0 1200 630"/);
 });
 
@@ -98,7 +97,9 @@ test("the shell is never cached, so an upgrade actually reaches the client", asy
   const response = await worker.fetch(new Request(`${ORIGIN}/app`), env);
   assert.match(response.headers.get("Cache-Control") || "", /no-store/);
   const html = await response.text();
-  assert.match(html, /data-owner="Dana Okonkwo"/);
+  assert.ok(!html.includes(env.BRAIN_OWNER));
+  assert.ok(!html.includes(env.BRAIN_NAME));
+  assert.doesNotMatch(html, /data-(?:owner|brain)=/);
 });
 
 test("nothing is inline any more, so the policy forbids inline", async () => {

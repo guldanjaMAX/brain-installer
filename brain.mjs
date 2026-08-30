@@ -10778,7 +10778,7 @@ export async function cmdSetup(manifestPath, options = {}) {
   }
 
   /* --- 2. the manifest, asked for once --- */
-  const target = manifestPath || flags.manifest || "./brain.manifest.json";
+  const target = setupManifestTarget(manifestPath, flags);
   const shownTarget = commandPath(displayPath(target));
   let m;
   if (existsSync(target)) {
@@ -13129,11 +13129,26 @@ function manifestAccountId(manifestPath) {
   return manifest?.infrastructure?.cloudflare?.account_id || null;
 }
 
+/** Resolve setup's target before a fresh manifest exists or any token is read. */
+export function setupManifestTarget(manifestPath, flags = {}) {
+  const positional = typeof manifestPath === "string" && !manifestPath.startsWith("--")
+    ? manifestPath
+    : null;
+  const flagged = typeof flags.manifest === "string" ? flags.manifest : null;
+  return positional || flagged || "./brain.manifest.json";
+}
+
 async function cmdSetupInteractive(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
+  const target = setupManifestTarget(manifestPath, flags);
+  // A fresh install has no manifest to identify a stored-token slot yet. Do
+  // not turn that expected absence into CONFIG_INVALID before setup can create
+  // it. Resumed installs still load the exact declared account before asking
+  // for or retrieving a credential.
+  const accountId = existsSync(target) ? manifestAccountId(target) : null;
   return withCloudflareToken(
     () => cmdSetup(manifestPath, { flags }),
-    { accountId: manifestAccountId(manifestPath) },
+    { accountId },
   );
 }
 

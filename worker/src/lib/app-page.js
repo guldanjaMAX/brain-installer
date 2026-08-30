@@ -4,8 +4,8 @@
  *
  * The app itself is React and lives in frontend/; this serves the document that
  * loads it, plus everything a messaging app reads when the invite link is
- * pasted into a conversation: title, description, favicon, and Open Graph and
- * Twitter cards pointing at a preview image generated per install.
+ * pasted into a conversation: title, description, favicon, and generic Open
+ * Graph and Twitter cards. Client identity remains behind authentication.
  *
  * Keeping the shell here rather than shipping frontend/dist means the Worker
  * still serves one reviewed module, and the client never runs a build.
@@ -14,29 +14,22 @@
 import { APP_BUNDLE_ID } from "./app-assets.js";
 import { SEARCH_UNAVAILABLE, unavailableNotice } from "./retrieval-status.js";
 
-const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) =>
-  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-
 // Fallback only. The worker sends `notice` with the response; this covers a
 // cached page talking to a worker that did not.
 const GENERIC_UNAVAILABLE_NOTICE = unavailableNotice("unknown");
 
 /**
  * The brand mark, as a standalone SVG. Served at /brand/og.svg for link
- * previews and reused inline for the favicon, so a shared invite carries the
- * brain's own identity instead of a bare URL.
- *
- * Everything is drawn from per-install configuration. A hardcoded name or
- * logo here would ship one client's identity to every other client.
+ * previews and reused inline for the favicon. It is deliberately generic:
+ * messaging scrapers are unauthenticated, so a shared link must not disclose
+ * the configured owner or brain name before the recipient signs in.
  */
-export function brandOgSvg(env) {
-  const owner = esc(env.BRAIN_OWNER || "Your");
-  const possessive = /s$/i.test(owner) ? `${owner}'` : `${owner}'s`;
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="${possessive} brain">
+export function brandOgSvg(_env) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="Private Financial Brain">
   <rect width="1200" height="630" fill="#12141a"/>
   <circle cx="960" cy="140" r="300" fill="#3b5bdb" opacity="0.14"/>
   <circle cx="200" cy="560" r="240" fill="#3b5bdb" opacity="0.10"/>
-  <text x="96" y="330" fill="#ffffff" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="76" font-weight="600" letter-spacing="-2">${possessive} brain</text>
+  <text x="96" y="330" fill="#ffffff" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="76" font-weight="600" letter-spacing="-2">Private Financial Brain</text>
   <text x="96" y="404" fill="#aab3c5" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="34">Everything you have written, decided and been told.</text>
   <text x="96" y="452" fill="#aab3c5" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="34">Ask it anything. It answers with its sources.</text>
   <text x="96" y="556" fill="#7d94f5" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="27" letter-spacing="1">PRIVATE  ·  YOURS  ·  OPENS WITH YOUR FACE</text>
@@ -48,13 +41,10 @@ export const FAVICON = "data:image/svg+xml," + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">' +
   '<circle cx="16" cy="16" r="11" fill="#3b5bdb"/></svg>');
 
-export function appPageHtml(env, origin = "") {
-  const brainName = esc(env.BRAIN_NAME || "Your brain");
-  const owner = esc(env.BRAIN_OWNER || "");
-  // "Dana's brain", but "Chris' brain" — a possessive that reads wrong
-  // is the first thing a client notices about a page built for them.
-  const possessive = owner ? (/s$/i.test(owner) ? `${owner}'` : `${owner}'s`) : "";
-  const headline = possessive ? `${possessive} brain` : brainName;
+export function appPageHtml(_env, origin = "") {
+  // This shell, its metadata, and its preview image are public. Per-install
+  // identity becomes visible only after /api/app/me proves a live session.
+  const headline = "Private Financial Brain";
   const description =
     "Everything you have written, decided and been told, in one place you own. " +
     "Ask it anything and it answers with its sources. Opens with your face or fingerprint, never a password.";
@@ -82,7 +72,7 @@ export function appPageHtml(env, origin = "") {
 <meta name="twitter:description" content="${description}">
 <meta name="twitter:image" content="${origin}/brand/og.svg">
 <link rel="stylesheet" href="/app/assets/app.css?v=${APP_BUNDLE_ID}">
-<body><div id="root" data-owner="${owner}" data-brain="${brainName}"></div>
+<body><div id="root"></div>
 <script type="module" src="/app/assets/app.js?v=${APP_BUNDLE_ID}"></script>
 </html>`;
 }
