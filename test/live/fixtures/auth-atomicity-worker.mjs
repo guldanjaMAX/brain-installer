@@ -1,5 +1,5 @@
 import {
-  consumeChallenge, consumeEnrollmentCode, revokePasskey, sha256Hex,
+  consumeChallenge, consumeEnrollmentCode, recordPasskeyUse, revokePasskey, sha256Hex,
 } from "../../../worker/src/lib/auth-store.js";
 import { handleToken } from "../../../worker/src/lib/oauth.js";
 
@@ -30,6 +30,7 @@ async function reset(env) {
     env.DB.prepare("DELETE FROM owner_passkeys"),
     env.DB.prepare("DELETE FROM oauth_codes"),
     env.DB.prepare("DELETE FROM oauth_tokens"),
+    env.DB.prepare("DELETE FROM passkey_security_events"),
     env.DB.prepare("DELETE FROM owner_activity_events WHERE event_type = 'passkey_revoked'"),
     env.DB.prepare(
       "INSERT INTO auth_challenges (challenge_hash, purpose, expires_at) VALUES (?, 'login', ?)",
@@ -52,6 +53,11 @@ async function reset(env) {
          (credential_id, public_key_jwk, alg, sign_count, nickname, created_at)
        VALUES ('owner-b', '{}', -7, 0, 'Owner B', ?)`
     ).bind(now + 1),
+    env.DB.prepare(
+      `INSERT INTO owner_passkeys
+         (credential_id, public_key_jwk, alg, sign_count, nickname, created_at, grant_id)
+       VALUES ('counter-passkey', '{}', -7, 7, 'Counter fixture', ?, 'synthetic-scope')`
+    ).bind(now + 2),
   ]);
   return json({ reset: true });
 }
@@ -78,10 +84,31 @@ async function state(env) {
        (SELECT count(*) FROM enrollment_codes WHERE used_at IS NULL) AS unused_enrollments,
        (SELECT count(*) FROM oauth_codes) AS oauth_codes,
        (SELECT count(*) FROM oauth_tokens) AS oauth_tokens,
+       (SELECT count(*) FROM passkey_security_events
+          WHERE outcome = 'succeeded') AS succeeded_passkey_events,
        (SELECT count(*) FROM owner_passkeys
           WHERE grant_id IS NULL AND document_grant_id IS NULL) AS owner_passkeys`,
   ).first();
   return json(counts);
+}
+
+async function racePasskeyCounter(env) {
+  const event = {
+    rpId: "127.0.0.1", ceremony: "authentication", stage: "verify",
+    outcome: "succeeded", reasonCode: "passkey_used",
+    principalKind: "grant", grantId: "synthetic-scope",
+  };
+  const originalNow = Date.now;
+  Date.now = () => 1_788_102_400_000;
+  try {
+    const results = await Promise.all(Array.from(
+      { length: 24 },
+      () => recordPasskeyUse(env, "counter-passkey", 7, 8, event),
+    ));
+    return json({ winners: results.filter(Boolean).length });
+  } finally {
+    Date.now = originalNow;
+  }
 }
 
 export default {
@@ -97,6 +124,7 @@ export default {
       if (path === "/consume/enrollment") {
         return json({ consumed: Boolean(await consumeEnrollmentCode(env, ENROLLMENT)) });
       }
+      if (path === "/consume/passkey-counter") return racePasskeyCounter(env);
       if (path === "/consume/oauth") return oauthExchange(env);
       if (path === "/revoke/owner-a") return json(await revokePasskey(env, "owner-a"));
       if (path === "/revoke/owner-b") return json(await revokePasskey(env, "owner-b"));

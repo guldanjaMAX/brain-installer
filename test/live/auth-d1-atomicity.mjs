@@ -117,6 +117,9 @@ try {
   ));
   assert.equal(oauth.filter((result) => result.status === 200).length, 1);
 
+  const counterRace = await post(base, "/consume/passkey-counter");
+  assert.deepEqual(counterRace.body, { winners: 1 });
+
   const revocations = await Promise.all([
     post(base, "/revoke/owner-a"), post(base, "/revoke/owner-b"),
   ]);
@@ -128,6 +131,7 @@ try {
     unused_enrollments: 0,
     oauth_codes: 0,
     oauth_tokens: 1,
+    succeeded_passkey_events: 1,
     owner_passkeys: 1,
   });
   console.log(JSON.stringify({
@@ -137,6 +141,8 @@ try {
     challenge_winners: 1,
     enrollment_winners: 1,
     oauth_winners: 1,
+    passkey_counter_winners: 1,
+    succeeded_passkey_events: 1,
     owner_credentials_remaining: 1,
   }, null, 2));
 } finally {

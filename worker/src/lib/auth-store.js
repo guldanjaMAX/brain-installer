@@ -266,7 +266,7 @@ export async function recordPasskeyUse(
       `UPDATE owner_passkeys SET sign_count = ?, last_used_at = ?
         WHERE credential_id = ? AND sign_count = ?`,
     ).bind(signCount, lastUsedAt, credentialId, previousSignCount);
-    const statements = [update];
+    const statements = [];
     if (securityEvent) {
       statements.push(env.DB.prepare(
         `INSERT INTO passkey_security_events
@@ -274,13 +274,19 @@ export async function recordPasskeyUse(
           principal_kind, grant_id)
          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
            FROM owner_passkeys
-          WHERE credential_id = ? AND sign_count = ? AND last_used_at = ?`,
+          WHERE credential_id = ? AND sign_count = ?`,
       ).bind(
-        ...passkeyEventBindings(securityEvent), credentialId, signCount, lastUsedAt,
+        ...passkeyEventBindings(securityEvent), credentialId, previousSignCount,
       ));
     }
+    // D1 executes a batch as one transaction. Recording first against the
+    // pre-update counter means a later serialized loser cannot copy the
+    // winner's post-update state and emit a second success event. The event is
+    // not observable unless the following CAS update commits with it.
+    statements.push(update);
     const results = await env.DB.batch(statements);
-    return Number(results?.[0]?.meta?.changes || 0) === 1;
+    const updateResult = results?.[statements.length - 1];
+    return Number(updateResult?.meta?.changes || 0) === 1;
   } catch (error) {
     guard(error);
   }

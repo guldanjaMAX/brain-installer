@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import worker from "../src/index.js";
 import { mintSessionCookie } from "../src/lib/sessions.js";
 import {
-  consumeChallenge, consumeEnrollmentCode, revokePasskey, sha256Hex,
+  consumeChallenge, consumeEnrollmentCode, recordPasskeyUse, revokePasskey, sha256Hex,
 } from "../src/lib/auth-store.js";
 import { makeCredential, signAssertion, clientData, attestationObject } from "./webauthn-fixtures.mjs";
 
@@ -21,8 +21,10 @@ const RP = "brain.example.com";
 function authDb() {
   const tables = {
     challenges: new Map(), codes: new Map(), passkeys: new Map(), activity: [],
+    security: [],
     state: { session_generation: 1 },
   };
+  let batchTail = Promise.resolve();
   return {
     tables,
     prepare(sql) {
@@ -91,6 +93,13 @@ function authDb() {
             }
           }
           else if (/UPDATE install_state SET session_generation/.test(sql)) tables.state.session_generation += 1;
+          else if (/INSERT INTO passkey_security_events/.test(sql)) {
+            const row = tables.passkeys.get(bound[10]);
+            if (row && Number(row.sign_count) === Number(bound[11])) {
+              tables.security.push({ event_id: bound[0], outcome: bound[5] });
+              changes = 1;
+            }
+          }
           else if (/INSERT OR IGNORE INTO owner_activity_events/.test(sql)) {
             const conditionalRevoke = /FROM owner_passkeys p/.test(sql);
             const row = conditionalRevoke ? tables.passkeys.get(bound[3]) : null;
@@ -114,9 +123,14 @@ function authDb() {
       return statement;
     },
     async batch(statements) {
-      const results = [];
-      for (const statement of statements) results.push(await statement.run());
-      return results;
+      const execute = async () => {
+        const results = [];
+        for (const statement of statements) results.push(await statement.run());
+        return results;
+      };
+      const result = batchTail.then(execute);
+      batchTail = result.catch(() => {});
+      return result;
     },
   };
 }
@@ -337,4 +351,31 @@ test("parallel auth consumers have exactly one winner", async () => {
   assert.equal(revocations.filter((result) => result.removed).length, 1,
     "two concurrent revocations leave one unrestricted owner credential");
   assert.equal(db.tables.passkeys.size, 1);
+});
+
+test("a losing passkey counter CAS cannot duplicate succeeded telemetry", async () => {
+  const db = authDb();
+  const testEnv = env(db);
+  db.tables.passkeys.set("counter-passkey", {
+    credential_id: "counter-passkey", public_key_jwk: "{}", alg: -7,
+    sign_count: 7, nickname: "Counter device", created_at: Date.now(),
+    last_used_at: null, grant_id: null, document_grant_id: null,
+  });
+  const event = {
+    rpId: RP, ceremony: "authentication", stage: "verify", outcome: "succeeded",
+    reasonCode: "passkey_used", principalKind: "owner", grantId: null,
+  };
+  const originalNow = Date.now;
+  Date.now = () => 1_788_102_400_000;
+  try {
+    const results = await Promise.all([
+      recordPasskeyUse(testEnv, "counter-passkey", 7, 8, event),
+      recordPasskeyUse(testEnv, "counter-passkey", 7, 8, event),
+    ]);
+    assert.equal(results.filter(Boolean).length, 1);
+    assert.equal(db.tables.security.length, 1,
+      "the serialized CAS loser cannot copy the winner's same-millisecond state");
+  } finally {
+    Date.now = originalNow;
+  }
 });
