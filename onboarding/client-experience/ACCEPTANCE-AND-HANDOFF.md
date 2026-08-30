@@ -23,9 +23,10 @@ cases, the owner confirms the returned evidence. For unanswerable cases, the
 owner checks the live refusal. The session saves after every question and can
 resume after an interruption.
 
-A completed Golden 20 is an owner-reviewed smoke suite. It is not a release
-certification, a professional audit, or proof that every source and question is
-covered.
+A completed Golden 20 is an owner-reviewed private question set and defaults to
+the stricter onboarding profile. Passing that gate proves this first useful set,
+not a release certification, a professional audit, or coverage of every source
+and question.
 
 ### Golden 20 Claude prompt
 
