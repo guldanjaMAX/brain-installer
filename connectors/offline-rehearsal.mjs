@@ -1,6 +1,6 @@
 /** Installed credential-free rehearsal for provider adapter code. */
 
-import { syncQuickBooksOnline } from "./quickbooks-online.mjs";
+import { quickBooksCompanyFingerprint, syncQuickBooksOnline } from "./quickbooks-online.mjs";
 import { syncSlack } from "./slack.mjs";
 import { syncNotion } from "./notion.mjs";
 import { syncMicrosoftGraph } from "./microsoft-graph.mjs";
@@ -32,7 +32,12 @@ const SCENARIOS = Object.freeze([
           }], maxResults: 1 } });
         },
       });
-      expect(result.documents[0]?.source_id === "invoice:17", "qbo_identity");
+      const companyFingerprint = quickBooksCompanyFingerprint("offline-company");
+      expect(
+        result.documents[0]?.source_id === `company:${companyFingerprint}:invoice:17` &&
+        result.documents[0]?.metadata?.qbo_company_fingerprint === companyFingerprint,
+        "qbo_identity",
+      );
       expect(result.outcome.kind === "partial" && !result.cursor_can_advance, "qbo_deletion_truth");
     },
   }),

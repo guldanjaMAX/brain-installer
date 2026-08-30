@@ -16,7 +16,26 @@ export const QBO_RECONCILIATION_ENTITIES = Object.freeze([
   "Purchase", "Deposit", "Payment", "BillPayment", "Transfer", "SalesReceipt", "RefundReceipt",
 ]);
 const ENTITY = /^[A-Za-z][A-Za-z0-9]{0,63}$/;
+const REALM_ID = /^[A-Za-z0-9._~-]{1,128}$/;
 
+/**
+ * Normalize Intuit's opaque company identity without ever placing it
+ * in a document, receipt, manifest, or URI. The raw realmId remains only in
+ * the protected local OAuth record and the provider request path.
+ */
+export function normalizeQuickBooksRealmId(value) {
+  const realmId = String(value ?? "").trim();
+  if (!REALM_ID.test(realmId)) {
+    throw new TypeError("QuickBooks returned an invalid company identity");
+  }
+  return realmId;
+}
+
+/**
+ * Canonical non-disclosing company identity shared with Books Reality Check.
+ * Keep this exact algorithm stable because reconciliation claims, OAuth
+ * bindings, sync state, and corpus document identities all rely on it.
+ */
 export const quickBooksCompanyFingerprint = (realmId) => {
   const company = String(realmId || "").trim();
   if (!company) throw new TypeError("QuickBooks company identity is required");
@@ -24,6 +43,9 @@ export const quickBooksCompanyFingerprint = (realmId) => {
     .update(`quickbooks-company-v1:${company}`)
     .digest("hex");
 };
+
+// Compatibility alias for callers that use Intuit's realm terminology.
+export const quickBooksRealmFingerprint = quickBooksCompanyFingerprint;
 
 function amountMinor(value) {
   const text = String(value ?? "").trim();
@@ -100,11 +122,18 @@ export async function syncQuickBooksOnline({
   entities = QBO_DEFAULT_ENTITIES,
   minorVersion = null,
   snapshotAt = new Date().toISOString(),
+  expectedCompanyFingerprint = null,
+  expectedRealmFingerprint = null,
 } = {}) {
   if (!String(realmId || "").trim() || !accessToken) {
     throw new TypeError("QuickBooks realmId and accessToken are required");
   }
-  const companyFingerprint = quickBooksCompanyFingerprint(realmId);
+  const normalizedRealmId = normalizeQuickBooksRealmId(realmId);
+  const companyFingerprint = quickBooksCompanyFingerprint(normalizedRealmId);
+  const expectedFingerprint = expectedCompanyFingerprint || expectedRealmFingerprint;
+  if (expectedFingerprint && expectedFingerprint !== companyFingerprint) {
+    throw new TypeError("QuickBooks company identity does not match the authorized source binding");
+  }
   if (!Array.isArray(entities) || !entities.length || entities.some((name) => !ENTITY.test(String(name)))) {
     throw new TypeError("QuickBooks entities must be a non-empty list of safe entity names");
   }
@@ -116,7 +145,7 @@ export async function syncQuickBooksOnline({
     while (true) {
       guard.visit(`${entity}:${start}`);
       const query = `select * from ${entity} STARTPOSITION ${start} MAXRESULTS ${QBO_PAGE_SIZE}`;
-      const url = new URL(`${String(apiBase).replace(/\/$/, "")}/v3/company/${encodeURIComponent(realmId)}/query`);
+      const url = new URL(`${String(apiBase).replace(/\/$/, "")}/v3/company/${encodeURIComponent(normalizedRealmId)}/query`);
       url.searchParams.set("query", query);
       if (minorVersion) url.searchParams.set("minorversion", String(minorVersion));
       const { data } = await providerJson("quickbooks", url, { accessToken, fetchImpl });
@@ -126,20 +155,20 @@ export async function syncQuickBooksOnline({
         const id = String(row?.Id || "").trim();
         if (!id) continue;
         const changed = row?.MetaData?.LastUpdatedTime || row?.TxnDate || null;
-        const sourceId = `${entity.toLowerCase()}:${id}`;
+        const recordId = encodeURIComponent(id);
         const reconciliationLines = quickBooksReconciliationLines(entity, row)
           .map((line) => ({ ...line, qbo_company_fingerprint: companyFingerprint }));
-        documents.push(providerEnvelope("quickbooks", sourceId, {
+        documents.push(providerEnvelope("quickbooks", `company:${companyFingerprint}:${entity.toLowerCase()}:${recordId}`, {
           title: `${entity}: ${row.DisplayName || row.DocNumber || row.CompanyName || id}`,
           content: renderRecord(`QuickBooks ${entity}`, row),
           occurredAt: changed,
-          uri: `quickbooks://${entity.toLowerCase()}/${encodeURIComponent(id)}`,
+          uri: `quickbooks://company/${companyFingerprint}/${entity.toLowerCase()}/${recordId}`,
           metadata: {
+            qbo_company_fingerprint: companyFingerprint,
             entity_type: entity,
             provider_id: id,
             provider_version: changed,
             snapshot_at: snapshotAt,
-            qbo_company_fingerprint: companyFingerprint,
             reconciliation_lines: reconciliationLines,
           },
         }));
@@ -149,13 +178,16 @@ export async function syncQuickBooksOnline({
       start += rows.length;
     }
   }
-  return providerSyncResult({
-    provider: "quickbooks",
-    documents,
-    proposedCursor: null,
-    deletionAuthority: "unavailable",
-    warnings: [
-      "QuickBooks query snapshots are idempotent for present records but do not prove which previously loaded records were deleted.",
-    ],
+  return Object.freeze({
+    ...providerSyncResult({
+      provider: "quickbooks",
+      documents,
+      proposedCursor: null,
+      deletionAuthority: "unavailable",
+      warnings: [
+        "QuickBooks query snapshots are idempotent for present records but do not prove which previously loaded records were deleted.",
+      ],
+    }),
+    qbo_company_fingerprint: companyFingerprint,
   });
 }

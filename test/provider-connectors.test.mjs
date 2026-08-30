@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { ProviderSyncError, providerJson } from "../connectors/provider-sync.mjs";
-import { syncQuickBooksOnline } from "../connectors/quickbooks-online.mjs";
+import {
+  quickBooksCompanyFingerprint,
+  syncQuickBooksOnline,
+} from "../connectors/quickbooks-online.mjs";
 import { syncSlack } from "../connectors/slack.mjs";
 import { NOTION_API_VERSION, syncNotion } from "../connectors/notion.mjs";
 import { syncMicrosoftGraph } from "../connectors/microsoft-graph.mjs";
@@ -43,10 +46,36 @@ const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(
   });
   check("QuickBooks query is company-scoped and paginated",
     qboUrl.includes("/v3/company/realm-fixture/query") && new URL(qboUrl).searchParams.get("query").includes("MAXRESULTS 1000"));
+  const companyFingerprint = quickBooksCompanyFingerprint("realm-fixture");
   check("QuickBooks emits stable provenance envelopes",
-    result.documents[0].source_id === "invoice:17" && result.documents[0].metadata.entity_type === "Invoice" && !result.documents[0].uri.includes("realm-fixture"));
+    result.documents[0].source_id === `company:${companyFingerprint}:invoice:17` &&
+    result.documents[0].metadata.entity_type === "Invoice" &&
+    result.documents[0].metadata.qbo_company_fingerprint === companyFingerprint &&
+    result.qbo_company_fingerprint === companyFingerprint &&
+    !JSON.stringify(result).includes("realm-fixture"));
   check("QuickBooks snapshot withholds cursor because deletion truth is unavailable",
     result.outcome.kind === "partial" && result.cursor_can_advance === false && result.deletion_authority === "unavailable");
+}
+
+{
+  const collect = (realmId, expectedCompanyFingerprint = null) => syncQuickBooksOnline({
+    realmId,
+    expectedCompanyFingerprint,
+    accessToken: "token",
+    entities: ["Invoice"],
+    fetchImpl: async () => json({ QueryResponse: { Invoice: [{ Id: "17", DocNumber: "INV-17" }], maxResults: 1 } }),
+  });
+  const first = await collect("company-one");
+  const same = await collect("company-one", quickBooksCompanyFingerprint("company-one"));
+  const second = await collect("company-two");
+  check("QuickBooks document identity is stable inside one company and collision-safe across companies",
+    first.documents[0].source_id === same.documents[0].source_id &&
+    first.documents[0].source_id !== second.documents[0].source_id);
+  await assert.rejects(
+    collect("company-two", quickBooksCompanyFingerprint("company-one")),
+    /does not match the authorized source binding/,
+  );
+  check("QuickBooks refuses a wrong-company adapter call before it can ingest", true);
 }
 
 {
@@ -58,9 +87,10 @@ const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(
     }], maxResults: 1 } }),
   });
   const line = result.documents[0].metadata.reconciliation_lines[0];
-  check("QuickBooks emits deterministic bank-impact evidence with exact source fields",
+  check("QuickBooks emits deterministic company-bound bank-impact evidence with exact source fields",
     line.line_uid === "purchase:expense-1" && line.qbo_account_id === "qbo-bank-35" &&
     line.amount_minor === 26000 && line.direction === "outflow" &&
+    line.qbo_company_fingerprint === quickBooksCompanyFingerprint("realm-fixture") &&
     /TxnDate, TotalAmt, AccountRef/.test(line.source_locator));
   check("QuickBooks bank evidence excludes the company identity and OAuth custody",
     !JSON.stringify(line).includes("realm-fixture") && !JSON.stringify(line).includes("token"));
