@@ -292,6 +292,18 @@ test("revocation immediately closes reads and scoped sessions cannot reach owner
     entity_slug: ENTITY,
     document_ids: ["drive:a"],
   });
+  db.prepare(
+    `INSERT INTO owner_passkeys
+       (credential_id, public_key_jwk, alg, sign_count, nickname, created_at, last_used_at,
+        grant_id, document_grant_id)
+     VALUES (?, '{}', -7, 0, ?, ?, NULL, NULL, ?)`,
+  ).run("scoped-device", "Reviewer device", Date.now(), grant.grant_id);
+  db.prepare(
+    `INSERT INTO owner_passkeys
+       (credential_id, public_key_jwk, alg, sign_count, nickname, created_at, last_used_at,
+        grant_id, document_grant_id)
+     VALUES (?, '{}', -7, 0, ?, ?, NULL, NULL, NULL)`,
+  ).run("owner-device", "Owner device", Date.now() + 1);
   const scopedCookie = (await mintSessionCookie(env, 1, { grantId: grant.grant_id })).split(";")[0];
 
   const me = await worker.fetch(post("/api/app/me", {}, scopedCookie), env, {});
@@ -307,6 +319,14 @@ test("revocation immediately closes reads and scoped sessions cannot reach owner
     home: false, documents: true, ask: true, add_review: false, access: false,
     bank: false, targets: false, preferences: false,
   });
+  assert.deepEqual(meBody.devices.map((device) => device.credential_id), ["scoped-device"],
+    "a scoped principal must never enumerate the owner's passkeys");
+  const foreignDevice = await worker.fetch(post("/api/app/devices/revoke", {
+    credential_id: "owner-device",
+  }, scopedCookie), env, {});
+  assert.equal(foreignDevice.status, 403, "a scoped principal cannot revoke an owner's device");
+  const signoutAll = await worker.fetch(post("/api/app/signout-all", {}, scopedCookie), env, {});
+  assert.equal(signoutAll.status, 403, "a scoped principal cannot invalidate the owner's sessions");
   const documents = await worker.fetch(post("/api/app/document-access/documents", {}, scopedCookie), env, {});
   const documentsBody = await documents.json();
   assert.equal(documentsBody.documents.length, 1);

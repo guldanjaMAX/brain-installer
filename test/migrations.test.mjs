@@ -672,6 +672,49 @@ check("restart guard refuses an existing migration column with the wrong contrac
   check("cmdMigrate resumes after every committed SQL, receipt, and seed boundary",
     commandResumePassed, commandResumeDetail);
 
+  // v0.1.23 publicly shipped grants and zones as schema 15 and 16. The 0.2.0
+  // product tables must therefore begin at 17: changing an already-receipted
+  // migration in place would turn a routine update into a checksum conflict.
+  const publishedSchema16 = new DatabaseSync(":memory:");
+  for (const file of files.filter((name) => Number.parseInt(name, 10) <= 16)) {
+    const sql = readFileSync(join(DIR, file), "utf8");
+    for (const statement of splitStatements(sql)) publishedSchema16.exec(statement);
+    publishedSchema16.prepare(
+      `INSERT INTO schema_migrations (version,name,applied_at,checksum)
+       VALUES (?,?,?,?)`,
+    ).run(
+      Number.parseInt(file, 10),
+      file.replace(/\.sql$/, ""),
+      "2026-01-01T00:00:00Z",
+      createHash("sha256").update(sql).digest("hex").slice(0, 16),
+    );
+  }
+  publishedSchema16.prepare(
+    "UPDATE install_state SET schema_version=16 WHERE id=1",
+  ).run();
+  await cmdMigrate(manifestPath, {
+    silent: true,
+    resolveAccount: async () => ({ id: "fixture-account" }),
+    d1Query: adapterFor(publishedSchema16),
+    vectorDrainQuiesced: true,
+  });
+  const publishedUpgrade = publishedSchema16.prepare(
+    `SELECT
+       (SELECT schema_version FROM install_state WHERE id=1) schema_version,
+       (SELECT count(*) FROM schema_migrations) receipts,
+       (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='grants') grants_table,
+       (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fin_transactions') ledger_table,
+       (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='document_access_grants') document_grants_table`,
+  ).get();
+  check("the published schema-16 access release upgrades cleanly through product schema 22",
+    publishedUpgrade?.schema_version === LATEST_SCHEMA &&
+      publishedUpgrade.receipts === 22 &&
+      publishedUpgrade.grants_table === 1 &&
+      publishedUpgrade.ledger_table === 1 &&
+      publishedUpgrade.document_grants_table === 1,
+    JSON.stringify(publishedUpgrade));
+  publishedSchema16.close();
+
   const direct = makeCommandLegacy();
   const directFault = { after: null, mutations: 0 };
   let directError = null;
