@@ -135,6 +135,32 @@ try {
     JSON.stringify(uploadFoldersOf({ folders: ["/a", { path: "/b", source: "contracts" }] })) ===
     JSON.stringify([{ path: "/a", source: null }, { path: "/b", source: "contracts" }]));
 
+  {
+    const upload = loadSourceRegistry().upload;
+    const duplicateNamed = upload.legs({
+      m: { corpora: { upload: { folders: [
+        { path: "/a", source: "documents" },
+        { path: "/b", source: "documents" },
+      ] } } },
+      manifestPath: "/fixture/brain.manifest.json",
+      flags: {},
+    });
+    const implicitCollision = upload.legs({
+      m: { corpora: { upload: { folders: [
+        "/a",
+        { path: "/b", source: "upload" },
+      ] } } },
+      manifestPath: "/fixture/brain.manifest.json",
+      flags: {},
+    });
+    check("two folders cannot share one resume, document, and removal source identity",
+      /same source name: documents/.test(duplicateNamed.unavailable?.reason || ""),
+      JSON.stringify(duplicateNamed));
+    check("an implicit upload source cannot collide with an explicit upload source",
+      /same source name: upload/.test(implicitCollision.unavailable?.reason || ""),
+      JSON.stringify(implicitCollision));
+  }
+
   assert.throws(
     () => describeLoadResult(undefined),
     /no recognized completion receipt/,

@@ -7774,6 +7774,18 @@ export function loadSourceRegistry(commands = {}) {
             },
           };
         }
+        const sourceNames = folders.map((folder) => folder.source || "upload");
+        const duplicateSources = [...new Set(sourceNames.filter(
+          (source, index) => sourceNames.indexOf(source) !== index,
+        ))];
+        if (duplicateSources.length) {
+          return {
+            unavailable: {
+              reason: `multiple folders use the same source name: ${duplicateSources.join(", ")}`,
+              fix: "give every folder a unique lowercase source name. A source owns one resume file, document namespace, and removal boundary.",
+            },
+          };
+        }
         return folders.map((folder) => ({
           source: folder.source || "upload",
           detail: folder.path,
