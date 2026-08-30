@@ -747,11 +747,17 @@ export async function rewrapBankAccessReferences(env, {
  * the bank returns to. Nothing here is a credential, and nothing here is
  * written to the database.
  */
-export async function createLinkToken(env, { url, mode = "connect", itemRef = null, fetchImpl = fetch } = {}) {
+export async function createLinkToken(env, {
+  url,
+  mode = "connect",
+  itemRef = null,
+  requestId = null,
+  fetchImpl = fetch,
+} = {}) {
   const config = bankFeedConfig(env);
   if (config.provider === "plaid") {
     const { createPlaidLinkToken } = await import("./plaid-bank-feed.js");
-    return createPlaidLinkToken(env, { url, mode, itemRef, fetchImpl });
+    return createPlaidLinkToken(env, { url, mode, itemRef, sessionRef: requestId, fetchImpl });
   }
   const { tenantId, endUserRef } = tenantReference(env);
   const redirectUri = redirectUriFor(url);
@@ -1135,6 +1141,8 @@ export async function disconnectItem(env, itemRef, { fetchImpl = fetch, now = nu
 export function connectPageHtml(config) {
   const sdk = config.linkSdkUrl;
   const sdkOrigin = sdk ? new URL(sdk).origin : null;
+  const apiOrigin = config.apiBase ? new URL(config.apiBase).origin : null;
+  const connectOrigins = [...new Set([apiOrigin, sdkOrigin].filter(Boolean))];
   // The SDK's global is configuration, not a constant. An unconfigured page
   // says so plainly rather than failing at a name that is not there.
   const global = String(config.linkGlobal || "").replace(/[^A-Za-z0-9_$]/g, "").slice(0, 40);
@@ -1142,7 +1150,7 @@ export function connectPageHtml(config) {
     "default-src 'none'",
     `script-src 'unsafe-inline'${sdkOrigin ? ` ${sdkOrigin}` : ""}`,
     "style-src 'unsafe-inline'",
-    `connect-src 'self'${sdkOrigin ? ` ${sdkOrigin}` : ""}`,
+    `connect-src 'self'${connectOrigins.length ? ` ${connectOrigins.join(" ")}` : ""}`,
     `frame-src${sdkOrigin ? ` ${sdkOrigin}` : " 'none'"}`,
     "base-uri 'none'",
     "form-action 'none'",
@@ -1170,11 +1178,21 @@ async function post(path, body) {
   if (!r.ok) throw new Error(d.error || "that did not work");
   return d;
 }
+function linkRequestId() {
+  let value = null;
+  try { value = sessionStorage.getItem("bank_link_request_id"); } catch (e) {}
+  if (!value) {
+    value = crypto.randomUUID();
+    try { sessionStorage.setItem("bank_link_request_id", value); } catch (e) {}
+  }
+  return value;
+}
 async function start(existing) {
   say("Preparing a secure connection…");
   const params = new URLSearchParams(window.location.search);
   const requestedMode = params.get("mode") === "reauthorise" ? "reauthorise" : "connect";
   const begun = existing || await post("/api/bank-feed/link-token", {
+    request_id: linkRequestId(),
     mode: requestedMode,
     item_ref: requestedMode === "reauthorise" ? params.get("item_ref") : null,
   });
@@ -1191,7 +1209,10 @@ async function start(existing) {
           institution_ref: meta && meta.institution && meta.institution.institution_id,
           institution_label: meta && meta.institution && meta.institution.name,
         });
-        try { sessionStorage.removeItem("bank_link_session"); } catch (e) {}
+        try {
+          sessionStorage.removeItem("bank_link_session");
+          sessionStorage.removeItem("bank_link_request_id");
+        } catch (e) {}
         say("Connected. Your history is loading in the background. This can take a while, and you can close this page.");
       } catch (e) { say(e.message, true); }
     },
@@ -1270,8 +1291,20 @@ export async function handleBankFeed(env, request, url, path, ctx) {
       const access = await ownerAccess();
       if (!access.authorised) return ownerRefusal(access);
       const body = await readJson(request);
+      const runtime = bankFeedConfig(env);
+      if (runtime.provider === "plaid" &&
+          (typeof body.request_id !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(body.request_id))) {
+        return jsonResponse({
+          error: "invalid request",
+          code: "plaid_link_request_id_required",
+        }, 400);
+      }
       return jsonResponse(await createLinkToken(env, {
-        url: url.href, mode: body.mode === "reauthorise" ? "reauthorise" : "connect", itemRef: body.item_ref || null,
+        url: url.href,
+        mode: body.mode === "reauthorise" ? "reauthorise" : "connect",
+        itemRef: body.item_ref || null,
+        requestId: body.request_id || null,
+        fetchImpl: ctx?.bankFeedFetchImpl || fetch,
       }));
     }
 
@@ -1284,6 +1317,7 @@ export async function handleBankFeed(env, request, url, path, ctx) {
         publicToken: body.public_token,
         institutionRef: body.institution_ref || null,
         institutionLabel: body.institution_label || null,
+        fetchImpl: ctx?.bankFeedFetchImpl || fetch,
       });
       // The history load runs OUTSIDE this request. The owner gets an answer
       // now and the two years arrive behind them.
@@ -1328,6 +1362,16 @@ export async function handleBankFeed(env, request, url, path, ctx) {
   } catch (error) {
     // One exit for every failure, so no path out of this module can carry a
     // provider payload or a credential into a response.
-    return jsonResponse({ error: safeFeedError(error) }, error instanceof FeedConfigError ? 503 : 502);
+    const outcomeUnknown = error?.outcome_unknown === true;
+    const body = {
+      error: safeFeedError(error),
+      ...(error?.code ? { code: String(error.code).slice(0, 80) } : {}),
+      ...(outcomeUnknown ? {
+        outcome_unknown: true,
+        retry_safe: false,
+        recovery: "The provider may have accepted the one-time handoff. Keep this page open and ask the technician to review this connection before starting another one.",
+      } : {}),
+    };
+    return jsonResponse(body, error instanceof FeedConfigError || outcomeUnknown ? 503 : 502);
   }
 }

@@ -64,11 +64,17 @@ function accountSlug(itemRef, accountRef) {
     .replace(/[^a-z0-9_-]/g, "-").slice(0, 64);
 }
 
-function providerOptions(fetchImpl, body) {
+const PLAID_NO_AUTOMATIC_RETRY_PATHS = new Set([
+  "/item/public_token/exchange",
+  "/item/remove",
+]);
+
+function providerOptions(fetchImpl, body, path) {
   return {
     method: "POST",
     body,
     fetchImpl,
+    ...(PLAID_NO_AUTOMATIC_RETRY_PATHS.has(path) ? { maxAttempts: 1 } : {}),
     maxResponseBytes: 2 * 1024 * 1024,
   };
 }
@@ -80,8 +86,22 @@ export async function callPlaid(env, path, body, { fetchImpl = fetch } = {}) {
     client_id: config.clientId,
     secret: config.secret,
     ...body,
-  }));
+  }, path));
   return data || {};
+}
+
+function providerOutcomeUnknown(error) {
+  if (!(error instanceof ProviderSyncError)) return false;
+  return Number(error.status || 0) >= 500 ||
+    ["transport_error", "timeout", "deadline_exceeded", "aborted"].includes(String(error.code || ""));
+}
+
+function unknownOutcomeError(code, message, cause) {
+  const error = new Error(message, cause === undefined ? undefined : { cause });
+  error.code = code;
+  error.outcome_unknown = true;
+  error.retry_safe = false;
+  return error;
 }
 
 async function itemRow(env, tenantId, itemRef) {
@@ -125,6 +145,11 @@ export async function createPlaidLinkToken(env, {
   const { tenantId, endUserRef } = tenantReference(env);
   const stamp = nowIso(now);
   const ref = sessionRef || crypto.randomUUID();
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(ref)) {
+    const error = new Error("Plaid Link needs a stable retry identity");
+    error.code = "plaid_link_request_id_required";
+    throw error;
+  }
   const normalizedMode = mode === "reauthorise" ? "reauthorise" : "connect";
   const requestFingerprint = await sha256Hex(JSON.stringify({
     tenantId, normalizedMode, itemRef: itemRef || null, origin: new URL(url).origin,
@@ -178,12 +203,20 @@ export async function createPlaidLinkToken(env, {
   const created = await callPlaid(env, "/link/token/create", request, { fetchImpl });
   const sealed = await encryptAccessReference(env, created.link_token);
   const expiresAt = created.expiration || new Date(Date.parse(stamp) + 30 * 60_000).toISOString();
-  await env.DB.prepare(
+  const readyStatements = [env.DB.prepare(
     `UPDATE plaid_link_operations
         SET state='link_ready',link_ciphertext=?,link_iv=?,link_key_version=?,
             link_expires_at=?,updated_at=?
       WHERE tenant_id=? AND session_ref=?`,
-  ).bind(sealed.ciphertext, sealed.iv, sealed.keyVersion, expiresAt, stamp, tenantId, ref).run();
+  ).bind(sealed.ciphertext, sealed.iv, sealed.keyVersion, expiresAt, stamp, tenantId, ref)];
+  if (normalizedMode === "reauthorise") {
+    readyStatements.push(env.DB.prepare(
+      `UPDATE bank_feed_items SET status='reauth_required',
+          status_detail='Bank sign-in is in progress, and provider health still needs confirmation.'
+        WHERE tenant_id=? AND item_ref=?`,
+    ).bind(tenantId, itemRef));
+  }
+  await env.DB.batch(readyStatements);
   return {
     link_token: created.link_token,
     expiration: expiresAt,
@@ -209,19 +242,63 @@ export async function completePlaidLink(env, {
   const row = await linkRow(env, tenantId, sessionRef);
   if (!row) throw new Error("that Plaid Link session is not on this brain");
   if (row.mode === "reauthorise") {
-    if (!["link_ready", "completed"].includes(row.state)) {
+    if (row.state === "completed" && row.receipt_json) {
+      return { ...JSON.parse(row.receipt_json), replayed: true };
+    }
+    if (!["link_ready", "link_completed"].includes(row.state)) {
       throw new Error("Plaid update Link has not completed its reviewed session");
     }
     plaidLinkCompletion({ mode: row.mode });
-    const receipt = { item_ref: row.item_ref, updated: true, exchanged: false };
     await env.DB.prepare(
-      `UPDATE plaid_link_operations SET state='completed',receipt_json=?,completed_at=?,updated_at=?
+      `UPDATE plaid_link_operations SET state='link_completed',updated_at=?
         WHERE tenant_id=? AND session_ref=?`,
-    ).bind(JSON.stringify(receipt), stamp, stamp, tenantId, sessionRef).run();
-    await env.DB.prepare(
-      `UPDATE bank_feed_items SET status='connected',status_detail=NULL
-        WHERE tenant_id=? AND item_ref=?`,
-    ).bind(tenantId, row.item_ref).run();
+    ).bind(stamp, tenantId, sessionRef).run();
+    const item = await itemRow(env, tenantId, row.item_ref);
+    if (!item) throw new Error("that connection is not on this brain");
+    const accessToken = await decryptAccessReference(env, {
+      ciphertext: item.access_ciphertext,
+      iv: item.access_iv,
+      keyVersion: item.key_version,
+    });
+    let health;
+    try {
+      health = await callPlaid(env, "/item/get", { access_token: accessToken }, { fetchImpl });
+    } catch (error) {
+      await env.DB.prepare(
+        `UPDATE bank_feed_items SET status='reauth_required',
+            status_detail='Bank sign-in returned, but provider health could not be confirmed.',last_error_at=?
+          WHERE tenant_id=? AND item_ref=?`,
+      ).bind(stamp, tenantId, row.item_ref).run();
+      error.code ||= "PLAID_UPDATE_HEALTH_UNAVAILABLE";
+      throw error;
+    }
+    if (!health?.item || health.item.item_id !== row.item_ref || health.item.error) {
+      await env.DB.prepare(
+        `UPDATE bank_feed_items SET status='reauth_required',
+            status_detail='Bank sign-in returned, but the provider still reports that this connection needs attention.',last_error_at=?
+          WHERE tenant_id=? AND item_ref=?`,
+      ).bind(stamp, tenantId, row.item_ref).run();
+      const error = new Error("Plaid update completed without a healthy matching Item");
+      error.code = "PLAID_UPDATE_HEALTH_NOT_CONFIRMED";
+      throw error;
+    }
+    const receipt = {
+      item_ref: row.item_ref,
+      updated: true,
+      exchanged: false,
+      health_verified: true,
+      replayed: false,
+    };
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE plaid_link_operations SET state='completed',receipt_json=?,completed_at=?,updated_at=?
+          WHERE tenant_id=? AND session_ref=?`,
+      ).bind(JSON.stringify(receipt), stamp, stamp, tenantId, sessionRef),
+      env.DB.prepare(
+        `UPDATE bank_feed_items SET status='connected',status_detail=NULL,last_error_at=NULL
+          WHERE tenant_id=? AND item_ref=?`,
+      ).bind(tenantId, row.item_ref),
+    ]);
     return receipt;
   }
 
@@ -240,9 +317,7 @@ export async function completePlaidLink(env, {
       state: row.state,
       receipt: null,
     }, requestFingerprint);
-    const error = new Error(decision.reason);
-    error.code = decision.code;
-    throw error;
+    throw unknownOutcomeError(decision.code, decision.reason);
   }
   await env.DB.prepare(
     `UPDATE plaid_link_operations
@@ -253,9 +328,21 @@ export async function completePlaidLink(env, {
     `UPDATE plaid_link_operations SET state='exchange_started',updated_at=?
       WHERE tenant_id=? AND session_ref=?`,
   ).bind(stamp, tenantId, sessionRef).run();
-  const exchanged = await callPlaid(env, "/item/public_token/exchange", {
-    public_token: token,
-  }, { fetchImpl });
+  let exchanged;
+  try {
+    exchanged = await callPlaid(env, "/item/public_token/exchange", {
+      public_token: token,
+    }, { fetchImpl });
+  } catch (error) {
+    if (providerOutcomeUnknown(error)) {
+      throw unknownOutcomeError(
+        "PLAID_EXCHANGE_OUTCOME_UNKNOWN",
+        "Plaid may have accepted the one-time connection handoff, but its response did not return safely.",
+        error,
+      );
+    }
+    throw error;
+  }
   if (!exchanged.item_id || !exchanged.access_token) throw new Error("Plaid returned no usable Item");
   const sealed = await encryptAccessReference(env, exchanged.access_token);
   const receipt = {

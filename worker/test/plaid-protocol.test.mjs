@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { PLAID_PROFILE, bankFeedProfile } from "../src/lib/bank-feed-profiles.js";
-import { bankFeedConfig, bankFeedEnabled } from "../src/lib/bank-feed.js";
+import { bankFeedConfig, bankFeedEnabled, connectPageHtml } from "../src/lib/bank-feed.js";
 import {
   PlaidProtocolError,
   buildPlaidLinkTokenRequest,
@@ -66,6 +66,21 @@ check("named Plaid profile reaches the bank-feed runtime only with credentials",
   assert.equal(runtime.provider, "plaid");
   assert.equal(runtime.apiBase, "https://sandbox.plaid.com");
   assert.equal(runtime.linkGlobal, "Plaid");
+});
+
+check("Plaid Link CSP permits only the selected environment API origin", () => {
+  const base = {
+    BANK_FEED_PROVIDER: "plaid",
+    BANK_FEED_CLIENT_ID: "fixture-client-id",
+    BANK_FEED_SECRET: "fixture-secret",
+    BANK_FEED_WRAPPING_KEY_V2: `v2.${"A".repeat(43)}`,
+  };
+  const sandbox = connectPageHtml(bankFeedConfig({ ...base, BANK_FEED_ENV: "sandbox" })).csp;
+  const production = connectPageHtml(bankFeedConfig({ ...base, BANK_FEED_ENV: "production" })).csp;
+  assert.match(sandbox, /connect-src 'self' https:\/\/sandbox\.plaid\.com https:\/\/cdn\.plaid\.com/);
+  assert.doesNotMatch(sandbox, /production\.plaid\.com/);
+  assert.match(production, /connect-src 'self' https:\/\/production\.plaid\.com https:\/\/cdn\.plaid\.com/);
+  assert.doesNotMatch(production, /sandbox\.plaid\.com/);
 });
 
 check("an explicit custom endpoint remains explicit", () => {

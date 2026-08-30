@@ -418,14 +418,17 @@ const refuses = (db, sql, params = []) => {
   const { html, csp } = connectPageHtml(bankFeedConfig(d1(freshDb())));
   check("the page never asks for, stores, or carries the admin key",
     !html.includes("X-Admin-Key") && !html.includes("admin") && !html.includes("localStorage"), "");
-  check("the CSP is widened to exactly the configured SDK origin and nothing else",
+  check("the CSP is widened to exactly the configured SDK and API origins and nothing else",
     csp.includes("script-src 'unsafe-inline' https://cdn.provider.invalid") &&
+    csp.includes("connect-src 'self' https://sandbox.provider.invalid https://cdn.provider.invalid") &&
     csp.includes("default-src 'none'") && csp.includes("form-action 'none'") &&
     !csp.includes("*"), csp);
   check("it tells the owner plainly what it cannot see and what the connection cannot do",
     /never sees your bank\s*\npassword/.test(html) && /cannot move money/.test(html), "");
   check("it keeps the redirect return leg, without which every bank with its own login page fails silently",
     html.includes("oauth_state_id") && html.includes("receivedRedirectUri"), "");
+  check("it persists a client retry identity before requesting a Link token",
+    html.includes("bank_link_request_id") && html.includes("request_id: linkRequestId()"), "");
 }
 
 /* ============ authorising, and NOT loading two years inline ============ */

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createProductFixture } from "./product-contract-fixture.mjs";
+import { handleBankFeed } from "../src/lib/bank-feed.js";
 import {
   completePlaidLink,
   createPlaidLinkToken,
@@ -59,6 +60,8 @@ class PlaidSandboxFake {
   constructor() {
     this.calls = new Map();
     this.mutationRaised = false;
+    this.exchangeAvailable = true;
+    this.healthAvailable = true;
     this.removeAvailable = false;
     this.publicJwk = null;
   }
@@ -83,12 +86,20 @@ class PlaidSandboxFake {
       }
       return jsonResponse({
         link_token: "link-sandbox-short-lived",
-        expiration: "2026-08-30T13:30:00.000Z",
+        expiration: "2099-08-30T13:30:00.000Z",
       });
     }
     if (path === "/item/public_token/exchange") {
       assert.equal(body.public_token, "public-sandbox-once");
-      return jsonResponse({ item_id: "item-sandbox-1", access_token: "access-sandbox-secret" });
+      return this.exchangeAvailable
+        ? jsonResponse({ item_id: "item-sandbox-1", access_token: "access-sandbox-secret" })
+        : jsonResponse({ error_code: "INTERNAL_SERVER_ERROR" }, 500);
+    }
+    if (path === "/item/get") {
+      assert.equal(body.access_token, "access-sandbox-secret");
+      return this.healthAvailable
+        ? jsonResponse({ item: { item_id: "item-sandbox-1", error: null } })
+        : jsonResponse({ error_code: "ITEM_LOGIN_REQUIRED" }, 401);
     }
     if (path === "/accounts/get") {
       return jsonResponse({ accounts: [{
@@ -177,25 +188,34 @@ test("Plaid durable runtime closes response-loss, sync, webhook, fallback, and r
   const fetchImpl = provider.fetch.bind(provider);
   const stamp = "2026-08-30T13:00:00.000Z";
   try {
-    const firstLink = await createPlaidLinkToken(fixture.env, {
-      url: "https://brain.invalid/app/connect/bank",
-      sessionRef: "session-1",
-      fetchImpl,
-      now: stamp,
-    });
-    const replayedLink = await createPlaidLinkToken(fixture.env, {
-      url: "https://brain.invalid/app/connect/bank",
-      sessionRef: "session-1",
-      fetchImpl,
-      now: stamp,
-    });
+    const ownerHeaders = await fixture.ownerHeaders();
+    const linkUrl = new URL("https://brain.invalid/api/bank-feed/link-token");
+    const linkRoute = (body) => handleBankFeed(fixture.env, new Request(linkUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...ownerHeaders },
+      body: JSON.stringify(body),
+    }), linkUrl, linkUrl.pathname, { bankFeedFetchImpl: fetchImpl });
+    const missingIdentity = await linkRoute({ mode: "connect" });
+    assert.equal(missingIdentity.status, 400);
+    assert.equal((await missingIdentity.json()).code, "plaid_link_request_id_required");
+    assert.equal(provider.count("/link/token/create"), 0);
+
+    // Ignore the first HTTP body to model the provider and D1 commit succeeding
+    // while the browser loses the response. The same client identity must replay
+    // the exact Link token without a second provider creation.
+    const firstLinkResponse = await linkRoute({ request_id: "link-route-retry-0001", mode: "connect" });
+    assert.equal(firstLinkResponse.status, 200);
+    const firstLink = await firstLinkResponse.json();
+    const replayedLinkResponse = await linkRoute({ request_id: "link-route-retry-0001", mode: "connect" });
+    assert.equal(replayedLinkResponse.status, 200);
+    const replayedLink = await replayedLinkResponse.json();
     assert.equal(firstLink.link_token, replayedLink.link_token);
     assert.equal(replayedLink.replayed, true);
     assert.equal(provider.count("/link/token/create"), 1);
     assert.equal(fixture.first("SELECT link_ciphertext LIKE '%link-sandbox%' AS leaked FROM plaid_link_operations").leaked, 0);
 
     const exchange = await completePlaidLink(fixture.env, {
-      sessionRef: "session-1",
+      sessionRef: firstLink.session_ref,
       publicToken: "public-sandbox-once",
       institutionRef: "ins_fixture",
       institutionLabel: "Sandbox Bank",
@@ -203,7 +223,7 @@ test("Plaid durable runtime closes response-loss, sync, webhook, fallback, and r
       now: stamp,
     });
     const replayedExchange = await completePlaidLink(fixture.env, {
-      sessionRef: "session-1",
+      sessionRef: firstLink.session_ref,
       publicToken: "public-sandbox-once",
       fetchImpl,
       now: stamp,
@@ -220,17 +240,33 @@ test("Plaid durable runtime closes response-loss, sync, webhook, fallback, and r
       url: "https://brain.invalid/app/connect/bank",
       mode: "reauthorise",
       itemRef: "item-sandbox-1",
-      sessionRef: "session-update-1",
+      sessionRef: "session-update-request-1",
       fetchImpl,
       now: stamp,
     });
+    provider.healthAvailable = false;
+    await assert.rejects(completePlaidLink(fixture.env, {
+      sessionRef: "session-update-request-1",
+      publicToken: "ignored-update-public-token",
+      fetchImpl,
+      now: stamp,
+    }));
+    assert.equal(fixture.first(
+      "SELECT status FROM bank_feed_items WHERE item_ref='item-sandbox-1'",
+    ).status, "reauth_required");
+    assert.equal(fixture.first(
+      "SELECT state FROM plaid_link_operations WHERE session_ref='session-update-request-1'",
+    ).state, "link_completed");
+    provider.healthAvailable = true;
     const updateReceipt = await completePlaidLink(fixture.env, {
-      sessionRef: "session-update-1",
+      sessionRef: "session-update-request-1",
       publicToken: "ignored-update-public-token",
       fetchImpl,
       now: stamp,
     });
     assert.equal(updateReceipt.exchanged, false);
+    assert.equal(updateReceipt.health_verified, true);
+    assert.equal(provider.count("/item/get"), 2);
     assert.equal(provider.count("/item/public_token/exchange"), 1);
     assert.equal(fixture.first(
       "SELECT access_ciphertext FROM bank_feed_items WHERE item_ref='item-sandbox-1'",
@@ -305,6 +341,60 @@ test("Plaid durable runtime closes response-loss, sync, webhook, fallback, and r
     const status = await plaidFeedStatus(fixture.env);
     assert.equal(status.provider, "plaid");
     assert.equal(status.environment, "sandbox");
+  } finally {
+    fixture.close();
+  }
+});
+
+test("a lost public-token exchange response is single-shot and explicitly recoverable", async () => {
+  const fixture = await createProductFixture({
+    env: {
+      BANK_FEED_PROVIDER: "plaid",
+      BANK_FEED_ENV: "sandbox",
+      BANK_FEED_CLIENT_ID: "fixture-client-id",
+      BANK_FEED_SECRET: "fixture-secret",
+      BANK_FEED_WRAPPING_KEY_V2: `v2.${"A".repeat(43)}`,
+      BRAIN_NAME: "Sandbox Brain",
+    },
+  });
+  const provider = new PlaidSandboxFake();
+  provider.exchangeAvailable = false;
+  const fetchImpl = provider.fetch.bind(provider);
+  const ownerHeaders = await fixture.ownerHeaders();
+  const route = async (path, body) => {
+    const url = new URL(`https://brain.invalid${path}`);
+    return handleBankFeed(fixture.env, new Request(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...ownerHeaders },
+      body: JSON.stringify(body),
+    }), url, path, { bankFeedFetchImpl: fetchImpl });
+  };
+  try {
+    const link = await (await route("/api/bank-feed/link-token", {
+      request_id: "lost-exchange-route-0001",
+      mode: "connect",
+    })).json();
+    const exchangeBody = {
+      session_ref: link.session_ref,
+      public_token: "public-sandbox-once",
+    };
+    const first = await route("/api/bank-feed/exchange", exchangeBody);
+    assert.equal(first.status, 503);
+    const firstBody = await first.json();
+    assert.equal(firstBody.code, "PLAID_EXCHANGE_OUTCOME_UNKNOWN");
+    assert.equal(firstBody.outcome_unknown, true);
+    assert.equal(firstBody.retry_safe, false);
+    assert.match(firstBody.recovery, /review this connection/);
+    assert.equal(provider.count("/item/public_token/exchange"), 1);
+
+    const replay = await route("/api/bank-feed/exchange", exchangeBody);
+    assert.equal(replay.status, 503);
+    assert.equal((await replay.json()).outcome_unknown, true);
+    assert.equal(provider.count("/item/public_token/exchange"), 1);
+    assert.equal(fixture.first(
+      "SELECT state FROM plaid_link_operations WHERE session_ref='lost-exchange-route-0001'",
+    ).state, "exchange_started");
+    assert.equal(fixture.first("SELECT COUNT(*) AS n FROM bank_feed_items").n, 0);
   } finally {
     fixture.close();
   }
