@@ -152,19 +152,38 @@ register(".tsv", (buf, { name } = {}) => renderTable(parseDelimited(dec(buf), "\
  * JSON is flattened to "path: value" lines rather than pretty-printed, because
  * braces and brackets embed as noise while the leaf paths carry the meaning.
  */
+const MAX_JSON_VALUES = 20_000;
+
 register(".json", (buf) => {
   const raw = dec(buf);
   let parsed;
   try { parsed = JSON.parse(raw); } catch { return raw; }
   const lines = [];
-  const walk = (v, path) => {
-    if (lines.length > 20000) return;
-    if (v === null || typeof v !== "object") { lines.push(`${path}: ${String(v)}`); return; }
-    if (Array.isArray(v)) { v.forEach((x, i) => walk(x, `${path}[${i}]`)); return; }
-    for (const [k, x] of Object.entries(v)) walk(x, path ? `${path}.${k}` : k);
-  };
-  walk(parsed, "");
-  return lines.join("\n");
+  const pending = [{ value: parsed, path: "" }];
+  while (pending.length && lines.length < MAX_JSON_VALUES) {
+    const current = pending.pop();
+    const value = current.value;
+    if (value === null || typeof value !== "object") {
+      lines.push(`${current.path}: ${String(value)}`);
+      continue;
+    }
+    const entries = Array.isArray(value)
+      ? value.map((child, index) => [index, child])
+      : Object.entries(value);
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const [key, child] = entries[index];
+      pending.push({
+        value: child,
+        path: Array.isArray(value)
+          ? `${current.path}[${key}]`
+          : current.path ? `${current.path}.${key}` : String(key),
+      });
+    }
+  }
+  if (!pending.length) return lines.join("\n");
+  const note = `additional JSON values were not indexed; this file exceeds the ${MAX_JSON_VALUES} value limit`;
+  lines.push(`[${note}]`);
+  return { text: lines.join("\n"), note };
 }, "json");
 
 /* ------------------------------------------------------------ transcripts */

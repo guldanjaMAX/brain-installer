@@ -56,6 +56,25 @@ const read = async (name) => extract(bytes(name), name);
     /(?:^|\r?\n)  review_every_days: 30(?:\r?\n|$)/.test(got.text || ""), got.text);
 }
 
+/* ================= JSON, bounded without silent loss ================= */
+{
+  const wide = Object.fromEntries(Array.from({ length: 25_000 }, (_, index) => [`field_${index}`, index]));
+  const got = await extract(Buffer.from(JSON.stringify(wide)), "wide.json");
+  check("wide JSON states that values beyond the limit were not indexed",
+    /additional JSON values were not indexed/.test(got.note || "") &&
+      /additional JSON values were not indexed/.test(got.text || ""), JSON.stringify(got).slice(-300));
+  check("wide JSON is capped at exactly 20,000 values plus one omission marker",
+    (got.text || "").split("\n").length === 20_001, (got.text || "").split("\n").length);
+}
+{
+  const depth = 5_000;
+  const raw = `${'{"nested":'.repeat(depth)}"leaf"${"}".repeat(depth)}`;
+  const got = await extract(Buffer.from(raw), "deep.json");
+  check("deep valid JSON is flattened without recursive stack overflow",
+    got.error === undefined && /nested\.nested/.test(got.text || "") && /: leaf$/.test(got.text || ""),
+    got.error || got.text?.slice(0, 120));
+}
+
 /* ================= transcripts (.vtt) ================= */
 {
   const got = await read("saved-call.vtt");
