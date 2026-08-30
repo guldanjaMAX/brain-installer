@@ -74,9 +74,10 @@ synthetic setup, folder, connector, migration, search, owner-action, access, and
 technician scenarios. The final receipt separates automatic proof from the
 remaining live Cloudflare, provider, and physical-device checks.
 
-For an install day, `brain technician <manifest>` prints the eight-step read-only
+For an install day, `brain technician <manifest>` prints the nine-step read-only
 plan. Add `--json` when a local coding agent is guiding the session. Run one
-reviewed step at a time with `--run tools`, `cloudflare`, `plaid`, `google`, `zoom`,
+reviewed step at a time with `--run tools`, `cloudflare`, `plaid`, `google`,
+`quickbooks`, `zoom`,
 `imap`, `passkey`, or `verify`. The owner still handles login, 2FA, OAuth consent, and
 the physical passkey gesture. Tokens and app secrets go only into hidden
 terminal prompts or provider pages. The complete guide is

@@ -972,13 +972,14 @@ exact real-service or physical-device field gate still outstanding. Use
 runs.
 
 `brain technician <manifest>` is the matching install-day coordinator. Its
-default and `--json` forms are read-only. A selected `--run` step launches the
-existing command in a child process with an allowlisted environment. Google and
-Zoom values are collected by the shared hidden-input primitive, never placed in
-argv, and cleared from the coordinator's buffers and child environment object
-after the command exits. Tests assert ordering, rerun behavior, ambient-secret
-scrubbing, exact hostname confirmation before invite creation, and stop-on-fail
-verification.
+default form and plan-level `--json` form are read-only. Most selected `--run`
+steps launch the existing command in a child process with an allowlisted
+environment. The QuickBooks step instead passes its two hidden values directly
+to the existing in-process provider OAuth flow, never through argv or a child
+environment. `--run quickbooks --json` returns a stable success or error
+envelope for a local agent while the owner still handles browser consent. Tests
+assert ordering, rerun behavior, ambient-secret scrubbing, exact hostname
+confirmation before invite creation, and stop-on-fail verification.
 
 Current connector proof levels and the ranked acceptance backlog are maintained
 in [CONNECTOR-BACKLOG.md](./CONNECTOR-BACKLOG.md). Fixture coverage is never a

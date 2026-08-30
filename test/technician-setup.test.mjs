@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { cmdLocalTools } from "../brain.mjs";
+import { cmdConnectProvider, cmdLocalTools, cmdTechnician } from "../brain.mjs";
 
 import {
   TECHNICIAN_RUN_STEPS,
@@ -33,6 +34,7 @@ writeFileSync(manifestPath, JSON.stringify({
     google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] },
     gmail: { enabled: true },
     calendar: { enabled: true },
+    quickbooks: { enabled: true, environment: "sandbox" },
     zoom: { enabled: true },
     imap: { enabled: true },
     bank_feed: { enabled: true, provider: "plaid" },
@@ -242,6 +244,179 @@ test("Plaid credentials cross only the secrets child environment and are zeroed"
   assert.ok(clientId.every((byte) => byte === 0));
   assert.ok(clientSecret.every((byte) => byte === 0));
   assert.ok(wrappingKey.every((byte) => byte === 0));
+});
+
+test("QuickBooks refuses missing manifests and incomplete configuration before any hidden prompt or OAuth call", async () => {
+  let prompts = 0;
+  let connects = 0;
+  const common = {
+    step: "quickbooks",
+    scriptPath: fixtureScriptPath,
+    readHidden: async () => { prompts++; return Buffer.from("must-not-be-read"); },
+    connectProvider: async () => { connects++; },
+  };
+  await assert.rejects(
+    runTechnicianStep({ ...common, manifestPath: join(sandbox, "missing-quickbooks.json") }),
+    (error) => error.code === "manifest_not_found",
+  );
+
+  const disabled = join(sandbox, "quickbooks-disabled.json");
+  writeFileSync(disabled, JSON.stringify({ corpora: { quickbooks: { enabled: false, environment: "sandbox" } } }));
+  await assert.rejects(
+    runTechnicianStep({ ...common, manifestPath: disabled }),
+    (error) => error.code === "quickbooks_not_enabled",
+  );
+
+  const noEnvironment = join(sandbox, "quickbooks-no-environment.json");
+  writeFileSync(noEnvironment, JSON.stringify({ corpora: { quickbooks: { enabled: true } } }));
+  await assert.rejects(
+    runTechnicianStep({ ...common, manifestPath: noEnvironment }),
+    (error) => error.code === "quickbooks_environment_required",
+  );
+  assert.equal(prompts, 0);
+  assert.equal(connects, 0);
+});
+
+test("QuickBooks technician JSON failures use a stable nonzero exit and recovery envelope", () => {
+  const disabled = join(sandbox, "quickbooks-json-disabled.json");
+  writeFileSync(disabled, JSON.stringify({ corpora: { quickbooks: { enabled: false, environment: "sandbox" } } }));
+  const result = spawnSync(process.execPath, [
+    resolve("brain.mjs"), "technician", disabled, "--run", "quickbooks", "--json",
+  ], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: process.env.HOME, NO_COLOR: "1" } });
+  assert.equal(result.status, 1);
+  assert.equal(result.stderr, "");
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.status, "error");
+  assert.equal(payload.error_code, "quickbooks_not_enabled");
+  assert.match(payload.recovery, /Enable it before connecting/);
+  assert.equal(payload.financial_authority, false);
+});
+
+test("QuickBooks uses two hidden prompts, existing OAuth custody, privacy-safe JSON, and exact verification commands", async () => {
+  const clientId = Buffer.from("fixture-intuit-client-id");
+  const clientSecret = Buffer.from("fixture-intuit-client-secret");
+  const entered = [clientId, clientSecret];
+  const prompts = [];
+  let authorizeOptions;
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...parts) => logs.push(parts.join(" "));
+  try {
+    const receipt = await cmdTechnician(manifestPath, { run: "quickbooks", json: true }, {
+      readHidden: async (request) => {
+        prompts.push(request);
+        return entered.shift();
+      },
+      spawn: () => { throw new Error("QuickBooks credentials must never reach a child process"); },
+      providerOptions: {
+        environment: {
+          QUICKBOOKS_CLIENT_ID: "ambient-client-must-not-win",
+          QUICKBOOKS_CLIENT_SECRET: "ambient-secret-must-not-win",
+        },
+        oauth: {
+          PROVIDER_DEFAULT_PORT: 47812,
+          providerOAuthConfig: () => ({ provider: "quickbooks", label: "QuickBooks Online", clientSecretRequired: true }),
+          providerRedirectUri: (port) => `http://127.0.0.1:${port}`,
+          loadProviderCredentials: () => null,
+          authorizeProvider: async (_provider, options) => {
+            authorizeOptions = options;
+            return { provider_metadata: { realm_id: "private-company-id" } };
+          },
+          providerCredentialDescription: () => "the existing fixture provider store",
+        },
+      },
+    });
+    assert.equal(receipt.status, "connected");
+    assert.equal(receipt.environment, "sandbox");
+    assert.equal(receipt.custody, "client_local_provider_store");
+    assert.equal(receipt.financial_authority, false);
+    assert.equal(authorizeOptions.clientId, "fixture-intuit-client-id");
+    assert.equal(authorizeOptions.clientSecret, "fixture-intuit-client-secret");
+    assert.equal(prompts.length, 2);
+    assert.ok(prompts.every((prompt) => /hidden/i.test(prompt.prompt)));
+    assert.deepEqual(receipt.verification_commands, [
+      `brain ingest ${JSON.stringify(resolve(manifestPath))} --from quickbooks --dry-run`,
+      `brain ingest ${JSON.stringify(resolve(manifestPath))} --from quickbooks`,
+    ]);
+  } finally {
+    console.log = originalLog;
+  }
+  const rendered = logs.join("\n");
+  assert.doesNotMatch(rendered, /fixture-intuit|ambient-|private-company-id/);
+  assert.doesNotMatch(JSON.stringify(logs), /client_secret|realm_id/);
+  assert.ok(clientId.every((byte) => byte === 0));
+  assert.ok(clientSecret.every((byte) => byte === 0));
+});
+
+test("QuickBooks owner cancellation and missing company identity never produce a success receipt", async () => {
+  const canceledValues = [Buffer.from("cancel-client"), Buffer.from("cancel-secret")];
+  await assert.rejects(
+    runTechnicianStep({
+      step: "quickbooks",
+      manifestPath,
+      scriptPath: fixtureScriptPath,
+      readHidden: async () => canceledValues.shift(),
+      connectProvider: async () => {
+        const error = new Error("provider refusal fixture");
+        error.code = "access_denied";
+        throw error;
+      },
+    }),
+    (error) => error.code === "owner_canceled" && /Nothing was marked connected/.test(error.message),
+  );
+
+  const missingRealmValues = [Buffer.from("realm-client"), Buffer.from("realm-secret")];
+  await assert.rejects(
+    runTechnicianStep({
+      step: "quickbooks",
+      manifestPath,
+      scriptPath: fixtureScriptPath,
+      readHidden: async () => missingRealmValues.shift(),
+      connectProvider: ({ provider, manifestPath: path, flags, credentials }) => cmdConnectProvider(provider, path, flags, {
+        credentials,
+        quiet: true,
+        environment: {},
+        oauth: {
+          PROVIDER_DEFAULT_PORT: 47812,
+          providerOAuthConfig: () => ({ provider: "quickbooks", label: "QuickBooks Online", clientSecretRequired: true }),
+          providerRedirectUri: () => "http://127.0.0.1:47812",
+          loadProviderCredentials: () => null,
+          authorizeProvider: async () => ({ provider_metadata: {} }),
+          providerCredentialDescription: () => "fixture store",
+        },
+      }),
+    }),
+    (error) => error.code === "quickbooks_realm_missing",
+  );
+});
+
+test("QuickBooks response loss records uncertainty and a clean rerun can succeed without a blind token retry", async () => {
+  let attempts = 0;
+  const connectProvider = async () => {
+    attempts++;
+    if (attempts === 1) {
+      const error = new Error("lost fixture response");
+      error.uncertain = true;
+      throw error;
+    }
+  };
+  const run = (prefix) => {
+    const values = [Buffer.from(`${prefix}-client`), Buffer.from(`${prefix}-secret`)];
+    return runTechnicianStep({
+      step: "quickbooks",
+      manifestPath,
+      scriptPath: fixtureScriptPath,
+      readHidden: async () => values.shift(),
+      connectProvider,
+    });
+  };
+  await assert.rejects(
+    run("first"),
+    (error) => error.code === "oauth_response_uncertain" && /Rerun this same technician step/.test(error.message),
+  );
+  const receipt = await run("second");
+  assert.equal(receipt.completed, true);
+  assert.equal(attempts, 2);
 });
 
 test("Zoom collects the exact S2S values, strips ambient secrets, and zeroes every input", async () => {

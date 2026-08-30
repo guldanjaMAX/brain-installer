@@ -2,9 +2,11 @@
  * A small coordinator for the install-day account ceremonies.
  *
  * It deliberately does not become another credential store. Dashboard values
- * are read with the installer's existing hidden-input primitive, passed to one
- * short-lived child command through an allowlisted environment, then the input
- * buffers are zeroed. Nothing secret is placed in argv, a receipt, or JSON.
+ * are read with the installer's existing hidden-input primitive. Most are
+ * passed to one short-lived child command through an allowlisted environment.
+ * Provider OAuth values stay in-process and go directly to the existing local
+ * credential store. Input buffers are then zeroed. Nothing secret is placed in
+ * argv, a receipt, or JSON.
  *
  * The default command is read-only and machine-readable. This lets a human
  * technician, Codex, or another local assistant guide the same reviewed steps
@@ -43,6 +45,13 @@ export const TECHNICIAN_STEPS = Object.freeze([
     dashboard_url: "https://console.cloud.google.com/apis/credentials",
     human_boundary: "The owner chooses or creates the Google project and approves the OAuth consent screen in their browser.",
     automated_proof: "The connector stores the refresh grant locally and dry-runs each requested Google source.",
+  }),
+  Object.freeze({
+    id: "quickbooks",
+    title: "Connect the client's QuickBooks Online company",
+    dashboard_url: "https://developer.intuit.com/app/developer/dashboard",
+    human_boundary: "The client creates and owns the Intuit app, enters its values only at hidden prompts, and authorizes their company in the browser. Financial Brain has no shared Intuit account or credential custody.",
+    automated_proof: "The existing loopback OAuth flow stores the connection in the client's local provider credential store and prints the exact dry-run and first-ingest commands.",
   }),
   Object.freeze({
     id: "zoom",
@@ -103,7 +112,13 @@ function readManifestSummary(manifestPath, deps = {}) {
   const read = deps.readFileSync || readFileSync;
   const absolute = resolve(manifestPath);
   if (!exists(absolute)) {
-    return { path: absolute, exists: false, final_hostname: null, enabled_connectors: [] };
+    return {
+      path: absolute,
+      exists: false,
+      final_hostname: null,
+      enabled_connectors: [],
+      connector_environments: { quickbooks: null },
+    };
   }
   let manifest;
   try {
@@ -111,8 +126,11 @@ function readManifestSummary(manifestPath, deps = {}) {
   } catch (error) {
     throw new Error(`could not read the technician manifest: ${error.message}`);
   }
-  const enabled = ["google_drive", "gmail", "calendar", "zoom", "imap", "bank_feed"]
+  const enabled = ["google_drive", "gmail", "calendar", "quickbooks", "zoom", "imap", "bank_feed"]
     .filter((name) => manifest?.corpora?.[name]?.enabled === true);
+  const quickbooksEnvironment = typeof manifest?.corpora?.quickbooks?.environment === "string"
+    ? manifest.corpora.quickbooks.environment.trim().toLowerCase()
+    : null;
   return {
     path: absolute,
     exists: true,
@@ -120,6 +138,7 @@ function readManifestSummary(manifestPath, deps = {}) {
       ? manifest.brain.domain.trim().toLowerCase()
       : null,
     enabled_connectors: enabled,
+    connector_environments: { quickbooks: quickbooksEnvironment },
   };
 }
 
@@ -129,7 +148,7 @@ export function technicianPlan(manifestPath, deps = {}) {
   }
   const manifest = readManifestSummary(manifestPath, deps);
   return {
-    schema_version: 2,
+    schema_version: 3,
     mode: "read_only_plan",
     proof_level: "workflow_only",
     manifest,
@@ -144,7 +163,7 @@ export function technicianPlan(manifestPath, deps = {}) {
       let state = "not_checked";
       if (step.id === "tools") state = "ready_to_start";
       if (step.id === "cloudflare" && !manifest.exists) state = "ready_after_local_tools";
-      if (["plaid", "google", "zoom", "imap", "passkey", "verify"].includes(step.id) && !manifest.exists) {
+      if (["plaid", "google", "quickbooks", "zoom", "imap", "passkey", "verify"].includes(step.id) && !manifest.exists) {
         state = "waiting_for_install_record";
       }
       if (step.id === "plaid" && manifest.exists && !manifest.enabled_connectors.includes("bank_feed")) {
@@ -157,6 +176,15 @@ export function technicianPlan(manifestPath, deps = {}) {
           !["google_drive", "gmail", "calendar"].every((name) => manifest.enabled_connectors.includes(name))) {
         state = "requires_manifest_enablement";
       }
+      if (step.id === "quickbooks" && manifest.exists &&
+          !manifest.enabled_connectors.includes("quickbooks")) {
+        state = "requires_manifest_enablement";
+      }
+      if (step.id === "quickbooks" && manifest.exists &&
+          manifest.enabled_connectors.includes("quickbooks") &&
+          !["sandbox", "production"].includes(manifest.connector_environments.quickbooks)) {
+        state = "requires_environment_selection";
+      }
       if (step.id === "imap" && manifest.exists && !manifest.enabled_connectors.includes("imap")) {
         state = "requires_manifest_enablement";
       }
@@ -168,6 +196,9 @@ export function technicianPlan(manifestPath, deps = {}) {
         ...step,
         command: technicianDisplayCommand(step.id, manifest.path),
         state,
+        ...(step.id === "quickbooks"
+          ? { environment: manifest.connector_environments.quickbooks }
+          : {}),
       };
     }),
   };
@@ -214,6 +245,7 @@ function childCommands(step, manifestPath, flags, scriptPath) {
     case "cloudflare": return [command("setup", path)];
     case "plaid": return [command("secrets", path)];
     case "google": return [command("connect", "google", "--scopes", String(flags.scopes || "drive,gmail,calendar"))];
+    case "quickbooks": throw new Error("the QuickBooks technician step must use the in-process provider connection");
     case "zoom": return [command("connect", "zoom", path)];
     case "imap": {
       const host = String(flags.host || "").trim();
@@ -249,6 +281,13 @@ function bufferText(buffer) {
   return buffer.toString("utf8");
 }
 
+function codedError(message, code, options = {}) {
+  const error = new Error(message);
+  error.code = code;
+  if (options.uncertain === true) error.uncertain = true;
+  return error;
+}
+
 function runOne(spawn, nodePath, args, env) {
   const result = spawn(nodePath, args, { stdio: "inherit", env });
   if (result?.error) throw new Error(`the technician child could not start: ${result.error.message}`);
@@ -267,6 +306,7 @@ export async function runTechnicianStep({
   spawn = spawnSync,
   nodePath = process.execPath,
   manifestDeps = {},
+  connectProvider = null,
 } = {}) {
   if (!TECHNICIAN_RUN_STEPS.includes(step)) {
     throw new Error(`--run accepts one of: ${TECHNICIAN_RUN_STEPS.join(", ")}`);
@@ -274,7 +314,10 @@ export async function runTechnicianStep({
   if (!manifestPath || !scriptPath) throw new Error("the technician step needs a manifest and installer path");
   const summary = readManifestSummary(manifestPath, manifestDeps);
   if (!["tools", "cloudflare"].includes(step) && !summary.exists) {
-    throw new Error("the install record is not ready yet. The Cloudflare step creates it, and then this step can continue.");
+    throw codedError(
+      "the install record is not ready yet. The Cloudflare step creates it, and then this step can continue.",
+      "manifest_not_found",
+    );
   }
   if (step === "google") {
     const mapping = { drive: "google_drive", gmail: "gmail", calendar: "calendar" };
@@ -286,6 +329,23 @@ export async function runTechnicianStep({
   }
   if (step === "plaid" && !summary.enabled_connectors.includes("bank_feed")) {
     throw new Error("the install plan needs corpora.bank_feed.enabled before Plaid credential entry");
+  }
+  if (step === "quickbooks") {
+    if (!summary.enabled_connectors.includes("quickbooks")) {
+      throw codedError(
+        "corpora.quickbooks.enabled is not true in this manifest. Enable it before connecting.",
+        "quickbooks_not_enabled",
+      );
+    }
+    if (!["sandbox", "production"].includes(summary.connector_environments.quickbooks)) {
+      throw codedError(
+        "corpora.quickbooks.environment must explicitly be sandbox or production before connecting.",
+        "quickbooks_environment_required",
+      );
+    }
+    if (typeof connectProvider !== "function") {
+      throw new Error("the QuickBooks step needs the reviewed in-process provider connector");
+    }
   }
   if (step === "passkey") {
     if (!summary.final_hostname) {
@@ -320,6 +380,56 @@ export async function runTechnicianStep({
       secretBuffers.push(clientId, clientSecret);
       explicitEnv.GOOGLE_CLIENT_ID = bufferText(clientId);
       if (clientSecret.length) explicitEnv.GOOGLE_CLIENT_SECRET = bufferText(clientSecret);
+    }
+    if (step === "quickbooks") {
+      if (typeof readHidden !== "function") throw new Error("the QuickBooks step needs a secure interactive terminal");
+      const clientId = await hiddenValue(readHidden, "  Intuit OAuth client ID (hidden): ", "Intuit OAuth client ID");
+      const clientSecret = await hiddenValue(readHidden, "  Intuit OAuth client secret (hidden): ", "Intuit OAuth client secret");
+      secretBuffers.push(clientId, clientSecret);
+      try {
+        await connectProvider({
+          provider: "quickbooks",
+          manifestPath,
+          flags: flags.port ? { port: flags.port } : {},
+          credentials: {
+            clientId: bufferText(clientId),
+            clientSecret: bufferText(clientSecret),
+          },
+        });
+      } catch (error) {
+        if (error?.uncertain === true) {
+          throw codedError(
+            "QuickBooks did not confirm the token response. No success was recorded. Rerun this same technician step instead of retrying the token exchange.",
+            "oauth_response_uncertain",
+            { uncertain: true },
+          );
+        }
+        if (error?.code === "access_denied") {
+          throw codedError(
+            "The owner canceled QuickBooks consent. Nothing was marked connected. Rerun this same technician step when they are ready.",
+            "owner_canceled",
+          );
+        }
+        const safeMessage = String(error?.message || "QuickBooks connection failed")
+          .replaceAll(bufferText(clientId), "[redacted]")
+          .replaceAll(bufferText(clientSecret), "[redacted]");
+        const safeError = codedError(safeMessage, error?.code || "quickbooks_connection_failed");
+        safeError.name = error?.name || safeError.name;
+        throw safeError;
+      }
+      const quotedManifest = JSON.stringify(resolve(manifestPath));
+      return {
+        step,
+        completed: true,
+        commands_run: 1,
+        environment: summary.connector_environments.quickbooks,
+        custody: "client_local_provider_store",
+        financial_authority: false,
+        verification_commands: [
+          `brain ingest ${quotedManifest} --from quickbooks --dry-run`,
+          `brain ingest ${quotedManifest} --from quickbooks`,
+        ],
+      };
     }
     if (step === "zoom") {
       if (typeof readHidden !== "function") throw new Error("the Zoom step needs a secure interactive terminal");

@@ -231,6 +231,12 @@ const warn = (s) => console.log(`${c.yellow("warn")}  ${s}`);
  * vanish from the history.
  */
 class Fatal extends Error {}
+class JsonFatal extends Fatal {
+  constructor(payload) {
+    super(JSON.stringify(payload, null, 2));
+    this.payload = payload;
+  }
+}
 
 const die = (s) => {
   throw new Fatal(s);
@@ -9400,8 +9406,14 @@ export async function cmdConnectProvider(provider, manifestPath, flags = {}, opt
   const prior = oauth.loadProviderCredentials(provider, storage);
   const prefix = provider.toUpperCase().replace(/-/g, "_");
   const environment = options.environment || process.env;
-  const clientId = environment[`${prefix}_CLIENT_ID`] || prior?.client_id || null;
-  const clientSecret = environment[`${prefix}_CLIENT_SECRET`] || prior?.client_secret || null;
+  const suppliedCredentials = options.credentials || {};
+  const clientId = suppliedCredentials.clientId || environment[`${prefix}_CLIENT_ID`] || prior?.client_id || null;
+  const clientSecret = suppliedCredentials.clientSecret || environment[`${prefix}_CLIENT_SECRET`] || prior?.client_secret || null;
+  if (provider === "quickbooks" && !["sandbox", "production"].includes(configuration.environment)) {
+    const error = new Fatal("corpora.quickbooks.environment must explicitly be sandbox or production before connecting.");
+    error.code = "quickbooks_environment_required";
+    throw error;
+  }
   if (!clientId || (config.clientSecretRequired && !clientSecret)) {
     const required = [`${prefix}_CLIENT_ID`, ...(config.clientSecretRequired ? [`${prefix}_CLIENT_SECRET`] : [])];
     die(
@@ -9411,12 +9423,15 @@ export async function cmdConnectProvider(provider, manifestPath, flags = {}, opt
         "the value through the approved local launcher. Do not put it in the manifest or command line."
     );
   }
-  if (prior && !environment[`${prefix}_CLIENT_ID`]) {
+  if (!options.quiet && prior && !suppliedCredentials.clientId && !environment[`${prefix}_CLIENT_ID`]) {
     info(`reusing the ${config.label} OAuth client already stored on this machine`);
   }
   const port = flags.port ? Number(flags.port) : oauth.PROVIDER_DEFAULT_PORT;
   if (!Number.isInteger(port) || port < 1024 || port > 65535) die("--port must be an integer from 1024 through 65535");
-  info(`requesting the manifest-enabled ${config.label} connection in the owner's browser`);
+  if (!options.quiet && provider === "quickbooks") {
+    info(`QuickBooks environment: ${configuration.environment} (selected by corpora.quickbooks.environment)`);
+  }
+  if (!options.quiet) info(`requesting the manifest-enabled ${config.label} connection in the owner's browser`);
   const connection = await oauth.authorizeProvider(provider, {
     clientId,
     clientSecret,
@@ -9425,14 +9440,18 @@ export async function cmdConnectProvider(provider, manifestPath, flags = {}, opt
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     ...(options.openImpl ? { openImpl: options.openImpl } : {}),
     ...(options.open === false ? { open: false } : {}),
-    ...(options.log ? { log: options.log } : {}),
+    ...(options.quiet ? { log: () => {} } : options.log ? { log: options.log } : {}),
   });
   if (provider === "quickbooks" && !connection?.provider_metadata?.realm_id) {
-    die("QuickBooks did not return a company identity, so the connection cannot be used safely.");
+    const error = new Fatal("QuickBooks did not return a company identity, so the connection cannot be used safely.");
+    error.code = "quickbooks_realm_missing";
+    throw error;
   }
-  ok(`connected. Credential stored in ${oauth.providerCredentialDescription(provider, storage)} (on this machine only)`);
-  info(`now run: brain ingest ${manifestPath} --from ${provider} --dry-run`);
-  info(`after review: brain schedule ${manifestPath} --provider ${provider} --install`);
+  if (!options.quiet) {
+    ok(`connected. Credential stored in ${oauth.providerCredentialDescription(provider, storage)} (on this machine only)`);
+    info(`now run: brain ingest ${manifestPath} --from ${provider} --dry-run`);
+    info(`after review: brain schedule ${manifestPath} --provider ${provider} --install`);
+  }
   return { provider, connected: true, storage: oauth.providerCredentialDescription(provider, storage) };
 }
 
@@ -13644,7 +13663,16 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
     else console.log(renderTechnicianPlan(plan));
     return plan;
   }
-  if (flags.json) die("--json is read-only and cannot be combined with --run");
+  if (flags.json && step !== "quickbooks") {
+    die("--json can be combined with --run only for the agent-safe QuickBooks ceremony");
+  }
+
+  if (step === "quickbooks" && !flags.json) {
+    const quickbooksPlan = plan.steps.find((item) => item.id === "quickbooks");
+    info(`QuickBooks environment: ${quickbooksPlan?.environment || "not selected"} (from corpora.quickbooks.environment)`);
+    info("The client owns the Intuit app and company authorization. Financial Brain has no shared Intuit account or credential custody.");
+    info("The browser is used only for the owner's Intuit consent. Both app values are entered at hidden terminal prompts.");
+  }
 
   const readHidden = options.readHidden || (({ prompt, noun, optional }) => readHiddenInput({
     prompt,
@@ -13667,11 +13695,56 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
       spawn: options.spawn || spawnSync,
       nodePath: options.nodePath || process.execPath,
       manifestDeps: options.manifestDeps || {},
+      connectProvider: options.connectProvider || ((request) => cmdConnectProvider(
+        request.provider,
+        request.manifestPath,
+        request.flags,
+        {
+          ...(options.providerOptions || {}),
+          credentials: request.credentials,
+          quiet: true,
+        },
+      )),
     });
+    if (step === "quickbooks") {
+      const output = {
+        schema_version: 1,
+        command: "technician.quickbooks",
+        status: "connected",
+        error_code: null,
+        environment: receipt.environment,
+        custody: receipt.custody,
+        financial_authority: receipt.financial_authority,
+        verification_commands: receipt.verification_commands,
+        recovery: null,
+      };
+      if (flags.json) console.log(JSON.stringify(output, null, 2));
+      else {
+        ok("QuickBooks Online connection stored in the client's existing local provider credential store");
+        info(`dry-run verification: ${receipt.verification_commands[0]}`);
+        info(`first ingest after review: ${receipt.verification_commands[1]}`);
+        info("Connection success means the QuickBooks reference loaded. It does not mean the books are correct.");
+      }
+      return output;
+    }
     ok(`${step} technician step completed`);
     info("rerun `brain technician <manifest>` to see the full plan; live proof still comes from the final field checklist");
     return receipt;
   } catch (error) {
+    if (flags.json && step === "quickbooks") {
+      const code = error?.code || "quickbooks_connection_failed";
+      throw new JsonFatal({
+        schema_version: 1,
+        command: "technician.quickbooks",
+        status: "error",
+        error_code: code,
+        environment: plan.steps.find((item) => item.id === "quickbooks")?.environment || null,
+        custody: "client_local_provider_store",
+        financial_authority: false,
+        verification_commands: [],
+        recovery: String(error?.message || error),
+      });
+    }
     die(String(error?.message || error));
   }
 }
@@ -14494,6 +14567,11 @@ if (IS_MAIN) {
     // clearer label. Anything else is a bug, and crash() says so.
     const reviewRequired = e instanceof DriveRemovalReviewRequired;
     if (e instanceof Fatal || reviewRequired) {
+      if (e instanceof JsonFatal) {
+        console.log(e.message);
+        process.exit(1);
+        return;
+      }
       // stdout, not stderr. This message is anticipated, already formatted, and
       // addressed to the user; the exit code is the machine-readable part.
       // PowerShell wraps anything on stderr in a NativeCommandError block, which

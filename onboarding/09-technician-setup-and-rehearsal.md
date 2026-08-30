@@ -126,7 +126,23 @@ token, and enters it into the hidden prompt. The existing setup command performs
 the account check, provisioning, migrations, deploy, key persistence, and
 health proof. It is safe to rerun after an interruption.
 
-### 3. Google
+### 3. Plaid bank feed
+
+Enable `corpora.bank_feed` with provider `plaid` and explicitly select Sandbox
+or Production. The client owns the Plaid account and Link configuration.
+Financial Brain has no shared Plaid account and no central bank-data custody.
+
+```bash
+brain technician "$HOME/Financial Brain/brain.manifest.json" --run plaid
+```
+
+The Plaid client ID, secret, and independent version-2 bank wrapping key are
+entered only at hidden prompts. The technician step writes the named Worker
+secrets without exposing their values. The account holder later completes
+Plaid Link in the browser. A configured connection is not reconciliation proof
+and never makes Plaid or QuickBooks financial authority.
+
+### 4. Google
 
 Leave Drive disabled until the owner has selected the folders it may read. To
 enable it, set `google_drive.enabled` to true and put the exact reviewed folder
@@ -142,7 +158,31 @@ client ID and optional client secret are entered at hidden prompts. Google
 consent stays in the owner's browser. The launcher passes the values only to the
 short-lived connector process and clears its input buffers afterward.
 
-### 4. Zoom
+### 5. QuickBooks Online
+
+Set `corpora.quickbooks.enabled` to `true` and explicitly select `sandbox` or
+`production` in `corpora.quickbooks.environment`. The client creates and owns
+the Intuit app and authorizes their own company. Financial Brain has no shared
+Intuit account and does not receive the app values or OAuth grant.
+
+```bash
+brain technician "$HOME/Financial Brain/brain.manifest.json" --run quickbooks
+```
+
+Both Intuit app values are entered at hidden prompts. The existing loopback
+OAuth flow opens the browser for owner consent and stores the connection in the
+existing local provider credential store. The command then prints the exact
+dry-run and first-ingest commands. A successful connection or ingest means the
+QuickBooks reference loaded. It does not prove the books are correct.
+
+For a Claude or Codex-guided visit, copy this prompt exactly and replace only
+the manifest path:
+
+```text
+Guide me through connecting my client-owned QuickBooks Online company to Financial Brain using /absolute/path/to/brain.manifest.json. First read the manifest and confirm corpora.quickbooks.enabled is true and corpora.quickbooks.environment explicitly says sandbox or production. Explain that I own the Intuit app and company authorization, Financial Brain has no shared Intuit account or credential custody, and QuickBooks will remain a reference rather than financial authority. Ask before running brain technician with --run quickbooks --json. Hand the terminal to me for both hidden prompts and never ask me to paste, print, log, or put either app value in a command. Let me complete Intuit consent in the browser. Then show the exact dry-run and first-ingest commands, stop before the real ingest until I approve it, and preserve any error_code and recovery text without exposing company identifiers or credentials.
+```
+
+### 6. Zoom
 
 Enable `zoom` in the manifest. A paid Zoom seat with cloud recording is
 required. Then run:
@@ -159,7 +199,7 @@ the second wakes it when the transcript is ready. The command probes the account
 writes the four Worker secrets, and proves the live validation challenge before
 it prints the webhook URL to save in Zoom.
 
-### 5. IMAP
+### 7. IMAP
 
 Enable `imap` in the manifest. Use the provider's IMAP host and an app password,
 not the normal mailbox password:
@@ -172,7 +212,7 @@ brain technician "$HOME/Financial Brain/brain.manifest.json" --run imap \
 The app password is requested by the connector's hidden prompt. It is stored
 only after a real mailbox read succeeds.
 
-### 6. Owner passkey
+### 8. Owner passkey
 
 Settle the final Brain hostname first. With the owner and intended device
 present, run:
@@ -187,7 +227,7 @@ single-use link that expires in 15 minutes. The owner opens it on their device
 and completes Face ID, fingerprint, or device PIN. This is the first point where
 a physical passkey becomes proven.
 
-### 7. Handoff checks
+### 9. Handoff checks
 
 ```bash
 brain technician "$HOME/Financial Brain/brain.manifest.json" --run verify

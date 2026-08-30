@@ -64,6 +64,21 @@ absolute test-kit and manifest paths.
 - Preview every deletion or forget plan and wait for exact approval before the
   command that mutates data.
 
+## QuickBooks boundary
+
+- The client creates and owns the Intuit app and authorizes their own company.
+  Financial Brain has no shared Intuit account and does not take credential
+  custody.
+- Confirm `corpora.quickbooks.enabled` and the explicit `sandbox` or
+  `production` environment in the manifest before running
+  `brain technician <manifest> --run quickbooks`.
+- Hand the terminal to the owner for both hidden app-value prompts, then let the
+  owner complete Intuit consent in the browser. Never ask for either value in
+  chat.
+- Treat a successful connection or ingest only as a loaded accounting-team
+  reference. QuickBooks is not financial authority and must be compared with
+  bank evidence and other provenance-bearing records.
+
 ## Recovery and completion
 
 - A failed technician step is ready to retry after its named prerequisite is
