@@ -72,6 +72,33 @@ test("private questions use JSON POST bodies and never enter URLs", async () => 
   assert.equal(JSON.parse(calls[1].body).q, "private legal question");
 });
 
+test("requested reranking carries an explicit actuation receipt", async () => {
+  const replies = [
+    { results: [{ ref_key: "a" }, { ref_key: "b" }], reranked: true, rerank_status: "applied", rerank_candidate_count: 30 },
+    { results: [{ ref_key: "a" }, { ref_key: "b" }], reranked: false, rerank_status: "fallback", rerank_candidate_count: 30 },
+    // A legacy Worker that only says false is not proof that the requested
+    // variant ran. The evaluator must call that unobserved, not disabled.
+    { results: [{ ref_key: "a" }, { ref_key: "b" }], reranked: false },
+    // The old route also said true before calling a reranker that could silently
+    // fall back. Without the explicit status, true is not an actuation receipt.
+    { results: [{ ref_key: "a" }, { ref_key: "b" }], reranked: true },
+  ];
+  const client = new BrainClient({
+    base: "https://brain.example",
+    adminKey: "fixture-key",
+    fetchImpl: async () => response(replies.shift()),
+  });
+
+  const applied = await client.retrieveWithStatus("invented question", { rerank: true });
+  const fallback = await client.retrieveWithStatus("invented question", { rerank: true });
+  const unobserved = await client.retrieveWithStatus("invented question", { rerank: true });
+  const legacyTrue = await client.retrieveWithStatus("invented question", { rerank: true });
+  assert.deepEqual(applied.rerank, { requested: true, status: "applied", candidate_count: 30 });
+  assert.deepEqual(fallback.rerank, { requested: true, status: "fallback", candidate_count: 30 });
+  assert.deepEqual(unobserved.rerank, { requested: true, status: "unobserved", candidate_count: null });
+  assert.deepEqual(legacyTrue.rerank, { requested: true, status: "unobserved", candidate_count: null });
+});
+
 test("private source-family identities and cursors use an authenticated JSON body", async () => {
   const calls = [];
   const client = new BrainClient({

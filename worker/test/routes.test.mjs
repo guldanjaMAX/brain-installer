@@ -145,6 +145,72 @@ const call = (env, path) => {
   check("a hit exposes stable document identity, not its chunk id", b.results[0].ref_key === "123" && b.results[0].chunk_uid === "meeting:123#0", JSON.stringify(b.results[0]));
 }
 
+/* A requested rerank is a measured variant, not a hopeful boolean. */
+{
+  const rows = Array.from({ length: 4 }, (_, index) => ({
+    ...ROW,
+    chunk_uid: `rerank-${index + 1}#0`,
+    doc_uid: `rerank-${index + 1}`,
+    source_id: `rerank-${index + 1}`,
+    title: `Invented evidence ${index + 1}`,
+    text: `Complementary invented evidence ${index + 1}`,
+  }));
+  const vectorIds = rows.map((row) => row.chunk_uid);
+  const fixtureAI = (rerankResponse) => ({
+    run: async (model) => model.includes("bge-")
+      ? { data: [[0.1, 0.2, 0.3]] }
+      : { response: rerankResponse, usage: {} },
+  });
+  const common = {
+    vectorIds,
+    extra: {
+      ANTHROPIC_API_KEY: "fixture-provider-key",
+      RERANK_MODEL: "@cf/fixture-reranker",
+    },
+  };
+  const appliedFixture = mkEnv(rows, {
+    ...common,
+    extra: { ...common.extra, AI: fixtureAI('[{"idx":2,"score":10},{"idx":0,"score":9}]') },
+  });
+  const applied = await (await call(
+    appliedFixture.env,
+    "/api/rag/unified?q=invented&limit=4&rerank=1",
+  )).json();
+  check("rerank receipt says applied only after a valid reorder",
+    applied.reranked === true && applied.rerank_status === "applied" &&
+      applied.rerank_candidate_count === 4,
+    JSON.stringify(applied));
+  check("a partial rerank keeps every candidate exactly once",
+    applied.results.map((row) => row.ref_key).join(",") ===
+      "rerank-3,rerank-1,rerank-2,rerank-4",
+    JSON.stringify(applied.results));
+
+  const fallbackFixture = mkEnv(rows, {
+    ...common,
+    extra: { ...common.extra, AI: fixtureAI("not-json") },
+  });
+  const fallback = await (await call(
+    fallbackFixture.env,
+    "/api/rag/unified?q=invented&limit=4&rerank=1",
+  )).json();
+  check("rerank failure reports fallback and preserves deterministic order",
+    fallback.reranked === false && fallback.rerank_status === "fallback" &&
+      fallback.rerank_candidate_count === 4 &&
+      fallback.results.map((row) => row.ref_key).join(",") ===
+        rows.map((row) => row.source_id).join(","),
+    JSON.stringify(fallback));
+
+  const disabledFixture = mkEnv(rows, { vectorIds });
+  const disabled = await (await call(
+    disabledFixture.env,
+    "/api/rag/unified?q=invented&limit=4&rerank=1",
+  )).json();
+  check("a requested rerank without its explicit provider reports disabled",
+    disabled.reranked === false && disabled.rerank_status === "disabled" &&
+      disabled.rerank_candidate_count === 0,
+    JSON.stringify(disabled));
+}
+
 /* The public source-weight contract is live on D1, including an explicit zero. */
 {
   const drive = { ...ROW, chunk_uid: "drive-weight#0", doc_uid: "drive-weight", source_id: "drive-weight", source: "drive", title: "Acme drive" };

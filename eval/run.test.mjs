@@ -582,6 +582,155 @@ test("onboarding refuses to skip its five safety questions", async () => {
   assert.match(result.stderr, /--no-think cannot be used with the onboarding profile/);
 });
 
+test("a requested rerank variant cannot pass when the Worker did not apply it", async () => {
+  const result = await runFixture({
+    questions: [{
+      id: "rerank-actuation",
+      kind: "single",
+      question: "Which invented fixture is relevant?",
+      expect: [{ any_of: ["curated:doc-a"] }],
+    }],
+    args: ["--rerank"],
+    artifacts: true,
+    route: ({ url }) => url.pathname === "/api/rag/unified"
+      ? {
+          body: {
+            results: [
+              { source: "curated", ref_key: "doc-a" },
+              { source: "curated", ref_key: "noise" },
+            ],
+            reranked: false,
+            rerank_status: "disabled",
+            rerank_candidate_count: 0,
+          },
+        }
+      : null,
+  });
+
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+  assert.equal(result.runArtifact.configuration.rerank, true);
+  assert.deepEqual(result.runArtifact.cases[0].rerank, {
+    status: "disabled",
+    candidate_count: 0,
+  });
+  assert.ok(result.runArtifact.hard_gates.failures.some((entry) =>
+    entry.reason === "RERANK_DISABLED"));
+});
+
+test("a requested rerank variant cannot pass when actuation is unobserved for one result", async () => {
+  const result = await runFixture({
+    questions: [{
+      id: "rerank-unobserved-single",
+      kind: "single",
+      question: "Which invented single fixture is relevant?",
+      expect: [{ any_of: ["curated:doc-a"] }],
+    }],
+    args: ["--rerank"],
+    artifacts: true,
+    route: ({ url }) => url.pathname === "/api/rag/unified"
+      ? { body: { results: [{ source: "curated", ref_key: "doc-a" }] } }
+      : null,
+  });
+
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+  assert.deepEqual(result.runArtifact.cases[0].rerank, {
+    status: "unobserved",
+    candidate_count: null,
+  });
+  assert.ok(result.runArtifact.hard_gates.failures.some((entry) =>
+    entry.reason === "RERANK_UNOBSERVED"));
+});
+
+test("an explicit one-candidate rerank no-op stays disabled and can pass", async () => {
+  const result = await runFixture({
+    questions: [{
+      id: "rerank-disabled-single",
+      kind: "single",
+      question: "Which invented single fixture is relevant?",
+      expect: [{ any_of: ["curated:doc-a"] }],
+    }],
+    args: ["--rerank"],
+    artifacts: true,
+    route: ({ url }) => url.pathname === "/api/rag/unified"
+      ? {
+          body: {
+            results: [{ source: "curated", ref_key: "doc-a" }],
+            reranked: false,
+            rerank_status: "disabled",
+            rerank_candidate_count: 0,
+          },
+        }
+      : null,
+  });
+
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.deepEqual(result.runArtifact.cases[0].rerank, {
+    status: "disabled",
+    candidate_count: 0,
+  });
+  assert.deepEqual(result.runArtifact.hard_gates.failures, []);
+});
+
+test("an applied rerank receipt requires multiple input and output candidates", async () => {
+  const question = {
+    id: "rerank-applied-consistency",
+    kind: "single",
+    question: "Which invented fixture is relevant?",
+    expect: [{ any_of: ["curated:doc-a"] }],
+  };
+  const evaluate = (results, candidateCount) => runFixture({
+    questions: [question],
+    args: ["--rerank"],
+    artifacts: true,
+    route: ({ url }) => url.pathname === "/api/rag/unified"
+      ? {
+          body: {
+            results,
+            reranked: true,
+            rerank_status: "applied",
+            rerank_candidate_count: candidateCount,
+          },
+        }
+      : null,
+  });
+
+  const insufficientInput = await evaluate([
+    { source: "curated", ref_key: "doc-a" },
+    { source: "curated", ref_key: "noise" },
+  ], 1);
+  assert.equal(insufficientInput.code, 1,
+    `${insufficientInput.stdout}\n${insufficientInput.stderr}`);
+  assert.ok(insufficientInput.runArtifact.hard_gates.failures.some((entry) =>
+    entry.reason === "RERANK_APPLIED_CANDIDATE_COUNT_INVALID"));
+
+  const missingInputReceipt = await evaluate([
+    { source: "curated", ref_key: "doc-a" },
+    { source: "curated", ref_key: "noise" },
+  ], undefined);
+  assert.equal(missingInputReceipt.code, 1,
+    `${missingInputReceipt.stdout}\n${missingInputReceipt.stderr}`);
+  assert.ok(missingInputReceipt.runArtifact.hard_gates.failures.some((entry) =>
+    entry.reason === "RERANK_APPLIED_CANDIDATE_COUNT_INVALID"));
+
+  const droppedToOne = await evaluate([
+    { source: "curated", ref_key: "doc-a" },
+  ], 2);
+  assert.equal(droppedToOne.code, 1, `${droppedToOne.stdout}\n${droppedToOne.stderr}`);
+  assert.ok(droppedToOne.runArtifact.hard_gates.failures.some((entry) =>
+    entry.reason === "RERANK_APPLIED_RESULT_COUNT_INVALID"));
+
+  const applied = await evaluate([
+    { source: "curated", ref_key: "doc-a" },
+    { source: "curated", ref_key: "noise" },
+  ], 2);
+  assert.equal(applied.code, 0, `${applied.stdout}\n${applied.stderr}`);
+  assert.deepEqual(applied.runArtifact.cases[0].rerank, {
+    status: "applied",
+    candidate_count: 2,
+  });
+  assert.deepEqual(applied.runArtifact.hard_gates.failures, []);
+});
+
 test("refusal reporting uses every safety question as its denominator", async () => {
   const result = await runFixture({
     questions: [

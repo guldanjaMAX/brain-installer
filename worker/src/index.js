@@ -240,8 +240,10 @@ async function rerank(env, q, results, limit) {
     .join("\n\n");
 
   const system = [
-    "You rank search results by how well they answer a question.",
+    "You rank search results by how well the result SET answers a question.",
+    "Prefer a complementary top set that covers distinct sub-questions, people, events, and time periods instead of repeating one fact.",
     "Return ONLY a JSON array like [{\"idx\":0,\"score\":9}], no prose.",
+    "Return each idx at most once. Unlisted candidates retain their original relative order after the scored candidates.",
     "Score 0 to 10. A result that merely mentions a word from the question, without answering it, scores low.",
     "A near-miss on a proper noun (a similar but different name) scores 0: it is a different subject, not a weak match.",
   ].join("\n");
@@ -257,13 +259,30 @@ async function rerank(env, q, results, limit) {
     });
     const text = data?.content?.[0]?.text || "";
     const parsed = JSON.parse(text.slice(text.indexOf("["), text.lastIndexOf("]") + 1));
-    const scored = parsed
-      .filter((p) => candidates[p.idx])
-      .sort((a, b) => b.score - a.score)
-      .map((p) => candidates[p.idx]);
-    return scored.length ? scored.slice(0, limit) : results;
+    const unique = new Map();
+    for (const item of Array.isArray(parsed) ? parsed : []) {
+      const idx = Number(item?.idx);
+      const score = Number(item?.score);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= candidates.length ||
+          !Number.isFinite(score) || score < 0 || score > 10) continue;
+      if (!unique.has(idx)) unique.set(idx, score);
+    }
+    if (!unique.size) {
+      return { results, status: "fallback", candidateCount: candidates.length };
+    }
+    const promoted = [...unique.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0] - b[0])
+      .map(([idx]) => candidates[idx]);
+    const promotedIndexes = new Set(unique.keys());
+    const retained = candidates.filter((_, idx) => !promotedIndexes.has(idx));
+    const tail = results.slice(candidates.length);
+    return {
+      results: [...promoted, ...retained, ...tail].slice(0, limit),
+      status: "applied",
+      candidateCount: candidates.length,
+    };
   } catch {
-    return results;
+    return { results, status: "fallback", candidateCount: candidates.length };
   }
 }
 
@@ -465,7 +484,8 @@ async function handleUnified(env, request, access = null, grantScope = { all: tr
   const limit = Math.min(parseInt(url.searchParams.get("limit")) || 10, 50);
   // Reranking is an explicit variant. Merely configuring a provider key must
   // not make /unified diverge from the deterministic order consumed by /think.
-  const doRerank = explicitlyEnabled(url.searchParams.get("rerank")) && !!env.ANTHROPIC_API_KEY;
+  const rerankRequested = explicitlyEnabled(url.searchParams.get("rerank"));
+  const canRerank = rerankRequested && !!env.ANTHROPIC_API_KEY;
 
   const {
     matches: retrieved, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
@@ -487,18 +507,36 @@ async function handleUnified(env, request, access = null, grantScope = { all: tr
 
   if (degraded === "fts") {
     const rows = retrieved.slice(0, limit);
-    return jsonResponse({ mode: "unified", entity_scope: entityScope, degraded, ...accessStatus, ...unavailable(rows), ...ignored, results: rows });
+    return jsonResponse({
+      mode: "unified", entity_scope: entityScope, degraded,
+      reranked: false,
+      ...(rerankRequested ? { rerank_status: "disabled", rerank_candidate_count: 0 } : {}),
+      ...accessStatus, ...unavailable(rows), ...ignored, results: rows,
+    });
   }
 
   let matches = retrieved;
+  let rerankStatus = rerankRequested ? (canRerank ? "fallback" : "disabled") : null;
+  let rerankCandidateCount = 0;
 
-  if (doRerank && Array.isArray(matches) && matches.length > 1) {
-    matches = await rerank(env, q, matches, limit);
+  if (canRerank && Array.isArray(matches) && matches.length > 1) {
+    const outcome = await rerank(env, q, matches, limit);
+    matches = outcome.results;
+    rerankStatus = outcome.status;
+    rerankCandidateCount = outcome.candidateCount;
+  } else if (canRerank) {
+    // A one-row result needs no reordering, but the requested variant did not
+    // exercise a reranker and must not be saved as proof that it did.
+    rerankStatus = "disabled";
   }
   if (Array.isArray(matches)) matches = matches.slice(0, limit);
 
   return jsonResponse({
-    mode: "unified", entity_scope: entityScope, reranked: doRerank,
+    mode: "unified", entity_scope: entityScope, reranked: rerankStatus === "applied",
+    ...(rerankRequested ? {
+      rerank_status: rerankStatus,
+      rerank_candidate_count: rerankCandidateCount,
+    } : {}),
     degraded: degraded || undefined, ...unavailable(Array.isArray(matches) ? matches : []),
     ...accessStatus, ...ignored, results: matches,
   });

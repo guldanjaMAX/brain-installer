@@ -293,7 +293,8 @@ async function runOne(client, q, opts) {
   const retrievalStarted = performance.now();
   let row;
   try {
-    const results = await client.retrieve(q.question, opts);
+    const observed = await client.retrieveWithStatus(q.question, opts);
+    const results = observed.results;
     const raw = scoreQuestion(q, results);
     const byDoc = scoreQuestion(q, dedupeByDocument(results));
     const quality = retrievalQuality(q, results, [1, opts.k, 10]);
@@ -306,6 +307,7 @@ async function runOne(client, q, opts) {
       retrieval_latency_ms: Math.round(performance.now() - retrievalStarted),
       returned: results.length,
       distinct: dedupeByDocument(results).length,
+      rerank: observed.rerank,
       top: results.slice(0, 3).map(documentKeyOf),
     };
   } catch (e) {
@@ -482,6 +484,14 @@ function sanitizedCase(entry, k) {
     returned: Number.isFinite(entry.returned) ? entry.returned : null,
     distinct: Number.isFinite(entry.distinct) ? entry.distinct : null,
     quality: entry.quality?.[k] || null,
+    rerank: entry.rerank?.requested === true
+      ? {
+          status: entry.rerank.status,
+          candidate_count: Number.isSafeInteger(entry.rerank.candidate_count)
+            ? entry.rerank.candidate_count
+            : null,
+        }
+      : null,
     refusal: entry.kind === "unanswerable" && entry.refusal
       ? { pass: entry.refusal.pass, inconclusive: entry.refusal.inconclusive, gaps: entry.refusal.gaps }
       : null,
@@ -1182,6 +1192,46 @@ export const ONBOARDING_QUALITY_MINIMUMS = Object.freeze({
   maximum_duplicate_waste: 0.1,
 });
 
+function rerankActuationFailure(entry) {
+  if (entry.rerank?.requested !== true) return null;
+
+  const status = entry.rerank.status || "unobserved";
+  const candidateCount = Number.isSafeInteger(entry.rerank.candidate_count) &&
+    entry.rerank.candidate_count >= 0
+    ? entry.rerank.candidate_count
+    : null;
+  const returned = Number.isSafeInteger(entry.returned) && entry.returned >= 0
+    ? entry.returned
+    : null;
+
+  // A legacy Worker omits this receipt. Even a one-row result must not turn
+  // that missing observation into proof that the requested variant ran.
+  if (status === "unobserved") return "RERANK_UNOBSERVED";
+
+  if (status === "applied") {
+    // Reordering fewer than two candidates is not reranking. Requiring both
+    // sides of the receipt also catches the old implementation that could feed
+    // many candidates to the model and return only one scored row.
+    if (candidateCount === null || candidateCount < 2) {
+      return "RERANK_APPLIED_CANDIDATE_COUNT_INVALID";
+    }
+    if (returned === null || returned < 2) {
+      return "RERANK_APPLIED_RESULT_COUNT_INVALID";
+    }
+    return null;
+  }
+
+  // Zero or one result has no ordering decision to make. An explicit disabled
+  // receipt is the truthful successful no-op; it must never be relabeled as an
+  // applied rerank merely to make the variant gate pass.
+  if (status === "disabled" && returned !== null && returned <= 1 &&
+      (candidateCount === null || candidateCount <= 1)) {
+    return null;
+  }
+
+  return `RERANK_${String(status).toUpperCase()}`;
+}
+
 function hardGateFailures(passes, k, profile = "smoke") {
   const failures = [];
   for (let passIndex = 0; passIndex < passes.length; passIndex++) {
@@ -1203,6 +1253,15 @@ function hardGateFailures(passes, k, profile = "smoke") {
       if (entry.error) {
         failures.push({ id: entry.id, scope: "case", pass, reason: "TRANSPORT_ERROR" });
         continue;
+      }
+      const rerankFailure = rerankActuationFailure(entry);
+      if (rerankFailure) {
+        failures.push({
+          id: entry.id,
+          scope: "case",
+          pass,
+          reason: rerankFailure,
+        });
       }
       const hasAnswerCheck = Object.hasOwn(entry, "answer");
       if (entry.answer_error) {

@@ -218,6 +218,19 @@ answer, and refusal latency are reported separately so first-value speed can be
 improved without hiding a slow safety path. Latency is measured here, not yet a
 hard gate. `--no-think` is not allowed with this profile.
 
+The default ranking remains deterministic. Multi-part questions may add one
+bounded clause-coverage list to reciprocal-rank fusion, but that list is built
+only from candidates that already passed the request's D1 access, entity, and
+filter predicates. It makes no additional database, Vectorize, or model call.
+
+`--rerank` is an explicit experimental variant. A requested rerank is valid
+only when the Worker returns `rerank_status: applied`; `disabled`, `fallback`,
+or an older response with no actuation status blocks the run whenever there was
+more than one candidate to reorder. The sanitized case artifact retains only
+that status and the aggregate candidate count. This prevents an unavailable or
+failed reranker from being recorded under a successful variant name. Reranking
+is never enabled merely because a provider credential exists.
+
 ### `brain eval <manifest> --profile release`
 
 This shipped v1 profile refuses to contact the brain unless the private suite

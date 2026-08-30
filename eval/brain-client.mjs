@@ -156,7 +156,7 @@ export class BrainClient {
    * the run output so a saved baseline can never be compared against a run made
    * with different settings without it being obvious.
    */
-  async retrieve(question, { limit = 10, rerank = false, graphBoost = false } = {}) {
+  async retrieveWithStatus(question, { limit = 10, rerank = false, graphBoost = false } = {}) {
     const body = {
       q: question,
       limit,
@@ -164,7 +164,25 @@ export class BrainClient {
       graph_boost: graphBoost ? 1 : 0,
     };
     const response = await this.#post("/api/rag/unified", body);
-    return Array.isArray(response?.results) ? response.results : [];
+    return {
+      results: Array.isArray(response?.results) ? response.results : [],
+      rerank: {
+        requested: rerank === true,
+        status: rerank === true
+          ? ["applied", "disabled", "fallback"].includes(response?.rerank_status)
+            ? response.rerank_status
+            : "unobserved"
+          : "not_requested",
+        candidate_count: Number.isSafeInteger(response?.rerank_candidate_count) &&
+          response.rerank_candidate_count >= 0
+          ? response.rerank_candidate_count
+          : null,
+      },
+    };
+  }
+
+  async retrieve(question, options = {}) {
+    return (await this.retrieveWithStatus(question, options)).results;
   }
 
   /** Cited answer plus gaps. Used for refusals and opt-in deterministic answer checks. */

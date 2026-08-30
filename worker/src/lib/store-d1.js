@@ -46,6 +46,15 @@ const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
 const LEXICAL_CHAMPION_TARGET_RANK = 5;
 const CURRENT_INTENT_RRF_WEIGHT = 1.25;
+// A multi-part question may need one document per clause. Give one exact,
+// complementary candidate for each strong clause a bounded lane of its own,
+// but keep it weaker than the reliable-date current-intent lane above.
+const LEXICAL_CLAUSE_RRF_WEIGHT = 1;
+const LEXICAL_CLAUSE_MIN_TERMS = 2;
+const LEXICAL_CLAUSE_MIN_COVERAGE = 0.6;
+const LEXICAL_CLAUSE_MAX_CLAUSES = 4;
+const LEXICAL_CLAUSE_MAX_TERMS = 8;
+const LEXICAL_CLAUSE_QUESTION_CUE = /\b(?:what|who|when|where|why|how|which)\b/i;
 // The answer route reads at most 900 characters from a retrieved snippet. Keep
 // both modalities inside that window when their best chunks differ, rather than
 // letting either a keyword-heavy header or a semantically similar preamble erase
@@ -394,6 +403,70 @@ const FTS_STOPWORDS = new Set([
   "say", "says", "should", "some", "tell", "than", "very",
 ]);
 
+const lexicalTokens = (value) => String(value || "")
+  .normalize("NFKC")
+  .toLowerCase()
+  .match(/[\p{L}\p{N}]+/gu) || [];
+
+function meaningfulLexicalTerms(value) {
+  return [...new Set(lexicalTokens(value)
+    .filter((term) => term.length >= 2 && !FTS_STOPWORDS.has(term)))]
+    .slice(0, LEXICAL_CLAUSE_MAX_TERMS);
+}
+
+/**
+ * One exact complementary document per explicit question clause.
+ *
+ * This is deliberately not a generic `and` splitter. Ordinary prose contains
+ * `and` constantly, and treating it as a second information need would turn a
+ * lexical overlap heuristic into query decomposition. Only sentence/question
+ * punctuation and `and who|what|when|where|how|which` are strong enough.
+ *
+ * Candidates have already passed D1 access/filter authority before reaching
+ * this helper. It performs no reads and can never introduce a new document.
+ */
+export function lexicalClauseAgreementCandidates(query, candidates) {
+  const clauses = String(query || "")
+    // A period is a boundary only when it introduces another explicit
+    // question. This keeps abbreviations such as "Inc." and ordinary context
+    // sentences from being mistaken for separate information needs.
+    .split(/(?:[?;]+|[.!](?=\s+(?:what|who|when|where|why|how|which)\b)|\band\s+(?=(?:what|who|when|where|why|how|which)\b))/i)
+    .map((clause) => ({ clause, terms: meaningfulLexicalTerms(clause) }))
+    .filter(({ clause, terms }) =>
+      LEXICAL_CLAUSE_QUESTION_CUE.test(clause) && terms.length >= LEXICAL_CLAUSE_MIN_TERMS)
+    .slice(0, LEXICAL_CLAUSE_MAX_CLAUSES);
+
+  // A single clause is already represented by the ordinary keyword list. The
+  // extra lane exists only to keep a multi-part question from losing every
+  // complementary document to results that weakly match the whole question.
+  if (clauses.length < 2) return [];
+
+  const rows = collapseRankedDocuments(Array.isArray(candidates) ? candidates : []);
+  const usedDocuments = new Set();
+  const selected = [];
+
+  for (const { terms } of clauses) {
+    const ranked = rows.map((row, index) => {
+      const document = retrievalDocumentKey(row);
+      if (!document || usedDocuments.has(document)) return null;
+      const tokens = new Set(lexicalTokens(`${row?.title || ""} ${row?.text || row?.snippet || ""}`));
+      const matched = terms.reduce((count, term) => count + (tokens.has(term) ? 1 : 0), 0);
+      const coverage = matched / terms.length;
+      if (matched < LEXICAL_CLAUSE_MIN_TERMS || coverage < LEXICAL_CLAUSE_MIN_COVERAGE) return null;
+      return { row, document, matched, coverage, index };
+    }).filter(Boolean).sort((a, b) =>
+      b.coverage - a.coverage || b.matched - a.matched || a.index - b.index
+    );
+    if (!ranked.length) continue;
+    usedDocuments.add(ranked[0].document);
+    selected.push(ranked[0].row);
+  }
+
+  // Partial decomposition is more dangerous than no decomposition: a lane
+  // claiming to cover two clauses must actually contribute two distinct rows.
+  return selected.length === clauses.length ? selected : [];
+}
+
 export async function searchKeyword(env, query, { limit, filters = {}, access = null, scope = null } = {}) {
   // FTS5 treats bare punctuation as syntax. A user question with an apostrophe
   // or a hyphen is not a query language expression, so it is quoted as a
@@ -631,6 +704,26 @@ export async function search(env, {
     ...(vectorWeight > 0 ? vecDocuments : []),
     ...(lexicalWeight > 0 ? kwDocuments : []),
   ];
+  const lexicalClauseWeight = Math.min(LEXICAL_CLAUSE_RRF_WEIGHT, lexicalWeight);
+  const lexicalClauseDocuments = lexicalClauseWeight > 0
+    ? lexicalClauseAgreementCandidates(
+        query,
+        // Prefer the keyword representative when both modalities found the
+        // same document. Its selected excerpt is the one that proved the exact
+        // clause terms; the vector representative may be a different passage.
+        [
+          ...(lexicalWeight > 0 ? kwDocuments : []),
+          ...(vectorWeight > 0 ? vecDocuments : []),
+        ].filter((row) => sourceWeight(row) > 0),
+      )
+    : [];
+  if (lexicalClauseDocuments.length) {
+    rankLists.push({
+      items: lexicalClauseDocuments,
+      weight: lexicalClauseWeight,
+      itemWeight: sourceWeight,
+    });
+  }
   const currentDocuments = collapseRankedDocuments(
     currentEvidenceCandidates(query, currentInputs, { filters, owner: env.BRAIN_OWNER }),
   );

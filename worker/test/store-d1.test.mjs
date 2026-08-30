@@ -1,6 +1,6 @@
 import {
   D1_QUERY_BIND_LIMIT, RETRIEVAL_CANDIDATE_DEPTH, collapseRankedDocuments, forget,
-  fuseRRF, search, searchVector, upsertChunks, replaceDocumentChunks,
+  fuseRRF, lexicalClauseAgreementCandidates, search, searchVector, upsertChunks, replaceDocumentChunks,
   canStageDocumentRevision, stageDocumentRevision, metadataTokenFor, vectorFilterFor,
 } from "../src/lib/store-d1.js";
 import {
@@ -620,6 +620,139 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("zero keyword weight disables the lexical champion boost",
     !disabled.results.some((row) => row.chunk_uid === lexical.chunk_uid),
     JSON.stringify(disabled.results));
+}
+
+/* ---- explicit multi-part questions retain one exact document per clause ---- */
+{
+  const renewal = {
+    chunk_uid: "renewal#0", doc_uid: "renewal", source_id: "renewal", source: "message",
+    title: "Orion renewal", text: "The Orion renewal amount is eight thousand dollars.", score: -1,
+  };
+  const approval = {
+    chunk_uid: "approval#0", doc_uid: "approval", source_id: "approval", source: "message",
+    title: "Extension approval", text: "Manager Avery approved the contract extension.", score: -0.9,
+  };
+  const distractors = Array.from({ length: 10 }, (_, index) => ({
+    chunk_uid: `clause-noise-${index}#0`, doc_uid: `clause-noise-${index}`,
+    source_id: `clause-noise-${index}`, source: "drive",
+    title: `Renewal background ${index}`, text: `Generic renewal note ${index}.`,
+    score: -0.8 + (index / 100),
+  }));
+  const query = "What is the Orion renewal amount? And which manager approved the contract extension?";
+  const keywordRows = [renewal, approval, ...distractors];
+  const hydrated = new Map(distractors.map((row) => [row.chunk_uid, row]));
+  const env = {
+    DB: {
+      prepare: (sql) => ({
+        bind: (...values) => ({
+          all: async () => ({
+            results: /FROM chunks_fts/.test(sql)
+              ? keywordRows
+              : values.map((id) => hydrated.get(id)).filter(Boolean),
+          }),
+        }),
+      }),
+    },
+    VECTORIZE: {
+      query: async () => ({ matches: distractors.map((row) => ({ id: row.chunk_uid })) }),
+    },
+  };
+
+  const pure = fuseRRF([
+    { items: distractors, key: "vector" },
+    { items: keywordRows, key: "keyword" },
+  ], { keyOf: (row) => row.doc_uid });
+  const pureRenewalRank = pure.findIndex((row) => row.doc_uid === renewal.doc_uid) + 1;
+  const pureApprovalRank = pure.findIndex((row) => row.doc_uid === approval.doc_uid) + 1;
+  const complementary = lexicalClauseAgreementCandidates(query, [...distractors, ...keywordRows]);
+  const improved = await search(env, { query, embedding: [0.1], limit: 10 });
+  const improvedIds = improved.results.map((row) => row.doc_uid);
+
+  check("ordinary two-list RRF buries both exact clause documents below rank five",
+    pureRenewalRank > 5 && pureApprovalRank > 5,
+    JSON.stringify({ pureRenewalRank, pureApprovalRank }));
+  check("strong clauses select one distinct complementary document apiece",
+    complementary.map((row) => row.doc_uid).join(",") === "renewal,approval",
+    JSON.stringify(complementary.map((row) => row.doc_uid)));
+  check("the bounded clause lane brings both exact documents into the top five",
+    improvedIds.indexOf("renewal") >= 0 && improvedIds.indexOf("renewal") < 5 &&
+      improvedIds.indexOf("approval") >= 0 && improvedIds.indexOf("approval") < 5,
+    JSON.stringify(improvedIds));
+
+  check("a weak second clause does not activate partial clause coverage",
+    lexicalClauseAgreementCandidates(
+      "What is the Orion renewal amount? And who approved?",
+      [...distractors, ...keywordRows],
+    ).length === 0);
+  check("a one-term question receives no lexical clause boost",
+    lexicalClauseAgreementCandidates("Orion?", [...distractors, ...keywordRows]).length === 0);
+  check("generic and is not treated as a strong clause boundary",
+    lexicalClauseAgreementCandidates(
+      "Orion renewal amount and manager approval",
+      [...distractors, ...keywordRows],
+    ).length === 0);
+  check("a company abbreviation and contextual preamble do not create a second question",
+    lexicalClauseAgreementCandidates(
+      "For Acme Inc. what is the Orion renewal amount and manager approval status?",
+      [...distractors, ...keywordRows],
+    ).length === 0);
+  check("a declarative preamble before one real question does not activate clause coverage",
+    lexicalClauseAgreementCandidates(
+      "This request concerns the Orion account. What is the renewal amount?",
+      [...distractors, ...keywordRows],
+    ).length === 0);
+
+  const keywordDisabled = await search(env, {
+    query, embedding: [0.1], limit: 10, weights: { keyword: 0 },
+  });
+  check("zero keyword weight disables the lexical clause lane",
+    !keywordDisabled.results.some((row) => row.doc_uid === "renewal" || row.doc_uid === "approval"),
+    JSON.stringify(keywordDisabled.results.map((row) => row.doc_uid)));
+
+  const keywordOnlyNoise = {
+    chunk_uid: "keyword-only-noise#0", doc_uid: "keyword-only-noise",
+    source_id: "keyword-only-noise", source: "drive",
+    title: "General account background", text: "A general account note.", score: -1,
+  };
+  const vectorOnlyRows = [
+    { ...renewal, chunk_uid: "vector-only-renewal#0", doc_uid: "vector-only-renewal", source_id: "vector-only-renewal" },
+    { ...approval, chunk_uid: "vector-only-approval#0", doc_uid: "vector-only-approval", source_id: "vector-only-approval" },
+  ];
+  const vectorOnlyByChunk = new Map(vectorOnlyRows.map((row) => [row.chunk_uid, row]));
+  const vectorOnlyEnv = {
+    DB: {
+      prepare: (sql) => ({
+        bind: (...values) => ({
+          all: async () => ({
+            results: /FROM chunks_fts/.test(sql)
+              ? [keywordOnlyNoise]
+              : values.map((id) => vectorOnlyByChunk.get(id)).filter(Boolean),
+          }),
+        }),
+      }),
+    },
+    VECTORIZE: {
+      query: async () => ({ matches: vectorOnlyRows.map((row) => ({ id: row.chunk_uid })) }),
+    },
+  };
+  const vectorDisabled = await search(vectorOnlyEnv, {
+    query, embedding: [0.1], limit: 10, weights: { vector: 0 },
+  });
+  check("zero vector weight cannot reintroduce vector-only documents through the clause lane",
+    vectorDisabled.results.map((row) => row.doc_uid).join(",") === keywordOnlyNoise.doc_uid,
+    JSON.stringify(vectorDisabled.results.map((row) => row.doc_uid)));
+
+  const sourceDisabled = await search(env, {
+    query, embedding: [0.1], limit: 10, weights: { message: 0 },
+  });
+  check("zero source weight cannot reintroduce a document through the clause lane",
+    !sourceDisabled.results.some((row) => row.doc_uid === "renewal" || row.doc_uid === "approval"),
+    JSON.stringify(sourceDisabled.results.map((row) => row.doc_uid)));
+
+  const firstFive = await search(env, { query, embedding: [0.1], limit: 5 });
+  check("the clause-aware ranking prefix is stable across public result limits",
+    firstFive.results.map((row) => row.doc_uid).join(",") === improvedIds.slice(0, 5).join(","),
+    JSON.stringify({ five: firstFive.results.map((row) => row.doc_uid), ten: improvedIds.slice(0, 5) }));
 }
 
 /* ---- exact copied documents collapse without erasing time or source context ---- */

@@ -162,7 +162,12 @@ test("100 exact documents plus every public filter stay authoritative and skip u
   for (let index = 0; index < 100; index++) {
     const id = `drive:allowed-${String(index).padStart(3, "0")}`;
     authorized.push(id);
-    insertDocument(db, id, ENTITY, index === 99 ? "needle appears once in the permitted record" : "ordinary permitted text", index);
+    const text = index === 98
+      ? "The Orion renewal amount is eight thousand dollars."
+      : index === 99
+        ? "needle appears once. Manager Avery approved the contract extension."
+        : "ordinary permitted text";
+    insertDocument(db, id, ENTITY, text, index);
   }
   // These would crowd an unscoped semantic/keyword top-K, but the exact D1
   // grant predicate excludes them before ranking.
@@ -236,6 +241,20 @@ test("100 exact documents plus every public filter stay authoritative and skip u
   assert.equal(search.degraded, "scoped-vector");
   assert.equal(search.degraded_reason, "document-scope-keyword-only");
   assert.equal(vectorCalls.count, 0, "scoped retrieval must not query unscoped Vectorize");
+
+  const complementary = await worker.fetch(post("/api/rag/unified", {
+    ...request,
+    q: "What is the Orion renewal amount? And which manager approved the contract extension?",
+  }, scopedCookie), env, {});
+  const complementaryBody = await complementary.json();
+  assert.equal(complementary.status, 200, JSON.stringify(complementaryBody));
+  assert.deepEqual(
+    new Set(complementaryBody.results.map((row) => row.doc_uid)),
+    new Set([authorized[98], authorized[99]]),
+  );
+  assert.ok(complementaryBody.results.every((row) => !row.doc_uid.includes("forbidden")));
+  assert.equal(vectorCalls.count, 0,
+    "clause coverage may reorder only the exact D1-authorized rows and must stay Vectorize-free");
 
   const ask = await worker.fetch(post("/api/rag/think", request, scopedCookie), env, {});
   const answer = await ask.json();

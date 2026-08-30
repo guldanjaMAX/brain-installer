@@ -112,6 +112,11 @@ without weakening the ingestion and deletion rules underneath them.**
   safe refusals, low duplicate waste, and any declared answer checks. Missing
   answers count as inconclusive, and retrieval, answer, and refusal speed are
   shown separately so the first useful moment can be improved honestly.
+- Multi-part questions now get a bounded deterministic coverage pass over the
+  documents search already authorized. It can bring complementary evidence
+  into the first results without another database, vector, or AI call. Optional
+  rerank experiments also report whether reranking was applied, unavailable,
+  or fell back, so a no-op can no longer be saved as an improvement.
 - The vector drain now runs every minute by default. It still embeds only after
   the previous batch is confirmed, so extra ticks are no-ops rather than extra
   model work.
