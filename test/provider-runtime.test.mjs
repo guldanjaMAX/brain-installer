@@ -62,6 +62,31 @@ function harness(overrides = {}) {
 }
 
 {
+  const conflict = completeResult();
+  conflict.deletions = [{ source_type: "fixture-provider", source_id: "one" }];
+  let batchesSent = 0;
+  let error;
+  const h = harness({
+    sync: async () => conflict,
+    sendBatch: async () => { batchesSent++; throw new Error("identity conflict reached delivery"); },
+  });
+  try { await runProviderConnector(h.options); } catch (caught) { error = caught; }
+  check("a provider identity cannot be live and deleted in one cursor window",
+    error?.code === "provider_identity_conflict" && batchesSent === 0 && h.states.length === 0 &&
+      h.receipts.map((receipt) => receipt.status).join(",") === "indexing,error");
+}
+
+{
+  const duplicate = completeResult();
+  duplicate.documents = [document("one"), { ...document("one"), content: "Conflicting second body" }];
+  let error;
+  const h = harness({ sync: async () => duplicate });
+  try { await runProviderConnector(h.options); } catch (caught) { error = caught; }
+  check("duplicate live identities across provider pages fail before delivery",
+    error?.code === "invalid_provider_identity" && h.states.length === 0 && h.receipts.at(-1).status === "error");
+}
+
+{
   let batchesSent = 0;
   const h = harness({
     approvedSnapshotFingerprint: null,

@@ -9,6 +9,7 @@ import { NOTION_API_VERSION, syncNotion } from "../connectors/notion.mjs";
 import { syncMicrosoftGraph } from "../connectors/microsoft-graph.mjs";
 import { syncDropbox } from "../connectors/dropbox.mjs";
 import { syncHubSpot } from "../connectors/hubspot.mjs";
+import { extractProviderFile } from "../connectors/provider-file.mjs";
 
 let ran = 0;
 const check = (name, value, detail = "") => {
@@ -19,6 +20,26 @@ const check = (name, value, detail = "") => {
 const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(value), {
   status, headers: { "content-type": "application/json", ...headers },
 });
+
+{
+  const rows = ["date,customer,summary"];
+  for (let index = 0; index < 5_002; index++) {
+    rows.push(`2026-08-01,Customer ${index},Completed reviewed service milestone ${index}`);
+  }
+  const extracted = await extractProviderFile(Buffer.from(`${rows.join("\n")}\n`), "history.csv", {
+    provider: "fixture",
+  });
+  check("provider files preserve an extractor's incomplete coverage signal",
+    extracted.ok === false && extracted.code === "incomplete_extraction");
+}
+
+{
+  const extracted = await extractProviderFile(Buffer.from("A".repeat(5_000)), "encoded.txt", {
+    provider: "fixture",
+  });
+  check("provider files reject encoded or repetitive junk before it pollutes retrieval",
+    extracted.ok === false && extracted.code === "low_quality_text");
+}
 
 {
   let error;
@@ -172,7 +193,9 @@ const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(
       }], "@odata.deltaLink": driveDelta });
       if (target.startsWith("https://files.fixture.sharepoint.com/")) {
         downloadUsedBearer = Boolean(options.headers?.Authorization);
-        return new Response("Plan body", { headers: { "content-type": "text/plain" } });
+        return new Response("The reviewed Microsoft plan records the owner, timeline, scope, and next milestone.", {
+          headers: { "content-type": "text/plain" },
+        });
       }
       throw new Error(`unexpected Graph URL ${target}`);
     },
@@ -180,7 +203,7 @@ const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(
   check("Graph mail requests immutable message IDs and saves terminal delta links",
     immutableIdHeader && result.proposed_cursor.mail.inbox === mailDelta && result.proposed_cursor.drives.D1 === driveDelta);
   check("OneDrive and SharePoint file bodies use common extraction without forwarding the bearer to the preauthenticated URL",
-    result.documents.some((item) => item.source_id === "drive:item:D1:f1" && item.content === "Plan body") && !downloadUsedBearer);
+    result.documents.some((item) => item.source_id === "drive:item:D1:f1" && /reviewed Microsoft plan/.test(item.content)) && !downloadUsedBearer);
   check("a full Graph baseline is authoritative and cursor-safe",
     result.authoritative_snapshot === true && result.snapshot_source_ids.length === 2 && result.cursor_can_advance === true);
 }
@@ -214,14 +237,16 @@ const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(
       }
       if (target.includes("files/download")) {
         contentArg = JSON.parse(options.headers["Dropbox-API-Arg"]);
-        return new Response("Dropbox plan body", { headers: { "content-type": "text/plain" } });
+        return new Response("The reviewed Dropbox plan records the owner, timeline, scope, and next milestone.", {
+          headers: { "content-type": "text/plain" },
+        });
       }
       throw new Error(`unexpected Dropbox URL ${target}`);
     },
   });
   check("Dropbox baseline requests recursive inventory and exact deletions", baselineShape && result.deletions[0].source_id === "path:/gone.txt");
   check("Dropbox downloads and extracts file bodies through the content endpoint",
-    contentArg.path === "id:plan" && result.documents[0].content === "Dropbox plan body");
+    contentArg.path === "id:plan" && /reviewed Dropbox plan/.test(result.documents[0].content));
   check("Dropbox baseline retains the terminal cursor and reconciliation inventory",
     result.proposed_cursor === "cursor-1" && result.authoritative_snapshot === true && result.cursor_can_advance === true);
 }

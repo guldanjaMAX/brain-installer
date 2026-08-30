@@ -38,10 +38,33 @@ export function normalizeProviderResult(source, result) {
   if (!result?.outcome || !Array.isArray(result.documents) || !Array.isArray(result.deletions)) {
     throw new TypeError("provider adapter returned no common sync result");
   }
+  const documents = result.documents.map((document) => ({ ...document, source_type: sourceName }));
+  const deletions = result.deletions.map((deletion) => ({ ...deletion, source_type: sourceName }));
+  const documentIds = documents.map((document) => String(document?.source_id || ""));
+  const deletionIds = deletions.map((deletion) => String(deletion?.source_id || ""));
+  if (documentIds.some((id) => !id.trim()) || new Set(documentIds).size !== documentIds.length) {
+    throw new ProviderDeliveryError("the provider result has an empty or duplicate live source identity", {
+      code: "invalid_provider_identity",
+    });
+  }
+  if (deletionIds.some((id) => !id.trim())) {
+    throw new ProviderDeliveryError("the provider result has an empty tombstone source identity", {
+      code: "invalid_provider_tombstone",
+    });
+  }
+  const live = new Set(documentIds);
+  if (deletionIds.some((id) => live.has(id))) {
+    // Applying a live row and its tombstone in one accepted provider window is
+    // order-dependent data loss. The adapter must resolve the ambiguity or the
+    // whole window remains retryable with its cursor withheld.
+    throw new ProviderDeliveryError("the provider result marks the same source identity live and deleted", {
+      code: "provider_identity_conflict",
+    });
+  }
   return {
     ...result,
-    documents: result.documents.map((document) => ({ ...document, source_type: sourceName })),
-    deletions: result.deletions.map((deletion) => ({ ...deletion, source_type: sourceName })),
+    documents,
+    deletions,
   };
 }
 

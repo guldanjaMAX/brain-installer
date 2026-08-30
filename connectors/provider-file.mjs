@@ -2,6 +2,7 @@
 
 import "../ingest/formats.mjs";
 import { canExtract, extract } from "../ingest/extract.mjs";
+import { textQuality } from "../ingest/quality.mjs";
 import { providerBytes } from "./provider-sync.mjs";
 
 export const PROVIDER_FILE_MAX_BYTES = 8 * 1024 * 1024;
@@ -25,16 +26,35 @@ export async function extractProviderFile(bytes, name, { provider } = {}) {
       reason: String(got?.error || `${fileName} contains no readable text`).slice(0, 240),
     };
   }
-  const extractedBytes = Buffer.byteLength(got.text, "utf8");
+  const content = got.text.trim();
+  const extractedBytes = Buffer.byteLength(content, "utf8");
   if (extractedBytes > PROVIDER_EXTRACTED_TEXT_MAX_BYTES) {
     return {
       ok: false, permanent: true, code: "extracted_text_too_large",
       reason: `${fileName} expands beyond the ${PROVIDER_EXTRACTED_TEXT_MAX_BYTES} byte extracted-text limit`,
     };
   }
+  // Container extractors name truncation and unreadable members explicitly.
+  // Dropping this bit here let OneDrive and Dropbox advance their cursors after
+  // indexing only the first 5,000 spreadsheet rows. A provider file is either
+  // complete or a retryable, owner-visible coverage gap.
+  if (got.incomplete === true) {
+    return {
+      ok: false, permanent: true, code: "incomplete_extraction",
+      reason: String(got.note || `${fileName} could only be extracted partially`).slice(0, 240),
+    };
+  }
+  const quality = textQuality(content);
+  if (!quality.ok) {
+    return {
+      ok: false, permanent: true, code: "low_quality_text",
+      reason: String(quality.reason || `${fileName} did not contain useful text`).slice(0, 240),
+      metrics: quality.metrics,
+    };
+  }
   return {
     ok: true,
-    content: got.text.trim(),
+    content,
     provenance: {
       extraction_method: got.how || "native",
       text_source: got.provenance?.text_source || "native",
