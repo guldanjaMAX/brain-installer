@@ -116,8 +116,15 @@ function parseDelimited(text, delim) {
 // embed. The cap is stated in the output so the truncation is visible.
 const MAX_ROWS = 5000;
 
-export function renderTable(rows, { label = "" } = {}) {
-  if (!rows.length) return "";
+/**
+ * Render one bounded table and retain the omission count separately.
+ *
+ * `renderTable()` stays string-compatible for existing callers. Extractors use
+ * this richer result so a visible prose marker is never the only evidence that
+ * rows were left out.
+ */
+export function renderTableResult(rows, { label = "" } = {}) {
+  if (!rows.length) return { text: "", omittedRows: 0, note: null };
   const header = rows[0].map((h) => String(h).trim());
   const looksLikeHeader = header.some((h) => h && !/^-?[\d.,$%()]+$/.test(h));
   const body = looksLikeHeader ? rows.slice(1) : rows;
@@ -137,14 +144,30 @@ export function renderTable(rows, { label = "" } = {}) {
       .filter(Boolean);
     if (pairs.length) out.push(pairs.join(" | "));
   }
-  if (body.length > shown.length) {
-    out.push(`[${body.length - shown.length} further rows were not indexed; this file exceeds the ${MAX_ROWS} row limit]`);
-  }
-  return out.join("\n");
+  const omittedRows = body.length - shown.length;
+  const note = omittedRows
+    ? `${omittedRows} further rows were not indexed; this file exceeds the ${MAX_ROWS} row limit`
+    : null;
+  if (note) out.push(`[${note}]`);
+  return { text: out.join("\n"), omittedRows, note };
 }
 
-register(".csv", (buf, { name } = {}) => renderTable(parseDelimited(dec(buf), ","), { label: name ? `Table: ${name}` : "" }), "csv");
-register(".tsv", (buf, { name } = {}) => renderTable(parseDelimited(dec(buf), "\t"), { label: name ? `Table: ${name}` : "" }), "tsv");
+export function renderTable(rows, options = {}) {
+  return renderTableResult(rows, options).text;
+}
+
+function extractDelimited(buf, delim, name) {
+  const rendered = renderTableResult(parseDelimited(dec(buf), delim), {
+    label: name ? `Table: ${name}` : "",
+  });
+  return {
+    text: rendered.text,
+    ...(rendered.note ? { note: rendered.note, incomplete: true } : {}),
+  };
+}
+
+register(".csv", (buf, { name } = {}) => extractDelimited(buf, ",", name), "csv");
+register(".tsv", (buf, { name } = {}) => extractDelimited(buf, "\t", name), "tsv");
 
 /* ------------------------------------------------------------------- json */
 
@@ -183,7 +206,7 @@ register(".json", (buf) => {
   if (!pending.length) return lines.join("\n");
   const note = `additional JSON values were not indexed; this file exceeds the ${MAX_JSON_VALUES} value limit`;
   lines.push(`[${note}]`);
-  return { text: lines.join("\n"), note };
+  return { text: lines.join("\n"), note, incomplete: true };
 }, "json");
 
 /* ------------------------------------------------------------ transcripts */
@@ -253,6 +276,7 @@ register(".ics", async (buf, { name } = {}) => {
   return {
     text: `Calendar export: ${label}\n\n${rendered.join("\n\n")}`,
     note: notes.length ? notes.join("; ") : undefined,
+    ...(notes.length ? { incomplete: true } : {}),
   };
 }, "calendar");
 
@@ -355,16 +379,16 @@ export function canExtract(name) {
  * ASYNC because PDF extraction is. Everything else stays synchronous internally;
  * awaiting a plain string costs nothing and keeps one call site for all formats.
  *
- * An extractor may also return { text, note } to report something true but
- * degraded — a scanned PDF, a truncated sheet — which the caller surfaces rather
- * than swallowing.
+ * An extractor may also return { text, note, incomplete } to report something
+ * true but degraded. `incomplete: true` is reserved for known source omission;
+ * a note by itself may be informational and must not be interpreted as loss.
  *
  * It may also return `provenance`, which says how the text was OBTAINED rather
  * than what it says. This has to be forwarded explicitly: it used to die here,
  * inside the one function every ingest path funnels through, so a document read
  * by OCR reached the corpus looking exactly like one read from a text layer.
  *
- * @returns {Promise<{ text: string|null, how: string|null, unsupported?: true, error?: string, note?: string, provenance?: object }>}
+ * @returns {Promise<{ text: string|null, how: string|null, unsupported?: true, error?: string, note?: string, incomplete?: true, provenance?: object }>}
  */
 export async function extract(buf, name, opts = {}) {
   const ext = extensionOf(name);
@@ -373,7 +397,14 @@ export async function extract(buf, name, opts = {}) {
   try {
     const out = await entry.fn(buf, { name, ...opts });
     if (out && typeof out === "object" && !Array.isArray(out)) {
-      return { text: out.text ?? null, how: entry.label, note: out.note, error: out.error, provenance: out.provenance };
+      return {
+        text: out.text ?? null,
+        how: entry.label,
+        note: out.note,
+        error: out.error,
+        provenance: out.provenance,
+        ...(out.incomplete === true ? { incomplete: true } : {}),
+      };
     }
     return { text: out, how: entry.label };
   } catch (e) {

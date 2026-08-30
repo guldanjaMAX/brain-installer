@@ -270,6 +270,7 @@ export function assembleOcr(pages, { totalPages, model } = {}) {
   return {
     ok: true,
     text: `${OCR_BANNER}\n\n${body}`,
+    ...(partial ? { incomplete: true } : {}),
     provenance: {
       text_source: partial ? "ocr_partial" : "ocr",
       text_reliable: false,

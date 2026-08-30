@@ -674,6 +674,7 @@ async function prepareMboxArchive(file, buf, hash, { sourceName }) {
     note: unreadable
       ? `${envelopes.length} message(s) loaded from this archive; ${unreadable} could not be read`
       : `${envelopes.length} message(s) loaded from this archive`,
+    ...(unreadable ? { incomplete: true } : {}),
   };
 }
 
@@ -821,10 +822,12 @@ export async function prepare(file, { sourceName, ocr = null }) {
       metadata: {
         category: sourceName, extracted_as: got.how, bytes: actualBytes,
         ...(note ? { extraction_note: note } : {}),
+        ...(got.incomplete === true ? { extraction_incomplete: true } : {}),
         ...(got.provenance ? { ocr: got.provenance } : {}),
       },
     },
     note,
+    ...(got.incomplete === true ? { incomplete: true } : {}),
   };
 }
 

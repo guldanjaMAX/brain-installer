@@ -17,6 +17,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import * as XLSX from "@e965/xlsx";
 import { extract, canExtract, supported } from "../ingest/extract.mjs";
 import { walk, prepare } from "../ingest/run.mjs";
 import { splitMbox, unquoteFromLine, mboxMessageKey } from "../ingest/mbox.mjs";
@@ -65,6 +66,8 @@ const read = async (name) => extract(bytes(name), name);
       /additional JSON values were not indexed/.test(got.text || ""), JSON.stringify(got).slice(-300));
   check("wide JSON is capped at exactly 20,000 values plus one omission marker",
     (got.text || "").split("\n").length === 20_001, (got.text || "").split("\n").length);
+  check("capped JSON carries a machine-visible incomplete signal",
+    got.incomplete === true, JSON.stringify(got).slice(-300));
 }
 {
   const depth = 5_000;
@@ -73,6 +76,56 @@ const read = async (name) => extract(bytes(name), name);
   check("deep valid JSON is flattened without recursive stack overflow",
     got.error === undefined && /nested\.nested/.test(got.text || "") && /: leaf$/.test(got.text || ""),
     got.error || got.text?.slice(0, 120));
+  check("complete JSON is not mislabeled incomplete", got.incomplete !== true, JSON.stringify(got));
+}
+
+/* ================= bounded tables, without false completeness ================= */
+{
+  const body = Array.from({ length: 5_001 }, (_, index) => `row-${index},${index}`).join("\n");
+  const cappedCsv = await extract(Buffer.from(`Name,Value\n${body}\n`), "large.csv");
+  check("CSV rows beyond the cap carry a machine-visible incomplete signal",
+    cappedCsv.incomplete === true && /1 further rows were not indexed/.test(cappedCsv.note || ""),
+    JSON.stringify(cappedCsv).slice(-300));
+
+  const cappedTsv = await extract(Buffer.from(`Name\tValue\n${body.replaceAll(",", "\t")}\n`), "large.tsv");
+  check("TSV uses the same structured cap signal as CSV",
+    cappedTsv.incomplete === true && /1 further rows were not indexed/.test(cappedTsv.note || ""),
+    JSON.stringify(cappedTsv).slice(-300));
+
+  const exactBody = Array.from({ length: 5_000 }, (_, index) => `row-${index},${index}`).join("\n");
+  const exactCsv = await extract(Buffer.from(`Name,Value\n${exactBody}\n`), "exact.csv");
+  check("a CSV exactly at the row limit stays complete",
+    exactCsv.incomplete !== true && !/not indexed/.test(exactCsv.text || ""), JSON.stringify(exactCsv).slice(-300));
+
+  const root = mkdtempSync(join(tmpdir(), "brain-incomplete-csv-"));
+  writeFileSync(join(root, "large.csv"), `Name,Value\n${body}\n`);
+  const walked = walk(root, {}).files[0];
+  const prepared = await prepare(walked, { sourceName: "documents" });
+  check("prepare preserves known extraction loss for orchestration",
+    prepared.incomplete === true && prepared.envelope?.metadata?.extraction_incomplete === true,
+    JSON.stringify(prepared).slice(-400));
+  rmSync(root, { recursive: true, force: true });
+}
+
+/* ================= spreadsheets, with exact per-sheet caps ================= */
+{
+  const workbook = XLSX.utils.book_new();
+  const cappedRows = [
+    ["Name", "Value"],
+    ...Array.from({ length: 5_001 }, (_, index) => [`row-${index}`, index]),
+  ];
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(cappedRows), "Capped");
+  const capped = await extract(XLSX.write(workbook, { bookType: "xlsx", type: "buffer" }), "large.xlsx");
+  check("XLSX rows beyond a sheet cap carry a machine-visible incomplete signal",
+    capped.incomplete === true && /1 row\(s\).*not indexed/.test(capped.note || ""), JSON.stringify(capped).slice(-300));
+
+  const completeWorkbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(completeWorkbook,
+    XLSX.utils.aoa_to_sheet([["Name", "Value"], ["complete-row", 1]]), "Complete");
+  const complete = await extract(
+    XLSX.write(completeWorkbook, { bookType: "xlsx", type: "buffer" }), "complete.xlsx");
+  check("a fully rendered workbook is not mislabeled incomplete",
+    complete.incomplete !== true && complete.note === undefined, JSON.stringify(complete));
 }
 
 /* ================= transcripts (.vtt) ================= */
@@ -185,6 +238,8 @@ const read = async (name) => extract(bytes(name), name);
     /From: Alex Rivera <alex@example\.test>/.test(loaded.envelopes[0].content) &&
     /Subject: Renewal terms/.test(loaded.envelopes[0].content), loaded.envelopes[0].content.slice(0, 200));
   check("the run says how many messages it found", /3 message\(s\) loaded/.test(loaded.note || ""), loaded.note);
+  check("an informational complete-mbox note does not imply missing content",
+    loaded.incomplete !== true, JSON.stringify(loaded));
 
   const broken = await prepare(one("broken.mbox"), { sourceName: "documents" });
   check("a file that is not an archive is REFUSED with the reason",
@@ -198,6 +253,8 @@ const read = async (name) => extract(bytes(name), name);
     got.how === "mail archive", JSON.stringify(got).slice(0, 200));
   check("and says out loud that a local folder would split it",
     /own document/.test(got.note || ""), got.note);
+  check("the complete fallback archive note is informational, not incomplete",
+    got.incomplete !== true, JSON.stringify(got));
   const refused = await read("not-an-archive.mbox");
   check("the fallback refuses a non-archive too",
     refused.text === null && /no message separator line/.test(refused.error || ""), JSON.stringify(refused));
@@ -227,6 +284,7 @@ const read = async (name) => extract(bytes(name), name);
   check("a VTODO is not read as a meeting",
     !/This is a task/.test(got.text || ""), got.text);
   check("it is labelled as a calendar", got.how === "calendar", got.how);
+  check("a fully read calendar is not mislabeled incomplete", got.incomplete !== true, JSON.stringify(got));
 }
 {
   const got = await read("timezones-only.ics");
@@ -238,6 +296,25 @@ const read = async (name) => extract(bytes(name), name);
   const parsed = parseIcs(readFileSync(join(FIXTURES, "truncated.ics"), "utf-8"));
   check("an unterminated final event counts as malformed, never as an event",
     parsed.events.length === 0 && parsed.malformed === 1, JSON.stringify(parsed));
+
+  const oneGoodOneBroken = [
+    "BEGIN:VCALENDAR",
+    "BEGIN:VEVENT", "UID:good", "DTSTART:20260612T180000Z", "SUMMARY:Readable event", "END:VEVENT",
+    "BEGIN:VEVENT", "UID:broken", "SUMMARY:Truncated event",
+    "END:VCALENDAR",
+  ].join("\r\n");
+  const partial = await extract(Buffer.from(oneGoodOneBroken), "partial.ics");
+  check("a calendar with readable and malformed events is explicitly incomplete",
+    partial.incomplete === true && /1 calendar entry could not be read/.test(partial.note || "") &&
+      /Readable event/.test(partial.text || ""), JSON.stringify(partial));
+
+  const events = Array.from({ length: 501 }, (_, index) => [
+    "BEGIN:VEVENT", `UID:event-${index}`, "DTSTART:20260612T180000Z", `SUMMARY:Event ${index}`, "END:VEVENT",
+  ].join("\r\n")).join("\r\n");
+  const capped = await extract(Buffer.from(`BEGIN:VCALENDAR\r\n${events}\r\nEND:VCALENDAR\r\n`), "capped.ics");
+  check("a calendar beyond its event cap is explicitly incomplete",
+    capped.incomplete === true && /1 further event\(s\) were not indexed/.test(capped.note || "") &&
+      !/Meeting: Event 500(?:\r?\n|$)/.test(capped.text || ""), JSON.stringify(capped).slice(-300));
 }
 
 /* ================= rich text (.rtf) ================= */

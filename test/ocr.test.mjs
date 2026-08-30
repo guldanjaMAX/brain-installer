@@ -136,6 +136,8 @@ const longPage = (n) =>
   check("provenance says ocr, not ocr_partial", good.provenance.text_source === "ocr", good.provenance.text_source);
   check("and the text is explicitly NOT reliable", good.provenance.text_reliable === false);
   check("confidence is 1 when every attempted page read", good.provenance.confidence === 1, String(good.provenance.confidence));
+  check("a completely read OCR document is not mislabeled incomplete",
+    good.incomplete !== true, JSON.stringify(good));
 
   const partial = assembleOcr([
     { page: 1, text: longPage(1) },
@@ -144,6 +146,8 @@ const longPage = (n) =>
   ], { totalPages: 3 });
   check("one bad page in three is indexed as PARTIAL, not as whole",
     partial.ok === true && partial.provenance.text_source === "ocr_partial", JSON.stringify(partial.refusal));
+  check("partial OCR has a machine-visible incomplete signal",
+    partial.incomplete === true, JSON.stringify(partial));
   check("the failed page is NAMED in the text rather than dropped",
     /\[\[page 3: could not be read/.test(partial.text), partial.text.slice(-160));
   check("and confidence falls below 1", partial.provenance.confidence < 1, String(partial.provenance.confidence));
@@ -216,6 +220,28 @@ function stubOcr({ reply = () => pageText, model = "@cf/google/gemma-4-26b-a4b-i
   check("a PDF with a text layer is extracted normally", /must never be sent to OCR/.test(got.text || ""), JSON.stringify(got).slice(0, 200));
   check("and NOT ONE page of it is sent to the model", ocr.calls.length === 0, JSON.stringify(ocr.calls));
   check("and it carries no OCR provenance", got.provenance === undefined, JSON.stringify(got.provenance));
+  check("a sparse native text layer is identified as incomplete",
+    got.incomplete === true && /probably a scan/.test(got.note || ""), JSON.stringify(got));
+
+  const completeNative = await extractPdf(new Uint8Array([1]), {}, {
+    pdfPassImpl: async () => ({
+      body: "A complete native text layer with enough content for the declared readability floor.",
+      totalPages: 1,
+      perPage: MIN_CHARS_PER_PAGE + 1,
+    }),
+  });
+  check("a complete native PDF is not mislabeled incomplete",
+    completeNative.incomplete !== true && completeNative.note === undefined, JSON.stringify(completeNative));
+
+  const thin = await extractPdf(new Uint8Array([1]), {}, {
+    pdfPassImpl: async () => ({
+      body: "Sparse form labels are readable but most of this page remains image-only.",
+      totalPages: 1,
+      perPage: MIN_CHARS_PER_PAGE - 1,
+    }),
+  });
+  check("a thin native PDF is explicitly incomplete rather than silently complete",
+    thin.incomplete === true && /probably a scan/.test(thin.note || ""), JSON.stringify(thin));
 
   // Requesting a render is itself a cost, so it is asked for only when there is
   // somewhere to send the pixels — but it is asked for BEFORE the text result
@@ -245,12 +271,23 @@ function stubOcr({ reply = () => pageText, model = "@cf/google/gemma-4-26b-a4b-i
   check("the stored text is marked as OCR in the body itself", got.text.includes(OCR_BANNER));
   check("provenance travels out of the extractor", got.provenance?.text_source === "ocr", JSON.stringify(got.provenance));
   check("the note tells the owner it was read from a picture", /read by OCR from a scanned image/.test(got.note || ""), got.note);
+  check("a fully read OCR scan is not mislabeled incomplete", got.incomplete !== true, JSON.stringify(got));
 
   /* ---- and it survives extract(), the funnel every ingest path uses ---- */
   const viaExtract = await extract(scanPdf(), "statement.pdf", { ocr: stubOcr() });
   check("extract() forwards the provenance instead of dropping it",
     viaExtract.provenance?.text_source === "ocr" && viaExtract.provenance.text_reliable === false,
     JSON.stringify(viaExtract.provenance));
+  check("extract() preserves the complete OCR classification", viaExtract.incomplete !== true, JSON.stringify(viaExtract));
+
+  const cappedOcr = stubOcr({ maxPages: 2, reply: (page) => longPage(page) });
+  const capped = await extractPdf(scanPdf({ pages: 3 }), { ocr: cappedOcr }, { pdfPassImpl: scannedPass });
+  check("an OCR page ceiling does not masquerade as full-document coverage",
+    capped.incomplete === true && capped.provenance?.text_source === "ocr_partial" &&
+      capped.provenance.pages_omitted === 1 && /configured OCR page limit/.test(capped.note || ""),
+    JSON.stringify(capped));
+  check("the OCR page ceiling stops calls at the configured bound", cappedOcr.calls.length === 2,
+    JSON.stringify(cappedOcr.calls));
 }
 
 {
@@ -293,6 +330,8 @@ function stubOcr({ reply = () => pageText, model = "@cf/google/gemma-4-26b-a4b-i
   const mixed = await extractPdf(scanPdf({ pages: 4 }), { ocr: flaky }, { pdfPassImpl: scannedPass });
   check("a single failing page is reported inline, not thrown",
     mixed.text?.includes("[[page 1: could not be read"), JSON.stringify(mixed).slice(0, 200));
+  check("a scan with one unreadable page is explicitly incomplete",
+    mixed.incomplete === true && mixed.provenance?.text_source === "ocr_partial", JSON.stringify(mixed));
 }
 
 /* ============================================ the model call, and custody */

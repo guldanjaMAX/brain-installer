@@ -26,7 +26,7 @@ import { strFromU8 } from "fflate";
 import * as XLSX from "@e965/xlsx";
 import PostalMime from "postal-mime";
 import { extractZipEntries, validateZipArchive } from "./archive.mjs";
-import { register, renderTable } from "./extract.mjs";
+import { register, renderTableResult } from "./extract.mjs";
 import { splitMbox } from "./mbox.mjs";
 import { stripMarkup } from "./quality.mjs";
 
@@ -257,10 +257,20 @@ async function ocrPdf(ocr, r, scanned) {
 
   const verdict = assembleOcr(pages, { totalPages: r.totalPages, model: ocr.model });
   if (!verdict.ok) return { text: null, error: `${scanned} ${verdict.refusal}.` };
+  // A configured OCR page ceiling is a cost boundary, not evidence that the
+  // unrendered tail was blank. Keep the usable prefix, but name it as partial
+  // in both the structured result and OCR provenance.
+  const omittedPages = Math.max(0, r.totalPages - images.length);
+  const incomplete = verdict.incomplete === true || omittedPages > 0;
   return {
     text: verdict.text,
-    note: verdict.note,
-    provenance: verdict.provenance,
+    note: omittedPages
+      ? `${verdict.note}; ${omittedPages} page${omittedPages === 1 ? " was" : "s were"} not read because this document exceeds the configured OCR page limit`
+      : verdict.note,
+    provenance: omittedPages
+      ? { ...verdict.provenance, text_source: "ocr_partial", pages_omitted: omittedPages }
+      : verdict.provenance,
+    ...(incomplete ? { incomplete: true } : {}),
   };
 }
 
@@ -330,6 +340,7 @@ export async function extractPdf(buf, { reread, ocr } = {}, { pdfPassImpl = pdfP
     return {
       text: r.body,
       note: `only ${Math.round(r.perPage)} characters per page, so this PDF is probably a scan and most of its content is not searchable`,
+      incomplete: true,
     };
   }
   return { text: r.body };
@@ -397,15 +408,17 @@ function sheetsToText(buf, name, { zipped = false } = {}) {
     if (!ws) continue;
     const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "", blankrows: false });
     if (!rows.length) continue;
-    const before = rows.length;
-    const rendered = renderTable(rows, { label: `Sheet: ${sheetName}${name ? ` (${name})` : ""}` });
-    if (rendered) out.push(rendered);
-    if (before > 5000) truncated += before - 5000;
+    const rendered = renderTableResult(rows, {
+      label: `Sheet: ${sheetName}${name ? ` (${name})` : ""}`,
+    });
+    if (rendered.text) out.push(rendered.text);
+    truncated += rendered.omittedRows;
   }
   if (!out.length) return { text: null, error: "the workbook has no readable rows" };
   return {
     text: out.join("\n\n"),
     note: truncated ? `${truncated} row(s) beyond the per-sheet limit were not indexed` : undefined,
+    ...(truncated ? { incomplete: true } : {}),
   };
 }
 
@@ -495,5 +508,6 @@ register(".mbox", async (buf) => {
     note: `${rendered.length} message(s) from one mail archive` +
       (unreadable ? `; ${unreadable} could not be read` : "") +
       "; loaded through a local folder they would each become their own document",
+    ...(unreadable ? { incomplete: true } : {}),
   };
 }, "mail archive");
