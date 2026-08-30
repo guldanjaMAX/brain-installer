@@ -7,7 +7,20 @@
  * query is sent over the network.
  */
 
-export const EVAL_PROFILES = Object.freeze(["smoke", "release"]);
+export const EVAL_PROFILES = Object.freeze(["smoke", "onboarding", "release"]);
+
+export const ONBOARDING_PROFILE_MINIMUMS = Object.freeze({
+  suite_cases: 20,
+  answerable_cases: 15,
+  unanswerable_cases: 5,
+  query_kinds: Object.freeze({
+    single: 6,
+    multi: 3,
+    temporal: 3,
+    person: 3,
+    unanswerable: 5,
+  }),
+});
 
 export const RELEASE_PROFILE_MINIMUMS = Object.freeze({
   suite_cases: 60,
@@ -69,6 +82,68 @@ export function evaluateProfileCoverage(golden, requestedProfile = "smoke") {
             observed: questions.length,
             minimum: minimums.suite_cases,
           })],
+    };
+  }
+
+  if (profile === "onboarding") {
+    const minimums = ONBOARDING_PROFILE_MINIMUMS;
+    const supportedKinds = Object.keys(minimums.query_kinds);
+    const counts = Object.fromEntries(supportedKinds.map((kind) => [
+      kind,
+      questions.filter((question) => question?.kind === kind).length,
+    ]));
+    const unsupportedKinds = questions.filter((question) =>
+      !supportedKinds.includes(question?.kind)).length;
+    const answerable = supportedKinds
+      .filter((kind) => kind !== "unanswerable")
+      .reduce((total, kind) => total + counts[kind], 0);
+    const unanswerable = counts.unanswerable || 0;
+    const failures = [];
+    if (questions.length < minimums.suite_cases) {
+      failures.push(failure("SUITE_BELOW_MINIMUM", {
+        observed: questions.length,
+        minimum: minimums.suite_cases,
+      }));
+    }
+    if (answerable < minimums.answerable_cases) {
+      failures.push(failure("ANSWERABLE_CASES_BELOW_MINIMUM", {
+        observed: answerable,
+        minimum: minimums.answerable_cases,
+      }));
+    }
+    if (unanswerable < minimums.unanswerable_cases) {
+      failures.push(failure("UNANSWERABLE_CASES_BELOW_MINIMUM", {
+        observed: unanswerable,
+        minimum: minimums.unanswerable_cases,
+      }));
+    }
+    if (unsupportedKinds > 0) {
+      failures.push(failure("CASES_WITH_UNSUPPORTED_QUERY_KIND", {
+        observed: unsupportedKinds,
+      }));
+    }
+    for (const [kind, minimum] of Object.entries(minimums.query_kinds)) {
+      const observed = counts[kind] || 0;
+      if (observed < minimum) {
+        failures.push(failure("QUERY_KIND_BELOW_MINIMUM", {
+          kind,
+          observed,
+          minimum,
+        }));
+      }
+    }
+    return {
+      profile,
+      scope: "owner-onboarding-golden-20",
+      minimums,
+      observed: {
+        suite_cases: questions.length,
+        answerable_cases: answerable,
+        unanswerable_cases: unanswerable,
+        query_kinds: counts,
+      },
+      required_slices: { query_kind: Object.keys(minimums.query_kinds) },
+      failures,
     };
   }
 
@@ -174,6 +249,18 @@ export function formatProfileFailures(result) {
     }
     if (entry.code === "RELEASE_SLICES_REQUIRED") {
       return "release_slices must declare risk, domain, format, and query_kind coverage";
+    }
+    if (entry.code === "ANSWERABLE_CASES_BELOW_MINIMUM") {
+      return `suite has ${entry.observed} answerable cases; ${result.profile} requires at least ${entry.minimum}`;
+    }
+    if (entry.code === "UNANSWERABLE_CASES_BELOW_MINIMUM") {
+      return `suite has ${entry.observed} unanswerable cases; ${result.profile} requires at least ${entry.minimum}`;
+    }
+    if (entry.code === "QUERY_KIND_BELOW_MINIMUM") {
+      return `query kind ${entry.kind} has ${entry.observed} cases; ${result.profile} requires at least ${entry.minimum}`;
+    }
+    if (entry.code === "CASES_WITH_UNSUPPORTED_QUERY_KIND") {
+      return `${entry.observed} cases use a query kind unsupported by the onboarding profile`;
     }
     if (entry.code === "REQUIRED_SLICE_DIMENSION_EMPTY") {
       return `release_slices.${entry.dimension} must name at least one required slice`;

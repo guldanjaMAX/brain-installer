@@ -8,8 +8,9 @@ designed for one shared installer and many isolated, private installations.
 This document contains both the shipped v1 behavior and the v2 specification.
 The current `eval/run.mjs` harness implements retrieval and refusal checks,
 opt-in deterministic answer canaries, an optional deterministic corpus
-inventory reconciliation, and two named profiles: diagnostic `smoke` and a
-deterministic `release` suite coverage gate. The answer canary
+inventory reconciliation, and three named profiles: diagnostic `smoke`, an
+owner-onboarding `onboarding` gate, and a deterministic `release` suite
+coverage gate. The answer canary
 proves only a literal atomic phrase or typed value inside one sentence, plus an
 inline citation that resolves to an allowed v1 evidence slot. It is not a
 semantic judge. The corpus reconciliation proves only logical source-family
@@ -174,6 +175,10 @@ opaque evidence references; diagnoses; timing; and cost.
 
 Unavailable evidence is recorded as `not_observable` with a reason code. A null
 field must never imply that provenance was successfully collected.
+Corpus fingerprint failures also retain only a sanitized observation stage,
+error kind, and optional HTTP status. Response bodies, family identities, and
+private locators never enter the report. If observability changes across the
+before-and-after bracket, the run stops and names those aggregate diagnostics.
 
 ## Evaluation profiles and future tiers
 
@@ -186,6 +191,32 @@ canary. Cases without that optional field remain retrieval-only, preserving v1
 cost and baseline behavior. Use smoke while writing a suite and after setup,
 ingest, sync, or a retrieval change. A smoke pass is a diagnostic result. It is
 not release certification, even when every small-set case passes.
+
+### `brain eval <manifest> --profile onboarding`
+
+This is the first-owner proof gate. It refuses to contact the brain unless the
+private suite has at least twenty reviewed questions with this minimum mix:
+
+- six single-document facts;
+- three multi-document syntheses;
+- three questions about facts that changed;
+- three questions that distinguish people; and
+- five questions the corpus genuinely cannot answer.
+
+Every safety question must produce a clean refusal. A missing answer, timeout,
+or unavailable answer route is inconclusive and blocks the gate. Every declared
+deterministic answer canary must also run and pass. Across answerable questions,
+complete evidence at five must be at least 80%, evidence-slot recall at five
+must be at least 90%, and duplicate waste at five must be no more than 10%.
+Transport errors block the run. These checks are aggregate-only in shareable
+artifacts and run after the structural preflight.
+
+The onboarding profile is stricter than smoke but is not release certification.
+It answers one practical question: can this owner already get reliable value
+from the smallest reviewed set of questions that matters to them? Retrieval,
+answer, and refusal latency are reported separately so first-value speed can be
+improved without hiding a slow safety path. Latency is measured here, not yet a
+hard gate. `--no-think` is not allowed with this profile.
 
 ### `brain eval <manifest> --profile release`
 
@@ -475,7 +506,7 @@ Build coverage in this order:
 ### The Golden 20 session
 
 `brain eval <manifest> --golden-20` is step 1 operationalized as a handoff
-ritual: operator and owner fill twenty slots together in one sitting — six
+ritual: operator and owner fill twenty slots together in one sitting: six
 single-document facts, three multi-document syntheses, three temporal
 questions about things that changed, three person-distinction questions, and
 five unanswerable questions the brain must refuse. The owner writes every
@@ -483,10 +514,14 @@ question from memory before retrieval runs, so the wording cannot borrow from
 the answering document; the session then runs their question and the owner
 confirms which returned documents are the right evidence, which records
 scorer-stable identities without any hand-edited JSON. Unanswerable entries
-get an on-the-spot live refusal check. The file saves after every question and
-the session resumes where it stopped, so an interrupted sitting loses nothing.
-The result is a valid smoke suite the moment the session ends — a starting
-point for the growth path above, not a substitute for it.
+get an on-the-spot live refusal check. A missing live answer is explicitly
+inconclusive, never praised as a safe refusal. The file saves after every
+question and the session resumes where it stopped, so an interrupted sitting
+loses nothing.
+The completed session offers to score the onboarding profile immediately. An
+incomplete session can still run smoke for diagnosis. Passing onboarding is a
+first-owner value gate and a starting point for the growth path above, not a
+substitute for the release profile.
 
 A small suite is a smoke test. A first release suite should contain roughly 60
 to 80 reviewed cases across its required slices. A stable release suite should

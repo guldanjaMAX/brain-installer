@@ -171,6 +171,23 @@ function releaseProfileFixture() {
   };
 }
 
+function onboardingProfileFixture() {
+  const kinds = [
+    ...Array(6).fill("single"),
+    ...Array(3).fill("multi"),
+    ...Array(3).fill("temporal"),
+    ...Array(3).fill("person"),
+    ...Array(5).fill("unanswerable"),
+  ];
+  return kinds.map((kind, index) => ({
+    id: `onboarding-${index + 1}`,
+    kind,
+    risk: "normal",
+    question: `Synthetic onboarding question ${index + 1}`,
+    expect: kind === "unanswerable" ? [] : [{ any_of: ["curated:doc-a"] }],
+  }));
+}
+
 function corpusContractFixture({ missing = false, incomplete = false } = {}) {
   const h = (character) => `sha256:${character.repeat(64)}`;
   return {
@@ -424,6 +441,172 @@ test("release profile passes its exact aggregate coverage floor and records the 
   assert.equal(result.runArtifact.suite.profile, "release");
   assert.equal(result.runArtifact.suite.profile_coverage.minimums.suite_cases, 60);
   assert.deepEqual(result.runArtifact.suite.profile_coverage.failures, []);
+});
+
+test("onboarding profile passes a complete Golden 20 and records separate latency lanes", async () => {
+  const result = await runFixture({
+    questions: onboardingProfileFixture(),
+    args: ["--profile", "onboarding"],
+    artifacts: true,
+  });
+
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /profile\s+onboarding \(owner-onboarding quality gate\)/);
+  assert.equal(result.runArtifact.suite.profile, "onboarding");
+  assert.equal(result.runArtifact.metrics.retrieval_latency.n, 15);
+  assert.equal(result.runArtifact.metrics.refusal_latency.n, 5);
+  assert.deepEqual(result.runArtifact.hard_gates.failures, []);
+});
+
+test("onboarding stops before network and artifacts when a private custom kind is present", async () => {
+  let requests = 0;
+  const privateKind = "private-client-workstream-name";
+  const questions = onboardingProfileFixture();
+  questions.push({
+    id: "private-kind",
+    kind: privateKind,
+    question: "Private question text",
+    expect: [{ any_of: ["curated:private-source"] }],
+  });
+  const result = await runFixture({
+    questions,
+    args: ["--profile", "onboarding"],
+    artifacts: true,
+    route: () => { requests++; return null; },
+  });
+
+  assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+  assert.equal(requests, 0);
+  assert.equal(result.runArtifact, null);
+  assert.match(result.stderr, /1 cases use a query kind unsupported by the onboarding profile/);
+  assert.doesNotMatch(result.stderr, /private-client-workstream-name|Private question|private-source/);
+});
+
+test("onboarding profile blocks a Golden 20 whose complete-evidence rate is below 80 percent", async () => {
+  const result = await runFixture({
+    questions: onboardingProfileFixture(),
+    args: ["--profile", "onboarding"],
+    artifacts: true,
+    route: ({ url, body }) => {
+      if (url.pathname !== "/api/rag/unified") return null;
+      const match = /Synthetic onboarding question (\d+)/.exec(String(body.q || ""));
+      const number = Number(match?.[1] || 0);
+      return number >= 1 && number <= 4
+        ? { body: { results: [{ source: "curated", ref_key: "wrong-doc", title: "Wrong fixture" }] } }
+        : null;
+    },
+  });
+
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+  assert.ok(result.runArtifact.hard_gates.failures.some((entry) =>
+    entry.reason === "ONBOARDING_COMPLETE_EVIDENCE_BELOW_80_PERCENT"));
+  assert.ok(result.runArtifact.hard_gates.failures.some((entry) =>
+    entry.reason === "ONBOARDING_SLOT_RECALL_BELOW_90_PERCENT"));
+});
+
+test("onboarding duplicate-waste boundary passes below 10 percent and blocks above it", async () => {
+  const runAt = (duplicatedQuestionCount) => runFixture({
+    questions: onboardingProfileFixture(),
+    args: ["--profile", "onboarding"],
+    artifacts: true,
+    route: ({ url, body }) => {
+      if (url.pathname !== "/api/rag/unified") return null;
+      const match = /Synthetic onboarding question (\d+)/.exec(String(body.q || ""));
+      const number = Number(match?.[1] || 0);
+      if (number < 1 || number > 15) return null;
+      const results = [
+        { source: "curated", ref_key: "doc-a" },
+        ...(number <= duplicatedQuestionCount
+          ? [{ source: "curated", ref_key: "doc-a" }]
+          : [{ source: "curated", ref_key: `noise-${number}-1` }]),
+        { source: "curated", ref_key: `noise-${number}-2` },
+        { source: "curated", ref_key: `noise-${number}-3` },
+        { source: "curated", ref_key: `noise-${number}-4` },
+      ];
+      return { body: { results } };
+    },
+  });
+
+  const below = await runAt(7);
+  assert.equal(below.code, 0, `${below.stdout}\n${below.stderr}`);
+  assert.ok(below.runArtifact.metrics.evidence_at_k.duplicate_waste < 0.1);
+
+  const above = await runAt(8);
+  assert.equal(above.code, 1, `${above.stdout}\n${above.stderr}`);
+  assert.ok(above.runArtifact.metrics.evidence_at_k.duplicate_waste > 0.1);
+  assert.ok(above.runArtifact.hard_gates.failures.some((entry) =>
+    entry.reason === "ONBOARDING_DUPLICATE_WASTE_ABOVE_10_PERCENT"));
+});
+
+test("onboarding blocks every declared answer canary, even at normal risk", async () => {
+  const questions = onboardingProfileFixture();
+  questions[0].expect = [{
+    slot_id: "fixture-evidence",
+    any_of: ["curated:doc-a"],
+  }];
+  questions[0].answer_expect = {
+    claim_boundary: "sentence",
+    claims: [{
+      claim_id: "fixture-claim",
+      contains_any: ["fixture phrase"],
+      evidence_slot_ids: ["fixture-evidence"],
+    }],
+  };
+  const result = await runFixture({
+    questions,
+    args: ["--profile", "onboarding"],
+    artifacts: true,
+    route: ({ url, body }) => {
+      if (url.pathname === "/api/rag/think" && body.q === questions[0].question) {
+        return { body: { answer: "A different claim [1].", citations: [] } };
+      }
+      return null;
+    },
+  });
+
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+  assert.ok(result.runArtifact.hard_gates.failures.some((entry) =>
+    entry.reason === "CLAIM_MISSING"));
+});
+
+test("onboarding refuses to skip its five safety questions", async () => {
+  let requests = 0;
+  const result = await runFixture({
+    questions: onboardingProfileFixture(),
+    args: ["--profile", "onboarding", "--no-think"],
+    route: () => { requests++; return null; },
+  });
+
+  assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+  assert.equal(requests, 0, "an impossible onboarding gate must fail before contacting the brain");
+  assert.match(result.stderr, /--no-think cannot be used with the onboarding profile/);
+});
+
+test("refusal reporting uses every safety question as its denominator", async () => {
+  const result = await runFixture({
+    questions: [
+      {
+        id: "answerable",
+        kind: "single",
+        question: "Which fixture is present?",
+        expect: [{ any_of: ["curated:doc-a"] }],
+      },
+      { id: "clean", kind: "unanswerable", question: "clean absence" },
+      { id: "unsafe", kind: "unanswerable", question: "unsafe absence" },
+      { id: "empty", kind: "unanswerable", question: "empty absence" },
+    ],
+    route: ({ url, body }) => {
+      if (url.pathname !== "/api/rag/think") return null;
+      if (body.q === "unsafe absence") {
+        return { body: { answer: "The documents do not answer that, but it definitely happened.", gaps: [] } };
+      }
+      if (body.q === "empty absence") return { body: { answer: null, gaps: [] } };
+      return null;
+    },
+  });
+
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /1\/3 clean; 1 unsafe; 1 inconclusive/);
 });
 
 test("release refuses to skip its required normal-risk unanswerable cases", async () => {
@@ -899,8 +1082,56 @@ test("malformed inventory remains not observable instead of becoming zero", asyn
   });
   assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
   assert.deepEqual(result.runArtifact.corpus, {
-    status: "not_observable", reason: "CONTENT_FINGERPRINT_UNAVAILABLE", bracketed: false,
+    status: "not_observable",
+    reason: "CONTENT_FINGERPRINT_UNAVAILABLE",
+    observation_error: { stage: "documents_contract", kind: "response_contract" },
+    bracketed: false,
   });
+});
+
+test("corpus observation failures retain only a typed stage and status", async () => {
+  const privateResponse = "private-upstream-body-that-must-not-enter-artifacts";
+  const result = await runFixture({
+    questions: [{
+      id: "q1", kind: "single", risk: "normal", question: "fixture question",
+      expect: [{ any_of: ["curated:doc-a"] }],
+    }],
+    args: ["--no-think"],
+    artifacts: true,
+    route: ({ url }) => url.pathname === "/api/admin/brain/source-families"
+      ? { status: 503, body: { error: privateResponse } }
+      : null,
+  });
+
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.deepEqual(result.runArtifact.corpus, {
+    status: "not_observable",
+    reason: "CONTENT_FINGERPRINT_UNAVAILABLE",
+    observation_error: { stage: "source_families", kind: "transient", http_status: 503 },
+    bracketed: false,
+  });
+  assert.doesNotMatch(JSON.stringify(result.runArtifact), new RegExp(privateResponse));
+});
+
+test("malformed source-family data is a response contract failure, not a network failure", async () => {
+  const result = await runFixture({
+    questions: [{
+      id: "q1", kind: "single", risk: "normal", question: "fixture question",
+      expect: [{ any_of: ["curated:doc-a"] }],
+    }],
+    args: ["--no-think"],
+    artifacts: true,
+    route: ({ url }) => url.pathname === "/api/admin/brain/source-families"
+      ? { body: { source: null, families: ["malformed-private-identity"], next_cursor: null } }
+      : null,
+  });
+
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.deepEqual(result.runArtifact.corpus.observation_error, {
+    stage: "source_families",
+    kind: "response_contract",
+  });
+  assert.doesNotMatch(JSON.stringify(result.runArtifact), /malformed-private-identity/);
 });
 
 test("sanitized artifacts and malformed JSON objects cannot masquerade as baselines", async () => {

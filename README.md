@@ -255,6 +255,20 @@ The command prompts for the question so it does not enter your shell history.
 Ask something only your documents could answer, then something they definitely
 do not cover. The second answer matters as much as the first.
 
+When the first useful folders or accounts are loaded, build the owner's private
+Golden 20 together:
+
+```bash
+brain eval ./brain.manifest.json --golden-20
+```
+
+The owner writes questions from memory before any result is shown. The Brain
+then helps identify the right evidence and saves after every question. A
+complete session checks twenty questions across facts, synthesis, changes,
+people, and safe refusals. It reports retrieval, answer, and refusal speed
+separately. Passing this onboarding gate proves the first useful question set,
+not the entire corpus or release readiness.
+
 ---
 
 ## What it reads

@@ -232,6 +232,12 @@ test("retrieval quality reports partial multi-evidence coverage and graded rank"
   assert.ok(quality[3].ndcg > 0 && quality[3].ndcg < 1);
 });
 
+test("an unfilled result window is not mislabeled as duplicate waste", () => {
+  const q = { expect: [{ doc: "a", any_of: ["curated:a"] }] };
+  const quality = retrievalQuality(q, [curated("a")], [5]);
+  assert.equal(quality[5].duplicate_waste, 0);
+});
+
 test("quality aggregation keeps complete evidence separate from average slot recall", () => {
   const summary = aggregateQuality([
     { quality: { 5: { slot_recall: 1, complete_evidence: true, precision: 0.4, ndcg: 1, duplicate_waste: 0 } } },

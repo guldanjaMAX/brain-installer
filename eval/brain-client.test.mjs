@@ -154,3 +154,42 @@ test("non-retryable 401 and 404 responses are attempted once", async () => {
     assert.equal(calls, 1, `HTTP ${status}`);
   }
 });
+
+test("request failures expose typed aggregate diagnostics without response content", async () => {
+  const privateResponse = "private-provider-message-that-must-not-leak";
+  const client = new BrainClient({
+    base: "https://brain.example",
+    adminKey: "fixture-key",
+    retries: 0,
+    fetchImpl: async () => response({ error: privateResponse }, 503),
+  });
+
+  await assert.rejects(async () => {
+    try {
+      await client.documents();
+    } catch (error) {
+      assert.equal(error.httpStatus, 503);
+      assert.equal(error.observationKind, "transient");
+      assert.doesNotMatch(error.message, new RegExp(privateResponse));
+      throw error;
+    }
+  }, /HTTP 503/);
+});
+
+test("HTTP 408 is retried within the configured bounded attempt count", async () => {
+  let calls = 0;
+  const client = new BrainClient({
+    base: "https://brain.example",
+    adminKey: "fixture-key",
+    retries: 1,
+    fetchImpl: async () => {
+      calls++;
+      return calls === 1
+        ? response({ error: "temporary timeout" }, 408)
+        : response({ rows: [] });
+    },
+  });
+
+  assert.deepEqual(await client.documents(), { rows: [] });
+  assert.equal(calls, 2);
+});

@@ -148,7 +148,8 @@ function loadOrStartGolden(goldenPath, manifest, now) {
       "Built with `brain eval --golden-20`: each question was written from",
       "memory BEFORE retrieval ran, then the owner confirmed which returned",
       "documents are the right evidence. Unanswerable entries are questions",
-      "the brain must refuse. Score with `brain eval <manifest>`.",
+      "the brain must refuse. Score the complete set with",
+      "`brain eval <manifest> --profile onboarding`.",
     ],
     questions: [],
   };
@@ -283,10 +284,13 @@ export async function runGolden20Session({
         // The scorer is the judge; this is the owner watching it refuse.
         try {
           const thought = await client.think(question, { limit: 6 });
-          const refused = thought?.answer == null || REFUSAL_HINT.test(String(thought.answer));
-          log(refused
-            ? "  Good: the brain refuses this today."
-            : "  Careful: the brain ANSWERED this today. The eval will fail here until that confabulation is fixed — which is the point.");
+          if (thought?.answer == null) {
+            log("  Not proven: the brain produced no answer. The eval will count this as inconclusive, not as a safe refusal.");
+          } else if (REFUSAL_HINT.test(String(thought.answer))) {
+            log("  Good: the brain refuses this today.");
+          } else {
+            log("  Careful: the brain ANSWERED this today. The eval will fail here until that confabulation is fixed — which is the point.");
+          }
         } catch {
           log("  (could not run the live refusal check; the eval will still test it)");
         }

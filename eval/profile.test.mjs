@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   EVAL_PROFILES,
+  ONBOARDING_PROFILE_MINIMUMS,
   RELEASE_PROFILE_MINIMUMS,
   evaluateProfileCoverage,
   formatProfileFailures,
@@ -34,11 +35,67 @@ function releaseSuite() {
 }
 
 test("profile names and release thresholds are fixed product policy", () => {
-  assert.deepEqual(EVAL_PROFILES, ["smoke", "release"]);
+  assert.deepEqual(EVAL_PROFILES, ["smoke", "onboarding", "release"]);
+  assert.deepEqual(ONBOARDING_PROFILE_MINIMUMS, {
+    suite_cases: 20,
+    answerable_cases: 15,
+    unanswerable_cases: 5,
+    query_kinds: {
+      single: 6,
+      multi: 3,
+      temporal: 3,
+      person: 3,
+      unanswerable: 5,
+    },
+  });
   assert.deepEqual(RELEASE_PROFILE_MINIMUMS, {
     suite_cases: 60,
     cases_per_required_slice: 5,
   });
+});
+
+function onboardingSuite() {
+  const kinds = [
+    ...Array(6).fill("single"),
+    ...Array(3).fill("multi"),
+    ...Array(3).fill("temporal"),
+    ...Array(3).fill("person"),
+    ...Array(5).fill("unanswerable"),
+  ];
+  return {
+    questions: kinds.map((kind, index) => ({ id: `onboarding-${index + 1}`, kind })),
+  };
+}
+
+test("onboarding accepts the reviewed Golden 20 composition", () => {
+  const result = evaluateProfileCoverage(onboardingSuite(), "onboarding");
+  assert.deepEqual(result.failures, []);
+  assert.equal(result.scope, "owner-onboarding-golden-20");
+  assert.equal(result.observed.answerable_cases, 15);
+  assert.equal(result.observed.unanswerable_cases, 5);
+});
+
+test("onboarding rejects a large suite that omits a required question kind", () => {
+  const suite = onboardingSuite();
+  for (const question of suite.questions.filter((entry) => entry.kind === "person")) {
+    question.kind = "single";
+  }
+  const result = evaluateProfileCoverage(suite, "onboarding");
+  assert.ok(result.failures.some((entry) =>
+    entry.code === "QUERY_KIND_BELOW_MINIMUM" && entry.kind === "person" && entry.observed === 0));
+  assert.match(formatProfileFailures(result), /query kind person has 0 cases/);
+});
+
+test("onboarding rejects unsupported kinds without exposing their private labels", () => {
+  const suite = onboardingSuite();
+  const privateKind = "private-client-workstream-name";
+  suite.questions.push({ id: "private-kind", kind: privateKind });
+  const result = evaluateProfileCoverage(suite, "onboarding");
+  assert.ok(result.failures.some((entry) =>
+    entry.code === "CASES_WITH_UNSUPPORTED_QUERY_KIND" && entry.observed === 1));
+  assert.equal(Object.hasOwn(result.observed.query_kinds, privateKind), false);
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(privateKind));
+  assert.doesNotMatch(formatProfileFailures(result), new RegExp(privateKind));
 });
 
 test("smoke remains a diagnostic profile for a small valid suite", () => {
@@ -127,6 +184,6 @@ test("release coverage failures contain no private case text or source reference
 test("unknown profiles fail closed", () => {
   assert.throws(
     () => evaluateProfileCoverage(releaseSuite(), "certify-everything"),
-    /evaluation profile must be one of: smoke, release/,
+    /evaluation profile must be one of: smoke, onboarding, release/,
   );
 });

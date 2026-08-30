@@ -13296,6 +13296,12 @@ export function evalChildArguments(base, goldenPath, requestedProfile, flags = {
   return args;
 }
 
+export function resolveRequestedEvalProfile(flags = {}, guidedDefault = null) {
+  return flags.profile && flags.profile !== true
+    ? String(flags.profile)
+    : guidedDefault || "smoke";
+}
+
 /** Create the owner's private eval set once, without links or broad file modes. */
 export function writePrivateEvalTemplate(destination, options = {}) {
   if (options.force) {
@@ -13352,6 +13358,7 @@ async function cmdEval(manifestPath) {
   const goldenPath = flags.golden && flags.golden !== true
     ? resolve(String(flags.golden))
     : join(dir, "brain.golden.json");
+  let guidedProfile = null;
 
   if (flags.init) {
     if (existsSync(goldenPath)) {
@@ -13374,9 +13381,10 @@ async function cmdEval(manifestPath) {
       `       the brain then finds it by matching words instead of meaning. That\n` +
       `       flatters the score and teaches you nothing.\n\n` +
       `    2. THEN find which document should answer each one and name it.\n\n` +
-      `    3. Add 4 or 5 questions you KNOW it cannot answer, marked unanswerable.\n` +
+      `    3. Add 5 questions you KNOW it cannot answer, marked unanswerable.\n` +
       `       These are the most valuable entries in the file.\n\n` +
-      `  Then run:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")}\n` +
+      `  Run smoke while writing:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")}\n` +
+      `  Run a complete Golden 20:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")} --profile onboarding\n` +
       `  Or build it in a guided session instead:  --golden-20\n`
     );
     return;
@@ -13412,10 +13420,19 @@ async function cmdEval(manifestPath) {
       closePrompts();
       return;
     }
-    const scoreNow = (await ask("Score it now with the smoke profile? (y/n)", "y")).toLowerCase();
+    guidedProfile = resolveRequestedEvalProfile(
+      flags,
+      session.complete ? "onboarding" : "smoke",
+    );
+    const scoreNow = (await ask(
+      `Score it now with the ${guidedProfile} profile? (y/n)`,
+      "y",
+    )).toLowerCase();
     closePrompts();
     if (scoreNow !== "y") {
-      console.log(`  Score later with:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")}`);
+      console.log(
+        `  Score later with:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")} --profile ${guidedProfile}`,
+      );
       return;
     }
     // Fall through into normal scoring: build twenty, then watch them score,
@@ -13435,18 +13452,16 @@ async function cmdEval(manifestPath) {
   // The top-level command owns this default and always passes it to the child.
   // A locally edited eval.config.json must not let the parent preflight smoke
   // while the child silently selects release after credential resolution.
-  const requestedProfile = flags.profile && flags.profile !== true
-    ? String(flags.profile)
-    : "smoke";
+  const requestedProfile = resolveRequestedEvalProfile(flags, guidedProfile);
 
   // This must stay ahead of account/base/admin-key resolution. Besides being
   // faster, that ordering makes the documented pre-credential release gate a
   // real product invariant rather than a property of the child runner alone.
   try {
     const preflight = assertEvalProfilePreflight(goldenPath, requestedProfile);
-    if (preflight.profile === "release" && flags["no-think"]) {
+    if ((preflight.profile === "release" || preflight.profile === "onboarding") && flags["no-think"]) {
       throw new Error(
-        "--no-think cannot be used with the release profile because every refusal and declared answer canary must run",
+        `--no-think cannot be used with the ${preflight.profile} profile because every refusal and declared answer canary must run`,
       );
     }
   } catch (error) {
@@ -15518,7 +15533,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain reconcile tax-quickbooks <manifest> --claim-file <private-json> --confirm-reviewed-claims
     brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
-    brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it
+    brain eval       <manifest> --golden-20  build the Golden 20, then run its onboarding gate
     brain token      <manifest>            is a Cloudflare token remembered on this Mac? --forget removes it
     brain technician <manifest>            read-only account setup plan; --run <step> launches one safe ceremony
     brain grant      <manifest> --name "X" --can ask,file   give one person scoped access; prints the token once

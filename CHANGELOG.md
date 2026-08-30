@@ -107,6 +107,11 @@ without weakening the ingestion and deletion rules underneath them.**
   active skip as a deletion. YAML files are read as text, and format-support
   upgrades force one complete Drive comparison so unchanged files are
   reconsidered immediately.
+- A completed guided Golden 20 now runs a real owner-onboarding quality gate,
+  not a permissive smoke check. It requires strong evidence coverage, all five
+  safe refusals, low duplicate waste, and any declared answer checks. Missing
+  answers count as inconclusive, and retrieval, answer, and refusal speed are
+  shown separately so the first useful moment can be improved honestly.
 - The vector drain now runs every minute by default. It still embeds only after
   the previous batch is confirmed, so extra ticks are no-ops rather than extra
   model work.

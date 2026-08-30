@@ -180,6 +180,27 @@ test("a live refusal check failure never aborts the session", async () => {
   assert.equal(summary.complete, true);
 });
 
+test("a missing live answer is inconclusive, never praised as a safe refusal", async () => {
+  const goldenPath = join(sandbox, "think-empty.golden.json");
+  const logs = [];
+  const client = {
+    async retrieve() { return []; },
+    async think() { return { answer: null, gaps: [] }; },
+  };
+  const summary = await runGolden20Session({
+    goldenPath,
+    client,
+    askFn: scriptedAsk(["what never happened?"]),
+    log: (line) => logs.push(line),
+    manifest: MANIFEST,
+    now: NOW,
+    plan: [{ kind: "unanswerable", count: 1, coach: "A verified absence." }],
+  });
+  assert.equal(summary.complete, true);
+  assert.match(logs.join("\n"), /count this as inconclusive, not as a safe refusal/);
+  assert.doesNotMatch(logs.join("\n"), /Good: the brain refuses/);
+});
+
 test("writeGoldenPrivate refuses a symlinked destination", () => {
   const target = join(sandbox, "real.json");
   writeFileSync(target, "{}\n");

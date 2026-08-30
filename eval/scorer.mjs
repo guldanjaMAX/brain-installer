@@ -562,7 +562,9 @@ export function retrievalQuality(question, results, ks = [1, 5, 10]) {
         : null,
       precision: relevant / k,
       ndcg: ideal > 0 ? dcg / ideal : null,
-      duplicate_waste: 1 - unique / k,
+      // Empty rank positions are not duplicates. Measure repeated logical
+      // documents only among results the retriever actually returned.
+      duplicate_waste: top.length ? 1 - unique / top.length : 0,
     };
   }
   return out;

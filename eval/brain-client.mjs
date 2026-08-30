@@ -48,13 +48,28 @@ function assertResponseStayedOnBrain(response, requestedUrl) {
   if (response?.redirected === true) {
     const error = new Error("brain request redirected; credentialed redirects are refused");
     error.retryable = false;
+    error.observationKind = "security_boundary";
     throw error;
   }
   if (response?.url && new URL(response.url).origin !== new URL(requestedUrl).origin) {
     const error = new Error("brain response came from a different origin");
     error.retryable = false;
+    error.observationKind = "security_boundary";
     throw error;
   }
+}
+
+function httpError(status) {
+  const error = new Error(`HTTP ${status}`);
+  error.httpStatus = status;
+  error.observationKind = status === 401 || status === 403
+    ? "authorization"
+    : status === 404 || status === 405
+      ? "unsupported_route"
+      : status === 408 || status === 429 || status >= 500
+        ? "transient"
+        : "http_error";
+  return error;
 }
 
 export class BrainClient {
@@ -92,23 +107,30 @@ export class BrainClient {
         if (!res.ok) {
           // A 5xx or a rate limit is worth another try; a 401 or a 404 will
           // never become a 200 and retrying only makes the run slower.
-          if (res.status >= 500 || res.status === 429) {
-            lastErr = new Error(`HTTP ${res.status}`);
+          if (res.status >= 500 || res.status === 429 || res.status === 408) {
+            lastErr = httpError(res.status);
             await sleep(400 * (attempt + 1));
             continue;
           }
-          const error = new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+          const error = httpError(res.status);
           error.retryable = false;
           throw error;
         }
         try {
           return JSON.parse(text);
         } catch {
-          throw new Error(`response was not JSON: ${text.slice(0, 200)}`);
+          const error = new Error("brain response was not valid JSON");
+          error.observationKind = "response_contract";
+          throw error;
         }
       } catch (e) {
         lastErr = e;
-        if (e.name === "AbortError") lastErr = new Error(`timed out after ${this.timeoutMs}ms`);
+        if (e.name === "AbortError") {
+          lastErr = new Error(`timed out after ${this.timeoutMs}ms`);
+          lastErr.observationKind = "transient";
+        } else if (!lastErr.observationKind) {
+          lastErr.observationKind = "transient";
+        }
         if (e.retryable === false) throw e;
         if (attempt === this.retries) break;
         await sleep(400 * (attempt + 1));

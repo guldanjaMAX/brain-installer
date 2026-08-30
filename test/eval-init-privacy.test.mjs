@@ -12,7 +12,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { evalChildArguments, writePrivateEvalTemplate } from "../brain.mjs";
+import {
+  evalChildArguments,
+  resolveRequestedEvalProfile,
+  writePrivateEvalTemplate,
+} from "../brain.mjs";
 
 const sandbox = mkdtempSync(join(tmpdir(), "brain-eval-init-"));
 try {
@@ -55,6 +59,12 @@ try {
     explicitDefaultArgs.slice(-2),
     ["--profile", "smoke"],
     "the child must never inherit a different profile from its local config",
+  );
+  assert.equal(resolveRequestedEvalProfile({}, "onboarding"), "onboarding");
+  assert.equal(
+    resolveRequestedEvalProfile({ profile: "release" }, "onboarding"),
+    "release",
+    "an explicit profile must control both the guided prompt and the child evaluator",
   );
 
   const cli = fileURLToPath(new URL("../brain.mjs", import.meta.url));
@@ -183,6 +193,34 @@ try {
   assert.equal(skipBeforeAdminKey.status, 1, skipOutput);
   assert.match(skipOutput, /--no-think cannot be used with the release profile/);
   assert.doesNotMatch(skipOutput, /no admin key found|set ADMIN_KEY|Keychain/);
+
+  const onboardingPath = join(sandbox, "onboarding.golden.json");
+  const onboardingKinds = [
+    ...Array(6).fill("single"),
+    ...Array(3).fill("multi"),
+    ...Array(3).fill("temporal"),
+    ...Array(3).fill("person"),
+    ...Array(5).fill("unanswerable"),
+  ];
+  writeFileSync(onboardingPath, JSON.stringify({
+    schema_version: 1,
+    questions: onboardingKinds.map((kind, index) => ({
+      id: `onboarding-${index + 1}`,
+      kind,
+      question: `Synthetic onboarding question ${index + 1}`,
+      expect: kind === "unanswerable" ? [] : [{ any_of: ["curated:fixture"] }],
+    })),
+  }));
+  const onboardingSkip = runProfilePreflight(
+    domainManifest,
+    onboardingPath,
+    ["--no-think"],
+    "onboarding",
+  );
+  const onboardingSkipOutput = `${onboardingSkip.stdout || ""}${onboardingSkip.stderr || ""}`;
+  assert.equal(onboardingSkip.status, 1, onboardingSkipOutput);
+  assert.match(onboardingSkipOutput, /--no-think cannot be used with the onboarding profile/);
+  assert.doesNotMatch(onboardingSkipOutput, /no admin key found|set ADMIN_KEY|Keychain/);
 
   console.log("eval init privacy: all focused tests passed");
 } finally {

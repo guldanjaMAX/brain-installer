@@ -1169,7 +1169,15 @@ Vectorize index, and temporary admin-key item. The harness refuses ordinary
 client manifests and never accepts or prints a private corpus.
 
 `brain eval <manifest>` uses the `smoke` profile by default. It is diagnostic,
-not certification. `brain eval <manifest> --profile release` fails before
+not certification. A completed guided Golden 20 defaults to `--profile
+onboarding`: at least six single, three multi, three temporal, three person, and
+five unanswerable cases. It requires every refusal and declared answer canary
+to complete and pass, at least 80% complete evidence at five, at least 90%
+evidence-slot recall at five, and no more than 10% duplicate waste at five. A
+missing answer is inconclusive, not a refusal. Retrieval, answer, and refusal
+latency are recorded separately, but latency is not yet a hard gate.
+
+`brain eval <manifest> --profile release` fails before
 reading the admin key or contacting the brain unless the private suite has at
 least 60 cases, explicit risk, domain, format, and query-kind declarations, and
 at least five cases in every declared slice. That is a v1 retrieval-suite

@@ -389,6 +389,15 @@ function performanceSummary(scored) {
   return { n: values.length, p50_ms: percentile(values, 0.5), p95_ms: percentile(values, 0.95) };
 }
 
+function retrievalPerformanceSummary(scored) {
+  const values = scored.map((row) => Number(row.retrieval_latency_ms)).filter(Number.isFinite);
+  return { n: values.length, p50_ms: percentile(values, 0.5), p95_ms: percentile(values, 0.95) };
+}
+
+function refusalPerformanceSummary(scored) {
+  return performanceSummary(scored.filter((row) => row.kind === "unanswerable"));
+}
+
 function answerPerformanceSummary(scored) {
   const values = scored.map((row) => Number(row.answer_latency_ms)).filter(Number.isFinite);
   return { n: values.length, p50_ms: percentile(values, 0.5), p95_ms: percentile(values, 0.95) };
@@ -591,6 +600,8 @@ function sanitizedRunArtifact(run, k) {
       refusal: run.refusals,
       deterministic_answer: run.deterministic_answers,
       latency: run.performance,
+      retrieval_latency: run.retrieval_performance,
+      refusal_latency: run.refusal_performance,
       answer_latency: run.answer_performance,
     },
     slices: run.slices,
@@ -714,7 +725,12 @@ function report(run, regressions, improvements, k) {
   L.push("");
   L.push(`  brain      ${run.base}`);
   L.push(`  golden     ${run.goldenLabel}  (${agg.n} scored, ${refusals.total} unanswerable)`);
-  L.push(`  profile    ${run.profile}${run.profile === "release" ? " (v1 retrieval-suite coverage floor passed)" : " (diagnostic; not certification)"}`);
+  const profileNote = run.profile === "release"
+    ? "v1 retrieval-suite coverage floor passed"
+    : run.profile === "onboarding"
+      ? "owner-onboarding quality gate"
+      : "diagnostic; not certification";
+  L.push(`  profile    ${run.profile} (${profileNote})`);
   L.push(`  variant    limit=${variant.limit} rerank=${variant.rerank} graph_boost=${variant.graphBoost}`);
   if (run.corpus_completeness) {
     const completeness = run.corpus_completeness;
@@ -746,13 +762,16 @@ function report(run, regressions, improvements, k) {
   L.push(`  complete evidence@${k} ${pct(run.quality.complete_evidence)}`);
   L.push(`  precision@${k}         ${pct(run.quality.precision)}       nDCG@10  ${run.quality_at_10.ndcg.toFixed(3)}`);
   L.push(`  duplicate waste@${k}   ${pct(run.quality.duplicate_waste)}`);
-  if (run.performance.p50_ms !== null) {
-    L.push(`  latency               p50 ${run.performance.p50_ms}ms   p95 ${run.performance.p95_ms}ms`);
+  if (run.retrieval_performance.p50_ms !== null) {
+    L.push(`  retrieval latency     p50 ${run.retrieval_performance.p50_ms}ms   p95 ${run.retrieval_performance.p95_ms}ms`);
+  }
+  if (run.refusal_performance.p50_ms !== null) {
+    L.push(`  refusal latency       p50 ${run.refusal_performance.p50_ms}ms   p95 ${run.refusal_performance.p95_ms}ms`);
   }
   if (refusals.total > 0) {
     L.push(
-      `  honest refusal  ${refusals.conclusive === 0 ? "n/a" : pct(refusals.passed / refusals.conclusive)}` +
-        `  (${refusals.passed}/${refusals.conclusive} unanswerable questions declined)`
+      `  honest refusal       ${pct(refusals.passed / refusals.total)}` +
+        `  (${refusals.passed}/${refusals.total} clean; ${refusals.failed} unsafe; ${refusals.inconclusive} inconclusive)`
     );
   }
   if (answers.total > 0) {
@@ -922,6 +941,12 @@ function canonicalInventory(docs) {
 }
 
 const CORPUS_PAGE_LIMIT = 1000;
+function sourceFamilyContractError(message) {
+  const error = new Error(message);
+  error.observationKind = "response_contract";
+  return error;
+}
+
 async function fingerprintSourceFamilies(client, inventoryRows, observeFamily = null) {
   const sourceFingerprints = new Map();
   let cursor = "";
@@ -932,20 +957,20 @@ async function fingerprintSourceFamilies(client, inventoryRows, observeFamily = 
   while (true) {
     const body = await client.sourceFamilies({ cursor, limit: CORPUS_PAGE_LIMIT });
     if (body?.source !== null || !Array.isArray(body?.families)) {
-      throw new Error("source-family inventory response is malformed");
+      throw sourceFamilyContractError("source-family inventory response is malformed");
     }
     if (body.families.length > CORPUS_PAGE_LIMIT) {
-      throw new Error("source-family inventory page exceeded its requested limit");
+      throw sourceFamilyContractError("source-family inventory page exceeded its requested limit");
     }
     for (const family of body.families) {
       const separator = typeof family === "string" ? family.indexOf(":") : -1;
       const source = separator > 0 ? family.slice(0, separator) : "";
       if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(source) ||
           !family.startsWith(`${source}:`) || /[\u0000-\u001f\u007f]/.test(family)) {
-        throw new Error("source-family inventory contains an invalid family identity");
+        throw sourceFamilyContractError("source-family inventory contains an invalid family identity");
       }
       if (previousFamily && family <= previousFamily) {
-        throw new Error("source-family inventory is not strictly ordered and unique");
+        throw sourceFamilyContractError("source-family inventory is not strictly ordered and unique");
       }
       previousFamily = family;
       let fingerprint = sourceFingerprints.get(source);
@@ -962,13 +987,13 @@ async function fingerprintSourceFamilies(client, inventoryRows, observeFamily = 
       if (observeFamily) observeFamily(source, family);
       count++;
       if (!Number.isSafeInteger(count)) {
-        throw new Error("source-family inventory count is too large");
+        throw sourceFamilyContractError("source-family inventory count is too large");
       }
     }
     const next = body.next_cursor;
     if (next === null || next === undefined || next === "") break;
     if (typeof next !== "string" || next !== body.families.at(-1) || seenCursors.has(next)) {
-      throw new Error("source-family inventory cursor is malformed or repeated");
+      throw sourceFamilyContractError("source-family inventory cursor is malformed or repeated");
     }
     seenCursors.add(next);
     cursor = next;
@@ -996,17 +1021,47 @@ async function fingerprintSourceFamilies(client, inventoryRows, observeFamily = 
   };
 }
 
+const CORPUS_OBSERVATION_KINDS = new Set([
+  "authorization",
+  "http_error",
+  "response_contract",
+  "security_boundary",
+  "transient",
+  "unsupported_route",
+]);
+
+function sanitizedCorpusObservationError(stage, error) {
+  const kind = CORPUS_OBSERVATION_KINDS.has(error?.observationKind)
+    ? error.observationKind
+    : stage.endsWith("_contract")
+      ? "response_contract"
+      : "transient";
+  const httpStatus = Number(error?.httpStatus);
+  return {
+    stage,
+    kind,
+    ...(Number.isSafeInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599
+      ? { http_status: httpStatus }
+      : {}),
+  };
+}
+
 async function collectCorpusSnapshot(client, contractBundle = null) {
+  let stage = "documents";
   try {
-    const inventory = canonicalInventory(await client.documents());
+    const documents = await client.documents();
+    stage = "documents_contract";
+    const inventory = canonicalInventory(documents);
     const reconciliation = contractBundle
       ? createCorpusReconciliationCollector(contractBundle)
       : null;
+    stage = "source_families";
     const familyInventory = await fingerprintSourceFamilies(
       client,
       inventory.rows,
       reconciliation ? (source, family) => reconciliation.observe(source, family) : null,
     );
+    stage = "source_families_contract";
     if (!reconciliation && familyInventory.inventory_mismatch_count > 0) {
       throw new Error("source-family inventory does not match the corpus summary");
     }
@@ -1030,7 +1085,11 @@ async function collectCorpusSnapshot(client, contractBundle = null) {
     }
     return snapshot;
   } catch (error) {
-    const unavailable = { status: "not_observable", reason: "CONTENT_FINGERPRINT_UNAVAILABLE" };
+    const unavailable = {
+      status: "not_observable",
+      reason: "CONTENT_FINGERPRINT_UNAVAILABLE",
+      observation_error: sanitizedCorpusObservationError(stage, error),
+    };
     if (contractBundle) {
       unavailable.completeness = corpusReconciliationUnavailable(
         contractBundle,
@@ -1043,6 +1102,13 @@ async function collectCorpusSnapshot(client, contractBundle = null) {
   }
 }
 
+function corpusObservationLabel(snapshot) {
+  if (snapshot?.status === "observed") return "observed";
+  const detail = snapshot?.observation_error;
+  if (!detail) return String(snapshot?.reason || "not_observable");
+  return `${detail.stage}/${detail.kind}${detail.http_status ? `/HTTP_${detail.http_status}` : ""}`;
+}
+
 function closeCorpusBracket(before, after) {
   if (before.status === "observed" && after.status === "observed") {
     if (before.snapshot_hash !== after.snapshot_hash) {
@@ -1052,8 +1118,15 @@ function closeCorpusBracket(before, after) {
     }
     return { ...before, bracketed: true };
   }
-  if (before.status !== after.status || before.reason !== after.reason) {
-    throw new Error("the corpus fingerprint became unavailable while evaluation was running");
+  if (
+    before.status !== after.status ||
+    before.reason !== after.reason ||
+    JSON.stringify(before.observation_error || null) !== JSON.stringify(after.observation_error || null)
+  ) {
+    throw new Error(
+      "the corpus fingerprint changed observability while evaluation was running " +
+      `(before ${corpusObservationLabel(before)}; after ${corpusObservationLabel(after)})`,
+    );
   }
   return { ...before, bracketed: false };
 }
@@ -1103,6 +1176,12 @@ async function collectProvenance(client, base, suiteBytes, corpus) {
   return p;
 }
 
+export const ONBOARDING_QUALITY_MINIMUMS = Object.freeze({
+  complete_evidence: 0.8,
+  slot_recall: 0.9,
+  maximum_duplicate_waste: 0.1,
+});
+
 function hardGateFailures(passes, k, profile = "smoke") {
   const failures = [];
   for (let passIndex = 0; passIndex < passes.length; passIndex++) {
@@ -1131,7 +1210,9 @@ function hardGateFailures(passes, k, profile = "smoke") {
         // regardless of risk. Treating provider or route failure as a normal
         // answer miss would produce a deceptively clean release result.
         failures.push({ id: entry.id, scope: "case", pass, reason: "ANSWER_TRANSPORT_ERROR" });
-      } else if (hasAnswerCheck && (entry.risk === "critical" || profile === "release")) {
+      } else if (hasAnswerCheck && (
+        entry.risk === "critical" || profile === "release" || profile === "onboarding"
+      )) {
         if (entry.answer_skipped) {
           failures.push({ id: entry.id, scope: "case", pass, reason: "ANSWER_PROBE_SKIPPED" });
         } else if (!entry.answer || entry.answer.inconclusive) {
@@ -1149,7 +1230,9 @@ function hardGateFailures(passes, k, profile = "smoke") {
       // required slice must therefore exercise and pass the refusal path,
       // regardless of its risk label. Smoke preserves the existing behavior in
       // which only critical case failures block the process.
-      if (entry.risk !== "critical" && !(profile === "release" && entry.kind === "unanswerable")) continue;
+      const allRefusalsBlock = (profile === "release" || profile === "onboarding") &&
+        entry.kind === "unanswerable";
+      if (entry.risk !== "critical" && !allRefusalsBlock) continue;
       if (entry.kind === "unanswerable") {
         if (entry.skipped) failures.push({ id: entry.id, scope: "case", pass, reason: "UNANSWERABLE_PROBE_SKIPPED" });
         else if (!entry.refusal || entry.refusal.inconclusive) {
@@ -1161,6 +1244,35 @@ function hardGateFailures(passes, k, profile = "smoke") {
         failures.push({ id: entry.id, scope: "case", pass, reason: `INCOMPLETE_EVIDENCE_AT_${k}` });
       }
     }
+    if (profile === "onboarding" && answerableCases > 0) {
+      const answerable = passes[passIndex].filter((entry) => entry.kind !== "unanswerable");
+      const quality = aggregateQuality(answerable, k);
+      if (quality.complete_evidence < ONBOARDING_QUALITY_MINIMUMS.complete_evidence) {
+        failures.push({
+          id: "__suite__",
+          scope: "suite",
+          pass: passIndex + 1,
+          reason: "ONBOARDING_COMPLETE_EVIDENCE_BELOW_80_PERCENT",
+        });
+      }
+      if (quality.slot_recall < ONBOARDING_QUALITY_MINIMUMS.slot_recall) {
+        failures.push({
+          id: "__suite__",
+          scope: "suite",
+          pass: passIndex + 1,
+          reason: "ONBOARDING_SLOT_RECALL_BELOW_90_PERCENT",
+        });
+      }
+      if (quality.duplicate_waste > ONBOARDING_QUALITY_MINIMUMS.maximum_duplicate_waste) {
+        failures.push({
+          id: "__suite__",
+          scope: "suite",
+          pass: passIndex + 1,
+          reason: "ONBOARDING_DUPLICATE_WASTE_ABOVE_10_PERCENT",
+        });
+      }
+    }
+
     // Individual normal/high misses remain diagnostics. A pass with answerable
     // cases but zero retrieval success is not usable and can never be green.
     if (answerableCases > 0 && successfulAnswerableCases === 0 && failures.length === failuresBeforePass) {
@@ -1274,7 +1386,7 @@ async function main() {
         "  --base <url>        brain base URL, overrides the config",
         "  --corpus-contract <path>  private source-inventory contract; enables completeness gates",
         "  --installation-ref <slug> manifest binding required with --corpus-contract",
-        "  --profile <name>    smoke (default) or release suite-coverage gate",
+        "  --profile <name>    smoke (default), onboarding Golden 20 gate, or release suite-coverage gate",
         "  --limit <n>         results requested per question (default/minimum 10 for nDCG@10)",
         "  --k <n>             evidence cutoff for question pass and quality metrics (default 5)",
         "  --rerank            turn the reranker on for this run",
@@ -1326,9 +1438,9 @@ async function main() {
   if (profileCoverage.failures.length > 0) {
     throw new Error(formatProfileFailures(profileCoverage));
   }
-  if (profile === "release" && bools.has("no-think")) {
+  if ((profile === "release" || profile === "onboarding") && bools.has("no-think")) {
     throw new Error(
-      "--no-think cannot be used with the release profile because every refusal and declared answer canary must run",
+      `--no-think cannot be used with the ${profile} profile because every refusal and declared answer canary must run`,
     );
   }
 
@@ -1478,6 +1590,8 @@ async function main() {
     total: unanswerable.length,
     conclusive: conclusive.length,
     passed: conclusive.filter((s) => s.refusal.pass).length,
+    failed: conclusive.filter((s) => s.refusal.pass !== true).length,
+    inconclusive: unanswerable.length - conclusive.length,
   };
   const deterministicAnswers = deterministicAnswerSummary(scored);
 
@@ -1533,6 +1647,8 @@ async function main() {
     quality_at_10: qualityAt10,
     slices: sliceSummary(retrieval, k),
     performance: performanceSummary(scored),
+    retrieval_performance: retrievalPerformanceSummary(scored),
+    refusal_performance: refusalPerformanceSummary(scored),
     answer_performance: answerPerformanceSummary(scored),
     refusals,
     deterministic_answers: deterministicAnswers,
