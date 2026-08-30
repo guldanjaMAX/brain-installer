@@ -5619,7 +5619,14 @@ async function cmdForget(manifestPath) {
   ).catch(() => {});
 
   await d1Query(acct.id, dbId, "DELETE FROM sources WHERE name = ?", [name]);
-  ok(`registry row for "${name}" removed, the name is free to reuse`);
+  if (String(row.kind || "").toLowerCase() === "quickbooks") {
+    ok(
+      `brain registry row for "${name}" removed; its local QuickBooks company reservation remains ` +
+      "so a different company cannot inherit the old source identity",
+    );
+  } else {
+    ok(`registry row for "${name}" removed, the name is free to reuse`);
+  }
 
   for (const wmsg of out.warnings) warn(wmsg);
   console.log("");
@@ -5715,17 +5722,22 @@ export async function cmdIngestProvider(m, manifestPath, flags, options = {}) {
   );
   const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
   const syncImpl = options.sync ?? await providerSyncImplementation(provider);
-  const loadAccess = () => oauth.providerAccessToken(provider, {
+  const loadAccess = (quickBooksBinding = null) => oauth.providerAccessToken(provider, {
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     ...(options.storage ? { storage: options.storage } : {}),
+    ...(quickBooksBinding ? { quickBooksBinding } : {}),
   });
   let preparedAccess = null;
   let identity = null;
   if (provider === "quickbooks") {
-    preparedAccess = await loadAccess();
-    if (typeof oauth.assertQuickBooksSourceBinding !== "function") {
-      throw new Error("the QuickBooks OAuth module cannot verify its company binding");
+    if (typeof oauth.assertQuickBooksSourceBinding !== "function" ||
+        typeof oauth.loadQuickBooksCredentials !== "function") {
+      throw new Error("the QuickBooks OAuth module cannot safely load and verify its company binding");
     }
+    const expectedBinding = { source: sourceName, environment: configuration.environment };
+    const stored = await oauth.loadQuickBooksCredentials(options.storage || {});
+    if (stored) oauth.assertQuickBooksSourceBinding(stored, expectedBinding);
+    preparedAccess = await loadAccess(expectedBinding);
     const binding = oauth.assertQuickBooksSourceBinding(preparedAccess.connection, {
       source: sourceName,
       environment: configuration.environment,
@@ -9477,7 +9489,9 @@ export async function cmdConnectProvider(provider, manifestPath, flags = {}, opt
   const redirectUri = provider === "quickbooks"
     ? oauth.quickBooksSandboxRedirectUri(port, redirectHost)
     : oauth.providerRedirectUri(port);
-  const prior = oauth.loadProviderCredentials(provider, storage);
+  const prior = provider === "quickbooks"
+    ? await oauth.loadQuickBooksCredentials(storage)
+    : oauth.loadProviderCredentials(provider, storage);
   const clientId = suppliedCredentials.clientId || environment[`${prefix}_CLIENT_ID`] || prior?.client_id || null;
   const clientSecret = suppliedCredentials.clientSecret || environment[`${prefix}_CLIENT_SECRET`] || prior?.client_secret || null;
   if (!clientId || (config.clientSecretRequired && !clientSecret)) {
@@ -9506,15 +9520,16 @@ export async function cmdConnectProvider(provider, manifestPath, flags = {}, opt
     storage,
     ...(provider === "quickbooks"
       ? {
-          prepareConnection: (candidate) => {
+          prepareConnection: (candidate, custody = {}) => {
             if (typeof oauth.bindQuickBooksConnection !== "function") {
               throw new Error("the QuickBooks OAuth module cannot bind the authorized company");
             }
             return oauth.bindQuickBooksConnection({
-              prior,
+              prior: custody.prior,
               candidate,
               source,
               environment: configuration.environment,
+              sourceRegistry: custody.sourceRegistry,
             });
           },
         }
@@ -9654,14 +9669,19 @@ export async function cmdReconcileQuickBooks(manifestPath, flags = {}, options =
     } else {
       const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
       const qbo = options.quickbooks ?? await import("./connectors/quickbooks-online.mjs");
+      if (typeof oauth.assertQuickBooksSourceBinding !== "function" ||
+          typeof oauth.loadQuickBooksCredentials !== "function") {
+        throw new Error("the QuickBooks OAuth module cannot safely load and verify its company binding");
+      }
+      const sourceName = assertSourceName(configuration.source || "quickbooks");
+      const expectedBinding = { source: sourceName, environment: configuration.environment };
+      const stored = await oauth.loadQuickBooksCredentials(options.storage || {});
+      if (stored) oauth.assertQuickBooksSourceBinding(stored, expectedBinding);
       const access = await oauth.providerAccessToken("quickbooks", {
         ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
         ...(options.storage ? { storage: options.storage } : {}),
+        quickBooksBinding: expectedBinding,
       });
-      const sourceName = assertSourceName(configuration.source || "quickbooks");
-      if (typeof oauth.assertQuickBooksSourceBinding !== "function") {
-        throw new Error("the QuickBooks OAuth module cannot verify its company binding");
-      }
       const binding = oauth.assertQuickBooksSourceBinding(access.connection, {
         source: sourceName,
         environment: configuration.environment,
@@ -10565,6 +10585,9 @@ export async function cmdDisconnectProvider(provider, manifestPath, flags = {}, 
   const result = await oauth.disconnectProvider(provider, {
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     storage: options.storage || {},
+    ...(provider === "quickbooks"
+      ? { source, environment: configuration.environment }
+      : {}),
   });
   if (result.already_disconnected) ok(`${oauth.providerOAuthConfig(provider).label} was already disconnected locally`);
   else if (result.remote_revoked) ok(`${oauth.providerOAuthConfig(provider).label} grant revoked, then local credentials removed`);
@@ -10589,12 +10612,19 @@ export async function cmdDisconnectProvider(provider, manifestPath, flags = {}, 
     `imported documents remain in the brain. When removal is wanted, separately review the preview from: ` +
     `brain forget ${manifestPath} --source ${source}`,
   );
+  if (provider === "quickbooks") {
+    info(
+      `the local source name "${source}" remains reserved for this QuickBooks company; ` +
+      "a different company can be connected with a new source name",
+    );
+  }
   return provider === "quickbooks"
     ? {
         ...result,
         source,
         imported_documents_retained: true,
         forget_operation_required: true,
+        source_company_binding_retained: true,
       }
     : result;
 }

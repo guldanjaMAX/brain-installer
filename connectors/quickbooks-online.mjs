@@ -34,7 +34,7 @@ export function normalizeQuickBooksRealmId(value) {
 /**
  * Canonical non-disclosing company identity shared with Books Reality Check.
  * Keep this exact algorithm stable because reconciliation claims, OAuth
- * bindings, sync state, and corpus document identities all rely on it.
+ * bindings, sync state, and source-namespace custody all rely on it.
  */
 export const quickBooksCompanyFingerprint = (realmId) => {
   const company = String(realmId || "").trim();
@@ -155,14 +155,14 @@ export async function syncQuickBooksOnline({
         const id = String(row?.Id || "").trim();
         if (!id) continue;
         const changed = row?.MetaData?.LastUpdatedTime || row?.TxnDate || null;
-        const recordId = encodeURIComponent(id);
+        const sourceId = `${entity.toLowerCase()}:${id}`;
         const reconciliationLines = quickBooksReconciliationLines(entity, row)
           .map((line) => ({ ...line, qbo_company_fingerprint: companyFingerprint }));
-        documents.push(providerEnvelope("quickbooks", `company:${companyFingerprint}:${entity.toLowerCase()}:${recordId}`, {
+        documents.push(providerEnvelope("quickbooks", sourceId, {
           title: `${entity}: ${row.DisplayName || row.DocNumber || row.CompanyName || id}`,
           content: renderRecord(`QuickBooks ${entity}`, row),
           occurredAt: changed,
-          uri: `quickbooks://company/${companyFingerprint}/${entity.toLowerCase()}/${recordId}`,
+          uri: `quickbooks://${entity.toLowerCase()}/${encodeURIComponent(id)}`,
           metadata: {
             qbo_company_fingerprint: companyFingerprint,
             entity_type: entity,

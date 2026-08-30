@@ -11,9 +11,12 @@
 
 import { createServer } from "node:http";
 import { createHash, randomBytes } from "node:crypto";
-import { lstatSync, mkdirSync, rmdirSync } from "node:fs";
+import {
+  existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmdirSync, unlinkSync, utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   googleAuthChildEnvironment,
   loadTokens,
@@ -127,7 +130,7 @@ export const PROVIDER_DEFAULT_PORT = 47812;
 export const PROVIDER_LOOPBACK_BIND_ADDRESS = "127.0.0.1";
 const QUICKBOOKS_SOURCE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const QUICKBOOKS_ENVIRONMENTS = new Set(["sandbox", "production"]);
-const REFRESH_IN_FLIGHT = new Map();
+const QUICKBOOKS_SOURCE_REGISTRY_KEY = "quickbooks_source_bindings";
 
 export class ProviderOAuthError extends Error {
   constructor(provider, phase, message, { status = null, code = null, uncertain = false } = {}) {
@@ -166,11 +169,46 @@ export function quickBooksSandboxRedirectUri(port = PROVIDER_DEFAULT_PORT, host 
   return `http://${callbackHost}:${callbackPort}/`;
 }
 
-function quickBooksBindingSources(connection) {
-  const sources = connection?.quickbooks_binding?.sources;
-  return sources && typeof sources === "object" && !Array.isArray(sources)
-    ? structuredClone(sources)
+function normalizedQuickBooksSources(value) {
+  const sources = value && typeof value === "object" && !Array.isArray(value)
+    ? value
     : {};
+  const normalized = {};
+  for (const [source, raw] of Object.entries(sources)) {
+    const sourceName = clean(source).toLowerCase();
+    const fingerprint = clean(raw?.qbo_company_fingerprint || raw?.realm_fingerprint).toLowerCase();
+    const environment = clean(raw?.environment).toLowerCase();
+    if (!QUICKBOOKS_SOURCE.test(sourceName) || !/^[a-f0-9]{64}$/.test(fingerprint) ||
+        !QUICKBOOKS_ENVIRONMENTS.has(environment)) {
+      throw new ProviderOAuthError("quickbooks", "binding", "the stored source-to-company registry is invalid", {
+        code: "source_binding_corrupt",
+      });
+    }
+    normalized[sourceName] = {
+      qbo_company_fingerprint: fingerprint,
+      environment,
+    };
+  }
+  return normalized;
+}
+
+function quickBooksBindingSources(connection) {
+  return normalizedQuickBooksSources(connection?.quickbooks_binding?.sources);
+}
+
+function mergeQuickBooksSources(left, right) {
+  const merged = normalizedQuickBooksSources(left);
+  for (const [source, binding] of Object.entries(normalizedQuickBooksSources(right))) {
+    const prior = merged[source];
+    if (prior && (prior.qbo_company_fingerprint !== binding.qbo_company_fingerprint ||
+        prior.environment !== binding.environment)) {
+      throw new ProviderOAuthError("quickbooks", "binding", "the protected source registries disagree", {
+        code: "source_binding_corrupt",
+      });
+    }
+    merged[source] = binding;
+  }
+  return merged;
 }
 
 function quickBooksConnectionFingerprint(connection) {
@@ -215,6 +253,7 @@ export function bindQuickBooksConnection({
   candidate,
   source = "quickbooks",
   environment = "sandbox",
+  sourceRegistry = null,
 } = {}) {
   const sourceName = clean(source).toLowerCase();
   const selectedEnvironment = clean(environment).toLowerCase();
@@ -237,7 +276,10 @@ export function bindQuickBooksConnection({
     });
   }
   const companyFingerprint = quickBooksCompanyFingerprint(realmId);
-  const sources = quickBooksBindingSources(prior);
+  const sources = mergeQuickBooksSources(
+    sourceRegistry?.sources || sourceRegistry,
+    quickBooksBindingSources(prior),
+  );
   const priorCompanyFingerprint = prior ? quickBooksConnectionFingerprint(prior) : null;
 
   // A legacy credential predating source bindings cannot prove which manifest
@@ -361,15 +403,144 @@ export function providerCredentialOptions(provider, options = {}) {
   };
 }
 
-export function loadProviderCredentials(provider, options = {}) {
-  const store = loadTokens(providerCredentialOptions(provider, options));
+function selectedProviderStorageBackend(options) {
+  const requested = options.backend || options.env?.[options.storeEnv] ||
+    process.env[options.storeEnv] || "auto";
+  if (!["auto", "keychain", "file"].includes(requested)) {
+    throw new Error(`${options.storeEnv} must be "keychain" or "file" (received "${requested}")`);
+  }
+  const platform = options.platform || process.platform;
+  const backend = requested === "auto" ? (platform === "darwin" ? "keychain" : "file") : requested;
+  if (backend === "keychain" && platform !== "darwin") {
+    throw new Error(`macOS Keychain storage was requested on a non-macOS system; use ${options.storeEnv}=file`);
+  }
+  return { backend, platform };
+}
+
+function loadProviderCredentialStore(provider, options = {}, {
+  allowQuickBooksMigration = false,
+} = {}) {
+  const key = providerOAuthConfig(provider).provider;
+  // Loading a legacy file into Keychain is a credential mutation. QuickBooks
+  // performs that migration only while holding its backend-independent custody
+  // lock; ordinary inspection remains side-effect free.
+  const guardedOptions = key === "quickbooks" && !allowQuickBooksMigration
+    ? { ...options, migrateLegacy: false }
+    : options;
+  const credentialOptions = providerCredentialOptions(key, guardedOptions);
+  if (key !== "quickbooks" || !allowQuickBooksMigration) {
+    return loadTokens(credentialOptions);
+  }
+  const { backend, platform } = selectedProviderStorageBackend(credentialOptions);
+  if (backend === "keychain") {
+    let store;
+    try {
+      // First prove Keychain is readable without allowing the generic helper to
+      // restore a possibly stale file over an unreadable newer token pair.
+      store = loadTokens({ ...credentialOptions, migrateLegacy: false });
+    } catch {
+      throw new ProviderOAuthError(
+        "quickbooks",
+        "mutation",
+        "the QuickBooks Keychain store could not be inspected; preserve local custody and resolve Keychain access before retrying",
+        { code: "credential_store_unavailable" },
+      );
+    }
+    const legacyPath = resolve(credentialOptions.path);
+    if (Object.keys(store).length === 0 && existsSync(legacyPath)) {
+      // Keychain is confirmed empty, so the verified legacy migration cannot
+      // overwrite an unseen current credential.
+      store = loadTokens({ ...credentialOptions, migrateLegacy: true });
+    }
+    // A crash after the Keychain commit but before legacy-file cleanup can
+    // leave two copies of one rotating token. Reconcile an exact duplicate
+    // under the shared lock, and fail closed on divergent custody.
+    if (existsSync(legacyPath)) {
+      const legacy = loadTokens({ ...credentialOptions, backend: "file", migrateLegacy: false });
+      if (JSON.stringify(legacy) !== JSON.stringify(store)) {
+        throw new ProviderOAuthError(
+          "quickbooks",
+          "mutation",
+          "the Keychain and legacy QuickBooks credential file disagree; preserve both and resolve custody before reconnecting",
+          { code: "credential_store_conflict" },
+        );
+      }
+      // Rewriting the verified current value invokes the storage helper's
+      // identity-checked removal of only that exact legacy duplicate.
+      saveTokens(store, credentialOptions);
+    }
+    return store;
+  }
+  const store = loadTokens(credentialOptions);
+  if (platform === "darwin") {
+    let keychainStore;
+    try {
+      keychainStore = loadTokens({ ...credentialOptions, backend: "keychain", migrateLegacy: false });
+    } catch {
+      throw new ProviderOAuthError(
+        "quickbooks",
+        "mutation",
+        "the alternate QuickBooks Keychain store could not be inspected; keep the current storage setting until custody can be verified",
+        { code: "credential_store_unavailable" },
+      );
+    }
+    if (Object.keys(keychainStore).length > 0) {
+      // Even an exact duplicate would let two independently selected
+      // backends later rotate the same single-use token. Refuse the backend
+      // switch and leave both copies untouched for explicit recovery.
+      throw new ProviderOAuthError(
+        "quickbooks",
+        "mutation",
+        "QuickBooks Keychain custody already exists; keep using Keychain or explicitly resolve it before selecting the file store",
+        { code: "credential_store_conflict" },
+      );
+    }
+  }
+  return store;
+}
+
+function providerConnectionFromStore(store) {
   const connection = store?.connection;
   return connection && typeof connection === "object" && !Array.isArray(connection)
     ? { ...connection }
     : null;
 }
 
-export function saveProviderCredentials(provider, connection, options = {}) {
+/**
+ * Non-secret, protected tombstone that keeps a source bound after disconnect.
+ * Imported documents remain, so clearing OAuth tokens must not make that source
+ * reusable for another company.
+ */
+export function loadQuickBooksSourceRegistry(options = {}) {
+  const store = loadProviderCredentialStore("quickbooks", options);
+  return Object.freeze({
+    schema_version: 1,
+    sources: normalizedQuickBooksSources(store?.[QUICKBOOKS_SOURCE_REGISTRY_KEY]?.sources),
+  });
+}
+
+export function loadProviderCredentials(provider, options = {}) {
+  return providerConnectionFromStore(loadProviderCredentialStore(provider, options));
+}
+
+/**
+ * Load QuickBooks custody, including a legacy-file-to-Keychain migration, only
+ * while holding the same lock used by refresh, reconnect, cursor, and revoke.
+ */
+export async function loadQuickBooksCredentials(storage = {}, options = {}) {
+  return withQuickBooksCredentialLock(
+    "quickbooks",
+    storage,
+    () => providerConnectionFromStore(loadProviderCredentialStore(
+      "quickbooks",
+      storage,
+      { allowQuickBooksMigration: true },
+    )),
+    options,
+  );
+}
+
+function saveProviderCredentialsUnlocked(provider, connection, options = {}) {
   if (!connection || typeof connection !== "object" || Array.isArray(connection)) {
     throw new TypeError("provider connection must be an object");
   }
@@ -379,7 +550,17 @@ export function saveProviderCredentials(provider, connection, options = {}) {
     provider: key,
     schema_version: 1,
   };
-  saveTokens({ connection: record }, providerCredentialOptions(key, options));
+  const storage = providerCredentialOptions(key, options);
+  let payload = { connection: record };
+  if (key === "quickbooks") {
+    const existing = loadQuickBooksSourceRegistry(options);
+    const sources = mergeQuickBooksSources(existing.sources, quickBooksBindingSources(record));
+    payload = {
+      connection: record,
+      [QUICKBOOKS_SOURCE_REGISTRY_KEY]: { schema_version: 1, sources },
+    };
+  }
+  saveTokens(payload, storage);
   const verified = loadProviderCredentials(key, options);
   if (!verified || JSON.stringify(verified) !== JSON.stringify(record)) {
     throw new Error(`${PROVIDER_OAUTH[key].label} credential replacement did not read back exactly`);
@@ -387,13 +568,62 @@ export function saveProviderCredentials(provider, connection, options = {}) {
   return verified;
 }
 
-export function clearProviderCredentials(provider, options = {}) {
+export function saveProviderCredentials(provider, connection, options = {}) {
+  const key = providerOAuthConfig(provider).provider;
+  if (key === "quickbooks") {
+    throw new ProviderOAuthError(
+      "quickbooks",
+      "mutation",
+      "direct QuickBooks credential replacement is not available; use the source-bound authorization or refresh flow",
+      { code: "credential_mutation_requires_custody" },
+    );
+  }
+  return saveProviderCredentialsUnlocked(key, connection, options);
+}
+
+function clearProviderCredentialsUnlocked(provider, options = {}) {
   const { provider: key } = providerOAuthConfig(provider);
-  saveTokens({}, providerCredentialOptions(key, options));
+  let retained = {};
+  if (key === "quickbooks") {
+    const store = loadProviderCredentialStore(key, options);
+    const connection = store?.connection && typeof store.connection === "object" && !Array.isArray(store.connection)
+      ? store.connection
+      : null;
+    const existing = normalizedQuickBooksSources(store?.[QUICKBOOKS_SOURCE_REGISTRY_KEY]?.sources);
+    const bound = quickBooksBindingSources(connection);
+    if (connection?.provider_metadata?.realm_id && Object.keys(bound).length === 0) {
+      throw new ProviderOAuthError(
+        "quickbooks",
+        "disconnect",
+        "the retained QuickBooks company must be bound to its manifest source before credentials can be removed",
+        { code: "source_binding_required" },
+      );
+    }
+    retained = {
+      [QUICKBOOKS_SOURCE_REGISTRY_KEY]: {
+        schema_version: 1,
+        sources: mergeQuickBooksSources(existing, bound),
+      },
+    };
+  }
+  saveTokens(retained, providerCredentialOptions(key, options));
   if (loadProviderCredentials(key, options) !== null) {
     throw new Error(`${PROVIDER_OAUTH[key].label} credentials were not removed from the local store`);
   }
   return true;
+}
+
+export function clearProviderCredentials(provider, options = {}) {
+  const key = providerOAuthConfig(provider).provider;
+  if (key === "quickbooks") {
+    throw new ProviderOAuthError(
+      "quickbooks",
+      "mutation",
+      "direct QuickBooks credential removal is not available; use the source-bound disconnect flow",
+      { code: "credential_mutation_requires_custody" },
+    );
+  }
+  return clearProviderCredentialsUnlocked(key, options);
 }
 
 /**
@@ -401,13 +631,21 @@ export function clearProviderCredentials(provider, options = {}) {
  * dependable token revocation endpoint. Providers without one return an
  * explicit owner-portal requirement instead of claiming the grant is gone.
  */
-export async function disconnectProvider(provider, {
+async function disconnectProviderUnlocked(provider, {
   fetchImpl = fetch,
   storage = {},
   revokeRemote = true,
-} = {}) {
+  source = null,
+  environment = null,
+} = {}, { assertOwned = null } = {}) {
   const config = providerOAuthConfig(provider);
-  const connection = loadProviderCredentials(config.provider, storage);
+  let connection = config.provider === "quickbooks"
+    ? providerConnectionFromStore(loadProviderCredentialStore(
+        config.provider,
+        storage,
+        { allowQuickBooksMigration: true },
+      ))
+    : loadProviderCredentials(config.provider, storage);
   if (!connection) {
     const result = {
       disconnected: true,
@@ -416,8 +654,43 @@ export async function disconnectProvider(provider, {
       remote_revocation_required: false,
     };
     return config.provider === "quickbooks"
-      ? { ...result, imported_documents_retained: true, forget_operation_required: true }
+      ? {
+          ...result,
+          imported_documents_retained: true,
+          forget_operation_required: true,
+          source_company_binding_retained: true,
+        }
       : result;
+  }
+  if (config.provider === "quickbooks") {
+    const activeSource = clean(source || connection.quickbooks_binding?.active_source).toLowerCase();
+    const activeEnvironment = clean(environment || connection.quickbooks_binding?.active_environment).toLowerCase();
+    if (!activeSource || !activeEnvironment) {
+      throw new ProviderOAuthError(
+        "quickbooks",
+        "disconnect",
+        "the manifest source and environment are required to preserve the company reservation before disconnect",
+        { code: "source_binding_required" },
+      );
+    }
+    if (Object.keys(quickBooksBindingSources(connection)).length > 0) {
+      assertQuickBooksSourceBinding(connection, {
+        source: activeSource,
+        environment: activeEnvironment,
+      });
+    }
+    connection = bindQuickBooksConnection({
+      prior: connection,
+      candidate: connection,
+      source: activeSource,
+      environment: activeEnvironment,
+      sourceRegistry: (() => {
+        const store = loadProviderCredentialStore(config.provider, storage, { allowQuickBooksMigration: true });
+        return store?.[QUICKBOOKS_SOURCE_REGISTRY_KEY] || null;
+      })(),
+    });
+    assertOwned?.();
+    connection = saveProviderCredentialsUnlocked(config.provider, connection, storage);
   }
   let remoteRevoked = false;
   let remoteRevocationRequired = false;
@@ -476,7 +749,8 @@ export async function disconnectProvider(provider, {
   } else {
     remoteRevocationRequired = true;
   }
-  clearProviderCredentials(config.provider, storage);
+  assertOwned?.();
+  clearProviderCredentialsUnlocked(config.provider, storage);
   const result = {
     disconnected: true,
     already_disconnected: false,
@@ -485,8 +759,27 @@ export async function disconnectProvider(provider, {
     remote_revocation_note: remoteRevocationNote,
   };
   return config.provider === "quickbooks"
-    ? { ...result, imported_documents_retained: true, forget_operation_required: true }
+    ? {
+        ...result,
+        imported_documents_retained: true,
+        forget_operation_required: true,
+        source_company_binding_retained: true,
+      }
     : result;
+}
+
+export async function disconnectProvider(provider, options = {}) {
+  const config = providerOAuthConfig(provider);
+  if (config.provider !== "quickbooks") {
+    return disconnectProviderUnlocked(config.provider, options);
+  }
+  const storage = options.storage || {};
+  return withQuickBooksCredentialLock(
+    config.provider,
+    storage,
+    (lock) => disconnectProviderUnlocked(config.provider, options, lock),
+    options,
+  );
 }
 
 export function loadProviderSyncState(provider, source, options = {}) {
@@ -500,28 +793,129 @@ export function saveProviderSyncState(provider, source, state, options = {}) {
   const sourceName = clean(source);
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(sourceName)) throw new TypeError("provider state needs a safe source name");
   if (!state || typeof state !== "object" || Array.isArray(state)) throw new TypeError("provider sync state must be an object");
-  const connection = loadProviderCredentials(config.provider, options);
-  if (!connection) throw new ProviderOAuthError(config.provider, "state", "this provider is not connected", { code: "not_connected" });
-  const next = {
-    ...connection,
-    sync_states: { ...(connection.sync_states || {}), [sourceName]: structuredClone(state) },
+  const save = ({ assertOwned = null } = {}) => {
+    const connection = config.provider === "quickbooks"
+      ? providerConnectionFromStore(loadProviderCredentialStore(
+          config.provider,
+          options,
+          { allowQuickBooksMigration: true },
+        ))
+      : loadProviderCredentials(config.provider, options);
+    if (!connection) throw new ProviderOAuthError(config.provider, "state", "this provider is not connected", { code: "not_connected" });
+    if (config.provider === "quickbooks" && connection.quickbooks_refresh_fence) {
+      throw new ProviderOAuthError("quickbooks", "state", "the last token refresh outcome is unknown; reconnect before saving more source state", {
+        code: "refresh_outcome_unknown",
+      });
+    }
+    const next = {
+      ...connection,
+      sync_states: { ...(connection.sync_states || {}), [sourceName]: structuredClone(state) },
+    };
+    assertOwned?.();
+    const saved = saveProviderCredentialsUnlocked(config.provider, next, options);
+    const verified = saved.sync_states?.[sourceName];
+    if (JSON.stringify(verified) !== JSON.stringify(state)) {
+      throw new Error(`${config.label} cursor replacement did not read back exactly`);
+    }
+    return structuredClone(verified);
   };
-  const saved = saveProviderCredentials(config.provider, next, options);
-  const verified = saved.sync_states?.[sourceName];
-  if (JSON.stringify(verified) !== JSON.stringify(state)) {
-    throw new Error(`${config.label} cursor replacement did not read back exactly`);
+  if (config.provider === "quickbooks") {
+    return withQuickBooksCredentialLock(
+      config.provider,
+      options,
+      ({ assertOwned }) => save({ assertOwned }),
+      options,
+    );
   }
-  return structuredClone(verified);
+  return save();
 }
 
 export function providerCredentialStatus(provider, options = {}) {
-  const storage = providerCredentialOptions(provider, options);
+  const config = providerOAuthConfig(provider);
+  const storage = providerCredentialOptions(config.provider, options);
   const envelope = tokenStorageStatus(storage);
   if (!envelope.exists) return { connected: false, readable: false, storage: envelope };
+  if (config.provider === "quickbooks") {
+    const { backend, platform } = selectedProviderStorageBackend(storage);
+    const legacyPending = backend === "keychain" && envelope.backend === "legacy-file";
+    const activeStorage = legacyPending
+      ? { ...storage, backend: "file", migrateLegacy: false }
+      : { ...storage, migrateLegacy: false };
+    const readable = verifyTokenStorageReadable(activeStorage);
+    if (!readable.readable) {
+      return { connected: false, readable: false, storage: envelope, reason: readable.reason };
+    }
+    let activeStore;
+    try {
+      activeStore = loadTokens(activeStorage);
+      if (backend === "keychain" && !legacyPending && existsSync(resolve(storage.path))) {
+        const legacy = loadTokens({ ...storage, backend: "file", migrateLegacy: false });
+        if (JSON.stringify(legacy) !== JSON.stringify(activeStore)) {
+          return {
+            connected: false,
+            readable: true,
+            storage: envelope,
+            reason: "the QuickBooks Keychain and legacy credential file disagree; resolve custody before ingest",
+          };
+        }
+      }
+      if (backend === "file" && platform === "darwin") {
+        const keychainStore = loadTokens({ ...storage, backend: "keychain", migrateLegacy: false });
+        if (Object.keys(keychainStore).length > 0) {
+          return {
+            connected: false,
+            readable: true,
+            storage: envelope,
+            reason: "QuickBooks Keychain custody already exists; keep the current backend until custody is resolved",
+          };
+        }
+      }
+    } catch {
+      return {
+        connected: false,
+        readable: false,
+        storage: envelope,
+        reason: "the alternate QuickBooks credential store could not be inspected safely",
+      };
+    }
+    const connection = providerConnectionFromStore(activeStore);
+    if (connection?.quickbooks_refresh_fence) {
+      return {
+        connected: false,
+        readable: true,
+        storage: envelope,
+        code: "refresh_outcome_unknown",
+        reason: "the last QuickBooks refresh outcome is unknown; reconnect before using this connection",
+      };
+    }
+    if (connection) {
+      try {
+        assertQuickBooksSourceBinding(connection, {
+          source: connection.quickbooks_binding?.active_source,
+          environment: connection.quickbooks_binding?.active_environment,
+        });
+      } catch (error) {
+        return {
+          connected: false,
+          readable: true,
+          storage: envelope,
+          code: error?.code || "source_binding_missing",
+          reason: "the stored QuickBooks connection needs a verified company and source binding; reconnect before ingest",
+        };
+      }
+    }
+    return {
+      connected: Boolean(connection),
+      readable: true,
+      storage: envelope,
+      migration_pending: Boolean(envelope.migrationPending) || legacyPending ||
+        (backend === "keychain" && existsSync(resolve(storage.path))),
+    };
+  }
   const readable = verifyTokenStorageReadable(storage);
   if (!readable.readable) return { connected: false, readable: false, storage: envelope, reason: readable.reason };
   let connected = false;
-  try { connected = Boolean(loadProviderCredentials(provider, options)); } catch { connected = false; }
+  try { connected = Boolean(loadProviderCredentials(config.provider, options)); } catch { connected = false; }
   return { connected, readable: true, storage: envelope };
 }
 
@@ -602,20 +996,59 @@ async function exchangeToken(provider, fields, credentials, {
   fetchImpl = fetch,
   phase,
   now = Date.now(),
+  tokenRequestTimeoutMs = 30_000,
 } = {}) {
   const config = providerOAuthConfig(provider);
   const request = tokenRequest(config, fields, credentials);
   let response;
+  let data = {};
   try {
-    response = await fetchImpl(config.tokenUrl, { method: "POST", ...request });
+    if (config.provider === "quickbooks") {
+      const controller = new AbortController();
+      const timeout = Math.max(1_000, Math.min(60_000, Number(tokenRequestTimeoutMs) || 30_000));
+      let timer;
+      const aborted = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          const error = new Error("QuickBooks token request timed out");
+          error.name = "AbortError";
+          reject(error);
+        }, timeout);
+        timer.unref?.();
+      });
+      try {
+        ({ response, data } = await Promise.race([
+          Promise.resolve(fetchImpl(config.tokenUrl, { method: "POST", ...request, signal: controller.signal }))
+            .then(async (received) => {
+              let parsed;
+              try {
+                parsed = await received.json();
+              } catch (error) {
+                throw Object.assign(new Error("QuickBooks token response could not be read"), {
+                  name: "TokenResponseError",
+                  cause: error,
+                });
+              }
+              return { response: received, data: parsed };
+            }),
+          aborted,
+        ]));
+      } finally {
+        clearTimeout(timer);
+      }
+    } else {
+      // Preserve every released non-QBO request byte and timing behavior.
+      response = await fetchImpl(config.tokenUrl, { method: "POST", ...request });
+      try { data = await response.json(); } catch { /* classified below without response text */ }
+    }
   } catch (error) {
     throw new ProviderOAuthError(config.provider, phase, "the token response was not received; reconnect before assuming access is valid", {
-      code: error?.name === "AbortError" ? "timeout" : "transport_error",
+      code: error?.name === "AbortError"
+        ? "timeout"
+        : error?.name === "TokenResponseError" ? "invalid_response" : "transport_error",
       uncertain: true,
     });
   }
-  let data = {};
-  try { data = await response.json(); } catch { /* classified below without response text */ }
   const payload = tokenPayload(config, data);
   if (!response.ok || payload.error || !clean(payload.access_token)) {
     throw new ProviderOAuthError(config.provider, phase, safeDetail(
@@ -686,34 +1119,181 @@ export async function exchangeProviderAuthorizationCode(provider, {
   return token;
 }
 
-function refreshStorageIdentity(provider, storage) {
-  const options = providerCredentialOptions(provider, storage);
-  return [
-    provider,
-    options.backend || "auto",
-    options.path,
-    options.keychainService,
-    options.keychainAccount,
-  ].join("\0");
-}
-
 export function providerRefreshLockPath(provider, storage = {}) {
   const options = providerCredentialOptions(provider, storage);
-  const identity = refreshStorageIdentity(provider, storage);
+  const key = providerOAuthConfig(provider).provider;
+  if (key !== "quickbooks") {
+    // Preserve the released pure path calculation byte-for-byte for providers
+    // that do not use the QBO custody lock.
+    const identity = [
+      provider,
+      options.backend || "auto",
+      options.path,
+      options.keychainService,
+      options.keychainAccount,
+    ].join("\0");
+    const fingerprint = createHash("sha256").update(identity).digest("hex").slice(0, 24);
+    return join(dirname(options.path), `.provider-refresh-${fingerprint}.lock`);
+  }
+  const { backend, platform } = selectedProviderStorageBackend(options);
+  let identity;
+  let lockRoot;
+  if (key === "quickbooks") {
+    // A default macOS read may migrate the same legacy file into Keychain.
+    // Both storage selections therefore share one lock rooted at that file's
+    // canonical directory and keyed by both possible custody locators.
+    const requestedPath = resolve(options.path);
+    mkdirSync(dirname(requestedPath), { recursive: true, mode: 0o700 });
+    assertPrivateQuickBooksDirectory(dirname(requestedPath), platform, options, "credential lock root");
+    const canonicalPath = join(realpathSync(dirname(requestedPath)), basename(requestedPath));
+    identity = [
+      key,
+      "file-or-keychain",
+      canonicalPath,
+      options.keychainService,
+      options.keychainAccount,
+    ].join("\0");
+    lockRoot = dirname(canonicalPath);
+  } else if (backend === "keychain") {
+    identity = [provider, "keychain", options.keychainService, options.keychainAccount].join("\0");
+    const requestedRoot = join(homedir(), ".brain");
+    mkdirSync(requestedRoot, { recursive: true, mode: 0o700 });
+    assertPrivateQuickBooksDirectory(requestedRoot, platform, options, "credential lock root");
+    lockRoot = realpathSync(requestedRoot);
+  } else {
+    const requestedPath = resolve(options.path);
+    mkdirSync(dirname(requestedPath), { recursive: true, mode: 0o700 });
+    assertPrivateQuickBooksDirectory(dirname(requestedPath), platform, options, "credential lock root");
+    const canonicalPath = join(realpathSync(dirname(requestedPath)), basename(requestedPath));
+    identity = [provider, "file", canonicalPath].join("\0");
+    lockRoot = dirname(canonicalPath);
+  }
+  mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
   const fingerprint = createHash("sha256").update(identity).digest("hex").slice(0, 24);
-  return join(dirname(options.path), `.provider-refresh-${fingerprint}.lock`);
+  return join(lockRoot, `.provider-refresh-${fingerprint}.lock`);
 }
 
 const waitFor = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+const QUICKBOOKS_LOCK_OWNER = /^owner-([a-f0-9]{32})\.json$/;
+
+const quickBooksLockOwnerName = (token) => `owner-${token}.json`;
+
+function readQuickBooksLockOwner(lockPath) {
+  let entries;
+  try {
+    entries = readdirSync(lockPath, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  if (entries.length === 0) return null;
+  const owners = entries.filter((entry) => entry.name.match(QUICKBOOKS_LOCK_OWNER));
+  if (entries.length !== 1 || owners.length !== 1 || !owners[0].isFile()) {
+    throw new ProviderOAuthError("quickbooks", "mutation", "the local credential lock contains unexpected files", {
+      code: "credential_lock_unsafe",
+    });
+  }
+  const tokenFromName = owners[0].name.match(QUICKBOOKS_LOCK_OWNER)[1];
+  const ownerPath = join(lockPath, owners[0].name);
+  let state;
+  try {
+    state = lstatSync(ownerPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!state.isFile() || state.isSymbolicLink() || state.size > 1_024) {
+    throw new ProviderOAuthError("quickbooks", "mutation", "the local credential lock owner is invalid", {
+      code: "credential_lock_unsafe",
+    });
+  }
+  if (state.nlink !== 1 || (process.platform !== "win32" &&
+      ((typeof process.getuid === "function" && state.uid !== process.getuid()) ||
+       (state.mode & 0o077) !== 0))) {
+    throw new ProviderOAuthError("quickbooks", "mutation", "the local credential lock owner is not private", {
+      code: "credential_lock_unsafe",
+    });
+  }
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(ownerPath, "utf8")); } catch {
+    throw new ProviderOAuthError("quickbooks", "mutation", "the local credential lock owner is unreadable", {
+      code: "credential_lock_unsafe",
+    });
+  }
+  if (parsed?.token !== tokenFromName ||
+      !Number.isSafeInteger(parsed?.pid) || parsed.pid < 1) {
+    throw new ProviderOAuthError("quickbooks", "mutation", "the local credential lock owner is malformed", {
+      code: "credential_lock_unsafe",
+    });
+  }
+  return { token: parsed.token, pid: parsed.pid, mtimeMs: state.mtimeMs, path: ownerPath };
+}
+
+function quickBooksLockOwnerAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    // EPERM and unfamiliar platform responses cannot prove that the owner is
+    // dead, so stale takeover fails closed.
+    return true;
+  }
+}
+
+function releaseQuickBooksLockOwner(lockPath, expectedToken) {
+  const owner = readQuickBooksLockOwner(lockPath);
+  if (!owner || owner.token !== expectedToken) return false;
+  // The token is part of the filename. An old owner can therefore remove only
+  // its own file, even if stale recovery has already created a successor lock.
+  unlinkSync(join(lockPath, quickBooksLockOwnerName(expectedToken)));
+  rmdirSync(lockPath);
+  return true;
+}
+
+function removeStaleQuickBooksLockOwner(lockPath, expectedOwner) {
+  if (!expectedOwner || quickBooksLockOwnerAlive(expectedOwner.pid)) return false;
+  const current = readQuickBooksLockOwner(lockPath);
+  if (!current ||
+      current.token !== expectedOwner.token ||
+      current.pid !== expectedOwner.pid ||
+      current.mtimeMs !== expectedOwner.mtimeMs ||
+      quickBooksLockOwnerAlive(current.pid)) {
+    return false;
+  }
+  unlinkSync(current.path);
+  rmdirSync(lockPath);
+  return true;
+}
+
+function assertPrivateQuickBooksDirectory(path, platform, options = {}, label = "credential lock") {
+  const state = lstatSync(path);
+  if (!state.isDirectory() || state.isSymbolicLink()) {
+    throw new ProviderOAuthError("quickbooks", "mutation", `the local ${label} must be a real directory`, {
+      code: "credential_lock_unsafe",
+    });
+  }
+  if (platform !== "win32" && process.platform !== "win32") {
+    const getUid = options.getUid || process.getuid;
+    const expectedUid = typeof getUid === "function" ? getUid() : null;
+    if ((expectedUid !== null && state.uid !== expectedUid) || (state.mode & 0o077) !== 0) {
+      throw new ProviderOAuthError("quickbooks", "mutation", `the local ${label} must be private to the current user`, {
+        code: "credential_lock_unsafe",
+      });
+    }
+  }
+  return state;
+}
+
 /**
- * Intuit rotates refresh tokens, so one in-memory promise is not enough when a
- * scheduler and a technician command run in separate processes. An atomic,
- * owner-local lock serializes the provider exchange before either process can
- * consume the same token. A stale empty lock can be recovered only after the
- * QBO token request deadline has safely elapsed.
+ * Every QBO credential mutation shares this owner-token lock. Refresh rotation,
+ * cursor writes, reconnect finalization, and revoke-plus-clear therefore cannot
+ * restore a consumed token or resurrect a disconnected credential. The owner
+ * token prevents an older holder from deleting a successor's lock after stale
+ * recovery, and task code verifies ownership immediately before durable writes.
  */
-async function withQuickBooksRefreshLock(provider, storage, task, {
+async function withQuickBooksCredentialLock(provider, storage, task, {
   refreshLockWaitMs = 45_000,
   refreshLockPollMs = 50,
   refreshLockStaleMs = 120_000,
@@ -721,11 +1301,23 @@ async function withQuickBooksRefreshLock(provider, storage, task, {
   const lockPath = providerRefreshLockPath(provider, storage);
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
   const deadline = Date.now() + Math.max(0, Number(refreshLockWaitMs) || 0);
-  let acquired = false;
-  while (!acquired) {
+  const staleAfter = Math.max(120_000, Number(refreshLockStaleMs) || 0);
+  let ownerToken = null;
+  while (!ownerToken) {
     try {
       mkdirSync(lockPath, { mode: 0o700 });
-      acquired = true;
+      ownerToken = randomBytes(16).toString("hex");
+      try {
+        writeFileSync(join(lockPath, quickBooksLockOwnerName(ownerToken)), JSON.stringify({
+          schema_version: 1,
+          token: ownerToken,
+          pid: process.pid,
+          created_at: new Date().toISOString(),
+        }), { encoding: "utf8", flag: "wx", mode: 0o600 });
+      } catch (error) {
+        try { rmdirSync(lockPath); } catch { /* preserve the original refusal */ }
+        throw error;
+      }
       break;
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
@@ -737,32 +1329,61 @@ async function withQuickBooksRefreshLock(provider, storage, task, {
         throw readError;
       }
       if (!state.isDirectory() || state.isSymbolicLink()) {
-        throw new ProviderOAuthError("quickbooks", "refresh", "the local refresh lock is not a safe directory", {
-          code: "refresh_lock_unsafe",
+        throw new ProviderOAuthError("quickbooks", "mutation", "the local credential lock is not a safe directory", {
+          code: "credential_lock_unsafe",
         });
       }
-      if (Date.now() - state.mtimeMs > Math.max(120_000, Number(refreshLockStaleMs) || 0)) {
+      assertPrivateQuickBooksDirectory(lockPath, storage.platform || process.platform, storage);
+      const owner = readQuickBooksLockOwner(lockPath);
+      const lastHeartbeat = owner?.mtimeMs ?? state.mtimeMs;
+      if (Date.now() - lastHeartbeat > staleAfter) {
         try {
-          rmdirSync(lockPath);
-          continue;
+          if (owner) {
+            if (!removeStaleQuickBooksLockOwner(lockPath, owner)) {
+              // A live process may have paused across sleep or a long event-loop
+              // stall. Its old timestamp is not permission to steal the lock.
+            } else {
+              continue;
+            }
+          }
+          else rmdirSync(lockPath);
+          if (!owner) continue;
         } catch (removeError) {
           if (removeError?.code === "ENOENT") continue;
+          if (removeError?.code !== "ENOTEMPTY") throw removeError;
         }
       }
       if (Date.now() >= deadline) {
-        throw new ProviderOAuthError("quickbooks", "refresh", "another local process is refreshing this connection; retry shortly", {
-          code: "refresh_in_progress",
+        throw new ProviderOAuthError("quickbooks", "mutation", "another local process is updating this connection; retry shortly", {
+          code: "credential_update_in_progress",
         });
       }
       await waitFor(Math.max(10, Math.min(1_000, Number(refreshLockPollMs) || 50)));
     }
   }
-  try {
-    return await task();
-  } finally {
-    if (acquired) {
-      try { rmdirSync(lockPath); } catch { /* stale recovery handles a crash or external cleanup */ }
+  const assertOwned = () => {
+    const owner = readQuickBooksLockOwner(lockPath);
+    if (!owner || owner.token !== ownerToken) {
+      throw new ProviderOAuthError("quickbooks", "mutation", "the local credential lock changed during the provider operation; reconnect before trusting the result", {
+        code: "credential_lock_lost",
+        uncertain: true,
+      });
     }
+    return true;
+  };
+  const heartbeat = setInterval(() => {
+    try {
+      assertOwned();
+      const now = new Date();
+      utimesSync(join(lockPath, quickBooksLockOwnerName(ownerToken)), now, now);
+    } catch { /* the task's ownership check turns this into a stable refusal */ }
+  }, Math.min(10_000, Math.max(1_000, Math.floor(staleAfter / 4))));
+  heartbeat.unref?.();
+  try {
+    return await task({ assertOwned });
+  } finally {
+    clearInterval(heartbeat);
+    try { releaseQuickBooksLockOwner(lockPath, ownerToken); } catch { /* a successor owns the path or recovery is explicit */ }
   }
 }
 
@@ -770,18 +1391,42 @@ async function refreshProviderCredentialsOnce(provider, connection, {
   fetchImpl = fetch,
   now = Date.now(),
   storage = {},
+  tokenRequestTimeoutMs = 30_000,
+  credentialLock = null,
+  quickBooksBinding = null,
 } = {}) {
   const config = providerOAuthConfig(provider);
-  if (!clean(connection?.refresh_token)) {
+  const quickbooks = config.provider === "quickbooks";
+  if (!quickbooks && !clean(connection?.refresh_token)) {
     throw new ProviderOAuthError(config.provider, "refresh", "the local connection has no refresh token; reconnect it", {
       code: "missing_refresh_token",
     });
   }
-  const quickbooks = config.provider === "quickbooks";
   if (quickbooks) {
-    const latestBefore = loadProviderCredentials(config.provider, storage);
+    const latestBefore = providerConnectionFromStore(loadProviderCredentialStore(
+      config.provider,
+      storage,
+      { allowQuickBooksMigration: true },
+    ));
+    if (!latestBefore) {
+      throw new ProviderOAuthError(config.provider, "refresh", "this provider was disconnected before refresh could start", {
+        code: "not_connected",
+      });
+    }
+    if (quickBooksBinding) assertQuickBooksSourceBinding(latestBefore, quickBooksBinding);
+    if (latestBefore.quickbooks_refresh_fence) {
+      throw new ProviderOAuthError(config.provider, "refresh", "the last refresh outcome is unknown; reconnect before trying again", {
+        code: "refresh_outcome_unknown",
+      });
+    }
     if (latestBefore?.refresh_token && latestBefore.refresh_token !== connection.refresh_token) {
       return latestBefore;
+    }
+    connection = latestBefore;
+    if (!clean(connection.refresh_token)) {
+      throw new ProviderOAuthError(config.provider, "refresh", "the local connection has no refresh token; reconnect it", {
+        code: "missing_refresh_token",
+      });
     }
     const refreshExpiresAt = connection.refresh_expires_at == null
       ? null
@@ -795,12 +1440,27 @@ async function refreshProviderCredentialsOnce(provider, connection, {
         code: "refresh_expired",
       });
     }
+    credentialLock?.assertOwned?.();
+    const tokenFingerprint = createHash("sha256")
+      .update(`quickbooks-refresh-v1:${connection.refresh_token}`)
+      .digest("hex");
+    connection = saveProviderCredentialsUnlocked(config.provider, {
+      ...connection,
+      // This fence is durable before Intuit can consume the rotating token.
+      // A process crash, lost body, wrong-realm response, or failed final save
+      // therefore requires reconnect instead of blindly replaying the request.
+      quickbooks_refresh_fence: {
+        state: "outcome_unknown",
+        attempted_at: new Date(now).toISOString(),
+        token_fingerprint: tokenFingerprint,
+      },
+    }, storage);
   }
   const token = await exchangeToken(config.provider, {
     grant_type: "refresh_token",
     refresh_token: connection.refresh_token,
   }, { clientId: connection.client_id, clientSecret: connection.client_secret }, {
-    fetchImpl, phase: "refresh", now,
+    fetchImpl, phase: "refresh", now, tokenRequestTimeoutMs,
   });
   const currentMetadata = connection.provider_metadata || {};
   const returnedMetadata = token.provider_metadata || {};
@@ -813,9 +1473,10 @@ async function refreshProviderCredentialsOnce(provider, connection, {
       });
     }
   }
+  const { quickbooks_refresh_fence: _priorRefreshFence, ...connectionWithoutFence } = connection;
   const replacement = quickbooks
     ? {
-        ...connection,
+        ...connectionWithoutFence,
         ...token,
         refresh_token: token.refresh_token || connection.refresh_token,
         refresh_expires_at: token.refresh_expires_at || connection.refresh_expires_at || null,
@@ -830,15 +1491,29 @@ async function refreshProviderCredentialsOnce(provider, connection, {
         refreshed_at: new Date(now).toISOString(),
       };
   if (quickbooks) {
-    const latestAfter = loadProviderCredentials(config.provider, storage);
-    if (latestAfter?.refresh_token && latestAfter.refresh_token !== connection.refresh_token) {
-      // Another process completed the same rotating refresh first. Its verified
-      // durable pair wins; never overwrite it with a response derived from the
-      // now-stale token.
-      return latestAfter;
+    if (!clean(token.refresh_token)) {
+      throw new ProviderOAuthError("quickbooks", "refresh", "the refresh response did not contain a replacement refresh token; reconnect before trusting it", {
+        code: "missing_rotated_refresh_token",
+        uncertain: true,
+      });
+    }
+    credentialLock?.assertOwned?.();
+    const latestAfter = providerConnectionFromStore(loadProviderCredentialStore(
+      config.provider,
+      storage,
+      { allowQuickBooksMigration: true },
+    ));
+    const expectedFence = connection.quickbooks_refresh_fence;
+    if (!latestAfter || latestAfter.refresh_token !== connection.refresh_token ||
+        latestAfter.quickbooks_refresh_fence?.state !== expectedFence?.state ||
+        latestAfter.quickbooks_refresh_fence?.token_fingerprint !== expectedFence?.token_fingerprint) {
+      throw new ProviderOAuthError("quickbooks", "refresh", "the local credential changed during token rotation; reconnect before trusting the result", {
+        code: "credential_changed",
+        uncertain: true,
+      });
     }
   }
-  return saveProviderCredentials(config.provider, replacement, storage);
+  return saveProviderCredentialsUnlocked(config.provider, replacement, storage);
 }
 
 /**
@@ -852,20 +1527,15 @@ export async function refreshProviderCredentials(provider, connection, options =
     return refreshProviderCredentialsOnce(config.provider, connection, options);
   }
   const storage = options.storage || {};
-  const key = refreshStorageIdentity(config.provider, storage);
-  const existing = REFRESH_IN_FLIGHT.get(key);
-  if (existing) return existing;
-  const pending = withQuickBooksRefreshLock(
+  return withQuickBooksCredentialLock(
     config.provider,
     storage,
-    () => refreshProviderCredentialsOnce(config.provider, connection, options),
+    ({ assertOwned }) => refreshProviderCredentialsOnce(config.provider, connection, {
+      ...options,
+      credentialLock: { assertOwned },
+    }),
     options,
-  )
-    .finally(() => {
-      if (REFRESH_IN_FLIGHT.get(key) === pending) REFRESH_IN_FLIGHT.delete(key);
-    });
-  REFRESH_IN_FLIGHT.set(key, pending);
-  return pending;
+  );
 }
 
 export async function providerAccessToken(provider, {
@@ -874,14 +1544,66 @@ export async function providerAccessToken(provider, {
   now = Date.now(),
   refreshSkewMs = 5 * 60 * 1000,
   storage = {},
+  quickBooksBinding = null,
+  tokenRequestTimeoutMs = 30_000,
+  refreshLockWaitMs = 45_000,
+  refreshLockPollMs = 50,
+  refreshLockStaleMs = 120_000,
 } = {}) {
-  const current = connection || loadProviderCredentials(provider, storage);
+  const config = providerOAuthConfig(provider);
+  if (config.provider === "quickbooks") {
+    return withQuickBooksCredentialLock(
+      config.provider,
+      storage,
+      async ({ assertOwned }) => {
+        // Never trust a caller-retained object for QBO. The durable record may
+        // now carry a refresh fence, a replacement token, or a new binding.
+        const current = providerConnectionFromStore(loadProviderCredentialStore(
+          config.provider,
+          storage,
+          { allowQuickBooksMigration: true },
+        ));
+        if (!current) {
+          throw new ProviderOAuthError(config.provider, "load", "this provider is not connected", {
+            code: "not_connected",
+          });
+        }
+        if (current.quickbooks_refresh_fence) {
+          throw new ProviderOAuthError("quickbooks", "load", "the last refresh outcome is unknown; reconnect before using this connection", {
+            code: "refresh_outcome_unknown",
+          });
+        }
+        if (!quickBooksBinding || typeof quickBooksBinding !== "object") {
+          throw new ProviderOAuthError("quickbooks", "binding", "the expected source and environment are required before using this connection", {
+            code: "source_binding_required",
+          });
+        }
+        assertQuickBooksSourceBinding(current, quickBooksBinding);
+        const expiresAt = Number(current.expires_at);
+        if (clean(current.access_token) && (!Number.isFinite(expiresAt) || expiresAt - now > refreshSkewMs)) {
+          return { accessToken: current.access_token, connection: current, refreshed: false };
+        }
+        const refreshed = await refreshProviderCredentialsOnce(config.provider, current, {
+          fetchImpl,
+          now,
+          storage,
+          tokenRequestTimeoutMs,
+          quickBooksBinding,
+          credentialLock: { assertOwned },
+        });
+        assertQuickBooksSourceBinding(refreshed, quickBooksBinding);
+        return { accessToken: refreshed.access_token, connection: refreshed, refreshed: true };
+      },
+      { refreshLockWaitMs, refreshLockPollMs, refreshLockStaleMs },
+    );
+  }
+  const current = connection || loadProviderCredentials(config.provider, storage);
   if (!current) throw new ProviderOAuthError(provider, "load", "this provider is not connected", { code: "not_connected" });
   const expiresAt = Number(current.expires_at);
   if (clean(current.access_token) && (!Number.isFinite(expiresAt) || expiresAt - now > refreshSkewMs)) {
     return { accessToken: current.access_token, connection: current, refreshed: false };
   }
-  const refreshed = await refreshProviderCredentials(provider, current, { fetchImpl, now, storage });
+  const refreshed = await refreshProviderCredentials(config.provider, current, { fetchImpl, now, storage });
   return { accessToken: refreshed.access_token, connection: refreshed, refreshed: true };
 }
 
@@ -976,8 +1698,26 @@ export async function authorizeProvider(provider, {
   now = Date.now(),
   storage = {},
   prepareConnection = null,
+  refreshLockWaitMs = 45_000,
+  refreshLockPollMs = 50,
+  refreshLockStaleMs = 120_000,
 } = {}) {
   const config = providerOAuthConfig(provider);
+  if (config.provider === "quickbooks" && typeof prepareConnection !== "function") {
+    throw new ProviderOAuthError("quickbooks", "binding", "QuickBooks authorization requires an explicit source and company binding", {
+      code: "source_binding_required",
+    });
+  }
+  const startingQuickBooksConnection = config.provider === "quickbooks"
+    ? await loadQuickBooksCredentials(storage, {
+        refreshLockWaitMs,
+        refreshLockPollMs,
+        refreshLockStaleMs,
+      })
+    : null;
+  const startingQuickBooksGeneration = config.provider === "quickbooks"
+    ? createHash("sha256").update(JSON.stringify(startingQuickBooksConnection)).digest("hex")
+    : null;
   const state = b64url(randomBytes(16));
   const proof = config.pkce ? pkce() : { verifier: null, challenge: null };
   const callbackHost = redirectHost || config.loopbackRedirectHost || "127.0.0.1";
@@ -1016,10 +1756,51 @@ export async function authorizeProvider(provider, {
     scopes: Array.isArray(scopes) ? scopes : config.scopes,
     connected_at: new Date(now).toISOString(),
   };
-  const prepared = typeof prepareConnection === "function"
-    ? await prepareConnection(candidate)
-    : candidate;
-  return saveProviderCredentials(config.provider, prepared, storage);
+  if (config.provider !== "quickbooks") {
+    const prepared = typeof prepareConnection === "function"
+      ? await prepareConnection(candidate)
+      : candidate;
+    return saveProviderCredentialsUnlocked(config.provider, prepared, storage);
+  }
+  return withQuickBooksCredentialLock(
+    config.provider,
+    storage,
+    async ({ assertOwned }) => {
+      const prior = providerConnectionFromStore(loadProviderCredentialStore(
+        config.provider,
+        storage,
+        { allowQuickBooksMigration: true },
+      ));
+      const currentGeneration = createHash("sha256")
+        .update(JSON.stringify(prior))
+        .digest("hex");
+      if (currentGeneration !== startingQuickBooksGeneration) {
+        throw new ProviderOAuthError(
+          "quickbooks",
+          "binding",
+          "the local QuickBooks connection changed while authorization was open; keep the existing credential and start a fresh connection ceremony",
+          { code: "credential_changed_during_authorization", uncertain: true },
+        );
+      }
+      const prepared = await prepareConnection(candidate, {
+        prior,
+        sourceRegistry: (() => {
+          const store = loadProviderCredentialStore(
+            config.provider,
+            storage,
+            { allowQuickBooksMigration: true },
+          );
+          return {
+            schema_version: 1,
+            sources: normalizedQuickBooksSources(store?.[QUICKBOOKS_SOURCE_REGISTRY_KEY]?.sources),
+          };
+        })(),
+      });
+      assertOwned();
+      return saveProviderCredentialsUnlocked(config.provider, prepared, storage);
+    },
+    { refreshLockWaitMs, refreshLockPollMs, refreshLockStaleMs },
+  );
 }
 
 /** Environment allowlist for a future provider helper child. Exported for tests. */

@@ -34,7 +34,7 @@ const SCENARIOS = Object.freeze([
       });
       const companyFingerprint = quickBooksCompanyFingerprint("offline-company");
       expect(
-        result.documents[0]?.source_id === `company:${companyFingerprint}:invoice:17` &&
+        result.documents[0]?.source_id === "invoice:17" &&
         result.documents[0]?.metadata?.qbo_company_fingerprint === companyFingerprint,
         "qbo_identity",
       );

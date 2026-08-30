@@ -330,7 +330,8 @@ const scope = {
     json: true,
   };
   let posted;
-  let assertedBinding = null;
+  const assertedBindings = [];
+  let accessBinding = null;
   let expectedCompanyFingerprint = null;
   const logs = [];
   const original = console.log;
@@ -340,12 +341,18 @@ const scope = {
       resolveAdminKey: () => "fixture-admin-secret",
       resolveBaseUrl: async () => "https://brain.fixture.invalid",
       oauth: {
-        providerAccessToken: async () => ({
+        loadQuickBooksCredentials: async () => ({
+          provider_metadata: { realm_id: "private-realm-id" },
+        }),
+        providerAccessToken: async (_provider, options) => {
+          accessBinding = options.quickBooksBinding;
+          return ({
           accessToken: "fixture-oauth-secret",
           connection: { provider_metadata: { realm_id: "private-realm-id" } },
-        }),
+          });
+        },
         assertQuickBooksSourceBinding: (_connection, scope) => {
-          assertedBinding = scope;
+          assertedBindings.push(scope);
           return { qbo_company_fingerprint: QBO_COMPANY };
         },
       },
@@ -357,7 +364,7 @@ const scope = {
           expectedCompanyFingerprint = options.expectedCompanyFingerprint;
           return {
           documents: [{
-            source_id: `company:${QBO_COMPANY}:purchase:planted`,
+            source_id: "purchase:planted",
             metadata: { reconciliation_lines: [{
               line_uid: "purchase:planted",
               qbo_account_id: "qbo-35",
@@ -386,11 +393,15 @@ const scope = {
       },
     });
     assert.equal(result.status, "mismatched");
-    assert.deepEqual(assertedBinding, { source: "quickbooks", environment: "sandbox" });
+    assert.deepEqual(assertedBindings, [
+      { source: "quickbooks", environment: "sandbox" },
+      { source: "quickbooks", environment: "sandbox" },
+    ]);
+    assert.deepEqual(accessBinding, { source: "quickbooks", environment: "sandbox" });
     assert.equal(expectedCompanyFingerprint, QBO_COMPANY);
     assert.equal(
       posted.payload.qbo_lines[0].source_doc_uid,
-      `quickbooks:company:${QBO_COMPANY}:purchase:planted`,
+      "quickbooks:purchase:planted",
     );
     assert.equal(posted.payload.qbo_coverage, "present_snapshot_partial");
   } finally {

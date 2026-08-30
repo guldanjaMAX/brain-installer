@@ -49,23 +49,30 @@ try {
 
   const ingestOrder = [];
   let adapterOptions = null;
+  let accessBinding = null;
   const ingestCompanyFingerprint = quickBooksCompanyFingerprint("fixture-company");
+  const ingestConnection = {
+    provider_metadata: {
+      realm_id: "fixture-company",
+      qbo_company_fingerprint: ingestCompanyFingerprint,
+    },
+  };
   const ingestPreview = await cmdIngestProvider({
     corpora: {
       quickbooks: { enabled: true, environment: "sandbox", source: "quickbooks" },
     },
   }, manifestPath, { from: "quickbooks", "dry-run": true }, {
     oauth: {
-      providerAccessToken: async () => {
+      loadQuickBooksCredentials: async () => {
+        ingestOrder.push("stored");
+        return ingestConnection;
+      },
+      providerAccessToken: async (_provider, options) => {
         ingestOrder.push("credential");
+        accessBinding = options.quickBooksBinding;
         return {
           accessToken: "fixture-access",
-          connection: {
-            provider_metadata: {
-              realm_id: "fixture-company",
-              qbo_company_fingerprint: ingestCompanyFingerprint,
-            },
-          },
+          connection: ingestConnection,
         };
       },
       assertQuickBooksSourceBinding: () => {
@@ -84,8 +91,10 @@ try {
       return { documents: [], deletions: [], warnings: [] };
     },
   });
-  check("QuickBooks ingest proves company binding before reading cursor state or calling the adapter",
-    ingestOrder.join(",") === "credential,binding,state,adapter" && ingestPreview.dry_run === true);
+  check("QuickBooks ingest proves durable company binding before token use, cursor state, or the adapter",
+    ingestOrder.join(",") === "stored,binding,credential,binding,state,adapter" &&
+    accessBinding?.source === "quickbooks" && accessBinding?.environment === "sandbox" &&
+    ingestPreview.dry_run === true);
   check("QuickBooks adapter receives the same canonical company fingerprint as its configuration receipt",
     adapterOptions.expectedCompanyFingerprint === ingestCompanyFingerprint &&
     adapterOptions.realmId === "fixture-company");
@@ -101,18 +110,25 @@ try {
       }),
       providerRedirectUri: (port) => `http://127.0.0.1:${port}`,
       quickBooksSandboxRedirectUri: (port, host) => `http://${host}:${port}/`,
-      loadProviderCredentials: () => null,
+      loadQuickBooksCredentials: async () => null,
       authorizeProvider: async (_provider, options) => {
         authorizeOptions = options;
-        return options.prepareConnection({ provider_metadata: { realm_id: "fixture-company" } });
+        return options.prepareConnection(
+          { provider_metadata: { realm_id: "fixture-company" } },
+          { prior: null, sourceRegistry: { schema_version: 1, sources: {} } },
+        );
       },
-      bindQuickBooksConnection: ({ candidate, source, environment }) => ({
+      bindQuickBooksConnection: ({ candidate, source, environment, sourceRegistry }) => ({
         ...candidate,
         provider_metadata: {
           ...candidate.provider_metadata,
           qbo_company_fingerprint: quickBooksCompanyFingerprint(candidate.provider_metadata.realm_id),
         },
-        quickbooks_binding: { active_source: source, active_environment: environment },
+        quickbooks_binding: {
+          active_source: source,
+          active_environment: environment,
+          source_registry_seen: sourceRegistry.schema_version,
+        },
       }),
       assertQuickBooksSourceBinding: (connection, { source, environment }) => ({
         source,
@@ -128,9 +144,11 @@ try {
   check("provider connect uses the fixed loopback callback port by default", authorizeOptions.port === 47812);
   check("QuickBooks connect uses the provider-specific documented localhost callback",
     authorizeOptions.redirectHost === "localhost" &&
-    authorizeOptions.redirectUri === "http://localhost:47812/");
+    authorizeOptions.redirectUri === "http://localhost:47812/" &&
+    connected.connected === true);
 
   const order = [];
+  let disconnectCustody = null;
   const disconnected = await cmdDisconnectProvider("quickbooks", manifestPath, {}, {
     scheduler: {
       removeProviderScheduler: () => {
@@ -139,8 +157,9 @@ try {
       },
     },
     oauth: {
-      disconnectProvider: async () => {
+      disconnectProvider: async (_provider, options) => {
         order.push("oauth");
+        disconnectCustody = options;
         return { disconnected: true, remote_revoked: true, remote_revocation_required: false };
       },
       providerOAuthConfig: () => ({ label: "QuickBooks Online" }),
@@ -149,7 +168,9 @@ try {
   });
   check("disconnect stops unattended refresh before revoking and clearing OAuth custody",
     order.join(",") === "scheduler,oauth" && disconnected.remote_revoked === true &&
-    disconnected.imported_documents_retained === true && disconnected.forget_operation_required === true);
+    disconnectCustody.source === "quickbooks" && disconnectCustody.environment === "sandbox" &&
+    disconnected.imported_documents_retained === true && disconnected.forget_operation_required === true &&
+    disconnected.source_company_binding_retained === true);
 
   const productionManifest = join(folder, "production.manifest.json");
   writeFileSync(productionManifest, JSON.stringify({

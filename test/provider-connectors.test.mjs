@@ -48,7 +48,7 @@ const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(
     qboUrl.includes("/v3/company/realm-fixture/query") && new URL(qboUrl).searchParams.get("query").includes("MAXRESULTS 1000"));
   const companyFingerprint = quickBooksCompanyFingerprint("realm-fixture");
   check("QuickBooks emits stable provenance envelopes",
-    result.documents[0].source_id === `company:${companyFingerprint}:invoice:17` &&
+    result.documents[0].source_id === "invoice:17" &&
     result.documents[0].metadata.entity_type === "Invoice" &&
     result.documents[0].metadata.qbo_company_fingerprint === companyFingerprint &&
     result.qbo_company_fingerprint === companyFingerprint &&
@@ -68,9 +68,12 @@ const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(
   const first = await collect("company-one");
   const same = await collect("company-one", quickBooksCompanyFingerprint("company-one"));
   const second = await collect("company-two");
-  check("QuickBooks document identity is stable inside one company and collision-safe across companies",
+  check("QuickBooks provider record identity stays backward-compatible while company custody remains distinct",
     first.documents[0].source_id === same.documents[0].source_id &&
-    first.documents[0].source_id !== second.documents[0].source_id);
+    first.documents[0].source_id === second.documents[0].source_id &&
+    first.qbo_company_fingerprint !== second.qbo_company_fingerprint &&
+    `quickbooks:${first.documents[0].source_id}` !==
+      `quickbooks_company_two:${second.documents[0].source_id}`);
   await assert.rejects(
     collect("company-two", quickBooksCompanyFingerprint("company-one")),
     /does not match the authorized source binding/,

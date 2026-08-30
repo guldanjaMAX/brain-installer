@@ -1152,7 +1152,7 @@ export function loadTokens(value) {
     const path = filePath(options);
     const state = readFileStoreState(path, { ...options, strict: platform === "win32" });
     if (!state) return {};
-    if (platform === "win32" && !state.encrypted) {
+    if (platform === "win32" && !state.encrypted && options.migrateLegacy !== false) {
       // A pre-DPAPI Windows file remains readable, but never remains plaintext
       // after a successful use. The transactional writer retains or restores
       // its credential record if encryption cannot be verified.

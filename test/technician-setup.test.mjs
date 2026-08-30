@@ -505,7 +505,7 @@ test("QuickBooks uses two hidden prompts, existing OAuth custody, privacy-safe J
           }),
           providerRedirectUri: (port) => `http://127.0.0.1:${port}`,
           quickBooksSandboxRedirectUri: (port, host) => `http://${host}:${port}/`,
-          loadProviderCredentials: () => null,
+          loadQuickBooksCredentials: async () => null,
           authorizeProvider: async (_provider, options) => {
             authorizeOptions = options;
             return options.prepareConnection({ provider_metadata: { realm_id: "private-company-id" } });
@@ -582,7 +582,7 @@ test("QuickBooks owner cancellation and missing company identity never produce a
           }),
           providerRedirectUri: () => "http://127.0.0.1:47812",
           quickBooksSandboxRedirectUri: () => "http://localhost:47812/",
-          loadProviderCredentials: () => null,
+          loadQuickBooksCredentials: async () => null,
           authorizeProvider: async () => ({ provider_metadata: {} }),
           bindQuickBooksConnection: ({ candidate }) => candidate,
           assertQuickBooksSourceBinding: () => { throw new Error("must not verify a missing company"); },
