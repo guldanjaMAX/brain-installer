@@ -49,4 +49,37 @@ describe("client update status", () => {
     expect(html).toContain("You are up to date");
     expect(html).toContain("Version 0.3.0");
   });
+
+  it("shows a held release explicitly without an executable handoff", () => {
+    const html = renderToStaticMarkup(<UpdateStatusCard update={{
+      status: "release_held",
+      release_state: "held",
+      available: false,
+      installed_version: "0.2.0",
+      latest_version: null,
+      checked_at: base.checked_at,
+      update_url: base.update_url,
+      held_reason: "Clean-machine checks remain open.",
+    }} onRetry={() => undefined} />);
+    expect(html).toContain("next release is held");
+    expect(html).toContain("Clean-machine checks remain open");
+    expect(html).toContain("No installer or update command is available");
+    expect(html).not.toContain("Copy for Claude");
+  });
+
+  it("shows a candidate as non-installable without a Claude command", () => {
+    const html = renderToStaticMarkup(<UpdateStatusCard update={{
+      status: "release_candidate",
+      release_state: "candidate",
+      available: false,
+      installed_version: "0.2.0",
+      latest_version: null,
+      checked_at: base.checked_at,
+      update_url: base.update_url,
+      held_reason: "Remote Windows proof remains open.",
+    }} onRetry={() => undefined} />);
+    expect(html).toContain("candidate is still under review");
+    expect(html).toContain("not installable until it becomes a reviewed stable release");
+    expect(html).not.toContain("Copy for Claude");
+  });
 });

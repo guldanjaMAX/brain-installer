@@ -34,7 +34,7 @@ async function stagedAsync(stage, operation) {
 }
 
 function parseArgs(argv) {
-  const allowed = new Set(["helper", "sha256", "operation", "length", "max"]);
+  const allowed = new Set(["helper", "sha256", "size", "dev", "ino", "operation", "length", "max"]);
   const out = {};
   for (let index = 0; index < argv.length; index += 2) {
     const key = argv[index];
@@ -62,20 +62,23 @@ function runtimeEnvironment() {
   return env;
 }
 
-function assertHelper(helper, expectedHash) {
+function assertHelper(helper, expected) {
+  const expectedSize = Number(expected.size);
   if (!isAbsolute(helper || "") || basename(helper).toLowerCase() !== "windows-dpapi-helper.exe" ||
-      !/^[a-f0-9]{64}$/.test(expectedHash || "")) {
+      !/^[a-f0-9]{64}$/.test(expected.sha256 || "") ||
+      !Number.isSafeInteger(expectedSize) || expectedSize < 1 || expectedSize > 4 * 1024 * 1024 ||
+      !/^\d+$/.test(expected.dev || "") || !/^\d+$/.test(expected.ino || "")) {
     throw new Error("invalid DPAPI helper contract");
   }
   const identity = lstatSync(helper);
   if (!identity.isFile() || identity.isSymbolicLink() || identity.nlink !== 1 ||
-      identity.size < 1 || identity.size > 4 * 1024 * 1024 ||
+      identity.size !== expectedSize || String(identity.dev) !== expected.dev || String(identity.ino) !== expected.ino ||
       resolve(realpathSync.native(helper)).toLowerCase() !== resolve(helper).toLowerCase()) {
     throw new Error("invalid DPAPI helper file");
   }
   const bytes = readFileSync(helper);
   try {
-    if (createHash("sha256").update(bytes).digest("hex") !== expectedHash) {
+    if (createHash("sha256").update(bytes).digest("hex") !== expected.sha256) {
       throw new Error("DPAPI helper integrity changed");
     }
   } finally {
@@ -102,8 +105,8 @@ function readExact(length) {
   return bytes;
 }
 
-async function invoke({ helper, helperIdentity, expectedHash, operation, expectedLength, maxOutput, env }, input) {
-  const revalidated = assertHelper(helper, expectedHash);
+async function invoke({ helper, helperIdentity, expected, operation, expectedLength, maxOutput, env }, input) {
+  const revalidated = assertHelper(helper, expected);
   if (!sameFile(revalidated, helperIdentity)) throw new Error("DPAPI helper identity changed");
   const child = spawn(helper, [operation, String(expectedLength)], {
     env,
@@ -165,7 +168,8 @@ async function main() {
     error.stage = "contract";
     throw error;
   }
-  const helperIdentity = staged("helper_validation", () => assertHelper(raw.helper, raw.sha256));
+  const expectedHelper = { sha256: raw.sha256, size: raw.size, dev: raw.dev, ino: raw.ino };
+  const helperIdentity = staged("helper_validation", () => assertHelper(raw.helper, expectedHelper));
   const env = staged("runtime_discovery", () => runtimeEnvironment());
   let input;
   let output;
@@ -174,7 +178,7 @@ async function main() {
     output = await stagedAsync(raw.operation === "protect" ? "protect" : "unprotect", () => invoke({
       helper: raw.helper,
       helperIdentity,
-      expectedHash: raw.sha256,
+      expected: expectedHelper,
       operation: raw.operation,
       expectedLength,
       maxOutput,

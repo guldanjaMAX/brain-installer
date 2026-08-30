@@ -16,6 +16,7 @@ import {
   realpathSync,
   rmdirSync,
   unlinkSync,
+  writeSync,
 } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,6 +29,8 @@ const WINDOWS_RUNTIME_ENV = Object.freeze([
 
 let activeSession = null;
 let exitHookInstalled = false;
+let exitCleanupAttempted = false;
+let sessionMetrics = { compile_count: 0, helper_invocations: 0 };
 
 function staged(stage, message) {
   const error = new Error(message);
@@ -212,10 +215,47 @@ export function disposeWindowsDpapiSession({ attempts = 5, pause = synchronousPa
   });
 }
 
+export function finalizeWindowsDpapiSession({ report, ...disposeOptions } = {}) {
+  const result = disposeWindowsDpapiSession(disposeOptions);
+  if (result.status === "cleanup_deferred") {
+    const line = `BRAIN_DPAPI_HYGIENE:cleanup_deferred issue_code=${result.issue_code}\n`;
+    try {
+      if (report) report(line);
+      else writeSync(2, Buffer.from(line, "ascii"));
+    } catch { /* reporting hygiene must not change crypto or credential-write success */ }
+  }
+  return result;
+}
+
+function cleanupAtProcessExit() {
+  if (exitCleanupAttempted) return;
+  exitCleanupAttempted = true;
+  finalizeWindowsDpapiSession();
+}
+
 function installExitHook() {
   if (exitHookInstalled) return;
   exitHookInstalled = true;
-  process.once("exit", () => { disposeWindowsDpapiSession(); });
+  process.once("beforeExit", cleanupAtProcessExit);
+  process.once("exit", cleanupAtProcessExit);
+}
+
+export function resetWindowsDpapiSessionMetrics() {
+  if (activeSession) {
+    throw staged("metrics", "Windows DPAPI metrics cannot reset while a helper session is active");
+  }
+  sessionMetrics = { compile_count: 0, helper_invocations: 0 };
+}
+
+export function recordWindowsDpapiHelperInvocation() {
+  if (!activeSession?.public) {
+    throw staged("metrics", "Windows DPAPI helper invocation has no active session");
+  }
+  sessionMetrics.helper_invocations += 1;
+}
+
+export function readWindowsDpapiSessionMetrics() {
+  return Object.freeze({ ...sessionMetrics });
 }
 
 export function prepareWindowsDpapiSession(options = {}) {
@@ -241,9 +281,13 @@ export function prepareWindowsDpapiSession(options = {}) {
       public: Object.freeze({
         helper: helper.path,
         sha256: helper.sha256,
+        size: helper.identity.size,
+        dev: String(helper.identity.dev),
+        ino: String(helper.identity.ino),
       }),
     };
     activeSession = session;
+    sessionMetrics.compile_count += 1;
     installExitHook();
     return session.public;
   } catch (error) {

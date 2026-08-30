@@ -134,7 +134,9 @@ export type BankStatus = {
   needs_attention?: BankConnection[];
 };
 export type UpdateStatus = {
-  status: "up_to_date" | "update_available" | "ahead" | "unavailable";
+  status: "release_held" | "release_candidate" | "up_to_date" | "update_available" | "ahead" | "unavailable";
+  release_state?: "held" | "candidate" | "stable";
+  available?: boolean;
   installed_version: string | null;
   latest_version: string | null;
   checked_at: string;
@@ -144,6 +146,7 @@ export type UpdateStatus = {
   changes?: string[];
   released_connectors?: string[];
   installer?: { url: string; sha256: string; bytes: number };
+  held_reason?: string;
   error?: "unavailable";
   code?: "update_check_unavailable" | "installed_version_unavailable";
 };

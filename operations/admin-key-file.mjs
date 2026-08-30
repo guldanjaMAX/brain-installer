@@ -31,6 +31,9 @@ import { fileURLToPath } from "node:url";
 import {
   disposeWindowsDpapiSession,
   prepareWindowsDpapiSession,
+  readWindowsDpapiSessionMetrics,
+  recordWindowsDpapiHelperInvocation,
+  resetWindowsDpapiSessionMetrics,
 } from "./windows-dpapi-session.mjs";
 
 const WINDOWS_DPAPI_HEADER = Buffer.from("BRAIN-ADMIN-KEY-DPAPI-V1\n", "ascii");
@@ -266,6 +269,9 @@ function runWindowsDpapi(input, options, operation, secretForMetadataCheck = nul
         WINDOWS_DPAPI_BRIDGE,
         "--helper", session.helper,
         "--sha256", session.sha256,
+        "--size", String(session.size),
+        "--dev", session.dev,
+        "--ino", session.ino,
         "--operation", operation,
         "--length", String(input.length),
         "--max", String(MAX_ADMIN_KEY_FILE_BYTES),
@@ -317,6 +323,9 @@ function runWindowsDpapi(input, options, operation, secretForMetadataCheck = nul
         : "Windows DPAPI returned no usable admin key for the current user",
     );
   }
+  if (!options.runPowerShell) {
+    (options.recordWindowsDpapiHelperInvocation ?? recordWindowsDpapiHelperInvocation)();
+  }
   return output;
 }
 
@@ -336,9 +345,13 @@ export function probeWindowsDpapi(options = {}) {
     throw new TypeError("the Windows DPAPI diagnostic needs two to thirty-two rounds");
   }
   const random = options.randomBytes ?? randomBytes;
+  const measuredSession = !options.runPowerShell;
   let completed = 0;
   let failure = null;
   try {
+    if (measuredSession) {
+      (options.resetWindowsDpapiSessionMetrics ?? resetWindowsDpapiSessionMetrics)();
+    }
     for (let index = 0; index < rounds; index++) {
       const plain = random(32);
       if (!Buffer.isBuffer(plain) || plain.length !== 32) {
@@ -375,6 +388,9 @@ export function probeWindowsDpapi(options = {}) {
       options.dpapiDisposeOptions || {},
     );
   }
+  const metrics = measuredSession
+    ? (options.readWindowsDpapiSessionMetrics ?? readWindowsDpapiSessionMetrics)()
+    : null;
   if (failure) {
     return Object.freeze({
       checked: true,
@@ -384,6 +400,7 @@ export function probeWindowsDpapi(options = {}) {
       issue_code: /^WINDOWS_DPAPI_[A-Z_]+$/.test(String(failure?.code || ""))
         ? failure.code
         : "WINDOWS_DPAPI_UNKNOWN",
+      ...(metrics ? metrics : {}),
     });
   }
   if (cleanup.status !== "not_applicable" && cleanup.status !== "clean") {
@@ -394,6 +411,7 @@ export function probeWindowsDpapi(options = {}) {
       stage: "cleanup_deferred",
       issue_code: cleanup.issue_code || "WINDOWS_DPAPI_CLEANUP_DEFERRED",
       cleanup_status: cleanup.status,
+      ...(metrics ? metrics : {}),
     });
   }
   return Object.freeze({
@@ -402,6 +420,7 @@ export function probeWindowsDpapi(options = {}) {
     rounds: completed,
     stage: null,
     ...(cleanup.status === "clean" ? { cleanup_status: "clean" } : {}),
+    ...(metrics ? metrics : {}),
   });
 }
 

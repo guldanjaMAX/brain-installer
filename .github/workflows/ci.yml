@@ -154,6 +154,19 @@ jobs:
           echo "$out"
           echo "$out" | grep -q "brain setup" || { echo "::error::user-prefix bin did not run"; exit 1; }
 
+      # The checkout probe above catches source-tree regressions. Release proof
+      # must also come from the exact globally installed tarball, including
+      # synthetic admin-key create, read, rotation, and ciphertext inspection.
+      - name: packed Windows DPAPI and admin-key release gate
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/financial-brain-cli"
+          package_root="$(npm root --global --prefix "$prefix")/brain-installer"
+          test -f "$package_root/scripts/windows-dpapi-release-gate.mjs"
+          node "$package_root/scripts/windows-dpapi-release-gate.mjs"
+
       # PowerShell can block npm.ps1/npx.ps1 under its default execution
       # policy. The website therefore uses the .cmd shims explicitly on
       # Windows, and CI must prove that exact beginner path.

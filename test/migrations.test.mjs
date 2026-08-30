@@ -870,7 +870,10 @@ check("restart guard refuses an existing migration column with the wrong contrac
         bind: (...next) => statement(next),
         first: async () => db.prepare(sql).get(...params) ?? null,
         all: async () => ({ results: db.prepare(sql).all(...params) }),
-        run: async () => db.prepare(sql).run(...params),
+        run: async () => {
+          const result = db.prepare(sql).run(...params);
+          return { ...result, meta: { changes: Number(result.changes) } };
+        },
       });
       return statement();
     },
@@ -934,6 +937,52 @@ check("restart guard refuses an existing migration column with the wrong contrac
     JSON.stringify({ failed, failedSource, successfulAt }));
   check("the real source registry keeps the logical count and failure reason",
     failedSource.document_count === 2 && /Drive API unavailable/.test(failedSource.stale_reason || ""), JSON.stringify(failedSource));
+
+  const smokeEnvelope = {
+    source_type: "install-smoke",
+    source_id: "public-first-install-v1",
+    title: "Financial Brain first-install smoke proof",
+    content: "This public, non-customer document proves one authenticated installation check.",
+    metadata: { proof_kind: "public_first_install_smoke", contains_customer_data: false, schema_version: 1 },
+  };
+  const ingestSmoke = () => worker.fetch(new Request("https://brain.example/api/admin/brain/ingest/batch", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ docs: [smokeEnvelope] }),
+  }), env, {});
+  const smokeReceipt = (completedAt) => post({
+    source: "install-smoke", kind: "upload", status: "ready",
+    run_id: "public_install_smoke_v1", lane: "manual",
+    started_at: completedAt, completed_at: completedAt,
+    docs_added: 1, detail: "fixed public first-install smoke document accepted",
+  });
+
+  const committedIngest = await (await ingestSmoke()).json();
+  const lostResponseAt = "2026-08-30T19:00:00.000Z";
+  await smokeReceipt(lostResponseAt); // The mutation committed; the caller lost this response.
+  const resumedIngest = await (await ingestSmoke()).json();
+  const resumedReceipt = await (await smokeReceipt("2026-08-30T19:05:00.000Z")).json();
+  const smokeDocumentCount = db.prepare(
+    "SELECT count(*) AS n FROM documents WHERE doc_uid='install-smoke:public-first-install-v1'"
+  ).get().n;
+  const smokeRunCount = db.prepare(
+    "SELECT count(*) AS n FROM sync_runs WHERE run_id='public_install_smoke_v1'"
+  ).get().n;
+  const smokeEventCount = db.prepare(
+    "SELECT count(*) AS n FROM source_events WHERE id=-2021001 AND source_name='install-smoke'"
+  ).get().n;
+  const smokeSource = db.prepare(
+    "SELECT last_ingest_at,document_count,status FROM sources WHERE name='install-smoke'"
+  ).get();
+  check("the fixed smoke ingest resumes as one unchanged public document after a lost response",
+    committedIngest.results?.[0]?.status === "created" &&
+      resumedIngest.results?.[0]?.status === "unchanged" && smokeDocumentCount === 1,
+    JSON.stringify({ committedIngest, resumedIngest, smokeDocumentCount }));
+  check("the fixed smoke receipt is exactly once across committed-response loss and retry",
+    smokeRunCount === 1 && smokeEventCount === 1 &&
+      smokeSource.status === "ready" && smokeSource.document_count === 1 &&
+      smokeSource.last_ingest_at === lostResponseAt && resumedReceipt.completed_at === lostResponseAt,
+    JSON.stringify({ smokeRunCount, smokeEventCount, smokeSource, resumedReceipt }));
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nmigrations: all ${ran} checks passed`);

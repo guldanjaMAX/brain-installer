@@ -38,7 +38,10 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { TextDecoder } from "node:util";
 import { restrictWindowsFileToCurrentUser } from "../operations/current-user-file.mjs";
-import { prepareWindowsDpapiSession } from "../operations/windows-dpapi-session.mjs";
+import {
+  prepareWindowsDpapiSession,
+  recordWindowsDpapiHelperInvocation,
+} from "../operations/windows-dpapi-session.mjs";
 
 export const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 export const TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -466,6 +469,9 @@ function runWindowsDpapi(input, options, operation) {
         WINDOWS_DPAPI_BRIDGE,
         "--helper", session.helper,
         "--sha256", session.sha256,
+        "--size", String(session.size),
+        "--dev", session.dev,
+        "--ino", session.ino,
         "--operation", operation,
         "--length", String(input.length),
         "--max", String(MAX_DPAPI_OUTPUT_BYTES),
@@ -492,6 +498,9 @@ function runWindowsDpapi(input, options, operation) {
     if (result?.status !== 0 || result?.error || !stdout.length ||
         stdout.length > MAX_DPAPI_OUTPUT_BYTES) {
       throw new Error(failureMessage);
+    }
+    if (!options.runPowerShell) {
+      (options.recordWindowsDpapiHelperInvocation || recordWindowsDpapiHelperInvocation)();
     }
     return Buffer.from(stdout);
   } catch {

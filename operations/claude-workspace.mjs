@@ -23,7 +23,7 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, join, parse, resolve } from "node:path";
+import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import { renderCopyableCommand } from "./command-display.mjs";
 
 export const CLAUDE_WORKSPACE_MARKER = "<!-- financial-brain-installer:claude-workspace:v1 -->";
@@ -93,7 +93,7 @@ function workspaceIdentity(manifestPath) {
   return createHash("sha256").update(resolve(manifestPath), "utf8").digest("hex").slice(0, 20);
 }
 
-function workspaceRoot(manifestPath, options = {}) {
+function workspacePaths(manifestPath, options = {}) {
   const configured = options.workspaceRoot || options.environment?.HOME ||
     options.environment?.USERPROFILE || homedir();
   const root = options.workspaceRoot
@@ -102,7 +102,10 @@ function workspaceRoot(manifestPath, options = {}) {
   if (!root || /[\u0000-\u001f\u007f]/.test(root)) {
     throw new Error("the dedicated Claude workspace root is invalid");
   }
-  return join(root, workspaceIdentity(manifestPath));
+  return Object.freeze({
+    trustedRoot: root,
+    workspace: join(root, workspaceIdentity(manifestPath)),
+  });
 }
 
 function sameCanonicalPath(left, right) {
@@ -117,10 +120,16 @@ function sameCanonicalPath(left, right) {
  * Recursive mkdir is deliberately avoided because the deterministic workspace
  * name is known in advance and may already have been replaced by a link.
  */
-function ensureCanonicalDirectory(path, { mode = 0o700 } = {}) {
+function ensureCanonicalDirectory(path, { mode = 0o700, trustedRoot = path } = {}) {
   const target = resolve(path);
+  const root = resolve(trustedRoot);
+  const descent = relative(root, target);
+  if (descent === ".." || descent.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) ||
+      isAbsolute(descent)) {
+    throw new Error("the dedicated Claude workspace escaped its trusted root");
+  }
   const missing = [];
-  let current = target;
+  let current = root;
   while (!existsSync(current)) {
     missing.push(current);
     const parent = dirname(current);
@@ -149,6 +158,17 @@ function ensureCanonicalDirectory(path, { mode = 0o700 } = {}) {
     mkdirSync(next, { recursive: false, mode });
     verify(next);
   }
+  verify(root);
+
+  // Revalidate every component from the owner-controlled root on every run.
+  // Checking only the deepest existing directory would trust a parent that was
+  // replaced or made writable after the first successful setup.
+  let candidate = root;
+  for (const part of descent.split(/[\\/]+/).filter(Boolean)) {
+    candidate = join(candidate, part);
+    if (!existsSync(candidate)) mkdirSync(candidate, { recursive: false, mode });
+    verify(candidate);
+  }
   verify(target);
   return target;
 }
@@ -175,7 +195,8 @@ function unrelatedAncestorGuide(workspace, target) {
 }
 
 export function writeClaudeWorkspaceGuide(manifestPath, options = {}) {
-  const workspace = ensureCanonicalDirectory(workspaceRoot(manifestPath, options));
+  const paths = workspacePaths(manifestPath, options);
+  const workspace = ensureCanonicalDirectory(paths.workspace, { trustedRoot: paths.trustedRoot });
   const target = join(workspace, "CLAUDE.md");
   chmodSync(workspace, 0o700);
   const ancestor = unrelatedAncestorGuide(workspace, target);
@@ -203,7 +224,11 @@ export function writeClaudeWorkspaceGuide(manifestPath, options = {}) {
     fsyncSync(fd);
     closeSync(fd);
     fd = null;
-    ensureCanonicalDirectory(workspace);
+    if (typeof options.beforeWorkspaceRename === "function") options.beforeWorkspaceRename();
+    // Node has no portable directory-relative, no-follow rename primitive.
+    // Revalidating the entire owner-only chain immediately before rename keeps
+    // the remaining race bounded to that final syscall.
+    ensureCanonicalDirectory(workspace, { trustedRoot: paths.trustedRoot });
     renameSync(temporary, target);
     chmodSync(target, 0o600);
   } catch (error) {

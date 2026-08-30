@@ -14770,15 +14770,22 @@ async function cmdZone(manifestPath) {
   return result;
 }
 
-async function cmdInvite(manifestPath) {
-  const { m } = loadManifest(manifestPath);
+export async function cmdInvite(manifestPath, options = {}) {
+  const isTTY = options.isTTY ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  if (!isTTY) {
+    handoffCheckError(
+      "OWNER_DIRECT_TERMINAL_REQUIRED",
+      "OWNER_DIRECT_TERMINAL_REQUIRED: `brain invite` can run only in a terminal the owner controls directly. No enrollment invite was created. Run the exact command there, outside any agent shell or captured subprocess.",
+    );
+  }
+  const { m } = (options.loadManifest ?? loadManifest)(manifestPath);
   // Cloudflare is OPTIONAL here, deliberately: inviting a new device must
   // keep working after our account token is revoked at handoff.
-  const acct = m.brain?.domain ? null : await resolveAccount(m);
-  const base = await resolveBaseUrl(m, acct);
-  const adminKey = resolveAdminKey(manifestPath);
+  const acct = m.brain?.domain ? null : await (options.resolveAccount ?? resolveAccount)(m);
+  const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, acct);
+  const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
   if (!adminKey) die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
-  const res = await http(`${base}/api/admin/auth/invite`, {
+  const res = await (options.request ?? http)(`${base}/api/admin/auth/invite`, {
     method: "POST",
     headers: { "X-Admin-Key": adminKey },
   }, { timeoutMs: 30_000, what: "the enrollment invite" });

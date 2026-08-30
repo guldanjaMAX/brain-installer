@@ -43,7 +43,7 @@ export function UpdateStatusCard({ update, onRetry }: {
   return (
     <Section
       title="Software updates"
-      blurb="This Brain checks Financial Brain's public stable release channel. It does not send your files, questions, manifest, source list, or account details."
+      blurb="This Brain checks Financial Brain's public release channel. It does not send your files, questions, manifest, source list, or account details."
       action={update?.status === "unavailable" ? (
         <button onClick={onRetry} className="text-[13.5px] text-accent font-medium">Check again</button>
       ) : undefined}
@@ -57,6 +57,26 @@ export function UpdateStatusCard({ update, onRetry }: {
             Your Brain keeps working. This screen is not treating an unreachable release channel as proof that you are up to date.
             {update.installed_version ? ` Installed version: ${update.installed_version}.` : ""}
           </p>
+        </div>
+      )}
+
+      {update?.status === "release_held" && (
+        <div className="px-4 py-4">
+          <p className="text-[14.5px] text-amber-900 font-medium">The next release is held.</p>
+          <p className="mt-1 text-[13.5px] text-ink-soft leading-relaxed">
+            {update.held_reason || "Release checks are still open."} No installer or update command is available yet.
+          </p>
+          <a href={update.update_url} target="_blank" rel="noreferrer" className="inline-block mt-3 text-[13px] text-accent font-medium">Read release status</a>
+        </div>
+      )}
+
+      {update?.status === "release_candidate" && (
+        <div className="px-4 py-4">
+          <p className="text-[14.5px] text-amber-900 font-medium">A candidate is still under review.</p>
+          <p className="mt-1 text-[13.5px] text-ink-soft leading-relaxed">
+            {update.held_reason || "Release checks are still open."} It is not installable until it becomes a reviewed stable release.
+          </p>
+          <a href={update.update_url} target="_blank" rel="noreferrer" className="inline-block mt-3 text-[13px] text-accent font-medium">Read release status</a>
         </div>
       )}
 

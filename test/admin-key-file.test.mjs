@@ -31,6 +31,7 @@ import {
 } from "../operations/admin-key-file.mjs";
 import {
   disposeWindowsDpapiSession,
+  finalizeWindowsDpapiSession,
   prepareWindowsDpapiSession,
 } from "../operations/windows-dpapi-session.mjs";
 
@@ -145,7 +146,13 @@ try {
       sessionPrepares++;
       if (!compiledSession) {
         sessionCompiles++;
-        compiledSession = { helper: "C:\\fixture\\windows-dpapi-helper.exe", sha256: "a".repeat(64) };
+        compiledSession = {
+          helper: "C:\\fixture\\windows-dpapi-helper.exe",
+          sha256: "a".repeat(64),
+          size: 1234,
+          dev: "7",
+          ino: "11",
+        };
       }
       return compiledSession;
     },
@@ -167,6 +174,15 @@ try {
       sessionDisposals++;
       return { status: "clean", attempts: 1 };
     },
+    resetWindowsDpapiSessionMetrics: () => {
+      sessionCompiles = 0;
+      sessionCalls.length = 0;
+    },
+    recordWindowsDpapiHelperInvocation: () => {},
+    readWindowsDpapiSessionMetrics: () => ({
+      compile_count: sessionCompiles,
+      helper_invocations: sessionCalls.length,
+    }),
     environment: {},
   });
   assert.deepEqual(sessionDiagnostic, {
@@ -175,6 +191,8 @@ try {
     rounds: 25,
     stage: null,
     cleanup_status: "clean",
+    compile_count: 1,
+    helper_invocations: 50,
   });
   assert.equal(sessionCompiles, 1, "25 rounds compile one process-scoped helper");
   assert.equal(sessionPrepares, 50, "every crypto operation reuses the same validated session");
@@ -233,6 +251,9 @@ try {
   const compiledOnce = prepareWindowsDpapiSession(sessionOptions);
   assert.equal(prepareWindowsDpapiSession(sessionOptions), compiledOnce);
   assert.equal(compileRuns, 1);
+  assert.equal(compiledOnce.size, Buffer.byteLength("fixed compiled helper bytes"));
+  assert.match(compiledOnce.dev, /^\d+$/);
+  assert.match(compiledOnce.ino, /^\d+$/);
   let lockedUnlinks = 0;
   const retriedCleanup = disposeWindowsDpapiSession({
     attempts: 5,
@@ -250,9 +271,11 @@ try {
   assert.deepEqual(retriedCleanup, { status: "clean", attempts: 3 });
 
   prepareWindowsDpapiSession(sessionOptions);
-  const deferredCleanup = disposeWindowsDpapiSession({
+  const cleanupReports = [];
+  const deferredCleanup = finalizeWindowsDpapiSession({
     attempts: 2,
     pause: () => {},
+    report: (line) => cleanupReports.push(line),
     unlink: () => {
       const error = new Error("fixture antivirus still holds the helper");
       error.code = "EBUSY";
@@ -264,6 +287,9 @@ try {
     attempts: 2,
     issue_code: "WINDOWS_DPAPI_CLEANUP_DEFERRED",
   });
+  assert.deepEqual(cleanupReports, [
+    "BRAIN_DPAPI_HYGIENE:cleanup_deferred issue_code=WINDOWS_DPAPI_CLEANUP_DEFERRED\n",
+  ]);
   assert.deepEqual(disposeWindowsDpapiSession({ pause: () => {} }), { status: "clean", attempts: 1 });
   rmSync(fakeWindowsRoot, { recursive: true, force: true });
 

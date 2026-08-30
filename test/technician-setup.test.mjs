@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { cmdConnectProvider, cmdLocalTools, cmdTechnician, runPublicInstallSmoke, verifyTechnicianHandoff } from "../brain.mjs";
+import { cmdConnectProvider, cmdInvite, cmdLocalTools, cmdTechnician, runPublicInstallSmoke, verifyTechnicianHandoff } from "../brain.mjs";
 
 import {
   TECHNICIAN_RUN_STEPS,
@@ -292,6 +292,46 @@ test("a group or world-writable Claude workspace parent is rejected on POSIX", {
     /not private to the current owner/i,
   );
   assert.equal(existsSync(join(hostileParent, "managed-root")), false);
+});
+
+test("the Claude workspace revalidates its trusted parent on every rerun", { skip: process.platform === "win32" }, () => {
+  const workspaceRoot = join(sandbox, "revalidated-dedicated-root");
+  const manifest = join(sandbox, "revalidated-manifest", "brain.manifest.json");
+  mkdirSync(resolve(manifest, ".."), { recursive: true });
+  writeFileSync(manifest, "{}");
+  const first = writeClaudeWorkspaceGuide(manifest, { workspaceRoot });
+  chmodSync(workspaceRoot, 0o777);
+  try {
+    assert.throws(
+      () => writeClaudeWorkspaceGuide(manifest, { workspaceRoot }),
+      /not private to the current owner/i,
+    );
+    assert.equal(readFileSync(first.path, "utf8").startsWith(CLAUDE_WORKSPACE_MARKER), true);
+  } finally {
+    chmodSync(workspaceRoot, 0o700);
+  }
+});
+
+test("the Claude workspace revalidates its full parent chain immediately before rename", { skip: process.platform === "win32" }, () => {
+  const workspaceRoot = join(sandbox, "rename-revalidated-root");
+  const manifest = join(sandbox, "rename-revalidated-manifest", "brain.manifest.json");
+  mkdirSync(resolve(manifest, ".."), { recursive: true });
+  writeFileSync(manifest, "{}");
+  const first = writeClaudeWorkspaceGuide(manifest, { workspaceRoot, brainCliPath: safeBrainPath });
+  const original = readFileSync(first.path, "utf8");
+  try {
+    assert.throws(
+      () => writeClaudeWorkspaceGuide(manifest, {
+        workspaceRoot,
+        brainCliPath: join(sandbox, "replacement-brain.mjs"),
+        beforeWorkspaceRename: () => chmodSync(workspaceRoot, 0o777),
+      }),
+      /not private to the current owner/i,
+    );
+    assert.equal(readFileSync(first.path, "utf8"), original);
+  } finally {
+    chmodSync(workspaceRoot, 0o700);
+  }
 });
 
 test("the plan is read-only, ordered, honest about proof, and agent-readable", () => {
@@ -889,6 +929,59 @@ test("passkey enrollment requires the exact host and never mints an invite in an
     (error) => error.code === "passkey_human_terminal_required" && /owner-only/i.test(error.message),
   );
   assert.equal(calls, 0);
+});
+
+test("brain invite itself refuses a non-TTY before manifest or network access", async () => {
+  let manifestReads = 0;
+  let networkCalls = 0;
+  const output = [];
+  const originalLog = console.log;
+  console.log = (...args) => output.push(args.map(String).join(" "));
+  try {
+    await assert.rejects(
+      cmdInvite(join(sandbox, "missing.manifest.json"), {
+        isTTY: false,
+        loadManifest: () => { manifestReads++; throw new Error("must not read manifest"); },
+        request: async () => { networkCalls++; throw new Error("must not call network"); },
+      }),
+      (error) => error.code === "OWNER_DIRECT_TERMINAL_REQUIRED" &&
+        /No enrollment invite was created/.test(error.message),
+    );
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(manifestReads, 0);
+  assert.equal(networkCalls, 0);
+  assert.doesNotMatch(output.join("\n"), /#enroll=|https?:\/\//);
+});
+
+test("brain invite keeps its exact interactive owner-terminal path", async () => {
+  let networkCalls = 0;
+  const output = [];
+  const originalLog = console.log;
+  console.log = (...args) => output.push(args.map(String).join(" "));
+  try {
+    const invite = await cmdInvite(manifestPath, {
+      isTTY: true,
+      loadManifest: () => ({ m: { brain: { domain: "brain.fixture.test" } } }),
+      resolveBaseUrl: async () => "https://brain.fixture.test",
+      resolveAdminKey: () => "fixture-admin-key",
+      request: async (url, request) => {
+        networkCalls++;
+        assert.equal(url, "https://brain.fixture.test/api/admin/auth/invite");
+        assert.equal(request.method, "POST");
+        return new Response(JSON.stringify({
+          url: "https://brain.fixture.test/app#enroll=synthetic-code",
+          rp_id: "brain.fixture.test",
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+    assert.equal(invite.rp_id, "brain.fixture.test");
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(networkCalls, 1);
+  assert.match(output.join("\n"), /synthetic-code/);
 });
 
 test("the first-install smoke uses one fixed public document and is idempotent after a lost response", async () => {
