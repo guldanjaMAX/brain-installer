@@ -21,7 +21,8 @@
 
 import { jsonResponse, privateNoStore, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
 import { resolvePrincipal, principalMay } from "./lib/grants.js";
-import { handleBankFeed } from "./lib/bank-feed.js";
+import { bankFeedEnabled, handleBankFeed } from "./lib/bank-feed.js";
+import { handlePlaidWebhook, runPlaidMaintenance } from "./lib/plaid-bank-feed.js";
 import { handleBankExportImport, BANK_IMPORT_PATH } from "./lib/fin-upload.js";
 import { handleFinApi, FIN_PATH_PREFIX } from "./lib/fin-api.js";
 import {
@@ -1640,6 +1641,13 @@ export default {
       return handleOwnerActions(env, request, path, { ingestEnvelope });
     }
 
+    // Plaid signs the exact raw body with a short-lived ES256 verification JWT.
+    // The handler fetches only the named public key, records no payload, and
+    // turns the notification into durable reconciliation debt.
+    if (path === "/api/webhooks/plaid") {
+      return handlePlaidWebhook(env, request);
+    }
+
     // The Zoom webhook sits in FRONT of the key gate because Zoom cannot send
     // the brain's admin key. Its authentication is the HMAC signature over the
     // raw body, verified in constant time inside the handler, which also fails
@@ -2046,7 +2054,13 @@ export default {
         if (!result?.skipped && result?.outcome?.kind !== "completed") {
           console.warn(`zoom delivery maintenance: ${result?.outcome?.kind || "unavailable"}`);
         }
-      })])
+      }), env.BANK_FEED_PROVIDER === "plaid" && bankFeedEnabled(env)
+        ? runPlaidMaintenance(env).then((result) => {
+          const synced = Number(result?.sync?.ran || 0);
+          const revoked = Number(result?.revocations?.ran || 0);
+          if (synced || revoked) console.log(`plaid maintenance: ${synced} synced, ${revoked} revocations`);
+        })
+        : Promise.resolve()])
     );
   },
 };

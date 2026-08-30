@@ -31,6 +31,13 @@ export const TECHNICIAN_STEPS = Object.freeze([
     automated_proof: "The installer verifies the token, provisions the exact account, deploys, migrates, and runs health checks.",
   }),
   Object.freeze({
+    id: "plaid",
+    title: "Configure the Plaid bank feed",
+    dashboard_url: "https://dashboard.plaid.com/",
+    human_boundary: "The client owns the Plaid account, chooses Sandbox or Production, registers this Brain's return address, and enters the Plaid client ID, secret, and independently stored bank wrapping key only into hidden terminal prompts.",
+    automated_proof: "The installer passes the three values to one short-lived secrets child, reads back Worker secret names without values, and leaves account authorization to the bank account holder in Plaid Link.",
+  }),
+  Object.freeze({
     id: "google",
     title: "Connect Google Drive, Gmail, and Calendar",
     dashboard_url: "https://console.cloud.google.com/apis/credentials",
@@ -104,7 +111,7 @@ function readManifestSummary(manifestPath, deps = {}) {
   } catch (error) {
     throw new Error(`could not read the technician manifest: ${error.message}`);
   }
-  const enabled = ["google_drive", "gmail", "calendar", "zoom", "imap"]
+  const enabled = ["google_drive", "gmail", "calendar", "zoom", "imap", "bank_feed"]
     .filter((name) => manifest?.corpora?.[name]?.enabled === true);
   return {
     path: absolute,
@@ -137,8 +144,11 @@ export function technicianPlan(manifestPath, deps = {}) {
       let state = "not_checked";
       if (step.id === "tools") state = "ready_to_start";
       if (step.id === "cloudflare" && !manifest.exists) state = "ready_after_local_tools";
-      if (["google", "zoom", "imap", "passkey", "verify"].includes(step.id) && !manifest.exists) {
+      if (["plaid", "google", "zoom", "imap", "passkey", "verify"].includes(step.id) && !manifest.exists) {
         state = "waiting_for_install_record";
+      }
+      if (step.id === "plaid" && manifest.exists && !manifest.enabled_connectors.includes("bank_feed")) {
+        state = "requires_manifest_enablement";
       }
       if (step.id === "zoom" && manifest.exists && !manifest.enabled_connectors.includes("zoom")) {
         state = "requires_manifest_enablement";
@@ -202,6 +212,7 @@ function childCommands(step, manifestPath, flags, scriptPath) {
   switch (step) {
     case "tools": return [command("tools")];
     case "cloudflare": return [command("setup", path)];
+    case "plaid": return [command("secrets", path)];
     case "google": return [command("connect", "google", "--scopes", String(flags.scopes || "drive,gmail,calendar"))];
     case "zoom": return [command("connect", "zoom", path)];
     case "imap": {
@@ -273,6 +284,9 @@ export async function runTechnicianStep({
       throw new Error(`the install plan needs these Google sources enabled before connection: ${requested.join(", ")}`);
     }
   }
+  if (step === "plaid" && !summary.enabled_connectors.includes("bank_feed")) {
+    throw new Error("the install plan needs corpora.bank_feed.enabled before Plaid credential entry");
+  }
   if (step === "passkey") {
     if (!summary.final_hostname) {
       throw new Error("the final Brain address is still open. Choose brain.domain first so the passkey is enrolled on its permanent address.");
@@ -287,6 +301,18 @@ export async function runTechnicianStep({
   const explicitEnv = {};
   let childEnv = null;
   try {
+    if (step === "plaid") {
+      if (typeof readHidden !== "function") throw new Error("the Plaid step needs a secure interactive terminal");
+      for (const [name, label] of [
+        ["BANK_FEED_CLIENT_ID", "Plaid client ID"],
+        ["BANK_FEED_SECRET", "Plaid secret"],
+        ["BANK_FEED_WRAPPING_KEY_V2", "bank wrapping key v2"],
+      ]) {
+        const value = await hiddenValue(readHidden, `  ${label} (hidden): `, label);
+        secretBuffers.push(value);
+        explicitEnv[name] = bufferText(value);
+      }
+    }
     if (step === "google") {
       if (typeof readHidden !== "function") throw new Error("the Google step needs a secure interactive terminal");
       const clientId = await hiddenValue(readHidden, "  Google OAuth client ID (hidden): ", "Google OAuth client ID");

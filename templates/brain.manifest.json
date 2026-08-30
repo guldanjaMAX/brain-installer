@@ -184,6 +184,27 @@
       "path": null,
       "source": "documents"
     },
+    "bank_feed": {
+      "_comment": [
+        "Plaid is the reviewed bank-feed profile. Keep this off until the",
+        "client has a Plaid account, Sandbox credentials have been entered",
+        "through the hidden prompt, the independent bank wrapping key is in",
+        "reviewed owner recovery custody, and the exact return and webhook URLs are",
+        "registered in that Plaid environment. Credentials never go here.",
+        "The account holder completes Link themselves. This brain requests only",
+        "read-only Transactions and never sees bank login credentials. Scheduled",
+        "reconciliation remains active because webhooks are not a sole source of truth."
+      ],
+      "enabled": false,
+      "provider": "plaid",
+      "environment": "sandbox",
+      "registered_redirect_uris": [],
+      "entity_slug": "primary",
+      "country_codes": [
+        "US"
+      ],
+      "reconciliation_interval_minutes": 360
+    },
     "whatsapp": {
       "_comment": [
         "Live capture through a paired linked device, and OPT-IN twice over:",

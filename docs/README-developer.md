@@ -832,7 +832,7 @@ Read this before scoping an engagement.
   with an in-memory D1-shaped adapter. The final domain and physical devices
   still need the weekend ceremony and access-control gate.
 - **Long-tail provider APIs remain absent.** Slack, Notion, Microsoft 365,
-  Dropbox, QuickBooks, Plaid, and CRM APIs are not product connectors. Manual
+  Dropbox, QuickBooks, and CRM APIs are not product connectors. Manual
   exports, a watched folder, or Drive are first-class custody plans, not a
   pretend API integration.
 - **No official WhatsApp Business Platform connector.** Safe WhatsApp chat
@@ -941,6 +941,11 @@ It covers encrypted artifacts, session-generation advancement, independent
 bank wrapping, legacy rewrap or explicit reauthorization, schema-24 empty
 agent authority, and deterministic interruption at every declared mutation
 boundary. It is synthetic proof only, not a live Cloudflare or bank drill.
+
+The named Plaid profile, durability model, credential-free rehearsal, optional
+live Sandbox runner, and remaining owner ceremony are documented in
+[PLAID.md](./PLAID.md). Built and locally green does not mean Plaid Sandbox,
+Production, a real institution, or the owner's primary bank has been tested.
 
 Provider HTTP connectors share total and per-attempt deadlines, AbortController
 cancellation, bounded exponential retry with jitter, both forms of Retry-After,

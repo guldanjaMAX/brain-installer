@@ -29,9 +29,12 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  WORKER_PROVIDER_SECRET_NAMES, optionalWorkerSecretNames, cmdSecrets,
+  WORKER_PROVIDER_SECRET_NAMES, optionalWorkerSecretNames, cmdSecrets, bankFeedWorkerBindings,
 } from "../brain.mjs";
-import { checkBankFeedRedirect, bankFeedRedirectUri, BANK_FEED_REDIRECT_PATH, OK, WARN, FAIL } from "../doctor.mjs";
+import {
+  checkBankFeedRedirect, bankFeedRedirectUri, plaidWebhookUri,
+  BANK_FEED_REDIRECT_PATH, PLAID_WEBHOOK_PATH, OK, WARN, FAIL,
+} from "../doctor.mjs";
 import { redirectUriFor } from "../worker/src/lib/bank-feed.js";
 
 let fail = 0, ran = 0;
@@ -279,11 +282,60 @@ try {
     });
     check("a fully prepared install passes and names the environment it will rehearse in",
       ready.status === OK && /sandbox/.test(ready.detail), JSON.stringify(ready));
+    const plaidReady = checkBankFeedRedirect({
+      ...manifest({ bankFeed: true }),
+      corpora: { bank_feed: {
+        enabled: true, provider: "plaid", environment: "sandbox",
+        registered_redirect_uris: ["https://fixture-brain.example.workers.dev/app/connect/bank"],
+      } },
+    });
+    check("the named Plaid profile needs no custom host and prints its signed webhook address",
+      plaidReady.status === OK && /plaid; sandbox/.test(plaidReady.detail) &&
+      plaidReady.detail.includes("https://fixture-brain.example.workers.dev/api/webhooks/plaid") &&
+      PLAID_WEBHOOK_PATH === "/api/webhooks/plaid" &&
+      plaidWebhookUri("fixture-brain.example.workers.dev") ===
+        "https://fixture-brain.example.workers.dev/api/webhooks/plaid",
+      JSON.stringify(plaidReady));
+    const plaidOverride = checkBankFeedRedirect({
+      ...manifest({ bankFeed: true }),
+      corpora: { bank_feed: {
+        enabled: true, provider: "plaid", environment: "sandbox",
+        registered_redirect_uris: ["https://fixture-brain.example.workers.dev/app/connect/bank"],
+        api_base: "https://unexpected.example",
+      } },
+    });
+    check("the named Plaid profile refuses custom endpoint overrides",
+      plaidOverride.status === FAIL && /custom endpoint override/.test(plaidOverride.detail),
+      JSON.stringify(plaidOverride));
     check("a different brain's registered address does not satisfy this brain's check",
       checkBankFeedRedirect({
         ...manifest({ bankFeed: true }),
         corpora: { bank_feed: { enabled: true, registered_redirect_uris: ["https://other-brain.example.workers.dev/app/connect/bank"] } },
       }).status === FAIL, "");
+  }
+
+  /* ============ deploy carries public Plaid configuration, never credentials ============ */
+  {
+    check("a brain with the feed off deploys no stale bank-feed configuration",
+      bankFeedWorkerBindings(manifest()).length === 0, "");
+    const plaidBindings = bankFeedWorkerBindings({
+      ...manifest({ bankFeed: true }),
+      client: { slug: "fixture", display_name: "Fixture Brain" },
+      corpora: { bank_feed: {
+        enabled: true, provider: "plaid", environment: "sandbox",
+        entity_slug: "primary", country_codes: ["US"], reconciliation_interval_minutes: 360,
+      } },
+    });
+    const plaidNames = plaidBindings.map((binding) => binding.name);
+    check("deploy names the Plaid profile and its reconciliation policy without endpoint overrides",
+      plaidNames.includes("BANK_FEED_PROVIDER") && plaidNames.includes("BANK_FEED_RECONCILE_MINUTES") &&
+      !plaidNames.includes("BANK_FEED_API_BASE") && !plaidNames.includes("BANK_FEED_LINK_SDK_URL"),
+      JSON.stringify(plaidBindings));
+    check("deploy metadata contains no Plaid credential name or fixture secret",
+      !JSON.stringify(plaidBindings).includes("BANK_FEED_CLIENT_ID") &&
+      !JSON.stringify(plaidBindings).includes("BANK_FEED_SECRET") &&
+      !JSON.stringify(plaidBindings).includes("fixture-service-secret"),
+      JSON.stringify(plaidBindings));
   }
 } finally {
   rmSync(sandbox, { recursive: true, force: true });

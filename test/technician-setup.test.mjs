@@ -35,6 +35,7 @@ writeFileSync(manifestPath, JSON.stringify({
     calendar: { enabled: true },
     zoom: { enabled: true },
     imap: { enabled: true },
+    bank_feed: { enabled: true, provider: "plaid" },
   },
 }));
 
@@ -209,6 +210,38 @@ test("Google credentials cross only the child environment, never argv, and input
   assert.equal(calls[0].options.env.GOOGLE_CLIENT_SECRET, "");
   assert.ok(clientId.every((byte) => byte === 0));
   assert.ok(clientSecret.every((byte) => byte === 0));
+});
+
+test("Plaid credentials cross only the secrets child environment and are zeroed", async () => {
+  const clientId = Buffer.from("fixture-plaid-client-id");
+  const clientSecret = Buffer.from("fixture-plaid-secret");
+  const wrappingKey = Buffer.from(`v2.${"A".repeat(43)}`);
+  const entered = [clientId, clientSecret, wrappingKey];
+  let call;
+  await runTechnicianStep({
+    step: "plaid",
+    manifestPath,
+    scriptPath: fixtureScriptPath,
+    nodePath: fixtureNodePath,
+    baseEnv: { PATH: "/safe/bin", ZOOM_CLIENT_SECRET: "ambient-zoom-secret" },
+    readHidden: async () => entered.shift(),
+    spawn: (node, args, options) => {
+      call = { node, args, options };
+      assert.equal(options.env.BANK_FEED_CLIENT_ID, "fixture-plaid-client-id");
+      assert.equal(options.env.BANK_FEED_SECRET, "fixture-plaid-secret");
+      assert.equal(options.env.BANK_FEED_WRAPPING_KEY_V2, `v2.${"A".repeat(43)}`);
+      assert.equal(options.env.ZOOM_CLIENT_SECRET, undefined);
+      return { status: 0 };
+    },
+  });
+  assert.deepEqual(call.args, [fixtureScriptPath, "secrets", manifestPath]);
+  assert.doesNotMatch(call.args.join(" "), /fixture-plaid/);
+  assert.equal(call.options.env.BANK_FEED_CLIENT_ID, "");
+  assert.equal(call.options.env.BANK_FEED_SECRET, "");
+  assert.equal(call.options.env.BANK_FEED_WRAPPING_KEY_V2, "");
+  assert.ok(clientId.every((byte) => byte === 0));
+  assert.ok(clientSecret.every((byte) => byte === 0));
+  assert.ok(wrappingKey.every((byte) => byte === 0));
 });
 
 test("Zoom collects the exact S2S values, strips ambient secrets, and zeroes every input", async () => {

@@ -532,10 +532,16 @@ export async function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_
  * `test/bank-feed-secrets.test.mjs` fails if they ever drift apart.
  */
 export const BANK_FEED_REDIRECT_PATH = "/app/connect/bank";
+export const PLAID_WEBHOOK_PATH = "/api/webhooks/plaid";
 
 export function bankFeedRedirectUri(domain) {
   const host = String(domain).replace(/^https?:\/\//, "").replace(/\/+$/, "");
   return `https://${host}${BANK_FEED_REDIRECT_PATH}`;
+}
+
+export function plaidWebhookUri(domain) {
+  const host = String(domain || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
+  return `https://${host}${PLAID_WEBHOOK_PATH}`;
 }
 
 /**
@@ -567,12 +573,13 @@ export function checkBankFeedRedirect(manifest) {
   }
 
   const required = bankFeedRedirectUri(domain);
+  const provider = feed.provider === "plaid" ? "plaid" : "custom";
   const declared = Array.isArray(feed.registered_redirect_uris) ? feed.registered_redirect_uris : [];
-  const missingConfig = [
-    !feed.api_base && "corpora.bank_feed.api_base",
-    !feed.link_sdk_url && "corpora.bank_feed.link_sdk_url",
-    !feed.link_global && "corpora.bank_feed.link_global",
-  ].filter(Boolean);
+  const missingConfig = provider === "custom" ? [
+      !feed.api_base && "corpora.bank_feed.api_base",
+      !feed.link_sdk_url && "corpora.bank_feed.link_sdk_url",
+      !feed.link_global && "corpora.bank_feed.link_global",
+    ].filter(Boolean) : [];
 
   if (!declared.includes(required)) {
     return check(
@@ -596,10 +603,20 @@ export function checkBankFeedRedirect(manifest) {
       "  library to load, so the connect button does nothing."
     );
   }
+  if (provider === "plaid" && (feed.api_base || feed.link_sdk_url || feed.link_global)) {
+    return check(
+      "Bank feed", FAIL,
+      "the Plaid profile has a custom endpoint override",
+      "  Remove corpora.bank_feed.api_base, link_sdk_url, and link_global. The named\n" +
+      "  Plaid profile pins its reviewed public endpoints and browser SDK. Use\n" +
+      "  provider: custom only for a separately reviewed compatible provider."
+    );
+  }
   const environment = feed.environment === "production" ? "production" : "sandbox";
+  const webhook = provider === "plaid" ? plaidWebhookUri(domain) : null;
   return check(
     "Bank feed", OK,
-    `${environment}; return address registered (${required})`,
+    `${provider}; ${environment}; return address registered (${required})${webhook ? `; signed webhook ${webhook}` : ""}`,
     environment === "sandbox"
       ? "  Sandbox is right for a rehearsal, and it is what lets an install be practised\n" +
         "  the same day. Switch to production once the client's own provider approval\n" +

@@ -1296,6 +1296,48 @@ export async function persistWorkersDevDomain(manifestPath, m, acct, scriptName,
   return m.brain.domain;
 }
 
+/** Public, non-secret Worker configuration for the optional bank feed. */
+export function bankFeedWorkerBindings(m) {
+  const feed = m?.corpora?.bank_feed;
+  if (feed?.enabled !== true) return [];
+  const provider = feed.provider === "plaid" ? "plaid" : "custom";
+  const bindings = [
+    { type: "plain_text", name: "BANK_FEED_PROVIDER", text: provider },
+    {
+      type: "plain_text",
+      name: "BANK_FEED_ENV",
+      text: feed.environment === "production" ? "production" : "sandbox",
+    },
+    {
+      type: "plain_text",
+      name: "BANK_FEED_DISPLAY_NAME",
+      text: String(m.client?.display_name || m.client?.slug || "this brain"),
+    },
+    { type: "plain_text", name: "BANK_FEED_ENTITY", text: String(feed.entity_slug || "primary") },
+    {
+      type: "plain_text",
+      name: "BANK_FEED_COUNTRIES",
+      text: (Array.isArray(feed.country_codes) && feed.country_codes.length ? feed.country_codes : ["US"])
+        .map((code) => String(code).toUpperCase()).join(","),
+    },
+    {
+      type: "plain_text",
+      name: "BANK_FEED_RECONCILE_MINUTES",
+      text: String(feed.reconciliation_interval_minutes ?? 360),
+    },
+  ];
+  if (provider === "custom") {
+    for (const [name, value] of [
+      ["BANK_FEED_API_BASE", feed.api_base],
+      ["BANK_FEED_LINK_SDK_URL", feed.link_sdk_url],
+      ["BANK_FEED_LINK_GLOBAL", feed.link_global],
+    ]) {
+      if (value) bindings.push({ type: "plain_text", name, text: String(value) });
+    }
+  }
+  return bindings;
+}
+
 export async function cmdDeploy(manifestPath, options = {}) {
   const { m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
@@ -1383,6 +1425,7 @@ export async function cmdDeploy(manifestPath, options = {}) {
         name: "OCR_MODEL",
         text: String(m.safety?.ocr?.model || "@cf/google/gemma-4-26b-a4b-it"),
       },
+      ...bankFeedWorkerBindings(m),
     ],
     // Without this, every secret set by `brain secrets` is wiped on the next
     // deploy. It is the single most destructive omission in a Workers deploy

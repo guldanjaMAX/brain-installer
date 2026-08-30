@@ -350,9 +350,9 @@ const runImport = (b, flags) => captured(() => cmdImportBank(manifest, manifestP
 /* ============ 10. the ledger has to exist first ============ */
 {
   const db = new DatabaseSync(":memory:");
-  // 0021 intentionally depends on the financial ledger introduced by 0017.
-  // This fixture proves the pre-ledger refusal, so omit both migrations.
-  for (const file of migrationFiles.filter((f) => !f.startsWith("0017") && !f.startsWith("0021"))) {
+  // Every later financial and Plaid migration depends on the ledger introduced
+  // by 0017. This fixture proves the actual pre-ledger prefix, so stop there.
+  for (const file of migrationFiles.filter((f) => f < "0017_")) {
     for (const statement of splitStatements(readFileSync(join(MIGRATIONS, file), "utf-8"))) db.exec(statement);
   }
   const env = { STORAGE: "d1", ADMIN_KEY, DB: d1(db) };

@@ -263,8 +263,8 @@ const refuses = (db, sql, params = []) => {
   check("the two service identifiers are read from env and exist nowhere as a constant",
     source.includes("env.BANK_FEED_CLIENT_ID") && source.includes("env.BANK_FEED_SECRET") &&
     !/BANK_FEED_CLIENT_ID\s*=\s*["'`]/.test(source), "");
-  check("there is no default provider host anywhere in the module: not one literal URL",
-    !source.includes("https://") && source.includes("env.BANK_FEED_API_BASE"), "");
+  check("the feed core carries no provider host and delegates named profiles explicitly",
+    !source.includes("https://") && source.includes("bankFeedProfile(env, environment)"), "");
   check("the tenant reference is confined to one function, so the deployment model stays reversible",
     (source.match(/function tenantReference/g) || []).length === 1 &&
     (source.match(/client_user_id/g) || []).length === 1, "");

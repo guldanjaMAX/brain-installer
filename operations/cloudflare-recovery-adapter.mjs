@@ -213,6 +213,18 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   // below so an invocation-local processing lease can never survive recovery.
   "zoom_deliveries",
   "zoom_reconciliation",
+  // Schema 26: webhook receipts plus reconciliation and revocation debt are
+  // durable. Link handoffs, partial sync windows, staging rows, and cached
+  // public verification keys are recreated empty. The committed Item cursor
+  // remains in bank_feed_items, so an interrupted window restarts safely.
+  "plaid_link_operations",
+  "plaid_sync_windows",
+  "plaid_sync_stage_accounts",
+  "plaid_sync_stage_transactions",
+  "plaid_webhook_events",
+  "plaid_webhook_keys",
+  "plaid_reconciliation",
+  "plaid_revocation_outbox",
 ]);
 
 /**
@@ -234,6 +246,9 @@ export const RECOVERY_EXPORT_TABLES = Object.freeze(
       table !== "support_passkeys" &&
       table !== "agent_action_receipts" &&
       table !== "zoom_deliveries" && table !== "zoom_reconciliation" &&
+      table !== "plaid_link_operations" && table !== "plaid_sync_windows" &&
+      table !== "plaid_sync_stage_accounts" && table !== "plaid_sync_stage_transactions" &&
+      table !== "plaid_webhook_keys" &&
       table !== "bank_feed_link_sessions" &&
       table !== "oauth_clients" && table !== "oauth_codes" && table !== "oauth_tokens"),
 );
@@ -311,7 +326,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // contract tracks the EXACT current schema by design: a drill against a
 // database one migration behind would export a table or column set that does
 // not match the reviewed list. Bumping this is required for every migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 25;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 26;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -379,6 +394,16 @@ const SCHEMA_23_TABLES = Object.freeze([
 ]);
 const SCHEMA_24_TABLES = Object.freeze(["agent_action_receipts"]);
 const SCHEMA_25_TABLES = Object.freeze(["zoom_deliveries", "zoom_reconciliation"]);
+const SCHEMA_26_TABLES = Object.freeze([
+  "plaid_link_operations",
+  "plaid_sync_windows",
+  "plaid_sync_stage_accounts",
+  "plaid_sync_stage_transactions",
+  "plaid_webhook_events",
+  "plaid_webhook_keys",
+  "plaid_reconciliation",
+  "plaid_revocation_outbox",
+]);
 
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
@@ -394,7 +419,7 @@ const AGGREGATE_FIELDS = Object.freeze([
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
      ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES, ...SCHEMA_18_TABLES,
      ...SCHEMA_19_TABLES, ...SCHEMA_21_TABLES, ...SCHEMA_22_TABLES, ...SCHEMA_23_TABLES,
-     ...SCHEMA_24_TABLES, ...SCHEMA_25_TABLES].includes(table)
+     ...SCHEMA_24_TABLES, ...SCHEMA_25_TABLES, ...SCHEMA_26_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1297,7 +1322,8 @@ function expectedRecoveryTables(migrations) {
     (latest >= 22 || !SCHEMA_22_TABLES.includes(table)) &&
     (latest >= 23 || !SCHEMA_23_TABLES.includes(table)) &&
     (latest >= 24 || !SCHEMA_24_TABLES.includes(table)) &&
-    (latest >= 25 || !SCHEMA_25_TABLES.includes(table)));
+    (latest >= 25 || !SCHEMA_25_TABLES.includes(table)) &&
+    (latest >= 26 || !SCHEMA_26_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {

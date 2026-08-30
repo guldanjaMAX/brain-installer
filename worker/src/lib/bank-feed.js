@@ -44,6 +44,7 @@
 import { jsonResponse, validateAdminKey } from "./core.js";
 import { ownerSessionPrincipal } from "./owner-auth.js";
 import { importBankExport, balanceRoleFor } from "./fin-import.js";
+import { bankFeedProfile } from "./bank-feed-profiles.js";
 
 /**
  * THE HOSTED FEED'S SIGN CONVENTION, WRITTEN DOWN ONCE.
@@ -100,8 +101,9 @@ class FeedConfigError extends Error {}
 export function bankFeedConfig(env) {
   const clientId = env.BANK_FEED_CLIENT_ID;
   const secret = env.BANK_FEED_SECRET;
-  const apiBase = env.BANK_FEED_API_BASE;
   const environment = env.BANK_FEED_ENV === "production" ? "production" : "sandbox";
+  const profile = bankFeedProfile(env, environment);
+  const apiBase = profile.apiBase;
   const missing = [
     !clientId && "BANK_FEED_CLIENT_ID",
     !secret && "BANK_FEED_SECRET",
@@ -123,22 +125,25 @@ export function bankFeedConfig(env) {
   }
   return {
     clientId, secret, environment,
+    provider: profile.provider,
     apiBase: base.origin,
-    linkSdkUrl: env.BANK_FEED_LINK_SDK_URL || null,
+    linkSdkUrl: profile.linkSdkUrl,
     // The browser global the provider's SDK installs. Configured, never
     // hard-coded, for the same reason the host is: a change of aggregator
     // should be a manifest edit and not a code change in every install.
-    linkGlobal: env.BANK_FEED_LINK_GLOBAL || null,
+    linkGlobal: profile.linkGlobal,
     displayName: env.BANK_FEED_DISPLAY_NAME || env.BRAIN_NAME || "this brain",
     countryCodes: String(env.BANK_FEED_COUNTRIES || "US").split(",").map((c) => c.trim()).filter(Boolean),
   };
 }
 
 export function bankFeedEnabled(env) {
+  const environment = env.BANK_FEED_ENV === "production" ? "production" : "sandbox";
+  const profile = bankFeedProfile(env, environment);
   return Boolean(
     env.BANK_FEED_CLIENT_ID &&
     env.BANK_FEED_SECRET &&
-    env.BANK_FEED_API_BASE &&
+    profile.apiBase &&
     bankAccessWrappingKeyConfigured(env)
   );
 }
@@ -744,6 +749,10 @@ export async function rewrapBankAccessReferences(env, {
  */
 export async function createLinkToken(env, { url, mode = "connect", itemRef = null, fetchImpl = fetch } = {}) {
   const config = bankFeedConfig(env);
+  if (config.provider === "plaid") {
+    const { createPlaidLinkToken } = await import("./plaid-bank-feed.js");
+    return createPlaidLinkToken(env, { url, mode, itemRef, fetchImpl });
+  }
   const { tenantId, endUserRef } = tenantReference(env);
   const redirectUri = redirectUriFor(url);
   const body = {
@@ -793,9 +802,15 @@ export async function createLinkToken(env, { url, mode = "connect", itemRef = nu
  * through would leave the owner staring at a spinner with nothing to resume.
  */
 export async function exchangePublicToken(env, {
-  publicToken, institutionRef = null, institutionLabel = null, fetchImpl = fetch,
+  sessionRef = null, publicToken, institutionRef = null, institutionLabel = null, fetchImpl = fetch,
 } = {}) {
   const config = bankFeedConfig(env);
+  if (config.provider === "plaid") {
+    const { completePlaidLink } = await import("./plaid-bank-feed.js");
+    return completePlaidLink(env, {
+      sessionRef, publicToken, institutionRef, institutionLabel, fetchImpl,
+    });
+  }
   const { tenantId } = tenantReference(env);
   if (!publicToken || typeof publicToken !== "string") {
     throw new FeedError("no authorisation handoff value was supplied", "NO_PUBLIC_TOKEN");
@@ -860,6 +875,10 @@ export async function exchangePublicToken(env, {
 export async function syncItemSlice(env, itemRef, {
   maxPages = MAX_PAGES_PER_SLICE, fetchImpl = fetch, now = null,
 } = {}) {
+  if (bankFeedConfig(env).provider === "plaid") {
+    const { syncPlaidItem } = await import("./plaid-bank-feed.js");
+    return syncPlaidItem(env, itemRef, { fetchImpl, now });
+  }
   const { tenantId } = tenantReference(env);
   const item = await loadItem(env, tenantId, itemRef);
   if (!item) return { item_ref: itemRef, ok: false, reason: "that connection is not on this brain" };
@@ -966,6 +985,10 @@ export function classifyItemError(code) {
  * to be able to tell the client where the load has got to.
  */
 export async function runFeedSlice(env, { maxItems = 3, maxPages = MAX_PAGES_PER_SLICE, fetchImpl = fetch, now = null } = {}) {
+  if (bankFeedConfig(env).provider === "plaid") {
+    const { runPlaidFeedSlice } = await import("./plaid-bank-feed.js");
+    return runPlaidFeedSlice(env, { maxItems, fetchImpl, now });
+  }
   const { tenantId } = tenantReference(env);
   const stamp = now || new Date().toISOString();
   const pending = (await env.DB.prepare(
@@ -1016,6 +1039,10 @@ export async function runFeedSlice(env, { maxItems = 3, maxPages = MAX_PAGES_PER
  * ciphertext, no provider payload.
  */
 export async function feedStatus(env) {
+  if (env.BANK_FEED_PROVIDER === "plaid") {
+    const { plaidFeedStatus } = await import("./plaid-bank-feed.js");
+    return plaidFeedStatus(env);
+  }
   const { tenantId } = tenantReference(env);
   const items = (await env.DB.prepare(
     `SELECT i.item_ref, i.institution_label, i.environment, i.status, i.status_detail, i.key_version,
@@ -1063,6 +1090,10 @@ export async function feedStatus(env) {
  * history because they unplugged a feed is unrecoverable and nobody asked for it.
  */
 export async function disconnectItem(env, itemRef, { fetchImpl = fetch, now = null } = {}) {
+  if (bankFeedConfig(env).provider === "plaid") {
+    const { disconnectPlaidItem } = await import("./plaid-bank-feed.js");
+    return disconnectPlaidItem(env, itemRef, { fetchImpl, now });
+  }
   const { tenantId } = tenantReference(env);
   const item = await loadItem(env, tenantId, itemRef);
   if (!item) return { ok: false, reason: "that connection is not on this brain" };
@@ -1141,20 +1172,27 @@ async function post(path, body) {
 }
 async function start(existing) {
   say("Preparing a secure connection…");
-  const token = existing || (await post("/api/bank-feed/link-token")).link_token;
-  try { sessionStorage.setItem("bank_link_token", token); } catch (e) {}
+  const params = new URLSearchParams(window.location.search);
+  const requestedMode = params.get("mode") === "reauthorise" ? "reauthorise" : "connect";
+  const begun = existing || await post("/api/bank-feed/link-token", {
+    mode: requestedMode,
+    item_ref: requestedMode === "reauthorise" ? params.get("item_ref") : null,
+  });
+  const token = begun.link_token;
+  try { sessionStorage.setItem("bank_link_session", JSON.stringify(begun)); } catch (e) {}
   const config = {
     token,
     onSuccess: async (publicToken, meta) => {
       say("Finishing up…");
       try {
         const done = await post("/api/bank-feed/exchange", {
+          session_ref: begun.session_ref,
           public_token: publicToken,
           institution_ref: meta && meta.institution && meta.institution.institution_id,
           institution_label: meta && meta.institution && meta.institution.name,
         });
-        try { sessionStorage.removeItem("bank_link_token"); } catch (e) {}
-        say("Connected. Your history is loading in the background — this can take a while, and you can close this page.");
+        try { sessionStorage.removeItem("bank_link_session"); } catch (e) {}
+        say("Connected. Your history is loading in the background. This can take a while, and you can close this page.");
       } catch (e) { say(e.message, true); }
     },
     onExit: (err) => { if (err) say("The connection was not completed.", true); },
@@ -1169,7 +1207,7 @@ async function start(existing) {
 }
 el("start").onclick = () => start().catch((e) => say(e.message, true));
 if (window.location.search.indexOf("oauth_state_id") >= 0) {
-  let saved = null; try { saved = sessionStorage.getItem("bank_link_token"); } catch (e) {}
+  let saved = null; try { saved = JSON.parse(sessionStorage.getItem("bank_link_session")); } catch (e) {}
   if (saved) start(saved).catch((e) => say(e.message, true));
 }
 </script></body></html>`;
@@ -1242,6 +1280,7 @@ export async function handleBankFeed(env, request, url, path, ctx) {
       if (!access.authorised) return ownerRefusal(access);
       const body = await readJson(request);
       const result = await exchangePublicToken(env, {
+        sessionRef: body.session_ref || null,
         publicToken: body.public_token,
         institutionRef: body.institution_ref || null,
         institutionLabel: body.institution_label || null,

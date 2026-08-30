@@ -200,7 +200,7 @@ function responseFailure(provider, response, raw, attempts, nowMs, maxRetryAfter
     data?.error_description || data?.message || data?.error?.message || data?.error || raw || `HTTP ${response.status}`,
   );
   const code = boundedProviderText(
-    data?.code || data?.error?.code || data?.error?.status || `http_${response.status}`,
+    data?.code || data?.error_code || data?.error?.code || data?.error?.status || `http_${response.status}`,
     80,
   );
   const retryAfterMs = parseRetryAfter(response.headers?.get?.("retry-after"), {

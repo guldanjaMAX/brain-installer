@@ -1,6 +1,6 @@
 # Connector readiness and ranked backlog
 
-Current as of 2026-08-29 for the isolated `codex/connector-next-wave` candidate.
+Current as of 2026-08-30 for the isolated v0.2.1 release candidates.
 
 This is the engineering proof ledger. The client-facing capability description
 lives in `onboarding/07-ingest-source-matrix.md`. No assertion count promotes a
@@ -43,13 +43,13 @@ a live service smoke test, not proof of a source connector or customer corpus.
 | Zoom webhook and delivery debt | Built | In-process | None, zero provider smoke | On an approved paid test seat, record one meeting, wait for transcript completion, prove debt creation and clearance, then retrieve the transcript with speaker provenance. |
 | Zoom transcript export | Built | Fixture | None accepted | Load a transcript exported by Zoom and prove timestamps, speaker attribution, rerun identity, and citation provenance. |
 | Bank CSV, OFX, and QFX | Built | Invented fixtures | None | Use reviewed exports from at least two institutions: reconcile counts and balances, rerun unchanged, import one revision, and prove every ledger row points to its source document and position. |
-| Hosted bank feed | Built | Scripted I/O | None | Against an approved test feed, prove initial load, cursor resume, pending-to-posted replacement, deletion or reversal handling, key rotation, and explicit unavailable status. |
+| Plaid hosted bank feed | Built | Scripted I/O and real SQLite/D1-compatible runtime | None, no Plaid credential or Sandbox call used | With an approved client-owned Plaid Sandbox account, run the disposable runner, then prove product Link, lost-response replay, whole-window sync promotion, pagination-mutation restart, pending-to-posted replacement, currency and provenance preservation, signed webhook receipt, scheduled fallback, update mode, durable revocation retry, and provider-confirmed Item removal. |
 | Financial ledger | Built schema, import, and reads | Scripted I/O | None, synthetic ledgers only | Complete the bank-export gate, then answer one approved question from ledger rows with source-document provenance rather than text retrieval. |
 | Scanned-PDF OCR | Built, off by default | Fixture and scripted I/O | None, no page reached real Workers AI | In a private disposable gate, test a typed scan, a one-bit fax or photocopy, and handwriting; verify exact page coverage, low-confidence marking, refusal, citation provenance, and no ledger claim from OCR text alone. |
 | Human custodian or manual portal export | Operational source type | Watched-folder and Drive paths tested as above | None for an actual delivery cadence | Record who supplies the artifact, cadence, expected format, date coverage, and one missed-delivery test that reports stale or unavailable instead of zero. |
 | IMAP | Built, read-only | Scripted real socket, 78 checks; TLS and provider behavior remain outside the harness | None | Use a seeded disposable Yahoo, Fastmail, iCloud, or hosted mailbox to prove TLS, app-password custody, folder inventory, baseline, UID resume, reconnect, no unread-state mutation, and explicit Archive/unclassified-folder reporting. |
 | Facebook Messenger export | Built, export-only | Fixture plus common folder-ingestion path | None | Load one current reviewed Download Your Information JSON export; prove exact timestamps, text repair, stable thread/session identity, attachment/unavailable counts, rerun idempotency, provenance, retrieval, and family deletion. |
-| QuickBooks, Plaid, Slack, Notion, Microsoft 365, Dropbox, and CRM APIs | Absent or product-decision blocked | None in this checkout | None | Do not start until demand, administrator custody, authorization contract, deletion semantics, and a provider test account are named. |
+| QuickBooks, Slack, Notion, Microsoft 365, Dropbox, and CRM APIs | Absent or product-decision blocked | None in this checkout | None | Do not start until demand, administrator custody, authorization contract, deletion semantics, and a provider test account are named. |
 
 ## Ranked work
 
@@ -81,9 +81,10 @@ a live service smoke test, not proof of a source connector or customer corpus.
 4. **Prove watched-folder behavior over real time.** The code path is shared and
    deterministic, but real macOS sleep, wake, File Provider, lock, and
    multi-tick behavior is still missing.
-5. **Prove bank normalization with real exports and a test feed.** The next risk
-   is provider shape, direction, revision, and deletion behavior, not another
-   bank-specific schema.
+5. **Run the Plaid Sandbox field gate and real-export normalization gate.** The
+   code now closes the local durability boundaries. The next risk is the real
+   provider shape, Link and webhook delivery, direction, revision, and removal
+   behavior, not another bank-specific schema.
 6. **Prove OCR on private real scans.** The implementation is complete and off.
    The field gate must include typed, one-bit, and handwritten pages and must
    preserve low-confidence and partial states.
