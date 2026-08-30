@@ -148,7 +148,7 @@ function ingestExitCli(scenario) {
     brain: { domain: "fixture.invalid" },
     infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
     safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
-    corpora: { google_drive: {} },
+    corpora: { google_drive: { enabled: true, root_folder_ids: ["fixture-root"] } },
   }));
   writeFileSync(join(userRoot, ".brain", "google-tokens.json"), JSON.stringify({
     google: {

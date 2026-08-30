@@ -286,9 +286,14 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
   is split into its individual messages, each keeping its own subject, sender
   and date. (Before this version half that sentence was false — there was no
   `.mbox` reader and the archive was silently skipped.)
-- **Google Drive OAuth and resumable partial real-account ingest are verified.**
-  A complete no-limit first sweep and the live add, edit, refuse, recover,
-  trash, and incremental-refresh cycle remain field gates. Gmail is covered by
+- **Google Drive is root-bound and disabled by default.** To enable it, the
+  manifest must name at least one reviewed folder id in
+  `corpora.google_drive.root_folder_ids`. Ingest traverses only those folders
+  and their descendants, including Shared Drives, and never follows a shortcut
+  to content outside them. Root confinement, move handling, conservative
+  tombstones, and resumability pass deterministic tests. A complete no-limit
+  first sweep and the live add, edit, refuse, recover, trash, permission-loss,
+  move, Shared Drive, and scheduler cycle remain field gates. Gmail is covered by
   the same OAuth and cursor-safety test harness but has not yet completed a
   real-account production run. Each client registers their own Google OAuth
   app, which takes about fifteen minutes.
@@ -323,10 +328,11 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
 - **Slack and Notion** do not exist as connectors.
 - **Meeting transcripts arrive two ways, neither of them a transcription
   service.** Zoom cloud recordings deliver themselves to a webhook on your own
-  worker (new recordings only, no backfill, paid Zoom seat required), and a
-  transcript you save by hand as `.vtt` or `.srt` is read from any folder that
-  is ingested. Nothing here transcribes audio; there is no speech recognition
-  in this product.
+  worker. The worker makes each delivery durable before acknowledging it and
+  checks a bounded recent window in case Zoom never delivered the webhook. A
+  paid Zoom seat is required. A transcript you save by hand as `.vtt` or `.srt`
+  is also read from any folder that is ingested. Nothing here transcribes audio;
+  there is no speech recognition in this product.
 
 ---
 

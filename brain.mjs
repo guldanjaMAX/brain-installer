@@ -4216,6 +4216,17 @@ export function driveExclusionIdsOf(raw) {
  */
 export function driveConnectorConfig(m, manifestPath, read = (path) => readFileSync(path, "utf-8")) {
   const declared = m?.corpora?.google_drive || {};
+  if (!Array.isArray(declared.root_folder_ids)) {
+    throw new Error("corpora.google_drive.root_folder_ids must be a non-empty array before Drive can run");
+  }
+  const rootFolderIds = [...new Set(
+    declared.root_folder_ids.map((value) => String(value || "").trim()).filter(Boolean)
+  )].sort();
+  if (!rootFolderIds.length) {
+    throw new Error(
+      "Google Drive is disabled until corpora.google_drive.root_folder_ids names at least one reviewed folder"
+    );
+  }
   let fileIds = driveExclusionIdsOf(declared.exclude_file_ids || []);
   if (declared.exclude_file_ids_file) {
     const filePath = resolve(dirname(resolve(manifestPath)), String(declared.exclude_file_ids_file));
@@ -4228,6 +4239,7 @@ export function driveConnectorConfig(m, manifestPath, read = (path) => readFileS
     fileIds = [...new Set([...fileIds, ...driveExclusionIdsOf(parsed)])].sort();
   }
   return {
+    rootFolderIds,
     excludeFileIds: fileIds,
     excludePaths: Array.isArray(declared.exclude_paths) ? declared.exclude_paths.map(String) : [],
     excludeNameParts: Array.isArray(declared.exclude_name_parts) ? declared.exclude_name_parts.map(String) : [],
@@ -4300,7 +4312,7 @@ export function drivePolicyFingerprint(
   extractorPolicyVersion = DRIVE_EXTRACTOR_POLICY_VERSION,
 ) {
   const normalized = {};
-  for (const key of ["excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
+  for (const key of ["rootFolderIds", "excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
     normalized[key] = [...new Set((config[key] || []).map((value) => String(value)))].sort();
   }
   normalized.credentialScanner = credentialScannerFingerprint(scannerEnabled);
@@ -7489,11 +7501,22 @@ export function loadSourceRegistry(commands = {}) {
     google_drive: {
       order: 60,
       label: "Google Drive",
-      scope: "documents, sheets, slides and PDFs with a text layer",
-      legs: ({ m, manifestPath, flags }) => [{
-        source: "drive",
-        run: () => ingestRemote(m, manifestPath, { ...flags, from: "drive" }),
-      }],
+      scope: "documents, sheets, slides and PDFs under the reviewed Drive roots",
+      legs: ({ m, manifestPath, flags }) => {
+        const roots = m?.corpora?.google_drive?.root_folder_ids;
+        if (!Array.isArray(roots) || !roots.some((value) => String(value || "").trim())) {
+          return {
+            unavailable: {
+              reason: "enabled, but the manifest names no reviewed Drive root",
+              fix: "add at least one folder id under corpora.google_drive.root_folder_ids, or leave Drive disabled",
+            },
+          };
+        }
+        return [{
+          source: "drive",
+          run: () => ingestRemote(m, manifestPath, { ...flags, from: "drive" }),
+        }];
+      },
     },
     iphone_backup: {
       order: 70,
@@ -8140,6 +8163,14 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       savedPolicyFingerprint: state.drive_policy_fingerprint,
       lastFullSweepAt: state.drive_last_full_sweep_at,
     });
+    // A root-bound walk is the current authority for membership. Revalidate
+    // it every run so a move into or out of a reviewed subtree cannot be
+    // missed by an account-wide change record that lacks ancestry context.
+    driveDecision = {
+      ...driveDecision,
+      incremental: false,
+      reason: "reviewed Drive roots are revalidated on every run",
+    };
   }
   let imapPolicyChanged = false;
   if (which === "imap") {
@@ -8301,6 +8332,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   if (which === "drive") {
     const drive = await import("./connectors/google-drive.mjs");
     const sourceDeletedUids = [];
+    info(`${sourcePolicy.rootFolderIds.length} reviewed Drive root folder(s) enforced`);
     if (!incremental && state.sync_token) info(`${driveDecision.reason}; using a full Drive comparison`);
     if (sourcePolicy.excludeFileIds.length) info(`${sourcePolicy.excludeFileIds.length} reviewed Drive file-id exclusion(s) enforced`);
     if (sourcePolicy.excludePaths.length) info(`${sourcePolicy.excludePaths.length} Drive path exclusion(s) enforced`);
@@ -8350,7 +8382,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     }
     if (!incremental) {
       info("full walk of Drive");
-      for await (const f of drive.listFiles(getToken)) {
+      for await (const f of drive.listRootedFiles(getToken, { rootFolderIds: sourcePolicy.rootFolderIds })) {
         files.push(f);
         if (files.length >= limit) break;
       }
@@ -8482,9 +8514,33 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       const storedUids = needsStoredInventory
         ? await listStoredSourceFamilies({ base, adminKey, source: sourceName })
         : new Set();
-      const vanishedUids = incremental
-        ? explicitlyDeletedUids
-        : [...explicitlyDeletedUids, ...[...storedUids].filter((uid) => !seenUids.has(uid))];
+      const vanishedUids = [...explicitlyDeletedUids];
+      const unresolvedAbsences = [];
+      if (!incremental) {
+        const scopedFolderIds = new Set(
+          files.filter((file) => file.mimeType === drive.FOLDER_MIME).map((file) => String(file.id))
+        );
+        for (const uid of [...storedUids].filter((value) => !seenUids.has(value))) {
+          const prefix = `${sourceName}:`;
+          if (!uid.startsWith(prefix)) continue;
+          const result = await drive.classifyScopedAbsence(getToken, uid.slice(prefix.length), {
+            scopedFolderIds,
+          });
+          if (result.kind === "source_deleted") vanishedUids.push(uid);
+          else if (result.kind === "left_scope") excludedUids.push(uid);
+          else unresolvedAbsences.push(result);
+        }
+        if (unresolvedAbsences.length) {
+          saveState(statePath, state);
+          throw new drive.DriveError(
+            `${unresolvedAbsences.length} formerly indexed Drive item(s) are unavailable. ` +
+              "Permission loss cannot be distinguished from hard deletion, so no tombstone was written and the cursor was withheld.",
+            0,
+            "scopeUnresolved",
+            { retryable: true },
+          );
+        }
+      }
 
       // A valid prior forget may have reached the Worker even if its response
       // was lost. Inventory is authoritative; clear only local retry markers

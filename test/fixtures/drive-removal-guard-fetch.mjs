@@ -112,7 +112,17 @@ globalThis.fetch = async (input, options = {}) => {
   }
 
   if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files") {
+    if (!String(url.searchParams.get("q") || "").includes("'fixture-root' in parents")) {
+      throw new Error("Drive ingest attempted an unscoped account-wide listing");
+    }
     return json({ files: [], nextPageToken: null, incompleteSearch: false });
+  }
+  if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files/fixture-root") {
+    return json({ id: "fixture-root", name: "Reviewed Root", mimeType: "application/vnd.google-apps.folder" });
+  }
+  if (url.hostname === "www.googleapis.com" && url.pathname.startsWith("/drive/v3/files/guard-family-")) {
+    const id = url.pathname.split("/").pop();
+    return json({ id, name: `${id}.txt`, mimeType: "text/plain", trashed: true, parents: ["fixture-root"] });
   }
 
   if (url.hostname === "fixture.invalid" && url.pathname === "/api/admin/brain/source-families") {

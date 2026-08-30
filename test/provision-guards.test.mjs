@@ -61,16 +61,29 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   check("a migration receipt yields a unique exact Drive exclusion list",
     driveExclusionIdsOf(receipt).join(",") === "bad-1,dup-2", JSON.stringify(driveExclusionIdsOf(receipt)));
   const cfg = driveConnectorConfig({
-    corpora: { google_drive: { exclude_file_ids: ["inline-1"], exclude_file_ids_file: "receipt.json", exclude_paths: ["Legal/Sealed"] } },
+    corpora: { google_drive: {
+      root_folder_ids: ["root-b", " root-a ", "root-b"],
+      exclude_file_ids: ["inline-1"], exclude_file_ids_file: "receipt.json", exclude_paths: ["Legal/Sealed"],
+    } },
     safety: { private_path_prefixes: ["_private"] },
   }, "/tmp/client/brain.manifest.json", () => JSON.stringify(receipt));
   check("inline and receipt exclusions are combined", cfg.excludeFileIds.join(",") === "bad-1,dup-2,inline-1", JSON.stringify(cfg));
   check("Drive receives path and private-prefix policy from the standard manifest",
     cfg.excludePaths[0] === "Legal/Sealed" && cfg.privatePrefixes[0] === "_private", JSON.stringify(cfg));
+  check("Drive roots are required, normalized, and stable",
+    cfg.rootFolderIds.join(",") === "root-a,root-b", JSON.stringify(cfg));
+  let missingRootError = null;
+  try {
+    driveConnectorConfig({ corpora: { google_drive: { enabled: true } } }, "/tmp/client/brain.manifest.json");
+  } catch (error) { missingRootError = error; }
+  check("Drive cannot run without a reviewed root boundary",
+    /root_folder_ids/.test(missingRootError?.message || ""), missingRootError?.message);
 
   const policyFingerprint = drivePolicyFingerprint(cfg);
   check("credential scanner mode is part of Drive policy identity",
     drivePolicyFingerprint(cfg, true) !== drivePolicyFingerprint(cfg, false));
+  check("reviewed Drive roots are part of durable policy identity",
+    drivePolicyFingerprint(cfg) !== drivePolicyFingerprint({ ...cfg, rootFolderIds: ["root-a"] }));
   const priorExtractorFingerprint = drivePolicyFingerprint(cfg, true, false, 1);
   check("the current extractor support is a durable Drive rescan marker",
     policyFingerprint !== priorExtractorFingerprint);

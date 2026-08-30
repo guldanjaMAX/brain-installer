@@ -152,7 +152,10 @@ try {
   // other case here scripts `legs` and never exercises the table's own wiring.
   {
     const dir = mkdtempSync(join(sandbox, "wiring-"));
-    const manifestPath = writeManifest(dir, { upload: { enabled: true, folders: ["/tmp/wiring"] } });
+    const manifestPath = writeManifest(dir, {
+      upload: { enabled: true, folders: ["/tmp/wiring"] },
+      google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] },
+    });
     const m = JSON.parse(readFileSync(manifestPath, "utf8"));
     const seen = [];
     const spy = (name) => async (_m, _path, flags) => { seen.push({ name, flags }); return { created: 0, updated: 0, unchanged: 0 }; };
@@ -192,7 +195,7 @@ try {
   {
     const dir = mkdtempSync(join(sandbox, "order-"));
     const manifestPath = writeManifest(dir, {
-      google_drive: { enabled: true }, gmail: { enabled: true }, calendar: { enabled: true },
+      google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] }, gmail: { enabled: true }, calendar: { enabled: true },
       imessage: { enabled: true }, upload: { enabled: true, folders: ["/tmp/x"] },
       whatsapp: { enabled: true }, iphone_backup: { enabled: true },
     });
@@ -210,6 +213,23 @@ try {
       ]), JSON.stringify(order));
   }
 
+  {
+    const dir = mkdtempSync(join(sandbox, "drive-root-gate-"));
+    const manifestPath = writeManifest(dir, { google_drive: { enabled: true } });
+    let driveRan = false;
+    const entries = await planLoad({
+      m: JSON.parse(readFileSync(manifestPath, "utf8")),
+      manifestPath,
+      probes: { google_drive: connected },
+      commands: { ingestRemote: async () => { driveRan = true; } },
+    });
+    const driveEntry = entries.find((entry) => entry.key === "google_drive");
+    check("an enabled Drive source without reviewed roots is unavailable and never run",
+      driveEntry?.status === "unavailable" &&
+        /reviewed Drive root/.test(driveEntry.outcome?.reason || "") && !driveRan,
+      JSON.stringify(driveEntry));
+  }
+
   /* ------------------- the headline case: one source fails, the rest still load */
   let sweep;
   {
@@ -220,7 +240,7 @@ try {
       imessage: { enabled: true },
       upload: { enabled: true, folders: ["/tmp/does-not-matter-scripted"] },
       gmail: { enabled: true },
-      google_drive: { enabled: true },
+      google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] },
       whatsapp: { enabled: true },
       zoom: { enabled: true },
       slack: { enabled: true },
@@ -353,7 +373,7 @@ try {
   {
     const dir = mkdtempSync(join(sandbox, "select-"));
     const manifestPath = writeManifest(dir, {
-      calendar: { enabled: true }, gmail: { enabled: true }, google_drive: { enabled: true },
+      calendar: { enabled: true }, gmail: { enabled: true }, google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] },
     });
     const behaviour = {
       calendar: () => ({ sent: { created: 1, updated: 0, unchanged: 0, refused: [], errors: [] } }),
@@ -404,7 +424,7 @@ try {
   {
     const dir = mkdtempSync(join(sandbox, "dry-"));
     const manifestPath = writeManifest(dir, {
-      calendar: { enabled: true }, gmail: { enabled: true }, google_drive: { enabled: true },
+      calendar: { enabled: true }, gmail: { enabled: true }, google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] },
     });
     let sends = 0;
     const preview = ({ flags }) => {
@@ -432,7 +452,7 @@ try {
   /* ------------------------------------------------------------------ resume */
   {
     const dir = mkdtempSync(join(sandbox, "resume-"));
-    const manifestPath = writeManifest(dir, { google_drive: { enabled: true } });
+    const manifestPath = writeManifest(dir, { google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] } });
     const statePath = join(dir, ".brain-ingest-drive.json");
     const UNITS = ["a", "b", "c"];
     const processedThisRun = [];

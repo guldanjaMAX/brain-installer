@@ -319,6 +319,12 @@ export const DRIVE_SCHEDULER_SPEC = Object.freeze({
     if (manifest?.corpora?.google_drive?.enabled !== true) {
       throw new Error("corpora.google_drive.enabled must be true before its scheduler can be installed");
     }
+    const roots = manifest?.corpora?.google_drive?.root_folder_ids;
+    if (!Array.isArray(roots) || !roots.some((value) => String(value || "").trim())) {
+      throw new Error(
+        "corpora.google_drive.root_folder_ids must name at least one reviewed folder before its scheduler can be installed"
+      );
+    }
   },
   domainMissingError:
     "brain.domain is required for unattended Drive ingest because the scheduled child intentionally receives no Cloudflare deployment token",
@@ -327,17 +333,21 @@ export const DRIVE_SCHEDULER_SPEC = Object.freeze({
   defaultSchedulerPath: () => DEFAULT_SCHEDULER_PATH,
   referenceExtrasOf: (manifest) => ({
     googleTokenStore: String(manifest?.operations?.google_token_store || "auto").toLowerCase(),
+    rootFolderIds: [...new Set(
+      (manifest?.corpora?.google_drive?.root_folder_ids || [])
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    )].sort(),
   }),
   validateExtras(reference) {
     if (!["auto", "keychain", "file"].includes(reference.googleTokenStore)) {
       throw new Error("operations.google_token_store must be auto, keychain or file");
     }
   },
-  // NEVER change this payload's keys or shapes: the hash is baked into every
-  // installed plist's argv, and a computation change strands them all on
-  // "configuration changed; reinstall".
+  // Root scope is deliberately part of the installed definition. A scope edit
+  // must stop the old scheduler until it is reviewed and reinstalled.
   configHashPayloadOf: (reference) => ({
-    version: 1,
+    version: 2,
     slug: reference.slug,
     manifest_path: reference.path,
     brain_path: reference.brainPath,
@@ -345,6 +355,7 @@ export const DRIVE_SCHEDULER_SPEC = Object.freeze({
     ingest_cron: reference.cron,
     admin_key_secret: reference.manifest?.operations?.admin_key_secret || null,
     google_token_store: reference.googleTokenStore,
+    root_folder_ids: reference.rootFolderIds,
   }),
   childArgumentsOf: (plan) => ["ingest", plan.path, "--from", "drive"],
   childEnvironmentOf: (plan, environment) => {

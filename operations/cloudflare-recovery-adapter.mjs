@@ -208,6 +208,11 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   // authority. The table must exist on a recovered target, but no preview,
   // confirmation, challenge, or idempotency state may cross recovery.
   "agent_action_receipts",
+  // Schema 25: accepted Zoom occurrences and the missed-webhook cursor are
+  // durable work debt. Their rows are restored through a reviewed projection
+  // below so an invocation-local processing lease can never survive recovery.
+  "zoom_deliveries",
+  "zoom_reconciliation",
 ]);
 
 /**
@@ -228,6 +233,7 @@ export const RECOVERY_EXPORT_TABLES = Object.freeze(
       table !== "support_enrollment_codes" && table !== "support_auth_challenges" &&
       table !== "support_passkeys" &&
       table !== "agent_action_receipts" &&
+      table !== "zoom_deliveries" && table !== "zoom_reconciliation" &&
       table !== "bank_feed_link_sessions" &&
       table !== "oauth_clients" && table !== "oauth_codes" && table !== "oauth_tokens"),
 );
@@ -298,13 +304,14 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   "outbox_generation",
   "vector_projection_bootstrap_base_count",
 ]);
-// Schemas 14 through 22 add owner passkeys, capability grants, zones, the financial ledger, bank feeds,
-// connector OAuth, extraction provenance, owner workspace state, and exact
-// document security. The vector protocol itself is unchanged, but the recovery
+// Schemas 14 through 25 add owner passkeys, capability grants, zones, the financial ledger, bank feeds,
+// connector OAuth, extraction provenance, owner workspace state, exact
+// document security, support authority, agent receipts, and Zoom delivery
+// debt. The vector protocol itself is unchanged, but the recovery
 // contract tracks the EXACT current schema by design: a drill against a
 // database one migration behind would export a table or column set that does
 // not match the reviewed list. Bumping this is required for every migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 24;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 25;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -371,6 +378,7 @@ const SCHEMA_23_TABLES = Object.freeze([
   "support_access_events",
 ]);
 const SCHEMA_24_TABLES = Object.freeze(["agent_action_receipts"]);
+const SCHEMA_25_TABLES = Object.freeze(["zoom_deliveries", "zoom_reconciliation"]);
 
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
@@ -386,7 +394,7 @@ const AGGREGATE_FIELDS = Object.freeze([
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
      ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES, ...SCHEMA_18_TABLES,
      ...SCHEMA_19_TABLES, ...SCHEMA_21_TABLES, ...SCHEMA_22_TABLES, ...SCHEMA_23_TABLES,
-     ...SCHEMA_24_TABLES].includes(table)
+     ...SCHEMA_24_TABLES, ...SCHEMA_25_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -997,6 +1005,141 @@ export async function normalizedInstallStateExport(binding, migrations, readRows
   return Buffer.from(`INSERT INTO "install_state" (${columns}) VALUES (${values});\n`, "utf8");
 }
 
+const ZOOM_DELIVERY_COLUMNS = Object.freeze([
+  "recording_uuid", "event_type", "meeting_id", "received_at_ms", "status",
+  "attempts", "next_attempt_at_ms", "lease_owner", "lease_expires_at_ms",
+  "last_error_code", "created_at_ms", "updated_at_ms", "completed_at_ms",
+]);
+const ZOOM_RECONCILIATION_COLUMNS = Object.freeze([
+  "id", "status", "window_from", "next_page_token", "next_run_at_ms",
+  "lease_owner", "lease_expires_at_ms", "last_error_code", "updated_at_ms",
+  "completed_at_ms",
+]);
+const ZOOM_DELIVERY_STATUSES = new Set([
+  "pending", "retryable", "completed", "refused", "unavailable",
+]);
+const ZOOM_RECONCILIATION_STATUSES = new Set([
+  "idle", "retryable", "unavailable", "refused",
+]);
+
+function assertZoomText(value, { nullable = false, min = 1, max }) {
+  if (nullable && value === null) return value;
+  if (typeof value !== "string" || value.length < min || value.length > max || value.includes("\0")) {
+    refuse("RECOVERY_ZOOM_STATE_INVALID");
+  }
+  return value;
+}
+
+function assertZoomInteger(value, { nullable = false } = {}) {
+  if (nullable && value === null) return value;
+  if (!Number.isSafeInteger(value) || value < 0) refuse("RECOVERY_ZOOM_STATE_INVALID");
+  return value;
+}
+
+function assertProjectedZoomRow(row, columns) {
+  if (!row || typeof row !== "object" || Array.isArray(row) ||
+      columns.some((column) => !Object.hasOwn(row, column))) {
+    refuse("RECOVERY_ZOOM_STATE_INVALID");
+  }
+  return row;
+}
+
+/**
+ * Preserve accepted Zoom delivery debt without reviving a Worker invocation.
+ *
+ * The raw tables cannot be delegated to Wrangler because it has no column
+ * projection and would persist lease owners. A processing row is recovered as
+ * immediately retryable, every lease is forced to NULL, and the singleton
+ * reconciliation cursor is replaced only after the migration has recreated it.
+ */
+export async function normalizedZoomDeliveryStateExport(binding, migrations, readRows) {
+  if ((migrations.at(-1)?.version || 0) < 25) return Buffer.alloc(0);
+  const deliveries = await readRows(
+    binding,
+    `SELECT recording_uuid,event_type,meeting_id,received_at_ms,
+            CASE WHEN status='processing' THEN 'retryable' ELSE status END AS status,
+            attempts,next_attempt_at_ms,
+            NULL AS lease_owner,NULL AS lease_expires_at_ms,
+            CASE WHEN status='processing' THEN 'recovered_processing_lease' ELSE last_error_code END AS last_error_code,
+            created_at_ms,updated_at_ms,completed_at_ms
+       FROM zoom_deliveries ORDER BY recording_uuid`,
+  );
+  const reconciliation = await readRows(
+    binding,
+    `SELECT id,
+            CASE WHEN status='processing' THEN 'retryable' ELSE status END AS status,
+            window_from,next_page_token,next_run_at_ms,
+            NULL AS lease_owner,NULL AS lease_expires_at_ms,
+            CASE WHEN status='processing' THEN 'recovered_processing_lease' ELSE last_error_code END AS last_error_code,
+            updated_at_ms,completed_at_ms
+       FROM zoom_reconciliation ORDER BY id`,
+  );
+  if (!Array.isArray(deliveries) || !Array.isArray(reconciliation) || reconciliation.length !== 1) {
+    refuse("RECOVERY_ZOOM_STATE_INVALID");
+  }
+
+  const statements = [];
+  for (const candidate of deliveries) {
+    const row = assertProjectedZoomRow(candidate, ZOOM_DELIVERY_COLUMNS);
+    assertZoomText(row.recording_uuid, { max: 512 });
+    if (!["recording.completed", "recording.transcript_completed"].includes(row.event_type)) {
+      refuse("RECOVERY_ZOOM_STATE_INVALID");
+    }
+    assertZoomText(row.meeting_id, { nullable: true, max: 100 });
+    assertZoomInteger(row.received_at_ms);
+    if (!ZOOM_DELIVERY_STATUSES.has(row.status)) refuse("RECOVERY_ZOOM_STATE_INVALID");
+    assertZoomInteger(row.attempts);
+    assertZoomInteger(row.next_attempt_at_ms);
+    if (row.lease_owner !== null || row.lease_expires_at_ms !== null) {
+      refuse("RECOVERY_ZOOM_STATE_INVALID");
+    }
+    assertZoomText(row.last_error_code, { nullable: true, max: 100 });
+    assertZoomInteger(row.created_at_ms);
+    assertZoomInteger(row.updated_at_ms);
+    assertZoomInteger(row.completed_at_ms, { nullable: true });
+    if (row.status === "completed" && row.completed_at_ms === null) {
+      refuse("RECOVERY_ZOOM_STATE_INVALID");
+    }
+    statements.push(
+      `INSERT INTO "zoom_deliveries" (${ZOOM_DELIVERY_COLUMNS.map(quoteIdentifier).join(",")}) VALUES (` +
+      `${ZOOM_DELIVERY_COLUMNS.map((column) => recoverySqlLiteral(row[column])).join(",")});\n`,
+    );
+  }
+
+  const row = assertProjectedZoomRow(reconciliation[0], ZOOM_RECONCILIATION_COLUMNS);
+  if (row.id !== 1 || !ZOOM_RECONCILIATION_STATUSES.has(row.status)) {
+    refuse("RECOVERY_ZOOM_STATE_INVALID");
+  }
+  assertZoomText(row.window_from, { min: 10, max: 10 });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(row.window_from)) refuse("RECOVERY_ZOOM_STATE_INVALID");
+  assertZoomText(row.next_page_token, { nullable: true, max: 2000 });
+  assertZoomInteger(row.next_run_at_ms);
+  if (row.lease_owner !== null || row.lease_expires_at_ms !== null) {
+    refuse("RECOVERY_ZOOM_STATE_INVALID");
+  }
+  assertZoomText(row.last_error_code, { nullable: true, max: 100 });
+  assertZoomInteger(row.updated_at_ms);
+  assertZoomInteger(row.completed_at_ms, { nullable: true });
+  statements.push(
+    `INSERT OR REPLACE INTO "zoom_reconciliation" (${ZOOM_RECONCILIATION_COLUMNS.map(quoteIdentifier).join(",")}) VALUES (` +
+    `${ZOOM_RECONCILIATION_COLUMNS.map((column) => recoverySqlLiteral(row[column])).join(",")});\n`,
+  );
+  return Buffer.from(statements.join(""), "utf8");
+}
+
+async function normalizedRecoveryStateExport(binding, migrations, readRows) {
+  let installState;
+  let zoomState;
+  try {
+    installState = await normalizedInstallStateExport(binding, migrations, readRows);
+    zoomState = await normalizedZoomDeliveryStateExport(binding, migrations, readRows);
+    return Buffer.concat([installState, zoomState]);
+  } finally {
+    if (installState) installState.fill(0);
+    if (zoomState) zoomState.fill(0);
+  }
+}
+
 /**
  * Compare executable SQLite schema rather than provider-specific formatting.
  *
@@ -1153,7 +1296,8 @@ function expectedRecoveryTables(migrations) {
     (latest >= 21 || !SCHEMA_21_TABLES.includes(table)) &&
     (latest >= 22 || !SCHEMA_22_TABLES.includes(table)) &&
     (latest >= 23 || !SCHEMA_23_TABLES.includes(table)) &&
-    (latest >= 24 || !SCHEMA_24_TABLES.includes(table)));
+    (latest >= 24 || !SCHEMA_24_TABLES.includes(table)) &&
+    (latest >= 25 || !SCHEMA_25_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {
@@ -2088,10 +2232,10 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
   async function remoteDataFingerprint(binding) {
     const path = join(pins.artifacts.path, ".brain-recovery-export.sql.tmp-readback");
     removeKnownPartial(path, pins.artifacts.path);
-    let normalizedInstallState = null;
+    let normalizedRecoveryState = null;
     try {
       const migrations = await remoteMigrationContract(binding);
-      normalizedInstallState = await normalizedInstallStateExport(binding, migrations, d1Rows);
+      normalizedRecoveryState = await normalizedRecoveryStateExport(binding, migrations, d1Rows);
       await wrangler(binding, [
         "d1", "export", binding.databaseName,
         "--remote", "--no-schema", "--output", path,
@@ -2099,12 +2243,12 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       ]);
       if (process.platform !== "win32") chmodSync(path, 0o600);
       return hashNormalizedDataExport(
-        normalizedInstallState,
+        normalizedRecoveryState,
         path,
         plan.artifact.max_single_import_bytes,
       );
     } finally {
-      if (normalizedInstallState) normalizedInstallState.fill(0);
+      if (normalizedRecoveryState) normalizedRecoveryState.fill(0);
       removeKnownPartial(path, pins.artifacts.path);
     }
   }
@@ -2134,7 +2278,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
 
   function combineExport(
     migrations,
-    normalizedInstallState,
+    normalizedRecoveryState,
     dataPartial,
     combinedPartial,
     dataFingerprint,
@@ -2159,7 +2303,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         writeSync(output, bytes);
         bytes.fill(0);
       }
-      writeSync(output, normalizedInstallState);
+      writeSync(output, normalizedRecoveryState);
       const checkedData = assertArtifactFile(dataPartial, {
         maxBytes: plan.artifact.max_single_import_bytes,
         allowEmpty: true,
@@ -2167,7 +2311,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       input = openSync(dataPartial, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
       const openedData = fstatSync(input);
       if (!sameFile(checkedData.info, openedData)) refuse("RECOVERY_EXPORT_ARTIFACT_CHANGED");
-      const copiedDataHash = createHash("sha256").update(normalizedInstallState);
+      const copiedDataHash = createHash("sha256").update(normalizedRecoveryState);
       const block = Buffer.allocUnsafe(1024 * 1024);
       for (;;) {
         const read = readSync(input, block, 0, block.length, null);
@@ -2396,9 +2540,9 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         pins.artifacts.path,
         plan.artifact.max_single_import_bytes,
       )) return artifactEvidence();
-      let normalizedInstallState = null;
+      let normalizedRecoveryState = null;
       try {
-        normalizedInstallState = await normalizedInstallStateExport(
+        normalizedRecoveryState = await normalizedRecoveryStateExport(
           pins.binding.source,
           migrations,
           d1Rows,
@@ -2411,13 +2555,13 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         if (process.platform !== "win32") chmodSync(dataPartial, 0o600);
         assertArtifactFile(dataPartial, { maxBytes: plan.artifact.max_single_import_bytes, allowEmpty: true });
         const dataFingerprint = hashNormalizedDataExport(
-          normalizedInstallState,
+          normalizedRecoveryState,
           dataPartial,
           plan.artifact.max_single_import_bytes,
         );
         combineExport(
           migrations,
-          normalizedInstallState,
+          normalizedRecoveryState,
           dataPartial,
           combinedPartial,
           dataFingerprint,
@@ -2441,7 +2585,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         try { removeKnownPartial(combinedPartial, pins.artifacts.path); } catch { /* original fixed failure wins */ }
         throw error;
       } finally {
-        if (normalizedInstallState) normalizedInstallState.fill(0);
+        if (normalizedRecoveryState) normalizedRecoveryState.fill(0);
       }
     },
 

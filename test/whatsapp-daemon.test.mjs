@@ -79,7 +79,7 @@ const baseManifest = {
   client: { slug: "acme-brain", display_name: "Acme", timezone: "America/Phoenix" },
   brain: { version: "0.1.22", domain: "brain.acme.test" },
   infrastructure: { cloudflare: { account_id: "account-123" } },
-  corpora: { google_drive: { enabled: true }, imessage: { enabled: true }, whatsapp: { enabled: true } },
+  corpora: { google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] }, imessage: { enabled: true }, whatsapp: { enabled: true } },
   operations: {
     ingest_cron: "0 9 * * *",
     admin_key_secret: "keychain://acme-brain-admin/owner",
@@ -258,7 +258,7 @@ try {
   }
   {
     const disabled = join(directory, "wa-disabled", "brain.manifest.json");
-    writeManifest({ ...baseManifest, corpora: { google_drive: { enabled: true } } }, disabled);
+    writeManifest({ ...baseManifest, corpora: { google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] } } }, disabled);
     let error = null;
     try { buildWhatsappDaemonPlan(disabled, opts()); } catch (caught) { error = caught; }
     check("corpora.whatsapp.enabled must be declared before the daemon can be installed",
@@ -346,7 +346,7 @@ try {
     // The precedent the iMessage and Drive removals set: switching a corpus
     // off must never strand an already-loaded LaunchAgent.
     const off = join(directory, "removal-with-corpus-off", "brain.manifest.json");
-    writeManifest({ ...baseManifest, corpora: { google_drive: { enabled: true } } }, off);
+    writeManifest({ ...baseManifest, corpora: { google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] } } }, off);
     const launchctl = scriptedLaunchctl({ print: LOADED });
     const removed = removeWhatsappDaemon(off, opts({ launchctl }));
     check("removal works with corpora.whatsapp.enabled already false",

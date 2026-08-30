@@ -44,10 +44,12 @@ export const EXPORTS = {
 export const EXPORT_LIMIT = 10 * 1024 * 1024;
 export const DOWNLOAD_LIMIT = 8 * 1024 * 1024;
 
-const FOLDER_MIME = "application/vnd.google-apps.folder";
+export const FOLDER_MIME = "application/vnd.google-apps.folder";
+export const SHORTCUT_MIME = "application/vnd.google-apps.shortcut";
 
-const FIELDS =
-  "nextPageToken, incompleteSearch, files(id, name, mimeType, size, createdTime, modifiedTime, trashed, parents, webViewLink, md5Checksum)";
+const FILE_FIELDS =
+  "id, name, mimeType, size, createdTime, modifiedTime, trashed, parents, webViewLink, md5Checksum, driveId, shortcutDetails(targetId,targetMimeType)";
+const FIELDS = `nextPageToken, incompleteSearch, files(${FILE_FIELDS})`;
 
 /** Never worth fetching: they carry no text and cost a request each. */
 const SKIP_MIME = /^(image|video|audio)\//;
@@ -184,7 +186,13 @@ export async function api(getAccessToken, path, {
   throw lastErr;
 }
 
-/** Walk every file the token can see, including shared drives. */
+/**
+ * Broad account search retained for the exact-name live fixture only.
+ *
+ * This is not an ingestion boundary. The deployed ingest path must use
+ * listRootedFiles(), which proves every returned item's ancestry from one of
+ * the manifest-owned roots before any content request is made.
+ */
 export async function* listFiles(getAccessToken, { pageSize = 1000, query, opts = {} } = {}) {
   let pageToken;
   do {
@@ -217,6 +225,187 @@ export async function* listFiles(getAccessToken, { pageSize = 1000, query, opts 
     for (const f of page.files || []) yield f;
     pageToken = page.nextPageToken;
   } while (pageToken);
+}
+
+const driveQueryValue = (value) => String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+
+export function normalizeRootFolderIds(values) {
+  if (!Array.isArray(values)) {
+    throw new DriveError("corpora.google_drive.root_folder_ids must be a non-empty array", 0, "rootPolicyMissing");
+  }
+  const roots = [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))].sort();
+  if (!roots.length) {
+    throw new DriveError(
+      "Google Drive is disabled until corpora.google_drive.root_folder_ids names at least one reviewed folder",
+      0,
+      "rootPolicyMissing",
+    );
+  }
+  return roots;
+}
+
+export async function getFileMetadata(getAccessToken, fileId, opts = {}) {
+  return api(getAccessToken, `/files/${encodeURIComponent(String(fileId))}`, {
+    search: { fields: FILE_FIELDS, supportsAllDrives: true },
+    ...opts,
+  });
+}
+
+/**
+ * Traverse only direct children of reviewed roots, including Shared Drives.
+ *
+ * A shortcut is returned as the shortcut object but never followed. Following
+ * it would let a shortcut placed inside an approved folder silently authorize
+ * an unrelated target elsewhere in the account. Overlapping roots are safe:
+ * Drive ids are deduplicated and their exact authorizing roots are merged.
+ */
+export async function* listRootedFiles(getAccessToken, {
+  rootFolderIds,
+  pageSize = 1000,
+  maxFiles = 250_000,
+  maxFolders = 100_000,
+  maxPages = 100_000,
+  opts = {},
+} = {}) {
+  const roots = normalizeRootFolderIds(rootFolderIds);
+  const found = new Map();
+  let pages = 0;
+  let folders = 0;
+
+  for (const rootId of roots) {
+    let root;
+    try {
+      root = await getFileMetadata(getAccessToken, rootId, opts);
+    } catch (error) {
+      if (error instanceof DriveError && (error.status === 403 || error.status === 404)) {
+        throw new DriveError(
+          `reviewed Drive root ${rootId} is unavailable; existing indexed content was preserved`,
+          error.status,
+          "rootUnavailable",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    if (root?.trashed === true || root?.mimeType !== FOLDER_MIME) {
+      throw new DriveError(
+        `reviewed Drive root ${rootId} is not an active folder; existing indexed content was preserved`,
+        0,
+        "rootUnavailable",
+      );
+    }
+
+    const queue = [root];
+    const visitedFolders = new Set();
+    while (queue.length) {
+      const folder = queue.shift();
+      const folderId = String(folder.id || "");
+      if (!folderId || visitedFolders.has(folderId)) continue;
+      visitedFolders.add(folderId);
+      folders++;
+      if (folders > maxFolders) {
+        throw new DriveError(`root-scoped Drive walk exceeded ${maxFolders} folders`, 0, "folderLimit");
+      }
+
+      const priorRoot = found.get(folderId);
+      found.set(folderId, {
+        ...(priorRoot || folder),
+        scope_root_ids: [...new Set([...(priorRoot?.scope_root_ids || []), rootId])].sort(),
+      });
+
+      let pageToken;
+      const seenPageTokens = new Set();
+      do {
+        if (pageToken && seenPageTokens.has(pageToken)) {
+          throw new DriveError(
+            `Google Drive repeated a page token while reading reviewed root ${rootId}`,
+            200,
+            "repeatedPageToken",
+          );
+        }
+        if (pageToken) seenPageTokens.add(pageToken);
+        pages++;
+        if (pages > maxPages) {
+          throw new DriveError(`root-scoped Drive walk exceeded ${maxPages} pages`, 0, "pageLimit");
+        }
+        const page = await api(getAccessToken, "/files", {
+          search: {
+            pageSize,
+            pageToken,
+            fields: FIELDS,
+            supportsAllDrives: true,
+            includeItemsFromAllDrives: true,
+            corpora: "allDrives",
+            q: `'${driveQueryValue(folderId)}' in parents and trashed = false`,
+            orderBy: "name",
+          },
+          ...opts,
+        });
+        if (page.incompleteSearch === true) {
+          throw new DriveError(
+            `Google Drive reported an incomplete search under reviewed root ${rootId}; existing indexed content was preserved`,
+            200,
+            "incompleteSearch",
+          );
+        }
+        for (const file of page.files || []) {
+          if (!file?.id || file.trashed === true) continue;
+          const id = String(file.id);
+          const prior = found.get(id);
+          found.set(id, {
+            ...(prior || file),
+            scope_root_ids: [...new Set([...(prior?.scope_root_ids || []), rootId])].sort(),
+          });
+          if (found.size > maxFiles) {
+            throw new DriveError(`root-scoped Drive walk exceeded ${maxFiles} files`, 0, "fileLimit");
+          }
+          if (file.mimeType === FOLDER_MIME) queue.push(file);
+        }
+        pageToken = page.nextPageToken || null;
+      } while (pageToken);
+    }
+  }
+
+  for (const file of found.values()) yield file;
+}
+
+/**
+ * Explain why a formerly indexed item is absent from a complete rooted walk.
+ *
+ * A 404 can mean hard deletion or permission loss. Drive does not distinguish
+ * those cases for this credential, so it is deliberately unresolved and must
+ * never become a tombstone. Visible trash and a visible move outside the
+ * approved folder set are authoritative removal evidence.
+ */
+export async function classifyScopedAbsence(getAccessToken, fileId, {
+  scopedFolderIds = new Set(),
+  opts = {},
+} = {}) {
+  let file;
+  try {
+    file = await getFileMetadata(getAccessToken, fileId, opts);
+  } catch (error) {
+    if (error instanceof DriveError && (error.status === 403 || error.status === 404)) {
+      return {
+        kind: "unresolved",
+        reason: "permission loss and hard deletion are indistinguishable",
+        retryable: true,
+      };
+    }
+    throw error;
+  }
+  if (file?.trashed === true) {
+    return { kind: "source_deleted", reason: "Drive reports the file is in trash", retryable: false };
+  }
+  const parents = Array.isArray(file?.parents) ? file.parents.map(String) : [];
+  if (parents.some((parent) => scopedFolderIds.has(parent))) {
+    return {
+      kind: "unresolved",
+      reason: "Drive still places the file under a reviewed folder but omitted it from the completed traversal",
+      retryable: true,
+    };
+  }
+  return { kind: "left_scope", reason: "the visible file moved outside every reviewed root", retryable: false };
 }
 
 /** The token that makes the NEXT run incremental. Fetch before the first walk. */
@@ -270,6 +459,12 @@ export async function listChanges(getAccessToken, pageToken, opts = {}) {
 export function triage(file) {
   if (file.trashed) return { skip: "the file is in the trash", skipCode: "source_deleted" };
   if (file.mimeType === FOLDER_MIME) return { skip: null, folder: true };
+  if (file.mimeType === SHORTCUT_MIME) {
+    return {
+      skip: "Drive shortcuts are not followed across the reviewed folder boundary",
+      skipCode: "shortcut_not_followed",
+    };
+  }
   if (file.mimeType?.startsWith("application/vnd.google-apps.")) {
     const e = EXPORTS[file.mimeType];
     if (!e) {
@@ -498,6 +693,8 @@ export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYP
       metadata: {
         extracted_as: got.how,
         drive_id: file.id,
+        root_folder_ids: Array.isArray(file.scope_root_ids) ? [...file.scope_root_ids].sort() : [],
+        drive_id_kind: file.mimeType === SHORTCUT_MIME ? "shortcut" : "file",
         mime: file.mimeType,
         platform: "drive",
         // Null is deliberate for a root-level file: it clears a stale folder

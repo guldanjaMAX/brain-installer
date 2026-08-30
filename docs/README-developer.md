@@ -234,6 +234,13 @@ zero advisories. That matters because this installs on the client's own machine
 during a live session, and a native build failing on their Windows box is not a
 problem you want to debug in front of them. Install with `npm ci --ignore-scripts`.
 
+ZIP-based Office files are never expanded with an all-at-once unzip. The shared
+`ingest/archive.mjs` path streams every entry, including entries the parser does
+not retain, through compressed-byte, expanded-byte, per-entry, file-count,
+nesting, path-depth, and compression-ratio limits. Provider downloads use the
+same fail-closed byte-bound principle through the Worker-bundled
+`worker/src/lib/provider-sync.js` contract.
+
 There is deliberately **no optional dependency tier**. An optional extractor
 fails *silently correct*: the run reports 61,000 files ingested and every
 contract is missing because a flag nobody set was not passed.
@@ -326,6 +333,14 @@ node brain.mjs ingest ./acme.manifest.json --from drive
 node brain.mjs ingest ./acme.manifest.json --from gmail
 ```
 
+Drive stays disabled unless `corpora.google_drive.enabled` is true and
+`corpora.google_drive.root_folder_ids` contains at least one reviewed folder
+id. The loader fetches each root, walks only direct-parent queries beneath it,
+and records the exact authorizing root ids in document metadata. Shared Drive
+queries retain `supportsAllDrives`, `includeItemsFromAllDrives`, and the
+incomplete-search signal. Shortcuts are reported but never followed across the
+boundary.
+
 For a mailbox that is not Gmail:
 
 ```bash
@@ -404,12 +419,16 @@ left in "Testing" is issued refresh tokens that expire after **seven days**, and
 the failure arrives a week later as an unattended sync that stopped working. A
 Google Workspace account should use "Internal" instead and avoids this entirely.
 
-**The second run is incremental.** Drive uses the changes feed, Gmail uses
-`historyId`, both saved in the same state file as the content hashes. That makes
-a re-sync proportional to what changed rather than to the corpus.
+**Gmail's second run is incremental.** Drive currently revalidates every
+reviewed root on every run. Unchanged Drive files are skipped from content
+download by their stable provider revision, so the safety comparison is a
+metadata walk rather than a repeated full ingest.
 
-**Drive deletions are applied.** When a file is deleted or trashed in Drive, the
-next incremental sync removes it from the brain, chunks and vectors both. The
+**Drive deletions require authoritative evidence.** Visible trash and a visible
+move outside every reviewed root remove the matching brain material. A 403 or
+404 can mean either permission loss or hard deletion, so it is never guessed to
+be a tombstone. The existing copy is preserved, source completion stays
+unavailable, and the cursor is withheld. The
 sync first intersects policy, source-deletion, and intentional-skip candidates
 with the authenticated stored-family inventory, deduplicates them, and checks
 one aggregate plan. More than 100 removals or more than 10% of the stored Drive
@@ -427,7 +446,7 @@ stored family is stale. Credential refusals remain immediate removal
 candidates. Missing or migration-derived prior versions, unchanged versions,
 and unknown codes retain any authenticated D1 family in
 `drive_retained_existing`, remove its `done` receipt, and keep the human reason
-in `skipped`. That retained marker survives no-change incremental runs and
+in `skipped`. That retained marker survives no-change root revalidation runs and
 closes source health as error until a fully accepted reingest or exact
 post-removal inventory clears it. New skipped files with no stored family are
 ordinary reported skips, not retained data. Scanner and policy upgrades are not
@@ -922,6 +941,21 @@ It covers encrypted artifacts, session-generation advancement, independent
 bank wrapping, legacy rewrap or explicit reauthorization, schema-24 empty
 agent authority, and deterministic interruption at every declared mutation
 boundary. It is synthetic proof only, not a live Cloudflare or bank drill.
+
+Provider HTTP connectors share total and per-attempt deadlines, AbortController
+cancellation, bounded exponential retry with jitter, both forms of Retry-After,
+streamed response limits, and repeated-cursor refusal in
+`worker/src/lib/provider-sync.js`. The repository-level
+`connectors/provider-sync.mjs` entrypoint re-exports that same implementation
+for CLI connectors. A connector reports completed, partial,
+retryable, unavailable, or refused explicitly. Only completed work can advance
+its durable provider cursor.
+
+Zoom records `recording.completed` and transcript-completed debt in D1 before
+returning HTTP 2xx. Scheduled maintenance reclaims expired leases, retries
+transient failures, and reconciles a bounded recent recordings window so a
+missing webhook does not become silent loss. These paths remain fixture-level
+proof until a paid real Zoom recording passes the field gate.
 
 Every value in `SUPPORT_ERROR_CODES` also has one entry in
 `support-recovery.mjs`. `brain support --explain <code>` renders the human form;

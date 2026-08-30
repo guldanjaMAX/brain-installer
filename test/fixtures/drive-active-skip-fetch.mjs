@@ -64,15 +64,15 @@ function files() {
   return [
     {
       id: "active-migrated", name: "migrated.bin", mimeType: "application/octet-stream", size: "200",
-      createdTime: "2025-01-01T00:00:00Z", modifiedTime: "2026-08-20T00:00:00Z", md5Checksum: "migrated-current",
+      createdTime: "2025-01-01T00:00:00Z", modifiedTime: "2026-08-20T00:00:00Z", md5Checksum: "migrated-current", parents: ["fixture-root"],
     },
     {
       id: "active-stale", name: "changed.bin", mimeType: "application/octet-stream", size: "200",
-      createdTime: "2025-01-01T00:00:00Z", modifiedTime: "2026-08-21T00:00:00Z", md5Checksum: "stale-current",
+      createdTime: "2025-01-01T00:00:00Z", modifiedTime: "2026-08-21T00:00:00Z", md5Checksum: "stale-current", parents: ["fixture-root"],
     },
     {
       id: "active-sensitive", name: "sensitive.txt", mimeType: "text/plain", size: "300",
-      createdTime: "2025-01-01T00:00:00Z", modifiedTime: "2026-08-22T00:00:00Z", md5Checksum: "sensitive-current",
+      createdTime: "2025-01-01T00:00:00Z", modifiedTime: "2026-08-22T00:00:00Z", md5Checksum: "sensitive-current", parents: ["fixture-root"],
     },
   ];
 }
@@ -90,7 +90,16 @@ globalThis.fetch = async (input, options = {}) => {
     return json({ changes: [], newStartPageToken: "fixture-skip-no-change-cursor" });
   }
   if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files") {
+    if (!String(url.searchParams.get("q") || "").includes("'fixture-root' in parents")) {
+      throw new Error("Drive ingest attempted an unscoped account-wide listing");
+    }
     return json({ files: files(), nextPageToken: null, incompleteSearch: false });
+  }
+  if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files/fixture-root") {
+    return json({ id: "fixture-root", name: "Reviewed Root", mimeType: "application/vnd.google-apps.folder" });
+  }
+  if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files/source-missing") {
+    return json({ id: "source-missing", name: "missing.txt", mimeType: "text/plain", trashed: true, parents: ["fixture-root"] });
   }
   if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files/active-sensitive") {
     // Invented test-only credential shape. The fixture never writes it to its

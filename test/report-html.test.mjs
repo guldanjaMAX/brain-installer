@@ -283,7 +283,7 @@ check("an unanswered question is named in the gap list", has(hollow, "No sources
 /* ------------------------- 4. empty seed set degrades gracefully */
 
 const noSeeds = renderReportHtml({
-  manifest: { client: { display_name: "Acme Consulting" }, corpora: { google_drive: { enabled: true } } },
+  manifest: { client: { display_name: "Acme Consulting" }, corpora: { google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] } } },
   acceptance: passingAcceptance,
   seedAnswers: [],
   expectedToFail: [],

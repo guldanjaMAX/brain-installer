@@ -30,7 +30,7 @@ writeFileSync(manifestPath, JSON.stringify({
   client: { slug: "fixture" },
   brain: { domain: "brain.fixture.test" },
   corpora: {
-    google_drive: { enabled: true },
+    google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] },
     gmail: { enabled: true },
     calendar: { enabled: true },
     zoom: { enabled: true },

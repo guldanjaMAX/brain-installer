@@ -54,6 +54,9 @@ globalThis.fetch = async (input, options = {}) => {
   }
 
   if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files") {
+    if (!String(url.searchParams.get("q") || "").includes("'fixture-root' in parents")) {
+      throw new Error("Drive ingest attempted an unscoped account-wide listing");
+    }
     return json({
       files: [{
         id: "fixture-file-one",
@@ -64,11 +67,20 @@ globalThis.fetch = async (input, options = {}) => {
         modifiedTime: "2026-08-20T12:00:00.000Z",
         md5Checksum: "fixture-revision",
         trashed: false,
-        parents: [],
+        parents: ["fixture-root"],
         webViewLink: "https://drive.example/fixture-file-one",
       }],
       nextPageToken: null,
       incompleteSearch: false,
+    });
+  }
+
+  if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files/fixture-root") {
+    return json({
+      id: "fixture-root",
+      name: "Reviewed Root",
+      mimeType: "application/vnd.google-apps.folder",
+      trashed: false,
     });
   }
 

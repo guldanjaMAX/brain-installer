@@ -50,7 +50,7 @@ const baseManifest = {
   client: { slug: "acme-brain", display_name: "Acme", timezone: "America/Phoenix" },
   brain: { version: "0.1.0", domain: "brain.acme.test" },
   infrastructure: { cloudflare: { account_id: "account-123" } },
-  corpora: { google_drive: { enabled: true }, imessage: { enabled: true } },
+  corpora: { google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] }, imessage: { enabled: true } },
   operations: {
     ingest_cron: "0 9 * * *",
     admin_key_secret: "keychain://acme-brain-admin/owner",
@@ -134,7 +134,7 @@ try {
   }
   {
     const disabledPath = join(directory, "disabled", "brain.manifest.json");
-    writeManifest({ ...baseManifest, corpora: { google_drive: { enabled: true } } }, disabledPath);
+    writeManifest({ ...baseManifest, corpora: { google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] } } }, disabledPath);
     let error = null;
     try { buildImessageSchedulerPlan(disabledPath, opts()); } catch (caught) { error = caught; }
     check("corpora.imessage.enabled must be declared before install",

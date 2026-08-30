@@ -24,6 +24,7 @@ import {
   RECOVERY_FIELD_GATE_STOP_STAGES,
   createCloudflareRecoveryFieldGateAdapters,
   normalizedInstallStateExport,
+  normalizedZoomDeliveryStateExport,
   parseCloudflareRecoveryCliArguments,
   previewCloudflareRecoveryFieldGate,
   runCloudflareRecoveryFieldGate,
@@ -195,6 +196,21 @@ const fixtureInstallState = Object.freeze({
 const normalizedInstallStateSql =
   `INSERT INTO "install_state" (${installStateColumns.map(([name]) => `"${name}"`).join(",")}) VALUES (` +
   `1,'fixture-brain','0.1.12',13,4,'2026-08-25T12:00:00.000Z',NULL,'stable',NULL,0,NULL,NULL,NULL,NULL,'bootstrap_required',1,NULL,'fixture:chunk#0004',NULL,0,5);\n`;
+const fixtureZoomReconciliation = Object.freeze({
+  id: 1,
+  status: "idle",
+  window_from: "2026-07-26",
+  next_page_token: null,
+  next_run_at_ms: 0,
+  lease_owner: null,
+  lease_expires_at_ms: null,
+  last_error_code: null,
+  updated_at_ms: 1,
+  completed_at_ms: null,
+});
+const normalizedZoomStateSql =
+  `INSERT OR REPLACE INTO "zoom_reconciliation" ("id","status","window_from","next_page_token","next_run_at_ms","lease_owner","lease_expires_at_ms","last_error_code","updated_at_ms","completed_at_ms") VALUES (` +
+  `1,'idle','2026-07-26',NULL,0,NULL,NULL,NULL,1,NULL);\n`;
 const schemaRows = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((name) => ({
     type: "table",
@@ -238,7 +254,9 @@ const aggregateTemplate = aggregateFromSql(
   ].map((name) => `0 AS "${name}"`).join(","),
 );
 const deterministicDataExport = "-- deterministic data-only fixture\n";
-const deterministicDataFingerprint = hash(normalizedInstallStateSql + deterministicDataExport);
+const deterministicDataFingerprint = hash(
+  normalizedInstallStateSql + normalizedZoomStateSql + deterministicDataExport,
+);
 const expectedSnapshot = Object.freeze({
   integrity: "ok",
   schema_fingerprint: hash(canonical({ migrations: appliedMigrations, schema: schemaRows })),
@@ -266,6 +284,12 @@ const expectedSnapshot = Object.freeze({
   ]) {
     assert.equal(RECOVERY_DURABLE_TABLES.includes(table), true, `${table} schema is recreated`);
     assert.equal(RECOVERY_EXPORT_TABLES.includes(table), false, `${table} live state is not restored`);
+  }
+  assert.equal(RECOVERY_DURABLE_TABLES.includes("agent_action_receipts"), true);
+  assert.equal(RECOVERY_EXPORT_TABLES.includes("agent_action_receipts"), false);
+  for (const table of ["zoom_deliveries", "zoom_reconciliation"]) {
+    assert.equal(RECOVERY_DURABLE_TABLES.includes(table), true, `${table} schema is recreated`);
+    assert.equal(RECOVERY_EXPORT_TABLES.includes(table), false, `${table} uses normalized restore`);
   }
 }
 
@@ -381,6 +405,93 @@ function snapshotForChunkCount(chunkCount) {
     normalizedInstallStateExport({}, appliedMigrations, readRows),
     (error) => error.code === "RECOVERY_INSTALL_STATE_INVALID",
   );
+  source.close();
+  destination.close();
+}
+
+// Zoom occurrences and reconciliation cursors are durable work debt. Recovery
+// preserves them, but a Worker that vanished mid-attempt cannot retain a live
+// lease in the restored database.
+{
+  const source = new DatabaseSync(":memory:");
+  const destination = new DatabaseSync(":memory:");
+  const migrationDirectory = join(process.cwd(), "migrations", "d1");
+  for (const name of readdirSync(migrationDirectory).filter((entry) => entry.endsWith(".sql")).sort()) {
+    const sql = readFileSync(join(migrationDirectory, name), "utf8");
+    source.exec(sql);
+    destination.exec(sql);
+  }
+  source.exec(
+    `INSERT INTO zoom_deliveries
+       (recording_uuid,event_type,meeting_id,received_at_ms,status,attempts,
+        next_attempt_at_ms,lease_owner,lease_expires_at_ms,last_error_code,
+        created_at_ms,updated_at_ms,completed_at_ms)
+     VALUES
+       ('recording-processing','recording.transcript_completed','meeting-1',10,
+        'processing',2,11,'source-worker-lease',999,NULL,10,12,NULL),
+       ('recording-complete','recording.completed',NULL,20,
+        'completed',1,20,NULL,NULL,NULL,20,21,21);
+     UPDATE zoom_reconciliation
+        SET status='processing', window_from='2026-08-01',
+            next_page_token='opaque-source-cursor', next_run_at_ms=30,
+            lease_owner='source-reconciliation-lease', lease_expires_at_ms=999,
+            last_error_code=NULL, updated_at_ms=31, completed_at_ms=NULL
+      WHERE id=1;`,
+  );
+  const normalized = await normalizedZoomDeliveryStateExport(
+    {},
+    appliedMigrations,
+    async (_binding, sql) => source.prepare(sql).all(),
+  );
+  const sql = normalized.toString("utf8");
+  assert.equal(sql.includes("source-worker-lease"), false);
+  assert.equal(sql.includes("source-reconciliation-lease"), false);
+  assert.match(sql, /recovered_processing_lease/);
+  destination.exec(sql);
+  assert.deepEqual(
+    destination.prepare(
+      `SELECT recording_uuid,status,attempts,next_attempt_at_ms,lease_owner,
+              lease_expires_at_ms,last_error_code,completed_at_ms
+         FROM zoom_deliveries ORDER BY recording_uuid`,
+    ).all().map((row) => ({ ...row })),
+    [
+      {
+        recording_uuid: "recording-complete",
+        status: "completed",
+        attempts: 1,
+        next_attempt_at_ms: 20,
+        lease_owner: null,
+        lease_expires_at_ms: null,
+        last_error_code: null,
+        completed_at_ms: 21,
+      },
+      {
+        recording_uuid: "recording-processing",
+        status: "retryable",
+        attempts: 2,
+        next_attempt_at_ms: 11,
+        lease_owner: null,
+        lease_expires_at_ms: null,
+        last_error_code: "recovered_processing_lease",
+        completed_at_ms: null,
+      },
+    ],
+  );
+  assert.deepEqual({ ...destination.prepare(
+    `SELECT status,window_from,next_page_token,next_run_at_ms,lease_owner,
+            lease_expires_at_ms,last_error_code,updated_at_ms
+       FROM zoom_reconciliation WHERE id=1`,
+  ).get() }, {
+    status: "retryable",
+    window_from: "2026-08-01",
+    next_page_token: "opaque-source-cursor",
+    next_run_at_ms: 30,
+    lease_owner: null,
+    lease_expires_at_ms: null,
+    last_error_code: "recovered_processing_lease",
+    updated_at_ms: 31,
+  });
+  normalized.fill(0);
   source.close();
   destination.close();
 }
@@ -771,6 +882,14 @@ function providerHarness({
           vector_projection_bootstrap_base_count: 0,
           session_generation: fixtureInstallState.session_generation + 1,
         }];
+      } else if (/FROM zoom_deliveries ORDER BY recording_uuid/.test(sql)) {
+        assert.match(sql, /CASE WHEN status='processing' THEN 'retryable'/);
+        assert.match(sql, /NULL AS lease_owner,NULL AS lease_expires_at_ms/);
+        rows = [];
+      } else if (/FROM zoom_reconciliation ORDER BY id/.test(sql)) {
+        assert.match(sql, /CASE WHEN status='processing' THEN 'retryable'/);
+        assert.match(sql, /NULL AS lease_owner,NULL AS lease_expires_at_ms/);
+        rows = [fixtureZoomReconciliation];
       } else if (/SELECT name FROM sqlite_schema/.test(sql)) {
         rows = [...RECOVERY_DURABLE_TABLES].sort().map((name) => ({ name }));
       } else if (/SELECT type,name,tbl_name/.test(sql)) {

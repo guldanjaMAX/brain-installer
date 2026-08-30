@@ -110,7 +110,7 @@ try {
     },
     brain: { version: "0.1.20", domain: "brain.acme-example.test", worker_name: "acme-brain" },
     corpora: {
-      google_drive: { enabled: true },
+      google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] },
       gmail: { enabled: true, oauth_secret: "secret://GMAIL_OAUTH" },
       calendar: { enabled: true, oauth_secret: "secret://GCAL_OAUTH" },
       upload: { enabled: true },

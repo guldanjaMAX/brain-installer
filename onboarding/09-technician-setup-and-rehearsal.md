@@ -113,7 +113,10 @@ health proof. It is safe to rerun after an interruption.
 
 ### 3. Google
 
-Enable `google_drive`, `gmail`, and `calendar` in the manifest, then run:
+Leave Drive disabled until the owner has selected the folders it may read. To
+enable it, set `google_drive.enabled` to true and put the exact reviewed folder
+ids in `google_drive.root_folder_ids`. Enable Gmail and Calendar only when they
+are also in scope, then run:
 
 ```bash
 brain technician "$HOME/Financial Brain/brain.manifest.json" --run google
@@ -135,9 +138,11 @@ brain technician "$HOME/Financial Brain/brain.manifest.json" --run zoom
 
 The Zoom admin creates a Server-to-Server OAuth app with
 `cloud_recording:read:admin`. `user:read:admin` is used only to prove the plan.
-The event subscription is `recording.transcript_completed`. The command probes
-the account, writes the four Worker secrets, and proves the live validation
-challenge before it prints the webhook URL to save in Zoom.
+The event subscription includes both `recording.completed` and
+`recording.transcript_completed`. The first creates durable delivery debt early;
+the second wakes it when the transcript is ready. The command probes the account,
+writes the four Worker secrets, and proves the live validation challenge before
+it prints the webhook URL to save in Zoom.
 
 ### 5. IMAP
 
@@ -196,14 +201,16 @@ The following are the shortest honest field gates:
 
 - Cloudflare: fresh install, exact-version health, and one synthetic document
   survives a retry.
-- Google Drive: complete first sweep, add, edit, trash, refuse, and incremental
-  refresh against a test folder.
+- Google Drive: complete root-bound sweep, nested folder, shortcut, add, edit,
+  visible move into and out of scope, trash, permission loss, Shared Drive,
+  refusal, and resumable refresh against reviewed test folders.
 - Gmail: one known received message and one sent message appear with provenance,
   then an incremental rerun adds no duplicate.
 - Calendar: one event with attendees and one cancellation appear; an unreadable
   calendar produces a partial result rather than a false empty result.
-- Zoom: one new paid-seat cloud recording produces a transcript after the
-  `recording.transcript_completed` event.
+- Zoom: one new paid-seat cloud recording produces a transcript after the two
+  configured recording delivery events, and a missed-webhook rehearsal leaves
+  durable debt for reconciliation.
 - IMAP: Inbox and Sent read successfully, excluded folders are named, and a
   second sync resumes from the UID watermarks.
 - Passkey: enroll, sign out, sign back in, add a second device, revoke it, and

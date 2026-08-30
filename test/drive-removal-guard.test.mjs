@@ -368,6 +368,7 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
   const priorFullSweep = "2000-01-01T00:00:00.000Z";
   const scannerFingerprint = credentialScannerFingerprint(true);
   const policyFingerprint = drivePolicyFingerprint({
+    rootFolderIds: ["fixture-root"],
     excludeFileIds: [],
     excludePaths: [],
     excludeNameParts: [],
@@ -434,7 +435,7 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
       brain: { domain: "fixture.invalid" },
       infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
       safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
-      corpora: { google_drive: {} },
+      corpora: { google_drive: { enabled: true, root_folder_ids: ["fixture-root"] } },
     }));
     writeFileSync(join(tokenRoot, "google-tokens.json"), JSON.stringify({
       google: {
@@ -556,6 +557,7 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
   const priorCursor = "fixture-active-skip-prior-cursor";
   const scannerFingerprint = credentialScannerFingerprint(true);
   const policyFingerprint = drivePolicyFingerprint({
+    rootFolderIds: ["fixture-root"],
     excludeFileIds: [],
     excludePaths: [],
     excludeNameParts: [],
@@ -603,7 +605,7 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
       brain: { domain: "fixture.invalid" },
       infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
       safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
-      corpora: { google_drive: {} },
+      corpora: { google_drive: { enabled: true, root_folder_ids: ["fixture-root"] } },
     }));
     writeFileSync(join(tokenRoot, "google-tokens.json"), JSON.stringify({
       google: {
@@ -661,12 +663,12 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     const noChange = run();
     assert.equal(noChange.code, 0, noChange.output.slice(-1_200));
     evidence = readEvidence();
-    assert.equal(evidence.forgetRequests, 2, "a no-change incremental run invented another removal");
-    assert.equal(evidence.inventoryReads, 3, "a no-change run unnecessarily paged the full stored corpus");
+    assert.equal(evidence.forgetRequests, 2, "a no-change rooted revalidation invented another removal");
+    assert.equal(evidence.inventoryReads, 4, "a rooted revalidation did not compare against stored source truth");
     assert.equal(evidence.receipts.ready, 0, "a no-change run erased retained-source health");
     assert.equal(evidence.receipts.error, 3);
     state = readState();
-    assert.equal(state.sync_token, "fixture-skip-no-change-cursor");
+    assert.equal(state.sync_token, "fixture-skip-next-cursor");
     assert.deepEqual(Object.keys(state.drive_retained_existing), ["drive:active-migrated"]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -681,6 +683,16 @@ const remoteStart = source.indexOf("async function cmdIngestRemote(");
 const remoteEnd = source.indexOf("\nasync function ", remoteStart + 1);
 assert.notEqual(remoteStart, -1, "cmdIngestRemote must exist");
 const remote = source.slice(remoteStart, remoteEnd === -1 ? source.length : remoteEnd);
+assert.match(
+  remote,
+  /drive\.listRootedFiles\(getToken,\s*\{\s*rootFolderIds:\s*sourcePolicy\.rootFolderIds\s*\}\)/,
+  "the deployed Drive ingest path must pass the manifest-owned roots into the rooted traversal",
+);
+assert.doesNotMatch(
+  remote,
+  /drive\.listFiles\(getToken/,
+  "the deployed Drive ingest path must never fall back to an account-wide listing",
+);
 const consumeStart = remote.indexOf("const consumeGroup = async (group) => {");
 const consumeEnd = remote.indexOf("\n  try {\n  if (!dry)", consumeStart);
 assert.ok(consumeStart !== -1 && consumeEnd > consumeStart, "remote group consumer must be inspectable");

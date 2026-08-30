@@ -705,7 +705,9 @@ check("restart guard refuses an existing migration column with the wrong contrac
        (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='grants') grants_table,
        (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fin_transactions') ledger_table,
        (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='document_access_grants') document_grants_table,
-       (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='support_sessions') support_sessions_table`,
+       (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='support_sessions') support_sessions_table,
+       (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='zoom_deliveries') zoom_deliveries_table,
+       (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='zoom_reconciliation') zoom_reconciliation_table`,
   ).get();
   check(`the published schema-16 access release upgrades cleanly through product schema ${LATEST_SCHEMA}`,
     publishedUpgrade?.schema_version === LATEST_SCHEMA &&
@@ -713,7 +715,9 @@ check("restart guard refuses an existing migration column with the wrong contrac
       publishedUpgrade.grants_table === 1 &&
       publishedUpgrade.ledger_table === 1 &&
       publishedUpgrade.document_grants_table === 1 &&
-      publishedUpgrade.support_sessions_table === 1,
+      publishedUpgrade.support_sessions_table === 1 &&
+      publishedUpgrade.zoom_deliveries_table === 1 &&
+      publishedUpgrade.zoom_reconciliation_table === 1,
     JSON.stringify(publishedUpgrade));
   publishedSchema16.close();
 

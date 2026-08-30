@@ -88,7 +88,8 @@
   "corpora": {
     "_comment": "Which sources this install ingests. Each maps to a connector.",
     "google_drive": {
-      "enabled": true,
+      "enabled": false,
+      "root_folder_ids": [],
       "exclude_paths": [],
       "exclude_name_parts": [],
       "exclude_file_ids": [],

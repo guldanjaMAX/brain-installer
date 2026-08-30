@@ -49,7 +49,7 @@ import {
 import {
   findGrantByCredentialHash, recordPasskeySecurityEvent, sourcesInScope,
 } from "./lib/auth-store.js";
-import { handleZoomWebhook } from "./lib/zoom.js";
+import { handleZoomWebhook, runZoomDeliveryMaintenance } from "./lib/zoom.js";
 import {
   handleOAuthMetadata, handleProtectedResourceMetadata, handleRegister,
   handleAuthorizePage, handleAuthorizeDecision, handleToken, validateConnectorToken,
@@ -2028,7 +2028,7 @@ export default {
   async scheduled(event, env, ctx) {
     if (backendOf(env) !== D1) return;
     ctx.waitUntil(
-      (async () => {
+      Promise.all([(async () => {
         // Bounded, because a Worker invocation has a wall clock and an unbounded
         // loop on a large backfill would be killed mid-batch every time.
         const r = await drainOutbox(env, {
@@ -2037,7 +2037,16 @@ export default {
           maxBatches: 10,
         });
         if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
-      })()
+      })(), runZoomDeliveryMaintenance(env).then((result) => {
+        const deliveries = Number(result?.deliveries?.claimed || 0);
+        const discovered = Number(result?.reconciliation?.recordings || 0);
+        if (deliveries || discovered) {
+          console.log(`zoom delivery maintenance: ${discovered} discovered, ${deliveries} claimed`);
+        }
+        if (!result?.skipped && result?.outcome?.kind !== "completed") {
+          console.warn(`zoom delivery maintenance: ${result?.outcome?.kind || "unavailable"}`);
+        }
+      })])
     );
   },
 };

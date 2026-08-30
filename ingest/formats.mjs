@@ -22,9 +22,10 @@
 
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { unzipSync, strFromU8 } from "fflate";
+import { strFromU8 } from "fflate";
 import * as XLSX from "@e965/xlsx";
 import PostalMime from "postal-mime";
+import { extractZipEntries, validateZipArchive } from "./archive.mjs";
 import { register, renderTable } from "./extract.mjs";
 import { splitMbox } from "./mbox.mjs";
 import { stripMarkup } from "./quality.mjs";
@@ -339,12 +340,12 @@ register(".pdf", extractPdf, "pdf", { binary: true });
 /* -------------------------------------------------------- ooxml (zip based) */
 
 function unzipText(buf, pick) {
-  const files = unzipSync(new Uint8Array(buf));
+  const { entries } = extractZipEntries(buf, {
+    label: "Office archive",
+    select: (name) => pick(name),
+  });
   const out = [];
-  for (const name of Object.keys(files).sort()) {
-    if (!pick(name)) continue;
-    out.push(strFromU8(files[name]));
-  }
+  for (const name of [...entries.keys()].sort()) out.push(strFromU8(entries.get(name)));
   return out;
 }
 
@@ -383,7 +384,11 @@ register(".pptx", (buf) => {
  * the CSV path uses, so "what was the checking balance in March" can actually
  * match a row.
  */
-function sheetsToText(buf, name) {
+function sheetsToText(buf, name, { zipped = false } = {}) {
+  // The spreadsheet reader owns workbook semantics, but its ZIP expansion is
+  // not a safety boundary. Stream and account for the complete OOXML package
+  // first so a workbook cannot allocate beyond the common archive limits.
+  if (zipped) validateZipArchive(buf, { label: "Spreadsheet archive" });
   const wb = XLSX.read(buf, { type: "buffer", cellDates: true, cellFormula: false, cellHTML: false });
   const out = [];
   let truncated = 0;
@@ -404,7 +409,10 @@ function sheetsToText(buf, name) {
   };
 }
 
-for (const ext of [".xlsx", ".xlsm", ".xls"]) register(ext, (buf, { name } = {}) => sheetsToText(buf, name), "spreadsheet", { binary: true });
+for (const ext of [".xlsx", ".xlsm"]) {
+  register(ext, (buf, { name } = {}) => sheetsToText(buf, name, { zipped: true }), "spreadsheet", { binary: true });
+}
+register(".xls", (buf, { name } = {}) => sheetsToText(buf, name), "spreadsheet", { binary: true });
 
 /* -------------------------------------------------------------------- email */
 

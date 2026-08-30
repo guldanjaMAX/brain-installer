@@ -1,6 +1,6 @@
 import {
-  api, listFiles, listChanges, startPageToken, triage, toEnvelope, DriveError, EXPORTS,
-  updateFolderIndex, folderPathFor, exclusionReason, driveVersion,
+  api, listFiles, listRootedFiles, listChanges, startPageToken, triage, toEnvelope, DriveError, EXPORTS,
+  updateFolderIndex, folderPathFor, exclusionReason, driveVersion, classifyScopedAbsence, FOLDER_MIME,
 } from "../connectors/google-drive.mjs";
 import { buildAuthUrl, pkce, exchangeCode, createTokenProvider, redirectUri } from "../connectors/google-auth.mjs";
 
@@ -223,6 +223,100 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   check("a trashed file counts as removed, not changed", r.removed.includes("c"), JSON.stringify(r));
   check("the next token is returned for the following run", r.nextToken === "T99");
 }
+
+/* ================= authoritative root boundary ================= */
+{
+  const calls = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(input);
+    calls.push(url);
+    const id = decodeURIComponent(url.pathname.split("/").pop());
+    if (url.pathname !== "/drive/v3/files") {
+      if (id === "root-a") return json({ id, name: "Approved", mimeType: FOLDER_MIME, parents: ["my-drive"] });
+      if (id === "shared-root") return json({ id, name: "Shared Approved", mimeType: FOLDER_MIME, driveId: "shared-1" });
+      return json({ error: { message: "not found" } }, 404);
+    }
+    const q = url.searchParams.get("q") || "";
+    if (q.includes("'root-a' in parents")) return json({ files: [
+      { id: "inside-a", name: "inside.txt", mimeType: "text/plain", parents: ["root-a"] },
+      { id: "nested", name: "Nested", mimeType: FOLDER_MIME, parents: ["root-a"] },
+      { id: "shortcut-out", name: "Outside shortcut", mimeType: "application/vnd.google-apps.shortcut",
+        parents: ["root-a"], shortcutDetails: { targetId: "outside-secret", targetMimeType: "text/plain" } },
+    ] });
+    if (q.includes("'nested' in parents")) return json({ files: [
+      { id: "inside-nested", name: "nested.txt", mimeType: "text/plain", parents: ["nested"] },
+    ] });
+    if (q.includes("'shared-root' in parents")) return json({ files: [
+      { id: "inside-shared", name: "shared.txt", mimeType: "text/plain", parents: ["shared-root"], driveId: "shared-1" },
+    ] });
+    return json({ files: [{ id: "outside-secret", name: "must-not-appear.txt" }] });
+  };
+  const files = [];
+  for await (const file of listRootedFiles(tok, {
+    rootFolderIds: ["shared-root", "root-a", "root-a"],
+    opts: { fetchImpl, sleep: async () => {} },
+  })) files.push(file);
+  const ids = files.map((file) => file.id).sort();
+  check("root traversal includes nested files under every reviewed root",
+    ["inside-a", "inside-nested", "inside-shared", "nested", "root-a", "shared-root", "shortcut-out"]
+      .every((id) => ids.includes(id)), ids.join(","));
+  check("an unrelated visible file is excluded by construction", !ids.includes("outside-secret"), ids.join(","));
+  check("every listing is a direct-parent query rather than an account sweep",
+    calls.filter((url) => url.pathname === "/drive/v3/files").every((url) => / in parents/.test(url.searchParams.get("q") || "")));
+  check("Shared Drive traversal keeps allDrives support on every child query",
+    calls.filter((url) => url.pathname === "/drive/v3/files").every((url) =>
+      url.searchParams.get("corpora") === "allDrives" &&
+      url.searchParams.get("includeItemsFromAllDrives") === "true" &&
+      url.searchParams.get("supportsAllDrives") === "true"));
+  check("a shortcut is observed but its out-of-scope target is never followed",
+    calls.every((url) => !url.pathname.endsWith("/outside-secret")) &&
+      triage(files.find((file) => file.id === "shortcut-out")).skipCode === "shortcut_not_followed");
+  check("root provenance names the exact reviewed root on every file",
+    files.find((file) => file.id === "inside-shared").scope_root_ids.join(",") === "shared-root" &&
+      files.find((file) => file.id === "inside-nested").scope_root_ids.join(",") === "root-a");
+}
+{
+  let error = null;
+  const fetchImpl = async (input) => {
+    const url = new URL(input);
+    if (url.pathname.endsWith("/root")) return json({ id: "root", name: "Root", mimeType: FOLDER_MIME });
+    return json({ files: [], nextPageToken: "same-token" });
+  };
+  try {
+    for await (const _file of listRootedFiles(tok, {
+      rootFolderIds: ["root"], opts: { fetchImpl, sleep: async () => {} },
+    })) { /* collect only after the complete traversal */ }
+  } catch (caught) { error = caught; }
+  check("a repeated rooted pagination cursor is refused before yielding partial scope",
+    error instanceof DriveError && error.reason === "repeatedPageToken", error?.message);
+}
+{
+  let error = null, yielded = 0;
+  try {
+    for await (const _file of listRootedFiles(tok, {
+      rootFolderIds: ["revoked-root"],
+      opts: { fetchImpl: async () => json({ error: { message: "not found" } }, 404), sleep: async () => {} },
+    })) yielded++;
+  } catch (caught) { error = caught; }
+  check("a missing or permission-lost root is unavailable, never an empty authoritative corpus",
+    yielded === 0 && error instanceof DriveError && error.reason === "rootUnavailable", error?.message);
+}
+{
+  const scopedFolderIds = new Set(["root", "nested"]);
+  const classify = (body, status = 200) => classifyScopedAbsence(tok, "old", {
+    scopedFolderIds,
+    opts: { fetchImpl: async () => json(body, status), sleep: async () => {} },
+  });
+  const moved = await classify({ id: "old", name: "old.txt", parents: ["outside"] });
+  const trashed = await classify({ id: "old", name: "old.txt", parents: ["root"], trashed: true });
+  const ambiguous = await classify({ error: { message: "not found" } }, 404);
+  const inconsistent = await classify({ id: "old", name: "old.txt", parents: ["nested"] });
+  check("a visible move out of scope is authoritative removal evidence", moved.kind === "left_scope");
+  check("visible trash is authoritative deletion evidence", trashed.kind === "source_deleted");
+  check("permission loss is not guessed to be hard deletion", ambiguous.kind === "unresolved" && ambiguous.retryable);
+  check("an item still parented inside scope but missing from the walk blocks tombstones",
+    inconsistent.kind === "unresolved" && inconsistent.retryable);
+}
 {
   const t = await startPageToken(tok, { fetchImpl: async () => json({ startPageToken: "T1" }), sleep: async () => {} });
   check("a start token can be fetched before the first walk", t === "T1");
@@ -282,6 +376,16 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   check("and it records where the date came from", r.envelope.date_source === "filename");
   check("modifiedTime is used only as a change signal", r.version.includes("2026-08-17") && !r.envelope.occurred_at.includes("2026-08-17"));
   check("the web link is kept for citations", r.envelope.uri === "https://drive/F1");
+}
+{
+  const file = { id: "F-provenance", name: "notes.txt", mimeType: "text/plain", size: "400",
+    createdTime: "2020-01-01T00:00:00Z", scope_root_ids: ["root-b", "root-a"] };
+  const r = await toEnvelope(tok, file, {}, {
+    fetchImpl: async () => bytes("A rooted Drive document with enough readable content for deterministic provenance testing."),
+    sleep: async () => {},
+  });
+  check("the ingest envelope preserves exact reviewed-root provenance",
+    r.envelope.metadata.root_folder_ids.join(",") === "root-a,root-b", JSON.stringify(r.envelope.metadata));
 }
 {
   const file = { id: "F-folder", name: "visit.txt", mimeType: "text/plain", size: "400",

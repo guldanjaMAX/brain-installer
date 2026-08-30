@@ -59,6 +59,7 @@ the same packaging caution as private evaluation data.
 | Storage | `worker/src/lib/store.js`, `store-d1.js`, `supabase.js` | Backend selection, D1 and legacy storage behavior, vector outbox, source lifecycle |
 | D1 schema | `migrations/d1/` | Append-only schema and data migrations |
 | Extraction | `ingest/` | File walking, format extraction, quality checks, dates, splitting, batching, resume state |
+| Provider safety | `worker/src/lib/provider-sync.js`, `connectors/provider-sync.mjs`, `ingest/archive.mjs` | Provider deadlines, bounded retries, typed outcomes, cursor progress, streamed response limits, and ZIP expansion limits |
 | Google sources | `connectors/google-auth.mjs`, `google-drive.mjs`, `gmail.mjs`, `google-calendar.mjs` | OAuth storage and source-specific listing, cursor, export, and envelope logic |
 | Local operations | `operations/` | Admin-key persistence, Claude owner-workspace guidance, and macOS unattended scheduling (Drive, iMessage capture, watched folder) |
 | MCP | `components/brain-mcp.mjs`, `brain-mcp-runtime.mjs` | Tool surface and runtime resolution of the current durable admin key |
@@ -146,8 +147,14 @@ reauthorization state before Vectorize rebuild starts. Schema 24 destructive
 agent-action receipts are live single-use authority, so recovery recreates
 their table empty and proves it remains empty on both sides of bank
 reconciliation. The immutable owner activity stream remains durable.
+Accepted Zoom occurrence UUIDs and the
+missed-webhook cursor are durable delivery debt and do survive recovery, but
+only through a reviewed projection that converts `processing` to `retryable`,
+clears both lease fields, and marks the interrupted attempt explicitly. Raw
+Zoom queue tables are excluded from the provider export so a source Worker
+identity never enters the recovery artifact.
 Exact older migration prefixes remain inspectable by the offline verifier only.
-The field recovery runner requires exact current schema 24 on both source and
+The field recovery runner requires exact current schema 25 on both source and
 restored target before it can export or invoke the current drain protocol.
 
 ## Ingest lifecycle
@@ -186,9 +193,12 @@ receipts keep a redacted reason for audit without storing the refused content.
 
 Local and remote state is saved adjacent to the manifest as
 `.brain-ingest-<source>.json`. Content hashes and source versions make reruns
-resumable. A failure stays retryable. Drive policy changes and periodic full
-sweeps compare source truth with stored families so excluded, deleted, moved,
-or no-longer-accessible files can be removed safely.
+resumable. A failure stays retryable. Drive requires reviewed
+`root_folder_ids`, then revalidates only those subtrees on every run. Direct
+parent queries include Shared Drive support, pagination must make progress, and
+shortcuts never expand authority. Visible trash and visible moves out of scope
+are removal evidence. Permission loss and hard deletion are indistinguishable
+at 403 or 404, so the existing family is preserved and completion is withheld.
 
 The authenticated HTTP batch route preserves one receipt per input document.
 For D1 it reads prior rows for unique document identities in one batch preflight,
@@ -239,7 +249,7 @@ connector skips become removal candidates only when a trusted prior canonical
 Drive version differs from the current one; a credential refusal is removed
 regardless of version. A missing, legacy, unchanged, or unknown receipt keeps
 the authenticated D1 family under a durable `drive_retained_existing` marker.
-That marker removes the ordinary `done` fast path, survives incremental runs,
+That marker removes the ordinary `done` fast path, survives rooted revalidation runs,
 and keeps source health incomplete until a replacement is fully accepted or
 an exact post-forget inventory proves the family absent.
 
@@ -248,7 +258,7 @@ an exact post-forget inventory proves the family absent.
 | Source | Current path |
 |---|---|
 | Local folders, including an Obsidian vault | Built through `--path`; Obsidian is file ingest, not a separate connector |
-| Google Drive | Built, resumable, incremental, deletion-aware, and schedulable on macOS |
+| Google Drive | Built, root-bound, resumable, conservatively deletion-aware, and schedulable on macOS; live root and Shared Drive acceptance remains open |
 | Gmail | Built with cursor safety; full real-account production validation remains a field gate |
 | Google Calendar | Built and wired through `brain ingest --from calendar`; row and receipt namespaces match, and event failure, refusal, or pending cancellation cleanup withholds the Google sync token; real-account validation remains a field gate |
 | Local watched folder | Built through the ordinary resumable folder ingest path and schedulable on macOS; multi-cycle field proof remains open |
@@ -256,7 +266,7 @@ an exact post-forget inventory proves the family absent.
 | WhatsApp | Safe per-chat export ingest is built. Unofficial paired-device live capture is opt-in, violates WhatsApp's Terms of Service, and is not real-account proven. Meta's official WhatsApp Business Platform connector is not built. |
 | SMS and Google Voice exports | Built as sessionized file imports; real export samples remain acceptance gates |
 | iPhone backup | Built against a synthetic unencrypted backup; an Apple-written backup remains a field gate |
-| Zoom | Built as a transcript webhook; a paid real-account meeting remains a field gate |
+| Zoom | Built as a durable transcript delivery queue with bounded missed-webhook reconciliation; a paid real-account meeting remains a field gate |
 | Bank exports and hosted feed | Built into the shared financial ledger; real-statement and real-feed reconciliation remain field gates |
 | OCR for scanned PDFs | Built, optional, and provenance-marked; local synthetic scans pass and private real scans remain a field gate |
 | Slack, Notion, Microsoft 365, QuickBooks, CRM sources | Not built; use an approved export and local ingest when suitable |
@@ -504,8 +514,8 @@ remain not observable until a richer read-only snapshot exists.
 | Add a Worker route | `worker/src/index.js`, auth boundary, route tests, client wrapper if applicable, operational docs |
 | Change retrieval or ranking | Worker retrieval/store code, deterministic unit tests, install-specific eval comparison, scale evidence |
 | Change D1 data | New numbered migration, store code, SQLite migration tests, rollback and reindex consequences |
-| Add a format | `ingest/extract.mjs` or `formats.mjs`, quality behavior, fixture tests, supported-format docs |
-| Add a connector | Connector module, OAuth scopes and storage, cursor and deletion rules, ingest dispatcher, source receipts, manifest and source matrix |
+| Add a format | `ingest/extract.mjs` or `formats.mjs`, shared archive limits where applicable, quality behavior, fixture tests, supported-format docs |
+| Add a connector | Connector module, the deployable `worker/src/lib/provider-sync.js` contract, OAuth scopes and storage, cursor and deletion rules, ingest dispatcher, source receipts, manifest and source matrix |
 | Change manifest fields | Schema, template, setup defaults, every reader, examples, package and contract tests |
 | Change credentials | Persistence modules, minimal child environments, rotation/readback tests, handoff and failure runbooks |
 | Change scheduling | `operations/drive-scheduler.mjs` and its connector specs (`imessage-scheduler.mjs`, `folder-scheduler.mjs`), launchd tests, freshness expectations, private log and lock behavior |

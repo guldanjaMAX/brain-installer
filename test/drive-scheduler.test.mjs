@@ -56,7 +56,7 @@ const baseManifest = {
   client: { slug: "acme-brain", display_name: "Acme", timezone: "America/Phoenix" },
   brain: { version: "0.1.0", domain: "brain.acme.test" },
   infrastructure: { cloudflare: { account_id: "account-123" } },
-  corpora: { google_drive: { enabled: true } },
+  corpora: { google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] } },
   operations: {
     ingest_cron: "0 9 * * *",
     admin_key_secret: "keychain://acme-brain-admin/owner",
@@ -223,6 +223,17 @@ try {
     let error = null;
     try { buildDriveSchedulerPlan(manifestPath, opts({ platform: "linux" })); } catch (caught) { error = caught; }
     check("non-macOS scheduling fails clearly", /currently implemented with macOS LaunchAgents/.test(error?.message), error?.message);
+  }
+  {
+    const unscopedPath = join(directory, "unscoped", "brain.manifest.json");
+    writeManifest({
+      ...baseManifest,
+      corpora: { google_drive: { enabled: true } },
+    }, unscopedPath);
+    let error = null;
+    try { buildDriveSchedulerPlan(unscopedPath, opts()); } catch (caught) { error = caught; }
+    check("an unattended Drive scheduler cannot run without reviewed roots",
+      /root_folder_ids/.test(error?.message || ""), error?.message);
   }
   {
     const noDomainPath = join(directory, "no-domain", "brain.manifest.json");

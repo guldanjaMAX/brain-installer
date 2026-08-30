@@ -133,10 +133,31 @@
       "properties": {
         "google_drive": {
           "type": "object",
+          "allOf": [
+            {
+              "if": {
+                "properties": { "enabled": { "const": true } },
+                "required": ["enabled"]
+              },
+              "then": {
+                "required": ["root_folder_ids"],
+                "properties": { "root_folder_ids": { "minItems": 1 } }
+              }
+            }
+          ],
           "properties": {
             "enabled": {
               "type": "boolean",
               "default": false
+            },
+            "root_folder_ids": {
+              "type": "array",
+              "description": "Exact reviewed folder ids that bound Drive ingestion. Only these folders and their descendants are traversed; shortcuts are not followed outside them.",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
             },
             "exclude_paths": {
               "type": "array",

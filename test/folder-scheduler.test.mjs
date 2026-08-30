@@ -59,7 +59,7 @@ const baseManifest = {
   brain: { version: "0.1.0", domain: "brain.acme.test" },
   infrastructure: { cloudflare: { account_id: "account-123" } },
   corpora: {
-    google_drive: { enabled: true },
+    google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] },
     imessage: { enabled: true },
     local_folder: { enabled: true, path: watched, source: "documents" },
   },
@@ -147,7 +147,7 @@ try {
   }
   {
     const path = join(directory, "disabled", "brain.manifest.json");
-    writeManifest({ ...baseManifest, corpora: { google_drive: { enabled: true } } }, path);
+    writeManifest({ ...baseManifest, corpora: { google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] } } }, path);
     let error = null;
     try { buildFolderSchedulerPlan(path, opts()); } catch (caught) { error = caught; }
     check("corpora.local_folder.enabled must be declared before install",

@@ -71,6 +71,7 @@ test("owner and security migrations resume after every statement boundary", asyn
     "0021_owner_workspace.sql",
     "0022_document_access_passkey_observability.sql",
     "0023_support_sessions.sql",
+    "0025_zoom_deliveries.sql",
   ].join(",")).split(",").map((name) => name.trim()).filter(Boolean);
 
   for (const target of targets) {

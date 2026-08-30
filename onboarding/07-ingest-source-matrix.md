@@ -12,7 +12,7 @@ I would rather lose a sale to an honest table than win one and spend week three 
 
 | Source | Status |
 |---|---|
-| Google Drive | **Built.** One real unbounded walk has partial real-data proof; the full add, edit, resume, delete, and scheduler lifecycle is not yet accepted |
+| Google Drive | **Built, root-bound, and off by default.** The manifest must name reviewed folder ids. Deterministic tests prove unrelated visible files are excluded. Live root, Shared Drive, move, permission-loss, delete, and scheduler acceptance remains open |
 | Direct upload and API push | **Built.** Live-service smoke proof exists with a synthetic corpus; no authorized real-document receipt is accepted yet |
 | A watched folder on your own machine | **Built, Mac-only for the schedule.** Name one folder in your manifest and it reloads itself on a schedule: new files load, edited files reload, deleted files are removed. This is what makes "drop it in a folder you already ingest" true for a folder that is not inside Google Drive. On Windows and Linux the same load runs by hand. Real multi-tick sleep, wake, and deletion behavior is not yet field-proven |
 | Gmail | Built: `brain connect google --scopes gmail`, then `brain ingest --from gmail`. Incremental via historyId; bulk mail excluded by default. Not yet run against a real mailbox |
@@ -24,7 +24,7 @@ I would rather lose a sale to an honest table than win one and spend week three 
 | iMessage (Mac) | **Built, Mac-only live path.** `brain connect imessage` checks Full Disk Access, loads history, then uses scheduler-tick capture. There is no accepted receipt from a real `chat.db` read yet. **Apple only exposes message history on a Mac; there is no path on Windows** |
 | iPhone messages, no Mac (Windows too) | **Built, as a one-time history load.** `brain ingest --from iphone-backup` reads an **unencrypted** local iPhone backup and loads the iMessage and SMS history inside it. A point-in-time snapshot, **not** live capture: nothing new arrives afterwards. Runs on Windows and macOS. Never yet run against a backup Apple wrote |
 | Facebook Messenger export | **Built as an export.** Select Messages and JSON in Meta's Download Your Information flow, then ingest the exported `message_*.json` files through Drive or the watched folder. Exact epoch timestamps, stable thread/session identity, rerun idempotency, explicit attachment-only/unavailable counts, and family deletion are fixture-tested. No current real export has been accepted yet; there is no live Facebook API connector. |
-| Zoom | **Built.** `brain connect zoom`: a webhook on your own worker loads each cloud-recording transcript automatically. **Needs a paid (Licensed) Zoom seat** — the free tier cannot cloud record at all. New recordings only, no backfill. Not yet run against a real Zoom account |
+| Zoom | **Built.** `brain connect zoom`: a webhook on your own worker loads each cloud-recording transcript automatically. The worker stores delivery debt before acknowledging Zoom and checks a bounded recent window for missed webhooks. **Needs a paid (Licensed) Zoom seat** because the free tier cannot cloud record at all. Not yet run against a real Zoom account |
 | Slack | Not built. Priced separately when it is |
 | Notion | Not built |
 | Microsoft 365, Outlook, SharePoint, OneDrive | Not built. Microsoft has disabled basic IMAP authentication for these accounts, so the IMAP connector above does **not** reach them either |
@@ -40,6 +40,11 @@ I would rather lose a sale to an honest table than win one and spend week three 
 ### Google Drive
 
 Connected with **read-only** access. It can look at documents. It cannot change, move, or delete anything, and that is enforced by the permission itself rather than by good behavior.
+
+It is off by default. Turning it on requires at least one exact folder id under
+`corpora.google_drive.root_folder_ids`. Only those folders and their descendants
+are traversed. A shortcut inside an approved folder does not authorize its
+target elsewhere in Drive.
 
 **What it reads:**
 
@@ -69,9 +74,18 @@ Connected with **read-only** access. It can look at documents. It cannot change,
 | Anything you excluded at intake | Excluded at the source. It is never read, not read and filtered |
 | Files whose names suggest credentials | Anything looking like a key file, an environment file, or a certificate is refused by name before it is opened |
 
-**How it stays current:** scheduled refreshes are normally incremental. A complete Drive comparison runs at least weekly and whenever source policy or folder changes require it. Re-running is safe: a document that has not changed since last time is skipped rather than duplicated.
+**How it stays current:** every refresh revalidates the reviewed folder trees.
+Unchanged files are skipped before downloading their content, so re-running is
+safe and does not duplicate documents.
 
-**When a file disappears from Drive**, the matching material is removed from your index. That removal is guarded: if the run could not see all of your Drive (a permissions blip or a network failure mid-walk), it cannot complete the comparison. If one cleanup plan is more than 100 documents or more than 10% of the stored Drive corpus, it stops before deleting anything or advancing its cursor. The owner sees aggregate reasons and an opaque plan fingerprint, never file names or IDs, and must approve that exact plan on the rerun. A stale document costs nothing. A wrongly emptied index costs everything.
+**When a file visibly moves outside an approved root or Drive reports it in
+trash**, the matching material is removed from your index. A 403 or 404 could
+mean permission loss or hard deletion, so the connector preserves the existing
+copy and reports the source incomplete instead of guessing. If one cleanup plan
+is more than 100 documents or more than 10% of the stored Drive corpus, it stops
+before deleting anything or advancing its cursor. The owner sees aggregate
+reasons and an opaque plan fingerprint, never file names or IDs, and must
+approve that exact plan on the rerun.
 
 **An active file that this version cannot read is not the same as a deleted file.** The connector records a typed reason. It removes the prior Brain copy only when a trusted earlier Drive receipt proves that the source revision changed, or when the credential scanner says the old copy is unsafe to keep. A migrated document with no trusted local receipt is preserved and marked unverified instead of being guessed stale. Drive stays visibly incomplete until that file is successfully reread or explicitly reviewed; a later no-change sync cannot turn it green by accident.
 
@@ -140,7 +154,7 @@ It reads your manifest, works out which sources you actually have, runs every on
 **What it does not do.**
 
 - It does not connect anything. If a source is switched on in your manifest but not yet authorized on this machine, it is skipped with the exact command that would connect it. Connecting is a decision, not something a load should do on your behalf.
-- It does not load Zoom, ever, and this is not a gap. Zoom **pushes**: a finished cloud recording calls your brain's own webhook and the transcript loads itself. There is nothing for a sweep to fetch, so it says so rather than printing a reassuring line for work it did not do.
+- It does not run Zoom from this local sweep. Zoom delivery and the bounded recent reconciliation both run inside your own Worker, where the durable delivery queue lives. The local command says so rather than claiming work it did not perform.
 - It does not reach anything your manifest does not name. Folders on your machine are read only if you list them under `corpora.upload.folders`.
 - It does not make a source work that is not built. A corpus your manifest declares that this version has no loader for is reported as exactly that, out loud.
 
@@ -261,11 +275,11 @@ The load is the named source `imessage`: `brain sources` shows its freshness aga
 
 **A paid (Licensed) Zoom seat is required, and that is not a soft requirement.** Zoom's free Basic tier has no cloud recording at all. No cloud recording means no transcript, which means there is nothing here to read. `brain connect zoom <manifest>` checks the plan while it runs and refuses to connect a Basic account, so you find out during setup rather than after the first call you wanted read. That check needs one extra read-only permission; if you leave it off, the command says the plan could not be confirmed instead of assuming it is fine.
 
-**How it works.** You create a Server-to-Server OAuth app in **your own** Zoom account and copy four values it shows you. `brain connect zoom` checks them against Zoom for real, writes them as secrets on **your own** Cloudflare worker, then runs Zoom's own validation challenge against your worker to prove the endpoint will pass before you paste its URL into Zoom. After that, Zoom notifies your worker each time a recording's transcript is ready, and your worker fetches that one transcript and stores it. We hold none of it: not the Zoom app, not the four credentials, not the recordings.
+**How it works.** You create a Server-to-Server OAuth app in **your own** Zoom account and copy four values it shows you. `brain connect zoom` checks them against Zoom for real, writes them as secrets on **your own** Cloudflare worker, then runs Zoom's own validation challenge against your worker to prove the endpoint will pass before you paste its URL into Zoom. After that, Zoom notifies your worker when a cloud recording or transcript is ready. Your worker records that delivery in its own D1 before it acknowledges Zoom, then fetches and stores the transcript under a reclaimable lease. The scheduled path also lists a bounded recent window so a webhook that never arrives does not disappear silently. We hold none of it: not the Zoom app, not the four credentials, not the recordings.
 
 **What lands, and what does not:**
 
-- **New recordings only. There is no backfill.** Meetings recorded before you connect stay where they are; nothing sweeps your Zoom account for past recordings. To bring old calls in, use the manual path below.
+- **Recent reconciliation is recovery, not a complete historical backfill.** The first scheduled check covers at most the previous 30 days, then uses a two-day overlap for missed webhooks and late transcripts. Older calls still need the manual path below.
 - **Cloud recording with audio transcript must be on** in your Zoom recording settings, for the meetings you want read. A meeting that was not cloud recorded produces nothing, and a recording with transcription turned off produces nothing.
 - **The transcript only.** Not the audio, not the video, not a summary, and no analysis of the call. One meeting becomes one searchable document.
 - **Speaker labels come from Zoom**, so people appear under whatever display name they joined with.
