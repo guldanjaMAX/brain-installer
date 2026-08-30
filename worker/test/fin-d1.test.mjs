@@ -25,6 +25,11 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS = join(HERE, "..", "..", "migrations", "d1");
 const LEDGER_MIGRATION = "0017_financial_ledger.sql";
+const LEDGER_DEPENDENT_MIGRATIONS = new Set([
+  LEDGER_MIGRATION,
+  "0021_owner_workspace.sql",
+  "0026_plaid_durability.sql",
+]);
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => {
@@ -40,7 +45,7 @@ function freshDb({ throughLedger = true } = {}) {
   const db = new DatabaseSync(":memory:");
   const files = throughLedger
     ? migrationFiles
-    : migrationFiles.filter((file) => file < LEDGER_MIGRATION);
+    : migrationFiles.filter((file) => !LEDGER_DEPENDENT_MIGRATIONS.has(file));
   for (const file of files) {
     for (const statement of statementsFor(file)) db.exec(statement);
   }
