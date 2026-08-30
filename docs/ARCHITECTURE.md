@@ -80,7 +80,7 @@ live path.
 `brain setup` is intentionally ordered:
 
 1. Run local preflight checks, including a signed-in Claude Code CLI for an
-   owner-machine install and pinned Wrangler 4. A deliberate `--no-connect`
+   owner-machine install and profile-capable pinned Wrangler 4.127.1. A deliberate `--no-connect`
    technician-machine install keeps Claude advisory on that machine.
 2. Create or resume the manifest, declare durable admin-key storage, and
    prepare the exact desired key before remote changes.

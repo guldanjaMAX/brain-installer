@@ -10,8 +10,20 @@ import { callLLM } from "../src/lib/core.js";
 const CF = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const call = (env, model) => callLLM(env, { model, system: "s", messages: [], label: "test" });
 
-// D1 logging is fire-and-forget in this path; a stub keeps the test offline.
-const db = () => ({ prepare: () => ({ bind: () => ({ run: async () => {}, first: async () => ({}) }), run: async () => {}, first: async () => ({}) }) });
+// D1 reserves before the provider call; this stub returns a durable reservation
+// receipt and a successful settlement while keeping provider routing offline.
+const db = () => {
+  let id = 0;
+  return {
+    exec: async () => {},
+    prepare: (sql) => ({
+      bind: () => ({
+        run: async () => ({ meta: { changes: 1 } }),
+        first: async () => /RETURNING id/.test(sql) ? ({ id: ++id }) : ({}),
+      }),
+    }),
+  };
+};
 
 let aiCalls, fetchCalls;
 const aiBinding = () => ({ run: async (m) => { aiCalls.push(m); return { response: "ok", usage: {} }; } });

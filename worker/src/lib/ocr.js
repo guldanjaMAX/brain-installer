@@ -6,11 +6,11 @@
 // token and get the same model. It must not, for three reasons that all point
 // the same way.
 //
-// The spend cap lives here. `callLLM` refuses once the day's budget is gone,
-// logs every call, and degrades rather than failing open. A CLI-side REST call
+// The estimated-spend budget lives here. `callLLM` atomically reserves before
+// every provider call and fails closed when the ledger is unavailable. A CLI-side REST call
 // would walk straight past all of it, on the client's own payment method, one
 // page at a time. OCR is the first bulk, automatic, per-document inference cost
-// this product has ever had; it is exactly the thing the cap was built for.
+// this product has ever had; it is exactly the thing the budget was built for.
 //
 // The credential is already right. The installer holds the brain admin key. A
 // direct REST path would mean a standing Cloudflare control-plane token present
@@ -129,18 +129,25 @@ export async function handleOcr(env, request) {
       usage: data?.usage || {},
     });
   } catch (error) {
-    // A cap hit, a provider mismatch and an outage are all statements about the
+    // A budget refusal, provider mismatch and outage are all statements about the
     // SYSTEM, never about the page. Returning any of them as "this page is
     // unreadable" would write a permanently wrong reason into the corpus, so
     // each keeps its own status and its own flag and the caller must not treat
     // them as evidence about the document.
     if (error?.llm_cap_exceeded) {
       return jsonResponse({
-        error: "OCR stopped because the daily spend cap was reached",
+        error: "OCR stopped because the daily estimated-spend budget could not reserve this page",
         detail: String(error.message || error).slice(0, 300),
         llm_cap_exceeded: true,
         spend_guard_degraded: error.spend_guard_degraded === true || undefined,
       }, 429);
+    }
+    if (error?.spend_guard_unavailable) {
+      return jsonResponse({
+        error: "OCR paused because the spend reservation ledger is unavailable",
+        detail: String(error.message || error).slice(0, 300),
+        spend_guard_unavailable: true,
+      }, 503);
     }
     if (error?.provider_mismatch) {
       return jsonResponse({

@@ -99,7 +99,7 @@ brain technician "$HOME/Financial Brain/brain.manifest.json" --run tools
 
 This proves the Claude CLI version and sign-in, installs and reads back the
 personal `/financial-brain-technician` skill, runs Anthropic's interactive
-doctor, and verifies pinned Wrangler 4. Claude Code's normal approval prompts
+doctor, and verifies profile-capable pinned Wrangler 4.127.1. Claude Code's normal approval prompts
 stay enabled.
 
 Open Claude Code and type `/skills`. Confirm `financial-brain-technician`

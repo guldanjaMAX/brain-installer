@@ -35,7 +35,7 @@ import {
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, retryQuarantinedVectorOps, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
@@ -60,6 +60,8 @@ import { handleSupportAccess } from "./lib/support-access.js";
 import {
   AGENT_DELETION_PATH_PREFIX, createAgentDeletionPreview, handleAgentDeletion,
 } from "./lib/agent-action-receipts.js";
+import { cleanupPublicAuthState, guardPublicRequest } from "./lib/public-request-guard.js";
+import { ownerReliabilityAlerts } from "./lib/reliability-alerts.js";
 
 /* ------------------------------------------------------------ retrieval */
 
@@ -673,7 +675,9 @@ async function handleThink(env, request, access = null, grantScope = { all: true
     answerError = e.no_key
       ? "no LLM key configured"
       : e.llm_cap_exceeded
-        ? "daily LLM spend cap reached"
+        ? "daily estimated LLM spend budget reached"
+        : e.spend_guard_unavailable
+          ? "LLM spend reservation unavailable"
         : e.message;
   }
 
@@ -823,7 +827,11 @@ async function handleThink(env, request, access = null, grantScope = { all: true
           }
         } catch (e) {
           answer = null;
-          answerError = e.llm_cap_exceeded ? "daily LLM spend cap reached" : "evidence gate could not verify support";
+          answerError = e.llm_cap_exceeded
+            ? "daily estimated LLM spend budget reached"
+            : e.spend_guard_unavailable
+              ? "LLM spend reservation unavailable"
+              : "evidence gate could not verify support";
           approvedDocs = [];
           evidenceGate = { supported: false, complete: false, error: "verification unavailable" };
         }
@@ -1526,6 +1534,7 @@ const PAUSED_CORPUS_MUTATION_PATHS = new Set([
   "/api/admin/brain/source-expectation",
   "/api/admin/brain/forget",
   "/api/admin/brain/reindex",
+  "/api/admin/brain/vector-retry",
   "/api/admin/brain/drain",
   // The ledger is not the corpus, but a paused upgrade means a migration is in
   // flight, and financial rows written against a half-migrated schema are the
@@ -1565,7 +1574,9 @@ export default {
             accepting_documents: false,
           }
           : { accepting_documents: true }),
-        brain: env.BRAIN_NAME || "brain",
+        // This route is intentionally public. Keep it operationally useful,
+        // but never disclose the owner's or install's configured identity.
+        service: "financial-brain",
         version: env.BRAIN_VERSION || "0.1.0",
         vector_writer_protocol: "lease-v1",
         vector_drain_mode: paused ? "paused-for-upgrade" : "active",
@@ -1583,6 +1594,9 @@ export default {
     // previewed as a 401 instead of an image.
     if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/") ||
         path.startsWith("/brand/") || path.startsWith("/app/assets/")) {
+      const guarded = await guardPublicRequest(env, request, url, path);
+      if (guarded.response) return guarded.response;
+      request = guarded.request;
       const response = await handleOwnerAuth(env, request, url, path);
       return path.startsWith("/api/app/") || path.startsWith("/auth/")
         ? privateNoStore(response)
@@ -1663,6 +1677,11 @@ export default {
     // bearer token those ceremonies earn — exactly the read-only class.
     if (path === "/.well-known/oauth-authorization-server") return handleOAuthMetadata(url);
     if (path === "/.well-known/oauth-protected-resource") return handleProtectedResourceMetadata(url);
+    if (path.startsWith("/oauth/")) {
+      const guarded = await guardPublicRequest(env, request, url, path);
+      if (guarded.response) return guarded.response;
+      request = guarded.request;
+    }
     if (path === "/oauth/register" && request.method === "POST") {
       return privateNoStore(await handleRegister(env, request));
     }
@@ -1857,6 +1876,10 @@ export default {
       if (path === "/api/admin/brain/documents" && request.method === "GET") {
         return privateNoStore(await handleDocuments(env));
       }
+      if (path === "/api/admin/brain/reliability-alerts" && request.method === "GET") {
+        if (backendOf(env) !== D1) return jsonResponse({ error: "reliability alerts apply to the d1 backend only" }, 400);
+        return privateNoStore(jsonResponse(await ownerReliabilityAlerts(env)));
+      }
       // Per-source freshness. Separate from /documents on purpose: that endpoint
       // answers "how much is in here", this one answers "how much of it is
       // current", and conflating them is how staleness stayed invisible.
@@ -1952,6 +1975,14 @@ export default {
         });
         return jsonResponse(r);
       }
+      if (path === "/api/admin/brain/vector-retry" && request.method === "POST") {
+        if (backendOf(env) !== D1) return jsonResponse({ error: "vector retry applies to the d1 backend only" }, 400);
+        const body = await request.json().catch(() => ({}));
+        return jsonResponse(await retryQuarantinedVectorOps(env, {
+          confirm: body.confirm === true,
+          limit: body.limit,
+        }));
+      }
       if (path === "/api/admin/brain/bootstrap" && request.method === "POST") {
         if (backendOf(env) !== D1) {
           return jsonResponse({ error: "bootstrap applies to the d1 backend only" }, 400);
@@ -2035,16 +2066,30 @@ export default {
    */
   async scheduled(event, env, ctx) {
     if (backendOf(env) !== D1) return;
+    // A compatibility cutover is a whole-database mutation barrier. Expired
+    // public auth state remains inert and can wait for the first active cron.
+    if (env.VECTOR_DRAIN_MODE === "paused-for-upgrade") return;
     ctx.waitUntil(
       Promise.all([(async () => {
-        // Bounded, because a Worker invocation has a wall clock and an unbounded
-        // loop on a large backfill would be killed mid-batch every time.
-        const r = await drainOutbox(env, {
-          embed: (text) => embedText(env, text),
-          embedBatch: (texts) => embedTexts(env, texts),
-          maxBatches: 10,
-        });
-        if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
+        // Both jobs are bounded. Cleanup must still run when the vector provider
+        // is failing, and a cleanup error must not stop the durable vector queue.
+        const [drainResult, cleanupResult] = await Promise.allSettled([
+          drainOutbox(env, {
+            embed: (text) => embedText(env, text),
+            embedBatch: (texts) => embedTexts(env, texts),
+            maxBatches: 10,
+          }),
+          cleanupPublicAuthState(env),
+        ]);
+        if (drainResult.status === "fulfilled") {
+          const r = drainResult.value;
+          if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
+        } else {
+          console.warn("vector outbox: scheduled drain failed");
+        }
+        if (cleanupResult.status === "rejected") {
+          console.warn("public auth state: scheduled TTL cleanup failed");
+        }
       })(), runZoomDeliveryMaintenance(env).then((result) => {
         const deliveries = Number(result?.deliveries?.claimed || 0);
         const discovered = Number(result?.reconciliation?.recordings || 0);

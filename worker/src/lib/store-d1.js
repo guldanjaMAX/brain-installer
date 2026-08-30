@@ -944,7 +944,147 @@ const DRAIN_LEASE_ACQUIRE_QUERIES = 1;
 const DRAIN_LEASE_RELEASE_QUERIES = 1;
 const DRAIN_PROJECTION_VERIFY_QUERIES = 1;
 const DRAIN_INITIAL_DEPTH_QUERIES = 1;
+const DRAIN_RETRY_STATE_QUERIES = 2;
 const DRAIN_BATCH_SIZE_MAX = 100;
+export const VECTOR_RETRY_MAX_ATTEMPTS = 5;
+const VECTOR_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
+
+async function ensureVectorRetryStateTable(env) {
+  if (typeof env?.DB?.exec !== "function") return;
+  await env.DB.exec(
+    `CREATE TABLE IF NOT EXISTS vector_outbox_retry_state (
+       chunk_uid TEXT NOT NULL,
+       generation INTEGER NOT NULL,
+       attempts INTEGER NOT NULL,
+       next_attempt_at INTEGER NOT NULL,
+       last_attempt_at INTEGER NOT NULL,
+       quarantined_at INTEGER,
+       failure_code TEXT NOT NULL,
+       last_error TEXT,
+       PRIMARY KEY (chunk_uid, generation)
+     );
+     CREATE INDEX IF NOT EXISTS idx_vector_outbox_retry_eligible
+       ON vector_outbox_retry_state (quarantined_at, next_attempt_at);`
+  );
+}
+
+async function cleanupVectorRetryState(env, limit = 500) {
+  await env.DB.prepare(
+    `DELETE FROM vector_outbox_retry_state
+      WHERE rowid IN (
+        SELECT s.rowid FROM vector_outbox_retry_state s
+         WHERE NOT EXISTS (
+           SELECT 1 FROM vector_outbox o
+            WHERE o.chunk_uid=s.chunk_uid AND o.generation=s.generation
+         )
+         LIMIT ?
+      )`
+  ).bind(limit).run();
+}
+
+function vectorRetryDelay(attempt) {
+  return VECTOR_RETRY_DELAYS_MS[Math.min(Math.max(attempt - 1, 0), VECTOR_RETRY_DELAYS_MS.length - 1)];
+}
+
+async function scheduleVectorFailures(env, rows, {
+  failureCode,
+  error,
+  now = Date.now(),
+} = {}) {
+  if (!rows.length) return { scheduled: 0, quarantined: 0 };
+  const detail = String(error || "vector operation failed").slice(0, 300);
+  const statements = [];
+  let quarantined = 0;
+  for (const row of rows) {
+    const attempt = Math.max(0, Number(row.attempts || 0)) + 1;
+    const quarantineAt = attempt >= VECTOR_RETRY_MAX_ATTEMPTS ? now : null;
+    if (quarantineAt !== null) quarantined++;
+    const nextAttemptAt = quarantineAt === null ? now + vectorRetryDelay(attempt) : now;
+    statements.push(env.DB.prepare(
+      `INSERT INTO vector_outbox_retry_state
+         (chunk_uid,generation,attempts,next_attempt_at,last_attempt_at,quarantined_at,failure_code,last_error)
+       VALUES (?,?,?,?,?,?,?,?)
+       ON CONFLICT(chunk_uid,generation) DO UPDATE SET
+         attempts=excluded.attempts,
+         next_attempt_at=excluded.next_attempt_at,
+         last_attempt_at=excluded.last_attempt_at,
+         quarantined_at=excluded.quarantined_at,
+         failure_code=excluded.failure_code,
+         last_error=excluded.last_error`
+    ).bind(
+      row.chunk_uid, row.generation, attempt, nextAttemptAt, now,
+      quarantineAt, failureCode, detail,
+    ));
+    statements.push(env.DB.prepare(
+      `UPDATE vector_outbox SET attempts=?, last_error=?
+       WHERE chunk_uid=? AND generation=?`
+    ).bind(attempt, detail, row.chunk_uid, row.generation));
+  }
+  await env.DB.batch(statements);
+  return { scheduled: rows.length - quarantined, quarantined };
+}
+
+/** Privacy-safe retry state for owner alerts and operator receipts. */
+export async function vectorRetrySummary(env, now = Date.now()) {
+  await ensureVectorRetryStateTable(env);
+  const row = await env.DB.prepare(
+    `SELECT count(*) AS tracked,
+            sum(CASE WHEN quarantined_at IS NOT NULL THEN 1 ELSE 0 END) AS quarantined,
+            sum(CASE WHEN quarantined_at IS NULL AND next_attempt_at > ? THEN 1 ELSE 0 END) AS delayed,
+            min(CASE WHEN quarantined_at IS NULL THEN next_attempt_at END) AS next_attempt_at
+       FROM vector_outbox_retry_state s
+      WHERE EXISTS (
+        SELECT 1 FROM vector_outbox o
+         WHERE o.chunk_uid=s.chunk_uid AND o.generation=s.generation
+      )`
+  ).bind(now).first();
+  return {
+    tracked: Number(row?.tracked || 0),
+    quarantined: Number(row?.quarantined || 0),
+    delayed: Number(row?.delayed || 0),
+    next_attempt_at: row?.next_attempt_at ?? null,
+  };
+}
+
+/** Explicit operator preview/confirm for quarantined vector generations. */
+export async function retryQuarantinedVectorOps(env, { confirm = false, limit = 100 } = {}) {
+  await ensureVectorRetryStateTable(env);
+  const bounded = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  const total = await env.DB.prepare(
+    `SELECT count(*) AS n FROM vector_outbox_retry_state s
+      WHERE s.quarantined_at IS NOT NULL
+        AND EXISTS (SELECT 1 FROM vector_outbox o
+          WHERE o.chunk_uid=s.chunk_uid AND o.generation=s.generation)`
+  ).first();
+  const quarantined = Number(total?.n || 0);
+  if (!confirm || quarantined === 0) {
+    return { quarantined, selected: Math.min(quarantined, bounded), retried: 0, dry_run: true };
+  }
+  const { results: rows } = await env.DB.prepare(
+    `SELECT s.chunk_uid, s.generation
+       FROM vector_outbox_retry_state s
+       JOIN vector_outbox o ON o.chunk_uid=s.chunk_uid AND o.generation=s.generation
+      WHERE s.quarantined_at IS NOT NULL
+      ORDER BY s.quarantined_at, s.chunk_uid LIMIT ?`
+  ).bind(bounded).all();
+  const statements = [];
+  for (const row of rows || []) {
+    statements.push(env.DB.prepare(
+      "DELETE FROM vector_outbox_retry_state WHERE chunk_uid=? AND generation=? AND quarantined_at IS NOT NULL"
+    ).bind(row.chunk_uid, row.generation));
+    statements.push(env.DB.prepare(
+      "UPDATE vector_outbox SET attempts=0,last_error=NULL WHERE chunk_uid=? AND generation=?"
+    ).bind(row.chunk_uid, row.generation));
+  }
+  if (statements.length) await env.DB.batch(statements);
+  return {
+    quarantined,
+    selected: (rows || []).length,
+    retried: (rows || []).length,
+    dry_run: false,
+    remaining_quarantined: Math.max(0, quarantined - (rows || []).length),
+  };
+}
 
 // One two-phase slice either submits or confirms. The largest path is an upsert
 // submission: queue/fence/delete/upsert reads plus the durable fence, final
@@ -1296,26 +1436,20 @@ async function confirmSubmittedVectors(env, rows) {
   }
   if (retrying.length) {
     const detail = "accepted Vectorize mutation was processed but the exact vector state was not query-visible; retrying";
-    const changes = await env.DB.batch(retrying.map((row) => row.op === "delete"
-      ? env.DB.prepare(
-        `UPDATE vector_outbox
-            SET submitted_mutation_id = NULL, submitted_at = NULL,
-                attempts = attempts + 1, last_error = ?5
-          WHERE chunk_uid = ?1 AND op = 'delete'
-            AND COALESCE(vector_id, chunk_uid) = ?2 AND generation = ?3
-            AND submitted_mutation_id = ?4`
-      ).bind(row.chunk_uid, row.provider_vector_id, row.generation, row.submitted_mutation_id, detail)
-      : env.DB.prepare(
-        `UPDATE vector_outbox
-            SET submitted_mutation_id = NULL, submitted_at = NULL,
-                attempts = attempts + 1, last_error = ?4
-          WHERE chunk_uid = ?1 AND op = 'upsert' AND generation = ?2
-            AND submitted_mutation_id = ?3`
-      ).bind(row.chunk_uid, row.generation, row.submitted_mutation_id, detail)));
+    const changes = await env.DB.batch(retrying.map((row) => env.DB.prepare(
+      `UPDATE vector_outbox
+          SET submitted_mutation_id = NULL, submitted_at = NULL
+        WHERE chunk_uid = ? AND generation = ? AND submitted_mutation_id = ?`
+    ).bind(row.chunk_uid, row.generation, row.submitted_mutation_id)));
     if (!Array.isArray(changes) || changes.length !== retrying.length) {
       throw new Error("the vector retry receipts were ambiguous");
     }
     retrying = retrying.filter((_, index) => drainLeaseChanges(changes[index]) === 1);
+    await scheduleVectorFailures(env, retrying, {
+      failureCode: "visibility_mismatch",
+      error: detail,
+      now: Date.now(),
+    });
   }
   return {
     confirmed: confirmed.length,
@@ -1334,11 +1468,11 @@ async function submitQueuedDeletes(env, rows, lease) {
     return (await recordSubmittedMutation(env, rows, "delete", receipt)).submitted;
   } catch (error) {
     const detail = String(error?.message || error).slice(0, 300);
-    await env.DB.batch(rows.map((row) => env.DB.prepare(
-      `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
-        WHERE chunk_uid = ?1 AND op = 'delete'
-          AND COALESCE(vector_id, chunk_uid) = ?3 AND generation = ?4`
-    ).bind(row.chunk_uid, detail, row.vector_id || row.chunk_uid, row.generation))).catch(() => {});
+    await scheduleVectorFailures(env, rows, {
+      failureCode: "delete_provider_failure",
+      error: detail,
+      now: lease.now(),
+    }).catch(() => {});
     const wrapped = new Error(`the vector index could not durably accept this delete batch: ${detail}`);
     wrapped.vectorDeleteFailed = true;
     throw wrapped;
@@ -1365,8 +1499,11 @@ async function drainOutboxBatch(env, {
   // stale confirmation can never acknowledge the newer operation.
   const { results: submittedRows } = await env.DB.prepare(
     `SELECT o.chunk_uid, COALESCE(o.vector_id, c.vector_id, o.chunk_uid) AS vector_id,
-            o.op, o.queued_at, o.generation, o.submitted_mutation_id, o.submitted_at
+            o.op, o.queued_at, o.generation, o.submitted_mutation_id, o.submitted_at,
+            COALESCE(s.attempts, o.attempts, 0) AS attempts
        FROM vector_outbox o LEFT JOIN chunks c ON c.chunk_uid = o.chunk_uid
+       LEFT JOIN vector_outbox_retry_state s
+         ON s.chunk_uid=o.chunk_uid AND s.generation=o.generation
       WHERE o.submitted_mutation_id IS NOT NULL
       ORDER BY o.queued_at LIMIT ?1`
   ).bind(batchSize).all();
@@ -1401,13 +1538,21 @@ async function drainOutboxBatch(env, {
   // Delete first. Orphans still consume Vectorize candidate slots even though
   // D1 hydration makes them unreachable, so leaving them behind damages recall.
   const { results: deletePending } = await env.DB.prepare(
-    `SELECT chunk_uid, COALESCE(vector_id, chunk_uid) AS vector_id, queued_at, generation
-       FROM vector_outbox
-      WHERE op = 'delete' AND submitted_mutation_id IS NULL
-      ORDER BY queued_at LIMIT ?1`
-  ).bind(batchSize).all();
+    `SELECT o.chunk_uid, COALESCE(o.vector_id, o.chunk_uid) AS vector_id,
+            o.queued_at, o.generation, COALESCE(s.attempts,o.attempts,0) AS attempts
+       FROM vector_outbox o
+       LEFT JOIN vector_outbox_retry_state s
+         ON s.chunk_uid=o.chunk_uid AND s.generation=o.generation
+      WHERE o.op = 'delete' AND o.submitted_mutation_id IS NULL
+        AND s.quarantined_at IS NULL
+        AND COALESCE(s.next_attempt_at,0) <= ?1
+      ORDER BY o.queued_at LIMIT ?2`
+  ).bind(lease.now(), batchSize).all();
   if (deletePending?.length) {
-    const submitted = await submitQueuedDeletes(env, deletePending, lease);
+    const selected = Number(deletePending[0]?.attempts || 0) > 0
+      ? deletePending.slice(0, 1)
+      : deletePending;
+    const submitted = await submitQueuedDeletes(env, selected, lease);
     const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
     return {
       drained: 0, deleted: 0, upserted: 0, submitted, waiting: submitted,
@@ -1417,13 +1562,18 @@ async function drainOutboxBatch(env, {
 
   const { results: pending } = await env.DB.prepare(
     `SELECT o.chunk_uid, o.queued_at, o.generation,
+            COALESCE(s.attempts,o.attempts,0) AS attempts,
             c.text, c.source, c.doc_uid, c.document_date,
             c.client, c.category, c.top_folder, c.platform
      FROM vector_outbox o JOIN chunks c ON c.chunk_uid = o.chunk_uid
+     LEFT JOIN vector_outbox_retry_state s
+       ON s.chunk_uid=o.chunk_uid AND s.generation=o.generation
      WHERE o.op = 'upsert' AND o.submitted_mutation_id IS NULL
-     ORDER BY o.queued_at LIMIT ?1`
+       AND s.quarantined_at IS NULL
+       AND COALESCE(s.next_attempt_at,0) <= ?1
+     ORDER BY o.queued_at LIMIT ?2`
   )
-    .bind(batchSize)
+    .bind(lease.now(), batchSize)
     .all();
 
   if (!pending?.length) {
@@ -1434,6 +1584,9 @@ async function drainOutboxBatch(env, {
     };
   }
 
+  const selectedPending = Number(pending[0]?.attempts || 0) > 0
+    ? pending.slice(0, 1)
+    : pending;
   const vectors = [];
   const idToChunk = new Map();
   // Capture every selected token before embedding starts. A poison row can
@@ -1441,7 +1594,7 @@ async function drainOutboxBatch(env, {
   // exact generation CAS. Building this map only after a successful embed
   // would silently leave those rows at attempts=0 forever.
   const chunkGeneration = new Map(
-    pending.map((row) => [row.chunk_uid, row.generation])
+    selectedPending.map((row) => [row.chunk_uid, row.generation])
   );
   const poisoned = [];
 
@@ -1452,10 +1605,10 @@ async function drainOutboxBatch(env, {
   // A failed group falls back to embedding its members one at a time. That keeps
   // the poison-isolation guarantee exactly as it was: a single bad chunk
   // quarantines itself rather than taking the other 49 down with it.
-  const embedded = new Array(pending.length).fill(undefined);
+  const embedded = new Array(selectedPending.length).fill(undefined);
   if (embedBatch) {
-    for (let i = 0; i < pending.length; i += embedGroup) {
-      const group = pending.slice(i, i + embedGroup);
+    for (let i = 0; i < selectedPending.length; i += embedGroup) {
+      const group = selectedPending.slice(i, i + embedGroup);
       try {
         const out = await embedBatch(group.map((r) => r.text));
         if (!Array.isArray(out) || out.length !== group.length) {
@@ -1474,8 +1627,8 @@ async function drainOutboxBatch(env, {
     }
   }
 
-  for (let idx = 0; idx < pending.length; idx++) {
-    const row = pending[idx];
+  for (let idx = 0; idx < selectedPending.length; idx++) {
+    const row = selectedPending[idx];
     let values = embedded[idx];
     if (values === undefined) {
       if (embedBatch && poisoned.some((p) => p.chunk_uid === row.chunk_uid)) continue;
@@ -1512,14 +1665,15 @@ async function drainOutboxBatch(env, {
       // Acceptance and its D1 receipt are one phase. If either fails, leave the
       // row queued so a later idempotent upsert creates a newer ordering fence.
       const err = String(e.message || e).slice(0, 300);
-      await env.DB.batch(
-        vectors.map((v) =>
-          env.DB.prepare(
-            `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
-             WHERE chunk_uid = ?1 AND op = 'upsert' AND generation = ?3`
-          ).bind(idToChunk.get(v.id), err, chunkGeneration.get(idToChunk.get(v.id)))
-        )
-      ).catch(() => {});
+      await scheduleVectorFailures(env, vectors.map((vector) => ({
+        chunk_uid: idToChunk.get(vector.id),
+        generation: chunkGeneration.get(idToChunk.get(vector.id)),
+        attempts: selectedPending.find((row) => row.chunk_uid === idToChunk.get(vector.id))?.attempts || 0,
+      })), {
+        failureCode: "upsert_provider_failure",
+        error: err,
+        now: lease.now(),
+      }).catch(() => {});
       const e2 = new Error(`the vector index could not durably accept this batch: ${err}`);
       e2.vectorUpsertFailed = true;
       throw e2;
@@ -1530,14 +1684,15 @@ async function drainOutboxBatch(env, {
   // queue. Accepted rows also stay queued, now in submitted state, until a later
   // invocation observes the exact generation through getByIds().
   if (poisoned.length) {
-    await env.DB.batch(
-      poisoned.map((p) =>
-        env.DB.prepare(
-          `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
-           WHERE chunk_uid = ?1 AND op = 'upsert' AND generation = ?3`
-        ).bind(p.chunk_uid, p.error, chunkGeneration.get(p.chunk_uid))
-      )
-    ).catch(() => {});
+    await Promise.all(poisoned.map((poison) => scheduleVectorFailures(env, [{
+      chunk_uid: poison.chunk_uid,
+      generation: chunkGeneration.get(poison.chunk_uid),
+      attempts: selectedPending.find((row) => row.chunk_uid === poison.chunk_uid)?.attempts || 0,
+    }], {
+      failureCode: "embedding_failure",
+      error: poison.error,
+      now: lease.now(),
+    }))).catch(() => {});
   }
 
   const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
@@ -1574,6 +1729,8 @@ export async function drainOutbox(env, options = {}) {
       remaining: 0, errors: [], busy: false, paused: true,
     };
   }
+  await ensureVectorRetryStateTable(env);
+  await cleanupVectorRetryState(env);
   const rawMaxBatches = Number(options.maxBatches ?? 1);
   const maxBatches = Number.isInteger(rawMaxBatches)
     ? Math.min(10, Math.max(1, rawMaxBatches))
@@ -1621,7 +1778,8 @@ export async function drainOutbox(env, options = {}) {
   };
   let operationError = null;
   let reservedQueries = DRAIN_LEASE_ACQUIRE_QUERIES + DRAIN_LEASE_RELEASE_QUERIES +
-    DRAIN_PROJECTION_VERIFY_QUERIES + DRAIN_INITIAL_DEPTH_QUERIES;
+    DRAIN_PROJECTION_VERIFY_QUERIES + DRAIN_INITIAL_DEPTH_QUERIES +
+    DRAIN_RETRY_STATE_QUERIES;
   const batchQueryUpperBound = drainBatchQueryUpperBound(batchSize);
   try {
     for (let batch = 0; batch < maxBatches; batch++) {
@@ -1748,6 +1906,7 @@ export async function diagnose(env, {
   sampleLimit = 10,
   duplicateChunkScanLimit = 100_000,
 } = {}) {
+  await ensureVectorRetryStateTable(env);
   const findings = [];
   const add = (f) => findings.push(f);
   const safe = async (id, fn) => {
@@ -1932,15 +2091,23 @@ export async function diagnose(env, {
   });
 
   await safe("quarantined", async () => {
-    const n = Number((await q1(env, "SELECT count(*) n FROM vector_outbox WHERE attempts > 0"))?.n || 0);
+    const n = Number((await q1(env,
+      `SELECT count(*) n FROM vector_outbox_retry_state s
+        WHERE s.quarantined_at IS NOT NULL
+          AND EXISTS (SELECT 1 FROM vector_outbox o
+            WHERE o.chunk_uid=s.chunk_uid AND o.generation=s.generation)`))?.n || 0);
     if (!n) return;
     const rows = await qAll(env,
-      "SELECT chunk_uid, attempts, last_error FROM vector_outbox WHERE attempts > 0 ORDER BY attempts DESC LIMIT ?1", sampleLimit);
+      `SELECT s.chunk_uid, s.attempts, s.failure_code, s.last_error
+         FROM vector_outbox_retry_state s
+         JOIN vector_outbox o ON o.chunk_uid=s.chunk_uid AND o.generation=s.generation
+        WHERE s.quarantined_at IS NOT NULL
+        ORDER BY s.quarantined_at, s.attempts DESC LIMIT ?1`, sampleLimit);
     add({ id: "quarantined", area: "integrity", severity: "crit", count: n,
       title: `${n} vector operation(s) failed and were set aside`,
-      detail: "Upsert failures stay invisible to meaning search; delete failures leave stale vectors consuming candidates. Both remain queued for repair.",
-      samples: rows.map((r) => `${r.chunk_uid}: ${String(r.last_error || "").slice(0, 90)}`),
-      action: "Read the errors above. Once the cause is fixed, `brain reindex <manifest> --yes` re-queues them." });
+      detail: "Each operation reached the bounded retry limit. Upsert failures stay invisible to meaning search; delete failures leave stale vectors consuming candidates. Later eligible work continues draining.",
+      samples: rows.map((r) => `${r.chunk_uid} (${r.failure_code}): ${String(r.last_error || "").slice(0, 90)}`),
+      action: "Fix the reported cause, preview POST /api/admin/brain/vector-retry, then repeat with {\"confirm\":true}." });
   });
 
   await safe("orphan_chunks", async () => {
@@ -2967,18 +3134,25 @@ export async function reindex(env, { source = null, dryRun = true, bootstrap = f
 }
 
 export async function outboxDepth(env) {
+  await ensureVectorRetryStateTable(env);
   const row = await env.DB.prepare(
-    `SELECT count(*) AS n, min(queued_at) AS oldest,
-            sum(CASE WHEN op = 'upsert' THEN 1 ELSE 0 END) AS upserts,
-            sum(CASE WHEN op = 'delete' THEN 1 ELSE 0 END) AS deletes,
-            sum(CASE WHEN submitted_mutation_id IS NOT NULL THEN 1 ELSE 0 END) AS submitted
-     FROM vector_outbox`
-  ).first();
+    `SELECT count(*) AS n, min(o.queued_at) AS oldest,
+            sum(CASE WHEN o.op = 'upsert' THEN 1 ELSE 0 END) AS upserts,
+            sum(CASE WHEN o.op = 'delete' THEN 1 ELSE 0 END) AS deletes,
+            sum(CASE WHEN o.submitted_mutation_id IS NOT NULL THEN 1 ELSE 0 END) AS submitted,
+            sum(CASE WHEN s.quarantined_at IS NOT NULL THEN 1 ELSE 0 END) AS quarantined,
+            sum(CASE WHEN s.quarantined_at IS NULL AND s.next_attempt_at > ? THEN 1 ELSE 0 END) AS delayed
+       FROM vector_outbox o
+       LEFT JOIN vector_outbox_retry_state s
+         ON s.chunk_uid=o.chunk_uid AND s.generation=o.generation`
+  ).bind(Date.now()).first();
   return {
     pending: Number(row?.n || 0),
     upserts: Number(row?.upserts || 0),
     deletes: Number(row?.deletes || 0),
     submitted: Number(row?.submitted || 0),
+    quarantined: Number(row?.quarantined || 0),
+    delayed: Number(row?.delayed || 0),
     oldest_queued_at: row?.oldest ?? null,
   };
 }
@@ -2991,6 +3165,7 @@ export async function outboxDepth(env) {
  * that starts after the D1 read simply starts after this point-in-time check.
  */
 export async function vectorReadiness(env) {
+  await ensureVectorRetryStateTable(env);
   let description;
   try {
     description = await env.VECTORIZE.describe();
@@ -3016,6 +3191,10 @@ export async function vectorReadiness(env) {
             (SELECT count(*) FROM vector_outbox) AS pending,
             (SELECT count(*) FROM vector_outbox
               WHERE submitted_mutation_id IS NOT NULL) AS submitted,
+            (SELECT count(*) FROM vector_outbox o
+              JOIN vector_outbox_retry_state s
+                ON s.chunk_uid=o.chunk_uid AND s.generation=o.generation
+             WHERE s.quarantined_at IS NOT NULL) AS quarantined,
             (SELECT min(queued_at) FROM vector_outbox) AS oldest_queued_at
        FROM install_state WHERE id = 1`
   ).first();
@@ -3025,7 +3204,8 @@ export async function vectorReadiness(env) {
   const expected = Number(state.expected_vectors);
   const pending = Number(state.pending);
   const submitted = Number(state.submitted);
-  if (![expected, pending, submitted].every((value) => Number.isSafeInteger(value) && value >= 0) ||
+  const quarantined = Number(state.quarantined || 0);
+  if (![expected, pending, submitted, quarantined].every((value) => Number.isSafeInteger(value) && value >= 0) ||
       submitted > pending) {
     throw new Error("the vector readiness counts are invalid");
   }
@@ -3060,6 +3240,9 @@ export async function vectorReadiness(env) {
     if (status === "bootstrap_required") {
       reason = "projection_bootstrap_required";
       action = "Run `brain update <manifest>` to resume the bounded legacy vector bootstrap.";
+    } else if (quarantined > 0) {
+      reason = "vector_work_quarantined";
+      action = "Fix the reported cause, then use the explicit vector-retry preview and confirmation endpoint.";
     } else if (pending > 0) {
       reason = submitted > 0 && !mutationProcessed
         ? "accepted_mutation_processing"
@@ -3087,6 +3270,7 @@ export async function vectorReadiness(env) {
     actual_vectors: vectorCount,
     pending,
     submitted,
+    quarantined,
     oldest_queued_at: state.oldest_queued_at ?? null,
     mutation_submitted_at: state.mutation_submitted_at ?? null,
     projection_status: status,

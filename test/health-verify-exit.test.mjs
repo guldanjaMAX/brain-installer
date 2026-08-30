@@ -340,7 +340,7 @@ if (SCENARIO) {
   const optionalWarnings = runScenario("verify-optional-warnings", "verify", { cloudflareToken: true });
   check("optional R2 and Vectorize access remain warnings",
     optionalWarnings.code === 0 && /R2 is not ready/.test(optionalWarnings.output) &&
-      /Provision can use wrangler login as a temporary fallback/.test(optionalWarnings.output) &&
+      /Provision can use a separately named Wrangler profile as a temporary fallback/.test(optionalWarnings.output) &&
       /D1 is reachable/.test(optionalWarnings.output) && /Workers is reachable/.test(optionalWarnings.output),
     optionalWarnings.output);
 

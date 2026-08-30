@@ -298,7 +298,16 @@ function stubOcr({ reply = () => pageText, model = "@cf/google/gemma-4-26b-a4b-i
 /* ============================================ the model call, and custody */
 
 {
-  const db = () => ({ prepare: () => ({ bind: () => ({ run: async () => {}, first: async () => ({ m: 0 }) }), run: async () => {}, first: async () => ({ m: 0 }) }) });
+  const db = (reserve = true) => {
+    let id = 0;
+    return {
+      exec: async () => {},
+      prepare: (sql) => ({ bind: () => ({
+        run: async () => ({ meta: { changes: 1 } }),
+        first: async () => /RETURNING id/.test(sql) ? (reserve ? { id: ++id } : null) : {},
+      }) }),
+    };
+  };
   const origFetch = globalThis.fetch;
   let anthropicCalls = 0;
   globalThis.fetch = async () => { anthropicCalls++; return { ok: true, status: 200, json: async () => ({ content: [], usage: {} }), text: async () => "" }; };
@@ -350,7 +359,17 @@ function stubOcr({ reply = () => pageText, model = "@cf/google/gemma-4-26b-a4b-i
   const req = (body) => new Request("https://brain.example/api/admin/brain/ocr", {
     method: "POST", headers: { "X-Admin-Key": key, "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
-  const db = { prepare: () => ({ bind: () => ({ run: async () => {}, first: async () => ({ m: 0 }) }), run: async () => {}, first: async () => ({ m: 0 }) }), exec: async () => {} };
+  const reservationDb = (reserve = true) => {
+    let id = 0;
+    return {
+      exec: async () => {},
+      prepare: (sql) => ({ bind: () => ({
+        run: async () => ({ meta: { changes: 1 } }),
+        first: async () => /RETURNING id/.test(sql) ? (reserve ? { id: ++id } : null) : {},
+      }) }),
+    };
+  };
+  const db = reservationDb();
 
   const unauth = await handleOcr({ ADMIN_KEY: key, OCR_ENABLED: "1", DB: db }, new Request("https://b/x", { method: "POST" }));
   check("the OCR route is admin-gated", unauth.status === 401, String(unauth.status));
@@ -373,7 +392,7 @@ function stubOcr({ reply = () => pageText, model = "@cf/google/gemma-4-26b-a4b-i
   const capped = await handleOcr(
     {
       ADMIN_KEY: key, OCR_ENABLED: "1", DAILY_LLM_CAP_USD: "0",
-      DB: { ...db, prepare: () => ({ bind: () => ({ run: async () => {}, first: async () => ({ m: 5_000_000 }) }) }) },
+      DB: reservationDb(false),
       AI: { run: async () => ({ response: "x" }) },
     },
     req({ image_base64: "AA", prompt: "p" }),

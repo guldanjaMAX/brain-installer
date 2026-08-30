@@ -2,6 +2,7 @@ import { run, localToolEnvironment, cloudflareCliEnvironment,
          checkNode, checkClaudeCode, checkCodex, checkAnthropicKey, checkGoogleConnection,
          checkWrangler,
          checkWranglerLogin, checkVectorize, checkVectorizeApi, checkCfToken, CF_TOKEN_SCOPES,
+         wranglerProfileArgs, wranglerProfileName, WRANGLER_PACKAGE,
          summarize, runAll, OK, WARN, FAIL } from "../doctor.mjs";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
@@ -26,7 +27,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   const missingTool = () => ({ ok: false, out: "not found", missing: true });
   const healthyTool = (_command, args) => ({
     ok: true,
-    out: args.includes("wrangler@4") ? "wrangler 4.34.0" :
+    out: args.includes(WRANGLER_PACKAGE) ? "wrangler 4.127.1" :
       args.includes("status") ? "" : "2.1.63 (Claude Code)",
   });
   check("Claude Code is a blocking owner-install requirement",
@@ -40,7 +41,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     : { ok: true, out: "2.1.63 (Claude Code)" };
   check("an installed but signed-out Claude Code is not a false green",
     checkClaudeCode({ runCommand: signedOutTool }).status === FAIL);
-  check("Wrangler 4 is a blocking requirement and is pinned through npx",
+  check("the profile-capable Wrangler release is a blocking requirement and is pinned through npx",
     checkWrangler(healthyTool).status === OK);
   check("Codex is never fatal", checkCodex().status !== FAIL);
   check("a missing Anthropic key is not a blocker", checkAnthropicKey().status !== FAIL);
@@ -125,12 +126,36 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 
 /* ---- the standard token owns Vectorize; browser login is only a fallback ---- */
 {
-  const l = checkWranglerLogin("0000");
-  if (l.status !== OK) {
-    check("wrangler login is described as a fallback", l.status === WARN && /fallback/i.test(l.fix), l.fix);
-  } else {
-    check("wrangler login reports signed in cleanly", !/\\.$/.test(l.detail.trim()), l.detail);
-  }
+  const accountId = "a".repeat(32);
+  const seen = [];
+  const signedIn = (_command, args, options) => {
+    seen.push({ args, options });
+    return { ok: true, out: JSON.stringify({ indexes: [] }) };
+  };
+  const l = checkWranglerLogin(accountId, signedIn);
+  check("wrangler login requires an explicit confirmation of the manifest account",
+    l.status === OK && /declared account/i.test(l.detail), JSON.stringify(l));
+  check("the confirmation read is pinned to the declared account and a named profile",
+    seen[0]?.args.includes("vectorize") && seen[0]?.args.includes("list") &&
+      seen[0]?.args.includes("--json") && seen[0]?.args.includes("--profile") &&
+      seen[0]?.args.includes(wranglerProfileName(accountId)) &&
+      seen[0]?.options?.env?.CLOUDFLARE_ACCOUNT_ID === accountId,
+    JSON.stringify(seen[0]));
+  const otherAccount = "b".repeat(32);
+  const mismatch = checkWranglerLogin(accountId, () => ({
+    ok: false,
+    out: "authorization failed for the selected account",
+  }));
+  check("a named profile that cannot read the declared account fails closed",
+    mismatch.status === FAIL && /could not confirm read access/i.test(mismatch.detail), JSON.stringify(mismatch));
+  check("per-account profile labels are stable, distinct, and do not expose account ids",
+    wranglerProfileName(accountId) === wranglerProfileName(accountId) &&
+      wranglerProfileName(accountId) !== wranglerProfileName(otherAccount) &&
+      !wranglerProfileName(accountId).includes(accountId), wranglerProfileName(accountId));
+  const originalArgs = [WRANGLER_PACKAGE, "vectorize", "list"];
+  const profiledArgs = wranglerProfileArgs(originalArgs, accountId);
+  check("profile argument construction is non-mutating",
+    originalArgs.length === 3 && profiledArgs.length === 5 && profiledArgs.at(-2) === "--profile");
   check("the scoped token includes Vectorize Edit", CF_TOKEN_SCOPES.includes("Vectorize: Edit"), JSON.stringify(CF_TOKEN_SCOPES));
 }
 {
@@ -150,19 +175,67 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     !/Recreate the account-scoped token/i.test(tokenCheck.fix), tokenCheck.fix);
   check("and it does not call it the CLIENT's account, which the owner may be reading",
     !/CLIENT's account/.test(tokenCheck.fix), tokenCheck.fix);
-  // Presence is not validity. This regressed once as "ok, ready to install"
-  // on a completely bogus token, which is the worst possible false green.
-  const bogus = await checkCfToken("cfut_thisIsNotARealTokenAtAll1234567890");
-  check("a syntactically plausible but invalid token FAILS rather than passing",
-    bogus.status === FAIL || bogus.status === WARN, JSON.stringify(bogus));
-  if (bogus.status === FAIL) {
-    check("and the invalid-token message says what to actually check",
-      /copied whole|expired|API Tokens/i.test(bogus.fix), bogus.fix);
-  }
+  const accountId = "c".repeat(32);
+  const active = { success: true, result: { status: "active" } };
+  const rejected = { success: false, errors: [{ code: 9109, message: "Invalid access token" }] };
+  const fixtureResponse = (status, payload) => new Response(JSON.stringify(payload), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+
+  const userCalls = [];
+  const userOwned = await checkCfToken("fixture-user-owned-token", {
+    accountId,
+    fetchImpl: async (url) => {
+      userCalls.push(url);
+      return fixtureResponse(200, active);
+    },
+  });
+  check("a valid user-owned token passes through the user-scoped verification path",
+    userOwned.status === OK && /user-owned/.test(userOwned.detail) &&
+      userCalls.length === 1 && /\/user\/tokens\/verify$/.test(userCalls[0]),
+    JSON.stringify({ userOwned, userCalls }));
+
+  const accountCalls = [];
+  const accountOwned = await checkCfToken("fixture-account-owned-token", {
+    accountId,
+    fetchImpl: async (url) => {
+      accountCalls.push(url);
+      return /\/user\/tokens\/verify$/.test(url)
+        ? fixtureResponse(403, rejected)
+        : fixtureResponse(200, active);
+    },
+  });
+  check("a valid account-owned token survives the user-endpoint rejection and passes account-scoped verification",
+    accountOwned.status === OK && /account-owned/.test(accountOwned.detail) &&
+      accountCalls[1] === `https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens/verify`,
+    JSON.stringify({ accountOwned, accountCalls }));
+
+  const invalidCalls = [];
+  const invalid = await checkCfToken("fixture-invalid-token", {
+    accountId,
+    fetchImpl: async (url) => {
+      invalidCalls.push(url);
+      return fixtureResponse(403, rejected);
+    },
+  });
+  check("an invalid token fails closed only after both applicable ownership paths reject it",
+    invalid.status === FAIL && invalidCalls.length === 2 && /every applicable verification path/i.test(invalid.detail),
+    JSON.stringify({ invalid, invalidCalls }));
+  check("the invalid-token message says what to actually check",
+    /copied whole|expired|API Tokens/i.test(invalid.fix), invalid.fix);
+
+  const ownershipUnknown = await checkCfToken("fixture-account-owned-token", {
+    fetchImpl: async () => fixtureResponse(403, rejected),
+  });
+  check("without an account id a user-endpoint rejection is indeterminate, not a false invalid-token failure",
+    ownershipUnknown.status === WARN && /account-owned token/i.test(ownershipUnknown.detail),
+    JSON.stringify(ownershipUnknown));
   if (saved) process.env.CLOUDFLARE_API_TOKEN = saved;
 }
 {
-  const v = checkVectorize("00000000000000000000000000000000");
+  const vectorAccount = "0".repeat(32);
+  const v = checkVectorize(vectorAccount, () => ({ ok: true, out: JSON.stringify({ indexes: [] }) }));
   // Three legitimate outcomes, and the middle one is the point: a login that can
   // see several accounts is NOT a billing problem, and saying so would send
   // someone to buy a plan they may already have.
@@ -264,7 +337,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   // straight through, deleting the client's own exported account id and leaving
   // wrangler unable to choose between their accounts.
   process.env.CLOUDFLARE_ACCOUNT_ID = "USERSET";
-  const l = checkWranglerLogin(undefined);
+  const l = checkWranglerLogin(undefined, () => { throw new Error("should not spawn without an account id"); });
   check("checking login without a manifest does not clobber the user's account id",
     process.env.CLOUDFLARE_ACCOUNT_ID === "USERSET" && !!l.status);
   const probe = run("node", ["-e", "console.log(process.env.CLOUDFLARE_ACCOUNT_ID || '(absent)')"], {

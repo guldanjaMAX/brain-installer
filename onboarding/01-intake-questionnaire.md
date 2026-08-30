@@ -169,7 +169,7 @@ Beyond what you are paying me, you will pay two vendors directly, on your own ca
 - Hosting and database: roughly **$5 to $25 a month** depending on volume
 - AI provider usage: roughly **$20 to $100 a month** depending on how much you use it
 
-I set a hard daily ceiling on the AI spend so a runaway process cannot produce a surprise bill.
+I set a daily estimated-spend budget for AI. The Brain atomically reserves a conservative amount before each request, so concurrent requests cannot all spend the same remaining budget. Provider prices and usage receipts can still change, so this is a strong runaway guard rather than an invoice-exact promise.
 
 I would rather you see these numbers now than find them on a statement later.
 

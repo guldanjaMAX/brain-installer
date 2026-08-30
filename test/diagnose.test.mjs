@@ -19,6 +19,9 @@ let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
 
 const MIG = fileURLToPath(new URL("../migrations/d1/", import.meta.url));
+const RELIABILITY_MIG = fileURLToPath(
+  new URL("../migrations/pending/operational_reliability_v021.sql", import.meta.url),
+);
 
 // A D1-shaped facade over real SQLite, so diagnose() runs unmodified.
 function makeEnv({ vectorCount = null } = {}) {
@@ -26,6 +29,9 @@ function makeEnv({ vectorCount = null } = {}) {
   for (const f of readdirSync(MIG).filter((f) => f.endsWith(".sql")).sort()) {
     db.exec(readFileSync(join(MIG, f), "utf-8"));
   }
+  // This branch deliberately keeps its schema unnumbered until 0023-0028
+  // freeze. Load that exact pending schema for the feature-level diagnostic.
+  db.exec(readFileSync(RELIABILITY_MIG, "utf-8"));
   db.prepare(
     `INSERT INTO install_state
        (id, client_slug, product_version, schema_version, gate_version, installed_at, ring)
@@ -313,6 +319,12 @@ const find = (r, id) => (r.findings || []).find((f) => f.id === id);
   doc(env._db, "d1"); chunk(env._db, "d1#0", "d1");
   env._db.prepare("INSERT INTO vector_outbox (chunk_uid, op, queued_at, attempts, last_error) VALUES (?,?,?,?,?)")
     .run("d1#0", "upsert", Date.now(), 3, "id too long; max is 64 bytes, got 67 bytes");
+  env._db.prepare(
+    `INSERT INTO vector_outbox_retry_state
+       (chunk_uid,generation,attempts,next_attempt_at,last_attempt_at,quarantined_at,failure_code,last_error)
+     SELECT chunk_uid,generation,5,?,?,?,'embedding_failure',?
+       FROM vector_outbox WHERE chunk_uid=?`,
+  ).run(Date.now(), Date.now(), Date.now(), "id too long; max is 64 bytes, got 67 bytes", "d1#0");
   const f = find(await diagnose(env), "quarantined");
   check("quarantined chunks are caught", f?.severity === "crit" && f.count === 1, JSON.stringify(f));
   check("and the real error is shown verbatim", (f?.samples || []).some((s) => /64 bytes/.test(s)), JSON.stringify(f?.samples));

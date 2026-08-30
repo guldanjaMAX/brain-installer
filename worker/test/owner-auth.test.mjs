@@ -28,11 +28,13 @@ function authDb() {
   let batchTail = Promise.resolve();
   return {
     tables,
+    async exec() {},
     prepare(sql) {
       let bound = [];
       const statement = {
         bind(...args) { bound = args; return statement; },
         async first() {
+          if (/INSERT INTO public_request_quotas/.test(sql)) return { request_count: 1 };
           if (/UPDATE enrollment_codes SET used_at/.test(sql)) {
             const row = tables.codes.get(bound[1]);
             if (!row || row.used_at || Number(row.expires_at) <= Number(bound[2])) return null;

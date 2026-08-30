@@ -22,6 +22,8 @@ import {
   drainOutbox,
   forget,
   forgetFamilies,
+  retryQuarantinedVectorOps,
+  vectorRetrySummary,
   vectorReadiness,
 } from "../worker/src/lib/store-d1.js";
 import { storeFor } from "../worker/src/lib/store.js";
@@ -40,6 +42,7 @@ function makeEnv({
   enforceD1PatternLimit = false,
   invalidGetByIdsPage = null,
   malformedAcceleratedVectorIdReadback = false,
+  rejectUpsertIds = [],
   skipAcceleratedVectorIdUpdate = false,
 } = {}) {
   const db = new DatabaseSync(":memory:");
@@ -61,6 +64,7 @@ function makeEnv({
   let processedUpToMutation = null;
   const pendingVectorMutations = [];
   const getByIdsCalls = [];
+  const control = { rejectUpsertIds: new Set(rejectUpsertIds) };
   const accept = (apply) => {
     const mutationId = `fixture-mutation-${++mutationSequence}`;
     if (autoProcessVectorMutations) {
@@ -117,6 +121,7 @@ function makeEnv({
     },
     _pendingVectorMutations: pendingVectorMutations,
     DB: {
+      exec: async (sql) => { db.exec(sql); return { count: 1 }; },
       prepare,
       batch: async (statements) => {
         d1Queries.submitted += statements.length;
@@ -149,6 +154,9 @@ function makeEnv({
     VECTORIZE: {
       upsert: async (vectors) => {
         upsertBatches.push(vectors.map((vector) => vector.id));
+        if (vectors.some((vector) => control.rejectUpsertIds.has(vector.id))) {
+          throw new Error("synthetic provider rejected one vector");
+        }
         return accept(() => {
           upserted.push(...vectors);
           for (const vector of vectors) visible.set(vector.id, structuredClone(vector));
@@ -173,7 +181,7 @@ function makeEnv({
       }),
     },
   };
-  return { env, db, deleted, upserted, upsertBatches, visible, d1Queries, getByIdsCalls };
+  return { env, db, deleted, upserted, upsertBatches, visible, d1Queries, getByIdsCalls, control };
 }
 
 const insertDocument = (db, uid, source = "drive") => db.prepare(
@@ -188,8 +196,14 @@ const insertChunk = (db, uid, doc, ix, vectorId = uid) => db.prepare(
 
 async function drainFully(env, options = {}, maxRounds = 20) {
   const total = { drained: 0, deleted: 0, upserted: 0, submitted: 0, failed: 0, remaining: null };
+  let retryClock = Date.now();
   for (let round = 0; round < maxRounds; round++) {
-    const part = await drainOutbox(env, { maxBatches: 10, ...options });
+    retryClock += 3 * 60 * 60 * 1000;
+    const part = await drainOutbox(env, {
+      maxBatches: 10,
+      ...options,
+      now: options.now || (() => retryClock),
+    });
     for (const field of ["drained", "deleted", "upserted", "submitted", "failed"]) {
       total[field] += Number(part[field] || 0);
     }
@@ -955,7 +969,7 @@ const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
     drainBatchQueryUpperBound(100) === 212);
   check("a ten-batch request stops before the internal D1 query budget",
     drained.drained === 200 && drained.remaining === 400 &&
-      submitted === 421 && submitted < DRAIN_D1_QUERY_BUDGET,
+      submitted === 422 && submitted < DRAIN_D1_QUERY_BUDGET,
     JSON.stringify({ drained, submitted, budget: DRAIN_D1_QUERY_BUDGET }));
   check("query-budget exhaustion never strands the exclusive drain lease",
     leaseState.owner === null && leaseState.expires === null,
@@ -1631,6 +1645,90 @@ for (const reportedChanges of [0, 9]) {
   check("accelerated bootstrap cannot run outside the verified pause",
     /requires the verified upgrade pause/.test(activeError?.message || "") && upsertBatches.length === 0,
     activeError?.message);
+}
+
+/* A provider-rejected vector is retried on schedule, isolated after its first
+   batch failure, quarantined at the bounded limit, and cannot starve later
+   generations. Operator retry is preview/confirm and returns aggregates only. */
+{
+  const { env, db, visible, control } = makeEnv({ rejectUpsertIds: ["poison#0"] });
+  let clock = 1_000_000;
+  const now = () => clock;
+  for (const [docUid, chunkUid] of [
+    ["drive:poison", "poison#0"],
+    ["drive:innocent", "innocent#0"],
+  ]) {
+    insertDocument(db, docUid);
+    insertChunk(db, chunkUid, docUid, 0);
+    db.prepare("INSERT INTO vector_outbox (chunk_uid,vector_id,op,queued_at) VALUES (?,?,'upsert',?)")
+      .run(chunkUid, chunkUid, clock++);
+  }
+
+  let firstError = null;
+  try {
+    await drainOutbox(env, { now, embed: async () => [0.1], embedBatch: async (texts) => texts.map(() => [0.1]), maxBatches: 10 });
+  } catch (error) { firstError = error; }
+  let retryRows = db.prepare(
+    "SELECT chunk_uid,attempts,next_attempt_at,quarantined_at FROM vector_outbox_retry_state ORDER BY chunk_uid"
+  ).all();
+  check("a rejected fresh batch receives durable retry schedules",
+    /synthetic provider rejected/.test(firstError?.message || "") && retryRows.length === 2 &&
+      retryRows.every((row) => row.attempts === 1 && row.next_attempt_at > clock && row.quarantined_at === null),
+    JSON.stringify({ message: firstError?.message, retryRows }));
+
+  // Oldest retry is attempted alone. Once it fails and moves into the future,
+  // the innocent row behind it is accepted and confirmed on the next pass.
+  clock = Number(retryRows.find((row) => row.chunk_uid === "poison#0").next_attempt_at);
+  await drainOutbox(env, { now, embed: async () => [0.1], maxBatches: 10 }).catch(() => {});
+  const innocent = await drainOutbox(env, {
+    now, embed: async () => [0.1], embedBatch: async (texts) => texts.map(() => [0.1]), maxBatches: 10,
+  });
+  check("a poison retry is isolated so an innocent row behind it completes",
+    visible.has("innocent#0") && !visible.has("poison#0") && innocent.remaining === 1,
+    JSON.stringify(innocent));
+
+  for (let expectedAttempt = 3; expectedAttempt <= 5; expectedAttempt++) {
+    const state = db.prepare(
+      "SELECT attempts,next_attempt_at FROM vector_outbox_retry_state WHERE chunk_uid='poison#0'"
+    ).get();
+    clock = Number(state.next_attempt_at);
+    await drainOutbox(env, { now, embed: async () => [0.1] }).catch(() => {});
+    const after = db.prepare(
+      "SELECT attempts FROM vector_outbox_retry_state WHERE chunk_uid='poison#0'"
+    ).get();
+    check(`poison retry ${expectedAttempt} is durably bounded`, after.attempts === expectedAttempt, JSON.stringify(after));
+  }
+  const summary = await vectorRetrySummary(env, clock);
+  const readiness = await vectorReadiness(env);
+  check("the fifth failure quarantines the poison generation and readiness names it",
+    summary.quarantined === 1 && summary.delayed === 0 && readiness.quarantined === 1 &&
+      readiness.reason === "vector_work_quarantined",
+    JSON.stringify({ summary, readiness }));
+
+  insertDocument(db, "drive:later");
+  insertChunk(db, "later#0", "drive:later", 0);
+  db.prepare("INSERT INTO vector_outbox (chunk_uid,vector_id,op,queued_at) VALUES ('later#0','later#0','upsert',?)")
+    .run(++clock);
+  const later = await drainOutbox(env, {
+    now, embed: async () => [0.1], embedBatch: async (texts) => texts.map(() => [0.1]), maxBatches: 10,
+  });
+  check("quarantine prevents starvation of later vector work",
+    visible.has("later#0") && later.remaining === 1, JSON.stringify(later));
+
+  const preview = await retryQuarantinedVectorOps(env, { confirm: false });
+  const confirmed = await retryQuarantinedVectorOps(env, { confirm: true });
+  check("operator retry is an aggregate preview followed by explicit confirmation",
+    preview.dry_run === true && preview.quarantined === 1 && preview.retried === 0 &&
+      confirmed.dry_run === false && confirmed.retried === 1 &&
+      !JSON.stringify({ preview, confirmed }).includes("poison#0"),
+    JSON.stringify({ preview, confirmed }));
+  control.rejectUpsertIds.clear();
+  const repaired = await drainOutbox(env, {
+    now, embed: async () => [0.1], embedBatch: async (texts) => texts.map(() => [0.1]), maxBatches: 10,
+  });
+  check("explicit retry converges after the provider cause is fixed",
+    repaired.remaining === 0 && visible.has("poison#0") && (await vectorReadiness(env)).ready === true,
+    JSON.stringify(repaired));
 }
 
 console.log(`\nvector delete outbox: ${ran - fail}/${ran} passed`);

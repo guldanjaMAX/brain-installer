@@ -93,7 +93,7 @@ You pay two vendors directly, on your own card, because these are your accounts:
 - **Hosting and database: roughly $5 to $25 a month**, depending on volume.
 - **AI provider usage: roughly $20 to $100 a month**, depending on how much you use it.
 
-I set a hard daily ceiling on the AI spend, so a runaway process cannot produce a surprise bill. The ceiling is written into your install and you can see it and change it.
+I set a daily estimated-spend budget for AI. The Brain atomically reserves a conservative amount before each request, so concurrent requests cannot all spend the same remaining budget. The setting is written into your install and you can see it and change it. Provider prices and usage receipts can still change, so it is not an invoice-exact promise.
 
 You will see these charges on your own statement next to my invoice. I would rather you see the numbers here than find them later.
 

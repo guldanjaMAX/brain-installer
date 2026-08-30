@@ -338,14 +338,16 @@ function ingestExitCli(scenario) {
       legacyPreview.out);
   }
 
-  const status = cli(["support"], {}, { userRoot, keepUserRoot: true });
+  const privateIdentitySentinel = "PRIVATE_CLIENT_IDENTITY_SENTINEL";
+  const status = cli(["support"], { BRAIN_NAME: privateIdentitySentinel }, { userRoot, keepUserRoot: true });
   check("support status reports the bounded recent shareable count without exposing the home path",
     status.code === 0 && /1 recent shareable issue note\(s\) available to preview or export/i.test(status.out) &&
       /last 30 days, newest 200 notes, up to 2 MiB/i.test(status.out) &&
       /safe expired and overflow notes are cleaned up after writes/i.test(status.out) &&
       /fresh or concurrent files may remain until a later safe cleanup/i.test(status.out) &&
       /links and special files are refused and require manual review/i.test(status.out) &&
-      !status.out.includes(userRoot) && !/stored locally/i.test(status.out), status.out);
+      !status.out.includes(userRoot) && !status.out.includes(privateIdentitySentinel) &&
+      !/stored locally/i.test(status.out), status.out);
 
   const exportPath = join(userRoot, "safe-support-export.jsonl");
   const exported = cli(["support", "--export", exportPath], {}, { userRoot, keepUserRoot: true });

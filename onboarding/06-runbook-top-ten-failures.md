@@ -345,9 +345,9 @@ node brain.mjs deploy <manifest>
 node brain.mjs health <manifest>
 ```
 
-**`daily LLM spend cap reached`**
+**`daily estimated LLM spend budget reached`**
 
-Working as designed. You hit the daily ceiling written into your install, which exists so a runaway process cannot produce a surprise bill. It resets at midnight UTC.
+Working as designed. The next request could not reserve enough of the daily estimated-spend budget written into your install. Reservations are atomic across concurrent requests and the budget resets at midnight UTC.
 
 If it is happening regularly and legitimately, the ceiling is too low for how you use it. Raise `safety.daily_llm_spend_cap_usd` in the manifest and redeploy:
 
@@ -355,7 +355,7 @@ If it is happening regularly and legitimately, the ceiling is too low for how yo
 node brain.mjs deploy <manifest>
 ```
 
-Before raising it, check **why** you hit it. A cap hit on a quiet day is a loop, not a busy day.
+Before raising it, check **why** you hit it. A budget refusal on a quiet day may indicate a retry loop or failed provider calls retaining conservative reservations.
 
 **Who:** you.
 

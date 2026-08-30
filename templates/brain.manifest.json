@@ -33,8 +33,9 @@
         "  Account > Workers R2 Storage: Edit   (only if r2_bucket is set)",
         "  Account > Workers AI: Read",
         "Vectorize Edit was verified on 2026-08-23 for index creation and every",
-        "metadata index. `npx wrangler@4 login` is only a fallback for an older",
-        "token that does not carry that permission.",
+        "metadata index. A separate named Wrangler profile is only a fallback",
+        "for an older token that does not carry that permission; `brain doctor`",
+        "prints its exact profile sign-in step and confirms this manifest account.",
         "",
         "The account must ALSO be on the Workers Paid plan, 5 USD a month minimum.",
         "Free can create Vectorize, but its vector, daily-write, and Worker CPU limits are prototype-scale. Paid is the supported production baseline."
@@ -291,7 +292,7 @@
     ],
     "daily_llm_spend_cap_usd": 10,
     "ocr": {
-      "_comment": "Read scanned PDFs by sending each page image to a vision model through THIS brain's own Workers AI binding. OFF by default on purpose: it spends money on the client's own Cloudflare account, once per scanned page, and nobody should discover that after the fact. Every page still passes the daily spend cap, and every document read this way is MARKED as OCR so an answer resting on it says so.",
+      "_comment": "Read scanned PDFs by sending each page image to a vision model through THIS brain's own Workers AI binding. OFF by default on purpose: it spends money on the client's own Cloudflare account, once per scanned page, and nobody should discover that after the fact. Every page must atomically reserve a conservative amount from the daily estimated-spend budget, and every document read this way is MARKED as OCR so an answer resting on it says so.",
       "enabled": false,
       "model": "@cf/google/gemma-4-26b-a4b-it",
       "_model_note": "Must be a Cloudflare @cf/ model. OCR refuses anything else rather than send a picture of a client document to a provider this manifest does not name.",

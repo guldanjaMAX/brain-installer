@@ -2261,9 +2261,6 @@ const bootstrapCompletion = () => ({
         const installedLauncher = process.platform === "win32"
           ? join(prefix, "brain.cmd")
           : join(prefix, "bin", "brain");
-        const manifestPath = join(sandbox, "Financial Brain", "brain.manifest.json");
-        mkdirSync(join(sandbox, "Financial Brain"), { recursive: true });
-        writeFileSync(manifestPath, JSON.stringify(manifestFixture()));
         const isolatedEnvironment = {
           PATH: process.env.PATH || "",
           HOME: fakeHome,
@@ -2273,6 +2270,52 @@ const bootstrapCompletion = () => ({
           ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
           ...(process.env.WINDIR ? { WINDIR: process.env.WINDIR } : {}),
         };
+        const cleanUsage = spawnSync(installedLauncher, [], {
+          cwd: firstDirectory,
+          encoding: "utf8",
+          env: isolatedEnvironment,
+          shell: process.platform === "win32",
+          timeout: 30_000,
+        });
+        check(
+          "the packed launcher starts from a clean user profile and prints its usage",
+          cleanUsage.status === 0 && /brain setup|commands:/i.test(`${cleanUsage.stdout}\n${cleanUsage.stderr}`),
+          `${cleanUsage.stdout}\n${cleanUsage.stderr}`,
+        );
+
+        const noManifestUpdate = spawnSync(installedLauncher, ["update"], {
+          cwd: firstDirectory,
+          encoding: "utf8",
+          env: isolatedEnvironment,
+          shell: process.platform === "win32",
+          timeout: 30_000,
+        });
+        const noManifestUpdateOutput = `${noManifestUpdate.stdout || ""}\n${noManifestUpdate.stderr || ""}`;
+        check(
+          "the packed release reports a clean fresh install with no remembered manifest",
+          noManifestUpdate.status !== 0 && /no installed Brain was found|no manifest found/i.test(noManifestUpdateOutput),
+          noManifestUpdateOutput,
+        );
+
+        const manifestPath = join(sandbox, "Financial Brain", "brain.manifest.json");
+        const nonexistentStatus = spawnSync(installedLauncher, ["status", manifestPath], {
+          cwd: firstDirectory,
+          encoding: "utf8",
+          env: isolatedEnvironment,
+          shell: process.platform === "win32",
+          timeout: 30_000,
+        });
+        const nonexistentStatusOutput = `${nonexistentStatus.stdout || ""}\n${nonexistentStatus.stderr || ""}`;
+        check(
+          "the packed release fails cleanly on an explicitly nonexistent manifest without creating it",
+          nonexistentStatus.status !== 0 && !existsSync(manifestPath) &&
+            /manifest|could not read|not found|no such file/i.test(nonexistentStatusOutput) &&
+            !/\bat .*\.mjs:\d+/.test(nonexistentStatusOutput),
+          nonexistentStatusOutput,
+        );
+
+        mkdirSync(join(sandbox, "Financial Brain"), { recursive: true });
+        writeFileSync(manifestPath, JSON.stringify(manifestFixture()));
         const setupReceipt = spawnSync(process.execPath, [
           "--input-type=module",
           "--eval",

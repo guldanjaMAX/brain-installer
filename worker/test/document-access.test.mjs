@@ -22,6 +22,7 @@ const ENTITY = "fixture-family";
 function d1(db) {
   return {
     raw: db,
+    async exec(sql) { db.exec(sql); },
     prepare(sql) {
       let bound = [];
       const statement = {

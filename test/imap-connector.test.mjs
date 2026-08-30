@@ -25,10 +25,9 @@
 //     the specification and from documented provider behavior, and is NOT
 //     verified by this file. The scripted server answers the way the RFC says
 //     a server should; a real one may not.
-//   - NO TLS. Production connects with `tls.connect` and Node's default
-//     certificate verification. The fixture is plain TCP reached through the
-//     `socketFactory` seam, so TLS negotiation and certificate validation are
-//     untested here.
+//   - TLS is local and synthetic. The suite proves implicit TLS, explicit trust
+//     of the synthetic CA, and default rejection of an untrusted certificate.
+//     It does not prove a live provider's certificate chain or TLS policy.
 //   - NO KEYCHAIN WRITE. Credential custody is asserted on the storage
 //     OPTIONS the connector produces (which item, which env var), not by
 //     writing to a real macOS Keychain.
@@ -44,6 +43,7 @@ import * as imap from "../connectors/imap.mjs";
 import { toEnvelope as gmailToEnvelope } from "../connectors/gmail.mjs";
 import { PassThrough } from "node:stream";
 import { readHiddenSecret } from "../brain.mjs";
+import selfsigned from "selfsigned";
 
 let fail = 0, ran = 0;
 const check = (name, condition, detail = "") => {
@@ -107,12 +107,13 @@ const REPLY = message({
 
 /* ------------------------------------------------------- server + client */
 
-function buildServer() {
+function buildServer(options = {}) {
   const inbox = new Folder("INBOX", { uidvalidity: 4001 });
   inbox.add(ENGAGEMENT, { internaldate: "24-Aug-2026 16:00:00 +0000" });
   inbox.add(INVOICE, { internaldate: "25-Aug-2026 09:12:00 +0000" });
   inbox.add(NEWSLETTER, { internaldate: "25-Aug-2026 11:40:00 +0000" });
   return new ScriptedImapServer({
+    ...options,
     username: "owner@northwind-example.test",
     password: "abcdefghijklmnop",
     folders: [
@@ -560,6 +561,44 @@ try {
     String(imap.parseInternalDate("13-Aug-2026 10:22:31 +0200")));
   check("a malformed INTERNALDATE is null rather than an invented date",
     imap.parseInternalDate("not a date") === null && imap.parseInternalDate("") === null, "expected null");
+
+  /* ============================================================ *
+   * 12. Implicit TLS and certificate verification.
+   * ============================================================ */
+  const identity = await selfsigned.generate(
+    [{ name: "commonName", value: "127.0.0.1" }],
+    {
+      days: 1,
+      keySize: 2048,
+      algorithm: "sha256",
+      extensions: [{ name: "subjectAltName", altNames: [{ type: 7, ip: "127.0.0.1" }] }],
+    },
+  );
+  const tlsServer = buildServer({ tls: { key: identity.private, cert: identity.cert } });
+  await tlsServer.listen();
+  try {
+    const trusted = new imap.ImapClient({
+      host: "127.0.0.1",
+      port: tlsServer.port,
+      socketFactory: tlsServer.tlsSocketFactory({ ca: identity.cert }),
+    });
+    await trusted.connect();
+    await trusted.login(tlsServer.username, tlsServer.password);
+    const tlsInbox = await trusted.examine("INBOX");
+    await trusted.logout();
+    check("TLS fixture: implicit TLS reaches a real authenticated IMAP command",
+      tlsInbox.uidvalidity === 4001 && tlsServer.log.some((line) => line === "LOGIN <redacted>"),
+      JSON.stringify({ uidvalidity: tlsInbox.uidvalidity, log: tlsServer.log }));
+
+    const untrusted = new imap.ImapClient({ host: "127.0.0.1", port: tlsServer.port, timeoutMs: 2000 });
+    let certificateError = null;
+    try { await untrusted.connect(); } catch (error) { certificateError = error; }
+    check("TLS fixture: production defaults reject an untrusted mailbox certificate",
+      certificateError instanceof imap.ImapError && /self-signed|certificate/i.test(certificateError.message),
+      String(certificateError?.message));
+  } finally {
+    await tlsServer.close();
+  }
 
   await server.close();
 

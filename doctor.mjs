@@ -17,6 +17,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { platform } from "node:os";
 import { tokenStorageStatus, verifyTokenStorageReadable } from "./connectors/google-auth.mjs";
@@ -24,6 +25,7 @@ import { tokenStorageStatus, verifyTokenStorageReadable } from "./connectors/goo
 export const OK = "ok";
 export const WARN = "warn";
 export const FAIL = "fail";
+export const WRANGLER_PACKAGE = "wrangler@4.127.1";
 
 /**
  * The ONE description of how Vectorize is reached, so the CLI, the doctor, the
@@ -54,9 +56,9 @@ export const CF_PLAN_NOTE =
 export const VECTORIZE_REMEDY =
   "  Recreate the account-scoped token with Vectorize: Edit. That is the standard\n" +
   "  path and has been verified for index and metadata-index creation.\n" +
-  "  Temporary fallback: run `npx wrangler@4 login` in the account owner's browser.\n" +
-  "  Provision can use that session for Vectorize while the API token drives the\n" +
-  "  remaining steps.\n" +
+  "  Temporary fallback: run `brain doctor <manifest>` and follow its exact named\n" +
+  "  Wrangler-profile sign-in step. Provision confirms the manifest account before\n" +
+  "  that isolated session can be used for Vectorize.\n" +
   CF_PLAN_NOTE;
 
 /** The token scopes, in one place, for the same reason. */
@@ -147,6 +149,24 @@ export function cloudflareCliEnvironment(accountId, environment = process.env) {
     : {});
 }
 
+/**
+ * Give each account-owned install a stable, non-identifying Wrangler auth
+ * profile. The account id never appears in the profile label, and two accounts
+ * cannot accidentally share the default OAuth session.
+ */
+export function wranglerProfileName(accountId) {
+  const normalized = String(accountId || "").trim();
+  if (!normalized) return null;
+  const digest = createHash("sha256").update(normalized, "utf8").digest("hex").slice(0, 16);
+  return `financial-brain-${digest}`;
+}
+
+/** Add the per-install profile to a Wrangler command without mutating argv. */
+export function wranglerProfileArgs(args, accountId) {
+  const profile = wranglerProfileName(accountId);
+  return profile ? [...args, "--profile", profile] : [...args];
+}
+
 function quoteWin(a) {
   return /[\s"^&|<>()]/.test(a) ? `"${String(a).replace(/"/g, '\\"')}"` : a;
 }
@@ -220,20 +240,20 @@ export function checkNode() {
 }
 
 export function checkWrangler(runCommand = run) {
-  const r = runCommand("npx", ["wrangler@4", "--version"], {
+  const r = runCommand("npx", [WRANGLER_PACKAGE, "--version"], {
     timeout: 120_000,
     inheritEnv: false,
     env: localToolEnvironment(),
   });
   const version = r.out.match(/\b(\d+)\.(\d+)\.(\d+)\b/);
-  if (r.ok && version && Number(version[1]) === 4) {
+  if (r.ok && version && Number(version[1]) === 4 && Number(version[2]) >= 127) {
     return check("wrangler", OK, version[0]);
   }
   return check(
     "wrangler",
     FAIL,
-    r.ok && version ? `returned ${version[0]}, but major version 4 is required` : "could not be run",
-    "wrangler is fetched on demand by npx, so this usually means no network or a blocked npm registry.\n  Test with: npx wrangler@4 --version"
+    r.ok && version ? `returned ${version[0]}, but 4.127 or newer is required for isolated auth profiles` : "could not be run",
+    `wrangler is fetched on demand by npx, so this usually means no network or a blocked npm registry.\n  Test with: npx ${WRANGLER_PACKAGE} --version`
   );
 }
 
@@ -254,24 +274,46 @@ function cfEnv(accountId) {
   return cloudflareCliEnvironment(accountId);
 }
 
-export function checkWranglerLogin(accountId) {
+export function checkWranglerLogin(accountId, runCommand = run) {
+  if (!accountId) {
+    return check(
+      "wrangler login",
+      WARN,
+      "not checked: the Cloudflare account id is not known yet",
+      "Run `brain doctor <manifest>` after setup has selected the account. The fallback uses a separate named Wrangler profile for that install.",
+    );
+  }
   const env = cfEnv(accountId);
-  const r = run("npx", ["wrangler@4", "whoami"], {
+  const r = runCommand("npx", wranglerProfileArgs([
+    WRANGLER_PACKAGE, "vectorize", "list", "--json",
+  ], accountId), {
     timeout: 120_000,
     inheritEnv: false,
     env,
   });
-  if (r.ok && /You are logged in|Account Name/i.test(r.out)) {
-    const email = (r.out.match(/associated with the email ([^\s]+@[^\s]+?)[.\s]*$/im) || r.out.match(/([\w.+-]+@[\w-]+\.[\w.]+[\w])/) || [])[1];
-    const accounts = (r.out.match(/│/g) || []).length;
-    return check("wrangler login", OK, email ? `signed in as ${email}` : "signed in", accounts > 8 ? "this login can see several accounts, so account_id in the manifest is required" : undefined);
+  if (r.ok) {
+    return check(
+      "wrangler login",
+      OK,
+      "isolated profile confirmed by a read-only Vectorize request to the declared account",
+    );
+  }
+  if (!/profile.*(?:not found|could not be found)|not logged in|no credentials/i.test(r.out)) {
+    return check(
+      "wrangler login",
+      FAIL,
+      "the isolated profile could not confirm read access to Vectorize in the declared account",
+      `Re-authenticate this install's profile with: npx ${WRANGLER_PACKAGE} auth create ${wranglerProfileName(accountId)}\n` +
+        "  Then rerun `brain doctor <manifest>`. The fallback will not act on a logged-in profile that cannot read the exact manifest account.",
+    );
   }
   return check(
     "wrangler login",
     WARN,
-    "not signed in",
-    "Run: npx wrangler@4 login\n" +
-      "  This opens the browser and the session belongs to whoever signs in.\n" +
+    "this install's isolated Wrangler profile is not signed in",
+    `Run: npx ${WRANGLER_PACKAGE} auth create ${wranglerProfileName(accountId)}\n` +
+      "  This opens the browser and stores a separate named profile for this install.\n" +
+      "  Doctor then confirms the exact manifest account before the profile can be used.\n" +
       "  This is only a fallback when the scoped API token cannot reach Vectorize."
   );
 }
@@ -316,47 +358,11 @@ export async function checkVectorizeApi(accountId, cloudflareToken = process.env
   }
 }
 
-export function checkVectorize(accountId) {
-  const env = cfEnv(accountId);
-  const r = run("npx", ["wrangler@4", "vectorize", "list"], {
-    timeout: 120_000,
-    inheritEnv: false,
-    env,
-  });
-  if (r.ok) {
-    return check("Vectorize", OK, /haven't created any indexes/i.test(r.out) ? "reachable, no indexes yet" : "reachable");
-  }
-  // A login that can see several accounts cannot act without being told which
-  // one, and wrangler says so rather than failing for any Vectorize reason.
-  // Reporting that as "not on the paid plan" sends someone to spend money on a
-  // problem they do not have, which is worse than reporting nothing.
-  // What wrangler ACTUALLY does with several accounts and no choice made: it
-  // falls back to an all-zeros account id, gets an auth error from that, and
-  // then prints the account table. So the zeros are the reliable tell, not any
-  // phrase about accounts.
-  if (/accounts\/0{32}\//.test(r.out) || /more than one account|unable to select one/i.test(r.out)) {
-    return check(
-      "Vectorize",
-      WARN,
-      "not checked: this login can see several Cloudflare accounts",
-      "Nothing is wrong yet. Tell it which account to use and re-run:\n" +
-        "    export CLOUDFLARE_ACCOUNT_ID='<the account id>'\n" +
-        "  `brain setup` asks for this and then checks properly. If you already have a\n" +
-        "  manifest, `brain doctor <manifest>` reads the id from it."
-    );
-  }
-
-  const paid = /workers paid|not entitled|upgrade|subscription|billing/i.test(r.out);
-  return check(
-    "Vectorize",
-    FAIL,
-    paid ? "the account is not on the Workers Paid plan" : "unreachable",
-    "Recreate the scoped token with Vectorize: Edit, then re-run. Workers Paid\n" +
-      "  (5 USD monthly minimum) is the supported production baseline because Free\n" +
-      "  has prototype-scale vector, daily-write, and Worker CPU limits.\n" +
-      "  Confirm the plan separately in Cloudflare dashboard > Workers & Pages > Plans.\n" +
-      "  Without it the brain can only match documents that repeat the words in the question."
-  );
+export function checkVectorize(accountId, runCommand = run) {
+  const identity = checkWranglerLogin(accountId, runCommand);
+  return identity.status === OK
+    ? check("Vectorize", OK, "reachable through the isolated profile in the declared account")
+    : { ...identity, name: "Vectorize" };
 }
 
 export function checkClaudeCode({
@@ -468,46 +474,76 @@ export function checkGoogleConnection(storageStatus, verify = verifyTokenStorage
  * The scoped API token drives every Cloudflare step. Wrangler login is only a
  * fallback for an older or incorrectly scoped token.
  */
-export async function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_TOKEN) {
+export async function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_TOKEN, {
+  accountId,
+  fetchImpl = fetch,
+  timeoutMs = 15_000,
+} = {}) {
   if (cloudflareToken) {
     // Presence is not validity. A typo'd, revoked, or expired token used to
     // report "ok  ready to install" and then fail deep inside provisioning,
     // which is the worst place to learn it. One cheap call settles it here.
-    try {
-      const res = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
-        headers: { authorization: `Bearer ${cloudflareToken}` },
-        signal: AbortSignal.timeout(15_000),
-      });
-      let payload = null;
-      try { payload = await res.json(); } catch { /* status below is enough */ }
-      if (res.ok && payload?.success && payload?.result?.status === "active") {
-        return check("Cloudflare token", OK, "verified and active");
+    const endpoints = [
+      { owner: "user-owned", url: "https://api.cloudflare.com/client/v4/user/tokens/verify" },
+      ...(accountId ? [{
+        owner: "account-owned",
+        url: `https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens/verify`,
+      }] : []),
+    ];
+    const rejections = [];
+    const networkErrors = [];
+    for (const endpoint of endpoints) {
+      try {
+        const res = await fetchImpl(endpoint.url, {
+          headers: { authorization: `Bearer ${cloudflareToken}` },
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        let payload = null;
+        try { payload = await res.json(); } catch { /* status below is enough */ }
+        if (res.ok && payload?.success && payload?.result?.status === "active") {
+          return check("Cloudflare token", OK, `verified and active (${endpoint.owner})`);
+        }
+        const detail = (payload?.errors || []).map((x) => x.message).filter(Boolean).join("; ")
+          || `HTTP ${res.status}`;
+        const status = String(payload?.result?.status || "");
+        if (/expired|disabled/i.test(`${status} ${detail}`)) {
+          return check(
+            "Cloudflare token",
+            FAIL,
+            /expired/i.test(`${status} ${detail}`) ? "the token has expired" : "the token is disabled",
+            `${CF_TOKEN_REJECTED_REMEDY}\n${CF_PLAN_NOTE}`,
+          );
+        }
+        rejections.push(`${endpoint.owner}: ${detail.slice(0, 80)}`);
+      } catch (error) {
+        networkErrors.push(`${endpoint.owner}: ${String(error?.message || error).slice(0, 60)}`);
       }
-      const detail = (payload?.errors || []).map((x) => x.message).filter(Boolean).join("; ")
-        || `HTTP ${res.status}`;
-      const expired = /expired/i.test(detail) || payload?.result?.status === "expired";
+    }
+    if (!accountId && rejections.length) {
       return check(
         "Cloudflare token",
-        FAIL,
-        expired ? "the token has expired" : `Cloudflare rejected this token: ${detail.slice(0, 120)}`,
-        "The value in CLOUDFLARE_API_TOKEN is not a token Cloudflare will accept.\n" +
-          "  Check it was copied whole, with no leading or trailing spaces, and that it\n" +
-          "  has not expired or been deleted: dash.cloudflare.com > My Profile > API Tokens.\n" +
-          `  Scopes: ${CF_TOKEN_SCOPES.join(", ")}.\n` +
-          "  Then run `brain setup` or `brain update` in an interactive terminal; it asks for the token without echo.\n" +
-          CF_PLAN_NOTE
+        WARN,
+        "the user-owned token endpoint rejected it, but no account id is available to check whether it is an account-owned token",
+        "Run `brain doctor <manifest>` once the manifest names the Cloudflare account. Doctor will then use the account-scoped verification path before deciding whether the token is invalid.",
       );
-    } catch (e) {
+    }
+    if (networkErrors.length) {
       // Offline or blocked. Do not claim the token is bad, and do not claim it is good.
       return check(
         "Cloudflare token",
         WARN,
-        `set, but could not be verified (${String(e.message).slice(0, 60)})`,
-        "The token is present but this machine could not reach api.cloudflare.com to check it.\n" +
-          "  Re-run `brain doctor` once the network is back. A VPN or corporate filter can\n" +
+        `set, but every applicable verification path could not be completed (${networkErrors.join("; ").slice(0, 120)})`,
+        "The token is present but this machine could not complete verification with api.cloudflare.com.\n" +
+          "  Re-run `brain doctor <manifest>` once the network is back. A VPN or corporate filter can\n" +
           "  also block it: Cloudflare WARP in particular breaks this call from inside a VM."
       );
     }
+    return check(
+      "Cloudflare token",
+      FAIL,
+      `Cloudflare rejected this token on every applicable verification path: ${rejections.join("; ").slice(0, 140)}`,
+      `${CF_TOKEN_REJECTED_REMEDY}\n${CF_PLAN_NOTE}`,
+    );
   }
   return check(
     "Cloudflare token",
@@ -664,12 +700,20 @@ export async function runAll({
   push(checkNode());
   push(checkWrangler(localRun));
   push(await checkNetwork());
-  out.push(await checkCfToken(cloudflareToken));
-  out.push(await checkVectorizeApi(accountId, cloudflareToken));
-  out.push(checkAnthropicKey());
-  out.push(checkClaudeCode({ runCommand: localRun, required: requireClaudeCode }));
-  out.push(checkCodex());
-  out.push(checkGoogleConnection(googleStorageStatus));
+  push(await checkCfToken(cloudflareToken, { accountId }));
+  const vectorize = await checkVectorizeApi(accountId, cloudflareToken);
+  push(vectorize);
+  if (accountId && vectorize.status !== OK) {
+    // Only surface the OAuth fallback when the standard scoped token path is
+    // unavailable. This keeps a healthy install from being told to create an
+    // unnecessary second credential while still printing the exact isolated
+    // profile repair in the run that needs it.
+    push(checkWranglerLogin(accountId, localRun));
+  }
+  push(checkAnthropicKey());
+  push(checkClaudeCode({ runCommand: localRun, required: requireClaudeCode }));
+  push(checkCodex());
+  push(checkGoogleConnection(googleStorageStatus));
   return out;
 }
 

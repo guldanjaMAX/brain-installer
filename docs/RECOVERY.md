@@ -19,6 +19,43 @@ declared domain must be separate from the source. A provider adapter must then
 prove that the target has zero user tables and zero vectors, with the expected
 Vectorize dimensions and metric, before the first target write is reachable.
 
+## Encrypted off-provider backup policy
+
+The verified D1 SQL artifact is the durable recovery source. After its local
+integrity and hash checks pass, encrypt its exact bytes with
+`operations/off-provider-backup.mjs` before copying it to storage operated
+independently from Cloudflare. The envelope uses AES-256-GCM, authenticates its
+creation time, retention class, and plaintext SHA-256, and never contains the
+key. The 32-byte key must be held out of band from both Cloudflare and the
+backup object. Losing either the artifact or the key must not expose or destroy
+the other copy.
+
+Required retention classes are:
+
+- daily: 14 copies, produced at least every 24 hours;
+- weekly: 8 copies, promoted from a verified daily artifact;
+- monthly: 12 copies, promoted from a verified daily artifact.
+
+Retention is applied only after the independent destination acknowledges the
+complete encrypted object and its artifact hash is checked. Do not remove a
+local or older independent copy based only on an upload command exit code.
+OAuth tokens, passkey challenges, enrollment codes, live sessions, drain
+leases, Vectorize receipts, and provider-derived vectors are not backup data.
+They are reauthorized, cleared, or rebuilt through the verified recovery flow.
+
+The service objectives are a 24-hour recovery point objective and an 8-hour
+recovery time objective. At least once every 90 days, restore one recent
+encrypted artifact into an isolated target, rebuild Vectorize, pass exact D1
+hash and aggregate comparisons, and run the release evaluation. Persist only
+the content-free evidence produced by `buildRestoreEvidence`: artifact hash,
+timestamps, duration, schema version, aggregate counts, and evaluation result.
+`restoreEvidenceStatus` reports the evidence due on day 91.
+
+This repository defines and tests encryption, retention metadata, objectives,
+and evidence expiry. It does not claim that an independent storage account is
+configured or that a live recurring restore has passed. Those remain explicit
+deployment acceptance gates for each installation.
+
 Initialize and inspect the control files with:
 
 ```bash

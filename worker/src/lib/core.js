@@ -1,4 +1,4 @@
-// core.js — HTTP helpers, auth, and the LLM call with its spend cap.
+// core.js — HTTP helpers, auth, and the LLM call with its spend budget.
 //
 // Extracted from a single-tenant worker and genericized. Every
 // Instance-specific values are now read from env.
@@ -74,30 +74,7 @@ const CAP_TABLE = `CREATE TABLE IF NOT EXISTS llm_call_log (
   est_cost_usd_micros INTEGER DEFAULT 0
 )`;
 
-let capCache = { day: null, micros: 0, checkedAt: 0 };
-
-// What THIS isolate has charged today. Written by this process on every billed
-// call, so no database can lose it. It is the floor under every budget
-// decision, and it is the whole reason a broken ledger cannot mean zero spend.
-let isolateLedger = { day: null, micros: 0 };
-
-// Why the guard is degraded, when it is. Kept so the refusal can name its cause
-// and so a health route can surface it, rather than leaving a silent hole where
-// a cap used to be.
 let guardState = { degraded: false, reason: null, since: null };
-
-// The share of the day's budget a degraded guard is still allowed to spend.
-// Small on purpose: enough to ride out a D1 blip, nowhere near enough for a
-// runaway loop to matter.
-const DEGRADED_BUDGET_FRACTION = 0.1;
-
-// ...and never more than this in absolute terms, however large the configured
-// cap is. A client running a $500/day cap has the appetite for it; a broken
-// ledger is still not a licence to spend at that rate unsupervised.
-const DEGRADED_BUDGET_CEILING_USD = 5;
-
-const degradedBudgetUsd = (capUsd) =>
-  Math.min(capUsd * DEGRADED_BUDGET_FRACTION, DEGRADED_BUDGET_CEILING_USD);
 
 const utcDay = () => new Date().toISOString().slice(0, 10);
 
@@ -114,23 +91,16 @@ function capUsdFor(env) {
   return Number.isFinite(n) && n >= 0 ? n : 10;
 }
 
-/** Record a billed call against this isolate, resetting on UTC day rollover. */
-function chargeIsolate(micros) {
-  const day = utcDay();
-  if (isolateLedger.day !== day) isolateLedger = { day, micros: 0 };
-  isolateLedger.micros += Math.max(0, Number(micros) || 0);
-}
-
 function markDegraded(reason) {
   if (!guardState.degraded || guardState.reason !== reason) {
-    console.warn(`[spend-guard] DEGRADED: ${reason}. Falling back to a reduced per-instance allowance.`);
+    console.warn(`[spend-budget] UNAVAILABLE: ${reason}. Provider call refused before spend.`);
     guardState = { degraded: true, reason, since: new Date().toISOString() };
   }
 }
 
 function markHealthy() {
   if (guardState.degraded) {
-    console.warn("[spend-guard] recovered: the spend ledger is readable again; the full cap is back in force.");
+    console.warn("[spend-budget] recovered: atomic reservations are available again.");
     guardState = { degraded: false, reason: null, since: null };
   }
 }
@@ -138,96 +108,73 @@ function markHealthy() {
 /** Read-only view of the guard, for health reporting and tests. */
 export function spendGuardStatus() {
   return {
+    mode: "atomic-estimated-spend-reservation",
     degraded: guardState.degraded,
     reason: guardState.reason,
     since: guardState.since,
-    isolate_day: isolateLedger.day,
-    isolate_spent_micros: isolateLedger.micros,
   };
 }
 
-/**
- * Per-UTC-day spend guard.
- *
- * Exists because a runaway loop is a billing incident, not a bug you notice
- * next month. The cost of the call in flight is folded in immediately, so a
- * tight loop is caught inside the cache window rather than after it expires.
- *
- * It does NOT fail open. It used to: the catch returned 0, which reported zero
- * spend and un-bound the cap for as long as D1 was unhappy. A cap that fails
- * open is not a cap. On a client-owned install the payment method behind it is
- * the client's, so the failure mode was somebody else's bill.
- *
- * It does not fail fully closed either. Refusing every answer because a logging
- * table hiccuped is its own kind of broken, and to the client it looks like the
- * brain is down. So the guard degrades: it falls back to what THIS isolate
- * knows it has spent and holds that against a small fraction of the day's
- * budget. Answers keep flowing through a blip; a loop hits the floor fast and
- * stops. Unbounded spend is unreachable in every branch, because the isolate
- * ledger only ever grows and is never replaced by a zero.
- *
- * The honest limit, stated rather than glossed: the degraded bound is per
- * isolate, not global. A runaway loop lives in one isolate and is bounded
- * exactly. Broad fan-out across many isolates while D1 is down is bounded only
- * by (isolates x reduced allowance), which is far tighter than "no cap" but is
- * not a single global number.
- */
-async function readSpend(env) {
-  const day = utcDay();
-  const now = Date.now();
-  if (isolateLedger.day !== day) isolateLedger = { day, micros: 0 };
-  const floor = isolateLedger.micros;
-
-  if (!env.DB) {
-    // No binding means no ledger exists to read, which is the same hole as a
-    // failing query: nothing outside this process could ever bind the cap.
-    markDegraded("no D1 binding, so no spend ledger exists to read");
-    return { micros: floor, degraded: true };
-  }
-
-  // While degraded, skip the cache window and retry every call, so the full cap
-  // comes back the moment D1 does.
-  if (!guardState.degraded && capCache.day === day && now - capCache.checkedAt < 60_000) {
-    return { micros: Math.max(capCache.micros, floor), degraded: false };
-  }
-
-  try {
-    const row = await env.DB.prepare(
-      "SELECT COALESCE(SUM(est_cost_usd_micros),0) AS m FROM llm_call_log WHERE day = ? AND status != 'blocked'"
-    )
-      .bind(day)
-      .first();
-    capCache = { day, micros: Number(row?.m || 0), checkedAt: now };
-    markHealthy();
-    // The stored sum can under-report: logCall swallows its own failures. Take
-    // whichever ledger is higher so a lost write cannot buy extra budget.
-    return { micros: Math.max(capCache.micros, floor), degraded: false };
-  } catch (err) {
-    markDegraded(`spend ledger query failed: ${err?.message || err}`);
-    return { micros: floor, degraded: true };
-  }
-}
-
 async function ensureLogTable(env) {
-  if (!env.DB) return;
-  try {
-    await env.DB.exec(CAP_TABLE.replace(/\s+/g, " "));
-  } catch {
-    /* table probably exists */
-  }
+  if (!env.DB) throw new Error("no D1 binding is available for atomic spend reservation");
+  await env.DB.exec(CAP_TABLE.replace(/\s+/g, " "));
 }
 
-async function logCall(env, { label, model, status, micros }) {
-  if (!env.DB) return;
+async function reserveSpend(env, { label, model, micros }) {
   const now = new Date().toISOString();
   try {
-    await env.DB.prepare(
-      "INSERT INTO llm_call_log (ts, day, label, model, status, est_cost_usd_micros) VALUES (?,?,?,?,?,?)"
-    )
-      .bind(now, now.slice(0, 10), label || null, model || null, status, micros || 0)
-      .run();
-  } catch {
-    /* logging must never break the call */
+    await ensureLogTable(env);
+    const capMicros = Math.floor(capUsdFor(env) * 1_000_000);
+    const row = await env.DB.prepare(
+      `INSERT INTO llm_call_log
+         (ts, day, label, model, status, est_cost_usd_micros)
+       SELECT ?, ?, ?, ?, 'reserved', ?
+       WHERE ? <= ?
+         AND COALESCE((
+           SELECT SUM(est_cost_usd_micros)
+           FROM llm_call_log
+           WHERE day = ? AND status != 'blocked'
+         ), 0) + ? <= ?
+       RETURNING id`,
+      )
+      .bind(
+        now, now.slice(0, 10), label || null, model || null, micros,
+        micros, capMicros, now.slice(0, 10), micros, capMicros,
+      )
+      .first();
+    markHealthy();
+    if (!row?.id) {
+      const error = new Error(
+        `daily estimated LLM spend budget of $${capUsdFor(env)} cannot reserve this request`,
+      );
+      error.llm_cap_exceeded = true;
+      error.llm_budget_exceeded = true;
+      throw error;
+    }
+    return Number(row.id);
+  } catch (error) {
+    if (error?.llm_budget_exceeded) throw error;
+    const reason = `atomic spend reservation failed: ${error?.message || error}`;
+    markDegraded(reason);
+    const refused = new Error(`${reason}. Refusing to call the provider without a reservation.`);
+    refused.spend_guard_unavailable = true;
+    throw refused;
+  }
+}
+
+async function settleSpend(env, reservationId, { status, micros }) {
+  try {
+    const result = await env.DB.prepare(
+      `UPDATE llm_call_log
+       SET status = ?, est_cost_usd_micros = ?
+       WHERE id = ? AND status = 'reserved'`,
+    ).bind(status, micros, reservationId).run();
+    const changes = Number(result?.meta?.changes ?? result?.changes ?? 0);
+    if (changes === 0) throw new Error("reservation row was not updated");
+  } catch (error) {
+    // The original conservative reservation remains counted. Never release
+    // budget merely because the receipt write failed.
+    markDegraded(`spend reservation settlement failed: ${error?.message || error}`);
   }
 }
 
@@ -261,6 +208,27 @@ export function workersAiRate(model) {
     if (id.startsWith(prefix) && (!best || prefix.length > best.prefix.length)) best = { prefix, rate };
   }
   return best ? best.rate : WORKERS_AI_FALLBACK_RATE;
+}
+
+const ANTHROPIC_ESTIMATED_RATE = { in: 3, out: 15 };
+
+function utf8Bytes(value) {
+  return new TextEncoder().encode(String(value || "")).byteLength;
+}
+
+/**
+ * Conservative pre-call reservation, in estimated USD micros.
+ *
+ * UTF-8 bytes are an upper bound on ordinary text token count. The serialized
+ * image is base64, so counting its bytes is conservative too. Provider prices
+ * can change outside this repository, therefore this is deliberately named an
+ * estimated-spend budget rather than advertised as an invoice-exact ceiling.
+ */
+export function estimateLlmReservationMicros({ provider, model, system, messages, image, maxTokens }) {
+  const inputBytes = utf8Bytes(JSON.stringify({ system: system || "", messages: messages || [], image: image || "" }));
+  const outputTokens = Math.max(1, Math.floor(Number(maxTokens) || 1000));
+  const rate = provider === "anthropic" ? ANTHROPIC_ESTIMATED_RATE : workersAiRate(model);
+  return Math.max(1, Math.ceil(inputBytes * rate.in + outputTokens * rate.out));
 }
 
 /**
@@ -335,28 +303,6 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
     }
   }
 
-  await ensureLogTable(env);
-
-  const capUsd = capUsdFor(env);
-  const { micros: spent, degraded } = await readSpend(env);
-  const budgetUsd = degraded ? degradedBudgetUsd(capUsd) : capUsd;
-  if (spent >= budgetUsd * 1_000_000) {
-    await logCall(env, { label, model, status: "blocked", micros: 0 });
-    const e = new Error(
-      degraded
-        ? `LLM spend guard is degraded (${guardState.reason}); the reduced ` +
-          `allowance of $${budgetUsd} for this instance is already spent. ` +
-          `Refusing rather than spending without a working cap.`
-        : `daily LLM spend cap of $${capUsd} reached`,
-    );
-    e.llm_cap_exceeded = true;
-    if (degraded) {
-      e.spend_guard_degraded = true;
-      console.warn(`[spend-guard] BLOCKED a call while degraded: ${guardState.reason}`);
-    }
-    throw e;
-  }
-
   // Route by the CONFIGURED MODEL, never by which key happens to be present.
   // A manifest that selects a Cloudflare model must reach Cloudflare, even on an
   // install that also carries an Anthropic key for reranking. Branching on the
@@ -364,16 +310,43 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
   // answer", so a client's document text reached a provider their own manifest
   // did not name. That is a custody claim, not a preference.
   const modelIsCloudflare = !model || String(model).startsWith("@cf/");
-  if (!apiKey || (modelIsCloudflare && env.AI)) {
-    const workersModel = String(model || "").startsWith("@cf/")
-      ? model
-      : env.WORKERS_AI_ANSWER_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+  if (modelIsCloudflare && !env.AI) {
+    // A Cloudflare model is configured but this worker has no AI binding to
+    // serve it. Quietly answering from Anthropic instead would move client
+    // document text to a provider the manifest does not name. Refuse and say so.
+    const e = new Error(
+      `the configured answer model ${model || "(default)"} is a Cloudflare model, ` +
+        "but this worker has no AI binding. Refusing to answer from a different " +
+        "provider than the manifest names.",
+    );
+    e.provider_mismatch = true;
+    throw e;
+  }
+
+  const useWorkers = !apiKey || modelIsCloudflare;
+  const maxTokens = Math.max(1, Math.floor(Number(max_tokens) || 1000));
+  const workersModel = String(model || "").startsWith("@cf/")
+    ? model
+    : env.WORKERS_AI_ANSWER_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+  const billedModel = useWorkers ? workersModel : model;
+  const provider = useWorkers ? "cloudflare-workers-ai" : "anthropic";
+  const reservedMicros = estimateLlmReservationMicros({
+    provider: useWorkers ? "workers-ai" : "anthropic",
+    model: billedModel,
+    system,
+    messages,
+    image,
+    maxTokens,
+  });
+  const reservationId = await reserveSpend(env, { label, model: billedModel, micros: reservedMicros });
+
+  if (useWorkers) {
     try {
       const data = await env.AI.run(workersModel, {
         messages: image === undefined
           ? [{ role: "system", content: system }, ...(messages || [])]
           : visionMessages(system, messages, image, env),
-        max_tokens: max_tokens || 1000,
+        max_tokens: maxTokens,
         temperature: 0,
       });
       const rawResponse = data?.response;
@@ -388,9 +361,12 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
       // Priced by the model actually called, per WORKERS_AI_RATES. Keep the
       // estimate conservative enough for the guard to remain useful.
       const rate = workersAiRate(workersModel);
-      const micros = Math.ceil(inTok * rate.in + outTok * rate.out);
-      chargeIsolate(micros);
-      await logCall(env, { label, model: workersModel, status: "ok", micros });
+      const hasUsage = Number.isFinite(Number(inTok)) && Number.isFinite(Number(outTok)) && (inTok > 0 || outTok > 0);
+      const micros = hasUsage ? Math.ceil(inTok * rate.in + outTok * rate.out) : reservedMicros;
+      if (micros > reservedMicros) {
+        console.warn(`[spend-budget] provider usage estimate ${micros} exceeded reservation ${reservedMicros}`);
+      }
+      await settleSpend(env, reservationId, { status: hasUsage ? "ok" : "ok-reserved", micros });
       return {
         content: [{ type: "text", text }],
         model: workersModel,
@@ -398,47 +374,41 @@ export async function callLLM(env, { model, system, messages, max_tokens, label,
         provider: "cloudflare-workers-ai",
       };
     } catch (error) {
-      await logCall(env, { label, model: workersModel, status: "error", micros: 0 });
+      await settleSpend(env, reservationId, { status: "error-reserved", micros: reservedMicros });
       throw new Error(`Workers AI: ${error?.message || error}`);
     }
   }
 
-  if (modelIsCloudflare) {
-    // A Cloudflare model is configured but this worker has no AI binding to
-    // serve it. Quietly answering from Anthropic instead would move client
-    // document text to a provider the manifest does not name. Refuse and say so.
-    const e = new Error(
-      `the configured answer model ${model || "(default)"} is a Cloudflare model, ` +
-        "but this worker has no AI binding. Refusing to answer from a different " +
-        "provider than the manifest names.",
-    );
-    e.provider_mismatch = true;
-    throw e;
-  }
   const anthropicModel = model;
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ model: anthropicModel, max_tokens: max_tokens || 1000, system, messages }),
-    signal: AbortSignal.timeout(timeoutMs || 45_000),
-  });
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: anthropicModel, max_tokens: maxTokens, system, messages }),
+      signal: AbortSignal.timeout(timeoutMs || 45_000),
+    });
 
-  if (!res.ok) {
-    const text = await res.text();
-    await logCall(env, { label, model, status: "error", micros: 0 });
-    throw new Error(`Anthropic ${res.status}: ${text.slice(0, 300)}`);
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Anthropic ${res.status}: ${text.slice(0, 300)}`);
+    }
+
+    const data = await res.json();
+    const inTok = data?.usage?.input_tokens || 0;
+    const outTok = data?.usage?.output_tokens || 0;
+    const hasUsage = Number.isFinite(Number(inTok)) && Number.isFinite(Number(outTok)) && (inTok > 0 || outTok > 0);
+    const micros = hasUsage ? Math.round(inTok * 3 + outTok * 15) : reservedMicros;
+    if (micros > reservedMicros) {
+      console.warn(`[spend-budget] provider usage estimate ${micros} exceeded reservation ${reservedMicros}`);
+    }
+    await settleSpend(env, reservationId, { status: hasUsage ? "ok" : "ok-reserved", micros });
+    return data;
+  } catch (error) {
+    await settleSpend(env, reservationId, { status: "error-reserved", micros: reservedMicros });
+    throw error;
   }
-
-  const data = await res.json();
-  // Rough cost estimate. Precision is not the point; catching a runaway is.
-  const inTok = data?.usage?.input_tokens || 0;
-  const outTok = data?.usage?.output_tokens || 0;
-  const micros = Math.round(inTok * 3 + outTok * 15);
-  chargeIsolate(micros);
-  await logCall(env, { label, model: data?.model || anthropicModel, status: "ok", micros });
-  return data;
 }

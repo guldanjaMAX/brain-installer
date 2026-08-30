@@ -41,8 +41,11 @@ clean public history.
   when the manifest actually sets an R2 bucket.
 
 Vectorize Edit was verified end to end on 2026-08-23: an account-scoped token
-created the index and all six metadata indexes through the API. `wrangler login`
-remains a compatibility fallback for an older token, not an install requirement.
+created the index and all six metadata indexes through the API. A per-install
+named Wrangler profile remains a compatibility fallback for an older token,
+not an install requirement. The fallback uses pinned Wrangler 4.127.1, passes
+the profile and manifest account together, and requires a successful read-only
+Vectorize request before any mutation.
 
 ---
 
@@ -254,7 +257,8 @@ characters per page, flagged and indexed anyway), and 14% had zero text.
 `safety.ocr.enabled` is off by default. When enabled, the existing PDF child
 extracts page images without a native dependency and sends each page through
 `POST /api/admin/brain/ocr` to Workers AI in the owner's Cloudflare account.
-The daily spend cap applies to every page. A scan is stored only when the
+The daily estimated-spend budget applies to every page. A conservative amount
+is atomically reserved before the provider call. A scan is stored only when the
 transcription clears the normal quality floor; unreadable pages are named
 inline, and a majority-unreadable or descriptive response refuses the whole
 document. `documents.text_source` and `text_reliable` carry the OCR provenance
@@ -440,6 +444,11 @@ macOS token file is deleted only after the full credential record has been
 written to Keychain and read back exactly. Browser, Keychain, Expect, ACL, and
 DPAPI helper processes receive a small allowlisted environment rather than the
 Terminal's ambient credentials.
+
+Field evidence is deliberately narrow: on 2026-08-30, one matching Windows 11
+field machine completed a DPAPI CurrentUser encrypt/decrypt round trip. That is
+one-machine field proof, not a universal Windows production claim. The Windows
+CI matrix and fresh-user, moved-profile, and recovery checks remain required.
 
 Choose OAuth client type **Desktop app**. Desktop clients accept the local
 loopback callback automatically. Google Cloud does not provide, or require, a

@@ -21,6 +21,9 @@ const health = async (env) => {
   assert.equal(body.status, "ok");
   assert.equal(body.accepting_documents, true);
   assert.equal(body.vector_drain_mode, "active");
+  assert.equal(body.service, "financial-brain", "the public route keeps a generic service identity");
+  assert.equal(body.brain, undefined, "the public route does not expose the configured client identity");
+  assert.ok(!JSON.stringify(body).includes(base.BRAIN_NAME), "no public health field contains the client identity");
 }
 
 /* ---------------- a paused brain says so, in the field that monitors read */

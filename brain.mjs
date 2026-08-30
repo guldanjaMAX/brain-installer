@@ -91,7 +91,13 @@ import {
   sanitizeEnvelope as sanitizeIngestEnvelope,
   GATE_VERSION as CREDENTIAL_GATE_VERSION,
 } from "./worker/src/lib/secret-scan.js";
-import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mjs";
+import {
+  cloudflareCliEnvironment,
+  localToolEnvironment,
+  run,
+  wranglerProfileArgs,
+  WRANGLER_PACKAGE,
+} from "./doctor.mjs";
 import {
   runAll as doctorRunAll,
   summarize as doctorSummarize,
@@ -835,7 +841,7 @@ async function cmdVerify(manifestPath) {
   } catch (e) {
     warn(
       "the API token cannot reach Vectorize. The standard token needs Vectorize: Edit." + "\n" +
-        "      Provision can use wrangler login as a temporary fallback." + "\n" +
+        "      Provision can use a separately named Wrangler profile as a temporary fallback." + "\n" +
         VECTORIZE_REMEDY + "\n" +
         `      detail: ${e.message.slice(0, 120)}`
     );
@@ -862,7 +868,7 @@ function wrangler(args, { accountId } = {}) {
   // made provision report "wrangler: not logged in" to a client whose doctor
   // had verified the login moments earlier.
   const env = cloudflareCliEnvironment(accountId);
-  const r = run("npx", ["wrangler@4", ...args], {
+  const r = run("npx", wranglerProfileArgs([WRANGLER_PACKAGE, ...args], accountId), {
     timeout: 180_000,
     inheritEnv: false,
     env,
@@ -871,8 +877,12 @@ function wrangler(args, { accountId } = {}) {
 }
 
 function wranglerAvailable(accountId) {
-  const r = wrangler(["whoami"], { accountId });
-  return r.ok && /You are logged in|Account Name/i.test(r.out);
+  if (!accountId) return false;
+  // The API token has been scrubbed, the named profile is explicit, and the
+  // manifest account id is in CLOUDFLARE_ACCOUNT_ID. A successful account-
+  // scoped read is the confirmation gate before any fallback mutation.
+  const r = wrangler(["vectorize", "list", "--json"], { accountId });
+  return r.ok;
 }
 
 /**

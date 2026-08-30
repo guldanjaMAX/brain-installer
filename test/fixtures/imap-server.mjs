@@ -9,11 +9,8 @@
 // UIDVALIDITY-roll assertion mean something: the connector has to reissue real
 // commands and re-read real bytes to get the right answer.
 //
-// WHAT IT IS NOT. It is plain TCP, not TLS. The production client calls
-// `tls.connect` with certificate verification left at Node's default, and this
-// fixture is reached through the connector's `socketFactory` seam instead.
-// TLS negotiation and certificate verification are therefore NOT covered here.
-// Every persona and address below is invented.
+// It can listen on plain TCP for protocol-focused tests or implicit TLS for the
+// transport gate. Every persona and address below is invented.
 
 import { createServer } from "node:net";
 
@@ -57,11 +54,12 @@ export class Folder {
 }
 
 export class ScriptedImapServer {
-  constructor({ username, password, folders = [], capabilities = ["IMAP4rev1", "SPECIAL-USE"] } = {}) {
+  constructor({ username, password, folders = [], capabilities = ["IMAP4rev1", "SPECIAL-USE"], tls = null } = {}) {
     this.username = username;
     this.password = password;
     this.folders = new Map(folders.map((f) => [f.name, f]));
     this.capabilities = capabilities;
+    this.tls = tls;
     /** Every command line the client sent, minus the password. The tests assert on this. */
     this.log = [];
     /** Set true to prove a failing send does not advance a cursor. */
@@ -73,7 +71,12 @@ export class ScriptedImapServer {
   folder(name) { return this.folders.get(name); }
 
   async listen() {
-    this.server = createServer((socket) => this.#session(socket));
+    if (this.tls) {
+      const { createServer: createTlsServer } = await import("node:tls");
+      this.server = createTlsServer(this.tls, (socket) => this.#session(socket));
+    } else {
+      this.server = createServer((socket) => this.#session(socket));
+    }
     await new Promise((resolve) => this.server.listen(0, "127.0.0.1", resolve));
     this.port = this.server.address().port;
     return this.port;
@@ -93,6 +96,20 @@ export class ScriptedImapServer {
       const socket = connect({ host: "127.0.0.1", port });
       await new Promise((resolve, reject) => {
         socket.once("connect", resolve);
+        socket.once("error", reject);
+      });
+      return socket;
+    };
+  }
+
+  /** Implicit TLS socket with a test-only CA supplied by the caller. */
+  tlsSocketFactory({ ca, servername = "127.0.0.1" } = {}) {
+    const port = this.port;
+    return async () => {
+      const { connect } = await import("node:tls");
+      const socket = connect({ host: "127.0.0.1", port, servername, ca });
+      await new Promise((resolve, reject) => {
+        socket.once("secureConnect", resolve);
         socket.once("error", reject);
       });
       return socket;

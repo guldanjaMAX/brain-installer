@@ -119,6 +119,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
           expected_vectors: 0,
           pending: 0,
           submitted: 0,
+          quarantined: 0,
           oldest_queued_at: null,
         }) })
         : ({ bind: () => ({ all: async () => ({ results: [] }) }) }),

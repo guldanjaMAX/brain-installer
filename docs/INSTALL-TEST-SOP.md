@@ -108,7 +108,11 @@ The full "watch it like a client" run from `planning/03`, on disposable VMs:
   screen recorder plus asciinema inside, delete the clone. The same image
   pulls onto any Apple Silicon Mac, which is what makes the bench portable.
 - **Windows:** UTM (free) with a Windows 11 ARM VM, same clone-and-delete
-  pattern, for watching the PowerShell path with human eyes.
+  pattern, for watching the PowerShell path with human eyes. A DPAPI
+  CurrentUser encrypt/decrypt round trip passed on one matching Windows 11
+  field machine on 2026-08-30. That is one-machine field proof only. It is not
+  a universal Windows production claim and does not replace the clean Windows
+  matrix, fresh-user, moved-profile, or recovery checks.
 
 Disk budget: roughly 60GB for the macOS image and 30GB for Windows. Run
 from an external SSD if the host drive is tight (set `TART_HOME`).
@@ -224,11 +228,23 @@ pastes a truncated, revoked, or expired token was told everything was fine and
 then failed deep inside provisioning, which is the worst place to learn it.
 This is the same "unearned trust" class as the `ok: true` on a broken install.
 
-**Fixed** in `doctor.mjs`: the check now calls `/user/tokens/verify`. Active
-token, `ok`. Rejected or expired token, `fail` with what to check. Network
+**Fixed and corrected again** in `doctor.mjs`: user-owned tokens are checked at
+`/user/tokens/verify`; account-owned tokens are checked at
+`/accounts/{account_id}/tokens/verify`. A token fails closed only after every
+applicable ownership path rejects it. Without an account id, a user-endpoint
+rejection is indeterminate because the token may be account-owned. Active
+token, `ok`. Expired or disabled token, `fail` with what to check. Network
 unreachable, `warn` that says it could not verify rather than guessing either
-way, and names WARP as a likely cause. Regression tests added in
-`test/doctor.test.mjs`.
+way. Credential-free fixtures cover valid user-owned, valid account-owned, and
+invalid tokens in `test/doctor.test.mjs`.
+
+### F-04A (SERIOUS, fixed locally): account-owned token false-negative
+
+The earlier F-04 fix sent every token through the user-owned endpoint. A valid
+account-owned token was therefore reported as invalid even though Cloudflare
+provides a separate account-scoped verification path. This was independently
+reproduced from the Doctor code and fixed with the ownership-aware flow above.
+No credential or live Cloudflare resource was used for reproduction or proof.
 
 ### F-05 (MODERATE, fixed): the no-token remedy contradicted itself
 
@@ -425,6 +441,19 @@ F-07 through F-12 are fixed in the 0.2.0 candidate with focused regression
 coverage. This does not close F-01, the missing Tier 1 fresh-machine setup
 workflow, the missing browser matrix, the Windows human bench, or the physical
 passkey and provider field gates.
+
+## Candidate issue triage, 2026-08-30
+
+- F-04 was stale as a blanket "fixed" claim and is corrected above. Its
+  account-owned variant is locally fixed with deterministic fixtures.
+- Issue #5's per-isolate degraded allowance is historical evidence, not the
+  current candidate design. The candidate uses an atomic D1 reservation before
+  provider invocation and retains a conservative reservation on failures.
+- Fable audit statements are hypotheses until independently reproduced. They
+  do not close or reopen an issue, and they do not count as release proof.
+- Tracker entries are marked fixed only after the focused regression and full
+  suite pass. Provider and fresh-machine entries remain open until their named
+  live acceptance is performed.
 
 
 ## F-08, wider than first thought

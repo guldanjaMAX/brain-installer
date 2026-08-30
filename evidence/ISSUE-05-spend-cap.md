@@ -1,5 +1,12 @@
 # Issue #5 evidence — the AI spend cap no longer fails open
 
+> Candidate triage, 2026-08-30: this is historical evidence for the earlier
+> per-isolate degraded-allowance repair. It is not the current v0.2.1 candidate
+> design. The candidate reserves estimated spend atomically in D1 before a
+> provider call and retains a conservative reservation when settlement cannot
+> complete. Use the candidate tests and current recovery documentation for the
+> release decision.
+
 Date: 2026-08-28. Branch `fix/issue5-spend-cap-fails-open`, built in an isolated
 worktree off `wave0/connector-gaps`. Scope was held to three files on purpose:
 `worker/src/lib/core.js`, a new `worker/test/spend-cap.test.mjs`, and its

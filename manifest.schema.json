@@ -530,11 +530,12 @@
         },
         "daily_llm_spend_cap_usd": {
           "type": "number",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Legacy field name for the daily estimated LLM spend budget in USD. Calls reserve a conservative estimate atomically before provider use. It is a runaway-spend guard, not an invoice-exact ceiling because provider prices and receipts can change."
         },
         "ocr": {
           "type": "object",
-          "description": "Read scanned PDFs by sending each page image to a vision model through THIS brain's own Workers AI binding. Off by default because it costs money on the client's own Cloudflare account, once per scanned page, and every page still passes the daily spend cap.",
+          "description": "Read scanned PDFs by sending each page image to a vision model through THIS brain's own Workers AI binding. Off by default because it costs money on the client's own Cloudflare account, once per scanned page, and every page must reserve from the daily estimated-spend budget.",
           "properties": {
             "enabled": {
               "type": "boolean",

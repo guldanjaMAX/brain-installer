@@ -415,10 +415,12 @@ try {
     const byChunkUid = new Map(corpusRows.map((r) => [r.chunk_uid, r]));
     let vectorMatchIds = [];
     let scriptedAnswer = "";
+    let spendReservationId = 0;
     const env = {
       STORAGE: "d1",
       ADMIN_KEY: "k",
       DB: {
+        exec: async () => {},
         prepare(sql) {
           const call = { binds: [] };
           return {
@@ -433,6 +435,7 @@ try {
               return { results: [] };
             },
             first: async () => {
+              if (/INSERT INTO llm_call_log/.test(sql)) return { id: ++spendReservationId };
               if (/vector_projection_mutation_id AS mutation_id/.test(sql)) {
                 return {
                   schema_version: 12, mutation_id: null, mutation_submitted_at: null,
@@ -448,7 +451,7 @@ try {
                 ? { n: corpusRows.length, stored_documents: corpusRows.length, logical_documents: corpusRows.length }
                 : null;
             },
-            run: async () => ({}),
+            run: async () => ({ meta: { changes: 1 } }),
           };
         },
         batch: async () => {},

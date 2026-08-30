@@ -33,11 +33,11 @@ brain tools
 ```
 
 The automated part proves the Claude version, `claude auth status`, and
-`npx wrangler@4 --version` in a credential-scrubbed child environment. In a real
+`npx wrangler@4.127.1 --version` in a credential-scrubbed child environment. In a real
 terminal it also opens `claude doctor`, which owns an interactive terminal UI
 and therefore cannot be truthfully replaced by a headless fixture.
 
-Wrangler is fetched on demand at pinned major version 4. It is not installed
+Wrangler is fetched on demand at the profile-capable pinned release. It is not installed
 globally and it does not receive ambient Brain, Google, Zoom, bank, or mail
 credentials just to print its version.
 
@@ -97,16 +97,17 @@ If an older token cannot reach Vectorize, create a correctly scoped replacement
 and enter it at the hidden `brain setup` or `brain update` prompt. Do not leave
 the old value in a shell environment.
 
-For a temporary compatibility test of an older account, the account owner can
-instead run:
+For a temporary compatibility test of an older account, run
+`brain doctor <manifest>` and follow the exact named-profile command it prints.
+The profile label is derived irreversibly from the declared account id, so it
+does not expose client identity and it cannot reuse another install's default
+OAuth session.
 
-```bash
-npx wrangler@4 login
-```
-
-They approve in their own browser. Provision uses that local OAuth session only
-for Vectorize. New installs should fix the scoped token and use hidden prompt
-entry so every client follows the same supported path.
+The account owner approves that named profile in their own browser. Doctor and
+provision pass the profile and the manifest account id together, and a
+read-only Vectorize request must succeed before any fallback mutation. New
+installs should fix the scoped token and use hidden prompt entry so every owner
+follows the same supported path.
 
 ---
 

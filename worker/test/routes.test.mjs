@@ -15,16 +15,21 @@ function mkEnv(rows, {
   extra = {},
 } = {}) {
   const seen = { sql: [], binds: [], vectorQueries: [] };
+  let spendReservationId = 0;
   const env = {
     STORAGE: "d1",
     ADMIN_KEY: "k",
     DB: {
+      exec: async (sql) => { seen.sql.push(sql); },
       prepare(sql) {
         seen.sql.push(sql);
         return {
           bind(...b) { seen.binds.push(b); return this; },
           all: async () => ({ results: rows }),
           first: async () => {
+            if (/INSERT INTO llm_call_log/.test(sql)) {
+              return { id: ++spendReservationId };
+            }
             if (/vector_projection_mutation_id AS mutation_id/.test(sql)) {
               return readinessRow || {
                 schema_version: 12,
@@ -49,7 +54,7 @@ function mkEnv(rows, {
               ? (countRow || { n: 0, stored_documents: 0, logical_documents: 0 })
               : null;
           },
-          run: async () => ({}),
+          run: async () => ({ meta: { changes: 1 } }),
         };
       },
       batch: async () => {},

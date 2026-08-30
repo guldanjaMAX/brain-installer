@@ -21,11 +21,13 @@ function connectorDb() {
   };
   return {
     tables,
+    async exec() {},
     prepare(sql) {
       let bound = [];
       const statement = {
         bind(...args) { bound = args; return statement; },
         async first() {
+          if (/INSERT INTO public_request_quotas/.test(sql)) return { request_count: 1 };
           if (/DELETE FROM oauth_codes/.test(sql)) {
             const row = tables.codes.get(bound[0]) || null;
             if (row) tables.codes.delete(bound[0]);

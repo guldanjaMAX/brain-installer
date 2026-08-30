@@ -65,7 +65,7 @@ registered Financial Brain MCP server before reaching for Cloudflare directly.
 - Ask privately: \`${brain} ask ${manifest}\`
 - Load one approved folder: \`${brain} ingest ${manifest} --path <approved-folder> --source documents\`
 
-Wrangler is available as pinned major version 4 through \`npx wrangler@4\`.
+Wrangler is available at the profile-capable pinned release through \`npx wrangler@4.127.1\`.
 Prefer the Brain CLI because it applies account pinning, migration safety, key
 storage, and proof checks. Use Wrangler directly only for a named diagnostic
 the owner has approved. Credentials stay in provider pages or hidden prompts rather than the command or this file.
