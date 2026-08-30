@@ -1,5 +1,7 @@
 /** Read-only QuickBooks Online accounting snapshots. */
 
+import { createHash } from "node:crypto";
+
 import {
   createPaginationGuard, providerEnvelope, providerJson, providerSyncResult, renderRecord,
 } from "./provider-sync.mjs";
@@ -10,7 +12,85 @@ export const QBO_DEFAULT_ENTITIES = Object.freeze([
   "SalesReceipt", "RefundReceipt",
 ]);
 export const QBO_PAGE_SIZE = 1_000;
+export const QBO_RECONCILIATION_ENTITIES = Object.freeze([
+  "Purchase", "Deposit", "Payment", "BillPayment", "Transfer", "SalesReceipt", "RefundReceipt",
+]);
 const ENTITY = /^[A-Za-z][A-Za-z0-9]{0,63}$/;
+
+export const quickBooksCompanyFingerprint = (realmId) => {
+  const company = String(realmId || "").trim();
+  if (!company) throw new TypeError("QuickBooks company identity is required");
+  return createHash("sha256")
+    .update(`quickbooks-company-v1:${company}`)
+    .digest("hex");
+};
+
+function amountMinor(value) {
+  const text = String(value ?? "").trim();
+  const match = text.match(/^(\d+)(?:\.(\d{1,2}))?$/);
+  if (!match) return null;
+  const amount = Number(match[1]) * 100 + Number((match[2] || "").padEnd(2, "0"));
+  return Number.isSafeInteger(amount) ? amount : null;
+}
+
+function accountValue(value) {
+  const id = String(value?.value || "").trim();
+  return id && id.length <= 128 ? id : null;
+}
+
+/**
+ * Deterministic cash-account evidence only. These are the QBO records whose
+ * schema names the bank-side account and amount directly. Invoices, bills,
+ * journal entries, and reports are deliberately excluded rather than guessed.
+ */
+export function quickBooksReconciliationLines(entity, row) {
+  const id = String(row?.Id || "").trim();
+  const postedOn = String(row?.TxnDate || "").trim();
+  const minor = amountMinor(row?.TotalAmt);
+  const currency = String(row?.CurrencyRef?.value || "USD").trim().toUpperCase();
+  if (!id || !/^\d{4}-\d{2}-\d{2}$/.test(postedOn) || minor === null || !/^[A-Z]{3}$/.test(currency)) {
+    return [];
+  }
+  const base = {
+    posted_on: postedOn,
+    amount_minor: minor,
+    currency,
+    source_id: `${String(entity).toLowerCase()}:${id}`,
+  };
+  const one = (account, direction, fields, suffix = "") => account ? [{
+    ...base,
+    line_uid: `${base.source_id}${suffix}`,
+    qbo_account_id: account,
+    direction,
+    source_locator: `QuickBooks ${entity} ${id}; fields ${fields}`,
+  }] : [];
+
+  if (entity === "Purchase") {
+    return one(accountValue(row.AccountRef), "outflow", "TxnDate, TotalAmt, AccountRef");
+  }
+  if (entity === "Deposit") {
+    return one(accountValue(row.DepositToAccountRef), "inflow", "TxnDate, TotalAmt, DepositToAccountRef");
+  }
+  if (entity === "Payment") {
+    return one(accountValue(row.DepositToAccountRef), "inflow", "TxnDate, TotalAmt, DepositToAccountRef");
+  }
+  if (entity === "SalesReceipt") {
+    return one(accountValue(row.DepositToAccountRef), "inflow", "TxnDate, TotalAmt, DepositToAccountRef");
+  }
+  if (entity === "RefundReceipt") {
+    return one(accountValue(row.DepositToAccountRef), "outflow", "TxnDate, TotalAmt, DepositToAccountRef");
+  }
+  if (entity === "BillPayment") {
+    return one(accountValue(row?.CheckPayment?.BankAccountRef), "outflow", "TxnDate, TotalAmt, CheckPayment.BankAccountRef");
+  }
+  if (entity === "Transfer") {
+    return [
+      ...one(accountValue(row.FromAccountRef), "outflow", "TxnDate, TotalAmt, FromAccountRef", ":from"),
+      ...one(accountValue(row.ToAccountRef), "inflow", "TxnDate, TotalAmt, ToAccountRef", ":to"),
+    ];
+  }
+  return [];
+}
 
 export async function syncQuickBooksOnline({
   realmId,
@@ -24,6 +104,7 @@ export async function syncQuickBooksOnline({
   if (!String(realmId || "").trim() || !accessToken) {
     throw new TypeError("QuickBooks realmId and accessToken are required");
   }
+  const companyFingerprint = quickBooksCompanyFingerprint(realmId);
   if (!Array.isArray(entities) || !entities.length || entities.some((name) => !ENTITY.test(String(name)))) {
     throw new TypeError("QuickBooks entities must be a non-empty list of safe entity names");
   }
@@ -45,7 +126,10 @@ export async function syncQuickBooksOnline({
         const id = String(row?.Id || "").trim();
         if (!id) continue;
         const changed = row?.MetaData?.LastUpdatedTime || row?.TxnDate || null;
-        documents.push(providerEnvelope("quickbooks", `${entity.toLowerCase()}:${id}`, {
+        const sourceId = `${entity.toLowerCase()}:${id}`;
+        const reconciliationLines = quickBooksReconciliationLines(entity, row)
+          .map((line) => ({ ...line, qbo_company_fingerprint: companyFingerprint }));
+        documents.push(providerEnvelope("quickbooks", sourceId, {
           title: `${entity}: ${row.DisplayName || row.DocNumber || row.CompanyName || id}`,
           content: renderRecord(`QuickBooks ${entity}`, row),
           occurredAt: changed,
@@ -55,6 +139,8 @@ export async function syncQuickBooksOnline({
             provider_id: id,
             provider_version: changed,
             snapshot_at: snapshotAt,
+            qbo_company_fingerprint: companyFingerprint,
+            reconciliation_lines: reconciliationLines,
           },
         }));
       }

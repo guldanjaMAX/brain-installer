@@ -50,6 +50,23 @@ const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(
 }
 
 {
+  const result = await syncQuickBooksOnline({
+    realmId: "realm-fixture", accessToken: "token", entities: ["Purchase"],
+    fetchImpl: async () => json({ QueryResponse: { Purchase: [{
+      Id: "expense-1", TxnDate: "2026-07-10", TotalAmt: "260.00",
+      AccountRef: { value: "qbo-bank-35" }, CurrencyRef: { value: "USD" },
+    }], maxResults: 1 } }),
+  });
+  const line = result.documents[0].metadata.reconciliation_lines[0];
+  check("QuickBooks emits deterministic bank-impact evidence with exact source fields",
+    line.line_uid === "purchase:expense-1" && line.qbo_account_id === "qbo-bank-35" &&
+    line.amount_minor === 26000 && line.direction === "outflow" &&
+    /TxnDate, TotalAmt, AccountRef/.test(line.source_locator));
+  check("QuickBooks bank evidence excludes the company identity and OAuth custody",
+    !JSON.stringify(line).includes("realm-fixture") && !JSON.stringify(line).includes("token"));
+}
+
+{
   const result = await syncSlack({
     accessToken: "token",
     fetchImpl: async (url) => {

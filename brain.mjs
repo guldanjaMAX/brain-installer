@@ -244,7 +244,7 @@ const die = (s) => {
 
 const SUPPORT_REMOTE_COMMANDS = new Set([
   "deploy", "diagnose", "drain", "health", "migrate", "provision",
-  "reindex", "rollback", "secrets", "update", "upgrade", "verify",
+  "reconcile", "reindex", "rollback", "secrets", "update", "upgrade", "verify",
 ]);
 let currentSupportCommand = "";
 
@@ -4254,6 +4254,7 @@ export const VALUE_FLAGS = new Set([
   // brain import bank. `--file` with no value must die saying so rather than
   // being read as a boolean and then reported as "needs --file".
   "file", "format", "account", "account-kind", "institution", "currency", "entity", "entity-label",
+  "qbo-account", "to", "direction",
 ]);
 
 /** Read an exact Drive-id exclusion list from either its portable shape or a migration receipt. */
@@ -9455,6 +9456,194 @@ export async function cmdConnectProvider(provider, manifestPath, flags = {}, opt
   return { provider, connected: true, storage: oauth.providerCredentialDescription(provider, storage) };
 }
 
+async function postQuickBooksBankReconciliation({ base, adminKey, payload, fetchImpl = fetch }) {
+  return retryTransient(async () => {
+    const res = await http(`${base}/api/fin/reconcile/quickbooks-bank`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }, { timeoutMs: 60_000, what: "the QuickBooks bank reconciliation", fetchImpl });
+    let raw;
+    try {
+      raw = await res.text();
+    } catch (error) {
+      error.retryable = true;
+      throw error;
+    }
+    let body;
+    try { body = JSON.parse(raw); } catch {
+      const error = new Error("the brain returned an invalid reconciliation response");
+      error.retryable = res.status >= 500;
+      throw error;
+    }
+    if (!res.ok) {
+      const error = new Error(body.recovery || body.error || "the reconciliation was refused");
+      error.code = body.error_code || body.code || "qbo_reconciliation_refused";
+      error.payload = body;
+      error.retryable = false;
+      throw error;
+    }
+    return body;
+  }, {
+    attempts: 3,
+    delayMs: 500,
+    maxDelayMs: 2_000,
+    shouldRetry: (error) => error?.retryable !== false,
+  });
+}
+
+function quickBooksReconciliationScope(flags) {
+  const required = ["account", "qbo-account", "from", "to", "direction"];
+  const missing = required.filter((name) => flags[name] === undefined || flags[name] === true || String(flags[name]).trim() === "");
+  if (missing.length) {
+    const error = new Fatal(`QuickBooks reconciliation needs ${missing.map((name) => `--${name} <value>`).join(", ")}.`);
+    error.code = "reconciliation_scope_required";
+    throw error;
+  }
+  return {
+    account_slug: String(flags.account),
+    qbo_account_id: String(flags["qbo-account"]),
+    period_start: String(flags.from),
+    period_end: String(flags.to),
+    direction: String(flags.direction).toLowerCase(),
+    currency: String(flags.currency === true || !flags.currency ? "USD" : flags.currency).toUpperCase(),
+  };
+}
+
+function renderQuickBooksReconciliation(result) {
+  console.log("");
+  console.log(`${c.bold("QuickBooks books reality check")}\n`);
+  info(`Status: ${result.status}`);
+  if (result.coverage) info(`Coverage: QuickBooks ${result.coverage.quickbooks}; bank ${result.coverage.bank}`);
+  if (Number.isInteger(result.qbo_total_minor) && Number.isInteger(result.bank_total_minor)) {
+    info(`Compared reference totals in minor units: QuickBooks ${result.qbo_total_minor}; bank ${result.bank_total_minor}`);
+  }
+  const counts = new Map();
+  for (const item of result.classifications || []) counts.set(item.classification, (counts.get(item.classification) || 0) + 1);
+  for (const [name, count] of counts) info(`${name}: ${count}`);
+  if (result.recovery) warn(result.recovery);
+  info("QuickBooks is an accounting-team reference, not financial authority. No source record or winning claim was changed.");
+}
+
+/**
+ * Compare one explicitly paired QuickBooks cash account and bank-ledger account.
+ * The live Intuit read stays on the owner machine; only normalized, cited money
+ * lines cross into the client's own Brain for an idempotent ledger comparison.
+ */
+export async function cmdReconcileQuickBooks(manifestPath, flags = {}, options = {}) {
+  assertKnownFlags(
+    flags,
+    ["account", "qbo-account", "from", "to", "direction", "currency", "json", "status", "retry"],
+    "brain reconcile quickbooks",
+  );
+  const scope = quickBooksReconciliationScope(flags);
+  try {
+    const { m } = loadManifest(manifestPath);
+    const configuration = m?.corpora?.quickbooks || {};
+    if (configuration.enabled !== true) {
+      const error = new Fatal("corpora.quickbooks.enabled is not true in this manifest. Enable and ingest it before reconciliation.");
+      error.code = "quickbooks_not_enabled";
+      throw error;
+    }
+    if (!["sandbox", "production"].includes(configuration.environment)) {
+      const error = new Fatal("corpora.quickbooks.environment must explicitly be sandbox or production.");
+      error.code = "quickbooks_environment_required";
+      throw error;
+    }
+    const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+    if (!adminKey) {
+      const error = new Fatal("no durable admin key was found for the client-owned Brain.");
+      error.code = "admin_key_unavailable";
+      throw error;
+    }
+    const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, null);
+    const post = options.postReconciliation || postQuickBooksBankReconciliation;
+    let payload = { ...scope };
+    if (flags.status) {
+      payload.action = "status";
+    } else {
+      const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
+      const qbo = options.quickbooks ?? await import("./connectors/quickbooks-online.mjs");
+      const access = await oauth.providerAccessToken("quickbooks", {
+        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+        ...(options.storage ? { storage: options.storage } : {}),
+      });
+      const realmId = access.connection?.provider_metadata?.realm_id;
+      const companyFingerprint = qbo.quickBooksCompanyFingerprint(realmId);
+      const configured = Array.isArray(configuration.entities) ? configuration.entities : qbo.QBO_DEFAULT_ENTITIES;
+      const entities = qbo.QBO_RECONCILIATION_ENTITIES.filter((name) => configured.includes(name));
+      if (!entities.length) {
+        const error = new Fatal("the manifest enables no deterministic QuickBooks cash-account record types for reconciliation.");
+        error.code = "qbo_reconciliation_entities_unavailable";
+        throw error;
+      }
+      const snapshot = await qbo.syncQuickBooksOnline({
+        realmId,
+        accessToken: access.accessToken,
+        apiBase: configuration.environment === "production"
+          ? "https://quickbooks.api.intuit.com"
+          : "https://sandbox-quickbooks.api.intuit.com",
+        entities,
+        minorVersion: configuration.minor_version || null,
+        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      });
+      const sourceName = assertSourceName(configuration.source || "quickbooks");
+      const lines = [];
+      for (const document of snapshot.documents || []) {
+        for (const line of document?.metadata?.reconciliation_lines || []) {
+          if (String(line.qbo_account_id) !== scope.qbo_account_id || line.direction !== scope.direction ||
+              String(line.currency).toUpperCase() !== scope.currency ||
+              line.posted_on < scope.period_start || line.posted_on > scope.period_end) continue;
+          lines.push({
+            ...line,
+            qbo_company_fingerprint: companyFingerprint,
+            source_doc_uid: `${sourceName}:${document.source_id}`,
+          });
+        }
+      }
+      payload = {
+        ...payload,
+        qbo_company_fingerprint: companyFingerprint,
+        qbo_coverage: "present_snapshot_partial",
+        qbo_lines: lines,
+      };
+    }
+    const result = await post({ base, adminKey, payload, fetchImpl: options.fetchImpl || fetch });
+    if (flags.json) console.log(JSON.stringify(result, null, 2));
+    else renderQuickBooksReconciliation(result);
+    return result;
+  } catch (error) {
+    if (flags.json) {
+      if (error instanceof JsonFatal) throw error;
+      const payload = error?.payload || {
+        schema_version: 1,
+        command: flags.status ? "reconcile.quickbooks_bank.status" : "reconcile.quickbooks_bank",
+        status: "error",
+        error_code: error?.code || "qbo_reconciliation_failed",
+        recovery: error?.code
+          ? String(error.message || error)
+          : "The bounded comparison failed without a trusted receipt. Verify the named connections and retry the exact same command.",
+        financial_authority: false,
+        mutated_source_records: false,
+      };
+      throw new JsonFatal(payload);
+    }
+    die(String(error?.message || error));
+  }
+}
+
+async function cmdReconcile(target) {
+  const which = String(target || "").toLowerCase();
+  if (which !== "quickbooks") {
+    die("brain reconcile currently supports quickbooks only");
+  }
+  const path = process.argv[4];
+  if (!path || path.startsWith("--")) {
+    die("usage: brain reconcile quickbooks <manifest> --account <slug> --qbo-account <id> --from <date> --to <date> --direction <inflow|outflow> [--json]");
+  }
+  return cmdReconcileQuickBooks(path, parseFlags(process.argv.slice(4)));
+}
+
 /**
  * brain connect google — the client authorises their OWN Google account.
  *
@@ -14432,6 +14621,7 @@ const commands = {
   update: cmdUpdate,
   upgrade: cmdUpgradeInteractive,
   rollback: dispatchRollback,
+  reconcile: cmdReconcile,
   schedule: cmdSchedule,
   support: cmdSupport,
   tools: cmdLocalTools,
@@ -14455,6 +14645,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain health     <manifest>            prove the install actually works
     brain drain      <manifest>            finish the vector embedding now, with a live ETA
     brain reindex    <manifest>            rebuild the vector index from D1, no source files needed
+    brain reconcile quickbooks <manifest> compare one paired QBO and bank account period; --json for agents
     brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it

@@ -365,6 +365,31 @@ rotating refresh token may have been consumed even when the response was lost.
 Ordinary provider reads share bounded deadlines, retry classification,
 `Retry-After`, response-size limits, and redirect refusal.
 
+After a reviewed QuickBooks ingest and bank-feed import, the CLI can run one
+bounded Books Reality Check for one paired ledger account, QuickBooks account,
+period, currency, and direction:
+
+```bash
+node brain.mjs reconcile quickbooks ./acme.manifest.json \
+  --account operating-checking --qbo-account 35 \
+  --from 2026-07-01 --to 2026-07-31 --direction outflow --json
+```
+
+Add `--status` to read the stored comparison without loading QuickBooks, or
+`--retry` to repeat the same idempotent write after a lost response. The result
+classifies exact unique pairs, ambiguous duplicates, amount or date conflicts,
+and records present on only one side. It preserves both source records, creates
+review-only exceptions for anything non-exact, and never chooses a winner.
+Every QuickBooks citation is bound to a non-secret fingerprint of the authorized
+company, and a company or account pairing mismatch refuses before any write.
+
+A successful command means the QuickBooks reference loaded and was compared.
+It does not mean the books are correct. The current QuickBooks query adapter has
+only present-record snapshot coverage, so even an all-exact real run remains
+blocked on incomplete QuickBooks coverage rather than becoming authoritative.
+Use the returned `status`, `acceptance_state`, `error_code`, `recovery`, and
+exact source locators as the agent-safe control contract.
+
 The adapter cannot commit a cursor. `connectors/provider-runtime.mjs` first
 requires an exact ingest receipt for every normalized document, applies exact
 tombstones, reads the source-family inventory back, then replaces protected
@@ -980,6 +1005,11 @@ environment. `--run quickbooks --json` returns a stable success or error
 envelope for a local agent while the owner still handles browser consent. Tests
 assert ordering, rerun behavior, ambient-secret scrubbing, exact hostname
 confirmation before invite creation, and stop-on-fail verification.
+
+`brain reconcile quickbooks <manifest> ... --json` is the matching agent-safe
+reality check after reviewed ingestion. It compares one explicit account,
+period, and direction, reports stable status and recovery fields, and cannot
+mutate either source or consume a financial ruling.
 
 Current connector proof levels and the ranked acceptance backlog are maintained
 in [CONNECTOR-BACKLOG.md](./CONNECTOR-BACKLOG.md). Fixture coverage is never a

@@ -78,6 +78,11 @@ absolute test-kit and manifest paths.
 - Treat a successful connection or ingest only as a loaded accounting-team
   reference. QuickBooks is not financial authority and must be compared with
   bank evidence and other provenance-bearing records.
+- After a reviewed ingest and bank import, use `brain reconcile quickbooks`
+  only for one owner-reviewed account pairing, period, and direction. Prefer
+  `--json` and preserve its status, citations, `error_code`, and `recovery`.
+- Never treat an exact pair as a ruling, resolve a generated exception, expose
+  the Intuit realm id, or continue past a company-identity or pairing refusal.
 
 ## Recovery and completion
 

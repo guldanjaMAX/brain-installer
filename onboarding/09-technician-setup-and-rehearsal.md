@@ -175,11 +175,29 @@ existing local provider credential store. The command then prints the exact
 dry-run and first-ingest commands. A successful connection or ingest means the
 QuickBooks reference loaded. It does not prove the books are correct.
 
+After the owner approves the real ingest and the matching bank account is
+loaded, run one explicit Books Reality Check. Replace each example selector
+with the reviewed account and period:
+
+```bash
+brain reconcile quickbooks "$HOME/Financial Brain/brain.manifest.json" \
+  --account operating-checking --qbo-account 35 \
+  --from 2026-07-01 --to 2026-07-31 --direction outflow --json
+```
+
+The command preserves the QuickBooks document and bank transaction as separate
+evidence. It reports exact unique pairs, ambiguous duplicates, amount or date
+conflicts, and one-sided records. It never resolves an exception or promotes
+QuickBooks to financial authority. A company identity mismatch, changed account
+pairing, missing source document, or incomplete evidence fails closed with a
+stable `error_code` and `recovery`. Use the same command with `--status` for a
+read-only check and `--retry` only after transport or lost-response uncertainty.
+
 For a Claude or Codex-guided visit, copy this prompt exactly and replace only
 the manifest path:
 
 ```text
-Guide me through connecting my client-owned QuickBooks Online company to Financial Brain using /absolute/path/to/brain.manifest.json. First read the manifest and confirm corpora.quickbooks.enabled is true and corpora.quickbooks.environment explicitly says sandbox or production. Explain that I own the Intuit app and company authorization, Financial Brain has no shared Intuit account or credential custody, and QuickBooks will remain a reference rather than financial authority. Ask before running brain technician with --run quickbooks --json. Hand the terminal to me for both hidden prompts and never ask me to paste, print, log, or put either app value in a command. Let me complete Intuit consent in the browser. Then show the exact dry-run and first-ingest commands, stop before the real ingest until I approve it, and preserve any error_code and recovery text without exposing company identifiers or credentials.
+Guide me through connecting my client-owned QuickBooks Online company to Financial Brain using /absolute/path/to/brain.manifest.json. First read the manifest and confirm corpora.quickbooks.enabled is true and corpora.quickbooks.environment explicitly says sandbox or production. Explain that I own the Intuit app and company authorization, Financial Brain has no shared Intuit account or credential custody, and QuickBooks will remain a reference rather than financial authority. Ask before running brain technician with --run quickbooks --json. Hand the terminal to me for both hidden prompts and never ask me to paste, print, log, or put either app value in a command. Let me complete Intuit consent in the browser. Then show the exact dry-run and first-ingest commands and stop before the real ingest until I approve it. After a reviewed ingest and bank import, ask me to select exactly one Brain account slug, QuickBooks account ID, date range, and inflow or outflow direction. Show brain reconcile quickbooks with those selectors and --json, then ask before running it. Never expose the Intuit realm ID or credential. Explain that matched, mismatched, ambiguous, one-sided, unavailable, and insufficient-evidence results are review states, never financial authority. Preserve both sources, every exact citation, error_code, and recovery instruction. Never resolve an exception or treat a successful comparison as proof that the books are correct.
 ```
 
 ### 6. Zoom
