@@ -382,6 +382,7 @@ try {
       internalDate: "1756051200000",
       threadId: "T-1",
       historyId: "H-1",
+      labelIds: ["INBOX"],
     }),
     sleep: async () => {},
   });
