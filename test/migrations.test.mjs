@@ -865,6 +865,7 @@ check("restart guard refuses an existing migration column with the wrong contrac
 /* ---- source lifecycle SQL is executed, not merely inspected by a mock ---- */
 {
   let batchTail = Promise.resolve();
+  let beforeNextBatch = null;
   const d1 = {
     prepare(sql) {
       const statement = (params = []) => ({
@@ -880,6 +881,9 @@ check("restart guard refuses an existing migration column with the wrong contrac
     },
     async batch(statements) {
       const execute = async () => {
+        const hook = beforeNextBatch;
+        beforeNextBatch = null;
+        if (hook) await hook();
         db.exec("BEGIN");
         try {
           const results = [];
@@ -948,7 +952,7 @@ check("restart guard refuses an existing migration column with the wrong contrac
     source_type: "install-smoke",
     source_id: "public-first-install-v1",
     title: "Financial Brain first-install smoke proof",
-    content: "This public, non-customer document proves one authenticated installation check.",
+    content: "This public, non-customer document proves that the deployed Financial Brain accepted, stored, and indexed one authenticated installation check.",
     metadata: { proof_kind: "public_first_install_smoke", contains_customer_data: false, schema_version: 1 },
   };
   const ingestSmoke = () => worker.fetch(new Request("https://brain.example/api/admin/brain/ingest/batch", {
@@ -1005,9 +1009,26 @@ check("restart guard refuses an existing migration column with the wrong contrac
     body: JSON.stringify({ docs: [wrongEnvelope] }),
   }), env, {})).json();
   const wrongDocument = await smokeReceipt("2026-08-30T18:01:00.000Z");
-  check("a different document under the reserved source cannot satisfy the fixed receipt",
-    wrongIngest.results?.[0]?.status === "created" && wrongDocument.status === 409 &&
+  check("the ingestion boundary refuses a different document under either reserved identity",
+    wrongIngest.results?.[0]?.status === "refused" &&
+      wrongIngest.results?.[0]?.source_id === null &&
+      wrongIngest.results?.[0]?.source_type === null && wrongDocument.status === 409 &&
       (await wrongDocument.json()).code === "PUBLIC_INSTALL_SMOKE_DOCUMENT_MISMATCH");
+
+  clearSmokeState();
+  const alteredEnvelope = {
+    ...smokeEnvelope,
+    content: "This is not the canonical public smoke content.",
+  };
+  const alteredIngest = await (await worker.fetch(new Request("https://brain.example/api/admin/brain/ingest/batch", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({ docs: [alteredEnvelope] }),
+  }), env, {})).json();
+  check("canonical smoke metadata cannot bless altered title or content",
+    alteredIngest.results?.[0]?.status === "refused" &&
+      db.prepare("SELECT count(*) AS n FROM documents WHERE source='install-smoke'").get().n === 0,
+    JSON.stringify(alteredIngest));
 
   clearSmokeState();
   await ingestSmoke();
@@ -1019,15 +1040,51 @@ check("restart guard refuses an existing migration column with the wrong contrac
 
   clearSmokeState();
   await ingestSmoke();
-  await worker.fetch(new Request("https://brain.example/api/admin/brain/ingest/batch", {
-    method: "POST",
-    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
-    body: JSON.stringify({ docs: [wrongEnvelope] }),
-  }), env, {});
+  await smokeReceipt("2026-08-30T18:02:30.000Z");
+  db.exec(
+    "UPDATE documents SET content_hash='0000000000000000000000000000000000000000000000000000000000000000' " +
+    "WHERE doc_uid='install-smoke:public-first-install-v1'",
+  );
+  const corruptedHashReceipt = await smokeReceipt("2026-08-30T18:02:45.000Z");
+  const corruptedFreshness = await (await worker.fetch(new Request(
+    "https://brain.example/api/admin/brain/freshness",
+    { headers: { "X-Admin-Key": "k" } },
+  ), env, {})).json();
+  const corruptedSmoke = corruptedFreshness.sources?.find((row) => row.name === "install-smoke");
+  check("a different 64-hex commit hash cannot satisfy receipt or freshness proof",
+    corruptedHashReceipt.status === 409 &&
+      (await corruptedHashReceipt.json()).code === "PUBLIC_INSTALL_SMOKE_DOCUMENT_MISMATCH" &&
+      corruptedSmoke?.documents === 1 && corruptedSmoke?.fixed_public_smoke === false,
+    JSON.stringify(corruptedSmoke));
+
+  clearSmokeState();
+  await ingestSmoke();
+  db.prepare(
+    `INSERT INTO documents (doc_uid,source,source_id,title,ingested_at,content_hash,meta)
+     VALUES ('install-smoke:raced-extra','install-smoke','raced-extra','Extra',1,?, '{}')`
+  ).run("a".repeat(64));
   const extraDocument = await smokeReceipt("2026-08-30T18:03:00.000Z");
-  check("a second noncanonical install-smoke document blocks the one-document proof",
+  check("a directly stored second install-smoke document blocks the one-document proof",
     extraDocument.status === 409 &&
       (await extraDocument.json()).code === "PUBLIC_INSTALL_SMOKE_DOCUMENT_MISMATCH");
+
+  clearSmokeState();
+  await ingestSmoke();
+  beforeNextBatch = () => db.prepare(
+    `INSERT INTO documents (doc_uid,source,source_id,title,ingested_at,content_hash,meta)
+     VALUES ('install-smoke:raced-extra','install-smoke','raced-extra','Raced extra',1,?, '{}')`
+  ).run("b".repeat(64));
+  const racedReceipt = await smokeReceipt("2026-08-30T18:03:30.000Z");
+  const racedBody = await racedReceipt.json();
+  const racedFreshness = await (await worker.fetch(new Request(
+    "https://brain.example/api/admin/brain/freshness",
+    { headers: { "X-Admin-Key": "k" } },
+  ), env, {})).json();
+  const racedSmoke = racedFreshness.sources?.find((row) => row.name === "install-smoke");
+  check("a document raced in after preflight fails the post-commit proof and live freshness",
+    racedReceipt.status === 409 && racedBody.code === "PUBLIC_INSTALL_SMOKE_RECEIPT_INCOMPLETE" &&
+      racedSmoke?.documents === 2 && racedSmoke?.fixed_public_smoke === false,
+    JSON.stringify({ racedBody, racedSmoke }));
 
   clearSmokeState();
   await ingestSmoke();

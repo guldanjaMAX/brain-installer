@@ -232,7 +232,12 @@ globalThis.fetch = async (input, options = {}) => {
       request: async (_url, options) => {
         smokeEnvelope = JSON.parse(options.body).docs[0];
         return new Response(JSON.stringify({
-          results: [{ source_id: "public-first-install-v1", status: "created" }],
+          results: [{
+            source_type: "install-smoke",
+            source_id: "public-first-install-v1",
+            doc_uid: "install-smoke:public-first-install-v1",
+            status: "created",
+          }],
         }), { status: 200, headers: { "content-type": "application/json" } });
       },
       postReceipt: async (receipt) => { smokeReceipt = receipt; },

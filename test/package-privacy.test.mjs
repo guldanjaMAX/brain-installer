@@ -486,6 +486,7 @@ const expected = [
   "worker/src/lib/fin-upload.js",
   "worker/src/lib/grants.js",
   "worker/src/lib/ingestion-outcome.js",
+  "worker/src/lib/install-smoke.js",
   "worker/src/lib/mcp-endpoint.js",
   "worker/src/lib/oauth.js",
   "worker/src/lib/plaid-bank-feed.js",

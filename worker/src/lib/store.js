@@ -30,6 +30,12 @@
 import * as d1 from "./store-d1.js";
 import { embedText, supabaseRpc } from "./supabase.js";
 import { sanitizeEnvelope, sanitizeSensitiveLinks } from "./secret-scan.js";
+import {
+  DEFAULT_INGEST_CHUNK_OVERLAP,
+  DEFAULT_INGEST_CHUNK_SIZE,
+  ingestChunkGeometry,
+  ingestContentHash,
+} from "./install-smoke.js";
 
 export const D1 = "d1";
 export const SUPABASE = "supabase";
@@ -48,8 +54,8 @@ export function backendOf(env) {
 // Keep the body below the embedding model's effective 512-token window even
 // after the title header is added. The previous 2000/500 geometry made 93% of
 // The first large field D1 corpus was long enough to be truncated before embedding.
-export const CHUNK_SIZE = 1500;
-export const CHUNK_OVERLAP = 300;
+export const CHUNK_SIZE = DEFAULT_INGEST_CHUNK_SIZE;
+export const CHUNK_OVERLAP = DEFAULT_INGEST_CHUNK_OVERLAP;
 // Cloudflare's paid Workers limit counts every statement submitted through a
 // D1 batch, not merely one service-binding round trip. Leave ten percent of the
 // 1,000-query invocation limit for platform/runtime evolution rather than
@@ -57,11 +63,7 @@ export const CHUNK_OVERLAP = 300;
 export const D1_INGEST_STATEMENT_BUDGET = 900;
 
 export function chunkGeometry(env = {}) {
-  const rawSize = Number.parseInt(env.CHUNK_SIZE, 10);
-  const rawOverlap = Number.parseInt(env.CHUNK_OVERLAP, 10);
-  const size = Number.isFinite(rawSize) ? Math.min(Math.max(rawSize, 256), 1800) : CHUNK_SIZE;
-  const overlap = Number.isFinite(rawOverlap) ? Math.min(Math.max(rawOverlap, 0), size - 1) : CHUNK_OVERLAP;
-  return { size, overlap };
+  return ingestChunkGeometry(env);
 }
 
 function conservativeChunkCount(content, geometry) {
@@ -110,11 +112,6 @@ export function chunkText(text, { size = CHUNK_SIZE, overlap = CHUNK_OVERLAP, he
   return out;
 }
 
-async function sha256Hex(s) {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(s)));
-  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
 async function prepareD1Envelope(env, envelope) {
   const { source_type, source_id, content, title } = envelope;
   const docUid = `${source_type}:${source_id}`;
@@ -145,7 +142,7 @@ async function prepareD1Envelope(env, envelope) {
   // Geometry is part of storage identity. A deploy that corrects chunk size
   // must re-chunk unchanged documents on their next ingest instead of taking
   // the content-only no-op path forever.
-  const hash = await sha256Hex(`chunk-v1:${geometry.size}:${geometry.overlap}\0${content}`);
+  const hash = await ingestContentHash(env, content);
   return {
     envelope,
     source_type,

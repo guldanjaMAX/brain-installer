@@ -35,7 +35,12 @@ import {
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, fixedPublicSmokeProof, reindex, retryQuarantinedVectorOps, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, fixedPublicSmokeState, reindex, retryQuarantinedVectorOps, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import {
+  PUBLIC_INSTALL_SMOKE_SOURCE,
+  isCanonicalPublicInstallSmokeEnvelope,
+  usesReservedPublicInstallSmokeIdentity,
+} from "./lib/install-smoke.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
@@ -928,6 +933,15 @@ async function handleIngest(env, request, scope = { all: true }) {
     );
   }
 
+  if (usesReservedPublicInstallSmokeIdentity(envelope) &&
+      !isCanonicalPublicInstallSmokeEnvelope(envelope)) {
+    return jsonResponse({
+      error: "refused: reserved first-install smoke identity",
+      code: "PUBLIC_INSTALL_SMOKE_ENVELOPE_RESERVED",
+      detail: "Only the fixed public first-install smoke document may use this identity. Nothing was written.",
+    }, 422);
+  }
+
   envelope = sanitizeIngestEnvelope(envelope);
   const { source_type, source_id, content } = envelope || {};
   if (!source_type || !source_id || typeof content !== "string") {
@@ -1067,6 +1081,17 @@ async function handleIngestBatch(env, request, scope = { all: true }) {
       };
       continue;
     }
+    if (usesReservedPublicInstallSmokeIdentity(rawEnvelope) &&
+        !isCanonicalPublicInstallSmokeEnvelope(rawEnvelope)) {
+      tally.refused++;
+      results[inputIndex] = {
+        source_id: null,
+        source_type: null,
+        status: "refused",
+        labels: ["reserved_install_smoke_identity"],
+      };
+      continue;
+    }
     const envelope = sanitizeIngestEnvelope(rawEnvelope);
     const ref = envelope && envelope.source_id != null ? String(envelope.source_id) : null;
     const slot = { source_id: ref, source_type: envelope?.source_type ?? null };
@@ -1190,7 +1215,6 @@ async function handleIngestBatch(env, request, scope = { all: true }) {
 
 const SOURCE_RECEIPT_STATUSES = new Set(["indexing", "ready", "error"]);
 const SOURCE_RUN_LANES = new Set(["incremental", "sweep", "manual"]);
-const PUBLIC_INSTALL_SMOKE_SOURCE = "install-smoke";
 const PUBLIC_INSTALL_SMOKE_RUN_ID = "public_install_smoke_v1";
 // SQLite AUTOINCREMENT assigns positive ids. Reserve one negative identity for
 // the one fixed public smoke artifact so a lost HTTP response can be retried
@@ -1322,9 +1346,11 @@ async function handleSourceReceipt(env, request) {
   const documents = Number(countRow?.logical_documents || 0);
   const storedDocuments = Number(countRow?.stored_documents || 0);
   if (fixedPublicSmoke) {
-    const exactDocument = documents === 1 && storedDocuments === 1 &&
-      await fixedPublicSmokeProof(env).catch(() => false);
-    if (!exactDocument) {
+    const smokeState = await fixedPublicSmokeState(env).catch(() => ({
+      proven: false,
+      documents: 0,
+    }));
+    if (!(documents === 1 && storedDocuments === 1 && smokeState.proven && smokeState.documents === 1)) {
       return jsonResponse({
         error: "the fixed public install-smoke document is missing or noncanonical",
         code: "PUBLIC_INSTALL_SMOKE_DOCUMENT_MISMATCH",
@@ -1422,13 +1448,14 @@ async function handleSourceReceipt(env, request) {
       ]);
     }
 
-    const [storedEvent, storedRun, storedSource] = await Promise.all([
+    const [storedEvent, storedRun, storedSource, storedSmokeState] = await Promise.all([
       env.DB.prepare("SELECT source_name,event,at,documents,detail FROM source_events WHERE id=?1")
         .bind(PUBLIC_INSTALL_SMOKE_EVENT_ID).first(),
       env.DB.prepare("SELECT source,lane,started_at,finished_at,error FROM sync_runs WHERE run_id=?1")
         .bind(PUBLIC_INSTALL_SMOKE_RUN_ID).first(),
       env.DB.prepare("SELECT kind,status,last_ingest_at,document_count FROM sources WHERE name=?1")
         .bind(PUBLIC_INSTALL_SMOKE_SOURCE).first(),
+      fixedPublicSmokeState(env).catch(() => ({ proven: false, documents: 0 })),
     ]);
     const storedAt = String(storedEvent?.at || "");
     const exactStoredState = storedEvent?.source_name === PUBLIC_INSTALL_SMOKE_SOURCE &&
@@ -1439,7 +1466,8 @@ async function handleSourceReceipt(env, request) {
       Number(storedRun?.finished_at) === Date.parse(storedAt) &&
       (storedRun?.error === null || storedRun?.error === undefined || storedRun?.error === "") &&
       storedSource?.kind === "upload" && storedSource?.status === "ready" &&
-      Number(storedSource?.document_count) === 1 && storedSource?.last_ingest_at === storedAt;
+      Number(storedSource?.document_count) === 1 && storedSource?.last_ingest_at === storedAt &&
+      storedSmokeState.proven && storedSmokeState.documents === 1;
     if (!exactStoredState) {
       return jsonResponse({
         error: "the fixed public install-smoke receipt did not commit one exact authoritative state",

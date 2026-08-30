@@ -58,6 +58,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { assertIngestionOutcome, ingestionOutcome } from "./ingest/outcome.mjs";
+import {
+  PUBLIC_INSTALL_SMOKE_DOC_UID,
+  PUBLIC_INSTALL_SMOKE_SOURCE,
+  publicInstallSmokeEnvelope,
+} from "./worker/src/lib/install-smoke.js";
 // The ingest pipeline is loaded LAZILY, inside the commands that use it. It
 // pulls in the PDF/Office dependencies at import time, so a top-level import
 // meant that on a clone without node_modules the very first command, including
@@ -14808,9 +14813,6 @@ function handoffCheckError(code, message) {
   throw error;
 }
 
-const PUBLIC_INSTALL_SMOKE_SOURCE = "install-smoke";
-const PUBLIC_INSTALL_SMOKE_ID = "public-first-install-v1";
-
 /** Load one fixed public document through the real deployed ingestion path. */
 export async function runPublicInstallSmoke(manifestPath, options = {}) {
   const { m } = loadManifest(manifestPath);
@@ -14829,17 +14831,7 @@ export async function runPublicInstallSmoke(manifestPath, options = {}) {
     );
   }
   const base = `https://${hostname}`;
-  const envelope = Object.freeze({
-    source_type: PUBLIC_INSTALL_SMOKE_SOURCE,
-    source_id: PUBLIC_INSTALL_SMOKE_ID,
-    title: "Financial Brain first-install smoke proof",
-    content: "This public, non-customer document proves that the deployed Financial Brain accepted, stored, and indexed one authenticated installation check.",
-    metadata: Object.freeze({
-      proof_kind: "public_first_install_smoke",
-      contains_customer_data: false,
-      schema_version: 1,
-    }),
-  });
+  const envelope = publicInstallSmokeEnvelope();
   const request = options.request ?? http;
   const response = await request(`${base}/api/admin/brain/ingest/batch`, {
     method: "POST",
@@ -14875,7 +14867,7 @@ export async function runPublicInstallSmoke(manifestPath, options = {}) {
     );
   }
   if (accepted.source_type !== PUBLIC_INSTALL_SMOKE_SOURCE ||
-      accepted.doc_uid !== `${PUBLIC_INSTALL_SMOKE_SOURCE}:${PUBLIC_INSTALL_SMOKE_ID}`) {
+      accepted.doc_uid !== PUBLIC_INSTALL_SMOKE_DOC_UID) {
     handoffCheckError(
       "INSTALL_SMOKE_INGEST_UNCONFIRMED",
       "the deployed smoke ingest receipt did not prove the exact fixed source and document identity. No source completion was recorded.",

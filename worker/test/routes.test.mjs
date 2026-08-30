@@ -1339,6 +1339,37 @@ const doc = (id, content = "some ordinary meeting content about the retainer") =
   ({ source_type: "meeting", source_id: id, title: `T${id}`, content });
 
 {
+  const { env, written } = mkBatchEnv();
+  const altered = {
+    source_type: "install-smoke",
+    source_id: "public-first-install-v1",
+    title: "Financial Brain first-install smoke proof",
+    content: "altered content with otherwise canonical identity",
+    metadata: {
+      proof_kind: "public_first_install_smoke",
+      contains_customer_data: false,
+      schema_version: 1,
+    },
+  };
+  const single = await post(env, "/api/admin/brain/ingest", altered);
+  const singleText = await single.text();
+  check("single ingest reserves the exact first-install smoke identity before storage",
+    single.status === 422 && written.length === 0 &&
+      !singleText.includes("public-first-install-v1") && !singleText.includes("altered content"),
+    singleText);
+
+  const batch = await post(env, "/api/admin/brain/ingest/batch", {
+    docs: [{ ...altered, source_type: "meeting" }],
+  });
+  const batchBody = await batch.json();
+  check("batch ingest reserves the smoke document id outside its canonical source without echoing it",
+    batch.status === 200 && batchBody.refused === 1 && written.length === 0 &&
+      batchBody.results?.[0]?.source_id === null && batchBody.results?.[0]?.source_type === null &&
+      batchBody.results?.[0]?.labels?.[0] === "reserved_install_smoke_identity",
+    JSON.stringify(batchBody));
+}
+
+{
   const { env, storedTexts, documents } = mkBatchEnv();
   const paymentToken = "Qz8Lm4".repeat(8);
   const capabilityUrl = `https://invoice.stripe.com/i/acct_fixture123/test_${paymentToken}`;

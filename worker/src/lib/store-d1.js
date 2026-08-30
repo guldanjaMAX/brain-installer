@@ -32,6 +32,15 @@
  */
 
 import { currentEvidenceCandidates } from "./query-intent.js";
+import {
+  PUBLIC_INSTALL_SMOKE_CHUNK,
+  PUBLIC_INSTALL_SMOKE_DOC_UID,
+  PUBLIC_INSTALL_SMOKE_ID,
+  PUBLIC_INSTALL_SMOKE_METADATA,
+  PUBLIC_INSTALL_SMOKE_SOURCE,
+  PUBLIC_INSTALL_SMOKE_TITLE,
+  publicInstallSmokeContentHash,
+} from "./install-smoke.js";
 
 const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
@@ -2340,7 +2349,10 @@ export async function freshnessReport(env, { now = Date.now() } = {}) {
   }
   // Kinds we can refresh without the client's machine being on.
   const AUTOMATABLE = new Set(["drive", "gmail", "calendar"]);
-  const fixedSmokeProven = await fixedPublicSmokeProof(env).catch(() => false);
+  const fixedSmokeState = await fixedPublicSmokeState(env).catch(() => ({
+    proven: false,
+    documents: 0,
+  }));
   return {
     sources: rows.map((s) => {
       const last = s.last_ingest_at ? Date.parse(s.last_ingest_at) : NaN;
@@ -2357,7 +2369,9 @@ export async function freshnessReport(env, { now = Date.now() } = {}) {
       return {
         name: s.name, kind: s.kind, state,
         source_status: String(s.status || "") || null,
-        documents: Number(s.document_count || 0),
+        documents: s.name === PUBLIC_INSTALL_SMOKE_SOURCE
+          ? fixedSmokeState.documents
+          : Number(s.document_count || 0),
         days_since_ingest: days,
         expected_every_days: expected ? Math.max(1, Math.round(expected / 86400)) : null,
         last_complete_sweep_at: s.last_complete_sweep_at || null,
@@ -2369,26 +2383,56 @@ export async function freshnessReport(env, { now = Date.now() } = {}) {
           : Math.floor(operational.indexingMs / 3600000),
         reason,
         automatable,
-        ...(s.name === "install-smoke" ? { fixed_public_smoke: fixedSmokeProven } : {}),
+        ...(s.name === PUBLIC_INSTALL_SMOKE_SOURCE
+          ? { fixed_public_smoke: fixedSmokeState.proven }
+          : {}),
       };
     }),
   };
 }
 
-/** Prove the exact fixed public smoke identity without returning its contents. */
-export async function fixedPublicSmokeProof(env) {
+/** Prove the one exact live fixed public document without returning its contents. */
+export async function fixedPublicSmokeState(env) {
+  const expectedContentHash = await publicInstallSmokeContentHash(env);
   const row = await env.DB.prepare(
-    `SELECT doc_uid,source,source_id,content_hash,meta
-       FROM documents
-      WHERE doc_uid='install-smoke:public-first-install-v1' AND deleted_at IS NULL`
+    `SELECT
+       (SELECT count(*) FROM documents
+         WHERE source=?1 AND deleted_at IS NULL) live_document_count,
+       d.doc_uid,d.source,d.source_id,d.title,d.content_hash,d.meta,
+       (SELECT count(*) FROM chunks c
+         WHERE c.doc_uid=?2) chunk_count,
+       (SELECT count(*) FROM chunks c
+         WHERE c.doc_uid=?2 AND c.chunk_uid=?3 AND c.chunk_ix=0
+           AND c.text=?4 AND c.source=?1 AND c.title=?5) exact_chunk_count
+       FROM (SELECT 1) seed
+       LEFT JOIN documents d ON d.doc_uid=?2 AND d.deleted_at IS NULL`
+  ).bind(
+    PUBLIC_INSTALL_SMOKE_SOURCE,
+    PUBLIC_INSTALL_SMOKE_DOC_UID,
+    `${PUBLIC_INSTALL_SMOKE_DOC_UID}#0`,
+    PUBLIC_INSTALL_SMOKE_CHUNK,
+    PUBLIC_INSTALL_SMOKE_TITLE,
   ).first();
-  if (!row || row.doc_uid !== "install-smoke:public-first-install-v1" ||
-      row.source !== "install-smoke" || row.source_id !== "public-first-install-v1" ||
-      !/^[a-f0-9]{64}$/.test(String(row.content_hash || ""))) return false;
+  const documents = Number(row?.live_document_count || 0);
+  const identityExact = documents === 1 && row?.doc_uid === PUBLIC_INSTALL_SMOKE_DOC_UID &&
+    row?.source === PUBLIC_INSTALL_SMOKE_SOURCE && row?.source_id === PUBLIC_INSTALL_SMOKE_ID &&
+    row?.title === PUBLIC_INSTALL_SMOKE_TITLE && Number(row?.chunk_count) === 1 &&
+    Number(row?.exact_chunk_count) === 1 && row?.content_hash === expectedContentHash;
   let metadata;
-  try { metadata = JSON.parse(String(row.meta || "{}")); } catch { return false; }
-  return metadata?.proof_kind === "public_first_install_smoke" &&
-    metadata?.contains_customer_data === false && Number(metadata?.schema_version) === 1;
+  try { metadata = JSON.parse(String(row?.meta || "{}")); } catch { metadata = null; }
+  const metadataKeys = metadata && !Array.isArray(metadata)
+    ? Object.keys(metadata).sort()
+    : [];
+  const metadataExact = metadataKeys.length === 3 &&
+    metadataKeys.join("|") === "contains_customer_data|proof_kind|schema_version" &&
+    metadata.proof_kind === PUBLIC_INSTALL_SMOKE_METADATA.proof_kind &&
+    metadata.contains_customer_data === PUBLIC_INSTALL_SMOKE_METADATA.contains_customer_data &&
+    metadata.schema_version === PUBLIC_INSTALL_SMOKE_METADATA.schema_version;
+  return { proven: Boolean(identityExact && metadataExact), documents };
+}
+
+export async function fixedPublicSmokeProof(env) {
+  return (await fixedPublicSmokeState(env)).proven;
 }
 
 // Ninety-nine ids plus the queued_at value exactly fit the installer's shared
