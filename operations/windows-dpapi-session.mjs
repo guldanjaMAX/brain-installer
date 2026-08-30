@@ -97,7 +97,10 @@ function assertFixedSource(path = WINDOWS_DPAPI_SOURCE) {
   const identity = lstatSync(path);
   if (!identity.isFile() || identity.isSymbolicLink() || identity.nlink !== 1 ||
       identity.size < 1 || identity.size > 64 * 1024 ||
-      resolve(realpathSync.native(path)).toLowerCase() !== resolve(path).toLowerCase()) {
+      // The JavaScript resolver retains a legitimate Windows 8.3 spelling but
+      // still resolves a linked ancestor. The native resolver expands 8.3
+      // names and would falsely reject a package installed through one.
+      resolve(realpathSync(path)).toLowerCase() !== resolve(path).toLowerCase()) {
     throw staged("source_validation", "invalid DPAPI source file");
   }
 }
