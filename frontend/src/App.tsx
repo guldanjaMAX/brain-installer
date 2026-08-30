@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { ApiError, api, type Me } from "./lib/api";
+import { ApiError, api, supportApi, type Me, type SupportMe } from "./lib/api";
 import { Gate } from "./components/Gate";
 import { Ask, ScopedAsk } from "./components/Ask";
 import { Settings } from "./components/Settings";
@@ -11,11 +11,30 @@ import { FinanceScopeProvider } from "./components/FinanceScope";
 import { ScopedDocuments } from "./components/ScopedDocuments";
 import { Attention } from "./components/ui";
 import { grantWorkspaceConfirmed } from "./lib/security";
+import { supportMeConfirmed } from "./lib/support";
+import { SupportDiagnostics } from "./components/SupportDiagnostics";
+import { SupportGate } from "./components/SupportGate";
 
 // The invite arrives as /app#enroll=<code>. It lives in the fragment on
 // purpose: a fragment is never sent to the server in a request line and never
 // lands in an access log or a referrer header.
-const inviteCode = (typeof location === "undefined" ? null : (location.hash.match(/enroll=([A-Za-z0-9_-]+)/) || [])[1]) || null;
+const inviteCode = (typeof location === "undefined" ? null : (location.hash.match(/^#enroll=([A-Za-z0-9_-]+)$/) || [])[1]) || null;
+export function supportInviteFromHash(hash: string): string | null {
+  return (hash.match(/^#support-enroll=([A-Za-z0-9_-]+)$/) || [])[1] || null;
+}
+
+export function supportModeFromHash(hash: string): boolean {
+  return /^#support(?:$|-enroll=[A-Za-z0-9_-]+$)/.test(hash);
+}
+
+const supportInviteCode = typeof location === "undefined" ? null : supportInviteFromHash(location.hash);
+// Keep the one-time code only in memory. The support gate still has the value
+// it needs for enrollment, while refreshes, screenshots, copied addresses, and
+// later browser history expose only the non-secret support-mode marker.
+if (supportInviteCode && typeof history !== "undefined") {
+  history.replaceState(null, "", "/app#support");
+}
+const supportMode = typeof location !== "undefined" && supportModeFromHash(location.hash);
 
 // The owner's name comes from the server-rendered shell, not from /api/app/me.
 // A signed-out visitor cannot call that endpoint, and the FIRST screen a client
@@ -34,13 +53,32 @@ export function visibleView(kind: "owner" | "grant", requested: View): View {
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
+  const [supportMe, setSupportMe] = useState<SupportMe | null>(null);
+  const [supportInvitePending, setSupportInvitePending] = useState(Boolean(supportInviteCode));
   const [view, setView] = useState<View>("home");
   const [ready, setReady] = useState(false);
   const [authNotice, setAuthNotice] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
+    if (supportMode) {
+      try {
+        setSupportMe(await supportApi<SupportMe>("/api/support/me"));
+        setMe(null);
+        setAuthNotice(null);
+      } catch (next) {
+        setSupportMe(null);
+        setMe(null);
+        setAuthNotice(next instanceof ApiError && next.status === 403 && typeof next.body.recovery === "string"
+          ? next.body.recovery
+          : null);
+      } finally {
+        setReady(true);
+      }
+      return;
+    }
     try {
       setMe(await api<Me>("/api/app/me"));
+      setSupportMe(null);
       setAuthNotice(null);
     } catch (next) {
       // A 401 is the ordinary signed-out case, not an error worth showing.
@@ -58,6 +96,23 @@ export function App() {
   // Nothing until the session is known: flashing the sign-in screen at someone
   // who is already signed in reads as being logged out.
   if (!ready) return null;
+
+  if (supportMode) {
+    if (supportInvitePending) {
+      return (
+        <SupportGate
+          inviteCode={supportInviteCode}
+          notice={authNotice}
+          onIn={() => { setSupportInvitePending(false); void refresh(); }}
+        />
+      );
+    }
+    if (!supportMe) return <SupportGate inviteCode={null} notice={authNotice} onIn={refresh} />;
+    if (!supportMeConfirmed(supportMe)) {
+      return <UnavailableSession message="The brain did not return the exact read-only support boundary. No owner or diagnostic surface is being opened." />;
+    }
+    return <SupportDiagnostics principal={supportMe.principal} onAccessEnded={refresh} />;
+  }
 
   if (!me?.signed_in) {
     return <Gate owner={me?.owner || shellOwner} inviteCode={inviteCode} notice={authNotice} onIn={refresh} />;

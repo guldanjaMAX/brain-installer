@@ -3567,6 +3567,15 @@ function printRollbackPreview({ bookmark, databaseId }) {
   return { confirmed: false, restored: false, databaseId, bookmark };
 }
 
+function d1UnsignedInteger(value, minimum = 0) {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= minimum;
+  }
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(value)) return false;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= minimum;
+}
+
 export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
   const preflight = rollbackLocalPreflight(manifestPath, bookmarkArg);
   if (options.confirmed !== true) return printRollbackPreview(preflight);
@@ -3589,45 +3598,80 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
   warn("this restores D1 only. Vectorize must be rebuilt before semantic retrieval is trustworthy.");
   info(`database ${dbId}, bookmark ${bookmark}`);
   const usesD1VectorOutbox = (m.infrastructure?.cloudflare?.storage || "d1") === "d1";
-  if (usesD1VectorOutbox) {
-    // Time travel restores the lease and mutation-fence rows too. Quiesce every
-    // old writer before restoring them, or an already-started mutation can land
-    // after the restore with no surviving receipt. Keep the Worker paused until
-    // the restored corpus has been durably marked for a new bootstrap epoch.
-    await deployRollbackWorker(pin.target, {
-      persistDomain: false,
-      pauseVectorDrainForUpgrade: true,
-    });
-    revalidateUpdateManifest(pin, "rollback paused vector-drain deployment");
-    await verifyRollbackHealth(pin.target, {
-      expectVersion: PRODUCT_VERSION,
-      expectDrainMode: "paused-for-upgrade",
-      reachOnly: true,
-    });
-    revalidateUpdateManifest(pin, "rollback paused vector-drain health verification");
-    await waitForVectorDrainCutover(waitForVectorDrainQuiescence, {
-      nextStep: "the D1 restore",
-    });
-    revalidateUpdateManifest(pin, "rollback vector-drain quiescence");
-  }
+  // Paused mode is also the support-auth barrier. Apply it for every D1
+  // rollback, including legacy manifests whose vector outbox lived elsewhere,
+  // then wait out older invocations before replacing authentication state.
+  await deployRollbackWorker(pin.target, {
+    persistDomain: false,
+    pauseVectorDrainForUpgrade: true,
+  });
+  revalidateUpdateManifest(pin, "rollback paused deployment");
+  await verifyRollbackHealth(pin.target, {
+    expectVersion: PRODUCT_VERSION,
+    expectDrainMode: "paused-for-upgrade",
+    reachOnly: true,
+  });
+  revalidateUpdateManifest(pin, "rollback paused health verification");
+  await waitForVectorDrainCutover(waitForVectorDrainQuiescence, {
+    nextStep: "the D1 restore",
+  });
+  revalidateUpdateManifest(pin, "rollback quiescence");
   await callCloudflare(`/accounts/${acct.id}/d1/database/${dbId}/time_travel/restore?bookmark=${encodeURIComponent(bookmark)}`, {
     method: "POST",
   });
   revalidateUpdateManifest(pin, "rollback restore");
-  ok("D1 restored");
-  if (usesD1VectorOutbox) {
-    try {
-      const schemaReceipt = await queryDatabase(
+  info("D1 bookmark restored; validating recovery barriers");
+  let restoredSchemaVersion;
+  try {
+    const schemaReceipt = await queryDatabase(
+      acct.id,
+      dbId,
+      "SELECT schema_version FROM install_state WHERE id = 1",
+    );
+    if (!schemaReceipt || !Array.isArray(schemaReceipt.results) ||
+        schemaReceipt.results.length !== 1 ||
+        !d1UnsignedInteger(schemaReceipt.results[0]?.schema_version, 1)) {
+      throw new Error("restored schema version did not read back");
+    }
+    restoredSchemaVersion = Number(schemaReceipt.results[0].schema_version);
+    if (restoredSchemaVersion >= 23) {
+      // D1 Time Travel restores authentication tables as well as business
+      // data. A signed support cookie would become valid again if its old
+      // live row and passkey were left in place. The paused Worker refuses
+      // all support routes during this window; clear every live authority
+      // table before any recovery can be reported successful. Immutable
+      // support_access_events and owner_activity_events deliberately remain.
+      await queryDatabase(acct.id, dbId, "DELETE FROM support_passkeys");
+      await queryDatabase(acct.id, dbId, "DELETE FROM support_enrollment_codes");
+      await queryDatabase(acct.id, dbId, "DELETE FROM support_auth_challenges");
+      await queryDatabase(acct.id, dbId, "DELETE FROM support_access_requests");
+      await queryDatabase(acct.id, dbId, "DELETE FROM support_sessions");
+      const supportReceipt = await queryDatabase(
         acct.id,
         dbId,
-        "SELECT schema_version FROM install_state WHERE id = 1",
+        `SELECT (SELECT COUNT(*) FROM support_passkeys) AS passkeys,
+                (SELECT COUNT(*) FROM support_enrollment_codes) AS enrollment_codes,
+                (SELECT COUNT(*) FROM support_auth_challenges) AS auth_challenges,
+                (SELECT COUNT(*) FROM support_access_requests) AS access_requests,
+                (SELECT COUNT(*) FROM support_sessions) AS sessions`,
       );
-      if (!schemaReceipt || !Array.isArray(schemaReceipt.results) ||
-          schemaReceipt.results.length !== 1 ||
-          !Number.isSafeInteger(Number(schemaReceipt.results[0]?.schema_version))) {
-        throw new Error("restored schema version did not read back");
+      const supportCounts = supportReceipt?.results?.length === 1
+        ? supportReceipt.results[0] : null;
+      if (!supportCounts || [
+        "passkeys", "enrollment_codes", "auth_challenges", "access_requests", "sessions",
+      ].some((field) => !d1UnsignedInteger(supportCounts[field]) || Number(supportCounts[field]) !== 0)) {
+        throw new Error("support authority did not read back empty");
       }
-      const restoredSchemaVersion = Number(schemaReceipt.results[0].schema_version);
+    }
+  } catch {
+    die(
+      "D1 was restored, but temporary support authority could not be verified empty.\n" +
+        "      The compatibility Worker remains paused and support access remains unavailable.\n" +
+        "      Do not return this brain to use until the restored schema is readable and support sessions, invites, challenges, requests, and passkeys all read back empty.",
+    );
+  }
+  if (usesD1VectorOutbox) {
+    try {
       if (restoredSchemaVersion < 12) {
         throw new Error("restored schema predates the supervised vector protocol");
       }
@@ -3691,12 +3735,16 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
           receipt.results[0]?.mutation_id !== null ||
           receipt.results[0]?.mutation_submitted_at !== null ||
           receipt.results[0]?.cursor !== null ||
+          !d1UnsignedInteger(receipt.results[0]?.submitted_rows) ||
           Number(receipt.results[0]?.submitted_rows) !== 0 ||
           receipt.results[0]?.high_water !== receipt.results[0]?.chunk_high_water ||
           (hasBulkBootstrap && (
             receipt.results[0]?.bootstrap_protocol !== null ||
+            !d1UnsignedInteger(receipt.results[0]?.bootstrap_base_count) ||
             Number(receipt.results[0]?.bootstrap_base_count) !== 0 ||
+            !d1UnsignedInteger(receipt.results[0]?.bootstrap_batch_count) ||
             Number(receipt.results[0]?.bootstrap_batch_count) !== 0 ||
+            !d1UnsignedInteger(receipt.results[0]?.tagged_rows) ||
             Number(receipt.results[0]?.tagged_rows) !== 0
           ))) {
         throw new Error("projection invalidation did not read back");
@@ -3714,6 +3762,7 @@ export async function cmdRollback(manifestPath, bookmarkArg, options = {}) {
     // orphans. Keep the complete corpus-write barrier live until a supervised
     // recovery creates/rebinds a clean index and rebuilds exact readiness.
   }
+  ok("D1 restored and recovery barriers verified");
   // A rolled-back run must never become the baseline for the next upgrade.
   const marked = await queryDatabase(
     acct.id,

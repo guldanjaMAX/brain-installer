@@ -5,6 +5,7 @@ import { Section, Row, Note, Empty, Badge, Chip, Confirm, EditableName, ago, ago
 import { OwnerPreferences } from "./OwnerPreferences";
 import { DocumentAccess } from "./DocumentAccess";
 import { PasskeyDiagnostics } from "./PasskeyDiagnostics";
+import { SupportAccess } from "./SupportAccess";
 
 /** Who and what can open this brain.
  *
@@ -62,6 +63,8 @@ export function Settings({ devices, connections, onChange }: {
       )}
 
       <OwnerPreferences />
+
+      <SupportAccess />
 
       <DocumentAccess />
 

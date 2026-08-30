@@ -41,6 +41,10 @@ import {
 } from "./document-access.js";
 import { appPageHtml, brandOgSvg } from "./app-page.js";
 import { APP_JS, APP_CSS } from "./app-assets.js";
+import {
+  createSupportSession, listSupportSessions, reissueSupportInvite,
+  revokeSupportSession, SupportAccessError,
+} from "./support-access.js";
 
 const APP_HEADER = "X-Brain-App";
 
@@ -149,6 +153,17 @@ function documentAccessErrorResponse(error) {
     code: error.code,
     detail: error.message,
   }, error.status);
+}
+
+function supportAccessErrorResponse(error) {
+  const status = error instanceof SupportAccessError ? error.status : 503;
+  const code = error instanceof SupportAccessError ? error.code : "support_access_unavailable";
+  const label = status === 400 ? "invalid_request"
+    : status === 403 ? "forbidden"
+      : status === 404 ? "not_found"
+        : status === 409 ? "conflict"
+          : "unavailable";
+  return jsonResponse({ error: label, code }, status);
 }
 
 async function observePasskey(env, event) {
@@ -591,6 +606,7 @@ export async function handleOwnerAuth(env, request, url, path) {
   }
 
   // Everything below requires a live session.
+  const supportAccessOwnerPath = path.startsWith("/api/app/support-access/");
   let principal;
   try {
     principal = await ownerSessionPrincipal(request, env);
@@ -598,7 +614,9 @@ export async function handleOwnerAuth(env, request, url, path) {
     return unavailable("owner_auth_unavailable");
   }
   if (!principal) {
-    return jsonResponse({ error: "unauthorized" }, 401);
+    return supportAccessOwnerPath
+      ? jsonResponse({ error: "unauthorized", code: "session_required" }, 401)
+      : jsonResponse({ error: "unauthorized" }, 401);
   }
   if (principal.denied) {
     return withCookie(jsonResponse({
@@ -724,6 +742,53 @@ export async function handleOwnerAuth(env, request, url, path) {
   // A scoped session may read only its exact granted documents and its own
   // minimal identity above. Unlisted future routes therefore fail owner-only.
   if (!ownerRequired(principal)) return scopedForbidden();
+
+  // A rollback restores the database underneath the paused Worker. Support
+  // authority is unavailable for that entire window, including owner reads,
+  // so neither an old cookie nor a newly written invite can cross the restore.
+  if (supportAccessOwnerPath && env.VECTOR_DRAIN_MODE === "paused-for-upgrade") {
+    return unavailable("support_access_unavailable");
+  }
+
+  if (path === "/api/app/support-access/status") {
+    try {
+      return jsonResponse(await listSupportSessions(env));
+    } catch (error) {
+      return supportAccessErrorResponse(error);
+    }
+  }
+  if (path === "/api/app/support-access/create") {
+    const payload = await body(request);
+    try {
+      const { enrollment_url_code: code, ...receipt } = await createSupportSession(env, payload);
+      return jsonResponse({
+        ...receipt,
+        enrollment_url: code ? `${url.origin}/app#support-enroll=${code}` : null,
+      });
+    } catch (error) {
+      return supportAccessErrorResponse(error);
+    }
+  }
+  if (path === "/api/app/support-access/reissue") {
+    const payload = await body(request);
+    try {
+      const { enrollment_url_code: code, ...receipt } = await reissueSupportInvite(env, payload);
+      return jsonResponse({
+        ...receipt,
+        enrollment_url: code ? `${url.origin}/app#support-enroll=${code}` : null,
+      });
+    } catch (error) {
+      return supportAccessErrorResponse(error);
+    }
+  }
+  if (path === "/api/app/support-access/revoke") {
+    const payload = await body(request);
+    try {
+      return jsonResponse(await revokeSupportSession(env, payload));
+    } catch (error) {
+      return supportAccessErrorResponse(error);
+    }
+  }
 
   if (path === "/api/app/document-access/status") {
     try {

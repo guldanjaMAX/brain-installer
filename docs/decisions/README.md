@@ -10,3 +10,4 @@ code it governs.
 
 - [001: Standardize new Brain installs on Cloudflare](001-cloudflare-native-standard.md)
 - [002: Accelerate exact legacy projection bootstrap only behind the paused barrier](002-paused-bootstrap-acceleration.md)
+- [003: Use native, read-only temporary support sessions](003-temporary-support-sessions.md)

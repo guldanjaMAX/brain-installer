@@ -5,12 +5,14 @@
 export class ApiError extends Error {
   status: number;
   body: Record<string, unknown>;
+  retryAfterSeconds: number | null;
 
-  constructor(status: number, body: Record<string, unknown>, fallback: string) {
+  constructor(status: number, body: Record<string, unknown>, fallback: string, retryAfterSeconds: number | null = null) {
     super(typeof body.error === "string" ? body.error : fallback);
     this.name = "ApiError";
     this.status = status;
     this.body = body;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -22,6 +24,26 @@ export async function api<T = unknown>(path: string, body?: unknown): Promise<T>
   });
   const data = await response.json().catch(() => ({})) as Record<string, unknown>;
   if (!response.ok) throw new ApiError(response.status, data, `HTTP ${response.status}`);
+  return data as T;
+}
+
+/** The support cookie is deliberately useless on owner routes. Its companion
+ * header is separate too, so no client helper can accidentally make temporary
+ * diagnostics look like an owner-app request. */
+export async function supportApi<T = unknown>(path: string, body?: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Brain-Support": "1" },
+    body: JSON.stringify(body ?? {}),
+  });
+  const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (!response.ok) {
+    const retryAfter = response.headers.get("Retry-After");
+    const retryAfterSeconds = retryAfter && /^(?:[1-9]|[12][0-9]|30)$/.test(retryAfter)
+      ? Number(retryAfter)
+      : null;
+    throw new ApiError(response.status, data, `HTTP ${response.status}`, retryAfterSeconds);
+  }
   return data as T;
 }
 
@@ -132,6 +154,15 @@ export type GrantPrincipal = {
   document_count: number;
   capabilities: Array<"documents:read" | "ask">;
 };
+export type SupportPrincipal = {
+  kind: "support";
+  support_session_id: string;
+  technician_label: string;
+  technician_identity_verified: false;
+  expires_at: number;
+  idle_expires_at: number;
+  read_only: true;
+};
 export type WorkspaceAllowlist = {
   home: boolean;
   documents: boolean;
@@ -157,6 +188,132 @@ export type Me = {
   workspace?: WorkspaceAllowlist;
   devices?: Device[];
   connections?: Connection[];
+};
+
+export type SupportWorkspace = {
+  support: true;
+  home: false;
+  documents: false;
+  ask: false;
+  add_review: false;
+  access: false;
+  bank: false;
+  targets: false;
+  preferences: false;
+  connections: false;
+};
+export type SupportMe = {
+  signed_in: true;
+  principal: SupportPrincipal;
+  workspace: SupportWorkspace;
+  can_fix: false;
+  repair_mode: "owner_approval_required_future";
+};
+
+export type SupportDurationMinutes = 15 | 30 | 60 | 120;
+export type SupportSessionState = "pending" | "active" | "expired" | "revoked";
+export type SupportAccessSession = {
+  support_session_id: string;
+  technician_label: string;
+  state: SupportSessionState;
+  authentication_state: "authenticated" | "reauthentication_required" | null;
+  created_at: number;
+  invite_state: "active" | "expired" | "consumed" | null;
+  enrollment_expires_at: number | null;
+  activated_at: number | null;
+  expires_at: number | null;
+  idle_expires_at: number | null;
+  last_used_at: number | null;
+  revoked_at: number | null;
+};
+export type SupportAccessStatus = {
+  status: "ready";
+  sessions: SupportAccessSession[];
+  policy: {
+    access: "read_only_diagnostics";
+    duration_choices_minutes: SupportDurationMinutes[];
+    default_duration_minutes: 30;
+    max_duration_minutes: 120;
+    enrollment_link_max_minutes: 10;
+    can_fix: false;
+    repair_mode: "owner_approval_required_future";
+  };
+};
+export type SupportAccessReceipt = {
+  status: "pending" | "active" | "revoked";
+  support_session_id: string;
+  technician_label?: string;
+  created_at?: number;
+  activated_at?: number | null;
+  expires_at?: number | null;
+  idle_expires_at?: number | null;
+  revoked_at?: number;
+  changed: boolean;
+  replayed: boolean;
+  request_id: string;
+  invite_state?: "active" | "consumed" | "expired";
+  enrollment_url?: string | null;
+  enrollment_expires_at?: number | null;
+};
+
+export type SupportSystemAccess = {
+  kind: "support";
+  technician_label: string;
+  expires_at: number;
+  remaining_seconds: number;
+  read_only: true;
+  can_fix: false;
+};
+export type SupportSystemPrivacy = {
+  mode: "aggregate_only";
+  content_visible: false;
+  search_available: false;
+  raw_errors_visible: false;
+  credentials_visible: false;
+  account_identifiers_visible: false;
+};
+export type SupportSystemProblem = {
+  code: "empty_corpus" | "undated_documents" | "source_registration_issue" | "empty_source"
+    | "index_consistency_issue" | "vector_backlog" | "vector_failures" | "orphan_chunks"
+    | "blank_chunks" | "duplicate_documents" | "chunk_outliers" | "oversized_chunks"
+    | "duplicate_chunks" | "diagnostic_issue";
+  area: "meta" | "coverage" | "integrity" | "efficiency" | "diagnostics";
+  severity: "crit" | "warn";
+  count: number;
+  repairability: "guidance_only";
+};
+export type SupportSystemSource = {
+  kind: "upload" | "drive" | "message" | "email" | "calendar" | "other";
+  label: "Files you uploaded" | "Google Drive" | "Messages" | "Email" | "Calendar" | "Meeting recordings" | "Another source";
+  state: "ok" | "never_synced" | "stale" | "broken" | "indexing" | "unknown";
+  documents: number;
+  days_since_ingest: number | null;
+  automatable: boolean;
+};
+export type SupportSystemStatus = {
+  status: "ready" | "partial";
+  observed_at: number;
+  unavailable: string[];
+  access: SupportSystemAccess;
+  privacy: SupportSystemPrivacy;
+  brain: {
+    product_version: string;
+    schema_version: number;
+    status: string | null;
+    accepting_documents: boolean | null;
+    drain_mode: string | null;
+  };
+  corpus?: { documents: number; chunks: number };
+  vectors?: {
+    ready: boolean;
+    expected: number;
+    visible: number;
+    pending: number;
+    percent_visible: number | null;
+  };
+  problem_counts?: { crit: number; warn: number; info: number };
+  problems?: SupportSystemProblem[];
+  sources?: SupportSystemSource[];
 };
 
 export type GrantedDocument = {
@@ -238,7 +395,8 @@ export type OwnerActivityEvent = {
   event_id: string;
   event_type: "upload_completed" | "approval_recorded" | "period_close_accepted" | "period_close_reopened" | "target_set" | "target_archived" | "preference_set"
     | "document_grant_created" | "document_grant_invite_reissued" | "document_grant_revoked"
-    | "passkey_added" | "passkey_renamed" | "passkey_revoked" | "sessions_revoked";
+    | "passkey_added" | "passkey_renamed" | "passkey_revoked" | "sessions_revoked"
+    | "support_access_created" | "support_access_activated" | "support_access_revoked";
   entity_slug: string | null;
   subject_kind: string;
   subject_id: string;

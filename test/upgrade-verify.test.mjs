@@ -1446,6 +1446,14 @@ const bootstrapCompletion = () => ({
     );
 
     const actions = [];
+    const supportAuthority = {
+      passkeys: ["active", "revoked"],
+      enrollment_codes: ["active", "revoked"],
+      auth_challenges: ["active"],
+      access_requests: ["active", "revoked"],
+      sessions: ["active", "revoked"],
+    };
+    const retainedSupportHistory = ["created", "revoked"];
     const restored = await cmdRollback(manifestPath, "fixture-bookmark", {
       confirmed: true,
       resolveAccount: async () => { actions.push("account"); return { id: "fixture-account" }; },
@@ -1479,7 +1487,24 @@ const bootstrapCompletion = () => ({
       d1Query: async (_account, _database, sql) => {
         if (/SELECT schema_version FROM install_state/.test(sql)) {
           actions.push("schema");
-          return { results: [{ schema_version: 13 }] };
+          return { results: [{ schema_version: 23 }] };
+        }
+        const supportDelete = sql.match(/^DELETE FROM (support_passkeys|support_enrollment_codes|support_auth_challenges|support_access_requests|support_sessions)$/);
+        if (supportDelete) {
+          const key = supportDelete[1].replace(/^support_/, "");
+          actions.push(`purge-${key}`);
+          supportAuthority[key] = [];
+          return { results: [], meta: { changes: 2 } };
+        }
+        if (/SELECT \(SELECT COUNT\(\*\) FROM support_passkeys\)/.test(sql)) {
+          actions.push("verify-support-empty");
+          return { results: [{
+            passkeys: supportAuthority.passkeys.length,
+            enrollment_codes: supportAuthority.enrollment_codes.length,
+            auth_challenges: supportAuthority.auth_challenges.length,
+            access_requests: supportAuthority.access_requests.length,
+            sessions: supportAuthority.sessions.length,
+          }] };
         }
         if (/UPDATE install_state/.test(sql)) {
           actions.push("invalidate");
@@ -1528,11 +1553,202 @@ const bootstrapCompletion = () => ({
       "explicit confirmation is the only path that performs the restore",
       restored?.confirmed === true && restored?.restored === true &&
         restored?.requiresVectorizeRecreation === true &&
-        actions.join(",") === "account,deploy-paused,health-paused,quiesce,restore,schema,invalidate,reset-batches,reset-receipts,readback,history",
+        actions.join(",") === "account,deploy-paused,health-paused,quiesce,restore,schema," +
+          "purge-passkeys,purge-enrollment_codes,purge-auth_challenges,purge-access_requests,purge-sessions," +
+          "verify-support-empty,invalidate,reset-batches,reset-receipts,readback,history",
       actions.join(","),
     );
+    check("rollback removes active and revoked live support authority but retains immutable history",
+      Object.values(supportAuthority).every((rows) => rows.length === 0) &&
+        retainedSupportHistory.join(",") === "created,revoked" &&
+        !actions.some((action) => /support.*events|owner.*activity/.test(action)),
+      JSON.stringify({ supportAuthority, retainedSupportHistory, actions }));
     check("rollback never reactivates a Worker against an orphaned provider index",
       !actions.includes("deploy-active") && !actions.includes("health-active"), actions.join(","));
+
+    const failedPurgeActions = [];
+    const failedPurgeOutput = [];
+    let failedPurgeError = null;
+    const priorPurgeLog = console.log;
+    try {
+      console.log = (...values) => failedPurgeOutput.push(values.map(String).join(" "));
+      await cmdRollback(manifestPath, "fixture-bookmark", {
+        confirmed: true,
+        resolveAccount: async () => ({ id: "fixture-account" }),
+        cmdDeploy: async () => { failedPurgeActions.push("deploy-paused"); },
+        cmdHealth: async () => { failedPurgeActions.push("health-paused"); },
+        waitForVectorDrainQuiescence: async () => { failedPurgeActions.push("quiesce"); },
+        cf: async () => { failedPurgeActions.push("restore"); },
+        d1Query: async (_account, _database, sql) => {
+          if (/SELECT schema_version FROM install_state/.test(sql)) {
+            failedPurgeActions.push("schema");
+            return { results: [{ schema_version: 23 }] };
+          }
+          if (sql === "DELETE FROM support_passkeys") {
+            failedPurgeActions.push("purge-passkeys");
+            return { results: [], meta: { changes: 2 } };
+          }
+          if (sql === "DELETE FROM support_enrollment_codes") {
+            failedPurgeActions.push("purge-failed");
+            throw new Error("fixture purge failure");
+          }
+          failedPurgeActions.push("UNEXPECTED-AFTER-FAILURE");
+          return { results: [] };
+        },
+      });
+    } catch (caught) {
+      failedPurgeError = caught;
+    } finally {
+      console.log = priorPurgeLog;
+    }
+    check("rollback purge failure leaves the Worker paused and never reports recovery ready",
+      /temporary support authority could not be verified empty.*Worker remains paused/is.test(failedPurgeError?.message || "") &&
+        failedPurgeActions.join(",") === "deploy-paused,health-paused,quiesce,restore,schema,purge-passkeys,purge-failed" &&
+        !failedPurgeOutput.some((line) => /recovery barriers verified/i.test(line)),
+      `${failedPurgeError?.message}; ${failedPurgeActions.join(",")}; ${failedPurgeOutput.join(" | ")}`);
+
+    const legacyManifest = manifestFixture();
+    legacyManifest.infrastructure.cloudflare.storage = "supabase";
+    const legacyManifestPath = join(sandbox, "legacy-vector-outbox.manifest.json");
+    writeFileSync(legacyManifestPath, JSON.stringify(legacyManifest));
+    const legacyActions = [];
+    const legacyRestore = await cmdRollback(legacyManifestPath, "fixture-bookmark", {
+      confirmed: true,
+      resolveAccount: async () => ({ id: "fixture-account" }),
+      cmdDeploy: async (_path, options) => {
+        legacyActions.push(options.pauseVectorDrainForUpgrade ? "deploy-paused" : "DEPLOY-ACTIVE");
+      },
+      cmdHealth: async (_path, options) => {
+        legacyActions.push(`health:${options.expectDrainMode}`);
+      },
+      waitForVectorDrainQuiescence: async () => { legacyActions.push("quiesce"); },
+      cf: async () => { legacyActions.push("restore"); },
+      d1Query: async (_account, _database, sql) => {
+        if (/SELECT schema_version FROM install_state/.test(sql)) {
+          legacyActions.push("schema");
+          return { results: [{ schema_version: 23 }] };
+        }
+        const supportDelete = sql.match(/^DELETE FROM (support_passkeys|support_enrollment_codes|support_auth_challenges|support_access_requests|support_sessions)$/);
+        if (supportDelete) {
+          legacyActions.push(`purge-${supportDelete[1]}`);
+          return { results: [], meta: { changes: 2 } };
+        }
+        if (/SELECT \(SELECT COUNT\(\*\) FROM support_passkeys\)/.test(sql)) {
+          legacyActions.push("verify-support-empty");
+          return { results: [{
+            passkeys: 0, enrollment_codes: 0, auth_challenges: 0, access_requests: 0, sessions: 0,
+          }] };
+        }
+        if (/UPDATE upgrade_runs SET status = 'rolled_back'/.test(sql)) {
+          legacyActions.push("history");
+          return { results: [], meta: { changes: 1 } };
+        }
+        legacyActions.push("UNEXPECTED-VECTOR-MUTATION");
+        throw new Error(`unexpected legacy-vector rollback SQL: ${sql}`);
+      },
+    });
+    check("non-D1 vector manifests still pause and purge support authority without vector invalidation",
+      legacyRestore?.restored === true && legacyRestore?.requiresVectorizeRecreation === false &&
+        legacyActions.join(",") ===
+          "deploy-paused,health:paused-for-upgrade,quiesce,restore,schema," +
+          "purge-support_passkeys,purge-support_enrollment_codes,purge-support_auth_challenges," +
+          "purge-support_access_requests,purge-support_sessions,verify-support-empty,history" &&
+        !legacyActions.includes("DEPLOY-ACTIVE") && !legacyActions.includes("UNEXPECTED-VECTOR-MUTATION"),
+      JSON.stringify({ legacyRestore, legacyActions }));
+
+    for (const [name, malformedSchema, malformedCounts] of [
+      ["null schema", null, null],
+      ["boolean schema", false, null],
+      ["empty schema", "", null],
+      ["noncanonical schema", "023", null],
+      ["null zero-count field", 23, {
+        passkeys: null, enrollment_codes: 0, auth_challenges: 0, access_requests: 0, sessions: 0,
+      }],
+      ["boolean zero-count field", 23, {
+        passkeys: false, enrollment_codes: 0, auth_challenges: 0, access_requests: 0, sessions: 0,
+      }],
+      ["empty zero-count field", 23, {
+        passkeys: "", enrollment_codes: 0, auth_challenges: 0, access_requests: 0, sessions: 0,
+      }],
+      ["noncanonical zero-count field", 23, {
+        passkeys: "00", enrollment_codes: 0, auth_challenges: 0, access_requests: 0, sessions: 0,
+      }],
+    ]) {
+      const malformedActions = [];
+      let malformedError = null;
+      try {
+        await cmdRollback(legacyManifestPath, "fixture-bookmark", {
+          confirmed: true,
+          resolveAccount: async () => ({ id: "fixture-account" }),
+          cmdDeploy: async () => { malformedActions.push("deploy-paused"); },
+          cmdHealth: async () => { malformedActions.push("health-paused"); },
+          waitForVectorDrainQuiescence: async () => { malformedActions.push("quiesce"); },
+          cf: async () => { malformedActions.push("restore"); },
+          d1Query: async (_account, _database, sql) => {
+            if (/SELECT schema_version FROM install_state/.test(sql)) {
+              malformedActions.push("schema");
+              return { results: [{ schema_version: malformedSchema }] };
+            }
+            if (/^DELETE FROM support_/.test(sql)) {
+              malformedActions.push("purge");
+              return { results: [], meta: { changes: 1 } };
+            }
+            if (/SELECT \(SELECT COUNT\(\*\) FROM support_passkeys\)/.test(sql)) {
+              malformedActions.push("verify");
+              return { results: [malformedCounts] };
+            }
+            malformedActions.push("UNEXPECTED-AFTER-MALFORMED");
+            return { results: [] };
+          },
+        });
+      } catch (caught) {
+        malformedError = caught;
+      }
+      check(`non-D1 rollback rejects a malformed ${name} receipt before success`,
+        /temporary support authority could not be verified empty.*Worker remains paused/is.test(malformedError?.message || "") &&
+          !malformedActions.includes("UNEXPECTED-AFTER-MALFORMED"),
+        `${malformedError?.message}; ${malformedActions.join(",")}`);
+    }
+
+    let malformedVectorError = null;
+    try {
+      await cmdRollback(manifestPath, "fixture-bookmark", {
+        confirmed: true,
+        resolveAccount: async () => ({ id: "fixture-account" }),
+        cmdDeploy: async () => {},
+        cmdHealth: async () => {},
+        waitForVectorDrainQuiescence: async () => {},
+        cf: async () => {},
+        d1Query: async (_account, _database, sql) => {
+          if (/SELECT schema_version FROM install_state/.test(sql)) {
+            return { results: [{ schema_version: 13 }] };
+          }
+          if (/SELECT vector_projection_status/.test(sql)) {
+            return { results: [{
+              status: "bootstrap_required",
+              lease_owner: null,
+              lease_expires_at: null,
+              mutation_id: null,
+              mutation_submitted_at: null,
+              cursor: null,
+              high_water: "fixture#9",
+              chunk_high_water: "fixture#9",
+              submitted_rows: null,
+              bootstrap_protocol: null,
+              bootstrap_base_count: 0,
+              bootstrap_batch_count: 0,
+              tagged_rows: 0,
+            }] };
+          }
+          return { results: [], meta: { changes: 1 } };
+        },
+      });
+    } catch (caught) {
+      malformedVectorError = caught;
+    }
+    check("rollback rejects a null vector zero-count receipt before recovery success",
+      /semantic projection could not be marked unverified.*Worker remains paused/is.test(malformedVectorError?.message || ""),
+      malformedVectorError?.message);
 
     const schema12Sql = [];
     const schema12Restore = await cmdRollback(manifestPath, "fixture-bookmark", {

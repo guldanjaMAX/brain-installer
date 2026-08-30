@@ -81,6 +81,14 @@ const deps = { health: okHealth, diagnose: okDiagnose, freshness: okFresh, vecto
   check("sources is ABSENT, not []", !("sources" in s));
 }
 {
+  const s = await ownerSystemStatus({}, {
+    ...deps,
+    freshness: async () => ({ sources: [], unavailable: true }),
+  });
+  check("a typed unavailable freshness result is NAMED", s.unavailable.includes("freshness"));
+  check("typed unavailable freshness omits sources, not healthy empty", !("sources" in s));
+}
+{
   const s = await ownerSystemStatus({}, { ...deps, vectorReadiness: async () => { throw new Error("down"); } });
   check("broken vectors are NAMED", s.unavailable.includes("vectors"));
   check("vectors is ABSENT, so no false 0%", !("vectors" in s));

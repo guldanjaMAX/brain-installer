@@ -1,4 +1,4 @@
-import { api } from "./api";
+import { api, supportApi } from "./api";
 
 // WebAuthn speaks ArrayBuffers; the wire speaks base64url. These two are the
 // whole translation layer.
@@ -103,6 +103,61 @@ export async function signIn(): Promise<void> {
   if (!assertion) throw new Error("no passkey was offered");
   const response = assertion.response as AuthenticatorAssertionResponse;
   await api("/auth/login/verify", {
+    credentialId: assertion.id,
+    authenticatorData: toB64u(response.authenticatorData),
+    clientDataJSON: toB64u(response.clientDataJSON),
+    signature: toB64u(response.signature),
+  });
+}
+
+/** Support passkeys have their own challenge tables, cookie, route family, and
+ * companion header. Keeping these calls separate from owner auth is the
+ * client-side half of preventing temporary diagnostics from becoming an owner
+ * session through a nullable or reused credential subject. */
+export async function enrollSupport(code: string): Promise<void> {
+  const options = await supportApi<RegisterOptions>("/api/support/auth/register/options", { code });
+  const credential = (await navigator.credentials.create({
+    publicKey: {
+      challenge: toBytes(options.challenge),
+      rp: { id: options.rp.id, name: options.rp.name },
+      user: {
+        id: crypto.getRandomValues(new Uint8Array(16)),
+        name: options.user_name,
+        displayName: options.user_name,
+      },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+      authenticatorSelection: { residentKey: "required", userVerification: "required" },
+      attestation: "none",
+    },
+  })) as PublicKeyCredential | null;
+  if (!credential) throw new Error("no support passkey was created");
+  const response = credential.response as AuthenticatorAttestationResponse;
+  await supportApi("/api/support/auth/register/verify", {
+    code,
+    credentialId: credential.id,
+    attestationObject: toB64u(response.attestationObject),
+    clientDataJSON: toB64u(response.clientDataJSON),
+  });
+}
+
+export async function signInSupport(): Promise<void> {
+  const options = await supportApi<{ challenge: string; rp_id: string }>("/api/support/auth/login/options");
+  let assertion: PublicKeyCredential | null;
+  try {
+    assertion = (await navigator.credentials.get({
+      publicKey: {
+        challenge: toBytes(options.challenge),
+        rpId: options.rp_id,
+        userVerification: "required",
+        allowCredentials: [],
+      },
+    })) as PublicKeyCredential | null;
+  } catch (error) {
+    throw explainCeremonyFailure(error, options.rp_id);
+  }
+  if (!assertion) throw new Error("no support passkey was offered");
+  const response = assertion.response as AuthenticatorAssertionResponse;
+  await supportApi("/api/support/auth/login/verify", {
     credentialId: assertion.id,
     authenticatorData: toB64u(response.authenticatorData),
     clientDataJSON: toB64u(response.clientDataJSON),

@@ -244,6 +244,24 @@ const expectedSnapshot = Object.freeze({
   content_fingerprint: deterministicDataFingerprint,
 });
 
+// Recovery preserves the immutable history an owner may later audit, but
+// recreates every live support authority empty. A restored signed cookie must
+// have no session row, passkey, request receipt, invite, or challenge capable
+// of making it valid again.
+{
+  assert.equal(RECOVERY_EXPORT_TABLES.includes("support_access_events"), true);
+  for (const table of [
+    "support_sessions",
+    "support_access_requests",
+    "support_enrollment_codes",
+    "support_auth_challenges",
+    "support_passkeys",
+  ]) {
+    assert.equal(RECOVERY_DURABLE_TABLES.includes(table), true, `${table} schema is recreated`);
+    assert.equal(RECOVERY_EXPORT_TABLES.includes(table), false, `${table} live state is not restored`);
+  }
+}
+
 function snapshotForChunkCount(chunkCount) {
   const aggregate = {
     ...aggregateTemplate,

@@ -55,6 +55,7 @@ import {
   handleAuthorizePage, handleAuthorizeDecision, handleToken, validateConnectorToken,
 } from "./lib/oauth.js";
 import { handleMcp } from "./lib/mcp-endpoint.js";
+import { handleSupportAccess } from "./lib/support-access.js";
 
 /* ------------------------------------------------------------ retrieval */
 
@@ -1580,6 +1581,14 @@ export default {
         path.startsWith("/brand/") || path.startsWith("/app/assets/")) {
       const response = await handleOwnerAuth(env, request, url, path);
       return path.startsWith("/api/app/") ? privateNoStore(response) : response;
+    }
+
+    // A technician session is a separate, stateful, read-only principal. Its
+    // cookie and companion header are not understood by owner, retrieval,
+    // financial, connector, OAuth, or admin routes. Every response, including
+    // ceremony errors, is private and non-cacheable.
+    if (path.startsWith("/api/support/")) {
+      return privateNoStore(await handleSupportAccess(env, request, url, path));
     }
 
     // The bank feed's owner surface sits in FRONT of the key gate for exactly

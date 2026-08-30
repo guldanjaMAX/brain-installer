@@ -174,6 +174,15 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "document_access_requests",
   "document_access_events",
   "passkey_security_events",
+  // Schema 23: bounded support history survives recovery, but every live
+  // support authority is recreated empty. Restoring an active session row or
+  // passkey alongside a still-signed cookie would resurrect technician access.
+  "support_sessions",
+  "support_access_requests",
+  "support_enrollment_codes",
+  "support_auth_challenges",
+  "support_passkeys",
+  "support_access_events",
 ]);
 
 /**
@@ -190,6 +199,9 @@ export const RECOVERY_EXPORT_TABLES = Object.freeze(
       // recovered brain re-issues challenges, invites, connector grants and
       // bank-authorisation sessions from scratch.
       table !== "auth_challenges" && table !== "enrollment_codes" &&
+      table !== "support_sessions" && table !== "support_access_requests" &&
+      table !== "support_enrollment_codes" && table !== "support_auth_challenges" &&
+      table !== "support_passkeys" &&
       table !== "bank_feed_link_sessions" &&
       table !== "oauth_clients" && table !== "oauth_codes" && table !== "oauth_tokens"),
 );
@@ -269,7 +281,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // contract tracks the EXACT current schema by design: a drill against a
 // database one migration behind would export a table or column set that does
 // not match the reviewed list. Bumping this is required for every migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 22;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 23;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -327,6 +339,14 @@ const SCHEMA_22_TABLES = Object.freeze([
   "document_access_events",
   "passkey_security_events",
 ]);
+const SCHEMA_23_TABLES = Object.freeze([
+  "support_sessions",
+  "support_access_requests",
+  "support_enrollment_codes",
+  "support_auth_challenges",
+  "support_passkeys",
+  "support_access_events",
+]);
 
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
@@ -341,7 +361,7 @@ const AGGREGATE_FIELDS = Object.freeze([
     // proven by the exported content, which these tables are fully part of.
     ["vector_bootstrap_batches", "owner_passkeys", "auth_challenges", "enrollment_codes",
      ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES, ...SCHEMA_18_TABLES,
-     ...SCHEMA_19_TABLES, ...SCHEMA_21_TABLES, ...SCHEMA_22_TABLES].includes(table)
+     ...SCHEMA_19_TABLES, ...SCHEMA_21_TABLES, ...SCHEMA_22_TABLES, ...SCHEMA_23_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1104,7 +1124,8 @@ function expectedRecoveryTables(migrations) {
     (latest >= 18 || !SCHEMA_18_TABLES.includes(table)) &&
     (latest >= 19 || !SCHEMA_19_TABLES.includes(table)) &&
     (latest >= 21 || !SCHEMA_21_TABLES.includes(table)) &&
-    (latest >= 22 || !SCHEMA_22_TABLES.includes(table)));
+    (latest >= 22 || !SCHEMA_22_TABLES.includes(table)) &&
+    (latest >= 23 || !SCHEMA_23_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {

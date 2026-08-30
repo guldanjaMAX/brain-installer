@@ -100,7 +100,7 @@ export async function ownerSystemStatus(env, deps) {
     unavailable.push("diagnose");
   }
 
-  if (fresh) {
+  if (fresh && fresh.unavailable !== true) {
     out.sources = (fresh.sources || []).map((s) => ({
       label: labelFor(s),
       kind: s.kind,

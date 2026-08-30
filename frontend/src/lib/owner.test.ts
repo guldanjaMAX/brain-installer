@@ -3,6 +3,7 @@ import type { OwnerUploadCapabilities } from "./api";
 import {
   activityEventsInWindow, confirmedOwnerWrite, defaultEntityScope, ingestionReceiptAction, logicalDocumentId, majorToMinor, readOwnerTextFile,
   periodClosePresentation, scopedAnswerLabel, validateOwnerUpload,
+  activitySentence,
 } from "./owner";
 
 const capabilities: OwnerUploadCapabilities = {
@@ -59,6 +60,16 @@ describe("owner upload boundary", () => {
 });
 
 describe("owner inputs and scoped answers", () => {
+  it("describes only support lifecycle changes in the owner history", () => {
+    const base = {
+      event_id: "support", entity_slug: null, subject_kind: "support_access",
+      subject_id: "support", display_label: "Support technician", occurred_at: "2026-08-30T00:00:00Z",
+    };
+    expect(activitySentence({ ...base, event_type: "support_access_created" })).toBe("Invited Support technician");
+    expect(activitySentence({ ...base, event_type: "support_access_activated" })).toBe("Opened support access for Support technician");
+    expect(activitySentence({ ...base, event_type: "support_access_revoked" })).toBe("Ended support access for Support technician");
+  });
+
   it("converts decimal money without floating point drift", () => {
     expect(majorToMinor("26300.10")).toBe(2_630_010);
     expect(majorToMinor("12.345")).toBeNull();

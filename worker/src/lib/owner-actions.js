@@ -39,6 +39,7 @@ const ACTIVITY_TYPES = new Set([
   "document_grant_created", "document_grant_invite_reissued",
   "document_grant_revoked", "passkey_added",
   "passkey_renamed", "passkey_revoked", "sessions_revoked",
+  "support_access_created", "support_access_activated", "support_access_revoked",
 ]);
 const MEDIA_TYPE_EXTENSIONS = Object.freeze({
   "text/plain": Object.freeze([".txt"]),

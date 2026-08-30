@@ -90,6 +90,9 @@ export function activitySentence(event: OwnerActivityEvent): string {
     passkey_renamed: "Renamed",
     passkey_revoked: "Removed",
     sessions_revoked: "Ended",
+    support_access_created: "Invited",
+    support_access_activated: "Opened support access for",
+    support_access_revoked: "Ended support access for",
   };
   return `${labels[event.event_type]} ${event.display_label}`;
 }

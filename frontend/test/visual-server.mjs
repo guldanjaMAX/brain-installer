@@ -88,7 +88,45 @@ const systemStatus = {
   unavailable: [],
 };
 
+const supportSystemStatus = {
+  status: "ready",
+  observed_at: Date.now(),
+  unavailable: [],
+  access: {
+    kind: "support",
+    technician_label: "Support technician",
+    expires_at: Date.now() + 60 * 60_000,
+    remaining_seconds: 3600,
+    read_only: true,
+    can_fix: false,
+  },
+  privacy: {
+    mode: "aggregate_only",
+    content_visible: false,
+    search_available: false,
+    raw_errors_visible: false,
+    credentials_visible: false,
+    account_identifiers_visible: false,
+  },
+  brain: {
+    product_version: "0.2.0",
+    schema_version: 23,
+    status: "ok",
+    accepting_documents: true,
+    drain_mode: "active",
+  },
+  corpus: { documents: 241, chunks: 2180 },
+  vectors: { ready: true, expected: 2180, visible: 2180, pending: 0, percent_visible: 100 },
+  problem_counts: { crit: 0, warn: 1, info: 0 },
+  problems: [{ code: "source_registration_issue", area: "coverage", severity: "warn", count: 1, repairability: "guidance_only" }],
+  sources: [
+    { label: "Google Drive", kind: "drive", state: "ok", documents: 202, days_since_ingest: 0, automatable: true },
+    { label: "Email", kind: "email", state: "stale", documents: 39, days_since_ingest: 12, automatable: false },
+  ],
+};
+
 const ownerActivity = [
+  { event_id: "event-support", event_type: "support_access_created", entity_slug: null, subject_kind: "support_access", subject_id: "support", display_label: "Support technician", occurred_at: "2026-08-30T06:30:00Z" },
   { event_id: "event-access", event_type: "document_grant_created", entity_slug: "mesa-coffee", subject_kind: "document_grant", subject_id: "grant", display_label: "External reviewer document access", occurred_at: "2026-08-29T17:00:00Z" },
   { event_id: "event-target", event_type: "target_set", entity_slug: "mesa-coffee", subject_kind: "target", subject_id: "monthly-revenue", display_label: "Monthly revenue target", occurred_at: "2026-08-29T16:00:00Z" },
   { event_id: "event-upload", event_type: "upload_completed", entity_slug: "mesa-coffee", subject_kind: "document", subject_id: "document", display_label: "July close notes", occurred_at: "2026-08-28T12:00:00Z" },
@@ -213,6 +251,83 @@ const server = createServer(async (request, response) => {
       principal: { kind: "owner", grant_id: null },
       devices: [{ credential_id: "device", nickname: "Primary device", created_at: Date.now() - 86400000 * 20, last_used_at: Date.now() - 60000 }],
       connections: [{ client_id: "app", name: "Claude", can_write: false, connected_at: Date.now() - 86400000 * 4, last_used_at: Date.now() - 3600000 }],
+    });
+  }
+  if (url.pathname === "/api/support/me") {
+    if (scenario !== "support") return sendJson(response, { error: "unauthorized", code: "support_session_required" }, 401);
+    return sendJson(response, {
+      signed_in: true,
+      principal: {
+        kind: "support",
+        support_session_id: "ss_fixture",
+        technician_label: "Support technician",
+        technician_identity_verified: false,
+        expires_at: supportSystemStatus.access.expires_at,
+        idle_expires_at: Date.now() + 15 * 60_000,
+        read_only: true,
+      },
+      workspace: {
+        support: true, home: false, documents: false, ask: false, add_review: false,
+        access: false, bank: false, targets: false, preferences: false, connections: false,
+      },
+      can_fix: false,
+      repair_mode: "owner_approval_required_future",
+    });
+  }
+  if (url.pathname === "/api/support/system") {
+    if (scenario !== "support") return sendJson(response, { error: "unauthorized", code: "support_session_required" }, 401);
+    return sendJson(response, supportSystemStatus);
+  }
+  if (url.pathname === "/api/support/signout") return sendJson(response, { signed_out: true });
+  if (url.pathname === "/api/app/support-access/status") {
+    return sendJson(response, {
+      status: "ready",
+      sessions: scenario === "empty" ? [] : [{
+        support_session_id: "ss_fixture",
+        technician_label: "Support technician",
+        state: "active",
+        created_at: Date.now() - 45 * 60_000,
+        invite_state: "consumed",
+        enrollment_expires_at: Date.now() - 35 * 60_000,
+        activated_at: Date.now() - 30 * 60_000,
+        expires_at: Date.now() + 30 * 60_000,
+        idle_expires_at: Date.now() + 15 * 60_000,
+        last_used_at: Date.now() - 60_000,
+        revoked_at: null,
+      }],
+      policy: {
+        access: "read_only_diagnostics",
+        duration_choices_minutes: [15, 30, 60, 120],
+        default_duration_minutes: 30,
+        max_duration_minutes: 120,
+        enrollment_link_max_minutes: 10,
+        can_fix: false,
+        repair_mode: "owner_approval_required_future",
+      },
+    });
+  }
+  if (url.pathname === "/api/app/support-access/create" || url.pathname === "/api/app/support-access/reissue") {
+    const body = await jsonBody(request);
+    return sendJson(response, {
+      status: "pending",
+      support_session_id: body.support_session_id || "ss_created",
+      technician_label: body.technician_label || "Support technician",
+      activated_at: null,
+      expires_at: null,
+      idle_expires_at: null,
+      changed: true,
+      replayed: scenario === "idempotent",
+      request_id: body.request_id,
+      invite_state: "active",
+      enrollment_url: "http://127.0.0.1/app#support-enroll=fixture-private",
+      enrollment_expires_at: Date.now() + 10 * 60_000,
+    });
+  }
+  if (url.pathname === "/api/app/support-access/revoke") {
+    const body = await jsonBody(request);
+    return sendJson(response, {
+      status: "revoked", support_session_id: body.support_session_id, revoked_at: Date.now(),
+      changed: true, replayed: scenario === "idempotent", request_id: body.request_id,
     });
   }
   if (url.pathname === "/api/app/document-access/documents") {
