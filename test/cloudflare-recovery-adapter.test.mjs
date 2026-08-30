@@ -287,6 +287,10 @@ const expectedSnapshot = Object.freeze({
   }
   assert.equal(RECOVERY_DURABLE_TABLES.includes("agent_action_receipts"), true);
   assert.equal(RECOVERY_EXPORT_TABLES.includes("agent_action_receipts"), false);
+  for (const table of ["owner_bank_import_previews", "owner_bank_import_commits"]) {
+    assert.equal(RECOVERY_DURABLE_TABLES.includes(table), true, `${table} schema is recreated`);
+    assert.equal(RECOVERY_EXPORT_TABLES.includes(table), false, `${table} live intent is not restored`);
+  }
   for (const table of ["zoom_deliveries", "zoom_reconciliation"]) {
     assert.equal(RECOVERY_DURABLE_TABLES.includes(table), true, `${table} schema is recreated`);
     assert.equal(RECOVERY_EXPORT_TABLES.includes(table), false, `${table} uses normalized restore`);

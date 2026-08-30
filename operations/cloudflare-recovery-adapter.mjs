@@ -186,6 +186,13 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "fin_period_closes",
   "owner_targets",
   "owner_preferences",
+  // Schema 31: browser bank previews and their single-use consumption claims
+  // are short-lived live intent, not durable financial evidence. The tables
+  // must exist after recovery but are recreated empty below. The completed
+  // response-loss receipt and human event already survive in the schema-21
+  // durable tables.
+  "owner_bank_import_previews",
+  "owner_bank_import_commits",
   // Schema 22: exact document grants, their immutable audit trail, persistent
   // idempotency receipts, and privacy-safe passkey telemetry are durable
   // security state. Restoring owner passkeys without their grant authority
@@ -254,6 +261,7 @@ export const RECOVERY_EXPORT_TABLES = Object.freeze(
       table !== "support_enrollment_codes" && table !== "support_auth_challenges" &&
       table !== "support_passkeys" &&
       table !== "agent_action_receipts" &&
+      table !== "owner_bank_import_previews" && table !== "owner_bank_import_commits" &&
       table !== "zoom_deliveries" && table !== "zoom_reconciliation" &&
       table !== "plaid_link_operations" && table !== "plaid_sync_windows" &&
       table !== "plaid_sync_stage_accounts" && table !== "plaid_sync_stage_transactions" &&
@@ -329,7 +337,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   "outbox_generation",
   "vector_projection_bootstrap_base_count",
 ]);
-// Schemas 14 through 29 add owner passkeys, capability grants, zones, the financial ledger, bank feeds,
+// Schemas 14 through 31 add owner passkeys, capability grants, zones, the financial ledger, bank feeds,
 // connector OAuth, extraction provenance, owner workspace state, exact
 // document security, support authority, agent receipts, and Zoom delivery
 // debt, plus durable Plaid readiness and destructive-outcome evidence. The
@@ -337,7 +345,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // EXACT current schema by design: a drill against a
 // database one migration behind would export a table or column set that does
 // not match the reviewed list. Bumping this is required for every migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 30;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 31;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -418,6 +426,10 @@ const SCHEMA_26_TABLES = Object.freeze([
 const SCHEMA_27_TABLES = Object.freeze(["public_request_quotas"]);
 const SCHEMA_28_TABLES = Object.freeze(["vector_outbox_retry_state"]);
 const SCHEMA_30_TABLES = Object.freeze(["plaid_account_entity_assignments"]);
+const SCHEMA_31_TABLES = Object.freeze([
+  "owner_bank_import_previews",
+  "owner_bank_import_commits",
+]);
 
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
@@ -434,7 +446,8 @@ const AGGREGATE_FIELDS = Object.freeze([
      ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES, ...SCHEMA_18_TABLES,
      ...SCHEMA_19_TABLES, ...SCHEMA_21_TABLES, ...SCHEMA_22_TABLES, ...SCHEMA_23_TABLES,
      ...SCHEMA_24_TABLES, ...SCHEMA_25_TABLES, ...SCHEMA_26_TABLES,
-     ...SCHEMA_27_TABLES, ...SCHEMA_28_TABLES, ...SCHEMA_30_TABLES].includes(table)
+     ...SCHEMA_27_TABLES, ...SCHEMA_28_TABLES, ...SCHEMA_30_TABLES,
+     ...SCHEMA_31_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1341,7 +1354,8 @@ function expectedRecoveryTables(migrations) {
     (latest >= 26 || !SCHEMA_26_TABLES.includes(table)) &&
     (latest >= 27 || !SCHEMA_27_TABLES.includes(table)) &&
     (latest >= 28 || !SCHEMA_28_TABLES.includes(table)) &&
-    (latest >= 30 || !SCHEMA_30_TABLES.includes(table)));
+    (latest >= 30 || !SCHEMA_30_TABLES.includes(table)) &&
+    (latest >= 31 || !SCHEMA_31_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {
