@@ -4749,6 +4749,79 @@ export function addLocalPathAliases(target, records, field, pathSeparator = sep)
   return target;
 }
 
+/**
+ * Stable, private identity for the exact folder one local source is allowed to
+ * resume from. The state file already contains private relative filenames, but
+ * there is no reason to add the owner's absolute folder path to it as well.
+ * Resolve first so relative and absolute spellings of the same folder agree;
+ * Windows path identity is case-insensitive for this binding.
+ */
+export function localIngestRootFingerprint(root, platform = process.platform) {
+  let canonical;
+  try {
+    canonical = realpathSync.native(resolve(String(root || "")));
+  } catch (error) {
+    throw new Error(`the local ingest folder identity could not be resolved (${error?.code || "unavailable"})`);
+  }
+  const comparable = platform === "win32" ? canonical.toLowerCase() : canonical;
+  return createHash("sha256")
+    .update("financial-brain-local-ingest-root-v1\0", "utf8")
+    .update(platform, "utf8")
+    .update("\0", "utf8")
+    .update(comparable, "utf8")
+    .digest("hex");
+}
+
+/** Keep a source's resume receipts bound to one canonical local folder. */
+export function bindLocalIngestRoot(state, rootFingerprint) {
+  if (!state || typeof state !== "object" || Array.isArray(state)) {
+    throw new Error("the local ingest resume state is invalid");
+  }
+  const fingerprint = String(rootFingerprint || "");
+  if (!/^[0-9a-f]{64}$/.test(fingerprint)) {
+    throw new Error("the current local ingest folder identity is invalid");
+  }
+  const prior = state.local_root_fingerprint;
+  if (prior !== undefined && !/^[0-9a-f]{64}$/.test(String(prior))) {
+    throw new Error("the saved local ingest folder identity is invalid");
+  }
+  if (prior && prior !== fingerprint) {
+    throw new Error(
+      "this source's resume state is bound to a different folder. " +
+        "Use a new --source name for this folder; the existing source identity cannot be repointed."
+    );
+  }
+  state.local_root_fingerprint = fingerprint;
+  return state;
+}
+
+/**
+ * A local hash receipt is only resumable while D1 still reports that exact
+ * logical family. A copied state file, a completed forget, or a lost restore
+ * must re-send the file instead of manufacturing an `unchanged` result.
+ */
+export function reconcileLocalResumeDone({ state, priorDone, storedFamilies, source }) {
+  if (!state || typeof state !== "object" || Array.isArray(state)) {
+    throw new Error("the local ingest resume state is invalid");
+  }
+  if (!(storedFamilies instanceof Set)) {
+    throw new Error("local ingest resume reconciliation needs an authenticated family set");
+  }
+  const normalizedSource = assertSourceName(source);
+  const authoritative = new Set();
+  let missing = 0;
+  for (const key of Object.keys(priorDone || {})) {
+    const portableKey = String(key).split(sep).join("/");
+    if (storedFamilies.has(`${normalizedSource}:${portableKey}`)) {
+      authoritative.add(key);
+      continue;
+    }
+    missing++;
+    if (state.done && typeof state.done === "object") delete state.done[key];
+  }
+  return Object.freeze({ authoritative, missing });
+}
+
 /** Record the current local skip under one portable key, retiring its old alias. */
 export function recordLocalSkippedDocumentState(state, { stateKey, nativePath, reason } = {}) {
   const key = String(stateKey || "");
@@ -5849,7 +5922,7 @@ async function cmdIngest(manifestPath) {
  * other per-source ingest already is, and keeps `brain load` running the SAME
  * walker an operator runs by hand rather than a second copy that could drift.
  */
-export async function cmdIngestLocal(m, manifestPath, flags) {
+export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
   // A local folder now reconciles its own deletions, so it has the same
   // approval gate Drive does. It stays invalid on every OTHER remote source,
   // which is checked in cmdIngestRemote.
@@ -5869,7 +5942,8 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
     );
   }
   if (!existsSync(root)) die(`no such folder: ${root}`);
-  const { walk, prepare, batchStream, splitOversized, loadState, saveState, removedSinceLastRun } = await ingestLib();
+  const ingest = options.ingest ?? await ingestLib();
+  const { walk, prepare, batchStream, splitOversized, loadState, saveState, removedSinceLastRun } = ingest;
 
   const sourceName = assertSourceName(flags.source === true ? null : flags.source || "upload");
   // A dry run sends nothing, so it must not demand credentials it will never
@@ -5885,18 +5959,26 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
         "do not paste the key into a shell command."
     );
   }
+  const listStoredFamilies = options.listStoredSourceFamilies ?? listStoredSourceFamilies;
 
   const statePath = join(dirname(resolve(manifestPath)), `.brain-ingest-${sourceName}.json`);
   const savedState = loadState(statePath);
+  const priorDone = { ...(savedState.done || {}) };
+  const rootBindingMissing = savedState.local_root_fingerprint === undefined;
   const state = flags.reset
-    ? { version: 1, done: {}, skipped: {}, ...(savedState.removed ? { removed: savedState.removed } : {}) }
+    ? {
+        version: 1,
+        done: {},
+        skipped: {},
+        ...(savedState.removed ? { removed: savedState.removed } : {}),
+        ...(savedState.local_root_fingerprint
+          ? { local_root_fingerprint: savedState.local_root_fingerprint }
+          : {}),
+      }
     : savedState;
-  const previouslyKnownKeys = new Set(Object.keys(savedState.done || {}));
   const scannerOn = m.safety?.credential_scanner?.enabled !== false;
   const scannerFingerprint = credentialScannerFingerprint(scannerOn);
   const scannerPolicyChanged = state.credential_scanner_fingerprint !== scannerFingerprint;
-  const alreadyDone = Object.keys(state.done).length;
-  if (alreadyDone && !flags.reset) info(`resuming: ${alreadyDone} file(s) already loaded`);
 
 
   // OCR, and what it will cost, decided ONCE per run and stated out loud
@@ -5938,6 +6020,53 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
         "      Fix the reported permission or filesystem error, then re-run the same command."
     );
   }
+
+  // The local resume file is useful evidence, never storage truth. Bind it to
+  // the canonical folder before any file can take the unchanged path. A
+  // different root for the same source is an identity collision, even when it
+  // happens to contain the same relative names and bytes.
+  const rootFingerprint = localIngestRootFingerprint(root);
+  bindLocalIngestRoot(state, rootFingerprint);
+
+  // Dry-run remains credential-free and never mutates resume state. A real run
+  // first inventories D1 and retires every local hash whose exact family is no
+  // longer present. This closes completed forgets, copied state, and restored
+  // manifests that otherwise looked unchanged without sending a document.
+  let previouslyKnownKeys = new Set(Object.keys(priorDone));
+  if (!dry) {
+    const initialStoredLocalFamilies = await listStoredFamilies({
+      base, adminKey, source: sourceName,
+    });
+    const reconciled = reconcileLocalResumeDone({
+      state,
+      priorDone,
+      storedFamilies: initialStoredLocalFamilies,
+      source: sourceName,
+    });
+    previouslyKnownKeys = reconciled.authoritative;
+    // Pre-binding releases cannot prove which canonical folder produced their
+    // hashes. Even when D1 still has the same family names, replay every such
+    // receipt once while establishing this root. Skips and pending removals
+    // remain intact; only the unproven unchanged fast path is retired.
+    const legacyReplayCount = rootBindingMissing ? Object.keys(priorDone).length : 0;
+    if (legacyReplayCount) {
+      for (const key of Object.keys(priorDone)) delete state.done[key];
+    }
+    saveState(statePath, state);
+    if (legacyReplayCount) {
+      warn(
+        `${legacyReplayCount} saved local receipt(s) predate folder identity binding. ` +
+          "They will be re-ingested once instead of trusted as unchanged."
+      );
+    } else if (reconciled.missing) {
+      warn(
+        `${reconciled.missing} saved local receipt(s) were no longer present in D1. ` +
+          "They will be re-ingested instead of counted as unchanged."
+      );
+    }
+  }
+  const alreadyDone = Object.keys(state.done).length;
+  if (alreadyDone && !flags.reset) info(`resuming: ${alreadyDone} file(s) already loaded`);
 
   const limited = flags.limit ? files.slice(0, parseInt(flags.limit, 10)) : files;
   if (flags.limit) warn(`--limit ${flags.limit}: only the first ${limited.length} file(s) will be considered`);
@@ -6016,7 +6145,7 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
     // "one prepared unit" is allowed to mean.
     if (r.envelopes) {
       const key = String(f.rel).split(sep).join("/");
-      if (!scannerPolicyChanged && r.hash && state.done[key] === r.hash) {
+      if (!dry && !scannerPolicyChanged && r.hash && state.done[key] === r.hash) {
         recordAcceptedDocumentState(state, {
           stateKey: key,
           hash: r.hash,
@@ -6068,7 +6197,7 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
     }
 
     const key = r.envelope ? r.envelope.source_id : String(f.rel).split(sep).join("/");
-    if (!scannerPolicyChanged && r.hash && state.done[key] === r.hash) {
+    if (!dry && !scannerPolicyChanged && r.hash && state.done[key] === r.hash) {
       recordAcceptedDocumentState(state, {
         stateKey: key,
         hash: r.hash,
@@ -6262,7 +6391,7 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   // a family that exists in D1. This matters most for the unattended folder
   // lane, where a missing File Provider mount can otherwise look like the
   // owner deleted everything.
-  const storedLocalFamilies = await listStoredSourceFamilies({
+  const storedLocalFamilies = await listStoredFamilies({
     base, adminKey, source: sourceName,
   });
   const localRemovalPlan = buildDriveRemovalPlan({
@@ -6314,7 +6443,7 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   // retry marker and fail the run instead of recording a clean source.
   const plannedLocalTargets = [...new Set([...localTruthTargets, ...vanishedTargets])];
   if (plannedLocalTargets.length) {
-    const afterLocalRemoval = await listStoredSourceFamilies({
+    const afterLocalRemoval = await listStoredFamilies({
       base, adminKey, source: sourceName,
     });
     const stillStored = plannedLocalTargets.filter((uid) => afterLocalRemoval.has(uid));

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   mkdirSync,
   mkdtempSync,
@@ -34,6 +35,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = join(HERE, "..", "brain.mjs");
 const DRIVE_GUARD_FETCH = pathToFileURL(join(HERE, "fixtures", "drive-removal-guard-fetch.mjs")).href;
 const DRIVE_ACTIVE_SKIP_FETCH = pathToFileURL(join(HERE, "fixtures", "drive-active-skip-fetch.mjs")).href;
+const LOCAL_RESUME_FETCH = pathToFileURL(join(HERE, "fixtures", "local-resume-integrity-fetch.mjs")).href;
 
 const CATEGORIES = ["source_policy", "source_deleted", "intentional_skip"];
 
@@ -686,6 +688,129 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
   }
 }
 
+/*
+ * Local hash receipts are subordinate to exact D1 family truth, and one source
+ * name cannot be silently repointed at another folder. The sequential fixture
+ * simulates a completed forget and a copied stale receipt without credentials
+ * or a live Worker.
+ */
+{
+  const directory = mkdtempSync(join(tmpdir(), "brain-local-resume-integrity-"));
+  const manifestPath = join(directory, "fixture.manifest.json");
+  const statePath = join(directory, ".brain-ingest-upload.json");
+  const evidencePath = join(directory, "resume-evidence.json");
+  const userRoot = join(directory, "isolated-user-root");
+  const rootA = join(directory, "folder-a");
+  const rootB = join(directory, "folder-b");
+  const contentA = "Quarterly planning record. The customer chose the cobalt launch plan after reviewing cost, timing, ownership, and support responsibilities in detail.";
+  const contentB = "Annual renewal record. The customer approved the amber service option after comparing scope, timing, delivery, and operating responsibilities in detail.";
+  const stripAnsi = (value) => String(value || "").replace(/\x1b\[[0-9;]*m/g, "");
+  const readState = () => JSON.parse(readFileSync(statePath, "utf8"));
+  const readEvidence = () => JSON.parse(readFileSync(evidencePath, "utf8"));
+  const writeEvidence = (value) => writeFileSync(evidencePath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+
+  const environment = {};
+  for (const name of ["PATH", "Path", "PATHEXT", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR"]) {
+    if (process.env[name] !== undefined) environment[name] = process.env[name];
+  }
+  Object.assign(environment, {
+    NO_COLOR: "1",
+    ADMIN_KEY: "fixture-admin",
+    BRAIN_LOCAL_RESUME_EVIDENCE: evidencePath,
+    BRAIN_LOCAL_RESUME_USER_ROOT: userRoot,
+  });
+  const run = (root, extra = []) => {
+    const result = spawnSync(process.execPath, [
+      "--import", LOCAL_RESUME_FETCH,
+      CLI, "ingest", manifestPath, "--path", root, "--source", "upload",
+      ...extra,
+    ], { encoding: "utf8", env: environment, timeout: 30_000 });
+    assert.equal(result.error, undefined, String(result.error || ""));
+    assert.equal(result.signal, null, `local resume fixture was terminated by ${result.signal}`);
+    return { code: result.status, output: stripAnsi(`${result.stdout || ""}${result.stderr || ""}`) };
+  };
+
+  try {
+    mkdirSync(userRoot, { recursive: true, mode: 0o700 });
+    mkdirSync(rootA, { recursive: true });
+    mkdirSync(rootB, { recursive: true });
+    writeFileSync(join(rootA, "first.txt"), contentA);
+    writeFileSync(join(rootB, "first.txt"), contentA);
+    writeFileSync(manifestPath, JSON.stringify({
+      client: { slug: "fixture" },
+      brain: { domain: "fixture.invalid" },
+      infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
+      safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
+      corpora: {},
+    }));
+
+    const first = run(rootA);
+    assert.equal(first.code, 0, first.output.slice(-1_500));
+    let state = readState();
+    assert.match(state.local_root_fingerprint, /^[0-9a-f]{64}$/);
+    assert.equal(state.done["first.txt"], createHash("sha256").update(contentA).digest("hex"));
+    let evidence = readEvidence();
+    assert.deepEqual(evidence.stored_families, ["upload:first.txt"]);
+    assert.equal(evidence.ingest_batches, 1);
+
+    // Simulate `brain forget --source upload`: D1 is empty while the adjacent
+    // state file still holds the old content hash. The rerun must send it.
+    evidence.stored_families = [];
+    writeEvidence(evidence);
+    const stateBeforePreview = readFileSync(statePath, "utf8");
+    const previewAfterForget = run(rootA, ["--dry-run"]);
+    assert.equal(previewAfterForget.code, 0, previewAfterForget.output.slice(-1_500));
+    assert.match(previewAfterForget.output, /1 document\(s\) would be sent; 0 unchanged/i);
+    assert.equal(readFileSync(statePath, "utf8"), stateBeforePreview, "dry run changed resume state");
+    assert.deepEqual(readEvidence(), evidence, "credential-free dry run contacted the Worker fixture");
+
+    const afterForget = run(rootA);
+    assert.equal(afterForget.code, 0, afterForget.output.slice(-1_500));
+    assert.match(afterForget.output, /saved local receipt.+no longer present in D1/i);
+    evidence = readEvidence();
+    assert.equal(evidence.ingest_batches, 2, "a D1-forgotten family was counted unchanged");
+    assert.deepEqual(evidence.stored_families, ["upload:first.txt"]);
+
+    // A pre-binding state cannot bootstrap authority merely because D1 still
+    // contains a family with the same name. It is replayed once, then bound.
+    state = readState();
+    delete state.local_root_fingerprint;
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+    const legacyState = run(rootA);
+    assert.equal(legacyState.code, 0, legacyState.output.slice(-1_500));
+    assert.match(legacyState.output, /predate folder identity binding.+re-ingested once/i);
+    evidence = readEvidence();
+    assert.equal(evidence.ingest_batches, 3, "an unbound legacy hash was trusted as unchanged");
+    assert.match(readState().local_root_fingerprint, /^[0-9a-f]{64}$/);
+
+    // Copy a matching hash into resume state while D1 contains a different
+    // family. A merely nonempty remote source is not proof for this exact file.
+    writeFileSync(join(rootA, "second.txt"), contentB);
+    state = readState();
+    state.done["second.txt"] = createHash("sha256").update(contentB).digest("hex");
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+    evidence = readEvidence();
+    evidence.stored_families = ["upload:first.txt"];
+    writeEvidence(evidence);
+    const copiedState = run(rootA);
+    assert.equal(copiedState.code, 0, copiedState.output.slice(-1_500));
+    assert.match(copiedState.output, /saved local receipt.+no longer present in D1/i);
+    evidence = readEvidence();
+    assert.equal(evidence.ingest_batches, 4, "a copied per-file receipt bypassed the D1 family check");
+    assert.deepEqual(evidence.stored_families, ["upload:first.txt", "upload:second.txt"]);
+
+    // The same source name and same bytes under another canonical root must
+    // stop before inventory, receipts, or writes.
+    const beforeCollision = { ...readEvidence() };
+    const wrongRoot = run(rootB);
+    assert.equal(wrongRoot.code, 1, wrongRoot.output.slice(-1_500));
+    assert.match(wrongRoot.output, /resume state is bound to a different folder/i);
+    assert.deepEqual(readEvidence(), beforeCollision, "a different-root source collision reached the Worker fixture");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 /* CLI wiring keeps the aggregate approval guard ahead of every planned deletion. */
 assert.ok(VALUE_FLAGS.has("approve-removals"), "a bare --approve-removals must be rejected as a missing value");
 const source = readFileSync(new URL("../brain.mjs", import.meta.url), "utf8")
@@ -779,12 +904,12 @@ assert.notEqual(localStart, -1, "local folder ingest must exist");
 assert.ok(localEnd > localStart, "local folder ingest must be inspectable");
 const local = source.slice(localStart, localEnd);
 const pendingIndex = local.indexOf("const pendingLocalUids");
-const localInventoryIndex = local.indexOf("const storedLocalFamilies = await listStoredSourceFamilies", pendingIndex);
+const localInventoryIndex = local.indexOf("const storedLocalFamilies = await listStoredFamilies", pendingIndex);
 const localBuildIndex = local.indexOf("const localRemovalPlan = buildDriveRemovalPlan", localInventoryIndex);
 const localGuardIndex = local.indexOf("assertDriveRemovalPlanSafe(localRemovalPlan", localBuildIndex);
 const localTargetsIndex = local.indexOf("const localTruthTargets", localGuardIndex);
 const localApplyIndex = local.indexOf("uids: localTruthTargets", localTargetsIndex);
-const localReadbackIndex = local.indexOf("const afterLocalRemoval = await listStoredSourceFamilies", localApplyIndex);
+const localReadbackIndex = local.indexOf("const afterLocalRemoval = await listStoredFamilies", localApplyIndex);
 assert.ok(
   pendingIndex !== -1 && localInventoryIndex > pendingIndex && localBuildIndex > localInventoryIndex,
   "local removal retries must re-enter a plan built from authenticated stored families",
