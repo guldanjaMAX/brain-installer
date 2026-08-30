@@ -332,6 +332,7 @@ const expected = [
   "docs/MAINTAINER.md",
   "docs/OWNER-WORKSPACE-API.md",
   "docs/PLAID.md",
+  "docs/QUICKBOOKS.md",
   "docs/RECOVERY.md",
   "docs/RECOVERY-BANK-SAFETY-ACCEPTANCE.md",
   "docs/RELEASE-GOVERNANCE.md",

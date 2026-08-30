@@ -334,6 +334,9 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
 - **QuickBooks Online, Slack, Notion, Microsoft 365, Dropbox, and HubSpot are
   sandbox-ready, not live-proven.** Each has local OAuth custody, refresh,
   bounded provider I/O, common receipts, scheduling, retry, and disconnect.
+  QuickBooks additionally binds credentials and document identities to one
+  canonical company fingerprint, discloses Intuit's broad Accounting scope,
+  and refuses production until its client-owned HTTPS callback exists.
   QuickBooks, Slack, Notion, and HubSpot name their incomplete deletion truth.
   Microsoft and Dropbox withhold opaque cursors when file bodies or source
   visibility are incomplete. Run `brain connectors --rehearse` for invented

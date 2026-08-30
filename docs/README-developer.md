@@ -365,6 +365,21 @@ rotating refresh token may have been consumed even when the response was lost.
 Ordinary provider reads share bounded deadlines, retry classification,
 `Retry-After`, response-size limits, and redirect refusal.
 
+QuickBooks is sandbox-only in this release. Its registered callback defaults to
+the exact Intuit-documented `http://localhost:47812/`, while the local listener
+remains bound to `127.0.0.1`. Intuit's single Accounting scope can authorize
+reads and writes; Financial Brain performs read/query calls only and discloses
+that mismatch before consent. The raw company id stays in protected OAuth
+custody, while one canonical company fingerprint binds the credential, source,
+configuration receipt, reconciliation evidence, and document identity.
+An older unbound QuickBooks credential must complete one sandbox reconnect
+before ingest; the connector reports `source_binding_missing` rather than
+guessing which company or source the old token represented.
+Production refuses before credential access or browser launch because it needs
+a client-owned HTTPS callback and single-use local handoff. See
+[QUICKBOOKS.md](./QUICKBOOKS.md) for the route contract, threat model, exact
+sandbox gate, refresh behavior, and disconnect retention semantics.
+
 After a reviewed QuickBooks ingest and bank-feed import, the CLI can run one
 bounded Books Reality Check for one paired ledger account, QuickBooks account,
 period, currency, and direction:
@@ -1055,6 +1070,11 @@ The named Plaid profile, durability model, credential-free rehearsal, optional
 live Sandbox runner, and remaining owner ceremony are documented in
 [PLAID.md](./PLAID.md). Built and locally green does not mean Plaid Sandbox,
 Production, a real institution, or the owner's primary bank has been tested.
+
+The QuickBooks company-binding, sandbox callback, broad-scope disclosure,
+production refusal, and next Intuit field gate are documented in
+[QUICKBOOKS.md](./QUICKBOOKS.md). Automated company-separation fixtures do not
+prove an Intuit sandbox or real company.
 
 Provider HTTP connectors share total and per-attempt deadlines, AbortController
 cancellation, bounded exponential retry with jitter, both forms of Retry-After,

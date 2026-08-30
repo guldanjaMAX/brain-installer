@@ -160,20 +160,39 @@ short-lived connector process and clears its input buffers afterward.
 
 ### 5. QuickBooks Online
 
-Set `corpora.quickbooks.enabled` to `true` and explicitly select `sandbox` or
-`production` in `corpora.quickbooks.environment`. The client creates and owns
-the Intuit app and authorizes their own company. Financial Brain has no shared
-Intuit account and does not receive the app values or OAuth grant.
+Set `corpora.quickbooks.enabled` to `true`, select `sandbox` in
+`corpora.quickbooks.environment`, and leave `redirect_host` at `localhost`
+unless the exact Intuit sandbox registration uses the reviewed loopback
+alternative. The client creates and owns the Intuit app and authorizes their own
+sandbox company. Financial Brain has no shared Intuit account and does not
+receive the app values or OAuth grant.
 
 ```bash
 brain technician "$HOME/Financial Brain/brain.manifest.json" --run quickbooks
 ```
 
-Both Intuit app values are entered at hidden prompts. The existing loopback
-OAuth flow opens the browser for owner consent and stores the connection in the
-existing local provider credential store. The command then prints the exact
-dry-run and first-ingest commands. A successful connection or ingest means the
+Both Intuit app values are entered at hidden prompts. Register the exact
+callback printed by the command, normally `http://localhost:47812/`. The browser
+consent page grants Intuit's broad Accounting permission, which can authorize
+reads and writes. Financial Brain explains that scope clearly and performs
+query/read calls only. The connector binds the credential and imported document
+identities to the authorized company, so selecting a different company cannot
+quietly replace an existing source. The command then prints the exact dry-run
+and first-ingest commands. A successful connection or ingest means the
 QuickBooks reference loaded. It does not prove the books are correct.
+
+If this computer has a QuickBooks credential from an earlier release, run this
+same sandbox connection once before ingest. That reconnect creates the company
+binding; until then the ingest pauses with `source_binding_missing` instead of
+guessing which company the older token belongs to.
+
+Production connection is not available in this release. Selecting `production`
+returns `quickbooks_production_callback_unavailable` before the credential store
+or browser is opened. Intuit production OAuth needs the reviewed client-owned
+HTTPS callback described in `docs/QUICKBOOKS.md`; an API key is not a substitute.
+Disconnecting revokes provider access and leaves imported documents in place.
+If the owner wants those documents removed, review a separate `brain forget`
+preview together.
 
 After the owner approves the real ingest and the matching bank account is
 loaded, run one explicit Books Reality Check. Replace each example selector
@@ -197,7 +216,7 @@ For a Claude or Codex-guided visit, copy this prompt exactly and replace only
 the manifest path:
 
 ```text
-Guide me through connecting my client-owned QuickBooks Online company to Financial Brain using /absolute/path/to/brain.manifest.json. First read the manifest and confirm corpora.quickbooks.enabled is true and corpora.quickbooks.environment explicitly says sandbox or production. Explain that I own the Intuit app and company authorization, Financial Brain has no shared Intuit account or credential custody, and QuickBooks will remain a reference rather than financial authority. Ask before running brain technician with --run quickbooks --json. Hand the terminal to me for both hidden prompts and never ask me to paste, print, log, or put either app value in a command. Let me complete Intuit consent in the browser. Then show the exact dry-run and first-ingest commands and stop before the real ingest until I approve it. After a reviewed ingest and bank import, ask me to select exactly one Brain account slug, QuickBooks account ID, date range, and inflow or outflow direction. Show brain reconcile quickbooks with those selectors and --json, then ask before running it. Never expose the Intuit realm ID or credential. Explain that matched, mismatched, ambiguous, one-sided, unavailable, and insufficient-evidence results are review states, never financial authority. Preserve both sources, every exact citation, error_code, and recovery instruction. Never resolve an exception or treat a successful comparison as proof that the books are correct.
+Guide me through connecting my client-owned QuickBooks Online sandbox company to Financial Brain using /absolute/path/to/brain.manifest.json. First read the manifest and confirm corpora.quickbooks.enabled is true, corpora.quickbooks.environment says sandbox, and the registered callback exactly matches the command's localhost URL. If the manifest says production, explain the quickbooks_production_callback_unavailable boundary and stop before credential or browser access. Explain that I own the Intuit app and company authorization, Financial Brain has no shared Intuit account or credential custody, and QuickBooks will remain a reference rather than financial authority. Explain that Intuit's Accounting consent is broader than Financial Brain's read-only runtime queries. Ask before running brain technician with --run quickbooks --json. Hand the terminal to me for both hidden prompts and keep both app values out of chat, printed output, logs, and commands. Let me complete Intuit consent in the browser. Then show the exact dry-run and first-ingest commands and stop before the real ingest until I approve it. After a reviewed ingest and bank import, ask me to select exactly one Brain account slug, QuickBooks account ID, date range, and inflow or outflow direction. Show brain reconcile quickbooks with those selectors and --json, then ask before running it. Never expose the Intuit realm ID or credential. Explain that matched, mismatched, ambiguous, one-sided, unavailable, and insufficient-evidence results are review states, never financial authority. Preserve both sources, every exact citation, error_code, and recovery instruction. Never resolve an exception or treat a successful comparison as proof that the books are correct.
 ```
 
 #### Optional human-confirmed tax review bridge

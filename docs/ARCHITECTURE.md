@@ -276,7 +276,7 @@ an exact post-forget inventory proves the family absent.
 | Zoom | Built as a durable transcript delivery queue with bounded missed-webhook reconciliation; a paid real-account meeting remains a field gate |
 | Bank exports and hosted feed | Built into the shared financial ledger; real-statement and real-feed reconciliation remain field gates |
 | OCR for scanned PDFs | Built, optional, and provenance-marked; local synthetic scans pass and private real scans remain a field gate |
-| QuickBooks Online | Sandbox-ready company snapshots with OAuth refresh and common receipts; query deletion truth and live sandbox proof remain open |
+| QuickBooks Online | Sandbox-ready, company-fingerprint-bound read snapshots with serialized refresh and revoke-before-disconnect; Intuit's consent is broader than runtime reads, production HTTPS callback, query deletion truth, and live sandbox proof remain open |
 | Slack and Notion | Sandbox-ready read-only snapshots with explicit incomplete deletion authority; no real workspace has crossed either boundary |
 | Microsoft 365 | Sandbox-ready Outlook delta plus OneDrive and SharePoint body extraction; real tenant consent and lifecycle proof remain open |
 | Dropbox | Sandbox-ready cursor sync and bounded body extraction; real account lifecycle proof remains open |

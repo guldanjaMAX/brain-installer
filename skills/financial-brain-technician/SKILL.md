@@ -69,12 +69,23 @@ absolute test-kit and manifest paths.
 - The client creates and owns the Intuit app and authorizes their own company.
   Financial Brain has no shared Intuit account and does not take credential
   custody.
-- Confirm `corpora.quickbooks.enabled` and the explicit `sandbox` or
-  `production` environment in the manifest before running
+- Confirm `corpora.quickbooks.enabled`, the explicit `sandbox` environment, and
+  the exact registered localhost callback in the manifest before running
   `brain technician <manifest> --run quickbooks`.
+- Explain that Intuit's Accounting consent can authorize reads and writes even
+  though Financial Brain performs query/read calls only. Keep that broader
+  permission visible before the owner consents.
 - Hand the terminal to the owner for both hidden app-value prompts, then let the
   owner complete Intuit consent in the browser. Never ask for either value in
   chat.
+- If the manifest selects production, preserve
+  `quickbooks_production_callback_unavailable` and stop. The client-owned HTTPS
+  callback is not implemented, and an API key cannot replace Intuit OAuth.
+- Confirm that the returned company binding matches the explicit source. A
+  different company needs a separate source and cannot silently replace the
+  existing one.
+- Explain that disconnect revokes provider access but keeps imported documents.
+  Any removal is a separate reviewed `brain forget` preview and approval.
 - Treat a successful connection or ingest only as a loaded accounting-team
   reference. QuickBooks is not financial authority and must be compared with
   bank evidence and other provenance-bearing records.
