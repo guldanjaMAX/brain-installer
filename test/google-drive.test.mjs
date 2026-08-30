@@ -1,14 +1,26 @@
 import {
   api, listFiles, listRootedFiles, listChanges, startPageToken, triage, toEnvelope, DriveError, EXPORTS,
-  updateFolderIndex, folderPathFor, exclusionReason, driveVersion, classifyScopedAbsence, FOLDER_MIME,
+  updateFolderIndex, folderPathFor, exclusionReason, driveVersion, classifyScopedAbsence, FOLDER_MIME, EXPORT_LIMIT,
 } from "../connectors/google-drive.mjs";
 import { buildAuthUrl, pkce, exchangeCode, createTokenProvider, redirectUri } from "../connectors/google-auth.mjs";
+import * as XLSX from "@e965/xlsx";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 240))); if (!c) fail++; };
 const tok = async () => "at-1";
 const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body, arrayBuffer: async () => new TextEncoder().encode(body).buffer });
 const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () => ({}), arrayBuffer: async () => new TextEncoder().encode(s).buffer });
+const binary = (body, status = 200) => {
+  const exact = Uint8Array.from(body);
+  return { ok: status < 400, status, json: async () => ({}), arrayBuffer: async () => exact.buffer };
+};
+const workbookBytes = (sheets) => {
+  const workbook = XLSX.utils.book_new();
+  for (const [name, rows] of sheets) {
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(rows), name);
+  }
+  return XLSX.write(workbook, { bookType: "xlsx", type: "buffer" });
+};
 
 /* ================= auth ================= */
 {
@@ -326,7 +338,10 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
 {
   check("a folder is neither indexed nor an error", triage({ mimeType: "application/vnd.google-apps.folder" }).folder === true);
   check("a Google Doc is exported, not downloaded", triage({ mimeType: "application/vnd.google-apps.document", name: "x" }).export.mime === "text/plain");
-  check("a Sheet exports as CSV, which the extractor renders header-aware", triage({ mimeType: "application/vnd.google-apps.spreadsheet", name: "x" }).export.mime === "text/csv");
+  const sheetPlan = triage({ mimeType: "application/vnd.google-apps.spreadsheet", name: "x" }).export;
+  check("a Sheet exports as one XLSX workbook so every tab survives",
+    sheetPlan.mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" && sheetPlan.ext === ".xlsx",
+    JSON.stringify(sheetPlan));
   check("a Google Form is skipped with a reason", /cannot be exported/.test(triage({ mimeType: "application/vnd.google-apps.form", name: "f" }).skip));
   check("an unsupported Google type has a stable skip code",
     triage({ mimeType: "application/vnd.google-apps.form", name: "f" }).skipCode === "unsupported_google_type");
@@ -408,11 +423,51 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
 {
   const file = { id: "F3", name: "Budget", mimeType: "application/vnd.google-apps.spreadsheet", size: "500", createdTime: "2026-01-01T00:00:00Z" };
   let exported = null;
+  const workbook = workbookBytes([
+    ["Accounts", [["Account", "Balance"], ["Checking", 15234.11]]],
+    ["Forecast", [["Quarter", "Projected Revenue"], ["Q4", 98250]]],
+  ]);
   const r = await toEnvelope(tok, file, {}, {
-    fetchImpl: async (url) => { exported = url; return bytes("Account,Balance\nChecking,15234.11\n"); }, sleep: async () => {},
+    fetchImpl: async (url) => { exported = url; return binary(workbook); }, sleep: async () => {},
   });
-  check("a Sheet is exported as CSV", new URL(exported).searchParams.get("mimeType") === "text/csv", String(exported));
-  check("and rendered header-aware, so a value is retrievable", /Account: Checking/.test(r.envelope.content), r.envelope?.content);
+  check("a native Sheet requests Google's whole-workbook XLSX export",
+    new URL(exported).searchParams.get("mimeType") === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    String(exported));
+  check("content from the first worksheet remains retrievable",
+    /Sheet: Accounts \(Budget\.xlsx\)/.test(r.envelope?.content || "") && /Account: Checking/.test(r.envelope?.content || ""),
+    r.envelope?.content);
+  check("content from a second worksheet remains retrievable",
+    /Sheet: Forecast \(Budget\.xlsx\)/.test(r.envelope?.content || "") && /Quarter: Q4/.test(r.envelope?.content || ""),
+    r.envelope?.content);
+  check("a complete multi-tab workbook is not mislabeled incomplete",
+    r.incomplete !== true && r.envelope?.metadata?.extraction_incomplete !== true, JSON.stringify(r));
+}
+{
+  const file = { id: "F3-tiny", name: "A", mimeType: "application/vnd.google-apps.spreadsheet", size: "100", createdTime: "2026-01-01T00:00:00Z" };
+  const tiny = workbookBytes([["S", [["x"]]]]);
+  const r = await toEnvelope(tok, file, {}, { fetchImpl: async () => binary(tiny), sleep: async () => {} });
+  check("a workbook with too little useful text is refused by the normal quality gate",
+    r.skip?.code === "quality_refused" && !r.envelope, JSON.stringify(r));
+}
+{
+  const file = { id: "F3-corrupt", name: "Broken", mimeType: "application/vnd.google-apps.spreadsheet", size: "100", createdTime: "2026-01-01T00:00:00Z" };
+  const r = await toEnvelope(tok, file, {}, {
+    fetchImpl: async () => binary(Buffer.from("this is not an XLSX workbook")), sleep: async () => {},
+  });
+  check("a corrupt workbook is an explicit extraction refusal, never a green empty Sheet",
+    r.skip?.code === "extraction_refused" && !r.envelope, JSON.stringify(r));
+}
+{
+  let fetched = false;
+  const file = {
+    id: "F3-oversized", name: "Huge", mimeType: "application/vnd.google-apps.spreadsheet",
+    size: String(EXPORT_LIMIT + 1), createdTime: "2026-01-01T00:00:00Z",
+  };
+  const r = await toEnvelope(tok, file, {}, {
+    fetchImpl: async () => { fetched = true; return binary(new Uint8Array()); }, sleep: async () => {},
+  });
+  check("an export beyond Google's byte ceiling is refused before downloading",
+    fetched === false && r.skip?.code === "file_unavailable" && /export limit/.test(r.skip?.reason || ""), JSON.stringify(r));
 }
 {
   const file = { id: "F4", name: "junk.txt", mimeType: "text/plain", size: "50", createdTime: "2026-01-01T00:00:00Z" };

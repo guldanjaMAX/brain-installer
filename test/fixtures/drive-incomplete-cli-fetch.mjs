@@ -1,14 +1,15 @@
 /**
  * Offline Google Drive + Worker fixture for command-level incomplete coverage.
  *
- * The `incomplete` mode exports one invented Google Sheet whose CSV contains
- * more rows than the reviewed extractor limit. The `policy` mode exposes only
- * one exact file-id exclusion. No request may leave these synthetic hosts.
+ * The `incomplete` mode exports one invented multi-tab Google Sheet as XLSX;
+ * one tab exceeds the reviewed per-sheet row limit. The `policy` mode exposes
+ * only one exact file-id exclusion. No request may leave these synthetic hosts.
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { syncBuiltinESMExports } from "node:module";
+import * as XLSX from "@e965/xlsx";
 
 const evidencePath = String(process.env.BRAIN_DRIVE_INCOMPLETE_EVIDENCE || "");
 const userRoot = String(process.env.BRAIN_DRIVE_INCOMPLETE_USER_ROOT || "");
@@ -62,10 +63,10 @@ function json(body, status = 200) {
   });
 }
 
-function raw(body) {
+function raw(body, contentType) {
   return new Response(body, {
     status: 200,
-    headers: { "content-type": "text/csv; charset=utf-8" },
+    headers: { "content-type": contentType },
   });
 }
 
@@ -114,13 +115,17 @@ function files() {
   }];
 }
 
-function oversizedSheetCsv() {
-  const rows = ["date,customer,amount,summary"];
+function oversizedSheetWorkbook() {
+  const rows = [["date", "customer", "amount", "summary"]];
   for (let index = 0; index < 5_002; index++) {
     const day = String((index % 28) + 1).padStart(2, "0");
-    rows.push(`2026-07-${day},Customer ${index},${100 + index},Completed reviewed service milestone ${index}`);
+    rows.push([`2026-07-${day}`, `Customer ${index}`, 100 + index, `Completed reviewed service milestone ${index}`]);
   }
-  return `${rows.join("\n")}\n`;
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook,
+    XLSX.utils.aoa_to_sheet([["Owner", "Status"], ["Fixture owner", "Reviewed"]]), "Summary");
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(rows), "Records");
+  return XLSX.write(workbook, { bookType: "xlsx", type: "buffer" });
 }
 
 globalThis.fetch = async (input, options = {}) => {
@@ -147,13 +152,14 @@ globalThis.fetch = async (input, options = {}) => {
   }
 
   if (url.hostname === "www.googleapis.com" && url.pathname === `/drive/v3/files/${SHEET_ID}/export`) {
-    if (mode !== "incomplete" || url.searchParams.get("mimeType") !== "text/csv") {
+    const spreadsheetMime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (mode !== "incomplete" || url.searchParams.get("mimeType") !== spreadsheetMime) {
       throw new Error("the fixture received an unexpected Drive export");
     }
     const evidence = readEvidence();
     evidence.exports++;
     saveEvidence(evidence);
-    return raw(oversizedSheetCsv());
+    return raw(oversizedSheetWorkbook(), spreadsheetMime);
   }
 
   if (url.hostname === "www.googleapis.com" && url.pathname.startsWith("/drive/v3/files/")) {

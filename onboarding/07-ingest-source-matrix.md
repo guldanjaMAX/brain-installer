@@ -53,7 +53,7 @@ target elsewhere in Drive.
 | Type | How |
 |---|---|
 | Google Docs | Full text |
-| Google Sheets | Cell contents as rows |
+| Google Sheets | Cell contents from every worksheet, rendered as named rows |
 | Google Slides | Text from the slides |
 | PDF | Text layer. A scanned PDF with no text layer can be read by OCR, if you turn OCR on |
 | Word (.docx), PowerPoint (.pptx), Excel (.xlsx) | Full text |

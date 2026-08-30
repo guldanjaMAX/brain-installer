@@ -42,6 +42,10 @@ the brain, not for whoever built it: what changed for them, and what to check.
 - Google Drive now revalidates the selected root folder on every run before it
   can use the change feed. A moved, deleted, or unauthorized root fails closed
   instead of silently widening or continuing from stale scope.
+- Google Sheets now preserve every worksheet in one bounded workbook export.
+  Previously only the first tab reached the Brain even though the load looked
+  successful; corrupt, oversized, low-text, and row-capped workbooks remain
+  explicit gaps instead of green empty documents.
 - PowerPoint files now keep slides in numeric order and place each slide's
   speaker notes immediately after it. Decks with ten or more slides no longer
   put slide 10 before slide 2 or separate all notes from their slides.

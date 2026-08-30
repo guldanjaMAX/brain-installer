@@ -9,8 +9,8 @@
  *
  * 1. A Google Doc has no bytes. files.get?alt=media returns 403 for native
  *    types; they must be exported, and the export format decides retrieval
- *    quality. text/plain for Docs, CSV for Sheets (one request per sheet is not
- *    worth it), text/plain for Slides.
+ *    quality. text/plain for Docs, XLSX for Sheets so every worksheet survives
+ *    one bounded export, and text/plain for Slides.
  *
  * 2. modifiedTime is a TRAP as a document date. A sync, a permission change or
  *    a bulk move rewrites it. Storing it made 80% of a real corpus look like it
@@ -36,7 +36,10 @@ export const SOURCE_TYPE = "drive";
 /** Native Google types, and what to ask for instead of bytes. */
 export const EXPORTS = {
   "application/vnd.google-apps.document": { mime: "text/plain", ext: ".txt" },
-  "application/vnd.google-apps.spreadsheet": { mime: "text/csv", ext: ".csv" },
+  "application/vnd.google-apps.spreadsheet": {
+    mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ext: ".xlsx",
+  },
   "application/vnd.google-apps.presentation": { mime: "text/plain", ext: ".txt" },
 };
 

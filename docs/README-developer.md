@@ -671,7 +671,10 @@ revision it was called to reconcile. Any new producer that turns one input into
 many documents must stamp `family_of`; leaving it out is a hard refusal at plan
 time rather than a silently unreconcilable source.
 
-A Google Doc is exported as text, a Sheet as CSV, and a Google Form not at all.
+A Google Doc is exported as text, a Sheet as one XLSX workbook so every
+worksheet reaches the shared bounded spreadsheet extractor, and a Google Form
+not at all. CSV and TSV exports are first-sheet-only and are therefore not used
+for native Google Sheets.
 
 `modifiedTime` is deliberately **not** used as a document date. A sync or a
 permission change rewrites it, and storing it once made 80% of a corpus look
