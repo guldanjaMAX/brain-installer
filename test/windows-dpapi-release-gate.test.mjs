@@ -57,6 +57,10 @@ test("the Windows release gate uses the production probe for exactly 25 fresh ro
 test("the bridge refuses a changed, hard-linked, or symlinked helper before reading input", () => {
   const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "brain-dpapi-bridge-contract-")));
   try {
+    const childSystemRoot = process.platform === "win32"
+      ? process.env.SystemRoot || process.env.SYSTEMROOT || process.env.WINDIR
+      : "/fixture/windows";
+    assert.ok(childSystemRoot, "the Windows test child requires the real OS runtime root");
     const run = (helper, sha256, expectedIdentity = lstatSync(helper)) => spawnSync(process.execPath, [
       bridgeFile,
       "--helper", helper,
@@ -70,7 +74,7 @@ test("the bridge refuses a changed, hard-linked, or symlinked helper before read
     ], {
       encoding: "utf8",
       input: Buffer.from([1, 2, 3, 4]),
-      env: { SystemRoot: "/fixture/windows", USERNAME: "fixture-user" },
+      env: { SystemRoot: childSystemRoot, USERNAME: "fixture-user" },
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 10_000,
     });
