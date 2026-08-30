@@ -41,6 +41,7 @@ import {
 } from "./document-access.js";
 import { appPageHtml, brandOgSvg } from "./app-page.js";
 import { APP_JS, APP_CSS } from "./app-assets.js";
+import { readUpdateStatus } from "./update-status.js";
 
 const APP_HEADER = "X-Brain-App";
 
@@ -264,7 +265,7 @@ export async function handleAdminDevices(env, request, path) {
 
 /* ------------------------------------------------------------ owner plane */
 
-export async function handleOwnerAuth(env, request, url, path) {
+export async function handleOwnerAuth(env, request, url, path, options = {}) {
   const requestStartedAt = Date.now();
   // The link-preview image. Public and cacheable by design: a scraper fetching
   // it must never need a credential, and it contains only the brain's own name.
@@ -724,6 +725,14 @@ export async function handleOwnerAuth(env, request, url, path) {
   // A scoped session may read only its exact granted documents and its own
   // minimal identity above. Unlisted future routes therefore fail owner-only.
   if (!ownerRequired(principal)) return scopedForbidden();
+
+  if (path === "/api/app/update-status") {
+    const result = await readUpdateStatus({
+      installedVersion: env.BRAIN_VERSION,
+      fetchImpl: options.fetchImpl || fetch,
+    });
+    return jsonResponse(result, result.status === "unavailable" ? 503 : 200);
+  }
 
   if (path === "/api/app/document-access/status") {
     try {

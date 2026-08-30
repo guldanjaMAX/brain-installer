@@ -96,6 +96,20 @@ export type BankStatus = {
   connections?: BankConnection[];
   needs_attention?: BankConnection[];
 };
+export type UpdateStatus = {
+  status: "up_to_date" | "update_available" | "ahead" | "unavailable";
+  installed_version: string | null;
+  latest_version: string | null;
+  checked_at: string;
+  published_at?: string;
+  update_url: "https://financialbrain.ai/update";
+  claude_prompt?: string;
+  changes?: string[];
+  released_connectors?: string[];
+  installer?: { url: string; sha256: string; bytes: number };
+  error?: "unavailable";
+  code?: "update_check_unavailable" | "installed_version_unavailable";
+};
 /** One problem the installer owns. `fix_owner` is always "installer" today:
  *  every diagnose remedy is a CLI command the owner cannot run. */
 export type Problem = {

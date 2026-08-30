@@ -45,7 +45,7 @@ describe("principal workspace routing", () => {
     expect(html).not.toContain("Home</button>");
     expect(html).not.toContain("This Year");
     expect(html).not.toContain("Add &amp; Review");
-    expect(html).not.toContain("Access</button>");
+    expect(html).not.toContain("Settings</button>");
     expect(html).not.toContain("Owner preferences");
     expect(html).not.toContain("Add a text record");
   });

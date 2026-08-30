@@ -95,7 +95,7 @@ export function App() {
               <Tab now={view} go={setView} to="documents">Documents</Tab>
               <Tab now={view} go={setView} to="ask">Explore</Tab>
               <Tab now={view} go={setView} to="review">Add &amp; Review</Tab>
-              <Tab now={view} go={setView} to="access">Access</Tab>
+              <Tab now={view} go={setView} to="access">Settings</Tab>
             </nav>
           </div>
         </header>

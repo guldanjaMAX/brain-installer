@@ -215,6 +215,35 @@ const server = createServer(async (request, response) => {
       connections: [{ client_id: "app", name: "Claude", can_write: false, connected_at: Date.now() - 86400000 * 4, last_used_at: Date.now() - 3600000 }],
     });
   }
+  if (url.pathname === "/api/app/update-status") {
+    if (scenario === "degraded") {
+      return sendJson(response, {
+        status: "unavailable",
+        error: "unavailable",
+        code: "update_check_unavailable",
+        installed_version: "0.2.0",
+        latest_version: null,
+        checked_at: "2026-08-30T12:00:00.000Z",
+        update_url: "https://financialbrain.ai/update",
+      }, 503);
+    }
+    return sendJson(response, {
+      status: "update_available",
+      installed_version: "0.2.0",
+      latest_version: "0.2.1",
+      checked_at: "2026-08-30T12:00:00.000Z",
+      published_at: "2026-08-30",
+      update_url: "https://financialbrain.ai/update",
+      claude_prompt: "Open https://financialbrain.ai/update, read the whole page, and help me safely update my Financial Brain.",
+      changes: ["A synthetic reviewed update is available in this local rehearsal."],
+      released_connectors: ["Synthetic connector proof only"],
+      installer: {
+        url: "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.2.1/brain-installer-0.2.1.tgz",
+        sha256: "a".repeat(64),
+        bytes: 4_000_000,
+      },
+    });
+  }
   if (url.pathname === "/api/app/document-access/documents") {
     if (scenario === "grant-unavailable") return sendJson(response, { error: "unavailable", code: "document_access_unavailable" }, 503);
     return sendJson(response, {

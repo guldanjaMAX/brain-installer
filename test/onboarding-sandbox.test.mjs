@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { resolve } from "node:path";
 
 import {
   SANDBOX_SCENARIOS,
@@ -41,4 +43,12 @@ test("the scenario menu covers happy, empty, unavailable, retry, conflict, and s
   for (const id of ["populated", "empty", "partial", "degraded", "conflict", "idempotent", "grant", "grant-unavailable", "signin"]) {
     assert.ok(ids.has(id), `missing ${id}`);
   }
+});
+
+test("the real UI rehearsal includes available and unavailable update fixtures", () => {
+  const fixture = readFileSync(resolve("frontend/test/visual-server.mjs"), "utf8");
+  assert.match(fixture, /\/api\/app\/update-status/);
+  assert.match(fixture, /status: "update_available"/);
+  assert.match(fixture, /code: "update_check_unavailable"/);
+  assert.match(fixture, /A synthetic reviewed update is available in this local rehearsal/);
 });

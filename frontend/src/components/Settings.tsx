@@ -1,10 +1,113 @@
 import { useEffect, useState } from "react";
-import { api, apiGet, type Device, type Connection, type BankStatus } from "../lib/api";
+import {
+  ApiError, api, apiGet,
+  type Device, type Connection, type BankStatus, type UpdateStatus,
+} from "../lib/api";
 import { enroll } from "../lib/passkey";
 import { Section, Row, Note, Empty, Badge, Chip, Confirm, EditableName, ago, agoISO } from "./ui";
 import { OwnerPreferences } from "./OwnerPreferences";
 import { DocumentAccess } from "./DocumentAccess";
 import { PasskeyDiagnostics } from "./PasskeyDiagnostics";
+
+function unavailableUpdateStatus(error: unknown): UpdateStatus {
+  if (error instanceof ApiError && error.status === 503 && error.body.status === "unavailable") {
+    return error.body as unknown as UpdateStatus;
+  }
+  return {
+    status: "unavailable",
+    error: "unavailable",
+    code: "update_check_unavailable",
+    installed_version: null,
+    latest_version: null,
+    checked_at: new Date().toISOString(),
+    update_url: "https://financialbrain.ai/update",
+  };
+}
+
+export function UpdateStatusCard({ update, onRetry }: {
+  update: UpdateStatus | null;
+  onRetry: () => void;
+}) {
+  const [copyState, setCopyState] = useState("Copy for Claude");
+  const copyPrompt = async () => {
+    if (!update?.claude_prompt) return;
+    try {
+      await navigator.clipboard.writeText(update.claude_prompt);
+      setCopyState("Copied");
+    } catch {
+      setCopyState("Select the prompt below");
+    }
+  };
+
+  return (
+    <Section
+      title="Software updates"
+      blurb="This Brain checks Financial Brain's public stable release channel. It does not send your files, questions, manifest, source list, or account details."
+      action={update?.status === "unavailable" ? (
+        <button onClick={onRetry} className="text-[13.5px] text-accent font-medium">Check again</button>
+      ) : undefined}
+    >
+      {!update && <Note>Checking the current stable release.</Note>}
+
+      {update?.status === "unavailable" && (
+        <div className="px-4 py-4">
+          <p className="text-[14.5px] text-amber-900 font-medium">The update check is unavailable right now.</p>
+          <p className="mt-1 text-[13.5px] text-ink-soft leading-relaxed">
+            Your Brain keeps working. This screen is not treating an unreachable release channel as proof that you are up to date.
+            {update.installed_version ? ` Installed version: ${update.installed_version}.` : ""}
+          </p>
+        </div>
+      )}
+
+      {update?.status === "up_to_date" && (
+        <Row>
+          <span className="min-w-0">
+            <span className="text-[14.5px] flex items-center gap-2 flex-wrap">
+              You are up to date <Badge tone="accent">Version {update.installed_version}</Badge>
+            </span>
+            <span className="block text-[13px] text-ink-soft mt-0.5">The installed version matches the current reviewed stable release.</span>
+          </span>
+          <a href={update.update_url} target="_blank" rel="noreferrer" className="text-[13px] text-accent font-medium">Read update notes</a>
+        </Row>
+      )}
+
+      {update?.status === "ahead" && (
+        <Note>
+          This Brain reports version {update.installed_version}, which is newer than the public stable release {update.latest_version}.
+          Ask your technician which release channel installed it before making another change.
+        </Note>
+      )}
+
+      {update?.status === "update_available" && (
+        <div className="px-4 py-4">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <span>
+              <span className="block text-[15px] font-semibold">Version {update.latest_version} is ready</span>
+              <span className="block text-[13px] text-ink-soft mt-0.5">You currently have {update.installed_version}.</span>
+            </span>
+            <Badge tone="warn">Update available</Badge>
+          </div>
+          {update.changes && (
+            <ul className="mt-4 pl-5 list-disc text-[13.5px] text-ink-soft leading-relaxed space-y-1.5">
+              {update.changes.map((change) => <li key={change}>{change}</li>)}
+            </ul>
+          )}
+          <div className="mt-4 border border-line bg-paper/60 rounded-xl p-3">
+            <p className="text-[12px] uppercase tracking-[0.08em] text-ink-soft font-semibold">Paste into Claude Code</p>
+            <code className="block mt-2 text-[13px] leading-relaxed text-ink break-words select-all">{update.claude_prompt}</code>
+            <div className="mt-3 flex items-center gap-3 flex-wrap">
+              <button onClick={copyPrompt} className="px-3.5 py-2 rounded-lg bg-accent text-white text-[13px] font-medium">{copyState}</button>
+              <a href={update.update_url} target="_blank" rel="noreferrer" className="text-[13px] text-accent font-medium">Open update guide</a>
+            </div>
+          </div>
+          <p className="mt-3 text-[13px] text-ink-soft leading-relaxed">
+            Claude begins with read-only checks and asks before Cloudflare changes, account connections, private-data ingestion, deletion, revocation, billing, or invites.
+          </p>
+        </div>
+      )}
+    </Section>
+  );
+}
 
 /** Who and what can open this brain.
  *
@@ -22,12 +125,16 @@ export function Settings({ devices, connections, onChange }: {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [banks, setBanks] = useState<BankStatus | null>(null);
+  const [update, setUpdate] = useState<UpdateStatus | null>(null);
 
   // The bank feed is a separate surface with its own auth, so it is fetched
   // here rather than folded into /api/app/me: a brain with no bank configured
   // should not make the whole page fail.
   const loadBanks = () => apiGet<BankStatus>("/api/bank-feed/status").then(setBanks).catch(() => setBanks(null));
-  useEffect(() => { loadBanks(); }, []);
+  const loadUpdate = () => api<UpdateStatus>("/api/app/update-status")
+    .then(setUpdate)
+    .catch((next) => setUpdate(unavailableUpdateStatus(next)));
+  useEffect(() => { loadBanks(); loadUpdate(); }, []);
 
   async function run(work: () => Promise<unknown>) {
     setError(null);
@@ -49,10 +156,10 @@ export function Settings({ devices, connections, onChange }: {
   return (
     <div>
       <header className="max-w-2xl mb-7">
-        <p className="eyebrow">People, devices, and apps</p>
-        <h1 className="page-title">Access</h1>
+        <p className="eyebrow">Your Brain</p>
+        <h1 className="page-title">Settings</h1>
         <p className="page-intro">
-          See owner devices, connected apps, exact-document access, and passkey proof at the level this brain can verify.
+          Check software updates, choose owner preferences, and manage devices, apps, document access, and passkey proof.
         </p>
       </header>
       {error && (
@@ -60,6 +167,8 @@ export function Settings({ devices, connections, onChange }: {
           {error}
         </p>
       )}
+
+      <UpdateStatusCard update={update} onRetry={() => { setUpdate(null); loadUpdate(); }} />
 
       <OwnerPreferences />
 

@@ -178,6 +178,13 @@ corpus/source write, not only vector drain. A failed update keeps the bookmark
 and tells you the safe rerun path. It never restores automatically because
 restoring would discard newer writes.
 
+After a release containing the update-status feature is installed, the owner
+workspace Settings page checks the public stable release feed and offers one
+reviewed Claude Code handoff when a newer version exists. It never updates in
+the background. An unreachable or invalid feed appears as unavailable, not as
+proof that the Brain is current. Existing 0.2.0 clients must use this manual
+update path once before the Settings check can appear.
+
 ---
 
 ## Load your documents
