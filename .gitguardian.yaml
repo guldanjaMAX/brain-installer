@@ -1,0 +1,30 @@
+# GitGuardian configuration.
+#
+# This repository contains SYNTHETIC credentials on purpose. It ships a
+# credential gate whose job is refusing to index real secrets, and a scanner
+# cannot be tested without secret-shaped inputs to test it against.
+#
+# Every value in the paths below was authored as a fixture. Verified 2026-08-18
+# by hashing each secret-shaped literal in the tree and comparing against the
+# live keys in the author's keychain: zero matches.
+#
+# If a real secret ever does land here, that is exactly the alert we want, so
+# this ignores PATHS that are known fixtures rather than muting the detectors.
+
+version: 2
+
+secret:
+  ignored-paths:
+    # The credential scanner's own test suite. Contains a deliberately
+    # realistic Anthropic key, Stripe webhook secret, Supabase PAT and others,
+    # so the gate can be proven to catch each shape.
+    - "worker/test/secret-scan.test.mjs"
+    # (A path-ignore for the first field-test regression suite was removed here:
+    # it named a collaborator in the path, and the file it pointed at no longer
+    # exists. If that suite comes back, name it after what it tests.)
+
+  ignored-matches:
+    # Documented inside the scanner itself, as the example of a hex value that
+    # must NOT be treated as a git SHA when it sits in secret context.
+    - name: "example admin key in a source comment"
+      match: "8f3a2b1c9d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a"

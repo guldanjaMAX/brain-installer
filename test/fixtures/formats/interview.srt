@@ -1,0 +1,11 @@
+1
+00:00:01,000 --> 00:00:06,400
+{\an8}<i>Morgan Diaz: The second warehouse came in at eleven thousand square feet.</i>
+
+2
+00:00:06,900 --> 00:00:11,250
+Sam Osei: That is bigger than we costed. What does it do to the monthly number?
+
+3
+00:00:11,700 --> 00:00:16,000
+Morgan Diaz: It adds about four hundred dollars, and the landlord will not split it.

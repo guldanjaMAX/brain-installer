@@ -1,0 +1,598 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brain-installer.invalid/schema/eval-suite-v2.schema.json",
+  "title": "Brain evaluation suite v2",
+  "description": "A portable evaluation contract. Shared fixtures must be synthetic. Private instance suites stay outside the repository and published package.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "suite_id",
+    "suite_version",
+    "data_class",
+    "cases"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "suite_id": {
+      "$ref": "#/$defs/slug"
+    },
+    "suite_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 1000
+    },
+    "data_class": {
+      "enum": [
+        "synthetic",
+        "private_instance"
+      ]
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/case"
+      }
+    }
+  },
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "status",
+        "risk",
+        "domains",
+        "formats",
+        "query_kind",
+        "question",
+        "actor",
+        "expected",
+        "provenance"
+      ],
+      "properties": {
+        "case_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "status": {
+          "enum": [
+            "candidate",
+            "reviewed",
+            "gold"
+          ]
+        },
+        "risk": {
+          "enum": [
+            "critical",
+            "high",
+            "normal"
+          ]
+        },
+        "domains": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        },
+        "formats": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        },
+        "query_kind": {
+          "enum": [
+            "single",
+            "multi",
+            "temporal",
+            "aggregate",
+            "conflict",
+            "unanswerable",
+            "entity_attribution",
+            "ocr_text",
+            "ocr_table",
+            "typo",
+            "adversarial"
+          ]
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "time": {
+          "$ref": "#/$defs/queryTime"
+        },
+        "expected": {
+          "$ref": "#/$defs/expected"
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "expected": {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "const": "answer"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "expected": {
+                "type": "object",
+                "properties": {
+                  "claims": {
+                    "type": "array",
+                    "minItems": 1
+                  },
+                  "evidence_slots": {
+                    "type": "array",
+                    "minItems": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "reviewed",
+                  "gold"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "provenance": {
+                "type": "object",
+                "required": [
+                  "reviewed_by",
+                  "reviewed_at"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "principal_id",
+        "tenant_id",
+        "authorized_owner_ids",
+        "scopes"
+      ],
+      "properties": {
+        "principal_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "authorized_owner_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        },
+        "scopes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        }
+      }
+    },
+    "queryTime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "query_as_of"
+      ],
+      "properties": {
+        "query_as_of": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "claims",
+        "evidence_slots",
+        "forbidden",
+        "citations"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "answer",
+            "abstain",
+            "clarify"
+          ]
+        },
+        "claims": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/claim"
+          }
+        },
+        "evidence_slots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidenceSlot"
+          }
+        },
+        "forbidden": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/forbiddenEvidence"
+          }
+        },
+        "citations": {
+          "$ref": "#/$defs/citationExpectation"
+        }
+      }
+    },
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claim_id",
+        "text",
+        "required",
+        "evidence_slot_ids"
+      ],
+      "properties": {
+        "claim_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "value": {
+          "$ref": "#/$defs/exactValue"
+        },
+        "evidence_slot_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        }
+      }
+    },
+    "exactValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "canonical",
+        "normalization",
+        "tolerance"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "string",
+            "number",
+            "currency",
+            "date",
+            "boolean",
+            "enum"
+          ]
+        },
+        "canonical": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "normalization": {
+          "enum": [
+            "none",
+            "casefold_whitespace",
+            "numeric",
+            "currency_minor_units",
+            "iso_date"
+          ]
+        },
+        "tolerance": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "evidenceSlot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "slot_id",
+        "required",
+        "min_hits",
+        "relevance_grade",
+        "any_of"
+      ],
+      "properties": {
+        "slot_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "min_hits": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "relevance_grade": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "shared_result_group": {
+          "$ref": "#/$defs/slug",
+          "description": "Slots with the same explicit group may be satisfied by one logical document. Ungrouped slots require distinct documents."
+        },
+        "any_of": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/evidenceReference"
+          }
+        }
+      }
+    },
+    "evidenceReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_id"
+      ],
+      "properties": {
+        "source_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "version_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "page": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "span_hash": {
+          "$ref": "#/$defs/hash"
+        }
+      }
+    },
+    "forbiddenEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "source_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "entity_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "owner_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "canary_hash": {
+          "$ref": "#/$defs/hash"
+        }
+      }
+    },
+    "citationExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "required_claim_ids"
+      ],
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "required_claim_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authored_by",
+        "source_snapshot_hash"
+      ],
+      "properties": {
+        "authored_by": {
+          "enum": [
+            "human",
+            "synthetic",
+            "production_failure"
+          ]
+        },
+        "reviewed_by": {
+          "$ref": "#/$defs/slug"
+        },
+        "reviewed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "source_snapshot_hash": {
+          "$ref": "#/$defs/hash"
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema_version": 2,
+      "suite_id": "synthetic-release",
+      "suite_version": "1",
+      "description": "Synthetic fixture only. It contains no owner or source content.",
+      "data_class": "synthetic",
+      "cases": [
+        {
+          "case_id": "sample-policy-001",
+          "status": "gold",
+          "risk": "normal",
+          "domains": [
+            "sample-records"
+          ],
+          "formats": [
+            "plain-text"
+          ],
+          "query_kind": "single",
+          "question": "Which sample policy code is listed for the fictional Example Cooperative?",
+          "actor": {
+            "principal_id": "sample-owner",
+            "tenant_id": "sample-install",
+            "authorized_owner_ids": [
+              "sample-owner"
+            ],
+            "scopes": [
+              "sample-records-read"
+            ]
+          },
+          "time": {
+            "query_as_of": null
+          },
+          "expected": {
+            "mode": "answer",
+            "claims": [
+              {
+                "claim_id": "policy-code",
+                "text": "The fictional policy code is SAMPLE-42.",
+                "required": true,
+                "value": {
+                  "type": "string",
+                  "canonical": "SAMPLE-42",
+                  "normalization": "casefold_whitespace",
+                  "tolerance": null
+                },
+                "evidence_slot_ids": [
+                  "policy-source"
+                ]
+              }
+            ],
+            "evidence_slots": [
+              {
+                "slot_id": "policy-source",
+                "required": true,
+                "min_hits": 1,
+                "relevance_grade": 3,
+                "any_of": [
+                  {
+                    "source_id": "synthetic-policy-document",
+                    "version_id": "version-1",
+                    "page": 1,
+                    "span_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                ]
+              }
+            ],
+            "forbidden": [],
+            "citations": {
+              "required": true,
+              "required_claim_ids": [
+                "policy-code"
+              ]
+            }
+          },
+          "provenance": {
+            "authored_by": "human",
+            "reviewed_by": "synthetic-reviewer",
+            "reviewed_at": "2026-01-01T00:00:00Z",
+            "source_snapshot_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        }
+      ]
+    }
+  ]
+}

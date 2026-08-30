@@ -1,0 +1,743 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brain-installer/manifest.schema.json",
+  "title": "brain install manifest",
+  "description": "One manifest per client install. The ONLY thing that differs between installs. Fields marked NOT YET WIRED are read by nothing today; they are kept because they describe intent, but do not tell a client they take effect.",
+  "type": "object",
+  "required": [
+    "manifest_version",
+    "client",
+    "brain",
+    "infrastructure"
+  ],
+  "properties": {
+    "manifest_version": {
+      "const": 1
+    },
+    "client": {
+      "type": "object",
+      "required": [
+        "slug",
+        "display_name"
+      ],
+      "properties": {
+        "slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{1,40}$",
+          "description": "Lowercase. Used to name the worker, the D1 database and the Vectorize index, so it cannot contain spaces or capitals."
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "primary_contact": {
+          "type": "string",
+          "format": "email"
+        },
+        "timezone": {
+          "type": "string"
+        }
+      }
+    },
+    "brain": {
+      "type": "object",
+      "required": [
+        "version"
+      ],
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "worker_name": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{1,60}$"
+        },
+        "domain": {
+          "type": "string",
+          "description": "NOT YET WIRED as provisioning. Nothing creates this route; health and test will PROBE it if set, so leave it out until the DNS and route exist or every command will fail against a hostname that does not resolve."
+        }
+      }
+    },
+    "infrastructure": {
+      "type": "object",
+      "required": [
+        "cloudflare"
+      ],
+      "properties": {
+        "cloudflare": {
+          "type": "object",
+          "required": [
+            "account_id"
+          ],
+          "properties": {
+            "account_id": {
+              "type": "string",
+              "minLength": 8
+            },
+            "storage": {
+              "enum": [
+                "d1",
+                "supabase"
+              ],
+              "default": "d1",
+              "description": "d1 keeps the entire brain inside the client's own Cloudflare account and is the standard backend at every corpus size. supabase exists only for migration or an explicitly measured retrieval limitation."
+            },
+            "d1_database_name": {
+              "type": "string",
+              "description": "Must be scoped to the client, e.g. acme-brain. A bare \"brain\" is refused at provision: it may already exist in the account and belong to something else."
+            },
+            "d1_database_id": {
+              "type": "string"
+            },
+            "vectorize_index": {
+              "type": "string",
+              "description": "Created by provision at 768 dimensions, cosine. Those are the output shape of @cf/baai/bge-base-en-v1.5 and are not free choices. Free can create this index, but Paid is the supported production baseline because Free has prototype-scale vector, daily-write, and Worker CPU limits."
+            },
+            "drain_cron": {
+              "type": "string",
+              "default": "* * * * *"
+            },
+            "r2_bucket": {
+              "type": "string",
+              "description": "Created by provision, but NOT YET WIRED: nothing binds or reads it."
+            },
+            "kv_namespace": {
+              "type": "string",
+              "description": "NOT YET WIRED. Never created, never bound."
+            },
+            "kv_namespace_id": {
+              "type": "string"
+            }
+          }
+        },
+        "supabase": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "project_ref": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "corpora": {
+      "type": "object",
+      "description": "Source declarations. Enabled connectors are enforced by their documented connect, ingest, schedule, disconnect, and forget commands.",
+      "properties": {
+        "google_drive": {
+          "type": "object",
+          "allOf": [
+            {
+              "if": {
+                "properties": { "enabled": { "const": true } },
+                "required": ["enabled"]
+              },
+              "then": {
+                "required": ["root_folder_ids"],
+                "properties": { "root_folder_ids": { "minItems": 1 } }
+              }
+            }
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "root_folder_ids": {
+              "type": "array",
+              "description": "Exact reviewed folder ids that bound Drive ingestion. Only these folders and their descendants are traversed; shortcuts are not followed outside them.",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
+            },
+            "exclude_paths": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "exclude_name_parts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "exclude_file_ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "exclude_file_ids_file": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Optional local JSON exclusion list, resolved relative to the manifest. It may also be a completed Supabase migration receipt."
+            }
+          }
+        },
+        "imap": {
+          "type": "object",
+          "description": "Any mailbox that speaks IMAP (Yahoo, Fastmail, iCloud, a hosting provider), enforced by brain connect imap and brain ingest --from imap. Most providers require an APP PASSWORD rather than the account password; it is entered hidden at connect and stored in the client's own macOS Keychain or Windows DPAPI store under an item named for IMAP, never as a flag and never in an environment variable. Read-only at the protocol level (EXAMINE, never SELECT), so nothing is marked read. Inbox and Sent are read by default; Junk, Trash, Drafts and an All Mail folder are skipped; an Archive folder is identified and also NOT read; a folder whose role cannot be identified is NOT read. Every folder is reported with the true reason, and folder containers that hold no mail are named as such rather than as folders that went unread. Incremental through UIDVALIDITY plus a per-folder UID watermark; a UIDVALIDITY change is announced and re-reads the whole folder rather than resuming. Bulk mail is excluded LOCALLY on message headers requiring two independent signals, which is a weaker instrument than Gmail's server-side category classifier and is not equivalent to it. Deletions made in the mailbox are NOT propagated to the brain.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "host": {
+              "type": "string",
+              "description": "IMAP hostname, for example imap.mail.yahoo.com. May also be supplied as --host at connect."
+            },
+            "port": {
+              "type": "integer",
+              "default": 993,
+              "description": "Implicit TLS. 993 unless the provider says otherwise. STARTTLS on 143 is not supported, because a failed upgrade is a silent downgrade."
+            },
+            "username": {
+              "type": "string",
+              "description": "The mailbox address. The password is never stored here."
+            }
+          }
+        },
+        "imessage": {
+          "type": "object",
+          "description": "Mac-only live message capture from Messages.app (chat.db), enforced by brain connect imessage and brain ingest --from imessage. Requires a Full Disk Access grant on the capturing Mac; SMS arrives alongside iMessage when Text Message Forwarding is on and is tagged sms. The capture schedule knob is operations.imessage_capture_cron (default: every minute).",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        "zoom": {
+          "type": "object",
+          "description": "Zoom cloud-recording transcripts, enforced by brain connect zoom. Requires a paid (Licensed) Zoom seat: the free Basic tier cannot cloud record at all, so it can never produce a transcript, and connect refuses it. The client creates a Server-to-Server OAuth app in their OWN Zoom account with the cloud_recording:read:admin scope; its four values are written as secrets on the client's own worker. Delivery is webhook-driven (recording.transcript_completed) for NEW recordings only; there is no backfill of recordings made before connecting.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        "whatsapp": {
+          "type": "object",
+          "description": "Live WhatsApp capture through a paired linked device, enforced by brain connect whatsapp (which additionally requires the --accept-risk acknowledgement) and drained by brain ingest --from whatsapp. Opt-in by design while the default posture is undecided: pairing joins the account with an unofficial client, a terms-of-service gray area carrying a small but real ban risk, and link-time history depth is only what the phone chooses to transfer. Installing the capture daemon needs macOS; Windows service supervision is not built. Knobs: operations.whatsapp_drain_cron (default: every minute), operations.whatsapp_daemon_path, operations.whatsapp_data_dir.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        "quickbooks": {
+          "type": "object",
+          "description": "QuickBooks Online accounting records queried read-only at runtime. Intuit's Accounting OAuth consent can authorize broader read and update access. Sandbox localhost OAuth is available; production stops before credential or browser access until the client-owned HTTPS callback is implemented. OAuth credentials and raw company identity remain in the local provider store. Disconnect retains imported documents, and query snapshots do not prove hard deletion.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "environment": { "enum": ["sandbox", "production"], "default": "sandbox" },
+            "redirect_host": {
+              "enum": ["localhost", "127.0.0.1"],
+              "default": "localhost",
+              "description": "Exact sandbox callback host. Intuit documents localhost. The callback server always binds 127.0.0.1 and this value cannot broaden listener scope."
+            },
+            "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "quickbooks" },
+            "minor_version": { "type": "integer", "minimum": 1, "maximum": 999 },
+            "entities": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "enum": ["Account", "Customer", "Vendor", "Invoice", "Payment", "Bill", "Purchase", "JournalEntry", "Deposit", "Transfer", "CreditMemo", "BillPayment", "Estimate", "SalesReceipt", "RefundReceipt"] }
+            }
+          }
+        },
+        "slack": {
+          "type": "object",
+          "description": "Read-only Slack conversation history using an owner-authorized user token in the local provider credential store. History pagination and bounded thread replies are read, but Slack does not provide an authoritative removal stream for all deleted messages, so deletion authority remains explicit rather than inferred.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "slack" },
+            "channel_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "include_thread_replies": { "type": "boolean", "default": true }
+          }
+        },
+        "notion": {
+          "type": "object",
+          "description": "Read-only Notion pages shared with the owner-authorized integration. Every visible page is paginated and its readable child blocks are recursively materialized. Unshared and hard-deleted pages are outside the integration's inventory, so deletion authority is reported as unavailable.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "notion" }
+          }
+        },
+        "microsoft": {
+          "type": "object",
+          "description": "Read-only Microsoft 365 Outlook, OneDrive, and selected SharePoint drives using Graph delta links. Message and drive tombstones are authoritative, and supported file bodies are downloaded to the owner machine for the common extraction path before a terminal delta link may advance.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "microsoft" },
+            "mail_folder_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 }, "default": ["inbox"] },
+            "drive_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "site_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "include_personal_drive": { "type": "boolean", "default": true }
+          }
+        },
+        "dropbox": {
+          "type": "object",
+          "description": "Read-only Dropbox recursive file sync with opaque cursors, exact deleted-path tombstones, and supported file bodies downloaded to the owner machine for common extraction. An expired cursor triggers a full reconciliation rather than guessing at missed changes.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "dropbox" },
+            "root_path": { "type": "string", "default": "" }
+          }
+        },
+        "hubspot": {
+          "type": "object",
+          "description": "Read-only HubSpot CRM snapshots for selected object types. Active and archived records are enumerated separately, but hard deletion has no complete incremental stream, so every run reports its deletion-authority gap instead of inferring absence.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "hubspot" },
+            "object_types": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "enum": ["contacts", "companies", "deals"] },
+              "default": ["contacts", "companies", "deals"]
+            }
+          }
+        },
+        "local_folder": {
+          "type": "object",
+          "description": "A local folder that reloads itself on a schedule, enforced by brain schedule <manifest> --install --folder and run by brain ingest <manifest> --path. This is what makes \"drop it in a folder you already ingest\" true for a folder that is not inside Google Drive. Each tick reuses the local ingest's content-hash resume state, so a new file is added, a changed file is re-sent, an unchanged file costs one read, and a file that is gone is removed through the same aggregate removal plan every other source uses. The schedule knob is operations.folder_ingest_cron (default: hourly). macOS only today: it installs as a per-user LaunchAgent.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Absolute path to the folder to watch, or null until one is chosen. A relative path is refused: a LaunchAgent's working directory is not the client's shell, so it would resolve somewhere neither party intended."
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]*$",
+              "maxLength": 64,
+              "default": "documents",
+              "description": "The named source this folder loads under, which is also the undo: brain forget <manifest> --source <name> removes exactly what it loaded."
+            }
+          }
+        },
+        "bank_feed": {
+          "type": "object",
+          "description": "A hosted, read-only bank connection the ACCOUNT HOLDER authorises themselves, in their own browser, on their own bank's screen. No password, one-time code, or bank credential is ever seen, requested, handled, or stored by the operator or by this codebase; what the brain receives is a read-only reference for fetching transaction history, and it is stored encrypted in the client's own D1. Setting enabled:true makes BANK_FEED_CLIENT_ID, BANK_FEED_SECRET, and the independently held BANK_FEED_WRAPPING_KEY_V2 eligible Worker secrets. The wrapping key is never derived from provider, admin, or session credentials and remains owner custody needed for recovery. Recommended posture is per-client credentials in the client's own provider account. Start Plaid in sandbox so an install can be rehearsed before the client's production approval lands. `brain doctor` fails when registered_redirect_uris does not contain this brain's own return address, because that registration cannot be fixed while a client is sitting in front of you mid-authorisation.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "provider": {
+              "enum": [
+                "plaid",
+                "custom"
+              ],
+              "default": "plaid",
+              "description": "plaid selects the reviewed public endpoint profile. custom preserves an explicitly configured compatible bank-feed provider. Credentials never belong in this manifest."
+            },
+            "environment": {
+              "enum": [
+                "sandbox",
+                "production"
+              ],
+              "default": "sandbox"
+            },
+            "api_base": {
+              "type": "string",
+              "format": "uri",
+              "description": "The HTTPS API origin for provider:custom. The named Plaid profile pins its own public sandbox and production origins and does not accept this override."
+            },
+            "link_sdk_url": {
+              "type": "string",
+              "format": "uri",
+              "description": "The browser SDK URL for provider:custom. The named Plaid profile pins its reviewed Link SDK URL."
+            },
+            "link_global": {
+              "type": "string",
+              "description": "The browser global for provider:custom. The named Plaid profile pins Plaid."
+            },
+            "registered_redirect_uris": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "format": "uri"
+              },
+              "description": "The return addresses actually registered in the client's own provider dashboard. Must contain https://<brain.domain>/app/connect/bank."
+            },
+            "entity_slug": {
+              "type": "string",
+              "description": "Which fin_entities scope feed rows belong to. Defaults to primary."
+            },
+            "country_codes": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Z]{2}$"
+              },
+              "default": [
+                "US"
+              ],
+              "description": "Plaid institution countries shown in Link. Defaults to US."
+            },
+            "reconciliation_interval_minutes": {
+              "type": "integer",
+              "minimum": 15,
+              "maximum": 1440,
+              "default": 360,
+              "description": "Scheduled Transactions Sync fallback interval. Webhooks request prompt reconciliation, but are never the only delivery path."
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "provider": {
+                    "const": "plaid"
+                  }
+                },
+                "required": [
+                  "provider"
+                ]
+              },
+              "then": {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "api_base"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "link_sdk_url"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "link_global"
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  },
+                  "provider": {
+                    "const": "custom"
+                  }
+                },
+                "required": [
+                  "enabled",
+                  "provider"
+                ]
+              },
+              "then": {
+                "required": [
+                  "api_base",
+                  "link_sdk_url",
+                  "link_global"
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "retrieval": {
+      "type": "object",
+      "description": "chunk_size, chunk_overlap and answer_model are deployed as Worker configuration. The standard answer model runs through the client-owned Cloudflare Workers AI binding. Other fields remain descriptive until their runtime wiring is documented.",
+      "properties": {
+        "embed_model": {
+          "const": "@cf/baai/bge-base-en-v1.5"
+        },
+        "embed_dimensions": {
+          "const": 768
+        },
+        "chunk_size": {
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 1800,
+          "default": 1500
+        },
+        "chunk_overlap": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 900,
+          "default": 300
+        },
+        "default_result_limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        },
+        "answer_model": {
+          "type": "string"
+        },
+        "rerank": {
+          "type": "boolean"
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "properties": {
+        "credential_scanner": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "gate_version": {
+              "type": "integer"
+            },
+            "mode": {
+              "enum": [
+                "refuse",
+                "flag_only"
+              ]
+            }
+          }
+        },
+        "private_path_prefixes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Enforced per path segment on local-folder and Google Drive ingest. Gmail has no folder path and does not use this rule."
+        },
+        "daily_llm_spend_cap_usd": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Legacy field name for the daily estimated LLM spend budget in USD. Calls reserve a conservative estimate atomically before provider use. It is a runaway-spend guard, not an invoice-exact ceiling because provider prices and receipts can change."
+        },
+        "ocr": {
+          "type": "object",
+          "description": "Read scanned PDFs by sending each page image to a vision model through THIS brain's own Workers AI binding. Off by default because it costs money on the client's own Cloudflare account, once per scanned page, and every page must reserve from the daily estimated-spend budget.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "model": {
+              "type": "string",
+              "default": "@cf/google/gemma-4-26b-a4b-it",
+              "description": "Must be a Cloudflare @cf/ model. OCR refuses any other, because a page of a scanned document may only reach the provider the manifest names."
+            },
+            "max_pages_per_document": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 40,
+              "description": "Ceiling on pages read per document. One model call per page, so this bounds both the wait and the spend on a single oversized scan."
+            }
+          }
+        }
+      }
+    },
+    "operations": {
+      "type": "object",
+      "description": "Machine-local unattended operations. ingest_cron is wired through the macOS Drive LaunchAgent scheduler. Health reports and webhooks remain descriptive until their commands are implemented.",
+      "properties": {
+        "ingest_cron": {
+          "type": "string",
+          "minLength": 9,
+          "description": "Numeric five-field cron schedule for unattended Google Drive ingest. Installed as a per-user macOS LaunchAgent; calendar times use the Mac's local timezone. brain.domain must also be set so refresh needs no Cloudflare deployment credential."
+        },
+        "admin_key_secret": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^keychain://[^/]+/.+$",
+          "description": "Optional non-secret macOS Keychain locator, keychain://<service>/<account>, for the brain admin key used by unattended ingest. Standard setup fills a deterministic locator automatically on macOS when no legacy adjacent .brain-admin-key exists. Windows keeps the adjacent key under DPAPI CurrentUser; Linux uses an owner-only adjacent file. brain secrets exactly verifies durable desired state before applying it to the Worker. A failed remote write can be retried with no ADMIN_KEY export. The secret value never enters the manifest or plist."
+        },
+        "recovery_artifact_key_secret": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^keychain://[^/]+/.+$",
+          "description": "Optional non-secret macOS Keychain locator, keychain://<service>/<account>, for the independent key that encrypts durable verified-recovery artifacts. The key value never enters the manifest, plan, state, command line, or artifact directory. The Cloudflare recovery field gate requires this locator on its target manifest."
+        },
+        "recovery_field_gate": {
+          "type": "object",
+          "description": "Short-lived, manually reviewed isolation evidence for a disposable recovery target. Never add this to a production manifest. The adapter binds distinct immutable paused and active Worker versions plus their shared script hash, and requires both route lists to be empty before it can use the disposable target key.",
+          "required": [
+            "paused_worker_version_id",
+            "active_worker_version_id",
+            "worker_script_etag",
+            "routes",
+            "custom_domains",
+            "reviewed_at"
+          ],
+          "properties": {
+            "paused_worker_version_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "active_worker_version_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "worker_script_etag": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "routes": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "custom_domains": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "reviewed_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "additionalProperties": false
+        },
+        "google_token_store": {
+          "enum": [
+            "auto",
+            "keychain",
+            "file"
+          ],
+          "default": "auto",
+          "description": "Durable Google OAuth token-store choice for unattended ingest. auto uses macOS Keychain; file preserves an explicit BRAIN_GOOGLE_TOKEN_STORE=file connection choice across sparse LaunchAgent environments."
+        },
+        "provider_crons": {
+          "type": "object",
+          "description": "Five-field cron schedules for locally stored OAuth provider connectors. Incremental Microsoft and Dropbox lanes default to hourly; full-snapshot lanes default to daily. Each installs as its own per-user macOS LaunchAgent.",
+          "properties": {
+            "quickbooks": { "type": "string", "minLength": 9 },
+            "slack": { "type": "string", "minLength": 9 },
+            "notion": { "type": "string", "minLength": 9 },
+            "microsoft": { "type": "string", "minLength": 9 },
+            "dropbox": { "type": "string", "minLength": 9 },
+            "hubspot": { "type": "string", "minLength": 9 }
+          },
+          "additionalProperties": false
+        },
+        "provider_token_stores": {
+          "type": "object",
+          "description": "Durable per-provider OAuth token-store choice for unattended ingest. auto uses macOS Keychain and the platform default elsewhere; file preserves an explicit owner-only file choice.",
+          "properties": {
+            "quickbooks": { "enum": ["auto", "keychain", "file"], "default": "auto" },
+            "slack": { "enum": ["auto", "keychain", "file"], "default": "auto" },
+            "notion": { "enum": ["auto", "keychain", "file"], "default": "auto" },
+            "microsoft": { "enum": ["auto", "keychain", "file"], "default": "auto" },
+            "dropbox": { "enum": ["auto", "keychain", "file"], "default": "auto" },
+            "hubspot": { "enum": ["auto", "keychain", "file"], "default": "auto" }
+          },
+          "additionalProperties": false
+        },
+        "health_cron": {
+          "type": "string",
+          "description": "NOT YET WIRED. No health scheduler is installed today."
+        },
+        "health_report_email": {
+          "type": "string",
+          "format": "email",
+          "description": "NOT YET WIRED. No report email is sent today."
+        },
+        "alert_webhook_secret": {
+          "type": "string",
+          "description": "NOT YET WIRED. No alert webhook is called today."
+        },
+        "whatsapp_drain_cron": {
+          "type": "string",
+          "minLength": 9,
+          "description": "Numeric five-field cron schedule for draining the WhatsApp capture outbox into the brain. Installed as a per-user macOS LaunchAgent alongside the resident capture daemon. Defaults to every minute when absent."
+        },
+        "whatsapp_daemon_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local path to the built WhatsApp capture daemon binary. Not a secret and not a credential; there is no download-on-connect yet, so the binary is either built from daemons/whatsapp or supplied here. Overridden by --daemon and by BRAIN_WHATSAPP_DAEMON."
+        },
+        "whatsapp_data_dir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local directory holding the WhatsApp linked-device session store and the capture outbox. Both the daemon and the drain read this same value; the default is ~/.brain/whatsapp/<client.slug>."
+        },
+        "folder_ingest_cron": {
+          "type": "string",
+          "minLength": 9,
+          "description": "Numeric five-field cron schedule for the watched local folder in corpora.local_folder. Installed as a per-user macOS LaunchAgent; calendar times use the Mac's local timezone. Defaults to hourly when absent. brain.domain must also be set so refresh needs no Cloudflare deployment credential."
+        }
+      }
+    },
+    "testing": {
+      "type": "object",
+      "properties": {
+        "probe_questions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "things_only_they_know": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "expected_to_fail": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ingest": {
+      "type": "object"
+    },
+    "access": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "const": "single_tenant_all_access"
+        },
+        "authorized_emails": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "NOT YET WIRED. Read by nothing. Auth is a single admin key: anyone holding it sees everything."
+        }
+      }
+    },
+    "handoff": {
+      "type": "object"
+    }
+  }
+}

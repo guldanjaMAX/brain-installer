@@ -1,0 +1,269 @@
+/**
+ * Turn a chronological message stream into retrieval-safe documents.
+ *
+ * Email is already a coherent document and keeps its individual identity.
+ * Short-form chat is grouped by thread into bounded sessions. The sessionizer
+ * is serializable so a long migration or connector sync can stop and resume
+ * without dropping the conversation that straddled a page boundary.
+ */
+
+const HOUR_MS = 60 * 60 * 1000;
+export const MESSAGE_CHAT_PLATFORMS = Object.freeze(["imessage", "sms", "whatsapp", "fb_messenger"]);
+const CHAT_PLATFORMS = new Set(MESSAGE_CHAT_PLATFORMS);
+export const MESSAGE_SESSION_DEFAULTS = Object.freeze({
+  maxGapMs: 6 * HOUR_MS,
+  maxChars: 18_000,
+  maxMessages: 50,
+});
+
+const clean = (value) => String(value || "").replace(/\r\n/g, "\n").trim();
+const iso = (value) => {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+};
+const dayOf = (value, timeZone = "UTC") => {
+  const normalized = iso(value);
+  if (!normalized) return null;
+  const parts = new Intl.DateTimeFormat("en", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(normalized));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+};
+const platformLabel = (value) => ({
+  imessage: "iMessage",
+  sms: "SMS",
+  whatsapp: "WhatsApp",
+  fb_messenger: "Facebook Messenger",
+  email: "Email",
+})[String(value || "").toLowerCase()] || String(value || "Message");
+
+const rowId = (row) => String(row.id || row.message_id || row.cursor_id || "").trim();
+const rowBody = (row) => clean(row.body ?? row.content);
+const rowTime = (row) => iso(row.ts);
+const threadKey = (row) => `${String(row.platform || "message").toLowerCase()}:${String(row.thread_id || "unknown")}`;
+const isMediaMarkerOnly = (body) => /^\[(?:audio|image|video)\]\s*$/i.test(body);
+
+const speakerOf = (row, ownerLabel) => {
+  if (String(row.direction || "").toLowerCase() === "out") return ownerLabel;
+  return clean(row.sender_name) || clean(row.thread_title) || "Incoming contact";
+};
+
+const sessionTitle = (session) => {
+  const subject = clean(session.thread_title);
+  const participants = [...new Set(session.participants || [])].filter(Boolean);
+  const who = subject || participants.slice(0, 3).join(", ") || "Conversation";
+  return `${who} · ${session.day}`;
+};
+
+const renderSession = (session) => {
+  const participants = [...new Set(session.participants || [])].filter(Boolean);
+  const header = [
+    `Conversation: ${clean(session.thread_title) || participants.join(", ") || "untitled"}`,
+    `Platform: ${platformLabel(session.platform)}`,
+    `Date: ${session.day}`,
+    participants.length ? `Participants: ${participants.join(", ")}` : null,
+    `Messages: ${session.message_count}`,
+  ].filter(Boolean).join("\n");
+  return `${header}\n\n${session.lines.join("\n\n")}`.trim();
+};
+
+export function emailEnvelope(row, { ownerLabel = "Owner" } = {}) {
+  const id = rowId(row);
+  const body = rowBody(row);
+  const occurredAt = rowTime(row);
+  if (!id || !body || !occurredAt || isMediaMarkerOnly(body)) return null;
+  const speaker = speakerOf(row, ownerLabel);
+  const direction = String(row.direction || "").toLowerCase() === "out" ? "outgoing" : "incoming";
+  const title = clean(row.thread_title) || `Email ${occurredAt.slice(0, 10)}`;
+  const content = [
+    `Email thread: ${title}`,
+    `Date: ${occurredAt}`,
+    `Direction: ${direction}`,
+    `From: ${speaker}`,
+    "",
+    body,
+  ].join("\n");
+  return {
+    source_type: "message",
+    source_id: id,
+    title,
+    content,
+    occurred_at: occurredAt,
+    date_source: "migration:message_timestamp",
+    date_reliable: true,
+    uri: row.thread_id ? `message-thread:${row.thread_id}#message:${id}` : `message:${id}`,
+    metadata: {
+      category: clean(row.category) || "message",
+      platform: "email",
+      thread_id: row.thread_id || null,
+      message_id: id,
+      direction,
+      sender: speaker,
+      migrated_from: "messaging.messages",
+    },
+  };
+}
+
+export function sessionEnvelope(session) {
+  if (!session?.first_id || !session?.message_count || !session.lines?.length) return null;
+  const participants = [...new Set(session.participants || [])].filter(Boolean);
+  return {
+    source_type: "message",
+    // The first message is stable for the lifetime of a session and keeps the
+    // public citation compatible with the original message namespace.
+    source_id: session.first_id,
+    title: sessionTitle(session),
+    content: renderSession(session),
+    occurred_at: session.first_ts,
+    date_source: "migration:conversation_session_start",
+    date_reliable: true,
+    uri: `message-thread:${session.thread_id}#session:${session.first_id}`,
+    metadata: {
+      category: clean(session.category) || "message",
+      platform: session.platform,
+      thread_id: session.thread_id,
+      first_message_id: session.first_id,
+      last_message_id: session.last_id,
+      message_count: session.message_count,
+      participants,
+      migrated_from: "messaging.messages",
+      grouped_as: "bounded_conversation_session",
+    },
+  };
+}
+
+const newSession = (row, ownerLabel, groupingTimezone) => {
+  const id = rowId(row);
+  const body = rowBody(row);
+  const ts = rowTime(row);
+  const speaker = speakerOf(row, ownerLabel);
+  return {
+    platform: String(row.platform || "message").toLowerCase(),
+    thread_id: String(row.thread_id || "unknown"),
+    thread_title: clean(row.thread_title),
+    category: clean(row.category) || "message",
+    day: dayOf(ts, groupingTimezone),
+    first_id: id,
+    last_id: id,
+    first_ts: ts,
+    last_ts: ts,
+    message_count: 1,
+    content_chars: body.length,
+    participants: speaker ? [speaker] : [],
+    lines: [`[${ts}] ${speaker}: ${body}`],
+  };
+};
+
+const appendSession = (session, row, ownerLabel) => {
+  const body = rowBody(row);
+  const ts = rowTime(row);
+  const speaker = speakerOf(row, ownerLabel);
+  session.last_id = rowId(row);
+  session.last_ts = ts;
+  session.message_count++;
+  session.content_chars += body.length;
+  if (speaker && !session.participants.includes(speaker)) session.participants.push(speaker);
+  session.lines.push(`[${ts}] ${speaker}: ${body}`);
+};
+
+const validChatRow = (row) => {
+  const platform = String(row.platform || "").toLowerCase();
+  return CHAT_PLATFORMS.has(platform) && !!rowId(row) && !!rowTime(row) && !!rowBody(row) && !isMediaMarkerOnly(rowBody(row));
+};
+
+/**
+ * Classify every source row before sessionization so completion accounting can
+ * prove that nothing disappeared merely because `push()` returned no closed
+ * document. A supported chat row normally stays pending, which is different
+ * from an unsupported or malformed row being skipped.
+ */
+export function messageRowDisposition(row) {
+  if (!rowId(row)) return "invalid_identity";
+  if (!rowTime(row)) return "invalid_time";
+  const body = rowBody(row);
+  if (!body) return "empty_content";
+  if (isMediaMarkerOnly(body)) return "media_marker";
+  const platform = String(row.platform || "").toLowerCase();
+  if (platform === "email" || CHAT_PLATFORMS.has(platform)) return "represented";
+  return "unsupported_platform";
+}
+
+export class MessageSessionizer {
+  constructor({
+    ownerLabel = "Owner",
+    maxGapMs = MESSAGE_SESSION_DEFAULTS.maxGapMs,
+    maxChars = MESSAGE_SESSION_DEFAULTS.maxChars,
+    maxMessages = MESSAGE_SESSION_DEFAULTS.maxMessages,
+    groupingTimezone = "UTC",
+    active = [],
+  } = {}) {
+    this.ownerLabel = ownerLabel;
+    this.maxGapMs = maxGapMs;
+    this.maxChars = maxChars;
+    this.maxMessages = maxMessages;
+    // Intl validates IANA names and canonicalizes aliases once at startup.
+    this.groupingTimezone = new Intl.DateTimeFormat("en", {
+      timeZone: groupingTimezone,
+    }).resolvedOptions().timeZone;
+    // A migration attempt may mutate sessions before a target request fails.
+    // Keep the durable checkpoint objects isolated so the caller can retry the
+    // same in-memory state without accidentally advancing uncommitted work.
+    const restored = structuredClone(active || []);
+    this.active = new Map(restored.map((session) => [`${session.platform}:${session.thread_id}`, session]));
+  }
+
+  /** Add one globally chronological row and return any documents it closes. */
+  push(row) {
+    const out = [];
+    const ts = rowTime(row);
+    if (!ts || !rowId(row) || !rowBody(row) || isMediaMarkerOnly(rowBody(row))) return out;
+
+    const now = Date.parse(ts);
+    const day = dayOf(ts, this.groupingTimezone);
+    for (const [key, session] of this.active) {
+      const expired = day !== session.day || now - Date.parse(session.last_ts) > this.maxGapMs;
+      if (expired) {
+        const envelope = sessionEnvelope(session);
+        if (envelope) out.push(envelope);
+        this.active.delete(key);
+      }
+    }
+
+    if (String(row.platform || "").toLowerCase() === "email") {
+      const envelope = emailEnvelope(row, { ownerLabel: this.ownerLabel });
+      if (envelope) out.push(envelope);
+      return out;
+    }
+    if (!validChatRow(row)) return out;
+
+    const key = threadKey(row);
+    let session = this.active.get(key);
+    const body = rowBody(row);
+    if (session && (session.message_count >= this.maxMessages || session.content_chars + body.length > this.maxChars)) {
+      const envelope = sessionEnvelope(session);
+      if (envelope) out.push(envelope);
+      this.active.delete(key);
+      session = null;
+    }
+    if (!session) {
+      this.active.set(key, newSession(row, this.ownerLabel, this.groupingTimezone));
+    } else {
+      appendSession(session, row, this.ownerLabel);
+    }
+    return out;
+  }
+
+  finish() {
+    const out = [...this.active.values()].map(sessionEnvelope).filter(Boolean);
+    this.active.clear();
+    return out;
+  }
+
+  snapshot() {
+    return structuredClone([...this.active.values()]);
+  }
+}

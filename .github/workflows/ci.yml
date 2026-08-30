@@ -1,0 +1,211 @@
+# CI exists for ONE reason above all others: this installer has never run on
+# Windows, and the first client install is on Windows. A green macOS run proves
+# nothing about the platform that matters.
+#
+# The Windows job is not a nice-to-have here. Three of the defects found by
+# review were Windows-specific (npm .cmd shims needing a shell since
+# CVE-2024-27980, percent-encoded paths, PowerShell quoting), and every one was
+# written from documentation rather than observation. This is the cheapest way
+# to turn that inference into evidence.
+
+name: ci
+
+permissions:
+  contents: read
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  history-privacy:
+    name: public git history privacy baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      # This baseline is containment, not a clean-history claim. It fails if a
+      # new credential/privacy object appears or a public ref stops descending
+      # from the reviewed incident inventory. The strict clean gate remains a
+      # release blocker until the approved remote rewrite completes.
+      - name: reject history regressions against the sanitized incident baseline
+        run: npm run privacy:history:remote
+
+  test:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Never cancel the Windows job because macOS failed. Windows is the one we
+      # are actually here to learn from.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        node: ['22', '24']
+    steps:
+      # Pin third-party actions to reviewed commits. A mutable major tag can
+      # change underneath an otherwise identical installer release.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          # This job does not need shared dependency-cache state. Keeping the
+          # cache off also removes a cache-poisoning input from release CI.
+          package-manager-cache: false
+
+      # --ignore-scripts is what the client is told to run, so CI runs the same
+      # thing. If a dependency needs a postinstall script, better to find out
+      # here than on someone's laptop.
+      - name: install
+        run: npm ci --ignore-scripts
+
+      # Fresh random bytes exercise 25 protect/unprotect round trips through one
+      # private process-scoped compiled helper, followed by exact captured-identity
+      # cleanup. The wrapper emits stable stage codes and counts only, never input,
+      # ciphertext, child output, or a credential. This is release evidence, not
+      # the supervised client gate.
+      - name: Windows DPAPI 25-round release gate
+        if: runner.os == 'Windows'
+        run: node scripts/windows-dpapi-release-gate.mjs
+
+      - name: unit and integration suite
+        run: npm test
+
+      # The CLI must START. On Windows a symlinked bin, a percent-encoded path
+      # or a .cmd shim can make it exit 0 having done nothing, which is worse
+      # than crashing because every exit-code check passes.
+      - name: cli starts and prints usage
+        shell: bash
+        run: |
+          out=$(node brain.mjs)
+          echo "$out"
+          echo "$out" | grep -q "brain setup" || { echo "::error::usage did not print"; exit 1; }
+
+      # doctor must RUN and report, with no Cloudflare credentials present. It
+      # is expected to report failures here; what is NOT acceptable is a crash,
+      # because doctor is the tool whose whole job is diagnosing a bare machine.
+      - name: doctor reports rather than crashing
+        shell: bash
+        run: |
+          set +e
+          out=$(node brain.mjs doctor 2>&1); code=$?
+          echo "$out"
+          echo "$out" | grep -q "Node" || { echo "::error::doctor produced no report"; exit 1; }
+          echo "$out" | grep -qi "cannot find module" && { echo "::error::doctor crashed on imports"; exit 1; }
+          echo "doctor exited $code, which is expected without credentials"
+          exit 0
+
+      # The real client entry point is a global install of the packed tarball,
+      # not `node brain.mjs`. That path has its own failure modes (bin symlink
+      # resolution, the shebang, PATHEXT on Windows) that direct invocation
+      # never exercises, and one of them already shipped once: the installed
+      # command ran and did nothing, exit 0.
+      - name: packed tarball installs globally and the bin works
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --silent prints just the filename, so this stays version-agnostic
+          # and does not depend on a glob matching.
+          name=$(npm pack --pack-destination "$RUNNER_TEMP" --silent | tail -1)
+          tgz="$RUNNER_TEMP/$name"
+          echo "packed: $tgz"
+          echo "TARBALL=$tgz" >> "$GITHUB_ENV"
+
+          npm install -g "$tgz"
+
+          # Locate the bin explicitly rather than trusting PATH: on Windows npm
+          # writes brain.cmd into the prefix root, on POSIX a symlink into bin/.
+          prefix=$(npm prefix -g)
+          if [ -x "$prefix/bin/brain" ]; then bin="$prefix/bin/brain";
+          elif [ -f "$prefix/brain.cmd" ]; then bin="$prefix/brain.cmd";
+          elif command -v brain >/dev/null 2>&1; then bin="brain";
+          else echo "::error::no brain bin found under $prefix"; ls -la "$prefix" "$prefix/bin" 2>/dev/null; exit 1; fi
+          echo "bin: $bin"
+
+          out=$("$bin")
+          echo "$out"
+          echo "$out" | grep -q "brain setup" || { echo "::error::installed bin ran but printed nothing"; exit 1; }
+
+      # The public guide uses a user-owned prefix. That avoids sudo/EACCES on
+      # Mac and Linux and keeps Windows inside the current profile. Exercise
+      # that exact shape as well as the traditional global install above.
+      - name: packed tarball installs in a user-owned prefix
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/financial-brain-cli"
+          npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$TARBALL"
+          if [ -x "$prefix/bin/brain" ]; then bin="$prefix/bin/brain";
+          elif [ -f "$prefix/brain.cmd" ]; then bin="$prefix/brain.cmd";
+          else echo "::error::no user-prefix brain bin found"; exit 1; fi
+          out=$("$bin")
+          echo "$out"
+          echo "$out" | grep -q "brain setup" || { echo "::error::user-prefix bin did not run"; exit 1; }
+
+      # The checkout probe above catches source-tree regressions. Release proof
+      # must also come from the exact globally installed tarball, including
+      # synthetic admin-key create, read, rotation, and ciphertext inspection.
+      - name: packed Windows DPAPI and admin-key release gate
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/financial-brain-cli"
+          package_root="$(npm root --global --prefix "$prefix")/brain-installer"
+          test -f "$package_root/scripts/windows-dpapi-release-gate.mjs"
+          node "$package_root/scripts/windows-dpapi-release-gate.mjs"
+
+      # PowerShell can block npm.ps1/npx.ps1 under its default execution
+      # policy. The website therefore uses the .cmd shims explicitly on
+      # Windows, and CI must prove that exact beginner path.
+      - name: Windows PowerShell user-prefix command works
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP 'financial-brain-powershell'
+          npm.cmd install --global --prefix $prefix --ignore-scripts --no-audit --no-fund $env:TARBALL
+          $out = & (Join-Path $prefix 'brain.cmd') | Out-String
+          $out
+          if ($out -notmatch 'brain setup') { throw 'PowerShell user-prefix bin did not run' }
+
+      # An install must never carry the author's own client data. package.json
+      # uses an allowlist; this fails loudly if a future edit turns it into a
+      # denylist that misses something.
+      - name: package contains no private data
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$TARBALL"
+          if command -v cygpath >/dev/null 2>&1; then
+            tarball=$(cygpath -u "$tarball")
+          fi
+          contents=$(tar -tzf "$tarball")
+          # NOTE: this is a FILENAME check on the tarball only; it never opens a file.
+          # It used to grep for the owner's first name, which put a real identity in a
+          # public CI config to catch a real identity. Content-level identity scanning is
+          # test/package-privacy.test.mjs, which scans every tracked file and is the
+          # authority; this step is only a last-ditch check on what npm would ship.
+          private_paths=$(
+            {
+              printf '%s\n' "$contents" | grep -Ei '(^|/)instances(/|$)|(^|/)eval/baselines(/|$)|(^|/)shadow|readiness|\.brain-(migration|ingest)' || true
+              printf '%s\n' "$contents" | grep -Ei '(^|/)eval/golden/' | grep -Ev '(^|/)eval/golden/TEMPLATE\.golden\.json$' || true
+            } | sort -u
+          )
+          if [ -n "$private_paths" ]; then
+            printf '%s\n' "$private_paths"
+            echo "::error::private evaluation data is in the published package"
+            exit 1
+          fi
+          echo "clean"

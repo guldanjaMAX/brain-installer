@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "contact": {
+    "label": "Financial Brain support",
+    "email": "support@financialbrain.ai",
+    "incident_email": "support@financialbrain.ai"
+  },
+  "coverage": {
+    "timezone": "America/Phoenix",
+    "window": "By scheduled appointment"
+  },
+  "response_targets": {
+    "scheduled_install": "During the scheduled install session",
+    "install_blocked_outside_session": "At the next agreed support window",
+    "standard_question": "Target set in the signed handoff",
+    "suspected_security_incident": "Use the incident contact immediately; formal timing is set in the signed agreement"
+  },
+  "offline": {
+    "first_action": "Keep the private support note local and rerun the same supported command after connectivity returns",
+    "escalation": "Share only an owner-approved sanitized support preview through the configured contact"
+  },
+  "legal_note": "Operational targets are not contractual service levels unless the signed engagement says otherwise"
+}

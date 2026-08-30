@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://financialbrain.ai/schema/support-profile-v1.json",
+  "title": "Financial Brain support profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "contact", "coverage", "response_targets", "offline", "legal_note"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "contact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "email", "incident_email"],
+      "properties": {
+        "label": { "type": "string", "minLength": 1 },
+        "email": { "type": "string", "format": "email" },
+        "incident_email": { "type": "string", "format": "email" }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timezone", "window"],
+      "properties": {
+        "timezone": { "type": "string", "minLength": 1 },
+        "window": { "type": "string", "minLength": 1 }
+      }
+    },
+    "response_targets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheduled_install", "install_blocked_outside_session", "standard_question", "suspected_security_incident"],
+      "properties": {
+        "scheduled_install": { "type": "string", "minLength": 1 },
+        "install_blocked_outside_session": { "type": "string", "minLength": 1 },
+        "standard_question": { "type": "string", "minLength": 1 },
+        "suspected_security_incident": { "type": "string", "minLength": 1 }
+      }
+    },
+    "offline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["first_action", "escalation"],
+      "properties": {
+        "first_action": { "type": "string", "minLength": 1 },
+        "escalation": { "type": "string", "minLength": 1 }
+      }
+    },
+    "legal_note": { "type": "string", "minLength": 1 }
+  }
+}

@@ -1,0 +1,16 @@
+# Default review owner for the public product repository.
+* @guldanjaMAX
+
+# Security, release, dependency, and privacy boundaries require the same owner
+# even when a future directory-specific rule is added above the default.
+/.github/ @guldanjaMAX
+/SECURITY.md @guldanjaMAX
+/package.json @guldanjaMAX
+/package-lock.json @guldanjaMAX
+/privacy/ @guldanjaMAX
+/scripts/privacy-identity.mjs @guldanjaMAX
+/scripts/scan-git-history-privacy.mjs @guldanjaMAX
+/test/package-privacy.test.mjs @guldanjaMAX
+/test/full-history-privacy.test.mjs @guldanjaMAX
+/migrations/ @guldanjaMAX
+/worker/src/lib/secret-scan.js @guldanjaMAX

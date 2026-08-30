@@ -1,0 +1,1214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brain-installer.invalid/schema/run-artifact-v2.schema.json",
+  "title": "Brain evaluation run artifact v2",
+  "description": "A machine-readable, owner-local evaluation result. It stores opaque references and measurements, not credentials or raw source content.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "tier",
+    "started_at",
+    "completed_at",
+    "status",
+    "suite",
+    "policy",
+    "code",
+    "corpus",
+    "configuration",
+    "provenance",
+    "summary_metrics",
+    "coverage",
+    "gate_results",
+    "case_results"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "run_id": {
+      "$ref": "#/$defs/slug"
+    },
+    "tier": {
+      "enum": [
+        "smoke",
+        "release",
+        "deep",
+        "monitor",
+        "explain"
+      ]
+    },
+    "started_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "completed_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "status": {
+      "enum": [
+        "pass",
+        "fail",
+        "inconclusive",
+        "error"
+      ]
+    },
+    "suite": {
+      "$ref": "#/$defs/versionedInput"
+    },
+    "policy": {
+      "$ref": "#/$defs/versionedInput"
+    },
+    "code": {
+      "$ref": "#/$defs/codeProvenance"
+    },
+    "corpus": {
+      "$ref": "#/$defs/corpusSnapshot"
+    },
+    "configuration": {
+      "$ref": "#/$defs/configuration"
+    },
+    "provenance": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/provenanceObservation"
+      }
+    },
+    "summary_metrics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/metricResult"
+      }
+    },
+    "coverage": {
+      "$ref": "#/$defs/coverage"
+    },
+    "gate_results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/gateResult"
+      }
+    },
+    "case_results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/caseResult"
+      }
+    }
+  },
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "versionedInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "hash"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/slug"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "hash": {
+          "$ref": "#/$defs/hash"
+        }
+      }
+    },
+    "codeProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "git_sha",
+        "package_version",
+        "evaluator_version",
+        "worker_version"
+      ],
+      "properties": {
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-f0-9]{7,64}$"
+        },
+        "package_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "evaluator_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "worker_version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        }
+      }
+    },
+    "corpusSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_id",
+        "contract_hash",
+        "snapshot_hash",
+        "inventory_complete",
+        "counts"
+      ],
+      "properties": {
+        "contract_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+        },
+        "contract_hash": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/hash"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "snapshot_hash": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/hash"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inventory_complete": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "counts": {
+          "$ref": "#/$defs/corpusCounts"
+        }
+      }
+    },
+    "corpusCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expected",
+        "indexed",
+        "excluded",
+        "quarantined",
+        "failed",
+        "tombstoned",
+        "unknown",
+        "vector_pending"
+      ],
+      "properties": {
+        "expected": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "indexed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "excluded": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "quarantined": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "failed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "tombstoned": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "unknown": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "vector_pending": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "retrieval_variant",
+        "cutoffs",
+        "repeats",
+        "content_capture",
+        "models"
+      ],
+      "properties": {
+        "retrieval_variant": {
+          "$ref": "#/$defs/slug"
+        },
+        "cutoffs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          }
+        },
+        "repeats": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "content_capture": {
+          "const": false
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/modelConfiguration"
+          }
+        }
+      }
+    },
+    "modelConfiguration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "model_id",
+        "configuration_hash"
+      ],
+      "properties": {
+        "role": {
+          "enum": [
+            "embedding",
+            "answer",
+            "reranker",
+            "judge"
+          ]
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "configuration_hash": {
+          "$ref": "#/$defs/hash"
+        }
+      }
+    },
+    "provenanceObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "status"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/slug"
+        },
+        "status": {
+          "enum": [
+            "observed",
+            "not_observable"
+          ]
+        },
+        "value": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/slug"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "not_observable"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "reason_code"
+            ]
+          }
+        }
+      ]
+    },
+    "metricResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric",
+        "value",
+        "sample_size",
+        "scope"
+      ],
+      "properties": {
+        "metric": {
+          "$ref": "#/$defs/metricName"
+        },
+        "cutoff": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "value": {
+          "type": "number"
+        },
+        "sample_size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "confidence_interval": {
+          "$ref": "#/$defs/confidenceInterval"
+        }
+      }
+    },
+    "confidenceInterval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "level",
+        "lower",
+        "upper",
+        "method"
+      ],
+      "properties": {
+        "level": {
+          "type": "number",
+          "exclusiveMinimum": 0.5,
+          "exclusiveMaximum": 1
+        },
+        "lower": {
+          "type": "number"
+        },
+        "upper": {
+          "type": "number"
+        },
+        "method": {
+          "enum": [
+            "paired_stratified_bootstrap",
+            "paired_permutation",
+            "wilson",
+            "exact_binomial"
+          ]
+        },
+        "resamples": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reviewed_cases",
+        "candidate_cases",
+        "slices",
+        "insufficient_slices"
+      ],
+      "properties": {
+        "reviewed_cases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "candidate_cases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "slices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/coverageSlice"
+          }
+        },
+        "insufficient_slices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/coverageSlice"
+          }
+        },
+        "chunk_coverage_fraction": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "coverageSlice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dimension",
+        "value",
+        "reviewed_cases"
+      ],
+      "properties": {
+        "dimension": {
+          "enum": [
+            "risk",
+            "domain",
+            "format",
+            "query_kind",
+            "connector",
+            "owner_scope"
+          ]
+        },
+        "value": {
+          "$ref": "#/$defs/slug"
+        },
+        "reviewed_cases": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "gateResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gate_id",
+        "outcome",
+        "observed_value",
+        "threshold",
+        "operator",
+        "confidence_bound"
+      ],
+      "properties": {
+        "gate_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "outcome": {
+          "enum": [
+            "pass",
+            "fail",
+            "insufficient_coverage",
+            "not_observable",
+            "error"
+          ]
+        },
+        "observed_value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "threshold": {
+          "type": "number"
+        },
+        "operator": {
+          "enum": [
+            "gte",
+            "lte",
+            "eq"
+          ]
+        },
+        "confidence_bound": {
+          "enum": [
+            "point",
+            "lower_95",
+            "upper_95"
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/slug"
+        }
+      }
+    },
+    "caseResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "outcome",
+        "repeat",
+        "primary_diagnosis",
+        "secondary_diagnoses",
+        "stage_observations",
+        "evidence",
+        "metrics",
+        "timing",
+        "cost",
+        "violations"
+      ],
+      "properties": {
+        "case_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "outcome": {
+          "enum": [
+            "pass",
+            "fail",
+            "inconclusive",
+            "error"
+          ]
+        },
+        "repeat": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "primary_diagnosis": {
+          "$ref": "#/$defs/diagnosis"
+        },
+        "secondary_diagnoses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/diagnosis"
+          }
+        },
+        "stage_observations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stageObservation"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidenceResult"
+          }
+        },
+        "metrics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/caseMetric"
+          }
+        },
+        "timing": {
+          "$ref": "#/$defs/timing"
+        },
+        "cost": {
+          "$ref": "#/$defs/cost"
+        },
+        "violations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        }
+      }
+    },
+    "diagnosis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "stage",
+        "source_id",
+        "page",
+        "span_hash"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/diagnosisCode"
+        },
+        "stage": {
+          "$ref": "#/$defs/stage"
+        },
+        "source_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+        },
+        "page": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "span_hash": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/hash"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/slug"
+        }
+      }
+    },
+    "stageObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "status"
+      ],
+      "properties": {
+        "stage": {
+          "$ref": "#/$defs/stage"
+        },
+        "status": {
+          "enum": [
+            "pass",
+            "fail",
+            "not_observable",
+            "not_applicable"
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/slug"
+        }
+      }
+    },
+    "evidenceResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "slot_id",
+        "hit",
+        "best_rank",
+        "source_id",
+        "version_id",
+        "page",
+        "span_hash",
+        "relevance_grade",
+        "entered_prompt",
+        "citation_resolved"
+      ],
+      "properties": {
+        "slot_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "hit": {
+          "type": "boolean"
+        },
+        "best_rank": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "source_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+        },
+        "version_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+        },
+        "page": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "span_hash": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/hash"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "relevance_grade": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 3
+        },
+        "entered_prompt": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "citation_resolved": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "caseMetric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric",
+        "value"
+      ],
+      "properties": {
+        "metric": {
+          "$ref": "#/$defs/metricName"
+        },
+        "cutoff": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "value": {
+          "type": "number"
+        }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "retrieval_ms",
+        "answer_ms",
+        "judge_ms",
+        "total_ms"
+      ],
+      "properties": {
+        "retrieval_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "answer_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "judge_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "total_ms": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "embedding_tokens",
+        "judge_tokens",
+        "estimated_usd",
+        "price_manifest_version"
+      ],
+      "properties": {
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "embedding_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "judge_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "estimated_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "price_manifest_version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "risk": {
+          "enum": [
+            "critical",
+            "high",
+            "normal"
+          ]
+        },
+        "domain": {
+          "$ref": "#/$defs/slug"
+        },
+        "format": {
+          "$ref": "#/$defs/slug"
+        },
+        "query_kind": {
+          "enum": [
+            "single",
+            "multi",
+            "temporal",
+            "aggregate",
+            "conflict",
+            "unanswerable",
+            "entity_attribution",
+            "ocr_text",
+            "ocr_table",
+            "typo",
+            "adversarial"
+          ]
+        },
+        "connector": {
+          "$ref": "#/$defs/slug"
+        },
+        "owner_scope": {
+          "$ref": "#/$defs/slug"
+        }
+      }
+    },
+    "stage": {
+      "enum": [
+        "source_inventory",
+        "source_policy",
+        "ingest",
+        "extraction",
+        "retrieval",
+        "context_assembly",
+        "generation",
+        "citation",
+        "freshness",
+        "isolation"
+      ]
+    },
+    "diagnosisCode": {
+      "enum": [
+        "PASS",
+        "SOURCE_ABSENT",
+        "POLICY_EXCLUDED",
+        "QUARANTINED",
+        "INGEST_MISSING",
+        "EXTRACT_OCR_MISSING",
+        "RETRIEVAL_RANK_MISS",
+        "CONTEXT_ASSEMBLY_DROP",
+        "GENERATOR_OMISSION",
+        "ANSWER_INCORRECT",
+        "HALLUCINATION",
+        "CITATION_MISSING",
+        "CITATION_UNSUPPORTED",
+        "CITATION_UNRESOLVABLE",
+        "TEMPORAL_CONFLICT",
+        "ACCESS_ISOLATION_FAILURE",
+        "ENTITY_MISATTRIBUTION",
+        "NOT_OBSERVABLE_AT_STAGE",
+        "EVALUATOR_ERROR"
+      ]
+    },
+    "metricName": {
+      "enum": [
+        "source_accounting_fraction",
+        "unknown_index_rows",
+        "excluded_sources_indexed",
+        "unresolved_critical_sources",
+        "exact_value_accuracy",
+        "evidence_slot_recall_at_k",
+        "complete_evidence_at_k",
+        "precision_at_k",
+        "recall_at_k",
+        "ndcg_at_k",
+        "mrr",
+        "duplicate_waste_at_k",
+        "claim_correctness",
+        "claim_completeness",
+        "claim_f1",
+        "faithfulness",
+        "citation_precision",
+        "citation_recall",
+        "citation_resolvability",
+        "abstention_recall",
+        "false_answer_rate",
+        "false_refusal_rate",
+        "unauthorized_retrieval_count",
+        "canary_emission_count",
+        "entity_misattribution_rate",
+        "stale_exposure_rate",
+        "current_evidence_at_k",
+        "correct_as_of_rate",
+        "lifecycle_pass_rate",
+        "retrieval_latency_p95_ms",
+        "answer_latency_p95_ms",
+        "cost_per_query_usd",
+        "error_rate",
+        "rank_flip_rate"
+      ]
+    }
+  },
+  "examples": [
+    {
+      "schema_version": 2,
+      "run_id": "synthetic-run-001",
+      "tier": "smoke",
+      "started_at": "2026-01-01T00:00:00Z",
+      "completed_at": "2026-01-01T00:00:01Z",
+      "status": "pass",
+      "suite": {
+        "id": "synthetic-release",
+        "version": "1",
+        "hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+      },
+      "policy": {
+        "id": "synthetic-release-policy",
+        "version": "1",
+        "hash": "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+      },
+      "code": {
+        "git_sha": null,
+        "package_version": "0.0.0-synthetic",
+        "evaluator_version": "2",
+        "worker_version": null
+      },
+      "corpus": {
+        "contract_id": "synthetic-corpus",
+        "contract_hash": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+        "snapshot_hash": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+        "inventory_complete": true,
+        "counts": {
+          "expected": 1,
+          "indexed": 1,
+          "excluded": 0,
+          "quarantined": 0,
+          "failed": 0,
+          "tombstoned": 0,
+          "unknown": 0,
+          "vector_pending": 0
+        }
+      },
+      "configuration": {
+        "retrieval_variant": "synthetic-default",
+        "cutoffs": [
+          1,
+          5,
+          10
+        ],
+        "repeats": 1,
+        "content_capture": false,
+        "models": []
+      },
+      "provenance": [
+        {
+          "name": "worker-version",
+          "status": "not_observable",
+          "value": null,
+          "reason_code": "smoke-fixture"
+        }
+      ],
+      "summary_metrics": [
+        {
+          "metric": "complete_evidence_at_k",
+          "cutoff": 5,
+          "value": 1,
+          "sample_size": 1,
+          "scope": {}
+        }
+      ],
+      "coverage": {
+        "reviewed_cases": 1,
+        "candidate_cases": 0,
+        "slices": [
+          {
+            "dimension": "domain",
+            "value": "sample-records",
+            "reviewed_cases": 1
+          }
+        ],
+        "insufficient_slices": [],
+        "chunk_coverage_fraction": null
+      },
+      "gate_results": [
+        {
+          "gate_id": "critical-complete-evidence-at-five",
+          "outcome": "pass",
+          "observed_value": 1,
+          "threshold": 1,
+          "operator": "gte",
+          "confidence_bound": "point"
+        }
+      ],
+      "case_results": [
+        {
+          "case_id": "sample-policy-001",
+          "outcome": "pass",
+          "repeat": 1,
+          "primary_diagnosis": {
+            "code": "PASS",
+            "stage": "retrieval",
+            "source_id": "synthetic-policy-document",
+            "page": 1,
+            "span_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "secondary_diagnoses": [],
+          "stage_observations": [
+            {
+              "stage": "retrieval",
+              "status": "pass"
+            },
+            {
+              "stage": "generation",
+              "status": "not_applicable"
+            }
+          ],
+          "evidence": [
+            {
+              "slot_id": "policy-source",
+              "hit": true,
+              "best_rank": 1,
+              "source_id": "synthetic-policy-document",
+              "version_id": "version-1",
+              "page": 1,
+              "span_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "relevance_grade": 3,
+              "entered_prompt": null,
+              "citation_resolved": null
+            }
+          ],
+          "metrics": [
+            {
+              "metric": "complete_evidence_at_k",
+              "cutoff": 5,
+              "value": 1
+            }
+          ],
+          "timing": {
+            "retrieval_ms": 10,
+            "answer_ms": null,
+            "judge_ms": null,
+            "total_ms": 10
+          },
+          "cost": {
+            "input_tokens": null,
+            "output_tokens": null,
+            "embedding_tokens": null,
+            "judge_tokens": null,
+            "estimated_usd": null,
+            "price_manifest_version": null
+          },
+          "violations": []
+        }
+      ]
+    }
+  ]
+}

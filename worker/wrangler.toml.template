@@ -1,0 +1,37 @@
+# Generated per install by `brain provision`. {{PLACEHOLDERS}} are filled from
+# the client manifest. Never commit a filled copy to a shared repo: it names
+# the client's own account and resource IDs.
+
+name = "{{WORKER_NAME}}"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+BRAIN_NAME = "{{BRAIN_NAME}}"
+BRAIN_OWNER = "{{BRAIN_OWNER}}"
+BRAIN_VERSION = "{{BRAIN_VERSION}}"
+ANSWER_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+RERANK_MODEL = "claude-haiku-4-5-20251001"
+DAILY_LLM_CAP_USD = "{{DAILY_LLM_CAP_USD}}"
+CREDENTIAL_SCANNER = "on"
+# OCR of scanned PDFs. Off by default: it costs money on this account, once per
+# scanned page. OCR_IMAGE_FORMAT selects how the page image is attached to the
+# model request; leave it unset for the OpenAI-style content array and set it to
+# "image_field" if the model rejects that shape.
+OCR_ENABLED = "0"
+OCR_MODEL = "@cf/google/gemma-4-26b-a4b-it"
+
+[ai]
+binding = "AI"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "{{D1_NAME}}"
+database_id = "{{D1_ID}}"
+
+# Secrets, set with `wrangler secret put` and never written to this file:
+#   ADMIN_KEY
+#   RAG_PROXY_KEY                (optional, read-only retrieval proxy)
+#   ANTHROPIC_API_KEY            (optional nonstandard provider override)
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_ROLE_KEY

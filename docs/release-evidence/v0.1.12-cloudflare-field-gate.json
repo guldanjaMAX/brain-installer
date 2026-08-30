@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "release": "0.1.12",
+  "candidate_commit": "8adc2a117be01b4712aa0d1f4224d06073901e18",
+  "completed_at": "2026-08-25T07:53:22Z",
+  "environment": "disposable real Cloudflare Worker, D1, Vectorize, and Workers AI",
+  "corpus": "synthetic only",
+  "harness_sha256": "b700abd94dd26cbc3711ad8b422bf332efdf3fd327cda8a16323e462fb87edfb",
+  "result": "passed",
+  "observations": {
+    "worker_version": "0.1.12",
+    "changed_batch_documents": 50,
+    "changed_batch_ms": 8740,
+    "unchanged_batch_documents": 50,
+    "unchanged_batch_ms": 118,
+    "mixed_batch_ms": 505,
+    "concurrent_receipts": [
+      "created",
+      "failed"
+    ],
+    "large_document_chunks": 99,
+    "embedded_operations": 151,
+    "verified_documents": 53,
+    "cleanup_documents": 53,
+    "final_vector_backlog": 0,
+    "critical_diagnosis_issues": 0
+  },
+  "cleanup_verification": {
+    "worker_health_http_status": 404,
+    "matching_d1_databases": 0,
+    "matching_vectorize_indexes": 0,
+    "matching_keychain_items": 0
+  },
+  "scope_note": "The live gate proves real service behavior. Forced D1 statement and final-CAS failures remain deterministic local SQLite integration tests because the public Worker API cannot inject a platform failure safely."
+}

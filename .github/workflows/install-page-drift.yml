@@ -1,0 +1,39 @@
+# The repo guards its own version alignment hard (test/current-version.test.mjs
+# pins package.json, the lockfile, the manifest template, the changelog and both
+# README install links together). None of that reaches the page a client
+# actually follows, which lives in another repo and hardcodes its own version.
+#
+# On 2026-08-28 that page shipped v0.1.16 while v0.1.19 was the latest release,
+# so every client got a brain with no passkey app and no Golden 20 session.
+# Nothing failed and nothing warned. This job is that missing alarm.
+#
+# It runs on a schedule rather than on push because the drift appears when the
+# OTHER repo stands still, which no commit here would ever trigger.
+
+name: install-page-drift
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "17 14 * * *"   # 07:17 Phoenix, daily
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  check:
+    name: does the install page ship the latest release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Compare the live install page against the latest release
+        run: node scripts/check-install-page-version.mjs

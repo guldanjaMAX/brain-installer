@@ -1,0 +1,409 @@
+/**
+ * oauth — the authorization server remote connectors sign in through.
+ *
+ * The Claude app and ChatGPT reach a brain as remote MCP connectors, and the
+ * MCP spec's auth story is OAuth 2.1: dynamic client registration, an
+ * authorize step, PKCE (S256 only), and bearer tokens on the endpoint. All
+ * of it lives HERE, in the owner's worker — no third-party identity service,
+ * which is the same custody stance as everything else.
+ *
+ * The authorize step IS the passkey page: a connector's consent screen is
+ * gated by the owner's session cookie, which only a Face ID / fingerprint
+ * ceremony can mint. A connector therefore cannot be approved by anyone but
+ * the person whose face opens the brain.
+ *
+ * Codes and tokens are stored hashed and are live security state:
+ *   - codes are single-use with a five-minute TTL;
+ *   - tokens are opaque 32-byte values, individually revocable, 30-day
+ *     expiry, and BORN INTO the current session generation — the owner's
+ *     "Sign out everywhere" bumps the generation and every connector token
+ *     dies with the cookies. One revocation story, no special cases.
+ *
+ * Tokens grant one exact named agent profile. The default librarian is
+ * read-only. Other profiles are explicit, fixed bundles, and none can execute
+ * deletion. A break-glass token can only create a bounded preview receipt that
+ * still requires a fresh owner passkey on the owner-only HTTP surface.
+ */
+
+import { jsonResponse } from "./core.js";
+import { FAVICON } from "./app-page.js";
+import { randomToken, sessionGeneration } from "./auth-store.js";
+import { ownerSessionPrincipal } from "./owner-auth.js";
+import {
+  AGENT_PROFILE_NAMES, DEFAULT_AGENT_PROFILE, profileDescription, profileFromScope, profileHas,
+} from "./agent-authority.js";
+
+const CODE_TTL_MS = 5 * 60 * 1000;
+const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const MIGRATION_HINT = "connector tables are missing; run `brain setup <manifest>` to apply migration 0015";
+
+function guard(error) {
+  if (/no such table/i.test(String(error?.message || error))) throw new Error(MIGRATION_HINT);
+  throw error;
+}
+
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function b64uSha256Bytes(bytes) {
+  let ascii = "";
+  for (const byte of bytes) ascii += String.fromCharCode(byte);
+  return btoa(ascii).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** RFC 7636 S256: base64url(sha256(verifier)) must equal the stored challenge. */
+async function pkceMatches(verifier, challenge) {
+  if (typeof verifier !== "string" || verifier.length < 43 || verifier.length > 128) return false;
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+  return b64uSha256Bytes(digest) === String(challenge);
+}
+
+function validRedirectUri(value) {
+  let url;
+  try {
+    url = new URL(String(value));
+  } catch {
+    return false;
+  }
+  // Connectors are hosted services; loopback is allowed for local MCP tooling.
+  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1";
+  return (url.protocol === "https:" || (url.protocol === "http:" && loopback)) && !url.username && !url.hash;
+}
+
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+/* ------------------------------------------------------------- discovery */
+
+export function handleOAuthMetadata(url) {
+  // RFC 8414 + RFC 9728: both documents point at this same origin. MCP
+  // clients read one or both to find the authorize and token endpoints.
+  return jsonResponse({
+    issuer: url.origin,
+    authorization_endpoint: `${url.origin}/oauth/authorize`,
+    token_endpoint: `${url.origin}/oauth/token`,
+    registration_endpoint: `${url.origin}/oauth/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+    scopes_supported: AGENT_PROFILE_NAMES,
+  });
+}
+
+export function handleProtectedResourceMetadata(url) {
+  return jsonResponse({
+    resource: `${url.origin}/mcp`,
+    authorization_servers: [url.origin],
+    bearer_methods_supported: ["header"],
+    scopes_supported: AGENT_PROFILE_NAMES,
+  });
+}
+
+/* ---------------------------------------------------------- registration */
+
+export async function handleRegister(env, request) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "invalid_client_metadata" }, 400);
+  }
+  const redirectUris = Array.isArray(body?.redirect_uris) ? body.redirect_uris.map(String) : [];
+  if (!redirectUris.length || redirectUris.length > 10 || !redirectUris.every(validRedirectUri)) {
+    return jsonResponse({ error: "invalid_redirect_uri" }, 400);
+  }
+  const clientId = randomToken(16);
+  try {
+    await env.DB.prepare(
+      "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at) VALUES (?, ?, ?, ?)",
+    ).bind(clientId, String(body.client_name || "").slice(0, 120) || null, JSON.stringify(redirectUris), Date.now()).run();
+  } catch (error) {
+    guard(error);
+  }
+  return jsonResponse({
+    client_id: clientId,
+    client_name: body.client_name || undefined,
+    redirect_uris: redirectUris,
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code"],
+    response_types: ["code"],
+  }, 201);
+}
+
+/* ------------------------------------------------------------- authorize */
+
+async function loadClient(env, clientId) {
+  try {
+    const row = await env.DB.prepare(
+      "SELECT client_id, client_name, redirect_uris FROM oauth_clients WHERE client_id = ?",
+    ).bind(String(clientId || "")).first();
+    if (!row) return null;
+    return { ...row, redirect_uris: JSON.parse(row.redirect_uris) };
+  } catch (error) {
+    guard(error);
+  }
+}
+
+/**
+ * OAuth stores one named agent profile in its existing scope field. More than
+ * one profile, an unknown scope, or the legacy read/write pair all collapse to
+ * librarian. A client cannot combine roles into an unreviewed capability set.
+ */
+export function normalizeScope(requested) {
+  return profileFromScope(requested || DEFAULT_AGENT_PROFILE);
+}
+
+function authorizeParams(url) {
+  const p = url.searchParams;
+  return {
+    client_id: p.get("client_id") || "",
+    redirect_uri: p.get("redirect_uri") || "",
+    state: p.get("state") || "",
+    scope: normalizeScope(p.get("scope")),
+    code_challenge: p.get("code_challenge") || "",
+    code_challenge_method: p.get("code_challenge_method") || "",
+    response_type: p.get("response_type") || "",
+  };
+}
+
+/**
+ * GET /oauth/authorize — the consent screen. Invalid client/redirect fails
+ * HERE and never redirects (an open redirect is the classic OAuth wound);
+ * every later error returns to the validated redirect_uri per spec.
+ */
+export async function handleAuthorizePage(env, url) {
+  const params = authorizeParams(url);
+  const client = await loadClient(env, params.client_id);
+  if (!client || !client.redirect_uris.includes(params.redirect_uri)) {
+    return jsonResponse({ error: "unknown client or redirect_uri" }, 400);
+  }
+  const back = (error) => Response.redirect(
+    `${params.redirect_uri}${params.redirect_uri.includes("?") ? "&" : "?"}error=${error}` +
+    (params.state ? `&state=${encodeURIComponent(params.state)}` : ""), 302);
+  if (params.response_type !== "code") return back("unsupported_response_type");
+  if (params.code_challenge_method !== "S256" || !/^[A-Za-z0-9_-]{43}$/.test(params.code_challenge)) {
+    return back("invalid_request");
+  }
+
+  const name = esc(client.client_name || "A connector");
+  const profile = profileDescription(params.scope);
+  const profileSentences = {
+    librarian: "It can ask questions and read documents. It cannot add, diagnose, change, or remove anything.",
+    "structured-contributor": "It can read and add contract-checked curated lessons. It cannot diagnose or remove anything.",
+    technician: "It can read documents and whole-brain diagnostics. It cannot add, change, or remove anything.",
+    "break-glass": "It can read, diagnose, and prepare an exact short-lived deletion preview. It cannot execute a deletion. Execution always requires your fresh passkey in the owner app.",
+  };
+  const grantSentence = `${esc(client.client_name || "A connector")} is requesting the ${profile.label} profile. ` +
+    profileSentences[profile.name];
+  const owner = String(env.BRAIN_OWNER || "").trim();
+  // "Dana's brain", not "acme-brain-shadow". The consent screen is the
+  // second thing a client ever sees and the first that names a third party, so
+  // it has to look like the same product the invite did.
+  const brain = esc(owner
+    ? (/s$/i.test(owner) ? `${owner}' brain` : `${owner}'s brain`)
+    : (env.BRAIN_NAME || "your brain"));
+  const query = esc(url.search.slice(1));
+  const page = `<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect ${name} to ${brain}</title>
+<meta name="theme-color" content="#faf9f6">
+<link rel="icon" href="${FAVICON}">
+<link rel="stylesheet" href="/app/assets/app.css">
+<body class="min-h-dvh flex items-center justify-center p-5">
+<main class="w-full max-w-md">
+  <div class="mb-6 text-[15px] text-ink-soft">${brain}</div>
+
+  <div class="bg-card border border-line rounded-2xl p-7 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+    <h1 class="text-[24px] leading-tight tracking-tight font-semibold">Connect ${name}?</h1>
+    <p class="text-ink-soft mt-3 leading-relaxed">
+      ${name} is asking to reach ${brain}. Here is exactly what that allows.
+    </p>
+
+    <p class="mt-4 text-ink-soft leading-relaxed">${grantSentence}</p>
+
+    <button id="approve"
+      class="mt-7 w-full rounded-xl bg-accent px-5 py-3.5 text-white font-semibold disabled:opacity-55 transition-opacity">
+      Approve with Face ID
+    </button>
+    <button id="deny" class="mt-2 w-full rounded-xl px-5 py-3 text-ink-soft">Cancel</button>
+    <p class="mt-4 text-[13px] text-ink-soft leading-relaxed">
+      Approving uses your passkey. Revoke it any time from Settings, or end every
+      connection at once with Sign out everywhere.
+    </p>
+    <p id="err" class="mt-4 text-[14px] text-red-700" hidden></p>
+  </div>
+</main>
+<script>
+(() => {
+  "use strict";
+  const q = "${query}";
+  const b64uToBytes = (s) => Uint8Array.from(atob(s.replace(/-/g,"+").replace(/_/g,"/") + "=".repeat((4 - s.length % 4) % 4)), c => c.charCodeAt(0));
+  const bytesToB64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/,"");
+  const api = (path, payload) => fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Brain-App": "1" }, body: JSON.stringify(payload || {}) })
+    .then(async (r) => { const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || ("HTTP " + r.status)); return j; });
+  async function signIn() {
+    const options = await api("/auth/login/options");
+    const assertion = await navigator.credentials.get({ publicKey: {
+      challenge: b64uToBytes(options.challenge), rpId: options.rp_id, userVerification: "required", allowCredentials: [],
+    }});
+    await api("/auth/login/verify", {
+      credentialId: assertion.id,
+      authenticatorData: bytesToB64u(assertion.response.authenticatorData),
+      clientDataJSON: bytesToB64u(assertion.response.clientDataJSON),
+      signature: bytesToB64u(assertion.response.signature),
+    });
+  }
+  document.getElementById("approve").onclick = async () => {
+    document.getElementById("err").hidden = true;
+    try {
+      let decision = await fetch("/oauth/authorize/decision?" + q, { method: "POST", headers: { "X-Brain-App": "1" } });
+      if (decision.status === 401) { await signIn(); decision = await fetch("/oauth/authorize/decision?" + q, { method: "POST", headers: { "X-Brain-App": "1" } }); }
+      const body = await decision.json();
+      if (!decision.ok || !body.redirect) throw new Error(body.error || ("HTTP " + decision.status));
+      location.href = body.redirect;
+    } catch (error) {
+      const el = document.getElementById("err");
+      el.textContent = String(error.message || error);
+      el.hidden = false;
+    }
+  };
+  document.getElementById("deny").onclick = () => {
+    const p = new URLSearchParams(q);
+    const u = p.get("redirect_uri");
+    location.href = u + (u.includes("?") ? "&" : "?") + "error=access_denied" + (p.get("state") ? "&state=" + encodeURIComponent(p.get("state")) : "");
+  };
+})();
+</script></html>`;
+  return new Response(page, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      // style-src 'self' for the shared app stylesheet; the ceremony script
+      // stays inline because this page is served mid-redirect and must not
+      // depend on a second request completing.
+      "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'self'; " +
+        "img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+/** POST /oauth/authorize/decision — passkey-session-gated approval. */
+export async function handleAuthorizeDecision(env, request, url) {
+  let principal;
+  try {
+    principal = await ownerSessionPrincipal(request, env);
+  } catch {
+    return jsonResponse({ error: "unavailable", code: "owner_auth_unavailable" }, 503);
+  }
+  if (!principal) return jsonResponse({ error: "unauthorized", code: "session_required" }, 401);
+  if (principal.kind !== "owner" || principal.grantId !== null) {
+    return jsonResponse({ error: "forbidden", code: "owner_required" }, 403);
+  }
+  const params = authorizeParams(url);
+  const client = await loadClient(env, params.client_id);
+  if (!client || !client.redirect_uris.includes(params.redirect_uri)) {
+    return jsonResponse({ error: "unknown client or redirect_uri" }, 400);
+  }
+  if (params.code_challenge_method !== "S256" || !/^[A-Za-z0-9_-]{43}$/.test(params.code_challenge)) {
+    return jsonResponse({ error: "invalid_request" }, 400);
+  }
+  const code = randomToken(32);
+  try {
+    await env.DB.prepare(
+      "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, code_challenge, scope, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).bind(await sha256Hex(code), client.client_id, params.redirect_uri, params.code_challenge, params.scope, Date.now() + CODE_TTL_MS).run();
+  } catch (error) {
+    guard(error);
+  }
+  const redirect = `${params.redirect_uri}${params.redirect_uri.includes("?") ? "&" : "?"}code=${code}` +
+    (params.state ? `&state=${encodeURIComponent(params.state)}` : "");
+  return jsonResponse({ redirect });
+}
+
+/* ----------------------------------------------------------------- token */
+
+export async function handleToken(env, request) {
+  let params;
+  const contentType = request.headers.get("Content-Type") || "";
+  try {
+    params = contentType.includes("json")
+      ? new Map(Object.entries(await request.json()))
+      : new Map(new URLSearchParams(await request.text()));
+  } catch {
+    return jsonResponse({ error: "invalid_request" }, 400);
+  }
+  if (params.get("grant_type") !== "authorization_code") {
+    return jsonResponse({ error: "unsupported_grant_type" }, 400);
+  }
+  const codeHash = await sha256Hex(String(params.get("code") || ""));
+  let row;
+  try {
+    row = await env.DB.prepare(
+      `DELETE FROM oauth_codes WHERE code_hash = ?
+       RETURNING client_id, redirect_uri, code_challenge, scope, expires_at, used_at`,
+    ).bind(codeHash).first();
+  } catch (error) {
+    guard(error);
+  }
+  // The delete itself chooses the only winner. Invalid client, redirect, or
+  // verifier data still burns a presented code on sight, preserving the
+  // interception-safe behavior without a read/delete race.
+  if (!row || row.used_at || Number(row.expires_at) <= Date.now() ||
+      String(row.client_id) !== String(params.get("client_id") || "") ||
+      String(row.redirect_uri) !== String(params.get("redirect_uri") || "")) {
+    return jsonResponse({ error: "invalid_grant" }, 400);
+  }
+  if (!(await pkceMatches(params.get("code_verifier"), row.code_challenge))) {
+    return jsonResponse({ error: "invalid_grant" }, 400);
+  }
+  const token = randomToken(32);
+  const generation = await sessionGeneration(env);
+  try {
+    await env.DB.prepare(
+      "INSERT INTO oauth_tokens (token_hash, client_id, scope, session_generation, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).bind(await sha256Hex(token), row.client_id, row.scope || DEFAULT_AGENT_PROFILE, generation, Date.now(), Date.now() + TOKEN_TTL_MS).run();
+  } catch (error) {
+    guard(error);
+  }
+  return jsonResponse({
+    access_token: token,
+    token_type: "Bearer",
+    expires_in: Math.floor(TOKEN_TTL_MS / 1000),
+    scope: row.scope || DEFAULT_AGENT_PROFILE,
+  });
+}
+
+/* ------------------------------------------------------------ validation */
+
+/** Bearer check for /mcp: unexpired, unrevoked, current-generation. */
+export async function validateConnectorToken(request, env) {
+  const header = request.headers.get("Authorization") || "";
+  const match = header.match(/^Bearer\s+([A-Za-z0-9_-]{20,})$/);
+  if (!match) return false;
+  let row;
+  try {
+    row = await env.DB.prepare(
+      "SELECT token_hash, client_id, scope, session_generation, expires_at, revoked_at FROM oauth_tokens WHERE token_hash = ?",
+    ).bind(await sha256Hex(match[1])).first();
+  } catch (error) {
+    if (/no such table/i.test(String(error?.message || error))) return false;
+    throw error;
+  }
+  if (!row || row.revoked_at || Number(row.expires_at) <= Date.now()) return false;
+  if (Number(row.session_generation) !== (await sessionGeneration(env))) return false;
+  await env.DB.prepare("UPDATE oauth_tokens SET last_used_at = ? WHERE token_hash = ?")
+    .bind(Date.now(), row.token_hash).run();
+  const profile = profileFromScope(row.scope);
+  return {
+    scope: profile,
+    profile,
+    clientId: String(row.client_id || ""),
+    tokenHash: String(row.token_hash),
+    // Kept for downstream compatibility while callers move to capabilities.
+    canWrite: profileHas(profile, "curated:write"),
+  };
+}

@@ -1,0 +1,399 @@
+{
+  "$schema": "../manifest.schema.json",
+  "_comment": [
+    "One manifest per client install. This file is the ONLY thing that differs",
+    "between installs. Everything else (worker code, schema, migrations, the MCP",
+    "server) is identical across every client, which is what makes an upgrade",
+    "possible without rebuilding by hand.",
+    "",
+    "It lives in the CLIENT's repo, in the CLIENT's account. We keep a copy only",
+    "while engaged, and it contains no secrets: every credential is a reference",
+    "to a secret store, never a value."
+  ],
+  "manifest_version": 1,
+  "client": {
+    "slug": "acme",
+    "display_name": "Acme Consulting",
+    "primary_contact": "owner@acme.com",
+    "timezone": "America/Phoenix"
+  },
+  "brain": {
+    "version": "0.2.1",
+    "domain": "brain.acme.com",
+    "worker_name": "acme-brain"
+  },
+  "infrastructure": {
+    "_comment": "Client-owned. We hold a scoped, expiring token and nothing else.",
+    "cloudflare": {
+      "_token_scopes": [
+        "The API token the client issues us needs exactly these, no more:",
+        "  Account > Workers Scripts: Edit",
+        "  Account > D1: Edit",
+        "  Account > Vectorize: Edit",
+        "  Account > Workers R2 Storage: Edit   (only if r2_bucket is set)",
+        "  Account > Workers AI: Read",
+        "Vectorize Edit was verified on 2026-08-23 for index creation and every",
+        "metadata index. A separate named Wrangler profile is only a fallback",
+        "for an older token that does not carry that permission; `brain doctor`",
+        "prints its exact profile sign-in step and confirms this manifest account.",
+        "",
+        "The account must ALSO be on the Workers Paid plan, 5 USD a month minimum.",
+        "Free can create Vectorize, but its vector, daily-write, and Worker CPU limits are prototype-scale. Paid is the supported production baseline."
+      ],
+      "account_id": "REQUIRED_client_account_id",
+      "storage": "d1",
+      "_storage_options": "d1 | supabase",
+      "d1_database_name": "REPLACE-WITH-slug-brain",
+      "d1_database_id": "filled_in_by_provisioner",
+      "_vectorize_index_comment": "The index NAME, not an id. Leave it out (or leave the placeholder) and provision derives <slug>-brain. Two installs must never share one name: the second would adopt the first's vectors.",
+      "vectorize_index": "filled_in_by_provisioner",
+      "drain_cron": "* * * * *",
+      "_drain_cron_comment": [
+        "Moves newly ingested chunks from D1 into Vectorize. It exists because",
+        "there is no transaction across the two, so a chunk lands in D1 first and",
+        "is embedded after. Until it drains, that chunk is findable by keyword and",
+        "invisible to semantic search, and NOTHING else reports that: both systems",
+        "are up and every health probe passes. `brain health` reads the backlog.",
+        "",
+        "Every minute, not every five. The drain advances roughly one batch per",
+        "Vectorize CONFIRMATION, not per tick, so the tick rate sets the ceiling",
+        "on how fast a backlog clears. Measured on a real install: */5 sustained",
+        "about 20 vectors a minute, which is over four days for a first load of",
+        "125k chunks. Every minute sustained about 59, which is closer to one.",
+        "",
+        "Raising it cannot raise the embedding bill. A tick that arrives before",
+        "Vectorize has confirmed the previous changeset returns immediately, on",
+        "one describe() call, having embedded nothing. The extra ticks are no-ops",
+        "and the work done per confirmation is unchanged. What changes is only",
+        "how long a new install spends looking empty."
+      ],
+      "r2_bucket": "brain-assets",
+      "kv_namespace": "BRAIN_KV",
+      "kv_namespace_id": "filled_in_by_provisioner"
+    },
+    "supabase": {
+      "_comment": [
+        "Migration and temporary rollback compatibility only. It is not a higher",
+        "product tier and it is not enabled automatically at any corpus size.",
+        "",
+        "D1 plus Vectorize is the standard architecture every client installs.",
+        "A different backend requires a measured eval failure, a diagnosed cause",
+        "and an explicit architecture decision. Chunk count alone is not a trigger."
+      ],
+      "enabled": false,
+      "project_ref": null,
+      "trigger_for_enabling": "no automatic trigger; migration or temporary rollback only",
+      "comfortable_below": "not defined; prove retrieval quality with the full eval set"
+    }
+  },
+  "corpora": {
+    "_comment": "Which sources this install ingests. Each maps to a connector.",
+    "google_drive": {
+      "enabled": false,
+      "root_folder_ids": [],
+      "exclude_paths": [],
+      "exclude_name_parts": [],
+      "exclude_file_ids": [],
+      "exclude_file_ids_file": null
+    },
+    "gmail": {
+      "enabled": false,
+      "oauth_secret": "secret://GMAIL_OAUTH"
+    },
+    "calendar": {
+      "enabled": false,
+      "oauth_secret": "secret://GCAL_OAUTH"
+    },
+    "imap": {
+      "_comment": [
+        "Any mailbox that speaks IMAP: Yahoo, Fastmail, iCloud, a mailbox your",
+        "host gave you. `brain connect imap <manifest> --host <h> --user <you>`",
+        "asks for the password hidden and stores it in YOUR OWN Keychain or",
+        "Windows DPAPI store, under an item named for IMAP, not for Google. Most",
+        "providers need an APP PASSWORD rather than the account password.",
+        "",
+        "Read-only at the protocol level, so nothing is marked as read. Inbox",
+        "and Sent are read; Junk, Trash, Drafts, All Mail and Archive are not;",
+        "a folder whose purpose cannot be identified is left alone too. Every",
+        "folder is named in the run with the true reason it was or was not read.",
+        "Incremental through UIDVALIDITY plus a per-folder UID watermark; when",
+        "the server changes UIDVALIDITY you are told and the folder is re-read.",
+        "",
+        "Bulk mail is filtered LOCALLY on message headers, needing two",
+        "independent signals. That is weaker than Gmail's server-side category",
+        "classifier and is not the same thing. Deletions in the mailbox are NOT",
+        "propagated. `brain disconnect imap` forgets the password."
+      ],
+      "enabled": false,
+      "host": null,
+      "port": 993,
+      "username": null
+    },
+    "imessage": {
+      "_comment": [
+        "Mac-only live message capture from Messages.app (chat.db); there is no",
+        "Windows or Linux path. `brain connect imessage` verifies the Full Disk",
+        "Access grant with a real read, runs the initial history load, then",
+        "installs an every-minute capture LaunchAgent (override the tick with",
+        "operations.imessage_capture_cron). SMS rides in when Text Message",
+        "Forwarding is on and is tagged sms. `brain disconnect imessage` undoes it."
+      ],
+      "enabled": false
+    },
+    "zoom": {
+      "_comment": [
+        "Zoom cloud-recording transcripts. Requires a PAID (Licensed) Zoom seat:",
+        "the free Basic tier cannot cloud record at all, so it can never produce",
+        "a transcript, and `brain connect zoom` refuses it rather than connecting",
+        "into a silent nothing. You create a Server-to-Server OAuth app in YOUR",
+        "OWN Zoom account with the cloud_recording:read:admin scope; connect",
+        "verifies it live, writes its four values as secrets on YOUR OWN worker,",
+        "and proves the webhook answers Zoom's validation before you paste the",
+        "URL into Zoom. NEW recordings only: nothing backfills older ones.",
+        "`brain disconnect zoom` removes the secrets so deliveries are refused."
+      ],
+      "enabled": false
+    },
+    "slack": {
+      "_comment": [
+        "Read-only conversation history through the owner's own Slack app.",
+        "OAuth credentials stay in the local provider credential store and are",
+        "never placed in this manifest. Optionally restrict the load to exact",
+        "channel_ids. Removed-message authority remains an explicit gap."
+      ],
+      "enabled": false,
+      "channel_ids": [],
+      "include_thread_replies": true
+    },
+    "notion": {
+      "_comment": [
+        "Read-only pages explicitly shared with the owner's Notion integration.",
+        "OAuth credentials stay in the local provider credential store. Pages",
+        "outside the integration share boundary cannot be inventoried."
+      ],
+      "enabled": false
+    },
+    "quickbooks": {
+      "_comment": [
+        "QuickBooks Online runtime queries are read-only, but Intuit's one",
+        "Accounting OAuth scope grants broader read and update permission.",
+        "This release connects sandbox companies only. Register the exact",
+        "http://localhost:47812/ redirect shown by the technician command.",
+        "OAuth credentials and the selected company id stay in the local",
+        "provider credential store. Disconnect retains imported documents;",
+        "removal needs a separately reviewed forget preview."
+      ],
+      "enabled": false,
+      "environment": "sandbox",
+      "redirect_host": "localhost",
+      "entities": [
+        "Account", "Customer", "Vendor", "Invoice", "Payment", "Bill", "Purchase",
+        "JournalEntry", "Deposit", "Transfer", "CreditMemo", "BillPayment", "Estimate",
+        "SalesReceipt", "RefundReceipt"
+      ]
+    },
+    "microsoft": {
+      "_comment": [
+        "Microsoft 365 Outlook plus selected OneDrive or SharePoint drives.",
+        "Graph delta links carry exact message and file tombstones. Add exact",
+        "drive_ids or site_ids after reviewing the tenant selection."
+      ],
+      "enabled": false,
+      "mail_folder_ids": ["inbox"],
+      "drive_ids": [],
+      "site_ids": [],
+      "include_personal_drive": true
+    },
+    "dropbox": {
+      "_comment": "Recursive Dropbox body sync with exact cursor tombstones.",
+      "enabled": false,
+      "root_path": ""
+    },
+    "hubspot": {
+      "_comment": "Read-only contacts, companies, and deals. Hard deletion remains an explicit gap.",
+      "enabled": false,
+      "object_types": ["contacts", "companies", "deals"]
+    },
+    "upload": {
+      "_comment": "Manual drop zone. Always on: it is the fallback for anything with no connector.",
+      "enabled": true
+    },
+    "local_folder": {
+      "_comment": [
+        "A folder on this Mac that reloads itself on a schedule, so 'export it",
+        "into this folder and forget about it' is actually true for a folder",
+        "that is not inside Google Drive. Point it at wherever the client drops",
+        "things: a WhatsApp or SMS export, a saved .vtt meeting transcript, a",
+        "mail archive, scanned paperwork.",
+        "",
+        "Install it with `brain schedule <manifest> --install --folder`. Each",
+        "tick runs the ordinary local ingest, so it reuses that command's",
+        "content-hash resume state: a new file is added, a changed file is",
+        "re-sent, an unchanged file costs one read, and a file that is gone is",
+        "removed through the same aggregate removal plan Drive uses. The path",
+        "must be absolute. Tick with operations.folder_ingest_cron."
+      ],
+      "enabled": false,
+      "path": null,
+      "source": "documents"
+    },
+    "bank_feed": {
+      "_comment": [
+        "Plaid is the reviewed bank-feed profile. Keep this off until the",
+        "client has a Plaid account, Sandbox credentials have been entered",
+        "through the hidden prompt, the independent bank wrapping key is in",
+        "reviewed owner recovery custody, and the exact return and webhook URLs are",
+        "registered in that Plaid environment. Credentials never go here.",
+        "The account holder completes Link themselves. This brain requests only",
+        "read-only Transactions and never sees bank login credentials. Scheduled",
+        "reconciliation remains active because webhooks are not a sole source of truth."
+      ],
+      "enabled": false,
+      "provider": "plaid",
+      "environment": "sandbox",
+      "registered_redirect_uris": [],
+      "entity_slug": "primary",
+      "country_codes": [
+        "US"
+      ],
+      "reconciliation_interval_minutes": 360
+    },
+    "whatsapp": {
+      "_comment": [
+        "Live capture through a paired linked device, and OPT-IN twice over:",
+        "this flag, plus --accept-risk on `brain connect whatsapp <manifest>`.",
+        "Pairing uses an unofficial client, which is a terms-of-service gray area",
+        "with a small but real ban risk, and the history it collects at link time",
+        "is only what the phone chooses to transfer. Installing it needs macOS;",
+        "Windows supervision is not built. The per-chat Export chat path needs no",
+        "flag, no daemon and carries no such risk. `brain disconnect whatsapp`",
+        "undoes it. Knobs: operations.whatsapp_drain_cron, whatsapp_daemon_path,",
+        "whatsapp_data_dir."
+      ],
+      "enabled": false
+    }
+  },
+  "retrieval": {
+    "embed_model": "@cf/baai/bge-base-en-v1.5",
+    "embed_dimensions": 768,
+    "chunk_size": 1500,
+    "chunk_overlap": 300,
+    "default_result_limit": 8,
+    "answer_model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "rerank": false,
+    "_comment": "answer_model runs through the CLIENT's own Cloudflare Workers AI binding, so no external model credential is required."
+  },
+  "safety": {
+    "_comment": "Non-negotiable defaults. The scanner is what makes 'we store nothing dangerous' true rather than aspirational.",
+    "credential_scanner": {
+      "enabled": true,
+      "gate_version": 4,
+      "mode": "refuse",
+      "_mode_options": "refuse | flag_only"
+    },
+    "private_path_prefixes": [
+      "_private",
+      "_Private"
+    ],
+    "daily_llm_spend_cap_usd": 10,
+    "ocr": {
+      "_comment": "Read scanned PDFs by sending each page image to a vision model through THIS brain's own Workers AI binding. OFF by default on purpose: it spends money on the client's own Cloudflare account, once per scanned page, and nobody should discover that after the fact. Every page must atomically reserve a conservative amount from the daily estimated-spend budget, and every document read this way is MARKED as OCR so an answer resting on it says so.",
+      "enabled": false,
+      "model": "@cf/google/gemma-4-26b-a4b-it",
+      "_model_note": "Must be a Cloudflare @cf/ model. OCR refuses anything else rather than send a picture of a client document to a provider this manifest does not name.",
+      "max_pages_per_document": 40
+    }
+  },
+  "operations": {
+    "_ingest_cron_comment": [
+      "On macOS this installs as a per-user LaunchAgent and runs Google Drive",
+      "normally incrementally, with periodic and policy-triggered full comparisons.",
+      "The plist contains no credentials. Calendar times use",
+      "the Mac's local timezone, which the installer compares with client.timezone.",
+      "Standard brain setup fills admin_key_secret with a deterministic, non-secret",
+      "macOS Keychain locator before generating a key. An existing legacy adjacent",
+      ".brain-admin-key is preserved. Windows uses a DPAPI-protected adjacent file;",
+      "Linux uses an owner-only adjacent file. Never put the key itself here.",
+      "brain secrets updates and verifies that declared durable location.",
+      "google_token_store persists auto, keychain or file for unattended runs."
+    ],
+    "ingest_cron": "0 9 * * *",
+    "folder_ingest_cron": "0 * * * *",
+    "provider_crons": {
+      "quickbooks": "0 2 * * *",
+      "slack": "15 2 * * *",
+      "notion": "30 2 * * *",
+      "microsoft": "0 * * * *",
+      "dropbox": "15 * * * *",
+      "hubspot": "45 2 * * *"
+    },
+    "provider_token_stores": {
+      "quickbooks": "auto",
+      "slack": "auto",
+      "notion": "auto",
+      "microsoft": "auto",
+      "dropbox": "auto",
+      "hubspot": "auto"
+    },
+    "admin_key_secret": null,
+    "google_token_store": "auto",
+    "health_cron": "0 13 * * *",
+    "health_report_email": "owner@acme.com",
+    "alert_webhook_secret": "secret://ALERT_WEBHOOK_URL"
+  },
+  "testing": {
+    "_comment": [
+      "Filled from section 6 of the intake questionnaire, in the CLIENT'S OWN",
+      "WORDS. Do not tidy them into better English: 'why did we stop using",
+      "those guys' retrieves differently than 'vendor termination rationale',",
+      "and theirs is the phrasing that has to work.",
+      "",
+      "These do double duty. The acceptance suite uses them as retrieval probes,",
+      "so a passing install is one that answers THIS client's questions rather",
+      "than generic ones. And they are the kickoff script: the first thing the",
+      "client sees is their own ten questions answered with citations."
+    ],
+    "probe_questions": [],
+    "things_only_they_know": [],
+    "expected_to_fail": [],
+    "_expected_to_fail_note": [
+      "Two questions the client predicts it will get wrong, captured at intake.",
+      "Shown at kickoff alongside the wins. A tool that says what it does not",
+      "know is worth more than one that always sounds confident, and predicting",
+      "the misses in advance turns the gap list into honesty rather than failure."
+    ]
+  },
+  "ingest": {
+    "_comment": [
+      "The priority slice goes in FIRST and gets proven before the long tail",
+      "streams in behind it. Do NOT ingest chronologically: order by likely",
+      "answer value, usually the last 12 to 24 months plus every meeting",
+      "transcript. A default tuned for steady state quietly ruins the first",
+      "impression, which is the one that decides whether they trust it."
+    ],
+    "priority_slice": {
+      "source": null,
+      "since": null,
+      "note": "from intake question 2.4, the single folder that would already be worth it"
+    },
+    "full_backfill_since": null
+  },
+  "access": {
+    "_comment": [
+      "As of v0.1 everyone with access sees everything indexed. Document-level",
+      "permissions are NOT built. Any client with employees who must not share",
+      "sight of every document is out of scope until ACLs ship. This field exists",
+      "so the limitation is explicit in the install record rather than discovered",
+      "later."
+    ],
+    "model": "single_tenant_all_access",
+    "authorized_emails": [
+      "owner@acme.com"
+    ]
+  },
+  "handoff": {
+    "installer_token_expires": null,
+    "handoff_completed_at": null,
+    "_comment": "On handoff, the client revokes our token and this records the date. After that we hold nothing."
+  }
+}
