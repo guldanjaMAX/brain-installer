@@ -11995,9 +11995,22 @@ export async function cmdSetup(manifestPath, options = {}) {
   console.log(`\n  ${c.bold("Step 6 of 6")}  loading something in\n`);
   const folder = flags.path || (await prompt("A folder to load now (blank to skip)", ""));
   const initialLoadSkipped = !folder;
+  let initialLoadReceipt = null;
   if (folder && existsSync(folder)) {
-    process.argv = [process.argv[0], process.argv[1], "ingest", target, "--path", folder, "--source", "documents"];
-    await cmdIngest(target);
+    const priorArgv = process.argv;
+    try {
+      process.argv = [process.argv[0], process.argv[1], "ingest", target, "--path", folder, "--source", "documents"];
+      initialLoadReceipt = await (options.cmdIngest ?? cmdIngest)(target);
+    } finally {
+      process.argv = priorArgv;
+    }
+    if (!normalizeSetupIngestReceipt(initialLoadReceipt)) {
+      closePrompts();
+      die(
+        "that folder produced no accepted document. The Brain was not reported as live. " +
+          "Choose a folder with at least one supported readable file, then rerun setup."
+      );
+    }
   } else if (folder) {
     closePrompts();
     die(`no such folder: ${folder}. Nothing was loaded. Fix the path and re-run setup.`);
@@ -12020,26 +12033,42 @@ export async function cmdSetup(manifestPath, options = {}) {
   }
 
   closePrompts();
-  const countBacklog = options.backlogCount ?? backlogCount;
-  const outstanding = await countBacklog(target).catch(() => 0);
+  let finalVectorStatus = null;
+  if (!initialLoadSkipped) {
+    try {
+      const observeVectors = options.vectorStatus ?? setupVectorStatus;
+      finalVectorStatus = normalizeSetupVectorStatus(await observeVectors(target));
+      if (!finalVectorStatus) throw new Error("invalid vector readiness receipt");
+      if (!finalVectorStatus.query_ready && finalVectorStatus.pending === 0) {
+        throw new Error("empty queue without query readiness");
+      }
+    } catch {
+      die(
+        "the initial load may be stored, but setup could not prove its D1 and Vectorize state. " +
+          "Nothing was reported as ready. Run `brain health <manifest>` and repair the named issue before handoff."
+      );
+    }
+  }
   if (initialLoadSkipped) {
     console.log(`\n  ${c.yellow(c.bold("Core installation is ready. No source has been loaded yet."))}\n`);
     console.log(`  Complete the fixed public smoke proof before owner handoff:`);
     console.log(`    brain technician ${shownTarget} --run smoke\n`);
-  } else {
+  } else if (finalVectorStatus.query_ready) {
     console.log(`\n  ${c.green(c.bold("Your brain is live."))}\n`);
-  }
-  if (outstanding > 0) {
+  } else {
+    console.log(`\n  ${c.yellow(c.bold("Your files are stored. Meaning-based search is still loading."))}\n`);
     console.log(
-      `  ${c.yellow("Keyword search works now.")} ${outstanding} chunk(s) are still embedding, so\n` +
+      `  ${c.yellow("Keyword search works now.")} ${finalVectorStatus.pending} chunk(s) are still embedding, so\n` +
         `  meaning-based search is incomplete until they finish. Run:\n    brain drain ${shownTarget}\n`
     );
   }
-  if (!initialLoadSkipped) console.log(`  Ask it directly with: brain ask ${shownTarget}`);
+  if (finalVectorStatus?.query_ready) console.log(`  Ask it directly with: brain ask ${shownTarget}`);
   if (wired.length) {
     console.log(`  It is connected to: ${wired.join(", ")}.`);
-    if (!initialLoadSkipped) {
+    if (finalVectorStatus?.query_ready) {
       console.log(`  ${c.dim("Restart them, then ask a question about your own material.")}\n`);
+    } else if (!initialLoadSkipped) {
+      console.log(`  ${c.dim("Finish the vector drain, then restart them and ask your first question.")}\n`);
     } else {
       console.log(`  ${c.dim("Restart them after the smoke proof records one deployed source.")}\n`);
     }
@@ -13116,39 +13145,126 @@ currentSupportCommand = String(cmd || "");
  * a message had promised minutes. Understating this is a first-impression risk,
  * so the number is read from the install rather than guessed at.
  */
-/** Chunks still awaiting embedding, or 0 if it cannot be determined. */
-async function backlogCount(manifestPath) {
+function normalizeSetupVectorStatus(status) {
+  const validCount = (value) => Number.isSafeInteger(value) && value >= 0;
+  if (!status || typeof status !== "object" || Array.isArray(status) ||
+      typeof status.ready !== "boolean" ||
+      !validCount(status.pending) || !validCount(status.upserts) ||
+      !validCount(status.deletes) || !validCount(status.submitted) ||
+      !validCount(status.expected_vectors) || !validCount(status.actual_vectors) ||
+      !validCount(status.inventory_chunks) ||
+      status.upserts + status.deletes !== status.pending ||
+      status.submitted > status.pending ||
+      status.expected_vectors !== status.inventory_chunks ||
+      (status.ready && (status.pending !== 0 || status.submitted !== 0 ||
+        status.actual_vectors !== status.expected_vectors))) {
+    return null;
+  }
+  return Object.freeze({
+    pending: status.pending,
+    upserts: status.upserts,
+    deletes: status.deletes,
+    submitted: status.submitted,
+    expected_vectors: status.expected_vectors,
+    actual_vectors: status.actual_vectors,
+    inventory_chunks: status.inventory_chunks,
+    ready: status.ready,
+    query_ready: status.ready === true && status.pending === 0 &&
+      status.submitted === 0 && status.actual_vectors === status.expected_vectors,
+  });
+}
+
+function normalizeSetupIngestReceipt(receipt) {
+  const validCount = (value) => Number.isSafeInteger(value) && value >= 0;
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt) ||
+      !validCount(receipt.scanned) || !validCount(receipt.created) ||
+      !validCount(receipt.updated) || !validCount(receipt.unchanged) ||
+      !validCount(receipt.refused) || !validCount(receipt.skipped)) {
+    return null;
+  }
+  const accepted = receipt.created + receipt.updated + receipt.unchanged;
+  if (!Number.isSafeInteger(accepted) || receipt.scanned < 1 || accepted < 1) return null;
+  return Object.freeze({
+    scanned: receipt.scanned,
+    accepted,
+    created: receipt.created,
+    updated: receipt.updated,
+    unchanged: receipt.unchanged,
+    refused: receipt.refused,
+    skipped: receipt.skipped,
+  });
+}
+
+function summarizeD1InventoryRows(rows) {
+  if (!Array.isArray(rows)) return null;
+  const sourceTypes = new Set();
+  let chunks = 0;
+  let documents = 0;
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row) ||
+        typeof row.source_type !== "string" || !row.source_type.trim() ||
+        sourceTypes.has(row.source_type) ||
+        !Number.isSafeInteger(row.chunks) || row.chunks < 0 ||
+        !Number.isSafeInteger(row.documents) || row.documents < 0) {
+      return null;
+    }
+    sourceTypes.add(row.source_type);
+    chunks += row.chunks;
+    documents += row.documents;
+    if (!Number.isSafeInteger(chunks) || !Number.isSafeInteger(documents)) return null;
+  }
+  return Object.freeze({ chunks, documents });
+}
+
+/** Observe the post-load D1 and Vectorize state, or throw when it is not provable. */
+async function setupVectorStatus(manifestPath) {
   const { m } = loadManifest(manifestPath);
   const acct = m.brain?.domain ? null : await resolveAccount(m);
   const base = await resolveBaseUrl(m, acct);
   const adminKey = resolveAdminKey(manifestPath);
-  if (!adminKey) return 0;
+  if (!adminKey) throw new Error("durable admin key unavailable");
   const res = await http(`${base}/api/admin/brain/documents`, { headers: { "X-Admin-Key": adminKey } },
     { timeoutMs: 30_000, what: "the backlog check" });
-  if (!res.ok) return 0;
-  return Number((await res.json())?.vector_backlog?.pending || 0);
+  if (!res.ok) throw new Error(`documents endpoint returned ${res.status}`);
+  let inventory;
+  try { inventory = await res.json(); } catch {
+    throw new Error("documents endpoint returned invalid JSON");
+  }
+  if (String(inventory?.backend || "").trim().toLowerCase() !== "d1") {
+    throw new Error("documents endpoint did not prove D1");
+  }
+  const corpus = summarizeD1InventoryRows(inventory.rows);
+  const backlog = inventory?.vector_backlog;
+  const readiness = inventory?.vector_readiness;
+  const normalized = normalizeSetupVectorStatus({
+    pending: backlog?.pending,
+    upserts: backlog?.upserts,
+    deletes: backlog?.deletes,
+    submitted: backlog?.submitted,
+    expected_vectors: readiness?.expected_vectors,
+    actual_vectors: readiness?.actual_vectors,
+    inventory_chunks: corpus?.chunks,
+    ready: readiness?.ready,
+  });
+  if (!normalized || !backlog || typeof backlog !== "object" || Array.isArray(backlog) ||
+      Object.prototype.hasOwnProperty.call(backlog, "error") ||
+      !readiness || typeof readiness !== "object" || Array.isArray(readiness) ||
+      Object.prototype.hasOwnProperty.call(readiness, "error") ||
+      readiness.pending !== normalized.pending || readiness.submitted !== normalized.submitted) {
+    throw new Error("documents endpoint returned an invalid vector readiness receipt");
+  }
+  return normalized;
 }
 
 async function reportBacklog(manifestPath) {
   try {
-    const { m } = loadManifest(manifestPath);
-    const acct = m.brain?.domain ? null : await resolveAccount(m);
-    const base = await resolveBaseUrl(m, acct);
-    const adminKey = resolveAdminKey(manifestPath);
-    if (!adminKey) return;
-    const res = await http(`${base}/api/admin/brain/documents`, { headers: { "X-Admin-Key": adminKey } },
-      { timeoutMs: 30_000, what: "the backlog check" });
-    if (!res.ok) return;
-    const body = await res.json();
-    const pending = Number(body?.vector_backlog?.pending || 0);
-    const readiness = body?.vector_readiness;
-    if (!pending && readiness?.ready === true &&
-        readiness.actual_vectors === readiness.expected_vectors) {
+    const status = await setupVectorStatus(manifestPath);
+    if (status.query_ready) {
       ok("the vector index is query-ready: semantic search is live now");
       return;
     }
     const rel = relative(process.cwd(), manifestPath || "./brain.manifest.json");
-    if (!pending) {
+    if (!status.pending) {
       warn(
         "Vectorize has not proven the same query-visible corpus as D1." + "\n" +
           `        Verify it now:  brain health ${rel}`
@@ -13156,7 +13272,7 @@ async function reportBacklog(manifestPath) {
       return;
     }
     warn(
-      `${pending} chunk(s) are queued or awaiting visibility. Until confirmed they are findable` + "\n" +
+      `${status.pending} chunk(s) are queued or awaiting visibility. Until confirmed they are findable` + "\n" +
         "        by keyword and INVISIBLE to meaning-based search, and nothing else reports that." + "\n" +
         `        Finish it now instead of waiting for the cron:  brain drain ${rel}`
     );

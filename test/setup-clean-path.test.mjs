@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import {
+  mkdirSync,
   mkdtempSync,
   lstatSync,
   readdirSync,
@@ -482,6 +483,110 @@ try {
   assert.equal(partialState.vector_projection_status, "verified");
   assert.equal(partialDb.prepare("SELECT COUNT(*) count FROM schema_migrations").get().count, MIGRATION_FILES.length);
   partialDb.close();
+
+  // A selected folder is not proof that anything landed, and an unobservable
+  // vector projection is not the same as an empty backlog. Rehearse both
+  // failures plus the truthful loading/ready split through the real setup flow.
+  const initialFolder = join(sandbox, "first load");
+  mkdirSync(initialFolder, { recursive: true });
+  writeFileSync(join(initialFolder, "fixture.txt"), "fixture material");
+  const acceptedReceipt = Object.freeze({
+    scanned: 1, created: 1, updated: 0, unchanged: 0, refused: 0, skipped: 0,
+  });
+  const readyVectorStatus = Object.freeze({
+    ready: true,
+    pending: 0,
+    upserts: 0,
+    deletes: 0,
+    submitted: 0,
+    expected_vectors: 1,
+    actual_vectors: 1,
+    inventory_chunks: 1,
+  });
+  const setupWithInitialLoad = (overrides = {}) => ({
+    flags: { path: initialFolder, "no-connect": true },
+    doctorRunAll: async () => [],
+    setupWorkerScriptExists: async () => false,
+    configureStandardAdminKeyStorage: () => ({ changed: false }),
+    prepareSetupAdminKey: async () => ({ source: "durable", value: key, plan: { backend: "file" } }),
+    cmdVerify: async () => {},
+    cmdProvision: async () => {},
+    cmdMigrate: async () => {},
+    cmdDeploy: async () => {},
+    cmdSecrets: async () => {},
+    cmdDrain: async () => {},
+    cmdHealth: async () => {},
+    rememberInstalledManifest: () => ({}),
+    cmdIngest: async () => acceptedReceipt,
+    vectorStatus: async () => readyVectorStatus,
+    ...overrides,
+  });
+  const captureSetupOutput = async (action) => {
+    const output = [];
+    const original = console.log;
+    console.log = (...parts) => { output.push(parts.join(" ")); };
+    try {
+      return { value: await action(), output: output.join("\n") };
+    } catch (error) {
+      error.fixtureOutput = output.join("\n");
+      throw error;
+    } finally {
+      console.log = original;
+    }
+  };
+
+  let emptyLoadFailure;
+  try {
+    await captureSetupOutput(() => cmdSetup(target, setupWithInitialLoad({
+      cmdIngest: async () => ({
+        scanned: 0, created: 0, updated: 0, unchanged: 0, refused: 0, skipped: 1,
+      }),
+      vectorStatus: async () => { throw new Error("vector status must not run for an empty load"); },
+    })));
+  } catch (error) {
+    emptyLoadFailure = error;
+  }
+  assert.match(emptyLoadFailure?.message || "", /no accepted document.*not reported as live/i);
+  assert.doesNotMatch(emptyLoadFailure?.fixtureOutput || "", /Your brain is live/i);
+
+  let unknownVectorFailure;
+  try {
+    await captureSetupOutput(() => cmdSetup(target, setupWithInitialLoad({
+      vectorStatus: async () => { throw new Error("fixture documents endpoint stalled"); },
+    })));
+  } catch (error) {
+    unknownVectorFailure = error;
+  }
+  assert.match(unknownVectorFailure?.message || "", /could not prove its D1 and Vectorize state/i);
+  assert.doesNotMatch(unknownVectorFailure?.fixtureOutput || "", /Your brain is live/i);
+
+  let unreadyEmptyQueueFailure;
+  try {
+    await captureSetupOutput(() => cmdSetup(target, setupWithInitialLoad({
+      vectorStatus: async () => ({ ...readyVectorStatus, ready: false }),
+    })));
+  } catch (error) {
+    unreadyEmptyQueueFailure = error;
+  }
+  assert.match(unreadyEmptyQueueFailure?.message || "", /could not prove its D1 and Vectorize state/i);
+  assert.doesNotMatch(unreadyEmptyQueueFailure?.fixtureOutput || "", /Your brain is live/i);
+
+  const loading = await captureSetupOutput(() => cmdSetup(target, setupWithInitialLoad({
+    vectorStatus: async () => ({
+      ...readyVectorStatus,
+      ready: false,
+      pending: 2,
+      upserts: 2,
+      actual_vectors: 0,
+    }),
+  })));
+  assert.match(loading.output, /files are stored\. Meaning-based search is still loading/i);
+  assert.match(loading.output, /2 chunk\(s\).*brain drain/is);
+  assert.doesNotMatch(loading.output, /Your brain is live|Ask it directly/i);
+
+  const readyLoad = await captureSetupOutput(() => cmdSetup(target, setupWithInitialLoad()));
+  assert.match(readyLoad.output, /Your brain is live/i);
+  assert.match(readyLoad.output, /Ask it directly/i);
 
   if (process.platform !== "win32") {
     const { mode } = lstatSync(target);
