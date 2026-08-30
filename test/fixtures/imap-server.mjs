@@ -32,10 +32,19 @@ export class Folder {
     this.nextUid = 1;
   }
 
-  add(raw, { internaldate = "13-Aug-2026 10:22:31 +0000", uid = null } = {}) {
+  add(raw, {
+    internaldate = "13-Aug-2026 10:22:31 +0000",
+    uid = null,
+    declaredSize = null,
+  } = {}) {
     const assigned = uid ?? this.nextUid++;
     if (assigned >= this.nextUid) this.nextUid = assigned + 1;
-    this.messages.set(assigned, { uid: assigned, raw: Buffer.from(raw, "utf-8"), internaldate });
+    this.messages.set(assigned, {
+      uid: assigned,
+      raw: Buffer.from(raw, "utf-8"),
+      internaldate,
+      declaredSize: Number.isSafeInteger(declaredSize) && declaredSize >= 0 ? declaredSize : null,
+    });
     return assigned;
   }
 
@@ -45,7 +54,12 @@ export class Folder {
     const ordered = [...this.messages.values()].sort((a, b) => a.uid - b.uid);
     this.messages = new Map();
     this.nextUid = 1;
-    for (const message of ordered) this.add(message.raw.toString("utf-8"), { internaldate: message.internaldate });
+    for (const message of ordered) {
+      this.add(message.raw.toString("utf-8"), {
+        internaldate: message.internaldate,
+        declaredSize: message.declaredSize,
+      });
+    }
   }
 
   uids() {
@@ -202,8 +216,13 @@ export class ScriptedImapServer {
               const message = selected.messages.get(uid);
               seq++;
               if (!message) continue;
+              // `declaredSize` lets a fixture model a provider's oversized
+              // message metadata without allocating the attachment bytes. The
+              // production client fetches sizes first and therefore never asks
+              // this server for that body's literal.
+              const messageSize = message.declaredSize ?? message.raw.length;
               const head =
-                `* ${seq} FETCH (UID ${uid} INTERNALDATE "${message.internaldate}" RFC822.SIZE ${message.raw.length}`;
+                `* ${seq} FETCH (UID ${uid} INTERNALDATE "${message.internaldate}" RFC822.SIZE ${messageSize}`;
               if (!wantBody) { socket.write(`${head})${CRLF}`); continue; }
               socket.write(`${head} BODY[] {${message.raw.length}}${CRLF}`);
               socket.write(message.raw);

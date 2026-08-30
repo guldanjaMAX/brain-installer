@@ -34,9 +34,20 @@
 //
 // Every persona, address and domain below is invented.
 
-import { rmSync, mkdtempSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { Folder, ScriptedImapServer } from "./fixtures/imap-server.mjs";
 import * as imap from "../connectors/imap.mjs";
@@ -53,6 +64,10 @@ const check = (name, condition, detail = "") => {
 };
 
 const sandbox = mkdtempSync(join(tmpdir(), "imap-test-"));
+const HERE = dirname(fileURLToPath(import.meta.url));
+const CLI = join(HERE, "..", "brain.mjs");
+const LOAD_FETCH = pathToFileURL(join(HERE, "fixtures", "imap-load-fetch.mjs")).href;
+const stripAnsi = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, "");
 
 /* ------------------------------------------------------------- fixtures */
 
@@ -134,6 +149,108 @@ function buildServer(options = {}) {
       new Folder("[Gmail]", { uidvalidity: 4008, flags: ["\\Noselect", "\\HasChildren"] }),
     ],
   });
+}
+
+/**
+ * Run the real `brain ingest --from imap` command against a synthetic TLS
+ * mailbox and an in-process Worker fixture. The returned state and source
+ * receipts are the actual completion boundary used by `brain load` and source
+ * health, not a second test-only classifier.
+ */
+async function runImapLoadScenario({ name, identity, folders }) {
+  // Admin-key custody rejects a path whose spelling crosses the macOS
+  // `/var` -> `/private/var` link. Use the canonical fixture root just as a
+  // real manifest locator would be canonicalized before installation.
+  const directory = join(realpathSync(sandbox), `load-${name}`);
+  const userRoot = join(directory, "home");
+  const brainRoot = join(userRoot, ".brain");
+  const manifestPath = join(directory, "brain.manifest.json");
+  const statePath = join(directory, ".brain-ingest-mailbox.json");
+  const evidencePath = join(directory, "evidence.json");
+  const certPath = join(directory, "fixture-ca.pem");
+  mkdirSync(brainRoot, { recursive: true, mode: 0o700 });
+  chmodSync(userRoot, 0o700);
+  chmodSync(brainRoot, 0o700);
+
+  const server = new ScriptedImapServer({
+    username: "owner@northwind-example.test",
+    password: "abcdefghijklmnop",
+    folders,
+    tls: { key: identity.private, cert: identity.cert },
+  });
+  await server.listen();
+
+  writeFileSync(manifestPath, `${JSON.stringify({
+    manifest_version: 1,
+    client: { slug: "northwind", display_name: "Northwind Studio", timezone: "America/Phoenix" },
+    brain: { version: "0.2.1", domain: "fixture.invalid", worker_name: "northwind-brain" },
+    infrastructure: {
+      cloudflare: { account_id: "fixture-account", storage: "d1", d1_database_id: "fixture-db" },
+    },
+    safety: { credential_scanner: { enabled: false } },
+    corpora: { imap: { enabled: true, source: "mailbox" } },
+  }, null, 2)}\n`);
+  writeFileSync(join(directory, ".brain-admin-key"), "fixture-admin-key-for-offline-imap-test", { mode: 0o600 });
+  writeFileSync(join(brainRoot, "imap-credentials.json"), `${JSON.stringify({
+    imap: {
+      host: "127.0.0.1",
+      port: server.port,
+      username: server.username,
+      password: server.password,
+      connected_at: "2026-08-30T00:00:00.000Z",
+    },
+  }, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(evidencePath, `${JSON.stringify({ receipts: [], ingested: 0, reconciliations: 0 })}\n`, { mode: 0o600 });
+  writeFileSync(certPath, identity.cert, { mode: 0o600 });
+
+  const environment = { ...process.env };
+  for (const key of [
+    "ADMIN_KEY",
+    "BRAIN_DEBUG",
+    "CLOUDFLARE_API_TOKEN",
+    "GOOGLE_CLIENT_ID",
+    "GOOGLE_CLIENT_SECRET",
+    "NODE_OPTIONS",
+  ]) delete environment[key];
+  Object.assign(environment, {
+    HOME: userRoot,
+    BRAIN_IMAP_CREDENTIAL_STORE: "file",
+    BRAIN_IMAP_LOAD_EVIDENCE_PATH: evidencePath,
+    BRAIN_IMAP_LOAD_USER_ROOT: userRoot,
+    NODE_EXTRA_CA_CERTS: certPath,
+  });
+
+  let output = "";
+  let code = null;
+  try {
+    const child = spawn(process.execPath, [
+      "--import", LOAD_FETCH,
+      CLI, "ingest", manifestPath, "--from", "imap", "--source", "mailbox",
+    ], {
+      cwd: directory,
+      env: environment,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.on("data", (chunk) => { output += chunk.toString("utf8"); });
+    child.stderr.on("data", (chunk) => { output += chunk.toString("utf8"); });
+    code = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error(`the ${name} IMAP CLI fixture timed out`));
+      }, 30_000);
+      child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+      child.once("close", (status) => { clearTimeout(timeout); resolve(status); });
+    });
+  } finally {
+    await server.close();
+  }
+
+  return {
+    code,
+    output: stripAnsi(output),
+    state: existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : null,
+    evidence: JSON.parse(readFileSync(evidencePath, "utf8")),
+  };
 }
 
 async function connected(server) {
@@ -598,6 +715,84 @@ try {
       String(certificateError?.message));
   } finally {
     await tlsServer.close();
+  }
+
+  /* ============================================================ *
+   * 13. Real CLI source-health and watermark classification.
+   * ============================================================ */
+  {
+    const inbox = new Folder("INBOX", { uidvalidity: 8101 });
+    inbox.add(ENGAGEMENT);
+    inbox.add(NEWSLETTER);
+    const policy = await runImapLoadScenario({
+      name: "policy-only",
+      identity,
+      folders: [
+        inbox,
+        new Folder("Sent", { uidvalidity: 8102, flags: ["\\Sent"] }),
+        new Folder("Bulk Mail", { uidvalidity: 8103 }),
+      ],
+    });
+    const finalReceipt = policy.evidence.receipts.at(-1);
+    check("load health: a skipped junk folder and a two-signal bulk message stay completed within explicit policy",
+      policy.code === 0 && finalReceipt?.status === "ready" && finalReceipt?.walk_complete === true &&
+        /policy_skipped=2; coverage_gaps=0/.test(finalReceipt?.detail || ""),
+      JSON.stringify({ code: policy.code, receipt: finalReceipt, output: policy.output.slice(-500) }));
+    check("load health: a policy-complete IMAP run commits the exact folder watermark",
+      policy.state?.imap_folders?.INBOX?.uidvalidity === 8101 &&
+        policy.state?.imap_folders?.INBOX?.last_uid === 2 &&
+        policy.state?.imap_folders?.Sent?.uidvalidity === 8102,
+      JSON.stringify(policy.state?.imap_folders));
+  }
+
+  {
+    const inbox = new Folder("INBOX", { uidvalidity: 8201 });
+    inbox.add(ENGAGEMENT);
+    const uncovered = await runImapLoadScenario({
+      name: "uncovered-folders",
+      identity,
+      folders: [
+        inbox,
+        new Folder("Archive", { uidvalidity: 8202, flags: ["\\Archive"] }),
+        new Folder("Projekte", { uidvalidity: 8203 }),
+      ],
+    });
+    const finalReceipt = uncovered.evidence.receipts.at(-1);
+    check("load health: an identified-but-unlisted and an unclassified folder close the source as partial/error",
+      uncovered.code === 1 && finalReceipt?.status === "error" && finalReceipt?.walk_complete === false &&
+        /coverage_gaps=2/.test(finalReceipt?.detail || "") && /partial coverage/i.test(uncovered.output),
+      JSON.stringify({ code: uncovered.code, receipt: finalReceipt, output: uncovered.output.slice(-700) }));
+    check("load health: uncovered folders withhold every newly observed IMAP watermark while keeping accepted work resumable",
+      uncovered.state?.done && Object.keys(uncovered.state.done).length === 1 &&
+        !Object.hasOwn(uncovered.state, "imap_folders"),
+      JSON.stringify(uncovered.state));
+  }
+
+  {
+    const inbox = new Folder("INBOX", { uidvalidity: 8301 });
+    inbox.add(ENGAGEMENT);
+    inbox.add("\r\n");
+    inbox.add(message({
+      messageId: "oversized-attachment@northwind-example.test",
+      from: "Morgan Diaz <morgan.diaz@northwind-example.test>",
+      subject: "Large attachment",
+      body: "The real fixture body remains small because only the advertised size is relevant.",
+    }), { declaredSize: imap.MAX_MESSAGE_BYTES + 1 });
+    const messageGaps = await runImapLoadScenario({
+      name: "message-gaps",
+      identity,
+      folders: [inbox],
+    });
+    const finalReceipt = messageGaps.evidence.receipts.at(-1);
+    check("load health: unreadable and oversized messages are coverage gaps, not bulk-policy exclusions",
+      messageGaps.code === 1 && finalReceipt?.status === "error" &&
+        /skipped=2; policy_skipped=0; coverage_gaps=2/.test(finalReceipt?.detail || "") &&
+        /over the \S+MB limit/.test(messageGaps.output),
+      JSON.stringify({ code: messageGaps.code, detail: finalReceipt?.detail, output: messageGaps.output.slice(-800) }));
+    check("load health: unreadable or oversized mail withholds the IMAP watermark instead of advancing past loss",
+      messageGaps.state?.done && Object.keys(messageGaps.state.done).length === 1 &&
+        !Object.hasOwn(messageGaps.state, "imap_folders"),
+      JSON.stringify(messageGaps.state));
   }
 
   await server.close();
