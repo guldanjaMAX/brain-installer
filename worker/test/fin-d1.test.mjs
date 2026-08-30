@@ -29,6 +29,7 @@ const LEDGER_DEPENDENT_MIGRATIONS = new Set([
   LEDGER_MIGRATION,
   "0021_owner_workspace.sql",
   "0026_plaid_durability.sql",
+  "0029_plaid_provider_outcomes.sql",
 ]);
 
 let fail = 0, ran = 0;

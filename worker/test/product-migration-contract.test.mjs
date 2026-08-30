@@ -65,13 +65,14 @@ function addedColumn(statement) {
   return match ? { table: match[1], column: match[2], type: match[3].toUpperCase() } : null;
 }
 
-test("owner and security migrations resume after every statement boundary", async () => {
+test("selected product migrations resume after every statement boundary", async () => {
   const context = await migrationContext();
   const targets = (process.env.PRODUCT_CONTRACT_MIGRATIONS || [
     "0021_owner_workspace.sql",
     "0022_document_access_passkey_observability.sql",
     "0023_support_sessions.sql",
     "0025_zoom_deliveries.sql",
+    "0029_plaid_provider_outcomes.sql",
   ].join(",")).split(",").map((name) => name.trim()).filter(Boolean);
 
   for (const target of targets) {

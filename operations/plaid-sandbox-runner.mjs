@@ -2,7 +2,9 @@
 
 import { fileURLToPath } from "node:url";
 import {
+  PLAID_HISTORY_STATE,
   buildPlaidLinkTokenRequest,
+  mergePlaidHistoryState,
   plaidExchangeDecision,
   plaidLinkCompletion,
   plaidLinkTokenDecision,
@@ -65,6 +67,7 @@ export class CredentialFreePlaidFake {
         removed: [],
         next_cursor: "page-2",
         has_more: true,
+        transactions_update_status: "INITIAL_UPDATE_COMPLETE",
       };
     }
     if (cursor === "page-2" && !this.mutationRaised) {
@@ -92,6 +95,7 @@ export class CredentialFreePlaidFake {
         removed: [{ transaction_id: "removed-1" }],
         next_cursor: "complete-1",
         has_more: false,
+        transactions_update_status: "HISTORICAL_UPDATE_COMPLETE",
       };
     }
     throw new Error(`unexpected fake cursor: ${cursor}`);
@@ -99,7 +103,9 @@ export class CredentialFreePlaidFake {
 
   async remove() {
     this.removeCalls += 1;
-    if (this.removeCalls === 1) return { removed: false, errorCode: "FAKE_NETWORK_LOSS" };
+    if (this.removeCalls === 1) {
+      return { removed: false, outcomeUnknown: true, errorCode: "FAKE_NETWORK_LOSS" };
+    }
     return { removed: true };
   }
 }
@@ -199,6 +205,8 @@ export async function runPlaidSandboxRehearsal() {
     staged.get(0).added[0].isoCurrencyCode === "USD" && staged.get(1).added[0].unofficialCurrencyCode === "XBT");
   check("provider provenance survives",
     staged.get(1).added[0].provenance.endpoint === "/transactions/sync");
+  check("historical readiness comes from Plaid rather than an empty page",
+    promotion.historyState === PLAID_HISTORY_STATE.HISTORICAL);
 
   const rawWebhook = JSON.stringify({
     webhook_type: "TRANSACTIONS",
@@ -228,8 +236,9 @@ export async function runPlaidSandboxRehearsal() {
   check("signed webhook refuses altered raw bytes", alteredBodyRefused);
   check("valid transaction webhook schedules reconciliation",
     plaidWebhookDisposition({ issuedAt, payload: JSON.parse(rawWebhook) }).scheduleReconciliation === true);
-  check("replayed delivery is ignored",
-    plaidWebhookDisposition({ deliverySeen: true, issuedAt, payload: JSON.parse(rawWebhook) }).state === "replay");
+  const replay = plaidWebhookDisposition({ deliverySeen: true, issuedAt, payload: JSON.parse(rawWebhook) });
+  check("replayed delivery remains eligible to repair reconciliation debt",
+    replay.state === "replay" && replay.scheduleReconciliation === true);
   const outOfOrder = plaidWebhookDisposition({
     issuedAt: issuedAt - 60,
     lastIssuedAt: issuedAt,
@@ -259,10 +268,12 @@ export async function runPlaidSandboxRehearsal() {
 }
 
 async function liveSandboxCall(path, body, { clientId, secret, fetchImpl = fetch } = {}) {
+  const singleShot = path === "/item/public_token/exchange" || path === "/item/remove";
   const { data } = await providerJson("plaid-sandbox", `https://sandbox.plaid.com${path}`, {
     method: "POST",
     body: { client_id: clientId, secret, ...body },
     fetchImpl,
+    ...(singleShot ? { maxAttempts: 1 } : {}),
     maxResponseBytes: 2 * 1024 * 1024,
   });
   return data || {};
@@ -289,12 +300,18 @@ export async function runPlaidLiveSandbox({
     mode: "live-sandbox",
     fieldProof: false,
     liveSandboxProof: false,
+    providerApiProof: false,
+    routeD1Proof: false,
     disposableItemCreated: false,
     publicTokenExchanged: false,
     syncWindowCompleted: false,
+    history_state: "running",
+    provider_history_state: PLAID_HISTORY_STATE.UNKNOWN,
+    historical_update_complete: false,
     transactionRefreshRequested: false,
     loginReset: false,
     updateTokenCreated: false,
+    updateHealthProven: false,
     webhookRequested: false,
     webhookDeliveryProven: false,
     providerRemovalConfirmed: false,
@@ -333,10 +350,17 @@ export async function runPlaidLiveSandbox({
       cursor = page.next_cursor;
       receipt.pages += 1;
       receipt.transactionsSeen += (page.added || []).length + (page.modified || []).length;
+      receipt.provider_history_state = mergePlaidHistoryState(
+        receipt.provider_history_state,
+        page.transactions_update_status,
+      );
       hasMore = page.has_more === true;
     }
     if (hasMore) throw new Error("Plaid Sandbox sync exceeded the bounded page allowance");
     receipt.syncWindowCompleted = true;
+    receipt.historical_update_complete =
+      receipt.provider_history_state === PLAID_HISTORY_STATE.HISTORICAL;
+    receipt.history_state = receipt.historical_update_complete ? "complete" : "running";
 
     await liveSandboxCall("/sandbox/transactions/refresh", {
       access_token: accessToken,
@@ -369,9 +393,11 @@ export async function runPlaidLiveSandbox({
       // must be checked separately after the runner returns.
       receipt.webhookDeliveryProven = false;
     }
-    receipt.liveSandboxProof = receipt.disposableItemCreated && receipt.publicTokenExchanged &&
+    receipt.providerApiProof = receipt.disposableItemCreated && receipt.publicTokenExchanged &&
       receipt.syncWindowCompleted && receipt.transactionRefreshRequested && receipt.loginReset &&
-      receipt.updateTokenCreated;
+      receipt.updateTokenCreated && receipt.historical_update_complete;
+    receipt.liveSandboxProof = receipt.providerApiProof && receipt.routeD1Proof &&
+      receipt.updateHealthProven;
     return receipt;
   } finally {
     if (accessToken) {
@@ -384,6 +410,7 @@ export async function runPlaidLiveSandbox({
         receipt.providerRemovalConfirmed = false;
       }
     }
+    receipt.providerApiProof = receipt.providerApiProof && receipt.providerRemovalConfirmed;
     receipt.liveSandboxProof = receipt.liveSandboxProof && receipt.providerRemovalConfirmed;
   }
 }

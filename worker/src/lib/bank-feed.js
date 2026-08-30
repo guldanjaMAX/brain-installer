@@ -1355,7 +1355,9 @@ export async function handleBankFeed(env, request, url, path, ctx) {
       if (!access.authorised && !operatorAuthorised()) return ownerRefusal(access);
       const body = await readJson(request);
       if (!body.item_ref) return jsonResponse({ error: "name the connection to disconnect" }, 400);
-      return jsonResponse(await disconnectItem(env, String(body.item_ref)));
+      return jsonResponse(await disconnectItem(env, String(body.item_ref), {
+        fetchImpl: ctx?.bankFeedFetchImpl || fetch,
+      }));
     }
 
     return jsonResponse({ error: "not found" }, 404);

@@ -131,6 +131,65 @@ for (const trigger of ["vector_outbox_generation_ai", "vector_outbox_generation_
   check(`trigger ${trigger} exists`, names.has(trigger), "outbox generations could reuse a stale drain token");
 }
 
+/* ---- 0029 preserves Plaid readiness and destructive outcome certainty ---- */
+{
+  for (const [table, column] of [
+    ["bank_feed_backfill", "provider_history_state"],
+    ["plaid_sync_windows", "provider_history_state"],
+    ["plaid_revocation_outbox", "outcome_state"],
+  ]) {
+    const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name));
+    check(`${table}.${column} exists`, columns.has(column), [...columns].join(", "));
+  }
+
+  const legacy = new DatabaseSync(":memory:");
+  for (const file of files.filter((name) => name < "0029_")) {
+    for (const statement of splitStatements(readFileSync(join(DIR, file), "utf-8"))) legacy.exec(statement);
+  }
+  legacy.exec(`
+    INSERT INTO bank_feed_backfill
+      (tenant_id,item_ref,requested_days,state,queued_at,finished_at)
+    VALUES ('primary','legacy-complete',730,'complete','2026-01-01T00:00:00Z','2026-01-02T00:00:00Z');
+    INSERT INTO plaid_revocation_outbox
+      (tenant_id,item_ref,state,attempts,next_attempt_at,requested_at,updated_at,confirmed_at)
+    VALUES
+      ('primary','legacy-confirmed','confirmed',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'),
+      ('primary','legacy-unattempted','pending',0,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL),
+      ('primary','legacy-ambiguous','retryable',2,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL);
+  `);
+  for (const statement of splitStatements(
+    readFileSync(join(DIR, "0029_plaid_provider_outcomes.sql"), "utf-8"),
+  )) legacy.exec(statement);
+
+  const legacyBackfill = legacy.prepare(
+    "SELECT state,provider_history_state FROM bank_feed_backfill WHERE item_ref='legacy-complete'",
+  ).get();
+  check("a legacy complete backfill does not invent Plaid historical proof",
+    legacyBackfill.state === "complete" &&
+      legacyBackfill.provider_history_state === "TRANSACTIONS_UPDATE_STATUS_UNKNOWN",
+    JSON.stringify(legacyBackfill));
+  const legacyOutcomes = Object.fromEntries(legacy.prepare(
+    "SELECT item_ref,outcome_state FROM plaid_revocation_outbox ORDER BY item_ref",
+  ).all().map((row) => [row.item_ref, row.outcome_state]));
+  check("legacy revocations distinguish confirmed, unattempted, and ambiguous outcomes",
+    legacyOutcomes["legacy-confirmed"] === "confirmed" &&
+      legacyOutcomes["legacy-unattempted"] === "not_attempted" &&
+      legacyOutcomes["legacy-ambiguous"] === "unknown",
+    JSON.stringify(legacyOutcomes));
+
+  let invalidHistoryRefused = false;
+  let invalidOutcomeRefused = false;
+  try {
+    legacy.prepare("UPDATE bank_feed_backfill SET provider_history_state='made_up'").run();
+  } catch { invalidHistoryRefused = true; }
+  try {
+    legacy.prepare("UPDATE plaid_revocation_outbox SET outcome_state='maybe'").run();
+  } catch { invalidOutcomeRefused = true; }
+  check("Plaid provider history accepts only the reviewed readiness states", invalidHistoryRefused);
+  check("Plaid removal outcomes accept only the reviewed certainty states", invalidOutcomeRefused);
+  legacy.close();
+}
+
 /* queued_at is allowed to collide; the database-owned generation is not. */
 {
   db.prepare(

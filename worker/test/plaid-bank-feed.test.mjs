@@ -63,6 +63,7 @@ class PlaidSandboxFake {
     this.exchangeAvailable = true;
     this.exchangeDelayMs = 0;
     this.healthAvailable = true;
+    this.historySequence = null;
     this.removeAvailable = false;
     this.publicJwk = null;
   }
@@ -117,6 +118,17 @@ class PlaidSandboxFake {
       }] });
     }
     if (path === "/transactions/sync") {
+      if (Array.isArray(this.historySequence) && this.historySequence.length > 0) {
+        const state = this.historySequence.shift();
+        return jsonResponse({
+          added: [],
+          modified: [],
+          removed: [],
+          next_cursor: `history-${this.count("/transactions/sync")}`,
+          has_more: false,
+          transactions_update_status: state,
+        });
+      }
       if (!body.cursor) return jsonResponse({
         added: [{
           transaction_id: "pending-1",
@@ -131,6 +143,7 @@ class PlaidSandboxFake {
         removed: [],
         next_cursor: "page-2",
         has_more: true,
+        transactions_update_status: "INITIAL_UPDATE_COMPLETE",
       });
       if (body.cursor === "page-2" && !this.mutationRaised) {
         this.mutationRaised = true;
@@ -157,9 +170,11 @@ class PlaidSandboxFake {
         removed: [{ transaction_id: "withdrawn-1" }],
         next_cursor: "complete-1",
         has_more: false,
+        transactions_update_status: "HISTORICAL_UPDATE_COMPLETE",
       });
       if (body.cursor === "complete-1") return jsonResponse({
         added: [], modified: [], removed: [], next_cursor: "complete-2", has_more: false,
+        transactions_update_status: "HISTORICAL_UPDATE_COMPLETE",
       });
       throw new Error(`unexpected sync cursor ${body.cursor}`);
     }
@@ -317,29 +332,73 @@ test("Plaid durable runtime closes response-loss, sync, webhook, fallback, and r
     ), fixture.env, { waitUntil() {} });
     assert.equal(publicRouteRefusal.status, 401);
     const signed = await signedWebhook(rawBody, issuedAt);
+    signed.publicJwk.expired_at = issuedAt + 60;
     provider.publicJwk = signed.publicJwk;
     const request = () => new Request("https://brain.invalid/api/webhooks/plaid", {
       method: "POST",
       headers: { "Plaid-Verification": signed.jwt, "Content-Type": "application/json" },
       body: rawBody,
     });
-    assert.equal((await handlePlaidWebhook(fixture.env, request(), { fetchImpl, now: stamp })).status, 200);
+    fixture.raw("DELETE FROM plaid_reconciliation WHERE item_ref='item-sandbox-1'");
+    fixture.control.failNextBatch = true;
+    await assert.rejects(handlePlaidWebhook(fixture.env, request(), { fetchImpl, now: stamp }));
+    assert.equal(fixture.first("SELECT COUNT(*) AS n FROM plaid_webhook_events").n, 0);
+    assert.equal(fixture.first("SELECT COUNT(*) AS n FROM plaid_reconciliation").n, 0);
+
     assert.equal((await handlePlaidWebhook(fixture.env, request(), { fetchImpl, now: stamp })).status, 200);
     assert.equal(fixture.first("SELECT COUNT(*) AS n FROM plaid_webhook_events").n, 1);
     assert.equal(fixture.first("SELECT state FROM plaid_reconciliation WHERE item_ref='item-sandbox-1'").state, "pending");
+    assert.equal(fixture.first(
+      "SELECT expires_at FROM plaid_webhook_keys WHERE key_id='fixture-plaid-key'",
+    ).expires_at, new Date((issuedAt + 60) * 1000).toISOString());
+    assert.equal(provider.count("/webhook_verification_key/get"), 1);
+
+    fixture.raw("DELETE FROM plaid_reconciliation WHERE item_ref='item-sandbox-1'");
+    assert.equal((await handlePlaidWebhook(fixture.env, request(), { fetchImpl, now: stamp })).status, 200);
+    assert.equal(fixture.first(
+      "SELECT reason FROM plaid_reconciliation WHERE item_ref='item-sandbox-1'",
+    ).reason, "webhook_replay_repair");
+    assert.equal(provider.count("/webhook_verification_key/get"), 1);
+
+    fixture.raw(
+      "UPDATE plaid_webhook_keys SET expires_at='2026-08-30T12:59:59.000Z' WHERE key_id='fixture-plaid-key'",
+    );
+    assert.equal((await handlePlaidWebhook(fixture.env, request(), { fetchImpl, now: stamp })).status, 200);
+    assert.equal(provider.count("/webhook_verification_key/get"), 2);
+
+    fixture.raw("DELETE FROM plaid_webhook_keys WHERE key_id='fixture-plaid-key'");
+    provider.publicJwk.expired_at = issuedAt - 1;
+    assert.equal((await handlePlaidWebhook(fixture.env, request(), { fetchImpl, now: stamp })).status, 401);
+    assert.equal(provider.count("/webhook_verification_key/get"), 3);
+    provider.publicJwk.expired_at = issuedAt + 60;
 
     const scheduled = await runPlaidFeedSlice(fixture.env, { maxItems: 1, fetchImpl, now: stamp });
     assert.equal(scheduled.ran, 1);
     assert.equal(fixture.first("SELECT cursor FROM bank_feed_items WHERE item_ref='item-sandbox-1'").cursor, "complete-2");
 
     const firstDisconnect = await disconnectPlaidItem(fixture.env, "item-sandbox-1", { fetchImpl, now: stamp });
-    assert.equal(firstDisconnect.revocation_state, "retryable");
+    assert.equal(firstDisconnect.revocation_state, "unknown");
+    assert.equal(firstDisconnect.outcome_unknown, true);
+    assert.equal(firstDisconnect.retry_safe, false);
+    assert.equal(provider.count("/item/remove"), 1);
+    assert.equal(fixture.first(
+      "SELECT outcome_state FROM plaid_revocation_outbox WHERE item_ref='item-sandbox-1'",
+    ).outcome_state, "unknown");
     assert.notEqual(fixture.first("SELECT access_ciphertext FROM bank_feed_items WHERE item_ref='item-sandbox-1'").access_ciphertext,
       "REMOVED0000000000000000");
+    provider.healthAvailable = false;
+    fixture.raw("UPDATE plaid_revocation_outbox SET next_attempt_at=? WHERE item_ref='item-sandbox-1'", stamp);
+    const unresolved = await drainPlaidRevocations(fixture.env, { maxItems: 1, fetchImpl, now: stamp });
+    assert.equal(unresolved.items[0].outcome_unknown, true);
+    assert.equal(provider.count("/item/remove"), 1);
+    provider.healthAvailable = true;
     provider.removeAvailable = true;
     fixture.raw("UPDATE plaid_revocation_outbox SET next_attempt_at=? WHERE item_ref='item-sandbox-1'", stamp);
     const drained = await drainPlaidRevocations(fixture.env, { maxItems: 1, fetchImpl, now: stamp });
     assert.equal(drained.items[0].confirmed, true);
+    assert.equal(drained.items[0].outcome_state, "confirmed");
+    assert.equal(provider.count("/item/remove"), 2);
+    assert.equal(provider.count("/item/get"), 4);
     assert.equal(fixture.first("SELECT access_ciphertext FROM bank_feed_items WHERE item_ref='item-sandbox-1'").access_ciphertext,
       "REMOVED0000000000000000");
     const status = await plaidFeedStatus(fixture.env);
@@ -452,6 +511,97 @@ test("concurrent exchange retries atomically claim one single-use public token",
     assert.equal(durableReplay.status, 200);
     assert.equal((await durableReplay.json()).item_ref, "item-sandbox-1");
     assert.equal(provider.count("/item/public_token/exchange"), 1);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("empty Transactions Sync stays partial through NOT_READY and INITIAL provider states", async () => {
+  const fixture = await createProductFixture({
+    env: {
+      BANK_FEED_PROVIDER: "plaid",
+      BANK_FEED_ENV: "sandbox",
+      BANK_FEED_CLIENT_ID: "fixture-client-id",
+      BANK_FEED_SECRET: "fixture-secret",
+      BANK_FEED_WRAPPING_KEY_V2: `v2.${"A".repeat(43)}`,
+      BRAIN_NAME: "Sandbox Brain",
+    },
+  });
+  const provider = new PlaidSandboxFake();
+  provider.historySequence = [
+    "NOT_READY",
+    "INITIAL_UPDATE_COMPLETE",
+    "HISTORICAL_UPDATE_COMPLETE",
+  ];
+  const fetchImpl = provider.fetch.bind(provider);
+  const stamp = "2026-08-30T13:00:00.000Z";
+  try {
+    const link = await createPlaidLinkToken(fixture.env, {
+      url: "https://brain.invalid/app/connect/bank",
+      sessionRef: "empty-history-link-0001",
+      fetchImpl,
+      now: stamp,
+    });
+    await completePlaidLink(fixture.env, {
+      sessionRef: link.session_ref,
+      publicToken: "public-sandbox-once",
+      fetchImpl,
+      now: stamp,
+    });
+    fixture.raw(
+      `INSERT INTO bank_feed_backfill
+         (tenant_id,item_ref,requested_days,state,queued_at,started_at,provider_history_state)
+       VALUES ('primary','item-sandbox-2',730,'running',?,?,?)`,
+      stamp, stamp, "NOT_READY",
+    );
+
+    const firstSlice = await runPlaidFeedSlice(fixture.env, { maxItems: 1, fetchImpl, now: stamp });
+    assert.equal(firstSlice.ran, 1);
+    const notReady = firstSlice.items[0];
+    assert.equal(notReady.ok, false);
+    assert.equal(notReady.partial, true);
+    assert.equal(notReady.history_state, "running");
+    assert.equal(notReady.provider_history_state, "NOT_READY");
+    const notReadyBackfill = fixture.first(
+      "SELECT state,provider_history_state,finished_at FROM bank_feed_backfill WHERE item_ref='item-sandbox-1'",
+    );
+    assert.equal(notReadyBackfill.state, "running");
+    assert.equal(notReadyBackfill.provider_history_state, "NOT_READY");
+    assert.equal(notReadyBackfill.finished_at, null);
+    assert.equal(fixture.first(
+      "SELECT reason FROM plaid_reconciliation WHERE item_ref='item-sandbox-1'",
+    ).reason, "history_pending");
+    const partialStatus = await plaidFeedStatus(fixture.env);
+    assert.equal(partialStatus.connections[0].history.state, "running");
+    assert.equal(partialStatus.connections[0].history.provider_history_state, "NOT_READY");
+    assert.equal(partialStatus.connections[0].history.partial, true);
+
+    const initial = await syncPlaidItem(fixture.env, "item-sandbox-1", { fetchImpl, now: stamp });
+    assert.equal(initial.ok, false);
+    assert.equal(initial.partial, true);
+    assert.equal(initial.history_state, "running");
+    assert.equal(initial.provider_history_state, "INITIAL_UPDATE_COMPLETE");
+    assert.equal(fixture.first(
+      "SELECT provider_history_state FROM bank_feed_backfill WHERE item_ref='item-sandbox-1'",
+    ).provider_history_state, "INITIAL_UPDATE_COMPLETE");
+
+    const historical = await syncPlaidItem(fixture.env, "item-sandbox-1", { fetchImpl, now: stamp });
+    assert.equal(historical.ok, true);
+    assert.equal(historical.partial, false);
+    assert.equal(historical.history_state, "complete");
+    assert.equal(historical.provider_history_state, "HISTORICAL_UPDATE_COMPLETE");
+    const completeBackfill = fixture.first(
+      "SELECT state,provider_history_state,finished_at FROM bank_feed_backfill WHERE item_ref='item-sandbox-1'",
+    );
+    assert.equal(completeBackfill.state, "complete");
+    assert.equal(completeBackfill.provider_history_state, "HISTORICAL_UPDATE_COMPLETE");
+    assert.equal(completeBackfill.finished_at, stamp);
+    const untouchedItem = fixture.first(
+      "SELECT state,provider_history_state,finished_at FROM bank_feed_backfill WHERE item_ref='item-sandbox-2'",
+    );
+    assert.equal(untouchedItem.state, "running");
+    assert.equal(untouchedItem.provider_history_state, "NOT_READY");
+    assert.equal(untouchedItem.finished_at, null);
   } finally {
     fixture.close();
   }

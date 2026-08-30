@@ -3,11 +3,14 @@ import { readFileSync } from "node:fs";
 import { PLAID_PROFILE, bankFeedProfile } from "../src/lib/bank-feed-profiles.js";
 import { bankFeedConfig, bankFeedEnabled, connectPageHtml } from "../src/lib/bank-feed.js";
 import {
+  PLAID_HISTORY_STATE,
   PlaidProtocolError,
   buildPlaidLinkTokenRequest,
   plaidExchangeDecision,
   plaidLinkCompletion,
   plaidLinkTokenDecision,
+  mergePlaidHistoryState,
+  normalisePlaidHistoryState,
   plaidRevocationTransition,
   plaidWebhookDisposition,
   stagePlaidSyncWindow,
@@ -185,12 +188,32 @@ check("link completion refuses a mismatched session fingerprint", () => {
 });
 
 check("revocation never erases a token before provider confirmation", () => {
-  assert.equal(plaidRevocationTransition({ state: "pending", providerResult: { removed: false } }).eraseAccessToken, false);
+  const knownNegative = plaidRevocationTransition({ state: "pending", providerResult: { removed: false } });
+  const unknown = plaidRevocationTransition({
+    state: "pending",
+    providerResult: { removed: false, outcomeUnknown: true },
+  });
+  assert.equal(knownNegative.eraseAccessToken, false);
+  assert.equal(knownNegative.outcomeState, "not_removed");
+  assert.equal(knownNegative.retrySafe, true);
+  assert.equal(unknown.eraseAccessToken, false);
+  assert.equal(unknown.outcomeState, "unknown");
+  assert.equal(unknown.retrySafe, false);
   assert.equal(plaidRevocationTransition({ state: "pending", providerResult: { removed: true } }).eraseAccessToken, true);
 });
 
 check("replay and out-of-order webhook states are explicit", () => {
-  assert.equal(plaidWebhookDisposition({ deliverySeen: true }).state, "replay");
+  const replay = plaidWebhookDisposition({
+    deliverySeen: true,
+    payload: {
+      webhook_type: "TRANSACTIONS",
+      webhook_code: "SYNC_UPDATES_AVAILABLE",
+      initial_update_complete: true,
+    },
+  });
+  assert.equal(replay.state, "replay");
+  assert.equal(replay.scheduleReconciliation, true);
+  assert.equal(replay.historyState, PLAID_HISTORY_STATE.INITIAL);
   assert.deepEqual(
     plaidWebhookDisposition({
       issuedAt: 10,
@@ -199,6 +222,34 @@ check("replay and out-of-order webhook states are explicit", () => {
     }).state,
     "out_of_order",
   );
+});
+
+check("Plaid history evidence is monotonic and unknown values never imply completion", () => {
+  assert.equal(normalisePlaidHistoryState("made_up"), PLAID_HISTORY_STATE.UNKNOWN);
+  assert.equal(
+    mergePlaidHistoryState(PLAID_HISTORY_STATE.NOT_READY, PLAID_HISTORY_STATE.INITIAL),
+    PLAID_HISTORY_STATE.INITIAL,
+  );
+  assert.equal(
+    mergePlaidHistoryState(PLAID_HISTORY_STATE.HISTORICAL, PLAID_HISTORY_STATE.NOT_READY),
+    PLAID_HISTORY_STATE.HISTORICAL,
+  );
+});
+
+await checkAsync("an empty initial sync remains partial without historical provider evidence", async () => {
+  let staged = null;
+  const receipt = await stagePlaidSyncWindow({
+    requestPage: async () => ({
+      added: [], modified: [], removed: [], next_cursor: "empty-initial", has_more: false,
+      transactions_update_status: "NOT_READY",
+    }),
+    resetWindow: async () => {},
+    stagePage: async (page) => { staged = page; },
+    promoteWindow: async (promotion) => promotion,
+  });
+  assert.equal(staged.historyState, PLAID_HISTORY_STATE.NOT_READY);
+  assert.equal(receipt.historyState, PLAID_HISTORY_STATE.NOT_READY);
+  assert.deepEqual(receipt.counts, { added: 0, modified: 0, removed: 0 });
 });
 
 await checkAsync("sync refuses to run without durable staging callbacks", async () => {
@@ -233,6 +284,7 @@ await checkAsync("sync resumes a durably staged window without committing an int
         removed: [],
         next_cursor: "resume-complete",
         has_more: false,
+        transactions_update_status: "INITIAL_UPDATE_COMPLETE",
       };
     },
     resetWindow: async () => assert.fail("a valid durable resume must not reset its staged first page"),
@@ -246,6 +298,7 @@ await checkAsync("sync resumes a durably staged window without committing an int
   assert.equal(staged.size, 2);
   assert.equal(committedCursor, "resume-complete");
   assert.deepEqual(receipt.counts, { added: 2, modified: 0, removed: 0 });
+  assert.equal(receipt.historyState, PLAID_HISTORY_STATE.INITIAL);
 });
 
 await checkAsync("webhook verification refuses malformed JWTs", async () => {
@@ -259,7 +312,7 @@ try {
   const receipt = await runPlaidSandboxRehearsal();
   check("credential-free Plaid rehearsal covers the complete protocol", () => {
     assert.equal(receipt.fieldProof, false);
-    assert.equal(receipt.checkCount, 20);
+    assert.equal(receipt.checkCount, 21);
     assert.equal(receipt.providerCalls.exchange, 1);
     assert.equal(receipt.providerCalls.remove, 2);
   });
@@ -276,7 +329,10 @@ await checkAsync("live Sandbox runner is bounded, sanitized, and removes its dis
     const payloads = {
       "/sandbox/public_token/create": { public_token: "public-live-fixture" },
       "/item/public_token/exchange": { item_id: "item-live-fixture", access_token: "access-live-fixture" },
-      "/transactions/sync": { added: [], modified: [], removed: [], next_cursor: "cursor-live-1", has_more: false },
+      "/transactions/sync": {
+        added: [], modified: [], removed: [], next_cursor: "cursor-live-1", has_more: false,
+        transactions_update_status: "HISTORICAL_UPDATE_COMPLETE",
+      },
       "/sandbox/transactions/refresh": { request_id: "refresh" },
       "/sandbox/item/reset_login": { reset_login: true },
       "/link/token/create": { link_token: "link-live-fixture" },
@@ -295,7 +351,13 @@ await checkAsync("live Sandbox runner is bounded, sanitized, and removes its dis
     webhookUri: "https://fixture.example/api/webhooks/plaid",
     fetchImpl,
   });
-  assert.equal(receipt.liveSandboxProof, true);
+  assert.equal(receipt.providerApiProof, true);
+  assert.equal(receipt.liveSandboxProof, false);
+  assert.equal(receipt.routeD1Proof, false);
+  assert.equal(receipt.updateHealthProven, false);
+  assert.equal(receipt.history_state, "complete");
+  assert.equal(receipt.provider_history_state, "HISTORICAL_UPDATE_COMPLETE");
+  assert.equal(receipt.historical_update_complete, true);
   assert.equal(receipt.providerRemovalConfirmed, true);
   assert.equal(receipt.webhookRequested, true);
   assert.equal(receipt.webhookDeliveryProven, false);

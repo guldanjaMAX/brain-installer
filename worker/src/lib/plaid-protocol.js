@@ -5,6 +5,19 @@ export const PLAID_SYNC_COUNT = 500;
 export const PLAID_WEBHOOK_MAX_AGE_SECONDS = 5 * 60;
 export const PLAID_WEBHOOK_FUTURE_SKEW_SECONDS = 30;
 export const PLAID_MUTATION_CODE = "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION";
+export const PLAID_HISTORY_STATE = Object.freeze({
+  UNKNOWN: "TRANSACTIONS_UPDATE_STATUS_UNKNOWN",
+  NOT_READY: "NOT_READY",
+  INITIAL: "INITIAL_UPDATE_COMPLETE",
+  HISTORICAL: "HISTORICAL_UPDATE_COMPLETE",
+});
+
+const PLAID_HISTORY_RANK = new Map([
+  [PLAID_HISTORY_STATE.UNKNOWN, 0],
+  [PLAID_HISTORY_STATE.NOT_READY, 1],
+  [PLAID_HISTORY_STATE.INITIAL, 2],
+  [PLAID_HISTORY_STATE.HISTORICAL, 3],
+]);
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -27,6 +40,26 @@ function requiredText(value, field) {
 function optionalText(value) {
   const text = String(value || "").trim();
   return text || null;
+}
+
+export function normalisePlaidHistoryState(value) {
+  const state = optionalText(value);
+  return PLAID_HISTORY_RANK.has(state) ? state : PLAID_HISTORY_STATE.UNKNOWN;
+}
+
+export function mergePlaidHistoryState(current, observed) {
+  const left = normalisePlaidHistoryState(current);
+  const right = normalisePlaidHistoryState(observed);
+  return PLAID_HISTORY_RANK.get(right) > PLAID_HISTORY_RANK.get(left) ? right : left;
+}
+
+export function plaidWebhookHistoryState(payload) {
+  if (payload?.historical_update_complete === true) return PLAID_HISTORY_STATE.HISTORICAL;
+  if (payload?.initial_update_complete === true) return PLAID_HISTORY_STATE.INITIAL;
+  if (payload?.historical_update_complete === false || payload?.initial_update_complete === false) {
+    return PLAID_HISTORY_STATE.NOT_READY;
+  }
+  return PLAID_HISTORY_STATE.UNKNOWN;
 }
 
 function asIsoDate(value) {
@@ -231,7 +264,9 @@ export function plaidErrorCode(error) {
  */
 export async function stagePlaidSyncWindow({
   originalCursor = null,
+  originalHistoryState = PLAID_HISTORY_STATE.UNKNOWN,
   resumeCursor = null,
+  resumeHistoryState = PLAID_HISTORY_STATE.UNKNOWN,
   resumePageIndex = 0,
   resumeCounts = null,
   requestPage,
@@ -246,13 +281,14 @@ export async function stagePlaidSyncWindow({
   }
 
   let cursor = resumeCursor ?? originalCursor;
+  let historyState = mergePlaidHistoryState(originalHistoryState, resumeHistoryState);
   let pageIndex = Number.isInteger(resumePageIndex) && resumePageIndex >= 0 ? resumePageIndex : 0;
   let mutationRestarts = 0;
   let added = Number.isInteger(resumeCounts?.added) && resumeCounts.added >= 0 ? resumeCounts.added : 0;
   let modified = Number.isInteger(resumeCounts?.modified) && resumeCounts.modified >= 0 ? resumeCounts.modified : 0;
   let removed = Number.isInteger(resumeCounts?.removed) && resumeCounts.removed >= 0 ? resumeCounts.removed : 0;
 
-  if (pageIndex === 0) await resetWindow({ originalCursor, reason: "start" });
+  if (pageIndex === 0) await resetWindow({ originalCursor, historyState, reason: "start" });
 
   for (;;) {
     let page;
@@ -262,11 +298,12 @@ export async function stagePlaidSyncWindow({
       if (plaidErrorCode(error) !== PLAID_MUTATION_CODE || mutationRestarts >= maxMutationRestarts) throw error;
       mutationRestarts += 1;
       cursor = originalCursor;
+      historyState = normalisePlaidHistoryState(originalHistoryState);
       pageIndex = 0;
       added = 0;
       modified = 0;
       removed = 0;
-      await resetWindow({ originalCursor, reason: "mutation", mutationRestarts });
+      await resetWindow({ originalCursor, historyState, reason: "mutation", mutationRestarts });
       continue;
     }
 
@@ -277,6 +314,7 @@ export async function stagePlaidSyncWindow({
       requestCursor: cursor,
       nextCursor,
       hasMore: page?.has_more === true,
+      historyState: mergePlaidHistoryState(historyState, page?.transactions_update_status),
       added: Array.isArray(page?.added) ? page.added.map(normalisePlaidTransaction) : [],
       modified: Array.isArray(page?.modified) ? page.modified.map(normalisePlaidTransaction) : [],
       removed: Array.isArray(page?.removed)
@@ -284,6 +322,7 @@ export async function stagePlaidSyncWindow({
         : [],
     };
     await stagePage(stagedPage);
+    historyState = stagedPage.historyState;
     added += stagedPage.added.length;
     modified += stagedPage.modified.length;
     removed += stagedPage.removed.length;
@@ -297,6 +336,7 @@ export async function stagePlaidSyncWindow({
         pageCount: pageIndex,
         mutationRestarts,
         counts: { added, modified, removed },
+        historyState,
       });
     }
   }
@@ -355,28 +395,66 @@ export async function verifyPlaidWebhook({ rawBody, verificationJwt, getJwk, now
 }
 
 export function plaidWebhookDisposition({ deliverySeen, issuedAt, lastIssuedAt, payload } = {}) {
-  if (deliverySeen) return { state: "replay", scheduleReconciliation: false };
-  const outOfOrder = Number.isInteger(lastIssuedAt) && Number.isInteger(issuedAt) && issuedAt < lastIssuedAt;
   const type = optionalText(payload?.webhook_type);
   const code = optionalText(payload?.webhook_code);
   const relevant = type === "TRANSACTIONS" || type === "ITEM";
+  if (deliverySeen) {
+    return {
+      state: "replay",
+      scheduleReconciliation: relevant,
+      webhookType: type,
+      webhookCode: code,
+      itemId: optionalText(payload?.item_id),
+      historyState: plaidWebhookHistoryState(payload),
+    };
+  }
+  const outOfOrder = Number.isInteger(lastIssuedAt) && Number.isInteger(issuedAt) && issuedAt < lastIssuedAt;
   return {
     state: outOfOrder ? "out_of_order" : "accepted",
     scheduleReconciliation: relevant,
     webhookType: type,
     webhookCode: code,
     itemId: optionalText(payload?.item_id),
+    historyState: plaidWebhookHistoryState(payload),
   };
 }
 
 /** Token erasure is permitted only after the provider confirms Item removal. */
 export function plaidRevocationTransition({ state, providerResult = null } = {}) {
-  if (state === "confirmed") return { state: "confirmed", eraseAccessToken: true, retry: false };
-  if (providerResult?.removed === true) return { state: "confirmed", eraseAccessToken: true, retry: false };
+  if (state === "confirmed") {
+    return {
+      state: "confirmed",
+      outcomeState: "confirmed",
+      eraseAccessToken: true,
+      retry: false,
+      retrySafe: false,
+    };
+  }
+  if (providerResult?.removed === true) {
+    return {
+      state: "confirmed",
+      outcomeState: "confirmed",
+      eraseAccessToken: true,
+      retry: false,
+      retrySafe: false,
+    };
+  }
+  if (providerResult?.outcomeUnknown === true) {
+    return {
+      state: "pending",
+      outcomeState: "unknown",
+      eraseAccessToken: false,
+      retry: true,
+      retrySafe: false,
+      errorCode: optionalText(providerResult?.errorCode) || "PLAID_REMOVE_OUTCOME_UNKNOWN",
+    };
+  }
   return {
     state: "pending",
+    outcomeState: "not_removed",
     eraseAccessToken: false,
     retry: true,
+    retrySafe: true,
     errorCode: optionalText(providerResult?.errorCode) || "PLAID_REMOVE_NOT_CONFIRMED",
   };
 }

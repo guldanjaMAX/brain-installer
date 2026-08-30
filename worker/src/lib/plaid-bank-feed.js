@@ -12,12 +12,14 @@ import {
 } from "./bank-feed.js";
 import { balanceRoleFor } from "./fin-import.js";
 import {
+  PLAID_HISTORY_STATE,
   PLAID_WEBHOOK_PATH,
   buildPlaidLinkTokenRequest,
   normalisePlaidAccount,
   plaidExchangeDecision,
   plaidLinkCompletion,
   plaidLinkTokenDecision,
+  mergePlaidHistoryState,
   plaidRevocationTransition,
   plaidWebhookDisposition,
   stagePlaidSyncWindow,
@@ -356,7 +358,12 @@ export async function completePlaidLink(env, {
     item_ref: exchanged.item_id,
     institution_label: institutionLabel,
     environment: config.environment,
-    history: { state: "queued", requested_days: BACKFILL_DAYS },
+    history: {
+      state: "queued",
+      provider_history_state: PLAID_HISTORY_STATE.UNKNOWN,
+      partial: true,
+      requested_days: BACKFILL_DAYS,
+    },
   };
   await env.DB.batch([
     env.DB.prepare(
@@ -488,36 +495,66 @@ function stageTransactionsStatement(env, tenantId, windowRef, rows) {
 async function syncWindowRow(env, tenantId, itemRef, stamp) {
   let row = await env.DB.prepare(
     `SELECT window_ref,original_cursor,resume_cursor,next_page_index,added_count,modified_count,
-            removed_count,mutation_restarts,state
+            removed_count,mutation_restarts,state,provider_history_state
        FROM plaid_sync_windows WHERE tenant_id=? AND item_ref=?`,
   ).bind(tenantId, itemRef).first();
+  const backfill = await env.DB.prepare(
+    "SELECT provider_history_state FROM bank_feed_backfill WHERE tenant_id=? AND item_ref=?",
+  ).bind(tenantId, itemRef).first();
+  if (row && ["staging", "ready", "retryable"].includes(row.state)) {
+    const merged = mergePlaidHistoryState(
+      row.provider_history_state,
+      backfill?.provider_history_state,
+    );
+    if (merged !== row.provider_history_state) {
+      await env.DB.prepare(
+        "UPDATE plaid_sync_windows SET provider_history_state=?,updated_at=? WHERE tenant_id=? AND item_ref=?",
+      ).bind(merged, stamp, tenantId, itemRef).run();
+      row = { ...row, provider_history_state: merged };
+    }
+  }
   if (!row || !["staging", "ready", "retryable"].includes(row.state)) {
     const item = await itemRow(env, tenantId, itemRef);
+    const historyState = mergePlaidHistoryState(
+      backfill?.provider_history_state,
+      row?.provider_history_state,
+    );
     const windowRef = crypto.randomUUID();
     await env.DB.prepare(
       `INSERT INTO plaid_sync_windows
-         (tenant_id,item_ref,window_ref,original_cursor,resume_cursor,next_page_index,state,started_at,updated_at)
-       VALUES (?,?,?,?,?,0,'staging',?,?)
+         (tenant_id,item_ref,window_ref,original_cursor,resume_cursor,next_page_index,state,
+          provider_history_state,started_at,updated_at)
+       VALUES (?,?,?,?,?,0,'staging',?,?,?)
        ON CONFLICT(tenant_id,item_ref) DO UPDATE SET
          window_ref=excluded.window_ref,original_cursor=excluded.original_cursor,
          resume_cursor=excluded.resume_cursor,next_page_index=0,added_count=0,modified_count=0,
          removed_count=0,mutation_restarts=0,state='staging',started_at=excluded.started_at,
-         updated_at=excluded.updated_at,last_error_code=NULL,completed_at=NULL`,
-    ).bind(tenantId, itemRef, windowRef, item?.cursor || null, item?.cursor || null, stamp, stamp).run();
+         provider_history_state=excluded.provider_history_state,updated_at=excluded.updated_at,
+         last_error_code=NULL,completed_at=NULL`,
+    ).bind(tenantId, itemRef, windowRef, item?.cursor || null, item?.cursor || null,
+      historyState, stamp, stamp).run();
     row = await env.DB.prepare(
       `SELECT window_ref,original_cursor,resume_cursor,next_page_index,added_count,modified_count,
-              removed_count,mutation_restarts,state
+              removed_count,mutation_restarts,state,provider_history_state
          FROM plaid_sync_windows WHERE tenant_id=? AND item_ref=?`,
     ).bind(tenantId, itemRef).first();
   }
   return row;
 }
 
-function promotionStatements(env, { tenantId, itemRef, windowRef, finalCursor, stamp }) {
+function promotionStatements(env, {
+  tenantId,
+  itemRef,
+  windowRef,
+  finalCursor,
+  historyState,
+  stamp,
+}) {
   const sourceFeed = feedScopeKey(itemRef);
   const entitySlug = String(env.BANK_FEED_ENTITY || "primary");
   const interval = Math.min(Math.max(Number(env.BANK_FEED_RECONCILE_MINUTES) || DEFAULT_RECONCILE_MINUTES, 15), 1440);
-  const nextDue = new Date(Date.parse(stamp) + interval * 60_000).toISOString();
+  const historicalComplete = historyState === PLAID_HISTORY_STATE.HISTORICAL;
+  const nextDue = new Date(Date.parse(stamp) + (historicalComplete ? interval : 5) * 60_000).toISOString();
   return [
     env.DB.prepare(
       `INSERT INTO fin_accounts
@@ -577,13 +614,17 @@ function promotionStatements(env, { tenantId, itemRef, windowRef, finalCursor, s
     ).bind(stamp, tenantId, tenantId, windowRef),
     env.DB.prepare(
       `UPDATE bank_feed_items SET cursor=?,cursor_updated_at=?,last_synced_at=?,
-          status='connected',status_detail=NULL,last_error_at=NULL
+          status='connected',status_detail=?,last_error_at=NULL
         WHERE tenant_id=? AND item_ref=?`,
-    ).bind(finalCursor, stamp, stamp, tenantId, itemRef),
+    ).bind(finalCursor, stamp, stamp, historicalComplete
+      ? null
+      : "Plaid is still preparing historical transactions. The available activity is partial.",
+    tenantId, itemRef),
     env.DB.prepare(
-      `UPDATE bank_feed_backfill SET state='complete',finished_at=?,last_error=NULL
+      `UPDATE bank_feed_backfill SET state=?,provider_history_state=?,finished_at=?,last_error=NULL
         WHERE tenant_id=? AND item_ref=?`,
-    ).bind(stamp, tenantId, itemRef),
+    ).bind(historicalComplete ? "complete" : "running", historyState,
+      historicalComplete ? stamp : null, tenantId, itemRef),
     env.DB.prepare("DELETE FROM plaid_sync_stage_transactions WHERE tenant_id=? AND window_ref=?")
       .bind(tenantId, windowRef),
     env.DB.prepare("DELETE FROM plaid_sync_stage_accounts WHERE tenant_id=? AND window_ref=?")
@@ -593,10 +634,10 @@ function promotionStatements(env, { tenantId, itemRef, windowRef, finalCursor, s
     env.DB.prepare(
       `INSERT INTO plaid_reconciliation
          (tenant_id,item_ref,reason,state,due_at,attempts,last_error_code,updated_at)
-       VALUES (?,?,'scheduled','pending',?,0,NULL,?)
-       ON CONFLICT(tenant_id,item_ref) DO UPDATE SET reason='scheduled',state='pending',
+       VALUES (?,?,?,'pending',?,0,NULL,?)
+       ON CONFLICT(tenant_id,item_ref) DO UPDATE SET reason=excluded.reason,state='pending',
          due_at=excluded.due_at,last_error_code=NULL,updated_at=excluded.updated_at`,
-    ).bind(tenantId, itemRef, nextDue, stamp),
+    ).bind(tenantId, itemRef, historicalComplete ? "scheduled" : "history_pending", nextDue, stamp),
   ];
 }
 
@@ -618,11 +659,17 @@ export async function syncPlaidItem(env, itemRef, { fetchImpl = fetch, now = nul
         itemRef,
         windowRef: window.window_ref,
         finalCursor: window.resume_cursor,
+        historyState: window.provider_history_state,
         stamp,
       }));
+      const historicalComplete = window.provider_history_state === PLAID_HISTORY_STATE.HISTORICAL;
       return {
         item_ref: itemRef,
-        ok: true,
+        ok: historicalComplete,
+        partial: !historicalComplete,
+        status: historicalComplete ? "complete" : "partial",
+        history_state: historicalComplete ? "complete" : "running",
+        provider_history_state: window.provider_history_state,
         finalCursor: window.resume_cursor,
         pageCount: Number(window.next_page_index || 0),
         mutationRestarts: Number(window.mutation_restarts || 0),
@@ -640,7 +687,9 @@ export async function syncPlaidItem(env, itemRef, { fetchImpl = fetch, now = nul
       .map((account) => stagedAccount(itemRef, account));
     const result = await stagePlaidSyncWindow({
       originalCursor: window.original_cursor || null,
+      originalHistoryState: window.provider_history_state,
       resumeCursor: window.resume_cursor || window.original_cursor || null,
+      resumeHistoryState: window.provider_history_state,
       resumePageIndex: Number(window.next_page_index || 0),
       resumeCounts: {
         added: Number(window.added_count || 0),
@@ -652,7 +701,7 @@ export async function syncPlaidItem(env, itemRef, { fetchImpl = fetch, now = nul
         ...(cursor ? { cursor } : {}),
         count,
       }, { fetchImpl }),
-      resetWindow: async ({ originalCursor, reason, mutationRestarts = 0 }) => {
+      resetWindow: async ({ originalCursor, historyState, reason, mutationRestarts = 0 }) => {
         await env.DB.batch([
           env.DB.prepare("DELETE FROM plaid_sync_stage_transactions WHERE tenant_id=? AND window_ref=?")
             .bind(tenantId, window.window_ref),
@@ -662,9 +711,10 @@ export async function syncPlaidItem(env, itemRef, { fetchImpl = fetch, now = nul
           env.DB.prepare(
             `UPDATE plaid_sync_windows SET resume_cursor=?,next_page_index=0,added_count=0,
                 modified_count=0,removed_count=0,mutation_restarts=?,state='staging',
-                updated_at=?,last_error_code=?
+                provider_history_state=?,updated_at=?,last_error_code=?
               WHERE tenant_id=? AND item_ref=?`,
-          ).bind(originalCursor, mutationRestarts, stamp, reason === "mutation" ? "pagination_mutation" : null,
+          ).bind(originalCursor, mutationRestarts, historyState, stamp,
+            reason === "mutation" ? "pagination_mutation" : null,
             tenantId, itemRef),
         ]);
       },
@@ -675,9 +725,10 @@ export async function syncPlaidItem(env, itemRef, { fetchImpl = fetch, now = nul
           env.DB.prepare(
             `UPDATE plaid_sync_windows SET resume_cursor=?,next_page_index=?,
                 added_count=added_count+?,modified_count=modified_count+?,removed_count=removed_count+?,
-                state=?,updated_at=? WHERE tenant_id=? AND item_ref=?`,
+                state=?,provider_history_state=?,updated_at=? WHERE tenant_id=? AND item_ref=?`,
           ).bind(page.nextCursor, page.pageIndex + 1, page.added.length, page.modified.length,
-            page.removed.length, page.hasMore ? "staging" : "ready", stamp, tenantId, itemRef),
+            page.removed.length, page.hasMore ? "staging" : "ready", page.historyState,
+            stamp, tenantId, itemRef),
         ]);
       },
       promoteWindow: async (receipt) => {
@@ -686,12 +737,24 @@ export async function syncPlaidItem(env, itemRef, { fetchImpl = fetch, now = nul
           itemRef,
           windowRef: window.window_ref,
           finalCursor: receipt.finalCursor,
+          historyState: receipt.historyState,
           stamp,
         }));
         return receipt;
       },
     });
-    return { item_ref: itemRef, ok: true, ...result, has_more: false };
+    const { historyState: providerHistoryState, ...syncResult } = result;
+    const historicalComplete = providerHistoryState === PLAID_HISTORY_STATE.HISTORICAL;
+    return {
+      item_ref: itemRef,
+      ok: historicalComplete,
+      partial: !historicalComplete,
+      status: historicalComplete ? "complete" : "partial",
+      history_state: historicalComplete ? "complete" : "running",
+      provider_history_state: providerHistoryState,
+      ...syncResult,
+      has_more: false,
+    };
   } catch (error) {
     const kind = error instanceof ProviderSyncError ? error.outcome?.kind : "retryable";
     const state = kind === "unavailable" ? "unavailable" : kind === "refused" ? "refused" : "retryable";
@@ -745,17 +808,6 @@ export async function runPlaidFeedSlice(env, {
   return { ran: items.length, items };
 }
 
-async function queueReconciliation(env, tenantId, itemRef, reason, stamp) {
-  if (!itemRef) return;
-  await env.DB.prepare(
-    `INSERT INTO plaid_reconciliation
-       (tenant_id,item_ref,reason,state,due_at,attempts,updated_at)
-     VALUES (?,?,?,'pending',?,0,?)
-     ON CONFLICT(tenant_id,item_ref) DO UPDATE SET reason=excluded.reason,state='pending',
-       due_at=excluded.due_at,updated_at=excluded.updated_at`,
-  ).bind(tenantId, itemRef, reason, stamp, stamp).run();
-}
-
 async function plaidJwk(env, keyId, fetchImpl, stamp) {
   const cached = await env.DB.prepare(
     "SELECT jwk_json FROM plaid_webhook_keys WHERE key_id=? AND expires_at>?",
@@ -764,7 +816,17 @@ async function plaidJwk(env, keyId, fetchImpl, stamp) {
   const response = await callPlaid(env, "/webhook_verification_key/get", { key_id: keyId }, { fetchImpl });
   const key = response.key;
   if (!key || key.kid !== keyId) throw new Error("Plaid returned no matching webhook verification key");
-  const expiresAt = new Date(Date.parse(stamp) + 24 * 60 * 60_000).toISOString();
+  const fetchedAtMs = Date.parse(stamp);
+  let expiresAtMs = fetchedAtMs + 24 * 60 * 60_000;
+  if (key.expired_at !== null && key.expired_at !== undefined) {
+    if (!Number.isSafeInteger(key.expired_at) || key.expired_at <= 0) {
+      throw new Error("Plaid returned an invalid webhook key expiry");
+    }
+    const providerExpiresAtMs = key.expired_at * 1000;
+    if (providerExpiresAtMs <= fetchedAtMs) throw new Error("Plaid returned an expired webhook verification key");
+    expiresAtMs = Math.min(expiresAtMs, providerExpiresAtMs);
+  }
+  const expiresAt = new Date(expiresAtMs).toISOString();
   await env.DB.prepare(
     `INSERT INTO plaid_webhook_keys (key_id,jwk_json,fetched_at,expires_at) VALUES (?,?,?,?)
      ON CONFLICT(key_id) DO UPDATE SET jwk_json=excluded.jwk_json,fetched_at=excluded.fetched_at,
@@ -805,19 +867,43 @@ export async function handlePlaidWebhook(env, request, { fetchImpl = fetch, now 
     lastIssuedAt: Number.isInteger(latest?.issued_at) ? latest.issued_at : null,
     payload,
   });
-  if (!seen) {
-    await env.DB.prepare(
+  const statements = [
+    env.DB.prepare(
       `INSERT INTO plaid_webhook_events
          (delivery_id,tenant_id,item_ref,webhook_type,webhook_code,key_id,issued_at,
-          body_sha256,state,received_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+          body_sha256,state,received_at) VALUES (?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(delivery_id) DO NOTHING`,
     ).bind(verified.deliveryId, tenantId, payload.item_id || null, payload.webhook_type || null,
       payload.webhook_code || null, verified.kid, verified.issuedAt, verified.bodyHash,
-      disposition.state, stamp).run();
+      disposition.state, stamp),
+  ];
+  if (disposition.scheduleReconciliation && disposition.itemId) {
+    const reason = disposition.state === "out_of_order"
+      ? "out_of_order_webhook"
+      : disposition.state === "replay"
+        ? "webhook_replay_repair"
+        : "webhook";
+    statements.push(env.DB.prepare(
+      `INSERT INTO plaid_reconciliation
+         (tenant_id,item_ref,reason,state,due_at,attempts,updated_at)
+       VALUES (?,?,?,'pending',?,0,?)
+       ON CONFLICT(tenant_id,item_ref) DO UPDATE SET reason=excluded.reason,state='pending',
+         due_at=excluded.due_at,updated_at=excluded.updated_at`,
+    ).bind(tenantId, disposition.itemId, reason, stamp, stamp));
+    if (disposition.historyState !== PLAID_HISTORY_STATE.UNKNOWN) {
+      statements.push(env.DB.prepare(
+        `UPDATE bank_feed_backfill SET provider_history_state=CASE
+           WHEN ?='HISTORICAL_UPDATE_COMPLETE' THEN 'HISTORICAL_UPDATE_COMPLETE'
+           WHEN ?='INITIAL_UPDATE_COMPLETE' AND provider_history_state IN
+                ('TRANSACTIONS_UPDATE_STATUS_UNKNOWN','NOT_READY') THEN 'INITIAL_UPDATE_COMPLETE'
+           WHEN ?='NOT_READY' AND provider_history_state='TRANSACTIONS_UPDATE_STATUS_UNKNOWN' THEN 'NOT_READY'
+           ELSE provider_history_state END
+         WHERE tenant_id=? AND item_ref=?`,
+      ).bind(disposition.historyState, disposition.historyState, disposition.historyState,
+        tenantId, disposition.itemId));
+    }
   }
-  if (disposition.scheduleReconciliation) {
-    await queueReconciliation(env, tenantId, payload.item_id || null,
-      disposition.state === "out_of_order" ? "out_of_order_webhook" : "webhook", stamp);
-  }
+  await env.DB.batch(statements);
   return new Response("accepted", { status: 200 });
 }
 
@@ -829,7 +915,7 @@ export async function drainPlaidRevocations(env, {
   const { tenantId } = tenantReference(env);
   const stamp = nowIso(now);
   const rows = (await env.DB.prepare(
-    `SELECT o.item_ref,i.access_ciphertext,i.access_iv,i.key_version
+    `SELECT o.item_ref,o.outcome_state,i.access_ciphertext,i.access_iv,i.key_version
        FROM plaid_revocation_outbox o
        JOIN bank_feed_items i ON i.tenant_id=o.tenant_id AND i.item_ref=o.item_ref
       WHERE o.tenant_id=? AND o.state IN ('pending','retryable') AND o.next_attempt_at<=?
@@ -837,17 +923,50 @@ export async function drainPlaidRevocations(env, {
   ).bind(tenantId, stamp, Math.min(Math.max(Number(maxItems) || 3, 1), 10)).all())?.results || [];
   const results = [];
   for (const row of rows) {
-    let providerResult;
-    try {
-      const accessToken = await decryptAccessReference(env, {
-        ciphertext: row.access_ciphertext,
-        iv: row.access_iv,
-        keyVersion: row.key_version,
-      });
-      await callPlaid(env, "/item/remove", { access_token: accessToken }, { fetchImpl });
-      providerResult = { removed: true };
-    } catch (error) {
-      providerResult = { removed: false, errorCode: boundedCode(error) };
+    const accessToken = await decryptAccessReference(env, {
+      ciphertext: row.access_ciphertext,
+      iv: row.access_iv,
+      keyVersion: row.key_version,
+    });
+    let providerResult = null;
+    if (row.outcome_state === "unknown") {
+      try {
+        const item = await callPlaid(env, "/item/get", { access_token: accessToken }, { fetchImpl });
+        if (item?.item?.item_id === row.item_ref && !item.item.error) {
+          providerResult = null;
+        } else if (boundedCode(item?.item?.error) === "ITEM_NOT_FOUND") {
+          providerResult = { removed: true };
+        } else {
+          providerResult = {
+            removed: false,
+            outcomeUnknown: true,
+            errorCode: "PLAID_REMOVE_RECOVERY_UNCONFIRMED",
+          };
+        }
+      } catch (error) {
+        providerResult = boundedCode(error) === "ITEM_NOT_FOUND"
+          ? { removed: true }
+          : {
+              removed: false,
+              outcomeUnknown: true,
+              errorCode: "PLAID_REMOVE_RECOVERY_UNAVAILABLE",
+            };
+      }
+    }
+    if (providerResult === null) {
+      try {
+        await callPlaid(env, "/item/remove", { access_token: accessToken }, { fetchImpl });
+        providerResult = { removed: true };
+      } catch (error) {
+        const errorCode = boundedCode(error);
+        providerResult = errorCode === "ITEM_NOT_FOUND"
+          ? { removed: true }
+          : {
+              removed: false,
+              outcomeUnknown: providerOutcomeUnknown(error),
+              errorCode,
+            };
+      }
     }
     const transition = plaidRevocationTransition({ state: "pending", providerResult });
     if (transition.eraseAccessToken) {
@@ -859,17 +978,26 @@ export async function drainPlaidRevocations(env, {
         ).bind(stamp, tenantId, row.item_ref),
         env.DB.prepare(
           `UPDATE plaid_revocation_outbox SET state='confirmed',attempts=attempts+1,
-              last_error_code=NULL,updated_at=?,confirmed_at=? WHERE tenant_id=? AND item_ref=?`,
+              outcome_state='confirmed',last_error_code=NULL,updated_at=?,confirmed_at=?
+            WHERE tenant_id=? AND item_ref=?`,
         ).bind(stamp, stamp, tenantId, row.item_ref),
       ]);
     } else {
       const retryAt = new Date(Date.parse(stamp) + 5 * 60_000).toISOString();
       await env.DB.prepare(
         `UPDATE plaid_revocation_outbox SET state='retryable',attempts=attempts+1,
-            next_attempt_at=?,last_error_code=?,updated_at=? WHERE tenant_id=? AND item_ref=?`,
-      ).bind(retryAt, providerResult.errorCode, stamp, tenantId, row.item_ref).run();
+            outcome_state=?,next_attempt_at=?,last_error_code=?,updated_at=?
+          WHERE tenant_id=? AND item_ref=?`,
+      ).bind(transition.outcomeState, retryAt, transition.errorCode, stamp,
+        tenantId, row.item_ref).run();
     }
-    results.push({ item_ref: row.item_ref, confirmed: transition.eraseAccessToken });
+    results.push({
+      item_ref: row.item_ref,
+      confirmed: transition.eraseAccessToken,
+      outcome_state: transition.outcomeState,
+      outcome_unknown: transition.outcomeState === "unknown",
+      retry_safe: transition.retrySafe,
+    });
   }
   return { ran: results.length, items: results };
 }
@@ -885,10 +1013,12 @@ export async function disconnectPlaidItem(env, itemRef, {
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO plaid_revocation_outbox
-         (tenant_id,item_ref,state,attempts,next_attempt_at,requested_at,updated_at)
-       VALUES (?,?,'pending',0,?,?,?)
+         (tenant_id,item_ref,state,outcome_state,attempts,next_attempt_at,requested_at,updated_at)
+       VALUES (?,?,'pending','not_attempted',0,?,?,?)
        ON CONFLICT(tenant_id,item_ref) DO UPDATE SET
          state=CASE WHEN plaid_revocation_outbox.state='confirmed' THEN 'confirmed' ELSE 'pending' END,
+         outcome_state=CASE WHEN plaid_revocation_outbox.state='confirmed' THEN 'confirmed'
+                            ELSE plaid_revocation_outbox.outcome_state END,
          next_attempt_at=excluded.next_attempt_at,updated_at=excluded.updated_at`,
     ).bind(tenantId, itemRef, stamp, stamp, stamp),
     env.DB.prepare(
@@ -898,15 +1028,21 @@ export async function disconnectPlaidItem(env, itemRef, {
     ).bind(tenantId, itemRef),
   ]);
   const drained = await drainPlaidRevocations(env, { maxItems: 1, fetchImpl, now: stamp });
-  const confirmed = drained.items.some((entry) => entry.item_ref === itemRef && entry.confirmed);
+  const result = drained.items.find((entry) => entry.item_ref === itemRef) || null;
+  const confirmed = result?.confirmed === true;
+  const outcomeUnknown = result?.outcome_unknown === true;
   return {
     ok: true,
     revoked_at_provider: confirmed,
-    revocation_state: confirmed ? "confirmed" : "retryable",
+    revocation_state: confirmed ? "confirmed" : outcomeUnknown ? "unknown" : "retryable",
+    outcome_unknown: outcomeUnknown,
+    retry_safe: result?.retry_safe ?? false,
     history_kept: true,
     detail: confirmed
       ? "The provider confirmed removal. Financial history was kept."
-      : "Removal is queued for retry. The encrypted access token is retained only for provider revocation.",
+      : outcomeUnknown
+        ? "The provider response was lost or unclear. The encrypted access token is retained so the next recovery can check Item health before another removal call."
+        : "Removal is queued for retry. The encrypted access token is retained only for provider revocation.",
   };
 }
 
@@ -925,8 +1061,10 @@ export async function plaidFeedStatus(env) {
   }
   const rows = (await env.DB.prepare(
     `SELECT i.item_ref,i.institution_label,i.environment,i.status,i.status_detail,i.connected_at,
-            i.last_synced_at,b.state AS history_state,b.pages_done,b.transactions_seen,b.unread_lines,
-            r.state AS reconciliation_state,r.due_at,o.state AS revocation_state,o.attempts AS revocation_attempts
+            i.last_synced_at,b.state AS history_state,b.provider_history_state,
+            b.pages_done,b.transactions_seen,b.unread_lines,
+            r.state AS reconciliation_state,r.due_at,o.state AS revocation_state,
+            o.outcome_state AS revocation_outcome_state,o.attempts AS revocation_attempts
        FROM bank_feed_items i
        LEFT JOIN bank_feed_backfill b ON b.tenant_id=i.tenant_id AND b.item_ref=i.item_ref
        LEFT JOIN plaid_reconciliation r ON r.tenant_id=i.tenant_id AND r.item_ref=i.item_ref
@@ -949,21 +1087,29 @@ export async function plaidFeedStatus(env) {
       last_synced_at: row.last_synced_at,
       history: {
         state: row.history_state || "none",
+        provider_history_state: row.provider_history_state || PLAID_HISTORY_STATE.UNKNOWN,
+        partial: row.provider_history_state !== PLAID_HISTORY_STATE.HISTORICAL,
         pages_done: row.pages_done || 0,
         transactions_seen: row.transactions_seen || 0,
         unread_lines: row.unread_lines || 0,
       },
       reconciliation: { state: row.reconciliation_state || "none", due_at: row.due_at || null },
-      revocation: { state: row.revocation_state || "none", attempts: row.revocation_attempts || 0 },
+      revocation: {
+        state: row.revocation_state || "none",
+        outcome_state: row.revocation_outcome_state || "none",
+        outcome_unknown: row.revocation_outcome_state === "unknown",
+        attempts: row.revocation_attempts || 0,
+      },
     })),
     needs_attention: rows.filter((row) => row.status !== "connected" ||
       ["retryable", "unavailable", "refused"].includes(row.reconciliation_state) ||
-      row.revocation_state === "retryable").map((row) => ({
+      row.revocation_state === "retryable" || row.revocation_outcome_state === "unknown").map((row) => ({
       item_ref: row.item_ref,
       status: row.status,
       detail: row.status_detail,
       reconciliation_state: row.reconciliation_state || null,
       revocation_state: row.revocation_state || null,
+      revocation_outcome_state: row.revocation_outcome_state || null,
     })),
   };
 }

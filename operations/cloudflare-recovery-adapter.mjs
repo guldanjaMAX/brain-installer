@@ -325,14 +325,15 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   "outbox_generation",
   "vector_projection_bootstrap_base_count",
 ]);
-// Schemas 14 through 28 add owner passkeys, capability grants, zones, the financial ledger, bank feeds,
+// Schemas 14 through 29 add owner passkeys, capability grants, zones, the financial ledger, bank feeds,
 // connector OAuth, extraction provenance, owner workspace state, exact
 // document security, support authority, agent receipts, and Zoom delivery
-// debt. The vector protocol itself is unchanged, but the recovery
-// contract tracks the EXACT current schema by design: a drill against a
+// debt, plus durable Plaid readiness and destructive-outcome evidence. The
+// vector protocol itself is unchanged, but the recovery contract tracks the
+// EXACT current schema by design: a drill against a
 // database one migration behind would export a table or column set that does
 // not match the reviewed list. Bumping this is required for every migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 28;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 29;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {

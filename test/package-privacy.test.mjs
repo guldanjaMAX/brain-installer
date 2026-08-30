@@ -406,6 +406,7 @@ const expected = [
   "migrations/d1/0026_plaid_durability.sql",
   "migrations/d1/0027_public_request_quotas.sql",
   "migrations/d1/0028_vector_retry_state.sql",
+  "migrations/d1/0029_plaid_provider_outcomes.sql",
   "onboarding/00-pre-install-interview.md",
   "onboarding/01-intake-RUNBOOK.md",
   "onboarding/01-intake-questionnaire.md",
