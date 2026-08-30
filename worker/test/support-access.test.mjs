@@ -66,6 +66,11 @@ function fixture() {
        (id,client_slug,product_version,schema_version,gate_version,installed_at,ring,session_generation)
      VALUES (1,'fixture','0.2.0',23,0,'2026-08-30T00:00:00Z','test',1)`,
   ).run();
+  db.prepare(
+    `INSERT INTO owner_passkeys
+       (credential_id,public_key_jwk,alg,sign_count,nickname,created_at,grant_id,document_grant_id)
+     VALUES ('support-fixture-owner-passkey','{}',-7,0,'Fixture owner',1,NULL,NULL)`,
+  ).run();
   const env = {
     STORAGE: "d1",
     DB: d1(db),
@@ -91,7 +96,9 @@ const cookieOf = (response) => (response.headers.get("Set-Cookie") || "").split(
 
 async function ownerHeaders(env) {
   return {
-    Cookie: (await mintSessionCookie(env, 1, { grantId: null })).split(";")[0],
+    Cookie: (await mintSessionCookie(env, 1, {
+      grantId: null, credentialId: "support-fixture-owner-passkey",
+    })).split(";")[0],
     "X-Brain-App": "1",
   };
 }
@@ -211,8 +218,8 @@ test("support access is separate, short-lived, read-only, auditable, and immedia
     const supportCookie = cookieOf(verifyResponse);
     assert.match(supportCookie, /^brain_support_session=v1\./);
     assert.equal(db.prepare("SELECT count(*) n FROM support_passkeys").get().n, 1);
-    assert.equal(db.prepare("SELECT count(*) n FROM owner_passkeys").get().n, 0,
-      "support credentials never enter owner device storage");
+    assert.equal(db.prepare("SELECT count(*) n FROM owner_passkeys").get().n, 1,
+      "support registration never adds a credential to owner device storage");
 
     const activated = db.prepare(
       "SELECT activated_at,expires_at,duration_minutes FROM support_sessions WHERE support_session_id=?",
