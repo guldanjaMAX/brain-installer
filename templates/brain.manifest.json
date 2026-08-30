@@ -175,12 +175,17 @@
     },
     "quickbooks": {
       "_comment": [
-        "QuickBooks Online read-only records. Start in the Intuit sandbox.",
+        "QuickBooks Online runtime queries are read-only, but Intuit's one",
+        "Accounting OAuth scope grants broader read and update permission.",
+        "This release connects sandbox companies only. Register the exact",
+        "http://localhost:47812/ redirect shown by the technician command.",
         "OAuth credentials and the selected company id stay in the local",
-        "provider credential store. Hard-deletion truth is not claimed."
+        "provider credential store. Disconnect retains imported documents;",
+        "removal needs a separately reviewed forget preview."
       ],
       "enabled": false,
       "environment": "sandbox",
+      "redirect_host": "localhost",
       "entities": [
         "Account", "Customer", "Vendor", "Invoice", "Payment", "Bill", "Purchase",
         "JournalEntry", "Deposit", "Transfer", "CreditMemo", "BillPayment", "Estimate",

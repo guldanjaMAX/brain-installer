@@ -5629,7 +5629,7 @@ export const PROVIDER_CONNECTOR_IDS = Object.freeze([
   "quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot",
 ]);
 
-function providerConfigurationFingerprint(provider, source, configuration) {
+export function providerConfigurationFingerprint(provider, source, configuration, identity = null) {
   const canonical = (value) => {
     if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
     if (value && typeof value === "object") {
@@ -5637,7 +5637,19 @@ function providerConfigurationFingerprint(provider, source, configuration) {
     }
     return JSON.stringify(value);
   };
-  return createHash("sha256").update(canonical({ version: 1, provider, source, configuration })).digest("hex");
+  // Preserve the released v1 bytes for every non-QuickBooks provider so this
+  // hardening cannot reset their cursors or configuration receipts. QBO alone
+  // adds the canonical company identity to its v2 fingerprint.
+  const payload = provider === "quickbooks"
+    ? {
+        version: 2,
+        provider,
+        source,
+        configuration,
+        qbo_company_fingerprint: identity?.qbo_company_fingerprint || null,
+      }
+    : { version: 1, provider, source, configuration };
+  return createHash("sha256").update(canonical(payload)).digest("hex");
 }
 
 async function providerSyncImplementation(provider) {
@@ -5659,6 +5671,7 @@ function providerAdapterOptions(provider, configuration, connection) {
         : "https://sandbox-quickbooks.api.intuit.com",
       entities: configuration.entities,
       minorVersion: configuration.minor_version || null,
+      expectedCompanyFingerprint: connection?.provider_metadata?.qbo_company_fingerprint || null,
     };
   }
   if (provider === "slack") return {
@@ -5688,13 +5701,27 @@ export async function cmdIngestProvider(m, manifestPath, flags, options = {}) {
   const sourceName = assertSourceName(
     flags.source === true || !flags.source ? configuration.source || provider : flags.source,
   );
-  const fingerprint = providerConfigurationFingerprint(provider, sourceName, configuration);
   const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
   const syncImpl = options.sync ?? await providerSyncImplementation(provider);
-  const resolveAccess = () => oauth.providerAccessToken(provider, {
+  const loadAccess = () => oauth.providerAccessToken(provider, {
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     ...(options.storage ? { storage: options.storage } : {}),
   });
+  let preparedAccess = null;
+  let identity = null;
+  if (provider === "quickbooks") {
+    preparedAccess = await loadAccess();
+    if (typeof oauth.assertQuickBooksSourceBinding !== "function") {
+      throw new Error("the QuickBooks OAuth module cannot verify its company binding");
+    }
+    const binding = oauth.assertQuickBooksSourceBinding(preparedAccess.connection, {
+      source: sourceName,
+      environment: configuration.environment,
+    });
+    identity = { qbo_company_fingerprint: binding.qbo_company_fingerprint };
+  }
+  const fingerprint = providerConfigurationFingerprint(provider, sourceName, configuration, identity);
+  const resolveAccess = () => preparedAccess ? Promise.resolve(preparedAccess) : loadAccess();
   const loadState = () => oauth.loadProviderSyncState(provider, sourceName, options.storage || {});
   const saveState = (state) => oauth.saveProviderSyncState(provider, sourceName, state, options.storage || {});
   const adapter = ({ cursor, access }) => syncImpl({
@@ -9404,40 +9431,82 @@ export async function cmdConnectProvider(provider, manifestPath, flags = {}, opt
   const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
   const config = oauth.providerOAuthConfig(provider);
   const storage = options.storage || {};
-  const prior = oauth.loadProviderCredentials(provider, storage);
   const prefix = provider.toUpperCase().replace(/-/g, "_");
   const environment = options.environment || process.env;
   const suppliedCredentials = options.credentials || {};
-  const clientId = suppliedCredentials.clientId || environment[`${prefix}_CLIENT_ID`] || prior?.client_id || null;
-  const clientSecret = suppliedCredentials.clientSecret || environment[`${prefix}_CLIENT_SECRET`] || prior?.client_secret || null;
+  const source = assertSourceName(configuration.source || provider);
   if (provider === "quickbooks" && !["sandbox", "production"].includes(configuration.environment)) {
     const error = new Fatal("corpora.quickbooks.environment must explicitly be sandbox or production before connecting.");
     error.code = "quickbooks_environment_required";
     throw error;
   }
+  if (provider === "quickbooks" && configuration.environment === "production") {
+    const error = new Fatal(
+      "QuickBooks production connection is not available in this release. Intuit production OAuth needs a client-owned HTTPS callback with a single-use local handoff; the loopback callback is sandbox-only. No credential or browser flow was opened.",
+    );
+    error.code = "quickbooks_production_callback_unavailable";
+    throw error;
+  }
+  const port = flags.port ? Number(flags.port) : oauth.PROVIDER_DEFAULT_PORT;
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) die("--port must be an integer from 1024 through 65535");
+  const redirectHost = provider === "quickbooks"
+    ? String(configuration.redirect_host || config.loopbackRedirectHost || "localhost").toLowerCase()
+    : "127.0.0.1";
+  if (provider === "quickbooks" && !["localhost", "127.0.0.1"].includes(redirectHost)) {
+    const error = new Fatal(
+      "corpora.quickbooks.redirect_host must be localhost or 127.0.0.1. The callback listener remains local-only.",
+    );
+    error.code = "quickbooks_redirect_host_invalid";
+    throw error;
+  }
+  if (provider === "quickbooks" && typeof oauth.quickBooksSandboxRedirectUri !== "function") {
+    throw new Error("the QuickBooks OAuth module cannot construct its sandbox callback");
+  }
+  const redirectUri = provider === "quickbooks"
+    ? oauth.quickBooksSandboxRedirectUri(port, redirectHost)
+    : oauth.providerRedirectUri(port);
+  const prior = oauth.loadProviderCredentials(provider, storage);
+  const clientId = suppliedCredentials.clientId || environment[`${prefix}_CLIENT_ID`] || prior?.client_id || null;
+  const clientSecret = suppliedCredentials.clientSecret || environment[`${prefix}_CLIENT_SECRET`] || prior?.client_secret || null;
   if (!clientId || (config.clientSecretRequired && !clientSecret)) {
     const required = [`${prefix}_CLIENT_ID`, ...(config.clientSecretRequired ? [`${prefix}_CLIENT_SECRET`] : [])];
     die(
       `${required.join(" and ")} ${required.length === 1 ? "is" : "are"} not available.\n` +
         `      Create the OAuth app in the owner's ${config.label} account, register ` +
-        `${oauth.providerRedirectUri(flags.port ? Number(flags.port) : oauth.PROVIDER_DEFAULT_PORT)}, and inject ` +
+        `${redirectUri}, and inject ` +
         "the value through the approved local launcher. Do not put it in the manifest or command line."
     );
   }
   if (!options.quiet && prior && !suppliedCredentials.clientId && !environment[`${prefix}_CLIENT_ID`]) {
     info(`reusing the ${config.label} OAuth client already stored on this machine`);
   }
-  const port = flags.port ? Number(flags.port) : oauth.PROVIDER_DEFAULT_PORT;
-  if (!Number.isInteger(port) || port < 1024 || port > 65535) die("--port must be an integer from 1024 through 65535");
   if (!options.quiet && provider === "quickbooks") {
     info(`QuickBooks environment: ${configuration.environment} (selected by corpora.quickbooks.environment)`);
+    info("Intuit's Accounting scope can read and update accounting data. Financial Brain uses only read/query calls, but the consent screen grants that broader provider permission.");
   }
   if (!options.quiet) info(`requesting the manifest-enabled ${config.label} connection in the owner's browser`);
   const connection = await oauth.authorizeProvider(provider, {
     clientId,
     clientSecret,
     port,
+    redirectHost,
+    redirectUri,
     storage,
+    ...(provider === "quickbooks"
+      ? {
+          prepareConnection: (candidate) => {
+            if (typeof oauth.bindQuickBooksConnection !== "function") {
+              throw new Error("the QuickBooks OAuth module cannot bind the authorized company");
+            }
+            return oauth.bindQuickBooksConnection({
+              prior,
+              candidate,
+              source,
+              environment: configuration.environment,
+            });
+          },
+        }
+      : {}),
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     ...(options.openImpl ? { openImpl: options.openImpl } : {}),
     ...(options.open === false ? { open: false } : {}),
@@ -9447,6 +9516,15 @@ export async function cmdConnectProvider(provider, manifestPath, flags = {}, opt
     const error = new Fatal("QuickBooks did not return a company identity, so the connection cannot be used safely.");
     error.code = "quickbooks_realm_missing";
     throw error;
+  }
+  if (provider === "quickbooks") {
+    if (typeof oauth.assertQuickBooksSourceBinding !== "function") {
+      throw new Error("the QuickBooks OAuth module cannot verify the stored company binding");
+    }
+    oauth.assertQuickBooksSourceBinding(connection, {
+      source,
+      environment: configuration.environment,
+    });
   }
   if (!options.quiet) {
     ok(`connected. Credential stored in ${oauth.providerCredentialDescription(provider, storage)} (on this machine only)`);
@@ -10482,8 +10560,18 @@ export async function cmdDisconnectProvider(provider, manifestPath, flags = {}, 
   } catch (error) {
     warn(`the provider is disconnected, but its remote freshness expectation could not be cleared: ${String(error?.message || error).slice(0, 160)}`);
   }
-  info(`documents already loaded remain in the brain; remove them with: brain forget ${manifestPath} --source ${source}`);
-  return result;
+  info(
+    `imported documents remain in the brain. When removal is wanted, separately review the preview from: ` +
+    `brain forget ${manifestPath} --source ${source}`,
+  );
+  return provider === "quickbooks"
+    ? {
+        ...result,
+        source,
+        imported_documents_retained: true,
+        forget_operation_required: true,
+      }
+    : result;
 }
 
 /**
@@ -14041,6 +14129,7 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
     const quickbooksPlan = plan.steps.find((item) => item.id === "quickbooks");
     info(`QuickBooks environment: ${quickbooksPlan?.environment || "not selected"} (from corpora.quickbooks.environment)`);
     info("The client owns the Intuit app and company authorization. Financial Brain has no shared Intuit account or credential custody.");
+    info("Intuit grants its broad Accounting permission. Financial Brain uses read/query calls only; the provider scope itself is not read-only.");
     info("The browser is used only for the owner's Intuit consent. Both app values are entered at hidden terminal prompts.");
   }
 
@@ -14085,6 +14174,7 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
         environment: receipt.environment,
         custody: receipt.custody,
         financial_authority: receipt.financial_authority,
+        oauth_permission: receipt.oauth_permission,
         verification_commands: receipt.verification_commands,
         recovery: null,
       };
@@ -14111,6 +14201,7 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
         environment: plan.steps.find((item) => item.id === "quickbooks")?.environment || null,
         custody: "client_local_provider_store",
         financial_authority: false,
+        oauth_permission: "broad_accounting_scope_runtime_read_only",
         verification_commands: [],
         recovery: String(error?.message || error),
       });

@@ -24,6 +24,10 @@ import {
   verifyTokenStorageReadable,
 } from "./google-auth.mjs";
 import { providerJson, providerRequest } from "./provider-sync.mjs";
+import {
+  normalizeQuickBooksRealmId,
+  quickBooksCompanyFingerprint,
+} from "./quickbooks-online.mjs";
 
 const b64url = (bytes) => Buffer.from(bytes).toString("base64url");
 const clean = (value) => String(value ?? "").trim();
@@ -44,7 +48,11 @@ export const PROVIDER_OAUTH = Object.freeze({
     clientAuth: "basic",
     clientSecretRequired: true,
     tokenBody: "form",
-    pkce: true,
+    // Intuit's current discovery metadata returns no supported challenge
+    // method, and its official confidential-client samples use state plus Basic
+    // client authentication. Do not claim an unenforced PKCE control.
+    pkce: false,
+    loopbackRedirectHost: "localhost",
     callbackMetadataRequired: Object.freeze(["realm_id"]),
   }),
   slack: Object.freeze({
@@ -115,6 +123,10 @@ export const PROVIDER_OAUTH = Object.freeze({
 });
 
 export const PROVIDER_DEFAULT_PORT = 47812;
+export const PROVIDER_LOOPBACK_BIND_ADDRESS = "127.0.0.1";
+const QUICKBOOKS_SOURCE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const QUICKBOOKS_ENVIRONMENTS = new Set(["sandbox", "production"]);
+const REFRESH_IN_FLIGHT = new Map();
 
 export class ProviderOAuthError extends Error {
   constructor(provider, phase, message, { status = null, code = null, uncertain = false } = {}) {
@@ -135,7 +147,205 @@ export function providerOAuthConfig(provider) {
   return { provider: key, ...config };
 }
 
-export const providerRedirectUri = (port = PROVIDER_DEFAULT_PORT) => `http://127.0.0.1:${port}`;
+// This is an established callback contract for every existing non-QuickBooks
+// provider. Keep it byte-compatible, including the lack of a trailing slash.
+export const providerRedirectUri = (port = PROVIDER_DEFAULT_PORT) =>
+  `http://127.0.0.1:${port}`;
+
+/** Intuit's documented sandbox callback, while the server still binds IPv4 loopback. */
+export function quickBooksSandboxRedirectUri(port = PROVIDER_DEFAULT_PORT, host = "localhost") {
+  const callbackHost = clean(host).toLowerCase();
+  if (!new Set(["localhost", "127.0.0.1"]).has(callbackHost)) {
+    throw new TypeError("QuickBooks callback host must be localhost or 127.0.0.1");
+  }
+  const callbackPort = Number(port);
+  if (!Number.isInteger(callbackPort) || callbackPort < 1024 || callbackPort > 65535) {
+    throw new TypeError("provider callback port must be an integer from 1024 through 65535");
+  }
+  return `http://${callbackHost}:${callbackPort}/`;
+}
+
+function quickBooksBindingSources(connection) {
+  const sources = connection?.quickbooks_binding?.sources;
+  return sources && typeof sources === "object" && !Array.isArray(sources)
+    ? structuredClone(sources)
+    : {};
+}
+
+function quickBooksConnectionFingerprint(connection) {
+  const stored = clean(
+    connection?.provider_metadata?.qbo_company_fingerprint ||
+    connection?.provider_metadata?.realm_fingerprint,
+  );
+  const raw = clean(connection?.provider_metadata?.realm_id);
+  if (stored && !/^[a-f0-9]{64}$/.test(stored)) {
+    throw new ProviderOAuthError("quickbooks", "binding", "the stored company binding is invalid", {
+      code: "source_binding_corrupt",
+    });
+  }
+  let derived = null;
+  try {
+    derived = raw ? quickBooksCompanyFingerprint(normalizeQuickBooksRealmId(raw)) : null;
+  } catch {
+    throw new ProviderOAuthError("quickbooks", "binding", "the protected company identity is invalid", {
+      code: "source_binding_corrupt",
+    });
+  }
+  if (stored && derived && stored !== derived) {
+    throw new ProviderOAuthError("quickbooks", "binding", "the stored company binding does not match its protected company identity", {
+      code: "source_binding_corrupt",
+    });
+  }
+  return derived || stored || null;
+}
+
+const sourceCompanyFingerprint = (binding) => clean(
+  binding?.qbo_company_fingerprint || binding?.realm_fingerprint,
+);
+
+/**
+ * Bind a newly authorized QuickBooks token pair to its company, environment,
+ * and explicit manifest source before the protected credential is replaced.
+ * A different company may use a new source name, but it can never silently
+ * take over an already-bound source.
+ */
+export function bindQuickBooksConnection({
+  prior = null,
+  candidate,
+  source = "quickbooks",
+  environment = "sandbox",
+} = {}) {
+  const sourceName = clean(source).toLowerCase();
+  const selectedEnvironment = clean(environment).toLowerCase();
+  if (!QUICKBOOKS_SOURCE.test(sourceName)) {
+    throw new ProviderOAuthError("quickbooks", "binding", "the configured QuickBooks source name is invalid", {
+      code: "invalid_source",
+    });
+  }
+  if (!QUICKBOOKS_ENVIRONMENTS.has(selectedEnvironment)) {
+    throw new ProviderOAuthError("quickbooks", "binding", "the QuickBooks environment is not selected", {
+      code: "environment_required",
+    });
+  }
+  let realmId;
+  try {
+    realmId = normalizeQuickBooksRealmId(candidate?.provider_metadata?.realm_id);
+  } catch {
+    throw new ProviderOAuthError("quickbooks", "binding", "the provider did not return a valid company identity", {
+      code: "missing_realm_id",
+    });
+  }
+  const companyFingerprint = quickBooksCompanyFingerprint(realmId);
+  const sources = quickBooksBindingSources(prior);
+  const priorCompanyFingerprint = prior ? quickBooksConnectionFingerprint(prior) : null;
+
+  // A legacy credential predating source bindings cannot prove which manifest
+  // alias selected it. Bind that prior company to the source being reconnected
+  // so an alias cannot become a silent company-switch escape hatch.
+  if (priorCompanyFingerprint && Object.keys(sources).length === 0) {
+    sources[sourceName] = {
+      qbo_company_fingerprint: priorCompanyFingerprint,
+      environment: clean(prior?.quickbooks_binding?.environment || selectedEnvironment).toLowerCase(),
+    };
+  }
+  const existing = sources[sourceName] || null;
+  if (existing && sourceCompanyFingerprint(existing) !== companyFingerprint) {
+    throw new ProviderOAuthError(
+      "quickbooks",
+      "binding",
+      "the selected company does not match this QuickBooks source; keep the existing company or configure a different source name",
+      { code: "unexpected_company" },
+    );
+  }
+  if (existing && existing.environment !== selectedEnvironment) {
+    throw new ProviderOAuthError(
+      "quickbooks",
+      "binding",
+      "this QuickBooks source is already bound to a different environment; configure a different source name",
+      { code: "unexpected_environment" },
+    );
+  }
+  sources[sourceName] = {
+    qbo_company_fingerprint: companyFingerprint,
+    environment: selectedEnvironment,
+  };
+  return {
+    ...candidate,
+    sync_states: { ...(prior?.sync_states || {}), ...(candidate?.sync_states || {}) },
+    provider_metadata: {
+      ...(candidate?.provider_metadata || {}),
+      realm_id: realmId,
+      qbo_company_fingerprint: companyFingerprint,
+    },
+    quickbooks_binding: {
+      schema_version: 1,
+      active_source: sourceName,
+      active_environment: selectedEnvironment,
+      active_company_fingerprint: companyFingerprint,
+      sources,
+    },
+  };
+}
+
+/** Refuse ingest when the active token cannot prove the configured source. */
+export function assertQuickBooksSourceBinding(connection, {
+  source = "quickbooks",
+  environment = "sandbox",
+} = {}) {
+  const sourceName = clean(source).toLowerCase();
+  const selectedEnvironment = clean(environment).toLowerCase();
+  let realmId;
+  try {
+    realmId = normalizeQuickBooksRealmId(connection?.provider_metadata?.realm_id);
+  } catch {
+    throw new ProviderOAuthError(
+      "quickbooks",
+      "binding",
+      "the local QuickBooks credential has no valid company identity; reconnect it before ingest",
+      { code: "source_binding_missing" },
+    );
+  }
+  const companyFingerprint = quickBooksCompanyFingerprint(realmId);
+  const active = clean(
+    connection?.quickbooks_binding?.active_company_fingerprint ||
+    connection?.quickbooks_binding?.active_realm_fingerprint,
+  );
+  const sourceBinding = quickBooksBindingSources(connection)[sourceName];
+  const activeSource = clean(connection?.quickbooks_binding?.active_source || sourceName).toLowerCase();
+  const activeEnvironment = clean(
+    connection?.quickbooks_binding?.active_environment || sourceBinding?.environment || selectedEnvironment,
+  ).toLowerCase();
+  if (active !== companyFingerprint || activeSource !== sourceName || !sourceBinding) {
+    throw new ProviderOAuthError(
+      "quickbooks",
+      "binding",
+      "this local QuickBooks connection is not bound to the configured source; reconnect it before ingest",
+      { code: "source_binding_missing" },
+    );
+  }
+  if (sourceCompanyFingerprint(sourceBinding) !== companyFingerprint) {
+    throw new ProviderOAuthError(
+      "quickbooks",
+      "binding",
+      "the active QuickBooks company does not match the configured source; reconnect the expected company",
+      { code: "wrong_realm" },
+    );
+  }
+  if (sourceBinding.environment !== selectedEnvironment || activeEnvironment !== selectedEnvironment) {
+    throw new ProviderOAuthError(
+      "quickbooks",
+      "binding",
+      "the active QuickBooks credential belongs to a different environment",
+      { code: "wrong_environment" },
+    );
+  }
+  return Object.freeze({
+    source: sourceName,
+    environment: selectedEnvironment,
+    realm_id: realmId,
+    qbo_company_fingerprint: companyFingerprint,
+  });
+}
 
 export function providerCredentialOptions(provider, options = {}) {
   const { provider: key, label } = providerOAuthConfig(provider);
@@ -198,7 +408,15 @@ export async function disconnectProvider(provider, {
   const config = providerOAuthConfig(provider);
   const connection = loadProviderCredentials(config.provider, storage);
   if (!connection) {
-    return { disconnected: true, already_disconnected: true, remote_revoked: false, remote_revocation_required: false };
+    const result = {
+      disconnected: true,
+      already_disconnected: true,
+      remote_revoked: false,
+      remote_revocation_required: false,
+    };
+    return config.provider === "quickbooks"
+      ? { ...result, imported_documents_retained: true, forget_operation_required: true }
+      : result;
   }
   let remoteRevoked = false;
   let remoteRevocationRequired = false;
@@ -212,8 +430,15 @@ export async function disconnectProvider(provider, {
     } else if (config.provider === "quickbooks") {
       const credential = Buffer.from(`${connection.client_id}:${connection.client_secret || ""}`, "utf8").toString("base64");
       await providerRequest("quickbooks", "https://developer.api.intuit.com/v2/oauth2/tokens/revoke", {
-        fetchImpl, method: "POST", headers: { Authorization: `Basic ${credential}` },
-        body: { token: connection.refresh_token || connection.access_token }, maxAttempts: 1,
+        fetchImpl,
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${credential}`,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ token: connection.refresh_token || connection.access_token }),
+        maxAttempts: 1,
       });
       remoteRevoked = true;
     } else if (config.provider === "slack") {
@@ -251,13 +476,16 @@ export async function disconnectProvider(provider, {
     remoteRevocationRequired = true;
   }
   clearProviderCredentials(config.provider, storage);
-  return {
+  const result = {
     disconnected: true,
     already_disconnected: false,
     remote_revoked: remoteRevoked,
     remote_revocation_required: remoteRevocationRequired,
     remote_revocation_note: remoteRevocationNote,
   };
+  return config.provider === "quickbooks"
+    ? { ...result, imported_documents_retained: true, forget_operation_required: true }
+    : result;
 }
 
 export function loadProviderSyncState(provider, source, options = {}) {
@@ -336,6 +564,9 @@ function basicAuth(clientId, clientSecret) {
 function tokenRequest(config, fields, { clientId, clientSecret }) {
   const values = { ...fields };
   const headers = { Accept: "application/json" };
+  if (config.provider === "quickbooks") {
+    headers["x-include-refresh-token-hard-expires-in"] = "true";
+  }
   if (config.clientAuth === "basic") headers.Authorization = basicAuth(clientId, clientSecret);
   else {
     values.client_id = clientId;
@@ -395,10 +626,24 @@ async function exchangeToken(provider, fields, credentials, {
     });
   }
   const seconds = Number(payload.expires_in);
+  const refreshSeconds = Number(
+    payload.x_refresh_token_expires_in ?? payload.refresh_token_expires_in,
+  );
+  const refreshHardSeconds = Number(payload.refresh_token_hard_expires_in);
   return {
     access_token: payload.access_token,
     refresh_token: payload.refresh_token || null,
     expires_at: Number.isFinite(seconds) && seconds > 0 ? now + seconds * 1000 : null,
+    ...(config.provider === "quickbooks"
+      ? {
+          refresh_expires_at: Number.isFinite(refreshSeconds) && refreshSeconds > 0
+            ? now + refreshSeconds * 1000
+            : null,
+          refresh_hard_expires_at: Number.isFinite(refreshHardSeconds) && refreshHardSeconds > 0
+            ? now + refreshHardSeconds * 1000
+            : null,
+        }
+      : {}),
     scope: clean(payload.scope) || null,
     token_type: clean(payload.token_type) || "Bearer",
     provider_metadata: Object.fromEntries(Object.entries({
@@ -438,7 +683,18 @@ export async function exchangeProviderAuthorizationCode(provider, {
   return token;
 }
 
-export async function refreshProviderCredentials(provider, connection, {
+function refreshStorageIdentity(provider, storage) {
+  const options = providerCredentialOptions(provider, storage);
+  return [
+    provider,
+    options.backend || "auto",
+    options.path,
+    options.keychainService,
+    options.keychainAccount,
+  ].join("\0");
+}
+
+async function refreshProviderCredentialsOnce(provider, connection, {
   fetchImpl = fetch,
   now = Date.now(),
   storage = {},
@@ -449,19 +705,90 @@ export async function refreshProviderCredentials(provider, connection, {
       code: "missing_refresh_token",
     });
   }
+  const quickbooks = config.provider === "quickbooks";
+  if (quickbooks) {
+    const latestBefore = loadProviderCredentials(config.provider, storage);
+    if (latestBefore?.refresh_token && latestBefore.refresh_token !== connection.refresh_token) {
+      return latestBefore;
+    }
+    const refreshExpiresAt = connection.refresh_expires_at == null
+      ? null
+      : Number(connection.refresh_expires_at);
+    const refreshHardExpiresAt = connection.refresh_hard_expires_at == null
+      ? null
+      : Number(connection.refresh_hard_expires_at);
+    if ((Number.isFinite(refreshExpiresAt) && refreshExpiresAt > 0 && refreshExpiresAt <= now) ||
+        (Number.isFinite(refreshHardExpiresAt) && refreshHardExpiresAt > 0 && refreshHardExpiresAt <= now)) {
+      throw new ProviderOAuthError(config.provider, "refresh", "the refresh grant has expired; reconnect it", {
+        code: "refresh_expired",
+      });
+    }
+  }
   const token = await exchangeToken(config.provider, {
     grant_type: "refresh_token",
     refresh_token: connection.refresh_token,
   }, { clientId: connection.client_id, clientSecret: connection.client_secret }, {
     fetchImpl, phase: "refresh", now,
   });
-  const replacement = {
-    ...connection,
-    ...token,
-    refresh_token: token.refresh_token || connection.refresh_token,
-    refreshed_at: new Date(now).toISOString(),
-  };
+  const currentMetadata = connection.provider_metadata || {};
+  const returnedMetadata = token.provider_metadata || {};
+  if (config.provider === "quickbooks" && returnedMetadata.realm_id) {
+    const before = quickBooksCompanyFingerprint(currentMetadata.realm_id);
+    const after = quickBooksCompanyFingerprint(returnedMetadata.realm_id);
+    if (before !== after) {
+      throw new ProviderOAuthError("quickbooks", "refresh", "the refresh response changed the authorized company identity", {
+        code: "wrong_realm",
+      });
+    }
+  }
+  const replacement = quickbooks
+    ? {
+        ...connection,
+        ...token,
+        refresh_token: token.refresh_token || connection.refresh_token,
+        refresh_expires_at: token.refresh_expires_at || connection.refresh_expires_at || null,
+        refresh_hard_expires_at: token.refresh_hard_expires_at || connection.refresh_hard_expires_at || null,
+        provider_metadata: { ...currentMetadata, ...returnedMetadata },
+        refreshed_at: new Date(now).toISOString(),
+      }
+    : {
+        ...connection,
+        ...token,
+        refresh_token: token.refresh_token || connection.refresh_token,
+        refreshed_at: new Date(now).toISOString(),
+      };
+  if (quickbooks) {
+    const latestAfter = loadProviderCredentials(config.provider, storage);
+    if (latestAfter?.refresh_token && latestAfter.refresh_token !== connection.refresh_token) {
+      // Another process completed the same rotating refresh first. Its verified
+      // durable pair wins; never overwrite it with a response derived from the
+      // now-stale token.
+      return latestAfter;
+    }
+  }
   return saveProviderCredentials(config.provider, replacement, storage);
+}
+
+/**
+ * Serialize rotating refresh tokens inside one process and use a durable
+ * compare-before-replace check to avoid overwriting a newer pair written by a
+ * concurrent process.
+ */
+export async function refreshProviderCredentials(provider, connection, options = {}) {
+  const config = providerOAuthConfig(provider);
+  if (config.provider !== "quickbooks") {
+    return refreshProviderCredentialsOnce(config.provider, connection, options);
+  }
+  const storage = options.storage || {};
+  const key = refreshStorageIdentity(config.provider, storage);
+  const existing = REFRESH_IN_FLIGHT.get(key);
+  if (existing) return existing;
+  const pending = refreshProviderCredentialsOnce(config.provider, connection, options)
+    .finally(() => {
+      if (REFRESH_IN_FLIGHT.get(key) === pending) REFRESH_IN_FLIGHT.delete(key);
+    });
+  REFRESH_IN_FLIGHT.set(key, pending);
+  return pending;
 }
 
 export async function providerAccessToken(provider, {
@@ -486,8 +813,9 @@ const html = (title, body) =>
   `<body style="font:16px/1.6 system-ui;margin:12vh auto;max-width:34rem;padding:0 1.5rem;color:#1a1a1a">` +
   `<h1 style="font-size:1.4rem">${title}</h1><p>${body}</p></body>`;
 
-function loopbackCode({ provider, url, state, port, timeoutMs, open, openImpl, log }) {
+function loopbackCode({ provider, url, state, port, redirectUri, timeoutMs, open, openImpl, log }) {
   const config = providerOAuthConfig(provider);
+  const expectedHost = new URL(redirectUri).host;
   return new Promise((resolve, reject) => {
     let settled = false;
     let timer;
@@ -499,7 +827,12 @@ function loopbackCode({ provider, url, state, port, timeoutMs, open, openImpl, l
       callback(value);
     };
     const server = createServer((request, response) => {
-      const got = new URL(request.url, providerRedirectUri(port));
+      if (String(request.headers.host || "").toLowerCase() !== expectedHost.toLowerCase()) {
+        response.writeHead(400, { "content-type": "text/html; charset=utf-8" })
+          .end(html("Not connected", "The response did not match this local callback."));
+        return;
+      }
+      const got = new URL(request.url, redirectUri);
       if (got.pathname !== "/") { response.writeHead(404).end(); return; }
       const error = got.searchParams.get("error");
       if (got.searchParams.get("state") !== state) {
@@ -535,7 +868,10 @@ function loopbackCode({ provider, url, state, port, timeoutMs, open, openImpl, l
     server.on("error", (error) => finish(reject, new ProviderOAuthError(config.provider, "callback",
       error?.code === "EADDRINUSE" ? `local callback port ${port} is already in use` : "the local callback could not start",
       { code: error?.code || "callback_error" })));
-    server.listen(port, "127.0.0.1", () => {
+    // The registered URL may use localhost, as Intuit documents for sandbox,
+    // but the listener itself is always pinned to IPv4 loopback. No manifest
+    // option can broaden it to a LAN or wildcard address.
+    server.listen(port, PROVIDER_LOOPBACK_BIND_ADDRESS, () => {
       if (!open) return;
       const opened = openImpl(url);
       log(opened
@@ -553,6 +889,8 @@ export async function authorizeProvider(provider, {
   clientSecret = null,
   scopes = null,
   port = PROVIDER_DEFAULT_PORT,
+  redirectHost = null,
+  redirectUri = null,
   timeoutMs = 300_000,
   open = true,
   fetchImpl = fetch,
@@ -560,15 +898,29 @@ export async function authorizeProvider(provider, {
   log = console.log,
   now = Date.now(),
   storage = {},
+  prepareConnection = null,
 } = {}) {
   const config = providerOAuthConfig(provider);
   const state = b64url(randomBytes(16));
   const proof = config.pkce ? pkce() : { verifier: null, challenge: null };
-  const redirectUri = providerRedirectUri(port);
+  const callbackHost = redirectHost || config.loopbackRedirectHost || "127.0.0.1";
+  const callbackUri = redirectUri || (config.provider === "quickbooks"
+    ? quickBooksSandboxRedirectUri(port, callbackHost)
+    : providerRedirectUri(port));
   const url = buildProviderAuthorizationUrl(config.provider, {
-    clientId, redirectUri, state, challenge: proof.challenge, scopes,
+    clientId, redirectUri: callbackUri, state, challenge: proof.challenge, scopes,
   });
-  const callback = await loopbackCode({ provider: config.provider, url, state, port, timeoutMs, open, openImpl, log });
+  const callback = await loopbackCode({
+    provider: config.provider,
+    url,
+    state,
+    port,
+    redirectUri: callbackUri,
+    timeoutMs,
+    open,
+    openImpl,
+    log,
+  });
   for (const field of config.callbackMetadataRequired || []) {
     if (!clean(callback.callback_metadata?.[field])) {
       throw new ProviderOAuthError(config.provider, "callback", `${field} was not returned, so the connection identity is incomplete`, {
@@ -577,16 +929,20 @@ export async function authorizeProvider(provider, {
     }
   }
   const token = await exchangeProviderAuthorizationCode(config.provider, {
-    clientId, clientSecret, code: callback.code, verifier: proof.verifier, redirectUri, fetchImpl, now,
+    clientId, clientSecret, code: callback.code, verifier: proof.verifier, redirectUri: callbackUri, fetchImpl, now,
   });
-  return saveProviderCredentials(config.provider, {
+  const candidate = {
     ...token,
     provider_metadata: { ...token.provider_metadata, ...callback.callback_metadata },
     client_id: clientId,
     client_secret: clientSecret || null,
     scopes: Array.isArray(scopes) ? scopes : config.scopes,
     connected_at: new Date(now).toISOString(),
-  }, storage);
+  };
+  const prepared = typeof prepareConnection === "function"
+    ? await prepareConnection(candidate)
+    : candidate;
+  return saveProviderCredentials(config.provider, prepared, storage);
 }
 
 /** Environment allowlist for a future provider helper child. Exported for tests. */

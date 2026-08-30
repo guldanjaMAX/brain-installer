@@ -273,6 +273,28 @@ test("QuickBooks refuses missing manifests and incomplete configuration before a
     runTechnicianStep({ ...common, manifestPath: noEnvironment }),
     (error) => error.code === "quickbooks_environment_required",
   );
+  const production = join(sandbox, "quickbooks-production.json");
+  writeFileSync(production, JSON.stringify({ corpora: { quickbooks: { enabled: true, environment: "production" } } }));
+  assert.equal(
+    technicianPlan(production).steps.find((step) => step.id === "quickbooks").state,
+    "production_callback_unavailable",
+  );
+  await assert.rejects(
+    runTechnicianStep({ ...common, manifestPath: production }),
+    (error) => error.code === "quickbooks_production_callback_unavailable",
+  );
+  const invalidRedirect = join(sandbox, "quickbooks-invalid-redirect.json");
+  writeFileSync(invalidRedirect, JSON.stringify({
+    corpora: { quickbooks: { enabled: true, environment: "sandbox", redirect_host: "0.0.0.0" } },
+  }));
+  assert.equal(
+    technicianPlan(invalidRedirect).steps.find((step) => step.id === "quickbooks").state,
+    "requires_redirect_host_review",
+  );
+  await assert.rejects(
+    runTechnicianStep({ ...common, manifestPath: invalidRedirect }),
+    (error) => error.code === "quickbooks_redirect_host_invalid",
+  );
   assert.equal(prompts, 0);
   assert.equal(connects, 0);
 });
@@ -315,13 +337,25 @@ test("QuickBooks uses two hidden prompts, existing OAuth custody, privacy-safe J
         },
         oauth: {
           PROVIDER_DEFAULT_PORT: 47812,
-          providerOAuthConfig: () => ({ provider: "quickbooks", label: "QuickBooks Online", clientSecretRequired: true }),
+          providerOAuthConfig: () => ({
+            provider: "quickbooks", label: "QuickBooks Online", clientSecretRequired: true,
+            loopbackRedirectHost: "localhost",
+          }),
           providerRedirectUri: (port) => `http://127.0.0.1:${port}`,
+          quickBooksSandboxRedirectUri: (port, host) => `http://${host}:${port}/`,
           loadProviderCredentials: () => null,
           authorizeProvider: async (_provider, options) => {
             authorizeOptions = options;
-            return { provider_metadata: { realm_id: "private-company-id" } };
+            return options.prepareConnection({ provider_metadata: { realm_id: "private-company-id" } });
           },
+          bindQuickBooksConnection: ({ candidate, source, environment }) => ({
+            ...candidate,
+            provider_metadata: { ...candidate.provider_metadata, qbo_company_fingerprint: "a".repeat(64) },
+            quickbooks_binding: { active_source: source, active_environment: environment },
+          }),
+          assertQuickBooksSourceBinding: (_connection, { source, environment }) => ({
+            source, environment, qbo_company_fingerprint: "a".repeat(64),
+          }),
           providerCredentialDescription: () => "the existing fixture provider store",
         },
       },
@@ -330,8 +364,10 @@ test("QuickBooks uses two hidden prompts, existing OAuth custody, privacy-safe J
     assert.equal(receipt.environment, "sandbox");
     assert.equal(receipt.custody, "client_local_provider_store");
     assert.equal(receipt.financial_authority, false);
+    assert.equal(receipt.oauth_permission, "broad_accounting_scope_runtime_read_only");
     assert.equal(authorizeOptions.clientId, "fixture-intuit-client-id");
     assert.equal(authorizeOptions.clientSecret, "fixture-intuit-client-secret");
+    assert.equal(authorizeOptions.redirectUri, "http://localhost:47812/");
     assert.equal(prompts.length, 2);
     assert.ok(prompts.every((prompt) => /hidden/i.test(prompt.prompt)));
     assert.deepEqual(receipt.verification_commands, [
@@ -378,10 +414,16 @@ test("QuickBooks owner cancellation and missing company identity never produce a
         environment: {},
         oauth: {
           PROVIDER_DEFAULT_PORT: 47812,
-          providerOAuthConfig: () => ({ provider: "quickbooks", label: "QuickBooks Online", clientSecretRequired: true }),
+          providerOAuthConfig: () => ({
+            provider: "quickbooks", label: "QuickBooks Online", clientSecretRequired: true,
+            loopbackRedirectHost: "localhost",
+          }),
           providerRedirectUri: () => "http://127.0.0.1:47812",
+          quickBooksSandboxRedirectUri: () => "http://localhost:47812/",
           loadProviderCredentials: () => null,
           authorizeProvider: async () => ({ provider_metadata: {} }),
+          bindQuickBooksConnection: ({ candidate }) => candidate,
+          assertQuickBooksSourceBinding: () => { throw new Error("must not verify a missing company"); },
           providerCredentialDescription: () => "fixture store",
         },
       }),

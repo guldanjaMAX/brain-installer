@@ -244,10 +244,15 @@
         },
         "quickbooks": {
           "type": "object",
-          "description": "Read-only QuickBooks Online accounting records. The owner authorizes their own Intuit app, and OAuth credentials remain in the local provider credential store. Query snapshots do not prove hard deletion, so the connector reports an explicit deletion gap and reads a complete present-record snapshot on each run.",
+          "description": "QuickBooks Online accounting records queried read-only at runtime. Intuit's Accounting OAuth consent can authorize broader read and update access. Sandbox localhost OAuth is available; production stops before credential or browser access until the client-owned HTTPS callback is implemented. OAuth credentials and raw company identity remain in the local provider store. Disconnect retains imported documents, and query snapshots do not prove hard deletion.",
           "properties": {
             "enabled": { "type": "boolean", "default": false },
             "environment": { "enum": ["sandbox", "production"], "default": "sandbox" },
+            "redirect_host": {
+              "enum": ["localhost", "127.0.0.1"],
+              "default": "localhost",
+              "description": "Exact sandbox callback host. Intuit documents localhost. The callback server always binds 127.0.0.1 and this value cannot broaden listener scope."
+            },
             "source": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64, "default": "quickbooks" },
             "minor_version": { "type": "integer", "minimum": 1, "maximum": 999 },
             "entities": {

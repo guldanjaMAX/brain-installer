@@ -50,8 +50,8 @@ export const TECHNICIAN_STEPS = Object.freeze([
     id: "quickbooks",
     title: "Connect the client's QuickBooks Online company",
     dashboard_url: "https://developer.intuit.com/app/developer/dashboard",
-    human_boundary: "The client creates and owns the Intuit app, enters its values only at hidden prompts, and authorizes their company in the browser. Financial Brain has no shared Intuit account or credential custody.",
-    automated_proof: "The existing loopback OAuth flow stores the connection in the client's local provider credential store and prints the exact dry-run and first-ingest commands.",
+    human_boundary: "The client creates and owns the Intuit app, enters its values only at hidden prompts, and authorizes their sandbox company in the browser. Intuit grants its broad Accounting permission; Financial Brain uses read/query calls only, but the provider scope itself is not read-only.",
+    automated_proof: "The sandbox-only localhost OAuth flow binds the company to the explicit source, stores the connection in the client's local provider credential store, and prints the exact dry-run and first-ingest commands. Production remains unavailable until the client-owned HTTPS callback and local handoff are implemented.",
   }),
   Object.freeze({
     id: "zoom",
@@ -118,6 +118,7 @@ function readManifestSummary(manifestPath, deps = {}) {
       final_hostname: null,
       enabled_connectors: [],
       connector_environments: { quickbooks: null },
+      connector_redirect_hosts: { quickbooks: null },
     };
   }
   let manifest;
@@ -131,6 +132,9 @@ function readManifestSummary(manifestPath, deps = {}) {
   const quickbooksEnvironment = typeof manifest?.corpora?.quickbooks?.environment === "string"
     ? manifest.corpora.quickbooks.environment.trim().toLowerCase()
     : null;
+  const quickbooksRedirectHost = typeof manifest?.corpora?.quickbooks?.redirect_host === "string"
+    ? manifest.corpora.quickbooks.redirect_host.trim().toLowerCase()
+    : "localhost";
   return {
     path: absolute,
     exists: true,
@@ -139,6 +143,7 @@ function readManifestSummary(manifestPath, deps = {}) {
       : null,
     enabled_connectors: enabled,
     connector_environments: { quickbooks: quickbooksEnvironment },
+    connector_redirect_hosts: { quickbooks: quickbooksRedirectHost },
   };
 }
 
@@ -185,6 +190,15 @@ export function technicianPlan(manifestPath, deps = {}) {
           !["sandbox", "production"].includes(manifest.connector_environments.quickbooks)) {
         state = "requires_environment_selection";
       }
+      if (step.id === "quickbooks" && manifest.exists &&
+          manifest.enabled_connectors.includes("quickbooks") &&
+          !["localhost", "127.0.0.1"].includes(manifest.connector_redirect_hosts.quickbooks)) {
+        state = "requires_redirect_host_review";
+      }
+      if (step.id === "quickbooks" && manifest.exists &&
+          manifest.connector_environments.quickbooks === "production") {
+        state = "production_callback_unavailable";
+      }
       if (step.id === "imap" && manifest.exists && !manifest.enabled_connectors.includes("imap")) {
         state = "requires_manifest_enablement";
       }
@@ -197,7 +211,10 @@ export function technicianPlan(manifestPath, deps = {}) {
         command: technicianDisplayCommand(step.id, manifest.path),
         state,
         ...(step.id === "quickbooks"
-          ? { environment: manifest.connector_environments.quickbooks }
+          ? {
+              environment: manifest.connector_environments.quickbooks,
+              redirect_host: manifest.connector_redirect_hosts.quickbooks,
+            }
           : {}),
       };
     }),
@@ -343,6 +360,18 @@ export async function runTechnicianStep({
         "quickbooks_environment_required",
       );
     }
+    if (summary.connector_environments.quickbooks === "production") {
+      throw codedError(
+        "QuickBooks production connection is not available in this release. The client-owned HTTPS callback and single-use local handoff must be implemented and field-tested first. No credential prompt or browser flow was opened.",
+        "quickbooks_production_callback_unavailable",
+      );
+    }
+    if (!["localhost", "127.0.0.1"].includes(summary.connector_redirect_hosts.quickbooks)) {
+      throw codedError(
+        "corpora.quickbooks.redirect_host must be localhost or 127.0.0.1. The callback listener remains local-only.",
+        "quickbooks_redirect_host_invalid",
+      );
+    }
     if (typeof connectProvider !== "function") {
       throw new Error("the QuickBooks step needs the reviewed in-process provider connector");
     }
@@ -425,6 +454,7 @@ export async function runTechnicianStep({
         environment: summary.connector_environments.quickbooks,
         custody: "client_local_provider_store",
         financial_authority: false,
+        oauth_permission: "broad_accounting_scope_runtime_read_only",
         verification_commands: [
           `brain ingest ${quotedManifest} --from quickbooks --dry-run`,
           `brain ingest ${quotedManifest} --from quickbooks`,
