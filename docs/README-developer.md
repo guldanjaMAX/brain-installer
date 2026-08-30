@@ -1065,6 +1065,11 @@ for CLI connectors. A connector reports completed, partial,
 retryable, unavailable, or refused explicitly. Only completed work can advance
 its durable provider cursor.
 
+Plaid's single-use public-token exchange and destructive Item removal explicitly
+opt out of generic automatic retries. Their D1 receipts expose an unknown outcome
+and a same-session recovery path instead of guessing that a lost response means
+the provider did nothing.
+
 Zoom records `recording.completed` and transcript-completed debt in D1 before
 returning HTTP 2xx. Scheduled maintenance reclaims expired leases, retries
 transient failures, and reconciles a bounded recent recordings window so a

@@ -6,6 +6,10 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## Next release
 
+- Plaid bank connections now keep historical loading visibly partial until
+  Plaid confirms the historical update, verify update-mode health before saying
+  connected, repair webhook reconciliation debt atomically, and recover unclear
+  disconnect responses without blindly repeating a removal request.
 - The owner workspace Settings page can check Financial Brain's public stable
   release channel and show `update available`, `up to date`, `ahead of stable`,
   or an explicit `unavailable` state. The check sends no client files,

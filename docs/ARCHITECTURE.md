@@ -155,12 +155,13 @@ only through a reviewed projection that converts `processing` to `retryable`,
 clears both lease fields, and marks the interrupted attempt explicitly. Raw
 Zoom queue tables are excluded from the provider export so a source Worker
 identity never enters the recovery artifact.
-Plaid webhook receipts, reconciliation debt, and revocation debt survive
+Plaid webhook receipts, reconciliation debt, exact provider history readiness,
+and revocation outcome certainty survive
 through their reviewed recovery projections. Public request quota windows and
 vector retry bookkeeping are live operational state, so schemas 27 and 28 are
 recreated empty on the target.
 Exact older migration prefixes remain inspectable by the offline verifier only.
-The field recovery runner requires exact current schema 28 on both source and
+The field recovery runner requires exact current schema 29 on both source and
 restored target before it can export or invoke the current drain protocol.
 
 ## Ingest lifecycle

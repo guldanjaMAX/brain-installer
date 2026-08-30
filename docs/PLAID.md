@@ -58,13 +58,19 @@ status response, support artifact, or recovery artifact.
 ## Runtime contract
 
 - Initial Link requests only `transactions`, with up to 730 days requested.
+- The Link page's Content Security Policy permits the pinned SDK origin and only
+  the API origin for the selected Sandbox or Production environment.
 - Update mode supplies the existing access token and omits `products`,
   `transactions`, and other product-specific parameters. A successful update
-  keeps the existing access token and does not exchange a public token.
-- An unexpired durable Link receipt is replayed after a lost browser response.
+  keeps the existing access token and does not exchange a public token. The
+  connection remains `reauth_required` until `/item/get` proves the same Item is
+  healthy.
+- The browser persists one client request ID for Link-token creation. An
+  unexpired durable Link receipt is replayed after a lost response.
 - A completed token-exchange receipt is replayed without calling Plaid twice.
-  An internally ambiguous public-token exchange fails closed because Plaid
-  public tokens are single-use.
+  D1 atomically allows one concurrent request to claim the single-use public
+  token. Exchange is never automatically retried. An ambiguous outcome returns
+  `PLAID_EXCHANGE_OUTCOME_UNKNOWN` and keeps the same recovery identity.
 - Access tokens use the independent versioned bank-feed wrapping key. They are
   never protected by the admin key or session-signing key.
 - Every `transactions/sync` `has_more` window is staged from the original
@@ -72,15 +78,27 @@ status response, support artifact, or recovery artifact.
   set-based D1 promotion only after the complete window is present.
 - `TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION` discards the staged attempt and
   restarts from that original cursor.
+- An empty page is not historical-completion evidence. The exact Plaid state is
+  stored in `provider_history_state` as
+  `TRANSACTIONS_UPDATE_STATUS_UNKNOWN`, `NOT_READY`,
+  `INITIAL_UPDATE_COMPLETE`, or `HISTORICAL_UPDATE_COMPLETE`; the result stays
+  `ok:false, partial:true` until the historical state is observed. Receipts and
+  status expose the local `history_state` (`queued`, `running`, or `complete`)
+  separately. Both states are scoped to one Plaid Item. Historical readiness
+  for one Item never completes another Item. Within an Item, Plaid's readiness
+  is the provider evidence for the accounts belonging to that Item.
 - `pending_transaction_id`, official currency, unofficial currency, provider
   account and transaction IDs, endpoint, window, and page provenance survive
   normalization.
 - The webhook accepts only a current ES256 `Plaid-Verification` JWT whose
   fetched key ID matches and whose SHA-256 claim matches the exact raw request
-  body. Replays and out-of-order deliveries are recorded explicitly. Webhooks
-  request reconciliation but never replace scheduled reconciliation.
+  body. The key cache expires no later than Plaid's `expired_at`. Event receipt,
+  readiness evidence, and reconciliation debt commit in one D1 batch. A replay
+  repairs missing debt, while out-of-order delivery remains explicit.
 - Disconnect creates durable revocation debt. The encrypted access token stays
-  available for retry until `/item/remove` succeeds. Financial history stays.
+  until provider removal is confirmed. `/item/remove` is single-shot. A lost or
+  unclear response is stored as `unknown`; recovery checks `/item/get` before
+  considering another removal call. Financial history stays.
 
 These rules follow Plaid's current [Transactions Sync guidance](https://plaid.com/docs/transactions/),
 [update-mode guidance](https://plaid.com/docs/link/update-mode/),
@@ -96,7 +114,7 @@ node operations/plaid-sandbox-runner.mjs
 ```
 
 It uses invented values and a fake provider. It exercises response loss,
-correct update mode, pagination mutation restart, whole-window promotion,
+correct update mode, historical readiness, pagination mutation restart, whole-window promotion,
 pending-to-posted linkage, official and unofficial currency preservation,
 signed webhooks, replay ordering, and revocation retry. It prints
 `fieldProof: false` on purpose.
@@ -117,13 +135,17 @@ has also been approved for this gate:
 node operations/plaid-sandbox-runner.mjs --live
 ```
 
-The runner creates one disposable Sandbox Item, exchanges its public token,
-completes a bounded `transactions/sync` window, requests a synthetic refresh,
+The runner creates one disposable Sandbox Item, exchanges its public token once,
+completes a bounded `transactions/sync` window, reports local `history_state`
+separately from exact `provider_history_state`, requests a synthetic refresh,
 forces `ITEM_LOGIN_REQUIRED`, creates the correct update-mode Link token,
 optionally requests a test webhook, and removes the Item in `finally`. Its
 receipt never contains an Item ID or token. Provider acceptance of a fired
-webhook is not delivery proof. The deployed Brain's signed webhook receipt and
-scheduled fallback must be checked separately.
+webhook is not delivery proof. `providerApiProof` covers only this sanitized
+provider-API subset. `liveSandboxProof` stays false until the same disposable
+Item also passes the Financial Brain route/D1 path and update-mode health proof.
+The deployed Brain's signed webhook receipt and scheduled fallback must be
+checked separately.
 
 ## Owner ceremony still required before the primary bank
 
