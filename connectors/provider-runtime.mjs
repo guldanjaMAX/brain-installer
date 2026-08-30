@@ -142,9 +142,10 @@ function resultDetail(result, tally, removal, cursorAdvanced) {
 }
 
 /**
- * Run one provider window. Permanent provider limitations return a partial
- * outcome with a ready receipt and no cursor advancement. Delivery failures
- * close the source as error and throw so a scheduler cannot record success.
+ * Run one provider window. Permanent provider limitations preserve accepted
+ * documents, but close the source as error and never advance its cursor.
+ * Delivery failures also close the source as error and throw so a scheduler
+ * cannot record success.
  */
 export async function runProviderConnector({
   provider,
@@ -265,7 +266,12 @@ export async function runProviderConnector({
       deletionReadbackVerified = true;
     }
     const deliveryComplete = tally.failed === 0 && tally.refused === 0 && removal.pending === 0 && deletionReadbackVerified;
-    const cursorAdvanced = deliveryComplete && normalized.cursor_can_advance && normalized.proposed_cursor !== null;
+    const sourceComplete = normalized.outcome.kind === "completed";
+    // The common runner, not an individual adapter, owns cursor and health
+    // truth. An inconsistent adapter must not turn an explicit partial result
+    // into a skipped provider window or a healthy source receipt.
+    const cursorAdvanced = deliveryComplete && sourceComplete &&
+      normalized.cursor_can_advance && normalized.proposed_cursor !== null;
     const completedAt = now().toISOString();
     if (cursorAdvanced) {
       await saveState({
@@ -279,12 +285,13 @@ export async function runProviderConnector({
       throw new ProviderDeliveryError(detail, { code: "provider_delivery_incomplete", tally });
     }
     await postReceipt(base, adminKey, {
-      source: sourceName, kind, status: "ready", run_id: runId, lane,
+      source: sourceName, kind, status: sourceComplete ? "ready" : "error", run_id: runId, lane,
       started_at: startedAt, completed_at: completedAt,
       docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
-      walk_complete: normalized.outcome.kind === "completed",
+      walk_complete: sourceComplete,
       outcome_kind: normalized.outcome.kind,
       deletion_authority: normalized.deletion_authority,
+      ...(sourceComplete ? {} : { error: detail }),
       detail,
     });
     return {

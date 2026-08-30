@@ -124,16 +124,18 @@ function harness(overrides = {}) {
 
 {
   const partial = completeResult();
-  partial.proposed_cursor = null;
-  partial.cursor_can_advance = false;
   partial.deletion_authority = "unavailable";
   partial.warnings = ["hard deletion is not exposed"];
   partial.outcome = ingestionOutcome("partial", { reason: partial.warnings[0] });
   const h = harness({ sync: async () => partial });
   const result = await runProviderConnector(h.options);
-  check("a permanent deletion-authority gap stays explicit without failing a scheduled snapshot",
-    result.outcome.kind === "partial" && h.receipts.at(-1).status === "ready" && h.receipts.at(-1).walk_complete === false);
-  check("partial provider results never advance opaque state", h.states.length === 0 && result.cursor_advanced === false);
+  check("a partial provider window preserves accepted documents but never posts healthy source state",
+    result.outcome.kind === "partial" && result.tally.unchanged === 1 &&
+    h.receipts.at(-1).status === "error" && h.receipts.at(-1).walk_complete === false &&
+    h.receipts.at(-1).outcome_kind === "partial");
+  check("an explicit partial outcome overrides an inconsistent adapter cursor flag",
+    partial.cursor_can_advance === true && partial.proposed_cursor.page === "opaque-next" &&
+    h.states.length === 0 && result.cursor_advanced === false);
 }
 
 {
