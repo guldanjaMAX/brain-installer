@@ -1,4 +1,4 @@
--- 0020_document_access_passkey_observability
+-- 0022_document_access_passkey_observability
 --
 -- A document grant names exact logical documents. It never names a source,
 -- folder, connector, tag, or coarse zone. New material therefore remains

@@ -1,4 +1,4 @@
--- 0015_financial_ledger — the structured financial layer, in the client's own D1.
+-- 0017_financial_ledger — the structured financial layer, in the client's own D1.
 --
 -- WHY THIS EXISTS
 --

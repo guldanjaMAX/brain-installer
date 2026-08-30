@@ -108,11 +108,11 @@ Four append-only migrations make the D1-to-Vectorize protocol durable:
   every row before its batch and outbox receipts can be cleared.
 
 Later append-only migrations extend the product without replacing those
-storage rules. `0019` adds authoritative document entity scope plus owner
+storage rules. `0021` adds authoritative document entity scope plus owner
 uploads, approvals, period close, append-only activity, targets, preferences,
-and durable request replay. `0020` adds exact-document grants, scoped sessions,
-and aggregate passkey timing. Install order is fixed: 0019 must complete before
-0020. The restart-safe migration adapter is the acceptance path for interrupted
+and durable request replay. `0022` adds exact-document grants, scoped sessions,
+and aggregate passkey timing. Install order is fixed: 0021 must complete before
+0022. The restart-safe migration adapter is the acceptance path for interrupted
 column additions; raw statement replay is not a substitute.
 
 `brain update` deploys a paused compatibility Worker and verifies its exact

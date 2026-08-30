@@ -17,7 +17,7 @@ change and everything else follows from it.
 | `ingest/bank-export.mjs` | the file reader: OFX, QFX, and CSV with column detection and refusal. Zero dependencies |
 | `worker/src/lib/fin-import.js` | the ONE write boundary into `fin_*`, shared by both sources |
 | `worker/src/lib/bank-feed.js` | the hosted feed: authorisation, custody, bounded sync, routes |
-| `migrations/d1/0016_bank_feed.sql` | 3 connector-state tables. **No ledger column was added or changed** |
+| `migrations/d1/0018_bank_feed.sql` | 3 connector-state tables. **No ledger column was added or changed** |
 | `ingest/extract.mjs` | `.ofx` and `.qfx` registered through the existing format machinery |
 | `brain.mjs` | the secrets trap, both halves, gated on a manifest flag |
 | `doctor.mjs` | the return-address preflight |
@@ -131,7 +131,7 @@ and a migration on a live financial ledger later.
 **Custody.** The access reference is encrypted with AES-GCM under a key derived
 from a worker secret the database does not contain, stored with a key version so
 it can be rotated. It fails closed: with no key material available it refuses to
-store rather than storing plaintext. `migrations/d1/0016` carries a CHECK that
+store rather than storing plaintext. `migrations/d1/0018` carries a CHECK that
 makes that structural — ciphertext is base64 and base64 has no hyphen, so a
 plaintext reference is refused by the database itself. Every path out of the
 module runs through one redactor, because the reference implementation put the

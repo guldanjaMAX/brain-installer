@@ -110,7 +110,7 @@ const post = (path, payload, cookie) => new Request(ORIGIN + path, {
   body: JSON.stringify(payload || {}),
 });
 
-test("0019 backfills only unambiguous existing corpus authority before 0020", () => {
+test("0021 backfills only unambiguous existing corpus authority before 0022", () => {
   const db = new DatabaseSync(":memory:");
   applyMigrationRange(db, 1, 18);
   const addDocument = db.prepare(

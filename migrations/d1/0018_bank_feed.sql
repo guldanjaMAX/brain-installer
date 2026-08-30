@@ -1,8 +1,8 @@
--- 0016_bank_feed — connector state for the hosted read-only bank feed.
+-- 0018_bank_feed — connector state for the hosted read-only bank feed.
 --
 -- WHY THIS IS A SEPARATE MIGRATION FROM THE LEDGER
 --
--- 0015 holds financial FACTS. This file holds the plumbing that fetches them:
+-- 0017 holds financial FACTS. This file holds the plumbing that fetches them:
 -- which banks the owner connected, where each connection has read up to, and
 -- the encrypted reference that lets the worker ask for more. None of that is a
 -- financial fact and none of it belongs in `fin_*`.

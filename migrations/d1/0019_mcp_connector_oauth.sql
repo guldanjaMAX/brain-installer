@@ -1,4 +1,4 @@
--- 0017_mcp_connector_oauth — remote connectors (Claude app, ChatGPT) sign in
+-- 0019_mcp_connector_oauth — remote connectors (Claude app, ChatGPT) sign in
 -- with OAuth; the authorize step is the owner's passkey page.
 --
 -- Clients register themselves (RFC 7591 dynamic registration, public clients

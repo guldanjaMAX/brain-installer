@@ -86,12 +86,12 @@ const refuses = (db, sql, params = []) => {
   try { db.prepare(sql).run(...params); return false; } catch { return true; }
 };
 
-/* ============ migration 0016: the connector's own schema ============ */
+/* ============ migration 0018: the connector's own schema ============ */
 {
   const db = freshDb();
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'bank_feed%'")
     .all().map((r) => r.name).sort();
-  check("0016 creates the three connector tables and nothing else",
+  check("0018 creates the three connector tables and nothing else",
     JSON.stringify(tables) === JSON.stringify(["bank_feed_backfill", "bank_feed_items", "bank_feed_link_sessions"]),
     JSON.stringify(tables));
 

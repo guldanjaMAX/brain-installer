@@ -255,7 +255,7 @@ ChatGPT, on your phone, with nothing to install.**
   write budget — batches now pack themselves to fit it, found live when a
   two-day catch-up was refused in one over-full call.
 
-After updating, run `brain setup <manifest>` (applies migration 0015), then
+After updating, run `brain setup <manifest>` (applies migration 0017), then
 `brain mcp-config <manifest>` to see your connector URL and the exact
 click-path for each app.
 

@@ -23,8 +23,8 @@ import { mintSessionCookie } from "../src/lib/sessions.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS = join(HERE, "..", "..", "migrations", "d1");
-const LEDGER_MIGRATION = "0015_financial_ledger.sql";
-const OWNER_WORKSPACE_MIGRATION = "0019_owner_workspace.sql";
+const LEDGER_MIGRATION = "0017_financial_ledger.sql";
+const OWNER_WORKSPACE_MIGRATION = "0021_owner_workspace.sql";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => {

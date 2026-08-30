@@ -22,7 +22,7 @@ reason to weaken the tests.
 
 | Contract | Automated evidence | Required result |
 | --- | --- | --- |
-| Restart-safe 0019 and 0020 | `product-migration-contract.test.mjs` | The production `runRestartSafeMigrationStatements` runner resumes after every statement, skips only a compatible existing column, refuses an incompatible column, and all non-ALTER statements replay safely. |
+| Restart-safe 0021 and 0022 | `product-migration-contract.test.mjs` | The production `runRestartSafeMigrationStatements` runner resumes after every statement, skips only a compatible existing column, refuses an incompatible column, and all non-ALTER statements replay safely. |
 | Append-only human evidence | `product-migration-contract.test.mjs` | SQLite triggers refuse UPDATE and DELETE for owner activity and approvals. |
 | Owner authentication | `owner-actions-contract.test.mjs` | Positive owner session plus `X-Brain-App: 1` is required. Admin key fallback and missing companion header are refused. Private responses are no-store. |
 | Owner upload | `owner-actions-contract.test.mjs` | Only the frozen text formats are accepted. `document_id` is stable document identity; source identity is server-owned. Size, media, scope, and credential refusals mutate nothing. |
@@ -46,7 +46,7 @@ reason to weaken the tests.
 Against exact `11e4363`:
 
 - `product-migration-contract.test.mjs`: 0 passed, 1 failed, 1 skipped because
-  migrations 0019 and 0020 are absent.
+  migrations 0021 and 0022 are absent.
 - `owner-actions-contract.test.mjs`: 0 passed, 7 failed because the owner
   routes, migration tables, durable upload finalizer, and stable error codes are
   absent.
@@ -61,10 +61,10 @@ must still pass.
 
 ## Focused evidence before integration
 
-- Backend worktree: owner actions 7/7 passed; entity scope 2/2 passed; 0019
+- Backend worktree: owner actions 7/7 passed; entity scope 2/2 passed; 0021
   restart/append-only 2/2 passed.
 - Security commit `b80ab337c1b0e321540941f9fd95f420b7595e6c`:
-  repository document-access tests 4/4 passed; 0020 restart test passed after
+  repository document-access tests 4/4 passed; 0022 restart test passed after
   every statement boundary.
 - QA branch: syntax checks passed; the package test-chain guard includes all
   100 tracked test files; freshness 25/25 and vector delete outbox 90/90 passed.

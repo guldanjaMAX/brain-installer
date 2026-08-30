@@ -1,4 +1,4 @@
-/** Owner workspace contracts against the real 0019 SQLite schema. */
+/** Owner workspace contracts against the real 0021 SQLite schema. */
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";

@@ -1,6 +1,6 @@
 # Owner workspace API contract
 
-This document freezes the backend contract introduced by D1 migration 0019.
+This document freezes the backend contract introduced by D1 migration 0021.
 All routes use JSON `POST`, return `Cache-Control: no-store`, and require both a
 valid passkey session and `X-Brain-App: 1`. The session must resolve positively
 to `{ kind: "owner", grantId: null }`. There is no admin-key fallback.
@@ -193,7 +193,7 @@ emits no event.
 private JSON body. D1 validates a live owned entity, then applies exact
 `documents.entity_slug` equality to keyword search and vector hydration.
 
-Migration 0019 backfills this authority only from an unambiguous live
+Migration 0021 backfills this authority only from an unambiguous live
 `fin_documents.corpus_doc_uid` mapping. It never infers authority from the
 free-form legacy `documents.client` label. Unmapped or ambiguous legacy rows
 remain `NULL` and owner-only.

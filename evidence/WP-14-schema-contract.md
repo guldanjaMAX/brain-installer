@@ -19,7 +19,7 @@ work rather than take it on faith.
 
 | File | What it is |
 |---|---|
-| `migrations/d1/0015_financial_ledger.sql` | 13 tables, 34 indexes, all statements idempotent |
+| `migrations/d1/0017_financial_ledger.sql` | 13 tables, 34 indexes, all statements idempotent |
 | `worker/src/lib/fin-d1.js` | the read path: 11 exported query functions plus one snapshot composer |
 | `worker/test/fin-d1.test.mjs` | 132 checks against a real SQLite database, registered in the `npm test` chain |
 | `operations/cloudflare-recovery-adapter.mjs` | the reviewed durable-table list, extended (see "What else had to change") |
@@ -343,7 +343,7 @@ PASS  obligations nobody has examined are counted apart from those checked and c
 PASS  an unreachable database returns unavailable, not a total of zero
 PASS  no client-facing outcome word appears anywhere on the wire
 PASS  all 15 amounts on the wire are integers in minor units
-PASS  0015 resumes after every one of its 47 independently committed statements
+PASS  0017 resumes after every one of its 47 independently committed statements
 ```
 
 Restart safety is proved the way the migration engine's own suite proves it: the

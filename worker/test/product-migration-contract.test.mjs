@@ -68,8 +68,8 @@ function addedColumn(statement) {
 test("owner and security migrations resume after every statement boundary", async () => {
   const context = await migrationContext();
   const targets = (process.env.PRODUCT_CONTRACT_MIGRATIONS || [
-    "0019_owner_workspace.sql",
-    "0020_document_access_passkey_observability.sql",
+    "0021_owner_workspace.sql",
+    "0022_document_access_passkey_observability.sql",
   ].join(",")).split(",").map((name) => name.trim()).filter(Boolean);
 
   for (const target of targets) {
@@ -129,12 +129,12 @@ test("owner and security migrations resume after every statement boundary", asyn
 
 test("owner activity and approvals are physically append-only", async (t) => {
   const context = await migrationContext();
-  if (!context.statements.has("0019_owner_workspace.sql")) {
-    t.skip("focused security-migration run does not contain backend migration 0019");
+  if (!context.statements.has("0021_owner_workspace.sql")) {
+    t.skip("focused security-migration run does not contain backend migration 0021");
     return;
   }
-  const db = freshBefore(context, "0019_owner_workspace.sql");
-  apply(db, context.statements.get("0019_owner_workspace.sql"));
+  const db = freshBefore(context, "0021_owner_workspace.sql");
+  apply(db, context.statements.get("0021_owner_workspace.sql"));
 
   db.prepare(
     `INSERT INTO owner_activity_events

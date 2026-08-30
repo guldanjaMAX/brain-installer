@@ -102,7 +102,7 @@ cap already applies, every call lands in `llm_call_log` under the label `ocr`,
 and routine ingest needs no standing Cloudflare control-plane token.
 
 New files: `ingest/page-image.mjs`, `ingest/ocr.mjs`, `worker/src/lib/ocr.js`,
-`migrations/d1/0018_extraction_provenance.sql`, `test/ocr.test.mjs`,
+`migrations/d1/0020_extraction_provenance.sql`, `test/ocr.test.mjs`,
 `test/fixtures/scan-pdf.mjs`.
 
 ---
@@ -115,7 +115,7 @@ the point entirely: **both retrieval queries select a fixed column list, and the
 citation object is built from that list.** A flag in `meta` sits in D1 and never
 reaches the reader.
 
-So migration 0018 promotes two columns onto `documents`, following the
+So migration 0020 promotes two columns onto `documents`, following the
 `date_source` / `date_reliable` precedent exactly — date trust travels with
 retrieval because trust that does not travel is not trust:
 

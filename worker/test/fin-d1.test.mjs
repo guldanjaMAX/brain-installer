@@ -24,8 +24,8 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS = join(HERE, "..", "..", "migrations", "d1");
-const LEDGER_MIGRATION = "0015_financial_ledger.sql";
-const OWNER_WORKSPACE_MIGRATION = "0019_owner_workspace.sql";
+const LEDGER_MIGRATION = "0017_financial_ledger.sql";
+const OWNER_WORKSPACE_MIGRATION = "0021_owner_workspace.sql";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => {
@@ -138,7 +138,7 @@ const NOW = "2026-08-28T00:00:00Z";
 /* ------------------------------------- restart safety: re-applying is safe -- */
 {
   // D1 commits each statement independently, so a crash mid-file must leave a
-  // database the same migration can be run over again. Every statement in 0015
+  // database the same migration can be run over again. Every statement in 0017
   // is a CREATE ... IF NOT EXISTS, which this proves by running the whole file a
   // second time and then once more statement by statement from each fault point.
   const db = freshDb();
@@ -150,7 +150,7 @@ const NOW = "2026-08-28T00:00:00Z";
     reapplied = false;
     detail = error.message;
   }
-  check("0015 re-applies cleanly over itself", reapplied, detail);
+  check("0017 re-applies cleanly over itself", reapplied, detail);
 
   const ledgerStatements = statementsFor(LEDGER_MIGRATION);
   let everyResumePassed = true;
@@ -175,7 +175,7 @@ const NOW = "2026-08-28T00:00:00Z";
     candidate.close();
     if (!everyResumePassed) break;
   }
-  check(`0015 resumes after every one of its ${ledgerStatements.length} independently committed statements`,
+  check(`0017 resumes after every one of its ${ledgerStatements.length} independently committed statements`,
     everyResumePassed, resumeDetail);
   db.close();
 }

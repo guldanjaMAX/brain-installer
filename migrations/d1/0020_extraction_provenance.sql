@@ -1,4 +1,4 @@
--- 0018_extraction_provenance — how the text got here, promoted to a real column
+-- 0020_extraction_provenance — how the text got here, promoted to a real column
 -- so it can reach a citation.
 --
 -- WHY A COLUMN AND NOT A `meta` KEY
