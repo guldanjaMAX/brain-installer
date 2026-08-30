@@ -2,7 +2,10 @@ import { walk, prepare, batches, batchStream, splitOversized, estimatedStatement
 import { estimateD1IngestStatements } from "../worker/src/lib/store.js";
 import { extract, isBinaryFormat, register, supported } from "../ingest/extract.mjs";
 import { extractPdf, pdfPassIsolated } from "../ingest/formats.mjs";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync, readdirSync } from "node:fs";
+import {
+  linkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync, readdirSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -52,6 +55,123 @@ put("docs/report.pdf", "%PDF-1.4 not really");
   check("an oversized file is skipped and the size stated",
     skipped.some((s) => /over the/.test(s.reason)), JSON.stringify(skipped.slice(0, 3)));
   check("the limit is respected", files.every((f) => f.size <= 10));
+}
+
+/* ---- local path authority survives hostile filesystem changes ---- */
+const makeDirectoryLink = (target, linkPath) => {
+  symlinkSync(target, linkPath, process.platform === "win32" ? "junction" : "dir");
+};
+
+{
+  const actualRoot = mkdtempSync(join(tmpdir(), "brain-ingest-real-root-"));
+  writeFileSync(join(actualRoot, "inside.md"), "This ordinary file is inside the real approved root.");
+  const linkedRoot = `${actualRoot}-linked`;
+  makeDirectoryLink(actualRoot, linkedRoot);
+  const result = walk(linkedRoot, {});
+  check("a symlink or junction ingest root is refused before enumeration",
+    result.complete === false && result.files.length === 0 &&
+      result.skipped.some((skip) => /ingest root is a symbolic link or junction/.test(skip.reason)),
+    JSON.stringify(result));
+  rmSync(linkedRoot, { recursive: true, force: true });
+  rmSync(actualRoot, { recursive: true, force: true });
+}
+
+{
+  const linkRoot = mkdtempSync(join(tmpdir(), "brain-ingest-file-link-"));
+  const outsideRoot = mkdtempSync(join(tmpdir(), "brain-ingest-file-target-"));
+  const outside = join(outsideRoot, "outside.md");
+  const linked = join(linkRoot, "linked.md");
+  writeFileSync(outside, "Outside-only material must never become an ingest envelope.");
+  let fileLink = true;
+  try {
+    symlinkSync(outside, linked, "file");
+  } catch (error) {
+    // Some Windows hosts reserve file symlinks even though directory junctions
+    // are available to ordinary users. A final junction exercises the same
+    // reparse-point refusal without weakening that platform's test lane.
+    if (process.platform !== "win32" || !["EPERM", "EACCES", "UNKNOWN"].includes(error?.code)) throw error;
+    fileLink = false;
+    makeDirectoryLink(outsideRoot, linked);
+  }
+  const result = walk(linkRoot, {});
+  check("an initial symlink file or Windows reparse entry is a visible refusal",
+    result.complete === false && result.files.length === 0 &&
+      result.skipped.some((skip) => skip.path === "linked.md" && /symbolic links and junctions/.test(skip.reason)),
+    JSON.stringify(result));
+  const direct = await prepare({
+    full: linked, rel: "linked.md", name: "linked.md", size: fileLink ? statSync(outside).size : 1,
+  }, { sourceName: "docs" });
+  check("prepare also refuses an initial link when called directly",
+    !!direct.skip && !direct.envelope && /symbolic links and junctions/.test(direct.skip.reason),
+    JSON.stringify(direct));
+  rmSync(linkRoot, { recursive: true, force: true });
+  rmSync(outsideRoot, { recursive: true, force: true });
+}
+
+{
+  const swapRoot = mkdtempSync(join(tmpdir(), "brain-ingest-swap-"));
+  const outsideRoot = mkdtempSync(join(tmpdir(), "brain-ingest-swap-target-"));
+  const original = join(swapRoot, "approved.md");
+  const outside = join(outsideRoot, "outside.md");
+  const outsideOnly = "OUTSIDE_SWAP_SENTINEL must never be extracted.";
+  writeFileSync(original, "The approved file has enough ordinary words to pass text quality safely.");
+  writeFileSync(outside, outsideOnly);
+  const approved = walk(swapRoot, {}).files[0];
+  rmSync(original);
+  let usedLink = true;
+  try {
+    symlinkSync(outside, original, "file");
+  } catch (error) {
+    if (process.platform !== "win32" || !["EPERM", "EACCES", "UNKNOWN"].includes(error?.code)) throw error;
+    usedLink = false;
+    writeFileSync(original, outsideOnly);
+  }
+  const swapped = await prepare(approved, { sourceName: "docs" });
+  check("a walk-to-read replacement is refused before replacement bytes are used",
+    !!swapped.skip && !swapped.envelope &&
+      /symbolic links and junctions|changed after the folder was scanned/.test(swapped.skip.reason) &&
+      !JSON.stringify(swapped).includes("OUTSIDE_SWAP_SENTINEL"),
+    `${usedLink ? "link" : "identity"}: ${JSON.stringify(swapped)}`);
+  rmSync(swapRoot, { recursive: true, force: true });
+  rmSync(outsideRoot, { recursive: true, force: true });
+}
+
+{
+  // Keep the approved inode but make its path escape through a parent link.
+  // Matching identity alone is insufficient here, so this proves canonical
+  // root containment is checked independently before the descriptor read.
+  const containedRoot = mkdtempSync(join(tmpdir(), "brain-ingest-contained-"));
+  const outsideRoot = mkdtempSync(join(tmpdir(), "brain-ingest-contained-target-"));
+  const slot = join(containedRoot, "slot");
+  mkdirSync(slot);
+  const approvedPath = join(slot, "same.md");
+  writeFileSync(approvedPath, "The approved inode begins within the selected folder boundary.");
+  const approved = walk(containedRoot, {}).files[0];
+  linkSync(approvedPath, join(outsideRoot, "same.md"));
+  rmSync(slot, { recursive: true, force: true });
+  makeDirectoryLink(outsideRoot, slot);
+  const escaped = await prepare(approved, { sourceName: "docs" });
+  check("a matching file identity reached through an outside-root junction is still refused",
+    !!escaped.skip && !escaped.envelope && /outside the approved ingest root/.test(escaped.skip.reason),
+    JSON.stringify(escaped));
+  rmSync(containedRoot, { recursive: true, force: true });
+  rmSync(outsideRoot, { recursive: true, force: true });
+}
+
+{
+  const growthRoot = mkdtempSync(join(tmpdir(), "brain-ingest-growth-"));
+  const growing = join(growthRoot, "growing.md");
+  writeFileSync(growing, "This initially small document is approved by the folder walk.");
+  const approved = walk(growthRoot, {}).files[0];
+  // writeFileSync truncates and rewrites the same regular-file identity. The
+  // descriptor gate must therefore enforce the byte ceiling independently of
+  // the walk's stale size metadata.
+  writeFileSync(growing, Buffer.alloc(MAX_FILE_BYTES + 1, 0x61));
+  const oversized = await prepare(approved, { sourceName: "docs" });
+  check("the actual descriptor read rechecks the 8MB ceiling after the walk",
+    !!oversized.skip && !oversized.envelope && /over the 8MB limit/.test(oversized.skip.reason),
+    JSON.stringify(oversized));
+  rmSync(growthRoot, { recursive: true, force: true });
 }
 
 /* ---- prepare: every rejection carries a legible reason ---- */

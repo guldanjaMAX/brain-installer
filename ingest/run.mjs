@@ -20,10 +20,11 @@
  */
 
 import {
-  readFileSync, readdirSync, statSync, writeFileSync, existsSync, mkdirSync,
-  renameSync, chmodSync, rmSync,
+  closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync,
+  readdirSync, realpathSync, writeFileSync, existsSync, mkdirSync, renameSync,
+  chmodSync, rmSync,
 } from "node:fs";
-import { join, relative, sep, basename, dirname } from "node:path";
+import { isAbsolute, join, relative, resolve, sep, basename, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { extract, canExtract, extensionOf, isBinaryFormat } from "./extract.mjs";
 import {
@@ -92,11 +93,234 @@ export const fileSizeLimitFor = (name, maxBytes, archiveBytes) =>
     ? archiveBytes
     : maxBytes);
 
+class LocalFileSafetyError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "LocalFileSafetyError";
+    this.code = code;
+  }
+}
+
+const localFileFail = (code, message) => {
+  throw new LocalFileSafetyError(code, message);
+};
+
+const nativeRealpath = realpathSync.native || realpathSync;
+
+const comparablePath = (value) => {
+  const normalized = resolve(String(value));
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+};
+
+function pathIsWithin(root, candidate) {
+  const rel = relative(comparablePath(root), comparablePath(candidate));
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+function regularFileSnapshot(st) {
+  return {
+    dev: String(st.dev),
+    ino: String(st.ino),
+    size: String(st.size),
+    mtimeNs: String(st.mtimeNs ?? BigInt(Math.trunc(Number(st.mtimeMs) * 1e6))),
+    ctimeNs: String(st.ctimeNs ?? BigInt(Math.trunc(Number(st.ctimeMs) * 1e6))),
+  };
+}
+
+const sameFileIdentity = (left, right) => left.dev === right.dev && left.ino === right.ino;
+
+const sameFileVersion = (left, right) =>
+  sameFileIdentity(left, right) && left.size === right.size &&
+  left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+
+function inspectRegularPath(path) {
+  let st;
+  try {
+    st = lstatSync(path, { bigint: true });
+  } catch (error) {
+    localFileFail("LOCAL_FILE_METADATA_UNAVAILABLE", `file metadata could not be read: ${error.code || "unavailable"}`);
+  }
+  if (st.isSymbolicLink()) {
+    localFileFail("LOCAL_FILE_LINK_REFUSED", "symbolic links and junctions are not ingested");
+  }
+  if (!st.isFile()) localFileFail("LOCAL_FILE_NOT_REGULAR", "the path is not a regular file");
+  return regularFileSnapshot(st);
+}
+
+function approveLocalRoot(root) {
+  const rootPath = resolve(String(root));
+  let st;
+  try {
+    st = lstatSync(rootPath, { bigint: true });
+  } catch (error) {
+    localFileFail("LOCAL_ROOT_METADATA_UNAVAILABLE", `folder metadata could not be read: ${error.code || "unavailable"}`);
+  }
+  if (st.isSymbolicLink()) {
+    localFileFail("LOCAL_ROOT_LINK_REFUSED", "the ingest root is a symbolic link or junction");
+  }
+  if (!st.isDirectory()) localFileFail("LOCAL_ROOT_NOT_DIRECTORY", "the ingest root is not a directory");
+  let rootReal;
+  try {
+    rootReal = nativeRealpath(rootPath);
+  } catch (error) {
+    localFileFail("LOCAL_ROOT_REALPATH_UNAVAILABLE", `folder identity could not be resolved: ${error.code || "unavailable"}`);
+  }
+  return { rootPath, rootReal };
+}
+
+function approveWalkedFile(full, rootApproval) {
+  const fullPath = resolve(String(full));
+  const identity = inspectRegularPath(fullPath);
+  let fileReal;
+  try {
+    fileReal = nativeRealpath(fullPath);
+  } catch (error) {
+    localFileFail("LOCAL_FILE_REALPATH_UNAVAILABLE", `file identity could not be resolved: ${error.code || "unavailable"}`);
+  }
+  if (!pathIsWithin(rootApproval.rootReal, fileReal)) {
+    localFileFail("LOCAL_FILE_OUTSIDE_ROOT", "the file resolves outside the approved ingest root");
+  }
+  return { rootPath: rootApproval.rootPath, rootReal: rootApproval.rootReal, identity };
+}
+
+function localReadApproval(file) {
+  if (file?._localApproval?.rootReal && file?._localApproval?.identity) return file._localApproval;
+
+  // A few format fixtures call prepare() directly. Give those calls the same
+  // link-refusing descriptor read, with the containing directory as the narrow
+  // root. Production folder ingest always supplies walk()'s earlier identity.
+  const fullPath = resolve(String(file?.full || ""));
+  const rootPath = resolve(fullPath, "..");
+  let rootReal;
+  try {
+    rootReal = nativeRealpath(rootPath);
+  } catch (error) {
+    localFileFail("LOCAL_ROOT_REALPATH_UNAVAILABLE", `folder identity could not be resolved: ${error.code || "unavailable"}`);
+  }
+  return { rootPath, rootReal, identity: inspectRegularPath(fullPath) };
+}
+
+function openLocalNoFollow(path) {
+  // POSIX exposes O_NOFOLLOW. Windows does not expose the equivalent reparse
+  // flag through Node, so descriptor identity is checked before any byte read.
+  const noFollow = process.platform === "win32" ? 0 : (constants.O_NOFOLLOW || 0);
+  try {
+    return openSync(path, constants.O_RDONLY | noFollow | (constants.O_CLOEXEC || 0));
+  } catch (error) {
+    if (error?.code === "ELOOP") {
+      localFileFail("LOCAL_FILE_LINK_REFUSED", "symbolic links and junctions are not ingested");
+    }
+    localFileFail("LOCAL_FILE_OPEN_REFUSED", `the approved file could not be opened: ${error.code || "unavailable"}`);
+  }
+}
+
+function readBoundedLocalFile(fd, maxBytes) {
+  const chunks = [];
+  let total = 0;
+  while (total <= maxBytes) {
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - total));
+    let count;
+    try {
+      count = readSync(fd, chunk, 0, chunk.length, total);
+    } catch (error) {
+      localFileFail("LOCAL_FILE_READ_FAILED", `the approved file could not be read: ${error.code || "unavailable"}`);
+    }
+    if (count === 0) break;
+    chunks.push(chunk.subarray(0, count));
+    total += count;
+  }
+  if (total > maxBytes) {
+    localFileFail("LOCAL_FILE_TOO_LARGE", `the file changed and is now over the ${(maxBytes / 1048576).toFixed(0)}MB limit`);
+  }
+  return Buffer.concat(chunks, total);
+}
+
+/** Read only the regular file identity approved by walk(), within its root. */
+function readApprovedLocalFile(file, { maxBytes }) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    localFileFail("LOCAL_FILE_LIMIT_INVALID", "the local file size limit is invalid");
+  }
+  const fullPath = resolve(String(file?.full || ""));
+  const approval = localReadApproval(file);
+  const pathBefore = inspectRegularPath(fullPath);
+  if (!sameFileIdentity(pathBefore, approval.identity)) {
+    localFileFail("LOCAL_FILE_IDENTITY_CHANGED", "the file changed after the folder was scanned; retry the ingest");
+  }
+  let realBefore;
+  try {
+    realBefore = nativeRealpath(fullPath);
+  } catch (error) {
+    localFileFail("LOCAL_FILE_REALPATH_UNAVAILABLE", `file identity could not be resolved: ${error.code || "unavailable"}`);
+  }
+  if (!pathIsWithin(approval.rootReal, realBefore)) {
+    localFileFail("LOCAL_FILE_OUTSIDE_ROOT", "the file resolves outside the approved ingest root");
+  }
+
+  const fd = openLocalNoFollow(fullPath);
+  try {
+    let before;
+    try {
+      const st = fstatSync(fd, { bigint: true });
+      if (!st.isFile()) localFileFail("LOCAL_FILE_NOT_REGULAR", "the opened path is not a regular file");
+      before = regularFileSnapshot(st);
+    } catch (error) {
+      if (error instanceof LocalFileSafetyError) throw error;
+      localFileFail("LOCAL_FILE_METADATA_UNAVAILABLE", `opened-file metadata could not be read: ${error.code || "unavailable"}`);
+    }
+    if (!sameFileIdentity(before, approval.identity) || !sameFileIdentity(before, pathBefore)) {
+      localFileFail("LOCAL_FILE_IDENTITY_CHANGED", "the file changed while it was being opened; retry the ingest");
+    }
+    if (BigInt(before.size) > BigInt(maxBytes)) {
+      localFileFail("LOCAL_FILE_TOO_LARGE", `the file changed and is now over the ${(maxBytes / 1048576).toFixed(0)}MB limit`);
+    }
+
+    const bytes = readBoundedLocalFile(fd, maxBytes);
+    let after;
+    try {
+      after = regularFileSnapshot(fstatSync(fd, { bigint: true }));
+    } catch (error) {
+      localFileFail("LOCAL_FILE_METADATA_UNAVAILABLE", `opened-file metadata could not be rechecked: ${error.code || "unavailable"}`);
+    }
+    if (!sameFileVersion(before, after) || BigInt(after.size) !== BigInt(bytes.length)) {
+      localFileFail("LOCAL_FILE_CHANGED_DURING_READ", "the file changed while it was being read; retry the ingest");
+    }
+
+    const pathAfter = inspectRegularPath(fullPath);
+    let realAfter;
+    try {
+      realAfter = nativeRealpath(fullPath);
+    } catch (error) {
+      localFileFail("LOCAL_FILE_REALPATH_UNAVAILABLE", `file identity could not be rechecked: ${error.code || "unavailable"}`);
+    }
+    if (!sameFileIdentity(pathAfter, after) || !pathIsWithin(approval.rootReal, realAfter)) {
+      localFileFail("LOCAL_FILE_IDENTITY_CHANGED", "the file path changed while it was being read; retry the ingest");
+    }
+    return bytes;
+  } finally {
+    try { closeSync(fd); } catch { /* the safety result above is authoritative */ }
+  }
+}
+
+const localFileSafetyReason = (error) => error instanceof LocalFileSafetyError
+  ? error.message
+  : `could not safely inspect the local file: ${error?.code || "unavailable"}`;
+
 export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES, archiveBytes = MAX_ARCHIVE_BYTES } = {}) {
   const files = [];
   const skipped = [];
   let complete = true;
   const prefixes = privatePrefixes.map((p) => p.toLowerCase());
+
+  let rootApproval;
+  try {
+    rootApproval = approveLocalRoot(root);
+  } catch (error) {
+    return {
+      files,
+      skipped: [{ path: root, reason: localFileSafetyReason(error) }],
+      complete: false,
+    };
+  }
 
   const isPrivate = (rel) =>
     rel.split(/[\\/]/).some((seg) => prefixes.some((p) => seg.toLowerCase().startsWith(p)));
@@ -115,6 +339,14 @@ export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES, ar
     for (const e of entries) {
       const full = join(dir, e.name);
       const rel = relative(root, full);
+      if (e.isSymbolicLink()) {
+        skipped.push({ path: rel, reason: "symbolic links and junctions are not ingested" });
+        // A link can stand in for one prior file or an entire prior subtree.
+        // Treating the walk as complete could therefore turn a refused link
+        // into deletion evidence for children that were never enumerated.
+        complete = false;
+        continue;
+      }
       if (e.isDirectory()) {
         if (SKIP_DIRS.has(e.name) || e.name.startsWith(".")) continue;
         if (isPrivate(rel)) {
@@ -136,19 +368,29 @@ export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES, ar
         skipped.push({ path: rel, reason: "matched a private path prefix from the manifest" });
         continue;
       }
-      let st;
-      try { st = statSync(full); } catch (error) {
-        skipped.push({ path: rel, reason: `file metadata could not be read: ${error.code || error.message}` });
+      let approval;
+      try {
+        approval = approveWalkedFile(full, rootApproval);
+      } catch (error) {
+        skipped.push({ path: rel, reason: localFileSafetyReason(error) });
+        // Any identity or containment failure means the walk did not establish
+        // a complete deletion boundary, so no ingest or removal may run.
         complete = false;
         continue;
       }
-      if (st.size === 0) { skipped.push({ path: rel, reason: "file is empty" }); continue; }
-      const sizeLimit = fileSizeLimitFor(e.name, maxBytes, archiveBytes);
-      if (st.size > sizeLimit) {
-        skipped.push({ path: rel, reason: `file is ${(st.size / 1048576).toFixed(1)}MB, over the ${(sizeLimit / 1048576).toFixed(0)}MB limit` });
+      const size = Number(approval.identity.size);
+      if (!Number.isSafeInteger(size) || size < 0) {
+        skipped.push({ path: rel, reason: "file size could not be represented safely" });
+        complete = false;
         continue;
       }
-      files.push({ full, rel, name: e.name, size: st.size });
+      if (size === 0) { skipped.push({ path: rel, reason: "file is empty" }); continue; }
+      const sizeLimit = fileSizeLimitFor(e.name, maxBytes, archiveBytes);
+      if (size > sizeLimit) {
+        skipped.push({ path: rel, reason: `file is ${(size / 1048576).toFixed(1)}MB, over the ${(sizeLimit / 1048576).toFixed(0)}MB limit` });
+        continue;
+      }
+      files.push({ full, rel, name: e.name, size, sizeLimit, _localApproval: approval });
     }
   };
 
@@ -461,12 +703,16 @@ export function removedSinceLastRun(knownKeys, present) {
  */
 export async function prepare(file, { sourceName, ocr = null }) {
   let buf;
+  const sizeLimit = Number.isSafeInteger(file?.sizeLimit)
+    ? file.sizeLimit
+    : fileSizeLimitFor(file?.name, MAX_FILE_BYTES, MAX_ARCHIVE_BYTES);
   try {
-    buf = readFileSync(file.full);
+    buf = readApprovedLocalFile(file, { maxBytes: sizeLimit });
   } catch (e) {
-    return { skip: { path: file.rel, reason: `could not read the file: ${e.code || e.message}` } };
+    return { skip: { path: file.rel, reason: localFileSafetyReason(e) } };
   }
-  const hash = sha(buf);
+  let hash = sha(buf);
+  let actualBytes = buf.length;
   const ext = extensionOf(file.name);
 
   // Content-sniffed, not extension-alone: most files with these extensions
@@ -529,7 +775,14 @@ export async function prepare(file, { sourceName, ocr = null }) {
   // for why an empty first pass is not proof of an empty document.
   const got = await extract(buf, file.name, {
     reread: () => {
-      try { return readFileSync(file.full); } catch { return null; }
+      try {
+        const reread = readApprovedLocalFile(file, { maxBytes: sizeLimit });
+        hash = sha(reread);
+        actualBytes = reread.length;
+        return reread;
+      } catch {
+        return null;
+      }
     },
     // Null on a dry run and whenever OCR is off, so the cheapest command stays
     // the cheapest command and nothing bills the owner without being asked.
@@ -566,7 +819,7 @@ export async function prepare(file, { sourceName, ocr = null }) {
         ? { text_source: got.provenance.text_source, text_reliable: got.provenance.text_reliable }
         : {}),
       metadata: {
-        category: sourceName, extracted_as: got.how, bytes: file.size,
+        category: sourceName, extracted_as: got.how, bytes: actualBytes,
         ...(note ? { extraction_note: note } : {}),
         ...(got.provenance ? { ocr: got.provenance } : {}),
       },
