@@ -126,6 +126,20 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("Windows doctor identifies the failed DPAPI stage with a stable code",
     dpapiFailed.status === FAIL && /compile stage/i.test(dpapiFailed.detail) && /WINDOWS_DPAPI_COMPILE/.test(dpapiFailed.fix),
     JSON.stringify(dpapiFailed));
+  const dpapiCleanupDeferred = checkWindowsCredentialProtection({
+    platformName: "win32",
+    probe: () => ({
+      passed: false,
+      rounds: 25,
+      stage: "cleanup_deferred",
+      issue_code: "WINDOWS_DPAPI_CLEANUP_DEFERRED",
+    }),
+  });
+  check("Windows doctor separates cleanup hygiene from a DPAPI crypto failure",
+    dpapiCleanupDeferred.status === FAIL && /25 DPAPI round trips passed/i.test(dpapiCleanupDeferred.detail) &&
+      /No credential write was classified as a crypto failure/i.test(dpapiCleanupDeferred.fix) &&
+      /WINDOWS_DPAPI_CLEANUP_DEFERRED/.test(dpapiCleanupDeferred.fix),
+    JSON.stringify(dpapiCleanupDeferred));
   check("the profile-capable Wrangler release is a blocking requirement and is pinned through npx",
     checkWrangler(healthyTool).status === OK);
   check("Codex is never fatal", checkCodex().status !== FAIL);

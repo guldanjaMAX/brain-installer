@@ -37,17 +37,20 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
    <brain-cli> technician "/absolute/path/to/brain.manifest.json" --json
    ```
 
-5. Explain the next incomplete step in ordinary language. Before running its
-   `--run` command, state what will change and ask the owner to approve that
-   exact action. On a clean machine this is the manifest-creating Cloudflare
-   setup command. The permission pass stays in the terminal's hidden prompt.
+5. Explain the next incomplete step in ordinary language. Before any action,
+   state what will change and ask the owner to approve that exact action. For
+   Cloudflare, never run the command through Claude's Bash tool. Give the owner
+   the plan's exact structured `owner_only_command` to paste and run in a
+   terminal they control directly, then observe only the credential-free
+   refresh. The hidden token prompt requires that real owner TTY.
 6. After setup creates the manifest, reread the bootstrap status and transition
    to manifest-bound technician mode. If an explicitly supplied pilot test kit
    exists, read it as additional acceptance evidence only. A kit with
    `ready_to_send: false`, a mismatched version, or a hold marker blocks that
    pilot, but absence of a kit does not block the packaged owner workflow.
-7. The public first-install plan guides local tools, the core Cloudflare install,
-   the owner-only first-passkey handoff, and final live verification. Plaid,
+7. The public first-install plan guides local tools, the owner-terminal
+   Cloudflare install, one fixed public non-customer smoke document, the
+   owner-only first-passkey handoff, and final live verification. Plaid,
    Google, QuickBooks, Zoom, IMAP, Slack, Notion, Microsoft 365, Dropbox,
    HubSpot, and watched-folder scheduling ceremonies are deferred from this
    public path. Existing connector code or fixtures are not permission to run
@@ -59,8 +62,10 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
    `next_action`, `manifest.path`, and the exact `cli` and `refresh` locators.
    Invoke `status.refresh.command` with exactly `status.refresh.args` as
    structured process arguments, never by joining or re-quoting them as a shell
-   string. Do that before deciding what to do next. A child exit code, a `completed` field, or a static
-   manifest is not proof that live state matches the plan.
+   string. Do that before deciding what to do next. A child exit code, a
+   `completed` field, or a static manifest is not proof that live state matches
+   the plan. `live_proof_recorded` is valid only for the deployed smoke or final
+   verifier. `handoff_complete` is terminal and requests no further mutation.
 
 ## Credential boundary
 
@@ -69,8 +74,9 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
 - Keep Cloudflare tokens, Brain keys, OAuth secrets, app passwords,
   authentication codes, passkey identifiers, and invite links out of chat,
   commands, logs, screenshots, and files.
-- When the CLI displays a hidden prompt, hand control to the owner. Do not ask
-  the owner to paste the value into Claude.
+- When a step needs a hidden prompt, use its `execution_boundary:
+  owner_direct_terminal` command. Do not launch it in Claude's Bash tool and do
+  not ask the owner to paste the value into Claude.
 - Never run `brain invite` or copy an enrollment link through an AI-controlled
   or captured terminal. The owner mints and opens the one-time link in a
   terminal and display they control directly. Final verification must observe
@@ -82,6 +88,12 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
   checks. Use Wrangler directly only for a named diagnostic the owner approves.
 
 ## Source and file boundary
+
+- The public smoke step is the only clean-install source action before owner
+  handoff. After explicit approval, it sends one fixed public non-customer
+  document through the deployed authenticated ingest path, requires its exact
+  receipt, records the `install-smoke` source ready, and drains vector work.
+  Never substitute an empty source row or private owner material.
 
 - Search only a folder or external-drive root the owner names. Use
   `claude --add-dir <approved-folder>` for that exact root.

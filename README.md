@@ -76,24 +76,30 @@ remaining live Cloudflare, provider, and physical-device checks.
 
 For an install day, `brain technician <manifest>` prints the read-only plan.
 Add `--json` when a local coding agent is guiding the session. The public
-first-install path runs `tools`, `cloudflare`, the owner-only `passkey` handoff,
-and `verify`. Plaid, Google, QuickBooks, Zoom, and IMAP ceremonies remain
+first-install path runs `tools`, the owner-terminal `cloudflare` ceremony, one
+fixed public `smoke` document, the owner-only `passkey` handoff, and `verify`.
+Plaid, Google, QuickBooks, Zoom, and IMAP ceremonies remain
 deferred until their secure custody and real-provider field gates are complete.
-The owner still handles login, 2FA, consent, and the physical passkey gesture.
+The owner still handles login, 2FA, consent, the Cloudflare hidden prompt, and
+the physical passkey gesture. The JSON plan provides exact structured
+`owner_only_command` fields for Cloudflare and passkey actions. Claude never
+runs those commands through its agent shell.
 The owner mints a one-time passkey invite only in a terminal they control
 directly; invite links never enter agent chat, captured output, or status files.
 The complete guide is
 [onboarding/09-technician-setup-and-rehearsal.md](onboarding/09-technician-setup-and-rehearsal.md).
 
 The deterministic owner handoff starts with `brain tools <manifest> --handoff`.
-Every Windows tools preflight now requires all 25 cold credential-protection
-rounds; `--deep-dpapi` remains an accepted compatibility spelling but no longer
+Every Windows tools preflight now requires 25 fresh credential-protection round
+trips through one private process-scoped helper, followed by clean helper
+disposal; `--deep-dpapi` remains an accepted compatibility spelling but no longer
 weakens or strengthens that gate. The command writes a private package-local bootstrap status beside
 the intended manifest and opens Claude with those exact paths. Every selected
 technician step then writes `.financial-brain-technician-status.json` with a
 stable status, issue code, retry boundary, exact manifest, and exact
 package-local refresh launcher. Claude must run that credential-free refresh
-before continuing. A child exit code or a static manifest is not live proof.
+before continuing. The smoke and final verification steps record live deployed
+proof; ordinary child exit codes and a static manifest do not.
 
 The optional Plaid profile is read-only, disabled by default, and still requires
 a client-owned Plaid account plus the account holder's own Link ceremony. Its
@@ -206,10 +212,11 @@ and tells you the safe rerun path. It never restores automatically because
 restoring would discard newer writes.
 
 After a release containing the update-status feature is installed, the owner
-workspace Settings page checks the public stable release feed and offers one
-reviewed Claude Code handoff when a newer version exists. It never updates in
-the background. An unreachable or invalid feed appears as unavailable, not as
-proof that the Brain is current. Existing 0.2.0 clients must use this manual
+workspace Settings page checks the public release feed. A held or candidate
+release is reported explicitly without any installer metadata or executable
+handoff. Only a valid stable release offers the reviewed Claude Code handoff,
+and it never updates in the background. An unreachable or invalid feed appears
+as unavailable, not as proof that the Brain is current. Existing 0.2.0 clients must use this manual
 update path once before the Settings check can appear.
 
 ---

@@ -455,6 +455,7 @@ const expected = [
   "operations/off-provider-backup.mjs",
   "operations/windows-dpapi.ps1",
   "operations/windows-dpapi-bridge.mjs",
+  "operations/windows-dpapi-session.mjs",
   "operations/windows-dpapi.cs",
   "package.json",
   "report-html.mjs",

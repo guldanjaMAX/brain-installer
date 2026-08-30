@@ -16,6 +16,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -104,6 +105,54 @@ function workspaceRoot(manifestPath, options = {}) {
   return join(root, workspaceIdentity(manifestPath));
 }
 
+function sameCanonicalPath(left, right) {
+  const normalize = (value) => process.platform === "win32"
+    ? resolve(value).toLowerCase()
+    : resolve(value);
+  return normalize(left) === normalize(right);
+}
+
+/**
+ * Create one directory chain without ever following a pre-existing symlink.
+ * Recursive mkdir is deliberately avoided because the deterministic workspace
+ * name is known in advance and may already have been replaced by a link.
+ */
+function ensureCanonicalDirectory(path, { mode = 0o700 } = {}) {
+  const target = resolve(path);
+  const missing = [];
+  let current = target;
+  while (!existsSync(current)) {
+    missing.push(current);
+    const parent = dirname(current);
+    if (parent === current) throw new Error("the dedicated Claude workspace has no safe existing parent");
+    current = parent;
+  }
+
+  const verify = (candidate) => {
+    const identity = lstatSync(candidate);
+    if (!identity.isDirectory() || identity.isSymbolicLink()) {
+      throw new Error("the dedicated Claude workspace path contains a symlink or non-directory component");
+    }
+    const canonical = realpathSync(candidate);
+    if (!sameCanonicalPath(canonical, candidate)) {
+      throw new Error("the dedicated Claude workspace path is not canonical");
+    }
+    if (typeof process.getuid === "function" &&
+        (identity.uid !== process.getuid() || (identity.mode & 0o022) !== 0)) {
+      throw new Error("the dedicated Claude workspace path is not private to the current owner");
+    }
+  };
+
+  verify(current);
+  while (missing.length) {
+    const next = missing.pop();
+    mkdirSync(next, { recursive: false, mode });
+    verify(next);
+  }
+  verify(target);
+  return target;
+}
+
 function unrelatedAncestorGuide(workspace, target) {
   let current = dirname(workspace);
   const root = parse(current).root;
@@ -126,9 +175,8 @@ function unrelatedAncestorGuide(workspace, target) {
 }
 
 export function writeClaudeWorkspaceGuide(manifestPath, options = {}) {
-  const workspace = workspaceRoot(manifestPath, options);
+  const workspace = ensureCanonicalDirectory(workspaceRoot(manifestPath, options));
   const target = join(workspace, "CLAUDE.md");
-  mkdirSync(workspace, { recursive: true, mode: 0o700 });
   chmodSync(workspace, 0o700);
   const ancestor = unrelatedAncestorGuide(workspace, target);
   if (ancestor) {
@@ -155,6 +203,7 @@ export function writeClaudeWorkspaceGuide(manifestPath, options = {}) {
     fsyncSync(fd);
     closeSync(fd);
     fd = null;
+    ensureCanonicalDirectory(workspace);
     renameSync(temporary, target);
     chmodSync(target, 0o600);
   } catch (error) {

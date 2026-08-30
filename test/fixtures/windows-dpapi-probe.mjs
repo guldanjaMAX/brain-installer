@@ -7,6 +7,10 @@
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  disposeWindowsDpapiSession,
+  prepareWindowsDpapiSession,
+} from "../../operations/windows-dpapi-session.mjs";
 
 if (process.platform !== "win32") process.exit(0);
 
@@ -25,12 +29,20 @@ for (const name of [
 }
 
 const bridge = fileURLToPath(new URL("../../operations/windows-dpapi-bridge.mjs", import.meta.url));
-const source = fileURLToPath(new URL("../../operations/windows-dpapi.cs", import.meta.url));
+let session;
+try {
+  session = prepareWindowsDpapiSession({ environment });
+} catch (error) {
+  const stage = /^[a-z_]+$/.test(String(error?.stage || "")) ? error.stage : "compile";
+  console.log(`dpapi-probe result=fail stage=${stage} timeout=no`);
+  process.exit(1);
+}
 
 function invoke(operation, input) {
   return spawnSync(process.execPath, [
     bridge,
-    "--source", source,
+    "--helper", session.helper,
+    "--sha256", session.sha256,
     "--operation", operation,
     "--length", String(input.length),
     "--max", "65536",
@@ -72,6 +84,8 @@ if (protectPassed) {
 fixed.fill(0);
 ciphertext.fill(0);
 const passed = protectPassed && unprotectPassed;
-const stage = !protectPassed ? "protect" : !unprotectPassed ? "unprotect" : "roundtrip";
-console.log(`dpapi-probe result=${passed ? "pass" : "fail"} stage=${stage} timeout=${protectTimedOut || unprotectTimedOut ? "yes" : "no"}`);
-process.exit(passed ? 0 : 1);
+const cleanup = disposeWindowsDpapiSession();
+const clean = cleanup.status === "clean";
+const stage = !protectPassed ? "protect" : !unprotectPassed ? "unprotect" : !clean ? "cleanup_deferred" : "roundtrip";
+console.log(`dpapi-probe result=${passed && clean ? "pass" : "fail"} stage=${stage} timeout=${protectTimedOut || unprotectTimedOut ? "yes" : "no"}`);
+process.exit(passed && clean ? 0 : 1);

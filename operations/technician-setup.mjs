@@ -37,6 +37,13 @@ export const TECHNICIAN_STEPS = Object.freeze([
     automated_proof: "The installer verifies the token, provisions the exact account, deploys, migrates, and runs health checks.",
   }),
   Object.freeze({
+    id: "smoke",
+    title: "Load the non-private first-install smoke document",
+    dashboard_url: null,
+    human_boundary: "The owner approves one fixed, public, non-customer smoke document and its tiny Workers AI embedding cost. No local file, account credential, or customer content is read.",
+    automated_proof: "The installer posts the fixed document through the deployed authenticated ingest boundary, requires its exact per-document receipt, records a ready manual source receipt, drains the vector work, and leaves the document in the owner's Brain as durable first-install evidence.",
+  }),
+  Object.freeze({
     id: "plaid",
     title: "Configure the Plaid bank feed",
     dashboard_url: "https://dashboard.plaid.com/",
@@ -124,7 +131,7 @@ function safeLastStepStatus(manifestPath, deps = {}) {
     if (parsed?.schema_version !== TECHNICIAN_STATUS_SCHEMA_VERSION ||
         parsed?.command !== "technician.step" ||
         !TECHNICIAN_RUN_STEPS.includes(parsed?.step) ||
-        !["status_refresh_required", "action_required"].includes(parsed?.status) ||
+        !["status_refresh_required", "action_required", "live_proof_recorded"].includes(parsed?.status) ||
         resolve(String(parsed?.manifest?.path || "")) !== resolve(manifestPath)) {
       return Object.freeze({ path, state: "invalid" });
     }
@@ -176,17 +183,33 @@ export function buildTechnicianStepStatus({
     "QUICKBOOKS_ENVIRONMENT_REQUIRED",
     "QUICKBOOKS_REDIRECT_HOST_INVALID",
     "OWNER_CANCELED",
+    "OWNER_DIRECT_TERMINAL_REQUIRED",
   ]);
-  const issueCode = succeeded ? "TECHNICIAN_STATUS_REFRESH_REQUIRED" : safeIssueCode(error);
+  const liveProof = succeeded && proofLevel === "live_data_plane_postconditions";
+  const issueCode = succeeded
+    ? liveProof ? "TECHNICIAN_LIVE_PROOF_RECORDED" : "TECHNICIAN_STATUS_REFRESH_REQUIRED"
+    : safeIssueCode(error);
+  const ownerAction = !succeeded && issueCode === "OWNER_DIRECT_TERMINAL_REQUIRED"
+    ? Object.freeze({
+        command: locator.command,
+        args: Object.freeze(step === "passkey"
+          ? [...locator.args, "invite", manifest]
+          : [...locator.args, "technician", manifest, "--run", step]),
+        execution_boundary: "owner_direct_terminal",
+        mutates_external_state: true,
+      })
+    : null;
   return Object.freeze({
     schema_version: TECHNICIAN_STATUS_SCHEMA_VERSION,
     command: "technician.step",
     step,
-    status: succeeded ? "status_refresh_required" : "action_required",
+    status: succeeded ? liveProof ? "live_proof_recorded" : "status_refresh_required" : "action_required",
     issue_code: issueCode,
     retry_safe: succeeded ? false : (!uncertain && retryableCodes.has(issueCode)),
     requires_human: succeeded ? false : true,
-    next_action: "Run the credential-free read-only refresh using refresh.command with exactly refresh.args. Do not continue from this receipt alone or reconstruct a shell command from these fields.",
+    next_action: ownerAction
+      ? "The owner must run owner_action.command with exactly owner_action.args in a direct terminal outside the agent tool, then run the credential-free refresh. Do not reconstruct a shell command from these fields."
+      : "Run the credential-free read-only refresh using refresh.command with exactly refresh.args. Do not continue from this receipt alone or reconstruct a shell command from these fields.",
     manifest: Object.freeze({ path: manifest }),
     cli: locator,
     refresh: Object.freeze({
@@ -194,6 +217,7 @@ export function buildTechnicianStepStatus({
       args: Object.freeze(refreshArgs),
       mutates_external_state: false,
     }),
+    ...(ownerAction ? { owner_action: ownerAction } : {}),
     status_file: statusFile ? resolve(statusFile) : null,
     proof_level: succeeded && proofLevel === "live_data_plane_postconditions"
       ? "live_data_plane_postconditions"
@@ -203,7 +227,9 @@ export function buildTechnicianStepStatus({
       : {}),
     proof_warning: succeeded
       ? proofLevel === "live_data_plane_postconditions"
-        ? "The deployed health, source freshness, and enrolled-device postconditions were checked live. This receipt stores aggregate state only."
+        ? step === "smoke"
+          ? "The fixed public document, exact ingest receipt, ready source receipt, and zero vector backlog were checked through the deployed data plane. This receipt stores aggregate state only."
+          : "The deployed health, exact smoke source, source freshness, and enrolled-device postconditions were checked live. This receipt stores aggregate state only."
         : "The selected command returned without an error, but live state was not inferred from its exit code or the manifest."
       : "The selected command did not complete. Review this issue and the refreshed plan before deciding whether the same step is safe to retry.",
     boundaries: Object.freeze({
@@ -290,20 +316,28 @@ export function technicianPlan(manifestPath, deps = {}) {
         mutates_external_state: false,
       })
     : null;
+  const lastStep = safeLastStepStatus(manifest.path, deps);
+  const priorNeedsAction = lastStep.state === "available" && lastStep.status === "action_required";
+  const handoffComplete = lastStep.state === "available" && lastStep.step === "verify" &&
+    lastStep.status === "live_proof_recorded" && lastStep.proof_level === "live_data_plane_postconditions";
   return {
     schema_version: 3,
     mode: "read_only_plan",
-    status: "plan_refreshed",
-    issue_code: null,
-    retry_safe: true,
-    requires_human: false,
-    next_action: "Review the next incomplete step and obtain explicit owner approval before any command that logs in, requests a credential, deploys, or changes data.",
-    proof_level: "workflow_only",
+    status: handoffComplete ? "handoff_complete" : priorNeedsAction ? "action_required" : "plan_refreshed",
+    issue_code: priorNeedsAction ? lastStep.issue_code : null,
+    retry_safe: handoffComplete ? false : priorNeedsAction ? lastStep.retry_safe : true,
+    requires_human: priorNeedsAction ? lastStep.requires_human : false,
+    next_action: handoffComplete
+      ? "The deployed smoke source, source freshness, and enrolled-device postconditions are recorded live. No further installer mutation is requested."
+      : priorNeedsAction
+      ? "Resolve the issue recorded in last_step before choosing another step. Refresh again with refresh.command and exactly refresh.args after the issue is addressed."
+      : "Review the next incomplete step and obtain explicit owner approval before any command that logs in, requests a credential, deploys, or changes data.",
+    proof_level: handoffComplete ? "live_data_plane_postconditions" : "workflow_only",
     manifest,
     cli,
     refresh,
-    last_step: safeLastStepStatus(manifest.path, deps),
-    warning: "This plan prepares the public first-install workflow. Live proof arrives only from the deployed health, source-freshness, and physical passkey checks.",
+    last_step: lastStep,
+    warning: "This plan prepares the public first-install workflow. Live proof arrives only from the deployed fixed-document smoke, health, source-freshness, and physical passkey checks.",
     coverage: {
       guided_steps: TECHNICIAN_RUN_STEPS.filter((step) => !DEFERRED_PUBLIC_CONNECTOR_STEPS.includes(step)),
       not_guided_in_this_release: [
@@ -331,9 +365,10 @@ export function technicianPlan(manifestPath, deps = {}) {
       let state = "not_checked";
       if (step.id === "tools") state = "ready_to_start";
       if (step.id === "cloudflare" && !manifest.exists) state = "ready_after_local_tools";
-      if (["plaid", "google", "quickbooks", "zoom", "imap", "passkey", "verify"].includes(step.id) && !manifest.exists) {
+      if (["smoke", "plaid", "google", "quickbooks", "zoom", "imap", "passkey", "verify"].includes(step.id) && !manifest.exists) {
         state = "waiting_for_install_record";
       }
+      if (step.id === "smoke" && manifest.exists) state = "ready_for_owner_approval";
       if (step.id === "plaid" && manifest.exists && !manifest.enabled_connectors.includes("bank_feed")) {
         state = "requires_manifest_enablement";
       }
@@ -371,13 +406,42 @@ export function technicianPlan(manifestPath, deps = {}) {
       if (DEFERRED_PUBLIC_CONNECTOR_STEPS.includes(step.id)) {
         state = "deferred_from_public_first_install";
       }
+      if (lastStep.state === "available" && lastStep.step === step.id) {
+        state = lastStep.status;
+      }
+      const ownerOnly = ["cloudflare", "passkey"].includes(step.id);
+      const ownerCli = cli || Object.freeze({ command: "<brain-cli>", args: Object.freeze([]) });
+      const ownerArgs = step.id === "passkey"
+        ? ["invite", manifest.path]
+        : ["technician", manifest.path, "--run", step.id];
+      const continuationArgs = step.id === "passkey"
+        ? ["technician", manifest.path, "--run", "verify"]
+        : ["technician", manifest.path, "--json"];
       return {
         order: index + 1,
         ...step,
-        command: DEFERRED_PUBLIC_CONNECTOR_STEPS.includes(step.id)
+        command: DEFERRED_PUBLIC_CONNECTOR_STEPS.includes(step.id) || ownerOnly
           ? null
           : technicianDisplayCommand(step.id, manifest.path, cli),
         state,
+        ...(ownerOnly
+          ? {
+              owner_only_command: Object.freeze({
+                command: ownerCli.command,
+                args: Object.freeze([...ownerCli.args, ...ownerArgs]),
+                execution_boundary: "owner_direct_terminal",
+                mutates_external_state: true,
+                must_run_in_direct_owner_terminal: true,
+                reveals_one_time_link: step.id === "passkey",
+              }),
+              owner_only_display: exactCommand(ownerCli, ownerArgs),
+              continuation: Object.freeze({
+                command: ownerCli.command,
+                args: Object.freeze([...ownerCli.args, ...continuationArgs]),
+                mutates_external_state: false,
+              }),
+            }
+          : {}),
         ...(step.id === "quickbooks"
           ? {
               environment: manifest.connector_environments.quickbooks,
@@ -424,8 +488,16 @@ export function renderTechnicianPlan(plan) {
     lines.push(`${step.order}. ${step.title}`);
     if (step.state !== "not_checked") lines.push(`   State: ${step.state.replaceAll("_", " ")}`);
     lines.push(`   ${step.human_boundary}`);
-    if (step.command) lines.push(`   Run: ${step.command}`);
-    else lines.push("   No public first-install command is available for this deferred connector ceremony.");
+    if (step.command) {
+      lines.push(`   Run: ${step.command}`);
+    } else if (step.owner_only_command) {
+      lines.push(`   Owner-only direct terminal: ${step.owner_only_display}`);
+      lines.push(step.id === "passkey"
+        ? "   Keep the one-time link on the owner's direct display, then continue with the structured continuation command in the JSON plan."
+        : "   Run this outside the agent tool so the hidden credential prompt owns a real TTY, then use the credential-free structured continuation in the JSON plan.");
+    } else {
+      lines.push("   No public first-install command is available for this deferred connector ceremony.");
+    }
     if (step.dashboard_url) lines.push(`   Dashboard: ${step.dashboard_url}`);
     lines.push("");
   }
@@ -438,6 +510,7 @@ function childCommands(step, manifestPath, flags, scriptPath) {
   switch (step) {
     case "tools": return [command("tools", path)];
     case "cloudflare": return [command("setup", path)];
+    case "smoke": return [];
     case "plaid": return [command("secrets", path)];
     case "google": return [command("connect", "google", "--scopes", String(flags.scopes || "drive,gmail,calendar"))];
     case "quickbooks": throw new Error("the QuickBooks technician step must use the in-process provider connection");
@@ -483,9 +556,15 @@ function codedError(message, code, options = {}) {
 
 function runOne(spawn, nodePath, args, env) {
   const result = spawn(nodePath, args, { stdio: "inherit", env });
-  if (result?.error) throw new Error(`the technician child could not start: ${result.error.message}`);
+  if (result?.error) throw codedError(
+    `the technician child could not start: ${result.error.message}`,
+    "technician_child_start_failed",
+  );
   if (result?.status !== 0) {
-    throw new Error("this technician step paused before completion. The step is ready to try again after the item above is resolved.");
+    throw codedError(
+      "this technician step paused before completion. The step is ready to try again after the item above is resolved.",
+      "technician_child_failed",
+    );
   }
 }
 
@@ -501,12 +580,20 @@ export async function runTechnicianStep({
   manifestDeps = {},
   connectProvider = null,
   verifyInstallation = null,
+  runInstallSmoke = null,
+  isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY),
 } = {}) {
   if (!TECHNICIAN_RUN_STEPS.includes(step)) {
     throw new Error(`--run accepts one of: ${TECHNICIAN_RUN_STEPS.join(", ")}`);
   }
   if (!manifestPath || !scriptPath) throw new Error("the technician step needs a manifest and installer path");
   const summary = readManifestSummary(manifestPath, manifestDeps);
+  if (step === "cloudflare" && !isTTY) {
+    throw codedError(
+      "The Cloudflare ceremony needs a real owner-controlled terminal for its hidden credential prompt. Run the exact owner-only command from the read-only technician plan outside the agent tool, then return to the credential-free status refresh.",
+      "owner_direct_terminal_required",
+    );
+  }
   if (!["tools", "cloudflare"].includes(step) && !summary.exists) {
     throw codedError(
       "the install record is not ready yet. The Cloudflare step creates it, and then this step can continue.",
@@ -668,6 +755,22 @@ export async function runTechnicianStep({
     childEnv = technicianChildEnvironment(baseEnv, explicitEnv);
     const commands = childCommands(step, manifestPath, flags, resolve(scriptPath));
     for (const args of commands) runOne(spawn, nodePath, args, childEnv);
+    if (step === "smoke") {
+      if (typeof runInstallSmoke !== "function") {
+        throw codedError(
+          "the deployed first-install smoke runner is unavailable. No source proof was created.",
+          "install_smoke_runner_unavailable",
+        );
+      }
+      const proof = await runInstallSmoke({ manifestPath });
+      return {
+        step,
+        completed: true,
+        commands_run: 0,
+        proof_level: "live_data_plane_postconditions",
+        proof,
+      };
+    }
     if (step === "verify") {
       if (typeof verifyInstallation !== "function") {
         throw codedError(

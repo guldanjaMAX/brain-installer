@@ -1,10 +1,11 @@
 /**
  * Windows-only release gate for the exact production DPAPI path.
  *
- * The production probe creates fresh random bytes for every round, exercises
- * the shipped compile/protect/unprotect/cleanup bridge, compares exact
- * readback, and wipes every buffer. This wrapper prints only stable diagnostic
- * fields. It never handles or emits a credential.
+ * The production probe creates fresh random bytes for every round, compiles one
+ * private process-scoped helper, exercises the shipped protect/unprotect bridge,
+ * compares exact readback, wipes every buffer, and requires clean helper
+ * disposal. This wrapper prints only stable diagnostic fields. It never handles
+ * or emits a credential.
  */
 
 import { probeWindowsDpapi } from "../operations/admin-key-file.mjs";
@@ -21,7 +22,8 @@ const stage = /^[a-z_]+$/.test(String(result.stage || "")) ? result.stage : "non
 const issueCode = /^WINDOWS_DPAPI_[A-Z_]+$/.test(String(result.issue_code || ""))
   ? result.issue_code
   : "WINDOWS_DPAPI_UNKNOWN";
-const passed = result.checked === true && result.passed === true && result.rounds === REQUIRED_ROUNDS;
+const passed = result.checked === true && result.passed === true &&
+  result.rounds === REQUIRED_ROUNDS && result.cleanup_status === "clean";
 
 if (!passed) {
   console.error(
@@ -30,4 +32,4 @@ if (!passed) {
   process.exit(1);
 }
 
-console.log(`windows-dpapi-release-gate result=pass rounds_completed=${REQUIRED_ROUNDS}`);
+console.log(`windows-dpapi-release-gate result=pass cleanup_status=clean rounds_completed=${REQUIRED_ROUNDS}`);

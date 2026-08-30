@@ -9,15 +9,18 @@ the brain, not for whoever built it: what changed for them, and what to check.
 - The first-install Claude handoff now launches only from a dedicated
   installer-owned workspace, refuses unrelated instruction files, preserves
   structured command arguments, and renders copyable commands with literal
-  POSIX or PowerShell quoting. On Windows, every tools preflight requires all 25
-  cold DPAPI round trips, verifies the saved user PATH by readback, and uses the
+  POSIX or PowerShell quoting. On Windows, every tools preflight requires 25
+  fresh DPAPI round trips through one private process-scoped helper, cleanly
+  disposes that helper, verifies the saved user PATH by readback, and uses the
   official native Claude executable for the shell-free handoff.
 - The public first-install path now defers Plaid, Google, QuickBooks, Zoom, and
   IMAP ceremonies until their secure credential custody and real-provider field
-  gates are complete. The technician wrapper never prints a passkey invite.
-  Final verification requires authenticated deployed health, at least one
-  configured source with an explicit freshness verdict, and at least one
-  enrolled device, while storing aggregate counts only.
+  gates are complete. Cloudflare credential entry and passkey invitation use
+  exact owner-terminal commands that never run through an agent shell. One
+  fixed public non-customer smoke document proves real deployed ingestion.
+  Final verification requires that exact ready source, its stored document and
+  freshness verdict, and at least one enrolled device, while storing aggregate
+  counts only. Empty installs no longer claim they are ready for questions.
 - Google Drive now revalidates the selected root folder on every run before it
   can use the change feed. A moved, deleted, or unauthorized root fails closed
   instead of silently widening or continuing from stale scope.

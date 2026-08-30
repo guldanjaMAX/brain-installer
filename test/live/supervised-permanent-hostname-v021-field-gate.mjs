@@ -159,4 +159,3 @@ console.log(JSON.stringify({
   checks_passed: receipt.checks.length,
   blocked_actions: receipt.blocked.length,
 }, null, 2));
-

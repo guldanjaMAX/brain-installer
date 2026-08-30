@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { cmdConnectProvider, cmdLocalTools, cmdTechnician, verifyTechnicianHandoff } from "../brain.mjs";
+import { cmdConnectProvider, cmdLocalTools, cmdTechnician, runPublicInstallSmoke, verifyTechnicianHandoff } from "../brain.mjs";
 
 import {
   TECHNICIAN_RUN_STEPS,
@@ -263,6 +263,37 @@ test("an unrelated instruction file inside the dedicated workspace blocks handof
   assert.equal(readFileSync(first.path, "utf8"), "untrusted workspace instructions\n");
 });
 
+test("a pre-existing symlink at the deterministic Claude workspace is rejected before mutation", () => {
+  const workspaceRoot = join(sandbox, "symlink-dedicated-root");
+  const manifest = join(sandbox, "symlink-manifest", "brain.manifest.json");
+  const outside = join(sandbox, "symlink-outside");
+  mkdirSync(resolve(manifest, ".."), { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(manifest, "{}");
+  const first = writeClaudeWorkspaceGuide(manifest, { workspaceRoot });
+  rmSync(first.workspace, { recursive: true, force: true });
+  symlinkSync(outside, first.workspace, "dir");
+  assert.throws(
+    () => writeClaudeWorkspaceGuide(manifest, { workspaceRoot }),
+    /symlink or non-directory component/i,
+  );
+  assert.equal(existsSync(join(outside, "CLAUDE.md")), false);
+});
+
+test("a group or world-writable Claude workspace parent is rejected on POSIX", { skip: process.platform === "win32" }, () => {
+  const hostileParent = join(sandbox, "writable-workspace-parent");
+  const manifest = join(sandbox, "writable-parent-manifest", "brain.manifest.json");
+  mkdirSync(resolve(manifest, ".."), { recursive: true });
+  mkdirSync(hostileParent, { recursive: true });
+  chmodSync(hostileParent, 0o777);
+  writeFileSync(manifest, "{}");
+  assert.throws(
+    () => writeClaudeWorkspaceGuide(manifest, { workspaceRoot: join(hostileParent, "managed-root") }),
+    /not private to the current owner/i,
+  );
+  assert.equal(existsSync(join(hostileParent, "managed-root")), false);
+});
+
 test("the plan is read-only, ordered, honest about proof, and agent-readable", () => {
   const missing = join(sandbox, "not-created.json");
   const plan = technicianPlan(missing);
@@ -277,6 +308,27 @@ test("the plan is read-only, ordered, honest about proof, and agent-readable", (
   assert.ok(plan.coverage.not_guided_in_this_release.some((name) => /Google connector/i.test(name)));
   assert.ok(plan.steps.filter((step) => ["plaid", "google", "quickbooks", "zoom", "imap"].includes(step.id))
     .every((step) => step.command === null && step.state === "deferred_from_public_first_install"));
+  const passkey = plan.steps.find((step) => step.id === "passkey");
+  assert.equal(passkey.command, null);
+  assert.deepEqual(passkey.owner_only_command, {
+    command: "<brain-cli>",
+    args: ["invite", resolve(missing)],
+    execution_boundary: "owner_direct_terminal",
+    mutates_external_state: true,
+    must_run_in_direct_owner_terminal: true,
+    reveals_one_time_link: true,
+  });
+  assert.deepEqual(passkey.continuation.args, ["technician", resolve(missing), "--run", "verify"]);
+  const cloudflare = plan.steps.find((step) => step.id === "cloudflare");
+  assert.equal(cloudflare.command, null);
+  assert.deepEqual(cloudflare.owner_only_command, {
+    command: "<brain-cli>",
+    args: ["technician", resolve(missing), "--run", "cloudflare"],
+    execution_boundary: "owner_direct_terminal",
+    mutates_external_state: true,
+    must_run_in_direct_owner_terminal: true,
+    reveals_one_time_link: false,
+  });
   assert.doesNotMatch(JSON.stringify(plan.steps), /(^|[^<-])\bbrain technician\b/i);
   for (const name of ["Slack", "Notion", "Microsoft 365", "Dropbox", "HubSpot", "watched-folder"]) {
     assert.match(JSON.stringify(plan.coverage), new RegExp(name, "i"));
@@ -304,6 +356,46 @@ test("the package-local JSON plan exposes stable course-correction fields and an
   assert.ok(plan.steps.filter((step) => step.command).every((step) => step.command.includes(safeNodePath)));
   assert.ok(plan.steps.filter((step) => step.command).every((step) => !step.command.includes('"' + safeNodePath + '"')));
   assert.match(plan.next_action, /explicit owner approval/i);
+  const passkey = plan.steps.find((step) => step.id === "passkey");
+  assert.deepEqual(passkey.owner_only_command.args, [safeBrainPath, "invite", missing]);
+  assert.deepEqual(passkey.continuation.args, [safeBrainPath, "technician", missing, "--run", "verify"]);
+  const cloudflare = plan.steps.find((step) => step.id === "cloudflare");
+  assert.deepEqual(cloudflare.owner_only_command.args, [safeBrainPath, "technician", missing, "--run", "cloudflare"]);
+  assert.equal(cloudflare.owner_only_command.execution_boundary, "owner_direct_terminal");
+});
+
+test("the Cloudflare ceremony refuses an agent shell without a TTY and records the exact owner action", async () => {
+  const workspace = join(sandbox, "cloudflare-no-tty");
+  mkdirSync(workspace, { recursive: true });
+  const manifest = join(workspace, "brain.manifest.json");
+  let children = 0;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    await assert.rejects(
+      cmdTechnician(manifest, { run: "cloudflare" }, {
+        scriptPath: fixtureScriptPath,
+        nodePath: fixtureNodePath,
+        isTTY: false,
+        spawn: () => { children++; return { status: 0 }; },
+      }),
+      /real owner-controlled terminal/i,
+    );
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(children, 0);
+  const status = JSON.parse(readFileSync(technicianStatusFilePath(manifest), "utf8"));
+  assert.equal(status.status, "action_required");
+  assert.equal(status.issue_code, "OWNER_DIRECT_TERMINAL_REQUIRED");
+  assert.equal(status.retry_safe, true);
+  assert.deepEqual(status.owner_action, {
+    command: fixtureNodePath,
+    args: [fixtureScriptPath, "technician", manifest, "--run", "cloudflare"],
+    execution_boundary: "owner_direct_terminal",
+    mutates_external_state: true,
+  });
+  assert.match(status.next_action, /owner_action\.command with exactly owner_action\.args/i);
 });
 
 test("every completed technician step writes a private status that requires an exact read-only refresh", async () => {
@@ -347,6 +439,7 @@ test("every completed technician step writes a private status that requires an e
   });
   assert.equal(refreshed.last_step.state, "available");
   assert.equal(refreshed.last_step.step, "tools");
+  assert.equal(refreshed.steps.find((step) => step.id === "tools").state, "status_refresh_required");
   assert.equal(refreshed.last_step.proof_level, "command_return_only");
 });
 
@@ -367,6 +460,14 @@ test("a corrupt manifest still leaves a fail-closed machine-readable step receip
   assert.equal(status.requires_human, true);
   assert.equal(status.refresh.mutates_external_state, false);
   assert.match(status.proof_warning, /did not complete/i);
+
+  writeFileSync(manifest, "{}", "utf8");
+  const refreshed = technicianPlan(manifest, {
+    cli: { command: fixtureNodePath, args: [fixtureScriptPath] },
+  });
+  assert.equal(refreshed.status, "action_required");
+  assert.equal(refreshed.issue_code, "TECHNICIAN_STEP_FAILED");
+  assert.equal(refreshed.steps.find((step) => step.id === "tools").state, "action_required");
 });
 
 test("the first technician step verifies local tools before any manifest or account exists", async () => {
@@ -790,6 +891,131 @@ test("passkey enrollment requires the exact host and never mints an invite in an
   assert.equal(calls, 0);
 });
 
+test("the first-install smoke uses one fixed public document and is idempotent after a lost response", async () => {
+  let postedReceipt = null;
+  let drained = 0;
+  let requestBody = null;
+  const response = (body, status = 200) => new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+  const common = {
+    resolveAdminKey: () => "fixture-admin-key",
+    postReceipt: async (receipt) => { postedReceipt = receipt; },
+    drain: async (path) => { drained++; assert.equal(path, manifestPath); return { remaining: 0 }; },
+  };
+
+  let receiptCalls = 0;
+  await assert.rejects(
+    runPublicInstallSmoke(manifestPath, {
+      ...common,
+      request: async (_url, request) => {
+        requestBody = JSON.parse(request.body);
+        return new Response("not-json", { status: 200 });
+      },
+      postReceipt: async () => { receiptCalls++; },
+      drain: async () => { throw new Error("must not drain without an exact ingest receipt"); },
+    }),
+    (error) => error.code === "INSTALL_SMOKE_INGEST_UNCONFIRMED",
+  );
+  assert.equal(receiptCalls, 0);
+  assert.equal(requestBody.docs.length, 1);
+  assert.equal(requestBody.docs[0].source_type, "install-smoke");
+  assert.equal(requestBody.docs[0].source_id, "public-first-install-v1");
+  assert.equal(requestBody.docs[0].metadata.contains_customer_data, false);
+
+  await assert.rejects(
+    runPublicInstallSmoke(manifestPath, {
+      ...common,
+      request: async () => response({ results: [{ source_id: "public-first-install-v1", status: "created" }] }),
+      postReceipt: async () => { throw new Error("fixture lost source-receipt response"); },
+      drain: async () => { throw new Error("must not drain after an unconfirmed source receipt"); },
+    }),
+    /lost source-receipt response/i,
+  );
+
+  const proof = await runPublicInstallSmoke(manifestPath, {
+    ...common,
+    now: () => new Date("2026-08-30T12:00:00.000Z"),
+    request: async (_url, request) => {
+      requestBody = JSON.parse(request.body);
+      return response({ results: [{ source_id: "public-first-install-v1", status: "unchanged" }] });
+    },
+  });
+  assert.equal(proof.document_status, "unchanged");
+  assert.equal(proof.contains_customer_data, false);
+  assert.equal(proof.stored_identifiers, false);
+  assert.equal(postedReceipt.source, "install-smoke");
+  assert.equal(postedReceipt.status, "ready");
+  assert.equal(postedReceipt.docs_unchanged, 1);
+  assert.equal(drained, 1);
+});
+
+test("a live smoke step records live proof and the refreshed plan preserves it", async () => {
+  const workspace = join(sandbox, "adaptive-live-smoke");
+  mkdirSync(workspace, { recursive: true });
+  const manifest = join(workspace, "brain.manifest.json");
+  writeFileSync(manifest, JSON.stringify({ brain: { domain: "brain.fixture.test" } }));
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    await cmdTechnician(manifest, { run: "smoke" }, {
+      scriptPath: fixtureScriptPath,
+      nodePath: fixtureNodePath,
+      runInstallSmoke: async () => ({
+        install_smoke_documents: 1,
+        checked_via: "deployed_authenticated_ingest",
+        stored_identifiers: false,
+      }),
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  const status = JSON.parse(readFileSync(technicianStatusFilePath(manifest), "utf8"));
+  assert.equal(status.status, "live_proof_recorded");
+  assert.equal(status.issue_code, "TECHNICIAN_LIVE_PROOF_RECORDED");
+  assert.equal(status.proof_level, "live_data_plane_postconditions");
+  const refreshed = technicianPlan(manifest, {
+    cli: { command: fixtureNodePath, args: [fixtureScriptPath] },
+  });
+  assert.equal(refreshed.last_step.status, "live_proof_recorded");
+  assert.equal(refreshed.steps.find((step) => step.id === "smoke").state, "live_proof_recorded");
+});
+
+test("successful live final verification produces a terminal handoff state", async () => {
+  const workspace = join(sandbox, "adaptive-live-verify");
+  mkdirSync(workspace, { recursive: true });
+  const manifest = join(workspace, "brain.manifest.json");
+  writeFileSync(manifest, JSON.stringify({ brain: { domain: "brain.fixture.test" } }));
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    await cmdTechnician(manifest, { run: "verify" }, {
+      scriptPath: fixtureScriptPath,
+      nodePath: fixtureNodePath,
+      verifyInstallation: async () => ({
+        source_count: 1,
+        source_states: { manual: 1 },
+        install_smoke_documents: 1,
+        enrolled_device_count: 1,
+        checked_via: "deployed_admin_data_plane",
+        stored_identifiers: false,
+      }),
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  const refreshed = technicianPlan(manifest, {
+    cli: { command: fixtureNodePath, args: [fixtureScriptPath] },
+  });
+  assert.equal(refreshed.status, "handoff_complete");
+  assert.equal(refreshed.proof_level, "live_data_plane_postconditions");
+  assert.equal(refreshed.retry_safe, false);
+  assert.equal(refreshed.requires_human, false);
+  assert.match(refreshed.next_action, /No further installer mutation is requested/i);
+  assert.equal(refreshed.steps.find((step) => step.id === "verify").state, "live_proof_recorded");
+});
+
 test("verification requires an in-process live postcondition probe and stores aggregate proof", async () => {
   await assert.rejects(runTechnicianStep({
     step: "verify",
@@ -833,7 +1059,10 @@ test("the deployed handoff verifier refuses empty/unavailable state and returns 
     fetchImpl: async (input) => {
       const path = new URL(typeof input === "string" ? input : input.url).pathname;
       if (path === "/api/admin/brain/freshness") {
-        return response({ sources: [{ name: "private-source", state: "ok" }] });
+        return response({ sources: [
+          { name: "install-smoke", kind: "upload", state: "manual", source_status: "ready", documents: 1 },
+          { name: "private-source", state: "ok", source_status: "ready", documents: 2 },
+        ] });
       }
       if (path === "/api/admin/auth/devices") {
         return response({ devices: [{ credential_id: "private-device-id" }] });
@@ -843,8 +1072,9 @@ test("the deployed handoff verifier refuses empty/unavailable state and returns 
   };
   const proof = await verifyTechnicianHandoff(manifestPath, options);
   assert.deepEqual(proof, {
-    source_count: 1,
-    source_states: { ok: 1 },
+    source_count: 2,
+    source_states: { manual: 1, ok: 1 },
+    install_smoke_documents: 1,
     enrolled_device_count: 1,
     checked_via: "deployed_admin_data_plane",
     stored_identifiers: false,
@@ -860,5 +1090,35 @@ test("the deployed handoff verifier refuses empty/unavailable state and returns 
       },
     }),
     (error) => error.code === "HANDOFF_NO_CONFIGURED_SOURCES",
+  );
+
+  for (const sources of [
+    [{ name: "other", state: "manual", source_status: "ready", documents: 1 }],
+    [{ name: "install-smoke", state: "manual", source_status: "pending", documents: 1 }],
+    [{ name: "install-smoke", state: "manual", source_status: "ready", documents: 0 }],
+  ]) {
+    await assert.rejects(
+      verifyTechnicianHandoff(manifestPath, {
+        ...options,
+        fetchImpl: async (input) => {
+          const path = new URL(typeof input === "string" ? input : input.url).pathname;
+          return path.endsWith("freshness") ? response({ sources }) : response({ devices: [{ credential_id: "private" }] });
+        },
+      }),
+      (error) => error.code === "HANDOFF_INSTALL_SMOKE_UNPROVEN",
+    );
+  }
+
+  await assert.rejects(
+    verifyTechnicianHandoff(manifestPath, {
+      ...options,
+      fetchImpl: async (input) => {
+        const path = new URL(typeof input === "string" ? input : input.url).pathname;
+        return path.endsWith("freshness")
+          ? response({ unavailable: true, sources: [{ name: "install-smoke", state: "manual", source_status: "ready", documents: 1 }] })
+          : response({ devices: [{ credential_id: "private" }] });
+      },
+    }),
+    (error) => error.code === "HANDOFF_SOURCE_FRESHNESS_UNAVAILABLE",
   );
 });

@@ -71,10 +71,11 @@ jobs:
       - name: install
         run: npm ci --ignore-scripts
 
-      # Fresh random bytes exercise the exact production bridge for 25 cold
-      # compile/protect/unprotect/cleanup rounds. The wrapper emits stable stage
-      # codes and counts only, never input, ciphertext, child output, or a
-      # credential. This is release evidence, not the supervised client gate.
+      # Fresh random bytes exercise 25 protect/unprotect round trips through one
+      # private process-scoped compiled helper, followed by exact captured-identity
+      # cleanup. The wrapper emits stable stage codes and counts only, never input,
+      # ciphertext, child output, or a credential. This is release evidence, not
+      # the supervised client gate.
       - name: Windows DPAPI 25-round release gate
         if: runner.os == 'Windows'
         run: node scripts/windows-dpapi-release-gate.mjs

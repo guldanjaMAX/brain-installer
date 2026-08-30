@@ -118,9 +118,11 @@ manifest version. Paused mode rejects every corpus and source mutation before
 D1 access.
 
 The owner workspace exposes `POST /api/app/update-status` as a read-only release
-check. The Worker sends an empty GET to the fixed public stable manifest, bounds
-and validates every field, and compares it with `BRAIN_VERSION`. It returns
-`update_available`, `up_to_date`, `ahead`, or an explicit 503 `unavailable`.
+check. The Worker sends an empty GET to the fixed public release manifest, bounds
+and validates every field, and compares a stable release with `BRAIN_VERSION`.
+It returns `release_held` or `release_candidate` without any installer metadata,
+`update_available`, `up_to_date`, `ahead` for a valid stable release, or an
+explicit 503 `unavailable` for an invalid or unreachable feed.
 No client payload or installed version is sent to the website, and no browser
 credential reaches the feed. The Settings card links to the reviewed guide and
 copies one fixed Claude Code prompt; it never applies an update. Because the
@@ -528,10 +530,12 @@ Terminal's ambient credentials.
 Windows evidence remains a release blocker. On 2026-08-30, one matching
 Windows 11 field machine completed an initial DPAPI CurrentUser round trip, but
 a later 25-round diagnostic on that machine observed four failed rounds. The
-stable stage codes help recovery; they are not a fix or production proof. CI
-now invokes the exact production bridge for 25 fresh rounds in both Windows
-Node jobs, but that job is not evidence until the candidate commit runs
-remotely. A supervised clean-client 25-round run plus fresh-user,
+stable stage codes help recovery; they are not a fix or production proof. The
+candidate now compiles one private process-scoped helper, verifies 25 fresh
+payload round trips through the exact production bridge, then requires clean
+captured-identity disposal in both Windows Node jobs. That CI contract is not
+evidence until the candidate commit runs remotely. A supervised clean-client
+25-round run plus fresh-user,
 moved-profile, and recovery checks remain separate field gates.
 
 The package-local Claude handoff is deliberately adaptive rather than a static
@@ -541,11 +545,23 @@ locators. Each `brain technician <manifest> --run <step>` invocation writes a
 private `.financial-brain-technician-status.json` on both completion and
 failure. That step receipt contains only stable status fields, `issue_code`,
 `retry_safe`, `requires_human`, an exact `next_action`, the manifest path, and
-the package-local CLI and refresh arrays. Its proof level is
-`command_return_only`. The agent must run the credential-free
+the package-local CLI and refresh arrays. Ordinary steps use
+`command_return_only`; the fixed public smoke and final verifier use
+`live_data_plane_postconditions`. The Cloudflare status also provides an exact
+structured owner action when an agent shell has no real TTY. The agent must run the credential-free
 `technician <manifest> --json` refresh before choosing another step and must
 not infer live success from exit code or manifest state. Login, 2FA, credential
-entry, deployment, and data mutations remain owner-confirmed boundaries.
+entry, deployment, and data mutations remain owner-confirmed boundaries. The
+Cloudflare hidden prompt and passkey invite run only in the owner's direct
+terminal. A successful final verifier produces terminal `handoff_complete`
+rather than another mutation instruction.
+
+The dedicated Claude workspace rejects symlinks, junction-like non-directory
+components, non-canonical paths, and, on POSIX, roots not owned privately by the
+current user. It revalidates the final directory before the atomic guide rename.
+On Windows the default root is the resolved owner `USERPROFILE`; Windows has no
+POSIX mode-bit claim in this check, so clean-client ACL behavior remains part of
+the Windows field gate.
 
 Choose OAuth client type **Desktop app**. Desktop clients accept the local
 loopback callback automatically. Google Cloud does not provide, or require, a

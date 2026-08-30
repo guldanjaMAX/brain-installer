@@ -11989,6 +11989,7 @@ export async function cmdSetup(manifestPath, options = {}) {
   /* --- 6. the first thing worth looking at --- */
   console.log(`\n  ${c.bold("Step 6 of 6")}  loading something in\n`);
   const folder = flags.path || (await prompt("A folder to load now (blank to skip)", ""));
+  const initialLoadSkipped = !folder;
   if (folder && existsSync(folder)) {
     process.argv = [process.argv[0], process.argv[1], "ingest", target, "--path", folder, "--source", "documents"];
     await cmdIngest(target);
@@ -12016,17 +12017,27 @@ export async function cmdSetup(manifestPath, options = {}) {
   closePrompts();
   const countBacklog = options.backlogCount ?? backlogCount;
   const outstanding = await countBacklog(target).catch(() => 0);
-  console.log(`\n  ${c.green(c.bold("Your brain is live."))}\n`);
+  if (initialLoadSkipped) {
+    console.log(`\n  ${c.yellow(c.bold("Core installation is ready. No source has been loaded yet."))}\n`);
+    console.log(`  Complete the fixed public smoke proof before owner handoff:`);
+    console.log(`    brain technician ${shownTarget} --run smoke\n`);
+  } else {
+    console.log(`\n  ${c.green(c.bold("Your brain is live."))}\n`);
+  }
   if (outstanding > 0) {
     console.log(
       `  ${c.yellow("Keyword search works now.")} ${outstanding} chunk(s) are still embedding, so\n` +
         `  meaning-based search is incomplete until they finish. Run:\n    brain drain ${shownTarget}\n`
     );
   }
-  console.log(`  Ask it directly with: brain ask ${shownTarget}`);
+  if (!initialLoadSkipped) console.log(`  Ask it directly with: brain ask ${shownTarget}`);
   if (wired.length) {
     console.log(`  It is connected to: ${wired.join(", ")}.`);
-    console.log(`  ${c.dim("Restart them, then ask a question about your own material.")}\n`);
+    if (!initialLoadSkipped) {
+      console.log(`  ${c.dim("Restart them, then ask a question about your own material.")}\n`);
+    } else {
+      console.log(`  ${c.dim("Restart them after the smoke proof records one deployed source.")}\n`);
+    }
   } else if (skipConnect) {
     console.log(`  Owner handoff still requires Claude Code connection on the owner's machine:`);
     console.log(`    brain mcp-config ${shownTarget}\n`);
@@ -14302,6 +14313,8 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
           quiet: true,
         },
       )),
+      runInstallSmoke: options.runInstallSmoke || ((request) => runPublicInstallSmoke(request.manifestPath)),
+      isTTY: options.isTTY ?? Boolean(process.stdin.isTTY && process.stdout.isTTY),
       verifyInstallation: options.verifyInstallation || (async (request) => {
         await cmdHealth(request.manifestPath, { durableAdminKeyOnly: true });
         return verifyTechnicianHandoff(request.manifestPath);
@@ -14788,6 +14801,114 @@ function handoffCheckError(code, message) {
   throw error;
 }
 
+const PUBLIC_INSTALL_SMOKE_SOURCE = "install-smoke";
+const PUBLIC_INSTALL_SMOKE_ID = "public-first-install-v1";
+
+/** Load one fixed public document through the real deployed ingestion path. */
+export async function runPublicInstallSmoke(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const hostname = String(m.brain?.domain || "").trim().toLowerCase();
+  if (!hostname) {
+    handoffCheckError(
+      "INSTALL_SMOKE_FINAL_HOST_REQUIRED",
+      "the first-install smoke requires brain.domain so it can prove the permanent deployed data plane without temporary Cloudflare account access.",
+    );
+  }
+  const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath, { ignoreEnvironment: true });
+  if (!adminKey) {
+    handoffCheckError(
+      "INSTALL_SMOKE_DURABLE_ADMIN_KEY_UNAVAILABLE",
+      "the first-install smoke could not read the manifest-declared durable admin key. No document was sent.",
+    );
+  }
+  const base = `https://${hostname}`;
+  const envelope = Object.freeze({
+    source_type: PUBLIC_INSTALL_SMOKE_SOURCE,
+    source_id: PUBLIC_INSTALL_SMOKE_ID,
+    title: "Financial Brain first-install smoke proof",
+    content: "This public, non-customer document proves that the deployed Financial Brain accepted, stored, and indexed one authenticated installation check.",
+    metadata: Object.freeze({
+      proof_kind: "public_first_install_smoke",
+      contains_customer_data: false,
+      schema_version: 1,
+    }),
+  });
+  const request = options.request ?? http;
+  const response = await request(`${base}/api/admin/brain/ingest/batch`, {
+    method: "POST",
+    headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+    body: JSON.stringify({ docs: [envelope] }),
+  }, { timeoutMs: 30_000, what: "the public first-install smoke ingest" });
+  const raw = await response.text();
+  let body;
+  try { body = JSON.parse(raw); } catch {
+    handoffCheckError(
+      "INSTALL_SMOKE_INGEST_UNCONFIRMED",
+      "the deployed smoke ingest returned no valid JSON receipt. No source completion was recorded.",
+    );
+  }
+  if (!response.ok) {
+    handoffCheckError(
+      "INSTALL_SMOKE_INGEST_UNCONFIRMED",
+      `the deployed smoke ingest returned HTTP ${response.status}. No source completion was recorded.`,
+    );
+  }
+  let results;
+  try { results = validateBatchReceipt(body, [{ envelope }]); } catch {
+    handoffCheckError(
+      "INSTALL_SMOKE_INGEST_UNCONFIRMED",
+      "the deployed smoke ingest receipt did not acknowledge the exact fixed document. No source completion was recorded.",
+    );
+  }
+  const accepted = results[0];
+  if (!accepted || !["created", "updated", "unchanged"].includes(accepted.status)) {
+    handoffCheckError(
+      "INSTALL_SMOKE_INGEST_REFUSED",
+      "the deployed Brain did not accept the fixed public smoke document. No source completion was recorded.",
+    );
+  }
+
+  const now = (options.now ?? (() => new Date()))().toISOString();
+  const postReceipt = options.postReceipt ?? ((receipt) => postSourceReceipt(
+    base,
+    adminKey,
+    receipt,
+    request,
+  ));
+  const counts = {
+    docs_added: accepted.status === "created" ? 1 : 0,
+    docs_updated: accepted.status === "updated" ? 1 : 0,
+    docs_unchanged: accepted.status === "unchanged" ? 1 : 0,
+  };
+  await postReceipt({
+    source: PUBLIC_INSTALL_SMOKE_SOURCE,
+    kind: "upload",
+    status: "ready",
+    run_id: "public_install_smoke_v1",
+    lane: "manual",
+    started_at: now,
+    completed_at: now,
+    ...counts,
+    detail: "fixed public first-install smoke document accepted",
+  });
+  const drain = options.drain ?? ((path) => cmdDrain(path));
+  const drainReceipt = await drain(manifestPath);
+  if (drainReceipt?.remaining !== 0) {
+    handoffCheckError(
+      "INSTALL_SMOKE_VECTOR_INCOMPLETE",
+      "the smoke document was stored, but its vector work is not query-ready. Rerun the same smoke step to resume the durable drain.",
+    );
+  }
+  return Object.freeze({
+    document_status: accepted.status,
+    source_status: "ready",
+    vector_remaining: 0,
+    contains_customer_data: false,
+    checked_via: "deployed_authenticated_ingest",
+    stored_identifiers: false,
+  });
+}
+
 /**
  * Prove final handoff postconditions through the deployed data plane.
  *
@@ -14836,10 +14957,26 @@ export async function verifyTechnicianHandoff(manifestPath, options = {}) {
     "HANDOFF_SOURCE_FRESHNESS_UNAVAILABLE",
     "the deployed source-freshness check",
   );
+  if (freshness?.unavailable === true) {
+    handoffCheckError(
+      "HANDOFF_SOURCE_FRESHNESS_UNAVAILABLE",
+      "the deployed Brain marked source freshness unavailable. The handoff remains incomplete.",
+    );
+  }
   if (!Array.isArray(freshness?.sources) || freshness.sources.length === 0) {
     handoffCheckError(
       "HANDOFF_NO_CONFIGURED_SOURCES",
       "the deployed Brain reported no configured sources. A zero exit code cannot satisfy the handoff.",
+    );
+  }
+  const smokeSource = freshness.sources.find((source) =>
+    String(source?.name || "") === PUBLIC_INSTALL_SMOKE_SOURCE);
+  if (!smokeSource || smokeSource.source_status !== "ready" ||
+      Number(smokeSource.documents || 0) < 1 ||
+      !["ok", "manual"].includes(String(smokeSource.state || ""))) {
+    handoffCheckError(
+      "HANDOFF_INSTALL_SMOKE_UNPROVEN",
+      "the deployed Brain does not contain a ready fixed first-install smoke source with at least one stored document. The handoff remains incomplete.",
     );
   }
   const stateCounts = {};
@@ -14870,6 +15007,7 @@ export async function verifyTechnicianHandoff(manifestPath, options = {}) {
   return Object.freeze({
     source_count: freshness.sources.length,
     source_states: Object.freeze(stateCounts),
+    install_smoke_documents: Number(smokeSource.documents),
     enrolled_device_count: deviceList.devices.length,
     checked_via: "deployed_admin_data_plane",
     stored_identifiers: false,

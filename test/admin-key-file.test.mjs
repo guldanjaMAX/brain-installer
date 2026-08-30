@@ -15,6 +15,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -28,6 +29,10 @@ import {
   validateAdminKeyFileDestination,
   writeAdminKeyFile,
 } from "../operations/admin-key-file.mjs";
+import {
+  disposeWindowsDpapiSession,
+  prepareWindowsDpapiSession,
+} from "../operations/windows-dpapi-session.mjs";
 
 const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-admin-key-file-")));
 const secretA = "a".repeat(48);
@@ -121,8 +126,65 @@ try {
     rounds: 25,
     stage: null,
   });
-  assert.equal(deepDpapi.calls.length, 50, "the deep release diagnostic needs 25 cold protect/decrypt round trips");
+  assert.equal(deepDpapi.calls.length, 50, "the deep release diagnostic needs 25 fresh protect/decrypt round trips");
   for (const call of deepDpapi.calls) call.input.fill(0);
+
+  let sessionCompiles = 0;
+  let sessionPrepares = 0;
+  let sessionDisposals = 0;
+  const sessionCalls = [];
+  let compiledSession = null;
+  const sessionCiphertexts = new Map();
+  let sessionSerial = 0;
+  let sessionRandomIndex = 0;
+  const sessionDiagnostic = probeWindowsDpapi({
+    platform: "win32",
+    rounds: 25,
+    randomBytes: () => Buffer.alloc(32, ++sessionRandomIndex),
+    prepareWindowsDpapiSession: () => {
+      sessionPrepares++;
+      if (!compiledSession) {
+        sessionCompiles++;
+        compiledSession = { helper: "C:\\fixture\\windows-dpapi-helper.exe", sha256: "a".repeat(64) };
+      }
+      return compiledSession;
+    },
+    runDpapiBridge: (command, args, options) => {
+      const input = Buffer.from(options.input);
+      const operation = args[args.indexOf("--operation") + 1];
+      sessionCalls.push({ command, args: [...args], env: { ...options.env }, input });
+      if (operation === "protect") {
+        const ciphertext = Buffer.from(`session-ciphertext-${++sessionSerial}`, "ascii");
+        sessionCiphertexts.set(ciphertext.toString("base64"), Buffer.from(input));
+        return { status: 0, stdout: ciphertext, stderr: Buffer.alloc(0) };
+      }
+      const plain = sessionCiphertexts.get(input.toString("base64"));
+      return plain
+        ? { status: 0, stdout: Buffer.from(plain), stderr: Buffer.alloc(0) }
+        : { status: 1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    },
+    disposeWindowsDpapiSession: () => {
+      sessionDisposals++;
+      return { status: "clean", attempts: 1 };
+    },
+    environment: {},
+  });
+  assert.deepEqual(sessionDiagnostic, {
+    checked: true,
+    passed: true,
+    rounds: 25,
+    stage: null,
+    cleanup_status: "clean",
+  });
+  assert.equal(sessionCompiles, 1, "25 rounds compile one process-scoped helper");
+  assert.equal(sessionPrepares, 50, "every crypto operation reuses the same validated session");
+  assert.equal(sessionCalls.length, 50, "25 rounds still perform 50 helper operations");
+  assert.equal(sessionDisposals, 1, "the release gate disposes the captured helper once");
+  assert.ok(sessionCalls.every((call) => {
+    const metadata = JSON.stringify({ command: call.command, args: call.args, env: call.env });
+    return !metadata.includes(call.input.toString("base64")) && !metadata.includes(call.input.toString("latin1"));
+  }), "DPAPI payload bytes never enter argv or environment");
+  for (const call of sessionCalls) call.input.fill(0);
 
   const stagedFailure = probeWindowsDpapi({
     platform: "win32",
@@ -142,6 +204,68 @@ try {
     stage: "compile",
     issue_code: "WINDOWS_DPAPI_COMPILE",
   });
+
+  const fakeWindowsRoot = join(sandbox, "session-runtime");
+  const fakeCompiler = join(fakeWindowsRoot, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe");
+  const fakeTemp = join(fakeWindowsRoot, "Temp");
+  mkdirSync(join(fakeCompiler, ".."), { recursive: true });
+  mkdirSync(fakeTemp, { recursive: true });
+  writeFileSync(fakeCompiler, "fixed fixture compiler", "utf8");
+  let compileRuns = 0;
+  const sessionSpawn = (command, args) => {
+    if (String(command).endsWith("icacls.exe")) {
+      return { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    }
+    const output = args.find((value) => String(value).startsWith("/out:"));
+    assert.ok(output, "fixture compiler received an exact output path");
+    compileRuns++;
+    writeFileSync(String(output).slice(5), "fixed compiled helper bytes", "utf8");
+    return { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+  };
+  const sessionOptions = {
+    environment: {
+      SystemRoot: fakeWindowsRoot,
+      TEMP: fakeTemp,
+      USERNAME: "fixture-user",
+    },
+    spawnSync: sessionSpawn,
+  };
+  const compiledOnce = prepareWindowsDpapiSession(sessionOptions);
+  assert.equal(prepareWindowsDpapiSession(sessionOptions), compiledOnce);
+  assert.equal(compileRuns, 1);
+  let lockedUnlinks = 0;
+  const retriedCleanup = disposeWindowsDpapiSession({
+    attempts: 5,
+    pause: () => {},
+    unlink: (path) => {
+      lockedUnlinks++;
+      if (lockedUnlinks < 3) {
+        const error = new Error("fixture antivirus lock");
+        error.code = "EBUSY";
+        throw error;
+      }
+      unlinkSync(path);
+    },
+  });
+  assert.deepEqual(retriedCleanup, { status: "clean", attempts: 3 });
+
+  prepareWindowsDpapiSession(sessionOptions);
+  const deferredCleanup = disposeWindowsDpapiSession({
+    attempts: 2,
+    pause: () => {},
+    unlink: () => {
+      const error = new Error("fixture antivirus still holds the helper");
+      error.code = "EBUSY";
+      throw error;
+    },
+  });
+  assert.deepEqual(deferredCleanup, {
+    status: "cleanup_deferred",
+    attempts: 2,
+    issue_code: "WINDOWS_DPAPI_CLEANUP_DEFERRED",
+  });
+  assert.deepEqual(disposeWindowsDpapiSession({ pause: () => {} }), { status: "clean", attempts: 1 });
+  rmSync(fakeWindowsRoot, { recursive: true, force: true });
 
   assert.equal(validateAdminKeyValue(secretB), secretB, "visible ASCII and an internal space are header-safe");
   for (const unsafe of [
@@ -473,6 +597,30 @@ try {
   }), /DPAPI.*prior key was left untouched/);
   assert.equal(String(dpapiFailure?.message || dpapiFailure).includes(secretB), false);
   assert.equal(failedMetadata.includes(secretB), false);
+  assert.deepEqual(readFileSync(windowsPath), priorBytes);
+  assert.deepEqual(readdirSync(windowsRoot), [".brain-admin-key"]);
+
+  let productionBridgeCalls = 0;
+  let compileFailure;
+  try {
+    writeAdminKeyFile(windowsPath, secretB, {
+      platform: "win32",
+      username: "fixture-user",
+      randomBytes: entropy(7),
+      prepareWindowsDpapiSession: () => {
+        const error = new Error("fixture compiler unavailable");
+        error.stage = "compile";
+        throw error;
+      },
+      runDpapiBridge: () => { productionBridgeCalls++; throw new Error("must not receive input"); },
+      runAcl: () => { throw new Error("ACL must not run after pre-input compile failure"); },
+    });
+  } catch (caught) {
+    compileFailure = caught;
+  }
+  assert.match(compileFailure?.message || "", /DPAPI at the compile stage.*prior key was left untouched/i);
+  assert.equal(compileFailure.code, "WINDOWS_DPAPI_COMPILE");
+  assert.equal(productionBridgeCalls, 0);
   assert.deepEqual(readFileSync(windowsPath), priorBytes);
   assert.deepEqual(readdirSync(windowsRoot), [".brain-admin-key"]);
 

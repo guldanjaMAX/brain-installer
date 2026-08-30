@@ -196,14 +196,13 @@ Worker reads `https://financialbrain.ai/update/manifest.json` server-to-server.
 The public request contains no client body, identity, files, questions,
 manifest, source list, account details, or installed version.
 
-The Worker treats the release feed as untrusted input. It refuses redirects,
-bounds the response and installer size, validates the exact first-party guide,
-Claude prompt, immutable GitHub asset URL, SHA-256 digest, and proof fields, then
-compares stable semantic versions. A successful response has `status` equal to
-`update_available`, `up_to_date`, or `ahead` and includes `installed_version`,
-`latest_version`, `checked_at`, and `update_url`. An available response also
-includes the reviewed changes, connector list, Claude prompt, and immutable
-installer receipt.
+The Worker treats the release feed as untrusted input. It refuses redirects and
+bounds the response. A validated schema-v2 `held` or `candidate` feed returns
+`release_held` or `release_candidate` with no installer, command, digest, or
+size. Only `stable` can expose the fixed Claude handoff and an immutable GitHub
+asset URL, SHA-256 digest, byte count, and reviewed changes. Stable responses
+have `status` equal to `update_available`, `up_to_date`, or `ahead` and include
+`installed_version`, `latest_version`, `checked_at`, and `update_url`.
 
 Missing local version truth, an unreachable feed, or any malformed field returns
 HTTP 503 with `status:"unavailable"`. It never falls back to a guessed installed

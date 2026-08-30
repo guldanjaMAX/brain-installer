@@ -87,8 +87,9 @@ argument arrays must never be joined into a shell string. An agent may guide
 the browser and explain each page, but the owner enters every token or secret
 into the provider page or hidden terminal prompt.
 
-The public first-install path covers local tools, the core Cloudflare install,
-an owner-only passkey handoff, and live final verification. Plaid, Google,
+The public first-install path covers local tools, the owner-terminal Cloudflare
+install, one fixed public smoke document, an owner-only passkey handoff, and
+live final verification. Plaid, Google,
 QuickBooks, Zoom, and IMAP sections below are retained as implementation and
 field-gate references only. Their technician commands fail closed in the public
 path until secure credential custody and real-provider acceptance are complete.
@@ -124,16 +125,30 @@ technician plan.
 
 ### 2. Cloudflare install
 
-```bash
-brain technician "$HOME/Financial Brain/brain.manifest.json" --run cloudflare
-```
-
-The owner signs in, confirms Workers Paid, creates the scoped installation
+The JSON plan supplies an exact structured `owner_only_command` for this step.
+The owner pastes and runs that package-local command in a terminal they control
+directly. Claude must not launch it through its Bash tool. If attempted without
+a real TTY, the step records `OWNER_DIRECT_TERMINAL_REQUIRED` before starting a
+child. The owner signs in, confirms Workers Paid, creates the scoped installation
 token, and enters it into the hidden prompt. The existing setup command performs
 the account check, provisioning, migrations, deploy, key persistence, and
-health proof. It is safe to rerun after an interruption.
+health proof. After it returns, Claude uses only the credential-free structured
+refresh from the status receipt.
 
-### 3. Plaid bank feed
+### 3. Fixed public smoke proof
+
+After explicit owner approval for one tiny Workers AI embedding cost, run:
+
+```bash
+brain technician "$HOME/Financial Brain/brain.manifest.json" --run smoke
+```
+
+This sends one fixed public non-customer document through the real deployed
+authenticated ingest path. It requires the exact document receipt, records the
+`install-smoke` source ready, drains vector work, and is idempotent after a lost
+response. It reads no owner folder or customer material.
+
+### 4. Plaid bank feed
 
 Enable `corpora.bank_feed` with provider `plaid` and explicitly select Sandbox
 or Production. The client owns the Plaid account and Link configuration.
@@ -149,7 +164,7 @@ secrets without exposing their values. The account holder later completes
 Plaid Link in the browser. A configured connection is not reconciliation proof
 and never makes Plaid or QuickBooks financial authority.
 
-### 4. Google
+### 5. Google
 
 Leave Drive disabled until the owner has selected the folders it may read. To
 enable it, set `google_drive.enabled` to true and put the exact reviewed folder
@@ -165,7 +180,7 @@ client ID and optional client secret are entered at hidden prompts. Google
 consent stays in the owner's browser. The launcher passes the values only to the
 short-lived connector process and clears its input buffers afterward.
 
-### 5. QuickBooks Online
+### 6. QuickBooks Online
 
 Set `corpora.quickbooks.enabled` to `true`, select `sandbox` in
 `corpora.quickbooks.environment`, and leave `redirect_host` at `localhost`
@@ -293,7 +308,7 @@ For a Claude or Codex-guided review, copy this prompt and replace only the paths
 Help me prepare a human-confirmed tax-to-QuickBooks review claim for /absolute/path/to/brain.manifest.json and save it only at /private/path/reviewed-tax-qbo-claim.json. Do not use OCR, retrieval snippets, bank deposits, transaction aggregation, or guessed mappings as proof. First verify that one exact tax document and one exact annual QuickBooks profit-and-loss report are already stored, readable, registered to the same single legal entity and exact period, and that the report document itself is QuickBooks-sourced and carries the same company fingerprint as the reviewed QuickBooks company evidence. If any custody, entity, tax year, period, currency, accounting basis, report coverage, company, or source fact is missing or ambiguous, stop and name it. Help me visually locate the tax form name and version, page, exact gross-receipts line label, and amount, then the QuickBooks report name, date range, cash or accrual basis, exact gross-receipts total label, and amount. Convert amounts to integer USD minor units only after I verify each conversion. Use gross_receipts as the measure on both sides only after I confirm those exact document labels are intended to represent that same measure. Write confirmation as owner_confirmed_from_document and scope_kind as single_entity. Keep the JSON file owner-only and never put its private contents in a command argument, chat, summary, log, repository, or synced folder. Open the local file for my private inspection instead of pasting it into chat, ask me to verify every field, then ask separately before running brain reconcile tax-quickbooks with --claim-file, --confirm-reviewed-claims, and --json. Explain that the CLI receipt omits the legal name, amounts, document IDs, and locators; matched, mismatched, and insufficient_evidence are review states; equal amounts prove no tax treatment; and the command never extracts, selects a winner, resolves a tax question, or changes either source document.
 ```
 
-### 6. Zoom
+### 7. Zoom
 
 Enable `zoom` in the manifest. A paid Zoom seat with cloud recording is
 required. Then run:
@@ -310,7 +325,7 @@ the second wakes it when the transcript is ready. The command probes the account
 writes the four Worker secrets, and proves the live validation challenge before
 it prints the webhook URL to save in Zoom.
 
-### 7. IMAP
+### 8. IMAP
 
 Enable `imap` in the manifest. Use the provider's IMAP host and an app password,
 not the normal mailbox password:
@@ -323,7 +338,7 @@ brain technician "$HOME/Financial Brain/brain.manifest.json" --run imap \
 The app password is requested by the connector's hidden prompt. It is stored
 only after a real mailbox read succeeds.
 
-### 8. Owner passkey
+### 9. Owner passkey
 
 Settle the final Brain hostname first. With the owner and intended device
 present, the owner opens a terminal and display they control directly and runs
@@ -332,30 +347,26 @@ creation through Claude, Codex, an agent tool, a captured terminal, or a shared
 screen. The one-time URL must stay out of chat, logs, screenshots, and status
 files.
 
-The technician boundary check is:
+Use the JSON plan's exact structured `owner_only_command`. It invokes the
+package-local `invite` command directly and never routes the one-time link
+through an agent. After the owner completes Face ID, fingerprint, or device PIN
+on the final hostname, use the plan's structured continuation to run final
+verification. That verifier must observe the enrolled device through the
+deployed data plane.
 
-```bash
-brain technician "$HOME/Financial Brain/brain.manifest.json" --run passkey \
-  --confirm-host brain.example.com
-```
-
-The confirmation exactly matches `brain.domain`. The technician command does
-not mint or print an invite. It records that the owner-only terminal ceremony is
-required. After the owner completes Face ID, fingerprint, or device PIN on the
-final hostname, the final verification step must observe an enrolled device
-through the deployed data plane.
-
-### 9. Handoff checks
+### 10. Handoff checks
 
 ```bash
 brain technician "$HOME/Financial Brain/brain.manifest.json" --run verify
 ```
 
 This runs authenticated deployed health, source-freshness, and enrolled-device
-postconditions with the manifest-declared durable key. It requires at least one
-configured source and at least one enrolled passkey, stores aggregate counts
-only, and fails closed when a check is unavailable. It does not use a temporary
-Cloudflare token or infer completion from a child exit code.
+postconditions with the manifest-declared durable key. It requires the exact
+ready `install-smoke` source with at least one stored document, acceptable live
+freshness, and at least one enrolled passkey. It stores aggregate counts only
+and fails closed when a check is unavailable. Success refreshes to terminal
+`handoff_complete`. It does not use a temporary Cloudflare token or infer
+completion from a child exit code.
 
 ## Optional provider connection ceremony
 

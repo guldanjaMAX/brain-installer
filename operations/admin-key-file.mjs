@@ -28,6 +28,10 @@ import { spawnSync } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { TextDecoder } from "node:util";
 import { fileURLToPath } from "node:url";
+import {
+  disposeWindowsDpapiSession,
+  prepareWindowsDpapiSession,
+} from "./windows-dpapi-session.mjs";
 
 const WINDOWS_DPAPI_HEADER = Buffer.from("BRAIN-ADMIN-KEY-DPAPI-V1\n", "ascii");
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
@@ -40,7 +44,6 @@ const WINDOWS_RUNTIME_ENV = Object.freeze([
 ]);
 const WINDOWS_DPAPI_HELPER = fileURLToPath(new URL("./windows-dpapi.ps1", import.meta.url));
 const WINDOWS_DPAPI_BRIDGE = fileURLToPath(new URL("./windows-dpapi-bridge.mjs", import.meta.url));
-const WINDOWS_DPAPI_SOURCE = fileURLToPath(new URL("./windows-dpapi.cs", import.meta.url));
 
 function lstatIfPresent(path) {
   try {
@@ -236,13 +239,33 @@ function runWindowsDpapi(input, options, operation, secretForMetadataCheck = nul
   // Tests inject the legacy PowerShell runner directly. Production asks a
   // fixed Node bridge to compile the fixed C# helper before it reads any secret,
   // then uses an ordinary asynchronous pipe for the exact bytes.
-  const runner = options.runPowerShell ?? spawnSync;
+  let session = null;
+  if (!options.runPowerShell) {
+    try {
+      session = (options.prepareWindowsDpapiSession ?? prepareWindowsDpapiSession)({
+        environment: options.environment ?? process.env,
+        ...(options.dpapiSessionOptions || {}),
+      });
+    } catch (caught) {
+      const stage = /^[a-z_]+$/.test(String(caught?.stage || "")) ? caught.stage : "compile";
+      const error = new Error(
+        operation === "protect"
+          ? `Windows could not protect the admin key with DPAPI at the ${stage} stage; the prior key was left untouched`
+          : `Windows could not decrypt the admin key with DPAPI at the ${stage} stage for the current user`,
+      );
+      error.code = `WINDOWS_DPAPI_${stage.toUpperCase()}`;
+      error.stage = stage;
+      throw error;
+    }
+  }
+  const runner = options.runPowerShell ?? options.runDpapiBridge ?? spawnSync;
   const runnerCommand = options.runPowerShell ? command : process.execPath;
   const runnerArgs = options.runPowerShell
     ? powerShellArgs
     : [
         WINDOWS_DPAPI_BRIDGE,
-        "--source", WINDOWS_DPAPI_SOURCE,
+        "--helper", session.helper,
+        "--sha256", session.sha256,
         "--operation", operation,
         "--length", String(input.length),
         "--max", String(MAX_ADMIN_KEY_FILE_BYTES),
@@ -300,7 +323,8 @@ function runWindowsDpapi(input, options, operation, secretForMetadataCheck = nul
 /**
  * Exercise the exact production DPAPI bridge without persisting a credential.
  * Each round uses fresh random bytes, verifies exact protect/unprotect readback,
- * wipes every buffer, and relies on the bridge's mandatory private-build cleanup.
+ * wipes every buffer, and reuses one private process-scoped compiled helper.
+ * The probe passes only after that captured helper is removed cleanly.
  */
 export function probeWindowsDpapi(options = {}) {
   const platform = options.platform ?? process.platform;
@@ -313,6 +337,7 @@ export function probeWindowsDpapi(options = {}) {
   }
   const random = options.randomBytes ?? randomBytes;
   let completed = 0;
+  let failure = null;
   try {
     for (let index = 0; index < rounds; index++) {
       const plain = random(32);
@@ -341,18 +366,43 @@ export function probeWindowsDpapi(options = {}) {
         if (opened) opened.fill(0);
       }
     }
-    return Object.freeze({ checked: true, passed: true, rounds: completed, stage: null });
   } catch (error) {
+    failure = error;
+  }
+  let cleanup = Object.freeze({ status: "not_applicable" });
+  if (!options.runPowerShell) {
+    cleanup = (options.disposeWindowsDpapiSession ?? disposeWindowsDpapiSession)(
+      options.dpapiDisposeOptions || {},
+    );
+  }
+  if (failure) {
     return Object.freeze({
       checked: true,
       passed: false,
       rounds: completed,
-      stage: /^[a-z_]+$/.test(String(error?.stage || "")) ? error.stage : "unknown",
-      issue_code: /^WINDOWS_DPAPI_[A-Z_]+$/.test(String(error?.code || ""))
-        ? error.code
+      stage: /^[a-z_]+$/.test(String(failure?.stage || "")) ? failure.stage : "unknown",
+      issue_code: /^WINDOWS_DPAPI_[A-Z_]+$/.test(String(failure?.code || ""))
+        ? failure.code
         : "WINDOWS_DPAPI_UNKNOWN",
     });
   }
+  if (cleanup.status !== "not_applicable" && cleanup.status !== "clean") {
+    return Object.freeze({
+      checked: true,
+      passed: false,
+      rounds: completed,
+      stage: "cleanup_deferred",
+      issue_code: cleanup.issue_code || "WINDOWS_DPAPI_CLEANUP_DEFERRED",
+      cleanup_status: cleanup.status,
+    });
+  }
+  return Object.freeze({
+    checked: true,
+    passed: true,
+    rounds: completed,
+    stage: null,
+    ...(cleanup.status === "clean" ? { cleanup_status: "clean" } : {}),
+  });
 }
 
 function protectAdminKeyForWindows(secret, options) {

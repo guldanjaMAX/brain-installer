@@ -1000,7 +1000,9 @@ try {
   assert.deepEqual(successfulSetupEvents, [
     "verify", "provision", "migrate", "deploy", "secrets", "drain", "health", "wire", "prompt", "backlog",
   ]);
-  assert.match(successfulSetup.output, /Step 6 of 6[\s\S]*Your brain is live/i);
+  assert.match(successfulSetup.output, /Step 6 of 6[\s\S]*Core installation is ready\. No source has been loaded yet/i);
+  assert.match(successfulSetup.output, /technician .*--run smoke/i);
+  assert.doesNotMatch(successfulSetup.output, /Your brain is live|ask a question about your own material/i);
   assert.match(successfulSetup.output, /connected to: Codex/i);
   assert.equal(successfulSetup.output.includes(replacementKey), false);
   assert.equal(successfulSetup.output.includes(currentKey), false);

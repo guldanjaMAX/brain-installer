@@ -42,7 +42,7 @@ function run(command, args, options = {}) {
   });
 }
 
-test("the packed CLI scaffolds a nonexistent manifest before any manifest-account lookup", () => {
+test("the packed CLI scaffolds a nonexistent manifest before any manifest-account lookup", async () => {
   const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "brain-packed-fresh-")));
   try {
     const pack = run(IS_WIN ? "npm.cmd" : "npm", [
@@ -158,6 +158,17 @@ test("the packed CLI scaffolds a nonexistent manifest before any manifest-accoun
       step.command.includes(bootstrapStatus.cli.args[0])));
     assert.ok(plan.steps.filter((step) => ["plaid", "google", "quickbooks", "zoom", "imap"].includes(step.id))
       .every((step) => step.command === null));
+    assert.equal(plan.steps.find((step) => step.id === "smoke").state, "waiting_for_install_record");
+    assert.deepEqual(plan.steps.find((step) => step.id === "cloudflare").owner_only_command, {
+      command: bootstrapStatus.cli.command,
+      args: [...bootstrapStatus.cli.args, "technician", manifestPath, "--run", "cloudflare"],
+      execution_boundary: "owner_direct_terminal",
+      mutates_external_state: true,
+      must_run_in_direct_owner_terminal: true,
+      reveals_one_time_link: false,
+    });
+    assert.deepEqual(plan.steps.find((step) => step.id === "passkey").owner_only_command.args,
+      [...bootstrapStatus.cli.args, "invite", manifestPath]);
     assert.doesNotMatch(JSON.stringify(plan.steps), /(^|[^\w/.-])brain technician\b/i);
     assert.match(JSON.stringify(plan.coverage), /watched-folder scheduling ceremony/i);
     const accountId = "a".repeat(32);
@@ -210,6 +221,28 @@ globalThis.fetch = async (input, options = {}) => {
       scaffoldOutput.indexOf(`Cloudflare account "Packed fixture account"`) < scaffoldOutput.indexOf("D1 is not reachable"),
       "the selected account must be shown before any account resource operation",
     );
+
+    manifest.brain = { ...(manifest.brain || {}), domain: "brain.fixture.test" };
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    const packedModule = await import(pathToFileURL(bootstrapStatus.cli.args[0]).href);
+    let smokeEnvelope = null;
+    let smokeReceipt = null;
+    const smokeProof = await packedModule.runPublicInstallSmoke(manifestPath, {
+      resolveAdminKey: () => "fixture-packed-admin-key",
+      request: async (_url, options) => {
+        smokeEnvelope = JSON.parse(options.body).docs[0];
+        return new Response(JSON.stringify({
+          results: [{ source_id: "public-first-install-v1", status: "created" }],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+      postReceipt: async (receipt) => { smokeReceipt = receipt; },
+      drain: async () => ({ remaining: 0 }),
+    });
+    assert.equal(smokeEnvelope.source_type, "install-smoke");
+    assert.equal(smokeEnvelope.metadata.contains_customer_data, false);
+    assert.equal(smokeReceipt.source, "install-smoke");
+    assert.equal(smokeReceipt.status, "ready");
+    assert.equal(smokeProof.checked_via, "deployed_authenticated_ingest");
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
   }

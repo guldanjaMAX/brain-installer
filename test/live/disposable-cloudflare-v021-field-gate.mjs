@@ -125,4 +125,3 @@ try {
   closeSync(descriptor);
 }
 console.log(JSON.stringify({ status: receipt.status, receipt: receiptPath, cleanup_required: true }, null, 2));
-
