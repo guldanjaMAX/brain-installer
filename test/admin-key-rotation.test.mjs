@@ -992,13 +992,9 @@ try {
       assert.equal(fallback, "");
       return "";
     },
-    backlogCount: async () => {
-      successfulSetupEvents.push("backlog");
-      return 0;
-    },
   }));
   assert.deepEqual(successfulSetupEvents, [
-    "verify", "provision", "migrate", "deploy", "secrets", "drain", "health", "wire", "prompt", "backlog",
+    "verify", "provision", "migrate", "deploy", "secrets", "drain", "health", "wire", "prompt",
   ]);
   assert.match(successfulSetup.output, /Step 6 of 6[\s\S]*Core installation is ready\. No source has been loaded yet/i);
   assert.match(successfulSetup.output, /technician .*--run smoke/i);
