@@ -11510,6 +11510,128 @@ export async function probeUpgradePause(manifestPath, options = {}) {
 }
 
 /**
+ * Read the deployed bank-feed runtime through its authenticated status route.
+ *
+ * The manifest proves only what deploy intended to send. This probe proves the
+ * Worker that is answering now has the matching public bindings and all of the
+ * secret material needed to construct the provider client. It never returns a
+ * credential or provider access reference.
+ */
+export async function probeBankFeedRuntime(manifestPath, options = {}) {
+  let m;
+  try {
+    ({ m } = (options.loadManifest ?? loadManifest)(manifestPath));
+  } catch (error) {
+    return { checked: false, reason: `manifest could not be read: ${String(error?.message || error).slice(0, 160)}` };
+  }
+
+  const feed = m?.corpora?.bank_feed;
+  if (feed?.enabled !== true) return { checked: true, enabled: false, body: null };
+
+  let base;
+  try {
+    const resolveProbeAccount = options.resolveAccount ?? resolveAccount;
+    const resolveBase = options.resolveBaseUrl ?? resolveBaseUrl;
+    const acct = m.brain?.domain ? null : await resolveProbeAccount(m);
+    base = await resolveBase(m, acct);
+  } catch (error) {
+    return { checked: false, reason: `could not resolve this install's URL: ${String(error?.message || error).slice(0, 160)}` };
+  }
+  if (!base) return { checked: false, reason: "could not determine a URL for this install" };
+
+  const readKey = options.resolveAdminKey ?? resolveAdminKey;
+  const adminKey = options.adminKey ?? readKey(manifestPath);
+  if (!adminKey) {
+    return {
+      checked: false,
+      reason: "no durable admin key is available for the private runtime check",
+      base,
+    };
+  }
+
+  let response, text;
+  try {
+    response = await (options.http ?? http)(`${base}/api/bank-feed/status`, {
+      headers: { "X-Admin-Key": adminKey },
+    }, { timeoutMs: 15_000, what: "the deployed bank-feed status" });
+    text = await response.text();
+  } catch (error) {
+    return {
+      checked: false,
+      reason: `could not reach the private bank-feed status: ${String(error?.message || error).slice(0, 160)}`,
+      base,
+    };
+  }
+
+  let body = null;
+  try { body = JSON.parse(text); } catch { /* validated below */ }
+  if (!response.ok || !body || typeof body !== "object" || Array.isArray(body)) {
+    return {
+      checked: false,
+      reason: `/api/bank-feed/status returned ${response.status} with an unreadable or refused response`,
+      base,
+    };
+  }
+  return { checked: true, enabled: true, body, base };
+}
+
+/** Compare a deployed bank runtime receipt with the manifest that produced it. */
+export function checkBankFeedRuntime(manifest, probe) {
+  const feed = manifest?.corpora?.bank_feed;
+  if (feed?.enabled !== true) return { name: "Bank runtime", status: D_OK, detail: "not in use on this brain" };
+
+  const repair =
+    "Run `brain deploy <manifest>` and then `brain secrets <manifest>`, in that order.\n" +
+    "  Then re-run `brain doctor <manifest>` so the deployed Worker confirms the same settings.";
+  if (!probe?.checked) {
+    return {
+      name: "Bank runtime",
+      status: D_FAIL,
+      detail: `not proven: ${probe?.reason || "the deployed status was unavailable"}`,
+      fix: repair,
+    };
+  }
+
+  const body = probe.body;
+  if (!body || body.configured !== true) {
+    return {
+      name: "Bank runtime",
+      status: D_FAIL,
+      detail: "the deployed Worker reports that the bank feed is not configured",
+      fix: repair,
+    };
+  }
+
+  const provider = feed.provider === "plaid" ? "plaid" : "custom";
+  const environment = feed.environment === "production" ? "production" : "sandbox";
+  const mismatches = [];
+  if (provider === "plaid" && body.provider !== "plaid") mismatches.push("provider");
+  if (body.environment !== environment) mismatches.push("environment");
+  if (!Array.isArray(body.connections) || !Array.isArray(body.needs_attention)) {
+    mismatches.push("status shape");
+  }
+  if (provider === "plaid") {
+    const interval = Number(feed.reconciliation_interval_minutes ?? 360);
+    if (Number(body.reconciliation_interval_minutes) !== interval) mismatches.push("refresh interval");
+    if (body.signed_webhook_path !== "/api/webhooks/plaid") mismatches.push("signed webhook path");
+  }
+  if (mismatches.length) {
+    return {
+      name: "Bank runtime",
+      status: D_FAIL,
+      detail: `the deployed Worker does not match the manifest (${mismatches.join(", ")})`,
+      fix: repair,
+    };
+  }
+
+  return {
+    name: "Bank runtime",
+    status: D_OK,
+    detail: `${provider}; ${environment}; deployed configuration confirmed; ${body.connections.length} connection(s)`,
+  };
+}
+
+/**
  * Everything `brain doctor <manifest> --repair` needs to explain a stuck
  * upgrade precisely instead of vaguely: which stage it died at, since when,
  * and the exact D1 recovery bookmark captured before that migration ran.
@@ -11902,6 +12024,27 @@ async function buildUpgradePauseCheck(manifestPath, options = {}) {
   return { name: "upgrade state", status: D_OK, detail: "accepting documents" };
 }
 
+/** A deployed-state gate for a manifest that declares a bank feed. */
+async function buildBankFeedRuntimeCheck(manifestPath, options = {}) {
+  let manifest;
+  try {
+    ({ m: manifest } = (options.loadManifest ?? loadManifest)(manifestPath));
+  } catch (error) {
+    return {
+      name: "Bank runtime",
+      status: D_FAIL,
+      detail: `not proven: manifest could not be read (${String(error?.message || error).slice(0, 120)})`,
+    };
+  }
+  let probe;
+  try {
+    probe = await (options.probeBankFeedRuntime ?? probeBankFeedRuntime)(manifestPath, options);
+  } catch (error) {
+    probe = { checked: false, reason: String(error?.message || error).slice(0, 160) };
+  }
+  return checkBankFeedRuntime(manifest, probe);
+}
+
 /**
  * The doctor check for plain `brain doctor <manifest>` (no flags): catches an
  * applied migration's checksum drift BEFORE an operator ever runs
@@ -11985,10 +12128,18 @@ async function cmdDoctor(manifestPath) {
     // bank-feed failure that is unrecoverable in front of a client is a return
     // address nobody registered.
     try {
-      const feedCheck = checkBankFeedRedirect(loadManifest(manifestPath).m);
+      const manifest = loadManifest(manifestPath).m;
+      const feedCheck = checkBankFeedRedirect(manifest);
       checks.push(feedCheck);
       const feedMark = feedCheck.status === D_OK ? c.green("ok  ") : feedCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
       console.log(`  ${feedMark}  ${feedCheck.name.padEnd(18)}  ${feedCheck.detail}`);
+
+      if (manifest?.corpora?.bank_feed?.enabled === true && manifest?.brain?.domain) {
+        const runtimeCheck = await buildBankFeedRuntimeCheck(manifestPath);
+        checks.push(runtimeCheck);
+        const runtimeMark = runtimeCheck.status === D_OK ? c.green("ok  ") : runtimeCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
+        console.log(`  ${runtimeMark}  ${runtimeCheck.name.padEnd(18)}  ${runtimeCheck.detail}`);
+      }
     } catch { /* doctor must work without a valid manifest */ }
   }
 

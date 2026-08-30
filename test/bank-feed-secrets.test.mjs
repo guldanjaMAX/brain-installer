@@ -30,6 +30,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   WORKER_PROVIDER_SECRET_NAMES, optionalWorkerSecretNames, cmdSecrets, bankFeedWorkerBindings,
+  probeBankFeedRuntime, checkBankFeedRuntime,
 } from "../brain.mjs";
 import {
   checkBankFeedRedirect, bankFeedRedirectUri, plaidWebhookUri,
@@ -336,6 +337,80 @@ try {
       !JSON.stringify(plaidBindings).includes("BANK_FEED_SECRET") &&
       !JSON.stringify(plaidBindings).includes("fixture-service-secret"),
       JSON.stringify(plaidBindings));
+  }
+
+  /* ============ manifest intent must match the deployed private runtime ============ */
+  {
+    const liveManifest = {
+      ...manifest({ bankFeed: true }),
+      corpora: { bank_feed: {
+        enabled: true,
+        provider: "plaid",
+        environment: "sandbox",
+        reconciliation_interval_minutes: 360,
+        registered_redirect_uris: ["https://fixture-brain.example.workers.dev/app/connect/bank"],
+      } },
+    };
+    const runtimeBody = {
+      configured: true,
+      provider: "plaid",
+      environment: "sandbox",
+      signed_webhook_path: "/api/webhooks/plaid",
+      reconciliation_interval_minutes: 360,
+      connections: [],
+      needs_attention: [],
+    };
+    const calls = [];
+    const runtimePath = writeManifest("runtime-proof", liveManifest);
+    const runtimeProbe = await probeBankFeedRuntime(runtimePath, {
+      resolveAdminKey: () => FIXTURE_KEY,
+      http: async (url, options) => {
+        calls.push({ url, key: options?.headers?.["X-Admin-Key"] });
+        return new Response(JSON.stringify(runtimeBody), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+    check("doctor reads the deployed private status route rather than trusting manifest intent",
+      runtimeProbe.checked === true && calls.length === 1 &&
+      calls[0].url === "https://fixture-brain.example.workers.dev/api/bank-feed/status" &&
+      calls[0].key === FIXTURE_KEY,
+      JSON.stringify({ runtimeProbe, calls: calls.map((entry) => ({ url: entry.url, key_present: Boolean(entry.key) })) }));
+    check("matching deployed Plaid configuration passes even before the first account is connected",
+      checkBankFeedRuntime(liveManifest, runtimeProbe).status === OK,
+      JSON.stringify(checkBankFeedRuntime(liveManifest, runtimeProbe)));
+
+    const missingSecrets = checkBankFeedRuntime(liveManifest, {
+      checked: true,
+      body: { ...runtimeBody, configured: false },
+    });
+    check("a Worker with missing effective secrets fails instead of reporting a healthy empty bank list",
+      missingSecrets.status === FAIL && /not configured/.test(missingSecrets.detail),
+      JSON.stringify(missingSecrets));
+
+    const staleDeploy = checkBankFeedRuntime(liveManifest, {
+      checked: true,
+      body: { ...runtimeBody, environment: "production", reconciliation_interval_minutes: 720 },
+    });
+    check("a stale deployment with the wrong environment or refresh interval fails by name",
+      staleDeploy.status === FAIL && /environment/.test(staleDeploy.detail) && /refresh interval/.test(staleDeploy.detail),
+      JSON.stringify(staleDeploy));
+
+    const unavailable = checkBankFeedRuntime(liveManifest, {
+      checked: false,
+      reason: "private status returned 503",
+    });
+    check("an unavailable runtime proof is a blocking failure, not a confident configured result",
+      unavailable.status === FAIL && /not proven/.test(unavailable.detail),
+      JSON.stringify(unavailable));
+
+    const refusedProbe = await probeBankFeedRuntime(runtimePath, {
+      resolveAdminKey: () => FIXTURE_KEY,
+      http: async () => new Response("unauthorized", { status: 401 }),
+    });
+    check("a refused private runtime receipt stays explicitly unproven",
+      refusedProbe.checked === false && /401/.test(refusedProbe.reason), JSON.stringify(refusedProbe));
   }
 } finally {
   rmSync(sandbox, { recursive: true, force: true });
