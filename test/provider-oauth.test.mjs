@@ -914,7 +914,12 @@ try {
 
 {
   const folder = mkdtempSync(join(tmpdir(), "brain-qbo-oauth-hardening-"));
-  const qboStorage = testFileStorage(folder);
+  // This block deliberately crashes a child process and resumes from the same
+  // credential file. Function-backed crypto doubles cannot cross that process
+  // boundary, so Windows exercises the real current-user DPAPI and ACL path.
+  const qboStorage = process.platform === "win32"
+    ? { backend: "file", platform: "win32", home: folder }
+    : testFileStorage(folder);
   try {
     const original = bindQuickBooksConnection({
       candidate: {
