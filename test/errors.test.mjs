@@ -309,10 +309,15 @@ function ingestExitCli(scenario) {
 }
 {
   const r = ingestExitCli("local-refused");
-  check("a credential refusal remains a reasoned outcome, not a failed run",
-    r.code === 0 && /refused for carrying live credentials/.test(r.out) &&
-      !/ingest is incomplete/.test(r.out), r.out.slice(-600));
-  check("a successful policy refusal does not create an issue note", r.journal === "", r.journal);
+  const events = journalEvents(r.journal);
+  check("an entirely refused load remains a reasoned failure, never a green run",
+    r.code === 1 && /refused for carrying live credentials/.test(r.out) &&
+      /NOT indexed/.test(r.out) && !/unexpected error|This is a bug in the installer/.test(r.out),
+    r.out.slice(-700));
+  check("an entirely refused load creates one sanitized retry note",
+    events.length === 1 && events[0]?.error_code === "INGEST_FAILED" &&
+      events[0]?.source === "local" && !r.journal.includes("fixture-note") &&
+      !r.journal.includes("synthetic_test_label"), r.journal);
   rmSync(r.dir, { recursive: true, force: true });
 }
 
