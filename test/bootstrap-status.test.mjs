@@ -204,3 +204,18 @@ test("status writes are private, exact, atomic, and refuse unsafe destinations",
     /must not pass through a linked path/i,
   );
 });
+
+test("Windows path rules still refuse a linked bootstrap status directory", () => {
+  const real = join(sandbox, "windows-real-status-dir");
+  const linked = join(sandbox, "windows-linked-status-dir");
+  mkdirSync(real);
+  symlinkSync(real, linked, process.platform === "win32" ? "junction" : "dir");
+  assert.throws(
+    () => writeBootstrapStatusFile(
+      join(linked, "brain.manifest.json"),
+      status(),
+      { platform: "win32" },
+    ),
+    /must not pass through a linked path/i,
+  );
+});

@@ -304,10 +304,13 @@ export function bootstrapStatusFilePath(manifestPath) {
 export function writeBootstrapStatusFile(manifestPath, status, options = {}) {
   const target = resolve(options.path || bootstrapStatusFilePath(manifestPath));
   const directory = dirname(target);
+  const platform = options.platform ?? process.platform;
   (options.mkdirImpl ?? mkdirSync)(directory, { recursive: true, mode: 0o700 });
-  const canonical = resolve((options.realpathImpl ?? realpathSync.native)(directory));
+  const realpathImpl = options.realpathImpl ??
+    (platform === "win32" ? realpathSync : realpathSync.native);
+  const canonical = resolve(realpathImpl(directory));
   const expected = resolve(directory);
-  const sameDirectory = (options.platform ?? process.platform) === "win32"
+  const sameDirectory = platform === "win32"
     ? canonical.toLowerCase() === expected.toLowerCase()
     : canonical === expected;
   if (!sameDirectory) throw new Error("the bootstrap status directory must not pass through a linked path");

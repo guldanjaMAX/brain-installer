@@ -65,7 +65,9 @@ function assertParent(path, expectedUid, platform, options = {}) {
   const parent = dirname(path);
   let realParent;
   try {
-    realParent = (options.realpath ?? realpathSync.native)(parent);
+    const realpath = options.realpath ??
+      (platform === "win32" ? realpathSync : realpathSync.native);
+    realParent = realpath(parent);
   } catch {
     throw new Error("the admin key directory must be a real existing directory");
   }

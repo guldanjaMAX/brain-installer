@@ -35,7 +35,7 @@ import {
   prepareWindowsDpapiSession,
 } from "../operations/windows-dpapi-session.mjs";
 
-const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-admin-key-file-")));
+const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "brain-admin-key-file-")));
 const secretA = "a".repeat(48);
 const secretB = "b-$&()[]{}-HEADER key-0123456789abcdef";
 const cipherA = Buffer.from("simulated-dpapi-ciphertext-a", "utf8");
@@ -812,6 +812,22 @@ try {
     username: "fixture-user",
     realpath: (path) => path.toUpperCase(),
   }).replaced, false, "Windows canonical path casing is compared case-insensitively");
+
+  const windowsRealParent = join(sandbox, "windows-real-admin-parent");
+  const windowsLinkedParent = join(sandbox, "windows-linked-admin-parent");
+  mkdirSync(windowsRealParent, { mode: 0o700 });
+  symlinkSync(
+    windowsRealParent,
+    windowsLinkedParent,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  assert.throws(
+    () => validateAdminKeyFileDestination(join(windowsLinkedParent, ".brain-admin-key"), {
+      platform: "win32",
+      username: "fixture-user",
+    }),
+    /must not pass through a linked directory/,
+  );
 
   if (process.platform !== "win32") {
     const residueRoot = join(sandbox, "residue-cleanup");
