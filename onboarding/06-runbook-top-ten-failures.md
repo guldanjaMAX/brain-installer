@@ -17,13 +17,23 @@ Written so you can fix it yourself. Every entry has what you see, why it happens
 
 ## Before anything else
 
-The installer reads the brain admin key from its durable local storage. Do not
-copy `.brain-admin-key` into your shell. On Windows that file is a DPAPI
+The installer reads the brain admin key from its durable local storage. Keep
+`.brain-admin-key` in that storage rather than copying it into your shell. On Windows that file is a DPAPI
 CurrentUser ciphertext envelope, not the key itself. A Cloudflare token is
 needed only for account-changing commands such as verify, provision, deploy,
 and secrets. The supported `brain setup` and `brain update` paths ask for it in
-a hidden terminal prompt. Low-level automation must inject it through an
-approved secret manager. Never paste a token or key into a shell command.
+a hidden terminal prompt. Low-level automation uses an approved secret manager,
+so the token or key stays out of shell commands and history.
+
+When the installer prints an issue code, start with its short recovery guide:
+
+```
+brain support --explain <issue-code>
+```
+
+It gives the same five answers for every problem: what happened, what stayed
+protected, whether retrying is safe, what to try next, and when a technician
+can help. The longer entries below add the provider-specific detail.
 
 **The one command that answers "is it broken":**
 
@@ -57,9 +67,10 @@ Given a manifest it goes past this machine and reads your brain's own state: whe
 
 ---
 
-## Stop and call [INSTALLER CONTACT]: two results that are emergencies
+## Please pause and call [INSTALLER CONTACT]: two urgent results
 
-These two are different from everything below. Do not work around them.
+These two benefit from a technician's immediate attention before the install
+continues.
 
 ### `THE BRAIN IS ANSWERING WITHOUT A KEY`
 
@@ -69,7 +80,7 @@ It means anyone who knows your brain's address can read your business records wi
 
 ### Tier 4 reports `THE GATE IS NOT ACTIVE`
 
-The credential protection is not running, and the test probe that should have been refused was stored instead. The failure message prints the exact two lines of SQL needed to remove what it wrote. Run those, then call me, because the protection needs to be turned back on before anything else is ingested.
+The credential protection is not running, and the test probe that should have been refused was stored instead. The failure message prints the exact two lines of SQL needed to remove what it wrote. Run those, then call [INSTALLER CONTACT] so the protection can be restored before the next ingest.
 
 ---
 
@@ -98,15 +109,17 @@ brain health <manifest>
 
 `brain setup` prompts for the Cloudflare token without echo, reuses the
 manifest's verified durable admin key, and applies that durable value to the
-Worker. Do not update the Worker secret separately in the dashboard.
+Worker. Keeping the key change inside `brain setup` preserves the local and
+Worker verification as one step.
 
 If the remote update fails, the durable value stays as the desired state.
 Rerun `brain setup <manifest>` and it will apply that same durable value again.
 If the intended replacement is not already in durable storage, stop and use the
 installer/operator's approved no-history credential launcher with `brain
 secrets`; that command does not provide a safe prompt for a new admin-key value.
-If local persistence fails, the Worker was not changed. Never copy the Windows
-`.brain-admin-key` envelope into another credential field.
+If local persistence fails, the Worker was not changed. The Windows
+`.brain-admin-key` envelope stays in its original protected location rather
+than being reused as a credential value.
 
 **Who:** you.
 
@@ -152,7 +165,7 @@ node brain.mjs deploy <manifest>
 node brain.mjs health <manifest>
 ```
 
-**Note:** this cuts both ways. A **deleted** brain can also keep answering for a few seconds. Never confirm a deletion by visiting the URL. Confirm it against the list of workers in your account.
+**Note:** this cuts both ways. A **deleted** brain can also keep answering for a few seconds. Confirm a deletion against the list of workers in your account; the URL alone can be briefly stale.
 
 **Who:** you.
 
@@ -181,21 +194,22 @@ this token can see more than one account and the manifest does not say which:
 Run `brain setup <manifest>` or `brain update <manifest>` in an interactive
 terminal and enter the replacement token at the hidden prompt. If you need the
 low-level `verify` command by itself, use an approved secret-manager-backed
-launcher; never paste the token into a shell command.
+launcher so the token stays out of shell commands and history.
 
-**Never fix this by deleting the account line from the manifest.** That does not solve the mismatch, it removes the guard that caught it.
+Keep the account line in the manifest. Deleting it would remove the guard that
+caught the mismatch rather than resolve which account is intended.
 
 **Who:** you.
 
 ---
 
-### 4. `R2 is NOT enabled`
+### 4. `R2 is not ready`
 
 **You see:** during verification:
 
 ```
-warn  R2 is NOT enabled (or the token lacks R2 scope). The client must enable it
-        in the dashboard, which requires a payment method even on the free tier.
+warn  R2 is not ready (it may be disabled or outside this token's scope). If this install uses R2,
+        the owner can enable it in the dashboard; Cloudflare asks for a payment method even on the free tier.
 ```
 
 **Why:** Cloudflare's file storage needs separate activation and a card on file, even on the free tier. It is the most common mid-install surprise.
@@ -206,7 +220,7 @@ warn  R2 is NOT enabled (or the token lacks R2 scope). The client must enable it
 node brain.mjs verify <manifest>
 ```
 
-**This is a warning, not a stop.** Your brain runs without R2. Do not let it block anything else.
+**This is a warning, not a stop.** Your brain runs without R2, so the rest of the install can continue.
 
 **Who:** you, in the dashboard.
 
@@ -233,7 +247,7 @@ brain health <manifest>
 Setup prompts for the Cloudflare token without echo and reuses the durable
 admin key. If that durable copy is missing or is not the intended value, stop
 and use the installer/operator's approved no-history credential launcher with
-`brain secrets`; never paste the admin key into a shell command.
+`brain secrets`, keeping the admin key out of shell commands and history.
 
 **Prevention:** deploy with `node brain.mjs deploy`. That is what it is for.
 
@@ -286,7 +300,7 @@ one. This is the failure that looks fine from every angle except the answers.
 **You see:** update reports a network interruption, a six-hour safety limit, or
 an aggregate bootstrap failure. The Worker says corpus writes are paused.
 
-**Why:** a pre-0.1.15 corpus must receive an exact generation receipt for every
+**Why:** a pre-0.1.15 corpus needs an exact generation receipt for every
 legacy vector. The updater stores each accepted and confirmed 1,000-row batch
 in D1. It keeps the write barrier active when the run stops because activating
 the Worker would make an incomplete semantic projection look finished.
@@ -298,9 +312,9 @@ brain update <manifest>
 ```
 
 It waits out the writer boundary again, then resumes the saved D1 batch and
-epoch. Do not run `brain deploy`, edit D1, or reset the projection cursor by
-hand. Existing retrieval remains available while source and corpus writes are
-paused.
+epoch. Continue through `brain update` so the deploy, D1 state, and projection
+cursor stay coordinated. Existing retrieval remains available while source and
+corpus writes are paused.
 
 After update succeeds, require both checks:
 
@@ -309,7 +323,7 @@ brain health <manifest>
 brain test <manifest>
 ```
 
-Both must report zero pending and submitted vector work with exact expected and
+Both checks should report zero pending and submitted vector work with exact expected and
 actual counts.
 
 **Who:** you. Call [INSTALLER CONTACT] if the same aggregate failure repeats.
@@ -432,7 +446,7 @@ node brain.mjs sources <manifest>
 ```
 migration 0002_llm_call_log was already applied but its content has changed.
       applied checksum a1b2c3d4, file checksum e5f6a7b8
-      Never edit an applied migration. Add a new one instead.
+      Applied migrations stay as history. Add a new migration for the next change.
 ```
 
 Every `migrate`, `update`, and `upgrade` stops there, and stays stopped until this is reconciled.
@@ -600,7 +614,7 @@ A document was refused because it contains a live password or API key. The respo
 
 **Nothing was written.** This is the protection working exactly as intended.
 
-**What to do:** rotate the named credential, because it has been sitting in a document. Then remove it from the file and load the document again. Do not turn the protection off to get the document in.
+**What to do:** rotate the named credential, because it has been sitting in a document. Then remove it from the file and load the document again. Keeping the protection enabled prevents the cleaned retry from recreating the same risk.
 
 ### "The documents do not answer this"
 
@@ -610,7 +624,13 @@ Not a failure. It is the feature. A tool that always produces something has taug
 
 ## What to send me when you need help
 
-There is no telemetry in your install. It reports nothing to me, ever. Recognized installer failures attempt to keep a small private issue journal on your own machine whenever its local storage is writable, so useful technical facts are less likely to be lost. The original failure is never hidden if the journal itself is unavailable. It stores only typed metadata such as installer version, operating system, command, and failure category. It does not store document contents, filenames, paths, account details, URLs, questions, answers, logs, stack traces, or credentials.
+Your install has no support telemetry. Recognized installer failures can leave a
+small private issue journal on this machine when its protected local storage is
+available. The fixed record contains typed details such as installer version,
+operating system, command, and failure category. Its schema has no fields for
+document contents, filenames, paths, account details, URLs, questions, answers,
+logs, stack traces, or credentials, and a journal problem cannot replace the
+original command result.
 
 After a successful note write, the installer makes a best-effort cleanup of
 safe expired and overflow notes. Fresh or concurrently written notes are left

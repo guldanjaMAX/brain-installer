@@ -20,14 +20,14 @@ export const TECHNICIAN_STEPS = Object.freeze([
     id: "tools",
     title: "Install and verify Claude Code, the Brain CLI, and Wrangler",
     dashboard_url: "https://financialbrain.ai/install",
-    human_boundary: "The owner signs in to Claude in their browser. The technician runs Anthropic's interactive doctor and never enables permission bypass.",
+    human_boundary: "The owner signs in to Claude in their browser. The technician runs Anthropic's interactive doctor with Claude Code's normal approval prompts enabled.",
     automated_proof: "The installer verifies the Claude CLI version and sign-in, runs claude doctor in a real terminal, and runs the pinned Wrangler 4 CLI with a credential-scrubbed environment.",
   }),
   Object.freeze({
     id: "cloudflare",
     title: "Install the private Brain",
     dashboard_url: "https://dash.cloudflare.com/profile/api-tokens",
-    human_boundary: "The owner signs in, completes 2FA, and creates the least-privilege token. The token is pasted only into the hidden terminal prompt.",
+    human_boundary: "The owner signs in, completes 2FA, and creates the least-privilege token. The hidden terminal prompt is ready when it is time to enter the token.",
     automated_proof: "The installer verifies the token, provisions the exact account, deploys, migrates, and runs health checks.",
   }),
   Object.freeze({
@@ -62,7 +62,7 @@ export const TECHNICIAN_STEPS = Object.freeze([
     id: "verify",
     title: "Run the handoff checks",
     dashboard_url: null,
-    human_boundary: "The technician reads every warning and records real connector and passkey results without converting an unavailable state into a pass.",
+    human_boundary: "The technician reviews each result and keeps unavailable connector or passkey checks clearly marked for follow-up.",
     automated_proof: "Doctor, health, source freshness, and enrolled-device checks run in order and stop on the first failure.",
   }),
 ]);
@@ -126,10 +126,10 @@ export function technicianPlan(manifestPath, deps = {}) {
     mode: "read_only_plan",
     proof_level: "workflow_only",
     manifest,
-    warning: "No account, OAuth grant, webhook, mailbox, or physical passkey is proven by this plan.",
+    warning: "This plan prepares the workflow. Live proof arrives during the account, connector, webhook, mailbox, and physical passkey checks.",
     rules: [
       "Run one step at a time and rerun the same step after an interruption.",
-      "Never paste a token, client secret, app password, invite code, or authentication code into an agent chat.",
+      "Keep tokens, client secrets, app passwords, invite codes, and authentication codes in provider pages or hidden terminal prompts.",
       "The owner handles login, 2FA, consent, billing, and physical-device prompts.",
       "Enroll the first passkey only after the final Brain hostname is fixed.",
     ],
@@ -138,7 +138,7 @@ export function technicianPlan(manifestPath, deps = {}) {
       if (step.id === "tools") state = "ready_to_start";
       if (step.id === "cloudflare" && !manifest.exists) state = "ready_after_local_tools";
       if (["google", "zoom", "imap", "passkey", "verify"].includes(step.id) && !manifest.exists) {
-        state = "blocked_until_install_record_exists";
+        state = "waiting_for_install_record";
       }
       if (step.id === "zoom" && manifest.exists && !manifest.enabled_connectors.includes("zoom")) {
         state = "requires_manifest_enablement";
@@ -151,7 +151,7 @@ export function technicianPlan(manifestPath, deps = {}) {
         state = "requires_manifest_enablement";
       }
       if (step.id === "passkey" && manifest.exists && !manifest.final_hostname) {
-        state = "blocked_until_final_hostname";
+        state = "waiting_for_final_hostname";
       }
       return {
         order: index + 1,
@@ -180,9 +180,9 @@ export function renderTechnicianPlan(plan) {
     `Install record: ${plan.manifest.exists ? "present, live state not checked" : "not created yet"}`,
     `Final hostname: ${plan.manifest.final_hostname || "not fixed yet"}`,
     "",
-    "This screen is a plan, not proof that anything is connected.",
+    "This screen prepares the visit. Each live check will add its own proof.",
     "The owner handles login, 2FA, consent, billing, and physical passkey prompts.",
-    "Secrets go only into hidden terminal prompts, never into agent chat.",
+    "Sensitive values stay in provider pages or hidden terminal prompts.",
     "",
   ];
   for (const step of plan.steps) {
@@ -220,7 +220,7 @@ function childCommands(step, manifestPath, flags, scriptPath) {
       command("sources", path),
       command("devices", path),
     ];
-    default: throw new Error(`--run must be one of: ${TECHNICIAN_RUN_STEPS.join(", ")}`);
+    default: throw new Error(`--run accepts one of: ${TECHNICIAN_RUN_STEPS.join(", ")}`);
   }
 }
 
@@ -242,7 +242,7 @@ function runOne(spawn, nodePath, args, env) {
   const result = spawn(nodePath, args, { stdio: "inherit", env });
   if (result?.error) throw new Error(`the technician child could not start: ${result.error.message}`);
   if (result?.status !== 0) {
-    throw new Error("the technician step did not complete. Nothing was marked done. Fix the message above and rerun the same command.");
+    throw new Error("this technician step paused before completion. The step is ready to try again after the item above is resolved.");
   }
 }
 
@@ -258,28 +258,28 @@ export async function runTechnicianStep({
   manifestDeps = {},
 } = {}) {
   if (!TECHNICIAN_RUN_STEPS.includes(step)) {
-    throw new Error(`--run must be one of: ${TECHNICIAN_RUN_STEPS.join(", ")}`);
+    throw new Error(`--run accepts one of: ${TECHNICIAN_RUN_STEPS.join(", ")}`);
   }
   if (!manifestPath || !scriptPath) throw new Error("the technician step needs a manifest and installer path");
   const summary = readManifestSummary(manifestPath, manifestDeps);
   if (!["tools", "cloudflare"].includes(step) && !summary.exists) {
-    throw new Error("the install manifest does not exist yet. Run the cloudflare step first.");
+    throw new Error("the install record is not ready yet. The Cloudflare step creates it, and then this step can continue.");
   }
   if (step === "google") {
     const mapping = { drive: "google_drive", gmail: "gmail", calendar: "calendar" };
     const requested = String(flags.scopes || "drive,gmail,calendar").split(",").map((value) => value.trim()).filter(Boolean);
     const missing = requested.map((name) => mapping[name]).filter((name) => !name || !summary.enabled_connectors.includes(name));
     if (missing.length) {
-      throw new Error(`the manifest must enable every requested Google source before connection: ${requested.join(", ")}`);
+      throw new Error(`the install plan needs these Google sources enabled before connection: ${requested.join(", ")}`);
     }
   }
   if (step === "passkey") {
     if (!summary.final_hostname) {
-      throw new Error("the manifest has no final brain.domain. Settle the final hostname before enrolling a passkey.");
+      throw new Error("the final Brain address is still open. Choose brain.domain first so the passkey is enrolled on its permanent address.");
     }
     const confirmed = String(flags["confirm-host"] || "").trim().toLowerCase();
     if (confirmed !== summary.final_hostname) {
-      throw new Error(`passkey enrollment is blocked until --confirm-host exactly matches ${summary.final_hostname}`);
+      throw new Error(`passkey enrollment is ready after --confirm-host exactly matches ${summary.final_hostname}`);
     }
   }
 

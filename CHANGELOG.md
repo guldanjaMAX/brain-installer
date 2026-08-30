@@ -17,6 +17,12 @@ without weakening the ingestion and deletion rules underneath them.**
   billing, and the physical passkey gesture. From a source checkout,
   `npm run rehearse:onboarding` opens the real owner workspace with synthetic
   data so every important screen can be tried before any account is connected.
+- Every private installer issue code now has a calm recovery guide through
+  `brain support --explain <code>`, with matching JSON for a local coding
+  assistant. A new offline `npm run rehearse:hiccups` lane deliberately tries
+  interrupted setup, missing folders, partial sources, lost responses,
+  migrations, search backlogs, access boundaries, and technician recovery, then
+  names the real-world field gate still required.
 - Owners can sign in with a passkey, upload a text document, record an approval,
   accept or reopen a period close, review append-only activity, and maintain
   targets and preferences. Retrying the same action after a lost response does

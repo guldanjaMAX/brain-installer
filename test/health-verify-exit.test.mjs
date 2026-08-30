@@ -333,13 +333,13 @@ if (SCENARIO) {
 
   const noR2 = runScenario("verify-no-r2", "verify", { cloudflareToken: true });
   check("verify does not probe R2 for a manifest that has no bucket",
-    noR2.code === 0 && !/R2 is NOT enabled/.test(noR2.output) &&
+    noR2.code === 0 && !/R2 is not ready/.test(noR2.output) &&
       /does not use R2 file storage/.test(noR2.output),
     noR2.output);
 
   const optionalWarnings = runScenario("verify-optional-warnings", "verify", { cloudflareToken: true });
   check("optional R2 and Vectorize access remain warnings",
-    optionalWarnings.code === 0 && /R2 is NOT enabled/.test(optionalWarnings.output) &&
+    optionalWarnings.code === 0 && /R2 is not ready/.test(optionalWarnings.output) &&
       /Provision can use wrangler login as a temporary fallback/.test(optionalWarnings.output) &&
       /D1 is reachable/.test(optionalWarnings.output) && /Workers is reachable/.test(optionalWarnings.output),
     optionalWarnings.output);

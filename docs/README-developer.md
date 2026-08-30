@@ -802,6 +802,16 @@ scenario routing, and absence of credential fields. This is browser-contract
 and layout evidence only. Cloudflare install, provider OAuth, webhook delivery,
 mailbox access, and physical WebAuthn remain field gates.
 
+`npm run rehearse:hiccups` is the matching offline failure rehearsal. It runs a
+curated set of product tests for interrupted setup, missing mounts and removal
+guards, partial connectors, lost-response idempotency, restart-safe migrations,
+vector backlog recovery, passkey and document scope, and technician support.
+The child environment is allowlisted so ambient provider and API credentials do
+not reach the test processes. Its receipt pairs every automatic proof with the
+exact real-service or physical-device field gate still outstanding. Use
+`-- --list`, `-- --only <scenario>`, or `-- --json` for targeted and agent-led
+runs.
+
 `brain technician <manifest>` is the matching install-day coordinator. Its
 default and `--json` forms are read-only. A selected `--run` step launches the
 existing command in a child process with an allowlisted environment. Google and
@@ -814,6 +824,14 @@ verification.
 Current connector proof levels and the ranked acceptance backlog are maintained
 in [CONNECTOR-BACKLOG.md](./CONNECTOR-BACKLOG.md). Fixture coverage is never a
 substitute for the named real-system field gate.
+
+Every value in `SUPPORT_ERROR_CODES` also has one entry in
+`support-recovery.mjs`. `brain support --explain <code>` renders the human form;
+`--json` returns the same fixed recovery contract for a local assistant. The
+catalog is deliberately separate from private issue events: a stored event
+keeps only its durable code, while wording and recovery steps can improve. Tests
+require complete catalog coverage, stable typed-error precedence, inviting
+language, and absence of secret-bearing fields.
 
 ```bash
 npm test

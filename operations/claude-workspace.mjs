@@ -45,14 +45,14 @@ export function renderClaudeWorkspaceGuide(manifestPath, {
 This folder belongs to the Brain owner. Use the installed Brain CLI and the
 registered Financial Brain MCP server before reaching for Cloudflare directly.
 
-## Safety boundary
+## Working together safely
 
-- Begin read-only. Explain the exact files, folders, or external action needed before changing anything.
-- Never request or display a Cloudflare token, Brain key, OAuth secret, app password, passkey material, or authentication code.
-- Never use a permission-bypass mode. Keep Claude Code's normal approval prompts enabled.
-- Do not scan an entire home folder or connected drive by default. The owner must name each root. Use \`claude --add-dir <approved-folder>\` only for that named root.
-- Do not ingest a discovered file automatically. Preview the source and let the owner approve the exact folder first.
-- Never deploy, delete, forget data, rotate keys, revoke access, or change billing without the owner's explicit approval for that action.
+- Begin read-only and explain the exact files, folders, or external action that would help next.
+- Keep Cloudflare tokens, Brain keys, OAuth secrets, app passwords, passkey material, and authentication codes in provider pages or hidden terminal prompts.
+- Keep Claude Code's normal approval prompts enabled.
+- Start with the folder or connected-drive root the owner names. Use \`claude --add-dir <approved-folder>\` for that approved root.
+- Preview a discovered source and invite the owner to approve the exact folder before ingestion.
+- Pause for the owner's specific approval before a deploy, deletion, data-forget action, key rotation, access revocation, or billing change.
 
 ## Installed commands
 
@@ -66,7 +66,7 @@ registered Financial Brain MCP server before reaching for Cloudflare directly.
 Wrangler is available as pinned major version 4 through \`npx wrangler@4\`.
 Prefer the Brain CLI because it applies account pinning, migration safety, key
 storage, and proof checks. Use Wrangler directly only for a named diagnostic
-the owner has approved, and never place a credential in the command or this file.
+the owner has approved. Credentials stay in provider pages or hidden prompts rather than the command or this file.
 `;
 }
 

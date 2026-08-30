@@ -33,6 +33,25 @@ This proves local layout, navigation, API response handling, access-surface
 separation, and empty-versus-unavailable language. It does not prove Cloudflare,
 Google consent, a real mailbox, Zoom delivery, or a physical passkey ceremony.
 
+## Rehearse the customer hiccups
+
+From the same source checkout:
+
+```bash
+npm run rehearse:hiccups
+```
+
+This offline lab deliberately tries the situations most likely to make an
+install day feel difficult: an interrupted setup, a missing watched folder, a
+partial connector, a lost save response, a paused migration, a search backlog,
+a stale or out-of-scope access request, and a technician step that needs help.
+It runs the product's real recovery, cursor, migration, deletion, authorization,
+and idempotency tests with synthetic data and a credential-scrubbed environment.
+
+The result names what passed automatically and the exact live field check that
+still remains. Use `npm run rehearse:hiccups -- --list` to see the scenarios or
+`npm run rehearse:hiccups -- --only folder-safety` to repeat one.
+
 ## The one technician command
 
 After installing the released CLI, start with the read-only plan:
@@ -50,7 +69,7 @@ brain technician "$HOME/Financial Brain/brain.manifest.json" --json
 The JSON contains workflow state, dashboard links, proof boundaries, and the
 next reviewed command. It contains no credentials. An agent may guide the
 browser and explain each page, but the owner enters every token or secret into
-the hidden terminal prompt. Do not paste one into agent chat.
+the provider page or hidden terminal prompt.
 
 ## Seven steps
 
@@ -64,7 +83,8 @@ brain technician "$HOME/Financial Brain/brain.manifest.json" --run tools
 ```
 
 This proves the Claude CLI version and sign-in, runs Anthropic's interactive
-doctor, and verifies pinned Wrangler 4. It never enables permission bypass.
+doctor, and verifies pinned Wrangler 4. Claude Code's normal approval prompts
+stay enabled.
 
 ### 2. Cloudflare install
 
@@ -128,7 +148,7 @@ brain technician "$HOME/Financial Brain/brain.manifest.json" --run passkey \
   --confirm-host brain.example.com
 ```
 
-The confirmation must exactly match `brain.domain`. The command creates one
+The confirmation exactly matches `brain.domain`. The command creates one
 single-use link that expires in 15 minutes. The owner opens it on their device
 and completes Face ID, fingerprint, or device PIN. This is the first point where
 a physical passkey becomes proven.
@@ -149,11 +169,11 @@ connector as live-proven only after its exact acceptance event occurs.
 |---|---:|---:|
 | Sign in, 2FA, consent, billing | Yes | Guide only |
 | Create a persistent token or OAuth app | Final click | Explain and verify fields |
-| Read or retain a credential | No chat sharing | Never |
-| Enter a credential | Hidden terminal or provider UI | Never type or echo it |
+| Read or retain a credential | Keep it in the provider or hidden prompt | Guide without seeing it |
+| Enter a credential | Hidden terminal or provider UI | Hand control to the owner |
 | Run installer and connector checks | May observe | Yes |
 | Complete passkey gesture | Yes, on their device | Observe result only |
-| Approve a named folder for Claude | Yes | Preview files read-only; never assume whole-drive access |
+| Approve a named folder for Claude | Yes | Preview the named folder read-only |
 | Record proof and unresolved gaps | Confirm result | Yes |
 
 ## Live acceptance events
@@ -175,4 +195,20 @@ The following are the shortest honest field gates:
 - Passkey: enroll, sign out, sign back in, add a second device, revoke it, and
   confirm the owner-facing telemetry contains no credential or ceremony secret.
 
-Fixture tests make these trials safer. They do not replace them.
+Fixture tests make these trials easier and safer. The events above are the live
+proof that finishes each connector or device check.
+
+## When a step pauses
+
+Every saved issue note has a stable code and a matching plain-language recovery
+guide. The code is safe to read aloud to a technician.
+
+```bash
+brain support --explain AUTH_REQUIRED
+brain support --explain AUTH_REQUIRED --json
+```
+
+The guide says what happened, what stayed protected, whether the same command
+is ready to retry, the next two steps, and when a technician can help. The JSON
+form gives Claude Code or Codex the same reviewed recovery contract without
+including private error text.

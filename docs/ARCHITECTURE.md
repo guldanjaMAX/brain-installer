@@ -393,13 +393,18 @@ location.
 
 The journal module has no network path and does not accept raw diagnostic text.
 Preview and export use the same bounded canonical bytes. Retention is best
-effort and cannot replace the original command result. A future central support
-path must remain opt-in, show exact payload bytes, and use a separate write-only
-credential rather than the admin key or Cloudflare token.
+effort and cannot replace the original command result. `support-recovery.mjs`
+maps every stable code to a human title, protection statement, retry state, next
+steps, and technician boundary. `brain support --explain` renders it without
+reading the journal; its JSON form lets a local assistant follow the same
+reviewed contract. A future central support path must remain opt-in, show exact
+payload bytes, and use a separate write-only credential rather than the admin
+key or Cloudflare token.
 
 When adding a failure mode, update the classifier, allowed journal schema,
-privacy and CLI tests, and troubleshooting runbook together. Prefer a stable,
-typed issue identity over matching mutable human wording.
+recovery catalog, privacy and CLI tests, hiccup rehearsal when applicable, and
+troubleshooting runbook together. Prefer a stable, typed issue identity over
+matching mutable human wording.
 
 ## Verification layers
 

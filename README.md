@@ -38,7 +38,7 @@ closed, without `sudo`, administrator access, or a shell-profile change.
 
 Setup and updates ask for the scoped Cloudflare token
 inside a hidden terminal prompt. The token exists only for that command and is
-never written to a file, command argument, log, or issue note.
+kept out of files, command arguments, logs, and issue notes.
 
 Mac or Linux:
 
@@ -63,17 +63,23 @@ checkout, run `npm run rehearse:onboarding`. It opens the real owner-workspace
 bundle with synthetic data and an unmistakable local-only banner. No account,
 credential, manifest, or deployment is used.
 
+Want to see how recovery behaves before install day? Run
+`npm run rehearse:hiccups` from the source checkout. It safely interrupts
+synthetic setup, folder, connector, migration, search, owner-action, access, and
+technician scenarios. The final receipt separates automatic proof from the
+remaining live Cloudflare, provider, and physical-device checks.
+
 For an install day, `brain technician <manifest>` prints the seven-step read-only
 plan. Add `--json` when a local coding agent is guiding the session. Run one
 reviewed step at a time with `--run tools`, `cloudflare`, `google`, `zoom`,
 `imap`, `passkey`, or `verify`. The owner still handles login, 2FA, OAuth consent, and
 the physical passkey gesture. Tokens and app secrets go only into hidden
-terminal prompts, never into agent chat. The complete guide is
+terminal prompts or provider pages. The complete guide is
 [onboarding/09-technician-setup-and-rehearsal.md](onboarding/09-technician-setup-and-rehearsal.md).
 
 You need three things first. `brain doctor` checks the technical access and tells
 you what to do about anything missing. Cloudflare does not expose the account's
-plan through the scoped install token, so you must confirm **Workers and Pages,
+plan through the scoped install token, so confirm **Workers and Pages,
 Plans: Paid** in the dashboard yourself before a production install.
 
 1. **Claude Code and an eligible Claude account.** Install the current native
@@ -159,7 +165,7 @@ The update verifies the Cloudflare account, requires a D1 restore bookmark,
 deploys and verifies a temporary paused Worker, waits for older Worker requests
 to finish, and applies migrations. A legacy corpus is then rebuilt in durable
 1,000-vector batches while writes remain paused. Several disjoint batches may
-be accepted at once, but every vector must read back with its exact generation
+be accepted at once, but exact-generation readback is what confirms each vector
 before its batch is acknowledged. An interrupted run resumes from D1 instead of
 starting over. Only after that proof does update deploy active mode, run
 exact-version health and the full acceptance suite, read the committed version
@@ -301,8 +307,9 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
 
 ## If something goes wrong
 
-Every command is safe to run again. Nothing is left half-written that re-running
-cannot finish.
+Installer commands are designed to resume or adopt completed work. The typed
+recovery guide below says whether the same command is ready now, ready after one
+step, or worth reviewing with the technician first.
 
 ```bash
 brain doctor                          # what is wrong with this machine
@@ -317,8 +324,8 @@ It ships inside this package, so it is on your machine already and readable with
 no network.
 
 For an admin-key rotation, use an approved no-history credential launcher to
-provide the replacement only to `brain secrets`. Never paste or export the
-replacement in a shell command. After a read-only Cloudflare account check, the
+provide the replacement only to `brain secrets`, keeping it out of shell
+commands and exported environment values. After a read-only Cloudflare account check, the
 command updates and verifies the manifest's declared Keychain item or adjacent
 protected file, then applies that durable desired value to the Worker. If the
 remote write fails, rerun the same command without supplying the replacement
@@ -334,11 +341,19 @@ command.
 
 Recognized command failures attempt to leave a private, sanitized issue note on
 this machine whenever its local journal is writable. A note contains the
-installer version, command, platform, and a typed failure code. It never
-contains document text, filenames, paths, account IDs, URLs, questions, answers,
-logs, stack traces, or credentials. The installer never uploads or sends these
-notes. An export written to a synced destination may be uploaded by that sync
-service.
+installer version, command, platform, and a typed failure code. Its fixed schema
+has no place for document text, filenames, paths, account IDs, URLs, questions,
+answers, logs, stack traces, or credentials. The installer keeps these notes on
+this machine. An export written to a synced destination may be uploaded by that
+sync service.
+
+Each typed code also has a calm recovery guide. It explains what happened, what
+stayed protected, whether retrying is safe, and the next useful step:
+
+```bash
+brain support --explain AUTH_REQUIRED
+brain support --explain AUTH_REQUIRED --json  # for a local coding assistant
+```
 
 Preview and export contain only recent shareable notes: at most the newest 200
 valid events from the last 30 days, capped at 2 MiB. After a successful write,
@@ -352,6 +367,7 @@ failure never replaces the command's original result.
 ```bash
 brain support                                  # recent shareable count and limits
 brain support --preview                       # exact bounded shareable bytes
+brain support --explain <issue-code>           # plain-language recovery
 brain support --export brain-support-review.jsonl  # destination sync may upload
 brain support --clear --yes                    # clear the journal after safety checks
 ```

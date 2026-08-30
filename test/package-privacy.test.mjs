@@ -465,6 +465,7 @@ const expected = [
   "report-html.mjs",
   "report.mjs",
   "support-journal.mjs",
+  "support-recovery.mjs",
   "templates/brain.manifest.json",
   "worker/src/index.js",
   "worker/src/lib/answer-render.js",

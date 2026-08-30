@@ -109,12 +109,14 @@ import {
   SUPPORT_MAX_AGE_DAYS,
   SUPPORT_MAX_BYTES,
   SUPPORT_MAX_EVENTS,
+  SUPPORT_ERROR_CODES,
   clearSupportJournal,
   exportSupportJournal,
   previewSupportJournal,
   productRelativeFingerprint,
   recordSupportEvent,
 } from "./support-journal.mjs";
+import { renderSupportRecovery, supportRecovery } from "./support-recovery.mjs";
 import { readAdminKeyFile, validateAdminKeyValue } from "./operations/admin-key-file.mjs";
 import { writeClaudeWorkspaceGuide } from "./operations/claude-workspace.mjs";
 import {
@@ -245,6 +247,8 @@ function supportSourceForCommand(command = "") {
 /** Classify in memory; the raw message is never passed to the journal. */
 export function supportErrorCode(error, { command = "", unexpected = false } = {}) {
   if (error instanceof DriveRemovalReviewRequired) return "SAFETY_REVIEW_REQUIRED";
+  const typedCode = typeof error?.code === "string" ? error.code.trim().toUpperCase() : "";
+  if (SUPPORT_ERROR_CODES.includes(typedCode)) return typedCode;
   const message = String(error?.message || "");
   if (/PDF.*tim(?:e|ed) out/i.test(message)) return "PDF_PROCESS_TIMEOUT";
   if (/PDF.*process/i.test(message)) return "PDF_PROCESS_FAILED";
@@ -336,24 +340,28 @@ export function supportProductRelativeLocation(error, options = {}) {
 function recordSupportFailure(error, { unexpected = false } = {}) {
   const command = currentSupportCommand;
   if (!command || command === "support") return null;
+  const errorCode = supportErrorCode(error, { command, unexpected });
   try {
     const productRelativeLocation = supportProductRelativeLocation(error);
     const input = {
       command,
       source: supportSourceForCommand(command),
-      errorCode: supportErrorCode(error, { command, unexpected }),
+      errorCode,
       ...(productRelativeLocation ? { productRelativeLocation } : {}),
     };
-    return recordSupportEvent(input).event_id;
+    return { eventId: recordSupportEvent(input).event_id, errorCode };
   } catch {
     // Support capture must never replace or hide the actual command failure.
-    return null;
+    return { eventId: null, errorCode };
   }
 }
 
-function printSupportReceipt(eventId, write = console.error) {
-  if (!eventId) return;
-  write(`  Private issue note ${eventId} was saved locally. The installer did not upload or send this issue note.`);
+function printSupportReceipt(receipt, write = console.error) {
+  if (!receipt?.errorCode) return;
+  write(`  Issue code: ${receipt.errorCode}`);
+  write(`  What to try next: brain support --explain ${receipt.errorCode}`);
+  if (!receipt.eventId) return;
+  write(`  Private issue note ${receipt.eventId} was saved locally. The installer did not upload or send this issue note.`);
   write("  Review the exact safe record with: brain support --preview");
 }
 
@@ -783,8 +791,8 @@ async function cmdVerify(manifestPath) {
     ok("R2 is enabled");
   } catch (e) {
     warn(
-      "R2 is NOT enabled (or the token lacks R2 scope). The client must enable it\n" +
-        "        in the dashboard, which requires a payment method even on the free tier.\n" +
+      "R2 is not ready (it may be disabled or outside this token's scope). If this install uses R2,\n" +
+        "        the owner can enable it in the dashboard; Cloudflare asks for a payment method even on the free tier.\n" +
         `        detail: ${e.message.slice(0, 120)}`
     );
   }
@@ -2376,7 +2384,7 @@ export async function cmdMigrate(manifestPath, options = {}) {
       die(
         `migration ${mig.name} was already applied but its content has changed.\n` +
           `      applied checksum ${prev.checksum}, file checksum ${mig.checksum}\n` +
-          "      Never edit an applied migration. Add a new one instead."
+          "      Applied migrations stay as history. Add a new migration for the next change."
       );
     }
   }
@@ -4076,7 +4084,7 @@ function assertSourceName(name) {
  * filename", which is intended.
  */
 export const VALUE_FLAGS = new Set([
-  "path", "source", "limit", "from", "manifest", "scopes", "port", "host", "user", "run", "confirm-host", "kind", "add", "bookmark", "export", "backup",
+  "path", "source", "limit", "from", "manifest", "scopes", "port", "host", "user", "run", "confirm-host", "kind", "add", "bookmark", "export", "explain", "backup",
   "golden", "profile", "k", "repeat", "baseline", "save", "artifacts",
   "corpus-contract", "approve-removals", "only", "skip",
   // brain import bank. `--file` with no value must die saying so rather than
@@ -12622,13 +12630,23 @@ function supportCommandOperation(label, operation) {
 async function cmdSupport() {
   const args = process.argv.slice(3);
   const flags = parseFlags(args);
+  assertKnownFlags(flags, new Set(["status", "preview", "export", "clear", "yes", "explain", "json"]), "brain support");
   const positional = args.filter((value, index) =>
-    !value.startsWith("--") && !(index > 0 && args[index - 1] === "--export"));
+    !value.startsWith("--") && !(index > 0 && ["--export", "--explain"].includes(args[index - 1])));
   if (positional.length) {
-    die("usage: brain support [--status|--preview|--export <file>|--clear --yes]");
+    die("usage: brain support [--status|--preview|--export <file>|--clear --yes|--explain <issue-code> [--json]]");
   }
-  const actions = ["preview", "export", "clear"].filter((name) => flags[name]);
-  if (actions.length > 1) die("choose only one of --preview, --export, or --clear");
+  const actions = ["status", "preview", "export", "clear", "explain"].filter((name) => flags[name]);
+  if (actions.length > 1) die("choose one support action at a time: preview, export, clear, or explain");
+  if (flags.json && !flags.explain) die("--json pairs with --explain <issue-code>");
+
+  if (flags.explain) {
+    const recovery = supportRecovery(flags.explain);
+    process.stdout.write(flags.json
+      ? `${JSON.stringify(recovery, null, 2)}\n`
+      : renderSupportRecovery(recovery));
+    return recovery;
+  }
 
   if (flags.preview) {
     // These are the exact canonical bytes export writes. Do not add a heading
@@ -13471,6 +13489,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain schedule   <manifest> --install --folder  install unattended refresh of the watched
                                            local folder declared in corpora.local_folder (macOS)
     brain support    [--preview|--export <file>]  inspect private local issue notes
+    brain support    --explain <issue-code>       plain-language recovery for a typed issue
 
   operate
     brain update     [manifest]            one safe update: snapshot, test, verify

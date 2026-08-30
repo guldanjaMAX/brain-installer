@@ -70,7 +70,7 @@ test("setup can create an owner-only Claude workspace guide with locators but no
   assert.ok(content.includes(`${JSON.stringify(safeNodePath)} ${JSON.stringify(safeBrainPath)}`));
   assert.match(content, /claude --add-dir <approved-folder>/);
   assert.match(content, /npx wrangler@4/);
-  assert.match(content, /never use a permission-bypass mode/i);
+  assert.match(content, /normal approval prompts enabled/i);
   assert.doesNotMatch(content, /CLOUDFLARE_API_TOKEN|ADMIN_KEY|client_secret|app_password/);
   // POSIX mode bits can prove the owner-only file mode directly. Windows does
   // not represent its inherited user-profile ACL in stat().mode and reports
@@ -107,8 +107,8 @@ test("the plan is read-only, ordered, honest about proof, and agent-readable", (
   assert.deepEqual(plan.steps.map((step) => step.id), TECHNICIAN_RUN_STEPS);
   assert.equal(plan.steps[0].state, "ready_to_start");
   assert.equal(plan.steps[1].state, "ready_after_local_tools");
-  assert.match(plan.warning, /No account.*proven/i);
-  assert.match(JSON.stringify(plan), /never paste/i);
+  assert.match(plan.warning, /Live proof arrives/i);
+  assert.match(JSON.stringify(plan), /hidden terminal prompts/i);
   assert.doesNotMatch(JSON.stringify(plan), /client_secret|app_password|api_token/i);
 });
 
@@ -258,7 +258,7 @@ test("verification is ordered and stops at the first failed proof", async () => 
         return { status: args[1] === "health" ? 1 : 0 };
       },
     }),
-    /did not complete/,
+    /paused before completion/,
   );
   assert.deepEqual(commands, ["doctor", "health"]);
 });
