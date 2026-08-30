@@ -2,7 +2,7 @@
 
 The owner should not have to understand OAuth, webhook validation, terminal
 environment variables, or passkey relying-party rules. The technician workflow
-turns those details into seven small ceremonies. It does not hide the parts only
+turns those details into a small first-install ceremony. It does not hide the parts only
 the account owner can do.
 
 ## Try the owner experience with no accounts
@@ -81,12 +81,19 @@ For a local coding agent, use the JSON form:
 brain technician "$HOME/Financial Brain/brain.manifest.json" --json
 ```
 
-The JSON contains workflow state, dashboard links, proof boundaries, and the
-next reviewed command. It contains no credentials. An agent may guide the
-browser and explain each page, but the owner enters every token or secret into
-the provider page or hidden terminal prompt.
+The JSON contains workflow state, dashboard links, proof boundaries, and
+structured command locators. It contains no credentials and its command plus
+argument arrays must never be joined into a shell string. An agent may guide
+the browser and explain each page, but the owner enters every token or secret
+into the provider page or hidden terminal prompt.
 
-## Seven steps
+The public first-install path covers local tools, the core Cloudflare install,
+an owner-only passkey handoff, and live final verification. Plaid, Google,
+QuickBooks, Zoom, and IMAP sections below are retained as implementation and
+field-gate references only. Their technician commands fail closed in the public
+path until secure credential custody and real-provider acceptance are complete.
+
+## Public first-install steps and deferred field references
 
 ### 1. Local tools
 
@@ -319,17 +326,24 @@ only after a real mailbox read succeeds.
 ### 8. Owner passkey
 
 Settle the final Brain hostname first. With the owner and intended device
-present, run:
+present, the owner opens a terminal and display they control directly and runs
+the package-local `brain invite <manifest>` command there. Do not run invite
+creation through Claude, Codex, an agent tool, a captured terminal, or a shared
+screen. The one-time URL must stay out of chat, logs, screenshots, and status
+files.
+
+The technician boundary check is:
 
 ```bash
 brain technician "$HOME/Financial Brain/brain.manifest.json" --run passkey \
   --confirm-host brain.example.com
 ```
 
-The confirmation exactly matches `brain.domain`. The command creates one
-single-use link that expires in 15 minutes. The owner opens it on their device
-and completes Face ID, fingerprint, or device PIN. This is the first point where
-a physical passkey becomes proven.
+The confirmation exactly matches `brain.domain`. The technician command does
+not mint or print an invite. It records that the owner-only terminal ceremony is
+required. After the owner completes Face ID, fingerprint, or device PIN on the
+final hostname, the final verification step must observe an enrolled device
+through the deployed data plane.
 
 ### 9. Handoff checks
 
@@ -337,9 +351,11 @@ a physical passkey becomes proven.
 brain technician "$HOME/Financial Brain/brain.manifest.json" --run verify
 ```
 
-This runs doctor, health, source freshness, and enrolled-device checks in order.
-It stops on the first failure and does not mark anything complete. Record a
-connector as live-proven only after its exact acceptance event occurs.
+This runs authenticated deployed health, source-freshness, and enrolled-device
+postconditions with the manifest-declared durable key. It requires at least one
+configured source and at least one enrolled passkey, stores aggregate counts
+only, and fails closed when a check is unavailable. It does not use a temporary
+Cloudflare token or infer completion from a child exit code.
 
 ## Optional provider connection ceremony
 

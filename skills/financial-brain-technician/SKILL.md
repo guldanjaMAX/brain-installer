@@ -46,17 +46,20 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
    exists, read it as additional acceptance evidence only. A kit with
    `ready_to_send: false`, a mismatched version, or a hold marker blocks that
    pilot, but absence of a kit does not block the packaged owner workflow.
-7. The packaged technician plan currently guides Plaid, Google, QuickBooks,
-   Zoom, IMAP, the first passkey, and final verification. Do not imply that it
-   guides Slack, Notion, Microsoft 365, Dropbox, HubSpot, or watched-folder
-   scheduling ceremonies. Treat those as separate connector or backlog work
-   until the plan names and proves them explicitly.
+7. The public first-install plan guides local tools, the core Cloudflare install,
+   the owner-only first-passkey handoff, and final live verification. Plaid,
+   Google, QuickBooks, Zoom, IMAP, Slack, Notion, Microsoft 365, Dropbox,
+   HubSpot, and watched-folder scheduling ceremonies are deferred from this
+   public path. Existing connector code or fixtures are not permission to run
+   them or proof that their credential custody and live provider field gates are
+   ready.
 8. After every `--run` command, whether it reports completion or failure, read
    the private `.financial-brain-technician-status.json` path printed by the
    CLI. Require `status`, `issue_code`, `retry_safe`, `requires_human`,
    `next_action`, `manifest.path`, and the exact `cli` and `refresh` locators.
-   Run `status.refresh.command` with exactly `status.refresh.args` before
-   deciding what to do next. A child exit code, a `completed` field, or a static
+   Invoke `status.refresh.command` with exactly `status.refresh.args` as
+   structured process arguments, never by joining or re-quoting them as a shell
+   string. Do that before deciding what to do next. A child exit code, a `completed` field, or a static
    manifest is not proof that live state matches the plan.
 
 ## Credential boundary
@@ -68,6 +71,10 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
   commands, logs, screenshots, and files.
 - When the CLI displays a hidden prompt, hand control to the owner. Do not ask
   the owner to paste the value into Claude.
+- Never run `brain invite` or copy an enrollment link through an AI-controlled
+  or captured terminal. The owner mints and opens the one-time link in a
+  terminal and display they control directly. Final verification must observe
+  an enrolled device through the deployed data plane.
 - Prefer browser-based `wrangler login` or `gh auth login` for optional local
   developer access. Do not create or print a broad Cloudflare or GitHub token.
 - Prefer the exact `<brain-cli>` launcher over direct Wrangler commands because the Brain CLI

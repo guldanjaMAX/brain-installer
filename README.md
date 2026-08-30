@@ -74,18 +74,21 @@ synthetic setup, folder, connector, migration, search, owner-action, access, and
 technician scenarios. The final receipt separates automatic proof from the
 remaining live Cloudflare, provider, and physical-device checks.
 
-For an install day, `brain technician <manifest>` prints the nine-step read-only
-plan. Add `--json` when a local coding agent is guiding the session. Run one
-reviewed step at a time with `--run tools`, `cloudflare`, `plaid`, `google`,
-`quickbooks`, `zoom`,
-`imap`, `passkey`, or `verify`. The owner still handles login, 2FA, OAuth consent, and
-the physical passkey gesture. Tokens and app secrets go only into hidden
-terminal prompts or provider pages. The complete guide is
+For an install day, `brain technician <manifest>` prints the read-only plan.
+Add `--json` when a local coding agent is guiding the session. The public
+first-install path runs `tools`, `cloudflare`, the owner-only `passkey` handoff,
+and `verify`. Plaid, Google, QuickBooks, Zoom, and IMAP ceremonies remain
+deferred until their secure custody and real-provider field gates are complete.
+The owner still handles login, 2FA, consent, and the physical passkey gesture.
+The owner mints a one-time passkey invite only in a terminal they control
+directly; invite links never enter agent chat, captured output, or status files.
+The complete guide is
 [onboarding/09-technician-setup-and-rehearsal.md](onboarding/09-technician-setup-and-rehearsal.md).
 
 The deterministic owner handoff starts with `brain tools <manifest> --handoff`.
-On Windows, add `--deep-dpapi` for the 25-round credential-protection
-diagnostic. The command writes a private package-local bootstrap status beside
+Every Windows tools preflight now requires all 25 cold credential-protection
+rounds; `--deep-dpapi` remains an accepted compatibility spelling but no longer
+weakens or strengthens that gate. The command writes a private package-local bootstrap status beside
 the intended manifest and opens Claude with those exact paths. Every selected
 technician step then writes `.financial-brain-technician-status.json` with a
 stable status, issue code, retry boundary, exact manifest, and exact

@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { cmdConnectProvider, cmdLocalTools, cmdTechnician } from "../brain.mjs";
+import { cmdConnectProvider, cmdLocalTools, cmdTechnician, verifyTechnicianHandoff } from "../brain.mjs";
 
 import {
   TECHNICIAN_RUN_STEPS,
@@ -96,7 +96,7 @@ test("Windows bootstrap repairs PATH, runs the 25-round gate, and launches Claud
     deepDpapi: true,
     isTTY: false,
     existsImpl: (path) => String(path).toLowerCase() === officialClaude.toLowerCase(),
-    runPowerShell: () => ({ status: 0, stdout: "", stderr: "" }),
+    runPowerShell: () => ({ status: 0, stdout: "BRAIN_CLAUDE_PATH_OK", stderr: "" }),
     runCommand: (command, args, options) => {
       calls.push({ command, args, options });
       if (command === "npx") return { ok: true, out: "wrangler 4.127.1" };
@@ -109,6 +109,7 @@ test("Windows bootstrap repairs PATH, runs the 25-round gate, and launches Claud
       return { checked: true, passed: true, rounds: options.rounds, stage: null };
     },
     claudeSkillOptions: { home },
+    claudeWorkspaceRoot: join(sandbox, "windows-dedicated-workspace"),
     launchClaude: (command, args, options) => {
       launch = { command, args, options };
       return { status: 0 };
@@ -121,7 +122,8 @@ test("Windows bootstrap repairs PATH, runs the 25-round gate, and launches Claud
   assert.ok(calls.some((call) => call.command === "claude" && call.args.join(" ") === "auth status"));
   assert.equal(launch.command, officialClaude);
   assert.equal(launch.options.shell, false);
-  assert.equal(launch.options.cwd, workspace);
+  assert.notEqual(launch.options.cwd, workspace);
+  assert.ok(readFileSync(join(launch.options.cwd, "CLAUDE.md"), "utf8").startsWith(CLAUDE_WORKSPACE_MARKER));
   assert.match(launch.args[0], /financial-brain-technician/);
   assert.doesNotMatch(launch.args[0], /fixture-admin|api[_-]?token|client_secret/i);
 
@@ -170,11 +172,12 @@ test("setup can create an owner-only Claude workspace guide with locators but no
   const first = writeClaudeWorkspaceGuide(manifest, {
     brainCliPath: safeBrainPath,
     nodePath: safeNodePath,
+    workspaceRoot: join(sandbox, "claude-workspace-root"),
   });
   const content = readFileSync(first.path, "utf8");
   assert.equal(first.status, "written");
   assert.ok(content.startsWith(CLAUDE_WORKSPACE_MARKER));
-  assert.ok(content.includes(`${JSON.stringify(safeNodePath)} ${JSON.stringify(safeBrainPath)}`));
+  assert.match(content, new RegExp(`Brain CLI invocation:.*${safeNodePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   assert.match(content, /claude --add-dir <approved-folder>/);
   assert.match(content, /npx wrangler@4/);
   assert.match(content, /normal approval prompts enabled/i);
@@ -189,21 +192,75 @@ test("setup can create an owner-only Claude workspace guide with locators but no
     writeClaudeWorkspaceGuide(manifest, {
       brainCliPath: safeBrainPath,
       nodePath: safeNodePath,
+      workspaceRoot: join(sandbox, "claude-workspace-root"),
     }).status,
     "verified",
   );
 });
 
-test("an unrelated Claude workspace guide is preserved byte-for-byte", () => {
+test("an unrelated manifest-directory guide is preserved and excluded from the dedicated handoff workspace", () => {
   const workspace = join(sandbox, "existing-claude-workspace");
   mkdirSync(workspace);
   const manifest = join(workspace, "brain.manifest.json");
   const target = join(workspace, "CLAUDE.md");
   writeFileSync(manifest, "{}");
   writeFileSync(target, "owner instructions\n");
-  const result = writeClaudeWorkspaceGuide(manifest, { brainCliPath: "/safe/bin/brain" });
-  assert.equal(result.status, "preserved_unrelated_existing_file");
+  const result = writeClaudeWorkspaceGuide(manifest, {
+    brainCliPath: "/safe/bin/brain",
+    workspaceRoot: join(sandbox, "existing-guide-dedicated-root"),
+  });
+  assert.equal(result.status, "written");
+  assert.notEqual(result.workspace, workspace);
   assert.equal(readFileSync(target, "utf8"), "owner instructions\n");
+  assert.ok(readFileSync(result.path, "utf8").startsWith(CLAUDE_WORKSPACE_MARKER));
+});
+
+test("copyable commands quote spaces, dollar expansion, and apostrophes without changing structured argv", () => {
+  const hostileRoot = join(sandbox, "command $(must-not-run) owner's folder");
+  mkdirSync(hostileRoot, { recursive: true });
+  const manifest = join(hostileRoot, "brain manifest.json");
+  writeFileSync(manifest, "{}");
+  const hostileNode = join(hostileRoot, "node $HOME owner's binary");
+  const hostileBrain = join(hostileRoot, "brain $(touch never) owner's.mjs");
+  const plan = technicianPlan(manifest, {
+    cli: { command: hostileNode, args: [hostileBrain] },
+  });
+  assert.deepEqual(plan.refresh, {
+    command: resolve(hostileNode),
+    args: [resolve(hostileBrain), "technician", resolve(manifest), "--json"],
+    mutates_external_state: false,
+  });
+  for (const command of plan.steps.map((step) => step.command).filter(Boolean)) {
+    if (process.platform === "win32") {
+      assert.match(command, /^& '/);
+      assert.match(command, /\$\(must-not-run\)/);
+      assert.match(command, /owner''s/);
+    } else {
+      assert.match(command, /^'/);
+      assert.match(command, /\$\(must-not-run\)/);
+      assert.match(command, /owner'"'"'s/);
+    }
+  }
+  const guide = writeClaudeWorkspaceGuide(manifest, {
+    brainCliPath: hostileBrain,
+    nodePath: hostileNode,
+    workspaceRoot: join(sandbox, "hostile-command-dedicated-root"),
+  });
+  const content = readFileSync(guide.path, "utf8");
+  assert.match(content, /\$\(touch never\)/);
+  assert.match(content, /brain manifest\.json' '--json|brain manifest\.json'/);
+});
+
+test("an unrelated instruction file inside the dedicated workspace blocks handoff", () => {
+  const workspaceRoot = join(sandbox, "colliding-dedicated-root");
+  const manifest = join(sandbox, "collision-manifest", "brain.manifest.json");
+  mkdirSync(resolve(manifest, ".."), { recursive: true });
+  writeFileSync(manifest, "{}");
+  const first = writeClaudeWorkspaceGuide(manifest, { workspaceRoot });
+  writeFileSync(first.path, "untrusted workspace instructions\n");
+  const blocked = writeClaudeWorkspaceGuide(manifest, { workspaceRoot });
+  assert.equal(blocked.status, "preserved_unrelated_existing_file");
+  assert.equal(readFileSync(first.path, "utf8"), "untrusted workspace instructions\n");
 });
 
 test("the plan is read-only, ordered, honest about proof, and agent-readable", () => {
@@ -216,7 +273,10 @@ test("the plan is read-only, ordered, honest about proof, and agent-readable", (
   assert.equal(plan.steps[1].state, "ready_after_local_tools");
   assert.match(plan.warning, /Live proof arrives/i);
   assert.match(JSON.stringify(plan), /hidden terminal prompts/i);
-  assert.ok(plan.steps.every((step) => step.command.startsWith("<brain-cli> ")));
+  assert.ok(plan.steps.filter((step) => step.command).every((step) => step.command.includes("<brain-cli>")));
+  assert.ok(plan.coverage.not_guided_in_this_release.some((name) => /Google connector/i.test(name)));
+  assert.ok(plan.steps.filter((step) => ["plaid", "google", "quickbooks", "zoom", "imap"].includes(step.id))
+    .every((step) => step.command === null && step.state === "deferred_from_public_first_install"));
   assert.doesNotMatch(JSON.stringify(plan.steps), /(^|[^<-])\bbrain technician\b/i);
   for (const name of ["Slack", "Notion", "Microsoft 365", "Dropbox", "HubSpot", "watched-folder"]) {
     assert.match(JSON.stringify(plan.coverage), new RegExp(name, "i"));
@@ -241,7 +301,8 @@ test("the package-local JSON plan exposes stable course-correction fields and an
     args: [safeBrainPath, "technician", missing, "--json"],
     mutates_external_state: false,
   });
-  assert.ok(plan.steps.every((step) => step.command.startsWith(JSON.stringify(safeNodePath))));
+  assert.ok(plan.steps.filter((step) => step.command).every((step) => step.command.includes(safeNodePath)));
+  assert.ok(plan.steps.filter((step) => step.command).every((step) => !step.command.includes('"' + safeNodePath + '"')));
   assert.match(plan.next_action, /explicit owner approval/i);
 });
 
@@ -339,6 +400,26 @@ test("the child environment strips ambient credentials and unrelated application
   assert.doesNotMatch(JSON.stringify(env), /must-not-cross/);
 });
 
+test("the public first-install path defers every connector before prompts, children, or provider calls", async () => {
+  let prompts = 0;
+  let children = 0;
+  let providers = 0;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    for (const step of ["plaid", "google", "quickbooks", "zoom", "imap"]) {
+      await assert.rejects(cmdTechnician(manifestPath, { run: step }, {
+        readHidden: async () => { prompts++; return Buffer.from("must-not-be-read"); },
+        spawn: () => { children++; return { status: 0 }; },
+        connectProvider: async () => { providers++; },
+      }), /deferred from the public first-install path/);
+    }
+  } finally {
+    console.log = originalLog;
+  }
+  assert.deepEqual({ prompts, children, providers }, { prompts: 0, children: 0, providers: 0 });
+});
+
 test("Google credentials cross only the child environment, never argv, and input buffers are zeroed", async () => {
   const clientId = Buffer.from("fixture-google-client-id");
   const clientSecret = Buffer.from("fixture-google-client-secret");
@@ -432,7 +513,7 @@ test("QuickBooks refuses missing manifests and incomplete configuration before a
   writeFileSync(production, JSON.stringify({ corpora: { quickbooks: { enabled: true, environment: "production" } } }));
   assert.equal(
     technicianPlan(production).steps.find((step) => step.id === "quickbooks").state,
-    "production_callback_unavailable",
+    "deferred_from_public_first_install",
   );
   await assert.rejects(
     runTechnicianStep({ ...common, manifestPath: production }),
@@ -444,7 +525,7 @@ test("QuickBooks refuses missing manifests and incomplete configuration before a
   }));
   assert.equal(
     technicianPlan(invalidRedirect).steps.find((step) => step.id === "quickbooks").state,
-    "requires_redirect_host_review",
+    "deferred_from_public_first_install",
   );
   await assert.rejects(
     runTechnicianStep({ ...common, manifestPath: invalidRedirect }),
@@ -464,14 +545,14 @@ test("QuickBooks technician JSON failures use a stable nonzero exit and recovery
   assert.equal(result.stderr, "");
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.status, "error");
-  assert.equal(payload.error_code, "quickbooks_not_enabled");
-  assert.match(payload.recovery, /Enable it before connecting/);
+  assert.equal(payload.error_code, "connector_deferred_from_public_install");
+  assert.match(payload.recovery, /deferred from the public first-install path/);
   assert.equal(payload.financial_authority, false);
   assert.equal(typeof payload.status_file, "string");
   const status = JSON.parse(readFileSync(payload.status_file, "utf8"));
   assert.equal(status.status, "action_required");
-  assert.equal(status.issue_code, "QUICKBOOKS_NOT_ENABLED");
-  assert.equal(status.retry_safe, true);
+  assert.equal(status.issue_code, "CONNECTOR_DEFERRED_FROM_PUBLIC_INSTALL");
+  assert.equal(status.retry_safe, false);
   assert.equal(status.requires_human, true);
   assert.equal(status.refresh.mutates_external_state, false);
 });
@@ -487,6 +568,7 @@ test("QuickBooks uses two hidden prompts, existing OAuth custody, privacy-safe J
   console.log = (...parts) => logs.push(parts.join(" "));
   try {
     const receipt = await cmdTechnician(manifestPath, { run: "quickbooks", json: true }, {
+      allowDeferredConnectorTest: true,
       readHidden: async (request) => {
         prompts.push(request);
         return entered.shift();
@@ -532,9 +614,19 @@ test("QuickBooks uses two hidden prompts, existing OAuth custody, privacy-safe J
     assert.equal(authorizeOptions.redirectUri, "http://localhost:47812/");
     assert.equal(prompts.length, 2);
     assert.ok(prompts.every((prompt) => /hidden/i.test(prompt.prompt)));
-    assert.deepEqual(receipt.verification_commands, [
-      `<brain-cli> ingest ${JSON.stringify(resolve(manifestPath))} --from quickbooks --dry-run`,
-      `<brain-cli> ingest ${JSON.stringify(resolve(manifestPath))} --from quickbooks`,
+    assert.deepEqual(receipt.verification, [
+      {
+        purpose: "dry_run",
+        command: process.execPath,
+        args: [resolve("brain.mjs"), "ingest", resolve(manifestPath), "--from", "quickbooks", "--dry-run"],
+        mutates_external_state: false,
+      },
+      {
+        purpose: "first_ingest_after_owner_review",
+        command: process.execPath,
+        args: [resolve("brain.mjs"), "ingest", resolve(manifestPath), "--from", "quickbooks"],
+        mutates_external_state: true,
+      },
     ]);
   } finally {
     console.log = originalLog;
@@ -677,7 +769,7 @@ test("IMAP passes only non-secret routing values and leaves app-password prompti
   assert.doesNotMatch(JSON.stringify(call), /ambient-secret/);
 });
 
-test("passkey enrollment refuses before mutation unless the exact final hostname is confirmed", async () => {
+test("passkey enrollment requires the exact host and never mints an invite in an agent-captured child", async () => {
   let calls = 0;
   const common = {
     step: "passkey",
@@ -691,24 +783,82 @@ test("passkey enrollment refuses before mutation unless the exact final hostname
     /exactly matches brain\.fixture\.test/,
   );
   assert.equal(calls, 0);
-  await runTechnicianStep({ ...common, flags: { "confirm-host": "BRAIN.FIXTURE.TEST" } });
-  assert.equal(calls, 1);
+  await assert.rejects(
+    runTechnicianStep({ ...common, flags: { "confirm-host": "BRAIN.FIXTURE.TEST" } }),
+    (error) => error.code === "passkey_human_terminal_required" && /owner-only/i.test(error.message),
+  );
+  assert.equal(calls, 0);
 });
 
-test("verification is ordered and stops at the first failed proof", async () => {
-  const commands = [];
+test("verification requires an in-process live postcondition probe and stores aggregate proof", async () => {
+  await assert.rejects(runTechnicianStep({
+    step: "verify",
+    manifestPath,
+    scriptPath: fixtureScriptPath,
+    nodePath: fixtureNodePath,
+  }), (error) => error.code === "handoff_verifier_unavailable");
+
+  let checked = 0;
+  const receipt = await runTechnicianStep({
+    step: "verify",
+    manifestPath,
+    scriptPath: fixtureScriptPath,
+    nodePath: fixtureNodePath,
+    spawn: () => { throw new Error("verification must not rely on a child exit code"); },
+    verifyInstallation: async ({ manifestPath: checkedPath }) => {
+      checked++;
+      assert.equal(checkedPath, manifestPath);
+      return {
+        source_count: 2,
+        source_states: { ok: 2 },
+        enrolled_device_count: 1,
+        checked_via: "deployed_admin_data_plane",
+        stored_identifiers: false,
+      };
+    },
+  });
+  assert.equal(checked, 1);
+  assert.equal(receipt.commands_run, 0);
+  assert.equal(receipt.proof_level, "live_data_plane_postconditions");
+  assert.equal(receipt.proof.enrolled_device_count, 1);
+});
+
+test("the deployed handoff verifier refuses empty/unavailable state and returns no identifiers", async () => {
+  const response = (body, status = 200) => new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+  const options = {
+    resolveAdminKey: () => "fixture-admin-key",
+    fetchImpl: async (input) => {
+      const path = new URL(typeof input === "string" ? input : input.url).pathname;
+      if (path === "/api/admin/brain/freshness") {
+        return response({ sources: [{ name: "private-source", state: "ok" }] });
+      }
+      if (path === "/api/admin/auth/devices") {
+        return response({ devices: [{ credential_id: "private-device-id" }] });
+      }
+      return response({ error: "unexpected" }, 404);
+    },
+  };
+  const proof = await verifyTechnicianHandoff(manifestPath, options);
+  assert.deepEqual(proof, {
+    source_count: 1,
+    source_states: { ok: 1 },
+    enrolled_device_count: 1,
+    checked_via: "deployed_admin_data_plane",
+    stored_identifiers: false,
+  });
+  assert.doesNotMatch(JSON.stringify(proof), /private-source|private-device-id/);
+
   await assert.rejects(
-    runTechnicianStep({
-      step: "verify",
-      manifestPath,
-      scriptPath: fixtureScriptPath,
-      nodePath: fixtureNodePath,
-      spawn: (_node, args) => {
-        commands.push(args[1]);
-        return { status: args[1] === "health" ? 1 : 0 };
+    verifyTechnicianHandoff(manifestPath, {
+      ...options,
+      fetchImpl: async (input) => {
+        const path = new URL(typeof input === "string" ? input : input.url).pathname;
+        return path.endsWith("freshness") ? response({ sources: [] }) : response({ devices: [] });
       },
     }),
-    /paused before completion/,
+    (error) => error.code === "HANDOFF_NO_CONFIGURED_SOURCES",
   );
-  assert.deepEqual(commands, ["doctor", "health"]);
 });

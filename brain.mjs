@@ -151,6 +151,7 @@ import {
 } from "./operations/bank-access-wrapping-key.mjs";
 import {
   buildTechnicianStepStatus,
+  DEFERRED_PUBLIC_CONNECTOR_STEPS,
   renderTechnicianPlan,
   runTechnicianStep,
   technicianPlan,
@@ -11968,11 +11969,13 @@ export async function cmdSetup(manifestPath, options = {}) {
       const guide = writeGuide(target, {
         brainCliPath: options.brainCliPath || fileURLToPath(import.meta.url),
         nodePath: options.nodePath || process.execPath,
+        environment: options.environment || process.env,
+        workspaceRoot: options.claudeWorkspaceRoot,
       });
       if (guide.status === "written" || guide.status === "verified") {
         ok(`Claude Code owner workspace ready at ${guide.path}`);
       } else {
-        warn(`preserved the existing CLAUDE.md at ${guide.path}; add the Financial Brain safety guide manually`);
+        die("the dedicated Claude workspace is not installer-owned. No existing CLAUDE.md was replaced. Resolve that local collision before handoff.");
       }
     } catch {
       closePrompts();
@@ -14174,7 +14177,7 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
   const cli = { command: nodePath, args: [scriptPath] };
   const step = flags.run ? String(flags.run).trim().toLowerCase() : null;
   const stepStatusPath = technicianStatusFilePath(manifestPath);
-  const persistStepStatus = (succeeded, error = null) => {
+  const persistStepStatus = (succeeded, error = null, receipt = null) => {
     const status = buildTechnicianStepStatus({
       step,
       manifestPath,
@@ -14182,6 +14185,8 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
       succeeded,
       error,
       statusFile: stepStatusPath,
+      proofLevel: receipt?.proof_level,
+      proof: receipt?.proof,
     });
     const writer = options.writeTechnicianStatus || ((path, payload) =>
       writeBootstrapStatusFile(path, payload, { path: stepStatusPath }));
@@ -14209,7 +14214,7 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
         custody: "client_local_provider_store",
         financial_authority: false,
         oauth_permission: "broad_accounting_scope_runtime_read_only",
-        verification_commands: [],
+        verification: [],
         recovery: "The read-only technician plan could not inspect the intended manifest. No provider action started.",
         status_file: failureStatus?.status_file || null,
         refresh: failureStatus?.refresh || null,
@@ -14229,6 +14234,33 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
   }
   if (flags.json && step !== "quickbooks") {
     die("--json can be combined with --run only for the agent-safe QuickBooks ceremony");
+  }
+
+  if (DEFERRED_PUBLIC_CONNECTOR_STEPS.includes(step) && options.allowDeferredConnectorTest !== true) {
+    const error = Object.assign(new Error(
+      `${step} is deferred from the public first-install path. Its existing connector command is not treated as an installer ceremony until secure credential custody and a real provider field gate are complete. No prompt, browser flow, or external change started.`,
+    ), { code: "connector_deferred_from_public_install" });
+    const failureStatus = persistStepStatus(false, error);
+    if (flags.json && step === "quickbooks") {
+      throw new JsonFatal({
+        schema_version: 1,
+        command: "technician.quickbooks",
+        status: "error",
+        error_code: error.code,
+        environment: plan.steps.find((item) => item.id === "quickbooks")?.environment || null,
+        custody: "client_local_provider_store",
+        financial_authority: false,
+        oauth_permission: "broad_accounting_scope_runtime_read_only",
+        verification: [],
+        recovery: error.message,
+        status_file: failureStatus.status_file,
+        refresh: failureStatus.refresh,
+        proof_level: failureStatus.proof_level,
+      });
+    }
+    warn(`machine-readable step status: ${failureStatus.status_file}`);
+    info(failureStatus.next_action);
+    die(error.message);
   }
 
   if (step === "quickbooks" && !flags.json) {
@@ -14270,10 +14302,14 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
           quiet: true,
         },
       )),
+      verifyInstallation: options.verifyInstallation || (async (request) => {
+        await cmdHealth(request.manifestPath, { durableAdminKeyOnly: true });
+        return verifyTechnicianHandoff(request.manifestPath);
+      }),
     });
     let stepStatus;
     try {
-      stepStatus = persistStepStatus(true);
+      stepStatus = persistStepStatus(true, null, receipt);
     } catch {
       const statusError = Object.assign(new Error(
         "The technician command returned, but its private status receipt could not be written and read back. Do not infer success or continue until the local status path is repaired.",
@@ -14291,7 +14327,7 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
         custody: receipt.custody,
         financial_authority: receipt.financial_authority,
         oauth_permission: receipt.oauth_permission,
-        verification_commands: receipt.verification_commands,
+        verification: receipt.verification,
         recovery: null,
         status_file: stepStatus.status_file,
         refresh: stepStatus.refresh,
@@ -14300,8 +14336,7 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
       if (flags.json) console.log(JSON.stringify(output, null, 2));
       else {
         ok("QuickBooks Online connection stored in the client's existing local provider credential store");
-        info(`dry-run verification: ${receipt.verification_commands[0]}`);
-        info(`first ingest after review: ${receipt.verification_commands[1]}`);
+        info("The JSON receipt contains structured command and args fields for the dry run and owner-approved first ingest. Do not join them into a shell string.");
         info("Connection success means the QuickBooks reference loaded. It does not mean the books are correct.");
         info(`machine-readable step status: ${stepStatus.status_file}`);
         info(stepStatus.next_action);
@@ -14334,7 +14369,7 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
         custody: "client_local_provider_store",
         financial_authority: false,
         oauth_permission: "broad_accounting_scope_runtime_read_only",
-        verification_commands: [],
+        verification: [],
         recovery: String(error?.message || error),
         status_file: failureStatus?.status_file || null,
         refresh: failureStatus?.refresh || null,
@@ -14392,7 +14427,7 @@ export async function cmdLocalTools(options = {}) {
     ? checkWindowsCredentialProtection({
         platformName,
         probe: options.dpapiProbe,
-        probeOptions: { rounds: deepDpapi ? 25 : 3, ...(options.dpapiProbeOptions || {}) },
+        probeOptions: { rounds: 25, ...(options.dpapiProbeOptions || {}) },
       })
     : { name: "Windows credential protection", status: D_OK, detail: "not applicable", rounds: 0 };
   const visibleChecks = platformName === "win32"
@@ -14508,6 +14543,9 @@ export async function cmdLocalTools(options = {}) {
         brainCliPath: cli.args[0],
         nodePath: cli.command,
         bootstrapStatusPath: bootstrapStatus.status_file,
+        platformName,
+        environment,
+        workspaceRoot: options.claudeWorkspaceRoot,
       });
     } catch {
       const failure = {
@@ -14523,11 +14561,33 @@ export async function cmdLocalTools(options = {}) {
       die("the Claude owner workspace could not be prepared safely. No existing CLAUDE.md was replaced.");
     }
     if (!["written", "verified"].includes(guide.status)) {
-      warn(`preserved the existing CLAUDE.md at ${guide.path}; the explicit bootstrap status remains authoritative for this handoff`);
+      bootstrapStatus = persistStatus({
+        ...bootstrapStatus,
+        status: "action_required",
+        issue_code: "CLAUDE_WORKSPACE_COLLISION",
+        retry_safe: false,
+        requires_human: true,
+        next_action: "Resolve the unrelated instruction file outside the dedicated installer-owned Claude workspace, then rerun this exact handoff.",
+        recovery: "No existing CLAUDE.md was replaced and Claude Code was not launched.",
+      });
+      die("Claude Code was not launched because the dedicated handoff workspace is not exclusively installer-owned.");
     }
-    const windowsClaude = platformName === "win32"
-      ? windowsClaudePathState({ environment, existsImpl: options.existsImpl }).executable
+    const windowsClaudeState = platformName === "win32"
+      ? windowsClaudePathState({ environment, existsImpl: options.existsImpl })
       : null;
+    const windowsClaude = windowsClaudeState?.executable || null;
+    if (platformName === "win32" && (!windowsClaude || !/\.exe$/i.test(windowsClaude))) {
+      bootstrapStatus = persistStatus({
+        ...bootstrapStatus,
+        status: "action_required",
+        issue_code: "CLAUDE_NATIVE_EXECUTABLE_REQUIRED",
+        retry_safe: true,
+        requires_human: true,
+        next_action: "Install Claude Code's official native claude.exe for this Windows user, then rerun the same handoff. A .cmd shim is not used for shell-free launch.",
+        recovery: "The local status and technician skill remain ready; Claude Code was not launched and no provisioning action started.",
+      });
+      die("Windows handoff requires the official claude.exe. A .cmd shim cannot be launched through this shell-free boundary.");
+    }
     const nativeClaude = environment.HOME
       ? join(environment.HOME, ".local", "bin", "claude")
       : null;
@@ -14538,7 +14598,7 @@ export async function cmdLocalTools(options = {}) {
       `and use the intended manifest at ${JSON.stringify(targetManifest)}. Begin read-only and keep every credential in a hidden prompt or provider page.`;
     const launch = options.launchClaude ?? spawnSync;
     const launched = launch(launcher, [starter], {
-      cwd: dirname(targetManifest),
+      cwd: guide.workspace,
       env: localToolEnvironment(environment),
       shell: false,
       stdio: "inherit",
@@ -14720,6 +14780,100 @@ async function cmdInvite(manifestPath) {
     "  requires re-enrollment, so settle the domain before the first invite.\n"
   );
   return invite;
+}
+
+function handoffCheckError(code, message) {
+  const error = new Fatal(message);
+  error.code = code;
+  throw error;
+}
+
+/**
+ * Prove final handoff postconditions through the deployed data plane.
+ *
+ * This intentionally does not touch the Cloudflare account API. It requires a
+ * final hostname and the already durable local admin key, then stores only
+ * aggregate source-state and passkey counts in the technician receipt.
+ */
+export async function verifyTechnicianHandoff(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const hostname = String(m.brain?.domain || "").trim().toLowerCase();
+  if (!hostname) {
+    handoffCheckError(
+      "HANDOFF_FINAL_HOST_REQUIRED",
+      "final handoff verification requires brain.domain. A workers.dev lookup would need temporary Cloudflare account access and cannot prove the permanent passkey origin.",
+    );
+  }
+  const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath, { ignoreEnvironment: true });
+  if (!adminKey) {
+    handoffCheckError(
+      "HANDOFF_DURABLE_ADMIN_KEY_UNAVAILABLE",
+      "final handoff verification could not read the manifest-declared durable admin key. No credential prompt was opened and no live state was inferred.",
+    );
+  }
+  const fetchImpl = options.fetchImpl;
+  const requestJson = async (path, issueCode, label) => {
+    let response;
+    try {
+      response = await http(`https://${hostname}${path}`, {
+        headers: { "X-Admin-Key": adminKey },
+      }, { timeoutMs: 30_000, what: label, ...(fetchImpl ? { fetchImpl } : {}) });
+    } catch {
+      handoffCheckError(issueCode, `${label} is unavailable. The handoff remains incomplete.`);
+    }
+    let body;
+    try { body = await response.json(); } catch {
+      handoffCheckError(issueCode, `${label} returned no valid JSON proof. The handoff remains incomplete.`);
+    }
+    if (!response.ok) {
+      handoffCheckError(issueCode, `${label} returned HTTP ${response.status}. The handoff remains incomplete.`);
+    }
+    return body;
+  };
+
+  const freshness = await requestJson(
+    "/api/admin/brain/freshness",
+    "HANDOFF_SOURCE_FRESHNESS_UNAVAILABLE",
+    "the deployed source-freshness check",
+  );
+  if (!Array.isArray(freshness?.sources) || freshness.sources.length === 0) {
+    handoffCheckError(
+      "HANDOFF_NO_CONFIGURED_SOURCES",
+      "the deployed Brain reported no configured sources. A zero exit code cannot satisfy the handoff.",
+    );
+  }
+  const stateCounts = {};
+  for (const source of freshness.sources) {
+    const state = String(source?.state || "unknown");
+    stateCounts[state] = (stateCounts[state] || 0) + 1;
+  }
+  const unacceptable = freshness.sources.filter((source) =>
+    !["ok", "manual"].includes(String(source?.state || "")));
+  if (unacceptable.length) {
+    handoffCheckError(
+      "HANDOFF_SOURCE_FRESHNESS_INCOMPLETE",
+      `${unacceptable.length} configured source(s) lack a current or explicitly manual live freshness verdict. The handoff remains incomplete.`,
+    );
+  }
+
+  const deviceList = await requestJson(
+    "/api/admin/auth/devices",
+    "HANDOFF_PASSKEY_STATUS_UNAVAILABLE",
+    "the deployed enrolled-device check",
+  );
+  if (!Array.isArray(deviceList?.devices) || deviceList.devices.length === 0) {
+    handoffCheckError(
+      "HANDOFF_NO_ENROLLED_PASSKEY",
+      "the deployed Brain reported no enrolled passkey. Invite creation or a command return is not proof of the physical-device ceremony.",
+    );
+  }
+  return Object.freeze({
+    source_count: freshness.sources.length,
+    source_states: Object.freeze(stateCounts),
+    enrolled_device_count: deviceList.devices.length,
+    checked_via: "deployed_admin_data_plane",
+    stored_identifiers: false,
+  });
 }
 
 /** List or revoke the owner's enrolled passkeys. */
@@ -15206,7 +15360,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain tools      [manifest]            verify local tools and write machine-readable bootstrap status
     brain tools      [manifest] --handoff  open Claude Code in the owner workspace with that status
     brain tools      [manifest] --json     print the same stable status for an agent or test
-    brain tools      [manifest] --deep-dpapi  run the 25-cold-round Windows release diagnostic
+    brain tools      [manifest] --deep-dpapi  compatibility flag; Windows always requires the 25-round gate
     brain verify     <manifest>            check the token and resolve the account
     brain provision  <manifest>            create D1 (and R2), write IDs back
     brain secrets    <manifest>            set secrets and durably rotate ADMIN_KEY

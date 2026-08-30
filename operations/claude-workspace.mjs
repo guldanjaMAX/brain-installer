@@ -1,9 +1,10 @@
 /**
- * Create the small, instance-local Claude Code guide beside a Brain manifest.
+ * Create the small, instance-local Claude Code guide in a dedicated workspace.
  *
  * This file contains locators and safety rules only. It never contains a
  * Cloudflare token, Brain admin key, provider credential, or copied user data.
- * An unrelated CLAUDE.md is preserved rather than merged or overwritten.
+ * An unrelated CLAUDE.md is preserved rather than merged or overwritten, and
+ * is never used as the working directory for an installer handoff.
  */
 
 import {
@@ -12,13 +13,17 @@ import {
   existsSync,
   fsyncSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readFileSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
+import { dirname, join, parse, resolve } from "node:path";
+import { renderCopyableCommand } from "./command-display.mjs";
 
 export const CLAUDE_WORKSPACE_MARKER = "<!-- financial-brain-installer:claude-workspace:v1 -->";
 
@@ -34,12 +39,18 @@ export function renderClaudeWorkspaceGuide(manifestPath, {
   brainCliPath = process.argv[1],
   nodePath = null,
   bootstrapStatusPath = null,
+  platformName = process.platform,
 } = {}) {
   const manifest = safeLocator(manifestPath, "manifest path");
   const brainScript = safeLocator(brainCliPath, "Brain CLI path");
-  const brain = nodePath
-    ? `${JSON.stringify(safeLocator(nodePath, "Node path"))} ${JSON.stringify(brainScript)}`
-    : JSON.stringify(brainScript);
+  const launcherCommand = nodePath ? safeLocator(nodePath, "Node path") : brainScript;
+  const launcherArgs = nodePath ? [brainScript] : [];
+  const brainCommand = (args = []) => renderCopyableCommand(
+    launcherCommand,
+    [...launcherArgs, ...args],
+    { platformName },
+  );
+  const brain = brainCommand();
   const bootstrapStatus = bootstrapStatusPath
     ? safeLocator(bootstrapStatusPath, "bootstrap status path")
     : join(dirname(manifest), ".financial-brain-bootstrap-status.json");
@@ -65,10 +76,10 @@ registered Financial Brain MCP server before reaching for Cloudflare directly.
 - Brain CLI invocation: \`${brain}\`
 - Package-local bootstrap status: \`${bootstrapStatus}\`
 - Manifest: \`${manifest}\`
-- Readiness: \`${brain} doctor ${manifest}\`
-- Source status: \`${brain} sources ${manifest}\`
-- Ask privately: \`${brain} ask ${manifest}\`
-- Load one approved folder: \`${brain} ingest ${manifest} --path <approved-folder> --source documents\`
+- Readiness: \`${brainCommand(["doctor", manifest])}\`
+- Source status: \`${brainCommand(["sources", manifest])}\`
+- Ask privately: \`${brainCommand(["ask", manifest])}\`
+- Load one approved folder: \`${brainCommand(["ingest", manifest, "--path", "<approved-folder>", "--source", "documents"])}\`
 
 Wrangler is available at the profile-capable pinned release through \`npx wrangler@4.127.1\`.
 Prefer the Brain CLI because it applies account pinning, migration safety, key
@@ -77,19 +88,63 @@ the owner has approved. Credentials stay in provider pages or hidden prompts rat
 `;
 }
 
+function workspaceIdentity(manifestPath) {
+  return createHash("sha256").update(resolve(manifestPath), "utf8").digest("hex").slice(0, 20);
+}
+
+function workspaceRoot(manifestPath, options = {}) {
+  const configured = options.workspaceRoot || options.environment?.HOME ||
+    options.environment?.USERPROFILE || homedir();
+  const root = options.workspaceRoot
+    ? resolve(String(configured))
+    : join(resolve(String(configured)), ".financial-brain", "claude-workspaces");
+  if (!root || /[\u0000-\u001f\u007f]/.test(root)) {
+    throw new Error("the dedicated Claude workspace root is invalid");
+  }
+  return join(root, workspaceIdentity(manifestPath));
+}
+
+function unrelatedAncestorGuide(workspace, target) {
+  let current = dirname(workspace);
+  const root = parse(current).root;
+  while (current && current !== root) {
+    const candidate = join(current, "CLAUDE.md");
+    if (candidate !== target && existsSync(candidate)) {
+      try {
+        const identity = lstatSync(candidate);
+        if (!identity.isFile() || identity.isSymbolicLink() || identity.nlink !== 1 ||
+            !readFileSync(candidate, "utf8").startsWith(CLAUDE_WORKSPACE_MARKER)) {
+          return candidate;
+        }
+      } catch {
+        return candidate;
+      }
+    }
+    current = dirname(current);
+  }
+  return null;
+}
+
 export function writeClaudeWorkspaceGuide(manifestPath, options = {}) {
-  const target = join(dirname(resolve(manifestPath)), "CLAUDE.md");
+  const workspace = workspaceRoot(manifestPath, options);
+  const target = join(workspace, "CLAUDE.md");
+  mkdirSync(workspace, { recursive: true, mode: 0o700 });
+  chmodSync(workspace, 0o700);
+  const ancestor = unrelatedAncestorGuide(workspace, target);
+  if (ancestor) {
+    return { path: target, workspace, changed: false, status: "blocked_unrelated_ancestor_guide", blocked_by: ancestor };
+  }
   const content = renderClaudeWorkspaceGuide(manifestPath, options);
   if (existsSync(target)) {
     const stat = lstatSync(target);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
-      return { path: target, changed: false, status: "preserved_unsafe_existing_file" };
+      return { path: target, workspace, changed: false, status: "preserved_unsafe_existing_file" };
     }
     const existing = readFileSync(target, "utf8");
     if (!existing.startsWith(CLAUDE_WORKSPACE_MARKER)) {
-      return { path: target, changed: false, status: "preserved_unrelated_existing_file" };
+      return { path: target, workspace, changed: false, status: "preserved_unrelated_existing_file" };
     }
-    if (existing === content) return { path: target, changed: false, status: "verified" };
+    if (existing === content) return { path: target, workspace, changed: false, status: "verified" };
   }
 
   const temporary = `${target}.${process.pid}.tmp`;
@@ -107,5 +162,5 @@ export function writeClaudeWorkspaceGuide(manifestPath, options = {}) {
     try { unlinkSync(temporary); } catch { /* no temporary file to remove */ }
     throw error;
   }
-  return { path: target, changed: true, status: "written" };
+  return { path: target, workspace, changed: true, status: "written" };
 }

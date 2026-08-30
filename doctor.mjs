@@ -150,7 +150,12 @@ const WINDOWS_CLAUDE_PATH_REPAIR_SCRIPT = [
   "$parts = @($userPath -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })",
   "$present = @($parts | Where-Object { [string]::Equals($_, $claudeBin, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0",
   "if (-not $present) { [Environment]::SetEnvironmentVariable('Path', (($parts + $claudeBin) -join ';'), 'User') }",
+  "$savedPath = [Environment]::GetEnvironmentVariable('Path', 'User')",
+  "$savedParts = @($savedPath -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })",
+  "$saved = @($savedParts | Where-Object { [string]::Equals($_, $claudeBin, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0",
+  "if (-not $saved) { exit 41 }",
   "$env:Path = $claudeBin + ';' + $env:Path",
+  "[Console]::Out.Write('BRAIN_CLAUDE_PATH_OK')",
 ].join("; ");
 
 function normalizedWindowsPath(value) {
@@ -167,7 +172,10 @@ export function windowsClaudePathState({
     return Object.freeze({ installed: false, onPath: false, bin: null, executable: null });
   }
   const bin = pathWin32.join(profile, ".local", "bin");
-  const candidates = [pathWin32.join(bin, "claude.exe"), pathWin32.join(bin, "claude.cmd")];
+  // Handoff launches with shell:false, so only the official native executable
+  // can satisfy this locator. A .cmd shim may be usable for a version probe,
+  // but it is not treated as a safe handoff executable.
+  const candidates = [pathWin32.join(bin, "claude.exe")];
   const executable = candidates.find((candidate) => {
     try { return existsImpl(candidate); } catch { return false; }
   }) || null;
@@ -211,7 +219,7 @@ export function persistWindowsClaudePath({
     timeout: 15_000,
     windowsHide: true,
   });
-  if (result?.error || result?.status !== 0) {
+  if (result?.error || result?.status !== 0 || String(result?.stdout || "").trim() !== "BRAIN_CLAUDE_PATH_OK") {
     return Object.freeze({ ...state, status: "failed", issue_code: "CLAUDE_PATH_UPDATE_FAILED" });
   }
   const currentPath = String(environment.PATH || environment.Path || "");
@@ -511,7 +519,7 @@ export function checkWindowsCredentialProtection({
   if (platformName !== "win32") {
     return check("Windows credential protection", OK, "not applicable on this platform");
   }
-  const result = probe({ platform: "win32", rounds: 3, ...probeOptions });
+  const result = probe({ platform: "win32", rounds: 25, ...probeOptions });
   if (result.passed) {
     return {
       ...check(

@@ -112,52 +112,54 @@ test("the packed CLI scaffolds a nonexistent manifest before any manifest-accoun
       ...baseEnvironment,
       PATH: [fakeBin, dirname(process.execPath), "/usr/bin", "/bin"].join(IS_WIN ? ";" : ":"),
     };
-    if (!IS_WIN) {
-      const bootstrap = run(wrapper, ["tools", manifestPath, "--json"], {
-        cwd: sandbox,
-        env: toolEnvironment,
-      });
-      assert.equal(bootstrap.status, 0, `${bootstrap.stdout}\n${bootstrap.stderr}`);
-      const bootstrapStatus = JSON.parse(bootstrap.stdout);
-      assert.equal(bootstrapStatus.issue_code, "BOOTSTRAP_READY_NO_MANIFEST");
-      assert.equal(bootstrapStatus.release.external_test_kit_required, false);
-      assert.equal(bootstrapStatus.manifest.state, "not_created");
-      assert.equal(bootstrapStatus.manifest.path, manifestPath);
-      assert.ok(existsSync(bootstrapStatus.status_file), "the packed wrapper did not write its bootstrap status");
-      assert.ok(existsSync(bootstrapStatus.cli.command), "the status did not keep an exact Node locator");
-      assert.ok(existsSync(bootstrapStatus.cli.args[0]), "the status did not keep an exact package-local CLI locator");
-      assert.ok(
-        existsSync(join(privateHome, ".claude", "skills", "financial-brain-technician", "SKILL.md")),
-        "the packed bootstrap did not install its package-local technician skill",
-      );
-      assert.ok(!existsSync(manifestPath), "read-only bootstrap unexpectedly created the intended manifest");
+    const bootstrap = run(wrapper, ["tools", manifestPath, "--json"], {
+      cwd: sandbox,
+      env: toolEnvironment,
+      timeout: IS_WIN ? 300_000 : 90_000,
+    });
+    assert.equal(bootstrap.status, 0, `${bootstrap.stdout}\n${bootstrap.stderr}`);
+    const bootstrapStatus = JSON.parse(bootstrap.stdout);
+    assert.equal(bootstrapStatus.issue_code, "BOOTSTRAP_READY_NO_MANIFEST");
+    assert.equal(bootstrapStatus.release.external_test_kit_required, false);
+    assert.equal(bootstrapStatus.manifest.state, "not_created");
+    assert.equal(bootstrapStatus.manifest.path, manifestPath);
+    if (IS_WIN) assert.equal(bootstrapStatus.checks.dpapi_rounds, 25);
+    assert.ok(existsSync(bootstrapStatus.status_file), "the packed wrapper did not write its bootstrap status");
+    assert.ok(existsSync(bootstrapStatus.cli.command), "the status did not keep an exact Node locator");
+    assert.ok(existsSync(bootstrapStatus.cli.args[0]), "the status did not keep an exact package-local CLI locator");
+    assert.ok(
+      existsSync(join(privateHome, ".claude", "skills", "financial-brain-technician", "SKILL.md")),
+      "the packed bootstrap did not install its package-local technician skill",
+    );
+    assert.ok(!existsSync(manifestPath), "read-only bootstrap unexpectedly created the intended manifest");
 
-      const normalClientEnvironment = minimalEnvironment({
-        HOME: privateHome,
-        USERPROFILE: privateHome,
-        PATH: [dirname(process.execPath), "/usr/bin", "/bin"].join(":"),
-        NO_COLOR: "1",
-      });
-      const technician = run(bootstrapStatus.cli.command, [
-        ...bootstrapStatus.cli.args,
-        "technician", manifestPath, "--json",
-      ], { cwd: sandbox, env: normalClientEnvironment });
-      assert.equal(technician.status, 0, `${technician.stdout}\n${technician.stderr}`);
-      const plan = JSON.parse(technician.stdout);
-      assert.equal(plan.mode, "read_only_plan");
-      assert.equal(plan.manifest.exists, false);
-      assert.deepEqual(plan.cli, bootstrapStatus.cli);
-      assert.deepEqual(plan.refresh, {
-        command: bootstrapStatus.cli.command,
-        args: [...bootstrapStatus.cli.args, "technician", manifestPath, "--json"],
-        mutates_external_state: false,
-      });
-      assert.ok(plan.steps.every((step) =>
-        step.command.startsWith(JSON.stringify(bootstrapStatus.cli.command)) &&
-        step.command.includes(JSON.stringify(bootstrapStatus.cli.args[0]))));
-      assert.doesNotMatch(JSON.stringify(plan.steps), /(^|[^\w/.-])brain technician\b/i);
-      assert.match(JSON.stringify(plan.coverage), /watched-folder scheduling ceremony/i);
-    }
+    const normalClientEnvironment = minimalEnvironment({
+      HOME: privateHome,
+      USERPROFILE: privateHome,
+      PATH: [dirname(process.execPath), "/usr/bin", "/bin"].join(IS_WIN ? ";" : ":"),
+      NO_COLOR: "1",
+    });
+    const technician = run(bootstrapStatus.cli.command, [
+      ...bootstrapStatus.cli.args,
+      "technician", manifestPath, "--json",
+    ], { cwd: sandbox, env: normalClientEnvironment });
+    assert.equal(technician.status, 0, `${technician.stdout}\n${technician.stderr}`);
+    const plan = JSON.parse(technician.stdout);
+    assert.equal(plan.mode, "read_only_plan");
+    assert.equal(plan.manifest.exists, false);
+    assert.deepEqual(plan.cli, bootstrapStatus.cli);
+    assert.deepEqual(plan.refresh, {
+      command: bootstrapStatus.cli.command,
+      args: [...bootstrapStatus.cli.args, "technician", manifestPath, "--json"],
+      mutates_external_state: false,
+    });
+    assert.ok(plan.steps.filter((step) => step.command).every((step) =>
+      step.command.includes(bootstrapStatus.cli.command) &&
+      step.command.includes(bootstrapStatus.cli.args[0])));
+    assert.ok(plan.steps.filter((step) => ["plaid", "google", "quickbooks", "zoom", "imap"].includes(step.id))
+      .every((step) => step.command === null));
+    assert.doesNotMatch(JSON.stringify(plan.steps), /(^|[^\w/.-])brain technician\b/i);
+    assert.match(JSON.stringify(plan.coverage), /watched-folder scheduling ceremony/i);
     const accountId = "a".repeat(32);
     const preload = join(sandbox, "offline-cloudflare.mjs");
     writeFileSync(preload, `

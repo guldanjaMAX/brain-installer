@@ -56,6 +56,13 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("Windows doctor detects the official Claude binary outside PATH",
     pathState.installed && !pathState.onPath && pathState.executable === windowsClaude,
     JSON.stringify(pathState));
+  const cmdOnly = windowsClaudePathState({
+    environment: windowsEnvironment,
+    existsImpl: (path) => /claude\.cmd$/i.test(String(path)),
+  });
+  check("a claude.cmd shim is not accepted as the native shell-free handoff executable",
+    cmdOnly.installed === false && cmdOnly.executable === null,
+    JSON.stringify(cmdOnly));
   const offPath = checkClaudeCode({
     runCommand: healthyTool,
     platformName: "win32",
@@ -75,12 +82,25 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     existsImpl: existsWindowsClaude,
     runPowerShell: (command, args, options) => {
       pathRepairCall = { command, args, options };
-      return { status: 0, stdout: "", stderr: "" };
+      return { status: 0, stdout: "BRAIN_CLAUDE_PATH_OK", stderr: "" };
     },
   });
   check("brain tools can persist the missing Windows Claude directory without discarding PATH",
     repaired.status === "updated" && windowsEnvironment.PATH.startsWith("C:\\Users\\Fixture\\.local\\bin;") &&
       windowsEnvironment.PATH.includes("C:\\Existing Tools"), JSON.stringify(repaired));
+  const falseGreenRepair = persistWindowsClaudePath({
+    platformName: "win32",
+    environment: {
+      USERPROFILE: "C:\\Users\\Fixture",
+      SystemRoot: "C:\\Windows",
+      PATH: "C:\\Windows\\System32",
+    },
+    existsImpl: existsWindowsClaude,
+    runPowerShell: () => ({ status: 0, stdout: "", stderr: "" }),
+  });
+  check("an exit-zero PATH write without the durable readback marker fails closed",
+    falseGreenRepair.status === "failed" && falseGreenRepair.issue_code === "CLAUDE_PATH_UPDATE_FAILED",
+    JSON.stringify(falseGreenRepair));
   check("the PATH repair child is credential-scrubbed and shell-free",
     pathRepairCall.options.shell === false && pathRepairCall.options.env.CLOUDFLARE_API_TOKEN === undefined &&
       /SetEnvironmentVariable/.test(pathRepairCall.args.at(-1)) && !/\bsetx\b/i.test(pathRepairCall.args.at(-1)),
@@ -94,10 +114,10 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     }).status === OK);
   const dpapiPassed = checkWindowsCredentialProtection({
     platformName: "win32",
-    probe: () => ({ passed: true, rounds: 3, stage: null }),
+    probe: ({ rounds }) => ({ passed: true, rounds, stage: null }),
   });
-  check("Windows doctor requires several DPAPI round trips without claiming a rate",
-    dpapiPassed.status === OK && /3 in-memory DPAPI/i.test(dpapiPassed.detail) && !/\d+\s*\/\s*\d+/.test(dpapiPassed.detail),
+  check("Windows doctor requires 25 DPAPI round trips without claiming a rate",
+    dpapiPassed.status === OK && /25 in-memory DPAPI/i.test(dpapiPassed.detail) && !/\d+\s*\/\s*\d+/.test(dpapiPassed.detail),
     JSON.stringify(dpapiPassed));
   const dpapiFailed = checkWindowsCredentialProtection({
     platformName: "win32",

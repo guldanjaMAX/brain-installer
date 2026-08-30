@@ -16,6 +16,7 @@
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
+import { renderCopyableCommand } from "./command-display.mjs";
 
 export const TECHNICIAN_STATUS_SCHEMA_VERSION = 1;
 export const TECHNICIAN_STATUS_BASENAME = ".financial-brain-technician-status.json";
@@ -40,42 +41,42 @@ export const TECHNICIAN_STEPS = Object.freeze([
     title: "Configure the Plaid bank feed",
     dashboard_url: "https://dashboard.plaid.com/",
     human_boundary: "The client owns the Plaid account, chooses Sandbox or Production, registers this Brain's return address, and enters the Plaid client ID, secret, and independently stored bank wrapping key only into hidden terminal prompts.",
-    automated_proof: "The installer passes the three values to one short-lived secrets child, reads back Worker secret names without values, and leaves account authorization to the bank account holder in Plaid Link.",
+    automated_proof: "Deferred from the public first-install path. Offline protocol tests do not prove secure live credential custody or Plaid Link acceptance.",
   }),
   Object.freeze({
     id: "google",
     title: "Connect Google Drive, Gmail, and Calendar",
     dashboard_url: "https://console.cloud.google.com/apis/credentials",
     human_boundary: "The owner chooses or creates the Google project and approves the OAuth consent screen in their browser.",
-    automated_proof: "The connector stores the refresh grant locally and dry-runs each requested Google source.",
+    automated_proof: "Deferred from the public first-install path. The current machine-global Google store and absent manifest-bound dry run do not satisfy multi-Brain custody proof.",
   }),
   Object.freeze({
     id: "quickbooks",
     title: "Connect the client's QuickBooks Online company",
     dashboard_url: "https://developer.intuit.com/app/developer/dashboard",
     human_boundary: "The client creates and owns the Intuit app, enters its values only at hidden prompts, and authorizes their sandbox company in the browser. Intuit grants its broad Accounting permission; Financial Brain uses read/query calls only, but the provider scope itself is not read-only.",
-    automated_proof: "The sandbox-only localhost OAuth flow binds the company to the explicit source, stores the connection in the client's local provider credential store, and prints the exact dry-run and first-ingest commands. Production remains unavailable until the client-owned HTTPS callback and local handoff are implemented.",
+    automated_proof: "Deferred from the public first-install path. Offline source-binding tests passed, but a real Intuit Sandbox company ceremony and client-owned production callback remain open.",
   }),
   Object.freeze({
     id: "zoom",
     title: "Connect Zoom cloud transcripts",
     dashboard_url: "https://marketplace.zoom.us/develop/create",
     human_boundary: "A Zoom admin creates a Server-to-Server OAuth app, grants the recording scope, and later saves the verified webhook subscription.",
-    automated_proof: "The connector probes the account and plan, writes Worker secrets, proves the live webhook challenge, and only then prints the URL to save.",
+    automated_proof: "Deferred from the public first-install path until the credential handoff avoids child environments and a real Zoom account completes the field gate.",
   }),
   Object.freeze({
     id: "imap",
     title: "Connect an IMAP mailbox",
     dashboard_url: null,
     human_boundary: "The mailbox owner creates an app password in their provider and enters it only into the hidden terminal prompt.",
-    automated_proof: "The connector performs a real read before storing the app password locally.",
+    automated_proof: "Deferred from the public first-install path pending the real mailbox field gate.",
   }),
   Object.freeze({
     id: "passkey",
     title: "Enroll the owner passkey",
     dashboard_url: null,
     human_boundary: "The owner opens the 15-minute link on their device and completes Face ID, fingerprint, or device PIN on the final Brain hostname.",
-    automated_proof: "The live Brain records privacy-safe ceremony outcome and timing. A local rehearsal cannot prove the physical-device ceremony.",
+    automated_proof: "The technician wrapper never mints or prints the one-time link. The owner completes that action in a directly controlled terminal and display; final verification requires an enrolled device from the deployed Brain.",
   }),
   Object.freeze({
     id: "verify",
@@ -87,6 +88,9 @@ export const TECHNICIAN_STEPS = Object.freeze([
 ]);
 
 export const TECHNICIAN_RUN_STEPS = Object.freeze(TECHNICIAN_STEPS.map((step) => step.id));
+export const DEFERRED_PUBLIC_CONNECTOR_STEPS = Object.freeze([
+  "plaid", "google", "quickbooks", "zoom", "imap",
+]);
 
 function cliLocator(cli) {
   if (!cli?.command || !Array.isArray(cli.args)) return null;
@@ -96,11 +100,9 @@ function cliLocator(cli) {
   });
 }
 
-function exactCommand(cli, args) {
+function exactCommand(cli, args, platformName = process.platform) {
   if (!cli) return null;
-  return [cli.command, ...cli.args, ...args]
-    .map((value) => JSON.stringify(String(value)))
-    .join(" ");
+  return renderCopyableCommand(cli.command, [...cli.args, ...args], { platformName });
 }
 
 export function technicianStatusFilePath(manifestPath) {
@@ -136,7 +138,7 @@ function safeLastStepStatus(manifestPath, deps = {}) {
         : null,
       retry_safe: parsed.retry_safe === true,
       requires_human: parsed.requires_human === true,
-      proof_level: parsed.proof_level === "command_return_only"
+      proof_level: ["command_return_only", "live_data_plane_postconditions"].includes(parsed.proof_level)
         ? parsed.proof_level
         : "not_verified",
     });
@@ -157,6 +159,8 @@ export function buildTechnicianStepStatus({
   succeeded,
   error = null,
   statusFile = null,
+  proofLevel = "command_return_only",
+  proof = null,
 } = {}) {
   if (!TECHNICIAN_RUN_STEPS.includes(step) || !manifestPath) {
     throw new TypeError("technician status needs a reviewed step and manifest path");
@@ -165,10 +169,6 @@ export function buildTechnicianStepStatus({
   if (!locator) throw new TypeError("technician status needs the exact package-local CLI locator");
   const manifest = resolve(manifestPath);
   const refreshArgs = [...locator.args, "technician", manifest, "--json"];
-  const refreshCommand = exactCommand(
-    Object.freeze({ command: locator.command, args: locator.args }),
-    ["technician", manifest, "--json"],
-  );
   const uncertain = error?.uncertain === true || error?.code === "oauth_response_uncertain";
   const retryableCodes = new Set([
     "MANIFEST_NOT_FOUND",
@@ -186,7 +186,7 @@ export function buildTechnicianStepStatus({
     issue_code: issueCode,
     retry_safe: succeeded ? false : (!uncertain && retryableCodes.has(issueCode)),
     requires_human: succeeded ? false : true,
-    next_action: `Run the credential-free read-only status refresh exactly: ${refreshCommand}. Do not continue from this receipt alone.`,
+    next_action: "Run the credential-free read-only refresh using refresh.command with exactly refresh.args. Do not continue from this receipt alone or reconstruct a shell command from these fields.",
     manifest: Object.freeze({ path: manifest }),
     cli: locator,
     refresh: Object.freeze({
@@ -195,9 +195,16 @@ export function buildTechnicianStepStatus({
       mutates_external_state: false,
     }),
     status_file: statusFile ? resolve(statusFile) : null,
-    proof_level: "command_return_only",
+    proof_level: succeeded && proofLevel === "live_data_plane_postconditions"
+      ? "live_data_plane_postconditions"
+      : "command_return_only",
+    ...(succeeded && proofLevel === "live_data_plane_postconditions" && proof
+      ? { proof }
+      : {}),
     proof_warning: succeeded
-      ? "The selected command returned without an error, but live state was not inferred from its exit code or the manifest."
+      ? proofLevel === "live_data_plane_postconditions"
+        ? "The deployed health, source freshness, and enrolled-device postconditions were checked live. This receipt stores aggregate state only."
+        : "The selected command returned without an error, but live state was not inferred from its exit code or the manifest."
       : "The selected command did not complete. Review this issue and the refreshed plan before deciding whether the same step is safe to retry.",
     boundaries: Object.freeze({
       status_refresh: "agent_safe",
@@ -296,10 +303,15 @@ export function technicianPlan(manifestPath, deps = {}) {
     cli,
     refresh,
     last_step: safeLastStepStatus(manifest.path, deps),
-    warning: "This plan prepares the workflow. Live proof arrives during the account, connector, webhook, mailbox, and physical passkey checks.",
+    warning: "This plan prepares the public first-install workflow. Live proof arrives only from the deployed health, source-freshness, and physical passkey checks.",
     coverage: {
-      guided_steps: [...TECHNICIAN_RUN_STEPS],
+      guided_steps: TECHNICIAN_RUN_STEPS.filter((step) => !DEFERRED_PUBLIC_CONNECTOR_STEPS.includes(step)),
       not_guided_in_this_release: [
+        "Plaid connector ceremony",
+        "Google connector ceremony",
+        "QuickBooks connector ceremony",
+        "Zoom connector ceremony",
+        "IMAP connector ceremony",
         "Slack connector ceremony",
         "Notion connector ceremony",
         "Microsoft 365 connector ceremony",
@@ -356,10 +368,15 @@ export function technicianPlan(manifestPath, deps = {}) {
       if (step.id === "passkey" && manifest.exists && !manifest.final_hostname) {
         state = "waiting_for_final_hostname";
       }
+      if (DEFERRED_PUBLIC_CONNECTOR_STEPS.includes(step.id)) {
+        state = "deferred_from_public_first_install";
+      }
       return {
         order: index + 1,
         ...step,
-        command: technicianDisplayCommand(step.id, manifest.path, cli),
+        command: DEFERRED_PUBLIC_CONNECTOR_STEPS.includes(step.id)
+          ? null
+          : technicianDisplayCommand(step.id, manifest.path, cli),
         state,
         ...(step.id === "quickbooks"
           ? {
@@ -372,19 +389,19 @@ export function technicianPlan(manifestPath, deps = {}) {
   };
 }
 
-export function technicianDisplayCommand(step, manifestPath, cli = null) {
+export function technicianDisplayCommand(step, manifestPath, cli = null, platformName = process.platform) {
   const path = resolve(manifestPath);
   if (!cli) {
-    const quoted = JSON.stringify(path);
-    if (step === "google") return `<brain-cli> technician ${quoted} --run google`;
-    if (step === "imap") return `<brain-cli> technician ${quoted} --run imap --host <imap-host> --user <email-address>`;
-    if (step === "passkey") return `<brain-cli> technician ${quoted} --run passkey --confirm-host <final-hostname>`;
-    return `<brain-cli> technician ${quoted} --run ${step}`;
+    const placeholder = Object.freeze({ command: "<brain-cli>", args: Object.freeze([]) });
+    if (step === "google") return exactCommand(placeholder, ["technician", path, "--run", "google"], platformName);
+    if (step === "imap") return exactCommand(placeholder, ["technician", path, "--run", "imap", "--host", "<imap-host>", "--user", "<email-address>"], platformName);
+    if (step === "passkey") return exactCommand(placeholder, ["technician", path, "--run", "passkey", "--confirm-host", "<final-hostname>"], platformName);
+    return exactCommand(placeholder, ["technician", path, "--run", step], platformName);
   }
-  if (step === "google") return exactCommand(cli, ["technician", path, "--run", "google"]);
-  if (step === "imap") return `${exactCommand(cli, ["technician", path, "--run", "imap"])} --host <imap-host> --user <email-address>`;
-  if (step === "passkey") return `${exactCommand(cli, ["technician", path, "--run", "passkey"])} --confirm-host <final-hostname>`;
-  return exactCommand(cli, ["technician", path, "--run", step]);
+  if (step === "google") return exactCommand(cli, ["technician", path, "--run", "google"], platformName);
+  if (step === "imap") return exactCommand(cli, ["technician", path, "--run", "imap", "--host", "<imap-host>", "--user", "<email-address>"], platformName);
+  if (step === "passkey") return exactCommand(cli, ["technician", path, "--run", "passkey", "--confirm-host", "<final-hostname>"], platformName);
+  return exactCommand(cli, ["technician", path, "--run", step], platformName);
 }
 
 export function renderTechnicianPlan(plan) {
@@ -407,7 +424,8 @@ export function renderTechnicianPlan(plan) {
     lines.push(`${step.order}. ${step.title}`);
     if (step.state !== "not_checked") lines.push(`   State: ${step.state.replaceAll("_", " ")}`);
     lines.push(`   ${step.human_boundary}`);
-    lines.push(`   Run: ${step.command}`);
+    if (step.command) lines.push(`   Run: ${step.command}`);
+    else lines.push("   No public first-install command is available for this deferred connector ceremony.");
     if (step.dashboard_url) lines.push(`   Dashboard: ${step.dashboard_url}`);
     lines.push("");
   }
@@ -433,13 +451,11 @@ function childCommands(step, manifestPath, flags, scriptPath) {
       if (flags.source) args.push("--source", String(flags.source));
       return [command(...args)];
     }
-    case "passkey": return [command("invite", path)];
-    case "verify": return [
-      command("doctor", path),
-      command("health", path),
-      command("sources", path),
-      command("devices", path),
-    ];
+    case "passkey": throw codedError(
+      "Passkey invite creation is owner-only. Open a terminal you control directly, run the package-local `brain invite` command there, and keep the one-time link out of AI chat, captured sessions, logs, screenshots, and status files. Then rerun the final verification step to prove an enrolled device exists.",
+      "passkey_human_terminal_required",
+    );
+    case "verify": return [];
     default: throw new Error(`--run accepts one of: ${TECHNICIAN_RUN_STEPS.join(", ")}`);
   }
 }
@@ -484,6 +500,7 @@ export async function runTechnicianStep({
   nodePath = process.execPath,
   manifestDeps = {},
   connectProvider = null,
+  verifyInstallation = null,
 } = {}) {
   if (!TECHNICIAN_RUN_STEPS.includes(step)) {
     throw new Error(`--run accepts one of: ${TECHNICIAN_RUN_STEPS.join(", ")}`);
@@ -606,7 +623,10 @@ export async function runTechnicianStep({
         safeError.name = error?.name || safeError.name;
         throw safeError;
       }
-      const quotedManifest = JSON.stringify(resolve(manifestPath));
+      const launcher = Object.freeze({
+        command: resolve(nodePath),
+        base_args: Object.freeze([resolve(scriptPath)]),
+      });
       return {
         step,
         completed: true,
@@ -615,10 +635,20 @@ export async function runTechnicianStep({
         custody: "client_local_provider_store",
         financial_authority: false,
         oauth_permission: "broad_accounting_scope_runtime_read_only",
-        verification_commands: [
-          `<brain-cli> ingest ${quotedManifest} --from quickbooks --dry-run`,
-          `<brain-cli> ingest ${quotedManifest} --from quickbooks`,
-        ],
+        verification: Object.freeze([
+          Object.freeze({
+            purpose: "dry_run",
+            command: launcher.command,
+            args: Object.freeze([...launcher.base_args, "ingest", resolve(manifestPath), "--from", "quickbooks", "--dry-run"]),
+            mutates_external_state: false,
+          }),
+          Object.freeze({
+            purpose: "first_ingest_after_owner_review",
+            command: launcher.command,
+            args: Object.freeze([...launcher.base_args, "ingest", resolve(manifestPath), "--from", "quickbooks"]),
+            mutates_external_state: true,
+          }),
+        ]),
       };
     }
     if (step === "zoom") {
@@ -638,6 +668,22 @@ export async function runTechnicianStep({
     childEnv = technicianChildEnvironment(baseEnv, explicitEnv);
     const commands = childCommands(step, manifestPath, flags, resolve(scriptPath));
     for (const args of commands) runOne(spawn, nodePath, args, childEnv);
+    if (step === "verify") {
+      if (typeof verifyInstallation !== "function") {
+        throw codedError(
+          "the final handoff verifier is unavailable. No live source or passkey postcondition was inferred from child exit codes.",
+          "handoff_verifier_unavailable",
+        );
+      }
+      const proof = await verifyInstallation({ manifestPath });
+      return {
+        step,
+        completed: true,
+        commands_run: commands.length,
+        proof_level: "live_data_plane_postconditions",
+        proof,
+      };
+    }
     return { step, completed: true, commands_run: commands.length };
   } finally {
     for (const buffer of secretBuffers) buffer.fill(0);
