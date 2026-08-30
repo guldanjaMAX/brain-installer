@@ -53,7 +53,7 @@ const read = async (name) => extract(bytes(name), name);
       got.how === "yaml",
     JSON.stringify(got));
   check("YAML indentation is preserved for retrieval context",
-    got.text?.includes("\n  review_every_days: 30\n"), got.text);
+    /(?:^|\r?\n)  review_every_days: 30(?:\r?\n|$)/.test(got.text || ""), got.text);
 }
 
 /* ================= transcripts (.vtt) ================= */
