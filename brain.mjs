@@ -9754,9 +9754,9 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   // Every batch landed, so it is now safe to say "we have everything up to
   // here". sendBatches dies rather than returning on a failure, so reaching
   // this line is the proof.
-  const remoteCursorCanAdvance = sourceCursorCanAdvance(tally) && (which === "drive" || (
-    tally.refused === 0 && coverageGaps === 0 && incompleteKeys.size === 0
-  ));
+  const remoteCursorCanAdvance = sourceCursorCanAdvance(tally) &&
+    tally.refused === 0 && coverageGaps === 0 && incompleteKeys.size === 0 &&
+    (which !== "drive" || driveRetainedExisting === 0);
   if (pendingCursor && remoteCursorCanAdvance) {
     state[pendingCursor.key] = pendingCursor.value;
     Object.assign(state, pendingCursor.statePatch || {});

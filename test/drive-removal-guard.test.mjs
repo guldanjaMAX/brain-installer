@@ -35,6 +35,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = join(HERE, "..", "brain.mjs");
 const DRIVE_GUARD_FETCH = pathToFileURL(join(HERE, "fixtures", "drive-removal-guard-fetch.mjs")).href;
 const DRIVE_ACTIVE_SKIP_FETCH = pathToFileURL(join(HERE, "fixtures", "drive-active-skip-fetch.mjs")).href;
+const DRIVE_INCOMPLETE_FETCH = pathToFileURL(join(HERE, "fixtures", "drive-incomplete-cli-fetch.mjs")).href;
 const LOCAL_RESUME_FETCH = pathToFileURL(join(HERE, "fixtures", "local-resume-integrity-fetch.mjs")).href;
 
 const CATEGORIES = ["source_policy", "source_deleted", "intentional_skip"];
@@ -655,8 +656,8 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
 
     const completed = run(["--approve-removals", approval]);
     assert.equal(completed.code, 1, completed.output.slice(-1_200));
-    assert.match(completed.output, /refused coverage|retained but unverified/i);
     assert.match(completed.output, /1 active Drive file\(s\) retain an existing Brain copy/i);
+    assert.match(completed.output, /finished with refused coverage/i);
     evidence = readEvidence();
     assert.equal(evidence.forgetRequests, 2, "source deletion and intentional skips were not separated");
     assert.equal(evidence.removedFamilies, 3, "only missing, known-stale and sensitive families should be removed");
@@ -666,7 +667,7 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     assert.equal(evidence.receipts.error, 2, "both the review stop and retained completion should be explicit errors");
 
     state = readState();
-    assert.equal(state.sync_token, "fixture-skip-next-cursor");
+    assert.equal(state.sync_token, priorCursor, "active Drive skips advanced the source cursor");
     assert.deepEqual(Object.keys(state.drive_retained_existing), ["drive:active-migrated"]);
     assert.equal(state.done["drive:active-migrated"], undefined);
     assert.equal(state.done["drive:active-stale"], undefined);
@@ -676,16 +677,174 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
 
     const noChange = run();
     assert.equal(noChange.code, 1, noChange.output.slice(-1_200));
+    assert.match(noChange.output, /finished with refused coverage/i);
     evidence = readEvidence();
     assert.equal(evidence.forgetRequests, 2, "a no-change rooted revalidation invented another removal");
     assert.equal(evidence.inventoryReads, 4, "a rooted revalidation did not compare against stored source truth");
     assert.equal(evidence.receipts.ready, 0, "a no-change run erased retained-source health");
     assert.equal(evidence.receipts.error, 3);
     state = readState();
-    assert.equal(state.sync_token, "fixture-skip-next-cursor");
+    assert.equal(state.sync_token, priorCursor, "a repeated active Drive gap advanced the source cursor");
     assert.deepEqual(Object.keys(state.drive_retained_existing), ["drive:active-migrated"]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+/*
+ * A Drive extractor can accept useful text without accepting the whole source
+ * document. Exercise the actual CLI so the envelope marker, resume receipt,
+ * source receipt, cursor decision and process exit cannot drift independently.
+ * A separate policy-only sweep proves an owner-reviewed exclusion is not
+ * mislabeled as missing coverage and is never downloaded.
+ */
+{
+  const stripAnsi = (value) => String(value || "").replace(/\x1b\[[0-9;]*m/g, "");
+  const baseEnvironment = {};
+  for (const name of ["PATH", "Path", "PATHEXT", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR"]) {
+    if (process.env[name] !== undefined) baseEnvironment[name] = process.env[name];
+  }
+
+  const runCase = (mode) => {
+    const directory = mkdtempSync(join(tmpdir(), `brain-drive-${mode}-coverage-`));
+    const manifestPath = join(directory, "fixture.manifest.json");
+    const statePath = join(directory, ".brain-ingest-drive.json");
+    const evidencePath = join(directory, "drive-evidence.json");
+    const userRoot = join(directory, "isolated-user-root");
+    const tokenRoot = join(userRoot, ".brain");
+    const priorCursor = `fixture-${mode}-prior-cursor`;
+    const excludeFileIds = mode === "policy" ? ["policy-file"] : [];
+    const scannerFingerprint = credentialScannerFingerprint(true);
+    const policyFingerprint = drivePolicyFingerprint({
+      rootFolderIds: ["fixture-root"],
+      excludeFileIds,
+      excludePaths: [],
+      excludeNameParts: [],
+      privatePrefixes: [],
+    }, true);
+
+    mkdirSync(tokenRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(manifestPath, JSON.stringify({
+      client: { slug: "fixture" },
+      brain: { domain: "fixture.invalid" },
+      infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
+      safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
+      corpora: {
+        google_drive: {
+          enabled: true,
+          root_folder_ids: ["fixture-root"],
+          exclude_file_ids: excludeFileIds,
+        },
+      },
+    }));
+    writeFileSync(join(tokenRoot, "google-tokens.json"), JSON.stringify({
+      google: {
+        client_id: "fixture-client",
+        client_secret: null,
+        refresh_token: "fixture-refresh",
+        scopes: ["drive"],
+      },
+    }), { mode: 0o600 });
+    writeFileSync(statePath, JSON.stringify({
+      version: 1,
+      done: {},
+      skipped: {},
+      sync_token: priorCursor,
+      drive_policy_fingerprint: policyFingerprint,
+      credential_scanner_fingerprint: scannerFingerprint,
+      drive_last_full_sweep_at: "2000-01-01T00:00:00.000Z",
+    }), { mode: 0o600 });
+
+    const environment = {
+      ...baseEnvironment,
+      NO_COLOR: "1",
+      ADMIN_KEY: "fixture-admin",
+      BRAIN_GOOGLE_TOKEN_STORE: "file",
+      BRAIN_DRIVE_INCOMPLETE_MODE: mode,
+      BRAIN_DRIVE_INCOMPLETE_EVIDENCE: evidencePath,
+      BRAIN_DRIVE_INCOMPLETE_USER_ROOT: userRoot,
+    };
+    const run = () => {
+      const result = spawnSync(process.execPath, [
+        "--import", DRIVE_INCOMPLETE_FETCH,
+        CLI, "ingest", manifestPath, "--from", "drive",
+      ], { encoding: "utf8", env: environment, timeout: 30_000 });
+      assert.equal(result.error, undefined, String(result.error || ""));
+      assert.equal(result.signal, null, `${mode} Drive CLI was terminated by ${result.signal}`);
+      return { code: result.status, output: stripAnsi(`${result.stdout || ""}${result.stderr || ""}`) };
+    };
+    return {
+      directory,
+      statePath,
+      evidencePath,
+      priorCursor,
+      run,
+      readState: () => JSON.parse(readFileSync(statePath, "utf8")),
+      readEvidence: () => JSON.parse(readFileSync(evidencePath, "utf8")),
+    };
+  };
+
+  const incomplete = runCase("incomplete");
+  try {
+    const first = incomplete.run();
+    assert.equal(first.code, 1, first.output.slice(-2_000));
+    assert.match(first.output, /source cursor was NOT advanced/i);
+    assert.match(first.output, /1 incomplete extraction/i);
+    assert.match(first.output, /finished with partial coverage/i);
+
+    let state = incomplete.readState();
+    assert.equal(state.sync_token, incomplete.priorCursor, "an incomplete extraction advanced the Drive cursor");
+    assert.equal(typeof state.done["drive:incomplete-sheet"], "string", "accepted Drive work was not resumable");
+    assert.equal(state.extraction_incomplete["drive:incomplete-sheet"], true);
+
+    let evidence = incomplete.readEvidence();
+    assert.equal(evidence.exports, 1);
+    assert.ok(evidence.ingest_batches > 0);
+    assert.ok(evidence.ingested_documents > 0);
+    assert.equal(evidence.incomplete_envelopes, evidence.ingested_documents);
+    const acceptedBatchCount = evidence.ingest_batches;
+    const acceptedDocumentCount = evidence.ingested_documents;
+    assert.deepEqual(evidence.stored_families, ["drive:incomplete-sheet"]);
+    assert.deepEqual(evidence.receipts, { indexing: 1, error: 1, ready: 0 });
+    assert.equal(evidence.last_final_receipt.status, "error");
+    assert.equal(evidence.last_final_receipt.walk_complete, false);
+    assert.match(evidence.last_final_receipt.error, /1 incomplete extraction/i);
+
+    // The accepted revision is cheap to resume but must remain visibly partial
+    // until a future complete extraction replaces its stored marker.
+    const resumed = incomplete.run();
+    assert.equal(resumed.code, 1, resumed.output.slice(-2_000));
+    assert.match(resumed.output, /1 incomplete extraction/i);
+    assert.match(resumed.output, /finished with partial coverage/i);
+    state = incomplete.readState();
+    assert.equal(state.sync_token, incomplete.priorCursor, "an unchanged incomplete receipt advanced the Drive cursor");
+    assert.equal(state.extraction_incomplete["drive:incomplete-sheet"], true);
+    evidence = incomplete.readEvidence();
+    assert.equal(evidence.exports, 1, "resume re-exported an unchanged incomplete Drive revision");
+    assert.equal(evidence.ingest_batches, acceptedBatchCount, "resume resent an unchanged incomplete Drive revision");
+    assert.equal(evidence.ingested_documents, acceptedDocumentCount, "resume duplicated an incomplete Drive family");
+    assert.deepEqual(evidence.receipts, { indexing: 2, error: 2, ready: 0 });
+  } finally {
+    rmSync(incomplete.directory, { recursive: true, force: true });
+  }
+
+  const policy = runCase("policy");
+  try {
+    const completed = policy.run();
+    assert.equal(completed.code, 0, completed.output.slice(-2_000));
+    assert.doesNotMatch(completed.output, /partial coverage/i);
+    const state = policy.readState();
+    assert.equal(state.sync_token, "fixture-policy-next-cursor");
+    assert.match(state.skipped["drive:policy-file"], /reviewed file-id policy/i);
+    const evidence = policy.readEvidence();
+    assert.equal(evidence.ingest_batches, 0);
+    assert.equal(evidence.unexpected_content_fetches, 0, "the excluded Drive file was downloaded");
+    assert.deepEqual(evidence.receipts, { indexing: 1, error: 0, ready: 1 });
+    assert.equal(evidence.last_final_receipt.status, "ready");
+    assert.equal(evidence.last_final_receipt.walk_complete, true);
+    assert.match(evidence.last_final_receipt.detail, /policy_skipped=1; coverage_gaps=0/i);
+  } finally {
+    rmSync(policy.directory, { recursive: true, force: true });
   }
 }
 
