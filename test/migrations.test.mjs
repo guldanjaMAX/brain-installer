@@ -190,6 +190,67 @@ for (const trigger of ["vector_outbox_generation_ai", "vector_outbox_generation_
   legacy.close();
 }
 
+/* ---- 0031 keeps owner bank previews bounded, content-free, and single-use ---- */
+{
+  const ownerImportDb = new DatabaseSync(":memory:");
+  for (const file of files) {
+    for (const statement of splitStatements(readFileSync(join(DIR, file), "utf-8"))) {
+      ownerImportDb.exec(statement);
+    }
+  }
+  const previewColumns = new Set(ownerImportDb.prepare(
+    "PRAGMA table_info(owner_bank_import_previews)",
+  ).all().map((row) => row.name));
+  check("0031 stores only a bank preview binding, never raw bytes or a file name",
+    ["preview_id", "tenant_id", "preview_hash", "content_sha256", "content_bytes",
+      "entity_slug", "source_doc_uid", "created_at", "expires_at"].every((name) => previewColumns.has(name)) &&
+      ![...previewColumns].some((name) => /raw|body|content_base64|file_name|mapping/.test(name)),
+    [...previewColumns].join(", "));
+
+  // Every 0031 statement is inherently restart-safe. The real migration
+  // runner may resume at any statement boundary without inventing a second
+  // preview or weakening the single-use constraint.
+  for (const statement of splitStatements(
+    readFileSync(join(DIR, "0031_owner_bank_import.sql"), "utf-8"),
+  )) ownerImportDb.exec(statement);
+  check("0031 raw replay is inherently idempotent", true);
+
+  const hexA = "a".repeat(64);
+  const hexB = "b".repeat(64);
+  ownerImportDb.prepare(
+    `INSERT INTO owner_bank_import_previews
+       (preview_id,tenant_id,preview_hash,content_sha256,content_bytes,entity_slug,
+        source_doc_uid,created_at,expires_at)
+     VALUES ('bank_preview_fixture','primary',?,?,128,'acme','owner-bank:fixture',
+             '2026-08-30T10:00:00.000Z','2026-08-30T10:15:00.000Z')`,
+  ).run(hexA, hexB);
+  ownerImportDb.prepare(
+    `INSERT INTO owner_bank_import_commits (tenant_id,preview_id,request_id,committed_at)
+     VALUES ('primary','bank_preview_fixture','request_one','2026-08-30T10:01:00.000Z')`,
+  ).run();
+  let secondConsumerRefused = false;
+  try {
+    ownerImportDb.prepare(
+      `INSERT INTO owner_bank_import_commits (tenant_id,preview_id,request_id,committed_at)
+       VALUES ('primary','bank_preview_fixture','request_two','2026-08-30T10:02:00.000Z')`,
+    ).run();
+  } catch { secondConsumerRefused = true; }
+  check("one preview can be consumed by exactly one owner request", secondConsumerRefused);
+
+  let malformedHashRefused = false;
+  try {
+    ownerImportDb.prepare(
+      `INSERT INTO owner_bank_import_previews
+         (preview_id,tenant_id,preview_hash,content_sha256,content_bytes,entity_slug,
+          source_doc_uid,created_at,expires_at)
+       VALUES ('bank_preview_bad','primary','not-a-hash',?,128,'acme','owner-bank:bad',
+               '2026-08-30T10:00:00.000Z','2026-08-30T10:15:00.000Z')`,
+    ).run(hexB);
+  } catch { malformedHashRefused = true; }
+  check("0031 refuses an unbound preview hash", malformedHashRefused);
+  ownerImportDb.close();
+}
+
 /* queued_at is allowed to collide; the database-owned generation is not. */
 {
   db.prepare(

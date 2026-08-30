@@ -15,6 +15,11 @@ import {
   decodeUploadBase64, extractOwnerUpload, OWNER_BINARY_MEDIA,
   OWNER_BINARY_UPLOAD_MAX_BYTES, OWNER_EXTRACTED_TEXT_MAX_BYTES, OWNER_IMAGE_UPLOAD_MAX_BYTES,
 } from "./upload-extract.js";
+import {
+  handleOwnerBankImport,
+  OWNER_BANK_IMPORT_CAPABILITIES_PATH,
+  OWNER_BANK_IMPORT_PATH_PREFIX,
+} from "./owner-bank-import.js";
 
 export const OWNER_PATH_PREFIX = "/api/owner/";
 export const OWNER_TENANT = "primary";
@@ -44,6 +49,7 @@ const ACTIVITY_TYPES = new Set([
   "document_grant_revoked", "passkey_added",
   "passkey_renamed", "passkey_revoked", "sessions_revoked",
   "support_access_created", "support_access_activated", "support_access_revoked",
+  "bank_import_completed",
 ]);
 const MEDIA_TYPE_EXTENSIONS = Object.freeze({
   "text/plain": Object.freeze([".txt"]),
@@ -1252,11 +1258,41 @@ async function preferenceSet(env, body) {
 }
 
 /** Route dispatcher mounted before the admin-key gate in index.js. */
-export async function handleOwnerActions(env, request, path, { ingestEnvelope, afterIngest, extractUpload } = {}) {
+export async function handleOwnerActions(env, request, path, {
+  ingestEnvelope,
+  afterIngest,
+  extractUpload,
+  afterBankImportCommit,
+  bankImportNow,
+} = {}) {
   if (request.method !== "POST") return respond({ error: "method not allowed" }, 405);
   const authFailure = await requireOwner(request, env);
   if (authFailure) return authFailure;
   if (path === "/api/owner/uploads/capabilities") return respond(UPLOAD_CAPABILITIES);
+  if (path === OWNER_BANK_IMPORT_CAPABILITIES_PATH) {
+    return handleOwnerBankImport(env, null, path);
+  }
+
+  // Bank preview and commit have their own migration/readiness contract. Route
+  // them before the general owner-workspace table probe so a missing or
+  // unavailable schema is reported as a bank-import outage, never as a vague
+  // empty workspace.
+  if (path.startsWith(OWNER_BANK_IMPORT_PATH_PREFIX)) {
+    const bankBody = await readBody(request);
+    if (!bankBody) return invalid("invalid_json_body");
+    if (env.VECTOR_DRAIN_MODE === "paused-for-upgrade") {
+      return unavailable("owner_writes_paused", { paused: true });
+    }
+    try {
+      return await handleOwnerBankImport(env, bankBody, path, {
+        validateEntity: validateOwnedEntityScope,
+        afterCommit: afterBankImportCommit,
+        now: bankImportNow,
+      });
+    } catch {
+      return unavailable("owner_bank_import_unavailable");
+    }
+  }
 
   try {
     if (!(await ownerWorkspaceInstalled(env))) {

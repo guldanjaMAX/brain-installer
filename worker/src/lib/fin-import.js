@@ -143,7 +143,7 @@ function locatorFor(envelope, part) {
  * Returns a receipt naming what landed and what could not be read. It never
  * throws for a bad row: a row the parser could not read is a row, not an error.
  */
-export async function importBankExport(env, envelope, {
+export function prepareBankExportImport(envelope, {
   tenantId = DEFAULT_TENANT,
   entitySlug = "primary",
   entityLabel = null,
@@ -151,7 +151,11 @@ export async function importBankExport(env, envelope, {
   origin = null,
 } = {}) {
   if (!envelope?.ok) {
-    return { imported: false, refused: true, reason: envelope?.refusal || "the export could not be read" };
+    return {
+      receipt: { imported: false, refused: true, reason: envelope?.refusal || "the export could not be read" },
+      statements: [],
+      transactionUids: [],
+    };
   }
   const stamp = nowIso(now);
   const source = normaliseOrigin(origin || {
@@ -172,6 +176,7 @@ export async function importBankExport(env, envelope, {
     unread_lines: 0,
     balance_snapshots: 0,
   };
+  const transactionUids = [];
 
   statements.push(entityStatement(tenantId, entitySlug, entityLabel, source, stamp));
 
@@ -207,14 +212,29 @@ export async function importBankExport(env, envelope, {
       const ordinal = (seen.get(shapeKey) || 0);
       seen.set(shapeKey, ordinal + 1);
       const uid = transactionUid(accountKey, txn, ordinal);
+      transactionUids.push(uid);
       if (txn.unparsedReason) receipt.unread_lines++;
       else receipt.transactions++;
       statements.push(transactionRow(tenantId, accountKey, uid, txn, statementRef, source, envelope, stamp));
     }
   }
+  return { receipt, statements, transactionUids };
+}
 
-  await runAll(env, statements);
-  return receipt;
+/**
+ * Execute the plan through the established ledger boundary.
+ *
+ * Owner-session imports use `prepareBankExportImport` directly so their
+ * single-use preview claim, all ledger rows, one activity event, and the
+ * response-loss receipt can share one D1 transaction. The operator and hosted
+ * feed paths continue through this function and keep their existing bounded
+ * multi-batch behavior.
+ */
+export async function importBankExport(env, envelope, options = {}) {
+  const plan = prepareBankExportImport(envelope, options);
+  if (!plan.receipt.imported) return plan.receipt;
+  await runAll(env, plan.statements);
+  return plan.receipt;
 }
 
 /* ------------------------------------------------------------ row builders */
