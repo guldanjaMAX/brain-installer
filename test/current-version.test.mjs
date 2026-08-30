@@ -18,6 +18,10 @@ assert.match(version, /^\d+\.\d+\.\d+$/, "package version must be a stable seman
 assert.equal(packageLock.version, version, "package-lock top-level version drifted");
 assert.equal(packageLock.packages?.[""]?.version, version, "package-lock root package version drifted");
 assert.equal(manifestTemplate.brain?.version, version, "manifest template version drifted");
+assert.equal(manifestTemplate.corpora?.upload?.enabled, false,
+  "the shipped manifest cannot enable a folder source before it names a folder");
+assert.notEqual(manifestTemplate.corpora?.local_folder?.source, "documents",
+  "the watched-folder default cannot collide with setup's first document source");
 assert.match(changelog, new RegExp(`^## ${version.replaceAll(".", "\\.")}$`, "m"), "changelog has no current-version heading");
 
 const releaseLinks = [...readme.matchAll(

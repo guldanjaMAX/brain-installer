@@ -4911,7 +4911,7 @@ export function assertNoIngestFailures(tally, { noun = "stored part" } = {}) {
  * The capture libraries count documents submitted to the Worker. The Worker
  * may still refuse one at its credential boundary. Preserve both numbers so a
  * sweep cannot turn "submitted" into "accepted", and expose that refusal as a
- * partial outcome even though it is an intentional security-policy result.
+ * non-complete outcome even though it is an intentional security-policy result.
  */
 export function unusableMessageRowCount(result) {
   const skipped = result?.rows_skipped;
@@ -12563,9 +12563,23 @@ export async function cmdSetup(manifestPath, options = {}) {
   const initialLoadSkipped = !folder;
   let initialLoadReceipt = null;
   if (folder && existsSync(folder)) {
+    let registration;
+    try {
+      const persistFolder = options.persistSetupFolder ?? persistSetupFolderRegistration;
+      registration = persistFolder(target, folder);
+    } catch (error) {
+      closePrompts();
+      die(
+        `setup could not save that folder as a resumable source: ${String(error?.message || error)}\n` +
+          "      Nothing was loaded. Fix the manifest source collision and rerun setup.",
+      );
+    }
     const priorArgv = process.argv;
     try {
-      process.argv = [process.argv[0], process.argv[1], "ingest", target, "--path", folder, "--source", "documents"];
+      process.argv = [
+        process.argv[0], process.argv[1], "ingest", target,
+        "--path", registration.path, "--source", registration.source,
+      ];
       initialLoadReceipt = await (options.cmdIngest ?? cmdIngest)(target);
     } finally {
       process.argv = priorArgv;
@@ -14875,6 +14889,63 @@ export function normalizeSetupFolderInput(value, { home = homedir() } = {}) {
     return join(String(home), ...parts);
   }
   return input;
+}
+
+/** Persist setup's first folder so the next `brain load` can actually resume it. */
+export function persistSetupFolderRegistration(manifestPath, folder) {
+  const path = resolve(String(folder || ""));
+  if (!folder || !path) throw new Error("the setup folder path is empty");
+  const { m } = loadManifest(manifestPath);
+  const corpora = m.corpora && typeof m.corpora === "object" && !Array.isArray(m.corpora)
+    ? m.corpora
+    : {};
+  const upload = corpora.upload && typeof corpora.upload === "object" && !Array.isArray(corpora.upload)
+    ? corpora.upload
+    : {};
+  const declared = uploadFoldersOf(upload);
+  const folders = declared.map((entry) => {
+    if (typeof entry.path !== "string" || !entry.path.trim()) {
+      throw new Error("corpora.upload contains a folder with no path");
+    }
+    return { path: entry.path, ...(entry.source ? { source: assertSourceName(entry.source) } : {}) };
+  });
+  const matching = folders.filter((entry) => resolve(entry.path) === path);
+  if (matching.length > 1) throw new Error("the setup folder is declared more than once under corpora.upload");
+
+  let source = matching[0]?.source || (matching.length ? "upload" : null);
+  if (!source) {
+    const claimedByUpload = new Set(folders.map((entry) => entry.source || "upload"));
+    for (let index = 0; index < 100; index += 1) {
+      const candidate = index === 0 ? "documents" : index === 1 ? "setup_documents" : `setup_documents_${index}`;
+      if (claimedByUpload.has(candidate)) continue;
+      const proposed = {
+        ...m,
+        corpora: {
+          ...corpora,
+          upload: { ...upload, enabled: true, folders: [...folders, { path, source: candidate }] },
+        },
+      };
+      if (!loadSourceNamespaceCollisions(proposed).has("upload")) {
+        source = candidate;
+        break;
+      }
+    }
+    if (!source) throw new Error("no collision-free source name was available for the setup folder");
+    folders.push({ path, source });
+  }
+
+  const updated = {
+    ...m,
+    corpora: { ...corpora, upload: { ...upload, enabled: true, folders } },
+  };
+  const collisions = loadSourceNamespaceCollisions(updated).get("upload") || [];
+  if (collisions.length) {
+    throw new Error(
+      `the folder source "${source}" is already owned by ${collisions[0].owners.join(" and ")}`,
+    );
+  }
+  saveManifest(manifestPath, updated);
+  return Object.freeze({ path, source });
 }
 
 async function cmdSetupInteractive(manifestPath) {

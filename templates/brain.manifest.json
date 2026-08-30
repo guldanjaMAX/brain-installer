@@ -215,8 +215,8 @@
       "object_types": ["contacts", "companies", "deals"]
     },
     "upload": {
-      "_comment": "Manual drop zone. Always on: it is the fallback for anything with no connector.",
-      "enabled": true
+      "_comment": "Manual drop zone. Setup enables and records it after a folder is chosen; until then there is no folder to load.",
+      "enabled": false
     },
     "local_folder": {
       "_comment": [
@@ -235,7 +235,7 @@
       ],
       "enabled": false,
       "path": null,
-      "source": "documents"
+      "source": "watched_documents"
     },
     "bank_feed": {
       "_comment": [

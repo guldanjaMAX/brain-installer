@@ -23,6 +23,7 @@ import {
   cmdMigrate,
   cmdSetup,
   normalizeSetupFolderInput,
+  persistSetupFolderRegistration,
   persistWorkersDevDomain,
   setupManifestTarget,
 } from "../brain.mjs";
@@ -39,6 +40,34 @@ assert.equal(setupManifestTarget("--no-connect", { "no-connect": true }), "./bra
 assert.equal(setupManifestTarget("--manifest", { manifest: "chosen.manifest.json" }), "chosen.manifest.json");
 assert.equal(normalizeSetupFolderInput('"C:\\Users\\Owner\\Brain Files"'), "C:\\Users\\Owner\\Brain Files");
 assert.equal(normalizeSetupFolderInput("~/Brain Files", { home: "/Users/Owner" }), "/Users/Owner/Brain Files");
+
+{
+  const registrationRoot = mkdtempSync(join(tmpdir(), "brain-setup-folder-registration-"));
+  try {
+    const manifest = join(registrationRoot, "brain.manifest.json");
+    const first = join(registrationRoot, "first");
+    const second = join(registrationRoot, "second");
+    mkdirSync(first);
+    mkdirSync(second);
+    writeFileSync(manifest, JSON.stringify({
+      corpora: {
+        upload: { enabled: false },
+        local_folder: { enabled: true, path: second, source: "documents" },
+      },
+    }));
+    const registered = persistSetupFolderRegistration(manifest, first);
+    assert.equal(registered.path, first);
+    assert.equal(registered.source, "setup_documents");
+    const saved = JSON.parse(readFileSync(manifest, "utf8"));
+    assert.equal(saved.corpora.upload.enabled, true);
+    assert.deepEqual(saved.corpora.upload.folders, [{ path: first, source: "setup_documents" }]);
+    assert.deepEqual(persistSetupFolderRegistration(manifest, first), registered);
+    assert.deepEqual(JSON.parse(readFileSync(manifest, "utf8")).corpora.upload.folders,
+      [{ path: first, source: "setup_documents" }]);
+  } finally {
+    rmSync(registrationRoot, { recursive: true, force: true });
+  }
+}
 
 assert.deepEqual(
   await chooseSetupAccount(async () => { throw new Error("one account needs no prompt"); }, {
@@ -606,6 +635,9 @@ try {
   assert.match(readyLoad.output, /files are stored and the vector index has caught up/i);
   assert.match(readyLoad.output, /brain technician .*--run verify/i);
   assert.doesNotMatch(readyLoad.output, /Your brain is live|Ask it directly/i);
+  const registeredSetupFolder = JSON.parse(readFileSync(target, "utf8")).corpora.upload;
+  assert.equal(registeredSetupFolder.enabled, true);
+  assert.deepEqual(registeredSetupFolder.folders, [{ path: initialFolder, source: "documents" }]);
 
   if (process.platform !== "win32") {
     const { mode } = lstatSync(target);
