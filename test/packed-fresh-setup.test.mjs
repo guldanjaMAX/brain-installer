@@ -97,10 +97,10 @@ test("the packed CLI scaffolds a nonexistent manifest before any manifest-accoun
     const fakeBin = join(sandbox, "fake-bin");
     mkdirSync(fakeBin, { recursive: true });
     if (IS_WIN) {
-      writeFileSync(join(fakeBin, "npx.cmd"), "@echo off\r\necho wrangler 4.125.0\r\n", "utf8");
+      writeFileSync(join(fakeBin, "npx.cmd"), "@echo off\r\necho wrangler 4.127.1\r\n", "utf8");
     } else {
       const npx = join(fakeBin, "npx");
-      writeFileSync(npx, "#!/bin/sh\nprintf '%s\\n' 'wrangler 4.125.0'\n", "utf8");
+      writeFileSync(npx, "#!/bin/sh\nprintf '%s\\n' 'wrangler 4.127.1'\n", "utf8");
       chmodSync(npx, 0o755);
     }
     const accountId = "a".repeat(32);
