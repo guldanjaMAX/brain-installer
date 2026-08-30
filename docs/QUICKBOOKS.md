@@ -43,15 +43,22 @@ The connection:
   the protected local provider store;
 - derives one canonical SHA-256 company fingerprint from
   `quickbooks-company-v1:<realmId>`;
-- binds the active credential, explicit source, environment, provider cursor,
-  configuration receipt, reconciliation claims, and every document identity to
-  that same fingerprint;
+- binds the active credential, explicit source namespace, environment, provider
+  cursor, configuration receipt, reconciliation claims, and document provenance
+  to that same fingerprint;
+- keeps provider record IDs byte-compatible with prior QuickBooks imports while
+  permanently reserving each local source namespace for one company, so another
+  company must use a different source and cannot collide with retained records;
 - refuses a different company for an existing source before replacing the
   stored credential;
 - permits another company only under a separately named source, and refuses an
   inactive source from using the active company's token;
-- serializes refresh-token rotation in process, compares the durable token again
-  before replacement, and retains the latest refresh-expiry evidence;
+- serializes every credential mutation across local processes, writes a durable
+  no-retry fence before refresh-token rotation, and retains the latest
+  refresh-expiry evidence;
+- treats the protected file and macOS Keychain as one custody boundary: an
+  exact crash-left duplicate is reconciled under the shared lock, while a
+  divergent or uninspectable alternate store refuses before any provider call;
 - revokes with Intuit before clearing the local credential.
 
 A QuickBooks credential created before company binding was added must complete
@@ -64,20 +71,22 @@ Disconnecting ends provider access. Imported documents remain in the Brain.
 Removing them is a separate reviewed action: first run the source-specific
 `brain forget` preview, review its scope, and then approve that operation
 separately. A disconnect receipt never claims that imported documents were
-deleted.
-
-Changing from the pre-company-bound document identity to the company-bound
-identity can leave prior QuickBooks documents until that reviewed forget and
-reingest is performed. Do not infer deletion from an absent QuickBooks query
-row. Intuit's query snapshots do not provide complete deletion truth.
+deleted. Disconnect also retains a non-secret local source-to-company
+reservation. A reviewed forget removes the Brain documents and its Brain
+registry row, but it does not make that local QuickBooks source name available
+to a different company. The same company may reconnect under it; another
+company uses a new source name. Do not infer deletion from an absent QuickBooks
+query row. Intuit's query snapshots do not provide complete deletion truth.
 
 ## Proof level
 
 Automated fixtures prove company separation, stable same-company reconnect,
 wrong-company refusal, paginated read calls, refresh rotation, refresh expiry,
-revoke success and failure, retained-document receipts, source cursor custody,
-and callback construction. They do not prove an Intuit sandbox login, consent,
-provider token behavior, a real company record, or a production callback.
+durable no-retry fencing after a lost response, refresh/cursor/disconnect race
+serialization, revoke success and failure, retained-document receipts, source
+cursor custody, and callback construction. They do not prove an Intuit sandbox
+login, consent, provider token behavior, a real company record, or a production
+callback.
 
 The next accepted field gate is an owner-approved Intuit sandbox company. It
 must inspect the exact documented authorization and confidential-client token

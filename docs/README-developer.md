@@ -371,7 +371,14 @@ remains bound to `127.0.0.1`. Intuit's single Accounting scope can authorize
 reads and writes; Financial Brain performs read/query calls only and discloses
 that mismatch before consent. The raw company id stays in protected OAuth
 custody, while one canonical company fingerprint binds the credential, source,
-configuration receipt, reconciliation evidence, and document identity.
+configuration receipt, reconciliation evidence, and document provenance. The
+provider record ID stays backward-compatible; the protected source namespace is
+permanently company-bound so retained documents cannot be inherited by a
+different company after disconnect.
+QuickBooks file and Keychain selections share one mutation lock. A verified
+crash-left duplicate is cleaned up under that lock; divergent custody or an
+uninspectable alternate Keychain refuses before refresh or ingest rather than
+guessing which rotating token is current.
 An older unbound QuickBooks credential must complete one sandbox reconnect
 before ingest; the connector reports `source_binding_missing` rather than
 guessing which company or source the old token represented.
