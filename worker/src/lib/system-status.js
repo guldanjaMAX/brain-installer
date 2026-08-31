@@ -30,6 +30,11 @@
  * itself in `unavailable` and its keys are ABSENT.
  */
 
+import {
+  normalizeSourceReceiptIssueCode,
+  sourceReceiptOwnerMessage,
+} from "../../../ingest/source-receipt.mjs";
+
 /** Slug to something a person can read. The slug is never rendered. */
 const SOURCE_LABELS = {
   curated: "Files you uploaded",
@@ -113,15 +118,24 @@ export async function ownerSystemStatus(env, deps) {
   }
 
   if (fresh && fresh.unavailable !== true) {
-    out.sources = (fresh.sources || []).map((s) => ({
-      label: labelFor(s),
-      kind: s.kind,
-      state: s.state,
-      documents: Number(s.documents || 0),
-      days_since_ingest: s.days_since_ingest ?? null,
-      reason: s.reason ?? null,
-      automatable: !!s.automatable,
-    }));
+    out.sources = (fresh.sources || []).map((s) => {
+      const issueCode = s.issue_code || (
+        s.state === "broken" && s.source_status === "error" ? "INGEST_FAILED" : null
+      );
+      const normalizedIssueCode = issueCode
+        ? normalizeSourceReceiptIssueCode(issueCode)
+        : null;
+      return {
+        label: labelFor(s),
+        kind: s.kind,
+        state: s.state,
+        documents: Number(s.documents || 0),
+        days_since_ingest: s.days_since_ingest ?? null,
+        issue_code: normalizedIssueCode,
+        reason: normalizedIssueCode ? sourceReceiptOwnerMessage(normalizedIssueCode) : s.reason ?? null,
+        automatable: !!s.automatable,
+      };
+    });
   } else {
     unavailable.push("freshness");
   }

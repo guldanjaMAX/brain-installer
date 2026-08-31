@@ -834,22 +834,50 @@ const call = (env, path) => {
   check("opening a run records its exact start in sync_runs",
     seen.sql.some((sql) => /INSERT INTO sync_runs[\s\S]*started_at/.test(sql)), JSON.stringify(seen.sql));
 
-  const failed = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
-    method: "POST",
-    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
-    body: JSON.stringify({
-      source: "drive", kind: "drive", status: "error", run_id: "run_drive_1",
-      lane: "incremental", error: "Drive API unavailable",
-    }),
-  }), env, {});
+  const rawProviderCanary = "RAW_PROVIDER_CANARY_7419";
+  const capturedLogs = [];
+  const originalConsole = {
+    log: console.log,
+    warn: console.warn,
+    error: console.error,
+  };
+  console.log = (...values) => capturedLogs.push(values);
+  console.warn = (...values) => capturedLogs.push(values);
+  console.error = (...values) => capturedLogs.push(values);
+  let failed;
+  try {
+    failed = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
+      method: "POST",
+      headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+      body: JSON.stringify({
+        source: "drive", kind: "drive", status: "error", run_id: "run_drive_1",
+        lane: "incremental",
+        issue_code: rawProviderCanary,
+        error: rawProviderCanary,
+        reason: rawProviderCanary,
+        detail: rawProviderCanary,
+        refusal_reason: rawProviderCanary,
+        delete_action: rawProviderCanary,
+      }),
+    }), env, {});
+  } finally {
+    console.log = originalConsole.log;
+    console.warn = originalConsole.warn;
+    console.error = originalConsole.error;
+  }
   const failedBody = await failed.json();
   check("a connector can close its run as failed",
-    failed.status === 200 && failedBody.status === "error" && /Drive API unavailable/.test(failedBody.error || ""), JSON.stringify(failedBody));
+    failed.status === 200 && failedBody.status === "error" &&
+      failedBody.issue_code === "INGEST_FAILED" && !("error" in failedBody), JSON.stringify(failedBody));
+  const failureEvidence = JSON.stringify({ binds: seen.binds, response: failedBody, logs: capturedLogs });
+  check("raw provider failure text never reaches D1 binds, the response, or Worker logs",
+    !failureEvidence.includes(rawProviderCanary), failureEvidence);
   const errorSourceSql = seen.sql.find((sql) => /INSERT INTO sources[\s\S]*'error'/.test(sql));
   check("a failed receipt does not advance last_ingest_at",
     !!errorSourceSql && !/last_ingest_at/.test(errorSourceSql), errorSourceSql || JSON.stringify(seen.sql));
-  check("a failed receipt closes the sync run with its error",
-    seen.sql.some((sql) => /INSERT INTO sync_runs[\s\S]*finished_at[\s\S]*error/.test(sql)), JSON.stringify(seen.sql));
+  check("a failed receipt closes the sync run with only its stable issue code",
+    seen.sql.some((sql) => /INSERT INTO sync_runs[\s\S]*finished_at[\s\S]*error/.test(sql)) &&
+      seen.binds.some((values) => values.includes("INGEST_FAILED")), JSON.stringify(seen.binds));
 
   const generated = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
     method: "POST",

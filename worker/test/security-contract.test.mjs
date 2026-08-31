@@ -448,3 +448,34 @@ test("owner reliability alerts aggregate stale sources, failed queues, and inter
     fixture.close();
   }
 });
+
+test("owner system status replaces legacy raw connector failures with calm recovery copy", async () => {
+  const fixture = await createProductFixture();
+  const rawProviderCanary = "RAW_PROVIDER_CANARY_OWNER_STATUS_5221";
+  try {
+    fixture.raw(
+      `INSERT INTO sources
+         (name,kind,status,created_at,last_ingest_at,expected_refresh_seconds,stale_reason,document_count)
+       VALUES ('drive','drive','error','2026-08-30T00:00:00Z','2026-08-30T00:00:00Z',86400,?,7)`,
+      rawProviderCanary,
+    );
+    const result = await json(await fixture.post(
+      "/api/app/system",
+      {},
+      await fixture.ownerHeaders(),
+    ));
+    assert.equal(result.response.status, 200);
+    assert.match(result.response.headers.get("cache-control") || "", /private/);
+    assert.match(result.response.headers.get("cache-control") || "", /no-store/);
+    assert.equal(JSON.stringify(result.body).includes(rawProviderCanary), false);
+    const drive = result.body.sources?.find((source) => source.label === "Google Drive");
+    assert.equal(drive?.state, "broken");
+    assert.equal(drive?.issue_code, "INGEST_FAILED");
+    assert.equal(
+      drive?.reason,
+      "The latest update did not finish. Your installer can safely retry it.",
+    );
+  } finally {
+    fixture.close();
+  }
+});

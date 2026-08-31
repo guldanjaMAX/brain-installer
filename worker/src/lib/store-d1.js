@@ -41,6 +41,10 @@ import {
   PUBLIC_INSTALL_SMOKE_TITLE,
   publicInstallSmokeContentHash,
 } from "./install-smoke.js";
+import {
+  normalizeSourceReceiptIssueCode,
+  sourceReceiptOwnerMessage,
+} from "../../../ingest/source-receipt.mjs";
 
 const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
@@ -2249,10 +2253,21 @@ function operationalFreshness(s, now) {
   const indexingMs = Number.isFinite(started) ? Math.max(0, now - started) : null;
 
   if (s.stale_reason) {
-    return { state: "broken", reason: String(s.stale_reason), indexingMs };
+    const issueCode = normalizeSourceReceiptIssueCode(s.stale_reason);
+    return {
+      state: "broken",
+      reason: sourceReceiptOwnerMessage(issueCode),
+      issueCode,
+      indexingMs,
+    };
   }
   if (status === "error") {
-    return { state: "broken", reason: "the last sync reported an error", indexingMs };
+    return {
+      state: "broken",
+      reason: sourceReceiptOwnerMessage("INGEST_FAILED"),
+      issueCode: "INGEST_FAILED",
+      indexingMs,
+    };
   }
   if (status !== "indexing") return { state: null, reason: null, indexingMs };
 
@@ -2381,6 +2396,7 @@ export async function freshnessReport(env, { now = Date.now() } = {}) {
         hours_indexing: operational.indexingMs === null
           ? null
           : Math.floor(operational.indexingMs / 3600000),
+        issue_code: operational.issueCode || null,
         reason,
         automatable,
         ...(s.name === PUBLIC_INSTALL_SMOKE_SOURCE

@@ -761,7 +761,8 @@ try {
     const finalReceipt = uncovered.evidence.receipts.at(-1);
     check("load health: an identified-but-unlisted and an unclassified folder close the source as partial/error",
       uncovered.code === 1 && finalReceipt?.status === "error" && finalReceipt?.walk_complete === false &&
-        /coverage_gaps=2/.test(finalReceipt?.detail || "") && /partial coverage/i.test(uncovered.output),
+        finalReceipt?.issue_code === "INGEST_FAILED" && !("detail" in finalReceipt) &&
+        /partial coverage/i.test(uncovered.output),
       JSON.stringify({ code: uncovered.code, receipt: finalReceipt, output: uncovered.output.slice(-700) }));
     check("load health: uncovered folders withhold every newly observed IMAP watermark while keeping accepted work resumable",
       uncovered.state?.done && Object.keys(uncovered.state.done).length === 1 &&
@@ -787,7 +788,7 @@ try {
     const finalReceipt = messageGaps.evidence.receipts.at(-1);
     check("load health: unreadable and oversized messages are coverage gaps, not bulk-policy exclusions",
       messageGaps.code === 1 && finalReceipt?.status === "error" &&
-        /skipped=2; policy_skipped=0; coverage_gaps=2/.test(finalReceipt?.detail || "") &&
+        finalReceipt?.issue_code === "INGEST_FAILED" && !("detail" in finalReceipt) &&
         /over the \S+MB limit/.test(messageGaps.output),
       JSON.stringify({ code: messageGaps.code, detail: finalReceipt?.detail, output: messageGaps.output.slice(-800) }));
     check("load health: unreadable or oversized mail withholds the IMAP watermark instead of advancing past loss",

@@ -89,7 +89,8 @@ function runCase(mode) {
       result.output.slice(-1_200));
     check("an unclassified incremental message withholds the cursor and closes health as error",
       result.state.history_id === "history-prior" && result.evidence.final_receipt?.status === "error" &&
-      /policy_skipped=0; coverage_gaps=1/.test(result.evidence.final_receipt?.detail || ""),
+      result.evidence.final_receipt?.issue_code === "INGEST_FAILED" &&
+      !("error" in result.evidence.final_receipt) && !("detail" in result.evidence.final_receipt),
       JSON.stringify(result.evidence.final_receipt));
   } finally { rmSync(result.directory, { recursive: true, force: true }); }
 }

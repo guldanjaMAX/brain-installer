@@ -149,7 +149,8 @@ try {
     check("a credential-gate refusal is explicit and never completion-shaped",
       result.watermark === 4 && result.refused === 1 && result.documents_accepted === 0 &&
       result.outcome?.kind === "refused" && result.outcome?.complete === false &&
-      refusing.receipts[1].status === "error" && /credential gate/.test(refusing.receipts[1].refusal_reason || ""),
+      refusing.receipts[1].status === "error" && refusing.receipts[1].issue_code === "INPUT_REFUSED" &&
+      !("error" in refusing.receipts[1]) && !("detail" in refusing.receipts[1]),
       JSON.stringify({ result, receipt: refusing.receipts[1] }));
 
     addMessage({ guid: "IG-D1", text: "And one more for the failure case", ts: "2026-03-05T10:00:00Z" });
@@ -161,7 +162,8 @@ try {
     check("a document failure throws instead of silently advancing the watermark",
       /scripted failure/.test(thrown?.message), thrown?.message);
     check("the failed run closed its receipt as an error",
-      failing.receipts.at(-1).status === "error" && /watermark stayed/.test(failing.receipts.at(-1).detail),
+      failing.receipts.at(-1).status === "error" && failing.receipts.at(-1).issue_code === "INGEST_FAILED" &&
+        !("error" in failing.receipts.at(-1)) && !("detail" in failing.receipts.at(-1)),
       JSON.stringify(failing.receipts));
     const retry = makeBrainFakes();
     const retried = await cmdIngestImessage(manifest, manifestPath, { "chat-db": dbPath }, retry.options);

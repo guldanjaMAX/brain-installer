@@ -672,6 +672,14 @@ after every event receipt and cancellation removal is accepted. A failed or
 refused event, or a pending cancellation cleanup, closes the source receipt as
 incomplete and leaves the prior token in place so the same Google window is
 retried idempotently.
+
+Error receipts carry a closed, server-validated `issue_code`. Provider error
+messages stay in the private local terminal and are not sent to or persisted in
+D1. The Worker accepts older callers that still send `error`, `reason`, or
+`detail`, but discards those fields and records `INGEST_FAILED` unless a valid
+stable code was supplied. Owner status renders reviewed recovery copy from the
+code rather than projecting stored diagnostic text.
+
 Its dry run returns the same common preview receipt as every other source. If
 any declared calendar cannot be read, the preview reports what it did see and
 then exits nonzero with the reconsent or provider fix instead of presenting a

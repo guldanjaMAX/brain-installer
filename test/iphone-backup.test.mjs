@@ -945,7 +945,8 @@ let cliDocs = [];
     refused.refused === 2 && refused.documents_accepted === 0 &&
     refused.outcome?.kind === "refused" && refused.outcome?.complete === false &&
     refusing.receipts.at(-1)?.status === "error" &&
-    /credential gate/.test(refusing.receipts.at(-1)?.refusal_reason || ""),
+    refusing.receipts.at(-1)?.issue_code === "INPUT_REFUSED" &&
+    !("error" in refusing.receipts.at(-1)) && !("detail" in refusing.receipts.at(-1)),
     JSON.stringify({ refused, receipt: refusing.receipts.at(-1) }));
 
   // A failed load closes its receipt as an error instead of leaving the run open.
@@ -958,9 +959,10 @@ let cliDocs = [];
   } catch (error) { thrown = error; }
   check("a document failure aborts the load rather than reporting a partial one as done",
     thrown && /document failure/.test(thrown.message), thrown?.message);
-  check("the aborted run closes its receipt as an error, and says a re-run is safe",
+  check("the aborted run closes its receipt with a stable issue code only",
     failing.receipts.at(-1).status === "error" &&
-    /re-reads the whole backup safely/.test(failing.receipts.at(-1).detail),
+    failing.receipts.at(-1).issue_code === "INGEST_FAILED" &&
+    !("error" in failing.receipts.at(-1)) && !("detail" in failing.receipts.at(-1)),
     JSON.stringify(failing.receipts.at(-1)));
 }
 

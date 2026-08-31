@@ -183,7 +183,9 @@ function harness(overrides = {}) {
   check("a failed document makes the run fail and withholds the cursor",
     error instanceof ProviderDeliveryError && h.states.length === 0);
   check("a delivery failure closes the source as error, never ready",
-    h.receipts.map((receipt) => receipt.status).join(",") === "indexing,error");
+    h.receipts.map((receipt) => receipt.status).join(",") === "indexing,error" &&
+      h.receipts.at(-1).issue_code === "INGEST_FAILED" &&
+      !("error" in h.receipts.at(-1)) && !("detail" in h.receipts.at(-1)));
 }
 
 {

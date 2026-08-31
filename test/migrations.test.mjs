@@ -1106,16 +1106,27 @@ check("restart guard refuses an existing migration column with the wrong contrac
   const successfulAt = db.prepare("SELECT last_ingest_at FROM sources WHERE name='drive'").get().last_ingest_at;
 
   await post({ source: "drive", kind: "drive", status: "indexing", run_id: "real_run_2", lane: "incremental" });
+  const rawProviderCanary = "RAW_PROVIDER_CANARY_SQLITE_9137";
   const failed = await (await post({
     source: "drive", kind: "drive", status: "error", run_id: "real_run_2",
-    lane: "incremental", error: "Drive API unavailable",
+    lane: "incremental", error: rawProviderCanary, reason: rawProviderCanary,
+    detail: rawProviderCanary, refusal_reason: rawProviderCanary,
   })).json();
   const failedSource = db.prepare("SELECT status,last_ingest_at,stale_reason,document_count FROM sources WHERE name='drive'").get();
+  const failedRun = db.prepare("SELECT error,refusal_reason,delete_action FROM sync_runs WHERE run_id='real_run_2'").get();
+  const failedEvent = db.prepare("SELECT detail FROM source_events WHERE source_name='drive' AND event='error' ORDER BY id DESC LIMIT 1").get();
   check("a real failed receipt is stored as an error without advancing last success",
-    failed.status === "error" && failedSource.status === "error" && failedSource.last_ingest_at === successfulAt,
+    failed.status === "error" && failed.issue_code === "INGEST_FAILED" && !("error" in failed) &&
+      failedSource.status === "error" && failedSource.last_ingest_at === successfulAt,
     JSON.stringify({ failed, failedSource, successfulAt }));
-  check("the real source registry keeps the logical count and failure reason",
-    failedSource.document_count === 2 && /Drive API unavailable/.test(failedSource.stale_reason || ""), JSON.stringify(failedSource));
+  check("the real source registry keeps the logical count and only a stable issue code",
+    failedSource.document_count === 2 && failedSource.stale_reason === "INGEST_FAILED" &&
+      failedRun.error === "INGEST_FAILED" && failedRun.refusal_reason === null && failedRun.delete_action === null,
+    JSON.stringify({ failedSource, failedRun }));
+  const storedFailureEvidence = JSON.stringify({ failed, failedSource, failedRun, failedEvent });
+  check("raw legacy provider text reaches no response, source, sync run, or source event",
+    !storedFailureEvidence.includes(rawProviderCanary) && /issue_code=INGEST_FAILED/.test(failedEvent.detail || ""),
+    storedFailureEvidence);
 
   const smokeEnvelope = {
     source_type: "install-smoke",

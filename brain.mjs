@@ -134,6 +134,10 @@ import {
   recordSupportEvent,
 } from "./support-journal.mjs";
 import { renderSupportRecovery, supportRecovery } from "./support-recovery.mjs";
+import {
+  normalizeSourceReceiptIssueCode,
+  sourceReceiptIssueCode,
+} from "./ingest/source-receipt.mjs";
 import { readAdminKeyFile, validateAdminKeyValue } from "./operations/admin-key-file.mjs";
 import { writeClaudeWorkspaceGuide } from "./operations/claude-workspace.mjs";
 import { installClaudeTechnicianSkill } from "./operations/claude-skill.mjs";
@@ -6952,8 +6956,7 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
       docs_added: tally.created,
       docs_updated: tally.updated,
       docs_unchanged: unchanged + tally.unchanged,
-      error: `${scannerRescanSkips.length} previously-indexed file(s) could not be rechecked by the current credential scanner`,
-      detail: `local folder ingest stopped during credential recheck; skipped=${skips.length}`,
+      issue_code: "SAFETY_REVIEW_REQUIRED",
     });
     sourceRunClosed = true;
     die(
@@ -6988,11 +6991,16 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
     docs_added: tally.created,
     docs_updated: tally.updated,
     docs_unchanged: unchanged + tally.unchanged,
-    detail: `local folder ingest ${complete ? "completed" : "completed incompletely"}; ` +
-      `source_inventory=${sourceInventory}; skipped=${skips.length}; coverage_gaps=${coverageGaps}; incomplete=${incompleteKeys.size}`,
-    ...(!complete
-      ? { error: `${tally.failed} failed; ${tally.refused} refused; ${coverageGaps} coverage gap(s); ${incompleteKeys.size} incomplete extraction(s)` }
-      : {}),
+    ...(complete
+      ? {
+          detail: "local folder ingest completed; " +
+            `source_inventory=${sourceInventory}; skipped=${skips.length}; coverage_gaps=${coverageGaps}; incomplete=${incompleteKeys.size}`,
+        }
+      : {
+          issue_code: tally.refused > 0
+            ? "INPUT_REFUSED"
+            : incompleteKeys.size > 0 ? "EXTRACTION_FAILED" : "INGEST_FAILED",
+        }),
   });
   sourceRunClosed = true;
 
@@ -7048,8 +7056,7 @@ export async function cmdIngestLocal(m, manifestPath, flags, options = {}) {
           docs_added: tally.created,
           docs_updated: tally.updated,
           docs_unchanged: unchanged + tally.unchanged,
-          error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
-          detail: "local folder ingest aborted before completion",
+          issue_code: sourceReceiptIssueCode(error),
         });
         sourceRunClosed = true;
       } catch (receiptError) {
@@ -7260,6 +7267,18 @@ export async function postSourceReceipt(base, adminKey, receipt, request = http,
   onRetry = () => {},
 } = {}) {
   const url = `${base}/api/admin/brain/source-receipt`;
+  const safeReceipt = { ...receipt };
+  if (String(safeReceipt.status || "").toLowerCase() === "error") {
+    safeReceipt.issue_code = normalizeSourceReceiptIssueCode(safeReceipt.issue_code);
+    // Keep legacy callers working, but do not put their former diagnostic
+    // fields on the wire. Detailed failures stay in the local terminal and
+    // support journal; the Worker receives only the stable classification.
+    delete safeReceipt.error;
+    delete safeReceipt.reason;
+    delete safeReceipt.detail;
+    delete safeReceipt.refusal_reason;
+    delete safeReceipt.delete_action;
+  }
   let res, raw;
   try {
     ({ res, raw } = await retryTransient(async () => {
@@ -7268,7 +7287,7 @@ export async function postSourceReceipt(base, adminKey, receipt, request = http,
         response = await request(url, {
           method: "POST",
           headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
-          body: JSON.stringify(receipt),
+          body: JSON.stringify(safeReceipt),
         }, { timeoutMs: 30_000, what: "the source freshness receipt" });
       } catch (error) {
         if (typeof error?.retryable === "boolean") throw error;
@@ -7304,9 +7323,9 @@ export async function postSourceReceipt(base, adminKey, receipt, request = http,
   }
   let body = null;
   try { body = JSON.parse(raw); } catch { /* checked below */ }
-  const identityMatches = body?.source === receipt.source &&
-    (!receipt.run_id || body?.run_id === receipt.run_id);
-  if (!res.ok || !body || body.status !== receipt.status || !identityMatches) {
+  const identityMatches = body?.source === safeReceipt.source &&
+    (!safeReceipt.run_id || body?.run_id === safeReceipt.run_id);
+  if (!res.ok || !body || body.status !== safeReceipt.status || !identityMatches) {
     throw new Error(
       `source freshness receipt was not accepted (${res.status}): ${body?.error || raw.slice(0, 160) || "invalid response"}`
     );
@@ -7527,20 +7546,20 @@ export async function cmdIngestCalendar(m, manifestPath, flags, options = {}) {
 
   const providerIncomplete = calendarFailures.length > 0;
   const finalStatus = deliveryIncomplete || providerIncomplete || result.summary.needs_reconsent ? "error" : "ready";
-  const incompleteReason = [
-    sent.errors.length ? `${sent.errors.length} event send(s) failed` : null,
-    sent.refused.length ? `${sent.refused.length} event(s) were refused` : null,
-    removalPending ? `${removalPending} cancellation removal(s) remain pending` : null,
-    providerIncomplete ? `${calendarFailures.length} of ${result.calendars.length} calendar(s) could not be read` : null,
-    result.summary.needs_reconsent ? "one or more calendars need Google reconsent" : null,
-  ].filter(Boolean).join("; ");
   await postReceipt(base, adminKey, {
     source: sourceName, kind: "calendar", status: finalStatus,
     run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
     docs_added: sent.created, docs_updated: sent.updated, docs_unchanged: sent.unchanged,
-    detail: `calendar sync: ${sent.created} created, ${sent.updated} updated, ${sent.unchanged} unchanged, ` +
-      `${sent.refused.length} refused, ${sent.errors.length} failed, ${removed} removed, ${removalPending} removal(s) pending`,
-    ...(finalStatus === "error" ? { error: incompleteReason || "calendar sync incomplete" } : {}),
+    ...(finalStatus === "error"
+      ? {
+          issue_code: result.summary.needs_reconsent
+            ? "AUTH_EXPIRED"
+            : sent.refused.length > 0 ? "INPUT_REFUSED" : "INGEST_FAILED",
+        }
+      : {
+          detail: `calendar sync: ${sent.created} created, ${sent.updated} updated, ${sent.unchanged} unchanged, ` +
+            `${sent.refused.length} refused, ${sent.errors.length} failed, ${removed} removed, ${removalPending} removal(s) pending`,
+        }),
   });
 
   const calendarSummary = `${sent.created} created, ${sent.updated} updated, ${sent.unchanged} unchanged, ${removed} cancellation(s) removed`;
@@ -7683,8 +7702,7 @@ export async function cmdIngestImessage(m, manifestPath, flags, options = {}) {
         await postReceipt(base, adminKey, {
           source: sourceName, kind: "imessage", status: "error", run_id: runId,
           lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
-          error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
-          detail: "iMessage capture aborted; the watermark stayed at the last durable page",
+          issue_code: sourceReceiptIssueCode(error),
         });
       } catch (receiptError) {
         warn(`the capture failed and its error receipt could not be recorded: ${String(receiptError?.message || receiptError).slice(0, 160)}`);
@@ -7720,9 +7738,9 @@ export async function cmdIngestImessage(m, manifestPath, flags, options = {}) {
     source: sourceName, kind: "imessage", status: complete ? "ready" : "error",
     run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
     docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
-    detail: `iMessage capture: ${summary}; ${tally.refused} refused`,
-    ...(tally.refused ? { refusal_reason: `${tally.refused} conversation document(s) refused by the credential gate` } : {}),
-    ...(!complete ? { error: ingestResult.outcome.reason || "the iMessage capture was incomplete" } : {}),
+    ...(complete
+      ? { detail: `iMessage capture: ${summary}; ${tally.refused} refused` }
+      : { issue_code: tally.refused > 0 ? "INPUT_REFUSED" : "INGEST_FAILED" }),
   });
 
   info(summary);
@@ -7850,8 +7868,7 @@ export async function cmdIngestWhatsapp(m, manifestPath, flags, options = {}) {
         await postReceipt(base, adminKey, {
           source: sourceName, kind: "whatsapp", status: "error", run_id: runId,
           lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
-          error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
-          detail: "WhatsApp drain aborted; the cursor stayed at the last durable page",
+          issue_code: sourceReceiptIssueCode(error),
         });
       } catch (receiptError) {
         warn(`the drain failed and its error receipt could not be recorded: ${String(receiptError?.message || receiptError).slice(0, 160)}`);
@@ -7884,9 +7901,9 @@ export async function cmdIngestWhatsapp(m, manifestPath, flags, options = {}) {
     source: sourceName, kind: "whatsapp", status: complete ? "ready" : "error",
     run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
     docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
-    detail: `WhatsApp drain: ${summary}; ${tally.refused} refused`,
-    ...(tally.refused ? { refusal_reason: `${tally.refused} conversation document(s) refused by the credential gate` } : {}),
-    ...(!complete ? { error: ingestResult.outcome.reason || "the WhatsApp drain was incomplete" } : {}),
+    ...(complete
+      ? { detail: `WhatsApp drain: ${summary}; ${tally.refused} refused` }
+      : { issue_code: tally.refused > 0 ? "INPUT_REFUSED" : "INGEST_FAILED" }),
   });
 
   info(summary);
@@ -8056,8 +8073,7 @@ export async function cmdIngestIphoneBackup(m, manifestPath, flags, options = {}
         await postReceipt(base, adminKey, {
           source: sourceName, kind: "iphone-backup", status: "error", run_id: runId,
           lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
-          error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
-          detail: "iPhone backup history load aborted; re-running re-reads the whole backup safely",
+          issue_code: sourceReceiptIssueCode(error),
         });
       } catch (receiptError) {
         warn(`the load failed and its error receipt could not be recorded: ${String(receiptError?.message || receiptError).slice(0, 160)}`);
@@ -8092,9 +8108,9 @@ export async function cmdIngestIphoneBackup(m, manifestPath, flags, options = {}
     source: sourceName, kind: "iphone-backup", status: complete ? "ready" : "error",
     run_id: runId, lane: "manual", started_at: startedAt, completed_at: new Date().toISOString(),
     docs_added: tally.created, docs_updated: tally.updated, docs_unchanged: tally.unchanged,
-    detail: `iPhone backup one-time history load (snapshot, not live capture): ${summary}; ${tally.refused} refused`,
-    ...(tally.refused ? { refusal_reason: `${tally.refused} conversation document(s) refused by the credential gate` } : {}),
-    ...(!complete ? { error: ingestResult.outcome.reason || "the iPhone backup load was incomplete" } : {}),
+    ...(complete
+      ? { detail: `iPhone backup one-time history load (snapshot, not live capture): ${summary}; ${tally.refused} refused` }
+      : { issue_code: tally.refused > 0 ? "INPUT_REFUSED" : "INGEST_FAILED" }),
   });
 
   info(summary);
@@ -10104,21 +10120,17 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     docs_added: tally.created,
     docs_updated: tally.updated,
     docs_unchanged: unchanged + tally.unchanged,
-    detail:
-      `${which} ${lane} sync ${finalStatus === "ready" ? "completed" : "completed incompletely"}; ` +
-      `skipped=${skips.length}; policy_skipped=${policySkipped}; coverage_gaps=${coverageGaps}; ` +
-      `incomplete=${incompleteKeys.size}; retained_existing=${driveRetainedExisting}`,
     ...(hasRemoteGap
       ? {
-          error: [
-            tally.failed ? `${tally.failed} document(s) failed` : null,
-            tally.refused ? `${tally.refused} document(s) refused` : null,
-            coverageGaps ? `${coverageGaps} coverage gap(s)` : null,
-            incompleteKeys.size ? `${incompleteKeys.size} incomplete extraction(s)` : null,
-            retainedDriveReason,
-          ].filter(Boolean).join("; "),
+          issue_code: tally.refused > 0
+            ? "INPUT_REFUSED"
+            : incompleteKeys.size > 0 ? "EXTRACTION_FAILED" : "INGEST_FAILED",
         }
-      : {}),
+      : {
+          detail: `${which} ${lane} sync completed; skipped=${skips.length}; ` +
+            `policy_skipped=${policySkipped}; coverage_gaps=${coverageGaps}; ` +
+            `incomplete=${incompleteKeys.size}; retained_existing=${driveRetainedExisting}`,
+        }),
   });
   runClosed = true;
 
@@ -10167,8 +10179,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
           source: sourceName, kind: which, status: "error", run_id: runId,
           lane, started_at: runStartedAt, completed_at: new Date().toISOString(),
           walk_complete: false, files_seen: scanned,
-          error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
-          detail: `${which} ${lane} sync aborted before its cursor could advance`,
+          issue_code: sourceReceiptIssueCode(error),
         });
         runClosed = true;
       } catch (receiptError) {

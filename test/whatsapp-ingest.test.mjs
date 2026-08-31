@@ -222,7 +222,8 @@ try {
       result.refused === 1 && result.documents_accepted === 0 &&
       result.outcome?.kind === "refused" && result.outcome?.complete === false &&
       refusing.receipts.at(-1)?.status === "error" &&
-      /credential gate/.test(refusing.receipts.at(-1)?.refusal_reason || ""),
+      refusing.receipts.at(-1)?.issue_code === "INPUT_REFUSED" &&
+      !("error" in refusing.receipts.at(-1)) && !("detail" in refusing.receipts.at(-1)),
       JSON.stringify({ result, receipt: refusing.receipts.at(-1) }));
   }
 

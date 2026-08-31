@@ -10,6 +10,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { batches, splitOversized } from "../ingest/envelope-batching.mjs";
 import { ingestionOutcome } from "../ingest/outcome.mjs";
+import { sourceReceiptIssueCode } from "../ingest/source-receipt.mjs";
 
 const SAFE_SOURCE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const RESULT_STATUSES = new Set(["created", "updated", "unchanged", "refused", "failed"]);
@@ -314,8 +315,7 @@ export async function runProviderConnector({
       walk_complete: sourceComplete,
       outcome_kind: normalized.outcome.kind,
       deletion_authority: normalized.deletion_authority,
-      ...(sourceComplete ? {} : { error: detail }),
-      detail,
+      ...(sourceComplete ? { detail } : { issue_code: "INGEST_FAILED" }),
     });
     return {
       ...normalized,
@@ -331,8 +331,7 @@ export async function runProviderConnector({
         await postReceipt(base, adminKey, {
           source: sourceName, kind, status: "error", run_id: runId, lane,
           started_at: startedAt, completed_at: now().toISOString(),
-          error: clean(error?.message || error).slice(0, 500),
-          detail: `${provider} sync aborted; its cursor was not advanced`,
+          issue_code: sourceReceiptIssueCode(error),
         });
       } catch { /* the original failure remains authoritative */ }
     }

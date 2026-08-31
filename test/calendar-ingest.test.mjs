@@ -163,7 +163,9 @@ try {
     check("a successful calendar sibling keeps its accepted state",
       saved?.primary?.sync_token === "TOK_OK", JSON.stringify(saved));
     check("a failed calendar sibling closes the whole source as error",
-      fakeReceipts.at(-1)?.receipt.status === "error" && /1 of 2 calendar/.test(fakeReceipts.at(-1)?.receipt.error || ""),
+      fakeReceipts.at(-1)?.receipt.status === "error" &&
+        fakeReceipts.at(-1)?.receipt.issue_code === "INGEST_FAILED" &&
+        !("error" in fakeReceipts.at(-1).receipt) && !("detail" in fakeReceipts.at(-1).receipt),
       JSON.stringify(fakeReceipts.at(-1)?.receipt));
     check("brain load sees mixed Calendar success as partial rather than complete",
       described.partial === true && described.outcome.kind === "partial", JSON.stringify(described));
@@ -311,7 +313,7 @@ try {
     check("an event send failure withholds the Calendar sync state",
       !existsSync(join(retryDir, ".brain-ingest-calendar.json")));
     check("an event send failure closes the source receipt as error",
-      fakeReceipts.at(-1)?.receipt.status === "error" && /send.*failed/.test(fakeReceipts.at(-1)?.receipt.error || ""),
+      fakeReceipts.at(-1)?.receipt.status === "error" && fakeReceipts.at(-1)?.receipt.issue_code === "INGEST_FAILED",
       JSON.stringify(fakeReceipts.at(-1)?.receipt));
 
     const retryImpl = fakeGoogle({
@@ -366,7 +368,7 @@ try {
     check("a refused Calendar event withholds the sync state",
       !existsSync(join(refusedDir, ".brain-ingest-calendar.json")));
     check("a refused Calendar event marks the source receipt incomplete",
-      fakeReceipts.at(-1)?.receipt.status === "error" && /refused/.test(fakeReceipts.at(-1)?.receipt.error || ""),
+      fakeReceipts.at(-1)?.receipt.status === "error" && fakeReceipts.at(-1)?.receipt.issue_code === "INPUT_REFUSED",
       JSON.stringify(fakeReceipts.at(-1)?.receipt));
   }
 
@@ -395,7 +397,7 @@ try {
     check("a pending Calendar cancellation withholds the sync state",
       !existsSync(join(cleanupDir, ".brain-ingest-calendar.json")));
     check("a pending Calendar cancellation marks the source receipt incomplete",
-      fakeReceipts.at(-1)?.receipt.status === "error" && /remain pending/.test(fakeReceipts.at(-1)?.receipt.error || ""),
+      fakeReceipts.at(-1)?.receipt.status === "error" && fakeReceipts.at(-1)?.receipt.issue_code === "INGEST_FAILED",
       JSON.stringify(fakeReceipts.at(-1)?.receipt));
   }
 

@@ -44,7 +44,8 @@ const DAILY = 86400;
 {
   const g = await coverageGaps(mk([{ name: "gmail", kind: "gmail", last_ingest_at: daysAgo(9), stale_reason: "auth_expired", expected_refresh_seconds: DAILY }]), { now: NOW });
   check("a broken sync is its own gap type", g[0]?.type === "sync_broken", JSON.stringify(g));
-  check("and names the cause verbatim, so it is actionable", /auth_expired/.test(g[0].detail), g[0].detail);
+  check("and replaces stored detail with reviewed recovery copy",
+    /connection needs to be refreshed/.test(g[0].detail) && !/auth_expired/.test(g[0].detail), g[0].detail);
 }
 
 /* ---- connector-reported failure is broken immediately, schedule or not ---- */
@@ -56,12 +57,12 @@ const DAILY = 86400;
   const f = await freshnessReport(mk(rows), { now: NOW });
   check("source status=error is surfaced as broken", f.sources[0]?.state === "broken", JSON.stringify(f));
   check("a status-only error still has an actionable non-null reason",
-    /last sync reported an error/.test(f.sources[0]?.reason || ""), JSON.stringify(f.sources[0]));
+    f.sources[0]?.issue_code === "INGEST_FAILED" && /safely retry/.test(f.sources[0]?.reason || ""), JSON.stringify(f.sources[0]));
   check("the underlying source status is retained in the report",
     f.sources[0]?.source_status === "error", JSON.stringify(f.sources[0]));
   const g = await coverageGaps(mk(rows), { now: NOW });
   check("a connector-reported error also qualifies retrieved answers",
-    g[0]?.type === "sync_broken" && /last sync reported an error/.test(g[0]?.detail || ""), JSON.stringify(g));
+    g[0]?.type === "sync_broken" && /safely retry/.test(g[0]?.detail || ""), JSON.stringify(g));
 }
 
 /* ---- a live run is distinct from a crashed or stuck run ---- */

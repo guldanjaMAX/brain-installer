@@ -73,6 +73,7 @@ import {
   QUICKBOOKS_OAUTH_PATH_PREFIX,
   QUICKBOOKS_OAUTH_PATHS,
 } from "./lib/quickbooks-oauth-callback.js";
+import { normalizeSourceReceiptIssueCode } from "../../ingest/source-receipt.mjs";
 
 /* ------------------------------------------------------------ retrieval */
 
@@ -1257,7 +1258,7 @@ const receiptCount = (value) => {
  *
  *   indexing { run_id, lane, started_at }
  *   ready    { run_id, completed_at, counters... }
- *   error    { run_id, completed_at, error }
+ *   error    { run_id, completed_at, issue_code }
  *
  * This route is authenticated by the brain admin key, so an installed
  * connector does not need a standing Cloudflare control-plane token merely to
@@ -1304,8 +1305,17 @@ async function handleSourceReceipt(env, request) {
     }, 409);
   }
 
-  const detailDefault = status === "indexing" ? "sync started" : status === "error" ? "sync failed" : "bulk-load receipt";
-  const detail = String(body?.detail || detailDefault).replace(/\s+/g, " ").slice(0, 500);
+  const issueCode = status === "error"
+    ? normalizeSourceReceiptIssueCode(body?.issue_code)
+    : null;
+  // Error text from a provider may contain owner content, remote identifiers,
+  // request URLs, or credentials. Older connector versions sent it in
+  // error/reason/detail. Do not even normalize those fields on the error path:
+  // the stable issue code is the complete durable failure contract.
+  const detailDefault = status === "indexing" ? "sync started" : "bulk-load receipt";
+  const detail = status === "error"
+    ? `sync failed issue_code=${issueCode}`
+    : String(body?.detail || detailDefault).replace(/\s+/g, " ").slice(0, 500);
 
   if (status === "indexing") {
     const startedMs = receiptTimeMs(body?.started_at);
@@ -1487,9 +1497,6 @@ async function handleSourceReceipt(env, request) {
       replayed: Boolean(priorEvent) || storedAt !== requestedCompletedAt,
     });
   }
-  const errorReason = status === "error"
-    ? String(body?.error || body?.reason || detail || "sync failed").replace(/\s+/g, " ").slice(0, 500)
-    : null;
   const walkComplete = body?.walk_complete === true || (
     status === "ready" && body?.walk_complete === undefined && body?.complete_sweep === true
   );
@@ -1514,7 +1521,7 @@ async function handleSourceReceipt(env, request) {
        ON CONFLICT(name) DO UPDATE SET
          kind=excluded.kind, status='error', document_count=excluded.document_count,
          stale_reason=excluded.stale_reason`
-    ).bind(source, kind, completedAt, documents, errorReason));
+    ).bind(source, kind, completedAt, documents, issueCode));
   }
 
   if (runId) {
@@ -1524,9 +1531,9 @@ async function handleSourceReceipt(env, request) {
       receiptCount(body?.files_seen), receiptCount(body?.docs_added),
       receiptCount(body?.docs_updated), receiptCount(body?.docs_unchanged),
       receiptCount(body?.proposed_deletes),
-      body?.delete_action ? String(body.delete_action).slice(0, 64) : null,
-      body?.refusal_reason ? String(body.refusal_reason).slice(0, 500) : null,
-      errorReason,
+      status === "error" ? null : body?.delete_action ? String(body.delete_action).slice(0, 64) : null,
+      status === "error" ? null : body?.refusal_reason ? String(body.refusal_reason).slice(0, 500) : null,
+      issueCode,
     ];
     statements.push(env.DB.prepare(
       `INSERT INTO sync_runs
@@ -1553,7 +1560,7 @@ async function handleSourceReceipt(env, request) {
     source, kind, status, documents, logical_documents: documents,
     stored_documents: storedDocuments, completed_at: completedAt,
     ...(runId ? { run_id: runId } : {}),
-    ...(errorReason ? { error: errorReason } : {}),
+    ...(issueCode ? { issue_code: issueCode } : {}),
   });
 }
 

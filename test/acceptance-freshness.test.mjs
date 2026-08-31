@@ -245,8 +245,9 @@ const named = (suite, needle) =>
   ];
   const suite = await tierDataFor(rows);
   const by = Object.fromEntries(suite.results.map((r) => [r.name, r]));
-  check("a broken connector fails and repeats its cause verbatim",
-    by["freshness: gmail"]?.status === "fail" && /refresh token was revoked/.test(by["freshness: gmail"].detail),
+  check("a broken connector fails with reviewed recovery copy instead of stored provider text",
+    by["freshness: gmail"]?.status === "fail" && /safely retry/.test(by["freshness: gmail"].detail) &&
+      !/refresh token was revoked/.test(by["freshness: gmail"].detail),
     JSON.stringify(by["freshness: gmail"]));
   check("a source expected to refresh that never has is its own named failure",
     by["freshness: calendar"]?.status === "fail" && /never completed a sync/.test(by["freshness: calendar"].detail),
