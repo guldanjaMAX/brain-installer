@@ -459,8 +459,11 @@ Setup, secrets, and upgrade also remove only the known Supabase or Anthropic
 Worker secrets that the manifest does not allow. Other secret names are left
 untouched, and every removal is read back from Cloudflare.
 
-For technical detail on any error, put `BRAIN_DEBUG=1` in front of the same
-command.
+For a useful technical receipt, start with the issue code printed by the
+command. `brain support --explain <issue-code>` gives the reviewed recovery
+steps, and `brain support --preview` shows the exact metadata-only note before
+you decide whether to share it. This keeps provider text, private paths, stack
+traces, and credentials out of support messages.
 
 Recognized command failures attempt to leave a private, sanitized issue note on
 this machine whenever its local journal is writable. A note contains the

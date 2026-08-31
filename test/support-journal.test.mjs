@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   SUPPORT_COMMANDS,
+  SUPPORT_SOURCES,
   SUPPORT_MAX_AGE_DAYS,
   SUPPORT_MAX_BYTES,
   SUPPORT_MAX_EVENTS,
@@ -131,6 +132,18 @@ try {
     assert.equal(
       previewSupportEvent({ command, source: "local", errorCode: "INTERNAL_ERROR" }, options(sandbox)).command,
       command,
+    );
+  }
+  const builtConnectorSources = [
+    "bank-feed", "calendar", "drive", "dropbox", "gmail", "hubspot", "imap",
+    "imessage", "iphone-backup", "microsoft", "notion", "plaid", "quickbooks",
+    "slack", "whatsapp", "zoom",
+  ];
+  for (const source of builtConnectorSources) {
+    assert.ok(SUPPORT_SOURCES.includes(source), `support source catalog is missing ${source}`);
+    assert.equal(
+      previewSupportEvent({ command: "connect", source, errorCode: "COMMAND_FAILED" }, options(sandbox)).source,
+      source,
     );
   }
   assert.equal(

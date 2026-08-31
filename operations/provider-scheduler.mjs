@@ -115,16 +115,39 @@ function optionValue(args, name) {
   return index >= 0 ? args[index + 1] : null;
 }
 
-function supportFailure(provider, action) {
+const UNCERTAIN_PROVIDER_CODES = new Set([
+  "OAUTH_RESPONSE_UNCERTAIN",
+  "REFRESH_OUTCOME_UNKNOWN",
+  "PLAID_EXCHANGE_OUTCOME_UNKNOWN",
+  "PLAID_REMOVE_OUTCOME_UNKNOWN",
+  "SAFETY_REVIEW_REQUIRED",
+]);
+
+function providerSchedulerErrorCode(error, action) {
+  const values = [error, error?.payload].filter((value) => value && typeof value === "object");
+  const typedCodes = [error?.code, error?.payload?.error_code, error?.payload?.issue_code]
+    .filter((value) => typeof value === "string")
+    .map((value) => value.trim().toUpperCase());
+  if (values.some((value) =>
+    value.uncertain === true || value.outcome_unknown === true || value.retry_safe === false
+  ) || typedCodes.some((code) => UNCERTAIN_PROVIDER_CODES.has(code))) {
+    return "SAFETY_REVIEW_REQUIRED";
+  }
+  return action === "install" ? "SCHEDULE_INSTALL_FAILED" : "SCHEDULE_RUN_FAILED";
+}
+
+export function recordProviderSchedulerFailure(provider, action, error, options = {}) {
+  const errorCode = providerSchedulerErrorCode(error, action);
   try {
-    return recordSupportEvent({
+    const event = recordSupportEvent({
       command: "schedule",
       source: provider,
-      errorCode: action === "install" ? "SCHEDULE_INSTALL_FAILED" : "SCHEDULE_RUN_FAILED",
+      errorCode,
       productRelativeLocation: "operations/provider-scheduler.mjs#main",
-    }).event_id;
+    }, options.journalOptions || {});
+    return { eventId: event.event_id, errorCode };
   } catch {
-    return null;
+    return { eventId: null, errorCode };
   }
 }
 
@@ -173,10 +196,17 @@ const IS_MAIN = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(im
 if (IS_MAIN) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
     const provider = String(process.argv[2] || "provider");
-    console.error(`${provider} scheduler failed: ${error.message}`);
-    const eventId = supportFailure(provider, process.argv[3]);
-    if (eventId) {
-      console.error(`Private issue note ${eventId} was saved locally. The installer did not upload or send it.`);
+    const receipt = recordProviderSchedulerFailure(provider, process.argv[3], error);
+    console.error(`${provider} scheduler stopped before it could confirm a complete result.`);
+    if (receipt.errorCode === "SAFETY_REVIEW_REQUIRED") {
+      console.error("The provider result may be uncertain. Please check its current state before retrying this action.");
+    } else {
+      console.error("The previous schedule and source cursor remain available for review.");
+    }
+    console.error(`Issue code: ${receipt.errorCode}`);
+    console.error(`What to try next: brain support --explain ${receipt.errorCode}`);
+    if (receipt.eventId) {
+      console.error(`Private issue note ${receipt.eventId} was saved locally. The installer did not upload or send it.`);
     }
     process.exitCode = 1;
   });

@@ -76,7 +76,7 @@ function cli(args, env = {}, options = {}) {
   const e = { ...process.env, ...env };
   delete e.CLOUDFLARE_API_TOKEN;
   delete e.ADMIN_KEY;
-  delete e.BRAIN_DEBUG;
+  if (!options.preserveDebug) delete e.BRAIN_DEBUG;
   e.BRAIN_TEST_USER_ROOT = userRoot;
   const imports = [ISOLATE_SUPPORT_ROOT, ...(options.imports || [])];
   const nodeArguments = imports.flatMap((specifier) => ["--import", specifier]);
@@ -93,15 +93,42 @@ function cli(args, env = {}, options = {}) {
 /* ---- an unexpected crash records exactly one sanitized internal note ---- */
 {
   const rawSentinel = "RAW_UNEXPECTED_CRASH_SENTINEL";
-  const r = cli(["whatsnew"], {}, { imports: [UNEXPECTED_CRASH] });
+  const r = cli(["whatsnew"], { BRAIN_DEBUG: "1" }, {
+    imports: [UNEXPECTED_CRASH],
+    preserveDebug: true,
+  });
   const events = journalEvents(r.journal);
   check("an unexpected command crash exits through the guarded failure path",
-    r.code === 1 && /unexpected error|This is a bug in the installer/.test(r.out), r.out.slice(0, 260));
+    r.code === 1 && /unexpected error|installer problem/.test(r.out), r.out.slice(0, 260));
+  check("unexpected output stays public-safe even when legacy debug mode is present",
+    !r.out.includes(rawSentinel) && !/\bat .*\.mjs:\d+/.test(r.out) &&
+      !/Every command here is safe to run again/.test(r.out), r.out.slice(0, 400));
   check("an unexpected crash creates exactly one INTERNAL_ERROR issue note",
     events.length === 1 && events[0]?.command === "whatsnew" && events[0]?.error_code === "INTERNAL_ERROR",
     r.journal);
   check("the unexpected crash note has a product call-site fingerprint and no raw error text",
     /^loc_[0-9a-f]{24}$/.test(events[0]?.fingerprint || "") && !r.journal.includes(rawSentinel), r.journal);
+}
+
+{
+  const r = cli(["whatsnew"], { BRAIN_TEST_UNCERTAIN_CRASH: "1" }, { imports: [UNEXPECTED_CRASH] });
+  const events = journalEvents(r.journal);
+  check("an uncertain one-time provider outcome is held for review",
+    r.code === 1 && events.length === 1 && events[0]?.error_code === "SAFETY_REVIEW_REQUIRED" &&
+      /check its current state.*before trying/is.test(r.out) &&
+      !/safe to run again|retry the same command/i.test(r.out), r.out.slice(0, 500));
+}
+
+/* ---- built connector failures retain their connector class ---- */
+for (const connector of ["imap", "slack"]) {
+  const userRoot = mkdtempSync(join(tmpdir(), `brain-${connector}-support-`));
+  const missingManifest = join(userRoot, "missing.manifest.json");
+  const r = cli(["connect", connector, missingManifest], {}, { userRoot, keepUserRoot: true });
+  const events = journalEvents(r.journal);
+  check(`${connector} failures create one connector-specific issue note`,
+    r.code === 1 && events.length === 1 && events[0]?.command === "connect" &&
+      events[0]?.source === connector && /Private issue note/.test(r.out), r.out.slice(0, 400));
+  rmSync(userRoot, { recursive: true, force: true });
 }
 
 /* ---- an unsafe journal never replaces the command's original failure ---- */

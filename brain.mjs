@@ -275,6 +275,9 @@ const SUPPORT_REMOTE_COMMANDS = new Set([
   "deploy", "diagnose", "drain", "health", "migrate", "provision",
   "reconcile", "reindex", "rollback", "secrets", "update", "upgrade", "verify",
 ]);
+export const PROVIDER_CONNECTOR_IDS = Object.freeze([
+  "quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot",
+]);
 let currentSupportCommand = "";
 
 function supportSourceForCommand(command = "") {
@@ -283,14 +286,14 @@ function supportSourceForCommand(command = "") {
   if (command === "ingest") {
     const index = process.argv.indexOf("--from");
     const remote = index >= 0 ? process.argv[index + 1] : null;
-    if (remote === "quickbooks") return "quickbooks";
+    if (PROVIDER_CONNECTOR_IDS.includes(remote)) return remote;
     if (["calendar", "drive", "gmail", "imap", "imessage", "iphone-backup", "whatsapp"].includes(remote)) return remote;
     return "local";
   }
   if (command === "connect" || command === "disconnect") {
     const which = String(process.argv[3] || "").toLowerCase();
     if (which === "bank") return "bank-feed";
-    if (which === "quickbooks") return "quickbooks";
+    if (PROVIDER_CONNECTOR_IDS.includes(which)) return which;
     if (which === "imap" || which === "imessage" || which === "whatsapp" || which === "zoom") return which;
     return "installer";
   }
@@ -5122,18 +5125,18 @@ export function localWalkSnapshotFingerprint({ files = [], skipped = [], complet
 /** Keep a source's resume receipts bound to one canonical local folder. */
 export function bindLocalIngestRoot(state, rootFingerprint) {
   if (!state || typeof state !== "object" || Array.isArray(state)) {
-    throw new Error("the local ingest resume state is invalid");
+    die("the local ingest resume state is invalid");
   }
   const fingerprint = String(rootFingerprint || "");
   if (!/^[0-9a-f]{64}$/.test(fingerprint)) {
-    throw new Error("the current local ingest folder identity is invalid");
+    die("the current local ingest folder identity is invalid");
   }
   const prior = state.local_root_fingerprint;
   if (prior !== undefined && !/^[0-9a-f]{64}$/.test(String(prior))) {
-    throw new Error("the saved local ingest folder identity is invalid");
+    die("the saved local ingest folder identity is invalid");
   }
   if (prior && prior !== fingerprint) {
-    throw new Error(
+    die(
       "this source's resume state is bound to a different folder. " +
         "Use a new --source name for this folder; the existing source identity cannot be repointed."
     );
@@ -6133,10 +6136,6 @@ async function cmdForget(manifestPath) {
  * step. Nothing is ever skipped silently; the run ends with a breakdown by
  * reason, and those reasons are kept in the state file.
  */
-export const PROVIDER_CONNECTOR_IDS = Object.freeze([
-  "quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot",
-]);
-
 export function providerConfigurationFingerprint(provider, source, configuration, identity = null) {
   const canonical = (value) => {
     if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -7090,7 +7089,7 @@ async function parseForgetResponse(res) {
 
 export function assertNoPendingRemovals(result, label = "source deletion") {
   if (Number(result?.pending || 0) > 0) {
-    throw new Error(
+    die(
       `${result.pending} ${label}(s) could not be confirmed. The source cursor was not advanced; re-run to retry them.`
     );
   }
@@ -9752,7 +9751,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
             ...Object.fromEntries(stillStored.map((uid) => [uid, failedAt])),
           };
           saveState(statePath, state);
-          throw new Error(
+          die(
             `${stillStored.length} planned Drive removal(s) remained after exact source-inventory readback. ` +
               "The source cursor was not advanced; re-running will retry them through the same approval gate."
           );
@@ -14017,40 +14016,39 @@ export function resolveAdminKey(manifestPath, {
 /* ------------------------------------------------------- failure handling */
 
 /**
- * Nothing raw ever reaches a client's terminal.
+ * Unexpected provider or runtime detail never reaches a client's terminal.
  *
  * Install number one runs live on someone's machine while they watch. A Node
  * stack trace in that moment tells them nothing they can act on and costs more
  * trust than the underlying bug does. This says three things instead: what
- * happened, that it is not their fault, and that re-running is safe, which is
- * true because every command here is idempotent.
- *
- * The stack is still one environment variable away for whoever has to fix it.
+ * happened, that it is not their fault, and the issue code that selects the
+ * reviewed recovery path. Some one-time provider actions deliberately refuse
+ * an automatic retry, so this handler never makes a blanket retry promise.
  */
 function crash(err) {
-  const msg = err && err.message ? err.message : String(err);
-  const supportEventId = recordSupportFailure(err, { unexpected: true });
+  const supportReceipt = recordSupportFailure(err, { unexpected: true });
   // A refused credential is not a bug in this tool, and saying so is worse than
   // saying nothing: a mistyped or expired token is the single most likely
   // install-day mistake, and "not something you did wrong" is the one sentence
   // that stops the owner from fixing it (bench, 2026-08-28).
   if (isCredentialRejection(err)) {
-    console.error(`\n${c.red("fail")}  Cloudflare refused the credential: ${msg}`);
+    console.error(`\n${c.red("fail")}  Cloudflare did not accept the saved approval or credential.`);
     console.error("  " + CF_TOKEN_REJECTED_REMEDY.split("\n").join("\n  "));
-    console.error("\n  Nothing was created or half-written. Re-run once the token is right.");
-    printSupportReceipt(supportEventId, (line) => console.error(line));
+    console.error("\n  The installer paused without marking this step complete. Re-run once the credential is ready.");
+    printSupportReceipt(supportReceipt, (line) => console.error(line));
     process.exit(1);
   }
-  console.error(`\n${c.red("unexpected error")}  ${msg}`);
-  console.error("  This is a bug in the installer, not something you did wrong.");
-  console.error("  Every command here is safe to run again: nothing is left half-written that");
-  console.error("  a re-run cannot finish.");
-  if (process.env.BRAIN_DEBUG) {
-    console.error("\n" + (err && err.stack ? err.stack : String(err)));
+  console.error(`\n${c.red("unexpected error")}  The installer hit something it did not expect.`);
+  console.error("  This is an installer problem, not something you caused.");
+  if (supportReceipt?.errorCode === "SAFETY_REVIEW_REQUIRED") {
+    console.error("  This provider action may have an uncertain result. Please check its current state");
+    console.error("  before trying the action again.");
+  } else if (supportReceipt?.eventId) {
+    console.error("  Your private issue note keeps the category and a product-code fingerprint for recovery.");
   } else {
-    console.error(`\n  For the technical detail to send on: ${c.bold("BRAIN_DEBUG=1")} <the same command>`);
+    console.error("  The issue code below selects a recovery path without showing private provider detail.");
   }
-  printSupportReceipt(supportEventId, (line) => console.error(line));
+  printSupportReceipt(supportReceipt, (line) => console.error(line));
   process.exit(1);
 }
 
