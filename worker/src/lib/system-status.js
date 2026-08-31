@@ -33,7 +33,7 @@
 import {
   normalizeSourceReceiptIssueCode,
   sourceReceiptOwnerMessage,
-} from "../../../ingest/source-receipt.mjs";
+} from "./source-receipt.js";
 
 /** Slug to something a person can read. The slug is never rendered. */
 const SOURCE_LABELS = {

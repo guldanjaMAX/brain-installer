@@ -137,7 +137,7 @@ import { renderSupportRecovery, supportRecovery } from "./support-recovery.mjs";
 import {
   normalizeSourceReceiptIssueCode,
   sourceReceiptIssueCode,
-} from "./ingest/source-receipt.mjs";
+} from "./worker/src/lib/source-receipt.js";
 import { readAdminKeyFile, validateAdminKeyValue } from "./operations/admin-key-file.mjs";
 import { writeClaudeWorkspaceGuide } from "./operations/claude-workspace.mjs";
 import { installClaudeTechnicianSkill } from "./operations/claude-skill.mjs";

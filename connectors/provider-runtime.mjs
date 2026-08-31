@@ -10,7 +10,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { batches, splitOversized } from "../ingest/envelope-batching.mjs";
 import { ingestionOutcome } from "../ingest/outcome.mjs";
-import { sourceReceiptIssueCode } from "../ingest/source-receipt.mjs";
+import { sourceReceiptIssueCode } from "../worker/src/lib/source-receipt.js";
 
 const SAFE_SOURCE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const RESULT_STATUSES = new Set(["created", "updated", "unchanged", "refused", "failed"]);

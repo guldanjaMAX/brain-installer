@@ -73,7 +73,7 @@ import {
   QUICKBOOKS_OAUTH_PATH_PREFIX,
   QUICKBOOKS_OAUTH_PATHS,
 } from "./lib/quickbooks-oauth-callback.js";
-import { normalizeSourceReceiptIssueCode } from "../../ingest/source-receipt.mjs";
+import { normalizeSourceReceiptIssueCode } from "./lib/source-receipt.js";
 
 /* ------------------------------------------------------------ retrieval */
 

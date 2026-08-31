@@ -44,7 +44,7 @@ import {
 import {
   normalizeSourceReceiptIssueCode,
   sourceReceiptOwnerMessage,
-} from "../../../ingest/source-receipt.mjs";
+} from "./source-receipt.js";
 
 const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
