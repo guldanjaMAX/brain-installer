@@ -231,6 +231,7 @@ export function buildBootstrapStatus({
   skill,
   claudeDoctor,
   deepDpapi = false,
+  cloudflareAccountPath = null,
   statusFile = null,
   observations = {},
 } = {}) {
@@ -264,6 +265,9 @@ export function buildBootstrapStatus({
     deepDpapi,
     observations: safeObservations,
   });
+  const accountPath = ["create", "existing"].includes(String(cloudflareAccountPath || "").trim().toLowerCase())
+    ? String(cloudflareAccountPath).trim().toLowerCase()
+    : null;
   return Object.freeze({
     schema_version: BOOTSTRAP_STATUS_SCHEMA_VERSION,
     command: "bootstrap",
@@ -274,6 +278,11 @@ export function buildBootstrapStatus({
       external_test_kit_required: false,
     }),
     manifest: Object.freeze({ ...manifest }),
+    cloudflare: Object.freeze({
+      account_path: accountPath,
+      account_path_state: accountPath ? "owner_selected" : "choose_during_cloudflare_step",
+      multiple_brains_per_account: true,
+    }),
     cli: Object.freeze({ command: resolve(cli.command), args: cli.args.map((value) => resolve(String(value))) }),
     status_file: statusFile ? resolve(statusFile) : null,
     checks: Object.freeze({

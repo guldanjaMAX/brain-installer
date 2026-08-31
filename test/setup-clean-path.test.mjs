@@ -116,6 +116,7 @@ try {
   };
   const events = [];
   const key = `fixture-${"k".repeat(40)}`;
+  const authProfile = `financial-brain-${"ab".repeat(12)}`;
   const prompt = async (question, fallback) => {
     if (/what is this brain for/i.test(question)) return "Clean Brain";
     if (/short name/i.test(question)) return "clean-brain";
@@ -123,6 +124,7 @@ try {
     return fallback || "";
   };
   await cmdSetup(target, {
+    cloudflareAuthProfile: authProfile,
     setupWorkerScriptExists: async () => false,
     ask: prompt,
     doctorRunAll: async (options) => {
@@ -181,8 +183,17 @@ try {
   assert.deepEqual(events, ["verify", "provision", "migrate", "deploy", "secrets", "drain", "health", "wire", "claude-guide"]);
   const saved = JSON.parse(readFileSync(target, "utf8"));
   assert.equal(saved.infrastructure.cloudflare.account_id, oneAccount.id);
+  assert.equal(saved.infrastructure.cloudflare.auth_profile, authProfile);
   assert.equal(saved.brain.domain, "clean-brain.owner-subdomain.workers.dev");
   assert.equal(readInstalledManifest(installedManifestOptions), realpathSync.native(target));
+
+  await assert.rejects(
+    cmdSetup(target, {
+      preflightChecks: [],
+      cloudflareAuthProfile: `financial-brain-${"cd".repeat(12)}`,
+    }),
+    /already bound to a different local Cloudflare sign-in profile/i,
+  );
 
   const resumedEvents = [];
   let resumedPinnedPath = null;

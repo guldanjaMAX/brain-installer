@@ -32,9 +32,9 @@ export const TECHNICIAN_STEPS = Object.freeze([
   Object.freeze({
     id: "cloudflare",
     title: "Install the private Brain",
-    dashboard_url: "https://dash.cloudflare.com/profile/api-tokens",
-    human_boundary: "The owner signs in, completes 2FA, and creates the least-privilege token. The hidden terminal prompt is ready when it is time to enter the token.",
-    automated_proof: "The installer verifies the token, provisions the exact account, deploys, migrates, and runs health checks.",
+    dashboard_url: "https://dash.cloudflare.com/",
+    human_boundary: "The owner creates a first Cloudflare account or signs in to one they already have, completes 2FA and billing in Cloudflare, then approves the limited Wrangler browser sign-in. No credential is copied into chat or a command.",
+    automated_proof: "The installer keeps Wrangler OAuth in the operating-system keyring, verifies the exact selected account, provisions separate Worker, D1, and Vectorize resources, deploys, migrates, and runs health checks.",
   }),
   Object.freeze({
     id: "smoke",
@@ -168,6 +168,7 @@ export function buildTechnicianStepStatus({
   statusFile = null,
   proofLevel = "command_return_only",
   proof = null,
+  ownerArgs = [],
 } = {}) {
   if (!TECHNICIAN_RUN_STEPS.includes(step) || !manifestPath) {
     throw new TypeError("technician status needs a reviewed step and manifest path");
@@ -176,8 +177,15 @@ export function buildTechnicianStepStatus({
   if (!locator) throw new TypeError("technician status needs the exact package-local CLI locator");
   const manifest = resolve(manifestPath);
   const refreshArgs = [...locator.args, "technician", manifest, "--json"];
+  const exactOwnerArgs = Array.isArray(ownerArgs) ? ownerArgs.map((value) => String(value)) : [];
+  const ownerArgsValid = exactOwnerArgs.length === 0 ||
+    (step === "cloudflare" && exactOwnerArgs.length === 2 &&
+      exactOwnerArgs[0] === "--cloudflare-account" &&
+      ["create", "existing"].includes(exactOwnerArgs[1]));
+  if (!ownerArgsValid) throw new TypeError("technician status received an unreviewed owner argument");
   const uncertain = error?.uncertain === true || error?.code === "oauth_response_uncertain";
   const retryableCodes = new Set([
+    "CLOUDFLARE_ACCOUNT_CHOICE_INVALID",
     "MANIFEST_NOT_FOUND",
     "QUICKBOOKS_NOT_ENABLED",
     "QUICKBOOKS_ENVIRONMENT_REQUIRED",
@@ -194,7 +202,7 @@ export function buildTechnicianStepStatus({
         command: locator.command,
         args: Object.freeze(step === "passkey"
           ? [...locator.args, "invite", manifest]
-          : [...locator.args, "technician", manifest, "--run", step]),
+          : [...locator.args, "technician", manifest, "--run", step, ...exactOwnerArgs]),
         execution_boundary: "owner_direct_terminal",
         mutates_external_state: true,
       })
@@ -357,8 +365,9 @@ export function technicianPlan(manifestPath, deps = {}) {
     },
     rules: [
       "Run one step at a time and rerun the same step after an interruption.",
-      "Keep tokens, client secrets, app passwords, invite codes, and authentication codes in provider pages or hidden terminal prompts.",
+      "Keep tokens, client secrets, app passwords, invite codes, and authentication codes in provider pages, OS credential stores, or hidden terminal prompts.",
       "The owner handles login, 2FA, consent, billing, and physical-device prompts.",
+      "A Cloudflare account may own several Brains; resource names and manifest IDs keep each Brain separate.",
       "Enroll the first passkey only after the final Brain hostname is fixed.",
     ],
     steps: TECHNICIAN_STEPS.map((step, index) => {
@@ -494,7 +503,7 @@ export function renderTechnicianPlan(plan) {
       lines.push(`   Owner-only direct terminal: ${step.owner_only_display}`);
       lines.push(step.id === "passkey"
         ? "   Keep the one-time link on the owner's direct display, then continue with the structured continuation command in the JSON plan."
-        : "   Run this outside the agent tool so the hidden credential prompt owns a real TTY, then use the credential-free structured continuation in the JSON plan.");
+        : "   Run this outside the agent tool so Cloudflare browser sign-in or a recovery-only hidden prompt owns a real TTY, then use the credential-free structured continuation in the JSON plan.");
     } else {
       lines.push("   No public first-install command is available for this deferred connector ceremony.");
     }
@@ -509,7 +518,12 @@ function childCommands(step, manifestPath, flags, scriptPath) {
   const command = (...args) => [scriptPath, ...args];
   switch (step) {
     case "tools": return [command("tools", path)];
-    case "cloudflare": return [command("setup", path)];
+    case "cloudflare": {
+      const args = ["setup", path];
+      const accountPath = String(flags["cloudflare-account"] || "").trim().toLowerCase();
+      if (accountPath) args.push("--cloudflare-account", accountPath);
+      return [command(...args)];
+    }
     case "smoke": return [];
     case "plaid": return [command("secrets", path)];
     case "google": return [command("connect", "google", "--scopes", String(flags.scopes || "drive,gmail,calendar"))];
@@ -590,9 +604,18 @@ export async function runTechnicianStep({
   const summary = readManifestSummary(manifestPath, manifestDeps);
   if (step === "cloudflare" && !isTTY) {
     throw codedError(
-      "The Cloudflare ceremony needs a real owner-controlled terminal for its hidden credential prompt. Run the exact owner-only command from the read-only technician plan outside the agent tool, then return to the credential-free status refresh.",
+      "The Cloudflare ceremony needs a real owner-controlled terminal for browser sign-in and its local callback. Run the exact owner-only command from the read-only technician plan outside the agent tool, then return to the credential-free status refresh.",
       "owner_direct_terminal_required",
     );
+  }
+  if (step === "cloudflare") {
+    const accountPath = String(flags["cloudflare-account"] || "").trim().toLowerCase();
+    if (accountPath && !["create", "existing"].includes(accountPath)) {
+      throw codedError(
+        "The Cloudflare account choice accepts create or existing. No sign-in or provisioning action started.",
+        "cloudflare_account_choice_invalid",
+      );
+    }
   }
   if (!["tools", "cloudflare"].includes(step) && !summary.exists) {
     throw codedError(

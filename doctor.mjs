@@ -28,6 +28,7 @@ export const OK = "ok";
 export const WARN = "warn";
 export const FAIL = "fail";
 export const WRANGLER_PACKAGE = "wrangler@4.127.1";
+export const WRANGLER_AUTH_PROFILE_PATTERN = /^financial-brain-[a-f0-9]{24}$/;
 
 /**
  * The ONE description of how Vectorize is reached, so the CLI, the doctor, the
@@ -117,7 +118,7 @@ const NEEDS_SHELL = new Set(["npx", "npm", "claude", "codex", "wrangler"]);
 // to print a version or inspect Cloudflare login state. Keep only process/path
 // essentials and explicitly non-secret configuration needed cross-platform.
 const LOCAL_TOOL_ENV_ALLOWLIST = Object.freeze([
-  "PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+  "PATH", "Path", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
   "USER", "USERNAME", "LOGNAME",
   "SystemRoot", "SYSTEMROOT", "WINDIR", "ComSpec", "COMSPEC", "PATHEXT",
   "TEMP", "TMP", "TMPDIR", "LANG", "LANGUAGE", "SHELL", "TERM",
@@ -251,10 +252,40 @@ export function wranglerProfileName(accountId) {
   return `financial-brain-${digest}`;
 }
 
-/** Add the per-install profile to a Wrangler command without mutating argv. */
-export function wranglerProfileArgs(args, accountId) {
-  const profile = wranglerProfileName(accountId);
-  return profile ? [...args, "--profile", profile] : [...args];
+function savedProfileWasSupplied(authProfile) {
+  return authProfile !== undefined && authProfile !== null;
+}
+
+/**
+ * Use the manifest's exact current profile when it has one. Deriving a legacy
+ * account-based profile is intentionally limited to older manifests which do
+ * not carry auth_profile at all. An invalid saved value must never fall through
+ * to a different profile or Wrangler's default session.
+ */
+export function resolveWranglerProfile(accountId, authProfile) {
+  if (savedProfileWasSupplied(authProfile)) {
+    const exact = String(authProfile);
+    if (!WRANGLER_AUTH_PROFILE_PATTERN.test(exact)) {
+      throw new TypeError("invalid saved Financial Brain Wrangler auth profile");
+    }
+    return exact;
+  }
+  return wranglerProfileName(accountId);
+}
+
+const emptyWranglerEnvFile = (platformName) => platformName === "win32" ? "NUL" : "/dev/null";
+
+/** Add the exact named profile and suppress dotenv without mutating argv. */
+export function wranglerProfileArgs(
+  args,
+  accountId,
+  authProfile,
+  { platformName = process.platform } = {},
+) {
+  const profile = resolveWranglerProfile(accountId, authProfile);
+  return profile
+    ? [...args, "--profile", profile, `--env-file=${emptyWranglerEnvFile(platformName)}`]
+    : [...args];
 }
 
 function quoteWin(a) {
@@ -360,11 +391,17 @@ export function checkWrangler(runCommand = run) {
  * their accounts. Clearing the API token IS intended: wrangler prefers it when
  * set and would authenticate as the wrong identity.
  */
-function cfEnv(accountId) {
-  return cloudflareCliEnvironment(accountId);
+function cfEnv(accountId, environment = process.env) {
+  return localToolEnvironment(cloudflareCliEnvironment(accountId, environment), {
+    CLOUDFLARE_AUTH_USE_KEYRING: "true",
+  });
 }
 
-export function checkWranglerLogin(accountId, runCommand = run) {
+export function checkWranglerLogin(accountId, runCommand = run, {
+  authProfile,
+  platformName = process.platform,
+  environment = process.env,
+} = {}) {
   if (!accountId) {
     return check(
       "wrangler login",
@@ -373,10 +410,21 @@ export function checkWranglerLogin(accountId, runCommand = run) {
       "Run `brain doctor <manifest>` after setup has selected the account. The fallback uses a separate named Wrangler profile for that install.",
     );
   }
-  const env = cfEnv(accountId);
+  let profile;
+  try {
+    profile = resolveWranglerProfile(accountId, authProfile);
+  } catch {
+    return check(
+      "wrangler login",
+      FAIL,
+      "the manifest's saved Cloudflare auth profile is invalid; no other profile was tried",
+      "Run `brain setup <manifest>` in an interactive terminal to create and save a new isolated Cloudflare profile. Doctor itself will not open a browser.",
+    );
+  }
+  const env = cfEnv(accountId, environment);
   const r = runCommand("npx", wranglerProfileArgs([
     WRANGLER_PACKAGE, "vectorize", "list", "--json",
-  ], accountId), {
+  ], accountId, authProfile, { platformName }), {
     timeout: 120_000,
     inheritEnv: false,
     env,
@@ -385,7 +433,7 @@ export function checkWranglerLogin(accountId, runCommand = run) {
     return check(
       "wrangler login",
       OK,
-      "isolated profile confirmed by a read-only Vectorize request to the declared account",
+      `${savedProfileWasSupplied(authProfile) ? "saved" : "legacy"} isolated profile confirmed by a read-only Vectorize request to the declared account`,
     );
   }
   if (!/profile.*(?:not found|could not be found)|not logged in|no credentials/i.test(r.out)) {
@@ -393,18 +441,17 @@ export function checkWranglerLogin(accountId, runCommand = run) {
       "wrangler login",
       FAIL,
       "the isolated profile could not confirm read access to Vectorize in the declared account",
-      `Re-authenticate this install's profile with: npx ${WRANGLER_PACKAGE} auth create ${wranglerProfileName(accountId)}\n` +
-        "  Then rerun `brain doctor <manifest>`. The fallback will not act on a logged-in profile that cannot read the exact manifest account.",
+      `Run \`brain setup <manifest>\` in an interactive terminal to re-authorize the isolated profile ${profile}.\n` +
+        "  Then rerun `brain doctor <manifest>`. Doctor will not act on a profile that cannot read the exact manifest account, and it never opens the browser itself.",
     );
   }
   return check(
     "wrangler login",
     WARN,
     "this install's isolated Wrangler profile is not signed in",
-    `Run: npx ${WRANGLER_PACKAGE} auth create ${wranglerProfileName(accountId)}\n` +
-      "  This opens the browser and stores a separate named profile for this install.\n" +
-      "  Doctor then confirms the exact manifest account before the profile can be used.\n" +
-      "  This is only a fallback when the scoped API token cannot reach Vectorize."
+    `Run \`brain setup <manifest>\` in an interactive terminal to authorize ${profile}.\n` +
+      "  Setup handles the browser ceremony and keeps the credential in the operating system keyring.\n" +
+      "  Doctor remains browser-free and then confirms the exact manifest account through this profile."
   );
 }
 
@@ -897,11 +944,14 @@ export async function checkNetwork() {
 /** Every check, in the order a person should fix them. */
 export async function runAll({
   accountId,
+  cloudflareAuthProfile,
   onResult,
   googleStorageStatus,
   cloudflareToken,
   requireClaudeCode = true,
   localRun = run,
+  networkCheck = checkNetwork,
+  skipCloudflare = false,
 } = {}) {
   const out = [];
   // Each result is handed to the caller the moment it exists, so a slow check
@@ -913,16 +963,23 @@ export async function runAll({
   };
   push(checkNode());
   push(checkWrangler(localRun));
-  push(await checkNetwork());
-  push(await checkCfToken(cloudflareToken, { accountId }));
-  const vectorize = await checkVectorizeApi(accountId, cloudflareToken);
-  push(vectorize);
-  if (accountId && vectorize.status !== OK) {
-    // Only surface the OAuth fallback when the standard scoped token path is
-    // unavailable. This keeps a healthy install from being told to create an
-    // unnecessary second credential while still printing the exact isolated
-    // profile repair in the run that needs it.
-    push(checkWranglerLogin(accountId, localRun));
+  push(await networkCheck());
+  if (!skipCloudflare) {
+    if (savedProfileWasSupplied(cloudflareAuthProfile)) {
+      // Browser OAuth is the normal credential for a current install. Its
+      // read-only named-profile probe replaces, rather than supplements, the
+      // legacy API-token checks so a missing recovery token is not a failure.
+      push(checkWranglerLogin(accountId, localRun, { authProfile: cloudflareAuthProfile }));
+    } else {
+      push(await checkCfToken(cloudflareToken, { accountId }));
+      const vectorize = await checkVectorizeApi(accountId, cloudflareToken);
+      push(vectorize);
+      if (accountId && vectorize.status !== OK) {
+        // Older manifests have no saved auth_profile. Preserve their derived
+        // per-account Wrangler fallback without ever selecting default.
+        push(checkWranglerLogin(accountId, localRun));
+      }
+    }
   }
   push(checkAnthropicKey());
   push(checkClaudeCode({ runCommand: localRun, required: requireClaudeCode }));

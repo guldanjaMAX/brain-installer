@@ -72,7 +72,13 @@
           "properties": {
             "account_id": {
               "type": "string",
-              "minLength": 8
+              "pattern": "^(?:[A-Fa-f0-9]{32}|REQUIRED_client_account_id)$",
+              "description": "Exact 32-hex Cloudflare account id. The explicit REQUIRED_client_account_id value is allowed only in the unconfigured package template and must be replaced before account-bound control-plane work."
+            },
+            "auth_profile": {
+              "type": "string",
+              "pattern": "^financial-brain-[a-f0-9]{24}$",
+              "description": "Non-secret local Wrangler OAuth profile used for this install's Cloudflare control-plane ceremony. The credential itself remains in Wrangler's OS-keyring-backed encrypted store and is never written to this manifest."
             },
             "storage": {
               "enum": [

@@ -10,10 +10,11 @@
  *
  * DESIGN RULES
  *
- * Everything runs against the CLIENT's Cloudflare account using a scoped token
- * the client issued. We never hold their data and the token is revoked at
- * handoff, so this tool must work from a standing start with nothing but that
- * token and a manifest.
+ * Everything runs against the owner's Cloudflare account. The normal local
+ * path is a named Wrangler browser sign-in backed by the operating system's
+ * credential store. A scoped API token remains available for automation,
+ * legacy installs, and explicit recovery. Neither credential belongs in the
+ * manifest, logs, chat, or command-line arguments.
  *
  * The account id is RESOLVED FROM THE TOKEN, never hardcoded and never taken
  * from the manifest as gospel. A token that can see two accounts is ambiguous
@@ -24,9 +25,9 @@
  * adopts them rather than creating duplicates. An installer you are afraid to
  * re-run is an installer you will not use.
  *
- * The token is read from CLOUDFLARE_API_TOKEN for automation or from a hidden,
- * command-scoped terminal prompt for setup/update. It is never written to the
- * manifest, logged, or passed as a command-line argument where `ps` could read it.
+ * A short-lived access token is held only for the command-scoped control-plane
+ * action. It is never written to the manifest, logged, or passed as a command-
+ * line argument where `ps` could read it.
  */
 
 import {
@@ -149,6 +150,15 @@ import {
   hasStoredCloudflareToken,
   storedTokenReference,
 } from "./operations/cloudflare-token-store.mjs";
+import {
+  chooseCloudflareAccountPath,
+  cloudflareAccountPlan,
+} from "./operations/cloudflare-account-bootstrap.mjs";
+import {
+  CloudflareOAuthSessionError,
+  cloudflareOAuthChildEnvironment,
+  withCloudflareOAuthSession,
+} from "./operations/cloudflare-oauth-session.mjs";
 import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
 import { deriveSessionSigningKey } from "./operations/session-signing-key.mjs";
 import {
@@ -408,9 +418,9 @@ function printSupportReceipt(receipt, write = console.error) {
 const cloudflareTokenSession = new AsyncLocalStorage();
 
 function activeCloudflareToken() {
-  if (process.env.CLOUDFLARE_API_TOKEN) return process.env.CLOUDFLARE_API_TOKEN;
   const scoped = cloudflareTokenSession.getStore();
-  return scoped ? scoped.toString("ascii") : null;
+  if (scoped) return scoped.toString("ascii");
+  return process.env.CLOUDFLARE_API_TOKEN || null;
 }
 
 export function cloudflareTokenAvailable() {
@@ -621,6 +631,241 @@ export async function withAvailableCloudflareToken(action, options = {}) {
       stored.fill(0);
     }
   });
+}
+
+/** Stable local identity used only to derive a new non-secret Wrangler profile. */
+export function cloudflareOAuthInstallIdentity(manifestPath) {
+  const target = resolve(String(manifestPath || "./brain.manifest.json"));
+  let canonical = target;
+  try {
+    canonical = realpathSync(target);
+  } catch {
+    try {
+      canonical = join(realpathSync(dirname(target)), basename(target));
+    } catch { /* the resolved path is still a stable local identity */ }
+  }
+  const digest = createHash("sha256")
+    .update("financial-brain/manifest-path/v1\0", "utf8")
+    .update(canonical, "utf8")
+    .digest("hex");
+  return `financial-brain-manifest-v1:${digest}`;
+}
+
+/** Render a many-account choice without treating display names as authority. */
+export async function promptForCloudflareOAuthAccount(request, options = {}) {
+  const accounts = Array.isArray(request?.accounts) ? request.accounts : [];
+  if (!accounts.length) return "";
+  const write = options.write ?? ((line) => console.log(line));
+  const askFn = options.askFn ?? ask;
+  write("");
+  write("  This Cloudflare sign-in can reach more than one account.");
+  write("  Choose the account that should own this Brain. Nothing has been created yet.");
+  write("");
+  for (const account of accounts) write(`    ${account.id}  ${account.name}`);
+  write("");
+  return String(await askFn("Cloudflare account id", "")).trim();
+}
+
+/** Human recovery copy for a bounded Wrangler OAuth failure. */
+export function cloudflareOAuthFailureMessage(error) {
+  const code = error instanceof CloudflareOAuthSessionError
+    ? error.code
+    : "CLOUDFLARE_OAUTH_UNAVAILABLE";
+  const recovery = {
+    CLOUDFLARE_KEYRING_UNAVAILABLE:
+      "Cloudflare sign-in could not use this computer's protected credential store. Close other setup windows, confirm macOS Keychain or Windows Credential Manager is available, and rerun the same command.",
+    CLOUDFLARE_OAUTH_REAUTH_REQUIRED:
+      "Cloudflare browser sign-in did not finish for this Brain. Leave the terminal open, complete the Cloudflare page in the same computer, and rerun the same command.",
+    CLOUDFLARE_OAUTH_SCOPE_MISSING:
+      "Cloudflare sign-in completed, but the approved access could not reach every required Workers, D1, Vectorize, and Workers AI surface. Review the selected account and rerun the sign-in.",
+    CLOUDFLARE_ACCOUNT_NONE:
+      "That Cloudflare login does not have an account ready for installation yet. Finish creating or joining the account in Cloudflare, then rerun the same command.",
+    CLOUDFLARE_ACCOUNT_SELECTION_CANCELLED:
+      "Cloudflare account selection was left unfinished. Rerun the same command when the owner is ready to choose the exact account.",
+    CLOUDFLARE_ACCOUNT_BINDING_MISMATCH:
+      "This Brain is already tied to a different Cloudflare account than the current sign-in can reach. Sign in as an owner of the account recorded by this Brain; no account or resource was changed.",
+    CLOUDFLARE_OAUTH_PROFILE_MISMATCH:
+      "The saved local Cloudflare sign-in profile does not belong to this Brain. Nothing was changed. Use the original manifest or begin a separate install folder.",
+  }[code] ||
+    "Cloudflare sign-in could not be verified safely. Nothing was changed. Check the network and the selected Cloudflare account, then rerun the same command.";
+  return `${recovery} Issue: ${code}. If browser sign-in remains unavailable, the installer can offer a recovery-only hidden token prompt.`;
+}
+
+function throwCloudflareOAuthFailure(error) {
+  const oauthCode = String(error?.code || "");
+  const supportCode = oauthCode === "CLOUDFLARE_OAUTH_REAUTH_REQUIRED"
+    ? "AUTH_EXPIRED"
+    : oauthCode === "CLOUDFLARE_OAUTH_SCOPE_MISSING"
+      ? "REMOTE_PERMISSION_DENIED"
+      : /TIMEOUT|REQUEST_FAILED|FETCH_UNAVAILABLE/.test(oauthCode)
+        ? "NETWORK_UNREACHABLE"
+        : /PROFILE|ACCOUNT_(?:BINDING|SELECTION|ID)/.test(oauthCode)
+          ? "CONFIG_INVALID"
+          : "AUTH_REQUIRED";
+  const failure = new Fatal(cloudflareOAuthFailureMessage(error));
+  failure.code = supportCode;
+  throw failure;
+}
+
+// Keep failures from the requested control-plane action distinct from failures
+// that occurred while establishing its Cloudflare session. A setup, update, or
+// repair action may already have made safe partial progress when it throws. It
+// must therefore propagate once, unchanged, instead of entering the browser
+// reauthentication or token-recovery paths and being run a second time.
+class CloudflareControlActionError extends Error {
+  constructor(cause) {
+    super("Cloudflare control action failed");
+    this.name = "CloudflareControlActionError";
+    this.cause = cause;
+  }
+}
+
+function throwOriginalCloudflareControlActionError(error) {
+  if (error instanceof CloudflareControlActionError) throw error.cause;
+}
+
+function throwCloudflareTokenFailure() {
+  const failure = new Fatal(
+    "Cloudflare access is not available, and this terminal cannot prompt securely for recovery access.\n" +
+      "      Run `brain setup <manifest>` or `brain update <manifest>` in an interactive terminal. " +
+      "The normal path reuses the saved browser sign-in; if needed, it can offer recovery-only hidden token entry.\n" +
+      "      Automation may inject CLOUDFLARE_API_TOKEN through an approved secret manager without putting it in a command.",
+  );
+  failure.code = "AUTH_REQUIRED";
+  throw failure;
+}
+
+/**
+ * Run one Cloudflare control-plane action with the install's normal browser
+ * OAuth profile or the explicit legacy/automation token path.
+ */
+export async function withCloudflareControlCredential(action, options = {}) {
+  const accountId = options.accountId || null;
+  // A stored recovery token is account-scoped. Placeholder, malformed, and
+  // absent account values must never fall through to a generic keyring slot,
+  // where an unrelated credential could be selected and sent to Cloudflare.
+  const recoveryAccountId = /^[a-f0-9]{32}$/i.test(String(accountId || ""))
+    ? String(accountId).toLowerCase()
+    : null;
+  const authProfile = options.authProfile || null;
+  const freshOAuth = options.freshOAuth === true;
+  const forceToken = options.forceToken === true;
+  const tokenRunner = options.withToken ?? withCloudflareToken;
+  const runToken = async () => {
+    try {
+      return await tokenRunner(
+        async () => {
+          try {
+            return await action(Object.freeze({ method: "api_token", profile: null, account: null, preflight: null }));
+          } catch (error) {
+            throw new CloudflareControlActionError(error);
+          }
+        },
+        { ...options, accountId: recoveryAccountId },
+      );
+    } catch (error) {
+      if (error instanceof CloudflareControlActionError) throw error;
+      throwCloudflareTokenFailure();
+    }
+  };
+  // A saved OAuth profile is authoritative for that Brain. An unrelated token
+  // left in the parent shell must not silently replace it. Fresh interactive
+  // setup also stays OAuth-first. Legacy manifests and explicit automation or
+  // recovery paths continue to use the token runner.
+  if (forceToken || (!freshOAuth && !authProfile)) {
+    try {
+      return await runToken();
+    } catch (error) {
+      throwOriginalCloudflareControlActionError(error);
+      throw error;
+    }
+  }
+  const routineSavedProfile = Boolean(authProfile) && !freshOAuth && options.reauthorizeOAuth !== true;
+  if (options.interactive === false && !routineSavedProfile) {
+    die(
+      "Cloudflare browser sign-in needs an owner-controlled terminal on this computer. " +
+        "Nothing was changed. Open Terminal or PowerShell and rerun the same command. " +
+        "Automation may use an approved secret manager."
+    );
+  }
+
+  const oauthRunner = options.withOAuthSession ?? withCloudflareOAuthSession;
+  const accountPrompt = options.accountPrompt ?? ((request) =>
+    promptForCloudflareOAuthAccount(request, { askFn: options.askFn ?? ask }));
+  const oauthSessionOptions = { ...(options.oauthOptions || {}) };
+  for (const reserved of ["profile", "installIdentity", "expectedAccountId", "reauthorize", "prompt", "action"]) {
+    delete oauthSessionOptions[reserved];
+  }
+  const runOAuth = async (reauthorize) => oauthRunner({
+    ...oauthSessionOptions,
+    ...(authProfile
+      ? { profile: authProfile }
+      : { installIdentity: options.installIdentity || cloudflareOAuthInstallIdentity(options.manifestPath) }),
+    expectedAccountId: accountId,
+    reauthorize,
+    prompt: accountPrompt,
+    action: async (session) => cloudflareTokenSession.run(session.token, async () => {
+      try {
+        return await action(Object.freeze({
+          method: "wrangler_oauth",
+          profile: session.profile,
+          account: session.account,
+          preflight: session.preflight,
+        }));
+      } catch (error) {
+        throw new CloudflareControlActionError(error);
+      }
+    }),
+  });
+
+  const initiallyReauthorize = options.reauthorizeOAuth === true;
+  const offerTokenRecovery = async (error) => {
+    if (options.allowTokenRecovery !== true || options.interactive === false) throw error;
+    const answer = String(await (options.askFn ?? ask)(
+      "Cloudflare browser sign-in is still unavailable. Use the recovery-only hidden token prompt now? (y/n)",
+      "n",
+    )).trim().toLowerCase();
+    if (answer !== "y" && answer !== "yes") throw error;
+    return runToken();
+  };
+
+  try {
+    return await runOAuth(initiallyReauthorize);
+  } catch (error) {
+    throwOriginalCloudflareControlActionError(error);
+    const mayRefresh = error instanceof CloudflareOAuthSessionError &&
+      ["CLOUDFLARE_OAUTH_REAUTH_REQUIRED", "CLOUDFLARE_OAUTH_SCOPE_MISSING"].includes(error.code) &&
+      !initiallyReauthorize && options.allowBrowserReauth === true && options.interactive !== false;
+    if (mayRefresh) {
+      const answer = String(await (options.askFn ?? ask)(
+        "Cloudflare sign-in needs a quick refresh in the browser. Open it now? (y/n)",
+        "y",
+      )).trim().toLowerCase();
+      if (answer === "y" || answer === "yes") {
+        try {
+          return await runOAuth(true);
+        } catch (refreshError) {
+          throwOriginalCloudflareControlActionError(refreshError);
+          try {
+            return await offerTokenRecovery(refreshError);
+          } catch (finalError) {
+            throwOriginalCloudflareControlActionError(finalError);
+            if (finalError instanceof Fatal) throw finalError;
+            closePrompts();
+            throwCloudflareOAuthFailure(finalError);
+          }
+        }
+      }
+    }
+    try {
+      return await offerTokenRecovery(error);
+    } catch (finalError) {
+      throwOriginalCloudflareControlActionError(finalError);
+      if (finalError instanceof Fatal) throw finalError;
+      closePrompts();
+      throwCloudflareOAuthFailure(finalError);
+    }
+  }
 }
 
 function token() {
@@ -886,14 +1131,23 @@ async function cmdVerify(manifestPath) {
  * CLOUDFLARE_API_TOKEN must be cleared for the child process. Wrangler prefers it
  * when set and will silently authenticate as the wrong identity.
  */
-function wrangler(args, { accountId } = {}) {
+function wrangler(args, { accountId, authProfile = null } = {}) {
   // Through doctor's runner, which knows that npm CLIs are .cmd shims on
   // Windows and that Node refuses to spawn those without a shell since
   // CVE-2024-27980. The previous raw spawnSync returned ENOENT there, which
   // made provision report "wrangler: not logged in" to a client whose doctor
   // had verified the login moments earlier.
-  const env = cloudflareCliEnvironment(accountId);
-  const r = run("npx", wranglerProfileArgs([WRANGLER_PACKAGE, ...args], accountId), {
+  const env = authProfile
+    ? cloudflareOAuthChildEnvironment({ accountId })
+    : cloudflareCliEnvironment(accountId);
+  const baseArgs = [WRANGLER_PACKAGE, ...args];
+  const profiled = authProfile
+    ? [...baseArgs, "--profile", authProfile]
+    : wranglerProfileArgs(baseArgs, accountId);
+  const exactArgs = authProfile
+    ? [...profiled, `--env-file=${process.platform === "win32" ? "NUL" : "/dev/null"}`]
+    : profiled;
+  const r = run("npx", exactArgs, {
     timeout: 180_000,
     inheritEnv: false,
     env,
@@ -901,12 +1155,12 @@ function wrangler(args, { accountId } = {}) {
   return { ok: r.ok, out: r.out, status: r.ok ? 0 : 1 };
 }
 
-function wranglerAvailable(accountId) {
+function wranglerAvailable(accountId, authProfile = null) {
   if (!accountId) return false;
   // The API token has been scrubbed, the named profile is explicit, and the
   // manifest account id is in CLOUDFLARE_ACCOUNT_ID. A successful account-
   // scoped read is the confirmation gate before any fallback mutation.
-  const r = wrangler(["vectorize", "list", "--json"], { accountId });
+  const r = wrangler(["vectorize", "list", "--json"], { accountId, authProfile });
   return r.ok;
 }
 
@@ -1159,7 +1413,7 @@ async function cmdProvision(manifestPath, { nextSteps = true } = {}) {
       // than stopping an install that can still complete.
       viaApi = false;
       info("the API token cannot reach Vectorize, trying wrangler's own session");
-      if (!wranglerAvailable(acct.id)) {
+      if (!wranglerAvailable(acct.id, cfg.auth_profile || null)) {
         die(
           `Vectorize is unreachable both ways, so the install cannot continue.\n` +
             `  API token: ${e.message.slice(0, 100)}\n` +
@@ -1167,7 +1421,7 @@ async function cmdProvision(manifestPath, { nextSteps = true } = {}) {
             VECTORIZE_REMEDY + "\n  Then re-run provision."
         );
       }
-      const r = wrangler(["vectorize", "list"], { accountId: acct.id });
+      const r = wrangler(["vectorize", "list"], { accountId: acct.id, authProfile: cfg.auth_profile || null });
       if (!r.ok) die(`wrangler could not list Vectorize indexes: ${r.out.slice(-300)}`);
       // wrangler prints a table; a name match is enough to know it exists.
       list = new RegExp(`\\b${idxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(r.out)
@@ -1207,7 +1461,7 @@ async function cmdProvision(manifestPath, { nextSteps = true } = {}) {
         // rank wrongly, so they are not configurable.
         const r = wrangler(
           ["vectorize", "create", idxName, "--dimensions=768", "--metric=cosine"],
-          { accountId: acct.id }
+          { accountId: acct.id, authProfile: cfg.auth_profile || null }
         );
         if (!r.ok) die(`wrangler could not create the Vectorize index: ${r.out.slice(-400)}`);
         ok(`Vectorize "${idxName}" created via wrangler (768-dim, cosine)`);
@@ -1227,7 +1481,7 @@ async function cmdProvision(manifestPath, { nextSteps = true } = {}) {
             : async () => {
                 const r = wrangler(
                   ["vectorize", "create-metadata-index", idxName, `--property-name=${propertyName}`, `--type=${indexType}`],
-                  { accountId: acct.id }
+                  { accountId: acct.id, authProfile: cfg.auth_profile || null }
                 );
                 if (!r.ok && !/already|exists/i.test(r.out)) throw new Error(r.out.slice(-200));
               },
@@ -1241,7 +1495,7 @@ async function cmdProvision(manifestPath, { nextSteps = true } = {}) {
             : async () => {
                 const r = wrangler(
                   ["vectorize", "list-metadata-index", idxName, "--json"],
-                  { accountId: acct.id }
+                  { accountId: acct.id, authProfile: cfg.auth_profile || null }
                 );
                 if (!r.ok) throw new Error(r.out.slice(-200));
                 try {
@@ -4274,7 +4528,7 @@ function assertSourceName(name) {
  * filename", which is intended.
  */
 export const VALUE_FLAGS = new Set([
-  "path", "source", "limit", "from", "manifest", "scopes", "port", "host", "user", "run", "confirm-host", "kind", "add", "bookmark", "export", "explain", "backup",
+  "path", "source", "limit", "from", "manifest", "scopes", "port", "host", "user", "run", "confirm-host", "cloudflare-account", "kind", "add", "bookmark", "export", "explain", "backup",
   "golden", "profile", "k", "repeat", "baseline", "save", "artifacts",
   "corpus-contract", "approve-removals", "only", "skip",
   // brain import bank. `--file` with no value must die saying so rather than
@@ -5173,8 +5427,18 @@ function gitignoreTheKey(dir) {
 function parseFlags(argv) {
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
-    if (!argv[i].startsWith("--")) continue;
-    const key = argv[i].slice(2);
+    const raw = String(argv[i]);
+    if (!raw.startsWith("--")) continue;
+    // Refuse the inline secret form before it can become an unknown flag name.
+    // assertKnownFlags intentionally prints unknown names, which would otherwise
+    // repeat the pasted value into the terminal and a support transcript.
+    if (raw.toLowerCase().startsWith("--cloudflare-token=")) {
+      die(
+        "--cloudflare-token opens a recovery-only hidden prompt. " +
+          "Please leave the token out of the command and enter it when the private prompt appears.",
+      );
+    }
+    const key = raw.slice(2);
     const next = argv[i + 1];
     if (next && !next.startsWith("--")) {
       flags[key] = next;
@@ -5256,11 +5520,15 @@ export function assertKnownFlags(flags, known, command) {
 
   const listed = [...allowed].sort().map((f) => `--${f}`).join(", ");
   const lines = unknown.map((key) => {
+    // `parseFlags` keeps an unsupported inline `--name=value` shape together
+    // so the command can reject it. Diagnostics must name only the option,
+    // never repeat the value into a terminal or support transcript.
+    const diagnosticKey = key.split("=", 1)[0].replace(/[\r\n\t]/g, "?");
     const near = [...allowed]
-      .map((candidate) => [candidate, editDistance(key, candidate)])
+      .map((candidate) => [candidate, editDistance(diagnosticKey, candidate)])
       .filter(([, distance]) => distance <= 3)
       .sort((a, b) => a[1] - b[1])[0];
-    return near ? `unknown option --${key} for \`${command}\`. Did you mean --${near[0]}?` : `unknown option --${key} for \`${command}\`.`;
+    return near ? `unknown option --${diagnosticKey} for \`${command}\`. Did you mean --${near[0]}?` : `unknown option --${diagnosticKey} for \`${command}\`.`;
   });
 
   die(
@@ -10591,15 +10859,25 @@ export async function cmdConnectBank(manifestPath, flags = {}, options = {}) {
   return { provider: "plaid", url, opened, live_provider_proof: false };
 }
 
-async function cmdConnect(target) {
-  const flags = parseFlags(process.argv.slice(3));
+export async function cmdConnect(target, options = {}) {
+  const argv = options.argv ?? process.argv;
+  const flags = parseFlags(argv.slice(3));
   const which = (target || "").toLowerCase();
-  if (which === "bank") return cmdConnectBank(process.argv[4], flags);
-  if (which === "imessage") return cmdConnectImessage(process.argv[4], flags);
-  if (which === "whatsapp") return cmdConnectWhatsapp(process.argv[4], flags);
-  if (which === "zoom") return cmdConnectZoom(process.argv[4], flags);
-  if (which === "imap") return cmdConnectImap(process.argv[4], flags);
-  if (PROVIDER_CONNECTOR_IDS.includes(which)) return cmdConnectProvider(which, process.argv[4], flags);
+  const manifestPath = argv[4];
+  if (which === "bank") return cmdConnectBank(manifestPath, flags);
+  if (which === "imessage") return cmdConnectImessage(manifestPath, flags);
+  if (which === "whatsapp") return cmdConnectWhatsapp(manifestPath, flags);
+  if (which === "zoom") {
+    const runManifestControl = options.withManifestControl ?? withManifestCloudflareControl;
+    const connectZoom = options.connectZoom ?? cmdConnectZoom;
+    return runManifestControl(
+      manifestPath,
+      () => connectZoom(manifestPath, flags, options.zoomOptions || {}),
+      options.controlOptions || {},
+    );
+  }
+  if (which === "imap") return cmdConnectImap(manifestPath, flags);
+  if (PROVIDER_CONNECTOR_IDS.includes(which)) return cmdConnectProvider(which, manifestPath, flags);
   if (which !== "google") {
     die(
       "brain connect supports bank, google, imap, imessage, whatsapp, zoom, quickbooks, slack, notion, microsoft, dropbox and hubspot.\n" +
@@ -11273,13 +11551,23 @@ export async function cmdDisconnectProvider(provider, manifestPath, flags = {}, 
  * requiring the operator to first declare the thing they are turning off
  * would strand the already-loaded LaunchAgent.
  */
-async function cmdDisconnect(target) {
-  const flags = parseFlags(process.argv.slice(3));
+export async function cmdDisconnect(target, options = {}) {
+  const argv = options.argv ?? process.argv;
+  const flags = parseFlags(argv.slice(3));
   const which = (target || "").toLowerCase();
-  if (which === "whatsapp") return cmdDisconnectWhatsapp(process.argv[4], flags);
-  if (which === "zoom") return cmdDisconnectZoom(process.argv[4], flags);
-  if (which === "imap") return cmdDisconnectImap(process.argv[4], flags);
-  if (PROVIDER_CONNECTOR_IDS.includes(which)) return cmdDisconnectProvider(which, process.argv[4], flags);
+  const manifestPath = argv[4];
+  if (which === "whatsapp") return cmdDisconnectWhatsapp(manifestPath, flags);
+  if (which === "zoom") {
+    const runManifestControl = options.withManifestControl ?? withManifestCloudflareControl;
+    const disconnectZoom = options.disconnectZoom ?? cmdDisconnectZoom;
+    return runManifestControl(
+      manifestPath,
+      () => disconnectZoom(manifestPath, flags, options.zoomOptions || {}),
+      options.controlOptions || {},
+    );
+  }
+  if (which === "imap") return cmdDisconnectImap(manifestPath, flags);
+  if (PROVIDER_CONNECTOR_IDS.includes(which)) return cmdDisconnectProvider(which, manifestPath, flags);
   if (which !== "imessage") {
     die(
       "brain disconnect supports imap, imessage, whatsapp, zoom, quickbooks, slack, notion, microsoft, dropbox and hubspot.\n" +
@@ -11290,7 +11578,7 @@ async function cmdDisconnect(target) {
         "         brain disconnect <quickbooks|slack|notion|microsoft|dropbox|hubspot> <manifest>"
     );
   }
-  return cmdDisconnectImessage(process.argv[4], flags);
+  return cmdDisconnectImessage(manifestPath, flags);
 }
 
 export async function cmdDisconnectImessage(manifestPath, flags = {}, options = {}) {
@@ -12147,11 +12435,14 @@ async function buildChecksumDriftCheck(manifestPath, options = {}) {
   return { name: "migration checksums", status: D_OK, detail: "every applied migration matches its file" };
 }
 
-async function cmdDoctor(manifestPath) {
+export async function cmdDoctor(manifestPath, options = {}) {
   let accountId;
+  let cloudflareAuthProfile;
   if (manifestPath && existsSync(manifestPath)) {
     try {
-      accountId = loadManifest(manifestPath).m?.infrastructure?.cloudflare?.account_id;
+      const cloudflare = loadManifest(manifestPath).m?.infrastructure?.cloudflare;
+      accountId = cloudflare?.account_id;
+      cloudflareAuthProfile = cloudflare?.auth_profile;
     } catch { /* doctor must work without a valid manifest */ }
   }
 
@@ -12162,51 +12453,96 @@ async function cmdDoctor(manifestPath) {
   // Printed as each check completes, not collected and dumped at the end.
   // Otherwise a first run sits silent for minutes while npx fetches wrangler,
   // and silence is indistinguishable from a hang to the person watching.
-  const checks = await withAvailableCloudflareToken(
-    () => doctorRunAll({
+  const runAvailableToken = options.withAvailableCloudflareToken ?? withAvailableCloudflareToken;
+  const runDoctorChecks = options.doctorRunAll ?? doctorRunAll;
+  const executeMachineChecks = () => runDoctorChecks({
       accountId,
+      cloudflareAuthProfile,
       cloudflareToken: activeCloudflareToken(),
       onResult: (x) => {
         const mark = x.status === D_OK ? c.green("ok  ") : x.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
         console.log(`  ${mark}  ${x.name.padEnd(18)}  ${x.detail}`);
       },
-    }),
-    {
+    });
+  // A current OAuth install must not even inspect the separate legacy token
+  // slot. Its named profile is authoritative, and runAll performs the exact
+  // browser-free Wrangler profile probe itself.
+  const checks = cloudflareAuthProfile
+    ? await executeMachineChecks()
+    : await runAvailableToken(executeMachineChecks, {
       accountId,
       onStorageError: (error) => warn(String(error?.message || error)),
-    },
-  );
+    });
 
   // An install-state check, not a machine-readiness check: only meaningful
   // once a manifest names a real, presumably-deployed brain.
   if (manifestPath && existsSync(manifestPath)) {
-    const upgradeCheck = await buildUpgradePauseCheck(manifestPath);
-    checks.push(upgradeCheck);
-    const mark = upgradeCheck.status === D_OK ? c.green("ok  ") : upgradeCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
-    console.log(`  ${mark}  ${upgradeCheck.name.padEnd(18)}  ${upgradeCheck.detail}`);
+    const runDeployedChecks = async () => {
+      const upgradeCheck = await (options.buildUpgradePauseCheck ?? buildUpgradePauseCheck)(manifestPath);
+      checks.push(upgradeCheck);
+      const mark = upgradeCheck.status === D_OK ? c.green("ok  ") : upgradeCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
+      console.log(`  ${mark}  ${upgradeCheck.name.padEnd(18)}  ${upgradeCheck.detail}`);
 
-    const checksumCheck = await buildChecksumDriftCheck(manifestPath);
-    checks.push(checksumCheck);
-    const checksumMark = checksumCheck.status === D_OK ? c.green("ok  ") : checksumCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
-    console.log(`  ${checksumMark}  ${checksumCheck.name.padEnd(18)}  ${checksumCheck.detail}`);
+      const checksumCheck = await (options.buildChecksumDriftCheck ?? buildChecksumDriftCheck)(manifestPath);
+      checks.push(checksumCheck);
+      const checksumMark = checksumCheck.status === D_OK ? c.green("ok  ") : checksumCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
+      console.log(`  ${checksumMark}  ${checksumCheck.name.padEnd(18)}  ${checksumCheck.detail}`);
 
-    // Offline and cheap, so it runs here rather than at connect time. The one
-    // bank-feed failure that is unrecoverable in front of a client is a return
-    // address nobody registered.
-    try {
-      const manifest = loadManifest(manifestPath).m;
-      const feedCheck = checkBankFeedRedirect(manifest);
-      checks.push(feedCheck);
-      const feedMark = feedCheck.status === D_OK ? c.green("ok  ") : feedCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
-      console.log(`  ${feedMark}  ${feedCheck.name.padEnd(18)}  ${feedCheck.detail}`);
+      // Offline and cheap, so it runs here rather than at connect time. The one
+      // bank-feed failure that is unrecoverable in front of a client is a return
+      // address nobody registered.
+      try {
+        const manifest = loadManifest(manifestPath).m;
+        const feedCheck = (options.checkBankFeedRedirect ?? checkBankFeedRedirect)(manifest);
+        checks.push(feedCheck);
+        const feedMark = feedCheck.status === D_OK ? c.green("ok  ") : feedCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
+        console.log(`  ${feedMark}  ${feedCheck.name.padEnd(18)}  ${feedCheck.detail}`);
 
-      if (manifest?.corpora?.bank_feed?.enabled === true && manifest?.brain?.domain) {
-        const runtimeCheck = await buildBankFeedRuntimeCheck(manifestPath);
-        checks.push(runtimeCheck);
-        const runtimeMark = runtimeCheck.status === D_OK ? c.green("ok  ") : runtimeCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
-        console.log(`  ${runtimeMark}  ${runtimeCheck.name.padEnd(18)}  ${runtimeCheck.detail}`);
+        if (manifest?.corpora?.bank_feed?.enabled === true && manifest?.brain?.domain) {
+          const runtimeCheck = await (options.buildBankFeedRuntimeCheck ?? buildBankFeedRuntimeCheck)(manifestPath);
+          checks.push(runtimeCheck);
+          const runtimeMark = runtimeCheck.status === D_OK ? c.green("ok  ") : runtimeCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
+          console.log(`  ${runtimeMark}  ${runtimeCheck.name.padEnd(18)}  ${runtimeCheck.detail}`);
+        }
+      } catch { /* doctor must work without a valid manifest */ }
+    };
+
+    if (cloudflareAuthProfile) {
+      let deployedChecksRan = false;
+      try {
+        await (options.withCloudflareControl ?? withCloudflareControlCredential)(async () => {
+          deployedChecksRan = true;
+          return runDeployedChecks();
+        }, {
+          manifestPath,
+          accountId,
+          authProfile: cloudflareAuthProfile,
+          interactive: false,
+          allowBrowserReauth: false,
+          allowTokenRecovery: false,
+          oauthOptions: {
+            ...(options.oauthOptions || {}),
+            // Plain doctor is read-only. Token capture already requires the OS
+            // keyring for this exact profile; it must not persist Wrangler's
+            // global keyring preference merely to perform a diagnostic read.
+            readOnlyExistingProfile: true,
+          },
+        });
+      } catch (error) {
+        if (deployedChecksRan) throw error;
+        // The machine checks already report the broken profile. Run the
+        // deployed checks once without a credential so each one is explicit
+        // about being unavailable rather than disappearing from the report.
+        await runDeployedChecks();
       }
-    } catch { /* doctor must work without a valid manifest */ }
+    } else {
+      // Legacy stored-token installs need the same command-scoped token to
+      // remain active through their D1 drift and pause reads.
+      await runAvailableToken(runDeployedChecks, {
+        accountId,
+        onStorageError: (error) => warn(String(error?.message || error)),
+      });
+    }
   }
 
   const s = doctorSummarize(checks);
@@ -12472,7 +12808,11 @@ export async function captureSetupD1Bookmark(manifestPath, options = {}) {
  */
 export async function cmdSetup(manifestPath, options = {}) {
   const flags = options.flags ?? parseFlags(process.argv.slice(3));
-  assertKnownFlags(flags, ["manifest", "path", "no-connect"], "brain setup");
+  assertKnownFlags(flags, ["manifest", "path", "no-connect", "cloudflare-account", "cloudflare-token"], "brain setup");
+  const accountPath = String(options.cloudflareAccountPath ?? flags["cloudflare-account"] ?? "").trim().toLowerCase();
+  if (accountPath && !["create", "existing"].includes(accountPath)) {
+    die("--cloudflare-account accepts create or existing");
+  }
   const skipConnect = shouldSkipSetupConnections(flags, options);
   const prompt = options.ask ?? ask;
   console.log(`\n  ${c.bold("brain setup")}  ${c.dim("nothing to a working brain")}\n`);
@@ -12480,15 +12820,15 @@ export async function cmdSetup(manifestPath, options = {}) {
   /* --- 1. preflight, because everything below assumes it --- */
   console.log(`  ${c.bold("Step 1 of 6")}  checking this machine\n`);
   const runDoctorChecks = options.doctorRunAll ?? doctorRunAll;
-  const checks = await runDoctorChecks({
-    accountId: undefined,
-    cloudflareToken: activeCloudflareToken(),
-    // A setup performed on the owner's machine includes Claude Code as a
-    // delivered capability. --no-connect is the explicit technician-machine
-    // exception and must not force the client's local assistant onto the
-    // technician's laptop.
-    requireClaudeCode: !skipConnect,
-  });
+  const checks = options.preflightChecks ?? await runDoctorChecks({
+      accountId: undefined,
+      cloudflareToken: activeCloudflareToken(),
+      // A setup performed on the owner's machine includes Claude Code as a
+      // delivered capability. --no-connect is the explicit technician-machine
+      // exception and must not force the client's local assistant onto the
+      // technician's laptop.
+      requireClaudeCode: !skipConnect,
+    });
   for (const x of checks) {
     const mark = x.status === D_OK ? c.green("ok  ") : x.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
     console.log(`    ${mark}  ${x.name}  ${c.dim(x.detail)}`);
@@ -12507,6 +12847,13 @@ export async function cmdSetup(manifestPath, options = {}) {
   let m;
   if (existsSync(target)) {
     m = loadManifest(target).m;
+    const savedProfile = m.infrastructure?.cloudflare?.auth_profile || null;
+    if (options.cloudflareAuthProfile && savedProfile && savedProfile !== options.cloudflareAuthProfile) {
+      die(
+        "this install is already bound to a different local Cloudflare sign-in profile. " +
+          "Nothing was changed. Use the saved profile or begin a separate install directory."
+      );
+    }
     ok(`resuming from ${relative(process.cwd(), target)}`);
   } else {
     console.log(`\n  ${c.bold("Step 2 of 6")}  about this install\n`);
@@ -12524,6 +12871,7 @@ export async function cmdSetup(manifestPath, options = {}) {
     delete cf.r2_bucket; // not wired to anything, so do not provision it
     cf.d1_database_name = `${slug}-brain`;
     cf.storage = "d1";
+    if (options.cloudflareAuthProfile) cf.auth_profile = options.cloudflareAuthProfile;
     delete tmpl.infrastructure.supabase;
 
     const account = await chooseSetupAccount(prompt, {
@@ -15067,7 +15415,7 @@ async function cmdSchedule(manifestPath) {
  * Failing here also means a run that cannot possibly work never asks anyone for
  * a credential.
  */
-function manifestAccountId(manifestPath) {
+export function manifestCloudflareControlBinding(manifestPath) {
   let manifest;
   try {
     manifest = loadManifest(manifestPath).m;
@@ -15079,7 +15427,19 @@ function manifestAccountId(manifestPath) {
         "      pass the full path to the manifest there."
     );
   }
-  return manifest?.infrastructure?.cloudflare?.account_id || null;
+  const accountId = manifest?.infrastructure?.cloudflare?.account_id || null;
+  const authProfile = manifest?.infrastructure?.cloudflare?.auth_profile || null;
+  if (authProfile && !/^[a-f0-9]{32}$/i.test(String(accountId || ""))) {
+    die(
+      "this install has a saved Cloudflare browser profile but no valid bound account. " +
+        "Nothing was changed. Restore the matching manifest from the install folder or begin a separate install."
+    );
+  }
+  return Object.freeze({ accountId, authProfile });
+}
+
+function manifestAccountId(manifestPath) {
+  return manifestCloudflareControlBinding(manifestPath).accountId;
 }
 
 /** Resolve setup's target before a fresh manifest exists or any token is read. */
@@ -15089,6 +15449,24 @@ export function setupManifestTarget(manifestPath, flags = {}) {
     : null;
   const flagged = typeof flags.manifest === "string" ? flags.manifest : null;
   return positional || flagged || "./brain.manifest.json";
+}
+
+/** Open the owner-facing account prerequisite before Wrangler asks for access. */
+export async function prepareCloudflareAccountCeremony(options = {}) {
+  const prompt = options.askFn ?? ask;
+  const path = await chooseCloudflareAccountPath(prompt, options.accountPath);
+  const plan = cloudflareAccountPlan(path);
+  const write = options.write ?? ((line) => console.log(line));
+  write("");
+  write(`  ${plan.title}`);
+  for (const step of plan.human_steps) write(`    - ${step}`);
+  write(`    - ${plan.multi_brain}`);
+  write("");
+  const opened = (options.openBrowserImpl ?? openBrowser)(plan.start_url, options.openBrowserOptions || {});
+  if (opened) write("  Cloudflare opened in your browser. The installer is waiting here.");
+  else write(`  Open this Cloudflare page in your browser: ${plan.start_url}`);
+  await prompt("Press Enter after the Cloudflare account is ready", "");
+  return plan;
 }
 
 /** Normalize paths pasted into setup's readline prompt, where no shell helps. */
@@ -15167,20 +15545,117 @@ export function persistSetupFolderRegistration(manifestPath, folder) {
 
 async function cmdSetupInteractive(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
+  assertKnownFlags(flags, ["manifest", "path", "no-connect", "cloudflare-account", "cloudflare-token"], "brain setup");
   const target = setupManifestTarget(manifestPath, flags);
-  // A fresh install has no manifest to identify a stored-token slot yet. Do
-  // not turn that expected absence into CONFIG_INVALID before setup can create
-  // it. Resumed installs still load the exact declared account before asking
-  // for or retrieving a credential.
-  const accountId = existsSync(target) ? manifestAccountId(target) : null;
-  return withCloudflareToken(
-    () => cmdSetup(manifestPath, { flags }),
-    { accountId },
+  const forceToken = flags["cloudflare-token"] === true;
+  if (flags["cloudflare-token"] && flags["cloudflare-token"] !== true) {
+    die("--cloudflare-token is a recovery switch. Do not put a token after it; the next prompt hides what you type.");
+  }
+  const resumed = existsSync(target);
+  const manifest = resumed ? loadManifest(target).m : null;
+  const accountId = manifest?.infrastructure?.cloudflare?.account_id || null;
+  const authProfile = manifest?.infrastructure?.cloudflare?.auth_profile || null;
+  const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  const automationToken = !interactive && cloudflareTokenAvailable();
+  // A stray token in an interactive shell cannot override the normal named
+  // browser profile. Noninteractive automation may still supply one, and
+  // legacy manifests without a saved profile retain their existing path.
+  const tokenPath = forceToken || (resumed && !authProfile) || automationToken;
+  let accountPath = String(flags["cloudflare-account"] || "").trim().toLowerCase() || null;
+  if (accountPath && !["create", "existing"].includes(accountPath)) {
+    die("--cloudflare-account accepts create or existing");
+  }
+
+  let localPreflightChecks = null;
+  if (!tokenPath) {
+    localPreflightChecks = await doctorRunAll({
+      skipCloudflare: true,
+      requireClaudeCode: !shouldSkipSetupConnections(flags),
+    });
+    const fatal = localPreflightChecks.filter((check) => check.status === D_FAIL);
+    if (fatal.length) {
+      console.log(`\n  ${c.bold("brain setup")}  ${c.dim("nothing to a working brain")}\n`);
+      console.log(`  ${c.bold("Step 1 of 6")}  checking this machine\n`);
+      for (const check of localPreflightChecks) {
+        const mark = check.status === D_OK ? c.green("ok  ") : check.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
+        console.log(`    ${mark}  ${check.name}  ${c.dim(check.detail)}`);
+      }
+      console.log("");
+      for (const check of fatal) console.log(`  ${c.red(check.name)}\n    ${check.fix.split("\n").join("\n    ")}\n`);
+      closePrompts();
+      die("setup cannot continue until the blocking items above are fixed. Re-run when they are.");
+    }
+  }
+  if (!resumed && !tokenPath && interactive) {
+    const ceremony = await prepareCloudflareAccountCeremony({
+      accountPath,
+      askFn: ask,
+    });
+    accountPath = ceremony.path;
+  }
+  return withCloudflareControlCredential(
+    (session) => cmdSetup(manifestPath, {
+      flags,
+      cloudflareAccountPath: accountPath,
+      cloudflareAuthProfile: session.profile || authProfile,
+      ...(localPreflightChecks ? {
+        preflightChecks: [
+          ...localPreflightChecks,
+          ...(session.method === "wrangler_oauth" ? [
+            {
+              name: "Cloudflare sign-in",
+              status: D_OK,
+              detail: "the named browser sign-in reached the exact selected account through the protected credential store",
+            },
+            {
+              name: "Vectorize",
+              status: D_OK,
+              detail: "the selected account passed the read-only Vectorize access check",
+            },
+          ] : [{
+            name: "Cloudflare recovery",
+            status: D_WARN,
+            detail: "setup is using the recovery-only hidden token path for this run",
+          }]),
+        ],
+      } : {}),
+      ...(session.account ? { listCloudflareAccounts: async () => [session.account] } : {}),
+    }),
+    {
+      manifestPath: target,
+      accountId,
+      authProfile,
+      freshOAuth: !resumed && !tokenPath,
+      forceToken: forceToken || automationToken,
+      reauthorizeOAuth: !resumed && !tokenPath,
+      allowBrowserReauth: resumed && interactive,
+      allowTokenRecovery: interactive,
+      interactive,
+      askFn: ask,
+    },
   );
 }
 
 async function cmdUpgradeInteractive(manifestPath) {
-  return withCloudflareToken(() => cmdUpgrade(manifestPath), { accountId: manifestAccountId(manifestPath) });
+  return withManifestCloudflareControl(manifestPath, () => cmdUpgrade(manifestPath));
+}
+
+/** Run a manifest-bound control-plane command through its exact saved custody. */
+export async function withManifestCloudflareControl(manifestPath, action, options = {}) {
+  const binding = manifestCloudflareControlBinding(manifestPath);
+  const interactive = options.interactive ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  const automationToken = !interactive && cloudflareTokenAvailable();
+  return (options.withCloudflareControl ?? withCloudflareControlCredential)(action, {
+    ...options,
+    manifestPath,
+    accountId: binding.accountId,
+    authProfile: binding.authProfile,
+    forceToken: options.forceToken === true || automationToken,
+    allowBrowserReauth: interactive,
+    allowTokenRecovery: interactive,
+    interactive,
+    askFn: options.askFn ?? ask,
+  });
 }
 
 /**
@@ -15192,7 +15667,7 @@ async function cmdUpgradeInteractive(manifestPath) {
 export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
   assertKnownFlags(
     flags,
-    ["json", "run", "host", "user", "port", "source", "scopes", "confirm-host"],
+    ["json", "run", "host", "user", "port", "source", "scopes", "confirm-host", "cloudflare-account"],
     "brain technician",
   );
   const scriptPath = options.scriptPath || fileURLToPath(import.meta.url);
@@ -15200,6 +15675,10 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
   const cli = { command: nodePath, args: [scriptPath] };
   const step = flags.run ? String(flags.run).trim().toLowerCase() : null;
   const stepStatusPath = technicianStatusFilePath(manifestPath);
+  const selectedCloudflareAccountPath = step === "cloudflare" &&
+    ["create", "existing"].includes(String(flags["cloudflare-account"] || "").trim().toLowerCase())
+    ? String(flags["cloudflare-account"]).trim().toLowerCase()
+    : null;
   const persistStepStatus = (succeeded, error = null, receipt = null) => {
     const status = buildTechnicianStepStatus({
       step,
@@ -15210,6 +15689,9 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
       statusFile: stepStatusPath,
       proofLevel: receipt?.proof_level,
       proof: receipt?.proof,
+      ownerArgs: selectedCloudflareAccountPath
+        ? ["--cloudflare-account", selectedCloudflareAccountPath]
+        : [],
     });
     const writer = options.writeTechnicianStatus || ((path, payload) =>
       writeBootstrapStatusFile(path, payload, { path: stepStatusPath }));
@@ -15428,6 +15910,10 @@ export async function cmdLocalTools(options = {}) {
   const json = options.json === true;
   const handoff = options.handoff === true;
   const deepDpapi = options.deepDpapi === true;
+  const cloudflareAccountPath = String(options.cloudflareAccountPath || "").trim().toLowerCase() || null;
+  if (cloudflareAccountPath && !["create", "existing"].includes(cloudflareAccountPath)) {
+    die("--cloudflare-account accepts create or existing");
+  }
   const shouldWriteStatus = options.writeStatus === true;
   const targetManifest = resolve(options.manifestPath || "./brain.manifest.json");
   let claudePath = { status: "not_applicable" };
@@ -15479,6 +15965,7 @@ export async function cmdLocalTools(options = {}) {
     skill,
     claudeDoctor,
     deepDpapi,
+    cloudflareAccountPath,
     statusFile: shouldWriteStatus ? intendedStatusPath : null,
   });
   const persistStatus = (status) => {
@@ -15620,7 +16107,9 @@ export async function cmdLocalTools(options = {}) {
       (nativeClaude && (options.existsImpl ?? existsSync)(nativeClaude) ? nativeClaude : "claude");
     const starter =
       `/financial-brain-technician Read the local bootstrap status at ${JSON.stringify(bootstrapStatus.status_file)} ` +
-      `and use the intended manifest at ${JSON.stringify(targetManifest)}. Begin read-only and keep every credential in a hidden prompt or provider page.`;
+      `and use the intended manifest at ${JSON.stringify(targetManifest)}. ` +
+      `${cloudflareAccountPath ? `The owner selected the ${cloudflareAccountPath} Cloudflare account path. ` : ""}` +
+      `Begin read-only and keep every credential in a hidden prompt or provider page.`;
     const launch = options.launchClaude ?? spawnSync;
     const launched = launch(launcher, [starter], {
       cwd: guide.workspace,
@@ -15656,7 +16145,7 @@ export async function cmdLocalTools(options = {}) {
 
 async function cmdLocalToolsInteractive(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
-  assertKnownFlags(flags, ["json", "handoff", "deep-dpapi"], "brain tools");
+  assertKnownFlags(flags, ["json", "handoff", "deep-dpapi", "cloudflare-account"], "brain tools");
   if (flags.json && flags.handoff) die("--json and --handoff are separate bootstrap modes");
   const target = typeof manifestPath === "string" && !manifestPath.startsWith("--")
     ? manifestPath
@@ -15666,6 +16155,7 @@ async function cmdLocalToolsInteractive(manifestPath) {
     json: flags.json === true,
     handoff: flags.handoff === true,
     deepDpapi: flags["deep-dpapi"] === true,
+    cloudflareAccountPath: flags["cloudflare-account"],
     writeStatus: true,
   });
 }
@@ -16065,22 +16555,35 @@ async function cmdDevices(manifestPath) {
   return { devices };
 }
 
-/** Is a Cloudflare token stored on this machine for this install's account? */
+/** Describe local Cloudflare custody without reading or printing a credential. */
 async function cmdToken(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
-  const accountId = manifestAccountId(manifestPath);
+  assertKnownFlags(flags, ["forget"], "brain token");
+  const binding = manifestCloudflareControlBinding(manifestPath);
+  const accountId = binding.accountId;
   if (!accountId) die("this manifest names no Cloudflare account, so there is no token slot to inspect.");
   if (flags.forget) {
     const removed = forgetCloudflareToken(accountId);
-    if (removed) ok(`stored Cloudflare token removed (${storedTokenReference(accountId)})`);
-    else info(`nothing stored for this account (${storedTokenReference(accountId)})`);
+    if (removed) ok(`legacy recovery token removed (${storedTokenReference(accountId)})`);
+    else info(`no legacy recovery token was stored for this account (${storedTokenReference(accountId)})`);
+    if (binding.authProfile) {
+      info("this Brain's named browser sign-in remains configured in Wrangler's operating-system credential store.");
+    }
+    return;
+  }
+  if (binding.authProfile) {
+    info(
+      "this Brain uses a named Cloudflare browser sign-in. Wrangler keeps its credential in the operating-system protected store; the manifest contains only the non-secret profile label."
+    );
+    info(hasStoredCloudflareToken(accountId)
+      ? `a separate legacy recovery token is also stored at ${storedTokenReference(accountId)}. Remove only that fallback with --forget.`
+      : "no separate legacy recovery token is stored. Normal setup and updates do not need one.");
     return;
   }
   info(hasStoredCloudflareToken(accountId)
-    ? `a Cloudflare token is stored for this account: ${storedTokenReference(accountId)}.\n` +
-      "      Provisioning runs load it automatically. Remove it with --forget — and always at client handoff:\n" +
-      "      revoking the token in Cloudflare does not delete this machine's stored copy."
-    : `nothing stored (${storedTokenReference(accountId)}). The next interactive setup or update will prompt once and offer to remember it.`);
+    ? `this older install has a recovery token stored for its account: ${storedTokenReference(accountId)}.\n` +
+      "      Provisioning commands load it automatically. Remove it with --forget after custody is no longer needed."
+    : `this older install has no stored recovery token (${storedTokenReference(accountId)}). The next interactive control-plane command offers hidden entry.`);
 }
 
 /** Beginner update path: verify custody first, then run the fully gated upgrade. */
@@ -16102,7 +16605,11 @@ export async function cmdUpdate(manifestPath, options = {}) {
     );
   }
   const pin = pinUpdateManifest(installed.path);
-  return withCloudflareToken(async () => {
+  const binding = manifestCloudflareControlBinding(pin.target);
+  const runControl = options.withCloudflareControl ?? withCloudflareControlCredential;
+  const interactive = options.interactive ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  const automationToken = !interactive && cloudflareTokenAvailable();
+  return runControl(async () => {
     revalidateUpdateManifest(pin, "update verification");
     await (options.cmdVerify ?? cmdVerify)(pin.target);
     revalidateUpdateManifest(pin, "update verification");
@@ -16125,18 +16632,29 @@ export async function cmdUpdate(manifestPath, options = {}) {
       }
     }
     return upgradeResult;
-  }, { accountId: manifestAccountId(pin.target), ...options });
+  }, {
+    ...options,
+    manifestPath: pin.target,
+    accountId: binding.accountId,
+    authProfile: binding.authProfile,
+    forceToken: options.forceToken === true || automationToken,
+    allowBrowserReauth: interactive,
+    allowTokenRecovery: interactive,
+    interactive,
+    askFn: options.askFn ?? ask,
+  });
 }
 
 export async function cmdRollbackInteractive(manifestPath, bookmarkArg, options = {}) {
   const preflight = rollbackLocalPreflight(manifestPath, bookmarkArg);
   if (options.confirmed !== true) return printRollbackPreview(preflight);
-  return withCloudflareToken(
+  return withManifestCloudflareControl(
+    manifestPath,
     () => (options.cmdRollback ?? cmdRollback)(manifestPath, bookmarkArg, {
       ...(options.rollbackOptions || {}),
       confirmed: true,
     }),
-    { accountId: manifestAccountId(manifestPath), ...options },
+    options,
   );
 }
 
@@ -16163,9 +16681,9 @@ const DOCTOR_FLAGS = ["repair", "rollback", "repair-checksum", "yes"];
  * --repair-checksum [--yes]` is the DIFFERENT path for an applied migration
  * whose file content has since changed — see diagnoseChecksumDrift's own
  * comment for why the two must not be conflated. All three need a Cloudflare
- * token (they read D1 and, once confirmed, mutate it) so each is wrapped in
- * withCloudflareToken exactly like `brain update` and `brain setup` already
- * are. Only one of the three may be requested at a time.
+ * Cloudflare control access (they read D1 and, once confirmed, mutate it), so
+ * each uses the manifest's exact saved browser profile or the legacy token
+ * path. Only one of the three may be requested at a time.
  */
 async function dispatchDoctor(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
@@ -16180,18 +16698,18 @@ async function dispatchDoctor(manifestPath) {
     if (!manifestPath || manifestPath.startsWith("--") || !existsSync(manifestPath)) {
       die("usage: brain doctor <manifest> --repair-checksum [--yes]");
     }
-    return withCloudflareToken(
+    return withManifestCloudflareControl(
+      manifestPath,
       () => cmdRepairChecksum(manifestPath, { confirmed: flags.yes === true }),
-      { accountId: manifestAccountId(manifestPath) },
     );
   }
   if (repairRequested || rollbackRequested) {
     if (!manifestPath || manifestPath.startsWith("--") || !existsSync(manifestPath)) {
       die("usage: brain doctor <manifest> --repair [--yes]\n      or: brain doctor <manifest> --rollback [--yes]");
     }
-    return withCloudflareToken(
+    return withManifestCloudflareControl(
+      manifestPath,
       () => cmdDoctorRepair(manifestPath, { action: rollbackRequested ? "rollback" : "repair", confirmed: flags.yes === true }),
-      { accountId: manifestAccountId(manifestPath) },
     );
   }
   return cmdDoctor(manifestPath);
@@ -16464,23 +16982,23 @@ const commands = {
   ask: cmdAsk,
   doctor: dispatchDoctor,
   whatsnew: cmdWhatsnew,
-  verify: cmdVerify,
-  provision: cmdProvision,
-  deploy: cmdDeploy,
-  secrets: cmdSecrets,
+  verify: (path) => withManifestCloudflareControl(path, () => cmdVerify(path)),
+  provision: (path) => withManifestCloudflareControl(path, () => cmdProvision(path)),
+  deploy: (path) => withManifestCloudflareControl(path, () => cmdDeploy(path)),
+  secrets: (path) => withManifestCloudflareControl(path, () => cmdSecrets(path)),
   health: cmdHealth,
   test: cmdTest,
   "mcp-config": cmdMcpConfig,
-  migrate: cmdMigrate,
+  migrate: (path) => withManifestCloudflareControl(path, () => cmdMigrate(path)),
   ingest: cmdIngest,
   import: cmdImport,
   connectors: () => cmdConnectors(),
   load: cmdLoad,
   connect: cmdConnect,
   disconnect: cmdDisconnect,
-  status: cmdStatus,
-  sources: cmdSources,
-  forget: cmdForget,
+  status: (path) => withManifestCloudflareControl(path, () => cmdStatus(path)),
+  sources: (path) => withManifestCloudflareControl(path, () => cmdSources(path)),
+  forget: (path) => withManifestCloudflareControl(path, () => cmdForget(path)),
   drain: cmdDrain,
   reindex: cmdReindex,
   diagnose: cmdDiagnose,
@@ -16506,6 +17024,9 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
 
   install
     brain setup      [manifest]            nothing to a working brain, one command
+    brain setup      [manifest] --cloudflare-account create  guide a first Cloudflare account
+    brain setup      [manifest] --cloudflare-account existing  use an account the owner already has
+    brain setup      [manifest] --cloudflare-token  recovery-only hidden API-token entry
     brain setup      [manifest] --no-connect  same, without touching THIS computer's AI tool config
     brain ask        <manifest>            ask a private question in this terminal
     brain doctor     [manifest]            check this machine has everything it needs
@@ -16513,7 +17034,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain tools      [manifest] --handoff  open Claude Code in the owner workspace with that status
     brain tools      [manifest] --json     print the same stable status for an agent or test
     brain tools      [manifest] --deep-dpapi  compatibility flag; Windows always requires the 25-round gate
-    brain verify     <manifest>            check the token and resolve the account
+    brain verify     <manifest>            check the saved Cloudflare access and exact account
     brain provision  <manifest>            create D1 (and R2), write IDs back
     brain secrets    <manifest>            set secrets and durably rotate ADMIN_KEY
     brain migrate    <manifest>            apply pending schema migrations
@@ -16526,7 +17047,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it
-    brain token      <manifest>            is a Cloudflare token remembered on this Mac? --forget removes it
+    brain token      <manifest>            describe browser sign-in and legacy recovery-token custody
     brain technician <manifest>            read-only account setup plan; --run <step> launches one safe ceremony
     brain grant      <manifest> --name "X" --can ask,file   give one person scoped access; prints the token once
     brain grants     <manifest>            who has access; --revoke <id> ends one
@@ -16616,8 +17137,10 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
   brain forget needs --source <name>, and --yes before it removes anything. Without
   --yes it prints exactly what would go and stops.
 
-  Provisioning and deployment require CLOUDFLARE_API_TOKEN. Routine source
-  refresh and health commands use the brain's domain and admin key instead.
+  Normal provisioning and deployment use this Brain's named Cloudflare browser
+  sign-in in the operating-system credential store. Older installs, automation,
+  and recovery may use a scoped API token. Routine source refresh and health
+  commands use the Brain's domain and admin key instead.
 `);
   process.exit(cmd ? 1 : 0);
 }

@@ -29,6 +29,14 @@ function runDoctor(...args) {
   });
 }
 
+function runSetup(...args) {
+  return spawnSync(process.execPath, [CLI, "setup", ...args], {
+    encoding: "utf8",
+    timeout: 30_000,
+    env: { ...process.env, NO_COLOR: "1" },
+  });
+}
+
 test("the exact field failure: an unknown doctor flag exits nonzero", () => {
   const result = runDoctor("--repair-checksums");
   assert.notEqual(result.status, 0, "an unrecognised flag must not exit 0");
@@ -74,4 +82,45 @@ test("assertKnownFlags reports every unknown flag, not only the first", () => {
     },
     "an unknown flag must abort rather than return",
   );
+});
+
+test("an inline Cloudflare token is rejected without reproducing its value", () => {
+  const fixture = "fixture-inline-secret-that-must-not-appear";
+  const result = runSetup(`--cloudflare-token=${fixture}`);
+  const output = `${result.stdout}${result.stderr}`;
+  assert.notEqual(result.status, 0);
+  assert.match(output, /recovery-only hidden prompt/);
+  assert.doesNotMatch(output, /fixture-inline-secret/);
+  assert.doesNotMatch(output, /cloudflare-token=/);
+});
+
+test("mixed-case inline Cloudflare token flags are also rejected without disclosure", () => {
+  const fixture = "fixture-mixed-case-secret-that-must-not-appear";
+  const result = runSetup(`--ClOuDfLaRe-ToKeN=${fixture}`);
+  const output = `${result.stdout}${result.stderr}`;
+  assert.notEqual(result.status, 0);
+  assert.match(output, /recovery-only hidden prompt/);
+  assert.doesNotMatch(output, /fixture-mixed-case-secret/);
+  assert.doesNotMatch(output, /ClOuDfLaRe-ToKeN=/);
+});
+
+test("a mistyped inline recovery flag never repeats its value", () => {
+  const fixture = "fixture-typo-secret-that-must-not-appear";
+  const result = runSetup(`--cloudflare-toke=${fixture}`);
+  const output = `${result.stdout}\n${result.stderr}`;
+  assert.notEqual(result.status, 0);
+  assert.match(output, /unknown option --cloudflare-toke/i);
+  assert.match(output, /Did you mean --cloudflare-token/i);
+  assert.doesNotMatch(output, /fixture-typo-secret/i);
+  assert.doesNotMatch(output, /cloudflare-toke=/i);
+});
+
+test("an extra dash on an inline recovery flag never repeats its value", () => {
+  const fixture = "fixture-extra-dash-secret-that-must-not-appear";
+  const result = runSetup(`---cloudflare-token=${fixture}`);
+  const output = `${result.stdout}\n${result.stderr}`;
+  assert.notEqual(result.status, 0);
+  assert.match(output, /unknown option ---cloudflare-token/i);
+  assert.doesNotMatch(output, /fixture-extra-dash-secret/i);
+  assert.doesNotMatch(output, /cloudflare-token=/i);
 });

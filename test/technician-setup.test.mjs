@@ -466,7 +466,7 @@ test("the Cloudflare ceremony refuses an agent shell without a TTY and records t
   console.log = () => {};
   try {
     await assert.rejects(
-      cmdTechnician(manifest, { run: "cloudflare" }, {
+      cmdTechnician(manifest, { run: "cloudflare", "cloudflare-account": "create" }, {
         scriptPath: fixtureScriptPath,
         nodePath: fixtureNodePath,
         isTTY: false,
@@ -484,11 +484,41 @@ test("the Cloudflare ceremony refuses an agent shell without a TTY and records t
   assert.equal(status.retry_safe, true);
   assert.deepEqual(status.owner_action, {
     command: fixtureNodePath,
-    args: [fixtureScriptPath, "technician", manifest, "--run", "cloudflare"],
+    args: [fixtureScriptPath, "technician", manifest, "--run", "cloudflare", "--cloudflare-account", "create"],
     execution_boundary: "owner_direct_terminal",
     mutates_external_state: true,
   });
   assert.match(status.next_action, /owner_action\.command with exactly owner_action\.args/i);
+});
+
+test("an invalid Cloudflare account choice records a retry-safe correction before any action", async () => {
+  const workspace = join(sandbox, "cloudflare-invalid-account-choice");
+  mkdirSync(workspace, { recursive: true });
+  const manifest = join(workspace, "brain.manifest.json");
+  let children = 0;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    await assert.rejects(
+      cmdTechnician(manifest, { run: "cloudflare", "cloudflare-account": "shared" }, {
+        scriptPath: fixtureScriptPath,
+        nodePath: fixtureNodePath,
+        isTTY: true,
+        spawn: () => { children++; return { status: 0 }; },
+      }),
+      /accepts create or existing/i,
+    );
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(children, 0);
+  const status = JSON.parse(readFileSync(technicianStatusFilePath(manifest), "utf8"));
+  assert.equal(status.status, "action_required");
+  assert.equal(status.issue_code, "CLOUDFLARE_ACCOUNT_CHOICE_INVALID");
+  assert.equal(status.retry_safe, true);
+  assert.equal(status.requires_human, true);
+  assert.equal("owner_action" in status, false);
+  assert.match(status.next_action, /credential-free read-only refresh/i);
 });
 
 test("every completed technician step writes a private status that requires an exact read-only refresh", async () => {

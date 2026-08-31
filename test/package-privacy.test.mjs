@@ -435,6 +435,8 @@ const expected = [
   "operations/command-display.mjs",
   "operations/claude-workspace.mjs",
   "operations/claude-skill.mjs",
+  "operations/cloudflare-account-bootstrap.mjs",
+  "operations/cloudflare-oauth-session.mjs",
   "operations/cloudflare-token-store.mjs",
   "operations/session-signing-key.mjs",
   "operations/technician-setup.mjs",

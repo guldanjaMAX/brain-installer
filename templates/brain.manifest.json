@@ -23,24 +23,27 @@
     "worker_name": "acme-brain"
   },
   "infrastructure": {
-    "_comment": "Client-owned. We hold a scoped, expiring token and nothing else.",
+    "_comment": "Client-owned. The ordinary installer uses this Brain's named Wrangler browser sign-in in the owner's protected operating-system credential store. The manifest stores only its non-secret profile label.",
     "cloudflare": {
       "_token_scopes": [
-        "The API token the client issues us needs exactly these, no more:",
+        "The normal path is a separate named Wrangler browser sign-in for this Brain.",
+        "If browser sign-in is unavailable and the owner approves the recovery-only",
+        "API-token path, that temporary token needs exactly these permissions:",
         "  Account > Workers Scripts: Edit",
         "  Account > D1: Edit",
         "  Account > Vectorize: Edit",
         "  Account > Workers R2 Storage: Edit   (only if r2_bucket is set)",
         "  Account > Workers AI: Read",
         "Vectorize Edit was verified on 2026-08-23 for index creation and every",
-        "metadata index. A separate named Wrangler profile is only a fallback",
-        "for an older token that does not carry that permission; `brain doctor`",
-        "prints its exact profile sign-in step and confirms this manifest account.",
+        "metadata index. `brain doctor` checks this Brain's exact saved browser",
+        "profile and account without opening a browser. A recovery token remains",
+        "separate and can be removed without removing the named browser profile.",
         "",
         "The account must ALSO be on the Workers Paid plan, 5 USD a month minimum.",
         "Free can create Vectorize, but its vector, daily-write, and Worker CPU limits are prototype-scale. Paid is the supported production baseline."
       ],
       "account_id": "REQUIRED_client_account_id",
+      "_auth_profile_comment": "Filled by the beginner installer after Cloudflare browser sign-in. This is a non-secret local profile name, not a token. One Cloudflare account may safely own many Brains; every Brain still receives its own Worker, D1 database, Vectorize index, secrets, and manifest resource IDs. The browser grant has account-wide control-plane authority, so separate resources prevent accidental overlap but are not a separate permission boundary.",
       "storage": "d1",
       "_storage_options": "d1 | supabase",
       "d1_database_name": "REPLACE-WITH-slug-brain",

@@ -3,7 +3,8 @@ import { run, localToolEnvironment, cloudflareCliEnvironment,
          checkWindowsCredentialProtection, persistWindowsClaudePath, windowsClaudePathState,
          checkWrangler,
          checkWranglerLogin, checkVectorize, checkVectorizeApi, checkCfToken, CF_TOKEN_SCOPES,
-         wranglerProfileArgs, wranglerProfileName, WRANGLER_PACKAGE,
+         resolveWranglerProfile, wranglerProfileArgs, wranglerProfileName,
+         WRANGLER_AUTH_PROFILE_PATTERN, WRANGLER_PACKAGE,
          summarize, runAll, OK, WARN, FAIL } from "../doctor.mjs";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
@@ -254,8 +255,137 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   const originalArgs = [WRANGLER_PACKAGE, "vectorize", "list"];
   const profiledArgs = wranglerProfileArgs(originalArgs, accountId);
   check("profile argument construction is non-mutating",
-    originalArgs.length === 3 && profiledArgs.length === 5 && profiledArgs.at(-2) === "--profile");
+    originalArgs.length === 3 && profiledArgs.length === 6 &&
+      profiledArgs.at(-3) === "--profile" && profiledArgs.at(-1) === "--env-file=/dev/null");
   check("the scoped token includes Vectorize Edit", CF_TOKEN_SCOPES.includes("Vectorize: Edit"), JSON.stringify(CF_TOKEN_SCOPES));
+}
+
+/* ---- current manifests bind doctor to their exact saved OAuth profile ---- */
+{
+  const accountId = "d".repeat(32);
+  const exactProfile = `financial-brain-${"1a".repeat(12)}`;
+  const legacyProfile = wranglerProfileName(accountId);
+  const ambientMarker = "ambient-value-that-must-not-cross";
+  const seen = [];
+  const result = checkWranglerLogin(accountId, (_command, args, options) => {
+    seen.push({ args, options });
+    return { ok: true, out: JSON.stringify({ indexes: [] }) };
+  }, {
+    authProfile: exactProfile,
+    platformName: "darwin",
+    environment: {
+      PATH: "/fixture/bin",
+      HOME: "/fixture/home",
+      CLOUDFLARE_API_TOKEN: ambientMarker,
+      CLOUDFLARE_API_KEY: ambientMarker,
+      CLOUDFLARE_EMAIL: "owner@example.test",
+      CF_API_TOKEN: ambientMarker,
+      WRANGLER_PROFILE: "default",
+      NODE_OPTIONS: "--require=/tmp/untrusted.cjs",
+    },
+  });
+  const call = seen[0];
+  const profileIndex = call?.args.indexOf("--profile") ?? -1;
+  check("a current manifest uses its exact 24-hex saved profile",
+    result.status === OK && WRANGLER_AUTH_PROFILE_PATTERN.test(exactProfile) &&
+      call?.args[profileIndex + 1] === exactProfile && !call?.args.includes(legacyProfile),
+    JSON.stringify({ result, args: call?.args }));
+  check("the saved-profile probe forces the OS keyring and exact manifest account",
+    call?.options?.inheritEnv === false &&
+      call?.options?.env?.CLOUDFLARE_AUTH_USE_KEYRING === "true" &&
+      call?.options?.env?.CLOUDFLARE_ACCOUNT_ID === accountId,
+    JSON.stringify(call?.options?.env));
+  check("the saved-profile probe suppresses dotenv and never starts browser authorization",
+    call?.args.at(-1) === "--env-file=/dev/null" &&
+      !call?.args.includes("--browser") && !call?.args.includes("create") &&
+      call?.args.includes("vectorize") && call?.args.includes("list"),
+    JSON.stringify(call?.args));
+  check("the saved-profile probe scrubs ambient Cloudflare credentials and default-profile selection",
+    !["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_KEY", "CLOUDFLARE_EMAIL", "CF_API_TOKEN",
+      "WRANGLER_PROFILE", "NODE_OPTIONS"].some((name) => Object.hasOwn(call?.options?.env || {}, name)) &&
+      !JSON.stringify(call).includes(ambientMarker) && !call?.args.includes("default"),
+    JSON.stringify(call));
+
+  let invalidSpawned = false;
+  const invalid = checkWranglerLogin(accountId, () => {
+    invalidSpawned = true;
+    return { ok: true, out: "" };
+  }, { authProfile: legacyProfile });
+  check("an invalid saved profile fails closed without deriving a legacy or default profile",
+    invalid.status === FAIL && !invalidSpawned && /no other profile was tried/i.test(invalid.detail),
+    JSON.stringify(invalid));
+  let invalidThrew = false;
+  try { resolveWranglerProfile(accountId, "financial-brain-not-valid"); } catch { invalidThrew = true; }
+  check("the shared profile resolver also refuses an invalid saved value",
+    invalidThrew && resolveWranglerProfile(accountId, undefined) === legacyProfile);
+
+  const windowsCalls = [];
+  const windows = checkWranglerLogin(accountId, (_command, args, options) => {
+    windowsCalls.push({ args, options });
+    return { ok: true, out: "[]" };
+  }, {
+    authProfile: exactProfile,
+    platformName: "win32",
+    environment: { Path: "C:\\fixture\\bin", USERPROFILE: "C:\\Users\\fixture" },
+  });
+  check("the Windows saved-profile probe uses NUL while remaining browser-free",
+    windows.status === OK && windowsCalls[0]?.args.at(-1) === "--env-file=NUL" &&
+      !windowsCalls[0]?.args.includes("--browser") &&
+      windowsCalls[0]?.options?.env?.CLOUDFLARE_AUTH_USE_KEYRING === "true" &&
+      windowsCalls[0]?.options?.env?.Path === "C:\\fixture\\bin",
+    JSON.stringify(windowsCalls[0]));
+}
+
+/* ---- runAll distinguishes normal OAuth from legacy token recovery ---- */
+{
+  const accountId = "e".repeat(32);
+  const exactProfile = `financial-brain-${"2b".repeat(12)}`;
+  const calls = [];
+  const healthyTool = (_command, args, options) => {
+    calls.push({ args, options });
+    if (args.includes("vectorize")) return { ok: true, out: "[]" };
+    if (args.includes(WRANGLER_PACKAGE)) return { ok: true, out: "wrangler 4.127.1" };
+    if (args.includes("status")) return { ok: true, out: "signed in" };
+    return { ok: true, out: "2.1.63 (Claude Code)" };
+  };
+  const networkCheck = async () => ({ name: "Network", status: OK, detail: "fixture reachable" });
+  const oauthChecks = await runAll({
+    accountId,
+    cloudflareAuthProfile: exactProfile,
+    cloudflareToken: undefined,
+    googleStorageStatus: { exists: false, description: "fixture secure storage" },
+    localRun: healthyTool,
+    networkCheck,
+  });
+  check("runAll treats a saved OAuth profile as the normal credential without a missing-token failure",
+    !oauthChecks.some((item) => item.name === "Cloudflare token") &&
+      oauthChecks.some((item) => item.name === "wrangler login" && item.status === OK) &&
+      !oauthChecks.some((item) => item.name === "Vectorize"),
+    JSON.stringify(oauthChecks));
+  const vectorCall = calls.find((call) => call.args.includes("vectorize"));
+  check("runAll passes the saved profile exactly into its browser-free diagnostic",
+    vectorCall?.args[vectorCall.args.indexOf("--profile") + 1] === exactProfile &&
+      !vectorCall?.args.includes("--browser") && vectorCall?.args.at(-1) === "--env-file=/dev/null",
+    JSON.stringify(vectorCall));
+
+  calls.length = 0;
+  const localOnly = await runAll({
+    accountId,
+    cloudflareAuthProfile: exactProfile,
+    cloudflareToken: "fixture-unused-token",
+    googleStorageStatus: { exists: false, description: "fixture secure storage" },
+    localRun: healthyTool,
+    networkCheck,
+    skipCloudflare: true,
+  });
+  check("skipCloudflare runs local readiness while omitting every credential and Vectorize probe",
+    localOnly.some((item) => item.name === "Node") &&
+      localOnly.some((item) => item.name === "wrangler") &&
+      localOnly.some((item) => item.name === "Network") &&
+      localOnly.some((item) => item.name === "Claude Code") &&
+      !localOnly.some((item) => ["Cloudflare token", "Vectorize", "wrangler login"].includes(item.name)) &&
+      !calls.some((call) => call.args.includes("vectorize")),
+    JSON.stringify(localOnly));
 }
 {
   const saved = process.env.CLOUDFLARE_API_TOKEN;

@@ -81,7 +81,7 @@ test("the packed CLI scaffolds a nonexistent manifest before any manifest-accoun
     });
     const noCredentialOutput = `${noCredential.stdout}${noCredential.stderr}`;
     assert.notEqual(noCredential.status, 0);
-    assert.match(noCredentialOutput, /cannot prompt securely|interactive terminal for hidden entry/i);
+    assert.match(noCredentialOutput, /owner-controlled terminal|open Terminal or PowerShell/i);
     assert.doesNotMatch(noCredentialOutput, /could not read the install manifest|CONFIG_INVALID/i);
     assert.ok(!existsSync(manifestPath), "credential refusal must not create partial local state");
 
