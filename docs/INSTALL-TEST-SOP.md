@@ -14,21 +14,37 @@ discovered on the day of an install.
 
 ## The test account
 
-One Cloudflare test account, never a client's and never a production account
-(see the we-store-nothing rule). Its scoped API token carries exactly the four
-install permissions (Workers Scripts Edit, D1 Edit, Vectorize Edit, Workers AI
-Read) and is scoped to that one account.
+One Cloudflare test account, never an owner's production account. It exercises
+two different credential paths and the receipt must name which one was used:
+
+1. **Primary first-install path:** a separate named Wrangler OAuth profile for
+   the disposable Brain, approved in the operator's browser and protected by the
+   Mac or Windows OS keyring.
+2. **Fallback path:** an expiring scoped API token with Workers Scripts Edit,
+   D1 Edit, Vectorize Edit, and Workers AI Read. This covers reviewed legacy,
+   automation, and recovery compatibility. It is not evidence that browser
+   OAuth works.
 
 This repo is public, so the account id, the login it belongs to, and the names
 of the live resources that share it are deliberately NOT written here. They
 live in the operator's private bench note, outside this repo. What matters publicly is the shape:
 
-- The token lives in the operator's OS keychain, never in a file, an argument,
-  or a shell history line. The scripts read it from there.
-- CI reads it from the repository secret `BRAIN_TEST_CF_TOKEN`.
+- Wrangler's named OAuth profile lives only in the operator's OS keyring. The
+  installer should never need its access value copied into chat or a command.
+- The fallback token lives in the operator's OS keychain, never in a file, an
+  argument, or a shell history line. The legacy test launcher reads it there.
+- CI may read the fallback from the repository secret `BRAIN_TEST_CF_TOKEN`.
+  A passing CI token lane is not a browser callback or keyring field receipt.
 - Proven 2026-08-27 and again 2026-08-28 on two separate accounts: those four
   permissions are sufficient for everything an install does, INCLUDING creating
-  the Vectorize index. No `wrangler login` is required anywhere in the flow.
+  the Vectorize index through the fallback API-token path.
+
+The named-profile implementation requests the pinned Wrangler 4.127.1 OAuth
+scopes available for account membership, Workers, D1, and Workers AI, then
+requires an exact read-only Vectorize request before any mutation because that
+Wrangler release exposes no separate Vectorize scope key. The deterministic
+contract is locally covered. A real macOS callback, real Windows callback, and
+live Vectorize preflight under that exact approval remain unproven field gates.
 
 ⚠️ **The test account is not empty.** It also hosts a live preview brain. Every
 teardown and cleanup MUST target test resources by exact name (allowlist), and
@@ -47,8 +63,10 @@ never touches a test install.
 ## Teardown
 
 The installer has no uninstall command, but every resource it creates can be
-deleted with the same token (Worker script, D1 database, Vectorize index).
-`scripts/teardown-test-brain.mjs` does this in one run. Run it after every
+deleted with the exact reviewed fallback credential (Worker script, D1
+database, Vectorize index).
+`scripts/teardown-test-brain.mjs` does this in one run. The reviewed fallback
+launcher currently supplies its exact scoped token. Run it after every
 cold-install test so the account stays clean. The installer also adopts
 existing resources by name, so an interrupted run can always be re-run
 safely before teardown.
@@ -62,11 +80,17 @@ its own: none of these assertions can see a screen.
 
 ## Tier 1: fresh-machine install matrix (CI)
 
-GitHub Actions workflow `install-matrix.yml`. Every runner is a genuinely
-fresh machine. Each job executes the install commands **verbatim from the
-public install page** (not from repo internals; the point is testing what a
-client actually types), then `brain whatsnew`, `brain doctor`, `brain setup`,
-a minimal `brain drain`, health verify, one `brain ask`, then teardown.
+GitHub Actions workflow `install-matrix.yml`. Every runner is a genuinely fresh
+machine. Each job executes the package-install commands **verbatim from the
+public install page** (not from repo internals; the point is testing what an
+owner actually types), then `brain whatsnew` and the credential-free parts of
+`brain doctor`.
+
+The disposable live-service sublane may use the repository's expiring fallback
+token to run `brain setup`, a minimal `brain drain`, health verify, one `brain
+ask`, and exact teardown. Its receipt must say `api_token_fallback`. A CI runner
+cannot honestly complete the owner's interactive browser approval or prove OS
+keyring custody. Those remain the supervised Mac and Windows field gates below.
 
 | Runner | What it proves |
 |---|---|
@@ -123,19 +147,25 @@ boredom (actual seconds), dread, and unearned trust.
 ## Break-tests (INS-03)
 
 From `planning/03`, run at least once per release cycle, cheapest first:
-bad token, Free-plan limits mid-drain, network drop mid-step, Ctrl-C
-mid-setup, wrong account selected. Judgement per failure message: could a
-non-technical owner act on it without calling us. If not, the message is
-the defect.
+unavailable OS keyring, browser callback port already occupied, owner cancels
+browser approval, missing Vectorize reachability, several visible accounts,
+wrong account selected, expired fallback token, Free-plan limits mid-drain,
+network drop mid-step, and Ctrl-C mid-setup. Judgement per failure message:
+could a non-technical owner act on it without calling us. If not, the message
+is the defect.
 
 ## Manual checklist before every client install day
 
 The short list automation cannot cover:
 
-1. Real passkey enrolment with Face ID on an actual iPhone against the test
+1. Complete the named Wrangler browser callback on an actual Mac, confirm the
+   exact account, and prove read-only Vectorize reachability.
+2. Complete the same named-profile callback and exact-account preflight on the
+   clean Windows field machine, with Credential Manager custody read back.
+3. Real passkey enrolment with Face ID on an actual iPhone against the test
    brain (domain settled first; passkeys bind to the exact host).
-2. One real `brain eval --golden-20` guided session end to end.
-3. Read the latest Tier 1 transcripts for anything a client would ask about.
+4. One real `brain eval --golden-20` guided session end to end.
+5. Read the latest Tier 1 transcripts for anything an owner would ask about.
 
 ## Evidence filing
 
@@ -150,7 +180,8 @@ offboarding). File defect write-ups with the gate id in the title.
 | Piece | Status |
 |---|---|
 | Tier 0 suite | BUILT (`npm test`) |
-| Test account + keychain-held scoped token | BUILT 2026-08-27 (token verified; Vectorize create/delete probe passed). Identifiers in the private bench note. |
+| Test account + keychain-held fallback token | BUILT 2026-08-27 (fallback token verified; Vectorize create/delete probe passed). Identifiers in the private bench note. |
+| Named Wrangler OAuth contract | BUILT and locally covered. Live macOS callback, Windows callback, and exact-grant Vectorize access remain TODO field gates. |
 | `scripts/teardown-test-brain.mjs` | BUILT 2026-08-28. Allowlist-only, dry-run by default, refuses protected and non-test names; create/detect/delete verified live. |
 | `install-matrix.yml` (Tier 1) | TODO |
 | Playwright suite (Tier 2) | TODO |

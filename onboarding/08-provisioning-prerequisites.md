@@ -15,9 +15,9 @@ account alone.
 |---|---|---|---|
 | 1 | Claude Code plus a current paid Anthropic plan that includes Claude Code | 5 min | Anthropic controls current eligibility, availability, and pricing; Financial Brain does not include that subscription |
 | 2 | Node.js 22 or newer | 5 min | Runs the Brain CLI and the pinned Wrangler 4 command |
-| 3 | A Cloudflare account | 5 min | Everything lives here. Theirs, not ours |
+| 3 | A Cloudflare account, created during setup if needed | 5 min | Everything lives here. Theirs, not ours |
 | 4 | **Workers Paid plan on it** | 2 min | 5 USD/month minimum. The Free plan is prototype-scale, not a supported production home for a real corpus |
-| 5 | An account-scoped, expiring API token | 5 min | One token drives every Cloudflare step |
+| 5 | A current browser and the computer's OS keyring | already present on most computers | Wrangler keeps this Brain's Cloudflare approval protected locally |
 
 No Supabase, database password, or separate answer-model API key is required.
 The Claude account is for the owner's Claude Code client, not for Worker answers.
@@ -44,6 +44,25 @@ Wrangler is fetched on demand at the profile-capable pinned release. It is not i
 globally and it does not receive ambient Brain, Google, Zoom, bank, or mail
 credentials just to print its version.
 
+## First Cloudflare account, or one you already have
+
+For most owners, **Create my first Cloudflare account** is the clearest path.
+The installer opens Cloudflare's official sign-up page and waits while the owner
+creates the account, verifies the email address, and completes any sign-in
+protection Cloudflare requests. Billing and 2FA stay entirely in Cloudflare's
+pages.
+
+If the owner already has Cloudflare, choose **Use a Cloudflare account I already
+have**. Sign in normally. If that login can reach more than one account, the
+installer lists them and asks the owner to confirm the exact account by name and
+ID before it creates anything. An existing account is an alternate starting
+point, not a special migration path.
+
+One Cloudflare account can hold several separate Brains. Each Brain receives its
+own Worker, D1 database, Vectorize index, secrets, hostname, and saved resource
+IDs. Create another Cloudflare account only when separate billing or separate
+administrators would be useful.
+
 ---
 
 ## Item 2 is the one that bites
@@ -57,8 +76,8 @@ personal or company corpus can cross those limits during its first load.
 **Confirm it before the session, not during it.** Cloudflare dashboard, Workers
 and Pages, Plans. It should say Paid. Upgrading takes about two minutes and a
 card. `brain doctor` proves Vectorize access, but Cloudflare does not expose the
-plan check through the scoped install token, so the dashboard remains the plan
-proof.
+account's paid-plan status through the install approval. The dashboard remains
+the plan proof.
 
 Current limits:
 
@@ -68,10 +87,28 @@ Current limits:
 
 ---
 
-## Credential: one scoped API token
+## Cloudflare sign-in
 
-The client issues a token at dash.cloudflare.com, My Profile, API Tokens,
-Create Token, Custom token, with exactly these permissions:
+The normal setup opens Cloudflare in the owner's browser. Wrangler creates a
+separate named profile for this Brain and keeps the approval in macOS Keychain
+or the Windows credential store. The profile label is derived from a stable,
+non-secret install identity. It does not contain the owner's name or account
+ID, and the installer never falls back to an unrelated default Wrangler
+profile.
+
+After browser approval, the installer performs read-only checks against the
+exact selected account for the account itself, Workers, D1, Vectorize, and
+Workers AI. A missing permission pauses setup before any resource change. The
+short-lived access value is held only in memory while that exact-account action
+runs and is then cleared. The owner never needs to copy it into Claude, Codex,
+a chat, a command, or a configuration file.
+
+### API-token fallback
+
+An expiring, account-scoped API token remains available for reviewed legacy,
+automation, or recovery work. It is not the normal first-install path. When a
+technician has confirmed that it is genuinely needed, use only the permissions
+required by that operation:
 
     Account > Workers Scripts        Edit
     Account > D1                     Edit
@@ -79,52 +116,33 @@ Create Token, Custom token, with exactly these permissions:
     Account > Workers AI             Read
     Account > Workers R2 Storage     Edit    (only if the manifest sets r2_bucket)
 
-Set an expiry. Nothing here needs to outlive the engagement.
-
-Keep the value in the account owner's password manager. Do not email it,
-message it, or put it in a shared terminal. The account owner enters it only at
-the hidden prompt in `brain setup` or `brain update`. Low-level automation must
-use an approved no-history secret-manager launcher.
-
-Vectorize Edit was verified end to end on 2026-08-23: the account-scoped token
-created the 768-dimensional index and all six metadata indexes through the API.
-
-The guided setup and update paths probe every required permission and name
-whichever is missing before making account changes. Run the appropriate path as
-soon as the account owner has created the token, not at the start of a support
-session.
-
-### Compatibility fallback
-
-If an older token cannot reach Vectorize, create a correctly scoped replacement
-and enter it at the hidden `brain setup` or `brain update` prompt. Do not leave
-the old value in a shell environment.
-
-For a temporary compatibility test of an older account, run
-`brain doctor <manifest>` and follow the exact named-profile command it prints.
-The profile label is derived irreversibly from the declared account id, so it
-does not expose client identity and it cannot reuse another install's default
-OAuth session.
-
-The account owner approves that named profile in their own browser. Doctor and
-provision pass the profile and the manifest account id together, and a
-read-only Vectorize request must succeed before any fallback mutation. New
-installs should fix the scoped token and use hidden prompt entry so every owner
-follows the same supported path.
+The owner enters the value in the Brain CLI's hidden prompt, or automation uses
+an approved no-history secret-manager launcher. It should not appear in chat,
+argv, an environment file, a screenshot, a support note, or a shared terminal.
+The earlier token path created a Vectorize index and all six metadata indexes in
+a live test account on 2026-08-23. That is useful fallback evidence, not proof
+of the new browser OAuth path.
 
 ---
 
 ## Verify before you start
 
 Run `node brain.mjs setup <manifest>` for a new install or
-`node brain.mjs update <manifest>` for an existing install. Enter the scoped
-token only when the hidden prompt asks for it.
+`node brain.mjs update <manifest>` for an existing install. Choose create or
+existing account, then complete Cloudflare's browser approval when it opens.
 
 The preflight should show five green lines: account resolved, R2, D1, Workers,
 Vectorize. A
 warning on R2 is survivable and the brain runs without it. **A warning on
 Vectorize is not** — it means the install would come up keyword-only, which
 looks healthy and answers badly, and that is far worse than failing loudly.
+
+The account-choice, exact-selection, keyring-only, permission, and in-memory
+cleanup contracts have deterministic local tests. They do not prove a real
+browser callback on the final Mac or Windows computer. The exact Wrangler OAuth
+permission set's access to live Vectorize also remains a field gate. Keep the
+release held until those Apple and Windows ceremonies and the live Vectorize
+preflight are recorded on the exact candidate.
 
 ---
 

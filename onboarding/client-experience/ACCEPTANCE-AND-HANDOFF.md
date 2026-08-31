@@ -65,7 +65,9 @@ Before closing the session, the owner should be able to:
 5. preview the local support note with `brain support --preview`;
 6. identify the manifest and private local evaluation suite without sharing
    their paths publicly;
-7. revoke the temporary Cloudflare token and verify the Brain still works;
+7. confirm the named Cloudflare browser profile is bound to the exact owner
+   account and, if a fallback API token was used, revoke that token and verify
+   the Brain still works;
 8. explain who can access the Brain and how to remove that access;
 9. find the approved support profile and update page.
 

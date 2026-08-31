@@ -11,7 +11,7 @@ One page. Every single thing you have to do, how long it takes you, and what hap
 | Day | What you do | Your time | What it holds up |
 |---|---|---|---|
 | **Day 1** | Intake call with me | 45 min | Everything. Nothing starts before this |
-| **Day 2** | Create the Cloudflare account and grant access to your sources | 30 min | Everything after it. This is the gate |
+| **Day 2** | Create your first Cloudflare account, or choose one you already control; approve browser sign-in; grant access to your sources | 30 min | Everything after it. This is the gate |
 | **Days 3 to 4** | Nothing | 0 | I build and deploy |
 | **Days 5 to 6** | Nothing. I may send one or two short questions | 5 min | I load your material, most valuable first |
 | **Day 7** | Nothing | 0 | I read the actual answers to your ten questions and fix what is wrong before you see any of it |
@@ -47,7 +47,7 @@ These are yours. I never own them, and that is the entire point: your material l
 
 | # | Account | Your time | What it is for |
 |---|---|---|---|
-| 1 | **Cloudflare** | 10 min | The brain itself, its database, and its file storage. Free to create |
+| 1 | **Cloudflare** | 10 min | The Brain itself, its database, and its search index. Create your first account during setup, or choose one you already control |
 | 2 | **Workers Paid, on that same Cloudflare account** | 2 min | 5 USD/month minimum. Free can create Vectorize now, but its vector, daily-write, and CPU ceilings are prototype-scale. See `08-provisioning-prerequisites.md` |
 Written answers run on Cloudflare Workers AI, so there is no second AI-provider
 account or credential. Plus one grant:
@@ -57,6 +57,11 @@ account or credential. Plus one grant:
 | 3 | **Read-only access** to the folders you named at intake | 10 min |
 
 That access is genuinely read-only. It can look at documents. It cannot change, move, or delete anything.
+
+One Cloudflare account can hold several separate Brains. Each Brain still gets
+its own Worker, database, search index, secrets, hostname, and saved resource
+IDs. A second account is optional when separate billing or administrators would
+be helpful.
 
 **Do all three in one sitting.** They take about 25 minutes together and much
 longer when split across several days, because each unfinished item has to be
@@ -117,7 +122,8 @@ What does not work is assuming they will be quick.
 Print this, or forward it to whoever is doing the setup.
 
 - [ ] Intake sheet returned, including all ten questions in section 6
-- [ ] Cloudflare account created, and I have been told which email it is under
+- [ ] Cloudflare path chosen: create the owner's first account, or use an exact existing account they control
+- [ ] Cloudflare browser approval completed from the owner's computer; no token copied into chat or a command
 - [ ] Cloudflare account upgraded to Workers Paid (verify in the Cloudflare dashboard; `node brain.mjs doctor` separately proves Vectorize access)
 - [ ] Read-only access granted to the folders named at intake
 - [ ] Workspace or personal gmail.com question answered, and if personal, the publishing step scheduled

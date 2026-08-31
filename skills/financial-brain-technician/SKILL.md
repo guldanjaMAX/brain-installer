@@ -39,10 +39,11 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
 
 5. Explain the next incomplete step in ordinary language. Before any action,
    state what will change and ask the owner to approve that exact action. For
-   Cloudflare, never run the command through Claude's Bash tool. Give the owner
-   the plan's exact structured `owner_only_command` to paste and run in a
-   terminal they control directly, then observe only the credential-free
-   refresh. The hidden token prompt requires that real owner TTY.
+   Cloudflare, give the owner the plan's exact structured `owner_only_command`
+   to run in a terminal they control directly. The normal path opens
+   Cloudflare's own browser sign-in and stores Wrangler OAuth through the
+   operating-system keyring. A hidden API-token prompt is a recovery path, not
+   the beginner path. Return to the credential-free refresh afterward.
 6. After setup creates the manifest, reread the bootstrap status and transition
    to manifest-bound technician mode. If an explicitly supplied pilot test kit
    exists, read it as additional acceptance evidence only. A kit with
@@ -81,8 +82,16 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
   or captured terminal. The owner mints and opens the one-time link in a
   terminal and display they control directly. Final verification must observe
   an enrolled device through the deployed data plane.
-- Prefer browser-based `wrangler login` or `gh auth login` for optional local
-  developer access. Do not create or print a broad Cloudflare or GitHub token.
+- For a first Cloudflare account, help the owner open Cloudflare's official
+  sign-up page, verify their email, and complete 2FA and Workers Paid billing.
+  If they already have an account, use that branch instead. One Cloudflare
+  account can own several separate Brains. The API account list and the
+  owner's exact selection remain authoritative before provisioning.
+- Prefer the installer's named-profile Wrangler browser sign-in. Do not run
+  `wrangler auth token`, print a broad Cloudflare token, or switch to Wrangler's
+  default profile. An unrestricted local shell can technically reach the
+  current user's credential stores, so leave Claude's normal approval prompts
+  enabled and use the package-local Brain CLI for control-plane work.
 - Prefer the exact `<brain-cli>` launcher over direct Wrangler commands because the Brain CLI
   applies account pinning, migration safety, protected key lookup, and proof
   checks. Use Wrangler directly only for a named diagnostic the owner approves.

@@ -1,9 +1,11 @@
 # brain-installer
 
-Provisions a retrieval brain into a **client's own Cloudflare account**. Text and
-keyword search live in D1, vectors live in Vectorize, and the Worker fuses them.
-Nothing runs on our infrastructure, and nothing but a scoped token is held during
-the engagement.
+Provisions a retrieval brain into the **owner's own Cloudflare account**. Text
+and keyword search live in D1, vectors live in Vectorize, and the Worker fuses
+them. Nothing runs on our infrastructure. The normal control-plane session is a
+per-install named Wrangler OAuth profile protected by the computer's OS
+keyring. The CLI holds its short-lived access value only in a zeroable in-memory
+buffer while an exact-account action runs.
 
 **Status: 0.2.1 local release candidate.** Provisioning, retrieval, resumable ingest,
 guarded deletion, owner actions, exact entity scope, document grants, passkey
@@ -36,20 +38,35 @@ an active baseline or exception path.
 
 - Node 22 or newer (uses `node:sqlite` for the migration tests)
 - A Cloudflare account **on the Workers Paid plan**, 5 USD a month minimum.
-  Vectorize has a Free allowance, but its vector capacity, D1 daily-write limit,
-  and Worker CPU limit are prototype-scale. Paid is this product's supported
-  production baseline.
-- A Cloudflare API token created in the client's own account with: Workers
-  Scripts Edit, D1 Edit, Vectorize Edit and Workers AI Read. It drives verify,
-  provisioning, migrations, deploy and secrets. Add Workers R2 Storage Edit only
-  when the manifest actually sets an R2 bucket.
+  Most first-time owners will create the account during setup; using an account
+  they already control is an equal alternate. Vectorize has a Free allowance,
+  but its vector capacity, D1 daily-write limit, and Worker CPU limit are
+  prototype-scale. Paid is this product's supported production baseline.
+- A working browser callback and OS keyring for the pinned Wrangler 4.127.1
+  named-profile login. The installer enables keyring custody, creates one
+  profile from the install's stable non-secret identity, lists all accounts the
+  grant can reach, requires exact account selection, then performs read-only
+  account, Workers, D1, Vectorize, and Workers AI preflights before mutation.
 
-Vectorize Edit was verified end to end on 2026-08-23: an account-scoped token
-created the index and all six metadata indexes through the API. A per-install
-named Wrangler profile remains a compatibility fallback for an older token,
-not an install requirement. The fallback uses pinned Wrangler 4.127.1, passes
-the profile and manifest account together, and requires a successful read-only
-Vectorize request before any mutation.
+One Cloudflare account can own several Brains. This never means shared Brain
+resources: every manifest binds its own Worker, D1 database, Vectorize index,
+secrets, hostname, and exact resource IDs. A separate account is optional when
+the owner wants billing or administrator isolation, not a technical requirement
+for another RAG installation.
+
+The pinned Wrangler release exposes no distinct Vectorize OAuth scope key. The
+candidate therefore requests the smallest available account, user, Workers,
+D1, and Workers AI scope set and treats the exact read-only Vectorize preflight
+as mandatory. This contract and its failure paths are locally covered. A real
+macOS callback, a real Windows callback, and live Vectorize access under this
+exact OAuth grant remain release field gates. Earlier end-to-end proof used an
+account-scoped API token and does not close those OAuth gates.
+
+An expiring account-scoped API token remains supported for reviewed legacy,
+automation, or recovery work. It is not the normal first-install credential.
+It must enter through a hidden prompt or approved no-history secret launcher,
+never chat, argv, an environment file, a screenshot, or a support note. Add R2
+Storage Edit only when the manifest actually sets an R2 bucket.
 
 ---
 
@@ -57,7 +74,7 @@ Vectorize request before any mutation.
 
 ```bash
 node brain.mjs doctor                        # check this machine first
-node brain.mjs setup                         # hidden token prompt, then one-command setup
+node brain.mjs setup                         # browser approval, then one-command setup
 ```
 
 `setup` runs everything below in the only order that works, generates the admin
@@ -66,10 +83,11 @@ available individually:
 
 ```bash
 cp templates/brain.manifest.json ./acme.manifest.json   # then edit it
-# Low-level automation must inject the scoped Cloudflare token through an
+# The ordinary path uses the manifest's named Wrangler OAuth profile. Low-level
+# legacy or recovery automation may inject an expiring scoped token through an
 # approved secret-manager-backed launcher. Never paste it into a shell command.
 
-node brain.mjs verify     ./acme.manifest.json   # token, account, every service
+node brain.mjs verify     ./acme.manifest.json   # exact account and every service
 node brain.mjs provision  ./acme.manifest.json   # D1 + Vectorize, writes IDs back
 node brain.mjs migrate    ./acme.manifest.json   # schema
 node brain.mjs deploy     ./acme.manifest.json   # worker, bindings, drain cron
@@ -569,9 +587,21 @@ structured owner action when an agent shell has no real TTY. The agent must run 
 `technician <manifest> --json` refresh before choosing another step and must
 not infer live success from exit code or manifest state. Login, 2FA, credential
 entry, deployment, and data mutations remain owner-confirmed boundaries. The
-Cloudflare hidden prompt and passkey invite run only in the owner's direct
-terminal. A successful final verifier produces terminal `handoff_complete`
-rather than another mutation instruction.
+Cloudflare browser approval and passkey invite run only from the owner's direct
+terminal. Claude may explain what the owner will see, but it does not receive
+the OAuth access value or the one-time passkey link. A successful final verifier
+produces terminal `handoff_complete` rather than another mutation instruction.
+
+The Cloudflare OAuth implementation is isolated in
+`operations/cloudflare-oauth-session.mjs`. Wrangler is forced onto OS-keyring
+custody and an empty env file, every child receives an allowlisted environment,
+and no default or directory profile is accepted. `auth token --json` is parsed
+directly from bounded bytes so the token does not become an immutable JavaScript
+string; both captured process output and the action buffer are cleared. Account
+pagination, duplicate identities, exact bound-account selection, redirects,
+oversized responses, missing permissions, and token expiry all fail closed.
+This is implementation and deterministic test proof. It is not the outstanding
+live Mac callback, Windows callback, or exact-grant Vectorize field receipt.
 
 The dedicated Claude workspace rejects symlinks, junction-like non-directory
 components, non-canonical paths, and, on POSIX, roots not owned privately by the
@@ -989,7 +1019,8 @@ destination is in a synced folder.
 
 Cross-install collection is deliberately a later, opt-in feature. If built, it
 needs a separate write-only support credential and an exact payload preview. It
-must never reuse a brain admin key or a client's Cloudflare token.
+must never reuse a brain admin key, a Wrangler OAuth session, or a Cloudflare
+API token.
 
 ---
 

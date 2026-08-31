@@ -83,9 +83,10 @@ brain technician "$HOME/Financial Brain/brain.manifest.json" --json
 
 The JSON contains workflow state, dashboard links, proof boundaries, and
 structured command locators. It contains no credentials and its command plus
-argument arrays must never be joined into a shell string. An agent may guide
-the browser and explain each page, but the owner enters every token or secret
-into the provider page or hidden terminal prompt.
+argument arrays stay separate rather than being joined into a shell string. An
+agent may guide the browser and explain each page. Cloudflare approval stays in
+Cloudflare's page; any provider secret that is still required stays in its
+provider page or the Brain CLI's hidden prompt.
 
 The public first-install path covers local tools, the owner-terminal Cloudflare
 install, one fixed public smoke document, an owner-only passkey handoff, and
@@ -129,11 +130,40 @@ The JSON plan supplies an exact structured `owner_only_command` for this step.
 The owner pastes and runs that package-local command in a terminal they control
 directly. Claude must not launch it through its Bash tool. If attempted without
 a real TTY, the step records `OWNER_DIRECT_TERMINAL_REQUIRED` before starting a
-child. The owner signs in, confirms Workers Paid, creates the scoped installation
-token, and enters it into the hidden prompt. The existing setup command performs
-the account check, provisioning, migrations, deploy, key persistence, and
-health proof. After it returns, Claude uses only the credential-free structured
-refresh from the status receipt.
+child.
+
+For most owners, choose **Create my first Cloudflare account**. The command
+opens Cloudflare's official sign-up page and waits while the owner creates the
+account, verifies the email address, and completes Cloudflare's own sign-in
+protection. If the owner already has an account, choose **Use a Cloudflare
+account I already have** and sign in normally. When that login can reach several
+accounts, the owner confirms the exact one by name and ID before setup creates
+anything.
+
+The same Cloudflare account can hold several separate Brains. Setup still gives
+each Brain its own Worker, D1 database, Vectorize index, secrets, hostname, and
+saved resource IDs. A separate account is useful for separate billing or
+administrators, but it is not required for another Brain.
+
+Wrangler then opens one browser approval for a named profile belonging only to
+this Brain. It keeps the approval in the Mac or Windows OS keyring. Nothing is
+copied into Claude, chat, or a command. The setup command checks the exact
+selected account, Workers, D1, Vectorize, and Workers AI before provisioning,
+then performs migrations, deploy, key persistence, and health proof. After it
+returns, Claude uses only the credential-free structured refresh from the
+status receipt.
+
+An expiring account-scoped API token remains a reviewed legacy, automation, or
+recovery fallback. If a specific recovery plan requires it, the owner enters it
+in the Brain CLI's hidden prompt or an approved no-history launcher. Keep it out
+of chat, commands, environment files, screenshots, and support notes.
+
+Local tests cover account choice, exact selection, keyring-only custody,
+permission failures, and clearing the short-lived access value. A real browser
+callback on the exact Mac and Windows machines and live Vectorize access under
+the pinned Wrangler permission set remain field gates. Until those are recorded
+for the exact candidate, this is implementation proof rather than a live install
+claim.
 
 ### 3. Fixed public smoke proof
 
@@ -411,9 +441,9 @@ proof claim.
 | Action | Owner | Technician or agent |
 |---|---:|---:|
 | Sign in, 2FA, consent, billing | Yes | Guide only |
-| Create a persistent token or OAuth app | Final click | Explain and verify fields |
-| Read or retain a credential | Keep it in the provider or hidden prompt | Guide without seeing it |
-| Enter a credential | Hidden terminal or provider UI | Hand control to the owner |
+| Approve a Cloudflare or provider connection | Final browser approval | Explain and verify the selected account and scope |
+| Read or retain a credential | Keep it in the provider, OS keyring, or hidden prompt | Guide without seeing it |
+| Enter a fallback credential | Hidden terminal or provider UI | Hand control to the owner |
 | Run installer and connector checks | May observe | Yes |
 | Complete passkey gesture | Yes, on their device | Observe result only |
 | Approve a named folder for Claude | Yes | Preview the named folder read-only |

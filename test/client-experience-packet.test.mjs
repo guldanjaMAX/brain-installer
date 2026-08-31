@@ -58,14 +58,16 @@ test("the source, Golden 20, support, and update contracts stay honest", () => {
   assert.match(all, /never performs a background update/);
 });
 
-test("Wrangler and the least-privilege token guidance match the released installer", () => {
-  assert.match(all, /npx wrangler@4 login/);
-  assert.match(all, /Vectorize fallback/);
+test("Wrangler browser sign-in and recovery-token guidance match the installer", () => {
+  assert.match(all, /named Cloudflare browser profile/i);
+  assert.match(all, /OS keyring/i);
+  assert.match(all, /API token remains available for a reviewed legacy/i);
   for (const permission of ["Workers Scripts", "D1", "Vectorize", "Workers AI"]) {
     assert.match(all, new RegExp(permission));
   }
-  assert.match(all, /Set a short expiry, normally two days/);
-  assert.match(all, /owner enters the value only in the\s+hidden/);
+  assert.match(all, /expiry, normally two days/i);
+  assert.match(all, /owner enter the value only through the Brain\s+CLI's hidden prompt/i);
+  assert.match(all, /real\s+browser callback[\s\S]*remain field gates/i);
 });
 
 test("support contact and response targets are explicit configurable fields", () => {

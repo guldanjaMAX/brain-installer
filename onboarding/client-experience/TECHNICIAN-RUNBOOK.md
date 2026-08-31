@@ -9,8 +9,8 @@ complete one stage before opening the next one.
    passkey-capable device if the owner wants one.
 2. Confirm Node.js 22 or newer. This is technician plumbing, not an owner task.
 3. Confirm the owner can sign in to Claude Code in their own browser.
-4. Confirm the owner controls the intended Cloudflare account and has reviewed
-   the Workers Paid plan and possible usage charges.
+4. Ask whether this is the owner's first Cloudflare account or an account they
+   already control. Confirm the Workers Paid plan and possible usage charges.
 5. Run `brain tools`. It verifies Claude Code, Claude sign-in, the installed
    `financial-brain-technician` skill, Anthropic's doctor, and pinned Wrangler 4.
 6. In Claude Code, run `/skills` and confirm
@@ -20,33 +20,39 @@ complete one stage before opening the next one.
 The skill must begin with a read-only plan. Skill presence proves that the
 instructions are installed, not that Cloudflare, a provider, or a passkey works.
 
-## 2. Cloudflare login and temporary permission
+## 2. Cloudflare account and browser approval
 
-The supported setup and update commands require an account-scoped Cloudflare
-token. The owner creates it with exactly these permissions:
+For most owners, choose **Create my first Cloudflare account**. The installer
+opens Cloudflare's official sign-up page so the owner can create the account,
+verify the email address, and complete Cloudflare's own sign-in protection. If
+the owner already has Cloudflare, choose **Use a Cloudflare account I already
+have** and sign in normally. When a login can reach more than one account, pause
+while the owner confirms the exact account by both name and ID.
 
-- Account, Workers Scripts, Edit
-- Account, D1, Edit
-- Account, Vectorize, Edit
-- Account, Workers AI, Read
-- Account, Workers R2 Storage, Edit only when the manifest enables R2
+One Cloudflare account may hold several Brains. Each one still receives a
+separate Worker, D1 database, Vectorize index, secrets, hostname, and saved
+resource IDs. Recommend another Cloudflare account only when separate billing
+or administrators would help.
 
-Set a short expiry, normally two days. The owner enters the value only in the
-hidden `brain setup` or `brain update` prompt. Never put it in chat, a command,
-an environment file, a screenshot, or a support note. On a supported Mac, the
-CLI may offer to remember the account-bound token in Keychain. The owner can
-remove it later with `brain token <manifest> --forget`.
+Wrangler opens Cloudflare in the owner's browser and keeps this Brain's named
+profile in the Mac or Windows OS keyring. The installer uses the short-lived
+access value only in memory and clears it after the exact-account action. The
+owner does not need to copy any Cloudflare token into chat, Claude, Codex, or a
+command.
 
-If an older token cannot reach Vectorize, the temporary compatibility path is:
+An expiring account-scoped API token remains available for a reviewed legacy,
+automation, or recovery path. If that exact plan calls for one, use only its
+required permissions: Workers Scripts Edit, D1 Edit, Vectorize Edit, and Workers
+AI Read, plus R2 Storage Edit only when this manifest uses R2. Set a short
+expiry, normally two days. Let the owner enter the value only through the Brain
+CLI's hidden prompt, or let reviewed automation use an approved no-history
+launcher. It stays out of the command line, chat, environment files,
+screenshots, and support notes.
 
-```text
-npx wrangler@4 login
-```
-
-Wrangler opens the owner's browser for approval and keeps its OAuth session on
-the local computer. Provisioning can use that session only as the documented
-Vectorize fallback. New installs should use the correctly scoped token because
-the rest of provisioning still requires the hidden token ceremony.
+The named-profile and keyring contract passes deterministic local tests. A real
+browser callback on the final Mac and Windows machines, plus live Vectorize
+access under the exact Wrangler approval, remain field gates. Record those
+results before describing the path as production-proven.
 
 ## 3. Install and app acceptance
 

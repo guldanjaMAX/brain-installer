@@ -36,9 +36,19 @@ $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
 The full command path below is deliberate. It keeps working after Terminal is
 closed, without `sudo`, administrator access, or a shell-profile change.
 
-Setup and updates ask for the scoped Cloudflare token
-inside a hidden terminal prompt. The token exists only for that command and is
-kept out of files, command arguments, logs, and issue notes.
+Setup and updates normally open Cloudflare in the owner's browser. Wrangler
+keeps that approval in the computer's OS keyring under a separate, non-secret
+profile for this Brain. The Brain CLI uses a short-lived access value only in
+memory while the Cloudflare step runs, then clears it. Nothing needs to be
+copied into Claude, Codex, a command, a chat, or a configuration file.
+
+An expiring Cloudflare API token remains available for a reviewed legacy,
+automation, or recovery workflow. It is a fallback, not the first-install
+experience. When that path is genuinely needed, the owner enters it in a
+hidden prompt or an approved no-history launcher. That fallback needs Workers
+Scripts Edit, D1 Edit, Vectorize Edit, and Workers AI Read for the selected
+account. Please keep it out of chat, command arguments, environment files,
+screenshots, and support notes.
 
 Mac or Linux:
 
@@ -80,8 +90,8 @@ first-install path runs `tools`, the owner-terminal `cloudflare` ceremony, one
 fixed public `smoke` document, the owner-only `passkey` handoff, and `verify`.
 Plaid, Google, QuickBooks, Zoom, and IMAP ceremonies remain
 deferred until their secure custody and real-provider field gates are complete.
-The owner still handles login, 2FA, consent, the Cloudflare hidden prompt, and
-the physical passkey gesture. The JSON plan provides exact structured
+The owner still handles login, 2FA, consent, the Cloudflare browser approval,
+and the physical passkey gesture. The JSON plan provides exact structured
 `owner_only_command` fields for Cloudflare and passkey actions. Claude never
 runs those commands through its agent shell.
 The owner mints a one-time passkey invite only in a terminal they control
@@ -113,7 +123,7 @@ field gate are in [docs/PLAID.md](docs/PLAID.md).
 
 You need three things first. `brain doctor` checks the technical access and tells
 you what to do about anything missing. Cloudflare does not expose the account's
-plan through the scoped install token, so confirm **Workers and Pages,
+plan through the installer sign-in, so confirm **Workers and Pages,
 Plans: Paid** in the dashboard yourself before a production install.
 
 1. **Claude Code and a current paid Anthropic plan that includes Claude Code.**
@@ -128,13 +138,30 @@ Plans: Paid** in the dashboard yourself before a production install.
    confirm it appears, then type `/financial-brain-technician` whenever you want
    the reviewed install, connector, recovery, or handoff guide. Claude Code's
    normal approval prompts stay enabled.
-2. **A Cloudflare account on the Workers Paid plan.** 5 USD a month minimum.
-   Cloudflare now lets Free accounts create the meaning-search index, but Free
-   has prototype-scale vector, daily database-write, and Worker CPU limits. Paid
-   is the supported production baseline so a real corpus does not hard-stop.
-3. **A Cloudflare API token**, created in your own account, with exactly four
-   permissions: Workers Scripts Edit, D1 Edit, Vectorize Edit and Workers AI
-   Read. The token can be limited to your account and given an expiry.
+2. **A Cloudflare account on the Workers Paid plan.** If this is your first
+   Cloudflare account, the installer starts with Cloudflare's official sign-up
+   page and waits while you create it, verify your email, and complete
+   Cloudflare's own sign-in protection. If you already have an account, choose
+   that option and sign in normally. The installer then shows every account the
+   approval can reach and asks you to confirm the exact one before anything is
+   created. Workers Paid is 5 USD a month minimum. Cloudflare now lets Free
+   accounts create the meaning-search index, but Free has prototype-scale
+   vector, daily database-write, and Worker CPU limits. Paid is the supported
+   production baseline so a real corpus does not hard-stop.
+3. **A browser and this computer's protected credential store.** Setup opens
+   Cloudflare's browser approval for one named Wrangler profile and requires
+   the macOS Keychain or Windows credential store. One Cloudflare account may
+   hold several Brains. Each Brain still receives its own Worker, D1 database,
+   Vectorize index, secrets, hostname, and saved resource identities. You do
+   not need another Cloudflare account for another Brain unless you want
+   separate billing or administrators.
+
+This browser-sign-in flow has deterministic local coverage, including exact
+account selection, keyring-only custody, permission failures, and clearing the
+short-lived access value. It is not yet live-proven on the final Mac and
+Windows install machines. The browser callback and the pinned Wrangler
+permission set's real Vectorize access are named release gates, so a locally
+green test is not yet a promise that this ceremony works in every real account.
 
 Written answers use Cloudflare Workers AI through the same account. There is no
 second AI-provider account or API key to create.
@@ -154,10 +181,13 @@ Windows PowerShell:
 & "$env:LOCALAPPDATA\FinancialBrain\brain.cmd" setup "$HOME\Financial Brain\brain.manifest.json"
 ```
 
-It asks three short questions and does everything else itself: creates the
-database and search index in your account, deploys the worker, generates and
-saves your key, checks it is alive, and connects the brain to Claude Code plus
-an installed Codex client. Successful Claude wiring writes an owner-only
+It asks a few short questions and does everything else itself: whether this is
+your first Cloudflare account or one you already use, which exact account will
+own this Brain, and the Brain's public name. Cloudflare sign-in happens in its
+own browser page. Setup then creates the database and search index in the
+confirmed account, deploys the worker, generates and saves your key, checks it
+is alive, and connects the brain to Claude Code plus an installed Codex client.
+Successful Claude wiring writes an owner-only
 `CLAUDE.md` beside the manifest. It gives Claude the exact Brain CLI and
 manifest paths, but it does not grant whole-disk access, permission bypass, or
 unapproved Cloudflare changes. On macOS a standard setup declares and verifies a login-Keychain
