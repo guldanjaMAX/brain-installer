@@ -74,6 +74,7 @@ test("selected product migrations resume after every statement boundary", async 
     "0025_zoom_deliveries.sql",
     "0029_plaid_provider_outcomes.sql",
     "0030_plaid_account_entity_assignments.sql",
+    "0032_quickbooks_oauth_intents.sql",
   ].join(",")).split(",").map((name) => name.trim()).filter(Boolean);
 
   for (const target of targets) {

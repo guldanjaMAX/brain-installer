@@ -193,6 +193,10 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   // durable tables.
   "owner_bank_import_previews",
   "owner_bank_import_commits",
+  // Schema 32: HTTPS callback handoffs contain live single-use OAuth
+  // authority. Recovery recreates the schema empty; it never exports a public
+  // key, callback envelope, capability hash, or claim/finalize receipt.
+  "quickbooks_oauth_intents",
   // Schema 22: exact document grants, their immutable audit trail, persistent
   // idempotency receipts, and privacy-safe passkey telemetry are durable
   // security state. Restoring owner passkeys without their grant authority
@@ -262,6 +266,7 @@ export const RECOVERY_EXPORT_TABLES = Object.freeze(
       table !== "support_passkeys" &&
       table !== "agent_action_receipts" &&
       table !== "owner_bank_import_previews" && table !== "owner_bank_import_commits" &&
+      table !== "quickbooks_oauth_intents" &&
       table !== "zoom_deliveries" && table !== "zoom_reconciliation" &&
       table !== "plaid_link_operations" && table !== "plaid_sync_windows" &&
       table !== "plaid_sync_stage_accounts" && table !== "plaid_sync_stage_transactions" &&
@@ -337,7 +342,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
   "outbox_generation",
   "vector_projection_bootstrap_base_count",
 ]);
-// Schemas 14 through 31 add owner passkeys, capability grants, zones, the financial ledger, bank feeds,
+// Schemas 14 through 32 add owner passkeys, capability grants, zones, the financial ledger, bank feeds,
 // connector OAuth, extraction provenance, owner workspace state, exact
 // document security, support authority, agent receipts, and Zoom delivery
 // debt, plus durable Plaid readiness and destructive-outcome evidence. The
@@ -345,7 +350,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // EXACT current schema by design: a drill against a
 // database one migration behind would export a table or column set that does
 // not match the reviewed list. Bumping this is required for every migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 31;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 32;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -430,6 +435,7 @@ const SCHEMA_31_TABLES = Object.freeze([
   "owner_bank_import_previews",
   "owner_bank_import_commits",
 ]);
+const SCHEMA_32_TABLES = Object.freeze(["quickbooks_oauth_intents"]);
 
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
@@ -447,7 +453,7 @@ const AGGREGATE_FIELDS = Object.freeze([
      ...SCHEMA_19_TABLES, ...SCHEMA_21_TABLES, ...SCHEMA_22_TABLES, ...SCHEMA_23_TABLES,
      ...SCHEMA_24_TABLES, ...SCHEMA_25_TABLES, ...SCHEMA_26_TABLES,
      ...SCHEMA_27_TABLES, ...SCHEMA_28_TABLES, ...SCHEMA_30_TABLES,
-     ...SCHEMA_31_TABLES].includes(table)
+     ...SCHEMA_31_TABLES, ...SCHEMA_32_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1355,7 +1361,8 @@ function expectedRecoveryTables(migrations) {
     (latest >= 27 || !SCHEMA_27_TABLES.includes(table)) &&
     (latest >= 28 || !SCHEMA_28_TABLES.includes(table)) &&
     (latest >= 30 || !SCHEMA_30_TABLES.includes(table)) &&
-    (latest >= 31 || !SCHEMA_31_TABLES.includes(table)));
+    (latest >= 31 || !SCHEMA_31_TABLES.includes(table)) &&
+    (latest >= 32 || !SCHEMA_32_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {

@@ -8,12 +8,14 @@ const POLICY = Object.freeze({
   oauth_register: { bodyBytes: 32 * 1024, windowSeconds: 3600, ipLimit: 8, clientLimit: 0 },
   oauth_authorize: { bodyBytes: 32 * 1024, windowSeconds: 60, ipLimit: 30, clientLimit: 20 },
   oauth_token: { bodyBytes: 32 * 1024, windowSeconds: 60, ipLimit: 40, clientLimit: 25 },
+  quickbooks_oauth_claim: { bodyBytes: 12 * 1024, windowSeconds: 60, ipLimit: 30, clientLimit: 0 },
 });
 
 function routeClass(path) {
   if (path === "/oauth/register") return "oauth_register";
   if (path === "/oauth/token") return "oauth_token";
   if (path.startsWith("/oauth/authorize")) return "oauth_authorize";
+  if (path === "/api/oauth/quickbooks/intents/claim") return "quickbooks_oauth_claim";
   if (path.startsWith("/auth/")) return "auth";
   return null;
 }

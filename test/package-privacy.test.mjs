@@ -411,6 +411,7 @@ const expected = [
   "migrations/d1/0029_plaid_provider_outcomes.sql",
   "migrations/d1/0030_plaid_account_entity_assignments.sql",
   "migrations/d1/0031_owner_bank_import.sql",
+  "migrations/d1/0032_quickbooks_oauth_intents.sql",
   "onboarding/00-pre-install-interview.md",
   "onboarding/01-intake-RUNBOOK.md",
   "onboarding/01-intake-questionnaire.md",
@@ -449,6 +450,7 @@ const expected = [
   "operations/folder-scheduler.mjs",
   "operations/imessage-scheduler.mjs",
   "operations/provider-scheduler.mjs",
+  "operations/quickbooks-callback-client.mjs",
   "operations/whatsapp-daemon.mjs",
   "operations/whatsapp-drain-scheduler.mjs",
   "operations/installed-manifest.mjs",
@@ -500,6 +502,8 @@ const expected = [
   "worker/src/lib/plaid-protocol.js",
   "worker/src/lib/provider-sync.js",
   "worker/src/lib/public-request-guard.js",
+  "worker/src/lib/quickbooks-callback-crypto.js",
+  "worker/src/lib/quickbooks-oauth-callback.js",
   "worker/src/lib/reliability-alerts.js",
   "worker/src/lib/remember-contract.js",
   "worker/src/lib/ocr.js",
@@ -621,9 +625,9 @@ for (const path of privateScanPaths) {
 }
 
 // A packlist can name every file and still hide a broken relative import.
-// Build and unpack the actual tarball, then import the recovery adapter from
-// that isolated package tree. The probe invokes no CLI entry point or network.
-let packedAdapterImportFailed = false;
+// Build and unpack the actual tarball, then import the recovery adapter and
+// callback helper from that isolated tree. The probe invokes no CLI or network.
+let packedModuleImportFailed = false;
 const packageProbeDirectory = SCAN_ONLY ? null : mkdtempSync(join(tmpdir(), "brain-package-probe-"));
 if (packageProbeDirectory) try {
   const actualPack = spawnSync(
@@ -639,7 +643,7 @@ if (packageProbeDirectory) try {
   let filename = null;
   try { filename = JSON.parse(actualPack.stdout)?.[0]?.filename || null; } catch { /* fixed failure below */ }
   if (actualPack.status !== 0 || !filename) {
-    packedAdapterImportFailed = true;
+    packedModuleImportFailed = true;
   } else {
     const extracted = spawnSync("tar", [
       "-xzf", join(packageProbeDirectory, filename), "-C", packageProbeDirectory,
@@ -648,29 +652,27 @@ if (packageProbeDirectory) try {
       shell: process.platform === "win32",
       timeout: 60_000,
     });
-    const adapterPath = join(
-      packageProbeDirectory,
-      "package",
-      "operations",
-      "cloudflare-recovery-adapter.mjs",
-    );
+    const packedImportPaths = [
+      join(packageProbeDirectory, "package", "operations", "cloudflare-recovery-adapter.mjs"),
+      join(packageProbeDirectory, "package", "operations", "quickbooks-callback-client.mjs"),
+    ];
     const importProbe = extracted.status === 0
       ? spawnSync(process.execPath, [
           "--input-type=module",
           "--eval",
-          "const {pathToFileURL}=await import('node:url');await import(pathToFileURL(process.env.PACK_IMPORT_PATH).href)",
+          "const {pathToFileURL}=await import('node:url');const paths=JSON.parse(process.env.PACK_IMPORT_PATHS);await import(pathToFileURL(paths[0]).href);const q=await import(pathToFileURL(paths[1]).href);const h=await q.createQuickBooksCallbackHandoff();if(h.privateKey.extractable!==false)process.exit(1)",
         ], {
           encoding: "utf-8",
           env: {
             PATH: process.env.PATH || "",
             ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
             ...(process.env.WINDIR ? { WINDIR: process.env.WINDIR } : {}),
-            PACK_IMPORT_PATH: adapterPath,
+            PACK_IMPORT_PATHS: JSON.stringify(packedImportPaths),
           },
           timeout: 60_000,
         })
       : { status: null };
-    packedAdapterImportFailed = extracted.status !== 0 || importProbe.status !== 0;
+    packedModuleImportFailed = extracted.status !== 0 || importProbe.status !== 0;
   }
 } finally {
   rmSync(packageProbeDirectory, { recursive: true, force: true });
@@ -680,7 +682,7 @@ if (packed.status !== 0 || (!SCAN_ONLY && !files.length) || forbidden.length || 
     bundleConfigMismatch || dependencyMismatch.length || gitIgnoreFailures.length ||
     canaryFailures.length || trackedEnumerationFailed ||
     privateTextMatches.length || privatePathMatches.length ||
-    packedAdapterImportFailed) {
+    packedModuleImportFailed) {
   console.error("FAIL  published package privacy allowlist");
   if (packed.status !== 0) {
     console.error(
@@ -712,7 +714,7 @@ if (packed.status !== 0 || (!SCAN_ONLY && !files.length) || forbidden.length || 
     console.error("replace the identity with a role word or an approved persona. Do not delete the sentence,");
     console.error("and do not remove the rule: a hit here is a finding, not a false alarm to be tuned away.");
   }
-  if (packedAdapterImportFailed) console.error("packed recovery adapter import probe failed");
+  if (packedModuleImportFailed) console.error("packed module import probe failed");
   process.exit(1);
 }
 

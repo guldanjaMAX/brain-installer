@@ -201,11 +201,11 @@ The normalized row is then hashed together with the remaining durable table
 export, so a retry cannot reuse a recovery artifact poisoned by an
 invocation-local lease, mutation fence, or old provider receipt. Older exact
 migration prefixes remain offline-inspectable, but the live field runner
-requires exact current schema 31 because it cannot safely use the current
+requires exact current schema 32 because it cannot safely use the current
 lease, visibility, and durable bulk-bootstrap protocol across a schema drift.
-Schema-31 bank-import previews and consumption claims are intentionally
-recreated empty. They coordinate one upload attempt and are not durable
-financial records or recovery receipts.
+Schema-31 bank-import previews and schema-32 QuickBooks callback intents are
+intentionally recreated empty. They coordinate one upload or authorization
+attempt and are not durable financial records or recovery receipts.
 Schema 29 also preserves Plaid's exact historical-readiness evidence and whether
 a destructive Item-removal response was confirmed, known not to remove, or
 unknown. Recovery does not turn an old local `complete` label into provider

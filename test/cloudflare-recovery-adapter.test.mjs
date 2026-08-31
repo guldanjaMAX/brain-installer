@@ -291,6 +291,10 @@ const expectedSnapshot = Object.freeze({
     assert.equal(RECOVERY_DURABLE_TABLES.includes(table), true, `${table} schema is recreated`);
     assert.equal(RECOVERY_EXPORT_TABLES.includes(table), false, `${table} live intent is not restored`);
   }
+  assert.equal(RECOVERY_DURABLE_TABLES.includes("quickbooks_oauth_intents"), true,
+    "QuickBooks callback intent schema is recreated");
+  assert.equal(RECOVERY_EXPORT_TABLES.includes("quickbooks_oauth_intents"), false,
+    "QuickBooks callback authority is never restored");
   for (const table of ["zoom_deliveries", "zoom_reconciliation"]) {
     assert.equal(RECOVERY_DURABLE_TABLES.includes(table), true, `${table} schema is recreated`);
     assert.equal(RECOVERY_EXPORT_TABLES.includes(table), false, `${table} uses normalized restore`);

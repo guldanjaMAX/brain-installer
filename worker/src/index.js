@@ -67,6 +67,12 @@ import {
 } from "./lib/agent-action-receipts.js";
 import { cleanupPublicAuthState, guardPublicRequest } from "./lib/public-request-guard.js";
 import { ownerReliabilityAlerts } from "./lib/reliability-alerts.js";
+import {
+  cleanupQuickBooksOAuthIntents,
+  handleQuickBooksOAuthRoute,
+  QUICKBOOKS_OAUTH_PATH_PREFIX,
+  QUICKBOOKS_OAUTH_PATHS,
+} from "./lib/quickbooks-oauth-callback.js";
 
 /* ------------------------------------------------------------ retrieval */
 
@@ -1857,6 +1863,23 @@ export default {
       return handleZoomWebhook(env, request, ctx);
     }
 
+    // Intuit's callback cannot carry the Brain admin key. Its random OAuth
+    // state selects one short-lived intent, while the claim route requires a
+    // separate random capability. The remaining management routes still take
+    // the ordinary whole-install admin key. Production remains unavailable
+    // unless the deployment explicitly records its request-logging review.
+    if (path === QUICKBOOKS_OAUTH_PATH_PREFIX || path.startsWith(`${QUICKBOOKS_OAUTH_PATH_PREFIX}/`)) {
+      if (path === QUICKBOOKS_OAUTH_PATHS.claim) {
+        const guarded = await guardPublicRequest(env, request, url, path);
+        if (guarded.response) return guarded.response;
+        request = guarded.request;
+      }
+      return handleQuickBooksOAuthRoute(env, request, url, path, {
+        adminAuthorized: path !== QUICKBOOKS_OAUTH_PATHS.callback &&
+          path !== QUICKBOOKS_OAUTH_PATHS.claim && validateAdminKey(request, env),
+      });
+    }
+
     // Remote connectors (the Claude apps, ChatGPT): OAuth discovery and
     // ceremonies in front of the gate, and the MCP endpoint guarded by the
     // bearer token those ceremonies earn — exactly the read-only class.
@@ -2259,13 +2282,14 @@ export default {
       Promise.all([(async () => {
         // Both jobs are bounded. Cleanup must still run when the vector provider
         // is failing, and a cleanup error must not stop the durable vector queue.
-        const [drainResult, cleanupResult] = await Promise.allSettled([
+        const [drainResult, cleanupResult, quickbooksCleanupResult] = await Promise.allSettled([
           drainOutbox(env, {
             embed: (text) => embedText(env, text),
             embedBatch: (texts) => embedTexts(env, texts),
             maxBatches: 10,
           }),
           cleanupPublicAuthState(env),
+          cleanupQuickBooksOAuthIntents(env),
         ]);
         if (drainResult.status === "fulfilled") {
           const r = drainResult.value;
@@ -2275,6 +2299,9 @@ export default {
         }
         if (cleanupResult.status === "rejected") {
           console.warn("public auth state: scheduled TTL cleanup failed");
+        }
+        if (quickbooksCleanupResult.status === "rejected") {
+          console.warn("quickbooks oauth intents: scheduled TTL cleanup failed");
         }
       })(), runZoomDeliveryMaintenance(env).then((result) => {
         const deliveries = Number(result?.deliveries?.claimed || 0);

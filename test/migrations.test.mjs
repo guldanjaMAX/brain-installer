@@ -253,6 +253,62 @@ for (const trigger of ["vector_outbox_generation_ai", "vector_outbox_generation_
 
 /* queued_at is allowed to collide; the database-owned generation is not. */
 
+/* ---- 0032 keeps QuickBooks callback capabilities hashed and restart-safe ---- */
+{
+  const columns = new Set(db.prepare(
+    "PRAGMA table_info(quickbooks_oauth_intents)",
+  ).all().map((row) => row.name));
+  check("0032 creates the short-lived QuickBooks callback intent table",
+    ["intent_hash", "state_hash", "claim_hash", "start_fingerprint",
+      "pkce_challenge_hash", "recipient_public_jwk", "callback_envelope",
+      "callback_fingerprint", "expires_at", "claimed_at", "finalized_at"].every(
+      (column) => columns.has(column),
+    ), [...columns].join(", "));
+  check("0032 has no plaintext provider or capability columns",
+    ![...columns].some((column) => [
+      "intent_id", "state", "claim_secret", "authorization_code", "realm_id",
+    ].includes(column)), [...columns].join(", "));
+
+  let replayed = true;
+  try {
+    for (const statement of splitStatements(
+      readFileSync(join(DIR, "0032_quickbooks_oauth_intents.sql"), "utf-8"),
+    )) db.exec(statement);
+  } catch { replayed = false; }
+  check("0032 raw replay is inherently idempotent", replayed);
+
+  const jwk = JSON.stringify({
+    kty: "EC", crv: "P-256", x: "x".repeat(43), y: "y".repeat(43), ext: true,
+  });
+  db.prepare(
+    `INSERT INTO quickbooks_oauth_intents
+       (tenant_id,intent_hash,state_hash,claim_hash,start_fingerprint,
+        recipient_public_jwk,source,environment,client_id_fingerprint,status,
+        created_at,expires_at)
+     VALUES ('primary',?,?,?,?,?,'quickbooks','production',?,'pending',1000,601000)`,
+  ).run("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64), jwk, "e".repeat(64));
+  let duplicateStateRefused = false;
+  try {
+    db.prepare(
+      `INSERT INTO quickbooks_oauth_intents
+         (tenant_id,intent_hash,state_hash,claim_hash,start_fingerprint,
+          recipient_public_jwk,source,environment,client_id_fingerprint,status,
+          created_at,expires_at)
+       VALUES ('primary',?,?,?,?,?,'quickbooks','production',?,'pending',1000,601000)`,
+    ).run("f".repeat(64), "b".repeat(64), "1".repeat(64), "2".repeat(64), jwk, "3".repeat(64));
+  } catch { duplicateStateRefused = true; }
+  check("one OAuth state can select only one QuickBooks intent", duplicateStateRefused);
+  let malformedEnvelopeRefused = false;
+  try {
+    db.prepare(
+      `UPDATE quickbooks_oauth_intents
+          SET status='received',callback_envelope='not-json',callback_fingerprint=?,received_at=2000
+        WHERE intent_hash=?`,
+    ).run("4".repeat(64), "a".repeat(64));
+  } catch { malformedEnvelopeRefused = true; }
+  check("0032 refuses a malformed callback envelope", malformedEnvelopeRefused);
+}
+
 /* ---- 0030 keeps Plaid account scope explicit and restart-safe ---- */
 {
   check("plaid_account_entity_assignments exists",
