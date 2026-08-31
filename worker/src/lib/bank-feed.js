@@ -239,6 +239,30 @@ export function safeFeedError(error) {
   return `the bank feed could not be reached${code}: ${redactFeedText(error?.message)}`;
 }
 
+/** Owner-facing recovery must preserve a provider's no-retry boundary. */
+export function bankFeedOwnerErrorMessage(data, status) {
+  const code = data && typeof data.code === "string" ? data.code : null;
+  if (data?.outcome_unknown === true && data?.retry_safe === false) {
+    const base = "The provider may have accepted this one-time step, but its result could not be confirmed. Keep this page open and ask a technician to review this connection before starting another one or retrying.";
+    return code ? `${base} Reference code: ${code}.` : base;
+  }
+  const messages = {
+    session_required: "Your sign-in has ended. Return to your Brain, sign in, and open this page again.",
+    owner_required: "This page is available only to the Brain owner.",
+    plaid_account_inventory_unavailable: "The bank is connected, but its account list is still arriving. Wait a moment and check again.",
+    bank_account_status_unavailable: "We could not safely read the account list. Your connection is unchanged. Please check again.",
+    bank_account_assignment_unavailable: "We could not safely save that choice. Nothing was moved. Please try the same choice again.",
+    bank_account_reassignment_requires_review: "This account already has financial history under another business. A technician should review it before anything moves.",
+    entity_not_found: "That business is no longer available. Refresh the list and choose an active business.",
+    entity_not_owned: "That business is not owner-controlled, so the account was not assigned to it.",
+    request_id_conflict: "This saved retry belongs to a different choice. Refresh the page and try again.",
+  };
+  const base = (code && messages[code]) || (status === 503
+    ? "This step is temporarily unavailable. Your earlier progress is safe. Please try again."
+    : "That step did not finish. Your earlier progress is safe. Please try again.");
+  return code ? `${base} Reference code: ${code}.` : base;
+}
+
 /**
  * One call to the provider.
  *
@@ -1197,24 +1221,7 @@ const el = (id) => document.getElementById(id);
 const appHeaders = { "Content-Type": "application/json", "X-Brain-App": "1" };
 const say = (text, bad) => { const target = el("status"); target.textContent = String(text || ""); target.className = bad ? "err" : "ok"; };
 const accountSay = (text, bad) => { const target = el("account-status"); target.textContent = String(text || ""); target.className = bad ? "err" : "note"; };
-function errorMessage(data, status) {
-  const code = data && typeof data.code === "string" ? data.code : null;
-  const messages = {
-    session_required: "Your sign-in has ended. Return to your Brain, sign in, and open this page again.",
-    owner_required: "This page is available only to the Brain owner.",
-    plaid_account_inventory_unavailable: "The bank is connected, but its account list is still arriving. Wait a moment and check again.",
-    bank_account_status_unavailable: "We could not safely read the account list. Your connection is unchanged. Please check again.",
-    bank_account_assignment_unavailable: "We could not safely save that choice. Nothing was moved. Please try the same choice again.",
-    bank_account_reassignment_requires_review: "This account already has financial history under another business. A technician should review it before anything moves.",
-    entity_not_found: "That business is no longer available. Refresh the list and choose an active business.",
-    entity_not_owned: "That business is not owner-controlled, so the account was not assigned to it.",
-    request_id_conflict: "This saved retry belongs to a different choice. Refresh the page and try again.",
-  };
-  const base = (code && messages[code]) || (status === 503
-    ? "This step is temporarily unavailable. Your earlier progress is safe. Please try again."
-    : "That step did not finish. Your earlier progress is safe. Please try again.");
-  return code ? base + " Reference code: " + code + "." : base;
-}
+const errorMessage = ${bankFeedOwnerErrorMessage.toString()};
 async function requestJson(path, init) {
   const r = await fetch(path, { credentials: "same-origin", ...init, headers: appHeaders });
   const d = await r.json().catch(() => ({}));

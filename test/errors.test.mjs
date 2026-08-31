@@ -13,6 +13,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -212,6 +213,31 @@ function ingestExitCli(scenario) {
 }
 
 /* ---- expected failures explain themselves and stay quiet about internals ---- */
+{
+  const r = cli(["invite", join(HERE, "..", "templates", "brain.manifest.json")]);
+  const events = journalEvents(r.journal);
+  check("an owner-only passkey refusal saves one private issue note",
+    r.code === 1 && events.length === 1 && events[0]?.command === "invite" &&
+      events[0]?.source === "passkey" && /Private issue note/.test(r.out), r.out);
+}
+{
+  // macOS exposes /var as a symlink to /private/var. Resolve it so the
+  // bootstrap-status path guard sees the same physical path the CLI opens.
+  const userRoot = realpathSync(mkdtempSync(join(tmpdir(), "brain-structured-support-")));
+  const manifest = join(userRoot, "missing.manifest.json");
+  const r = cli(["technician", manifest, "--run", "quickbooks", "--json"], {}, {
+    userRoot,
+    keepUserRoot: true,
+  });
+  const events = journalEvents(r.journal);
+  let body = null;
+  try { body = JSON.parse(r.out); } catch {}
+  check("a structured connector refusal stays valid JSON and saves silent local metadata",
+    r.code === 1 && body?.status === "error" && events.length === 1 &&
+      events[0]?.command === "technician" && events[0]?.source === "quickbooks" &&
+      !/Private issue note|What to try next/.test(r.out), r.out);
+  rmSync(userRoot, { recursive: true, force: true });
+}
 {
   const r = cli(["verify", join(HERE, "..", "templates", "brain.manifest.json")]);
   const events = journalEvents(r.journal);

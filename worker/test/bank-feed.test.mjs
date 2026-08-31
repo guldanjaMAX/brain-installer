@@ -32,6 +32,7 @@ import {
   BANK_ACCESS_WRAPPING_KEY_SECRET, bankAccessWrappingKeyConfigured,
   directionFor, accountKindFor, tenantReference, redirectUriFor, feedScopeKey,
   bankFeedConfig, bankFeedEnabled, normaliseFeedPage, redactFeedText, safeFeedError,
+  bankFeedOwnerErrorMessage,
   classifyItemError, encryptAccessReference, decryptAccessReference,
   rewrapBankAccessReferences,
   createLinkToken, exchangePublicToken, runFeedSlice, syncItemSlice, feedStatus,
@@ -442,6 +443,19 @@ const refuses = (db, sql, params = []) => {
     html.includes('bank_assignment_request:'), "");
   check("provider and database text is rendered as text rather than executable markup",
     !html.includes("innerHTML") && html.includes("textContent") && html.includes("replaceChildren"), "");
+  const unknown = bankFeedOwnerErrorMessage({
+    code: "PLAID_EXCHANGE_OUTCOME_UNKNOWN",
+    outcome_unknown: true,
+    retry_safe: false,
+  }, 503);
+  check("an unknown one-time provider outcome stops instead of recommending a retry",
+    /ask a technician.*before starting another one or retrying/i.test(unknown) &&
+      unknown.includes("PLAID_EXCHANGE_OUTCOME_UNKNOWN") &&
+      !/Please try again/i.test(unknown), unknown);
+  check("the generated owner page embeds that same no-retry recovery",
+    html.includes("const errorMessage = function bankFeedOwnerErrorMessage") &&
+      html.includes("The provider may have accepted this one-time step") &&
+      html.includes("data?.outcome_unknown === true && data?.retry_safe === false"), "");
   const inlineScripts = [...html.matchAll(/<script(?: [^>]*)?>([\s\S]*?)<\/script>/g)]
     .map((match) => match[1]).filter(Boolean);
   let inlineScriptParses = inlineScripts.length === 1;

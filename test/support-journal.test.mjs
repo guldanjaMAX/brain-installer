@@ -120,9 +120,11 @@ try {
 
   const publicCommands = [
     "setup", "ask", "doctor", "whatsnew", "verify", "provision", "deploy", "secrets",
-    "health", "test", "mcp-config", "migrate", "ingest", "connect", "status",
-    "sources", "forget", "drain", "reindex", "diagnose", "eval", "upgrade",
-    "rollback", "schedule", "support",
+    "health", "test", "mcp-config", "migrate", "ingest", "import", "connect",
+    "connectors", "disconnect", "status", "sources", "forget", "drain", "reindex",
+    "diagnose", "eval", "grant", "grants", "zone", "invite", "devices", "load", "token",
+    "update", "upgrade", "rollback", "reconcile", "schedule", "support", "tools",
+    "technician",
   ];
   for (const command of publicCommands) {
     assert.ok(SUPPORT_COMMANDS.includes(command), `support command catalog is missing ${command}`);

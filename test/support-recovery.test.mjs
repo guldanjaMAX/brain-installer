@@ -53,6 +53,22 @@ test("a typed product issue code wins over mutable error wording", () => {
   assert.equal(supportErrorCode(error, { command: "health" }), "HEALTH_CHECK_FAILED");
 });
 
+test("structured and provider safety codes map to stable public recovery", () => {
+  assert.equal(supportErrorCode({ payload: { error_code: "AUTH_REQUIRED" } }, { command: "technician" }), "AUTH_REQUIRED");
+  assert.equal(supportErrorCode({ code: "access_denied" }, { command: "connect" }), "AUTH_DENIED");
+  assert.equal(supportErrorCode({ code: "refresh_outcome_unknown" }, { command: "ingest" }), "SAFETY_REVIEW_REQUIRED");
+  assert.equal(supportErrorCode({ code: "wrong_realm" }, { command: "ingest" }), "SAFETY_REVIEW_REQUIRED");
+  assert.equal(supportErrorCode({
+    payload: { issue_code: "CLOUDFLARE_ACCOUNT_MISMATCH", retry_safe: false },
+  }, { command: "technician" }), "SAFETY_REVIEW_REQUIRED");
+  assert.equal(supportErrorCode({
+    code: "NETWORK_UNREACHABLE", uncertain: true,
+  }, { command: "connect" }), "SAFETY_REVIEW_REQUIRED");
+  assert.equal(supportErrorCode({
+    payload: { error_code: "COMMAND_FAILED", outcome_unknown: true },
+  }, { command: "technician" }), "SAFETY_REVIEW_REQUIRED");
+});
+
 test("the installed CLI explains a code in calm text or agent-readable JSON", () => {
   const text = spawnSync(process.execPath, [join(ROOT, "brain.mjs"), "support", "--explain", "AUTH_REQUIRED"], {
     cwd: ROOT,

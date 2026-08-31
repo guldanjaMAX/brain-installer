@@ -279,16 +279,31 @@ let currentSupportCommand = "";
 
 function supportSourceForCommand(command = "") {
   if (command === "schedule") return "scheduler";
+  if (command === "invite" || command === "devices") return "passkey";
   if (command === "ingest") {
     const index = process.argv.indexOf("--from");
     const remote = index >= 0 ? process.argv[index + 1] : null;
+    if (remote === "quickbooks") return "quickbooks";
     if (["calendar", "drive", "gmail", "imap", "imessage", "iphone-backup", "whatsapp"].includes(remote)) return remote;
     return "local";
   }
   if (command === "connect" || command === "disconnect") {
     const which = String(process.argv[3] || "").toLowerCase();
+    if (which === "bank") return "bank-feed";
+    if (which === "quickbooks") return "quickbooks";
     if (which === "imap" || which === "imessage" || which === "whatsapp" || which === "zoom") return which;
     return "installer";
+  }
+  if (command === "reconcile" && String(process.argv[3] || "").toLowerCase() === "quickbooks") {
+    return "quickbooks";
+  }
+  if (command === "technician") {
+    const runIndex = process.argv.indexOf("--run");
+    const step = runIndex >= 0 ? String(process.argv[runIndex + 1] || "").toLowerCase() : "";
+    if (step === "plaid") return "plaid";
+    if (step === "quickbooks") return "quickbooks";
+    if (step === "passkey") return "passkey";
+    if (step === "cloudflare") return "cloudflare";
   }
   if (SUPPORT_REMOTE_COMMANDS.has(command)) return "cloudflare";
   return "installer";
@@ -297,8 +312,34 @@ function supportSourceForCommand(command = "") {
 /** Classify in memory; the raw message is never passed to the journal. */
 export function supportErrorCode(error, { command = "", unexpected = false } = {}) {
   if (error instanceof DriveRemovalReviewRequired) return "SAFETY_REVIEW_REQUIRED";
-  const typedCode = typeof error?.code === "string" ? error.code.trim().toUpperCase() : "";
-  if (SUPPORT_ERROR_CODES.includes(typedCode)) return typedCode;
+  const typedCodes = [error?.code, error?.payload?.error_code, error?.payload?.issue_code]
+    .filter((value) => typeof value === "string")
+    .map((value) => value.trim().toUpperCase());
+  const safetySignals = [error, error?.payload].filter((value) => value && typeof value === "object");
+  if (safetySignals.some((value) =>
+    value.uncertain === true || value.outcome_unknown === true || value.retry_safe === false
+  ) || typedCodes.some((value) => [
+    "OAUTH_RESPONSE_UNCERTAIN",
+    "REFRESH_OUTCOME_UNKNOWN",
+    "PLAID_EXCHANGE_OUTCOME_UNKNOWN",
+    "PLAID_REMOVE_OUTCOME_UNKNOWN",
+  ].includes(value))) return "SAFETY_REVIEW_REQUIRED";
+  const publicCode = typedCodes.find((value) => SUPPORT_ERROR_CODES.includes(value));
+  if (publicCode) return publicCode;
+  if (typedCodes.some((value) => ["ACCESS_DENIED", "OWNER_CANCELED"].includes(value))) return "AUTH_DENIED";
+  if (typedCodes.includes("REFRESH_EXPIRED")) return "AUTH_EXPIRED";
+  if (typedCodes.some((value) => [
+    "MISSING_REFRESH_TOKEN",
+    "NOT_CONNECTED",
+    "SOURCE_BINDING_MISSING",
+  ].includes(value))) return "AUTH_REQUIRED";
+  if (typedCodes.some((value) => [
+    "SOURCE_BINDING_CORRUPT",
+    "SOURCE_BINDING_REQUIRED",
+    "UNEXPECTED_COMPANY",
+    "WRONG_ENVIRONMENT",
+    "WRONG_REALM",
+  ].includes(value))) return "SAFETY_REVIEW_REQUIRED";
   const message = String(error?.message || "");
   if (/PDF.*tim(?:e|ed) out/i.test(message)) return "PDF_PROCESS_TIMEOUT";
   if (/PDF.*process/i.test(message)) return "PDF_PROCESS_FAILED";
@@ -17171,6 +17212,9 @@ if (IS_MAIN) {
     const reviewRequired = e instanceof DriveRemovalReviewRequired;
     if (e instanceof Fatal || reviewRequired) {
       if (e instanceof JsonFatal) {
+        // Structured callers still get one JSON document on stdout. The local
+        // metadata-only issue note is silent and never changes that contract.
+        recordSupportFailure(e);
         console.log(e.message);
         process.exit(1);
         return;
