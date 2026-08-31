@@ -16,6 +16,7 @@
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
+import { bankFeedRedirectUri } from "../doctor.mjs";
 import { renderCopyableCommand } from "./command-display.mjs";
 
 export const TECHNICIAN_STATUS_SCHEMA_VERSION = 1;
@@ -45,10 +46,10 @@ export const TECHNICIAN_STEPS = Object.freeze([
   }),
   Object.freeze({
     id: "plaid",
-    title: "Configure the Plaid bank feed",
+    title: "Connect the Plaid Sandbox bank feed",
     dashboard_url: "https://dashboard.plaid.com/",
-    human_boundary: "The client owns the Plaid account, chooses Sandbox or Production, registers this Brain's return address, and enters the Plaid client ID, secret, and independently stored bank wrapping key only into hidden terminal prompts.",
-    automated_proof: "Deferred from the public first-install path. Offline protocol tests do not prove secure live credential custody or Plaid Link acceptance.",
+    human_boundary: "The client owns the Plaid account, explicitly selects Sandbox, registers this Brain's return address, and enters the Plaid client ID, secret, and independently stored bank wrapping key only into hidden prompts in a terminal they control. The account holder continues in the owner Link page.",
+    automated_proof: "The Sandbox-only technician step validates the manifest before prompting, writes the three values through one short-lived secrets child, clears them, then opens or prints the reviewed owner Link page. That ceremony still does not prove Plaid Link, a deployed route, D1 settlement, or a real bank.",
   }),
   Object.freeze({
     id: "google",
@@ -59,10 +60,10 @@ export const TECHNICIAN_STEPS = Object.freeze([
   }),
   Object.freeze({
     id: "quickbooks",
-    title: "Connect the client's QuickBooks Online company",
+    title: "Connect the client's QuickBooks Online Sandbox company",
     dashboard_url: "https://developer.intuit.com/app/developer/dashboard",
     human_boundary: "The client creates and owns the Intuit app, enters its values only at hidden prompts, and authorizes their sandbox company in the browser. Intuit grants its broad Accounting permission; Financial Brain uses read/query calls only, but the provider scope itself is not read-only.",
-    automated_proof: "Deferred from the public first-install path. Offline source-binding tests passed, but a real Intuit Sandbox company ceremony and client-owned production callback remain open.",
+    automated_proof: "The Sandbox-only technician step validates the manifest before prompting, passes both app values directly to the existing in-process OAuth flow, and returns structured dry-run and reviewed-ingest commands. A real Intuit Sandbox field receipt and client-owned production callback remain open.",
   }),
   Object.freeze({
     id: "zoom",
@@ -96,8 +97,10 @@ export const TECHNICIAN_STEPS = Object.freeze([
 
 export const TECHNICIAN_RUN_STEPS = Object.freeze(TECHNICIAN_STEPS.map((step) => step.id));
 export const DEFERRED_PUBLIC_CONNECTOR_STEPS = Object.freeze([
-  "plaid", "google", "quickbooks", "zoom", "imap",
+  "google", "zoom", "imap",
 ]);
+
+const SANDBOX_TECHNICIAN_STEPS = new Set(["plaid", "quickbooks"]);
 
 function cliLocator(cli) {
   if (!cli?.command || !Array.isArray(cli.args)) return null;
@@ -114,6 +117,71 @@ function exactCommand(cli, args, platformName = process.platform) {
 
 export function technicianStatusFilePath(manifestPath) {
   return join(dirname(resolve(String(manifestPath || "brain.manifest.json"))), TECHNICIAN_STATUS_BASENAME);
+}
+
+function sandboxCeremonyFromReceipt(step, receipt) {
+  if (!receipt?.completed || !SANDBOX_TECHNICIAN_STEPS.has(step) || receipt.environment !== "sandbox") {
+    return null;
+  }
+  if (step === "plaid") {
+    return Object.freeze({
+      schema_version: 1,
+      connector: "plaid",
+      environment: "sandbox",
+      outcome: "owner_link_page_ready",
+      credential_custody: "client_owned_worker_secret_store",
+      owner_interaction_pending: true,
+      live_provider_proof: false,
+      field_acceptance_pending: true,
+    });
+  }
+  const verification = Array.isArray(receipt.verification)
+    ? receipt.verification.map((item) => Object.freeze({
+        purpose: String(item.purpose),
+        command: resolve(String(item.command)),
+        args: Object.freeze(item.args.map((value) => String(value))),
+        mutates_external_state: item.mutates_external_state === true,
+      }))
+    : [];
+  return Object.freeze({
+    schema_version: 1,
+    connector: "quickbooks",
+    environment: "sandbox",
+    outcome: "oauth_connection_stored",
+    credential_custody: "client_local_provider_store",
+    financial_authority: false,
+    live_provider_proof: false,
+    field_acceptance_pending: true,
+    verification: Object.freeze(verification),
+  });
+}
+
+function safeSandboxCeremonySummary(value) {
+  if (value?.schema_version !== 1 || value?.environment !== "sandbox" ||
+      value?.live_provider_proof !== false || value?.field_acceptance_pending !== true) {
+    return null;
+  }
+  if (value.connector === "plaid" && value.outcome === "owner_link_page_ready" &&
+      value.credential_custody === "client_owned_worker_secret_store") {
+    return Object.freeze({
+      connector: "plaid",
+      environment: "sandbox",
+      outcome: "owner_link_page_ready",
+      live_provider_proof: false,
+      field_acceptance_pending: true,
+    });
+  }
+  if (value.connector === "quickbooks" && value.outcome === "oauth_connection_stored" &&
+      value.credential_custody === "client_local_provider_store" && value.financial_authority === false) {
+    return Object.freeze({
+      connector: "quickbooks",
+      environment: "sandbox",
+      outcome: "oauth_connection_stored",
+      live_provider_proof: false,
+      field_acceptance_pending: true,
+    });
+  }
+  return null;
 }
 
 function safeLastStepStatus(manifestPath, deps = {}) {
@@ -135,6 +203,7 @@ function safeLastStepStatus(manifestPath, deps = {}) {
         resolve(String(parsed?.manifest?.path || "")) !== resolve(manifestPath)) {
       return Object.freeze({ path, state: "invalid" });
     }
+    const sandboxCeremony = safeSandboxCeremonySummary(parsed.sandbox_ceremony);
     return Object.freeze({
       path,
       state: "available",
@@ -148,6 +217,7 @@ function safeLastStepStatus(manifestPath, deps = {}) {
       proof_level: ["command_return_only", "live_data_plane_postconditions"].includes(parsed.proof_level)
         ? parsed.proof_level
         : "not_verified",
+      ...(sandboxCeremony ? { sandbox_ceremony: sandboxCeremony } : {}),
     });
   } catch {
     return Object.freeze({ path, state: "invalid" });
@@ -168,6 +238,7 @@ export function buildTechnicianStepStatus({
   statusFile = null,
   proofLevel = "command_return_only",
   proof = null,
+  ceremonyReceipt = null,
   ownerArgs = [],
 } = {}) {
   if (!TECHNICIAN_RUN_STEPS.includes(step) || !manifestPath) {
@@ -190,10 +261,21 @@ export function buildTechnicianStepStatus({
     "QUICKBOOKS_NOT_ENABLED",
     "QUICKBOOKS_ENVIRONMENT_REQUIRED",
     "QUICKBOOKS_REDIRECT_HOST_INVALID",
+    "QUICKBOOKS_PORT_INVALID",
+    "PLAID_NOT_ENABLED",
+    "PLAID_PROVIDER_REQUIRED",
+    "PLAID_ENDPOINT_OVERRIDE_INVALID",
+    "PLAID_ENVIRONMENT_REQUIRED",
+    "PLAID_FINAL_HOSTNAME_REQUIRED",
+    "PLAID_REDIRECT_NOT_REGISTERED",
+    "TECHNICIAN_STEP_OPTION_INVALID",
+    "TECHNICIAN_CHILD_FAILED",
+    "TECHNICIAN_CHILD_START_FAILED",
     "OWNER_CANCELED",
     "OWNER_DIRECT_TERMINAL_REQUIRED",
   ]);
   const liveProof = succeeded && proofLevel === "live_data_plane_postconditions";
+  const sandboxCeremony = succeeded ? sandboxCeremonyFromReceipt(step, ceremonyReceipt) : null;
   const issueCode = succeeded
     ? liveProof ? "TECHNICIAN_LIVE_PROOF_RECORDED" : "TECHNICIAN_STATUS_REFRESH_REQUIRED"
     : safeIssueCode(error);
@@ -202,7 +284,8 @@ export function buildTechnicianStepStatus({
         command: locator.command,
         args: Object.freeze(step === "passkey"
           ? [...locator.args, "invite", manifest]
-          : [...locator.args, "technician", manifest, "--run", step, ...exactOwnerArgs]),
+          : [...locator.args, "technician", manifest, "--run", step,
+              ...(step === "quickbooks" ? ["--json"] : []), ...exactOwnerArgs]),
         execution_boundary: "owner_direct_terminal",
         mutates_external_state: true,
       })
@@ -233,6 +316,7 @@ export function buildTechnicianStepStatus({
     ...(succeeded && proofLevel === "live_data_plane_postconditions" && proof
       ? { proof }
       : {}),
+    ...(sandboxCeremony ? { sandbox_ceremony: sandboxCeremony } : {}),
     proof_warning: succeeded
       ? proofLevel === "live_data_plane_postconditions"
         ? step === "smoke"
@@ -271,6 +355,19 @@ export function technicianChildEnvironment(base = {}, explicit = {}) {
   return result;
 }
 
+function normalizedFinalHostname(value) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw.includes("://") ? raw : `https://${raw}`);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.port ||
+        parsed.pathname !== "/" || parsed.search || parsed.hash) return null;
+    return parsed.hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
 function readManifestSummary(manifestPath, deps = {}) {
   const exists = deps.existsSync || existsSync;
   const read = deps.readFileSync || readFileSync;
@@ -281,8 +378,11 @@ function readManifestSummary(manifestPath, deps = {}) {
       exists: false,
       final_hostname: null,
       enabled_connectors: [],
-      connector_environments: { quickbooks: null },
+      connector_environments: { plaid: null, quickbooks: null },
+      connector_providers: { plaid: null },
       connector_redirect_hosts: { quickbooks: null },
+      connector_redirects: { plaid: false },
+      connector_endpoint_overrides: { plaid: false },
     };
   }
   let manifest;
@@ -298,16 +398,34 @@ function readManifestSummary(manifestPath, deps = {}) {
     : null;
   const quickbooksRedirectHost = typeof manifest?.corpora?.quickbooks?.redirect_host === "string"
     ? manifest.corpora.quickbooks.redirect_host.trim().toLowerCase()
-    : "localhost";
+    : null;
+  const plaidEnvironment = typeof manifest?.corpora?.bank_feed?.environment === "string"
+    ? manifest.corpora.bank_feed.environment.trim().toLowerCase()
+    : null;
+  const plaidProvider = typeof manifest?.corpora?.bank_feed?.provider === "string"
+    ? manifest.corpora.bank_feed.provider.trim().toLowerCase()
+    : null;
+  const finalHostname = normalizedFinalHostname(manifest?.brain?.domain);
+  const expectedPlaidRedirect = finalHostname ? bankFeedRedirectUri(finalHostname) : null;
+  const registeredPlaidRedirects = Array.isArray(manifest?.corpora?.bank_feed?.registered_redirect_uris)
+    ? manifest.corpora.bank_feed.registered_redirect_uris
+    : [];
+  const plaidEndpointOverride = ["api_base", "link_sdk_url", "link_global"].some((name) => {
+    const value = manifest?.corpora?.bank_feed?.[name];
+    return value !== null && value !== undefined && String(value).trim() !== "";
+  });
   return {
     path: absolute,
     exists: true,
-    final_hostname: typeof manifest?.brain?.domain === "string" && manifest.brain.domain.trim()
-      ? manifest.brain.domain.trim().toLowerCase()
-      : null,
+    final_hostname: finalHostname,
     enabled_connectors: enabled,
-    connector_environments: { quickbooks: quickbooksEnvironment },
+    connector_environments: { plaid: plaidEnvironment, quickbooks: quickbooksEnvironment },
+    connector_providers: { plaid: plaidProvider },
     connector_redirect_hosts: { quickbooks: quickbooksRedirectHost },
+    connector_redirects: {
+      plaid: expectedPlaidRedirect !== null && registeredPlaidRedirects.includes(expectedPlaidRedirect),
+    },
+    connector_endpoint_overrides: { plaid: plaidEndpointOverride },
   };
 }
 
@@ -345,13 +463,11 @@ export function technicianPlan(manifestPath, deps = {}) {
     cli,
     refresh,
     last_step: lastStep,
-    warning: "This plan prepares the public first-install workflow. Live proof arrives only from the deployed fixed-document smoke, health, source-freshness, and physical passkey checks.",
+    warning: "This plan prepares the public first-install workflow. Plaid and QuickBooks are Sandbox-only ceremonies whose command receipts are not live connector proof. Live proof arrives from the deployed fixed-document smoke, health, source-freshness, and physical passkey checks.",
     coverage: {
       guided_steps: TECHNICIAN_RUN_STEPS.filter((step) => !DEFERRED_PUBLIC_CONNECTOR_STEPS.includes(step)),
       not_guided_in_this_release: [
-        "Plaid connector ceremony",
         "Google connector ceremony",
-        "QuickBooks connector ceremony",
         "Zoom connector ceremony",
         "IMAP connector ceremony",
         "Slack connector ceremony",
@@ -361,7 +477,7 @@ export function technicianPlan(manifestPath, deps = {}) {
         "HubSpot connector ceremony",
         "watched-folder scheduling ceremony",
       ],
-      note: "These sources may have separate connector commands or backlog work, but this technician plan does not claim to guide or prove them.",
+      note: "Plaid and QuickBooks Sandbox are guided but remain field gates. The sources listed here may have separate connector commands or backlog work, but this technician plan does not claim to guide or prove them.",
     },
     rules: [
       "Run one step at a time and rerun the same step after an interruption.",
@@ -378,8 +494,15 @@ export function technicianPlan(manifestPath, deps = {}) {
         state = "waiting_for_install_record";
       }
       if (step.id === "smoke" && manifest.exists) state = "ready_for_owner_approval";
-      if (step.id === "plaid" && manifest.exists && !manifest.enabled_connectors.includes("bank_feed")) {
-        state = "requires_manifest_enablement";
+      if (step.id === "plaid" && manifest.exists) {
+        if (!manifest.enabled_connectors.includes("bank_feed")) state = "requires_manifest_enablement";
+        else if (manifest.connector_providers.plaid !== "plaid") state = "requires_plaid_provider";
+        else if (manifest.connector_endpoint_overrides.plaid) state = "requires_endpoint_cleanup";
+        else if (!["sandbox", "production"].includes(manifest.connector_environments.plaid)) state = "requires_environment_selection";
+        else if (manifest.connector_environments.plaid === "production") state = "production_unavailable";
+        else if (!manifest.final_hostname) state = "waiting_for_final_hostname";
+        else if (!manifest.connector_redirects.plaid) state = "requires_redirect_registration";
+        else state = "ready_for_owner_approval";
       }
       if (step.id === "zoom" && manifest.exists && !manifest.enabled_connectors.includes("zoom")) {
         state = "requires_manifest_enablement";
@@ -388,23 +511,12 @@ export function technicianPlan(manifestPath, deps = {}) {
           !["google_drive", "gmail", "calendar"].every((name) => manifest.enabled_connectors.includes(name))) {
         state = "requires_manifest_enablement";
       }
-      if (step.id === "quickbooks" && manifest.exists &&
-          !manifest.enabled_connectors.includes("quickbooks")) {
-        state = "requires_manifest_enablement";
-      }
-      if (step.id === "quickbooks" && manifest.exists &&
-          manifest.enabled_connectors.includes("quickbooks") &&
-          !["sandbox", "production"].includes(manifest.connector_environments.quickbooks)) {
-        state = "requires_environment_selection";
-      }
-      if (step.id === "quickbooks" && manifest.exists &&
-          manifest.enabled_connectors.includes("quickbooks") &&
-          !["localhost", "127.0.0.1"].includes(manifest.connector_redirect_hosts.quickbooks)) {
-        state = "requires_redirect_host_review";
-      }
-      if (step.id === "quickbooks" && manifest.exists &&
-          manifest.connector_environments.quickbooks === "production") {
-        state = "production_callback_unavailable";
+      if (step.id === "quickbooks" && manifest.exists) {
+        if (!manifest.enabled_connectors.includes("quickbooks")) state = "requires_manifest_enablement";
+        else if (!["sandbox", "production"].includes(manifest.connector_environments.quickbooks)) state = "requires_environment_selection";
+        else if (manifest.connector_environments.quickbooks === "production") state = "production_callback_unavailable";
+        else if (!["localhost", "127.0.0.1"].includes(manifest.connector_redirect_hosts.quickbooks)) state = "requires_redirect_host_review";
+        else state = "ready_for_owner_approval";
       }
       if (step.id === "imap" && manifest.exists && !manifest.enabled_connectors.includes("imap")) {
         state = "requires_manifest_enablement";
@@ -418,11 +530,11 @@ export function technicianPlan(manifestPath, deps = {}) {
       if (lastStep.state === "available" && lastStep.step === step.id) {
         state = lastStep.status;
       }
-      const ownerOnly = ["cloudflare", "passkey"].includes(step.id);
+      const ownerOnly = ["cloudflare", "plaid", "quickbooks", "passkey"].includes(step.id);
       const ownerCli = cli || Object.freeze({ command: "<brain-cli>", args: Object.freeze([]) });
       const ownerArgs = step.id === "passkey"
         ? ["invite", manifest.path]
-        : ["technician", manifest.path, "--run", step.id];
+        : ["technician", manifest.path, "--run", step.id, ...(step.id === "quickbooks" ? ["--json"] : [])];
       const continuationArgs = step.id === "passkey"
         ? ["technician", manifest.path, "--run", "verify"]
         : ["technician", manifest.path, "--json"];
@@ -455,6 +567,13 @@ export function technicianPlan(manifestPath, deps = {}) {
           ? {
               environment: manifest.connector_environments.quickbooks,
               redirect_host: manifest.connector_redirect_hosts.quickbooks,
+            }
+          : {}),
+        ...(step.id === "plaid"
+          ? {
+              environment: manifest.connector_environments.plaid,
+              provider: manifest.connector_providers.plaid,
+              redirect_registered: manifest.connector_redirects.plaid,
             }
           : {}),
       };
@@ -503,7 +622,7 @@ export function renderTechnicianPlan(plan) {
       lines.push(`   Owner-only direct terminal: ${step.owner_only_display}`);
       lines.push(step.id === "passkey"
         ? "   Keep the one-time link on the owner's direct display, then continue with the structured continuation command in the JSON plan."
-        : "   Run this outside the agent tool so Cloudflare browser sign-in or a recovery-only hidden prompt owns a real TTY, then use the credential-free structured continuation in the JSON plan.");
+        : "   Run this outside the agent tool so browser sign-in and any hidden prompt stay in a real owner-controlled terminal, then use the credential-free structured continuation in the JSON plan.");
     } else {
       lines.push("   No public first-install command is available for this deferred connector ceremony.");
     }
@@ -525,7 +644,10 @@ function childCommands(step, manifestPath, flags, scriptPath) {
       return [command(...args)];
     }
     case "smoke": return [];
-    case "plaid": return [command("secrets", path)];
+    case "plaid": return [
+      command("secrets", path),
+      command("connect", "bank", path),
+    ];
     case "google": return [command("connect", "google", "--scopes", String(flags.scopes || "drive,gmail,calendar"))];
     case "quickbooks": throw new Error("the QuickBooks technician step must use the in-process provider connection");
     case "zoom": return [command("connect", "zoom", path)];
@@ -568,10 +690,55 @@ function codedError(message, code, options = {}) {
   return error;
 }
 
+const QUICKBOOKS_CONNECTION_ERROR_CODES = new Set([
+  "callback_error",
+  "callback_timeout",
+  "credential_changed_during_authorization",
+  "credential_lock_lost",
+  "credential_lock_unsafe",
+  "credential_mutation_requires_custody",
+  "credential_store_conflict",
+  "credential_store_unavailable",
+  "credential_update_in_progress",
+  "environment_required",
+  "invalid_source",
+  "missing_code",
+  "missing_realm_id",
+  "quickbooks_realm_missing",
+  "source_binding_corrupt",
+  "source_binding_required",
+  "state_mismatch",
+  "unexpected_company",
+  "unexpected_environment",
+]);
+
+function safeQuickBooksConnectionFailure(error) {
+  const candidate = String(error?.code || "").trim().toLowerCase();
+  const code = QUICKBOOKS_CONNECTION_ERROR_CODES.has(candidate)
+    ? candidate
+    : "quickbooks_connection_failed";
+  if (["unexpected_company", "missing_realm_id", "quickbooks_realm_missing"].includes(code)) {
+    return codedError(
+      "QuickBooks did not confirm the reviewed Sandbox company identity, so no usable connection was recorded. Return to the credential-free technician status before starting a new authorization.",
+      code,
+    );
+  }
+  if (code.startsWith("credential_") || code.startsWith("source_binding_")) {
+    return codedError(
+      "The protected QuickBooks credential store or company binding could not be confirmed, so no success receipt was recorded. Return to the credential-free technician status and review the named issue before retrying.",
+      code,
+    );
+  }
+  return codedError(
+    "The QuickBooks Sandbox connection did not complete, and no success receipt was recorded. Return to the credential-free technician status before deciding whether to retry the ceremony.",
+    code,
+  );
+}
+
 function runOne(spawn, nodePath, args, env) {
   const result = spawn(nodePath, args, { stdio: "inherit", env });
   if (result?.error) throw codedError(
-    `the technician child could not start: ${result.error.message}`,
+    "The technician child could not start. No operating-system detail was retained. Refresh the credential-free technician status, verify the package-local CLI still starts, then retry this same step.",
     "technician_child_start_failed",
   );
   if (result?.status !== 0) {
@@ -602,6 +769,16 @@ export async function runTechnicianStep({
   }
   if (!manifestPath || !scriptPath) throw new Error("the technician step needs a manifest and installer path");
   const summary = readManifestSummary(manifestPath, manifestDeps);
+  if (SANDBOX_TECHNICIAN_STEPS.has(step)) {
+    const allowed = step === "quickbooks" ? new Set(["run", "json", "port"]) : new Set(["run"]);
+    const unknown = Object.keys(flags).filter((name) => !allowed.has(name));
+    if (unknown.length) {
+      throw codedError(
+        `The ${step === "plaid" ? "Plaid" : "QuickBooks"} Sandbox step does not use --${unknown[0]}. No credential prompt or browser flow was opened.`,
+        "technician_step_option_invalid",
+      );
+    }
+  }
   if (step === "cloudflare" && !isTTY) {
     throw codedError(
       "The Cloudflare ceremony needs a real owner-controlled terminal for browser sign-in and its local callback. Run the exact owner-only command from the read-only technician plan outside the agent tool, then return to the credential-free status refresh.",
@@ -631,8 +808,49 @@ export async function runTechnicianStep({
       throw new Error(`the install plan needs these Google sources enabled before connection: ${requested.join(", ")}`);
     }
   }
-  if (step === "plaid" && !summary.enabled_connectors.includes("bank_feed")) {
-    throw new Error("the install plan needs corpora.bank_feed.enabled before Plaid credential entry");
+  if (step === "plaid") {
+    if (!summary.enabled_connectors.includes("bank_feed")) {
+      throw codedError(
+        "corpora.bank_feed.enabled is not true in this manifest. Enable it before connecting.",
+        "plaid_not_enabled",
+      );
+    }
+    if (summary.connector_providers.plaid !== "plaid") {
+      throw codedError(
+        "corpora.bank_feed.provider must explicitly be plaid for this reviewed Sandbox ceremony.",
+        "plaid_provider_required",
+      );
+    }
+    if (summary.connector_endpoint_overrides.plaid) {
+      throw codedError(
+        "The reviewed Plaid profile does not accept corpora.bank_feed.api_base, link_sdk_url, or link_global. Remove those custom endpoint fields before connecting. No credential prompt or Worker change was opened.",
+        "plaid_endpoint_override_invalid",
+      );
+    }
+    if (!["sandbox", "production"].includes(summary.connector_environments.plaid)) {
+      throw codedError(
+        "corpora.bank_feed.environment must explicitly be sandbox or production before connecting.",
+        "plaid_environment_required",
+      );
+    }
+    if (summary.connector_environments.plaid === "production") {
+      throw codedError(
+        "Plaid production connection is not available through this technician step. Use Sandbox for the reviewed field ceremony. No credential prompt or browser flow was opened.",
+        "plaid_production_unavailable",
+      );
+    }
+    if (!summary.final_hostname) {
+      throw codedError(
+        "brain.domain must be one final deployed HTTPS hostname before the Plaid return page can be reviewed.",
+        "plaid_final_hostname_required",
+      );
+    }
+    if (!summary.connector_redirects.plaid) {
+      throw codedError(
+        `Register ${bankFeedRedirectUri(summary.final_hostname)} in the client's Plaid Sandbox dashboard and record that exact address in corpora.bank_feed.registered_redirect_uris before connecting.`,
+        "plaid_redirect_not_registered",
+      );
+    }
   }
   if (step === "quickbooks") {
     if (!summary.enabled_connectors.includes("quickbooks")) {
@@ -659,9 +877,24 @@ export async function runTechnicianStep({
         "quickbooks_redirect_host_invalid",
       );
     }
+    if (flags.port !== undefined) {
+      const port = Number(flags.port);
+      if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+        throw codedError(
+          "--port must be an integer from 1024 through 65535. No credential prompt or browser flow was opened.",
+          "quickbooks_port_invalid",
+        );
+      }
+    }
     if (typeof connectProvider !== "function") {
       throw new Error("the QuickBooks step needs the reviewed in-process provider connector");
     }
+  }
+  if (SANDBOX_TECHNICIAN_STEPS.has(step) && !isTTY) {
+    throw codedError(
+      `The ${step === "plaid" ? "Plaid" : "QuickBooks"} Sandbox ceremony needs a real owner-controlled terminal for hidden credential entry and browser consent. Run the exact owner-only command from the read-only technician plan outside the agent tool, then return to the credential-free status refresh.`,
+      "owner_direct_terminal_required",
+    );
   }
   if (step === "passkey") {
     if (!summary.final_hostname) {
@@ -726,12 +959,7 @@ export async function runTechnicianStep({
             "owner_canceled",
           );
         }
-        const safeMessage = String(error?.message || "QuickBooks connection failed")
-          .replaceAll(bufferText(clientId), "[redacted]")
-          .replaceAll(bufferText(clientSecret), "[redacted]");
-        const safeError = codedError(safeMessage, error?.code || "quickbooks_connection_failed");
-        safeError.name = error?.name || safeError.name;
-        throw safeError;
+        throw safeQuickBooksConnectionFailure(error);
       }
       const launcher = Object.freeze({
         command: resolve(nodePath),
@@ -745,6 +973,8 @@ export async function runTechnicianStep({
         custody: "client_local_provider_store",
         financial_authority: false,
         oauth_permission: "broad_accounting_scope_runtime_read_only",
+        live_provider_proof: false,
+        field_acceptance_pending: true,
         verification: Object.freeze([
           Object.freeze({
             purpose: "dry_run",
@@ -777,7 +1007,31 @@ export async function runTechnicianStep({
 
     childEnv = technicianChildEnvironment(baseEnv, explicitEnv);
     const commands = childCommands(step, manifestPath, flags, resolve(scriptPath));
-    for (const args of commands) runOne(spawn, nodePath, args, childEnv);
+    for (let index = 0; index < commands.length; index++) {
+      const commandEnv = step === "plaid" && index > 0
+        ? technicianChildEnvironment(baseEnv)
+        : childEnv;
+      runOne(spawn, nodePath, commands[index], commandEnv);
+      if (step === "plaid" && index === 0) {
+        for (const buffer of secretBuffers) buffer.fill(0);
+        for (const key of Object.keys(explicitEnv)) {
+          explicitEnv[key] = "";
+          childEnv[key] = "";
+        }
+      }
+    }
+    if (step === "plaid") {
+      return {
+        step,
+        completed: true,
+        commands_run: commands.length,
+        environment: "sandbox",
+        custody: "client_owned_worker_secret_store",
+        owner_link_page: "opened_or_printed",
+        live_provider_proof: false,
+        field_acceptance_pending: true,
+      };
+    }
     if (step === "smoke") {
       if (typeof runInstallSmoke !== "function") {
         throw codedError(

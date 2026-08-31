@@ -90,12 +90,13 @@ provider page or the Brain CLI's hidden prompt.
 
 The public first-install path covers local tools, the owner-terminal Cloudflare
 install, one fixed public smoke document, an owner-only passkey handoff, and
-live final verification. Plaid, Google,
-QuickBooks, Zoom, and IMAP sections below are retained as implementation and
-field-gate references only. Their technician commands fail closed in the public
-path until secure credential custody and real-provider acceptance are complete.
+live final verification. After that core exists, Plaid and QuickBooks may run
+only as explicitly configured Sandbox ceremonies in an owner-controlled
+terminal. Their sanitized receipts prove the command boundary, not a live
+connector lifecycle. Google, Zoom, and IMAP remain implementation and field-gate
+references whose technician commands fail closed.
 
-## Public first-install steps and deferred field references
+## Public first-install, Sandbox ceremonies, and deferred field references
 
 ### 1. Local tools
 
@@ -180,8 +181,10 @@ response. It reads no owner folder or customer material.
 
 ### 4. Plaid bank feed
 
-Enable `corpora.bank_feed` with provider `plaid` and explicitly select Sandbox
-or Production. The client owns the Plaid account and Link configuration.
+Enable `corpora.bank_feed` with provider `plaid` and explicitly select
+`sandbox`. Record this Brain's exact final return address in
+`registered_redirect_uris`. The client owns the Plaid account and Link
+configuration.
 Financial Brain has no shared Plaid account and no central bank-data custody.
 
 ```bash
@@ -189,19 +192,27 @@ brain technician "$HOME/Financial Brain/brain.manifest.json" --run plaid
 ```
 
 The Plaid client ID, secret, and independent version-2 bank wrapping key are
-entered only at hidden prompts. The technician step writes the named Worker
-secrets without exposing their values. Once `brain doctor` confirms the exact
-return address is recorded, hand the browser to the owner with:
+entered only at hidden prompts in a terminal the owner controls. The technician
+step refuses missing configuration, an unregistered return address, a
+non-Plaid provider, Production, or an agent shell before prompting. It writes
+the named Worker secrets without exposing their values, clears them, then opens
+or prints the reviewed owner page. This owner-terminal command does not combine
+with `--json`; its fixed no-secret result is in the printed private status file.
+Claude continues using a separate credential-free
+`brain technician <manifest> --json` refresh. The same page can be reopened
+later without reading a credential:
 
 ```bash
 brain connect bank "$HOME/Financial Brain/brain.manifest.json"
 ```
 
-For a Claude-guided session, add `--print`; Claude can explain the next step
+For a Claude-guided follow-up, add `--print`; Claude can explain the next step
 without opening the page or receiving a credential. The account holder signs
 in, completes Plaid Link, and assigns every masked account to its business.
-A configured connection is not reconciliation proof and never makes Plaid or
-QuickBooks financial authority.
+The technician status says `live_provider_proof:false` until the owner Link,
+deployed route, D1, webhook, reconciliation, and disconnect field checks are
+recorded. A configured connection is not reconciliation proof and never makes
+Plaid or QuickBooks financial authority.
 
 ### 5. Google
 
@@ -229,7 +240,7 @@ sandbox company. Financial Brain has no shared Intuit account and does not
 receive the app values or OAuth grant.
 
 ```bash
-brain technician "$HOME/Financial Brain/brain.manifest.json" --run quickbooks
+brain technician "$HOME/Financial Brain/brain.manifest.json" --run quickbooks --json
 ```
 
 Both Intuit app values are entered at hidden prompts. Register the exact
@@ -238,9 +249,12 @@ consent page grants Intuit's broad Accounting permission, which can authorize
 reads and writes. Financial Brain explains that scope clearly and performs
 query/read calls only. The connector binds the credential and imported document
 identities to the authorized company, so selecting a different company cannot
-quietly replace an existing source. The command then prints the exact dry-run
-and first-ingest commands. A successful connection or ingest means the
-QuickBooks reference loaded. It does not prove the books are correct.
+quietly replace an existing source. The command then returns the exact dry-run
+and first-ingest commands as separate command and argument fields. Run the
+technician command in the owner's direct terminal; an agent shell receives an
+owner-terminal status instead of a credential prompt. A successful connection
+means only that the local OAuth connection was stored. The dry run and reviewed
+ingest remain separate, and neither proves the books are correct.
 
 If this computer has a QuickBooks credential from an earlier release, run this
 same sandbox connection once before ingest. That reconnect creates the company
@@ -277,7 +291,7 @@ For a Claude or Codex-guided visit, copy this prompt exactly and replace only
 the manifest path:
 
 ```text
-Guide me through connecting my client-owned QuickBooks Online sandbox company to Financial Brain using /absolute/path/to/brain.manifest.json. First read the manifest and confirm corpora.quickbooks.enabled is true, corpora.quickbooks.environment says sandbox, and the registered callback exactly matches the command's localhost URL. If the manifest says production, explain the quickbooks_production_callback_unavailable boundary and stop before credential or browser access. Explain that I own the Intuit app and company authorization, Financial Brain has no shared Intuit account or credential custody, and QuickBooks will remain a reference rather than financial authority. Explain that Intuit's Accounting consent is broader than Financial Brain's read-only runtime queries. Ask before running brain technician with --run quickbooks --json. Hand the terminal to me for both hidden prompts and keep both app values out of chat, printed output, logs, and commands. Let me complete Intuit consent in the browser. Then show the exact dry-run and first-ingest commands and stop before the real ingest until I approve it. After a reviewed ingest and bank import, ask me to select exactly one Brain account slug, QuickBooks account ID, date range, and inflow or outflow direction. Show brain reconcile quickbooks with those selectors and --json, then ask before running it. Never expose the Intuit realm ID or credential. Explain that matched, mismatched, ambiguous, one-sided, unavailable, and insufficient-evidence results are review states, never financial authority. Preserve both sources, every exact citation, error_code, and recovery instruction. Never resolve an exception or treat a successful comparison as proof that the books are correct.
+Guide me through connecting my client-owned QuickBooks Online sandbox company to Financial Brain using /absolute/path/to/brain.manifest.json. First read the manifest and confirm corpora.quickbooks.enabled is true, corpora.quickbooks.environment says sandbox, and the registered callback exactly matches the command's localhost URL. If the manifest says production, explain the quickbooks_production_callback_unavailable boundary and stop before credential or browser access. Explain that I own the Intuit app and company authorization, Financial Brain has no shared Intuit account or credential custody, and QuickBooks will remain a reference rather than financial authority. Explain that Intuit's Accounting consent is broader than Financial Brain's read-only runtime queries. Ask before showing the exact owner-only brain technician command with --run quickbooks --json, then let me run it in my direct terminal for both hidden prompts. Keep both app values out of chat, printed output, logs, and commands. Let me complete Intuit consent in the browser. Then show the exact structured dry-run and first-ingest commands and stop before the real ingest until I approve it. After a reviewed ingest and bank import, ask me to select exactly one Brain account slug, QuickBooks account ID, date range, and inflow or outflow direction. Show brain reconcile quickbooks with those selectors and --json, then ask before running it. Never expose the Intuit realm ID or credential. Explain that matched, mismatched, ambiguous, one-sided, unavailable, and insufficient-evidence results are review states, never financial authority. Preserve both sources, every exact citation, error_code, and recovery instruction. Never resolve an exception or treat a successful comparison as proof that the books are correct.
 ```
 
 #### Optional human-confirmed tax review bridge

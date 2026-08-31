@@ -37,6 +37,15 @@ configuration option for controlled compatibility testing, but Intuit's current
 sandbox documentation names `localhost`. The HTTP listener always binds
 `127.0.0.1`; the manifest cannot broaden it to a LAN or wildcard address.
 
+Run `brain technician <manifest> --run quickbooks --json` in a terminal the owner
+controls. The command refuses a missing or disabled manifest, a missing
+environment, Production, an unreviewed redirect host, or an agent shell before
+reading either hidden app value. It passes those two values directly to the
+existing in-process OAuth implementation; neither value enters argv, a child
+environment, log output, JSON, or the private technician status. After a
+confirmed connection, `--json` returns separate command and argument fields for
+the credential-free dry run and the later owner-approved ingest.
+
 The connection:
 
 - keeps the raw `realmId`, app secret, access token, and refresh token only in
@@ -97,6 +106,14 @@ run, first ingest, retrieval, disconnect, retained-document truth, and a
 separately reviewed forget preview.
 The receipt must contain fingerprints and counts only, not company identifiers,
 tokens, record content, or app values.
+
+The technician receipt is intentionally narrower than that field receipt. It
+records only that the local Sandbox OAuth connection was stored, retains
+`live_provider_proof:false`, and carries the two structured verification
+commands. Cancellation is safe to restart after a fresh status read. An
+uncertain token response records `OAUTH_RESPONSE_UNCERTAIN` and is not marked
+safe for a blind token retry. Unknown provider detail is reduced to a fixed
+error code and recovery sentence before it can reach status or JSON.
 
 ## Production is intentionally unavailable
 

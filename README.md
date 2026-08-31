@@ -88,12 +88,15 @@ For an install day, `brain technician <manifest>` prints the read-only plan.
 Add `--json` when a local coding agent is guiding the session. The public
 first-install path runs `tools`, the owner-terminal `cloudflare` ceremony, one
 fixed public `smoke` document, the owner-only `passkey` handoff, and `verify`.
-Plaid, Google, QuickBooks, Zoom, and IMAP ceremonies remain
-deferred until their secure custody and real-provider field gates are complete.
+After that core install exists, explicitly configured Sandbox manifests may
+also run the owner-terminal Plaid and QuickBooks ceremonies. Those steps record
+command-level custody and continuation receipts, not live connector proof.
+Google, Zoom, and IMAP ceremonies remain deferred until their secure custody
+and real-provider field gates are complete.
 The owner still handles login, 2FA, consent, the Cloudflare browser approval,
 and the physical passkey gesture. The JSON plan provides exact structured
-`owner_only_command` fields for Cloudflare and passkey actions. Claude never
-runs those commands through its agent shell.
+`owner_only_command` fields for Cloudflare, Plaid Sandbox, QuickBooks Sandbox,
+and passkey actions. Claude never runs those commands through its agent shell.
 The owner mints a one-time passkey invite only in a terminal they control
 directly; invite links never enter agent chat, captured output, or status files.
 The complete guide is
@@ -112,7 +115,12 @@ before continuing. The smoke and final verification steps record live deployed
 proof; ordinary child exit codes and a static manifest do not.
 
 The optional Plaid profile is read-only, disabled by default, and still requires
-a client-owned Plaid account plus the account holder's own Link ceremony. Each
+a client-owned Plaid account plus the account holder's own Link ceremony. The
+Sandbox-only `brain technician <manifest> --run plaid` step refuses an
+unregistered return address or a Production manifest before prompting. It keeps
+the three values inside one hidden owner-terminal handoff, clears them before
+opening or printing the reviewed Link page, and records no value or page URL in
+its status receipt. Each
 masked account remains staged until the signed-in owner assigns it to one active
 owned entity; an institution connection never defaults every account to one
 business scope. After configuration, `brain connect bank <manifest>` performs

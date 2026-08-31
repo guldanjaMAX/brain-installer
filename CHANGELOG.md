@@ -47,9 +47,14 @@ the brain, not for whoever built it: what changed for them, and what to check.
   fresh DPAPI round trips through one private process-scoped helper, cleanly
   disposes that helper, verifies the saved user PATH by readback, and uses the
   official native Claude executable for the shell-free handoff.
-- The public first-install path now defers Plaid, Google, QuickBooks, Zoom, and
-  IMAP ceremonies until their secure credential custody and real-provider field
-  gates are complete. Cloudflare browser sign-in and passkey invitation use
+- The public first-install path now defers Google, Zoom, and IMAP ceremonies
+  until their secure credential custody and real-provider field gates are
+  complete. Plaid and QuickBooks are available only for explicitly configured
+  Sandbox manifests in an owner-controlled terminal. Plaid clears its three
+  hidden values before opening or printing the reviewed owner Link page;
+  QuickBooks keeps both app values in the existing in-process OAuth path. Both
+  write fixed no-secret status receipts and still require real Sandbox field
+  acceptance. Cloudflare browser sign-in and passkey invitation use
   exact owner-terminal commands outside the agent shell. One fixed public
   non-customer smoke document proves real deployed ingestion.
   Final verification requires that exact ready source, its stored document and

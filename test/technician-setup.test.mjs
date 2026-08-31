@@ -35,10 +35,15 @@ writeFileSync(manifestPath, JSON.stringify({
     google_drive: { enabled: true, root_folder_ids: ["reviewed-root"] },
     gmail: { enabled: true },
     calendar: { enabled: true },
-    quickbooks: { enabled: true, environment: "sandbox" },
+    quickbooks: { enabled: true, environment: "sandbox", redirect_host: "localhost" },
     zoom: { enabled: true },
     imap: { enabled: true },
-    bank_feed: { enabled: true, provider: "plaid" },
+    bank_feed: {
+      enabled: true,
+      provider: "plaid",
+      environment: "sandbox",
+      registered_redirect_uris: ["https://brain.fixture.test/app/connect/bank"],
+    },
   },
 }));
 
@@ -402,8 +407,11 @@ test("the plan is read-only, ordered, honest about proof, and agent-readable", (
   assert.match(JSON.stringify(plan), /hidden terminal prompts/i);
   assert.ok(plan.steps.filter((step) => step.command).every((step) => step.command.includes("<brain-cli>")));
   assert.ok(plan.coverage.not_guided_in_this_release.some((name) => /Google connector/i.test(name)));
-  assert.ok(plan.steps.filter((step) => ["plaid", "google", "quickbooks", "zoom", "imap"].includes(step.id))
+  assert.ok(plan.steps.filter((step) => ["google", "zoom", "imap"].includes(step.id))
     .every((step) => step.command === null && step.state === "deferred_from_public_first_install"));
+  assert.ok(["plaid", "quickbooks"].every((id) => plan.coverage.guided_steps.includes(id)));
+  assert.ok(plan.steps.filter((step) => ["plaid", "quickbooks"].includes(step.id))
+    .every((step) => step.command === null && step.state === "waiting_for_install_record" && step.owner_only_command));
   const passkey = plan.steps.find((step) => step.id === "passkey");
   assert.equal(passkey.command, null);
   assert.deepEqual(passkey.owner_only_command, {
@@ -425,6 +433,15 @@ test("the plan is read-only, ordered, honest about proof, and agent-readable", (
     must_run_in_direct_owner_terminal: true,
     reveals_one_time_link: false,
   });
+  for (const connector of ["plaid", "quickbooks"]) {
+    const step = plan.steps.find((item) => item.id === connector);
+    assert.deepEqual(step.owner_only_command.args, [
+      "technician", resolve(missing), "--run", connector,
+      ...(connector === "quickbooks" ? ["--json"] : []),
+    ]);
+    assert.equal(step.owner_only_command.execution_boundary, "owner_direct_terminal");
+    assert.equal(step.owner_only_command.reveals_one_time_link, false);
+  }
   assert.doesNotMatch(JSON.stringify(plan.steps), /(^|[^<-])\bbrain technician\b/i);
   for (const name of ["Slack", "Notion", "Microsoft 365", "Dropbox", "HubSpot", "watched-folder"]) {
     assert.match(JSON.stringify(plan.coverage), new RegExp(name, "i"));
@@ -458,6 +475,14 @@ test("the package-local JSON plan exposes stable course-correction fields and an
   const cloudflare = plan.steps.find((step) => step.id === "cloudflare");
   assert.deepEqual(cloudflare.owner_only_command.args, [safeBrainPath, "technician", missing, "--run", "cloudflare"]);
   assert.equal(cloudflare.owner_only_command.execution_boundary, "owner_direct_terminal");
+  for (const connector of ["plaid", "quickbooks"]) {
+    const step = plan.steps.find((item) => item.id === connector);
+    assert.deepEqual(step.owner_only_command.args, [
+      safeBrainPath, "technician", missing, "--run", connector,
+      ...(connector === "quickbooks" ? ["--json"] : []),
+    ]);
+    assert.deepEqual(step.continuation.args, [safeBrainPath, "technician", missing, "--json"]);
+  }
 });
 
 test("the Cloudflare ceremony refuses an agent shell without a TTY and records the exact owner action", async () => {
@@ -627,19 +652,48 @@ test("the child environment strips ambient credentials and unrelated application
   assert.doesNotMatch(JSON.stringify(env), /must-not-cross/);
 });
 
-test("the public first-install path defers every connector before prompts, children, or provider calls", async () => {
+test("the public first-install path keeps Google, Zoom, and IMAP deferred before any prompt or child", async () => {
   let prompts = 0;
   let children = 0;
   let providers = 0;
   const originalLog = console.log;
   console.log = () => {};
   try {
-    for (const step of ["plaid", "google", "quickbooks", "zoom", "imap"]) {
+    for (const step of ["google", "zoom", "imap"]) {
       await assert.rejects(cmdTechnician(manifestPath, { run: step }, {
         readHidden: async () => { prompts++; return Buffer.from("must-not-be-read"); },
         spawn: () => { children++; return { status: 0 }; },
         connectProvider: async () => { providers++; },
       }), /deferred from the public first-install path/);
+    }
+  } finally {
+    console.log = originalLog;
+  }
+  assert.deepEqual({ prompts, children, providers }, { prompts: 0, children: 0, providers: 0 });
+});
+
+test("Plaid and QuickBooks Sandbox require a real owner terminal before hidden prompts or provider actions", async () => {
+  let prompts = 0;
+  let children = 0;
+  let providers = 0;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    for (const step of ["plaid", "quickbooks"]) {
+      await assert.rejects(cmdTechnician(manifestPath, { run: step }, {
+        isTTY: false,
+        readHidden: async () => { prompts++; return Buffer.from("must-not-be-read"); },
+        spawn: () => { children++; return { status: 0 }; },
+        connectProvider: async () => { providers++; },
+      }), /real owner-controlled terminal/i);
+      const status = JSON.parse(readFileSync(technicianStatusFilePath(manifestPath), "utf8"));
+      assert.equal(status.issue_code, "OWNER_DIRECT_TERMINAL_REQUIRED");
+      assert.equal(status.retry_safe, true);
+      assert.equal(status.owner_action.execution_boundary, "owner_direct_terminal");
+      assert.deepEqual(status.owner_action.args, [
+        resolve("brain.mjs"), "technician", manifestPath, "--run", step,
+        ...(step === "quickbooks" ? ["--json"] : []),
+      ]);
     }
   } finally {
     console.log = originalLog;
@@ -677,36 +731,226 @@ test("Google credentials cross only the child environment, never argv, and input
   assert.ok(clientSecret.every((byte) => byte === 0));
 });
 
-test("Plaid credentials cross only the secrets child environment and are zeroed", async () => {
+test("Plaid Sandbox sends secrets only to custody, clears them, then opens the reviewed owner page", async () => {
   const clientId = Buffer.from("fixture-plaid-client-id");
   const clientSecret = Buffer.from("fixture-plaid-secret");
   const wrappingKey = Buffer.from(`v2.${"A".repeat(43)}`);
   const entered = [clientId, clientSecret, wrappingKey];
-  let call;
-  await runTechnicianStep({
+  const calls = [];
+  const receipt = await runTechnicianStep({
     step: "plaid",
     manifestPath,
     scriptPath: fixtureScriptPath,
     nodePath: fixtureNodePath,
+    isTTY: true,
     baseEnv: { PATH: "/safe/bin", ZOOM_CLIENT_SECRET: "ambient-zoom-secret" },
     readHidden: async () => entered.shift(),
     spawn: (node, args, options) => {
-      call = { node, args, options };
-      assert.equal(options.env.BANK_FEED_CLIENT_ID, "fixture-plaid-client-id");
-      assert.equal(options.env.BANK_FEED_SECRET, "fixture-plaid-secret");
-      assert.equal(options.env.BANK_FEED_WRAPPING_KEY_V2, `v2.${"A".repeat(43)}`);
+      calls.push({ node, args, env: { ...options.env } });
+      if (calls.length === 1) {
+        assert.equal(options.env.BANK_FEED_CLIENT_ID, "fixture-plaid-client-id");
+        assert.equal(options.env.BANK_FEED_SECRET, "fixture-plaid-secret");
+        assert.equal(options.env.BANK_FEED_WRAPPING_KEY_V2, `v2.${"A".repeat(43)}`);
+      } else {
+        assert.equal(options.env.BANK_FEED_CLIENT_ID, undefined);
+        assert.equal(options.env.BANK_FEED_SECRET, undefined);
+        assert.equal(options.env.BANK_FEED_WRAPPING_KEY_V2, undefined);
+      }
       assert.equal(options.env.ZOOM_CLIENT_SECRET, undefined);
       return { status: 0 };
     },
   });
-  assert.deepEqual(call.args, [fixtureScriptPath, "secrets", manifestPath]);
-  assert.doesNotMatch(call.args.join(" "), /fixture-plaid/);
-  assert.equal(call.options.env.BANK_FEED_CLIENT_ID, "");
-  assert.equal(call.options.env.BANK_FEED_SECRET, "");
-  assert.equal(call.options.env.BANK_FEED_WRAPPING_KEY_V2, "");
+  assert.deepEqual(calls.map((call) => call.args), [
+    [fixtureScriptPath, "secrets", manifestPath],
+    [fixtureScriptPath, "connect", "bank", manifestPath],
+  ]);
+  assert.doesNotMatch(calls.map((call) => call.args.join(" ")).join("\n"), /fixture-plaid/);
+  assert.deepEqual(receipt, {
+    step: "plaid",
+    completed: true,
+    commands_run: 2,
+    environment: "sandbox",
+    custody: "client_owned_worker_secret_store",
+    owner_link_page: "opened_or_printed",
+    live_provider_proof: false,
+    field_acceptance_pending: true,
+  });
   assert.ok(clientId.every((byte) => byte === 0));
   assert.ok(clientSecret.every((byte) => byte === 0));
   assert.ok(wrappingKey.every((byte) => byte === 0));
+});
+
+test("Plaid uses its private status instead of run JSON and scrubs child-start OS detail", async () => {
+  let prompts = 0;
+  let children = 0;
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...parts) => logs.push(parts.join(" "));
+  try {
+    await assert.rejects(
+      cmdTechnician(manifestPath, { run: "plaid", json: true }, {
+        isTTY: true,
+        readHidden: async () => { prompts++; return Buffer.from("must-not-be-read"); },
+        spawn: () => { children++; return { status: 0 }; },
+      }),
+      /--json can be combined with --run only for.*QuickBooks/i,
+    );
+    assert.deepEqual({ prompts, children }, { prompts: 0, children: 0 });
+
+    const sensitiveDetail = "private-spawn-path-and-os-detail";
+    const entered = [
+      Buffer.from("spawn-failure-client"),
+      Buffer.from("spawn-failure-secret"),
+      Buffer.from(`v2.${"D".repeat(43)}`),
+    ];
+    const values = [...entered];
+    let visibleError;
+    await assert.rejects(
+      cmdTechnician(manifestPath, { run: "plaid" }, {
+        isTTY: true,
+        readHidden: async () => { prompts++; return values.shift(); },
+        spawn: () => {
+          children++;
+          return { error: new Error(`ENOENT ${sensitiveDetail}`), status: null };
+        },
+      }),
+      (error) => {
+        visibleError = error;
+        return /technician child could not start/i.test(error.message);
+      },
+    );
+    const statusText = readFileSync(technicianStatusFilePath(manifestPath), "utf8");
+    const status = JSON.parse(statusText);
+    assert.equal(status.issue_code, "TECHNICIAN_CHILD_START_FAILED");
+    assert.equal(status.retry_safe, true);
+    assert.equal(status.status, "action_required");
+    assert.doesNotMatch(`${visibleError.message}\n${statusText}\n${logs.join("\n")}`, new RegExp(sensitiveDetail, "i"));
+    assert.equal(children, 1);
+    assert.equal(prompts, 3);
+    assert.ok(entered.every((buffer) => buffer.every((byte) => byte === 0)));
+  } finally {
+    console.log = originalLog;
+  }
+});
+
+test("Plaid refuses missing, non-Sandbox, and unregistered manifests before any hidden prompt or child", async () => {
+  let prompts = 0;
+  let children = 0;
+  const common = {
+    step: "plaid",
+    scriptPath: fixtureScriptPath,
+    isTTY: true,
+    readHidden: async () => { prompts++; return Buffer.from("must-not-be-read"); },
+    spawn: () => { children++; return { status: 0 }; },
+  };
+  const writePlaid = (name, bankFeed, brain = { domain: "brain.fixture.test" }) => {
+    const path = join(sandbox, `${name}.json`);
+    writeFileSync(path, JSON.stringify({ brain, corpora: { bank_feed: bankFeed } }));
+    return path;
+  };
+
+  await assert.rejects(
+    runTechnicianStep({ ...common, manifestPath: join(sandbox, "missing-plaid.json") }),
+    (error) => error.code === "manifest_not_found",
+  );
+  await assert.rejects(
+    runTechnicianStep({ ...common, manifestPath, flags: { port: "47812" } }),
+    (error) => error.code === "technician_step_option_invalid",
+  );
+  const cases = [
+    ["disabled", { enabled: false, provider: "plaid", environment: "sandbox" }, "plaid_not_enabled"],
+    ["custom", { enabled: true, provider: "custom", environment: "sandbox" }, "plaid_provider_required"],
+    ["endpoint-override", {
+      enabled: true,
+      provider: "plaid",
+      environment: "sandbox",
+      api_base: "https://custom.invalid",
+      registered_redirect_uris: ["https://brain.fixture.test/app/connect/bank"],
+    }, "plaid_endpoint_override_invalid"],
+    ["no-environment", { enabled: true, provider: "plaid" }, "plaid_environment_required"],
+    ["production", { enabled: true, provider: "plaid", environment: "production" }, "plaid_production_unavailable"],
+    ["no-domain", { enabled: true, provider: "plaid", environment: "sandbox" }, "plaid_final_hostname_required", {}],
+    ["unregistered", { enabled: true, provider: "plaid", environment: "sandbox", registered_redirect_uris: [] }, "plaid_redirect_not_registered"],
+  ];
+  for (const [name, feed, code, brain] of cases) {
+    const path = writePlaid(`plaid-${name}`, feed, brain);
+    await assert.rejects(
+      runTechnicianStep({ ...common, manifestPath: path }),
+      (error) => error.code === code,
+    );
+  }
+  assert.equal(
+    technicianPlan(writePlaid("plaid-plan-production", {
+      enabled: true,
+      provider: "plaid",
+      environment: "production",
+    })).steps.find((step) => step.id === "plaid").state,
+    "production_unavailable",
+  );
+  assert.equal(
+    technicianPlan(writePlaid("plaid-plan-endpoint-override", {
+      enabled: true,
+      provider: "plaid",
+      environment: "sandbox",
+      link_sdk_url: "https://custom.invalid/link.js",
+      registered_redirect_uris: ["https://brain.fixture.test/app/connect/bank"],
+    })).steps.find((step) => step.id === "plaid").state,
+    "requires_endpoint_cleanup",
+  );
+  assert.deepEqual({ prompts, children }, { prompts: 0, children: 0 });
+});
+
+test("Plaid reruns replace one deterministic no-secret Sandbox status receipt", async () => {
+  const secrets = [
+    Buffer.from("first-plaid-client"), Buffer.from("first-plaid-secret"), Buffer.from(`v2.${"B".repeat(43)}`),
+    Buffer.from("second-plaid-client"), Buffer.from("second-plaid-secret"), Buffer.from(`v2.${"C".repeat(43)}`),
+  ];
+  const argv = [];
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...parts) => logs.push(parts.join(" "));
+  try {
+    const run = () => cmdTechnician(manifestPath, { run: "plaid" }, {
+      isTTY: true,
+      readHidden: async () => secrets.shift(),
+      spawn: (_node, args) => { argv.push([...args]); return { status: 0 }; },
+    });
+    const first = await run();
+    const firstStatus = readFileSync(first.status_file, "utf8");
+    const second = await run();
+    const secondStatus = readFileSync(second.status_file, "utf8");
+    assert.equal(second.status_file, first.status_file);
+    assert.equal(secondStatus, firstStatus);
+    const status = JSON.parse(secondStatus);
+    assert.deepEqual(status.sandbox_ceremony, {
+      schema_version: 1,
+      connector: "plaid",
+      environment: "sandbox",
+      outcome: "owner_link_page_ready",
+      credential_custody: "client_owned_worker_secret_store",
+      owner_interaction_pending: true,
+      live_provider_proof: false,
+      field_acceptance_pending: true,
+    });
+    assert.equal(status.proof_level, "command_return_only");
+    assert.deepEqual(technicianPlan(manifestPath).last_step.sandbox_ceremony, {
+      connector: "plaid",
+      environment: "sandbox",
+      outcome: "owner_link_page_ready",
+      live_provider_proof: false,
+      field_acceptance_pending: true,
+    });
+    assert.deepEqual(argv, [
+      [resolve("brain.mjs"), "secrets", manifestPath],
+      [resolve("brain.mjs"), "connect", "bank", manifestPath],
+      [resolve("brain.mjs"), "secrets", manifestPath],
+      [resolve("brain.mjs"), "connect", "bank", manifestPath],
+    ]);
+    assert.doesNotMatch(`${firstStatus}\n${logs.join("\n")}\n${JSON.stringify(argv)}`, /first-plaid|second-plaid|v2\.[BC]/);
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(secrets.length, 0);
 });
 
 test("QuickBooks refuses missing manifests and incomplete configuration before any hidden prompt or OAuth call", async () => {
@@ -736,11 +980,15 @@ test("QuickBooks refuses missing manifests and incomplete configuration before a
     runTechnicianStep({ ...common, manifestPath: noEnvironment }),
     (error) => error.code === "quickbooks_environment_required",
   );
+  await assert.rejects(
+    runTechnicianStep({ ...common, manifestPath, flags: { port: "not-a-port" } }),
+    (error) => error.code === "quickbooks_port_invalid",
+  );
   const production = join(sandbox, "quickbooks-production.json");
   writeFileSync(production, JSON.stringify({ corpora: { quickbooks: { enabled: true, environment: "production" } } }));
   assert.equal(
     technicianPlan(production).steps.find((step) => step.id === "quickbooks").state,
-    "deferred_from_public_first_install",
+    "production_callback_unavailable",
   );
   await assert.rejects(
     runTechnicianStep({ ...common, manifestPath: production }),
@@ -752,7 +1000,7 @@ test("QuickBooks refuses missing manifests and incomplete configuration before a
   }));
   assert.equal(
     technicianPlan(invalidRedirect).steps.find((step) => step.id === "quickbooks").state,
-    "deferred_from_public_first_install",
+    "requires_redirect_host_review",
   );
   await assert.rejects(
     runTechnicianStep({ ...common, manifestPath: invalidRedirect }),
@@ -772,16 +1020,61 @@ test("QuickBooks technician JSON failures use a stable nonzero exit and recovery
   assert.equal(result.stderr, "");
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.status, "error");
-  assert.equal(payload.error_code, "connector_deferred_from_public_install");
-  assert.match(payload.recovery, /deferred from the public first-install path/);
+  assert.equal(payload.error_code, "quickbooks_not_enabled");
+  assert.match(payload.recovery, /enabled is not true/i);
   assert.equal(payload.financial_authority, false);
   assert.equal(typeof payload.status_file, "string");
   const status = JSON.parse(readFileSync(payload.status_file, "utf8"));
   assert.equal(status.status, "action_required");
-  assert.equal(status.issue_code, "CONNECTOR_DEFERRED_FROM_PUBLIC_INSTALL");
-  assert.equal(status.retry_safe, false);
+  assert.equal(status.issue_code, "QUICKBOOKS_NOT_ENABLED");
+  assert.equal(status.retry_safe, true);
   assert.equal(status.requires_human, true);
   assert.equal(status.refresh.mutates_external_state, false);
+});
+
+test("public Plaid and QuickBooks production commands refuse before prompts even without a TTY", async () => {
+  const plaid = join(sandbox, "public-plaid-production.json");
+  const quickbooks = join(sandbox, "public-quickbooks-production.json");
+  writeFileSync(plaid, JSON.stringify({
+    brain: { domain: "brain.fixture.test" },
+    corpora: { bank_feed: { enabled: true, provider: "plaid", environment: "production" } },
+  }));
+  writeFileSync(quickbooks, JSON.stringify({
+    corpora: { quickbooks: { enabled: true, environment: "production", redirect_host: "localhost" } },
+  }));
+  let prompts = 0;
+  let providers = 0;
+  let children = 0;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    await assert.rejects(
+      cmdTechnician(plaid, { run: "plaid" }, {
+        isTTY: false,
+        readHidden: async () => { prompts++; return Buffer.from("must-not-be-read"); },
+        spawn: () => { children++; return { status: 0 }; },
+      }),
+      /Plaid production connection is not available/i,
+    );
+    const plaidIssue = JSON.parse(readFileSync(technicianStatusFilePath(plaid), "utf8")).issue_code;
+    let quickbooksPayload;
+    await assert.rejects(
+      cmdTechnician(quickbooks, { run: "quickbooks", json: true }, {
+        isTTY: false,
+        readHidden: async () => { prompts++; return Buffer.from("must-not-be-read"); },
+        connectProvider: async () => { providers++; },
+      }),
+      (error) => {
+        quickbooksPayload = error.payload;
+        return quickbooksPayload?.error_code === "quickbooks_production_callback_unavailable";
+      },
+    );
+    assert.equal(plaidIssue, "PLAID_PRODUCTION_UNAVAILABLE");
+    assert.equal(JSON.parse(readFileSync(quickbooksPayload.status_file, "utf8")).issue_code, "QUICKBOOKS_PRODUCTION_CALLBACK_UNAVAILABLE");
+  } finally {
+    console.log = originalLog;
+  }
+  assert.deepEqual({ prompts, providers, children }, { prompts: 0, providers: 0, children: 0 });
 });
 
 test("QuickBooks uses two hidden prompts, existing OAuth custody, privacy-safe JSON, and exact verification commands", async () => {
@@ -795,7 +1088,7 @@ test("QuickBooks uses two hidden prompts, existing OAuth custody, privacy-safe J
   console.log = (...parts) => logs.push(parts.join(" "));
   try {
     const receipt = await cmdTechnician(manifestPath, { run: "quickbooks", json: true }, {
-      allowDeferredConnectorTest: true,
+      isTTY: true,
       readHidden: async (request) => {
         prompts.push(request);
         return entered.shift();
@@ -836,6 +1129,8 @@ test("QuickBooks uses two hidden prompts, existing OAuth custody, privacy-safe J
     assert.equal(receipt.custody, "client_local_provider_store");
     assert.equal(receipt.financial_authority, false);
     assert.equal(receipt.oauth_permission, "broad_accounting_scope_runtime_read_only");
+    assert.equal(receipt.live_provider_proof, false);
+    assert.equal(receipt.field_acceptance_pending, true);
     assert.equal(authorizeOptions.clientId, "fixture-intuit-client-id");
     assert.equal(authorizeOptions.clientSecret, "fixture-intuit-client-secret");
     assert.equal(authorizeOptions.redirectUri, "http://localhost:47812/");
@@ -855,6 +1150,19 @@ test("QuickBooks uses two hidden prompts, existing OAuth custody, privacy-safe J
         mutates_external_state: true,
       },
     ]);
+    const status = JSON.parse(readFileSync(receipt.status_file, "utf8"));
+    assert.deepEqual(status.sandbox_ceremony, {
+      schema_version: 1,
+      connector: "quickbooks",
+      environment: "sandbox",
+      outcome: "oauth_connection_stored",
+      credential_custody: "client_local_provider_store",
+      financial_authority: false,
+      live_provider_proof: false,
+      field_acceptance_pending: true,
+      verification: receipt.verification,
+    });
+    assert.doesNotMatch(JSON.stringify(status), /fixture-intuit|ambient-|private-company-id/);
   } finally {
     console.log = originalLog;
   }
@@ -872,6 +1180,7 @@ test("QuickBooks owner cancellation and missing company identity never produce a
       step: "quickbooks",
       manifestPath,
       scriptPath: fixtureScriptPath,
+      isTTY: true,
       readHidden: async () => canceledValues.shift(),
       connectProvider: async () => {
         const error = new Error("provider refusal fixture");
@@ -888,6 +1197,7 @@ test("QuickBooks owner cancellation and missing company identity never produce a
       step: "quickbooks",
       manifestPath,
       scriptPath: fixtureScriptPath,
+      isTTY: true,
       readHidden: async () => missingRealmValues.shift(),
       connectProvider: ({ provider, manifestPath: path, flags, credentials }) => cmdConnectProvider(provider, path, flags, {
         credentials,
@@ -929,6 +1239,7 @@ test("QuickBooks response loss records uncertainty and a clean rerun can succeed
       step: "quickbooks",
       manifestPath,
       scriptPath: fixtureScriptPath,
+      isTTY: true,
       readHidden: async () => values.shift(),
       connectProvider,
     });
@@ -940,6 +1251,74 @@ test("QuickBooks response loss records uncertainty and a clean rerun can succeed
   const receipt = await run("second");
   assert.equal(receipt.completed, true);
   assert.equal(attempts, 2);
+});
+
+test("QuickBooks cancellation, uncertainty, and provider errors write stable redacted status before a clean rerun", async () => {
+  const cases = [
+    {
+      prefix: "cancel-value",
+      issue: "OWNER_CANCELED",
+      retrySafe: true,
+      makeError: () => Object.assign(new Error("provider cancellation with private detail"), { code: "access_denied" }),
+    },
+    {
+      prefix: "uncertain-value",
+      issue: "OAUTH_RESPONSE_UNCERTAIN",
+      retrySafe: false,
+      makeError: () => Object.assign(new Error("lost response with private detail"), { uncertain: true }),
+    },
+    {
+      prefix: "leak-value",
+      issue: "QUICKBOOKS_CONNECTION_FAILED",
+      retrySafe: false,
+      makeError: (client, secret) => Object.assign(
+        new Error(`provider exposed ${client}, ${secret}, authorization_code=private-code and realm=private-company`),
+        { code: "private-code-from-provider" },
+      ),
+    },
+  ];
+  for (const scenario of cases) {
+    const client = `${scenario.prefix}-client`;
+    const secret = `${scenario.prefix}-secret`;
+    const values = [Buffer.from(client), Buffer.from(secret)];
+    let payload;
+    await assert.rejects(
+      cmdTechnician(manifestPath, { run: "quickbooks", json: true }, {
+        isTTY: true,
+        readHidden: async () => values.shift(),
+        connectProvider: async () => { throw scenario.makeError(client, secret); },
+      }),
+      (error) => {
+        payload = error.payload;
+        return payload?.status === "error";
+      },
+    );
+    const statusText = readFileSync(payload.status_file, "utf8");
+    const status = JSON.parse(statusText);
+    assert.equal(status.issue_code, scenario.issue);
+    assert.equal(status.retry_safe, scenario.retrySafe);
+    assert.equal(status.status, "action_required");
+    assert.doesNotMatch(`${JSON.stringify(payload)}\n${statusText}`, new RegExp(`${scenario.prefix}|private-code|private-company`, "i"));
+  }
+
+  const successValues = [Buffer.from("clean-rerun-client"), Buffer.from("clean-rerun-secret")];
+  const originalLog = console.log;
+  let success;
+  console.log = () => {};
+  try {
+    success = await cmdTechnician(manifestPath, { run: "quickbooks", json: true }, {
+      isTTY: true,
+      readHidden: async () => successValues.shift(),
+      connectProvider: async () => {},
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  const finalStatus = JSON.parse(readFileSync(success.status_file, "utf8"));
+  assert.equal(finalStatus.status, "status_refresh_required");
+  assert.equal(finalStatus.issue_code, "TECHNICIAN_STATUS_REFRESH_REQUIRED");
+  assert.equal(finalStatus.sandbox_ceremony.outcome, "oauth_connection_stored");
+  assert.doesNotMatch(JSON.stringify(finalStatus), /clean-rerun/);
 });
 
 test("Zoom collects the exact S2S values, strips ambient secrets, and zeroes every input", async () => {

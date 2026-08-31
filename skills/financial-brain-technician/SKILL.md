@@ -51,12 +51,14 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
    pilot, but absence of a kit does not block the packaged owner workflow.
 7. The public first-install plan guides local tools, the owner-terminal
    Cloudflare install, one fixed public non-customer smoke document, the
-   owner-only first-passkey handoff, and final live verification. Plaid,
-   Google, QuickBooks, Zoom, IMAP, Slack, Notion, Microsoft 365, Dropbox,
-   HubSpot, and watched-folder scheduling ceremonies are deferred from this
-   public path. Existing connector code or fixtures are not permission to run
-   them or proof that their credential custody and live provider field gates are
-   ready.
+   owner-only first-passkey handoff, and final live verification. After that
+   core exists, the plan may offer Plaid and QuickBooks only for explicitly
+   configured Sandbox manifests and only through their structured owner-terminal
+   commands. Their sanitized receipts are command-level custody evidence, not
+   live connector proof. Google, Zoom, IMAP, Slack, Notion, Microsoft 365,
+   Dropbox, HubSpot, and watched-folder scheduling ceremonies remain deferred.
+   Existing connector code or fixtures are not permission to run them or proof
+   that their credential custody and live provider field gates are ready.
 8. After every `--run` command, whether it reports completion or failure, read
    the private `.financial-brain-technician-status.json` path printed by the
    CLI. Require `status`, `issue_code`, `retry_safe`, `requires_human`,
@@ -116,6 +118,23 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
 - Preview every deletion or forget plan and wait for exact approval before the
   command that mutates data.
 
+## Plaid boundary
+
+- Confirm the bank feed is enabled with provider `plaid`, environment
+  `sandbox`, the final Brain hostname, and the exact registered return address.
+  Refuse Production or any `api_base`, `link_sdk_url`, or `link_global` override
+  before a hidden prompt.
+- Give the owner the plan's exact structured Plaid command to run in their
+  direct terminal. The client ID, secret, and independent version-2 wrapping
+  key stay in hidden prompts. The second Link-page child receives none of them.
+- Do not append `--json` to that owner command. Read the private status path it
+  prints, then use its separate credential-free structured refresh. QuickBooks
+  is the only Sandbox owner ceremony that returns a JSON result directly.
+- Connection is still pending after that command. The account holder must sign
+  in with a Brain passkey, finish Plaid Link, and assign every masked account to
+  its owning entity. Preserve `live_provider_proof: false` until the deployed
+  route, D1, webhook, reconciliation, recovery, and disconnect gates pass.
+
 ## QuickBooks boundary
 
 - The client creates and owns the Intuit app and authorizes their own company.
@@ -123,7 +142,7 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
   custody.
 - Confirm `corpora.quickbooks.enabled`, the explicit `sandbox` environment, and
   the exact registered localhost callback in the manifest before running
-  `<brain-cli> technician <manifest> --run quickbooks`.
+  `<brain-cli> technician <manifest> --run quickbooks --json`.
 - Explain that Intuit's Accounting consent can authorize reads and writes even
   though Financial Brain performs query/read calls only. Keep that broader
   permission visible before the owner consents.

@@ -36,30 +36,50 @@ provider.
 
 The setup order is:
 
-1. Fix the Brain's final hostname and enable the Plaid profile in the manifest.
-2. Register `https://<brain-host>/app/connect/bank` in the client's Plaid environment.
+1. Fix the Brain's final hostname and enable the Plaid profile with
+   `environment: "sandbox"` in the manifest.
+2. Register `https://<brain-host>/app/connect/bank` in the client's Plaid
+   Sandbox environment and record that exact address in
+   `registered_redirect_uris`.
 3. Deploy and migrate the Brain.
-4. Run `brain technician <manifest> --run plaid` in an interactive terminal.
+4. Run `brain doctor <manifest>`. It prints the exact return and signed webhook
+   URLs and refuses a Plaid endpoint override.
+5. Run `brain technician <manifest> --run plaid` in an interactive terminal.
+   The command refuses a missing manifest, disabled feed, non-Plaid provider,
+   any custom Plaid endpoint field, missing environment, Production selection,
+   invalid final hostname, or unregistered return address before reading a
+   hidden value. It also refuses an agent shell and records the exact
+   owner-terminal continuation.
    The Plaid client ID, secret, and independently generated
    `BANK_FEED_WRAPPING_KEY_V2` are entered with echo disabled, cross only into
    one short-lived secrets child, and are then zeroed from the parent. Keep the
    wrapping key in the reviewed owner custody record before this step. It is
    required for recovery and is never derived from an admin, session, or Plaid
-   credential.
-5. Run `brain doctor <manifest>`. It prints the exact return and signed webhook
-   URLs and refuses a Plaid endpoint override.
-6. Run `brain connect bank <manifest>`. The CLI reads only the saved manifest,
-   checks that the exact return address is recorded, and prints the owner URL
-   without reading a credential or calling a Plaid API. It then opens the page
-   when the desktop permits; that browser page loads Plaid's Link SDK. Use
-   `--print` for a fully offline command that leaves the link for the owner to
-   open themselves.
+   credential. After that child returns, a second child receives no Plaid value
+   and opens or prints the reviewed owner Link page.
+   Do not add `--json` to this owner-terminal command. Plaid returns its fixed
+   no-secret result through the private technician status file; a coding agent
+   continues with the separate credential-free
+   `brain technician <manifest> --json` plan refresh. QuickBooks has a different
+   structured JSON ceremony.
+6. If the owner page needs to be reopened, run `brain connect bank <manifest>`.
+   The CLI reads only the saved manifest, checks that the exact return address
+   is recorded, and prints the owner URL without reading a credential or
+   calling a Plaid API. It then opens the page when the desktop permits; that
+   browser page loads Plaid's Link SDK. Use `--print` for a fully offline
+   command that leaves the link for the owner to open themselves.
 7. The account holder signs in to the Brain, completes Link themselves, and
    assigns each masked account to the business that owns it. Transactions stay
    staged until every discovered account has an owner-confirmed scope.
 
 No Plaid credential belongs in the manifest, shell history, source tree, log,
 status response, support artifact, or recovery artifact.
+
+The technician status stores only `connector: "plaid"`,
+`environment: "sandbox"`, `outcome: "owner_link_page_ready"`, fixed custody
+and pending-field-gate flags, plus the normal credential-free refresh command.
+It stores no Plaid value, page URL, account identity, or claim of live provider
+proof. Production remains outside this technician ceremony.
 
 ## Runtime contract
 

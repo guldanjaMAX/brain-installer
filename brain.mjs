@@ -15739,6 +15739,7 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
       statusFile: stepStatusPath,
       proofLevel: receipt?.proof_level,
       proof: receipt?.proof,
+      ceremonyReceipt: receipt,
       ownerArgs: selectedCloudflareAccountPath
         ? ["--cloudflare-account", selectedCloudflareAccountPath]
         : [],
@@ -15825,6 +15826,12 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
     info("Intuit grants its broad Accounting permission. Financial Brain uses read/query calls only; the provider scope itself is not read-only.");
     info("The browser is used only for the owner's Intuit consent. Both app values are entered at hidden terminal prompts.");
   }
+  if (step === "plaid") {
+    const plaidPlan = plan.steps.find((item) => item.id === "plaid");
+    info(`Plaid environment: ${plaidPlan?.environment || "not selected"} (from corpora.bank_feed.environment)`);
+    info("The client owns the Plaid Sandbox account and the independent bank wrapping key. Financial Brain has no shared Plaid credential custody.");
+    info("The three values are entered at hidden terminal prompts. After they are stored, the command clears them before opening or printing the owner Link page.");
+  }
 
   const readHidden = options.readHidden || (({ prompt, noun, optional }) => readHiddenInput({
     prompt,
@@ -15884,6 +15891,8 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
         custody: receipt.custody,
         financial_authority: receipt.financial_authority,
         oauth_permission: receipt.oauth_permission,
+        live_provider_proof: receipt.live_provider_proof,
+        field_acceptance_pending: receipt.field_acceptance_pending,
         verification: receipt.verification,
         recovery: null,
         status_file: stepStatus.status_file,
@@ -15894,13 +15903,19 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
       else {
         ok("QuickBooks Online connection stored in the client's existing local provider credential store");
         info("The JSON receipt contains structured command and args fields for the dry run and owner-approved first ingest. Do not join them into a shell string.");
-        info("Connection success means the QuickBooks reference loaded. It does not mean the books are correct.");
+        info("Connection success means only that the local OAuth connection was stored. No QuickBooks record is loaded until the separate reviewed ingest, and neither result proves the books are correct.");
         info(`machine-readable step status: ${stepStatus.status_file}`);
         info(stepStatus.next_action);
       }
       return output;
     }
-    ok(`${step} technician step completed`);
+    if (step === "plaid") {
+      ok("Plaid Sandbox secrets stored and the reviewed owner Link page opened or printed");
+      info("The account holder still signs in with a Brain passkey, completes Link, and assigns every masked account to its owning business.");
+      info("This command receipt is not Plaid Link, route, D1, webhook, reconciliation, or real-bank proof.");
+    } else {
+      ok(`${step} technician step completed`);
+    }
     info(`machine-readable step status: ${stepStatus.status_file}`);
     info(stepStatus.next_action);
     return { ...receipt, status_file: stepStatus.status_file, refresh: stepStatus.refresh };
@@ -17098,7 +17113,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it
     brain token      <manifest>            describe browser sign-in and legacy recovery-token custody
-    brain technician <manifest>            read-only account setup plan; --run <step> launches one safe ceremony
+    brain technician <manifest>            read-only plan; Plaid and QuickBooks --run steps are Sandbox-only
     brain grant      <manifest> --name "X" --can ask,file   give one person scoped access; prints the token once
     brain grants     <manifest>            who has access; --revoke <id> ends one
     brain zone       <manifest>            what is in which zone; --source X --zone Y to set one

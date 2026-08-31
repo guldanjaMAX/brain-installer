@@ -16,8 +16,10 @@ proof. A fresh 0.2.1 Cloudflare field gate, a 25-of-25 credential-protection
 gate on the exact Windows machine, the physical passkey ceremony on the final
 domain, the named connector lifecycle tests, and a real-account Windows install
 are still outside proof. The public first-install path deliberately defers
-Plaid, Google, QuickBooks, Zoom, and IMAP ceremonies until their secure custody
-and real-provider gates are complete. See "What is not built" and
+Google, Zoom, and IMAP ceremonies until their secure custody and real-provider
+gates are complete. Plaid and QuickBooks now have owner-terminal Sandbox-only
+ceremonies with command-level receipts; neither receipt is live connector
+proof. See "What is not built" and
 `CONNECTOR-BACKLOG.md` before promising anything to anyone.
 
 Engineering changes follow [the code, test, documentation, and tracking
@@ -1146,12 +1148,19 @@ runs.
 `brain technician <manifest>` is the matching install-day coordinator. Its
 default form and plan-level `--json` form are read-only. Most selected `--run`
 steps launch the existing command in a child process with an allowlisted
-environment. The QuickBooks step instead passes its two hidden values directly
-to the existing in-process provider OAuth flow, never through argv or a child
-environment. `--run quickbooks --json` returns a stable success or error
-envelope for a local agent while the owner still handles browser consent. Tests
-assert ordering, rerun behavior, ambient-secret scrubbing, exact hostname
-confirmation before invite creation, and stop-on-fail verification.
+environment. Plaid Sandbox validates its exact provider, environment, hostname,
+and registered return address before prompting. Its first child receives only
+the three hidden custody values; they are cleared before a second
+credential-free child opens or prints the owner Link page. QuickBooks Sandbox
+passes its two hidden values directly to the existing in-process provider OAuth
+flow, never through argv or a child environment. `--run quickbooks --json`
+returns a stable success or error envelope plus separate structured dry-run and
+reviewed-ingest commands while the owner still handles browser consent. Both
+steps refuse Production and non-owner terminals before prompting. Their private
+status receipts use fixed fields and explicitly retain
+`live_provider_proof:false`. Tests assert ordering, rerun behavior, cancellation
+and uncertain outcomes, status redaction, ambient-secret scrubbing, exact
+hostname confirmation before invite creation, and stop-on-fail verification.
 
 `brain reconcile quickbooks <manifest> ... --json` is the matching agent-safe
 reality check after reviewed ingestion. It compares one explicit account,
