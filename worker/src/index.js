@@ -1869,9 +1869,16 @@ export default {
     // the ordinary whole-install admin key. Production remains unavailable
     // unless the deployment explicitly records its request-logging review.
     if (path === QUICKBOOKS_OAUTH_PATH_PREFIX || path.startsWith(`${QUICKBOOKS_OAUTH_PATH_PREFIX}/`)) {
-      if (path === QUICKBOOKS_OAUTH_PATHS.claim) {
+      if (path === QUICKBOOKS_OAUTH_PATHS.callback || path === QUICKBOOKS_OAUTH_PATHS.claim) {
         const guarded = await guardPublicRequest(env, request, url, path);
-        if (guarded.response) return guarded.response;
+        if (guarded.response) {
+          // Callback failures still redirect away from Intuit's query string.
+          // Claim failures are private JSON for the local polling client.
+          if (path !== QUICKBOOKS_OAUTH_PATHS.callback) return guarded.response;
+          return handleQuickBooksOAuthRoute(env, request, url, path, {
+            publicGuardDenied: true,
+          });
+        }
         request = guarded.request;
       }
       return handleQuickBooksOAuthRoute(env, request, url, path, {

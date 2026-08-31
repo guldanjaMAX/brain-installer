@@ -10,12 +10,25 @@
 export const QUICKBOOKS_CALLBACK_ENVELOPE_VERSION = 1;
 export const QUICKBOOKS_CALLBACK_ENVELOPE_ALGORITHM =
   "ECDH-P256-HKDF-SHA256-AES-256-GCM";
+// With the maximum 512-character realm, maximum binding fields, and three
+// UTF-8 bytes per accepted UTF-16 code unit, 1,024 code characters serialize
+// to an envelope below D1's 8,192-character CHECK with more than 500 characters of
+// margin. Intuit's value is opaque, so the boundary is deliberately generous
+// without relying on it being ASCII.
+export const QUICKBOOKS_CALLBACK_AUTHORIZATION_CODE_MAX_CHARS = 1024;
+export const QUICKBOOKS_CALLBACK_REALM_ID_MAX_CHARS = 512;
+export const QUICKBOOKS_CALLBACK_ENVELOPE_MAX_CHARS = 8192;
 
 const DOMAIN = "financial-brain.quickbooks-callback-envelope.v1";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const HEX_64 = /^[0-9a-f]{64}$/;
 const B64U = /^[A-Za-z0-9_-]+$/;
+const CONTROL = /[\u0000-\u001f\u007f]/;
+// In Unicode mode a valid surrogate pair is one astral code point and does not
+// match this range; a lone surrogate does. Rejecting lone surrogates keeps the
+// three-UTF-8-bytes-per-code-unit envelope proof true.
+const LONE_SURROGATE = /[\uD800-\uDFFF]/u;
 
 export class QuickBooksCallbackCryptoError extends Error {
   constructor(code = "quickbooks_callback_crypto_unavailable") {
@@ -55,6 +68,10 @@ function b64uDecode(value, { min = 1, max = 8192 } = {}) {
   }
   const out = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index++) out[index] = binary.charCodeAt(index);
+  // Reject alternate spellings that differ only in unused base64 pad bits.
+  // The envelope fingerprint is over the serialized form, so accepting two
+  // strings for the same bytes would make string-level tamper checks ambiguous.
+  if (b64uEncode(out) !== value) fail("quickbooks_callback_envelope_invalid");
   return out;
 }
 
@@ -166,9 +183,11 @@ export async function encryptQuickBooksCallback({
 }) {
   try {
     if (typeof authorizationCode !== "string" || authorizationCode.length < 1 ||
-        authorizationCode.length > 4096 || /[\u0000-\u001f\u007f]/.test(authorizationCode) ||
-        typeof realmId !== "string" || realmId.length < 1 || realmId.length > 512 ||
-        /[\u0000-\u001f\u007f]/.test(realmId)) {
+        authorizationCode.length > QUICKBOOKS_CALLBACK_AUTHORIZATION_CODE_MAX_CHARS ||
+        CONTROL.test(authorizationCode) || LONE_SURROGATE.test(authorizationCode) ||
+        typeof realmId !== "string" || realmId.length < 1 ||
+        realmId.length > QUICKBOOKS_CALLBACK_REALM_ID_MAX_CHARS ||
+        CONTROL.test(realmId) || LONE_SURROGATE.test(realmId)) {
       fail("quickbooks_callback_provider_values_invalid");
     }
     const crypto = webCrypto();
@@ -265,9 +284,11 @@ export async function decryptQuickBooksCallback({ privateKey, privateJwk, envelo
     const plaintext = JSON.parse(decoder.decode(plaintextBytes));
     if (plaintext?.version !== QUICKBOOKS_CALLBACK_ENVELOPE_VERSION ||
         typeof plaintext.authorization_code !== "string" || !plaintext.authorization_code ||
-        plaintext.authorization_code.length > 4096 ||
+        plaintext.authorization_code.length > QUICKBOOKS_CALLBACK_AUTHORIZATION_CODE_MAX_CHARS ||
+        CONTROL.test(plaintext.authorization_code) || LONE_SURROGATE.test(plaintext.authorization_code) ||
         typeof plaintext.realm_id !== "string" || !plaintext.realm_id ||
-        plaintext.realm_id.length > 512 ||
+        plaintext.realm_id.length > QUICKBOOKS_CALLBACK_REALM_ID_MAX_CHARS ||
+        CONTROL.test(plaintext.realm_id) || LONE_SURROGATE.test(plaintext.realm_id) ||
         JSON.stringify(normalizeQuickBooksCallbackBinding(plaintext.binding)) !== JSON.stringify(binding)) {
       fail("quickbooks_callback_envelope_invalid");
     }

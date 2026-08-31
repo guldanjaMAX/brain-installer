@@ -12,6 +12,9 @@ import { jsonResponse, privateNoStore } from "./core.js";
 import {
   encryptQuickBooksCallback,
   normalizeQuickBooksCallbackBinding,
+  QUICKBOOKS_CALLBACK_AUTHORIZATION_CODE_MAX_CHARS,
+  QUICKBOOKS_CALLBACK_ENVELOPE_MAX_CHARS,
+  QUICKBOOKS_CALLBACK_REALM_ID_MAX_CHARS,
   QuickBooksCallbackCryptoError,
   sha256Hex,
   validateQuickBooksCallbackPublicJwk,
@@ -20,6 +23,7 @@ import {
 export const QUICKBOOKS_OAUTH_PATH_PREFIX = "/api/oauth/quickbooks";
 export const QUICKBOOKS_OAUTH_PATHS = Object.freeze({
   callback: `${QUICKBOOKS_OAUTH_PATH_PREFIX}/callback`,
+  result: `${QUICKBOOKS_OAUTH_PATH_PREFIX}/result`,
   start: `${QUICKBOOKS_OAUTH_PATH_PREFIX}/intents/start`,
   claim: `${QUICKBOOKS_OAUTH_PATH_PREFIX}/intents/claim`,
   finalize: `${QUICKBOOKS_OAUTH_PATH_PREFIX}/intents/finalize`,
@@ -32,7 +36,7 @@ const TENANT_ID = "primary";
 const HASH = /^[0-9a-f]{64}$/;
 const RANDOM_CAPABILITY = /^[A-Za-z0-9_-]{43,128}$/;
 const SOURCE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-const NEUTRAL_CALLBACK_HTML = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>QuickBooks connection received</title><body><main><h1>You can return to Financial Brain.</h1><p>This window can be closed.</p></main></body></html>";
+const NEUTRAL_CALLBACK_HTML = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Return to Financial Brain</title><body><main><h1>Return to Financial Brain to finish.</h1><p>Financial Brain will show whether QuickBooks connected or whether another try is needed.</p></main></body></html>";
 
 class RouteError extends Error {
   constructor(code, status = 400, error = "invalid_request") {
@@ -73,18 +77,37 @@ function cryptoUnavailable() {
   }, 503);
 }
 
-function neutralCallbackPage() {
+function callbackResponseHeaders() {
+  return {
+    "Cache-Control": "private, no-store, max-age=0",
+    "Pragma": "no-cache",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+  };
+}
+
+function callbackResultPage() {
   return new Response(NEUTRAL_CALLBACK_HTML, {
     status: 200,
     headers: {
+      ...callbackResponseHeaders(),
       "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "private, no-store, max-age=0",
-      "Pragma": "no-cache",
-      "Referrer-Policy": "no-referrer",
       "Content-Security-Policy": "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
       "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
-      "X-Content-Type-Options": "nosniff",
       "X-Frame-Options": "DENY",
+    },
+  });
+}
+
+function callbackResultRedirect() {
+  // Never leave Intuit's code, state, company id, or error detail in the final
+  // address bar. Every outcome uses the same clean page, which asks the local
+  // app to report the authoritative received/canceled/unavailable status.
+  return new Response(null, {
+    status: 303,
+    headers: {
+      ...callbackResponseHeaders(),
+      Location: QUICKBOOKS_OAUTH_PATHS.result,
     },
   });
 }
@@ -347,8 +370,10 @@ async function receiveCallback(env, url, now) {
   const codes = url.searchParams.getAll("code");
   const realms = url.searchParams.getAll("realmId");
   if (codes.length !== 1 || realms.length !== 1 ||
-      !codes[0] || codes[0].length > 4096 || /[\u0000-\u001f\u007f]/.test(codes[0]) ||
-      !realms[0] || realms[0].length > 512 || /[\u0000-\u001f\u007f]/.test(realms[0])) {
+      !codes[0] || codes[0].length > QUICKBOOKS_CALLBACK_AUTHORIZATION_CODE_MAX_CHARS ||
+      /[\u0000-\u001f\u007f]/.test(codes[0]) ||
+      !realms[0] || realms[0].length > QUICKBOOKS_CALLBACK_REALM_ID_MAX_CHARS ||
+      /[\u0000-\u001f\u007f]/.test(realms[0])) {
     await cancelPending(env, stateHash, now, "provider_callback_incomplete");
     return;
   }
@@ -365,6 +390,12 @@ async function receiveCallback(env, url, now) {
     realmId: realms[0],
   });
   const envelopeJson = JSON.stringify(envelope);
+  if (envelopeJson.length > QUICKBOOKS_CALLBACK_ENVELOPE_MAX_CHARS) {
+    // Defense in depth for any future binding-field change. Do not ask D1 to
+    // discover a contract mismatch after the provider code has been handled.
+    await cancelPending(env, stateHash, now, "provider_callback_incomplete");
+    return;
+  }
   const envelopeFingerprint = await sha256Hex(envelopeJson);
   await env.DB.prepare(
     `UPDATE quickbooks_oauth_intents
@@ -511,21 +542,27 @@ export async function handleQuickBooksOAuthRoute(
   request,
   url,
   path,
-  { adminAuthorized = false, now = Date.now() } = {},
+  { adminAuthorized = false, now = Date.now(), publicGuardDenied = false } = {},
 ) {
   const isCallback = path === QUICKBOOKS_OAUTH_PATHS.callback;
+  const isResult = path === QUICKBOOKS_OAUTH_PATHS.result;
+  if (isResult) {
+    // Scrub any manually appended query before rendering the completion page.
+    return url.search ? callbackResultRedirect() : callbackResultPage();
+  }
   if (!quickBooksOAuthCallbackReady(env)) {
-    return isCallback ? neutralCallbackPage() : unavailable();
+    return isCallback ? callbackResultRedirect() : unavailable();
   }
   if (isCallback) {
-    if (request.method !== "GET") return neutralCallbackPage();
-    try {
-      await receiveCallback(env, url, now);
-    } catch {
-      // Intuit always receives one neutral page. The local status route is the
-      // only diagnostic boundary, and it never exposes provider values.
+    if (!publicGuardDenied && request.method === "GET") {
+      try {
+        await receiveCallback(env, url, now);
+      } catch {
+        // The query-free page never claims completion. The local status route
+        // is the only diagnostic boundary, and it exposes stable codes only.
+      }
     }
-    return neutralCallbackPage();
+    return callbackResultRedirect();
   }
   if (request.method !== "POST") {
     return privateJson({ error: "not_found", code: "quickbooks_oauth_route_not_found" }, 404);

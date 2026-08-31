@@ -123,7 +123,7 @@ reading a local credential or opening a browser. An API key cannot replace
 Intuit OAuth. Intuit production redirects require a registered HTTPS SaaS
 domain, so the sandbox loopback callback is not a production shortcut.
 
-### Threat model for the future HTTPS callback
+### Threat model for the held HTTPS callback
 
 The callback must resist:
 
@@ -142,9 +142,11 @@ The callback must resist:
 The HTTPS endpoint must be hosted in the client's own Cloudflare account. It
 must not be a shared Financial Brain callback or a technician-owned relay.
 
-### Frozen route contract before implementation
+### Implemented callback core, still held from field use
 
-The following is an implementation contract, not a currently available route:
+The following core is implemented behind two explicit Worker enablement gates.
+It is not wired into the production connect command and has not passed its
+client-owned hostname, Cloudflare logging, or Intuit field gates:
 
 1. The local technician generates a random intent id, random OAuth state,
    random claim secret, and an ephemeral encryption key pair. The private key
@@ -162,7 +164,9 @@ The following is an implementation contract, not a currently available route:
    unexpired pending intent, encrypts the authorization code and `realmId` to
    the local ephemeral public key, and performs one conditional pending-to-
    received transition. A second callback cannot replace the ciphertext. A
-   provider retry receives the same neutral success page.
+   provider retry receives the same query-free redirect. The result page never
+   claims that a connection succeeded; the local status route reports whether
+   the intent was received, canceled, expired, or unavailable.
 4. A private `POST /api/oauth/quickbooks/intents/claim` uses the intent id and
    claim secret over HTTPS. It returns the same encrypted callback envelope
    after response loss and uses `Cache-Control: private, no-store`. It never
@@ -183,12 +187,12 @@ authorization code, state, claim secret, ciphertext, tokens, raw company id, or
 provider error body. Cloudflare request-log and tracing behavior must also be
 reviewed with the exact production route before field use.
 
-### Why the production callback is not implemented in this slice
+### Why Production remains unavailable
 
-The contract needs durable intent state and restart-safe conditional updates,
-which requires a coordinated D1 migration. Migration numbers 0029 and 0030 are
-reserved by parallel work. The final client-owned hostname, Cloudflare logging
-policy, and any future Intuit PKCE support also need explicit decisions and sandbox proof.
-Implementing a partial relay without those boundaries would make production
-look available before it is safe. No live app, account, callback, or credential
-was used for this work.
+The durable D1 intent state, encrypted handoff, conditional transitions,
+query-free result page, bounded public routes, cleanup, and recovery exclusion
+are implemented and locally tested. The production CLI still refuses before
+credentials or browser launch. The final client-owned hostname, Cloudflare
+request-log policy, local token-exchange and credential-save integration, any
+future Intuit PKCE support, and the complete Intuit field proof remain open.
+No live app, account, callback, or credential was used for this work.

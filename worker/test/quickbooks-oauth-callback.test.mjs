@@ -17,7 +17,13 @@ import {
   QUICKBOOKS_OAUTH_INTENT_TTL_MS,
   QUICKBOOKS_OAUTH_PATHS,
 } from "../src/lib/quickbooks-oauth-callback.js";
-import { sha256Hex } from "../src/lib/quickbooks-callback-crypto.js";
+import {
+  encryptQuickBooksCallback,
+  QUICKBOOKS_CALLBACK_AUTHORIZATION_CODE_MAX_CHARS,
+  QUICKBOOKS_CALLBACK_ENVELOPE_MAX_CHARS,
+  QUICKBOOKS_CALLBACK_REALM_ID_MAX_CHARS,
+  sha256Hex,
+} from "../src/lib/quickbooks-callback-crypto.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
@@ -177,6 +183,28 @@ function assertPrivate(response) {
   assert.equal(response.headers.get("pragma"), "no-cache");
 }
 
+function assertCleanCallbackRedirect(response) {
+  assert.equal(response.status, 303);
+  assertPrivate(response);
+  const location = response.headers.get("location");
+  assert.equal(location, QUICKBOOKS_OAUTH_PATHS.result);
+  const clean = new URL(location, "https://brain.invalid");
+  assert.equal(clean.search, "");
+  assert.equal(clean.hash, "");
+  return clean;
+}
+
+async function assertHonestCallbackResult(env, redirect) {
+  const clean = assertCleanCallbackRedirect(redirect);
+  const result = await worker.fetch(new Request(clean), env, { waitUntil() {} });
+  assert.equal(result.status, 200);
+  assertPrivate(result);
+  const body = await result.text();
+  assert.match(body, /will show whether QuickBooks connected or whether another try is needed/i);
+  assert.doesNotMatch(body, /connection received|connected successfully|connection complete/i);
+  return body;
+}
+
 test("callback core is disabled unless field enablement and logging review are explicit", async () => {
   const db = freshDb();
   try {
@@ -204,8 +232,7 @@ test("callback core is disabled unless field enablement and logging review are e
     const callback = await worker.fetch(new Request(
       `https://brain.invalid${QUICKBOOKS_OAUTH_PATHS.callback}?code=not-consumed&state=not-consumed&realmId=not-consumed`,
     ), env, { waitUntil() {} });
-    assert.equal(callback.status, 200);
-    assert.match(await callback.text(), /return to Financial Brain/);
+    await assertHonestCallbackResult(env, callback);
     assert.equal(db.prepare("SELECT count(*) AS n FROM quickbooks_oauth_intents").get().n, 0);
   } finally {
     db.close();
@@ -325,10 +352,13 @@ test("one callback wins, claim replays one envelope, and the local helper authen
       env,
       { waitUntil() {} },
     )));
-    const callbackBodies = await Promise.all(callbackResponses.map((response) => response.text()));
-    assert.equal(new Set(callbackBodies).size, 1, "every callback result uses the same neutral page");
-    assert.ok(callbackResponses.every((response) => response.status === 200));
+    const callbackLocations = callbackResponses.map((response) => {
+      assertCleanCallbackRedirect(response);
+      return response.headers.get("location");
+    });
+    assert.equal(new Set(callbackLocations).size, 1, "every callback result uses the same clean path");
     assert.ok(callbackResponses.every((response) => response.headers.get("referrer-policy") === "no-referrer"));
+    await assertHonestCallbackResult(env, callbackResponses[0]);
 
     const row = db.prepare("SELECT * FROM quickbooks_oauth_intents").get();
     assert.equal(row.status, "received");
@@ -342,7 +372,7 @@ test("one callback wins, claim replays one envelope, and the local helper authen
     const replayCallback = await worker.fetch(new Request(
       `https://brain.invalid${QUICKBOOKS_OAUTH_PATHS.callback}?code=provider-code-too-late&state=${fixture.startBody.state}&realmId=${fixture.realmId}`,
     ), env, { waitUntil() {} });
-    assert.equal(await replayCallback.text(), callbackBodies[0]);
+    assertCleanCallbackRedirect(replayCallback);
     assert.equal(
       db.prepare("SELECT callback_envelope FROM quickbooks_oauth_intents").get().callback_envelope,
       acceptedEnvelope,
@@ -383,8 +413,8 @@ test("one callback wins, claim replays one envelope, and the local helper authen
     assert.deepEqual(secondClaim.body.envelope, firstClaim.body.envelope);
     assert.equal(secondClaim.body.callback_fingerprint, firstClaim.body.callback_fingerprint);
     const tampered = structuredClone(firstClaim.body.envelope);
-    tampered.ciphertext_b64u = `${tampered.ciphertext_b64u.slice(0, -1)}${
-      tampered.ciphertext_b64u.endsWith("A") ? "B" : "A"
+    tampered.ciphertext_b64u = `${tampered.ciphertext_b64u.startsWith("A") ? "B" : "A"}${
+      tampered.ciphertext_b64u.slice(1)
     }`;
     await assert.rejects(
       openQuickBooksCallbackHandoff({
@@ -393,6 +423,19 @@ test("one callback wins, claim replays one envelope, and the local helper authen
         expectedBinding: expectedBinding(fixture),
       }),
       (error) => error.code === "quickbooks_callback_decryption_failed",
+    );
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const noncanonical = structuredClone(firstClaim.body.envelope);
+    const saltTail = alphabet.indexOf(noncanonical.salt_b64u.at(-1));
+    assert.equal(saltTail % 4, 0, "a 32-byte salt has two canonical zero pad bits");
+    noncanonical.salt_b64u = `${noncanonical.salt_b64u.slice(0, -1)}${alphabet[saltTail + 1]}`;
+    await assert.rejects(
+      openQuickBooksCallbackHandoff({
+        privateKey: fixture.keys.privateKey,
+        envelope: noncanonical,
+        expectedBinding: expectedBinding(fixture),
+      }),
+      (error) => error.code === "quickbooks_callback_envelope_invalid",
     );
     assert.equal(captured.join("\n"), "", "callback handling must not emit application logs");
   } finally {
@@ -432,6 +475,64 @@ test("the local helper refuses a reconnect company mismatch before token exchang
   } finally {
     db.close();
   }
+});
+
+test("every accepted provider-value boundary fits the durable D1 envelope", async () => {
+  const keys = await createQuickBooksCallbackHandoff();
+  const createdAt = Number.MAX_SAFE_INTEGER - 900_001;
+  const binding = {
+    intent_fingerprint: "a".repeat(64),
+    source: `a${"z".repeat(63)}`,
+    environment: "production",
+    client_id_fingerprint: "b".repeat(64),
+    expected_company_fingerprint: "c".repeat(64),
+    created_at: createdAt,
+    expires_at: createdAt + 900_000,
+  };
+  // U+0800 takes three UTF-8 bytes for one UTF-16 code unit. Valid astral
+  // characters average two bytes per code unit, JSON quote/backslash escaping
+  // takes two, controls are refused, and lone surrogates are refused. This is
+  // therefore the maximum serialized plaintext size for the accepted lengths.
+  const widest = "\u0800";
+  const realmId = widest.repeat(QUICKBOOKS_CALLBACK_REALM_ID_MAX_CHARS);
+  for (const codeLength of [
+    QUICKBOOKS_CALLBACK_AUTHORIZATION_CODE_MAX_CHARS - 1,
+    QUICKBOOKS_CALLBACK_AUTHORIZATION_CODE_MAX_CHARS,
+  ]) {
+    const envelope = await encryptQuickBooksCallback({
+      recipientPublicJwk: keys.publicJwk,
+      binding,
+      authorizationCode: widest.repeat(codeLength),
+      realmId,
+    });
+    const serialized = JSON.stringify(envelope);
+    assert.ok(serialized.length <= QUICKBOOKS_CALLBACK_ENVELOPE_MAX_CHARS,
+      `${codeLength} accepted worst-case characters produced ${serialized.length}`);
+    assert.equal(new TextEncoder().encode(serialized).byteLength, serialized.length,
+      "the stored envelope is ASCII, so D1 character and transport-byte ceilings agree");
+  }
+  assert.match(
+    readFileSync(join(MIGRATIONS, "0032_quickbooks_oauth_intents.sql"), "utf8"),
+    new RegExp(`length\\(callback_envelope\\) BETWEEN 100 AND ${QUICKBOOKS_CALLBACK_ENVELOPE_MAX_CHARS}`),
+  );
+  await assert.rejects(
+    encryptQuickBooksCallback({
+      recipientPublicJwk: keys.publicJwk,
+      binding,
+      authorizationCode: widest.repeat(QUICKBOOKS_CALLBACK_AUTHORIZATION_CODE_MAX_CHARS + 1),
+      realmId,
+    }),
+    (error) => error.code === "quickbooks_callback_provider_values_invalid",
+  );
+  await assert.rejects(
+    encryptQuickBooksCallback({
+      recipientPublicJwk: keys.publicJwk,
+      binding,
+      authorizationCode: "\ud800",
+      realmId,
+    }),
+    (error) => error.code === "quickbooks_callback_provider_values_invalid",
+  );
 });
 
 test("finalize is company-bound, single-use, response-loss safe, and clears ciphertext", async () => {
@@ -524,7 +625,7 @@ test("provider errors become one stable canceled state without provider-detail l
     const callback = await worker.fetch(new Request(
       `https://brain.invalid${QUICKBOOKS_OAUTH_PATHS.callback}?error=access_denied&error_description=${providerDetail}&state=${fixture.startBody.state}`,
     ), env, { waitUntil() {} });
-    assert.equal(callback.status, 200);
+    await assertHonestCallbackResult(env, callback);
     const row = db.prepare("SELECT * FROM quickbooks_oauth_intents").get();
     assert.equal(row.status, "canceled");
     assert.equal(row.terminal_reason, "provider_authorization_not_completed");
@@ -540,6 +641,91 @@ test("provider errors become one stable canceled state without provider-detail l
     assert.equal(claim.response.status, 409);
     assert.equal(claim.body.code, "quickbooks_oauth_intent_canceled");
     assert.equal(JSON.stringify(claim.body).includes(providerDetail), false);
+  } finally {
+    db.close();
+  }
+});
+
+test("outage, malformed, and unknown callbacks all leave a clean and honest browser page", async () => {
+  const db = freshDb();
+  const captured = [];
+  const originals = { log: console.log, warn: console.warn, error: console.error };
+  console.log = (...values) => captured.push(values.join(" "));
+  console.warn = (...values) => captured.push(values.join(" "));
+  console.error = (...values) => captured.push(values.join(" "));
+  try {
+    const env = environment(db);
+    const fixture = await startFixture(env, {
+      intent_id: "A".repeat(43), state: "B".repeat(43), claim_secret: "C".repeat(43),
+    });
+    const malformedDetail = "malformed-provider-detail-must-not-survive";
+    const malformed = await worker.fetch(new Request(
+      `https://brain.invalid${QUICKBOOKS_OAUTH_PATHS.callback}?code=${malformedDetail}&state=${fixture.startBody.state}`,
+    ), env, { waitUntil() {} });
+    const malformedPage = await assertHonestCallbackResult(env, malformed);
+    assert.equal(malformedPage.includes(malformedDetail), false);
+    const canceled = db.prepare(
+      "SELECT status,terminal_reason FROM quickbooks_oauth_intents WHERE intent_hash=?",
+    ).get(fixture.start.body.intent_fingerprint);
+    assert.equal(canceled.status, "canceled");
+    assert.equal(canceled.terminal_reason, "provider_callback_incomplete");
+
+    const unknownDetail = "unknown-state-provider-detail-must-not-survive";
+    const unknown = await worker.fetch(new Request(
+      `https://brain.invalid${QUICKBOOKS_OAUTH_PATHS.callback}?code=${unknownDetail}&state=${"D".repeat(43)}&realmId=unknown-realm`,
+    ), env, { waitUntil() {} });
+    const unknownPage = await assertHonestCallbackResult(env, unknown);
+    assert.equal(unknownPage.includes(unknownDetail), false);
+
+    const outageDetail = "outage-provider-detail-must-not-survive";
+    const outageUrl = new URL(
+      `https://brain.invalid${QUICKBOOKS_OAUTH_PATHS.callback}?code=${outageDetail}&state=${"E".repeat(43)}&realmId=outage-realm`,
+    );
+    const outage = await handleQuickBooksOAuthRoute(
+      environment(db, { fail: true }),
+      new Request(outageUrl),
+      outageUrl,
+      QUICKBOOKS_OAUTH_PATHS.callback,
+    );
+    const outagePage = await assertHonestCallbackResult(env, outage);
+    assert.equal(outagePage.includes(outageDetail), false);
+
+    const dirtyResult = await worker.fetch(new Request(
+      `https://brain.invalid${QUICKBOOKS_OAUTH_PATHS.result}?code=${outageDetail}`,
+    ), env, { waitUntil() {} });
+    await assertHonestCallbackResult(env, dirtyResult);
+    assert.equal(captured.join("\n").includes("provider-detail"), false);
+    assert.equal(captured.join("\n").includes("synthetic database detail"), false);
+  } finally {
+    console.log = originals.log;
+    console.warn = originals.warn;
+    console.error = originals.error;
+    db.close();
+  }
+});
+
+test("the public callback is quota-bounded without returning provider query detail", async () => {
+  const db = freshDb();
+  try {
+    const env = environment(db);
+    const providerDetail = "quota-provider-detail-must-not-survive";
+    const responses = [];
+    for (let index = 0; index < 31; index++) {
+      responses.push(await worker.fetch(new Request(
+        `https://brain.invalid${QUICKBOOKS_OAUTH_PATHS.callback}?code=${providerDetail}&state=${"Q".repeat(43)}&realmId=quota-realm`,
+        { headers: { "CF-Connecting-IP": "192.0.2.88" } },
+      ), env, { waitUntil() {} }));
+    }
+    for (const response of responses) {
+      assertCleanCallbackRedirect(response);
+      assert.equal((response.headers.get("location") || "").includes(providerDetail), false);
+    }
+    const quota = db.prepare(
+      `SELECT request_count FROM public_request_quotas
+        WHERE route_class='quickbooks_oauth_callback'`,
+    ).get();
+    assert.equal(quota.request_count, 30);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM quickbooks_oauth_intents").get().n, 0);
   } finally {
     db.close();
   }
