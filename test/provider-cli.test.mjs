@@ -10,6 +10,7 @@ import {
   providerConfigurationFingerprint,
 } from "../brain.mjs";
 import { quickBooksCompanyFingerprint } from "../connectors/quickbooks-online.mjs";
+import { runProviderRehearsal } from "../connectors/offline-rehearsal.mjs";
 
 let ran = 0;
 const check = (name, value, detail = "") => {
@@ -238,6 +239,13 @@ try {
   const proof = await cmdConnectors({ rehearse: true }, { catalog, rehearsal });
   check("connector rehearsal keeps its explicit offline proof level and field gate",
     proof.rehearsal.proof_level === "offline_invented_data" && proof.rehearsal.field_gate_still_required === true);
+
+  const installedRehearsal = await runProviderRehearsal();
+  check("every installed provider rehearsal clears the common extraction-quality boundary",
+    installedRehearsal.passed === true &&
+      installedRehearsal.results.length === 6 &&
+      installedRehearsal.results.every((result) => result.passed === true),
+    JSON.stringify(installedRehearsal.results));
 
   let blocked;
   try {

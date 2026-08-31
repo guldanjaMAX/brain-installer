@@ -91,7 +91,11 @@ const SCENARIOS = Object.freeze([
             id: "f1", name: "Plan.txt", file: { mimeType: "text/plain" },
             "@microsoft.graph.downloadUrl": "https://offline.sharepoint.com/download?invented=1",
           }], "@odata.deltaLink": "https://graph.microsoft.com/offline-drive-delta" });
-          if (target.startsWith("https://offline.sharepoint.com/")) return textResponse("Invented drive body");
+          if (target.startsWith("https://offline.sharepoint.com/")) {
+            return textResponse(
+              "Invented drive body for the offline connector rehearsal. It contains no customer information.",
+            );
+          }
           throw Object.assign(new Error("unexpected Microsoft rehearsal URL"), { code: "microsoft_url" });
         },
       });
@@ -105,7 +109,9 @@ const SCENARIOS = Object.freeze([
       const result = await syncDropbox({
         accessToken: "offline-token",
         fetchImpl: async (url) => String(url).includes("files/download")
-          ? textResponse("Invented Dropbox body")
+          ? textResponse(
+            "Invented Dropbox body for the offline connector rehearsal. It contains no customer information.",
+          )
           : response({ entries: [
             { ".tag": "file", id: "id:plan", name: "Plan.txt", path_lower: "/plan.txt", server_modified: "2026-01-05T00:00:00.000Z" },
             { ".tag": "deleted", path_lower: "/gone.txt" },
