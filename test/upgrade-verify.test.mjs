@@ -2220,13 +2220,24 @@ const bootstrapCompletion = () => ({
     mkdirSync(reopenedDirectory, { recursive: true });
     mkdirSync(reinstalledDirectory, { recursive: true });
 
-    const pack = spawnSync("npm", [
+    // Invoke npm's JavaScript entrypoint directly when this test is running
+    // under `npm test`. On Windows, a shell-wrapped npm.cmd timeout can kill
+    // cmd.exe while leaving npm alive with the install prefix still open.
+    const runNpm = (args, options) => process.env.npm_execpath
+      ? spawnSync(process.execPath, [process.env.npm_execpath, ...args], {
+          ...options,
+          shell: false,
+        })
+      : spawnSync("npm", args, {
+          ...options,
+          shell: process.platform === "win32",
+        });
+    const pack = runNpm([
       "pack", "--json", "--ignore-scripts", "--pack-destination", packDirectory,
     ], {
       cwd: root,
       encoding: "utf8",
-      shell: process.platform === "win32",
-      timeout: 60_000,
+      timeout: 180_000,
     });
     let archive = null;
     try { archive = JSON.parse(pack.stdout)?.[0]?.filename || null; } catch { /* fixed check below */ }
@@ -2237,14 +2248,13 @@ const bootstrapCompletion = () => ({
     );
 
     if (pack.status === 0 && archive) {
-      const installPacked = (cwd) => spawnSync("npm", [
+      const installPacked = (cwd) => runNpm([
           "install", "--global", "--ignore-scripts", "--no-audit", "--no-fund",
           "--prefix", prefix, join(packDirectory, archive),
         ], {
           cwd,
           encoding: "utf8",
-          shell: process.platform === "win32",
-          timeout: 60_000,
+          timeout: 180_000,
         });
       const install = installPacked(firstDirectory);
       check(
@@ -2385,7 +2395,12 @@ const bootstrapCompletion = () => ({
       }
     }
   } finally {
-    rmSync(sandbox, { recursive: true, force: true });
+    rmSync(sandbox, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === "win32" ? 10 : 0,
+      retryDelay: 250,
+    });
   }
 }
 
