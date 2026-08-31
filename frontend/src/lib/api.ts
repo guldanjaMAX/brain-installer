@@ -57,7 +57,7 @@ export function requestId(prefix = "owner"): string {
 export function ownerError(error: unknown): { status: number | null; message: string } {
   if (error instanceof ApiError) {
     if (error.body.code === "owner_upload_ocr_disabled") {
-      return { status: error.status, message: "Private image OCR is not enabled for this brain. Nothing was added." };
+      return { status: error.status, message: "Private image OCR is not enabled for this Brain. Nothing was added." };
     }
     if (error.body.code === "owner_upload_ocr_spend_cap") {
       return { status: error.status, message: "The private OCR spending limit was reached. Nothing was added." };
@@ -508,18 +508,18 @@ export type OwnerWriteReceipt = {
 
 export type OwnerUploadCapabilities = {
   supported_media_types: string[];
-  text_media_types: string[];
-  binary_media_types: string[];
+  text_media_types?: string[];
+  binary_media_types?: string[];
   supported_extensions: string[];
   media_type_extensions: Record<string, string[]>;
   max_content_bytes: number;
-  max_binary_bytes: number;
-  max_ocr_image_bytes: number;
-  media_type_max_bytes: Record<string, number>;
+  max_binary_bytes?: number;
+  max_ocr_image_bytes?: number;
+  media_type_max_bytes?: Record<string, number>;
   content_encoding: "utf-8";
   empty_media_type_supported: false;
   normalization: string;
-  scanned_pdf_ocr_supported: false;
+  scanned_pdf_ocr_supported?: false;
 };
 
 /** One financial scope. The slug is a transport identity only. Every visible

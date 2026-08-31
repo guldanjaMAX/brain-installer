@@ -101,15 +101,19 @@ export function OwnerUpload({ onStored }: { onStored?: () => void }) {
     ? [...capabilities.supported_media_types, ...capabilities.supported_extensions].join(",")
     : undefined;
 
+  const binaryReady = Boolean(capabilities?.supported_media_types.some((mediaType) =>
+    mediaType === "application/pdf" || mediaType.startsWith("image/") || mediaType.startsWith("application/vnd.")));
+  const binaryLimit = capabilities?.max_binary_bytes ?? capabilities?.max_content_bytes ?? 0;
+
   return (
-    <Section title="Add a document" blurb={`Add a text file, PDF, Office document, email file, or image to ${scope ? activeLabel : "one selected business"}. The brain extracts the text and stores it through the same ingestion path as every other source.`}>
+    <Section title="Add a document" blurb={`Add a supported document or receipt to ${scope ? activeLabel : "one selected business"}. The Brain reads and stores it through the same protected path as every other owner upload.`}>
       {capabilitiesUnavailable && (
         <Attention>Upload limits could not be read from the brain, so file selection is unavailable. No file was submitted.</Attention>
       )}
       {!capabilities && !capabilitiesUnavailable && <Note>Reading supported file types and size limits.</Note>}
       {capabilities && (
         <div className="p-4">
-          <label className="block text-[13px] font-medium">Choose a document
+          <label className="block text-[13px] font-medium">Choose a document or receipt
             <input
               type="file"
               accept={accept}
@@ -119,10 +123,13 @@ export function OwnerUpload({ onStored }: { onStored?: () => void }) {
             />
           </label>
           <p className="mt-2 text-[12.5px] text-ink-soft">
-            {capabilities.supported_extensions.join(", ")} · text up to {capabilities.max_content_bytes.toLocaleString()} bytes · documents up to {capabilities.max_binary_bytes.toLocaleString()} bytes · OCR images up to {capabilities.max_ocr_image_bytes.toLocaleString()} bytes
+            {capabilities.supported_extensions.join(", ")} · text up to {capabilities.max_content_bytes.toLocaleString()} bytes
+            {binaryReady ? ` · documents up to ${binaryLimit.toLocaleString()} bytes` : ""}
           </p>
           <p className="mt-2 text-[12.5px] text-ink-soft leading-relaxed">
-            PNG and JPEG files use private OCR. PDFs need a readable text layer. Scanned PDF page OCR, RTF, ZIP archives, and unknown file types are not accepted.
+            {binaryReady
+              ? "This Brain reports protected document upload. Images may use private OCR. A PDF without a readable text layer can still be refused, and the receipt will say why."
+              : "This installed Brain accepts text records only. PDF, image, Office, email, archive, and unknown file types remain closed and will not be labeled uploaded."}
           </p>
           {!scope && <div className="mt-3"><Attention>Select one business above before adding a record.</Attention></div>}
           {file && <p className="mt-3 text-[13.5px]">Ready to submit: <span className="font-medium">{file.name}</span></p>}

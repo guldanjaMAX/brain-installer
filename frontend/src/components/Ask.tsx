@@ -1,13 +1,12 @@
-import { useState } from "react";
-import { ApiError, api, type Answer, type GrantPrincipal } from "../lib/api";
+import { useEffect, useState } from "react";
+import { api, type Answer } from "../lib/api";
 // Shared with the Worker: the rule that an incomplete search must never render
 // as an absence is a product rule, not a rendering detail, so both surfaces
 // derive it from one module instead of each writing their own.
 import { answerText, confidenceText, unavailableSearch } from "../lib/answer-render.js";
-import { Attention, TruthNote } from "./ui";
+import { Attention } from "./ui";
 import { FinanceScopeBar, useFinanceScope } from "./FinanceScope";
 import { scopedAnswerLabel } from "../lib/owner";
-import { scopedRetrievalConfirmed } from "../lib/security";
 
 /** How sure the brain is, and why. The basis is shown rather than summarised:
  *  a bare percentage is a number to argue with, a percentage with its reasons
@@ -47,17 +46,32 @@ function Trust({ answer }: { answer: Answer }) {
   );
 }
 
-export function Ask() {
+export function Ask({ initialQuestion, onManage }: {
+  initialQuestion?: { id: number; text: string } | null;
+  onManage: () => void;
+}) {
   const { activeLabel, scope } = useFinanceScope();
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState<Answer | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [answerLabel, setAnswerLabel] = useState<string | null>(null);
+  const [attachment, setAttachment] = useState<File | null>(null);
+
+  useEffect(() => {
+    if (!initialQuestion?.text) return;
+    setQuestion(initialQuestion.text);
+    setAnswer(null);
+    setError(null);
+  }, [initialQuestion?.id, initialQuestion?.text]);
 
   async function ask() {
     const q = question.trim();
     if (!q || busy) return;
+    if (attachment) {
+      setError("This Brain cannot read a file for one question and then discard it yet. Remove the attachment to ask from saved records, or save the document first under Manage.");
+      return;
+    }
     setBusy(true);
     setError(null);
     setAnswer(null);
@@ -103,10 +117,49 @@ export function Ask() {
         className="w-full rounded-xl border border-line bg-card p-4 text-[16px] leading-relaxed
                    outline-none focus:border-accent resize-y"
       />
+      <div className="mt-3">
+        <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-line bg-card px-3 py-2 text-[13.5px] font-medium text-ink-soft hover:border-accent hover:text-accent">
+          <span aria-hidden="true">+</span>
+          {attachment ? "Replace document" : "Attach document"}
+          <input
+            type="file"
+            className="sr-only"
+            aria-label="Choose a document to attach to this question"
+            onChange={(event) => {
+              setAttachment(event.target.files?.[0] || null);
+              setError(null);
+            }}
+          />
+        </label>
+      </div>
+      {attachment && (
+        <div className="mt-3 rounded-2xl border border-line bg-card p-4">
+          <div className="flex items-start justify-between gap-3 flex-wrap">
+            <span className="min-w-0">
+              <span className="block text-[14px] font-medium break-all">{attachment.name}</span>
+              <span className="block text-[12.5px] text-ink-soft mt-0.5">{fileSize(attachment.size)} · preview only, not uploaded or read</span>
+            </span>
+            <button type="button" onClick={() => setAttachment(null)} className="text-[13px] text-red-700 px-2 py-1 rounded-lg hover:bg-red-50">
+              Remove
+            </button>
+          </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
+              <p className="text-[13.5px] font-medium text-amber-900">Use for this question only</p>
+              <p className="mt-1 text-[12.5px] leading-relaxed text-amber-900">Not available yet. The Brain has no verified path that reads the file and proves it was discarded afterwards.</p>
+            </div>
+            <div className="rounded-xl border border-line bg-paper p-3">
+              <p className="text-[13.5px] font-medium">Save to my records</p>
+              <p className="mt-1 text-[12.5px] leading-relaxed text-ink-soft">Add it deliberately to one entity under Manage, wait for its receipt, then ask from the saved record.</p>
+              <button type="button" onClick={onManage} className="mt-2 text-[13px] font-medium text-accent">Open Manage</button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="flex items-center gap-3 mt-3">
         <button
           onClick={ask}
-          disabled={busy || !question.trim()}
+          disabled={busy || !question.trim() || Boolean(attachment)}
           className="rounded-xl bg-accent px-5 py-2.5 text-white font-semibold
                      disabled:opacity-45 transition-opacity"
         >
@@ -153,102 +206,8 @@ export function Ask() {
   );
 }
 
-export function ScopedAsk({ principal, onAccessEnded }: {
-  principal: GrantPrincipal;
-  onAccessEnded: () => void;
-}) {
-  const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState<Answer | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function ask() {
-    const q = question.trim();
-    if (!q || busy) return;
-    setBusy(true);
-    setError(null);
-    setAnswer(null);
-    try {
-      // There is intentionally no business/document selector and no client
-      // scope in this body. The live grant on the session is the only scope.
-      const next = await api<Answer>("/api/rag/think", { q, limit: 12 });
-      if (!scopedRetrievalConfirmed(next, principal)) {
-        setError("The brain could not prove that this answer used only the exact shared documents. No answer is being shown.");
-        return;
-      }
-      setAnswer(next);
-    } catch (next) {
-      if (next instanceof ApiError && next.status === 403) {
-        setError(typeof next.body.recovery === "string"
-          ? next.body.recovery
-          : "This document access is no longer active. Ask the owner for a new link.");
-        onAccessEnded();
-      } else if (next instanceof ApiError && next.status === 503) {
-        setError("Search is unavailable right now. That is not an answer with no matches.");
-      } else {
-        setError(next instanceof Error ? next.message : String(next));
-      }
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <section aria-busy={busy}>
-      <header className="max-w-2xl mb-5">
-        <p className="eyebrow">Exact shared evidence</p>
-        <h1 className="page-title">Ask &amp; Explore</h1>
-        <p className="page-intro">
-          Ask across only the documents in this access. There is no switch to another business, the owner workspace, or the rest of the brain.
-        </p>
-      </header>
-      <div className="max-w-3xl">
-        <TruthNote>
-          Shared access uses exact-document keyword retrieval. Broader semantic search is not applied, and an empty result is treated as incomplete search rather than proof that nothing exists.
-        </TruthNote>
-        <textarea
-          value={question}
-          onChange={(event) => setQuestion(event.target.value)}
-          onKeyDown={(event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void ask(); }}
-          placeholder="Ask the shared documents…"
-          aria-label="Ask the shared documents"
-          rows={3}
-          className="w-full rounded-xl border border-line bg-card p-4 text-[16px] leading-relaxed outline-none focus:border-accent resize-y"
-        />
-        <div className="flex items-center gap-3 mt-3">
-          <button
-            onClick={ask}
-            disabled={busy || !question.trim()}
-            className="rounded-xl bg-accent px-5 py-2.5 text-white font-semibold disabled:opacity-45 transition-opacity"
-          >
-            {busy ? "Thinking…" : "Ask shared documents"}
-          </button>
-          <span className="text-[13px] text-ink-soft">⌘ + Enter</span>
-        </div>
-        {error && <div className="mt-4"><Attention>{error}</Attention></div>}
-        {answer && (
-          <article className="mt-6 bg-card border border-line rounded-2xl p-6">
-            <p className="text-[12px] uppercase tracking-wider text-ink-soft font-semibold mb-3">
-              Exact shared documents only
-            </p>
-            <p className="whitespace-pre-wrap leading-relaxed">{answerText(answer)}</p>
-            <Trust answer={answer} />
-            {!!answer.citations?.length && (
-              <div className="mt-4 pt-4 border-t border-line">
-                <h2 className="text-[12px] uppercase tracking-wider text-ink-soft font-semibold">Sources</h2>
-                <ul className="mt-2 space-y-1.5">
-                  {answer.citations.map((citation) => (
-                    <li key={citation.n} className="text-[13.5px] text-ink-soft leading-snug">
-                      <span className="text-accent font-medium">[{citation.n}]</span> {citation.title}
-                      {citation.ts && <span className="opacity-70"> · {String(citation.ts).slice(0, 10)}</span>}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </article>
-        )}
-      </div>
-    </section>
-  );
+function fileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} bytes`;
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }

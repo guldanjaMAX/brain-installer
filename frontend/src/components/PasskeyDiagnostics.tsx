@@ -42,8 +42,13 @@ export function PasskeyDiagnostics() {
             <Proof label="Live proven" value={status.proof.live_proven} detail="Requires an independently verified production ceremony." />
           </div>
           <Note>
-            Relying party: {status.rp_id}. {status.devices.owner} owner {status.devices.owner === 1 ? "passkey" : "passkeys"} and {status.devices.grant} document-access {status.devices.grant === 1 ? "passkey" : "passkeys"} are recorded.
+            Relying party: {status.rp_id}. {status.devices.owner} owner {status.devices.owner === 1 ? "passkey is" : "passkeys are"} recorded.
           </Note>
+          {status.devices.grant > 0 && (
+            <Attention>
+              {status.devices.grant} legacy document-access {status.devices.grant === 1 ? "passkey is" : "passkeys are"} still recorded by the backend. This owner-only interface will not open that workspace, but the installer should revoke the legacy access before client launch.
+            </Attention>
+          )}
           {status.ceremonies.length === 0 ? (
             <Empty>No privacy-safe ceremony outcome is recorded yet.</Empty>
           ) : status.ceremonies.map((event, index) => (

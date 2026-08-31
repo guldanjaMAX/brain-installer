@@ -18,7 +18,7 @@ export type OutcomeKey = "WORKING" | "NEEDS" | "FILED" | "CURRENT" | "PROBLEM";
 
 export const OUTCOME: Record<OutcomeKey, { label: string; glyph: string; tone: Tone }> = {
   WORKING: { label: "Working on it", glyph: "○", tone: "wait" },
-  NEEDS:   { label: "Needs you",     glyph: "△", tone: "act" },
+  NEEDS:   { label: "Priority",      glyph: "△", tone: "act" },
   FILED:   { label: "Filed",         glyph: "■", tone: "done" },
   CURRENT: { label: "Current",       glyph: "●", tone: "good" },
   PROBLEM: { label: "Problem",       glyph: "✕", tone: "bad" },

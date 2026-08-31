@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 
 import worker from "../src/index.js";
 import { appPageHtml, brandOgSvg } from "../src/lib/app-page.js";
+import { APP_JS } from "../src/lib/app-assets.js";
 
 const ORIGIN = "https://brain.example.com";
 const env = { BRAIN_NAME: "acme-brain", BRAIN_OWNER: "Dana Okonkwo" };
@@ -89,6 +90,25 @@ test("the app bundle is served with the right types and is cacheable", async () 
   const html = appPageHtml(env, ORIGIN);
   assert.match(html, /\/app\/assets\/app\.js\?v=[0-9a-f]{12}/);
   assert.match(html, /\/app\/assets\/app\.css\?v=[0-9a-f]{12}/);
+});
+
+test("the generated owner bundle carries the approved navigation and Manage experience", () => {
+  for (const phrase of [
+    "Your financial life, in one clear view",
+    "Customized Tasks",
+    "Review Priorities",
+    "Business entities",
+    "Set up your data",
+    "Scan documents or receipts",
+    "Attach document",
+    "Priority",
+  ]) {
+    assert.ok(APP_JS.includes(phrase), `missing generated UI phrase: ${phrase}`);
+  }
+  assert.ok(!APP_JS.includes("Needs you"), "the retired status label reached the owner bundle");
+  assert.ok(!APP_JS.includes("Add & Review"), "the retired primary destination reached the owner bundle");
+  assert.ok(APP_JS.includes("This Financial Brain uses owner-only access"));
+  assert.ok(APP_JS.includes("legacy document-access"));
 });
 
 test("the shell is never cached, so an upgrade actually reaches the client", async () => {
