@@ -6,6 +6,13 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## 0.2.1
 
+- First installation now starts by creating a client-owned Cloudflare account
+  or selecting one the owner already has. Wrangler opens Cloudflare in the
+  browser, saves a separate named sign-in in the computer's protected
+  credential store, verifies the exact account and required services, and
+  reuses that profile for later checks and updates. An API token is now a
+  recovery-only option when browser sign-in is unavailable, rather than
+  something the owner normally copies into a prompt or command.
 - Plaid setup now has one owner handoff command. `brain connect bank <manifest>`
   checks the recorded return address without using a credential or network
   call, then opens the owner-only Link page. The page works as a normal browser
@@ -39,9 +46,9 @@ the brain, not for whoever built it: what changed for them, and what to check.
   official native Claude executable for the shell-free handoff.
 - The public first-install path now defers Plaid, Google, QuickBooks, Zoom, and
   IMAP ceremonies until their secure credential custody and real-provider field
-  gates are complete. Cloudflare credential entry and passkey invitation use
-  exact owner-terminal commands that never run through an agent shell. One
-  fixed public non-customer smoke document proves real deployed ingestion.
+  gates are complete. Cloudflare browser sign-in and passkey invitation use
+  exact owner-terminal commands outside the agent shell. One fixed public
+  non-customer smoke document proves real deployed ingestion.
   Final verification requires that exact ready source, its stored document and
   freshness verdict, and at least one enrolled device, while storing aggregate
   counts only. Empty installs no longer claim they are ready for questions.
