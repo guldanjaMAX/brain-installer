@@ -157,6 +157,27 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
 
 ## Recovery and completion
 
+- When the owner says that Financial Brain failed, stopped, or "did nothing,"
+  begin with the private local issue journal instead of asking them to copy a
+  terminal error into chat. Run the exact package-local equivalents of:
+
+  ```bash
+  <brain-cli> support --preview
+  <brain-cli> support --explain <ISSUE_CODE> --json
+  ```
+
+  `--preview` sends nothing. Read the newest safe event, use its `error_code`
+  with `--explain`, and translate the reviewed recovery into ordinary language.
+  Then run only the relevant read-only check, such as `doctor`, `health`,
+  `sources`, `schedule`, or the technician plan. Never ask the owner to email or
+  paste raw logs, provider responses, filenames, paths, source content, or
+  authentication details. Do not export or transmit the journal unless the
+  owner reviews the exact preview and approves that specific share.
+- A useful first response is: "I found the local Financial Brain issue note. I
+  will check what stayed protected and whether retrying is safe before changing
+  anything." Report the stable issue code, the plain-language cause, what was
+  protected, and the next action. If no safe event exists, say that clearly and
+  use read-only checks rather than inventing a diagnosis.
 - A failed technician step is ready to retry after its named prerequisite is
   fixed only when its durable status says `retry_safe: true`. Always run the
   credential-free exact `refresh` command first. If it says false, uncertain,

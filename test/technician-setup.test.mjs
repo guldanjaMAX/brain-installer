@@ -146,6 +146,9 @@ test("the personal Claude technician skill installs exactly, verifies on rerun, 
   assert.match(content, new RegExp(CLAUDE_TECHNICIAN_SKILL_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(content, /\/financial-brain-technician/);
   assert.match(content, /brain technician/i);
+  assert.match(content, /support --preview/);
+  assert.match(content, /support --explain <ISSUE_CODE> --json/);
+  assert.match(content, /preview.*sends nothing/is);
   assert.doesNotMatch(content, /CLOUDFLARE_API_TOKEN|ADMIN_KEY|client_secret|app_password/);
   if (process.platform === "win32") assert.equal(statSync(first.path).isFile(), true);
   else assert.equal(statSync(first.path).mode & 0o777, 0o600);
