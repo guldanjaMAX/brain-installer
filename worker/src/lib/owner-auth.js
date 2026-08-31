@@ -76,14 +76,8 @@ export async function validateOwnerSession(request, env) {
   return principal !== null && principal.denied !== true;
 }
 
-/**
- * Resolve who is behind the passkey session instead of flattening identity to
- * a boolean. Owner-write routes must use this function and require kind=owner
- * plus grantId=null. That positive check remains fail-closed when scoped
- * passkeys are added later.
- */
-export async function ownerSessionPrincipal(request, env) {
-  if (!appRequest(request)) return null;
+async function resolveOwnerSessionPrincipal(request, env, { requireAppHeader = true } = {}) {
+  if (requireAppHeader && !appRequest(request)) return null;
   const session = await readSessionCookie(request, env, await sessionGeneration(env));
   if (!session) return null;
   const devices = await listPasskeys(env);
@@ -106,6 +100,29 @@ export async function ownerSessionPrincipal(request, env) {
     };
   }
   return grantSubjectPrincipal(env, session.grantId);
+}
+
+/**
+ * Resolve who is behind the passkey session instead of flattening identity to
+ * a boolean. Owner-write routes must use this function and require kind=owner
+ * plus grantId=null. That positive check remains fail-closed when scoped
+ * passkeys are added later.
+ */
+export async function ownerSessionPrincipal(request, env) {
+  return resolveOwnerSessionPrincipal(request, env, { requireAppHeader: true });
+}
+
+/**
+ * Resolve a passkey session for a read-only top-level page navigation.
+ *
+ * Browsers cannot attach X-Brain-App to an address-bar navigation. This seam
+ * is therefore limited to GET page handlers. Every API read and write must
+ * continue to use ownerSessionPrincipal so the companion CSRF header remains
+ * mandatory.
+ */
+export async function ownerNavigationPrincipal(request, env) {
+  if (request.method !== "GET") return null;
+  return resolveOwnerSessionPrincipal(request, env, { requireAppHeader: false });
 }
 
 async function grantSubjectPrincipal(env, grantId) {

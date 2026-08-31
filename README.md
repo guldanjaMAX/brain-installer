@@ -105,7 +105,9 @@ The optional Plaid profile is read-only, disabled by default, and still requires
 a client-owned Plaid account plus the account holder's own Link ceremony. Each
 masked account remains staged until the signed-in owner assigns it to one active
 owned entity; an institution connection never defaults every account to one
-business scope. Its
+business scope. After configuration, `brain connect bank <manifest>` performs
+an offline redirect-readiness check, prints the exact owner page, and opens it
+without reading a Plaid or Cloudflare credential. Its
 offline rehearsal, opt-in live Sandbox runner, custody rules, and remaining
 field gate are in [docs/PLAID.md](docs/PLAID.md).
 

@@ -30,7 +30,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   WORKER_PROVIDER_SECRET_NAMES, optionalWorkerSecretNames, cmdSecrets, bankFeedWorkerBindings,
-  probeBankFeedRuntime, checkBankFeedRuntime,
+  cmdConnectBank, probeBankFeedRuntime, checkBankFeedRuntime,
 } from "../brain.mjs";
 import {
   checkBankFeedRedirect, bankFeedRedirectUri, plaidWebhookUri,
@@ -313,6 +313,88 @@ try {
         ...manifest({ bankFeed: true }),
         corpora: { bank_feed: { enabled: true, registered_redirect_uris: ["https://other-brain.example.workers.dev/app/connect/bank"] } },
       }).status === FAIL, "");
+  }
+
+  /* ============ the owner opener is manifest-only and credential-free ============ */
+  {
+    const readyManifest = {
+      ...manifest({ bankFeed: true }),
+      corpora: { bank_feed: {
+        enabled: true,
+        provider: "plaid",
+        environment: "sandbox",
+        registered_redirect_uris: ["https://fixture-brain.example.workers.dev/app/connect/bank"],
+      } },
+    };
+    const readyPath = writeManifest("connect-bank-ready", readyManifest);
+    const output = [];
+    const originalLog = console.log;
+    const originalFetch = globalThis.fetch;
+    let fetchAttempts = 0;
+    let openedUrl = null;
+    let printOpened = false;
+    let opened;
+    let printed;
+    let fallback;
+    try {
+      console.log = (...parts) => output.push(parts.join(" "));
+      globalThis.fetch = async () => {
+        fetchAttempts++;
+        throw new Error("connect bank must not use the network");
+      };
+      opened = await cmdConnectBank(readyPath, {}, {
+        openImpl: (url) => { openedUrl = url; return true; },
+      });
+      printed = await cmdConnectBank(readyPath, { print: true }, {
+        openImpl: () => { printOpened = true; return true; },
+      });
+      fallback = await cmdConnectBank(readyPath, {}, {
+        openImpl: () => { throw new Error("no desktop opener"); },
+      });
+    } finally {
+      console.log = originalLog;
+      globalThis.fetch = originalFetch;
+    }
+    const rendered = output.join("\n");
+    check("brain connect bank opens exactly the registered owner page without a Cloudflare or provider call",
+      opened.opened === true && opened.live_provider_proof === false &&
+      openedUrl === "https://fixture-brain.example.workers.dev/app/connect/bank" && fetchAttempts === 0,
+      JSON.stringify({ opened, openedUrl, fetchAttempts }));
+    check("--print leaves the same exact URL for an agent or owner without launching anything",
+      printed.opened === false && printOpened === false && rendered.includes(printed.url), rendered);
+    let valuedPrintError = "";
+    try {
+      await cmdConnectBank(readyPath, { print: "true" }, {
+        openImpl: () => { printOpened = true; return true; },
+      });
+    } catch (error) { valuedPrintError = String(error?.message || error); }
+    check("a value after --print is refused rather than turning browser launch back on",
+      /does not take a value/.test(valuedPrintError) && printOpened === false, valuedPrintError);
+    check("a missing desktop opener still leaves the exact printable recovery link",
+      fallback.opened === false && rendered.includes(fallback.url), rendered);
+    check("the opener output contains no ambient or bank credential value",
+      !rendered.includes(FIXTURE_KEY) && !rendered.includes("fixture-service-secret"), rendered);
+
+    let unregisteredError = "";
+    try {
+      await cmdConnectBank(writeManifest("connect-bank-unregistered", {
+        ...manifest({ bankFeed: true }),
+        corpora: { bank_feed: { enabled: true, provider: "plaid", environment: "sandbox" } },
+      }), { print: true });
+    }
+    catch (error) { unregisteredError = String(error?.message || error); }
+    check("the owner page stays closed until the exact provider return address is recorded",
+      /return address/.test(unregisteredError) && /Register this exact address/.test(unregisteredError), unregisteredError);
+
+    let malformedError = "";
+    try {
+      await cmdConnectBank(writeManifest("connect-bank-malformed", {
+        ...readyManifest,
+        brain: { ...readyManifest.brain, domain: "https://user@example.invalid/path" },
+      }), { print: true });
+    } catch (error) { malformedError = String(error?.message || error); }
+    check("a hostname carrying sign-in data or a path is refused before browser launch",
+      /one HTTPS hostname/.test(malformedError), malformedError);
   }
 
   /* ============ deploy carries public Plaid configuration, never credentials ============ */

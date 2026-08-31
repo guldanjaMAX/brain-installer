@@ -10,10 +10,10 @@ export const CONNECTOR_EXPANSION_CATALOG = Object.freeze([
     next_acceptance: "Use an Intuit sandbox company to prove consent, returned company identity, same-company reconnect, wrong-company refusal, refresh rotation, pagination, changed records, outage recovery, disconnect retention, retrieval, and a separate forget preview.",
   }),
   row({
-    id: "plaid", label: "Plaid bank aggregation", build: "profile_on_common_bank_feed",
-    automated_proof: "sqlite_and_scripted_provider_io", rehearsal_available: false, installed_connection: false,
-    current_boundary: "The Plaid profile uses the existing hosted bank-feed contract. A real Link ceremony is not part of this connector slice.",
-    next_acceptance: "Use Plaid Sandbox Link to prove token exchange, cursor resume, pending-to-posted replacement, removals, outage, and disconnect.",
+    id: "plaid", label: "Plaid bank aggregation", build: "owner_link_and_account_scope_ready",
+    automated_proof: "sqlite_and_scripted_provider_io", rehearsal_available: false, installed_connection: true,
+    current_boundary: "The owner-only browser Link page, lost-response replay, signed webhooks, staged sync, masked per-account entity assignment, automatic resume, and provider-confirmed disconnect are wired. No Plaid credential, Sandbox Item, bank login, or real transaction has crossed this build.",
+    next_acceptance: "Use an approved Plaid Sandbox account to drive Link through the deployed Brain, assign every masked account, prove D1 promotion and cursor resume, trigger webhook and fallback paths, disconnect, and confirm provider removal. Then separately approve one real read-only Item.",
   }),
   row({
     id: "slack", label: "Slack", build: "sandbox_ready_runner",

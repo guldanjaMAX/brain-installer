@@ -160,9 +160,18 @@ brain technician "$HOME/Financial Brain/brain.manifest.json" --run plaid
 
 The Plaid client ID, secret, and independent version-2 bank wrapping key are
 entered only at hidden prompts. The technician step writes the named Worker
-secrets without exposing their values. The account holder later completes
-Plaid Link in the browser. A configured connection is not reconciliation proof
-and never makes Plaid or QuickBooks financial authority.
+secrets without exposing their values. Once `brain doctor` confirms the exact
+return address is recorded, hand the browser to the owner with:
+
+```bash
+brain connect bank "$HOME/Financial Brain/brain.manifest.json"
+```
+
+For a Claude-guided session, add `--print`; Claude can explain the next step
+without opening the page or receiving a credential. The account holder signs
+in, completes Plaid Link, and assigns every masked account to its business.
+A configured connection is not reconciliation proof and never makes Plaid or
+QuickBooks financial authority.
 
 ### 5. Google
 

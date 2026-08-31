@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  cmdConnectBank,
   cmdConnectors,
   cmdConnectProvider,
   cmdDisconnectProvider,
@@ -10,7 +11,8 @@ import {
   providerConfigurationFingerprint,
 } from "../brain.mjs";
 import { quickBooksCompanyFingerprint } from "../connectors/quickbooks-online.mjs";
-import { runProviderRehearsal } from "../connectors/offline-rehearsal.mjs";
+import { providerRehearsalScenarios, runProviderRehearsal } from "../connectors/offline-rehearsal.mjs";
+import { connectorCatalog } from "../connectors/catalog.mjs";
 
 let ran = 0;
 const check = (name, value, detail = "") => {
@@ -28,12 +30,52 @@ writeFileSync(manifestPath, JSON.stringify({
   infrastructure: { cloudflare: { account_id: "fixture-account", storage: "d1" } },
   corpora: { quickbooks: { enabled: true, environment: "sandbox" } },
 }));
+const bankManifestPath = join(folder, "bank.manifest.json");
+writeFileSync(bankManifestPath, JSON.stringify({
+  manifest_version: 1,
+  client: { slug: "fixture", display_name: "Fixture", timezone: "America/Phoenix" },
+  brain: { version: "0.2.0", domain: "fixture.invalid", worker_name: "fixture-brain" },
+  infrastructure: { cloudflare: { account_id: "fixture-account", storage: "d1" } },
+  corpora: { bank_feed: {
+    enabled: true,
+    provider: "plaid",
+    environment: "sandbox",
+    registered_redirect_uris: ["https://fixture.invalid/app/connect/bank"],
+  } },
+}));
 
 const realLog = console.log;
 const realWarn = console.warn;
 console.log = () => {};
 console.warn = () => {};
 try {
+  let bankPageUrl = null;
+  const bankConnection = await cmdConnectBank(bankManifestPath, {}, {
+    openImpl: (url) => { bankPageUrl = url; return true; },
+  });
+  check("bank connect opens the deployed owner page without handling a Plaid credential",
+    bankConnection.opened === true && bankConnection.live_provider_proof === false &&
+    bankConnection.url === "https://fixture.invalid/app/connect/bank" && bankPageUrl === bankConnection.url);
+  let skippedOpen = false;
+  const printedOnly = await cmdConnectBank(bankManifestPath, { print: true }, {
+    openImpl: () => { skippedOpen = true; return true; },
+  });
+  check("bank connect can print the exact owner link without opening a browser",
+    printedOnly.opened === false && skippedOpen === false);
+  let valuedPrintError = "";
+  try {
+    await cmdConnectBank(bankManifestPath, { print: "true" }, {
+      openImpl: () => { skippedOpen = true; return true; },
+    });
+  } catch (error) {
+    valuedPrintError = String(error?.message || error);
+  }
+  check("bank connect refuses a value after --print instead of unexpectedly opening a browser",
+    /does not take a value/.test(valuedPrintError) && skippedOpen === false, valuedPrintError);
+  const rehearsalIds = new Set(providerRehearsalScenarios().map((scenario) => scenario.id));
+  check("the catalog advertises offline rehearsal only when an installed scenario exists",
+    connectorCatalog().every((entry) => !entry.rehearsal_available || rehearsalIds.has(entry.id)));
+
   const priorSlackFingerprint = "ddbe158e2e3f497532e698cdbc780afe4d518bf49045283d07cb64f1b5289f5e";
   check("non-QuickBooks configuration fingerprints remain byte-compatible with released v1 cursors",
     providerConfigurationFingerprint("slack", "slack", {

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createProductFixture } from "./product-contract-fixture.mjs";
+import { createProductFixture, seedOwnedEntity } from "./product-contract-fixture.mjs";
 import {
   completePlaidLink,
   createPlaidLinkToken,
@@ -73,7 +73,7 @@ async function runScheduled(worker, env) {
   await work;
 }
 
-test("the actual Worker cron retries a failed Plaid refresh and resumes without duplicate promotion", async () => {
+test("the actual Worker cron retries a failed Plaid refresh, waits for owner scope, and resumes once", async () => {
   const fixture = await createProductFixture({
     env: {
       BANK_FEED_PROVIDER: "plaid",
@@ -81,7 +81,6 @@ test("the actual Worker cron retries a failed Plaid refresh and resumes without 
       BANK_FEED_CLIENT_ID: "fixture-client-id",
       BANK_FEED_SECRET: "fixture-secret",
       BANK_FEED_WRAPPING_KEY_V2: `v2.${"A".repeat(43)}`,
-      BANK_FEED_ENTITY: "primary",
       BANK_FEED_RECONCILE_MINUTES: "360",
       BRAIN_NAME: "Scheduled Fixture Brain",
     },
@@ -91,6 +90,7 @@ test("the actual Worker cron retries a failed Plaid refresh and resumes without 
   const stamp = "2026-08-30T13:00:00.000Z";
   const previousFetch = globalThis.fetch;
   try {
+    seedOwnedEntity(fixture, "scheduled-company", "Scheduled Company");
     const link = await createPlaidLinkToken(fixture.env, {
       url: "https://brain.invalid/app/connect/bank",
       sessionRef: "scheduled-link-request-0001",
@@ -126,6 +126,23 @@ test("the actual Worker cron retries a failed Plaid refresh and resumes without 
       "UPDATE plaid_reconciliation SET due_at='2000-01-01T00:00:00.000Z' WHERE item_ref='item-scheduled-1'",
     );
     await runScheduled(fixture.worker, fixture.env);
+
+    assert.equal(fixture.first(
+      "SELECT cursor FROM bank_feed_items WHERE item_ref='item-scheduled-1'",
+    ).cursor, null);
+    assert.equal(fixture.first("SELECT COUNT(*) AS n FROM fin_transactions").n, 0);
+    const accountRef = fixture.first(
+      "SELECT account_ref FROM plaid_account_entity_assignments WHERE item_ref='item-scheduled-1'",
+    ).account_ref;
+    const ownerHeaders = await fixture.ownerHeaders();
+    const assignment = await fixture.post("/api/bank-feed/accounts/assign", {
+      request_id: "scheduled-assignment-request-0001",
+      account_ref: accountRef,
+      entity_slug: "scheduled-company",
+    }, ownerHeaders);
+    assert.equal(assignment.status, 201);
+    assert.equal(fixture.waitUntil.length, 1);
+    await Promise.all(fixture.waitUntil);
 
     assert.equal(fixture.first(
       "SELECT cursor FROM bank_feed_items WHERE item_ref='item-scheduled-1'",

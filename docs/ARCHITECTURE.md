@@ -161,8 +161,11 @@ through their reviewed recovery projections. Public request quota windows and
 vector retry bookkeeping are live operational state, so schemas 27 and 28 are
 recreated empty on the target.
 Exact older migration prefixes remain inspectable by the offline verifier only.
-The field recovery runner requires exact current schema 30 on both source and
+The field recovery runner requires exact current schema 31 on both source and
 restored target before it can export or invoke the current drain protocol.
+Schema-31 bank-import previews and consumption claims are invocation-local
+coordination state, so recovery recreates those tables empty instead of
+copying an interrupted upload intent into the restored Brain.
 
 ## Ingest lifecycle
 

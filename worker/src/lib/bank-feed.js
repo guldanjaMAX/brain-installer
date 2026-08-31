@@ -42,7 +42,7 @@
  */
 
 import { jsonResponse, privateNoStore, validateAdminKey } from "./core.js";
-import { ownerSessionPrincipal } from "./owner-auth.js";
+import { ownerNavigationPrincipal, ownerSessionPrincipal } from "./owner-auth.js";
 import { importBankExport, balanceRoleFor } from "./fin-import.js";
 import { bankFeedProfile } from "./bank-feed-profiles.js";
 import {
@@ -128,11 +128,22 @@ export function bankFeedConfig(env) {
   if (base.protocol !== "https:") {
     throw new FeedConfigError("BANK_FEED_API_BASE must be https");
   }
+  let linkSdkUrl = null;
+  if (profile.linkSdkUrl) {
+    let parsedSdk;
+    try { parsedSdk = new URL(profile.linkSdkUrl); } catch {
+      throw new FeedConfigError("BANK_FEED_LINK_SDK_URL is not a valid URL");
+    }
+    if (parsedSdk.protocol !== "https:") {
+      throw new FeedConfigError("BANK_FEED_LINK_SDK_URL must be https");
+    }
+    linkSdkUrl = parsedSdk.href;
+  }
   return {
     clientId, secret, environment,
     provider: profile.provider,
     apiBase: base.origin,
-    linkSdkUrl: profile.linkSdkUrl,
+    linkSdkUrl,
     // The browser global the provider's SDK installs. Configured, never
     // hard-coded, for the same reason the host is: a change of aggregator
     // should be a manifest edit and not a code change in every install.
@@ -1157,32 +1168,61 @@ export function connectPageHtml(config) {
     "style-src 'unsafe-inline'",
     `connect-src 'self'${connectOrigins.length ? ` ${connectOrigins.join(" ")}` : ""}`,
     `frame-src${sdkOrigin ? ` ${sdkOrigin}` : " 'none'"}`,
+    "frame-ancestors 'none'",
     "base-uri 'none'",
     "form-action 'none'",
   ].join("; ");
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect a bank</title>
-<style>body{font:16px/1.5 -apple-system,system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1.25rem}
-h1{font-size:1.35rem}p{color:#444}button{font:inherit;padding:.7rem 1.1rem;border:0;border-radius:.5rem;background:#1f2937;color:#fff;cursor:pointer}
-.note{font-size:.9rem;color:#666}.err{color:#b00020;white-space:pre-wrap}</style></head><body>
+<style>body{font:16px/1.5 -apple-system,system-ui,sans-serif;max-width:44rem;margin:3rem auto;padding:0 1.25rem;color:#202124}
+h1{font-size:1.5rem;margin-bottom:.5rem}h2{font-size:1.15rem;margin:0 0 .4rem}p{color:#444}button,select{font:inherit;padding:.7rem 1rem;border-radius:.55rem}button{border:0;background:#1f2937;color:#fff;cursor:pointer}button.secondary{background:#e8eaed;color:#202124}button:disabled{opacity:.55;cursor:wait}
+.note{font-size:.9rem;color:#666}.err{color:#9b1c1c;white-space:pre-wrap}.ok{color:#285c35;white-space:pre-wrap}.panel{margin-top:2rem;border:1px solid #dadce0;border-radius:.8rem;padding:1rem}.account{border-top:1px solid #eee;padding:1rem 0}.account:first-child{border-top:0}.account h3{font-size:1rem;margin:0}.account p{margin:.3rem 0}.assign{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin-top:.7rem}.assign select{min-width:15rem;border:1px solid #aaa;background:#fff}.actions{display:flex;gap:.7rem;align-items:center;flex-wrap:wrap}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}</style></head><body>
 <h1>Connect a bank account</h1>
 <p>You sign in to your bank yourself, on your bank's own screen. This page never sees your bank
 password or your security codes, and nobody else does either. What comes back is read-only: it can
 look at your transactions and it cannot move money.</p>
 <p class="note">Environment: ${config.environment}. You can disconnect at any time, and your history stays.</p>
-<button id="start">Connect a bank</button>
-<div id="status" role="status"></div>
+<div class="actions"><button id="start">Connect a bank</button><a href="/app">Back to your Brain</a></div>
+<p id="status" role="status" aria-live="polite"></p>
+<section class="panel" aria-labelledby="accounts-heading">
+  <h2 id="accounts-heading">Choose where each account belongs</h2>
+  <p class="note">Your bank may return personal and business accounts together. We wait for you to choose the right business before adding any transactions.</p>
+  <p id="account-status" role="status" aria-live="polite">Looking for connected accounts…</p>
+  <div id="accounts"></div>
+  <button id="refresh" class="secondary" type="button">Check again</button>
+</section>
 ${sdk ? `<script src="${sdk}"></script>` : ""}
 <script>
 const el = (id) => document.getElementById(id);
-const say = (text, bad) => { el("status").innerHTML = bad ? '<p class="err">' + text + '</p>' : '<p>' + text + '</p>'; };
-async function post(path, body) {
-  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
-    credentials: "same-origin", body: JSON.stringify(body || {}) });
+const appHeaders = { "Content-Type": "application/json", "X-Brain-App": "1" };
+const say = (text, bad) => { const target = el("status"); target.textContent = String(text || ""); target.className = bad ? "err" : "ok"; };
+const accountSay = (text, bad) => { const target = el("account-status"); target.textContent = String(text || ""); target.className = bad ? "err" : "note"; };
+function errorMessage(data, status) {
+  const code = data && typeof data.code === "string" ? data.code : null;
+  const messages = {
+    session_required: "Your sign-in has ended. Return to your Brain, sign in, and open this page again.",
+    owner_required: "This page is available only to the Brain owner.",
+    plaid_account_inventory_unavailable: "The bank is connected, but its account list is still arriving. Wait a moment and check again.",
+    bank_account_status_unavailable: "We could not safely read the account list. Your connection is unchanged. Please check again.",
+    bank_account_assignment_unavailable: "We could not safely save that choice. Nothing was moved. Please try the same choice again.",
+    bank_account_reassignment_requires_review: "This account already has financial history under another business. A technician should review it before anything moves.",
+    entity_not_found: "That business is no longer available. Refresh the list and choose an active business.",
+    entity_not_owned: "That business is not owner-controlled, so the account was not assigned to it.",
+    request_id_conflict: "This saved retry belongs to a different choice. Refresh the page and try again.",
+  };
+  const base = (code && messages[code]) || (status === 503
+    ? "This step is temporarily unavailable. Your earlier progress is safe. Please try again."
+    : "That step did not finish. Your earlier progress is safe. Please try again.");
+  return code ? base + " Reference code: " + code + "." : base;
+}
+async function requestJson(path, init) {
+  const r = await fetch(path, { credentials: "same-origin", ...init, headers: appHeaders });
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error || "that did not work");
+  if (!r.ok) throw new Error(errorMessage(d, r.status));
   return d;
 }
+const post = (path, body) => requestJson(path, { method: "POST", body: JSON.stringify(body || {}) });
+const get = (path) => requestJson(path, { method: "GET" });
 function linkRequestId() {
   let value = null;
   try { value = sessionStorage.getItem("bank_link_request_id"); } catch (e) {}
@@ -1191,6 +1231,117 @@ function linkRequestId() {
     try { sessionStorage.setItem("bank_link_request_id", value); } catch (e) {}
   }
   return value;
+}
+function assignmentRequestId(accountRef, entitySlug) {
+  const key = "bank_assignment_request:" + accountRef + ":" + entitySlug;
+  let value = null;
+  try { value = sessionStorage.getItem(key); } catch (e) {}
+  if (!value) {
+    value = crypto.randomUUID();
+    try { sessionStorage.setItem(key, value); } catch (e) {}
+  }
+  return { key, value };
+}
+function make(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  if (className) node.className = className;
+  return node;
+}
+async function ownedEntities() {
+  const data = await post("/api/fin/snapshot", { sections: ["entities"] });
+  if (!Array.isArray(data.entities)) throw new Error("The business list is unavailable. No account choices were changed.");
+  return data.entities.filter((entity) => entity && entity.status === "active" && entity.relationship === "owned");
+}
+async function assignAccount(account, entitySlug, button) {
+  const retry = assignmentRequestId(account.account_ref, entitySlug);
+  button.disabled = true;
+  accountSay("Saving that choice…");
+  try {
+    const result = await post("/api/bank-feed/accounts/assign", {
+      request_id: retry.value,
+      account_ref: account.account_ref,
+      entity_slug: entitySlug,
+    });
+    try { sessionStorage.removeItem(retry.key); } catch (e) {}
+    accountSay(result.changed === false
+      ? "That account was already assigned there. Nothing else changed."
+      : "Saved. The account can now continue loading into the chosen business.");
+    await loadAccounts();
+  } catch (error) {
+    accountSay(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+function renderAccounts(accounts, entities) {
+  const root = el("accounts");
+  root.replaceChildren();
+  for (const account of accounts) {
+    const card = make("article", null, "account");
+    card.append(make("h3", account.masked_identifier || "Bank account"));
+    const institution = account.institution_label ? account.institution_label + ". " : "";
+    if (account.assignment && account.assignment.state === "assigned") {
+      card.append(make("p", institution + "Assigned to " + (account.assignment.entity_label || "the selected business") + "."));
+    } else {
+      card.append(make("p", institution + "Choose the business that owns this account."));
+      const row = make("div", null, "assign");
+      const label = make("label", "Business", "sr-only");
+      const select = make("select");
+      label.htmlFor = select.id = "entity-" + account.account_ref;
+      select.append(make("option", "Choose a business"));
+      select.options[0].value = "";
+      for (const entity of entities) {
+        const option = make("option", entity.label || entity.legal_name || entity.entity_slug);
+        option.value = entity.entity_slug;
+        select.append(option);
+      }
+      const button = make("button", "Assign account");
+      button.type = "button";
+      button.disabled = entities.length === 0;
+      button.onclick = () => {
+        if (!select.value) { accountSay("Choose a business first.", true); return; }
+        assignAccount(account, select.value, button);
+      };
+      row.append(label, select, button);
+      card.append(row);
+    }
+    root.append(card);
+  }
+}
+async function loadAccounts(options) {
+  const quiet = options && options.quiet;
+  if (!quiet) accountSay("Checking connected accounts…");
+  try {
+    const values = await Promise.all([get("/api/bank-feed/accounts"), ownedEntities()]);
+    const data = values[0];
+    const entities = values[1];
+    if (!Array.isArray(data.accounts)) throw new Error("The account list is unavailable. Nothing is being shown as empty.");
+    renderAccounts(data.accounts, entities);
+    if (data.accounts.length === 0) {
+      accountSay("No accounts have arrived yet. If you just connected, wait a moment and check again.");
+    } else if (data.summary && data.summary.assignment_required > 0) {
+      accountSay(data.summary.assignment_required + (data.summary.assignment_required === 1
+        ? " account needs a business choice before its transactions can load."
+        : " accounts need business choices before their transactions can load."));
+    } else if (data.state === "current") {
+      accountSay("Every account is assigned and current.");
+    } else {
+      accountSay("Every account is assigned. Some history is still loading or needs attention.");
+    }
+    return data.accounts.length;
+  } catch (error) {
+    accountSay(error.message, true);
+    return -1;
+  }
+}
+async function waitForAccounts() {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 1250));
+    const count = await loadAccounts({ quiet: true });
+    if (count > 0) return;
+  }
+  accountSay("The connection is saved, but the account list is still loading. You can leave this page open or check again in a few minutes.");
 }
 async function start(existing) {
   say("Preparing a secure connection…");
@@ -1218,7 +1369,8 @@ async function start(existing) {
           sessionStorage.removeItem("bank_link_session");
           sessionStorage.removeItem("bank_link_request_id");
         } catch (e) {}
-        say("Connected. Your history is loading in the background. This can take a while, and you can close this page.");
+        say("Connected. We’re finding your accounts now. Choose which business each one belongs to before its transactions are added.");
+        waitForAccounts();
       } catch (e) { say(e.message, true); }
     },
     onExit: (err) => { if (err) say("The connection was not completed.", true); },
@@ -1232,6 +1384,8 @@ async function start(existing) {
   sdk.create(config).open();
 }
 el("start").onclick = () => start().catch((e) => say(e.message, true));
+el("refresh").onclick = () => loadAccounts();
+loadAccounts();
 if (window.location.search.indexOf("oauth_state_id") >= 0) {
   let saved = null; try { saved = JSON.parse(sessionStorage.getItem("bank_link_session")); } catch (e) {}
   if (saved) start(saved).catch((e) => say(e.message, true));
@@ -1274,7 +1428,11 @@ export async function handleBankFeed(env, request, url, path, ctx) {
   try {
     if (path === "/app/connect/bank") {
       if (request.method !== "GET") return jsonResponse({ error: "method not allowed" }, 405);
-      const access = await ownerAccess();
+      const principal = await ownerNavigationPrincipal(request, env);
+      const access = {
+        authorised: principal?.kind === "owner" && principal.grantId === null,
+        scoped: Boolean(principal),
+      };
       if (!access.authorised) {
         if (access.scoped) return new Response("Only the owner can connect a bank.", { status: 403 });
         return new Response("Sign in first at /app, then open this page again.", {
@@ -1286,6 +1444,7 @@ export async function handleBankFeed(env, request, url, path, ctx) {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
           "Content-Security-Policy": csp,
+          "X-Frame-Options": "DENY",
           "Referrer-Policy": "no-referrer",
           "X-Content-Type-Options": "nosniff",
           "Cache-Control": "private, no-store",
@@ -1327,7 +1486,11 @@ export async function handleBankFeed(env, request, url, path, ctx) {
       });
       // The history load runs OUTSIDE this request. The owner gets an answer
       // now and the two years arrive behind them.
-      if (ctx?.waitUntil) ctx.waitUntil(runFeedSlice(env).catch(() => {}));
+      if (ctx?.waitUntil) {
+        ctx.waitUntil(runFeedSlice(env, {
+          fetchImpl: ctx?.bankFeedFetchImpl || fetch,
+        }).catch(() => {}));
+      }
       return jsonResponse(result);
     }
 
@@ -1366,6 +1529,23 @@ export async function handleBankFeed(env, request, url, path, ctx) {
       }
       const body = await readJson(request);
       const assigned = await assignPlaidAccountEntity(env, body);
+      if (assigned.body?.changed && assigned.body?.replayed !== true && ctx?.waitUntil) {
+        // Resume only once every discovered account has an owner-confirmed
+        // scope. A status read after the committed assignment is advisory: if
+        // it is unavailable, keep the successful receipt and let the regular
+        // scheduled worker retry instead of turning a committed write into a
+        // misleading 503 response.
+        let readyToResume = false;
+        try {
+          const status = await plaidOwnerAccountStatus(env);
+          readyToResume = !status.unavailable && status.summary?.assignment_required === 0;
+        } catch {}
+        if (readyToResume) {
+          ctx.waitUntil(runFeedSlice(env, {
+            fetchImpl: ctx?.bankFeedFetchImpl || fetch,
+          }).catch(() => {}));
+        }
+      }
       return ownerJson(assigned.body, assigned.status);
     }
 

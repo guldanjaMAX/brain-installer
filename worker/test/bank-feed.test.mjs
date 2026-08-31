@@ -278,6 +278,11 @@ const refuses = (db, sql, params = []) => {
       try { bankFeedConfig(d1(freshDb(), { BANK_FEED_API_BASE: "http://x.invalid" })); return false; }
       catch (e) { return /must be https/.test(e.message); }
     })(), "");
+  check("a non-https browser SDK is refused before it can enter the connect page",
+    (() => {
+      try { bankFeedConfig(d1(freshDb(), { BANK_FEED_LINK_SDK_URL: "http://cdn.invalid/link.js" })); return false; }
+      catch (e) { return /SDK_URL must be https/.test(e.message); }
+    })(), "");
   check("SANDBOX IS THE DEFAULT, so an install can be rehearsed the same day",
     bankFeedConfig(d1(freshDb())).environment === "sandbox" &&
     bankFeedConfig(d1(freshDb(), { BANK_FEED_ENV: "production" })).environment === "production", "");
@@ -422,6 +427,7 @@ const refuses = (db, sql, params = []) => {
     csp.includes("script-src 'unsafe-inline' https://cdn.provider.invalid") &&
     csp.includes("connect-src 'self' https://sandbox.provider.invalid https://cdn.provider.invalid") &&
     csp.includes("default-src 'none'") && csp.includes("form-action 'none'") &&
+    csp.includes("frame-ancestors 'none'") &&
     !csp.includes("*"), csp);
   check("it tells the owner plainly what it cannot see and what the connection cannot do",
     /never sees your bank\s*\npassword/.test(html) && /cannot move money/.test(html), "");
@@ -429,6 +435,19 @@ const refuses = (db, sql, params = []) => {
     html.includes("oauth_state_id") && html.includes("receivedRedirectUri"), "");
   check("it persists a client retry identity before requesting a Link token",
     html.includes("bank_link_request_id") && html.includes("request_id: linkRequestId()"), "");
+  check("every page API call carries the companion app header required beside the passkey cookie",
+    html.includes('"X-Brain-App": "1"'), "");
+  check("it exposes the masked account-assignment workflow and preserves assignment retry identities",
+    html.includes('/api/bank-feed/accounts') && html.includes('/api/bank-feed/accounts/assign') &&
+    html.includes('bank_assignment_request:'), "");
+  check("provider and database text is rendered as text rather than executable markup",
+    !html.includes("innerHTML") && html.includes("textContent") && html.includes("replaceChildren"), "");
+  const inlineScripts = [...html.matchAll(/<script(?: [^>]*)?>([\s\S]*?)<\/script>/g)]
+    .map((match) => match[1]).filter(Boolean);
+  let inlineScriptParses = inlineScripts.length === 1;
+  try { if (inlineScriptParses) Function(inlineScripts[0]); } catch { inlineScriptParses = false; }
+  check("the complete inline owner-page JavaScript parses before a field browser sees it",
+    inlineScriptParses, `inline scripts: ${inlineScripts.length}`);
 }
 
 /* ============ authorising, and NOT loading two years inline ============ */

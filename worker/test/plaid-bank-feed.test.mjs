@@ -247,6 +247,131 @@ class MultiEntityPlaidFake extends PlaidSandboxFake {
   }
 }
 
+test("bank connect navigation accepts the owner cookie while every API still requires the app header", async () => {
+  const fixture = await createProductFixture({
+    env: {
+      BANK_FEED_PROVIDER: "plaid",
+      BANK_FEED_ENV: "sandbox",
+      BANK_FEED_CLIENT_ID: "fixture-client-id",
+      BANK_FEED_SECRET: "fixture-secret",
+      BANK_FEED_WRAPPING_KEY_V2: `v2.${"A".repeat(43)}`,
+      BRAIN_NAME: "Sandbox Brain",
+    },
+  });
+  try {
+    const ownerHeaders = await fixture.ownerHeaders();
+    const navigationHeaders = { Cookie: ownerHeaders.Cookie };
+    const pageUrl = new URL("https://brain.invalid/app/connect/bank");
+    const page = await handleBankFeed(fixture.env, new Request(pageUrl, {
+      headers: navigationHeaders,
+    }), pageUrl, pageUrl.pathname, {});
+    assert.equal(page.status, 200);
+    assert.match(page.headers.get("cache-control"), /private, no-store/);
+    assert.equal(page.headers.get("x-frame-options"), "DENY");
+    assert.match(page.headers.get("content-security-policy"), /frame-ancestors 'none'/);
+    const html = await page.text();
+    assert.match(html, /X-Brain-App/);
+    assert.match(html, /Choose where each account belongs/);
+
+    const accountsUrl = new URL("https://brain.invalid/api/bank-feed/accounts");
+    const cookieOnlyApi = await handleBankFeed(fixture.env, new Request(accountsUrl, {
+      headers: navigationHeaders,
+    }), accountsUrl, accountsUrl.pathname, {});
+    assert.equal(cookieOnlyApi.status, 401);
+    assert.equal((await cookieOnlyApi.json()).code, "session_required");
+
+    const authenticatedApi = await handleBankFeed(fixture.env, new Request(accountsUrl, {
+      headers: ownerHeaders,
+    }), accountsUrl, accountsUrl.pathname, {});
+    assert.equal(authenticatedApi.status, 200);
+    assert.deepEqual((await authenticatedApi.json()).accounts, []);
+
+    const scopedHeaders = await fixture.ownerHeaders({ grantId: "grant-fixture" });
+    const scopedPage = await handleBankFeed(fixture.env, new Request(pageUrl, {
+      headers: { Cookie: scopedHeaders.Cookie },
+    }), pageUrl, pageUrl.pathname, {});
+    assert.equal(scopedPage.status, 403);
+    assert.match(await scopedPage.text(), /Only the owner/);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("the final owner account assignment immediately resumes the staged Plaid import", async () => {
+  const fixture = await createProductFixture({
+    env: {
+      BANK_FEED_PROVIDER: "plaid",
+      BANK_FEED_ENV: "sandbox",
+      BANK_FEED_CLIENT_ID: "fixture-client-id",
+      BANK_FEED_SECRET: "fixture-secret",
+      BANK_FEED_WRAPPING_KEY_V2: `v2.${"A".repeat(43)}`,
+      BRAIN_NAME: "Sandbox Brain",
+    },
+  });
+  const provider = new PlaidSandboxFake();
+  const fetchImpl = provider.fetch.bind(provider);
+  const stamp = "2026-08-30T13:00:00.000Z";
+  try {
+    seedOwnedEntity(fixture, "fixture-company", "Fixture Company");
+    const link = await createPlaidLinkToken(fixture.env, {
+      url: "https://brain.invalid/app/connect/bank",
+      sessionRef: "assignment-resume-link-0001",
+      fetchImpl,
+      now: stamp,
+    });
+    await completePlaidLink(fixture.env, {
+      sessionRef: link.session_ref,
+      publicToken: "public-sandbox-once",
+      fetchImpl,
+      now: stamp,
+    });
+    const staged = await runPlaidFeedSlice(fixture.env, { maxItems: 1, fetchImpl, now: stamp });
+    assert.equal(staged.items[0].status, "assignment_required");
+    assert.equal(fixture.first("SELECT COUNT(*) AS n FROM fin_transactions").n, 0);
+    const accountRef = fixture.first(
+      "SELECT account_ref FROM plaid_account_entity_assignments WHERE item_ref='item-sandbox-1'",
+    ).account_ref;
+    const ownerHeaders = await fixture.ownerHeaders();
+    const assignUrl = new URL("https://brain.invalid/api/bank-feed/accounts/assign");
+    const assignmentBody = {
+      request_id: "assignment-resume-request-0001",
+      account_ref: accountRef,
+      entity_slug: "fixture-company",
+    };
+    const background = [];
+    const response = await handleBankFeed(fixture.env, new Request(assignUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...ownerHeaders },
+      body: JSON.stringify(assignmentBody),
+    }), assignUrl, assignUrl.pathname, {
+      bankFeedFetchImpl: fetchImpl,
+      waitUntil(promise) { background.push(Promise.resolve(promise)); },
+    });
+    assert.equal(response.status, 201);
+    assert.equal(background.length, 1);
+    const replayBackground = [];
+    const replay = await handleBankFeed(fixture.env, new Request(assignUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...ownerHeaders },
+      body: JSON.stringify(assignmentBody),
+    }), assignUrl, assignUrl.pathname, {
+      bankFeedFetchImpl: fetchImpl,
+      waitUntil(promise) { replayBackground.push(Promise.resolve(promise)); },
+    });
+    assert.equal(replay.status, 200);
+    assert.equal((await replay.json()).replayed, true);
+    assert.equal(replayBackground.length, 0);
+    await Promise.all(background);
+    assert.equal(fixture.first("SELECT cursor FROM bank_feed_items WHERE item_ref='item-sandbox-1'").cursor, "complete-1");
+    assert.equal(fixture.first("SELECT COUNT(*) AS n FROM fin_transactions").n, 2);
+    assert.equal(fixture.first(
+      "SELECT entity_slug FROM fin_accounts WHERE external_ref='account-1'",
+    ).entity_slug, "fixture-company");
+  } finally {
+    fixture.close();
+  }
+});
+
 test("Plaid durable runtime closes response-loss, sync, webhook, fallback, and revocation boundaries", async () => {
   const fixture = await createProductFixture({
     env: {
@@ -680,11 +805,16 @@ test("empty Transactions Sync stays partial through NOT_READY and INITIAL provid
       "SELECT account_ref FROM plaid_account_entity_assignments WHERE item_ref='item-sandbox-1'",
     ).account_ref;
     const ownerHeaders = await fixture.ownerHeaders();
-    const assigned = await fixture.post("/api/bank-feed/accounts/assign", {
-      request_id: "empty-history-assignment-0001",
-      account_ref: accountRef,
-      entity_slug: "fixture-company",
-    }, ownerHeaders);
+    const assignUrl = new URL("https://brain.invalid/api/bank-feed/accounts/assign");
+    const assigned = await handleBankFeed(fixture.env, new Request(assignUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...ownerHeaders },
+      body: JSON.stringify({
+        request_id: "empty-history-assignment-0001",
+        account_ref: accountRef,
+        entity_slug: "fixture-company",
+      }),
+    }), assignUrl, assignUrl.pathname, {});
     assert.equal(assigned.status, 201);
 
     const notReady = await syncPlaidItem(fixture.env, "item-sandbox-1", { fetchImpl, now: stamp });
@@ -798,10 +928,17 @@ test("scheduled promotion keeps two Plaid accounts in their exact owner-confirme
     );
     const byProvider = Object.fromEntries(refs.map((row) => [row.provider_account_id, row.account_ref]));
     const ownerHeaders = await fixture.ownerHeaders();
-    const assign = (requestId, accountRef, entitySlug) => fixture.post(
-      "/api/bank-feed/accounts/assign",
-      { request_id: requestId, account_ref: accountRef, entity_slug: entitySlug },
-      ownerHeaders,
+    const assignUrl = new URL("https://brain.invalid/api/bank-feed/accounts/assign");
+    const assign = (requestId, accountRef, entitySlug) => handleBankFeed(
+      fixture.env,
+      new Request(assignUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...ownerHeaders },
+        body: JSON.stringify({ request_id: requestId, account_ref: accountRef, entity_slug: entitySlug }),
+      }),
+      assignUrl,
+      assignUrl.pathname,
+      {},
     );
 
     const closed = await assign(

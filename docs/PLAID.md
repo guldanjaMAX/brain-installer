@@ -48,8 +48,15 @@ The setup order is:
    credential.
 5. Run `brain doctor <manifest>`. It prints the exact return and signed webhook
    URLs and refuses a Plaid endpoint override.
-6. The account holder signs in to the Brain, opens the bank connection page,
-   and completes Link themselves.
+6. Run `brain connect bank <manifest>`. The CLI reads only the saved manifest,
+   checks that the exact return address is recorded, and prints the owner URL
+   without reading a credential or calling a Plaid API. It then opens the page
+   when the desktop permits; that browser page loads Plaid's Link SDK. Use
+   `--print` for a fully offline command that leaves the link for the owner to
+   open themselves.
+7. The account holder signs in to the Brain, completes Link themselves, and
+   assigns each masked account to the business that owns it. Transactions stay
+   staged until every discovered account has an owner-confirmed scope.
 
 No Plaid credential belongs in the manifest, shell history, source tree, log,
 status response, support artifact, or recovery artifact.
@@ -59,6 +66,11 @@ status response, support artifact, or recovery artifact.
 - Initial Link requests only `transactions`, with up to 730 days requested.
 - The Link page's Content Security Policy permits the pinned SDK origin and only
   the API origin for the selected Sandbox or Production environment.
+- A normal top-level page navigation is authorized by the signed owner session
+  cookie because browsers cannot add application headers to address-bar
+  navigation. Every page API request still requires both that cookie and
+  `X-Brain-App: 1`. The page renders provider labels as text, never executable
+  markup.
 - Update mode supplies the existing access token and omits `products`,
   `transactions`, and other product-specific parameters. A successful update
   keeps the existing access token and does not exchange a public token. The
@@ -89,6 +101,10 @@ status response, support artifact, or recovery artifact.
   a second owner activity event. Neither route accepts the admin key as a
   fallback or returns Item, provider-account, ledger-account, or transaction
   identifiers.
+- The browser preserves one assignment request ID until a successful response.
+  A retry after a lost response therefore returns the one stored receipt and
+  one activity event. The final required assignment immediately resumes the
+  staged import; earlier assignments do not start a partially scoped promotion.
 - `TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION` discards the staged attempt and
   restarts from that original cursor.
 - An empty page is not historical-completion evidence. The exact Plaid state is

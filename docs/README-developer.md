@@ -1135,6 +1135,12 @@ live Sandbox runner, and remaining owner ceremony are documented in
 Production, a real institution, or the owner's primary bank has been tested.
 Plaid account scope is owner-confirmed per masked account. An Item-level
 `entity_slug` is never authority and no account defaults to `primary`.
+`brain connect bank <manifest>` performs a deliberately manifest-only readiness
+check. It refuses a missing or malformed saved hostname and an unrecorded
+provider redirect before best-effort browser launch. The CLI does not resolve a
+Cloudflare account, inspect a secret, call the Worker, or call a Plaid API. An
+opened browser page does load Plaid's Link SDK. `--print` is the fully offline,
+agent-safe form.
 
 The QuickBooks company-binding, sandbox callback, broad-scope disclosure,
 production refusal, and next Intuit field gate are documented in

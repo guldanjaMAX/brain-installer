@@ -89,7 +89,7 @@ async function ingestLib() {
 async function ingestOcrLib() {
   return await import("./ingest/ocr.mjs");
 }
-import { authorize, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
+import { authorize, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT, openBrowser } from "./connectors/google-auth.mjs";
 import {
   redact as redactConfirmedSecrets,
   scanEnvelope as scanEnvelopeSecrets,
@@ -108,6 +108,7 @@ import {
 import {
   runAll as doctorRunAll,
   summarize as doctorSummarize,
+  bankFeedRedirectUri,
   checkBankFeedRedirect,
   checkClaudeCode,
   checkNode,
@@ -10535,9 +10536,65 @@ async function cmdReconcile(target) {
  * so one vendor-owned OAuth client serving many customers would require Google
  * verification plus a paid annual CASA security assessment.
  */
+export async function cmdConnectBank(manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die("usage: brain connect bank <manifest> [--print]");
+  }
+  const unknownFlags = Object.keys(flags).filter((key) => key !== "print");
+  if (unknownFlags.length) die(`brain connect bank does not recognize --${unknownFlags[0]}`);
+  if (flags.print !== undefined && flags.print !== true) {
+    die("--print is a switch and does not take a value. Put it at the end of the command.");
+  }
+  const { m } = loadManifest(manifestPath);
+  const feed = m?.corpora?.bank_feed || {};
+  if (feed.enabled !== true) {
+    die("corpora.bank_feed.enabled is not true in this manifest. Enable the Plaid bank feed before opening its owner page.");
+  }
+  if (String(feed.provider || "").toLowerCase() !== "plaid") {
+    die("brain connect bank currently opens the reviewed Plaid owner flow. Set corpora.bank_feed.provider to plaid first.");
+  }
+  const domainValue = String(m?.brain?.domain || "").trim();
+  if (!domainValue) {
+    die("this Brain has no saved address yet. Run brain deploy first, then rerun brain connect bank.");
+  }
+  let domainUrl;
+  try {
+    domainUrl = new URL(domainValue.includes("://") ? domainValue : `https://${domainValue}`);
+  } catch {
+    die("brain.domain is not a valid deployed HTTPS hostname. Run brain doctor before opening the bank page.");
+  }
+  if (domainUrl.protocol !== "https:" || domainUrl.username || domainUrl.password || domainUrl.port ||
+      domainUrl.pathname !== "/" || domainUrl.search || domainUrl.hash) {
+    die("brain.domain must be one HTTPS hostname with no port, path, sign-in value, query, or fragment.");
+  }
+  const redirectCheck = checkBankFeedRedirect(m);
+  if (redirectCheck.status !== D_OK) {
+    die(
+      `${redirectCheck.detail}.\n` +
+      `      ${redirectCheck.fix || "Run brain doctor and finish the bank return-address setup first."}`
+    );
+  }
+  const url = bankFeedRedirectUri(domainUrl.host);
+  const shouldOpen = flags.print !== true && options.open !== false;
+  const opener = options.openImpl ?? openBrowser;
+  let opened = false;
+  if (shouldOpen) {
+    try { opened = opener(url) === true; } catch { opened = false; }
+  }
+
+  if (opened) ok("opened the owner-only bank connection page in the browser");
+  else if (shouldOpen) warn("the browser did not open automatically. Use the link below in the owner's browser.");
+  else info("browser opening was skipped. Use the owner-only link below when the account holder is ready.");
+  console.log(`\n  ${url}\n`);
+  info("The owner signs in with their Brain passkey, completes Plaid Link, and assigns each masked account to the business that owns it.");
+  info("Opening this page does not enter a Plaid credential, contact a bank, or prove the connector until the owner continues in the browser.");
+  return { provider: "plaid", url, opened, live_provider_proof: false };
+}
+
 async function cmdConnect(target) {
   const flags = parseFlags(process.argv.slice(3));
   const which = (target || "").toLowerCase();
+  if (which === "bank") return cmdConnectBank(process.argv[4], flags);
   if (which === "imessage") return cmdConnectImessage(process.argv[4], flags);
   if (which === "whatsapp") return cmdConnectWhatsapp(process.argv[4], flags);
   if (which === "zoom") return cmdConnectZoom(process.argv[4], flags);
@@ -10545,8 +10602,9 @@ async function cmdConnect(target) {
   if (PROVIDER_CONNECTOR_IDS.includes(which)) return cmdConnectProvider(which, process.argv[4], flags);
   if (which !== "google") {
     die(
-      "brain connect supports google, imap, imessage, whatsapp, zoom, quickbooks, slack, notion, microsoft, dropbox and hubspot.\n" +
-        "  Usage: brain connect google --scopes drive,gmail,calendar\n" +
+      "brain connect supports bank, google, imap, imessage, whatsapp, zoom, quickbooks, slack, notion, microsoft, dropbox and hubspot.\n" +
+        "  Usage: brain connect bank <manifest>\n" +
+        "         brain connect google --scopes drive,gmail,calendar\n" +
         "         brain connect imap <manifest> --host imap.example.com --user you@example.com\n" +
         "         brain connect imessage <manifest>\n" +
         "         brain connect whatsapp <manifest> --accept-risk\n" +
@@ -16482,6 +16540,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain connect zoom     <manifest>      Zoom cloud-recording transcripts (needs a paid Zoom seat)
     brain connect imap     <manifest>      any IMAP mailbox (Yahoo, Fastmail, iCloud, a host): app
                                            password entered hidden, proven by a real read first
+    brain connect bank     <manifest>      open the owner-only Plaid Link and masked account assignment page
     brain connect <provider> <manifest>    QuickBooks, Slack, Notion, Microsoft, Dropbox or HubSpot OAuth
     brain connectors [--rehearse]         exact installed boundary and credential-free adapter proof
     brain load       <manifest>            load EVERYTHING this manifest has: one sweep of every

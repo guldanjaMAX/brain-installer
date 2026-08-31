@@ -6,6 +6,12 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## 0.2.1
 
+- Plaid setup now has one owner handoff command. `brain connect bank <manifest>`
+  checks the recorded return address without using a credential or network
+  call, then opens the owner-only Link page. The page works as a normal browser
+  navigation, keeps every API behind the passkey session plus app header, shows
+  only masked accounts, preserves retry identities after lost responses, and
+  resumes loading after the final business assignment.
 - A first load no longer turns partial evidence into a green setup. Corrupt or
   truncated exports, unreadable files, parser limits, partial provider pages,
   mixed Calendar failures, and incomplete Drive visibility keep both the direct
