@@ -506,6 +506,7 @@ const expected = [
   "worker/src/lib/quickbooks-oauth-callback.js",
   "worker/src/lib/reliability-alerts.js",
   "worker/src/lib/remember-contract.js",
+  "worker/src/lib/source-receipt.js",
   "worker/src/lib/ocr.js",
   "worker/src/lib/owner-auth.js",
   "worker/src/lib/owner-bank-import.js",
