@@ -219,6 +219,7 @@ globalThis.fetch = async (input, options = {}) => {
       evidence.last_final_receipt = {
         status: receipt.status,
         walk_complete: receipt.walk_complete,
+        issue_code: receipt.issue_code || null,
         error: receipt.error || null,
         detail: receipt.detail || null,
       };

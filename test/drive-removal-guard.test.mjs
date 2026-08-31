@@ -810,7 +810,9 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     assert.deepEqual(evidence.receipts, { indexing: 1, error: 1, ready: 0 });
     assert.equal(evidence.last_final_receipt.status, "error");
     assert.equal(evidence.last_final_receipt.walk_complete, false);
-    assert.match(evidence.last_final_receipt.error, /1 incomplete extraction/i);
+    assert.equal(evidence.last_final_receipt.issue_code, "EXTRACTION_FAILED");
+    assert.equal(evidence.last_final_receipt.error, null,
+      "raw extraction detail must not cross the source-receipt boundary");
 
     // The accepted revision is cheap to resume but must remain visibly partial
     // until a future complete extraction replaces its stored marker.
