@@ -151,7 +151,8 @@ kit is an optional supervised-pilot overlay, not a universal prerequisite.
   chat.
 - If the manifest selects production, preserve
   `quickbooks_production_callback_unavailable` and stop. The client-owned HTTPS
-  callback is not implemented, and an API key cannot replace Intuit OAuth.
+  callback core is implemented but is not connected to this installer ceremony
+  or field-approved yet. An API key cannot replace Intuit OAuth.
 - Confirm that the returned company binding matches the explicit source. A
   different company needs a separate source and cannot silently replace the
   existing one.

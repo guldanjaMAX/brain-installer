@@ -73,8 +73,10 @@ the brain, not for whoever built it: what changed for them, and what to check.
 - QuickBooks Sandbox connections bind the authorized company to one explicit
   source and keep company identifiers out of receipts. Books-to-bank and
   human-confirmed tax comparisons preserve both sources and never make
-  QuickBooks financial authority. Production OAuth remains unavailable until a
-  client-owned HTTPS callback is implemented and field-tested.
+  QuickBooks financial authority. The client-owned HTTPS callback core is now
+  restart-safe and locally tested, but Production OAuth remains unavailable
+  until the CLI wiring, client hostname, Cloudflare logging review, and Intuit
+  field acceptance are complete.
 
 - Plaid bank connections now keep historical loading visibly partial until
   Plaid confirms the historical update, verify update-mode health before saying

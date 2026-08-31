@@ -424,8 +424,10 @@ guessing which rotating token is current.
 An older unbound QuickBooks credential must complete one sandbox reconnect
 before ingest; the connector reports `source_binding_missing` rather than
 guessing which company or source the old token represented.
-Production refuses before credential access or browser launch because it needs
-a client-owned HTTPS callback and single-use local handoff. See
+Production refuses before credential access or browser launch. The client-owned
+HTTPS callback and single-use local handoff core exist behind explicit gates,
+but the CLI token-exchange/save path, final hostname, Cloudflare logging review,
+and Intuit field acceptance remain open. See
 [QUICKBOOKS.md](./QUICKBOOKS.md) for the route contract, threat model, exact
 sandbox gate, refresh behavior, and disconnect retention semantics.
 
