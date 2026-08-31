@@ -69,6 +69,21 @@ test("structured and provider safety codes map to stable public recovery", () =>
   }, { command: "technician" }), "SAFETY_REVIEW_REQUIRED");
 });
 
+test("uncertain provider recovery never claims that nothing was applied", () => {
+  const code = supportErrorCode({
+    payload: {
+      issue_code: "NETWORK_UNREACHABLE",
+      outcome_unknown: true,
+      retry_safe: false,
+    },
+  }, { command: "technician" });
+  const rendered = renderSupportRecovery(supportRecovery(code));
+  assert.equal(code, "SAFETY_REVIEW_REQUIRED");
+  assert.match(rendered, /one-time provider result could not be confirmed/i);
+  assert.match(rendered, /Check its current state before trying it again/i);
+  assert.doesNotMatch(rendered, /nothing (?:beyond .* )?was applied/i);
+});
+
 test("the installed CLI explains a code in calm text or agent-readable JSON", () => {
   const text = spawnSync(process.execPath, [join(ROOT, "brain.mjs"), "support", "--explain", "AUTH_REQUIRED"], {
     cwd: ROOT,
