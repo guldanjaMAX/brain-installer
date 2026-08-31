@@ -230,6 +230,19 @@ npm audit --offline
 npm pack --dry-run --json --ignore-scripts
 ```
 
+The source-only orchestrator runs those checks together with the synthetic
+hiccup, Plaid, local D1 auth, passkey-protocol, package-hash, and installed CLI
+gates. It writes an aggregate private receipt and keeps every live action in a
+separate human checklist:
+
+```bash
+npm run field:prepare -- --expect-sha <reviewed-40-character-git-sha>
+```
+
+In a source checkout, see `docs/FIELD-PREPARE.md`. A passing receipt is offline preparation only. It
+does not prove a Cloudflare account, physical passkey, Plaid Sandbox,
+QuickBooks Sandbox, institution, customer corpus, or CI matrix.
+
 Run `node --check` on every changed JavaScript module. The full GitHub matrix
 must pass on Windows, macOS, and Linux with Node 22 and 24. That is six jobs.
 Local macOS success does not replace Windows and Linux evidence.

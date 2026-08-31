@@ -78,3 +78,8 @@ planning/
 # which IS committed; dist/ and node_modules are not.
 frontend/node_modules/
 frontend/dist/
+
+# Source-only field preparation writes aggregate synthetic proof here. The
+# directory is private machine-local evidence, never product source or package
+# content.
+.field-prepare/

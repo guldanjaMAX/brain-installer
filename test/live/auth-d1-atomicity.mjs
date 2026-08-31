@@ -10,7 +10,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,19 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
 const fixture = join(HERE, "fixtures", "auth-atomicity-worker.mjs");
 const migrations = join(ROOT, "migrations", "d1");
+const wranglerCli = join(ROOT, "node_modules", "wrangler", "bin", "wrangler.js");
+const expectedWranglerVersion = "4.127.1";
+const packageJson = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
+const packageLock = JSON.parse(readFileSync(join(ROOT, "package-lock.json"), "utf8"));
+assert.equal(packageJson.devDependencies?.wrangler, expectedWranglerVersion,
+  "Wrangler must remain an exact dev dependency");
+assert.equal(packageLock.packages?.["node_modules/wrangler"]?.version, expectedWranglerVersion,
+  "package-lock must pin the exact Wrangler used by this gate");
+assert.equal(existsSync(wranglerCli), true,
+  "run npm ci --ignore-scripts before the local D1 auth gate");
+const installedWrangler = JSON.parse(readFileSync(join(ROOT, "node_modules", "wrangler", "package.json"), "utf8"));
+assert.equal(installedWrangler.version, expectedWranglerVersion,
+  "installed Wrangler does not match the reviewed package lock");
 const temporary = mkdtempSync(join(tmpdir(), "brain-auth-d1-"));
 const persistence = join(temporary, "state");
 const config = join(temporary, "wrangler.jsonc");
@@ -32,7 +45,7 @@ const childEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) 
 
 function run(args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn("npx", ["--yes", "wrangler@4", ...args], {
+    const child = spawn(process.execPath, [wranglerCli, ...args], {
       cwd: ROOT, env: childEnv, stdio: options.stdio || ["ignore", "pipe", "pipe"],
     });
     let output = "";
@@ -82,8 +95,8 @@ try {
   ]);
 
   const port = await freePort();
-  dev = spawn("npx", [
-    "--yes", "wrangler@4", "dev", "--local", "--ip", "127.0.0.1",
+  dev = spawn(process.execPath, [wranglerCli,
+    "dev", "--local", "--ip", "127.0.0.1",
     "--port", String(port), "--persist-to", persistence, "--config", config,
   ], { cwd: ROOT, env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
   let devOutput = "";
