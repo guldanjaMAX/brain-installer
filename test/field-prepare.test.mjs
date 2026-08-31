@@ -22,7 +22,8 @@ test("the default profile contains every credential-free preparation gate", () =
   const options = parseFieldPrepareArgs([]);
   const ids = buildStepPlan(options).map((step) => step.id);
   assert.deepEqual(ids, [
-    "source-identity", "full-suite", "hiccup-lab", "plaid-fake",
+    "source-identity", "full-suite", "frontend-test", "frontend-build",
+    "hiccup-lab", "plaid-fake",
     "d1-auth-atomicity", "passkey-protocol", "package-privacy",
     "history-privacy", "dependency-audit", "package-build", "clean-prefix-smoke",
     "source-identity-final", "private-home-cleanup",
@@ -32,6 +33,8 @@ test("the default profile contains every credential-free preparation gate", () =
 test("fast and selected profiles cannot become accidental full proof", () => {
   const fast = buildStepPlan(parseFieldPrepareArgs(["--fast"])).map((step) => step.id);
   assert.ok(fast.includes("focused-suite"));
+  assert.ok(fast.includes("frontend-test"));
+  assert.ok(fast.includes("frontend-build"));
   assert.ok(fast.includes("hiccup-lab-fast"));
   assert.ok(fast.includes("package-privacy-fast"));
   assert.ok(!fast.includes("full-suite"));

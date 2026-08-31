@@ -74,6 +74,26 @@ jobs:
       - name: install
         run: npm ci --ignore-scripts
 
+      # The browser installer, Settings update notice, owner workspace, and
+      # connector recovery states live in a separate React dependency graph.
+      # Backend tests cannot prove that graph compiles or that its interaction
+      # contracts still pass, so install and exercise it explicitly.
+      - name: install owner app
+        run: npm ci --prefix frontend --ignore-scripts
+
+      - name: owner app tests
+        run: npm --prefix frontend test
+
+      # build-to-worker.mjs must reproduce the reviewed tracked bundle exactly.
+      # A dirty diff means the shipped Worker UI is stale even if React tests
+      # passed against newer source files.
+      - name: owner app production bundle parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix frontend run build
+          git diff --exit-code -- worker/src/lib/app-assets.js
+
       # Fresh random bytes exercise 25 protect/unprotect round trips through one
       # private process-scoped compiled helper, followed by exact captured-identity
       # cleanup. The wrapper emits stable stage codes and counts only, never input,

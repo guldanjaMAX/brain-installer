@@ -32,6 +32,8 @@ const IS_WINDOWS = process.platform === "win32";
 const WRANGLER_PACKAGE = "wrangler@4.127.1";
 const FULL_PROFILE = Object.freeze([
   "full-suite",
+  "frontend-test",
+  "frontend-build",
   "hiccup-lab",
   "plaid-fake",
   "d1-auth-atomicity",
@@ -44,6 +46,8 @@ const FULL_PROFILE = Object.freeze([
 ]);
 const FAST_PROFILE = Object.freeze([
   "focused-suite",
+  "frontend-test",
+  "frontend-build",
   "hiccup-lab-fast",
   "plaid-fake",
   "d1-auth-atomicity",
@@ -76,6 +80,14 @@ const STEP_CATALOG = Object.freeze({
   "focused-suite": commandStep(
     "focused-suite", "Field harness contract tests", process.execPath,
     ["test/field-prepare.test.mjs"], "Fast source-harness contract proof.",
+  ),
+  "frontend-test": npmStep(
+    "frontend-test", "Owner app test suite", ["--prefix", "frontend", "test"],
+    "The exact owner app source passes its Vitest interaction and state-contract suite.",
+  ),
+  "frontend-build": npmStep(
+    "frontend-build", "Owner app production bundle parity", ["--prefix", "frontend", "run", "build"],
+    "The exact owner app builds and reproduces the reviewed Worker asset bundle without changing the source tree.",
   ),
   "hiccup-lab": commandStep(
     "hiccup-lab", "Complete synthetic customer hiccup lab", process.execPath,
