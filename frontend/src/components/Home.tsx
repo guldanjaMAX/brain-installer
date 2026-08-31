@@ -11,6 +11,7 @@ import {
 } from "./ui";
 import { FinanceScopeBar, useFinanceScope } from "./FinanceScope";
 import { OwnerActivity } from "./OwnerActivity";
+import { CustomizedTasks } from "./CustomizedTasks";
 
 const FIN_SECTIONS = [
   "accounts", "documents", "deadlines", "exceptions", "reconciliations", "obligations", "cash",
@@ -31,7 +32,7 @@ const FIN_LABELS: Record<string, string> = {
  * gaps. It never promotes installer commands into owner actions, and it does
  * not claim a ranked action list because the ledger has no common consequence
  * score, snooze state, or owner model across every collection. */
-export function Home() {
+export function Home({ onExplore }: { onExplore: (question?: string) => void }) {
   const { scope, entities, activeLabel } = useFinanceScope();
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [systemLoaded, setSystemLoaded] = useState(false);
@@ -80,12 +81,24 @@ export function Home() {
   return (
     <div aria-busy={!systemLoaded || financeBusy}>
       <FinanceScopeBar />
-      <header className="max-w-3xl">
+      <header className="max-w-4xl rounded-3xl border border-line bg-card px-5 py-6 sm:px-7 sm:py-7 shadow-[0_16px_44px_rgba(42,35,27,0.06)]">
         <p className="eyebrow">Owner view</p>
-        <h1 className="page-title">What deserves your attention</h1>
-        <p className="page-intro">
-          Current records, visible gaps, and the evidence behind each answer for {activeLabel}.
-        </p>
+        <div className="mt-1 flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
+          <div className="min-w-0">
+            <h1 className="page-title">Your financial life, in one clear view</h1>
+            <p className="mt-3 text-[13px] uppercase tracking-[0.09em] text-ink-soft">
+              Viewing <span className="font-semibold text-ink normal-case tracking-normal">{activeLabel}</span>
+            </p>
+            <p className="page-intro mt-2">
+              Current records, visible gaps, and the evidence behind each answer.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3 lg:w-[30rem]" aria-label="Home shortcuts">
+            <HeroButton onClick={() => onExplore()}>Explore</HeroButton>
+            <HeroButton onClick={() => scrollToSection("home-customized-tasks")}>Customized Tasks</HeroButton>
+            <HeroButton onClick={() => scrollToSection("home-priorities")}>Review Priorities</HeroButton>
+          </div>
+        </div>
       </header>
 
       <div className="mt-6 max-w-3xl">
@@ -128,10 +141,16 @@ export function Home() {
         <OwnerActivity />
       </div>
 
+      <div className="mt-7 max-w-3xl">
+        <CustomizedTasks scope={scope} activeLabel={activeLabel} onRun={onExplore} />
+      </div>
+
       {finance?.ledger_installed && !financeIsEmpty && (
         <div className="mt-7 grid gap-7 lg:grid-cols-[minmax(0,1.35fr)_minmax(19rem,0.85fr)] lg:items-start">
           <div>
-            <AttentionList snapshot={finance} entities={entities} scopeName={activeLabel} />
+            <div id="home-priorities" className="scroll-mt-24">
+              <AttentionList snapshot={finance} entities={entities} scopeName={activeLabel} />
+            </div>
             <BusinessStanding snapshot={finance} entities={entities} scope={scope} />
           </div>
           <div>
@@ -249,10 +268,26 @@ function AttentionList({ snapshot, entities, scopeName }: {
         </Row>
       ))}
       {items.length > shown.length && (
-        <Note>{items.length - shown.length} more items are recorded in This Year and Add &amp; Review.</Note>
+        <Note>{items.length - shown.length} more items are recorded in This Year.</Note>
       )}
     </Section>
   );
+}
+
+function HeroButton({ onClick, children }: { onClick: () => void; children: string }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="min-h-11 rounded-xl border border-line bg-paper px-3 py-2.5 text-[13.5px] font-medium text-ink hover:border-accent hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+    >
+      {children}
+    </button>
+  );
+}
+
+function scrollToSection(id: string) {
+  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function Glance({ snapshot, scopeName }: { snapshot: FinSnapshot; scopeName: string }) {

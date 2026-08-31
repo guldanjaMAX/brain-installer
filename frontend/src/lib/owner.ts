@@ -20,7 +20,7 @@ export function validateOwnerUpload(
   if (!capabilities.supported_media_types.includes(mediaType)) {
     return {
       supported: false,
-      reason: "This file type is not accepted. Choose a supported text, PDF, Office, email, PNG, or JPEG file.",
+      reason: "This file type is not accepted. Choose a supported text, PDF, Office, email, PNG, or JPEG file. Nothing was uploaded.",
     };
   }
   if (!extension || !capabilities.media_type_extensions[mediaType]?.includes(extension)) {
@@ -29,9 +29,10 @@ export function validateOwnerUpload(
       reason: "The filename extension does not match the file type, so it was not uploaded.",
     };
   }
-  const limit = capabilities.media_type_max_bytes?.[mediaType] ?? (capabilities.binary_media_types.includes(mediaType)
-    ? capabilities.max_binary_bytes
-    : capabilities.max_content_bytes);
+  const binaryTypes = capabilities.binary_media_types || [];
+  const limit = capabilities.media_type_max_bytes?.[mediaType]
+    ?? (binaryTypes.includes(mediaType) ? capabilities.max_binary_bytes : capabilities.max_content_bytes)
+    ?? capabilities.max_content_bytes;
   if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > limit) {
     return {
       supported: false,

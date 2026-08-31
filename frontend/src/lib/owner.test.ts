@@ -25,6 +25,18 @@ const capabilities: OwnerUploadCapabilities = {
   scanned_pdf_ocr_supported: false,
 };
 
+/** A Brain that reports text-only uploads, which is what a v0.2.0 install
+ *  reports today. Binary types stay closed until the install declares them. */
+const textOnlyCapabilities: OwnerUploadCapabilities = {
+  ...capabilities,
+  supported_media_types: ["text/plain", "text/markdown"],
+  binary_media_types: [],
+  supported_extensions: [".txt", ".md", ".markdown"],
+  media_type_extensions: { "text/plain": [".txt"], "text/markdown": [".md", ".markdown"] },
+  max_binary_bytes: undefined,
+  media_type_max_bytes: { "text/plain": 1_000_000, "text/markdown": 1_000_000 },
+};
+
 describe("owner upload boundary", () => {
   it("accepts only an exact backend-declared MIME and extension pair", () => {
     expect(validateOwnerUpload({ name: "notes.md", type: "text/markdown", size: 12 }, capabilities)).toEqual({ supported: true, mediaType: "text/markdown" });
@@ -60,6 +72,26 @@ describe("owner upload boundary", () => {
       arrayBuffer: async () => bytes.buffer,
     } as unknown as File;
     await expect(readOwnerTextFile(file, capabilities)).rejects.toThrow(/not valid UTF-8/);
+  });
+
+  it("opens binary documents only when the installed Brain declares the exact capability", async () => {
+    const documentCapabilities: OwnerUploadCapabilities = {
+      ...capabilities,
+      supported_media_types: [...capabilities.supported_media_types, "application/pdf"],
+      binary_media_types: ["application/pdf"],
+      supported_extensions: [...capabilities.supported_extensions, ".pdf"],
+      media_type_extensions: { ...capabilities.media_type_extensions, "application/pdf": [".pdf"] },
+      max_binary_bytes: 10,
+      media_type_max_bytes: { "application/pdf": 10 },
+    };
+    const bytes = Uint8Array.from([0x25, 0x50, 0x44, 0x46]);
+    const file = {
+      name: "receipt.pdf", type: "application/pdf", size: bytes.byteLength,
+      arrayBuffer: async () => bytes.buffer,
+    } as unknown as File;
+    await expect(readOwnerUploadFile(file, documentCapabilities)).resolves.toEqual({ content_base64: "JVBERg==" });
+    expect(validateOwnerUpload({ name: "receipt.pdf", type: "application/pdf", size: 11 }, documentCapabilities).supported).toBe(false);
+    expect(validateOwnerUpload({ name: "receipt.pdf", type: "application/pdf", size: 4 }, textOnlyCapabilities).supported).toBe(false);
   });
 
   it("requires a common-ingestion identity and action before calling a request uploaded", () => {
