@@ -1140,11 +1140,16 @@ function mkSourceFamilyEnv(documents, extra = {}) {
     `${legacyGet.status} ${legacyGet.headers.get("cache-control") || "missing"}`);
 
   const failed = await call(mkSourceFamilyEnv([], {
-    DB: { prepare() { throw new Error("fixture inventory failure"); } },
+    DB: { prepare() { throw new Error("RAW_WORKER_500_INVENTORY_SENTINEL"); } },
   }).env, "/api/admin/brain/source-families?source=drive");
+  const failedBody = await failed.json();
   check("source-family failure responses cannot be cached",
     failed.status === 500 && /no-store/.test(failed.headers.get("cache-control") || ""),
     `${failed.status} ${failed.headers.get("cache-control") || "missing"}`);
+  check("source-family failures expose a stable code, not exception detail",
+    failedBody.error === "unavailable" && failedBody.code === "internal_error" &&
+      !JSON.stringify(failedBody).includes("RAW_WORKER_500_INVENTORY_SENTINEL"),
+    JSON.stringify(failedBody));
 
   const max = await call(env, "/api/admin/brain/source-families?source=drive&limit=1000");
   check("the documented 1000-family page limit is accepted with one lookahead row",
@@ -1177,11 +1182,34 @@ function mkSourceFamilyEnv(documents, extra = {}) {
 
   const failedDocuments = await call({
     STORAGE: "d1", ADMIN_KEY: "k",
-    DB: { prepare() { throw new Error("fixture documents failure"); } },
+    DB: { prepare() { throw new Error("RAW_WORKER_500_DOCUMENTS_SENTINEL"); } },
   }, "/api/admin/brain/documents");
+  const failedDocumentsBody = await failedDocuments.json();
   check("private aggregate inventory failures cannot be cached",
     failedDocuments.status === 500 && /no-store/.test(failedDocuments.headers.get("cache-control") || ""),
     `${failedDocuments.status} ${failedDocuments.headers.get("cache-control") || "missing"}`);
+  check("aggregate inventory failures expose a stable code, not exception detail",
+    failedDocumentsBody.error === "unavailable" && failedDocumentsBody.code === "internal_error" &&
+      !JSON.stringify(failedDocumentsBody).includes("RAW_WORKER_500_DOCUMENTS_SENTINEL"),
+    JSON.stringify(failedDocumentsBody));
+
+  const partial = mkEnv([{
+    source_type: "meeting", stored_documents: 1, logical_documents: 1,
+    total: 1, embedded: 0, last_ingest_at: 1750000000000,
+  }]);
+  const originalPrepare = partial.env.DB.prepare.bind(partial.env.DB);
+  partial.env.DB.prepare = (sql) => {
+    if (/FROM vector_outbox o/.test(sql)) throw new Error("RAW_VECTOR_BACKLOG_SENTINEL");
+    return originalPrepare(sql);
+  };
+  partial.env.VECTORIZE.describe = async () => { throw new Error("RAW_VECTOR_READINESS_SENTINEL"); };
+  const partialResponse = await call(partial.env, "/api/admin/brain/documents");
+  const partialBody = await partialResponse.json();
+  check("partial inventory failures use stable section codes without raw detail",
+    partialResponse.status === 200 &&
+      partialBody.vector_backlog?.code === "vector_backlog_unavailable" &&
+      partialBody.vector_readiness?.code === "vector_readiness_unavailable" &&
+      !JSON.stringify(partialBody).includes("RAW_VECTOR_"), JSON.stringify(partialBody));
 }
 
 {

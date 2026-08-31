@@ -1685,15 +1685,19 @@ async function handleDocuments(env) {
     // has to be visible rather than inferred from search feeling worse.
     try {
       out.vector_backlog = await outboxDepth(env);
-    } catch (e) {
-      out.vector_backlog = { error: e.message };
+    } catch {
+      out.vector_backlog = { error: "unavailable", code: "vector_backlog_unavailable" };
     }
     // Queue depth proves work is durable; readiness proves accepted async
     // mutations are actually visible to Vectorize queries. Both are required.
     try {
       out.vector_readiness = await vectorReadiness(env);
-    } catch (e) {
-      out.vector_readiness = { ready: false, error: e.message };
+    } catch {
+      out.vector_readiness = {
+        ready: false,
+        error: "unavailable",
+        code: "vector_readiness_unavailable",
+      };
     }
   }
   return jsonResponse(out);
@@ -2226,13 +2230,14 @@ export default {
         });
       }
       return jsonResponse({ error: "not found" }, 404);
-    } catch (e) {
-      const response = jsonResponse({ error: e.message }, 500);
-      if (path === "/api/admin/brain/source-families" ||
-          path === "/api/admin/brain/documents") {
-        return privateNoStore(response);
-      }
-      return response;
+    } catch {
+      // Exceptions can carry SQL, provider text, source identities, or paths.
+      // The authenticated client gets one stable recovery identity instead;
+      // detailed operational investigation stays inside the owner's account.
+      return privateNoStore(jsonResponse({
+        error: "unavailable",
+        code: "internal_error",
+      }, 500));
     }
   },
 

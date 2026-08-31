@@ -137,7 +137,7 @@ export async function handleOcr(env, request) {
     if (error?.llm_cap_exceeded) {
       return jsonResponse({
         error: "OCR stopped because the daily estimated-spend budget could not reserve this page",
-        detail: String(error.message || error).slice(0, 300),
+        code: "ocr_budget_exceeded",
         llm_cap_exceeded: true,
         spend_guard_degraded: error.spend_guard_degraded === true || undefined,
       }, 429);
@@ -145,22 +145,20 @@ export async function handleOcr(env, request) {
     if (error?.spend_guard_unavailable) {
       return jsonResponse({
         error: "OCR paused because the spend reservation ledger is unavailable",
-        detail: String(error.message || error).slice(0, 300),
+        code: "ocr_spend_guard_unavailable",
         spend_guard_unavailable: true,
       }, 503);
     }
     if (error?.provider_mismatch) {
       return jsonResponse({
         error: "OCR refused rather than sending a scanned page to another provider",
-        detail: String(error.message || error).slice(0, 300),
+        code: "ocr_provider_mismatch",
         provider_mismatch: true,
       }, 409);
     }
     return jsonResponse({
       error: "the OCR model call failed",
-      // Verbatim, because if the image shape is wrong this sentence is the
-      // whole diagnosis and paraphrasing it would cost an afternoon.
-      detail: String(error?.message || error).slice(0, 400),
+      code: "ocr_provider_unavailable",
       model,
       image_format: imageFormat,
     }, 502);

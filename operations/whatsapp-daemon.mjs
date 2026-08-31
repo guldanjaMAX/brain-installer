@@ -63,6 +63,8 @@ import { fileURLToPath } from "node:url";
 
 import {
   launchctlChildEnvironment,
+  printSchedulerFailureReceipt,
+  recordDriveSchedulerFailure,
   rotateDriveSchedulerLogs,
   schedulerIdentity,
 } from "./drive-scheduler.mjs";
@@ -471,7 +473,16 @@ async function main(argv = process.argv.slice(2)) {
 const IS_MAIN = process.argv[1] && resolve(process.argv[1]) === SELF_PATH;
 if (IS_MAIN) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
-    console.error(`WhatsApp capture daemon supervision failed: ${error.message}`);
+    const action = process.argv[2];
+    const eventId = recordDriveSchedulerFailure(error, {
+      action,
+      productRelativeLocation: "operations/whatsapp-daemon.mjs#main",
+    });
+    printSchedulerFailureReceipt({
+      schedulerNoun: "WhatsApp capture supervision",
+      action,
+      eventId,
+    });
     process.exitCode = 1;
   });
 }

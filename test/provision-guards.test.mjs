@@ -632,6 +632,13 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   for (const [name, txt] of [["README.md", readme], ["templates/brain.manifest.json", tmpl]])
     check(`${name} includes Vectorize Edit in the scoped token`, /Vectorize(?::)?\s+(?:Edit|edit)/.test(txt), `${name} omitted it`);
 
+  const templateManifest = JSON.parse(tmpl);
+  check("the public template does not imply automatic email or webhook alerts exist",
+    !("health_report_email" in templateManifest.operations) &&
+      !("alert_webhook_secret" in templateManifest.operations) &&
+      !("health_cron" in templateManifest.operations),
+    JSON.stringify(templateManifest.operations));
+
   check("the installer does not claim tokens cannot reach Vectorize", !/no API token can reach Vectorize/i.test(brain));
 
   check("the Vectorize remedy exists in exactly one place", (doctor.match(/export const VECTORIZE_REMEDY/g) || []).length === 1);

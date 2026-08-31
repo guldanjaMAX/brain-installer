@@ -18,6 +18,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { previewSupportJournal, recordSupportEvent } from "../support-journal.mjs";
 import {
   buildDriveSchedulerPlan,
@@ -314,6 +315,46 @@ try {
       journal.trim().split("\n").filter(Boolean).length === 1 &&
       journal.includes('"command":"schedule"') && !journal.includes("fixture spawn failure"),
       journal);
+  }
+  {
+    const cliRoot = join(directory, "scheduler-cli-redaction-home");
+    mkdirSync(cliRoot, { recursive: true });
+    const cliEnvironment = {};
+    for (const key of ["PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR"]) {
+      if (process.env[key] !== undefined) cliEnvironment[key] = process.env[key];
+    }
+    cliEnvironment.HOME = cliRoot;
+    cliEnvironment.USERPROFILE = cliRoot;
+    const missingPath = join(directory, "RAW_BACKGROUND_FAILURE_SENTINEL.json");
+    const probes = [
+      ["drive", "../operations/drive-scheduler.mjs", ["install", missingPath], "SCHEDULE_INSTALL_FAILED"],
+      ["watched folder", "../operations/folder-scheduler.mjs", ["install", missingPath], "SCHEDULE_INSTALL_FAILED"],
+      ["iMessage", "../operations/imessage-scheduler.mjs", ["install", missingPath], "SCHEDULE_INSTALL_FAILED"],
+      ["WhatsApp drain", "../operations/whatsapp-drain-scheduler.mjs", ["install", missingPath], "SCHEDULE_INSTALL_FAILED"],
+      ["WhatsApp daemon", "../operations/whatsapp-daemon.mjs", ["install", missingPath], "SCHEDULE_INSTALL_FAILED"],
+      ["curated", "../operations/curated-sync-scheduler.mjs", ["status", missingPath], "SCHEDULE_RUN_FAILED"],
+    ];
+    for (const [label, relativeModule, args, issueCode] of probes) {
+      const executable = fileURLToPath(new URL(relativeModule, import.meta.url));
+      const result = spawnSync(process.execPath, [executable, ...args], {
+        encoding: "utf8",
+        env: cliEnvironment,
+        timeout: 30_000,
+      });
+      const output = `${result.stdout || ""}${result.stderr || ""}`;
+      check(`${label} background failure prints one stable recovery code`,
+        result.status === 1 && output.includes(`Issue code: ${issueCode}`) &&
+        output.includes(`brain support --explain ${issueCode}`), output);
+      check(`${label} background failure does not print raw detail or a stack`,
+        !output.includes("RAW_BACKGROUND_FAILURE_SENTINEL") &&
+        !/\bat .*\.mjs:\d+/.test(output), output);
+    }
+    const cliJournal = previewSupportJournal({ root: cliRoot });
+    const cliEvents = cliJournal.trim().split("\n").filter(Boolean);
+    check("every background wrapper saves one metadata-only private issue note",
+      cliEvents.length === probes.length &&
+      cliEvents.every((line) => line.includes('"command":"schedule"')) &&
+      !cliJournal.includes("RAW_BACKGROUND_FAILURE_SENTINEL"), cliJournal);
   }
   {
     check("production scheduler log retention is capped at five MiB with two history files",

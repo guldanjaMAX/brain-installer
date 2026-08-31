@@ -455,6 +455,18 @@ function zoomFailureCode(error) {
     .slice(0, 100);
 }
 
+function zoomOperationalIssueCode(error, fallback) {
+  if (error?.zoom_not_configured) return "AUTH_REQUIRED";
+  if (error instanceof ProviderSyncError) {
+    if (error.status === 401 || error.status === 403) return "REMOTE_PERMISSION_DENIED";
+    if (error.status === 429) return "RATE_LIMITED";
+    if (error.outcome?.kind === "unavailable" || error.outcome?.kind === "retryable") {
+      return "REMOTE_UNAVAILABLE";
+    }
+  }
+  return fallback;
+}
+
 /** Fetch, gate, and ingest one claimed recording without changing its debt row. */
 export async function processZoomDelivery(env, delivery, deps = {}) {
   const fetchImpl = deps.fetchImpl || fetch;
@@ -498,11 +510,11 @@ export async function processZoomDelivery(env, delivery, deps = {}) {
     } catch (error) {
       // The document is already written. A receipt failure makes `brain
       // sources` thinner, not the brain wrong.
-      console.warn(`[zoom] source receipt failed: ${String(error?.message || error).slice(0, 200)}`);
+      console.warn("[zoom] source receipt failed; issue_code=COMMAND_FAILED");
     }
     return { outcome: ingestionOutcome("completed"), code: null, result };
   } catch (error) {
-    console.error(`[zoom] transcript ingest failed: ${String(error?.message || error).slice(0, 300)}`);
+    console.error(`[zoom] transcript ingest failed; issue_code=${zoomOperationalIssueCode(error, "INGEST_FAILED")}`);
     return { outcome: zoomFailureOutcome(error), code: zoomFailureCode(error), error };
   }
 }
@@ -772,7 +784,7 @@ export async function handleZoomWebhook(env, request, ctx, deps = {}) {
   try {
     await deliveryStore.persist(env, { uuid, eventType: event, meetingId: object?.id, receivedAtMs: now });
   } catch (error) {
-    console.error(`[zoom] delivery debt could not be persisted: ${String(error?.message || error).slice(0, 200)}`);
+    console.error("[zoom] delivery debt could not be persisted; issue_code=INGEST_FAILED");
     return jsonResponse({
       error: "the Zoom delivery could not be made durable",
       retryable: true,
@@ -786,7 +798,7 @@ export async function handleZoomWebhook(env, request, ctx, deps = {}) {
   }).catch((error) => {
     // Persistence already succeeded. A crash or claim failure leaves the row
     // for the scheduled maintenance path or the next webhook to reclaim.
-    console.error(`[zoom] durable delivery drain failed: ${String(error?.message || error).slice(0, 240)}`);
+    console.error("[zoom] durable delivery drain failed; issue_code=SCHEDULE_RUN_FAILED");
   });
 
   if (ctx?.waitUntil) ctx.waitUntil(work);

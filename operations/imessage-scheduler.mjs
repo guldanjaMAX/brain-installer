@@ -29,6 +29,7 @@ import {
   installScheduler,
   recordDriveSchedulerFailure,
   recordDriveSchedulerResult,
+  printSchedulerFailureReceipt,
   removeScheduler,
   runScheduledIngest,
   safeIngestEnvironment,
@@ -118,12 +119,6 @@ function recordImessageSchedulerFailure(error, { action = "run" } = {}) {
   });
 }
 
-function printSupportReceipt(eventId) {
-  if (!eventId) return;
-  console.error(`Private issue note ${eventId} was saved locally. The installer did not upload or send this issue note.`);
-  console.error("Review the exact safe record with: brain support --preview");
-}
-
 async function main(argv = process.argv.slice(2)) {
   const [command, manifestPath] = argv;
   if (!command || !manifestPath || !["install", "status", "remove", "run"].includes(command)) {
@@ -137,9 +132,16 @@ async function main(argv = process.argv.slice(2)) {
     const result = runImessageCapture(manifestPath, options);
     const message = result.reason || `iMessage capture ${result.status}`;
     console.log(`[${new Date().toISOString()}] ${message}`);
-    printSupportReceipt(recordDriveSchedulerResult(result, {
+    const eventId = recordDriveSchedulerResult(result, {
       productRelativeLocation: "operations/imessage-scheduler.mjs#main",
-    }));
+    });
+    if (result.signal) {
+      printSchedulerFailureReceipt({
+        schedulerNoun: "iMessage capture scheduler",
+        action: "run",
+        eventId,
+      });
+    }
     return result.code;
   }
   const result = command === "install"
@@ -167,8 +169,12 @@ async function main(argv = process.argv.slice(2)) {
 const IS_MAIN = process.argv[1] && resolve(process.argv[1]) === SELF_PATH;
 if (IS_MAIN) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
-    console.error(`iMessage capture scheduler failed: ${error.message}`);
-    printSupportReceipt(recordImessageSchedulerFailure(error, { action: process.argv[2] }));
+    const action = process.argv[2];
+    printSchedulerFailureReceipt({
+      schedulerNoun: "iMessage capture scheduler",
+      action,
+      eventId: recordImessageSchedulerFailure(error, { action }),
+    });
     process.exitCode = 1;
   });
 }

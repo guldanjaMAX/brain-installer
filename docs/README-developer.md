@@ -975,6 +975,14 @@ and journal failure never replaces the original error. This is local support
 evidence, not telemetry: no network call exists in the journal module, and
 the installer does not upload or send journal data.
 
+The public manifest template intentionally omits the reserved, unwired
+`health_report_email` and `alert_webhook_secret` fields. No automatic email or
+webhook exists. If an opt-in notification transport is added later, its payload
+must be a separate allowlist limited to stable issue code, event ID, product
+version, and severity. Raw errors, logs, content, paths, account identifiers,
+provider payloads, and credentials remain local and are never notification
+fields.
+
 ```bash
 brain support
 brain support --preview

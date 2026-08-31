@@ -473,6 +473,12 @@ answers, logs, stack traces, or credentials. The installer keeps these notes on
 this machine. An export written to a synced destination may be uploaded by that
 sync service.
 
+Automatic support email and alert webhooks are not available in this release.
+Nothing sends an issue note, log, document, or provider response off this
+computer. A future opt-in notification may carry only allowlisted metadata such
+as the stable issue code, event ID, product version, and severity. It may not
+carry raw errors, source content, paths, account details, or credentials.
+
 Each typed code also has a calm recovery guide. It explains what happened, what
 stayed protected, whether retrying is safe, and the next useful step:
 

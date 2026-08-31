@@ -35,6 +35,7 @@ import { recordSupportEvent } from "../support-journal.mjs";
 import {
   cronToCalendarIntervals,
   expectedRefreshSecondsForCron,
+  printSchedulerFailureReceipt,
   renderLaunchAgentPlist,
   rotateDriveSchedulerLogs,
   safeIngestEnvironment,
@@ -686,12 +687,6 @@ export function recordCuratedSchedulerResult(result, options = {}) {
   return recordCuratedSchedulerFailure(options);
 }
 
-function printSupportReceipt(eventId) {
-  if (!eventId) return;
-  console.error(`Private issue note ${eventId} was saved locally. Nothing was uploaded or sent.`);
-  console.error("Review the exact safe record with: brain support --preview");
-}
-
 export function parseCuratedSchedulerCliArguments(argv) {
   if (!Array.isArray(argv)) fail("curated scheduler arguments are invalid");
   const [rawCommand, planPath, flag, configHash, ...extra] = argv;
@@ -738,16 +733,19 @@ async function main(argv = process.argv.slice(2)) {
       console.log(`[${new Date().toISOString()}] curated sync ${result.status}`);
       return result.code;
     } catch (error) {
-      console.error(`Curated scheduler failed: ${String(error?.message || "unknown failure")}`);
       const eventId = recordCuratedSchedulerFailure();
-      printSupportReceipt(eventId);
+      printSchedulerFailureReceipt({ schedulerNoun: "Curated scheduler", action: "run", eventId });
       return eventId ? CHILD_FAILURE_JOURNALED_EXIT : CHILD_FAILURE_UNJOURNALED_EXIT;
     }
   }
   if (command === "run") {
     const result = runScheduledCuratedSync(planPath, { expectedConfigHash });
     console.log(`[${new Date().toISOString()}] ${result.reason ?? `curated sync ${result.status}`}`);
-    printSupportReceipt(recordCuratedSchedulerResult(result));
+    const eventId = recordCuratedSchedulerResult(result);
+    if (!result.childJournaled &&
+        (result.status === "failed" || result.signal || result.childAbnormallyTerminated)) {
+      printSchedulerFailureReceipt({ schedulerNoun: "Curated scheduler", action: "run", eventId });
+    }
     return result.code;
   }
   console.log(JSON.stringify(statusSummary(statusScheduledCuratedSync(planPath)), null, 2));
@@ -757,8 +755,11 @@ async function main(argv = process.argv.slice(2)) {
 const IS_MAIN = process.argv[1] && resolve(process.argv[1]) === resolve(DEFAULT_SCHEDULER_PATH);
 if (IS_MAIN) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
-    console.error(`Curated scheduler failed: ${String(error?.message || "unknown failure")}`);
-    printSupportReceipt(recordCuratedSchedulerFailure());
+    printSchedulerFailureReceipt({
+      schedulerNoun: "Curated scheduler",
+      action: "run",
+      eventId: recordCuratedSchedulerFailure(),
+    });
     process.exitCode = 1;
   });
 }

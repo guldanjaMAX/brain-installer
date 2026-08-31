@@ -154,18 +154,56 @@ function signedEvent(event, uuid = "webhook-uuid", now = WEBHOOK_NOW) {
 }
 
 {
-  const response = await handleZoomWebhook(
-    { ZOOM_WEBHOOK_SECRET_TOKEN: SECRET },
-    signedEvent(ZOOM_TRANSCRIPT_EVENT),
-    { waitUntil() { throw new Error("background work must not start"); } },
-    {
-      now: () => WEBHOOK_NOW,
-      deliveryStore: { async persist() { throw new Error("D1 unavailable"); } },
-    },
-  );
-  const body = await response.json();
-  check("a persistence failure returns retryable 503 instead of losing the delivery behind HTTP 2xx",
-    response.status === 503 && body.retryable === true && body.error.includes("durable"));
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args.map(String).join(" "));
+  try {
+    const response = await handleZoomWebhook(
+      { ZOOM_WEBHOOK_SECRET_TOKEN: SECRET },
+      signedEvent(ZOOM_TRANSCRIPT_EVENT),
+      { waitUntil() { throw new Error("background work must not start"); } },
+      {
+        now: () => WEBHOOK_NOW,
+        deliveryStore: { async persist() { throw new Error("RAW_ZOOM_PERSISTENCE_SENTINEL"); } },
+      },
+    );
+    const body = await response.json();
+    check("a persistence failure returns retryable 503 instead of losing the delivery behind HTTP 2xx",
+      response.status === 503 && body.retryable === true && body.error.includes("durable"));
+    check("a persistence failure logs a stable code without raw storage detail",
+      errors.join(" ").includes("issue_code=INGEST_FAILED") &&
+        !errors.join(" ").includes("RAW_ZOOM_PERSISTENCE_SENTINEL"), errors.join(" "));
+  } finally {
+    console.error = originalError;
+  }
+}
+
+{
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args.map(String).join(" "));
+  try {
+    const response = await handleZoomWebhook(
+      { ZOOM_WEBHOOK_SECRET_TOKEN: SECRET },
+      signedEvent(ZOOM_TRANSCRIPT_EVENT),
+      null,
+      {
+        now: () => WEBHOOK_NOW,
+        deliveryStore: {
+          async persist() {},
+          async claim() { throw new Error("RAW_ZOOM_DRAIN_SENTINEL"); },
+        },
+      },
+    );
+    const body = await response.json();
+    check("a post-persistence drain failure leaves the durable webhook acknowledged",
+      response.status === 200 && body.durable === true);
+    check("a post-persistence drain failure logs a stable code without raw queue detail",
+      errors.join(" ").includes("issue_code=SCHEDULE_RUN_FAILED") &&
+        !errors.join(" ").includes("RAW_ZOOM_DRAIN_SENTINEL"), errors.join(" "));
+  } finally {
+    console.error = originalError;
+  }
 }
 
 function reconciliationStore() {

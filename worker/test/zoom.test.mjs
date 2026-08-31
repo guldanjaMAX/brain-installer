@@ -25,6 +25,7 @@ import {
   describeZoomPlan,
   gatedIngest,
   handleZoomWebhook,
+  processZoomDelivery,
   verifyZoomSignature,
   vttToPlainTranscript,
   zoomHmacHex,
@@ -487,6 +488,33 @@ check("an empty or missing VTT parses to an empty string",
 check("double encoding is exactly two passes of encodeURIComponent",
   zoomRecordingPathId(UUID) === "aB3%252FxY9z%252BQw%253D%253D", zoomRecordingPathId(UUID));
 
+{
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.map(String).join(" "));
+  try {
+    const zoom = mkZoomFetch();
+    const sink = mkIngest();
+    const result = await processZoomDelivery(mkEnv(), {
+      recording_uuid: UUID,
+      meeting_id: MEETING_ID,
+    }, {
+      token: "fixture-access-token",
+      fetchImpl: zoom.fetchImpl,
+      ingest: sink.ingest,
+      recordReceipt: async () => { throw new Error("RAW_ZOOM_RECEIPT_SENTINEL"); },
+    });
+    check("a Zoom source-receipt failure leaves the stored transcript complete",
+      result.outcome.kind === "completed" && sink.envelopes.length === 1,
+      JSON.stringify(result.outcome));
+    check("a Zoom source-receipt failure logs a stable code without raw storage detail",
+      warnings.join(" ").includes("issue_code=COMMAND_FAILED") &&
+        !warnings.join(" ").includes("RAW_ZOOM_RECEIPT_SENTINEL"), warnings.join(" "));
+  } finally {
+    console.warn = originalWarn;
+  }
+}
+
 /* ============================================== transcript missing or empty */
 
 {
@@ -522,8 +550,10 @@ check("double encoding is exactly two passes of encodeURIComponent",
     await handleZoomWebhook(env, signedRequest(transcriptEvent()), null, {
       fetchImpl: zoom.fetchImpl, ingest: sink.ingest, recordReceipt: async () => true,
     });
-    check("a 403 from Zoom names the missing scope instead of a bare status",
-      errors.join(" ").includes(ZOOM_REQUIRED_SCOPE) && sink.envelopes.length === 0, errors.join(" "));
+    check("a 403 from Zoom logs only the stable permission recovery code",
+      errors.join(" ").includes("issue_code=REMOTE_PERMISSION_DENIED") &&
+        !errors.join(" ").includes(ZOOM_REQUIRED_SCOPE) && sink.envelopes.length === 0,
+      errors.join(" "));
   } finally {
     console.error = originalError;
   }

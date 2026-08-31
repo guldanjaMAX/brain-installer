@@ -436,8 +436,23 @@ function stubOcr({ reply = () => pageText, model = "@cf/google/gemma-4-26b-a4b-i
     },
     req({ image_base64: "AA", prompt: "p" }),
   );
+  const cappedBody = await capped.clone().json();
   check("the daily spend cap binds on the OCR route too",
-    capped.status === 429 && (await capped.clone().json()).llm_cap_exceeded === true, String(capped.status));
+    capped.status === 429 && cappedBody.llm_cap_exceeded === true &&
+      cappedBody.code === "ocr_budget_exceeded", JSON.stringify(cappedBody));
+
+  const providerFailure = await handleOcr(
+    {
+      ADMIN_KEY: key, OCR_ENABLED: "1", DB: reservationDb(),
+      AI: { run: async () => { throw new Error("RAW_OCR_PROVIDER_SENTINEL"); } },
+    },
+    req({ image_base64: "AA", prompt: "p" }),
+  );
+  const providerFailureBody = await providerFailure.json();
+  check("OCR provider failures expose a stable code without raw provider detail",
+    providerFailure.status === 502 && providerFailureBody.code === "ocr_provider_unavailable" &&
+      !JSON.stringify(providerFailureBody).includes("RAW_OCR_PROVIDER_SENTINEL") &&
+      !("detail" in providerFailureBody), JSON.stringify(providerFailureBody));
 
   const huge = await handleOcr({ ADMIN_KEY: key, OCR_ENABLED: "1", DB: db }, req({ image_base64: "A".repeat(4_000_001), prompt: "p" }));
   check("an oversized page image is refused with the size stated", huge.status === 413, String(huge.status));

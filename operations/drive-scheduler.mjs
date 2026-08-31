@@ -1308,10 +1308,32 @@ export function recordDriveSchedulerResult(result, options = {}) {
   return recordDriveSchedulerFailure(null, { action: "run", ...options });
 }
 
-function printDriveSchedulerSupportReceipt(eventId) {
-  if (!eventId) return;
-  console.error(`Private issue note ${eventId} was saved locally. The installer did not upload or send this issue note.`);
-  console.error("Review the exact safe record with: brain support --preview");
+export function schedulerFailureCode(action = "run") {
+  return action === "install" ? "SCHEDULE_INSTALL_FAILED" : "SCHEDULE_RUN_FAILED";
+}
+
+/**
+ * Render one safe recovery boundary for background-job wrappers.
+ *
+ * Wrapper exceptions can contain a manifest path, provider response, source
+ * identity, or child-process detail. Those values belong in neither launchd's
+ * long-lived logs nor a support message. The private journal deliberately
+ * records only the stable issue code and fixed metadata.
+ */
+export function printSchedulerFailureReceipt({
+  schedulerNoun = "Background refresh",
+  action = "run",
+  eventId = null,
+} = {}) {
+  const errorCode = schedulerFailureCode(action);
+  console.error(`${schedulerNoun} stopped before it could confirm a complete result.`);
+  console.error("The existing schedule and source state remain available for review.");
+  console.error(`Issue code: ${errorCode}`);
+  console.error(`What to try next: brain support --explain ${errorCode}`);
+  if (eventId) {
+    console.error(`Private issue note ${eventId} was saved locally. The installer did not upload or send it.`);
+  }
+  return errorCode;
 }
 
 async function main(argv = process.argv.slice(2)) {
@@ -1327,7 +1349,10 @@ async function main(argv = process.argv.slice(2)) {
     const result = runDriveIngest(manifestPath, options);
     const message = result.reason || `Drive ingest ${result.status}`;
     console.log(`[${new Date().toISOString()}] ${message}`);
-    printDriveSchedulerSupportReceipt(recordDriveSchedulerResult(result));
+    const eventId = recordDriveSchedulerResult(result);
+    if (result.signal) {
+      printSchedulerFailureReceipt({ schedulerNoun: "Drive scheduler", action: "run", eventId });
+    }
     return result.code;
   }
   const result = command === "install"
@@ -1343,9 +1368,12 @@ async function main(argv = process.argv.slice(2)) {
 const IS_MAIN = process.argv[1] && resolve(process.argv[1]) === DEFAULT_SCHEDULER_PATH;
 if (IS_MAIN) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
-    console.error(`Drive scheduler failed: ${error.message}`);
     const eventId = recordDriveSchedulerFailure(error, { action: process.argv[2] });
-    printDriveSchedulerSupportReceipt(eventId);
+    printSchedulerFailureReceipt({
+      schedulerNoun: "Drive scheduler",
+      action: process.argv[2],
+      eventId,
+    });
     process.exitCode = 1;
   });
 }
