@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import {
   api, ownerError, type OwnerUploadCapabilities, type OwnerWriteReceipt,
 } from "../lib/api";
-import { ingestionReceiptAction, logicalDocumentId, readOwnerTextFile, validateOwnerUpload } from "../lib/owner";
+import { ingestionReceiptAction, logicalDocumentId, readOwnerUploadFile, validateOwnerUpload } from "../lib/owner";
 import { Attention, Note, Section } from "./ui";
 import { useFinanceScope } from "./FinanceScope";
 import { useActionRequests } from "./useActionRequests";
@@ -58,7 +58,7 @@ export function OwnerUpload({ onStored }: { onStored?: () => void }) {
     try {
       const validation = validateOwnerUpload(file, capabilities);
       if (validation.supported === false) throw new Error(validation.reason);
-      const content = await readOwnerTextFile(file, capabilities);
+      const payload = await readOwnerUploadFile(file, capabilities);
       const documentId = await logicalDocumentId(scope, file.name);
       const receipt = await api<OwnerWriteReceipt>("/api/owner/uploads", {
         request_id: id,
@@ -66,9 +66,10 @@ export function OwnerUpload({ onStored }: { onStored?: () => void }) {
         document_id: documentId,
         media_type: validation.mediaType,
         file_name: file.name,
+        ...(payload.content_base64 ? { content_base64: payload.content_base64 } : {}),
         envelope: {
           title: file.name,
-          content,
+          ...(payload.content !== undefined ? { content: payload.content } : {}),
           metadata: { entity_slug: scope },
         },
       });
@@ -84,8 +85,8 @@ export function OwnerUpload({ onStored }: { onStored?: () => void }) {
         : action === "unchanged"
         ? "The brain confirmed this upload request was already stored. No duplicate was created."
         : action === "updated"
-          ? "The brain confirmed the stored text was updated and recorded the change."
-          : "The brain confirmed the text was stored and recorded the change.");
+          ? "The brain confirmed the stored document text was updated and recorded the change."
+          : "The brain confirmed the document text was stored and recorded the change.");
       requests.confirmed(actionKey);
       setFile(null);
       onStored?.();
@@ -100,15 +101,19 @@ export function OwnerUpload({ onStored }: { onStored?: () => void }) {
     ? [...capabilities.supported_media_types, ...capabilities.supported_extensions].join(",")
     : undefined;
 
+  const binaryReady = Boolean(capabilities?.supported_media_types.some((mediaType) =>
+    mediaType === "application/pdf" || mediaType.startsWith("image/") || mediaType.startsWith("application/vnd.")));
+  const binaryLimit = capabilities?.max_binary_bytes ?? capabilities?.max_content_bytes ?? 0;
+
   return (
-    <Section title="Add a text record" blurb={`Add UTF-8 text or Markdown to ${scope ? activeLabel : "one selected business"}. The brain scans and stores it through the same ingestion path as every other source.`}>
+    <Section title="Add a document" blurb={`Add a supported document or receipt to ${scope ? activeLabel : "one selected business"}. The Brain reads and stores it through the same protected path as every other owner upload.`}>
       {capabilitiesUnavailable && (
         <Attention>Upload limits could not be read from the brain, so file selection is unavailable. No file was submitted.</Attention>
       )}
       {!capabilities && !capabilitiesUnavailable && <Note>Reading supported file types and size limits.</Note>}
       {capabilities && (
         <div className="p-4">
-          <label className="block text-[13px] font-medium">Choose UTF-8 text or Markdown
+          <label className="block text-[13px] font-medium">Choose a document or receipt
             <input
               type="file"
               accept={accept}
@@ -118,10 +123,13 @@ export function OwnerUpload({ onStored }: { onStored?: () => void }) {
             />
           </label>
           <p className="mt-2 text-[12.5px] text-ink-soft">
-            {capabilities.supported_extensions.join(", ")} · up to {capabilities.max_content_bytes.toLocaleString()} bytes · {capabilities.content_encoding.toUpperCase()}
+            {capabilities.supported_extensions.join(", ")} · text up to {capabilities.max_content_bytes.toLocaleString()} bytes
+            {binaryReady ? ` · documents up to ${binaryLimit.toLocaleString()} bytes` : ""}
           </p>
           <p className="mt-2 text-[12.5px] text-ink-soft leading-relaxed">
-            PDF, image, Office, RTF, email, archive, binary, and unknown file types are not supported in owner upload. They require a separate extraction path and will not be labeled uploaded.
+            {binaryReady
+              ? "This Brain reports protected document upload. Images may use private OCR. A PDF without a readable text layer can still be refused, and the receipt will say why."
+              : "This installed Brain accepts text records only. PDF, image, Office, email, archive, and unknown file types remain closed and will not be labeled uploaded."}
           </p>
           {!scope && <div className="mt-3"><Attention>Select one business above before adding a record.</Attention></div>}
           {file && <p className="mt-3 text-[13.5px]">Ready to submit: <span className="font-medium">{file.name}</span></p>}
@@ -132,7 +140,7 @@ export function OwnerUpload({ onStored }: { onStored?: () => void }) {
             disabled={!file || !scope || busy}
             className="mt-3 rounded-xl bg-accent px-4 py-2.5 text-white text-[13.5px] font-medium disabled:opacity-45"
           >
-            {busy ? "Submitting" : "Add text record"}
+            {busy ? "Submitting" : "Add document"}
           </button>
         </div>
       )}

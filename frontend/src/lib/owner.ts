@@ -20,22 +20,55 @@ export function validateOwnerUpload(
   if (!capabilities.supported_media_types.includes(mediaType)) {
     return {
       supported: false,
-      reason: "Owner upload currently accepts UTF-8 text and Markdown only. PDF, image, Office, mail, archive, and unknown file types need a different extraction path and were not uploaded.",
+      reason: "This file type is not accepted by this Brain. Nothing was uploaded.",
     };
   }
   if (!extension || !capabilities.media_type_extensions[mediaType]?.includes(extension)) {
     return {
       supported: false,
-      reason: "The selected file does not have a supported .txt, .md, or .markdown filename, so it was not uploaded.",
+      reason: "The filename extension does not match the file type, so it was not uploaded.",
     };
   }
-  if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > capabilities.max_content_bytes) {
+  const binaryTypes = capabilities.binary_media_types || [];
+  const limit = capabilities.media_type_max_bytes?.[mediaType]
+    ?? (binaryTypes.includes(mediaType) ? capabilities.max_binary_bytes : capabilities.max_content_bytes)
+    ?? capabilities.max_content_bytes;
+  if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > limit) {
     return {
       supported: false,
-      reason: "Owner text upload is limited to 1,000,000 bytes. This file was not uploaded.",
+      reason: `This file is larger than the ${limit.toLocaleString()} byte upload limit, so it was not uploaded.`,
     };
   }
-  return { supported: true, mediaType: mediaType as typeof OWNER_UPLOAD_MEDIA[number] };
+  return { supported: true, mediaType };
+}
+
+function arrayBufferBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(bytes.length, offset + 0x8000)));
+  }
+  return btoa(binary);
+}
+
+export async function readOwnerUploadFile(
+  file: File,
+  capabilities: OwnerUploadCapabilities,
+): Promise<{ content?: string; content_base64?: string }> {
+  const validation = validateOwnerUpload(file, capabilities);
+  if (validation.supported === false) throw new Error(validation.reason);
+  const textTypes = capabilities.text_media_types || OWNER_UPLOAD_MEDIA;
+  if (textTypes.includes(validation.mediaType as typeof textTypes[number])) {
+    return { content: await readOwnerTextFile(file, capabilities) };
+  }
+  const bytes = await file.arrayBuffer();
+  const limit = capabilities.media_type_max_bytes?.[validation.mediaType]
+    ?? capabilities.max_binary_bytes
+    ?? capabilities.max_content_bytes;
+  if (bytes.byteLength > limit) {
+    throw new Error("The selected document is larger than the declared upload limit. It was not uploaded.");
+  }
+  return { content_base64: arrayBufferBase64(bytes) };
 }
 
 export async function readOwnerTextFile(file: File, capabilities: OwnerUploadCapabilities): Promise<string> {

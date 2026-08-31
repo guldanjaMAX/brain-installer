@@ -3,8 +3,9 @@ import { api, apiGet, type Device, type Connection, type BankStatus } from "../l
 import { enroll } from "../lib/passkey";
 import { Section, Row, Note, Empty, Badge, Chip, Confirm, EditableName, ago, agoISO } from "./ui";
 import { OwnerPreferences } from "./OwnerPreferences";
-import { DocumentAccess } from "./DocumentAccess";
 import { PasskeyDiagnostics } from "./PasskeyDiagnostics";
+import { EntityManager } from "./EntityManager";
+import { DataSetup } from "./DataSetup";
 
 /** Who and what can open this brain.
  *
@@ -49,23 +50,32 @@ export function Settings({ devices, connections, onChange }: {
   return (
     <div>
       <header className="max-w-2xl mb-7">
-        <p className="eyebrow">People, devices, and apps</p>
-        <h1 className="page-title">Access</h1>
+        <p className="eyebrow">Settings</p>
+        <h1 className="page-title">Manage</h1>
         <p className="page-intro">
-          See owner devices, connected apps, exact-document access, and passkey proof at the level this brain can verify.
+          Organize business entities, prepare data sources, and review the owner devices and apps that can open this Brain.
         </p>
       </header>
+      <nav aria-label="Manage sections" className="mb-7 flex flex-wrap gap-2">
+        <JumpButton target="manage-entities">Business entities</JumpButton>
+        <JumpButton target="manage-data-setup">Set up your data</JumpButton>
+        <JumpButton target="manage-owner-access">Owner access</JumpButton>
+      </nav>
       {error && (
         <p className="mb-5 text-[14px] text-red-700 bg-red-50 border border-red-200 rounded-xl px-4 py-3">
           {error}
         </p>
       )}
 
-      <OwnerPreferences />
+      <EntityManager />
 
-      <DocumentAccess />
+      <DataSetup banks={banks} />
 
-      <PasskeyDiagnostics />
+      <div id="manage-owner-access" className="scroll-mt-24">
+        <OwnerPreferences />
+
+        <PasskeyDiagnostics />
+      </div>
 
       <Section
         title="Your devices"
@@ -252,5 +262,17 @@ export function Settings({ devices, connections, onChange }: {
         </Row>
       </Section>
     </div>
+  );
+}
+
+function JumpButton({ target, children }: { target: string; children: string }) {
+  return (
+    <button
+      type="button"
+      onClick={() => document.getElementById(target)?.scrollIntoView({ behavior: "smooth", block: "start" })}
+      className="rounded-xl border border-line bg-card px-3 py-2 text-[13px] font-medium text-ink-soft hover:border-accent hover:text-accent"
+    >
+      {children}
+    </button>
   );
 }

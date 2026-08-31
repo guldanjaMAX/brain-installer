@@ -1,16 +1,13 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { ApiError, api, type Me } from "./lib/api";
 import { Gate } from "./components/Gate";
-import { Ask, ScopedAsk } from "./components/Ask";
+import { Ask } from "./components/Ask";
 import { Settings } from "./components/Settings";
 import { Home } from "./components/Home";
 import { Documents } from "./components/Documents";
 import { ThisYear } from "./components/ThisYear";
-import { AddReview } from "./components/AddReview";
 import { FinanceScopeProvider } from "./components/FinanceScope";
-import { ScopedDocuments } from "./components/ScopedDocuments";
 import { Attention } from "./components/ui";
-import { grantWorkspaceConfirmed } from "./lib/security";
 
 // The invite arrives as /app#enroll=<code>. It lives in the fragment on
 // purpose: a fragment is never sent to the server in a request line and never
@@ -23,18 +20,23 @@ const inviteCode = (typeof location === "undefined" ? null : (location.hash.matc
 const root = typeof document === "undefined" ? null : document.getElementById("root");
 const shellOwner = root?.dataset.owner || "";
 
-export type View = "home" | "year" | "documents" | "ask" | "review" | "access";
-export const OWNER_VIEWS: readonly View[] = ["home", "year", "documents", "ask", "review", "access"];
-export const GRANT_VIEWS: readonly View[] = ["documents", "ask"];
+export type View = "home" | "year" | "documents" | "ask" | "access";
+export const OWNER_VIEWS: readonly View[] = ["home", "year", "documents", "ask", "access"];
+export const PRIMARY_OWNER_NAV: ReadonlyArray<{ view: View; label: string }> = [
+  { view: "home", label: "Home" },
+  { view: "year", label: "This Year" },
+  { view: "documents", label: "Documents" },
+  { view: "access", label: "Manage" },
+];
 
-export function visibleView(kind: "owner" | "grant", requested: View): View {
-  const allowed = kind === "grant" ? GRANT_VIEWS : OWNER_VIEWS;
-  return allowed.includes(requested) ? requested : allowed[0];
+export function visibleView(requested: View): View {
+  return OWNER_VIEWS.includes(requested) ? requested : OWNER_VIEWS[0];
 }
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [view, setView] = useState<View>("home");
+  const [askSeed, setAskSeed] = useState<{ id: number; text: string } | null>(null);
   const [ready, setReady] = useState(false);
   const [authNotice, setAuthNotice] = useState<string | null>(null);
 
@@ -64,10 +66,7 @@ export function App() {
   }
 
   if (me.principal?.kind === "grant") {
-    if (!grantWorkspaceConfirmed(me.workspace)) {
-      return <UnavailableSession message="The brain did not return the exact shared-workspace allowlist. No owner or document surface is being opened." />;
-    }
-    return <GrantWorkspace me={me} onAccessEnded={refresh} />;
+    return <UnavailableSession message="This Financial Brain uses owner-only access. Sign in with an owner passkey to open the workspace." />;
   }
 
   if (me.principal?.kind !== "owner") {
@@ -76,6 +75,10 @@ export function App() {
 
   const owner = me.owner || shellOwner;
   const possessive = owner ? (/s$/i.test(owner) ? `${owner}'` : `${owner}'s`) : "Your";
+  const openExplore = (question = "") => {
+    if (question) setAskSeed({ id: Date.now(), text: question });
+    setView("ask");
+  };
 
   return (
     <FinanceScopeProvider>
@@ -90,26 +93,21 @@ export function App() {
               <span>{possessive} brain</span>
             </button>
             <nav aria-label="Primary" className="flex items-center gap-1 text-[13.5px] w-full overflow-x-auto lg:w-auto pb-0.5 lg:pb-0">
-              <Tab now={view} go={setView} to="home">Home</Tab>
-              <Tab now={view} go={setView} to="year">This Year</Tab>
-              <Tab now={view} go={setView} to="documents">Documents</Tab>
-              <Tab now={view} go={setView} to="ask">Explore</Tab>
-              <Tab now={view} go={setView} to="review">Add &amp; Review</Tab>
-              <Tab now={view} go={setView} to="access">Access</Tab>
+              {PRIMARY_OWNER_NAV.map((item) => (
+                <Tab key={item.view} now={view} go={setView} to={item.view}>{item.label}</Tab>
+              ))}
             </nav>
           </div>
         </header>
         <main className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-7 sm:py-9 pb-24">
-          {/* Explore stays mounted across a visit to Access: losing an answer
-              because you checked who had access is a small betrayal of a page
-              whose whole subject is trust. */}
-          {view === "home" && <Home />}
+          {/* Explore stays mounted across a visit to Manage so an owner does
+              not lose an answer while checking settings or adding a record. */}
+          {view === "home" && <Home onExplore={openExplore} />}
           {view === "year" && <ThisYear />}
           {view === "documents" && <Documents />}
           <div className={view === "ask" ? "" : "hidden"}>
-            <Ask />
+            <Ask initialQuestion={askSeed} onManage={() => setView("access")} />
           </div>
-          {view === "review" && <AddReview />}
           {view === "access" && (
             <Settings
               devices={me.devices || []}
@@ -120,36 +118,6 @@ export function App() {
         </main>
       </div>
     </FinanceScopeProvider>
-  );
-}
-
-export function GrantWorkspace({ me, onAccessEnded }: { me: Me; onAccessEnded: () => void }) {
-  const principal = me.principal;
-  const [requested, setRequested] = useState<View>("documents");
-  if (principal?.kind !== "grant") return null;
-  const view = visibleView("grant", requested);
-  const title = me.brain ? `${me.brain} · shared access` : "Shared brain access";
-  return (
-    <div className="min-h-dvh">
-      <header className="px-4 sm:px-6 lg:px-8 border-b border-line bg-card/90 backdrop-blur sticky top-0 z-20">
-        <div className="max-w-6xl mx-auto min-h-16 flex flex-col justify-center gap-2 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
-          <button onClick={() => setRequested("documents")} className="flex items-center gap-2 text-[14.5px] text-ink-soft hover:text-ink shrink-0">
-            <span className="w-7 h-7 rounded-lg bg-ink text-white grid place-items-center text-[12px] font-semibold" aria-hidden="true">FB</span>
-            <span>{title}</span>
-          </button>
-          <nav aria-label="Shared workspace" className="flex items-center gap-1 text-[13.5px]">
-            <Tab now={view} go={setRequested} to="documents">Documents</Tab>
-            <Tab now={view} go={setRequested} to="ask">Explore</Tab>
-          </nav>
-        </div>
-      </header>
-      <main className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-7 sm:py-9 pb-24">
-        {view === "documents" && <ScopedDocuments principal={principal} onAccessEnded={onAccessEnded} />}
-        <div className={view === "ask" ? "" : "hidden"}>
-          <ScopedAsk principal={principal} onAccessEnded={onAccessEnded} />
-        </div>
-      </main>
-    </div>
   );
 }
 

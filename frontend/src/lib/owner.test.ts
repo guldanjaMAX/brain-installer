@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { OwnerUploadCapabilities } from "./api";
 import {
   activityEventsInWindow, confirmedOwnerWrite, defaultEntityScope, ingestionReceiptAction, logicalDocumentId, majorToMinor, readOwnerTextFile,
-  periodClosePresentation, scopedAnswerLabel, validateOwnerUpload,
+  periodClosePresentation, readOwnerUploadFile, scopedAnswerLabel, validateOwnerUpload,
 } from "./owner";
 
 const capabilities: OwnerUploadCapabilities = {
@@ -41,6 +41,26 @@ describe("owner upload boundary", () => {
       arrayBuffer: async () => bytes.buffer,
     } as unknown as File;
     await expect(readOwnerTextFile(file, capabilities)).rejects.toThrow(/not valid UTF-8/);
+  });
+
+  it("opens binary documents only when the installed Brain declares the exact capability", async () => {
+    const documentCapabilities: OwnerUploadCapabilities = {
+      ...capabilities,
+      supported_media_types: [...capabilities.supported_media_types, "application/pdf"],
+      binary_media_types: ["application/pdf"],
+      supported_extensions: [...capabilities.supported_extensions, ".pdf"],
+      media_type_extensions: { ...capabilities.media_type_extensions, "application/pdf": [".pdf"] },
+      max_binary_bytes: 10,
+      media_type_max_bytes: { "application/pdf": 10 },
+    };
+    const bytes = Uint8Array.from([0x25, 0x50, 0x44, 0x46]);
+    const file = {
+      name: "receipt.pdf", type: "application/pdf", size: bytes.byteLength,
+      arrayBuffer: async () => bytes.buffer,
+    } as unknown as File;
+    await expect(readOwnerUploadFile(file, documentCapabilities)).resolves.toEqual({ content_base64: "JVBERg==" });
+    expect(validateOwnerUpload({ name: "receipt.pdf", type: "application/pdf", size: 11 }, documentCapabilities).supported).toBe(false);
+    expect(validateOwnerUpload({ name: "receipt.pdf", type: "application/pdf", size: 4 }, capabilities).supported).toBe(false);
   });
 
   it("requires a common-ingestion identity and action before calling a request uploaded", () => {
