@@ -8,6 +8,7 @@ import { run, localToolEnvironment, cloudflareCliEnvironment,
          summarize, runAll, OK, WARN, FAIL } from "../doctor.mjs";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
+const EMPTY_WRANGLER_ENV_ARG = process.platform === "win32" ? "--env-file=NUL" : "--env-file=/dev/null";
 
 /* ---- every non-ok check MUST carry a fix. A failure without one is half a job. ---- */
 {
@@ -256,7 +257,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   const profiledArgs = wranglerProfileArgs(originalArgs, accountId);
   check("profile argument construction is non-mutating",
     originalArgs.length === 3 && profiledArgs.length === 6 &&
-      profiledArgs.at(-3) === "--profile" && profiledArgs.at(-1) === "--env-file=/dev/null");
+      profiledArgs.at(-3) === "--profile" && profiledArgs.at(-1) === EMPTY_WRANGLER_ENV_ARG);
   check("the scoped token includes Vectorize Edit", CF_TOKEN_SCOPES.includes("Vectorize: Edit"), JSON.stringify(CF_TOKEN_SCOPES));
 }
 
@@ -365,7 +366,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   const vectorCall = calls.find((call) => call.args.includes("vectorize"));
   check("runAll passes the saved profile exactly into its browser-free diagnostic",
     vectorCall?.args[vectorCall.args.indexOf("--profile") + 1] === exactProfile &&
-      !vectorCall?.args.includes("--browser") && vectorCall?.args.at(-1) === "--env-file=/dev/null",
+      !vectorCall?.args.includes("--browser") && vectorCall?.args.at(-1) === EMPTY_WRANGLER_ENV_ARG,
     JSON.stringify(vectorCall));
 
   calls.length = 0;
