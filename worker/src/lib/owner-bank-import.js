@@ -9,7 +9,7 @@
  * deletion signal.
  */
 
-import { readBankExport } from "../../../ingest/bank-export.mjs";
+import { readBankExport } from "./bank-export.js";
 import { jsonResponse, privateNoStore } from "./core.js";
 import { prepareBankExportImport, DEFAULT_TENANT } from "./fin-import.js";
 import { ledgerInstalled } from "./fin-d1.js";

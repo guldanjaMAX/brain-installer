@@ -477,6 +477,7 @@ const expected = [
   "worker/src/lib/auth-store.js",
   "worker/src/lib/bank-feed.js",
   "worker/src/lib/bank-feed-profiles.js",
+  "worker/src/lib/bank-export.js",
   "worker/src/lib/confidence.js",
   "worker/src/lib/connections.js",
   "worker/src/lib/core.js",

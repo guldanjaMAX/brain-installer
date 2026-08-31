@@ -11,11 +11,12 @@
     "brain": "./brain.mjs"
   },
   "scripts": {
+    "build:worker-bank-export": "node scripts/build-worker-bank-export.mjs",
     "build:worker-upload": "node scripts/build-worker-upload-extract.mjs",
     "rehearse:hiccups": "node scripts/customer-hiccup-lab.mjs",
     "rehearse:reliability": "node scripts/operational-fault-lab.mjs",
     "rehearse:onboarding": "node scripts/onboarding-sandbox.mjs",
-    "pretest": "npm run build:worker-upload -- --check && node test/archive-safety.test.mjs && node test/provider-sync-safety.test.mjs && node test/linkedin-export.test.mjs && node test/provider-cli.test.mjs && node test/provider-connectors.test.mjs && node test/provider-oauth.test.mjs && node test/provider-runtime.test.mjs && node test/provider-scheduler.test.mjs && node worker/test/upload-extract.test.mjs && node --no-warnings worker/test/zoom-delivery-safety.test.mjs && node --no-warnings --test worker/test/plaid-scheduled.test.mjs",
+    "pretest": "npm run build:worker-upload -- --check && npm run build:worker-bank-export -- --check && node test/archive-safety.test.mjs && node test/provider-sync-safety.test.mjs && node test/linkedin-export.test.mjs && node test/provider-cli.test.mjs && node test/provider-connectors.test.mjs && node test/provider-oauth.test.mjs && node test/provider-runtime.test.mjs && node test/provider-scheduler.test.mjs && node worker/test/upload-extract.test.mjs && node --no-warnings worker/test/zoom-delivery-safety.test.mjs && node --no-warnings --test worker/test/plaid-scheduled.test.mjs",
     "privacy:history": "node scripts/scan-git-history-privacy.mjs --ref HEAD --require-zero-findings",
     "privacy:history:remote": "node scripts/scan-git-history-privacy.mjs --remote origin --ref HEAD --require-zero-findings",
     "privacy:history:strict": "node scripts/scan-git-history-privacy.mjs --remote origin --ref HEAD --require-zero-findings",
