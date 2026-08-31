@@ -15,6 +15,7 @@ import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import { createCredentialFreeProviderEnvironment } from "../../scripts/field-prepare.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
@@ -40,8 +41,7 @@ const database = "auth-atomicity-local";
 
 // Explicitly remove provider credentials from both Wrangler subprocesses. The
 // harness is evidence only if it cannot silently cross the local boundary.
-const childEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
-  !/^(CLOUDFLARE_|CF_|WRANGLER_)/i.test(name)));
+const childEnv = createCredentialFreeProviderEnvironment(process.env);
 
 function run(args, options = {}) {
   return new Promise((resolve, reject) => {

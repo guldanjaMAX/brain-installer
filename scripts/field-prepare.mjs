@@ -260,6 +260,15 @@ export function createSafeEnvironment(source, privateHome) {
   return environment;
 }
 
+export function createCredentialFreeProviderEnvironment(source) {
+  return {
+    ...Object.fromEntries(Object.entries(source).filter(([name]) =>
+      !/^(CLOUDFLARE_|CF_|WRANGLER_)/i.test(name))),
+    WRANGLER_SEND_METRICS: "false",
+    DO_NOT_TRACK: "1",
+  };
+}
+
 export function buildNpmInvocation(npmCli, args) {
   return Object.freeze({
     command: process.execPath,

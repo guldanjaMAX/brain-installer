@@ -10,6 +10,7 @@ import {
   buildNpmInvocation,
   buildStepPlan,
   buildWindowsBatchInvocation,
+  createCredentialFreeProviderEnvironment,
   createSafeEnvironment,
   parseFieldPrepareArgs,
   renderFieldChecklist,
@@ -92,6 +93,22 @@ test("npm and Windows wrapper launches avoid ambient shell execution", () => {
   assert.equal(batch.shell, false);
   assert.deepEqual(batch.args.slice(0, 3), ["/d", "/s", "/c"]);
   assert.throws(() => buildWindowsBatchInvocation("cmd.exe", "bad\"path.cmd"), /refused/);
+});
+
+test("provider subprocesses drop credentials while keeping telemetry disabled", () => {
+  const safe = createCredentialFreeProviderEnvironment({
+    PATH: "/fixture/bin",
+    CLOUDFLARE_API_TOKEN: "fixture-token",
+    CF_ACCOUNT_ID: "fixture-account",
+    WRANGLER_HYPERDRIVE_LOCAL_CONNECTION_STRING: "fixture-connection",
+    WRANGLER_SEND_METRICS: "true",
+  });
+  assert.equal(safe.PATH, "/fixture/bin");
+  assert.equal(safe.CLOUDFLARE_API_TOKEN, undefined);
+  assert.equal(safe.CF_ACCOUNT_ID, undefined);
+  assert.equal(safe.WRANGLER_HYPERDRIVE_LOCAL_CONNECTION_STRING, undefined);
+  assert.equal(safe.WRANGLER_SEND_METRICS, "false");
+  assert.equal(safe.DO_NOT_TRACK, "1");
 });
 
 test("the command boundary refuses live modes, manifests, and mutating Cloudflare runners", () => {
