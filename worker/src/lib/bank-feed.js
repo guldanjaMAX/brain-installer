@@ -41,10 +41,15 @@
  * citation still resolves, which is the most expensive mistake available here.
  */
 
-import { jsonResponse, validateAdminKey } from "./core.js";
+import { jsonResponse, privateNoStore, validateAdminKey } from "./core.js";
 import { ownerSessionPrincipal } from "./owner-auth.js";
 import { importBankExport, balanceRoleFor } from "./fin-import.js";
 import { bankFeedProfile } from "./bank-feed-profiles.js";
+import {
+  assignPlaidAccountEntity,
+  PlaidAccountEntityError,
+  plaidOwnerAccountStatus,
+} from "./plaid-account-entities.js";
 
 /**
  * THE HOSTED FEED'S SIGN CONVENTION, WRITTEN DOWN ONCE.
@@ -1264,6 +1269,7 @@ export async function handleBankFeed(env, request, url, path, ctx) {
     ? jsonResponse({ error: "forbidden", code: "owner_required" }, 403)
     : jsonResponse({ error: "unauthorized", code: "session_required" }, 401);
   const operatorAuthorised = () => validateAdminKey(request, env);
+  const ownerJson = (body, status = 200) => privateNoStore(jsonResponse(body, status));
 
   try {
     if (path === "/app/connect/bank") {
@@ -1331,6 +1337,38 @@ export async function handleBankFeed(env, request, url, path, ctx) {
       return jsonResponse(await feedStatus(env));
     }
 
+    if (path === "/api/bank-feed/accounts" && request.method === "GET") {
+      const access = await ownerAccess();
+      if (!access.authorised) return privateNoStore(ownerRefusal(access));
+      const runtime = bankFeedConfig(env);
+      if (runtime.provider !== "plaid") {
+        return ownerJson({
+          error: "unavailable",
+          code: "plaid_account_assignment_unavailable",
+          unavailable: true,
+          sections_unavailable: ["accounts"],
+        }, 503);
+      }
+      const status = await plaidOwnerAccountStatus(env);
+      return ownerJson(status, status.unavailable ? 503 : 200);
+    }
+
+    if (path === "/api/bank-feed/accounts/assign" && request.method === "POST") {
+      const access = await ownerAccess();
+      if (!access.authorised) return privateNoStore(ownerRefusal(access));
+      const runtime = bankFeedConfig(env);
+      if (runtime.provider !== "plaid") {
+        return ownerJson({
+          error: "unavailable",
+          code: "plaid_account_assignment_unavailable",
+          unavailable: true,
+        }, 503);
+      }
+      const body = await readJson(request);
+      const assigned = await assignPlaidAccountEntity(env, body);
+      return ownerJson(assigned.body, assigned.status);
+    }
+
     if (path === "/api/bank-feed/sync" && request.method === "POST") {
       if (!operatorAuthorised()) return jsonResponse({ error: "unauthorized" }, 401);
       const body = await readJson(request);
@@ -1362,6 +1400,22 @@ export async function handleBankFeed(env, request, url, path, ctx) {
 
     return jsonResponse({ error: "not found" }, 404);
   } catch (error) {
+    if (error instanceof PlaidAccountEntityError) {
+      const errorName = error.status === 503
+        ? "unavailable"
+        : error.status === 409
+          ? "conflict"
+          : error.status === 404
+            ? "not_found"
+            : error.status === 403
+              ? "forbidden"
+              : "invalid_request";
+      return privateNoStore(jsonResponse({
+        error: errorName,
+        code: error.code,
+        ...(error.status === 503 ? { unavailable: true } : {}),
+      }, error.status));
+    }
     // One exit for every failure, so no path out of this module can carry a
     // provider payload or a credential into a response.
     const outcomeUnknown = error?.outcome_unknown === true;

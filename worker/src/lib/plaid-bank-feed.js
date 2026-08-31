@@ -25,6 +25,10 @@ import {
   stagePlaidSyncWindow,
   verifyPlaidWebhook,
 } from "./plaid-protocol.js";
+import {
+  discoverPlaidAccountAssignments,
+  plaidAccountAssignmentReadiness,
+} from "./plaid-account-entities.js";
 
 const PROVIDER = "plaid";
 const BACKFILL_DAYS = 730;
@@ -542,6 +546,23 @@ async function syncWindowRow(env, tenantId, itemRef, stamp) {
   return row;
 }
 
+async function restoreReadyWindowAssignmentInventory(env, { tenantId, itemRef, windowRef, stamp }) {
+  const staged = (await env.DB.prepare(
+    `SELECT provider_account_id AS providerAccountId
+       FROM plaid_sync_stage_accounts
+      WHERE tenant_id=? AND window_ref=? ORDER BY provider_account_id`,
+  ).bind(tenantId, windowRef).all())?.results || [];
+  // Schema 30 can be installed while an older Worker-owned window is already
+  // ready to promote. Reconstruct only the opaque owner references from that
+  // durable staged inventory. No provider call and no default entity is needed.
+  await discoverPlaidAccountAssignments(env, {
+    tenantId,
+    itemRef,
+    accounts: staged,
+    at: stamp,
+  });
+}
+
 function promotionStatements(env, {
   tenantId,
   itemRef,
@@ -551,26 +572,94 @@ function promotionStatements(env, {
   stamp,
 }) {
   const sourceFeed = feedScopeKey(itemRef);
-  const entitySlug = String(env.BANK_FEED_ENTITY || "primary");
   const interval = Math.min(Math.max(Number(env.BANK_FEED_RECONCILE_MINUTES) || DEFAULT_RECONCILE_MINUTES, 15), 1440);
   const historicalComplete = historyState === PLAID_HISTORY_STATE.HISTORICAL;
   const nextDue = new Date(Date.parse(stamp) + (historicalComplete ? interval : 5) * 60_000).toISOString();
   return [
+    // The preflight gives the owner a useful assignment_required result. This
+    // guard runs again inside the promotion batch so a concurrent entity
+    // retirement or reassignment cannot create a partial promotion. A malformed
+    // JSON expression deliberately aborts and rolls back the complete batch.
+    env.DB.prepare(
+      `SELECT CASE WHEN
+          EXISTS (SELECT 1 FROM plaid_sync_stage_accounts
+                   WHERE tenant_id=? AND window_ref=?)
+          AND NOT EXISTS (
+            SELECT 1 FROM plaid_sync_stage_accounts s
+            LEFT JOIN plaid_account_entity_assignments a
+              ON a.tenant_id=s.tenant_id AND a.item_ref=?
+             AND a.provider_account_id=s.provider_account_id
+            LEFT JOIN fin_entities e
+              ON e.tenant_id=a.tenant_id AND e.entity_slug=a.entity_slug
+             AND e.superseded_by_id IS NULL AND e.status='active' AND e.relationship='owned'
+            WHERE s.tenant_id=? AND s.window_ref=?
+              AND (a.entity_slug IS NULL OR e.entity_slug IS NULL)
+          )
+        THEN 1 ELSE json_extract('plaid account assignment required','$') END AS assignment_guard`,
+    ).bind(tenantId, windowRef, itemRef, tenantId, windowRef),
     env.DB.prepare(
       `INSERT INTO fin_accounts
          (tenant_id,account_slug,entity_slug,label,account_kind,balance_role,mask,currency,
           feed_mode,external_ref,provenance,source_feed,basis_state,recorded_at,
           source_iso_currency_code,source_unofficial_currency_code)
-       SELECT tenant_id,account_slug,?,name,account_kind,balance_role,mask,currency,
-              'live',provider_account_id,'feed',?,'confirmed',?,iso_currency_code,unofficial_currency_code
-         FROM plaid_sync_stage_accounts WHERE tenant_id=? AND window_ref=?
+       SELECT s.tenant_id,s.account_slug,a.entity_slug,s.name,s.account_kind,s.balance_role,s.mask,s.currency,
+              'live',s.provider_account_id,'feed',?,'confirmed',?,s.iso_currency_code,s.unofficial_currency_code
+         FROM plaid_sync_stage_accounts s
+         JOIN plaid_account_entity_assignments a
+           ON a.tenant_id=s.tenant_id AND a.item_ref=? AND a.provider_account_id=s.provider_account_id
+         JOIN fin_entities e
+           ON e.tenant_id=a.tenant_id AND e.entity_slug=a.entity_slug
+          AND e.superseded_by_id IS NULL AND e.status='active' AND e.relationship='owned'
+        WHERE s.tenant_id=? AND s.window_ref=?
        ON CONFLICT(tenant_id,account_slug) WHERE superseded_by_id IS NULL DO UPDATE SET
-         label=excluded.label,account_kind=excluded.account_kind,balance_role=excluded.balance_role,
+         entity_slug=excluded.entity_slug,label=excluded.label,
+         account_kind=excluded.account_kind,balance_role=excluded.balance_role,
          mask=excluded.mask,currency=excluded.currency,feed_mode='live',external_ref=excluded.external_ref,
          source_iso_currency_code=excluded.source_iso_currency_code,
          source_unofficial_currency_code=excluded.source_unofficial_currency_code,
          provenance='feed',source_feed=excluded.source_feed,basis_state='confirmed',recorded_at=excluded.recorded_at`,
-    ).bind(entitySlug, sourceFeed, stamp, tenantId, windowRef),
+    ).bind(sourceFeed, stamp, itemRef, tenantId, windowRef),
+    env.DB.prepare(
+      `INSERT INTO fin_account_coverage
+         (tenant_id,account_slug,coverage_status,covered_from,covered_to,basis_note,
+          computed_at,provenance,source_feed,basis_state,recorded_at)
+       SELECT s.tenant_id,s.account_slug,
+              CASE WHEN ? THEN 'complete'
+                   WHEN COUNT(t.provider_transaction_id)>0 THEN 'partial' ELSE 'missing' END,
+              MIN(t.posted_on),
+              CASE WHEN ? THEN substr(?,1,10) ELSE MAX(t.posted_on) END,
+              CASE WHEN ? THEN 'Plaid completed the requested history window.'
+                   WHEN COUNT(t.provider_transaction_id)>0 THEN 'Plaid history is still arriving.'
+                   ELSE 'No dated transaction coverage has promoted yet.' END,
+              ?,'feed',?,'confirmed',?
+         FROM plaid_sync_stage_accounts s
+         JOIN plaid_account_entity_assignments a
+           ON a.tenant_id=s.tenant_id AND a.item_ref=? AND a.provider_account_id=s.provider_account_id
+         JOIN fin_entities e
+           ON e.tenant_id=a.tenant_id AND e.entity_slug=a.entity_slug
+          AND e.superseded_by_id IS NULL AND e.status='active' AND e.relationship='owned'
+         LEFT JOIN plaid_sync_stage_transactions t
+           ON t.tenant_id=s.tenant_id AND t.window_ref=s.window_ref
+          AND t.provider_account_id=s.provider_account_id AND t.operation IN ('added','modified')
+        WHERE s.tenant_id=? AND s.window_ref=?
+        GROUP BY s.tenant_id,s.account_slug
+       ON CONFLICT(tenant_id,account_slug) WHERE superseded_by_id IS NULL DO UPDATE SET
+         coverage_status=excluded.coverage_status,covered_from=excluded.covered_from,
+         covered_to=excluded.covered_to,basis_note=excluded.basis_note,
+         computed_at=excluded.computed_at,provenance='feed',source_feed=excluded.source_feed,
+         basis_state='confirmed',recorded_at=excluded.recorded_at`,
+    ).bind(
+      historicalComplete ? 1 : 0,
+      historicalComplete ? 1 : 0,
+      stamp,
+      historicalComplete ? 1 : 0,
+      stamp,
+      sourceFeed,
+      stamp,
+      itemRef,
+      tenantId,
+      windowRef,
+    ),
     env.DB.prepare(
       `INSERT INTO fin_transactions
          (tenant_id,txn_uid,account_slug,posted_on,amount_minor,direction,raw_amount_minor,
@@ -641,6 +730,38 @@ function promotionStatements(env, {
   ];
 }
 
+function assignmentBlockedResult(itemRef, readiness, receipt = {}) {
+  return {
+    item_ref: itemRef,
+    ok: false,
+    partial: true,
+    status: readiness.state,
+    assignment_required: readiness.state === "assignment_required",
+    unavailable: readiness.state === "unavailable",
+    code: readiness.code,
+    account_count: readiness.account_count,
+    assignments_remaining: readiness.assignment_required,
+    invalid_assignments: readiness.invalid_assignments || 0,
+    cursor_advanced: false,
+    ...receipt,
+  };
+}
+
+async function promotePlaidWindow(env, details, receipt = {}) {
+  const readiness = await plaidAccountAssignmentReadiness(env, details);
+  if (!readiness.ready) return assignmentBlockedResult(details.itemRef, readiness, receipt);
+  try {
+    await env.DB.batch(promotionStatements(env, details));
+  } catch (error) {
+    // If authority changed between the read and the transactional guard, report
+    // the new owner action instead of turning it into a generic provider error.
+    const after = await plaidAccountAssignmentReadiness(env, details);
+    if (!after.ready) return assignmentBlockedResult(details.itemRef, after, receipt);
+    throw error;
+  }
+  return { ...receipt, promoted: true };
+}
+
 export async function syncPlaidItem(env, itemRef, { fetchImpl = fetch, now = null } = {}) {
   const { tenantId } = tenantReference(env);
   const stamp = nowIso(now);
@@ -654,14 +775,21 @@ export async function syncPlaidItem(env, itemRef, { fetchImpl = fetch, now = nul
   const window = await syncWindowRow(env, tenantId, itemRef, stamp);
   try {
     if (window.state === "ready") {
-      await env.DB.batch(promotionStatements(env, {
+      await restoreReadyWindowAssignmentInventory(env, {
+        tenantId,
+        itemRef,
+        windowRef: window.window_ref,
+        stamp,
+      });
+      const promoted = await promotePlaidWindow(env, {
         tenantId,
         itemRef,
         windowRef: window.window_ref,
         finalCursor: window.resume_cursor,
         historyState: window.provider_history_state,
         stamp,
-      }));
+      });
+      if (!promoted.promoted) return promoted;
       const historicalComplete = window.provider_history_state === PLAID_HISTORY_STATE.HISTORICAL;
       return {
         item_ref: itemRef,
@@ -685,6 +813,7 @@ export async function syncPlaidItem(env, itemRef, { fetchImpl = fetch, now = nul
     const accountPayload = await callPlaid(env, "/accounts/get", { access_token: accessToken }, { fetchImpl });
     const accounts = (Array.isArray(accountPayload.accounts) ? accountPayload.accounts : [])
       .map((account) => stagedAccount(itemRef, account));
+    await discoverPlaidAccountAssignments(env, { tenantId, itemRef, accounts, at: stamp });
     const result = await stagePlaidSyncWindow({
       originalCursor: window.original_cursor || null,
       originalHistoryState: window.provider_history_state,
@@ -732,17 +861,17 @@ export async function syncPlaidItem(env, itemRef, { fetchImpl = fetch, now = nul
         ]);
       },
       promoteWindow: async (receipt) => {
-        await env.DB.batch(promotionStatements(env, {
+        return promotePlaidWindow(env, {
           tenantId,
           itemRef,
           windowRef: window.window_ref,
           finalCursor: receipt.finalCursor,
           historyState: receipt.historyState,
           stamp,
-        }));
-        return receipt;
+        }, receipt);
       },
     });
+    if (result.promoted !== true) return result;
     const { historyState: providerHistoryState, ...syncResult } = result;
     const historicalComplete = providerHistoryState === PLAID_HISTORY_STATE.HISTORICAL;
     return {

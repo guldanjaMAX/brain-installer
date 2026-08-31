@@ -386,7 +386,7 @@
             },
             "entity_slug": {
               "type": "string",
-              "description": "Which fin_entities scope feed rows belong to. Defaults to primary."
+              "description": "Legacy custom-provider scope only. Plaid ignores this Item-level value: every discovered Plaid account remains staged until the owner assigns that exact masked account to one active owned fin_entities scope."
             },
             "country_codes": {
               "type": "array",

@@ -246,13 +246,14 @@
         "registered in that Plaid environment. Credentials never go here.",
         "The account holder completes Link themselves. This brain requests only",
         "read-only Transactions and never sees bank login credentials. Scheduled",
-        "reconciliation remains active because webhooks are not a sole source of truth."
+        "reconciliation remains active because webhooks are not a sole source of truth.",
+        "After Link, assign each masked account to its owning entity. Plaid never",
+        "defaults every account at one institution to a primary entity."
       ],
       "enabled": false,
       "provider": "plaid",
       "environment": "sandbox",
       "registered_redirect_uris": [],
-      "entity_slug": "primary",
       "country_codes": [
         "US"
       ],

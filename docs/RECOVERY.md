@@ -201,12 +201,17 @@ The normalized row is then hashed together with the remaining durable table
 export, so a retry cannot reuse a recovery artifact poisoned by an
 invocation-local lease, mutation fence, or old provider receipt. Older exact
 migration prefixes remain offline-inspectable, but the live field runner
-requires exact current schema 29 because it cannot safely use the current
+requires exact current schema 30 because it cannot safely use the current
 lease, visibility, and durable bulk-bootstrap protocol across a schema drift.
 Schema 29 also preserves Plaid's exact historical-readiness evidence and whether
 a destructive Item-removal response was confirmed, known not to remove, or
 unknown. Recovery does not turn an old local `complete` label into provider
 historical proof and does not blindly replay an unknown removal.
+
+Schema 30 preserves the owner's per-account entity assignments. A restored
+Item cannot promote or advance its cursor until every discovered account still
+maps to one active owned entity; no recovered account falls back to a primary
+entity.
 
 Schema 22 recovery is exact and intentionally asymmetric. Exact-document
 grants, grant membership, durable request receipts, document-access audit

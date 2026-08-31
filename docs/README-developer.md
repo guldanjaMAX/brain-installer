@@ -1130,6 +1130,8 @@ The named Plaid profile, durability model, credential-free rehearsal, optional
 live Sandbox runner, and remaining owner ceremony are documented in
 [PLAID.md](./PLAID.md). Built and locally green does not mean Plaid Sandbox,
 Production, a real institution, or the owner's primary bank has been tested.
+Plaid account scope is owner-confirmed per masked account. An Item-level
+`entity_slug` is never authority and no account defaults to `primary`.
 
 The QuickBooks company-binding, sandbox callback, broad-scope disclosure,
 production refusal, and next Intuit field gate are documented in

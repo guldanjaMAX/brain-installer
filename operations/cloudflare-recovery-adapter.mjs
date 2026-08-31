@@ -225,6 +225,10 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "plaid_webhook_keys",
   "plaid_reconciliation",
   "plaid_revocation_outbox",
+  // Schema 30: owner-confirmed account scope is durable authority. Losing it
+  // would either strand every restored Plaid window or tempt a future default
+  // assignment, so it crosses recovery with the ledger and Item cursor.
+  "plaid_account_entity_assignments",
   // Schemas 27 and 28: request-window counters and vector retry bookkeeping
   // are live operational state. Their tables must exist after recovery, but
   // neither rate-limit history nor stale provider retry state crosses brains.
@@ -333,7 +337,7 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // EXACT current schema by design: a drill against a
 // database one migration behind would export a table or column set that does
 // not match the reviewed list. Bumping this is required for every migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 29;
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 30;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -413,6 +417,7 @@ const SCHEMA_26_TABLES = Object.freeze([
 ]);
 const SCHEMA_27_TABLES = Object.freeze(["public_request_quotas"]);
 const SCHEMA_28_TABLES = Object.freeze(["vector_outbox_retry_state"]);
+const SCHEMA_30_TABLES = Object.freeze(["plaid_account_entity_assignments"]);
 
 const AGGREGATE_FIELDS = Object.freeze([
   ...RECOVERY_DURABLE_TABLES.map((table) => [
@@ -429,7 +434,7 @@ const AGGREGATE_FIELDS = Object.freeze([
      ...SCHEMA_15_TABLES, ...SCHEMA_16_TABLES, ...SCHEMA_17_TABLES, ...SCHEMA_18_TABLES,
      ...SCHEMA_19_TABLES, ...SCHEMA_21_TABLES, ...SCHEMA_22_TABLES, ...SCHEMA_23_TABLES,
      ...SCHEMA_24_TABLES, ...SCHEMA_25_TABLES, ...SCHEMA_26_TABLES,
-     ...SCHEMA_27_TABLES, ...SCHEMA_28_TABLES].includes(table)
+     ...SCHEMA_27_TABLES, ...SCHEMA_28_TABLES, ...SCHEMA_30_TABLES].includes(table)
       ? "SELECT 0"
       : `SELECT COUNT(*) FROM ${quoteIdentifier(table)}`,
   ]),
@@ -1335,7 +1340,8 @@ function expectedRecoveryTables(migrations) {
     (latest >= 25 || !SCHEMA_25_TABLES.includes(table)) &&
     (latest >= 26 || !SCHEMA_26_TABLES.includes(table)) &&
     (latest >= 27 || !SCHEMA_27_TABLES.includes(table)) &&
-    (latest >= 28 || !SCHEMA_28_TABLES.includes(table)));
+    (latest >= 28 || !SCHEMA_28_TABLES.includes(table)) &&
+    (latest >= 30 || !SCHEMA_30_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {

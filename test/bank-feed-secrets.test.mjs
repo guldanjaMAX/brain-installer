@@ -330,8 +330,15 @@ try {
     const plaidNames = plaidBindings.map((binding) => binding.name);
     check("deploy names the Plaid profile and its reconciliation policy without endpoint overrides",
       plaidNames.includes("BANK_FEED_PROVIDER") && plaidNames.includes("BANK_FEED_RECONCILE_MINUTES") &&
-      !plaidNames.includes("BANK_FEED_API_BASE") && !plaidNames.includes("BANK_FEED_LINK_SDK_URL"),
+      !plaidNames.includes("BANK_FEED_API_BASE") && !plaidNames.includes("BANK_FEED_LINK_SDK_URL") &&
+      !plaidNames.includes("BANK_FEED_ENTITY"),
       JSON.stringify(plaidBindings));
+    const customNames = bankFeedWorkerBindings({
+      ...manifest({ bankFeed: true }),
+      corpora: { bank_feed: { enabled: true, provider: "custom", entity_slug: "fixture-company" } },
+    }).map((binding) => binding.name);
+    check("only the compatible custom feed receives its explicit single-entity binding",
+      customNames.includes("BANK_FEED_ENTITY"), JSON.stringify(customNames));
     check("deploy metadata contains no Plaid credential name or fixture secret",
       !JSON.stringify(plaidBindings).includes("BANK_FEED_CLIENT_ID") &&
       !JSON.stringify(plaidBindings).includes("BANK_FEED_SECRET") &&

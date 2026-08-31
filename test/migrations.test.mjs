@@ -252,6 +252,58 @@ for (const trigger of ["vector_outbox_generation_ai", "vector_outbox_generation_
 }
 
 /* queued_at is allowed to collide; the database-owned generation is not. */
+
+/* ---- 0030 keeps Plaid account scope explicit and restart-safe ---- */
+{
+  check("plaid_account_entity_assignments exists",
+    names.has("plaid_account_entity_assignments"), [...names].join(", "));
+  check("the pending-assignment index exists",
+    names.has("idx_plaid_account_entity_pending"));
+  const migration = splitStatements(
+    readFileSync(join(DIR, "0030_plaid_account_entity_assignments.sql"), "utf-8"),
+  );
+  let replayed = true;
+  try {
+    for (const statement of migration) db.exec(statement);
+  } catch { replayed = false; }
+  check("0030 raw replay is inherently idempotent", replayed);
+
+  db.prepare(
+    `INSERT INTO plaid_account_entity_assignments
+       (tenant_id,item_ref,provider_account_id,account_ref,entity_slug,
+        discovered_at,last_seen_at,assigned_at,updated_at)
+     VALUES ('primary','fixture-item','fixture-provider-account',
+             'acct_0123456789abcdef0123456789abcdef',NULL,
+             '2026-08-30T00:00:00Z','2026-08-30T00:00:00Z',NULL,'2026-08-30T00:00:00Z')`,
+  ).run();
+  const pending = db.prepare(
+    "SELECT entity_slug,assigned_at FROM plaid_account_entity_assignments WHERE item_ref='fixture-item'",
+  ).get();
+  check("a newly discovered account remains unassigned rather than defaulting to primary",
+    pending.entity_slug === null && pending.assigned_at === null, JSON.stringify(pending));
+
+  let duplicateRefRefused = false;
+  let malformedRefRefused = false;
+  try {
+    db.prepare(
+      `INSERT INTO plaid_account_entity_assignments
+         (tenant_id,item_ref,provider_account_id,account_ref,discovered_at,last_seen_at,updated_at)
+       VALUES ('primary','second-item','second-account','acct_0123456789abcdef0123456789abcdef',
+               '2026-08-30T00:00:00Z','2026-08-30T00:00:00Z','2026-08-30T00:00:00Z')`,
+    ).run();
+  } catch { duplicateRefRefused = true; }
+  try {
+    db.prepare(
+      `INSERT INTO plaid_account_entity_assignments
+         (tenant_id,item_ref,provider_account_id,account_ref,discovered_at,last_seen_at,updated_at)
+       VALUES ('primary','third-item','third-account','account-secret-id',
+               '2026-08-30T00:00:00Z','2026-08-30T00:00:00Z','2026-08-30T00:00:00Z')`,
+    ).run();
+  } catch { malformedRefRefused = true; }
+  check("one owner-safe account ref cannot identify two provider accounts", duplicateRefRefused);
+  check("a raw or malformed provider identifier cannot become an owner account ref", malformedRefRefused);
+}
+
 {
   db.prepare(
     `INSERT INTO install_state

@@ -102,7 +102,10 @@ before continuing. The smoke and final verification steps record live deployed
 proof; ordinary child exit codes and a static manifest do not.
 
 The optional Plaid profile is read-only, disabled by default, and still requires
-a client-owned Plaid account plus the account holder's own Link ceremony. Its
+a client-owned Plaid account plus the account holder's own Link ceremony. Each
+masked account remains staged until the signed-in owner assigns it to one active
+owned entity; an institution connection never defaults every account to one
+business scope. Its
 offline rehearsal, opt-in live Sandbox runner, custody rules, and remaining
 field gate are in [docs/PLAID.md](docs/PLAID.md).
 

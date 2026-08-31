@@ -1347,7 +1347,6 @@ export function bankFeedWorkerBindings(m) {
       name: "BANK_FEED_DISPLAY_NAME",
       text: String(m.client?.display_name || m.client?.slug || "this brain"),
     },
-    { type: "plain_text", name: "BANK_FEED_ENTITY", text: String(feed.entity_slug || "primary") },
     {
       type: "plain_text",
       name: "BANK_FEED_COUNTRIES",
@@ -1361,6 +1360,14 @@ export function bankFeedWorkerBindings(m) {
     },
   ];
   if (provider === "custom") {
+    // The compatible custom feed still imports one explicitly configured
+    // ledger scope. Plaid never receives this binding because one institution
+    // connection can contain accounts owned by several different entities.
+    bindings.push({
+      type: "plain_text",
+      name: "BANK_FEED_ENTITY",
+      text: String(feed.entity_slug || "primary"),
+    });
     for (const [name, value] of [
       ["BANK_FEED_API_BASE", feed.api_base],
       ["BANK_FEED_LINK_SDK_URL", feed.link_sdk_url],

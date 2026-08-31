@@ -23,7 +23,6 @@ The manifest names public, non-secret policy only:
         "https://brain.example/app/connect/bank"
       ],
       "country_codes": ["US"],
-      "entity_slug": "primary",
       "reconciliation_interval_minutes": 360
     }
   }
@@ -76,6 +75,20 @@ status response, support artifact, or recovery artifact.
 - Every `transactions/sync` `has_more` window is staged from the original
   committed cursor. The ledger rows and final cursor become visible in one
   set-based D1 promotion only after the complete window is present.
+- An Item is not a business scope. Every discovered account receives one opaque
+  `account_ref` and remains staged until the signed-in owner assigns it to one
+  active owned entity. Missing, retired, counterparty, or unavailable entity
+  authority blocks the complete promotion and cursor advance. `entity_slug` in
+  an older Plaid manifest is ignored; it never defaults new accounts to
+  `primary`.
+- `GET /api/bank-feed/accounts` is owner-session-only and returns masked account
+  labels, assignment, freshness, provider-history, and coverage states. It
+  returns unavailable rather than a healthy empty list when D1 or the account
+  inventory cannot be proved. `POST /api/bank-feed/accounts/assign` uses a
+  stable `request_id`; an unchanged retry replays one receipt and never appends
+  a second owner activity event. Neither route accepts the admin key as a
+  fallback or returns Item, provider-account, ledger-account, or transaction
+  identifiers.
 - `TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION` discards the staged attempt and
   restarts from that original cursor.
 - An empty page is not historical-completion evidence. The exact Plaid state is
@@ -159,7 +172,7 @@ checked separately.
 - The owner completes Link, institution login, consent, MFA, and any later update-mode
   repair on his own device.
 - The first Production connection is checked against the institution's visible
-  account list, date coverage, transaction direction, currency, pending and
+  account list, per-account entity assignment, date coverage, transaction direction, currency, pending and
   posted replacement, webhook delivery, scheduled fallback, disconnect, and
   provider-side removal.
 - A sanitized receipt is reviewed before the connector is called field-proven.

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createProductFixture } from "./product-contract-fixture.mjs";
+import { createProductFixture, seedCounterparty, seedOwnedEntity } from "./product-contract-fixture.mjs";
 import { handleBankFeed } from "../src/lib/bank-feed.js";
 import {
   completePlaidLink,
@@ -190,6 +190,63 @@ class PlaidSandboxFake {
   }
 }
 
+class MultiEntityPlaidFake extends PlaidSandboxFake {
+  async fetch(url, init) {
+    const path = new URL(url).pathname;
+    if (path !== "/accounts/get" && path !== "/transactions/sync") {
+      return super.fetch(url, init);
+    }
+    this.calls.set(path, this.count(path) + 1);
+    if (path === "/accounts/get") {
+      return jsonResponse({ accounts: [
+        {
+          account_id: "household-account-internal",
+          name: "Household checking",
+          mask: "1111",
+          type: "depository",
+          subtype: "checking",
+          balances: { current: "1000.00", available: "900.00", iso_currency_code: "USD" },
+        },
+        {
+          account_id: "business-account-internal",
+          name: "Business card",
+          mask: "2222",
+          type: "credit",
+          subtype: "credit card",
+          balances: { current: "200.00", available: "800.00", iso_currency_code: "USD" },
+        },
+      ] });
+    }
+    return jsonResponse({
+      added: [
+        {
+          transaction_id: "household-transaction-internal",
+          account_id: "household-account-internal",
+          amount: "20.00",
+          iso_currency_code: "USD",
+          date: "2026-08-30",
+          pending: false,
+          name: "Household fixture",
+        },
+        {
+          transaction_id: "business-transaction-internal",
+          account_id: "business-account-internal",
+          amount: "30.00",
+          iso_currency_code: "USD",
+          date: "2026-08-30",
+          pending: false,
+          name: "Business fixture",
+        },
+      ],
+      modified: [],
+      removed: [],
+      next_cursor: "multi-entity-complete",
+      has_more: false,
+      transactions_update_status: "HISTORICAL_UPDATE_COMPLETE",
+    });
+  }
+}
+
 test("Plaid durable runtime closes response-loss, sync, webhook, fallback, and revocation boundaries", async () => {
   const fixture = await createProductFixture({
     env: {
@@ -207,6 +264,7 @@ test("Plaid durable runtime closes response-loss, sync, webhook, fallback, and r
   const fetchImpl = provider.fetch.bind(provider);
   const stamp = "2026-08-30T13:00:00.000Z";
   try {
+    seedOwnedEntity(fixture, "fixture-company", "Fixture Company");
     const ownerHeaders = await fixture.ownerHeaders();
     const linkUrl = new URL("https://brain.invalid/api/bank-feed/link-token");
     const linkRoute = (body) => handleBankFeed(fixture.env, new Request(linkUrl, {
@@ -291,6 +349,61 @@ test("Plaid durable runtime closes response-loss, sync, webhook, fallback, and r
       "SELECT access_ciphertext FROM bank_feed_items WHERE item_ref='item-sandbox-1'",
     ).access_ciphertext, ciphertextBeforeUpdate);
 
+    const unassigned = await syncPlaidItem(fixture.env, "item-sandbox-1", { fetchImpl, now: stamp });
+    assert.equal(unassigned.ok, false);
+    assert.equal(unassigned.status, "assignment_required");
+    assert.equal(unassigned.cursor_advanced, false);
+    assert.equal(fixture.first("SELECT cursor FROM bank_feed_items WHERE item_ref='item-sandbox-1'").cursor, null);
+    assert.equal(fixture.first("SELECT COUNT(*) AS n FROM fin_transactions").n, 0);
+
+    assert.equal(fixture.first("SELECT state FROM plaid_sync_windows WHERE item_ref='item-sandbox-1'").state, "ready");
+    const accountRef = fixture.first(
+      "SELECT account_ref FROM plaid_account_entity_assignments WHERE item_ref='item-sandbox-1'",
+    ).account_ref;
+
+    const statusUrl = new URL("https://brain.invalid/api/bank-feed/accounts");
+    const statusResponse = await handleBankFeed(fixture.env, new Request(statusUrl, {
+      headers: ownerHeaders,
+    }), statusUrl, statusUrl.pathname, {});
+    assert.equal(statusResponse.status, 200);
+    const ownerStatus = await statusResponse.json();
+    assert.equal(ownerStatus.state, "assignment_required");
+    assert.equal(ownerStatus.accounts[0].account_ref, accountRef);
+    assert.equal(ownerStatus.accounts[0].assignment.state, "assignment_required");
+    assert.match(ownerStatus.accounts[0].masked_identifier, /ending 1234/);
+    assert.equal(JSON.stringify(ownerStatus).includes("item-sandbox-1"), false);
+    assert.equal(JSON.stringify(ownerStatus).includes("account-1"), false);
+
+    const assignUrl = new URL("https://brain.invalid/api/bank-feed/accounts/assign");
+    const assign = (body, headers = ownerHeaders) => handleBankFeed(fixture.env, new Request(assignUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    }), assignUrl, assignUrl.pathname, {});
+    const noAdminFallback = await assign({
+      request_id: "assign-account-request-0001",
+      account_ref: accountRef,
+      entity_slug: "fixture-company",
+    }, { "X-Admin-Key": fixture.env.ADMIN_KEY });
+    assert.equal(noAdminFallback.status, 401);
+    const assignment = await assign({
+      request_id: "assign-account-request-0001",
+      account_ref: accountRef,
+      entity_slug: "fixture-company",
+    });
+    assert.equal(assignment.status, 201);
+    assert.equal((await assignment.json()).changed, true);
+    const assignmentReplay = await assign({
+      request_id: "assign-account-request-0001",
+      account_ref: accountRef,
+      entity_slug: "fixture-company",
+    });
+    assert.equal(assignmentReplay.status, 200);
+    assert.equal((await assignmentReplay.json()).replayed, true);
+    assert.equal(fixture.first(
+      "SELECT COUNT(*) AS n FROM owner_activity_events WHERE event_type='bank_account_entity_assigned'",
+    ).n, 1);
+
     fixture.control.failOn = /UPDATE bank_feed_items SET cursor=/;
     const interrupted = await syncPlaidItem(fixture.env, "item-sandbox-1", { fetchImpl, now: stamp });
     assert.equal(interrupted.ok, false);
@@ -319,6 +432,9 @@ test("Plaid durable runtime closes response-loss, sync, webhook, fallback, and r
     assert.equal(posted.source_provider, "plaid");
     assert.ok(posted.source_window_ref);
     assert.equal(posted.source_page_index, 1);
+    assert.equal(fixture.first(
+      "SELECT entity_slug FROM fin_accounts WHERE external_ref='account-1'",
+    ).entity_slug, "fixture-company");
 
     const rawBody = JSON.stringify({
       webhook_type: "TRANSACTIONS",
@@ -536,6 +652,7 @@ test("empty Transactions Sync stays partial through NOT_READY and INITIAL provid
   const fetchImpl = provider.fetch.bind(provider);
   const stamp = "2026-08-30T13:00:00.000Z";
   try {
+    seedOwnedEntity(fixture, "fixture-company", "Fixture Company");
     const link = await createPlaidLinkToken(fixture.env, {
       url: "https://brain.invalid/app/connect/bank",
       sessionRef: "empty-history-link-0001",
@@ -557,7 +674,20 @@ test("empty Transactions Sync stays partial through NOT_READY and INITIAL provid
 
     const firstSlice = await runPlaidFeedSlice(fixture.env, { maxItems: 1, fetchImpl, now: stamp });
     assert.equal(firstSlice.ran, 1);
-    const notReady = firstSlice.items[0];
+    assert.equal(firstSlice.items[0].status, "assignment_required");
+    assert.equal(firstSlice.items[0].cursor_advanced, false);
+    const accountRef = fixture.first(
+      "SELECT account_ref FROM plaid_account_entity_assignments WHERE item_ref='item-sandbox-1'",
+    ).account_ref;
+    const ownerHeaders = await fixture.ownerHeaders();
+    const assigned = await fixture.post("/api/bank-feed/accounts/assign", {
+      request_id: "empty-history-assignment-0001",
+      account_ref: accountRef,
+      entity_slug: "fixture-company",
+    }, ownerHeaders);
+    assert.equal(assigned.status, 201);
+
+    const notReady = await syncPlaidItem(fixture.env, "item-sandbox-1", { fetchImpl, now: stamp });
     assert.equal(notReady.ok, false);
     assert.equal(notReady.partial, true);
     assert.equal(notReady.history_state, "running");
@@ -602,6 +732,316 @@ test("empty Transactions Sync stays partial through NOT_READY and INITIAL provid
     assert.equal(untouchedItem.state, "running");
     assert.equal(untouchedItem.provider_history_state, "NOT_READY");
     assert.equal(untouchedItem.finished_at, null);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("scheduled promotion keeps two Plaid accounts in their exact owner-confirmed entities", async () => {
+  const fixture = await createProductFixture({
+    env: {
+      BANK_FEED_PROVIDER: "plaid",
+      BANK_FEED_ENV: "sandbox",
+      BANK_FEED_CLIENT_ID: "fixture-client-id",
+      BANK_FEED_SECRET: "fixture-secret",
+      BANK_FEED_WRAPPING_KEY_V2: `v2.${"A".repeat(43)}`,
+      // This legacy Item-level value is intentionally wrong. Promotion must
+      // never consult it or fall back to primary.
+      BANK_FEED_ENTITY: "wrong-default",
+      BRAIN_NAME: "Sandbox Brain",
+    },
+  });
+  const provider = new MultiEntityPlaidFake();
+  const fetchImpl = provider.fetch.bind(provider);
+  const stamp = "2026-08-30T13:00:00.000Z";
+  try {
+    seedOwnedEntity(fixture, "household", "Household");
+    seedOwnedEntity(fixture, "operating-company", "Operating Company");
+    seedOwnedEntity(fixture, "closed-company", "Closed Company");
+    seedCounterparty(fixture, "outside-buyer");
+    fixture.raw("UPDATE fin_entities SET status='closed' WHERE entity_slug='closed-company'");
+    const link = await createPlaidLinkToken(fixture.env, {
+      url: "https://brain.invalid/app/connect/bank",
+      sessionRef: "multi-entity-link-0001",
+      fetchImpl,
+      now: stamp,
+    });
+    await completePlaidLink(fixture.env, {
+      sessionRef: link.session_ref,
+      publicToken: "public-sandbox-once",
+      institutionLabel: "Two-Scope Bank",
+      fetchImpl,
+      now: stamp,
+    });
+
+    const staged = await runPlaidFeedSlice(fixture.env, { maxItems: 1, fetchImpl, now: stamp });
+    assert.equal(staged.items[0].status, "assignment_required");
+    assert.equal(staged.items[0].assignments_remaining, 2);
+    assert.equal(fixture.first("SELECT cursor FROM bank_feed_items").cursor, null);
+    assert.equal(fixture.first("SELECT COUNT(*) AS n FROM fin_accounts").n, 0);
+    assert.equal(fixture.first("SELECT COUNT(*) AS n FROM fin_transactions").n, 0);
+
+    // Schema 30 can arrive after an older Worker has staged a ready window.
+    // Rebuild only the opaque owner refs from D1, without another provider read,
+    // and keep the cursor blocked for assignment.
+    const accountReadsBeforeResume = provider.count("/accounts/get");
+    fixture.raw("DELETE FROM plaid_account_entity_assignments");
+    const resumedInventory = await runPlaidFeedSlice(fixture.env, { maxItems: 1, fetchImpl, now: stamp });
+    assert.equal(resumedInventory.items[0].status, "assignment_required");
+    assert.equal(resumedInventory.items[0].assignments_remaining, 2);
+    assert.equal(provider.count("/accounts/get"), accountReadsBeforeResume);
+    assert.equal(fixture.first("SELECT COUNT(*) AS n FROM plaid_account_entity_assignments").n, 2);
+    assert.equal(fixture.first("SELECT cursor FROM bank_feed_items").cursor, null);
+
+    const refs = fixture.rows(
+      "SELECT provider_account_id,account_ref FROM plaid_account_entity_assignments ORDER BY provider_account_id",
+    );
+    const byProvider = Object.fromEntries(refs.map((row) => [row.provider_account_id, row.account_ref]));
+    const ownerHeaders = await fixture.ownerHeaders();
+    const assign = (requestId, accountRef, entitySlug) => fixture.post(
+      "/api/bank-feed/accounts/assign",
+      { request_id: requestId, account_ref: accountRef, entity_slug: entitySlug },
+      ownerHeaders,
+    );
+
+    const closed = await assign(
+      "multi-entity-closed-0001",
+      byProvider["business-account-internal"],
+      "closed-company",
+    );
+    assert.equal(closed.status, 404);
+    const counterparty = await assign(
+      "multi-entity-counterparty-0001",
+      byProvider["business-account-internal"],
+      "outside-buyer",
+    );
+    assert.equal(counterparty.status, 403);
+    assert.equal((await counterparty.json()).code, "entity_not_owned");
+
+    const household = await assign(
+      "multi-entity-household-0001",
+      byProvider["household-account-internal"],
+      "household",
+    );
+    assert.equal(household.status, 201);
+    const requestConflict = await assign(
+      "multi-entity-household-0001",
+      byProvider["household-account-internal"],
+      "operating-company",
+    );
+    assert.equal(requestConflict.status, 409);
+    assert.equal((await requestConflict.json()).code, "request_id_conflict");
+    const unchanged = await assign(
+      "multi-entity-household-unchanged-0001",
+      byProvider["household-account-internal"],
+      "household",
+    );
+    assert.equal(unchanged.status, 200);
+    assert.deepEqual(await unchanged.json(), {
+      assigned: true,
+      request_id: "multi-entity-household-unchanged-0001",
+      account_ref: byProvider["household-account-internal"],
+      masked_identifier: "Household checking ending 1111",
+      entity_scope: { entity_slug: "household" },
+      entity_label: "Household",
+      changed: false,
+      activity_event_id: null,
+      replayed: false,
+    });
+
+    // Model a commit failure before any assignment/event/receipt can land,
+    // followed by an unchanged retry carrying the same identity.
+    fixture.control.failNextBatch = true;
+    const lost = await assign(
+      "multi-entity-business-0001",
+      byProvider["business-account-internal"],
+      "operating-company",
+    );
+    assert.equal(lost.status, 503);
+    assert.equal(fixture.first(
+      "SELECT entity_slug FROM plaid_account_entity_assignments WHERE provider_account_id='business-account-internal'",
+    ).entity_slug, null);
+    const business = await assign(
+      "multi-entity-business-0001",
+      byProvider["business-account-internal"],
+      "operating-company",
+    );
+    assert.equal(business.status, 201);
+    const businessBody = await business.json();
+    assert.equal(businessBody.account_ref, byProvider["business-account-internal"]);
+    assert.equal(JSON.stringify(businessBody).includes("business-account-internal"), false);
+
+    // A scope that becomes non-live after assignment blocks the already-ready
+    // window. Restoring that reviewed entity lets the same scheduled debt
+    // promote without asking Plaid for another page.
+    fixture.raw("UPDATE fin_entities SET status='closed' WHERE entity_slug='operating-company'");
+    const invalidScope = await runPlaidFeedSlice(fixture.env, { maxItems: 1, fetchImpl, now: stamp });
+    assert.equal(invalidScope.items[0].status, "assignment_required");
+    assert.equal(invalidScope.items[0].invalid_assignments, 1);
+    assert.equal(fixture.first("SELECT cursor FROM bank_feed_items").cursor, null);
+    assert.equal(fixture.first("SELECT COUNT(*) AS n FROM fin_transactions").n, 0);
+    fixture.raw("UPDATE fin_entities SET status='active' WHERE entity_slug='operating-company'");
+
+    const promoted = await runPlaidFeedSlice(fixture.env, { maxItems: 1, fetchImpl, now: stamp });
+    assert.equal(promoted.items[0].ok, true);
+    assert.equal(fixture.first("SELECT cursor FROM bank_feed_items").cursor, "multi-entity-complete");
+    const assignments = fixture.rows(
+      `SELECT f.external_ref,f.entity_slug,t.external_id
+         FROM fin_accounts f JOIN fin_transactions t
+           ON t.tenant_id=f.tenant_id AND t.account_slug=f.account_slug
+        ORDER BY f.external_ref`,
+    ).map((row) => ({ ...row }));
+    assert.deepEqual(assignments, [
+      {
+        external_ref: "business-account-internal",
+        entity_slug: "operating-company",
+        external_id: "business-transaction-internal",
+      },
+      {
+        external_ref: "household-account-internal",
+        entity_slug: "household",
+        external_id: "household-transaction-internal",
+      },
+    ]);
+    assert.equal(assignments.some((row) => row.entity_slug === "wrong-default" || row.entity_slug === "primary"), false);
+    assert.equal(fixture.first(
+      "SELECT COUNT(*) AS n FROM owner_activity_events WHERE event_type='bank_account_entity_assigned'",
+    ).n, 2);
+
+    // A ledger row lands after preflight but before the assignment batch. The
+    // in-batch guard refuses historical reclassification. A retry gives the
+    // same stable code and neither attempt creates a receipt or human event.
+    fixture.raw("DELETE FROM fin_transactions WHERE external_id='business-transaction-internal'");
+    const originalDb = fixture.env.DB;
+    let injectedHistory = false;
+    fixture.env.DB = {
+      ...originalDb,
+      async batch(statements) {
+        if (!injectedHistory) {
+          injectedHistory = true;
+          const businessAccountSlug = fixture.first(
+            "SELECT account_slug FROM fin_accounts WHERE external_ref='business-account-internal'",
+          ).account_slug;
+          fixture.raw(
+            `INSERT INTO fin_transactions
+               (tenant_id,txn_uid,account_slug,posted_on,amount_minor,direction,currency,
+                description,provenance,source_feed,basis_state,recorded_at)
+             VALUES ('primary','plaid:assignment-race',?,'2026-08-30',100,'outflow','USD',
+                     'Synthetic assignment race','feed','bank-feed:item-sandbox-1','confirmed',?)`,
+            businessAccountSlug,
+            stamp,
+          );
+        }
+        return originalDb.batch(statements);
+      },
+    };
+    let raced;
+    try {
+      raced = await assign(
+        "multi-entity-race-0001",
+        byProvider["business-account-internal"],
+        "household",
+      );
+    } finally {
+      fixture.env.DB = originalDb;
+    }
+    assert.equal(raced.status, 409);
+    assert.equal((await raced.json()).code, "bank_account_reassignment_requires_review");
+    const racedRetry = await assign(
+      "multi-entity-race-0001",
+      byProvider["business-account-internal"],
+      "household",
+    );
+    assert.equal(racedRetry.status, 409);
+    assert.equal((await racedRetry.json()).code, "bank_account_reassignment_requires_review");
+    assert.equal(fixture.first(
+      "SELECT entity_slug FROM plaid_account_entity_assignments WHERE provider_account_id='business-account-internal'",
+    ).entity_slug, "operating-company");
+    assert.equal(fixture.first(
+      "SELECT COUNT(*) AS n FROM owner_action_requests WHERE request_id='multi-entity-race-0001'",
+    ).n, 0);
+    assert.equal(fixture.first(
+      "SELECT COUNT(*) AS n FROM owner_activity_events WHERE request_id='multi-entity-race-0001'",
+    ).n, 0);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("owner account status reports D1 failure as unavailable instead of empty", async () => {
+  const fixture = await createProductFixture({
+    env: {
+      BANK_FEED_PROVIDER: "plaid",
+      BANK_FEED_ENV: "sandbox",
+      BANK_FEED_CLIENT_ID: "fixture-client-id",
+      BANK_FEED_SECRET: "fixture-secret",
+      BANK_FEED_WRAPPING_KEY_V2: `v2.${"A".repeat(43)}`,
+    },
+  });
+  try {
+    const ownerHeaders = await fixture.ownerHeaders();
+    fixture.control.failOn = /FROM bank_feed_items i\s+WHERE i\.tenant_id=\?/;
+    const response = await fixture.worker.fetch(new Request(
+      "https://brain.invalid/api/bank-feed/accounts",
+      { headers: ownerHeaders },
+    ), fixture.env, { waitUntil() {} });
+    assert.equal(response.status, 503);
+    const body = await response.json();
+    assert.equal(body.error, "unavailable");
+    assert.equal(body.code, "bank_account_status_unavailable");
+    assert.equal(body.unavailable, true);
+    assert.equal(Object.hasOwn(body, "accounts"), false);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("owner account status refuses a partial inventory that could hide another Item", async () => {
+  const fixture = await createProductFixture({
+    env: {
+      BANK_FEED_PROVIDER: "plaid",
+      BANK_FEED_ENV: "sandbox",
+      BANK_FEED_CLIENT_ID: "fixture-client-id",
+      BANK_FEED_SECRET: "fixture-secret",
+      BANK_FEED_WRAPPING_KEY_V2: `v2.${"A".repeat(43)}`,
+    },
+  });
+  try {
+    for (const [itemRef, label] of [
+      ["item-with-inventory", "Visible fixture bank"],
+      ["item-without-inventory", "Missing fixture bank"],
+    ]) {
+      fixture.raw(
+        `INSERT INTO bank_feed_items
+           (tenant_id,item_ref,institution_label,access_ciphertext,access_iv,key_version,
+            environment,status,connected_at)
+         VALUES ('primary',?,?,'AAAAAAAAAAAAAAAA','BBBBBBBB',2,
+                 'sandbox','connected','2026-08-30T00:00:00Z')`,
+        itemRef,
+        label,
+      );
+    }
+    fixture.raw(
+      `INSERT INTO plaid_account_entity_assignments
+         (tenant_id,item_ref,provider_account_id,account_ref,entity_slug,
+          discovered_at,last_seen_at,assigned_at,updated_at)
+       VALUES ('primary','item-with-inventory','provider-account-private',
+               'acct_0123456789abcdef0123456789abcdef',NULL,
+               '2026-08-30T00:00:00Z','2026-08-30T00:00:00Z',NULL,
+               '2026-08-30T00:00:00Z')`,
+    );
+    const ownerHeaders = await fixture.ownerHeaders();
+    const response = await fixture.worker.fetch(new Request(
+      "https://brain.invalid/api/bank-feed/accounts",
+      { headers: ownerHeaders },
+    ), fixture.env, { waitUntil() {} });
+    assert.equal(response.status, 503);
+    const body = await response.json();
+    assert.equal(body.error, "unavailable");
+    assert.equal(body.code, "plaid_account_inventory_unavailable");
+    assert.equal(body.unavailable, true);
+    assert.equal(Object.hasOwn(body, "accounts"), false);
+    assert.equal(JSON.stringify(body).includes("item-without-inventory"), false);
   } finally {
     fixture.close();
   }
