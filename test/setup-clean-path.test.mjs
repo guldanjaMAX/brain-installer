@@ -39,7 +39,12 @@ assert.equal(setupManifestTarget("client.manifest.json", {}), "client.manifest.j
 assert.equal(setupManifestTarget("--no-connect", { "no-connect": true }), "./brain.manifest.json");
 assert.equal(setupManifestTarget("--manifest", { manifest: "chosen.manifest.json" }), "chosen.manifest.json");
 assert.equal(normalizeSetupFolderInput('"C:\\Users\\Owner\\Brain Files"'), "C:\\Users\\Owner\\Brain Files");
-assert.equal(normalizeSetupFolderInput("~/Brain Files", { home: "/Users/Owner" }), "/Users/Owner/Brain Files");
+{
+  const setupHome = join(tmpdir(), "Owner Home");
+  const expectedFolder = join(setupHome, "Brain Files");
+  assert.equal(normalizeSetupFolderInput("~/Brain Files", { home: setupHome }), expectedFolder);
+  assert.equal(normalizeSetupFolderInput("~\\Brain Files", { home: setupHome }), expectedFolder);
+}
 
 {
   const registrationRoot = mkdtempSync(join(tmpdir(), "brain-setup-folder-registration-"));
