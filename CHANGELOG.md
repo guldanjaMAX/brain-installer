@@ -6,6 +6,9 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## 0.2.1
 
+- Installer downloads and Settings update checks now use the clean Financial
+  Brain release home. The `brain` command, install folder, and package name stay
+  the same.
 - First installation now starts by creating a client-owned Cloudflare account
   or selecting one the owner already has. Wrangler opens Cloudflare in the
   browser, saves a separate named sign-in in the computer's protected

@@ -44,9 +44,9 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
-	"github.com/guldanjaMAX/brain-installer/daemons/whatsapp/internal/capture"
-	"github.com/guldanjaMAX/brain-installer/daemons/whatsapp/internal/outbox"
-	"github.com/guldanjaMAX/brain-installer/daemons/whatsapp/internal/paths"
+	"github.com/guldanjaMAX/financial-brain-installer/daemons/whatsapp/internal/capture"
+	"github.com/guldanjaMAX/financial-brain-installer/daemons/whatsapp/internal/outbox"
+	"github.com/guldanjaMAX/financial-brain-installer/daemons/whatsapp/internal/paths"
 )
 
 const logPrefix = "[wa-daemon] "

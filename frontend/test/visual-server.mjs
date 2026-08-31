@@ -395,7 +395,7 @@ const server = createServer(async (request, response) => {
       changes: ["A synthetic reviewed update is available in this local rehearsal."],
       released_connectors: ["Synthetic connector proof only"],
       installer: {
-        url: "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.2.1/brain-installer-0.2.1.tgz",
+        url: "https://github.com/guldanjaMAX/financial-brain-installer/releases/download/v0.2.1/brain-installer-0.2.1.tgz",
         sha256: "a".repeat(64),
         bytes: 4_000_000,
       },

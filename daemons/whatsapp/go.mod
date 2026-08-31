@@ -1,4 +1,4 @@
-module github.com/guldanjaMAX/brain-installer/daemons/whatsapp
+module github.com/guldanjaMAX/financial-brain-installer/daemons/whatsapp
 
 go 1.25.0
 

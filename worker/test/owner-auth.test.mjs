@@ -239,7 +239,7 @@ test("invite -> enroll -> sign in -> settings, end to end", async () => {
         update_url: "https://financialbrain.ai/update",
         claude_prompt: "Open https://financialbrain.ai/update, read the whole page, and help me safely update my Financial Brain.",
         installer: {
-          url: "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.3.0/brain-installer-0.3.0.tgz",
+          url: "https://github.com/guldanjaMAX/financial-brain-installer/releases/download/v0.3.0/brain-installer-0.3.0.tgz",
           sha256: "a".repeat(64),
           bytes: 4_000_000,
         },

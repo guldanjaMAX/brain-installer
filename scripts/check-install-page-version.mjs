@@ -21,7 +21,7 @@
  * not be read (silence is not proof of health).
  */
 const PAGE = "https://financialbrain.ai/install";
-const RELEASES = "https://api.github.com/repos/guldanjaMAX/brain-installer/releases/latest";
+const RELEASES = "https://api.github.com/repos/guldanjaMAX/financial-brain-installer/releases/latest";
 
 const get = async (url, headers = {}) => {
   const res = await fetch(url, {

@@ -6,6 +6,7 @@ import {
 } from "../src/lib/update-status.js";
 
 const NOW = new Date("2026-08-30T12:00:00.000Z");
+const PREDECESSOR_RELEASE_REPOSITORY = ["guldanjaMAX", "brain-installer"].join("/");
 
 function manifest(release = "0.3.0", overrides = {}) {
   return {
@@ -16,7 +17,7 @@ function manifest(release = "0.3.0", overrides = {}) {
     update_url: "https://financialbrain.ai/update",
     claude_prompt: "Open https://financialbrain.ai/update, read the whole page, and help me safely update my Financial Brain.",
     installer: {
-      url: `https://github.com/guldanjaMAX/brain-installer/releases/download/v${release}/brain-installer-${release}.tgz`,
+      url: `https://github.com/guldanjaMAX/financial-brain-installer/releases/download/v${release}/brain-installer-${release}.tgz`,
       sha256: "a".repeat(64),
       bytes: 4_000_000,
     },
@@ -38,7 +39,7 @@ function v2Manifest(state = "held", overrides = {}) {
     published_at: stable ? "2026-08-30" : null,
     update_url: "https://financialbrain.ai/update",
     installer: stable ? {
-      url: `https://github.com/guldanjaMAX/brain-installer/releases/download/v${release}/brain-installer-${release}.tgz`,
+      url: `https://github.com/guldanjaMAX/financial-brain-installer/releases/download/v${release}/brain-installer-${release}.tgz`,
       sha256: "b".repeat(64),
       bytes: 4_100_000,
     } : null,
@@ -144,6 +145,10 @@ test("v2 stable refuses missing or malformed immutable release metadata", async 
     v2Manifest("stable", { release: null }),
     v2Manifest("stable", { installer: null }),
     v2Manifest("stable", { installer: { ...v2Manifest("stable").installer, url: "https://attacker.example/archive" } }),
+    v2Manifest("stable", { installer: {
+      ...v2Manifest("stable").installer,
+      url: `https://github.com/${PREDECESSOR_RELEASE_REPOSITORY}/releases/download/v0.3.0/brain-installer-0.3.0.tgz`,
+    } }),
     v2Manifest("stable", { installer: { ...v2Manifest("stable").installer, sha256: "bad" } }),
     v2Manifest("stable", { installer: { ...v2Manifest("stable").installer, bytes: 0 } }),
     v2Manifest("stable", { held_reason: "not actually stable" }),

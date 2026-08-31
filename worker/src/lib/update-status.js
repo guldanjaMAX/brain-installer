@@ -47,7 +47,7 @@ function validatedLegacyStableManifest(value) {
   const changes = boundedStrings(value.changes, { maxItems: 12, maxLength: 400 });
   const connectors = boundedStrings(value.released_connectors, { maxItems: 20, maxLength: 160 });
   const installer = value.installer;
-  const expectedAsset = `https://github.com/guldanjaMAX/brain-installer/releases/download/v${release}/brain-installer-${release}.tgz`;
+  const expectedAsset = `https://github.com/guldanjaMAX/financial-brain-installer/releases/download/v${release}/brain-installer-${release}.tgz`;
   if (!stableParts(release) || !/^\d{4}-\d{2}-\d{2}$/.test(String(value.published_at || ""))) return null;
   if (value.update_url !== UPDATE_GUIDE_URL || value.claude_prompt !== CLAUDE_UPDATE_PROMPT) return null;
   if (!changes || !connectors || !installer || typeof installer !== "object") return null;
@@ -89,7 +89,7 @@ function validatedV2Manifest(value) {
   const release = String(value.release || "");
   const changes = boundedStrings(value.changes, { maxItems: 12, maxLength: 400 });
   const installer = value.installer;
-  const expectedAsset = `https://github.com/guldanjaMAX/brain-installer/releases/download/v${release}/brain-installer-${release}.tgz`;
+  const expectedAsset = `https://github.com/guldanjaMAX/financial-brain-installer/releases/download/v${release}/brain-installer-${release}.tgz`;
   if (value.available !== true || !stableParts(release) ||
       !/^\d{4}-\d{2}-\d{2}$/.test(String(value.published_at || "")) ||
       value.held_reason !== null || !changes || !installer || typeof installer !== "object" ||

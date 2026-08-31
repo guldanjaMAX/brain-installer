@@ -23,7 +23,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 
-	"github.com/guldanjaMAX/brain-installer/daemons/whatsapp/internal/outbox"
+	"github.com/guldanjaMAX/financial-brain-installer/daemons/whatsapp/internal/outbox"
 )
 
 const groupServer = "g.us"
