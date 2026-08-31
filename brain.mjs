@@ -15566,6 +15566,17 @@ async function cmdSetupInteractive(manifestPath) {
     die("--cloudflare-account accepts create or existing");
   }
 
+  // A brand-new browser OAuth install cannot succeed through a pipe. Refuse
+  // before even the public network readiness probe so an agent shell does not
+  // touch Cloudflare and an offline machine still receives the correct owner
+  // boundary instead of an unrelated connectivity error.
+  if (!resumed && !interactive && !tokenPath) {
+    die(
+      "Cloudflare browser sign-in needs an owner-controlled terminal on this computer. " +
+        "Nothing was changed. Open Terminal or PowerShell and rerun the same command."
+    );
+  }
+
   let localPreflightChecks = null;
   if (!tokenPath) {
     localPreflightChecks = await doctorRunAll({
