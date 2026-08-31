@@ -209,6 +209,7 @@ the full release gate.
 
 | Change area | Focused checks |
 |---|---|
+| Owner app, installer guidance, and Settings | `npm ci --prefix frontend --ignore-scripts`, `npm --prefix frontend test`, `npm --prefix frontend run build`, then `git diff --exit-code -- worker/src/lib/app-assets.js` |
 | CLI failure and issue notes | `node test/errors.test.mjs` and `node test/support-journal.test.mjs` |
 | Provisioning and update | `node test/provision-guards.test.mjs` and `node test/upgrade-verify.test.mjs` |
 | Credentials | `node test/admin-key-rotation.test.mjs`, `node test/google-auth-storage.test.mjs`, and `node test/mcp-rotation.test.mjs` |

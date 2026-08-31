@@ -4,13 +4,15 @@
 receipt, an exact package digest, and a human field checklist. It is a source
 maintainer command. It is not installed as a `brain` command.
 
-The default profile runs the complete offline product suite, the customer
-hiccup lab, the fake Plaid rehearsal, local D1 auth atomicity, the passkey
-protocol self-test, source and history privacy, an offline dependency audit,
-package creation, SHA-256, and a clean-prefix installed CLI smoke.
+The default profile runs the complete offline product suite, the owner app
+tests and production-bundle parity check, the customer hiccup lab, the fake
+Plaid rehearsal, local D1 auth atomicity, the passkey protocol self-test,
+source and history privacy, an offline dependency audit, package creation,
+SHA-256, and a clean-prefix installed CLI smoke.
 
 ```bash
 npm ci --ignore-scripts
+npm ci --prefix frontend --ignore-scripts
 npm run field:prepare -- --expect-sha <reviewed-40-character-git-sha>
 ```
 
@@ -58,6 +60,11 @@ The local D1 atomicity check uses the exact Wrangler version pinned in
 preparation command runs npm in offline mode and refuses a mismatch. It removes
 every Cloudflare and Wrangler credential variable and binds only a disposable
 local D1 database. It does not contact the npm registry or a Cloudflare account.
+
+The owner app steps also run offline after its separate dependency install.
+They execute the React interaction suite, rebuild the production UI, and rely
+on the closing clean-tree check to prove that `worker/src/lib/app-assets.js`
+already matches the exact reviewed frontend source.
 
 The generated checklist keeps the work that cannot be automated explicit:
 clean Windows installation, a disposable Cloudflare deployment and cleanup,
