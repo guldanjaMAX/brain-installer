@@ -42,10 +42,50 @@ function run(command, args, options = {}) {
   });
 }
 
+// npm writes the install prefix that the cleanup below has to delete, so it must
+// not be reached through a shell. On Windows a shell-wrapped npm.cmd timeout
+// kills cmd.exe and leaves npm alive with the prefix still open, which is what
+// turns a completed run into an undeletable sandbox. Same reasoning and same fix
+// as test/upgrade-verify.test.mjs; scripts/field-prepare.mjs buildNpmInvocation
+// is the shipped form of this invocation.
+function runNpm(args, options = {}) {
+  const timeout = options.timeout ?? (IS_WIN ? 300_000 : 180_000);
+  if (process.env.npm_execpath) {
+    return run(process.execPath, [process.env.npm_execpath, ...args], {
+      ...options, shell: false, timeout,
+    });
+  }
+  return run(IS_WIN ? "npm.cmd" : "npm", args, { ...options, timeout });
+}
+
+// Windows refuses to delete a directory that is any live process's current
+// directory, and Defender holds a freshly written executable open for a few
+// milliseconds after the writer closes it. This sandbox is a full
+// `npm install --global --prefix` tree with .cmd/.ps1 shims in it, so both
+// apply. Node's recursive remover only retries EBUSY/EPERM/ENOTEMPTY when
+// maxRetries is non-zero; without that a run that passed every assertion still
+// fails at cleanup.
+function removeSandbox(path) {
+  try {
+    rmSync(path, { recursive: true, force: true, maxRetries: IS_WIN ? 20 : 0, retryDelay: 250 });
+  } catch (error) {
+    // Every assertion has already run. A retained disposable directory on an
+    // ephemeral runner is a warning, not a release signal.
+    if (!IS_WIN || !["EBUSY", "EPERM", "ENOTEMPTY"].includes(error?.code)) throw error;
+    console.warn(`WARN  Windows retained the disposable install sandbox: ${error.code}`);
+  }
+}
+
 test("the packed CLI scaffolds a nonexistent manifest before any manifest-account lookup", async () => {
   const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "brain-packed-fresh-")));
+  // Never hand a child the sandbox as its working directory. On Windows the
+  // final rmdir of a directory that is a live process's CWD fails outright, and
+  // a .cmd wrapper's grandchild can outlive the cmd.exe that spawnSync waited
+  // on. No assertion here depends on the working directory: every path the CLI
+  // is given is absolute.
+  const scratch = realpathSync(mkdtempSync(join(tmpdir(), "brain-packed-cwd-")));
   try {
-    const pack = run(IS_WIN ? "npm.cmd" : "npm", [
+    const pack = runNpm([
       "pack", "--json", "--ignore-scripts", "--pack-destination", sandbox,
     ], { cwd: ROOT, env: minimalEnvironment() });
     assert.equal(pack.status, 0, `${pack.stdout}\n${pack.stderr}`);
@@ -55,10 +95,10 @@ test("the packed CLI scaffolds a nonexistent manifest before any manifest-accoun
     assert.ok(existsSync(archive), "npm did not create the reviewed tarball");
 
     const prefix = join(sandbox, "prefix");
-    const install = run(IS_WIN ? "npm.cmd" : "npm", [
+    const install = runNpm([
       "install", "--global", "--ignore-scripts", "--no-audit", "--no-fund",
       "--prefix", prefix, archive,
-    ], { cwd: sandbox, env: minimalEnvironment() });
+    ], { cwd: scratch, env: minimalEnvironment() });
     assert.equal(install.status, 0, `${install.stdout}\n${install.stderr}`);
     const wrapper = IS_WIN ? join(prefix, "brain.cmd") : join(prefix, "bin", "brain");
     assert.ok(existsSync(wrapper), "the package did not install its public brain wrapper");
@@ -75,7 +115,7 @@ test("the packed CLI scaffolds a nonexistent manifest before any manifest-accoun
     const manifestPath = join(sandbox, "new-brain", "brain.manifest.json");
 
     const noCredential = run(wrapper, ["setup", manifestPath, "--no-connect"], {
-      cwd: sandbox,
+      cwd: scratch,
       env: baseEnvironment,
       input: "",
     });
@@ -87,7 +127,7 @@ test("the packed CLI scaffolds a nonexistent manifest before any manifest-accoun
     assert.ok(!existsSync(manifestPath), "credential refusal must not create partial local state");
 
     const barePath = run(wrapper, ["setup", manifestPath, "--path"], {
-      cwd: sandbox,
+      cwd: scratch,
       env: baseEnvironment,
       input: "",
     });
@@ -114,7 +154,7 @@ test("the packed CLI scaffolds a nonexistent manifest before any manifest-accoun
       PATH: [fakeBin, dirname(process.execPath), "/usr/bin", "/bin"].join(IS_WIN ? ";" : ":"),
     };
     const bootstrap = run(wrapper, ["tools", manifestPath, "--json"], {
-      cwd: sandbox,
+      cwd: scratch,
       env: toolEnvironment,
       timeout: IS_WIN ? 300_000 : 90_000,
     });
@@ -143,7 +183,7 @@ test("the packed CLI scaffolds a nonexistent manifest before any manifest-accoun
     const technician = run(bootstrapStatus.cli.command, [
       ...bootstrapStatus.cli.args,
       "technician", manifestPath, "--json",
-    ], { cwd: sandbox, env: normalClientEnvironment });
+    ], { cwd: scratch, env: normalClientEnvironment });
     assert.equal(technician.status, 0, `${technician.stdout}\n${technician.stderr}`);
     const plan = JSON.parse(technician.stdout);
     assert.equal(plan.mode, "read_only_plan");
@@ -199,7 +239,7 @@ globalThis.fetch = async (input, options = {}) => {
 `, "utf8");
 
     const scaffold = run(wrapper, ["setup", manifestPath, "--no-connect"], {
-      cwd: sandbox,
+      cwd: scratch,
       env: {
         ...baseEnvironment,
         PATH: toolEnvironment.PATH,
@@ -250,6 +290,7 @@ globalThis.fetch = async (input, options = {}) => {
     assert.equal(smokeReceipt.status, "ready");
     assert.equal(smokeProof.checked_via, "deployed_authenticated_ingest");
   } finally {
-    rmSync(sandbox, { recursive: true, force: true });
+    // scratch must be removed even if the sandbox delete rethrows a non-Windows code.
+    try { removeSandbox(sandbox); } finally { removeSandbox(scratch); }
   }
 });
