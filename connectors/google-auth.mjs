@@ -267,6 +267,57 @@ export async function exchangeCode({ clientId, clientSecret, code, verifier, por
   };
 }
 
+/**
+ * Which Google account actually granted this token.
+ *
+ * The consent screen is the only place the account gets chosen, and a person
+ * with a personal and a work Google account picks the wrong one silently —
+ * then loads someone else's mailbox into the brain. Echoing the address back
+ * right after consent is the cheapest possible tripwire.
+ *
+ * The generic userinfo endpoint is NOT used, deliberately: it requires an
+ * identity scope (openid/email) this product never requests, and widening the
+ * consent screen for an echo would be backwards. Every granted scope already
+ * carries its own identity read — Drive answers /drive/v3/about?fields=user,
+ * Gmail answers users/me/profile — so the echo works with exactly what was
+ * consented to. calendar.events.readonly alone carries no identity read, and
+ * the echo says nothing rather than asking for more.
+ *
+ * Fail-soft on purpose: this runs immediately after a connect that just
+ * succeeded, and a hiccup here must never turn that success into a failure.
+ * Nothing read here is stored.
+ */
+export async function fetchConnectedAccountEmail(accessToken, scopeNames = [], fetchImpl = fetch) {
+  const names = Array.isArray(scopeNames) ? scopeNames : [];
+  const probes = [];
+  if (names.includes("drive")) {
+    probes.push({
+      url: "https://www.googleapis.com/drive/v3/about?fields=user",
+      pick: (json) => json?.user?.emailAddress,
+    });
+  }
+  if (names.includes("gmail")) {
+    probes.push({
+      url: "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+      pick: (json) => json?.emailAddress,
+    });
+  }
+  for (const probe of probes) {
+    try {
+      const res = await fetchImpl(probe.url, {
+        headers: { authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) continue;
+      const address = probe.pick(await res.json());
+      if (typeof address === "string" && address.includes("@")) return address;
+    } catch {
+      // The next probe, or null: never an error out of an echo.
+    }
+  }
+  return null;
+}
+
 /* ------------------------------------------------------------ token storage */
 
 export const tokenPath = (home = homedir()) => join(home, ".brain", "google-tokens.json");

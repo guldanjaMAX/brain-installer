@@ -9,6 +9,7 @@ import {
   saveTokens, loadTokens, tokenStorageDescription, tokenStorageStatus,
   verifyTokenStorageReadable,
   googleAuthChildEnvironment, openBrowser,
+  fetchConnectedAccountEmail,
   GOOGLE_KEYCHAIN_SERVICE, GOOGLE_KEYCHAIN_ACCOUNT,
 } from "../connectors/google-auth.mjs";
 
@@ -769,6 +770,84 @@ try {
   }
 } finally {
   rmSync(directory, { recursive: true, force: true });
+}
+
+
+/* ---- the account echo: consenting on the wrong Google account must be visible ---- */
+//
+// The consent screen is the only moment the account is chosen, and a person
+// with two Google accounts picks the wrong one silently. The connect command
+// therefore echoes which account actually granted the token — read with the
+// scopes ALREADY granted, because every scope this product requests is a
+// restricted read scope and none of them can call the generic userinfo
+// endpoint. Drive grants /drive/v3/about; Gmail grants users/me/profile;
+// calendar.events.readonly grants no account-identity read at all. The echo
+// stores nothing and must never break a connect that just succeeded.
+{
+  const stubFetch = (routes) => {
+    const calls = [];
+    const impl = async (url, init = {}) => {
+      calls.push({ url: String(url), auth: init?.headers?.authorization || "" });
+      const hit = routes.find((r) => String(url).includes(r.match));
+      if (!hit) return { ok: false, status: 404, json: async () => ({}) };
+      if (hit.throws) throw new Error("socket hang up");
+      return { ok: hit.status ? hit.status < 300 : true, status: hit.status || 200, json: hit.json };
+    };
+    impl.calls = calls;
+    return impl;
+  };
+
+  const driveFetch = stubFetch([
+    { match: "www.googleapis.com/drive/v3/about", json: async () => ({ user: { emailAddress: "owner@fixture.example" } }) },
+  ]);
+  const viaDrive = await fetchConnectedAccountEmail("access-fixture", ["drive"], driveFetch);
+  check("a drive-scoped token reads the account from drive/v3/about",
+    viaDrive === "owner@fixture.example", JSON.stringify({ viaDrive, calls: driveFetch.calls }));
+  check("the about probe asks only for the user field",
+    driveFetch.calls.length === 1 && /fields=user/.test(driveFetch.calls[0].url), JSON.stringify(driveFetch.calls));
+  check("the probe carries the access token as a bearer",
+    driveFetch.calls[0].auth === "Bearer access-fixture", JSON.stringify(driveFetch.calls));
+
+  const gmailFetch = stubFetch([
+    { match: "gmail.googleapis.com/gmail/v1/users/me/profile", json: async () => ({ emailAddress: "owner@fixture.example" }) },
+  ]);
+  const viaGmail = await fetchConnectedAccountEmail("access-fixture", ["gmail"], gmailFetch);
+  check("a gmail-only token reads the account from the gmail profile",
+    viaGmail === "owner@fixture.example", JSON.stringify({ viaGmail, calls: gmailFetch.calls }));
+
+  const bothFetch = stubFetch([
+    { match: "www.googleapis.com/drive/v3/about", json: async () => ({ user: { emailAddress: "owner@fixture.example" } }) },
+    { match: "gmail.googleapis.com", json: async () => ({ emailAddress: "wrong-lane@fixture.example" }) },
+  ]);
+  const viaBoth = await fetchConnectedAccountEmail("access-fixture", ["drive", "gmail"], bothFetch);
+  check("with both scopes one probe suffices",
+    viaBoth === "owner@fixture.example" && bothFetch.calls.length === 1, JSON.stringify(bothFetch.calls));
+
+  const calendarFetch = stubFetch([]);
+  const viaCalendar = await fetchConnectedAccountEmail("access-fixture", ["calendar"], calendarFetch);
+  check("calendar-events-only grants no identity read, so the echo declines quietly",
+    viaCalendar === null && calendarFetch.calls.length === 0, JSON.stringify(calendarFetch.calls));
+
+  const refused = await fetchConnectedAccountEmail("access-fixture", ["drive"],
+    stubFetch([{ match: "drive/v3/about", status: 401, json: async () => ({ error: { code: 401 } }) }]));
+  check("an HTTP refusal returns null rather than breaking the connect", refused === null);
+
+  const dead = await fetchConnectedAccountEmail("access-fixture", ["drive"],
+    stubFetch([{ match: "drive/v3/about", throws: true }]));
+  check("a network failure returns null rather than breaking the connect", dead === null);
+
+  const malformed = await fetchConnectedAccountEmail("access-fixture", ["drive"],
+    stubFetch([{ match: "drive/v3/about", json: async () => ({ user: {} }) }]));
+  check("a payload without an address returns null, never undefined-as-string",
+    malformed === null, JSON.stringify(malformed));
+
+  const gmailFallback = stubFetch([
+    { match: "drive/v3/about", status: 403, json: async () => ({}) },
+    { match: "gmail.googleapis.com/gmail/v1/users/me/profile", json: async () => ({ emailAddress: "owner@fixture.example" }) },
+  ]);
+  const fallback = await fetchConnectedAccountEmail("access-fixture", ["drive", "gmail"], gmailFallback);
+  check("a refused drive probe falls back to the gmail profile before giving up",
+    fallback === "owner@fixture.example" && gmailFallback.calls.length === 2, JSON.stringify(gmailFallback.calls));
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\ngoogle auth storage: all ${ran} tests passed`);
