@@ -245,6 +245,10 @@ export class Acceptance {
     this.tolerateStaleSources = tolerateStaleSources === true;
     this.results = [];
     this.tierFailed = null;
+    // Capabilities the run could not exercise at all. A skip inside a tier is
+    // a detail; a whole capability going untested changes what "passed" means,
+    // so the summary carries it and the verdict has to say it.
+    this.untested = [];
   }
 
   static isFreshnessCheck(name) {
@@ -428,6 +432,7 @@ export class Acceptance {
     // ones. A brain that returns results for "test" but nothing for "what did
     // we agree with our biggest customer" has passed a meaningless check.
     if (!probes || !probes.length) {
+      this.untested.push("retrieval");
       return this.record(
         t,
         "retrieval probes",
@@ -659,6 +664,37 @@ export class Acceptance {
       counts,
       passed: counts.fail === 0,
       stoppedAtTier: this.tierFailed,
+      untested: [...this.untested],
     };
   }
+}
+
+/**
+ * The one-line verdict a person reads last, with any honesty qualifiers.
+ *
+ * A suite that skipped its whole retrieval tier has not proven the thing the
+ * client actually bought, and an unqualified "passed" is how a false green
+ * reaches a kickoff call: reach, data, safety and operations were checked,
+ * and nobody asked the brain a single question. The headline itself changes,
+ * not just a detail line above it, because the headline is the sentence that
+ * gets read aloud and pasted into a thread.
+ *
+ * Exit semantics are the caller's and stay unchanged: a failed suite still
+ * fails, a passed-but-unqualified suite still exits clean.
+ */
+export function acceptanceVerdict(summary) {
+  if (!summary?.passed) return { headline: "acceptance suite FAILED", warnings: [] };
+  const untested = Array.isArray(summary.untested) ? summary.untested : [];
+  if (untested.includes("retrieval")) {
+    return {
+      headline: "acceptance suite passed — but retrieval was NOT tested",
+      warnings: [
+        "retrieval was NOT tested: testing.probe_questions is empty in the manifest.",
+        "Reach, data, safety and operations were checked; nobody asked this brain a",
+        "single question. Fill testing.probe_questions from the intake — the client's",
+        "own words, not tidied English — then re-run: brain test <manifest>",
+      ],
+    };
+  }
+  return { headline: "acceptance suite passed", warnings: [] };
 }
