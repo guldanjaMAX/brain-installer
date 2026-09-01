@@ -76,6 +76,7 @@ import {
   runAll as doctorRunAll,
   summarize as doctorSummarize,
   checkBankFeedRedirect,
+  checkPrioritySlice,
   checkClaudeCode,
   checkWrangler,
   OK as D_OK,
@@ -10466,6 +10467,16 @@ async function cmdDoctor(manifestPath) {
       const feedMark = feedCheck.status === D_OK ? c.green("ok  ") : feedCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
       console.log(`  ${feedMark}  ${feedCheck.name.padEnd(18)}  ${feedCheck.detail}`);
     } catch { /* doctor must work without a valid manifest */ }
+
+    // Offline and cheap, like the bank-feed check: the first-load ordering
+    // decision only helps while it can still be made, so doctor surfaces it
+    // before install rather than letting the report discover it after.
+    try {
+      const sliceCheck = checkPrioritySlice(loadManifest(manifestPath).m);
+      checks.push(sliceCheck);
+      const sliceMark = sliceCheck.status === D_OK ? c.green("ok  ") : sliceCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
+      console.log(`  ${sliceMark}  ${sliceCheck.name.padEnd(18)}  ${sliceCheck.detail}`);
+    } catch { /* doctor must work without a valid manifest */ }
   }
 
   const s = doctorSummarize(checks);
@@ -11164,6 +11175,13 @@ export async function cmdSetup(manifestPath, options = {}) {
 
   /* --- 6. the first thing worth looking at --- */
   console.log(`\n  ${c.bold("Step 6 of 6")}  loading something in\n`);
+  // The one moment the first-load order can still be chosen. After this the
+  // archive has already made the first impression, or the slice has.
+  const sliceCheck = checkPrioritySlice(m);
+  if (sliceCheck.status !== D_OK) {
+    warn(sliceCheck.detail);
+    for (const line of sliceCheck.fix.split("\n")) console.log(`  ${c.dim(line.trim() ? "  " + line.trim() : "")}`);
+  }
   const folder = flags.path || (await prompt("A folder to load now (blank to skip)", ""));
   if (folder && existsSync(folder)) {
     process.argv = [process.argv[0], process.argv[1], "ingest", target, "--path", folder, "--source", "documents"];
