@@ -1955,7 +1955,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
         result.stdout.fill(0);
         result.stderr.fill(0);
       }
-      rmSync(callDirectory, { recursive: true, force: true });
+      rmSync(callDirectory, { recursive: true, force: true, maxRetries: process.platform === "win32" ? 20 : 0, retryDelay: 250 });
       revalidate();
     }
   }

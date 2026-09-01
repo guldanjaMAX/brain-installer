@@ -282,11 +282,11 @@ export async function openChatDbReadOnly(path, {
         db,
         snapshotDir,
         close: () => {
-          try { db.close(); } finally { rmSync(snapshotDir, { recursive: true, force: true }); }
+          try { db.close(); } finally { rmSync(snapshotDir, { recursive: true, force: true, maxRetries: process.platform === "win32" ? 20 : 0, retryDelay: 250 }); }
         },
       };
     } catch (copyError) {
-      if (snapshotDir) rmSync(snapshotDir, { recursive: true, force: true });
+      if (snapshotDir) rmSync(snapshotDir, { recursive: true, force: true, maxRetries: process.platform === "win32" ? 20 : 0, retryDelay: 250 });
       if (copyError?.code === "EPERM" || copyError?.code === "EACCES") {
         throw new ChatDbAccessError(
           "full_disk_access_denied",

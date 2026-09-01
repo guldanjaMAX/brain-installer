@@ -700,11 +700,11 @@ export async function openBackupSmsDb(located, {
       workDir,
       copied: true,
       close: () => {
-        try { db.close(); } finally { rmSync(workDir, { recursive: true, force: true }); }
+        try { db.close(); } finally { rmSync(workDir, { recursive: true, force: true, maxRetries: process.platform === "win32" ? 20 : 0, retryDelay: 250 }); }
       },
     };
   } catch (copyError) {
-    if (workDir) rmSync(workDir, { recursive: true, force: true });
+    if (workDir) rmSync(workDir, { recursive: true, force: true, maxRetries: process.platform === "win32" ? 20 : 0, retryDelay: 250 });
     throw new IphoneBackupError(
       "sms_db_unreadable",
       `the Messages database inside the backup could not be opened (${String(copyError?.message || copyError)})` +
