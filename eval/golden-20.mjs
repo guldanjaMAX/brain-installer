@@ -184,6 +184,69 @@ function parsePicks(text, max) {
 }
 
 /**
+ * The shape a title-only evidence source must have. This mirrors
+ * golden-validation.mjs and the corpus contract in run.mjs: a source is an
+ * ingest family name, lowercase, `[a-z0-9][a-z0-9_-]{0,63}`. The scorer
+ * matches title-only evidence only inside an exact source (scorer.mjs,
+ * slotMatches), so a value like "Google Drive" can never match anything and
+ * the validator refuses the file at the end of the session — after the
+ * owner's twenty minutes are already written into it.
+ */
+const SOURCE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+/** The families every install starts with; custom --source names extend them. */
+const CANONICAL_SOURCES = ["drive", "curated", "message"];
+
+function editDistance(a, b) {
+  const m = a.length;
+  const n = b.length;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const row = [i];
+    for (let j = 1; j <= n; j++) {
+      row[j] = Math.min(
+        prev[j] + 1,
+        row[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    prev = row;
+  }
+  return prev[n];
+}
+
+/**
+ * The nearest valid source name for a value that failed the contract, or null
+ * when nothing salvageable remains. Canonical names win: "Google Drive" is
+ * someone describing drive, not naming a custom family. A normalised form that
+ * matches no canonical name but satisfies the contract is offered as itself,
+ * because custom --source families are legitimate.
+ */
+export function suggestSourceName(raw) {
+  const cleaned = String(raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!cleaned) return null;
+  for (const canon of CANONICAL_SOURCES) {
+    if (cleaned === canon || cleaned.includes(canon)) return canon;
+  }
+  let best = null;
+  let bestDistance = 3; // more than two edits away is a different word, not a typo
+  for (const canon of CANONICAL_SOURCES) {
+    const distance = editDistance(cleaned, canon);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = canon;
+    }
+  }
+  if (best) return best;
+  return SOURCE_NAME.test(cleaned) ? cleaned : null;
+}
+
+/**
  * How many chunks are still waiting to reach the vector index.
  *
  * The evidence step below asks the brain to find the document that answers a
@@ -252,20 +315,58 @@ async function captureEvidence({ kind, question, client, askFn, log, backlog = n
       any_of: chosen.flatMap((r) => identitiesOf(r)),
     }];
   }
-  const fallback = (await askFn(
-    "None were right. (u) it is actually unanswerable, (t) type the document title, (s) skip",
-    "s",
-  )).toLowerCase();
-  if (fallback === "u") return "unanswerable";
-  if (fallback === "t") {
-    const doc = await askFn("Document title, as ingested");
-    if (!doc) return "skip";
-    const source = await askFn("Its source (drive, curated, message, ...)", "drive");
-    // Title-only evidence: honest about being weaker than a confirmed
-    // reference, and the validator requires the source to be named.
-    return [{ doc, source }];
+  // The question above this menu is a slot of the owner's memory, written
+  // live. Discarding it is the one irreversible outcome here, and it used to
+  // be the DEFAULT: a bare Enter, or any unrecognised key, threw the question
+  // away without a word. Every path that loses the question now passes one
+  // explicit confirm. The confirm's default starts at "n" (keep), and flips
+  // to "y" after a refusal so that a reader that answers only defaults — a
+  // finished pipe, brain.mjs ask() after stdin EOF — still terminates instead
+  // of cycling this menu forever.
+  let discardDefault = "n";
+  const confirmDiscard = async () => {
+    const answer = (await askFn("Discard this question? y/n", discardDefault))
+      .trim().toLowerCase();
+    if (answer.startsWith("y")) return true;
+    discardDefault = "y";
+    return false;
+  };
+  while (true) {
+    const fallback = (await askFn(
+      "None were right. (u) it is actually unanswerable, (t) type the document title, (s) skip",
+      "s",
+    )).toLowerCase();
+    if (fallback === "u") return "unanswerable";
+    if (fallback === "t") {
+      let doc = String(await askFn("Document title, as ingested")).trim();
+      if (!doc) {
+        // No default exists for a title, so a bare Enter here used to mean
+        // "skip" without saying so. Explain once, ask once more.
+        log("  A blank title cannot serve as evidence: the scorer matches the");
+        log("  title exactly as it was ingested. Type it, or Enter again to stop.");
+        doc = String(await askFn("Document title, as ingested")).trim();
+      }
+      if (!doc) {
+        if (await confirmDiscard()) return "skip";
+        continue; // back to the menu with the question intact
+      }
+      let source = String(await askFn("Its source (drive, curated, message, ...)", "drive")).trim();
+      while (!SOURCE_NAME.test(source)) {
+        // A source the contract cannot express would be written to disk now
+        // and refused by the validator at the end of the session — a broken
+        // file, discovered after the work. Refuse it here instead.
+        const suggestion = suggestSourceName(source);
+        log(`  "${source}" is not a source name the scorer can match: lowercase`);
+        log(`  letters, digits, - and _ only${suggestion ? `. Did you mean "${suggestion}"?` : "."}`);
+        source = String(await askFn("Its source (drive, curated, message, ...)", suggestion || "drive")).trim();
+      }
+      // Title-only evidence: honest about being weaker than a confirmed
+      // reference, and the validator requires the source to be named.
+      return [{ doc, source }];
+    }
+    // "s", a bare Enter, or any unrecognised key: the skip path.
+    if (await confirmDiscard()) return "skip";
   }
-  return "skip";
 }
 
 /**
