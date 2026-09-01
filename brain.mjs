@@ -3826,7 +3826,7 @@ export async function cmdTest(manifestPath, options = {}) {
     return;
   }
 
-  const { Acceptance } = await import("./acceptance.mjs");
+  const { Acceptance, acceptanceVerdict } = await import("./acceptance.mjs");
   const suite = new Acceptance({
     base,
     adminKey: key,
@@ -3864,7 +3864,12 @@ export async function cmdTest(manifestPath, options = {}) {
   if (!out.passed) {
     throw new Fatal("acceptance suite FAILED");
   }
-  ok("acceptance suite passed");
+  // The headline is qualified when a whole capability went untested, because
+  // "passed" unqualified is the sentence that reaches the client. Exit
+  // semantics are untouched: untested is not failed.
+  const verdict = acceptanceVerdict(out);
+  for (const line of verdict.warnings) warn(line);
+  ok(verdict.headline);
 }
 
 /* ----------------------------------------------------------- mcp-config */
@@ -10830,6 +10835,32 @@ export async function cmdSetup(manifestPath, options = {}) {
     console.log(`  No AI tool registration was reported. Verify Claude Code with \`brain tools\`, then run:`);
     console.log(`    brain mcp-config ${shownTarget}\n`);
   }
+
+  const probeWarning = emptyProbeQuestionsWarning(m, shownTarget);
+  if (probeWarning) {
+    console.log("");
+    for (const line of probeWarning) warn(line);
+    console.log("");
+  }
+}
+
+/**
+ * Lines warning that an install carries no probe questions, or null when it
+ * has real ones. Without probes the acceptance suite skips its retrieval tier
+ * and can pass without anyone asking the brain a single question, so setup —
+ * the moment someone is present who can still collect the questions — says so
+ * loudly instead of leaving it to be discovered on the report.
+ */
+export function emptyProbeQuestionsWarning(manifest, manifestPath = "brain.manifest.json") {
+  const probes = manifest?.testing?.probe_questions;
+  if (Array.isArray(probes) && probes.some((q) => String(q || "").trim())) return null;
+  return [
+    "testing.probe_questions is EMPTY. The acceptance suite will skip its whole",
+    "retrieval tier, so nothing will ever prove this brain answers the owner's",
+    "questions — a test run can read green without anyone asking it anything.",
+    `Fill testing.probe_questions in ${manifestPath} with the owner's own`,
+    `questions from the intake, then run: brain test ${manifestPath}`,
+  ];
 }
 
 /** Keep install-account custody separate from edits to the operator's machine. */
