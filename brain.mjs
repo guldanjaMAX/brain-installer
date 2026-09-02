@@ -3689,7 +3689,7 @@ export async function cmdUpgrade(manifestPath, options = {}) {
           expectDrainMode: usesD1VectorOutbox ? "active" : null,
         }));
       await runStage("full acceptance test", () =>
-        verifyAcceptance(executionPin.target, { expectVersion: toVersion }));
+        verifyAcceptance(executionPin.target, { expectVersion: toVersion, staleSourcesAsWarnings: true }));
       await runStage("D1 version commit", () => queryDatabase(
         accountId,
         dbId,
@@ -4039,6 +4039,7 @@ export async function cmdTest(manifestPath, options = {}) {
     adminKey: key,
     manifest: m,
     expectVersion: options.expectVersion || null,
+    tolerateStaleSources: options.staleSourcesAsWarnings === true,
   });
   info(`acceptance suite against ${base}`);
   const out = await suite.run({
@@ -4065,6 +4066,11 @@ export async function cmdTest(manifestPath, options = {}) {
 
   const { pass, fail, warn: w, skip } = out.counts;
   console.log(`\n  ${pass} passed, ${fail} failed, ${w} warnings, ${skip} skipped`);
+  const stale = out.results.filter((r) => r.downgraded);
+  if (stale.length) {
+    warn(`${stale.length} source check(s) are stale and were counted as warnings, not failures: a source has not refreshed on schedule.`);
+    info("That is separate from this update. `brain sources` shows which, and the checkup guide covers reconnecting.");
+  }
   if (out.stoppedAtTier) {
     console.log(`  ${c.red(`stopped after tier ${out.stoppedAtTier}: later tiers would be noise`)}`);
   }

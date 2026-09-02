@@ -230,18 +230,34 @@ export function freshnessVerdicts({ ok, status, payload, expectedBackend = "d1" 
 }
 
 export class Acceptance {
-  constructor({ base, adminKey, manifest, expectVersion = null, fetchImpl = fetch }) {
+  constructor({ base, adminKey, manifest, expectVersion = null, fetchImpl = fetch, tolerateStaleSources = false }) {
     this.base = String(base).replace(/\/+$/, "");
     this.key = adminKey;
     this.m = manifest || {};
     this.fetch = fetchImpl;
     this.expectVersion = expectVersion;
+    // Freshness is a fact about a SOURCE, not about the brain or a release.
+    // An update runs this suite after the new code is already live, and a
+    // Google grant that lapsed last week made every such update report
+    // UPGRADE_FAILED and leave the version stamp unrecorded. The update asks
+    // for stale sources as warnings; a standalone `brain test` keeps them as
+    // failures, because there the question is "is this brain proven".
+    this.tolerateStaleSources = tolerateStaleSources === true;
     this.results = [];
     this.tierFailed = null;
   }
 
+  static isFreshnessCheck(name) {
+    return name === "every source expected to refresh is current" || String(name).startsWith("freshness: ");
+  }
+
   record(tier, name, status, detail) {
-    this.results.push({ tier, name, status, detail });
+    let downgraded = false;
+    if (status === FAIL && this.tolerateStaleSources && Acceptance.isFreshnessCheck(name)) {
+      status = WARN;
+      downgraded = true;
+    }
+    this.results.push(downgraded ? { tier, name, status, detail, downgraded } : { tier, name, status, detail });
     if (status === FAIL && this.tierFailed === null) this.tierFailed = tier;
     return status;
   }
