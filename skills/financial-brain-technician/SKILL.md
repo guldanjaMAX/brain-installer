@@ -64,6 +64,26 @@ absolute test-kit and manifest paths.
 - Preview every deletion or forget plan and wait for exact approval before the
   command that mutates data.
 
+## Updates and checkups
+
+- A brain that already exists is never fixed by `brain setup`. On an existing
+  Worker, setup re-enters the paused cutover it was written for, and every
+  error in that state suggests exactly that. The path is `brain doctor` and
+  its preview, then `brain update`, which resumes from its saved bookmark.
+- An update is its own appointment, not part of a loading session: the brain
+  refuses new material during its cutover pause. Run it in the foreground and
+  leave the window open. On a quiet brain the pause ends in under a minute;
+  on a busy one it can take the full twenty, and it says which.
+- Read WHICH lines fail at the end of an update. If every FAIL begins with
+  `freshness:`, the update succeeded and a source needs attention; anything
+  else is a stop. Keep the output either way.
+- Before calling a brain proven, count `testing.probe_questions` in the
+  manifest. An empty list means the retrieval tier was not exercised.
+- For a loading or scoring call, start read-only: two `brain health`
+  readings two minutes apart, then `brain sources`. Pending falling means the
+  index is keeping up; pending and the vector count both flat means it is
+  paused, which the next release clears and a hand repair must not.
+
 ## Recovery and completion
 
 - A failed technician step is ready to retry after its named prerequisite is

@@ -29,27 +29,7 @@
  * manifest, logged, or passed as a command-line argument where `ps` could read it.
  */
 
-import {
-  chmodSync,
-  closeSync,
-  constants as fsConstants,
-  existsSync,
-  fstatSync,
-  fsyncSync,
-  lstatSync,
-  mkdtempSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  readdirSync,
-  realpathSync,
-  renameSync,
-  rmdirSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
-  writeSync,
-} from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, existsSync, fstatSync, fsyncSync, lstatSync, mkdtempSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync, appendFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, isAbsolute, join, dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1556,19 +1536,50 @@ export async function cmdDeploy(manifestPath, options = {}) {
   // reports itself healthy the whole time because both systems are up.
   if ((cfg.storage || "d1") === "d1") {
     const schedule = cfg.drain_cron || "* * * * *";
+    // Read before writing. A schedule that already matches (a resumed setup, a
+    // redeploy, one added by hand after a failure) is success, not a reason to
+    // issue a PUT that can fail. This call was unconditional and died on a real
+    // install where the cron had been added in the dashboard minutes earlier.
+    let existing = null;
     try {
-      await cf(`/accounts/${acct.id}/workers/scripts/${scriptName}/schedules`, {
-        method: "PUT",
-        body: [{ cron: schedule }],
-      });
-      ok(`vector drain scheduled (${schedule})`);
-    } catch (e) {
-      die(
-        `could not set the drain cron: ${e.message.slice(0, 120)}\n` +
-          "  The Worker code was uploaded, but a D1 install without this required schedule\n" +
-          "  accumulates text that is keyword-searchable and NOT semantically searchable.\n" +
-          "  Fix Worker schedule access and re-run `brain deploy`; the upload is safe to repeat."
-      );
+      const current = await cf(`/accounts/${acct.id}/workers/scripts/${scriptName}/schedules`);
+      const crons = (current?.schedules || current || []).map((row) => String(row?.cron || ""));
+      if (crons.includes(schedule)) existing = schedule;
+    } catch {
+      existing = null; // unreadable is not "absent"; fall through to the PUT
+    }
+    if (existing) {
+      ok(`vector drain already scheduled (${schedule})`);
+    } else {
+      try {
+        await cf(`/accounts/${acct.id}/workers/scripts/${scriptName}/schedules`, {
+          method: "PUT",
+          body: [{ cron: schedule }],
+        });
+        ok(`vector drain scheduled (${schedule})`);
+      } catch (e) {
+        const message = String(e.message || e);
+        // The free plan allows everything up to this exact call. A client who
+        // reaches it has a complete brain except for the schedule, ten minutes
+        // in, and the fix is the plan, not a reinstall. Say that.
+        if (/10063|Workers Paid/i.test(message)) {
+          die(
+            "the drain cron needs the Cloudflare Workers Paid plan (about five dollars a month).\n" +
+              "  Everything else is in place: the database, the search index, the migrations and\n" +
+              "  the Worker are all deployed. Only this schedule is missing.\n" +
+              "  Upgrade the plan at dash.cloudflare.com (Workers & Pages, Plans), then run the same\n" +
+              "  command again; every step before this one is skipped as already done."
+          );
+        }
+        die(
+          `could not set the drain cron: ${message.slice(0, 120)}\n` +
+            "  The Worker code was uploaded, but a D1 install without this required schedule\n" +
+            "  accumulates text that is keyword-searchable and NOT semantically searchable.\n" +
+            "  Fix Worker schedule access, then run `brain setup` or `brain update` again in an\n" +
+            "  interactive terminal; those read your stored credential, and every completed step\n" +
+            "  is skipped. (`brain deploy` alone needs CLOUDFLARE_API_TOKEN in the environment.)"
+        );
+      }
     }
   }
   // Same reasoning as provision: suppressed when setup drives the step.
@@ -4059,6 +4070,17 @@ export async function cmdTest(manifestPath, options = {}) {
   }
   if (!out.passed) {
     throw new Fatal("acceptance suite FAILED");
+  }
+  // A suite that skipped retrieval has not proven the thing the client is
+  // paying for. It used to print a bare "passed" here, which on a real install
+  // sat directly on the contract's "your own questions were asked live" line
+  // while nothing had been asked. Say what was and was not exercised.
+  const retrievalSkipped = out.results.some((r) => r.name === "retrieval probes" && r.status === "skip");
+  if (retrievalSkipped) {
+    warn("retrieval was NOT exercised: testing.probe_questions in the manifest is empty.");
+    info("Add the client's own questions, then run `brain test` again before calling this install proven.");
+    ok("acceptance suite passed (retrieval not exercised)");
+    return;
   }
   ok("acceptance suite passed");
 }
@@ -10648,6 +10670,35 @@ export async function prepareSetupAdminKey(manifestPath, manifest, options = {})
 }
 
 /** Read whether setup is resuming over an already deployed Worker. */
+/**
+ * Is the Worker that already exists a live brain on the current writer
+ * protocol? Read-only, and null on any doubt.
+ *
+ * Setup's paused cutover exists for a Worker deployed by an OLDER package,
+ * one that cannot honour the drain lease. It was applied to every Worker
+ * that merely existed, so re-running setup on a healthy, finished brain
+ * paused it and walked it back into the same cutover. On a real install
+ * that happened after the cutover had already failed once, and every error
+ * message in that state pointed at `brain setup`. This is how setup tells a
+ * finished brain from an unfinished one before deciding.
+ */
+export async function probeExistingWorkerHealth(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const domain = m.brain?.domain;
+  if (!domain) return null;
+  const fetchHealth = options.http ?? http;
+  try {
+    const res = await fetchHealth(`https://${domain}/health`, {}, { timeoutMs: 15_000, what: "the health check" });
+    if (!res?.ok) return null;
+    const body = JSON.parse(await res.text());
+    if (body?.ok !== true) return null;
+    if (body.vector_writer_protocol !== "lease-v1" || body.vector_drain_mode !== "active") return null;
+    return { version: String(body.version || ""), acceptingDocuments: body.accepting_documents === true };
+  } catch {
+    return null;
+  }
+}
+
 export async function setupWorkerScriptExists(manifestPath, options = {}) {
   const { m } = loadManifest(manifestPath);
   const resolveSetupAccount = options.resolveAccount ?? resolveAccount;
@@ -10891,13 +10942,35 @@ export async function cmdSetup(manifestPath, options = {}) {
     return result;
   };
   let workerAlreadyExisted;
+  let liveLeaseBrain = null;
   try {
     workerAlreadyExisted = await runPinnedSetupStage(
       "setup Worker inventory",
       (pinnedPath) => detectExistingWorker(pinnedPath),
     );
-    if (workerAlreadyExisted &&
-        (setupExecutionPin.manifest.infrastructure?.cloudflare?.storage || "d1") === "d1") {
+    const usesD1 = (setupExecutionPin.manifest.infrastructure?.cloudflare?.storage || "d1") === "d1";
+    if (workerAlreadyExisted && usesD1) {
+      const probeLiveWorker = options.probeExistingWorkerHealth ?? probeExistingWorkerHealth;
+      liveLeaseBrain = await runPinnedSetupStage(
+        "setup live Worker check",
+        (pinnedPath) => probeLiveWorker(pinnedPath),
+      );
+    }
+    if (liveLeaseBrain) {
+      // A finished brain on the lease protocol is not a cutover candidate. If
+      // it is on another release, setup is the wrong tool and says so before
+      // touching anything; if it is on this one, there is nothing to migrate
+      // or deploy, and setup continues with keys and health, which is what a
+      // resumed setup on a finished brain actually needs.
+      if (liveLeaseBrain.version && liveLeaseBrain.version !== PRODUCT_VERSION) {
+        die(
+          `this brain is already installed and live on version ${liveLeaseBrain.version}; this package is ${PRODUCT_VERSION}.\n` +
+            `      Run \`brain update ${shownTarget}\` to bring it forward. Setup does not update a live brain,\n` +
+            "      and rerunning it here would pause a working one. Nothing was changed."
+        );
+      }
+      ok(`this brain is already installed and live on ${PRODUCT_VERSION}; no cutover, migration or deploy needed`);
+    } else if (workerAlreadyExisted && usesD1) {
       // A resumed setup can encounter a Worker deployed by an older package.
       // Quiesce it with the same compatibility protocol as `brain update`
       // before any new lease columns are applied.
@@ -10960,7 +11033,9 @@ export async function cmdSetup(manifestPath, options = {}) {
     removePinnedExecutionManifest(setupExecutionPin);
     setupExecutionPin = null;
   }
-  if (!workerAlreadyExisted ||
+  if (liveLeaseBrain) {
+    // Already installed, already this release: keys and health come next.
+  } else if (!workerAlreadyExisted ||
       (setupOriginalPin.manifest.infrastructure?.cloudflare?.storage || "d1") !== "d1") {
     // Do not claim quiescence merely because one manifest script name was not
     // found. A genuinely fresh D1 has no install_state row and migrates normally;
@@ -12237,7 +12312,9 @@ async function reportBacklog(manifestPath) {
     warn(
       `${pending} chunk(s) are queued or awaiting visibility. Until confirmed they are findable` + "\n" +
         "        by keyword and INVISIBLE to meaning-based search, and nothing else reports that." + "\n" +
-        `        Finish it now instead of waiting for the cron:  brain drain ${rel}`
+        "        The scheduled drain finishes this on its own, roughly fifty a minute, and" + "\n" +
+        "        `brain health` shows it moving. Do not run `brain drain` while the cron is" + "\n" +
+        "        scheduled: the two share one lease and a manual run only waits on it."
     );
   } catch {
     // Never fail an ingest because the follow-up report could not be fetched.
@@ -13239,6 +13316,69 @@ async function cmdTechnicianInteractive(manifestPath) {
  * caller really has a TTY. This keeps release tests deterministic while still
  * giving the owner Anthropic's own installation diagnosis on install day.
  */
+
+/**
+ * Make `brain` survive a new terminal.
+ *
+ * The install puts the CLI under a user npm prefix (no sudo on a Mac), and the
+ * page has the client export that prefix's bin for the current session only.
+ * Close the terminal and `brain` is gone, which on a real install read as the
+ * product having uninstalled itself, twice, on one machine. Login and
+ * non-login shells read different files, so all three are written: zsh reads
+ * .zshrc, a login bash reads .bash_profile, an interactive non-login bash
+ * reads .bashrc. Idempotent: a file that already names the directory is left
+ * alone. Windows has no profile to append to; the folder is named instead.
+ */
+export function persistCliPath({
+  binDir,
+  home = process.env.HOME || "",
+  platform = process.platform,
+  existsSync: exists = existsSync,
+  readFileSync: read = readFileSync,
+  appendFileSync: append = appendFileSync,
+} = {}) {
+  if (!binDir) return { action: "skipped", reason: "no bin directory" };
+  if (platform === "win32") {
+    return { action: "manual", reason: `add ${binDir} to PATH through System Properties, Environment Variables (never setx)` };
+  }
+  // Only a user prefix needs this. /usr/local/bin and Homebrew are on PATH already.
+  if (!/npm-global/.test(binDir)) return { action: "skipped", reason: "system prefix is already on PATH" };
+  const line = `export PATH="${binDir}:$PATH"`;
+  const written = [];
+  const present = [];
+  for (const name of [".zshrc", ".bash_profile", ".bashrc"]) {
+    const file = join(home, name);
+    let current = "";
+    try { current = exists(file) ? read(file, "utf8") : ""; } catch { current = ""; }
+    if (current.includes(binDir)) { present.push(name); continue; }
+    try {
+      append(file, `${current && !current.endsWith("\n") ? "\n" : ""}\n# Financial Brain CLI (added by brain tools)\n${line}\n`);
+      written.push(name);
+    } catch (error) {
+      return { action: "failed", reason: `${name}: ${String(error?.message || error).slice(0, 120)}`, written, present };
+    }
+  }
+  return { action: written.length ? "written" : "present", written, present, line };
+}
+
+/** The bin directory this running CLI was launched from, or null. */
+export function runningCliBinDir(argv1 = process.argv[1], platform = process.platform) {
+  if (!argv1) return null;
+  let real = argv1;
+  try { real = realpathSync(argv1); } catch { /* keep the given path */ }
+  // Normalise both separator styles: a Windows path is examined on a Mac in
+  // tests, and a resolved path can mix them.
+  const normalised = real.replace(/\\/g, "/");
+  const marker = "/lib/node_modules/";
+  const at = normalised.indexOf(marker);
+  if (at === -1) {
+    // Windows global installs live directly under the prefix.
+    const win = normalised.indexOf("/node_modules/");
+    return platform === "win32" && win !== -1 ? normalised.slice(0, win) : null;
+  }
+  return `${normalised.slice(0, at)}/bin`;
+}
+
 export async function cmdLocalTools(options = {}) {
   const runCommand = options.runCommand ?? run;
   const claude = checkClaudeCode({ runCommand, required: true });
@@ -13283,6 +13423,19 @@ export async function cmdLocalTools(options = {}) {
     else ok(`${label} skill /financial-brain-technician ${r.status}`);
   }
   info("In either tool, type `/financial-brain-technician` to begin the guided plan.");
+
+  // Persist the CLI's own bin directory before anything else can go wrong,
+  // so a new terminal still has `brain` even if the rest of this stops.
+  const pathResult = (options.persistCliPath ?? persistCliPath)({
+    binDir: options.cliBinDir ?? runningCliBinDir(),
+  });
+  if (pathResult.action === "written") {
+    ok(`brain will be on PATH in new terminals (${pathResult.written.join(", ")})`);
+  } else if (pathResult.action === "manual") {
+    info(`so brain works in a new terminal: ${pathResult.reason}`);
+  } else if (pathResult.action === "failed") {
+    warn(`could not persist the CLI path: ${pathResult.reason}`);
+  }
 
   const hasTty = options.isTTY ?? (process.stdin.isTTY === true && process.stdout.isTTY === true);
   if (!hasTty) {

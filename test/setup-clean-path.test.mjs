@@ -155,6 +155,7 @@ try {
       assert.notEqual(path, target);
       return true;
     },
+    probeExistingWorkerHealth: async () => null,
     captureSetupD1Bookmark: async (path) => {
       assert.equal(path, resumedPinnedPath);
       resumedEvents.push("bookmark");
@@ -210,6 +211,62 @@ try {
     "health:durable",
     "wire",
   ]);
+
+  // A finished brain on the lease protocol is not a cutover candidate. Setup
+  // used to pause it and walk it back into the cutover purely because the
+  // Worker existed, and every error message in that state suggested setup.
+  const runningVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+  const liveEvents = [];
+  await cmdSetup(target, {
+    ask: prompt,
+    doctorRunAll: async () => [],
+    setupWorkerScriptExists: async () => true,
+    probeExistingWorkerHealth: async () => ({ version: runningVersion, acceptingDocuments: true }),
+    captureSetupD1Bookmark: async () => { liveEvents.push("bookmark"); return "never"; },
+    waitForVectorDrainQuiescence: async () => { liveEvents.push("wait"); },
+    configureStandardAdminKeyStorage: () => ({ changed: false }),
+    prepareSetupAdminKey: async () => ({ source: "durable", value: key, plan: { backend: "file" } }),
+    cmdVerify: async () => { liveEvents.push("verify"); },
+    cmdProvision: async () => { liveEvents.push("provision"); },
+    cmdMigrate: async () => { liveEvents.push("migrate"); },
+    cmdDeploy: async () => { liveEvents.push("deploy"); },
+    cmdSecrets: async () => { liveEvents.push("secrets"); },
+    cmdDrain: async () => { liveEvents.push("drain"); },
+    cmdHealth: async (_path, options) => { liveEvents.push(options.reachOnly ? `health:${options.expectDrainMode}` : "health:durable"); },
+    wireAgents: async () => { liveEvents.push("wire"); return { wired: [], failures: [], skipped: [] }; },
+    backlogCount: async () => 0,
+    installedManifestOptions,
+  });
+  assert.deepEqual(liveEvents, ["verify", "provision", "secrets", "drain", "health:durable", "wire"],
+    "a live brain on this release is neither paused, migrated nor redeployed by setup");
+
+  // On another release, setup names the right tool and touches nothing.
+  const otherEvents = [];
+  await assert.rejects(
+    () => cmdSetup(target, {
+      ask: prompt,
+      doctorRunAll: async () => [],
+      setupWorkerScriptExists: async () => true,
+      probeExistingWorkerHealth: async () => ({ version: "0.0.1", acceptingDocuments: true }),
+      captureSetupD1Bookmark: async () => { otherEvents.push("bookmark"); return "never"; },
+      waitForVectorDrainQuiescence: async () => { otherEvents.push("wait"); },
+      configureStandardAdminKeyStorage: () => ({ changed: false }),
+      prepareSetupAdminKey: async () => ({ source: "durable", value: key, plan: { backend: "file" } }),
+      cmdVerify: async () => { otherEvents.push("verify"); },
+      cmdProvision: async () => { otherEvents.push("provision"); },
+      cmdMigrate: async () => { otherEvents.push("migrate"); },
+      cmdDeploy: async () => { otherEvents.push("deploy"); },
+      cmdSecrets: async () => { otherEvents.push("secrets"); },
+      cmdDrain: async () => { otherEvents.push("drain"); },
+      cmdHealth: async () => { otherEvents.push("health"); },
+      wireAgents: async () => { otherEvents.push("wire"); return { wired: [], failures: [], skipped: [] }; },
+      backlogCount: async () => 0,
+      installedManifestOptions,
+    }),
+    (error) => /already installed and live on version 0\.0\.1/.test(String(error?.message || error)) &&
+      /brain update/.test(String(error?.message || error)),
+  );
+  assert.deepEqual(otherEvents, ["verify", "provision"], "nothing after the check runs on a brain from another release");
 
   // An interrupted projection bootstrap is a durable partial success: setup
   // stops before full health/wiring, and a rerun invokes the same drain again
