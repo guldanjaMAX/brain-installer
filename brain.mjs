@@ -119,7 +119,10 @@ import {
 import { renderSupportRecovery, supportRecovery } from "./support-recovery.mjs";
 import { readAdminKeyFile, validateAdminKeyValue } from "./operations/admin-key-file.mjs";
 import { writeClaudeWorkspaceGuide } from "./operations/claude-workspace.mjs";
-import { installClaudeTechnicianSkill } from "./operations/claude-skill.mjs";
+import {
+  installClaudeTechnicianSkill,
+  installTechnicianSkillEverywhere,
+} from "./operations/claude-skill.mjs";
 import {
   loadStoredCloudflareToken,
   storeCloudflareToken,
@@ -13131,19 +13134,32 @@ export async function cmdLocalTools(options = {}) {
     die("the required local tools are not ready. Fix those items and rerun `brain tools`.");
   }
 
-  let technicianSkill;
-  try {
-    technicianSkill = (options.installClaudeSkill ?? installClaudeTechnicianSkill)(
-      options.claudeSkillOptions || { environment: process.env },
-    );
-  } catch (error) {
+  // Codex reads the same skill format from ~/.codex/skills, so the one reviewed
+  // file serves both assistants. Install into each: which one the owner
+  // actually opens is not predictable from here, and a missing guide in the
+  // tool they chose looks like the product simply does not have one.
+  const skillOptions = options.claudeSkillOptions || { environment: process.env };
+  const installEverywhere = options.installTechnicianSkills ?? installTechnicianSkillEverywhere;
+  const skillResults = options.installClaudeSkill
+    ? [{ root: ".claude", ...options.installClaudeSkill(skillOptions) }]
+    : installEverywhere(skillOptions);
+
+  // One assistant failing must not cost the other, but a total failure is fatal:
+  // the guide is the product on install day.
+  const installed = skillResults.filter((r) => r.status !== "failed");
+  if (!installed.length) {
     die(
-      `Claude Code is ready, but its Financial Brain technician skill could not be installed safely: ${error?.message || error}\n` +
+      `Claude Code is ready, but the Financial Brain technician skill could not be installed safely: ${skillResults[0]?.error || "unknown"}\n` +
       "      Nothing existing was overwritten. Resolve that path and rerun `brain tools`."
     );
   }
-  ok(`Claude Code skill /financial-brain-technician ${technicianSkill.status}`);
-  info("Open Claude Code and type `/skills` to see it, or `/financial-brain-technician` to begin the guided plan.");
+  const technicianSkill = installed[0];
+  for (const r of skillResults) {
+    const label = r.root === ".codex" ? "Codex" : "Claude Code";
+    if (r.status === "failed") warn(`${label} skill not installed: ${r.error}`);
+    else ok(`${label} skill /financial-brain-technician ${r.status}`);
+  }
+  info("In either tool, type `/financial-brain-technician` to begin the guided plan.");
 
   const hasTty = options.isTTY ?? (process.stdin.isTTY === true && process.stdout.isTTY === true);
   if (!hasTty) {

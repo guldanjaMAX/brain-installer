@@ -4,6 +4,17 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.3.1
+
+**The guide now installs for Codex as well as Claude Code.**
+
+- `brain tools` writes the technician skill into both `~/.claude/skills` and
+  `~/.codex/skills`. They use the identical format, so it is one reviewed file
+  in two places. Whichever assistant you open, `/financial-brain-technician`
+  is there.
+- If one of them cannot be written, the other still is, and the one that failed
+  is named rather than silently skipped.
+
 ## 0.3.0
 
 **Sign in with your browser. No token to create, and nothing to paste.**

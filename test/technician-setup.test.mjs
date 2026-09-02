@@ -300,3 +300,51 @@ test("verification is ordered and stops at the first failed proof", async () => 
   );
   assert.deepEqual(commands, ["doctor", "health"]);
 });
+
+// Codex reads the same skill format from ~/.codex/skills, so one reviewed file
+// serves both assistants. Installing only Claude Code leaves the guide missing
+// in whichever tool the owner actually opens, which looks like the product
+// simply does not have one.
+test("the technician skill installs for both Claude Code and Codex, idempotently", async () => {
+  const { installTechnicianSkillEverywhere, technicianSkillPaths, AGENT_SKILL_ROOTS } =
+    await import("../operations/claude-skill.mjs");
+  const { mkdtempSync, existsSync, readFileSync, writeFileSync, realpathSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  // realpathSync: /tmp is a symlink on macOS and the installer correctly
+  // refuses to write a skill through one.
+  const home = realpathSync(mkdtempSync(join(realpathSync(tmpdir()), "fb-agents-")));
+
+  assert.deepEqual([...AGENT_SKILL_ROOTS], [".claude", ".codex"]);
+  const paths = technicianSkillPaths({ home });
+  assert.equal(paths.length, 2);
+  assert.ok(paths.some((p) => p.includes(join(".claude", "skills"))));
+  assert.ok(paths.some((p) => p.includes(join(".codex", "skills"))));
+
+  const first = installTechnicianSkillEverywhere({ home });
+  assert.equal(first.length, 2);
+  for (const r of first) assert.equal(r.status, "installed", `${r.root}: ${r.error || ""}`);
+  for (const p of paths) assert.ok(existsSync(p), `${p} must exist`);
+  assert.equal(
+    readFileSync(paths[0], "utf8"),
+    readFileSync(paths[1], "utf8"),
+    "both assistants must get the identical reviewed file",
+  );
+
+  // Re-running verifies rather than rewriting.
+  for (const r of installTechnicianSkillEverywhere({ home })) {
+    assert.equal(r.status, "verified");
+    assert.equal(r.changed, false);
+  }
+
+  // One assistant failing is reported, not thrown, so it cannot silently cost
+  // the other. A regular file where a directory belongs is the realistic shape:
+  // it is what a stray download or a half-finished install leaves behind.
+  writeFileSync(join(home, ".blocked"), "not a directory");
+  const mixed = installTechnicianSkillEverywhere({ home, agentRoots: [".claude", ".blocked"] });
+  assert.equal(mixed.length, 2);
+  assert.equal(mixed[0].status, "verified", "a later failure must not undo an earlier success");
+  assert.equal(mixed[1].status, "failed");
+  assert.ok(mixed[1].error, "a failure must carry its reason");
+});

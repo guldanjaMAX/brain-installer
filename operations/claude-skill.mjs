@@ -63,14 +63,44 @@ function reviewedSkillContent(sourcePath = PACKAGED_SKILL_PATH) {
   return content;
 }
 
+/**
+ * Every local assistant that reads this skill format.
+ *
+ * Codex and Claude Code use the identical layout, `<root>/skills/<name>/SKILL.md`
+ * with the same frontmatter, so one reviewed file serves both. Installing only
+ * one of them means the guide is missing in whichever tool the owner actually
+ * opens, and that is not predictable from here.
+ */
+export const AGENT_SKILL_ROOTS = Object.freeze([".claude", ".codex"]);
+
 export function claudeTechnicianSkillPath(options = {}) {
-  return join(
-    ownerHome(options),
-    ".claude",
-    "skills",
-    CLAUDE_TECHNICIAN_SKILL_NAME,
-    "SKILL.md",
-  );
+  return technicianSkillPathFor(options.agentRoot ?? ".claude", options);
+}
+
+export function technicianSkillPathFor(root, options = {}) {
+  return join(ownerHome(options), root, "skills", CLAUDE_TECHNICIAN_SKILL_NAME, "SKILL.md");
+}
+
+/** Where the skill goes for every assistant, in install order. */
+export function technicianSkillPaths(options = {}) {
+  return (options.agentRoots ?? AGENT_SKILL_ROOTS).map((root) => technicianSkillPathFor(root, options));
+}
+
+/**
+ * Install for every assistant. One failing must not silently cost the others,
+ * so each is attempted and the results are reported together.
+ */
+export function installTechnicianSkillEverywhere(options = {}) {
+  const roots = options.agentRoots ?? AGENT_SKILL_ROOTS;
+  const results = [];
+  for (const root of roots) {
+    try {
+      results.push({ root, ...installClaudeTechnicianSkill({ ...options, agentRoot: root }) });
+    } catch (error) {
+      results.push({ root, status: "failed", changed: false, error: String(error?.message || error) });
+    }
+  }
+  return results;
 }
 
 export function installClaudeTechnicianSkill(options = {}) {
