@@ -10565,11 +10565,17 @@ export function buildSetupManifest({ display, slug, accountId }) {
  * The recovery path for an install whose setup exited before Step 2, and the
  * way to prepare a manifest before a call rather than during one.
  */
-async function cmdInit(manifestPath) {
+async function cmdInit(manifestPath, options = {}) {
   // Each command parses its own flags. A bare `brain init --name x` leaves the
   // flag sitting in the manifest slot, so read from there rather than eating it.
   const pathIsFlag = typeof manifestPath === "string" && manifestPath.startsWith("--");
-  const flags = parseFlags(process.argv.slice(pathIsFlag ? 3 : 4));
+  const flags = options.flags ?? parseFlags(process.argv.slice(pathIsFlag ? 3 : 4));
+  assertKnownFlags(flags, ["manifest", "name", "slug", "account"], "brain init");
+  // Every command resolves its own asker. Omitting this shipped a `brain init`
+  // that worked with all three flags and threw "prompt is not defined" the
+  // moment it had to ask anything, which is exactly the fresh install it was
+  // written for. Found by an operator's live install, 2026-09-02.
+  const prompt = options.ask ?? ask;
   const target = (pathIsFlag ? null : manifestPath) || flags.manifest;
   if (!target) {
     die("brain init needs a path.\n" +

@@ -4,6 +4,19 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.2.3
+
+**`brain init` asks its questions again.**
+
+- 0.2.2's `brain init` worked when given `--name`, `--slug` and `--account`,
+  and stopped with "prompt is not defined" the moment it had to ask you
+  anything, which is exactly the fresh install it was written for. It now
+  resolves its own asker the way every other command does.
+- A typo like `--nmae` is refused and suggests the right flag, instead of being
+  ignored while the run continues.
+- The test suite now answers the questions rather than only passing the flags,
+  because the flags were what hid this.
+
 ## 0.2.2
 
 **A stopped install no longer leaves you with nothing.**
