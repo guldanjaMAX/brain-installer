@@ -4,6 +4,22 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.3.3
+
+**Connect your assistants with one command, instead of copying one.**
+
+```
+brain mcp-config <manifest> --apply
+```
+
+- It registers your brain with Claude Code and Codex, whichever are installed,
+  and checks afterwards that what was written matches exactly. Setup already did
+  this at the end of an install; this is the same thing on its own, for a brain
+  you already have or an assistant you installed later.
+- Without `--apply` it still just prints the commands, unchanged.
+- If one assistant cannot be connected it says which, and leaves nothing half
+  written.
+
 ## 0.3.2
 
 **Setup waits for Cloudflare instead of giving up on it.**

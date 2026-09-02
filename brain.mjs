@@ -4032,8 +4032,31 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
-export async function cmdMcpConfig(manifestPath) {
+export async function cmdMcpConfig(manifestPath, options = {}) {
   const { m } = loadManifest(manifestPath);
+  const flags = options.flags ?? parseFlags(process.argv.slice(4));
+  assertKnownFlags(flags, ["manifest", "apply"], "brain mcp-config");
+
+  // Printing a command someone then has to copy, paste and get right is how a
+  // connected brain ends up unconnected. Setup already wires both assistants at
+  // step 5; this exposes the same reconciler on its own, for a brain that is
+  // already installed or an assistant that arrived afterwards.
+  if (flags.apply) {
+    const result = await (options.wireAgents ?? wireAgents)(m, manifestPath, options.wireOptions || {});
+    if (result.wired.length) ok(`connected: ${result.wired.join(", ")}`);
+    for (const name of result.skipped) info(`${name}: nothing to do`);
+    if (result.failures.length) {
+      die(
+        `could not connect: ${result.failures.join(", ")}.\n` +
+        "      Nothing was left half-written. Run `brain mcp-config <manifest>` without --apply\n" +
+        "      to see the exact commands and run them yourself."
+      );
+    }
+    if (!result.wired.length && !result.skipped.length) {
+      info("no supported assistant found on this computer. Install Claude Code or Codex first.");
+    }
+    return result;
+  }
 
   let base = m.brain?.domain ? `https://${m.brain.domain}` : null;
   if (!base) {
@@ -13834,6 +13857,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain import bank <manifest> --file <statement.ofx|.qfx|.csv>  a bank export the owner
                                            downloaded, into the structured ledger (--dry-run previews)
     brain mcp-config <manifest>            config to connect the client's AI tools
+    brain mcp-config <manifest> --apply    connect them for real: registers the brain with
+                                           Claude Code and Codex, whichever are installed
     brain schedule   <manifest> --install  install unattended Drive refresh on macOS
     brain schedule   <manifest> --install --folder  install unattended refresh of the watched
                                            local folder declared in corpora.local_folder (macOS)
