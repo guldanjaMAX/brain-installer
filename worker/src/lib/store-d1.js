@@ -1001,7 +1001,13 @@ async function scheduleVectorFailures(env, rows, {
   let quarantined = 0;
   for (const row of rows) {
     const attempt = Math.max(0, Number(row.attempts || 0)) + 1;
-    const quarantineAt = attempt >= VECTOR_RETRY_MAX_ATTEMPTS ? now : null;
+    // A visibility mismatch is a systemic confirmation artifact, never a
+    // property of the row: quarantining on it strands healthy rows behind an
+    // operator ceremony after any stall lasting a few cycles. The backoff
+    // ladder still applies (capped at its last rung), so these rows retry
+    // forever instead of dying.
+    const quarantineAt = failureCode !== "visibility_mismatch" &&
+      attempt >= VECTOR_RETRY_MAX_ATTEMPTS ? now : null;
     if (quarantineAt !== null) quarantined++;
     const nextAttemptAt = quarantineAt === null ? now + vectorRetryDelay(attempt) : now;
     statements.push(env.DB.prepare(
@@ -1324,18 +1330,48 @@ async function projectionFenceState(env) {
   return { mutationId, submittedAt };
 }
 
-async function projectionFenceProcessed(env, fence) {
-  if (!fence?.mutationId) return true;
-  const info = await env.VECTORIZE.describe();
+const VECTOR_FENCE_CLOCK_SKEW_MS = 5 * 60_000;
+
+/**
+ * True when the index has processed at least up to the recorded fence.
+ *
+ * The watermark id is opaque, so a differing id alone is ambiguous: not yet
+ * ours, or already past ours. Requiring exact equality turned that ambiguity
+ * into a permanent stall the moment any mutation this fence did not record
+ * processed after ours (a crash between provider accept and the fence write,
+ * or any out-of-band mutation) - the watermark can never equal the recorded
+ * id again, and every drain cycle waits forever. The mutation log is totally
+ * ordered and FIFO-applied, which is the precondition for a single high-water
+ * mark to mean anything at all, so a processed mutation dated a full skew
+ * margin after our recorded submission proves ours is behind it. Row-level
+ * truth still comes from the getByIds proofs in confirmSubmittedVectors; a
+ * fence that opens has confirmed nothing by itself.
+ *
+ * Returns true (covered), false (not yet), or null when the provider response
+ * carries no usable watermark shape - each caller keeps its own contract
+ * error message for that case.
+ */
+function fenceWatermarkCovers(fence, info) {
   const processed = info?.processedUpToMutation;
   // A brand-new index legitimately reports no processed watermark while its
   // first accepted changeset is still pending. That is "not yet", not a
   // malformed response. Other shapes still fail closed.
   if (processed === null || processed === undefined || processed === "") return false;
-  if (typeof processed !== "string" && typeof processed !== "number") {
+  if (typeof processed !== "string" && typeof processed !== "number") return null;
+  if (String(processed) === fence.mutationId) return true;
+  const processedAt = Date.parse(String(info?.processedUpToDatetime ?? ""));
+  return Number.isFinite(processedAt) &&
+    Number.isSafeInteger(fence.submittedAt) &&
+    processedAt >= fence.submittedAt + VECTOR_FENCE_CLOCK_SKEW_MS;
+}
+
+async function projectionFenceProcessed(env, fence) {
+  if (!fence?.mutationId) return true;
+  const covered = fenceWatermarkCovers(fence, await env.VECTORIZE.describe());
+  if (covered === null) {
     throw new Error("Vectorize did not expose its processed mutation watermark");
   }
-  return String(processed) === fence.mutationId;
+  return covered;
 }
 
 /** Mark the full projection verified only across one exact, empty-queue cut. */
@@ -1348,7 +1384,7 @@ async function markProjectionVerifiedIfExact(env) {
   const fence = await projectionFenceState(env);
   const processed = fence.mutationId === null
     ? true
-    : String(description?.processedUpToMutation ?? "") === fence.mutationId;
+    : fenceWatermarkCovers(fence, description) === true;
   if (!processed) return false;
   const result = await env.DB.prepare(
     `UPDATE install_state
@@ -1491,6 +1527,19 @@ async function submitQueuedDeletes(env, rows, lease) {
  * pretending the write completed inline would make read-after-write look
  * broken. Draining separately makes the lag a visible queue instead.
  */
+// Retry classes that may ride in a full batch. visibility_mismatch means the
+// mutation was accepted but its effect was not yet query-visible: a systemic
+// condition, never a property of the row - the fence stall that creates these
+// rows en masse would otherwise serialize the whole queue to one row per
+// cycle behind them. embedding_failure is already isolated per-row inside the
+// embed loop below. Every other class (provider batch rejections, and legacy
+// rows carrying no recorded class) keeps the exclusive head slice, which is
+// how one poison row proves itself alone.
+const VECTOR_BATCH_SAFE_RETRY_CODES = new Set(["visibility_mismatch", "embedding_failure"]);
+const headRetryNeedsIsolation = (row) =>
+  Number(row?.attempts || 0) > 0 &&
+  !VECTOR_BATCH_SAFE_RETRY_CODES.has(String(row?.failure_code || ""));
+
 async function drainOutboxBatch(env, {
   embed,
   embedBatch,
@@ -1543,7 +1592,8 @@ async function drainOutboxBatch(env, {
   // D1 hydration makes them unreachable, so leaving them behind damages recall.
   const { results: deletePending } = await env.DB.prepare(
     `SELECT o.chunk_uid, COALESCE(o.vector_id, o.chunk_uid) AS vector_id,
-            o.queued_at, o.generation, COALESCE(s.attempts,o.attempts,0) AS attempts
+            o.queued_at, o.generation, COALESCE(s.attempts,o.attempts,0) AS attempts,
+            s.failure_code
        FROM vector_outbox o
        LEFT JOIN vector_outbox_retry_state s
          ON s.chunk_uid=o.chunk_uid AND s.generation=o.generation
@@ -1553,7 +1603,7 @@ async function drainOutboxBatch(env, {
       ORDER BY o.queued_at LIMIT ?2`
   ).bind(lease.now(), batchSize).all();
   if (deletePending?.length) {
-    const selected = Number(deletePending[0]?.attempts || 0) > 0
+    const selected = headRetryNeedsIsolation(deletePending[0])
       ? deletePending.slice(0, 1)
       : deletePending;
     const submitted = await submitQueuedDeletes(env, selected, lease);
@@ -1567,6 +1617,7 @@ async function drainOutboxBatch(env, {
   const { results: pending } = await env.DB.prepare(
     `SELECT o.chunk_uid, o.queued_at, o.generation,
             COALESCE(s.attempts,o.attempts,0) AS attempts,
+            s.failure_code,
             c.text, c.source, c.doc_uid, c.document_date,
             c.client, c.category, c.top_folder, c.platform
      FROM vector_outbox o JOIN chunks c ON c.chunk_uid = o.chunk_uid
@@ -1588,7 +1639,7 @@ async function drainOutboxBatch(env, {
     };
   }
 
-  const selectedPending = Number(pending[0]?.attempts || 0) > 0
+  const selectedPending = headRetryNeedsIsolation(pending[0])
     ? pending.slice(0, 1)
     : pending;
   const vectors = [];
@@ -3290,7 +3341,10 @@ export async function vectorReadiness(env) {
     } else if (typeof processed !== "string" && typeof processed !== "number") {
       throw new Error("the vector index did not expose its processed mutation watermark");
     } else {
-      mutationProcessed = String(processed) === mutationId;
+      mutationProcessed = fenceWatermarkCovers(
+        { mutationId, submittedAt: Number(state.mutation_submitted_at) },
+        description,
+      ) === true;
     }
   }
 

@@ -2308,6 +2308,12 @@ export default {
         if (drainResult.status === "fulfilled") {
           const r = drainResult.value;
           if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
+          // A cycle that only waited used to log nothing at all, which let a
+          // stalled fence run silent for hours. Waiting is normal for a cycle
+          // or two; the line exists so more than that is visible in a tail.
+          else if (!r.paused && !r.busy && !r.submitted && Number(r.waiting) > 0) {
+            console.log(`vector outbox: waiting on confirmation, ${r.remaining} queued`);
+          }
         } else {
           console.warn("vector outbox: scheduled drain failed");
         }
