@@ -43,19 +43,23 @@ try {
 
 let pinned = null;
 try {
-  // Cache-bust: the page is a hashed-chunk SPA and a stale bundle reads like
-  // a healthy one. The version lives in the chunk, not the HTML shell.
+  // The page no longer carries a version. It hands Claude Code a guide served
+  // by the kit worker, and THAT pins the release a client downloads. So read
+  // the page for the guide it names, then read the pin out of the guide. A
+  // page that names no guide, or a guide with no pin, is still drift: the
+  // client would be handed nothing to install. Cache-bust both reads.
   const html = await (await get(`${PAGE}?cb=${Date.now()}`)).text();
-  const chunks = [...html.matchAll(/\/_next\/static\/chunks\/[A-Za-z0-9._-]+\.js/g)].map((m) => m[0]);
-  const ordered = [...chunks.filter((c) => /SetupGuide/i.test(c)), ...chunks];
-  for (const path of [...new Set(ordered)]) {
-    const js = await (await get(new URL(path, PAGE).href)).text();
-    const hit = js.match(/releases\/download\/\$\{([A-Za-z_$][\w$]*)\}/);
-    if (hit) {
-      const assign = js.match(new RegExp(`\\b${hit[1].replace(/\$/g, "\\$")}\\s*=\\s*\`(v?\\d+\\.\\d+\\.\\d+)\``));
-      if (assign) { pinned = assign[1]; break; }
-    }
-    const direct = js.match(/releases\/download\/(v\d+\.\d+\.\d+)\//);
+  const guides = [...new Set(
+    [...html.matchAll(/https:\/\/fb-install-errors\.james-d13\.workers\.dev\/[A-Za-z0-9._/-]*guide[A-Za-z0-9._/-]*/g)]
+      .map((m) => m[0].replace(/&quot;|["'\\]+$/g, "")),
+  )];
+  if (!guides.length) {
+    console.error("\n  The install page names no guide for Claude to download.\n  The page may have been restructured. Check it by hand before shipping.\n");
+    process.exit(1);
+  }
+  for (const guide of guides) {
+    const md = await (await get(`${guide}${guide.includes("?") ? "&" : "?"}cb=${Date.now()}`)).text();
+    const direct = md.match(/releases\/download\/(v\d+\.\d+\.\d+)\//);
     if (direct) { pinned = direct[1]; break; }
   }
 } catch (e) {

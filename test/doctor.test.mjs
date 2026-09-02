@@ -21,6 +21,19 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("each check says what it saw", all.every((x) => typeof x.detail === "string" && x.detail.length));
 }
 
+/* ---- every check is printed as it completes, not just the first three ---- */
+{
+  const seen = [];
+  const all = await runAll({
+    accountId: "0000",
+    googleStorageStatus: { exists: false, description: "fixture secure storage" },
+    onResult: (x) => seen.push(x.name),
+  });
+  check("doctor reports every check to the caller as it finishes",
+    seen.length === all.length && all.every((x, i) => seen[i] === x.name),
+    `${seen.length} reported of ${all.length}: ${JSON.stringify(seen)}`);
+}
+
 /* ---- the severity split is the whole point: fatal blocks, optional does not ---- */
 {
   const node = checkNode();

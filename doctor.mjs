@@ -778,16 +778,19 @@ export async function runAll({
     if (onResult) onResult(x);
     return x;
   };
+  // Every check goes through push(), never out.push(): the first three used
+  // push() and the rest bypassed it, so a healthy machine printed three lines
+  // out of ten and looked truncated to anyone watching a screen share.
   push(checkNode());
   push(checkWrangler(localRun));
   push(await checkNetwork());
-  out.push(await checkCfToken(cloudflareToken));
-  out.push(await checkVectorizeApi(accountId, cloudflareToken));
-  out.push(await checkWorkersPaidPlan(accountId, cloudflareToken));
-  out.push(checkAnthropicKey());
-  out.push(checkClaudeCode({ runCommand: localRun, required: requireClaudeCode }));
-  out.push(checkCodex());
-  out.push(checkGoogleConnection(googleStorageStatus));
+  push(await checkCfToken(cloudflareToken));
+  push(await checkVectorizeApi(accountId, cloudflareToken));
+  push(await checkWorkersPaidPlan(accountId, cloudflareToken));
+  push(checkAnthropicKey());
+  push(checkClaudeCode({ runCommand: localRun, required: requireClaudeCode }));
+  push(checkCodex());
+  push(checkGoogleConnection(googleStorageStatus));
   return out;
 }
 
