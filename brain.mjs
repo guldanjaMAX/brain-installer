@@ -1288,39 +1288,38 @@ export async function persistWorkersDevDomain(manifestPath, m, acct, scriptName,
   return m.brain.domain;
 }
 
-export async function cmdDeploy(manifestPath, options = {}) {
-  const { m } = loadManifest(manifestPath);
-  const acct = await resolveAccount(m);
-  const cfg = m.infrastructure.cloudflare;
-  const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
+/**
+ * The bank feed's worker configuration.
+ *
+ * This had no deployment path at all. manifest.schema.json declared
+ * corpora.bank_feed, doctor.mjs validated every field of it, and the worker
+ * metadata emitted none of them, so a complete manifest that passed every
+ * check still produced a worker reporting the feed unconfigured. Only the two
+ * secrets ever reached the worker. A check that inspects something other than
+ * the artifact is worse than no check, because it certifies the install at the
+ * exact moment it is wrong.
+ *
+ * Emitted only when the feed is actually enabled, so a brain that does not use
+ * it carries no bank configuration at all. The environment is stated rather
+ * than inferred, for the same reason STORAGE is.
+ */
+export function bankFeedWorkerVars(m) {
+  const feed = m?.corpora?.bank_feed;
+  if (feed?.enabled !== true) return [];
+  const text = (name, value) =>
+    value ? [{ type: "plain_text", name, text: String(value) }] : [];
+  return [
+    ...text("BANK_FEED_API_BASE", feed.api_base),
+    { type: "plain_text", name: "BANK_FEED_ENV", text: feed.environment === "production" ? "production" : "sandbox" },
+    ...text("BANK_FEED_LINK_SDK_URL", feed.link_sdk_url),
+    ...text("BANK_FEED_LINK_GLOBAL", feed.link_global),
+    ...text("BANK_FEED_ENTITY", feed.entity_slug),
+  ];
+}
 
-  if (!cfg.d1_database_id) die("no d1_database_id in the manifest. Run `brain provision` first.");
-
-  const srcRoot = join(HERE, "worker", "src");
-  const files = collectWorkerFiles(srcRoot);
-  if (!files.length) die(`no worker source found at ${srcRoot}`);
-
-  const form = new FormData();
-  for (const f of files) {
-    // Module specifiers are relative to src/, matching the import paths.
-    // POSIX separators ALWAYS. A module specifier is a URL, not a filesystem
-    // path, and the worker imports "./lib/core.js". On Windows relative()
-    // returns "lib\\core.js", so every module uploads under a name the runtime
-    // cannot resolve and the worker dies with: No such module "lib/core.js".
-    // Found by the first real Windows install; CI could not catch it because
-    // deploying needs live Cloudflare credentials.
-    const rel = relative(srcRoot, f).split(sep).join("/");
-    form.append(
-      rel,
-      new Blob([readFileSync(f, "utf-8")], { type: "application/javascript+module" }),
-      rel
-    );
-  }
-
-  const metadata = {
-    main_module: "index.js",
-    compatibility_date: "2026-01-01",
-    bindings: [
+/** Every binding this manifest puts on the worker. Exported so a test can read the artifact. */
+export function workerBindings(m, cfg, options = {}) {
+  return [
       { type: "d1", name: "DB", id: cfg.d1_database_id },
       { type: "ai", name: "AI" },
       // Explicit, never inferred. The worker CAN guess its backend from which
@@ -1375,7 +1374,52 @@ export async function cmdDeploy(manifestPath, options = {}) {
         name: "OCR_MODEL",
         text: String(m.safety?.ocr?.model || "@cf/google/gemma-4-26b-a4b-it"),
       },
-    ],
+    ...bankFeedWorkerVars(m),
+  ];
+}
+
+export async function cmdDeploy(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const acct = await resolveAccount(m);
+  const cfg = m.infrastructure.cloudflare;
+  const scriptName = m.brain?.worker_name || `${m.client?.slug || "client"}-brain`;
+
+  if (!cfg.d1_database_id) die("no d1_database_id in the manifest. Run `brain provision` first.");
+
+  const srcRoot = join(HERE, "worker", "src");
+  const files = collectWorkerFiles(srcRoot);
+  if (!files.length) die(`no worker source found at ${srcRoot}`);
+
+  const form = new FormData();
+  for (const f of files) {
+    // Module specifiers are relative to src/, matching the import paths.
+    // POSIX separators ALWAYS. A module specifier is a URL, not a filesystem
+    // path, and the worker imports "./lib/core.js". On Windows relative()
+    // returns "lib\\core.js", so every module uploads under a name the runtime
+    // cannot resolve and the worker dies with: No such module "lib/core.js".
+    // Found by the first real Windows install; CI could not catch it because
+    // deploying needs live Cloudflare credentials.
+    const rel = relative(srcRoot, f).split(sep).join("/");
+    form.append(
+      rel,
+      new Blob([readFileSync(f, "utf-8")], { type: "application/javascript+module" }),
+      rel
+    );
+  }
+
+  const feedCfg = m?.corpora?.bank_feed;
+  if (feedCfg?.enabled === true && !String(feedCfg.api_base || "").trim()) {
+    die(
+      "corpora.bank_feed is enabled but has no api_base, so the feed would deploy unconfigured.\n" +
+        "  There is deliberately no default: a missing host must stop here rather than reach an\n" +
+        "  unintended endpoint. Set corpora.bank_feed.api_base, or set enabled to false."
+    );
+  }
+
+  const metadata = {
+    main_module: "index.js",
+    compatibility_date: "2026-01-01",
+    bindings: workerBindings(m, cfg, options),
     // Without this, every secret set by `brain secrets` is wiped on the next
     // deploy. It is the single most destructive omission in a Workers deploy
     // and it fails silently: the worker deploys fine and then 500s on use.
