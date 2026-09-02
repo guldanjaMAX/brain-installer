@@ -13231,11 +13231,14 @@ function manifestAccountId(manifestPath) {
   try {
     manifest = loadManifest(manifestPath).m;
   } catch (error) {
+    const inWorktree = /[\\/]\.git[\\/]worktrees[\\/]/.test(String(manifestPath || ""));
     die(
       `could not read the install manifest at ${manifestPath || "brain.manifest.json"}: ${error?.message || error}\n` +
         "      Every provisioning command needs it, and nothing has been changed.\n" +
-        "      If you are working in a git worktree, instance files live only in the main checkout:\n" +
-        "      pass the full path to the manifest there."
+        (inWorktree
+          ? "      Instance files live only in the main checkout, not in a git worktree:\n" +
+            "      pass the full path to the manifest there."
+          : "      Check the path, or run `brain init <path>` to write a new manifest with no network and no token.")
     );
   }
   return manifest?.infrastructure?.cloudflare?.account_id || null;
@@ -13243,9 +13246,15 @@ function manifestAccountId(manifestPath) {
 
 async function cmdSetupInteractive(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
+  // A first install has no manifest yet: cmdSetup writes one from three
+  // questions (or brain init already did). Reading it here, before setup ever
+  // ran, refused every fresh install with CONFIG_INVALID and a hint about git
+  // worktrees, on a laptop that had never seen git. Only an EXISTING manifest
+  // is read for its account; a missing one is setup's job to create.
+  const pending = manifestPath || flags.manifest || "./brain.manifest.json";
   return withCloudflareToken(
     () => cmdSetup(manifestPath, { flags }),
-    { accountId: manifestAccountId(manifestPath) },
+    { accountId: existsSync(pending) ? manifestAccountId(pending) : null },
   );
 }
 
