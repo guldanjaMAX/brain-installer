@@ -4,6 +4,43 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.3.4
+
+**Your brain cannot get quietly stuck any more, and updates stop making you wait.**
+
+- Your brain hands new material to its search index in batches and waits for
+  the index to confirm each one. In some cases that confirmation could never
+  arrive, so new material kept queueing and stayed only partly searchable while
+  every health check said fine. Your brain kept working the whole time and
+  nothing was lost. It now recognises that its batch has been processed even
+  when the confirmation marker has moved past it, and it says so in its log
+  when it is waiting. If your brain was paused this way, this update clears it
+  on its own.
+- An update used to pause your brain for a fixed twenty minutes while older
+  writes finished, even when there were none. It now checks, and on a quiet
+  brain the pause ends in under a minute. A busy brain still gets the full
+  twenty, and the screen says which.
+- An update used to report itself failed when one of your sources had simply
+  not refreshed lately, for example a Google connection that lapsed. That is
+  about the source, not the update: it now completes, records the new version,
+  and tells you which source needs attention.
+- Running `brain setup` again on a brain that is already installed used to
+  pause it. Setup now checks first: on this release it goes straight to keys
+  and health, and on a different release it points you at `brain update`.
+- A first install is no longer turned away for not having a manifest yet;
+  setup creates it, as it was always meant to.
+- The drain schedule is only added if it is missing, and if your Cloudflare
+  plan is not Workers Paid the message says so plainly: everything else is
+  already in place and upgrading the plan then running the same command again
+  finishes it. `brain doctor` now shows a Workers plan line before install.
+- `brain deploy`, `provision`, `status` and `sources` use the same sign-in
+  your setup and update use, so a message that tells you to run one of them
+  no longer sends you somewhere that cannot sign in.
+- `brain tools` puts the `brain` command on your PATH for new terminals, so it
+  is still there tomorrow. `brain doctor` prints every check it runs, not just
+  the first three. `brain test` says when it could not exercise retrieval
+  because the manifest has no probe questions yet.
+
 ## 0.3.3
 
 **Connect your assistants with one command, instead of copying one.**

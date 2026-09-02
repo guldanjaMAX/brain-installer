@@ -49,8 +49,12 @@ try {
   // page that names no guide, or a guide with no pin, is still drift: the
   // client would be handed nothing to install. Cache-bust both reads.
   const html = await (await get(`${PAGE}?cb=${Date.now()}`)).text();
+  // Any absolute URL on the page whose path names a guide. The host is not
+  // hardcoded: the kit worker can move, and a hostname is not what this alarm
+  // is about. What it is about is whether the thing a client downloads pins
+  // the release we shipped.
   const guides = [...new Set(
-    [...html.matchAll(/https:\/\/fb-install-errors\.james-d13\.workers\.dev\/[A-Za-z0-9._/-]*guide[A-Za-z0-9._/-]*/g)]
+    [...html.matchAll(/https:\/\/[A-Za-z0-9.-]+\/[A-Za-z0-9._/-]*guide[A-Za-z0-9._/-]*/g)]
       .map((m) => m[0].replace(/&quot;|["'\\]+$/g, "")),
   )];
   if (!guides.length) {
