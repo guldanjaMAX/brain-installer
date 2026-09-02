@@ -75,3 +75,4 @@ planning/
 # which IS committed; dist/ and node_modules are not.
 frontend/node_modules/
 frontend/dist/
+*.tgz
