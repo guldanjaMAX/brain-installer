@@ -4581,7 +4581,7 @@ export const VALUE_FLAGS = new Set([
   "corpus-contract", "approve-removals", "only", "skip",
   // brain import bank. `--file` with no value must die saying so rather than
   // being read as a boolean and then reported as "needs --file".
-  "file", "format", "account", "account-kind", "institution", "currency", "entity", "entity-label",
+  "file", "format", "account", "account-kind", "name", "slug", "institution", "currency", "entity", "entity-label",
   "qbo-account", "to", "direction", "claim-file",
 ]);
 
@@ -12857,6 +12857,86 @@ export async function captureSetupD1Bookmark(manifestPath, options = {}) {
  * Every step is idempotent and the manifest is written after each, so an
  * interrupted setup is resumed by re-running the same command.
  */
+/** The slug suggested from a display name. It names the worker, D1 and the index. */
+export function defaultSlugFor(display) {
+  return String(display || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 30) || "brain";
+}
+
+/**
+ * Build a fresh manifest from the shipped template.
+ *
+ * Split out of setup so `brain init` can write one on a machine that has not
+ * passed preflight. Setup runs its machine checks BEFORE the manifest block
+ * and exits on a fatal one, so an install that stops there ends up with no
+ * manifest at all, and every recovery command then asks for the file that was
+ * never written. That loop is what `brain init` breaks.
+ */
+export function buildSetupManifest({ display, slug, accountId, authProfile = null }) {
+  const tmpl = JSON.parse(readFileSync(join(HERE, "templates", "brain.manifest.json"), "utf-8"));
+  tmpl.client = {
+    slug,
+    display_name: display,
+    primary_contact: "",
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  };
+  tmpl.brain = { version: PRODUCT_VERSION, worker_name: `${slug}-brain` };
+  const cf = tmpl.infrastructure.cloudflare;
+  for (const k of ["d1_database_id", "vectorize_index", "kv_namespace_id"]) delete cf[k];
+  delete cf.r2_bucket; // not wired to anything, so do not provision it
+  cf.d1_database_name = `${slug}-brain`;
+  cf.storage = "d1";
+  cf.account_id = accountId;
+  // Browser sign-in binds an install to one saved local profile. It is set
+  // only when setup actually resolved one, so `brain init` (no network, no
+  // sign-in) still writes a manifest that a later setup can bind.
+  if (authProfile) cf.auth_profile = authProfile;
+  delete tmpl.infrastructure.supabase;
+  return tmpl;
+}
+
+/**
+ * Write a manifest and stop. No network, no token, no machine checks.
+ *
+ * The recovery path for an install whose setup exited before Step 2, and the
+ * way to prepare a manifest before a call rather than during one.
+ */
+async function cmdInit(manifestPath) {
+  // Each command parses its own flags. A bare `brain init --name x` leaves the
+  // flag sitting in the manifest slot, so read from there rather than eating it.
+  const pathIsFlag = typeof manifestPath === "string" && manifestPath.startsWith("--");
+  const flags = parseFlags(process.argv.slice(pathIsFlag ? 3 : 4));
+  const target = (pathIsFlag ? null : manifestPath) || flags.manifest;
+  if (!target) {
+    die("brain init needs a path.\n" +
+        "  Example: brain init \"$HOME/Financial Brain/brain.manifest.json\"\n" +
+        "  Optional: --name \"Acme Inc\"  --slug acme  --account <cloudflare account id>");
+  }
+  if (existsSync(target)) {
+    closePrompts();
+    die(`${relative(process.cwd(), target)} already exists, so nothing was written.\n` +
+        "  Run `brain setup` with that same path to carry on.");
+  }
+  const display = String(flags.name || await prompt("What is this brain for? (a person or a company)", "My Brain")).trim();
+  const slug = String(flags.slug || await prompt(
+    "Short name, lowercase, no spaces (names the worker and the database)",
+    defaultSlugFor(display),
+  )).trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(slug)) {
+    closePrompts();
+    die(`"${slug}" cannot name a worker. Use lowercase letters, numbers and hyphens.`);
+  }
+  const accountId = String(flags.account || await prompt("Cloudflare account id", "")).trim();
+  if (!/^[0-9a-f]{32}$/.test(accountId)) {
+    closePrompts();
+    die("that does not look like a Cloudflare account id.\n" +
+        "  It is 32 hex characters, shown in the dashboard URL and on the account home page.");
+  }
+  createSetupManifest(target, buildSetupManifest({ display, slug, accountId }));
+  closePrompts();
+  ok(`wrote ${relative(process.cwd(), target)}`);
+  info(`next: brain setup ${commandPath(displayPath(target))}`);
+}
+
 export async function cmdSetup(manifestPath, options = {}) {
   const flags = options.flags ?? parseFlags(process.argv.slice(3));
   assertKnownFlags(flags, ["manifest", "path", "no-connect", "cloudflare-account", "cloudflare-token"], "brain setup");
@@ -12889,7 +12969,10 @@ export async function cmdSetup(manifestPath, options = {}) {
     console.log("");
     for (const x of fatal) console.log(`  ${c.red(x.name)}\n    ${x.fix.split("\n").join("\n    ")}\n`);
     closePrompts();
-    die("setup cannot continue until the blocking items above are fixed. Re-run when they are.");
+    die("setup cannot continue until the items above are fixed. Re-run when they are.\n" +
+        "      Setup writes the manifest after these checks, so on a first run there is no manifest\n" +
+        "      yet. `brain init <path>` writes one now, with no network and no token, and setup\n" +
+        "      resumes from it.");
   }
 
   /* --- 2. the manifest, asked for once --- */
@@ -12911,24 +12994,16 @@ export async function cmdSetup(manifestPath, options = {}) {
     const display = await prompt("What is this brain for? (a person or a company)", "My Brain");
     const slug = (await prompt(
       "Short name, lowercase, no spaces (names the worker and the database)",
-      display.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 30) || "brain"
+      defaultSlugFor(display)
     )).toLowerCase();
-
-    const tmpl = JSON.parse(readFileSync(join(HERE, "templates", "brain.manifest.json"), "utf-8"));
-    tmpl.client = { slug, display_name: display, primary_contact: "", timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
-    tmpl.brain = { version: PRODUCT_VERSION, worker_name: `${slug}-brain` };
-    const cf = tmpl.infrastructure.cloudflare;
-    for (const k of ["d1_database_id", "vectorize_index", "kv_namespace_id"]) delete cf[k];
-    delete cf.r2_bucket; // not wired to anything, so do not provision it
-    cf.d1_database_name = `${slug}-brain`;
-    cf.storage = "d1";
-    if (options.cloudflareAuthProfile) cf.auth_profile = options.cloudflareAuthProfile;
-    delete tmpl.infrastructure.supabase;
 
     const account = await chooseSetupAccount(prompt, {
       listAccounts: options.listCloudflareAccounts,
     });
-    cf.account_id = account.id;
+    const tmpl = buildSetupManifest({
+      display, slug, accountId: account.id,
+      authProfile: options.cloudflareAuthProfile,
+    });
     ok(`Cloudflare account "${account.name}" (${account.id})`);
 
     createSetupManifest(target, tmpl);
@@ -17054,6 +17129,7 @@ export async function cmdConnectors(flags = parseFlags(process.argv.slice(3)), o
 }
 
 const commands = {
+  init: cmdInit,
   setup: cmdSetupInteractive,
   ask: cmdAsk,
   doctor: dispatchDoctor,
@@ -17099,6 +17175,10 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
   console.log(`${c.bold("brain")} — provision and manage a client-owned brain install
 
   install
+    brain init       <manifest>            write the manifest and stop: no network, no token,
+                                           no machine checks. --name, --slug and --account
+                                           make it ask nothing. Use it if setup stopped before
+                                           it got to write one.
     brain setup      [manifest]            nothing to a working brain, one command
     brain setup      [manifest] --cloudflare-account create  guide a first Cloudflare account
     brain setup      [manifest] --cloudflare-account existing  use an account the owner already has
