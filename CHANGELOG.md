@@ -4,6 +4,20 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.3.2
+
+**Setup waits for Cloudflare instead of giving up on it.**
+
+- Creating your search index involves several filters, and how long Cloudflare
+  takes to switch each one on is not predictable. The old limit was 90 seconds,
+  and on two rehearsals out of three Cloudflare took longer, which stopped a
+  perfectly good install at step three of six. It now waits up to five minutes
+  and tells you it is still waiting, so a slow minute does not look like a
+  freeze.
+- The rule underneath has not changed and will not: your brain is never loaded
+  into a search index whose filters are not ready yet, because a filter only
+  applies to what is added after it exists.
+
 ## 0.3.1
 
 **The guide now installs for Codex as well as Claude Code.**

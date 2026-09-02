@@ -962,11 +962,17 @@ export async function ensureMetadataIndex({
   create,
   exists,
   attempts = 3,
-  // Cloudflare took just over 30 seconds to expose a newly-created metadata
-  // index during the first live shadow provision on 2026-08-23. Ten polls at
-  // three seconds stopped one check too early. Allow up to 90 seconds while
-  // preserving the fail-closed rule before any vectors are written.
-  verifyAttempts = 30,
+  // How long Cloudflare takes to expose a new metadata index is not stable.
+  // 2026-08-23: just over 30 seconds, so ten polls at three seconds was one
+  // check short. 2026-09-02: two of three rehearsals blew through 90 seconds
+  // on different properties, which stopped a provision at step three of six on
+  // a brain that was otherwise fine.
+  //
+  // This is a WAIT, not a failure, so the patience is now five minutes. The
+  // fail-closed rule is unchanged and must stay: a metadata index applies only
+  // to vectors written after it exists, so continuing early would leave that
+  // filter permanently broken for everything ingested from then on.
+  verifyAttempts = 100,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   log = ok,
   onFatal = die,
@@ -1013,13 +1019,20 @@ export async function ensureMetadataIndex({
     } catch (e) {
       lastError = e?.message || String(e);
     }
+    // A silent two-minute pause reads as a hang, and a hang on a screen share
+    // is when people start pressing things.
+    if (attempt % 10 === 0) {
+      log(`still waiting for the "${propertyName}" index to become active (${attempt * 3}s). This is normal.`);
+    }
     if (attempt < verifyAttempts) await sleep(3000);
   }
 
   return onFatal(
     `the metadata index on "${propertyName}" was requested but never became active: ${String(lastError || "unknown").slice(0, 120)}` + "\n" +
-      "  Provision will not ingest into an index whose filters are not ready." + "\n" +
-      "  Re-run `brain provision`; no corpus data has been written yet."
+      "  Provision will not ingest into an index whose filters are not ready, because" + "\n" +
+      "  Vectorize applies one only to vectors written after it exists." + "\n" +
+      "  Cloudflare is being slow rather than broken. Nothing has been written, so" + "\n" +
+      "  re-run `brain provision` and it will carry on from here."
   );
 }
 
