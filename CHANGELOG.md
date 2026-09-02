@@ -4,6 +4,26 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.3.0
+
+**Sign in with your browser. No token to create, and nothing to paste.**
+
+- Run `npx wrangler@4 login` once, click Allow, and every command works. No API
+  token page, no picking a template, no remembering that the template leaves out
+  the database, no Zone Resources, no sixty-character paste into a hidden prompt.
+  On the first live install that step took three attempts and about 25 minutes.
+- Because nothing has to be typed in secret, setup no longer needs a real
+  terminal. It runs anywhere, including inside an assistant session.
+- Your brain tells you which sign-in it used, every run. Signing in as the wrong
+  person is how work lands in the wrong account, and it is silent when it happens.
+- Prefer the narrow four-permission token instead? Nothing changed for you, and
+  `BRAIN_NO_WRANGLER_LOGIN=1` turns the browser path off entirely.
+- **A working sign-in is no longer reported as broken.** The check only
+  recognised one kind of credential and failed a browser or account-scoped
+  sign-in as "Invalid API Token", stopping an install before anything was made.
+- When a machine check stops setup, it only suggests `brain init` if you really
+  have no manifest yet, instead of sending you to fix something that is fine.
+
 ## 0.2.3
 
 **`brain init` asks its questions again.**

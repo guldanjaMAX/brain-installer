@@ -483,6 +483,25 @@ export async function checkCfToken(cloudflareToken = process.env.CLOUDFLARE_API_
       if (res.ok && payload?.success && payload?.result?.status === "active") {
         return check("Cloudflare token", OK, "verified and active");
       }
+      // `/user/tokens/verify` only recognises USER API tokens. A `wrangler login`
+      // session and an account-owned token both work perfectly for accounts, D1,
+      // Workers and Vectorize, and both are rejected here as "Invalid API Token".
+      // Calling that a failure stops a working install at the preflight, so ask
+      // the question that actually matters: can this credential see an account?
+      try {
+        const probe = await fetch("https://api.cloudflare.com/client/v4/accounts", {
+          headers: { authorization: `Bearer ${cloudflareToken}` },
+          signal: AbortSignal.timeout(15_000),
+        });
+        const accounts = probe.ok ? await probe.json().catch(() => null) : null;
+        if (accounts?.success && Array.isArray(accounts.result) && accounts.result.length) {
+          return check(
+            "Cloudflare credential", OK,
+            `browser or account-scoped sign-in, ${accounts.result.length} account(s) visible`,
+          );
+        }
+      } catch { /* fall through to the token verdict below */ }
+
       const detail = (payload?.errors || []).map((x) => x.message).filter(Boolean).join("; ")
         || `HTTP ${res.status}`;
       const expired = /expired/i.test(detail) || payload?.result?.status === "expired";

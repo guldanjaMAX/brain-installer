@@ -137,6 +137,7 @@ import {
 import { guardBrainAdminFetch } from "./components/brain-http.mjs";
 import { confidenceLine } from "./worker/src/lib/confidence.js";
 import { retrievalUnavailable, unavailableNotice } from "./worker/src/lib/retrieval-status.js";
+import { readWranglerOAuthToken } from "./operations/wrangler-oauth.mjs";
 import {
   adminKeyPersistencePlan,
   parseAdminKeySecretReference,
@@ -378,6 +379,48 @@ export function cloudflareTokenAvailable() {
   return Boolean(process.env.CLOUDFLARE_API_TOKEN || cloudflareTokenSession.getStore());
 }
 
+/**
+ * Run the CLI inside the client's `wrangler login` session when nothing else
+ * supplies a credential.
+ *
+ * Resolved once, at the entry point, rather than inside activeCloudflareToken.
+ * A lazy global fallback reaches every caller including the test suite, so
+ * whether a credential "exists" would depend on who happens to be signed in on
+ * the machine running it. Here the scope is exactly one CLI invocation.
+ */
+export async function withWranglerSessionIfNeeded(run, options = {}) {
+  if (cloudflareTokenAvailable()) return run();
+  // An explicit opt-out, for anyone who wants the narrow four-permission token
+  // rather than account-wide OAuth, and for tests that must assert on the
+  // no-credential path without depending on who is signed in on the machine.
+  const env = options.env ?? process.env;
+  if (env.BRAIN_NO_WRANGLER_LOGIN) return run();
+  let token = null;
+  try {
+    token = (options.readWranglerOAuthToken ?? readWranglerOAuthToken)();
+  } catch {
+    token = null; // one credential source among several; absence is ordinary
+  }
+  if (!token) return run();
+  const buffer = Buffer.from(token, "ascii");
+  // Name the identity, because wrangler authenticating as the wrong person is
+  // how an operator provisions into their own account instead of the client's,
+  // and it is silent when it happens.
+  //
+  // Never on a --json run. Machine-readable output is the whole contract of
+  // those commands, and one friendly line on stdout ahead of it turns a parsed
+  // object into a syntax error for whatever is reading it.
+  const machineReadable = (options.argv ?? process.argv).includes("--json");
+  if (!machineReadable) ok("using this computer's `wrangler login` session for Cloudflare");
+  return cloudflareTokenSession.run(buffer, async () => {
+    try {
+      return await run();
+    } finally {
+      buffer.fill(0);
+    }
+  });
+}
+
 function validateCloudflareTokenBytes(value) {
   const bytes = Buffer.isBuffer(value) ? Buffer.from(value) : Buffer.from(String(value || ""), "ascii");
   if (bytes.length < 20 || bytes.length > 512 || [...bytes].some((byte) => byte < 0x21 || byte > 0x7e)) {
@@ -484,9 +527,12 @@ export function readHiddenCloudflareToken({ input = process.stdin, output = proc
     output,
     noun: "Cloudflare token",
     insecure:
-      "no Cloudflare token is available and this terminal cannot prompt securely. " +
-      "Rerun from an interactive terminal for hidden entry. For automation, inject " +
-      "CLOUDFLARE_API_TOKEN through an approved secret manager; never paste it into a shell command.",
+      "no Cloudflare credential is available and this terminal cannot prompt securely.\n" +
+      "  The simplest fix is a browser sign-in, which needs no token at all:\n" +
+      "    npx wrangler@4 login\n" +
+      "  Then run this command again. Alternatively rerun from a real terminal for hidden\n" +
+      "  entry, or inject CLOUDFLARE_API_TOKEN through an approved secret manager. Never\n" +
+      "  paste a token into a shell command.",
     // A Cloudflare token is printable ASCII with no spaces, so a space is a
     // paste accident and is caught at the keystroke rather than at the API.
     accepts: (byte) => byte >= 0x21 && byte <= 0x7e,
@@ -588,9 +634,12 @@ function token() {
   const t = activeCloudflareToken();
   if (!t) {
     die(
-      "CLOUDFLARE_API_TOKEN is not set.\n" +
-        "      Run `brain setup` or `brain update` in an interactive terminal for hidden token entry.\n" +
-        "      Low-level automation must inject it through an approved secret manager; never paste it\n" +
+      "no Cloudflare credential is available.\n" +
+        "      Easiest: sign in through the browser, which needs no token at all:\n" +
+        "        npx wrangler@4 login\n" +
+        "      Or run `brain setup` or `brain update` in a real terminal for hidden token entry.\n" +
+        "      Low-level automation must inject CLOUDFLARE_API_TOKEN through an approved secret\n" +
+        "      manager; never paste it\n" +
         "      into a shell command. It is deliberately not read from the manifest."
     );
   }
@@ -10636,10 +10685,15 @@ export async function cmdSetup(manifestPath, options = {}) {
     console.log("");
     for (const x of fatal) console.log(`  ${c.red(x.name)}\n    ${x.fix.split("\n").join("\n    ")}\n`);
     closePrompts();
-    die("setup cannot continue until the items above are fixed. Re-run when they are.\n" +
-        "      Setup writes the manifest after these checks, so on a first run there is no manifest\n" +
-        "      yet. `brain init <path>` writes one now, with no network and no token, and setup\n" +
-        "      resumes from it.");
+    // Only offer `brain init` when there is genuinely no manifest. Suggesting it
+    // to someone who already has one sends them hunting for a second problem.
+    const pending = manifestPath || flags.manifest || "./brain.manifest.json";
+    die("setup cannot continue until the items above are fixed. Re-run when they are." +
+        (existsSync(pending)
+          ? ""
+          : "\n      Setup writes the manifest after these checks, so on a first run there is no\n" +
+            "      manifest yet. `brain init <path>` writes one now, with no network and no token,\n" +
+            "      and setup resumes from it."));
   }
 
   /* --- 2. the manifest, asked for once --- */
@@ -13819,7 +13873,9 @@ if (IS_MAIN) {
   process.on("unhandledRejection", (e) => crash(e));
   process.on("uncaughtException", (e) => crash(e));
 
-  commands[cmd](manifestPath).catch((e) => {
+  // Wrapped so a client who signed in with `wrangler login` never has to mint
+  // or paste a token. Scoped to this one invocation.
+  withWranglerSessionIfNeeded(() => commands[cmd](manifestPath)).catch((e) => {
     // Fatal is a failure this code ANTICIPATED and already explained: a missing
     // token, a free-tier account, a typo'd source name. A Drive removal review
     // is an intentional safety stop with the same no-crash treatment and a

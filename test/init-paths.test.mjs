@@ -23,19 +23,19 @@ const run = (args, input = "") =>
   spawnSync(process.execPath, [CLI, "init", ...args], { input, encoding: "utf8" });
 
 // Fully interactive: no flags at all, every answer typed.
-const interactive = run([join(dir, "a.json")], `Malini Bhakta\nmalini\n${ACCOUNT}\n`);
+const interactive = run([join(dir, "a.json")], `Rowan Vale\nrowanvale\n${ACCOUNT}\n`);
 assert.equal(interactive.status, 0, `interactive init failed: ${interactive.stderr}`);
 assert.doesNotMatch(`${interactive.stdout}${interactive.stderr}`, /is not defined/,
   "init must resolve its own asker, like every other command");
 const a = JSON.parse(readFileSync(join(dir, "a.json"), "utf8"));
-assert.equal(a.client.slug, "malini");
-assert.equal(a.client.display_name, "Malini Bhakta");
-assert.equal(a.brain.worker_name, "malini-brain");
+assert.equal(a.client.slug, "rowanvale");
+assert.equal(a.client.display_name, "Rowan Vale");
+assert.equal(a.brain.worker_name, "rowanvale-brain");
 
 // Partly flagged: the mixed path, which is what an operator actually types.
-const partial = run([join(dir, "b.json"), "--name", "Chet Bhakta"], `chet\n${ACCOUNT}\n`);
+const partial = run([join(dir, "b.json"), "--name", "Harbour Stone"], `harbourstone\n${ACCOUNT}\n`);
 assert.equal(partial.status, 0, `partly-flagged init failed: ${partial.stderr}`);
-assert.equal(JSON.parse(readFileSync(join(dir, "b.json"), "utf8")).client.slug, "chet");
+assert.equal(JSON.parse(readFileSync(join(dir, "b.json"), "utf8")).client.slug, "harbourstone");
 
 // Fully flagged: must not read stdin at all.
 const flagged = run([join(dir, "c.json"), "--name", "Puppy Dreams", "--slug", "puppydreams", "--account", ACCOUNT]);

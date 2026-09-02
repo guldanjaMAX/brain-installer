@@ -77,6 +77,10 @@ function cli(args, env = {}, options = {}) {
   delete e.ADMIN_KEY;
   delete e.BRAIN_DEBUG;
   e.BRAIN_TEST_USER_ROOT = userRoot;
+  // These assert what happens when NO Cloudflare credential exists. A
+  // `wrangler login` on the machine running the suite is a credential, so pin
+  // it off rather than letting the result depend on who is signed in.
+  e.BRAIN_NO_WRANGLER_LOGIN = "1";
   const imports = [ISOLATE_SUPPORT_ROOT, ...(options.imports || [])];
   const nodeArguments = imports.flatMap((specifier) => ["--import", specifier]);
   // Generous: on a cold machine the Cloudflare checks download wrangler before
