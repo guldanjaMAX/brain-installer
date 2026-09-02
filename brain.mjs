@@ -13269,6 +13269,20 @@ async function cmdUpgradeInteractive(manifestPath) {
 }
 
 /**
+ * Give a provisioning command the same credential ladder setup and update
+ * have: an environment token, the browser sign-in session, the credential
+ * stored for this brain's account, and only then a hidden prompt.
+ *
+ * deploy, provision, status and sources read only the first two. On a real
+ * install the failure message after a cron error said "re-run brain deploy",
+ * deploy then said the token was not set and to run setup, and setup was the
+ * one command that would have paused the brain. A dead end made of three
+ * correct sentences. The stored credential existed the whole time.
+ */
+const withStoredCloudflareToken = (command) => (manifestPath) =>
+  withCloudflareToken(() => command(manifestPath), { accountId: manifestAccountId(manifestPath) });
+
+/**
  * Guide one install-day account ceremony at a time without becoming a second
  * credential store. The default is a read-only plan. A selected step launches
  * the existing reviewed command in a short-lived child with an allowlisted
@@ -14027,8 +14041,8 @@ const commands = {
   doctor: dispatchDoctor,
   whatsnew: cmdWhatsnew,
   verify: cmdVerify,
-  provision: cmdProvision,
-  deploy: cmdDeploy,
+  provision: withStoredCloudflareToken(cmdProvision),
+  deploy: withStoredCloudflareToken(cmdDeploy),
   secrets: cmdSecrets,
   health: cmdHealth,
   test: cmdTest,
@@ -14039,8 +14053,8 @@ const commands = {
   load: cmdLoad,
   connect: cmdConnect,
   disconnect: cmdDisconnect,
-  status: cmdStatus,
-  sources: cmdSources,
+  status: withStoredCloudflareToken(cmdStatus),
+  sources: withStoredCloudflareToken(cmdSources),
   forget: cmdForget,
   drain: cmdDrain,
   reindex: cmdReindex,
