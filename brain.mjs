@@ -1757,9 +1757,10 @@ export async function cmdSecrets(manifestPath, options = {}) {
   if (!provided.length) {
     die(
       "no ADMIN_KEY was found in durable storage. Run `brain setup <manifest>` to generate,\n" +
-        "      persist, and verify one. A deliberate manual replacement must be injected by an\n" +
-        "      approved no-history credential launcher before `brain secrets`; never paste the key\n" +
-        "      into a shell command."
+        "      persist, and verify one. On a brain that is already live, setup checks that first and\n" +
+        "      goes straight to keys; it does not pause or migrate a finished brain. A deliberate\n" +
+        "      manual replacement must be injected by an approved no-history credential launcher\n" +
+        "      before `brain secrets`; never paste the key into a shell command."
     );
   }
 
