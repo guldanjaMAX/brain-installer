@@ -4,7 +4,7 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
-## 0.2.1
+## 0.2.2
 
 **A stopped install no longer leaves you with nothing.**
 
@@ -17,6 +17,9 @@ the brain, not for whoever built it: what changed for them, and what to check.
 - `--name`, `--slug` and `--account` make it ask nothing, so your manifest can
   be prepared before the call rather than during it.
 - The message setup prints when a machine check fails now tells you this.
+- Your bank feed's settings now actually reach your brain. Before this, a brain
+  could be set up for a bank connection, pass every check, and still report the
+  feed as unconfigured, because the settings were never sent to it.
 
 ## 0.2.0
 
