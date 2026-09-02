@@ -2975,12 +2975,77 @@ export const VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS = 20 * 60 * 1000;
  * Field evidence showed that a silent wait looks exactly like a hung process,
  * which caused a correct paused cutover to be interrupted before migration.
  */
-export async function waitForVectorDrainCutover(waiter, { nextStep = "database migration" } = {}) {
+export const VECTOR_DRAIN_CUTOVER_POLL_MS = 15_000;
+
+/**
+ * Wait until no older writer can still be touching the vector index.
+ *
+ * Without a probe this is the full fixed grace: a brain from before the drain
+ * lease existed (schema < 11) cannot be asked whether it is done, so time is
+ * the only proof, and the paused Worker deployed just before this returns
+ * before ever taking the lease. That is the legacy contract and it stays.
+ *
+ * With a probe, the brain is asked instead of assumed. Every brain on the
+ * lease schema coordinates its writers through install_state, so "quiet" is
+ * observable: no lease held (or an expired one), and no accepted batch still
+ * waiting for its confirmation. Two consecutive quiet readings a poll apart
+ * are required, because a single reading can land between a release and the
+ * next acquire. The probe never shortens the grace below what it proves: a
+ * probe error, or a brain that stays busy, falls back to the full fixed wait.
+ * On an idle brain this turns a twenty-minute pause during which the brain
+ * refuses documents into about thirty seconds. Measured 2026-09-02: a live
+ * update sat the entire twenty minutes with the lease free and zero rows
+ * queued.
+ */
+export async function waitForVectorDrainCutover(waiter, {
+  nextStep = "database migration",
+  probe = null,
+  pollMs = VECTOR_DRAIN_CUTOVER_POLL_MS,
+  now = Date.now,
+} = {}) {
   const minutes = Math.ceil(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS / 60_000);
-  info(`safety pause: waiting ${minutes} minutes for older database writers to finish`);
+  if (typeof probe !== "function") {
+    info(`safety pause: waiting ${minutes} minutes for older database writers to finish`);
+    info(`Keep this window open. The Worker is safely paused, but ${nextStep} has not started yet.`);
+    await waiter(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS);
+    ok(`safety pause complete; starting ${nextStep}`);
+    return { waitedMs: VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS, proven: false };
+  }
+  info(`safety pause: checking that older database writers have finished (up to ${minutes} minutes)`);
   info(`Keep this window open. The Worker is safely paused, but ${nextStep} has not started yet.`);
-  await waiter(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS);
-  ok(`safety pause complete; starting ${nextStep}`);
+  const startedAt = now();
+  const deadline = startedAt + VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS;
+  let quietReadings = 0;
+  let waitedMs = 0;
+  while (true) {
+    let reading;
+    try {
+      reading = await probe();
+    } catch (error) {
+      const remaining = Math.max(0, deadline - now());
+      info(`could not read the writer state (${String(error?.message || error).slice(0, 120)}); waiting the full pause instead`);
+      await waiter(remaining);
+      ok(`safety pause complete; starting ${nextStep}`);
+      return { waitedMs: waitedMs + remaining, proven: false };
+    }
+    const quiet = reading && reading.leaseFree === true && Number(reading.inFlight || 0) === 0;
+    quietReadings = quiet ? quietReadings + 1 : 0;
+    if (quietReadings >= 2) {
+      ok(`older database writers have finished; starting ${nextStep}`);
+      return { waitedMs, proven: true };
+    }
+    if (!quiet) {
+      info(`an older writer is still active (${Number(reading?.inFlight || 0)} accepted batch(es) awaiting confirmation); checking again`);
+    }
+    const remaining = deadline - now();
+    if (remaining <= 0) {
+      ok(`safety pause complete; starting ${nextStep}`);
+      return { waitedMs, proven: false };
+    }
+    const step = Math.min(pollMs, remaining);
+    await waiter(step);
+    waitedMs += step;
+  }
 }
 
 // A large legacy corpus can need hundreds of bulk bootstrap requests plus
@@ -3532,8 +3597,30 @@ export async function cmdUpgrade(manifestPath, options = {}) {
             expectDrainMode: "paused-for-upgrade",
             reachOnly: true,
           }));
+        // A brain on the lease schema can be asked whether its writers are
+        // done instead of being made to wait the full grace. Older brains
+        // keep the fixed wait. The probe reads only, and any read failure
+        // falls back to the full wait inside waitForVectorDrainCutover.
+        const leaseAware = Number(before?.schema_version || 0) >= 11;
         await runStage("vector-drain quiescence", () =>
-          waitForVectorDrainCutover(waitForVectorDrainQuiescence));
+          waitForVectorDrainCutover(waitForVectorDrainQuiescence, {
+            probe: leaseAware ? async () => {
+              const r = await queryDatabase(accountId, dbId,
+                `SELECT vector_drain_lease_owner AS owner,
+                        vector_drain_lease_expires_at AS expires_at,
+                        (SELECT COUNT(*) FROM vector_outbox
+                          WHERE submitted_mutation_id IS NOT NULL) AS in_flight
+                   FROM install_state WHERE id = 1`);
+              const row = r?.results?.[0];
+              if (!row) throw new Error("install_state row missing");
+              const expires = Number(row.expires_at || 0);
+              return {
+                leaseFree: row.owner === null || row.owner === undefined || row.owner === "" ||
+                  (Number.isFinite(expires) && expires > 0 && expires < Date.now()),
+                inFlight: Number(row.in_flight || 0),
+              };
+            } : null,
+          }));
         await runStage("migration", () => migrate(executionPin.target, {
           vectorDrainQuiesced: true,
         }));
