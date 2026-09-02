@@ -38,9 +38,9 @@ assert.equal(partial.status, 0, `partly-flagged init failed: ${partial.stderr}`)
 assert.equal(JSON.parse(readFileSync(join(dir, "b.json"), "utf8")).client.slug, "harbourstone");
 
 // Fully flagged: must not read stdin at all.
-const flagged = run([join(dir, "c.json"), "--name", "Puppy Dreams", "--slug", "puppydreams", "--account", ACCOUNT]);
+const flagged = run([join(dir, "c.json"), "--name", "Example Company", "--slug", "examplecompany", "--account", ACCOUNT]);
 assert.equal(flagged.status, 0, `flagged init failed: ${flagged.stderr}`);
-assert.equal(JSON.parse(readFileSync(join(dir, "c.json"), "utf8")).client.slug, "puppydreams");
+assert.equal(JSON.parse(readFileSync(join(dir, "c.json"), "utf8")).client.slug, "examplecompany");
 
 // A typo must be refused rather than silently ignored, and write nothing.
 const typo = run([join(dir, "d.json"), "--nmae", "x"]);
