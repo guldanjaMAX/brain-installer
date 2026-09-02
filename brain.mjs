@@ -13654,6 +13654,10 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
   console.log(`${c.bold("brain")} — provision and manage a client-owned brain install
 
   install
+    brain init       <manifest>            write the manifest and stop: no network, no token,
+                                           no machine checks. --name, --slug and --account
+                                           make it ask nothing. Use it if setup stopped before
+                                           it got to write one.
     brain setup      [manifest]            nothing to a working brain, one command
     brain setup      [manifest] --no-connect  same, without touching THIS computer's AI tool config
     brain ask        <manifest>            ask a private question in this terminal

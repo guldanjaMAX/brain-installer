@@ -4,6 +4,20 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.2.1
+
+**A stopped install no longer leaves you with nothing.**
+
+- `brain init <path>` writes your manifest and stops. It needs no network, no
+  Cloudflare token, and no passing machine checks. Setup runs its checks first
+  and exits if one fails, so before this an install that stopped early had no
+  manifest at all, and every command afterwards asked for the file that was
+  never written. If setup stops on you, run `brain init`, then run setup again
+  and it carries on from there.
+- `--name`, `--slug` and `--account` make it ask nothing, so your manifest can
+  be prepared before the call rather than during it.
+- The message setup prints when a machine check fails now tells you this.
+
 ## 0.2.0
 
 **Your brain now has an owner workspace, scoped sharing, and financial actions,
