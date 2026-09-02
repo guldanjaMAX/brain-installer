@@ -1180,18 +1180,52 @@ async function projectionFenceState(env) {
   return { mutationId, submittedAt };
 }
 
-async function projectionFenceProcessed(env, fence) {
-  if (!fence?.mutationId) return true;
-  const info = await env.VECTORIZE.describe();
+const VECTOR_FENCE_CLOCK_SKEW_MS = 5 * 60_000;
+
+/**
+ * True when the index has processed at least up to the recorded fence.
+ *
+ * The watermark id is opaque, so a differing id alone is ambiguous: not yet
+ * ours, or already past ours. Requiring exact equality turned that ambiguity
+ * into a permanent stall the moment any mutation this fence did not record
+ * processed after ours - a crash between the provider accepting a changeset
+ * and the fence write landing, or any out-of-band mutation. The watermark can
+ * then never equal the recorded id again, so every drain cycle waits forever
+ * while ingest keeps queueing behind it. The brain stays up, answers
+ * questions, and reports healthy the entire time.
+ *
+ * The mutation log is totally ordered and FIFO-applied, which is the
+ * precondition for a single high-water mark to mean anything at all, so a
+ * processed mutation dated a full skew margin after our recorded submission
+ * proves ours is behind it. Row-level truth still comes from the getByIds
+ * proofs in confirmSubmittedVectors: a delete is only ever confirmed by
+ * absence, so an open fence confirms nothing by itself.
+ *
+ * Returns true (covered), false (not yet), or null when the provider response
+ * carries no usable watermark shape - each caller keeps its own contract
+ * error for that case.
+ */
+function fenceWatermarkCovers(fence, info) {
   const processed = info?.processedUpToMutation;
   // A brand-new index legitimately reports no processed watermark while its
   // first accepted changeset is still pending. That is "not yet", not a
   // malformed response. Other shapes still fail closed.
   if (processed === null || processed === undefined || processed === "") return false;
-  if (typeof processed !== "string" && typeof processed !== "number") {
+  if (typeof processed !== "string" && typeof processed !== "number") return null;
+  if (String(processed) === fence.mutationId) return true;
+  const processedAt = Date.parse(String(info?.processedUpToDatetime ?? ""));
+  return Number.isFinite(processedAt) &&
+    Number.isSafeInteger(fence.submittedAt) &&
+    processedAt >= fence.submittedAt + VECTOR_FENCE_CLOCK_SKEW_MS;
+}
+
+async function projectionFenceProcessed(env, fence) {
+  if (!fence?.mutationId) return true;
+  const covered = fenceWatermarkCovers(fence, await env.VECTORIZE.describe());
+  if (covered === null) {
     throw new Error("Vectorize did not expose its processed mutation watermark");
   }
-  return String(processed) === fence.mutationId;
+  return covered;
 }
 
 /** Mark the full projection verified only across one exact, empty-queue cut. */
@@ -1204,7 +1238,7 @@ async function markProjectionVerifiedIfExact(env) {
   const fence = await projectionFenceState(env);
   const processed = fence.mutationId === null
     ? true
-    : String(description?.processedUpToMutation ?? "") === fence.mutationId;
+    : fenceWatermarkCovers(fence, description) === true;
   if (!processed) return false;
   const result = await env.DB.prepare(
     `UPDATE install_state
@@ -3041,7 +3075,10 @@ export async function vectorReadiness(env) {
     } else if (typeof processed !== "string" && typeof processed !== "number") {
       throw new Error("the vector index did not expose its processed mutation watermark");
     } else {
-      mutationProcessed = String(processed) === mutationId;
+      mutationProcessed = fenceWatermarkCovers(
+        { mutationId, submittedAt: Number(state.mutation_submitted_at) },
+        description,
+      ) === true;
     }
   }
 

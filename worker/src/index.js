@@ -2003,6 +2003,12 @@ export default {
           maxBatches: 10,
         });
         if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
+        // A cycle that only waited used to log nothing at all, which let a
+        // stalled fence run silent for hours. Waiting a cycle or two is
+        // normal; the line exists so more than that is visible in a tail.
+        else if (!r.paused && !r.busy && !r.submitted && Number(r.waiting) > 0) {
+          console.log(`vector outbox: waiting on confirmation, ${r.remaining} queued`);
+        }
       })()
     );
   },
