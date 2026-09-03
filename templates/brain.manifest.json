@@ -18,7 +18,7 @@
     "timezone": "America/Phoenix"
   },
   "brain": {
-    "version": "0.3.3",
+    "version": "0.3.5",
     "domain": "brain.acme.com",
     "worker_name": "acme-brain"
   },
@@ -283,7 +283,18 @@
     "priority_slice": {
       "source": null,
       "since": null,
-      "note": "from intake question 2.4, the single folder that would already be worth it"
+      "note": "from intake question 2.4, the single folder that would already be worth it",
+      "_example": {
+        "source": "client-files",
+        "since": "2025-01-01",
+        "note": "intake 2.4: the active-clients folder. First load: brain ingest <manifest> --path <that folder> --source client-files"
+      },
+      "_example_note": [
+        "A filled slice looks like _example: copy its values up into source and",
+        "since. source is the name the first `brain ingest --source` run uses;",
+        "since bounds that first pass to the months that answer today's",
+        "questions. Underscore keys are documentation and are never read."
+      ]
     },
     "full_backfill_since": null
   },

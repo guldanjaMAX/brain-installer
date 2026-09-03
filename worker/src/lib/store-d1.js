@@ -1180,18 +1180,52 @@ async function projectionFenceState(env) {
   return { mutationId, submittedAt };
 }
 
-async function projectionFenceProcessed(env, fence) {
-  if (!fence?.mutationId) return true;
-  const info = await env.VECTORIZE.describe();
+const VECTOR_FENCE_CLOCK_SKEW_MS = 5 * 60_000;
+
+/**
+ * True when the index has processed at least up to the recorded fence.
+ *
+ * The watermark id is opaque, so a differing id alone is ambiguous: not yet
+ * ours, or already past ours. Requiring exact equality turned that ambiguity
+ * into a permanent stall the moment any mutation this fence did not record
+ * processed after ours - a crash between the provider accepting a changeset
+ * and the fence write landing, or any out-of-band mutation. The watermark can
+ * then never equal the recorded id again, so every drain cycle waits forever
+ * while ingest keeps queueing behind it. The brain stays up, answers
+ * questions, and reports healthy the entire time.
+ *
+ * The mutation log is totally ordered and FIFO-applied, which is the
+ * precondition for a single high-water mark to mean anything at all, so a
+ * processed mutation dated a full skew margin after our recorded submission
+ * proves ours is behind it. Row-level truth still comes from the getByIds
+ * proofs in confirmSubmittedVectors: a delete is only ever confirmed by
+ * absence, so an open fence confirms nothing by itself.
+ *
+ * Returns true (covered), false (not yet), or null when the provider response
+ * carries no usable watermark shape - each caller keeps its own contract
+ * error for that case.
+ */
+function fenceWatermarkCovers(fence, info) {
   const processed = info?.processedUpToMutation;
   // A brand-new index legitimately reports no processed watermark while its
   // first accepted changeset is still pending. That is "not yet", not a
   // malformed response. Other shapes still fail closed.
   if (processed === null || processed === undefined || processed === "") return false;
-  if (typeof processed !== "string" && typeof processed !== "number") {
+  if (typeof processed !== "string" && typeof processed !== "number") return null;
+  if (String(processed) === fence.mutationId) return true;
+  const processedAt = Date.parse(String(info?.processedUpToDatetime ?? ""));
+  return Number.isFinite(processedAt) &&
+    Number.isSafeInteger(fence.submittedAt) &&
+    processedAt >= fence.submittedAt + VECTOR_FENCE_CLOCK_SKEW_MS;
+}
+
+async function projectionFenceProcessed(env, fence) {
+  if (!fence?.mutationId) return true;
+  const covered = fenceWatermarkCovers(fence, await env.VECTORIZE.describe());
+  if (covered === null) {
     throw new Error("Vectorize did not expose its processed mutation watermark");
   }
-  return String(processed) === fence.mutationId;
+  return covered;
 }
 
 /** Mark the full projection verified only across one exact, empty-queue cut. */
@@ -1204,7 +1238,7 @@ async function markProjectionVerifiedIfExact(env) {
   const fence = await projectionFenceState(env);
   const processed = fence.mutationId === null
     ? true
-    : String(description?.processedUpToMutation ?? "") === fence.mutationId;
+    : fenceWatermarkCovers(fence, description) === true;
   if (!processed) return false;
   const result = await env.DB.prepare(
     `UPDATE install_state
@@ -2405,7 +2439,8 @@ async function acceleratedBootstrapReceipt(env, phase) {
       `SELECT count(*) AS n,
               sum(CASE WHEN submitted_mutation_id IS NULL THEN 1 ELSE 0 END) AS queued,
               sum(CASE WHEN submitted_mutation_id IS NOT NULL THEN 1 ELSE 0 END) AS submitted,
-              sum(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS failed
+              sum(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS failed,
+              sum(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS retrying
          FROM vector_outbox`
     ).first(),
     env.DB.prepare(
@@ -2441,6 +2476,9 @@ async function acceleratedBootstrapReceipt(env, phase) {
     remaining: total - confirmed,
     in_flight_batches: inFlight,
     failed,
+    // Same count under its honest name: outbox rows attempted at least once and
+    // still queued, i.e. accepted by Vectorize but not yet visible. Not lost.
+    retrying: failed,
     complete,
     vector_ready: readiness.ready === true,
     expected_vectors: readiness.expected_vectors,
@@ -2722,6 +2760,20 @@ export async function acceleratedVectorBootstrap(env, options = {}) {
   // Finish at most one schema-12 residue page before establishing the bulk-v2
   // boundary. This handles a 0.1.14 update interrupted after queue or submit.
   if (state.protocol !== ACCELERATED_BOOTSTRAP_PROTOCOL) {
+    // Queued UPSERT rows are superseded by the bulk projection, which re-embeds
+    // every chunk from D1 in provider-sized batches with per-batch receipts.
+    // Draining them here instead means one 100-row confirmation at a time:
+    // about a day on a brain that loaded 205,791 rows before updating
+    // (2026-09-03), with the brain refusing new material the whole time. Drop
+    // them and walk the corpus. DELETE rows still have to reach the provider
+    // and nothing else will send them, so they drain first, serially.
+    const superseded = await env.DB.prepare(
+      "DELETE FROM vector_outbox WHERE op='upsert'"
+    ).run();
+    if (drainLeaseChanges(superseded) > 0) {
+      await resetVectorProjectionBootstrap(env);
+      state = await bootstrapStateV2(env);
+    }
     const residue = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
     if (Number(residue?.n || 0) > 0) {
       await drainOutbox(env, {
@@ -3041,7 +3093,10 @@ export async function vectorReadiness(env) {
     } else if (typeof processed !== "string" && typeof processed !== "number") {
       throw new Error("the vector index did not expose its processed mutation watermark");
     } else {
-      mutationProcessed = String(processed) === mutationId;
+      mutationProcessed = fenceWatermarkCovers(
+        { mutationId, submittedAt: Number(state.mutation_submitted_at) },
+        description,
+      ) === true;
     }
   }
 

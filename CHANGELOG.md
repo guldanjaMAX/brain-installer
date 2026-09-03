@@ -4,6 +4,103 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.3.5
+
+- The index rebuild during an update no longer gives up two minutes after it
+  starts. On a real backlog the first confirmation from the index can take
+  longer than that, and the rule that ended the wait only counted
+  confirmations. A scale rehearsal (2,544 waiting rows) on 0.3.4 stopped with
+  "stayed unconfirmed for 8 consecutive rounds" and left the brain paused.
+  Any counter moving now keeps the wait alive, and it ends only after fifteen
+  minutes with no movement at all, inside the six-hour limit that already
+  bounds the phase. The waiting line prints what is submitted and in flight.
+- A brain that loaded a lot before updating no longer spends the update
+  pushing its waiting rows through the index one hundred at a time. Queued
+  upserts are handed to the bulk rebuild, which re-embeds every chunk in
+  provider-sized batches; only deletions still go one by one, first. On a
+  brain with 205,791 waiting rows that is about two hours instead of a day,
+  and the brain accepts new material again as soon as it finishes.
+- One interrupted poll during the rebuild no longer ends the update. The
+  request is retried eight times with backoff inside the movement budget.
+- An acceptance run that never asked the brain a question no longer reads as a
+  plain green. The headline itself says retrieval was not tested, and the
+  report says so too, because "passed" is the sentence that gets read aloud.
+- `brain connect google` names which Google account actually consented, so a
+  client who signs in with the wrong one finds out immediately rather than
+  after a load returns somebody else's documents.
+- The golden-20 session no longer implies a document is missing while the
+  index is still loading. It reads the backlog once at the start, says so, and
+  an empty result during a rebuild says "very likely too early" instead of
+  "absent". Recognised message exports are named at the end of an ingest.
+- Three prompts in the golden-20 session could discard or corrupt the owner's
+  just-written work: an unrecognised keystroke fell through to discard, a bare
+  Enter on the title did the same, and a free-text source wrote a broken file.
+  Each now confirms, defaults to keeping the work, and validates the source.
+- A setup or update that cannot read the database now says why. The three
+  preflight reads used to report only that they could not verify the brain,
+  discarding the provider's message, so an account that had hit Cloudflare's
+  daily D1 limit produced a line nobody could act on. The cause is quoted, and
+  a quota refusal names whose limit it is, when it resets, and that nothing was
+  changed.
+- `brain schedule` on Windows or Linux now says plainly that the installer
+  does not create the automatic refresh there yet, that everything else
+  works, and prints the scheduled-task or cron recipe to use instead. It used
+  to stop with "unexpected error, this is a bug in the installer", which one
+  Windows owner read as the whole system being Apple-only.
+
+## 0.3.4
+
+**Your brain cannot get quietly stuck any more, and updates stop making you wait.**
+
+- Your brain hands new material to its search index in batches and waits for
+  the index to confirm each one. In some cases that confirmation could never
+  arrive, so new material kept queueing and stayed only partly searchable while
+  every health check said fine. Your brain kept working the whole time and
+  nothing was lost. It now recognises that its batch has been processed even
+  when the confirmation marker has moved past it, and it says so in its log
+  when it is waiting. If your brain was paused this way, this update clears it
+  on its own.
+- An update used to pause your brain for a fixed twenty minutes while older
+  writes finished, even when there were none. It now checks, and on a quiet
+  brain the pause ends in under a minute. A busy brain still gets the full
+  twenty, and the screen says which.
+- An update used to report itself failed when one of your sources had simply
+  not refreshed lately, for example a Google connection that lapsed. That is
+  about the source, not the update: it now completes, records the new version,
+  and tells you which source needs attention.
+- Running `brain setup` again on a brain that is already installed used to
+  pause it. Setup now checks first: on this release it goes straight to keys
+  and health, and on a different release it points you at `brain update`.
+- A first install is no longer turned away for not having a manifest yet;
+  setup creates it, as it was always meant to.
+- The drain schedule is only added if it is missing, and if your Cloudflare
+  plan is not Workers Paid the message says so plainly: everything else is
+  already in place and upgrading the plan then running the same command again
+  finishes it. `brain doctor` now shows a Workers plan line before install.
+- `brain deploy`, `provision`, `status` and `sources` use the same sign-in
+  your setup and update use, so a message that tells you to run one of them
+  no longer sends you somewhere that cannot sign in.
+- `brain tools` puts the `brain` command on your PATH for new terminals, so it
+  is still there tomorrow. `brain doctor` prints every check it runs, not just
+  the first three. `brain test` says when it could not exercise retrieval
+  because the manifest has no probe questions yet.
+
+- A brain update no longer stops when the index has accepted a vector it has
+  not yet made visible. The update waits for it, within the same time limit it
+  already had, and stops only if nothing confirms across eight polls. Two real
+  0.2.0 to 0.3.4 updates had ended with "failed aggregate operation(s)" while
+  the Worker finished the job on its own a minute later. The receipt now also
+  names that count `retrying`.
+- The final check "deployed version matches the manifest" now reads the live
+  Worker version against the update target instead of comparing two values
+  captured before the update, which had certified a stale pair.
+
+- A `wrangler login` session that expires partway through a setup or update
+  is renewed once and the interrupted request repeated, instead of stopping
+  with "Invalid access token" worded as if the owner had typed a bad token.
+  When renewal does not help, the message now says the session expired and
+  to run `npx wrangler@4 login` before re-running the same command.
+
 ## 0.3.3
 
 **Connect your assistants with one command, instead of copying one.**

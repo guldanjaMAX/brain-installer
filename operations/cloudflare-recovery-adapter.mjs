@@ -1413,9 +1413,13 @@ const BOOTSTRAP_BUSY_FIELDS = Object.freeze([
   "protocol", "busy", "remaining", "retry_after_seconds",
 ]);
 
+// Workers from 0.3.4 also report the not-yet-visible count as `retrying`;
+// older Workers do not. Either shape is the same aggregate-only contract.
+const OPTIONAL_RECEIPT_FIELDS = new Set(["retrying"]);
+
 function exactAggregateReceiptFields(body, expected, code) {
   if (!body || typeof body !== "object" || Array.isArray(body)) refuse(code);
-  const actual = Object.keys(body).sort();
+  const actual = Object.keys(body).filter((field) => !(OPTIONAL_RECEIPT_FIELDS.has(field) && expected.includes("failed"))).sort();
   const wanted = [...expected].sort();
   if (actual.length !== wanted.length || actual.some((field, index) => field !== wanted[index])) {
     // Do not echo fields or values. This endpoint is allowed to return aggregate

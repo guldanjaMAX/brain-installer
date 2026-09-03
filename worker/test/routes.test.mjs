@@ -1957,8 +1957,8 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
       receipt.phase === "complete" && receipt.complete === true &&
       JSON.stringify(Object.keys(receipt).sort()) === JSON.stringify([
         "actual_vectors", "complete", "confirmed", "epoch", "expected_vectors", "failed",
-        "in_flight_batches", "phase", "protocol", "queued", "remaining", "submitted",
-        "total", "vector_ready",
+        "in_flight_batches", "phase", "protocol", "queued", "remaining", "retrying",
+        "submitted", "total", "vector_ready",
       ]),
     JSON.stringify(receipt));
   check("an empty bootstrap performs no embedding or vector write",
