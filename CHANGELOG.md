@@ -22,6 +22,12 @@ the brain, not for whoever built it: what changed for them, and what to check.
   and the brain accepts new material again as soon as it finishes.
 - One interrupted poll during the rebuild no longer ends the update. The
   request is retried eight times with backoff inside the movement budget.
+- An acceptance run that never asked the brain a question no longer reads as a
+  plain green. The headline itself says retrieval was not tested, and the
+  report says so too, because "passed" is the sentence that gets read aloud.
+- `brain connect google` names which Google account actually consented, so a
+  client who signs in with the wrong one finds out immediately rather than
+  after a load returns somebody else's documents.
 - The golden-20 session no longer implies a document is missing while the
   index is still loading. It reads the backlog once at the start, says so, and
   an empty result during a rebuild says "very likely too early" instead of
