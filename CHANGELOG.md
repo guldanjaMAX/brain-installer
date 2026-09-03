@@ -22,6 +22,14 @@ the brain, not for whoever built it: what changed for them, and what to check.
   and the brain accepts new material again as soon as it finishes.
 - One interrupted poll during the rebuild no longer ends the update. The
   request is retried eight times with backoff inside the movement budget.
+- The golden-20 session no longer implies a document is missing while the
+  index is still loading. It reads the backlog once at the start, says so, and
+  an empty result during a rebuild says "very likely too early" instead of
+  "absent". Recognised message exports are named at the end of an ingest.
+- Three prompts in the golden-20 session could discard or corrupt the owner's
+  just-written work: an unrecognised keystroke fell through to discard, a bare
+  Enter on the title did the same, and a free-text source wrote a broken file.
+  Each now confirms, defaults to keeping the work, and validates the source.
 - A setup or update that cannot read the database now says why. The three
   preflight reads used to report only that they could not verify the brain,
   discarding the provider's message, so an account that had hit Cloudflare's
