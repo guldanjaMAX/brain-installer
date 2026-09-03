@@ -41,6 +41,16 @@ the brain, not for whoever built it: what changed for them, and what to check.
   the first three. `brain test` says when it could not exercise retrieval
   because the manifest has no probe questions yet.
 
+- A brain update no longer stops when the index has accepted a vector it has
+  not yet made visible. The update waits for it, within the same time limit it
+  already had, and stops only if nothing confirms across eight polls. Two real
+  0.2.0 to 0.3.4 updates had ended with "failed aggregate operation(s)" while
+  the Worker finished the job on its own a minute later. The receipt now also
+  names that count `retrying`.
+- The final check "deployed version matches the manifest" now reads the live
+  Worker version against the update target instead of comparing two values
+  captured before the update, which had certified a stale pair.
+
 ## 0.3.3
 
 **Connect your assistants with one command, instead of copying one.**

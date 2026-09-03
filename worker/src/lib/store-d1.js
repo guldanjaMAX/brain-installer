@@ -2439,7 +2439,8 @@ async function acceleratedBootstrapReceipt(env, phase) {
       `SELECT count(*) AS n,
               sum(CASE WHEN submitted_mutation_id IS NULL THEN 1 ELSE 0 END) AS queued,
               sum(CASE WHEN submitted_mutation_id IS NOT NULL THEN 1 ELSE 0 END) AS submitted,
-              sum(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS failed
+              sum(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS failed,
+              sum(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS retrying
          FROM vector_outbox`
     ).first(),
     env.DB.prepare(
@@ -2475,6 +2476,9 @@ async function acceleratedBootstrapReceipt(env, phase) {
     remaining: total - confirmed,
     in_flight_batches: inFlight,
     failed,
+    // Same count under its honest name: outbox rows attempted at least once and
+    // still queued, i.e. accepted by Vectorize but not yet visible. Not lost.
+    retrying: failed,
     complete,
     vector_ready: readiness.ready === true,
     expected_vectors: readiness.expected_vectors,

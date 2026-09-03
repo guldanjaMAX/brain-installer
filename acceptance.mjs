@@ -299,6 +299,7 @@ export class Acceptance {
       const h = await this.get("/health", { auth: false });
       if (!h.ok) return this.record(t, "health responds", FAIL, `HTTP ${h.status}`);
       const observedVersion = h.json?.version ?? null;
+      this.observedVersion = observedVersion;
       if (this.expectVersion && observedVersion !== this.expectVersion) {
         return this.record(
           t,
@@ -605,13 +606,26 @@ export class Acceptance {
       Number(installState.gate_version) >= 2 ? PASS : WARN,
       `gate version ${installState.gate_version}`
     );
-    const declared = this.m.brain?.version;
-    if (declared) {
+    // Compare what is LIVE against what the operator asked for. On 2026-09-03 a
+    // 0.2.0 -> 0.3.4 update printed "install 0.2.0, manifest 0.2.0" as a PASS
+    // because both values were read before the update; the live Worker said
+    // 0.3.4. A check that never looks at the artifact certifies nothing.
+    const target = this.expectVersion || this.m.brain?.version || null;
+    const live = this.observedVersion ?? null;
+    if (target) {
       this.record(
         t,
         "deployed version matches the manifest",
-        installState.product_version === declared ? PASS : WARN,
-        `install ${installState.product_version}, manifest ${declared}`
+        live && live === target ? PASS : WARN,
+        `live ${live ?? "unknown"}, expected ${target}`
+      );
+    }
+    if (live && installState.product_version && installState.product_version !== live) {
+      this.record(
+        t,
+        "install state records the running version",
+        WARN,
+        `install state ${installState.product_version}, live ${live}; the version commit has not landed yet`
       );
     }
     const cap = this.m.safety?.daily_llm_spend_cap_usd;

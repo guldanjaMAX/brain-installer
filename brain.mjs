@@ -3067,6 +3067,10 @@ export async function waitForVectorDrainCutover(waiter, {
 // resume the same epoch rather than keeping an installer alive indefinitely.
 export const ACCELERATED_BOOTSTRAP_MAX_MS = 6 * 60 * 60 * 1000;
 export const ACCELERATED_BOOTSTRAP_MAX_ROUNDS = 20_000;
+// A vector Vectorize accepted but has not yet exposed. Poll rather than abort;
+// abort only when this many consecutive rounds show no confirmations at all.
+const ACCELERATED_BOOTSTRAP_STALL_ROUNDS = 8;
+const ACCELERATED_BOOTSTRAP_RETRY_WAIT_MS = 15_000;
 const ACCELERATED_BOOTSTRAP_POLL_MS = 3_000;
 const ACCELERATED_BOOTSTRAP_REQUEST_MAX_MS = 180_000;
 const BOOTSTRAP_PHASES = new Set(["legacy_drain", "building", "waiting", "complete"]);
@@ -3200,7 +3204,11 @@ export function validateAcceleratedBootstrapProgress(previous, current) {
   if (previous.phase !== "legacy_drain" && current.phase === "legacy_drain") {
     die("the accelerated bootstrap returned to legacy cleanup after bulk work began. Re-run `brain update <manifest>`; the Worker remains paused.");
   }
-  if (current.phase === "building") {
+  // A receipt with failed > 0 is the Worker saying "accepted by Vectorize, not
+  // yet visible, re-queued". Two such receipts in a row are the expected shape
+  // of that wait, not a stall; the runner bounds it with its own stall counter.
+  // Only a receipt that reports nothing retrying must show movement each round.
+  if (current.phase === "building" && current.failed === 0) {
     const changed = [
       "confirmed",
       "remaining",
@@ -3268,6 +3276,7 @@ export async function runAcceleratedBootstrap({
   let previous = null;
   let lastRemaining = null;
   let rounds = 0;
+  let stalledRounds = 0;
 
   for (let round = 1; round <= roundLimit; round++) {
     const roundNow = Number(now());
@@ -3350,13 +3359,38 @@ export async function runAcceleratedBootstrap({
       die(`accelerated bootstrap failed with HTTP ${response.status}. No response content was printed. Re-run \`brain update <manifest>\`; the Worker remains paused.`);
     }
     const receipt = validateAcceleratedBootstrapReceipt(response.body);
+    // Older Workers report the not-yet-visible count only as `failed`; newer ones
+    // also name it `retrying`. Read either, the semantics are the same.
+    if (receipt && typeof receipt === "object" && receipt.retrying !== undefined) receipt.failed = Number(receipt.retrying);
     validateAcceleratedBootstrapProgress(previous, receipt);
     if (lastRemaining !== null && receipt.remaining > lastRemaining) {
       die("the accelerated bootstrap remaining count increased. Re-run `brain update <manifest>`; the Worker remains paused.");
     }
+    // `failed` on this receipt is the Worker's count of outbox rows with
+    // attempts > 0 that are still queued: vectors Vectorize ACCEPTED but has not
+    // yet made visible, re-queued for the next confirm. It is a retry signal, not
+    // a terminal one; the drain path labels the same number `retrying`. Dying on
+    // first sight of it aborted a live 0.2.0 -> 0.3.4 update twice on 2026-09-03
+    // while the Worker finished the job on its own a minute later. Keep polling
+    // within the existing deadline; give up only when it stops moving.
     if (receipt.failed > 0) {
-      die(`the accelerated bootstrap reported ${receipt.failed} failed aggregate operation(s). Re-run \`brain update <manifest>\`; the Worker remains paused.`);
+      const moved = previous === null ||
+        receipt.confirmed > previous.confirmed || receipt.remaining < previous.remaining;
+      stalledRounds = moved ? 0 : stalledRounds + 1;
+      if (stalledRounds >= ACCELERATED_BOOTSTRAP_STALL_ROUNDS) {
+        die(`the accelerated bootstrap has ${receipt.failed} vector(s) that stayed unconfirmed for ${stalledRounds} consecutive rounds with no progress. Re-run \`brain update <manifest>\`; the Worker remains paused.`);
+      }
+      info(`${receipt.failed} vector(s) accepted but not yet visible; waiting for Vectorize (${receipt.confirmed}/${receipt.total} confirmed)`);
+      previous = receipt;
+      lastRemaining = receipt.remaining;
+      onProgress(receipt);
+      const remainingMs = Math.max(0, deadline - Number(now()));
+      const delayMs = Math.min(ACCELERATED_BOOTSTRAP_RETRY_WAIT_MS, remainingMs);
+      if (delayMs <= 0) break;
+      await sleep(delayMs);
+      continue;
     }
+    stalledRounds = 0;
     previous = receipt;
     lastRemaining = receipt.remaining;
     onProgress(receipt);
