@@ -137,6 +137,11 @@ const RULES = [
     sha: "68d85a0a124d90d9eea4b9e3b436db429c8223911d52076d70aef4b78d9686c5" },
   { label: "family member first name", mode: "word", cs: false, words: 1, len: 6, fnv: 995860805,
     sha: "b675f2f6f1f675bb7be2e6694f55af82c76d063fcdf8c4606839d32bf505ef23" },
+  // A client's BUSINESS name. It sat in a test fixture from v0.2.3 through
+  // v0.3.3 and this scanner passed every time, because the vocabulary was
+  // people: first names and surnames. A company name is an identity too.
+  { label: "client business name", mode: "word", cs: false, words: 2, len: 12, fnv: 3350984447,
+    sha: "01fad92f4806db6af9ba16fef1c4b985c57fb629c5c0552e56c1deb735be30c7" },
   // Real infrastructure ids that were committed to this repo as fixtures and
   // have since been replaced by same-shape synthetic values.
   { label: "cloudflare account id", mode: "any", cs: false, words: 1, len: 32, fnv: 3998430869,
