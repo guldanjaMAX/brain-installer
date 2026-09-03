@@ -3106,8 +3106,12 @@ const BOOTSTRAP_COMPLETION_FIELDS = Object.freeze([
   "vector_ready",
 ]);
 
+// Workers from 0.3.4 also report the not-yet-visible count as `retrying`;
+// older Workers do not. Either shape is the same aggregate-only contract.
+const OPTIONAL_RECEIPT_FIELDS = new Set(["retrying"]);
+
 function exactAggregateReceiptFields(body, expected, label) {
-  const actual = Object.keys(body).sort();
+  const actual = Object.keys(body).filter((field) => !(OPTIONAL_RECEIPT_FIELDS.has(field) && expected.includes("failed"))).sort();
   const wanted = [...expected].sort();
   if (actual.length !== wanted.length || actual.some((field, index) => field !== wanted[index])) {
     // Do not echo unexpected values or field names. This endpoint's privacy

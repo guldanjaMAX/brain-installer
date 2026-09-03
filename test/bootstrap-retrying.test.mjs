@@ -41,4 +41,18 @@ const opts = () => ({ now: () => clock, sleep: async (ms) => { clock += ms; }, m
   assert.ok(i >= 3 && i < 60, `bounded polling, saw ${i} requests`);
 }
 
+// A 0.3.4 Worker also names the count `retrying`. The aggregate-only contract
+// must accept that shape (and an older Worker's shape without it), and the
+// runner must read the honest name when both are present.
+{
+  const seq = [
+    receipt({ failed: 1, retrying: 1 }),
+    receipt({ phase: "complete", confirmed: 1, remaining: 0, complete: true, vector_ready: true, actual_vectors: 1, retrying: 0 }),
+  ];
+  let i = 0;
+  const out = await runAcceleratedBootstrap({ ...opts(), request: async () => res(seq[Math.min(i++, seq.length - 1)]) });
+  assert.equal(out.complete, true, "a receipt carrying `retrying` passes the aggregate-only contract and completes");
+  assert.equal(i, 2, "polled the retrying receipt, then the completion");
+}
+
 console.log("bootstrap: a retrying vector is waited for, a stuck one still stops the update");

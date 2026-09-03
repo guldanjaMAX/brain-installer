@@ -1406,16 +1406,20 @@ async function exactFetch(fetchImpl, base, path, options = {}, timeoutMs = 180_0
 const BOOTSTRAP_PHASES = new Set(["legacy_drain", "building", "waiting", "complete"]);
 const BOOTSTRAP_RECEIPT_FIELDS = Object.freeze([
   "protocol", "phase", "epoch", "total", "confirmed", "queued", "submitted",
-  "remaining", "in_flight_batches", "failed", "retrying", "complete", "vector_ready",
+  "remaining", "in_flight_batches", "failed", "complete", "vector_ready",
   "expected_vectors", "actual_vectors",
 ]);
 const BOOTSTRAP_BUSY_FIELDS = Object.freeze([
   "protocol", "busy", "remaining", "retry_after_seconds",
 ]);
 
+// Workers from 0.3.4 also report the not-yet-visible count as `retrying`;
+// older Workers do not. Either shape is the same aggregate-only contract.
+const OPTIONAL_RECEIPT_FIELDS = new Set(["retrying"]);
+
 function exactAggregateReceiptFields(body, expected, code) {
   if (!body || typeof body !== "object" || Array.isArray(body)) refuse(code);
-  const actual = Object.keys(body).sort();
+  const actual = Object.keys(body).filter((field) => !(OPTIONAL_RECEIPT_FIELDS.has(field) && expected.includes("failed"))).sort();
   const wanted = [...expected].sort();
   if (actual.length !== wanted.length || actual.some((field, index) => field !== wanted[index])) {
     // Do not echo fields or values. This endpoint is allowed to return aggregate
