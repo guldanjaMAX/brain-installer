@@ -13287,7 +13287,36 @@ async function cmdScheduleFolder(m, manifestPath, action) {
 }
 
 /** Install, inspect, or remove the standard per-client Drive scheduler. */
-async function cmdSchedule(manifestPath) {
+/**
+ * The scheduler is a macOS LaunchAgent. On any other platform the honest
+ * answer is a plain limitation plus the recipe the owner can use instead; a
+ * Windows owner used to get "unexpected error, this is a bug in the installer"
+ * here and concluded the whole system was Apple-only (2026-09-03).
+ */
+export function schedulePlatformLimitation(platform = process.platform, manifestPath = "<manifest>") {
+  if (platform === "darwin") return null;
+  const name = platform === "win32" ? "Windows" : platform;
+  const lines = [
+    `automatic refresh is not scheduled by the installer on ${name} yet; the brain itself, the install, the update and the checkup all work here.`,
+    "      Everything loads when you run it. To make it unattended, create one scheduled task that runs the refresh every hour.",
+  ];
+  if (platform === "win32") {
+    const q = '\\"'; // an escaped quote inside schtasks' /TR string
+    lines.push(
+      "      Find the command first:   where.exe brain",
+      `      Then (fill in both paths): schtasks /Create /F /SC HOURLY /TN "Financial Brain refresh" /TR "cmd /c ${q}${q}<path to brain.cmd>${q} load ${q}${manifestPath}${q} --only drive,calendar,upload${q}"`,
+      `      Run it once by hand first:  brain load "${manifestPath}" --only drive,calendar,upload`,
+    );
+  } else {
+    lines.push(`      For example with cron:     0 * * * * brain load "${manifestPath}" --only drive,calendar,upload`);
+  }
+  lines.push("      Confirm on the next check that `brain sources <manifest>` shows the last-ingest time moving.");
+  return lines.join("\n");
+}
+
+async function cmdSchedule(manifestPath, options = {}) {
+  const limitation = schedulePlatformLimitation(options.platform ?? process.platform, manifestPath);
+  if (limitation) die(limitation);
   if (!manifestPath) {
     die("usage: brain schedule <manifest> [--install|--status|--remove] [--folder]");
   }

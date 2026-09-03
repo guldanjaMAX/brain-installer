@@ -22,6 +22,11 @@ the brain, not for whoever built it: what changed for them, and what to check.
   and the brain accepts new material again as soon as it finishes.
 - One interrupted poll during the rebuild no longer ends the update. The
   request is retried eight times with backoff inside the movement budget.
+- `brain schedule` on Windows or Linux now says plainly that the installer
+  does not create the automatic refresh there yet, that everything else
+  works, and prints the scheduled-task or cron recipe to use instead. It used
+  to stop with "unexpected error, this is a bug in the installer", which one
+  Windows owner read as the whole system being Apple-only.
 
 ## 0.3.4
 
