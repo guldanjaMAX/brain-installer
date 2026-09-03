@@ -377,11 +377,17 @@ const bootstrapCompletion = () => ({
 
   let noProgressError = null;
   try {
-    const same = validateAcceleratedBootstrapReceipt(bootstrapReceipt());
+    const same = validateAcceleratedBootstrapReceipt(bootstrapReceipt({ submitted: 0, in_flight_batches: 0, queued: 2_000 }));
     validateAcceleratedBootstrapProgress(same, same);
   } catch (error) { noProgressError = error; }
   check("a building response cannot claim progress while every aggregate is unchanged",
     /without aggregate progress/.test(noProgressError?.message || ""), noProgressError?.message);
+  {
+    const busy = validateAcceleratedBootstrapReceipt(bootstrapReceipt({ submitted: 100, in_flight_batches: 1, queued: 1_900 }));
+    let busyError = null;
+    try { validateAcceleratedBootstrapProgress(busy, busy); } catch (error) { busyError = error; }
+    check("identical receipts with a batch in flight are a wait, not a stall claim", busyError === null, busyError?.message);
+  }
 }
 
 /* ---- receipt transport, busy ownership, and legacy stalls are bounded ---- */

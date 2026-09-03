@@ -3122,7 +3122,21 @@ export const ACCELERATED_BOOTSTRAP_MAX_MS = 6 * 60 * 60 * 1000;
 export const ACCELERATED_BOOTSTRAP_MAX_ROUNDS = 20_000;
 // A vector Vectorize accepted but has not yet exposed. Poll rather than abort;
 // abort only when this many consecutive rounds show no confirmations at all.
-const ACCELERATED_BOOTSTRAP_STALL_ROUNDS = 8;
+// The Worker reports movement in several counters, and on a real backlog the
+// first CONFIRMATION can take longer than the first re-submission: on
+// 2026-09-03 a 2,544-row rebuild showed `failed` fall 2544 -> 2444 while
+// `confirmed` stayed 0 for two minutes, and an 8-round rule that only counted
+// confirmations killed the update and left the brain paused. Movement is now
+// any aggregate changing, and the budget is time, generous, inside the outer
+// six-hour deadline that already bounds the whole phase.
+export const ACCELERATED_BOOTSTRAP_STALL_MS = 15 * 60_000;
+export const BOOTSTRAP_MOVEMENT_FIELDS = Object.freeze([
+  "confirmed", "remaining", "failed", "queued", "submitted", "in_flight_batches", "actual_vectors",
+]);
+export function bootstrapReceiptMoved(previous, current) {
+  if (!previous) return true;
+  return BOOTSTRAP_MOVEMENT_FIELDS.some((field) => current[field] !== previous[field]);
+}
 const ACCELERATED_BOOTSTRAP_RETRY_WAIT_MS = 15_000;
 const ACCELERATED_BOOTSTRAP_POLL_MS = 3_000;
 const ACCELERATED_BOOTSTRAP_REQUEST_MAX_MS = 180_000;
@@ -3265,7 +3279,13 @@ export function validateAcceleratedBootstrapProgress(previous, current) {
   // yet visible, re-queued". Two such receipts in a row are the expected shape
   // of that wait, not a stall; the runner bounds it with its own stall counter.
   // Only a receipt that reports nothing retrying must show movement each round.
-  if (current.phase === "building" && current.failed === 0) {
+  // A building Worker with batches submitted or in flight can answer two polls
+  // three seconds apart with identical aggregates while it waits on Vectorize;
+  // the runner's time budget covers that. Identical receipts with NOTHING
+  // submitted or in flight are the Worker claiming to build while idle.
+  const idle = current.submitted === 0 && current.in_flight_batches === 0 &&
+    previous.submitted === 0 && previous.in_flight_batches === 0;
+  if (current.phase === "building" && current.failed === 0 && idle) {
     const changed = [
       "confirmed",
       "remaining",
@@ -3333,7 +3353,7 @@ export async function runAcceleratedBootstrap({
   let previous = null;
   let lastRemaining = null;
   let rounds = 0;
-  let stalledRounds = 0;
+  let lastMovementAt = null;
 
   for (let round = 1; round <= roundLimit; round++) {
     const roundNow = Number(now());
@@ -3430,14 +3450,16 @@ export async function runAcceleratedBootstrap({
     // first sight of it aborted a live 0.2.0 -> 0.3.4 update twice on 2026-09-03
     // while the Worker finished the job on its own a minute later. Keep polling
     // within the existing deadline; give up only when it stops moving.
+    // Movement is any aggregate changing; a receipt identical to the last one
+    // for ACCELERATED_BOOTSTRAP_STALL_MS is the only thing that ends the wait.
+    const observedAt = Number(now());
+    if (lastMovementAt === null || bootstrapReceiptMoved(previous, receipt)) lastMovementAt = observedAt;
+    const quietMs = observedAt - lastMovementAt;
+    if (quietMs >= ACCELERATED_BOOTSTRAP_STALL_MS) {
+      die(`the accelerated bootstrap has not moved for ${Math.round(quietMs / 60_000)} minutes (${receipt.confirmed}/${receipt.total} confirmed, ${receipt.failed} unconfirmed, ${receipt.submitted} submitted, ${receipt.in_flight_batches} batch(es) in flight). Re-run \`brain update <manifest>\`; the Worker remains paused.`);
+    }
     if (receipt.failed > 0) {
-      const moved = previous === null ||
-        receipt.confirmed > previous.confirmed || receipt.remaining < previous.remaining;
-      stalledRounds = moved ? 0 : stalledRounds + 1;
-      if (stalledRounds >= ACCELERATED_BOOTSTRAP_STALL_ROUNDS) {
-        die(`the accelerated bootstrap has ${receipt.failed} vector(s) that stayed unconfirmed for ${stalledRounds} consecutive rounds with no progress. Re-run \`brain update <manifest>\`; the Worker remains paused.`);
-      }
-      info(`${receipt.failed} vector(s) accepted but not yet visible; waiting for Vectorize (${receipt.confirmed}/${receipt.total} confirmed)`);
+      info(`${receipt.failed} vector(s) accepted but not yet visible; waiting for Vectorize (${receipt.confirmed}/${receipt.total} confirmed, ${receipt.submitted} submitted, ${receipt.in_flight_batches} batch(es) in flight)`);
       previous = receipt;
       lastRemaining = receipt.remaining;
       onProgress(receipt);
@@ -3447,7 +3469,6 @@ export async function runAcceleratedBootstrap({
       await sleep(delayMs);
       continue;
     }
-    stalledRounds = 0;
     previous = receipt;
     lastRemaining = receipt.remaining;
     onProgress(receipt);

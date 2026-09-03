@@ -4,6 +4,17 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.3.5
+
+- The index rebuild during an update no longer gives up two minutes after it
+  starts. On a real backlog the first confirmation from the index can take
+  longer than that, and the rule that ended the wait only counted
+  confirmations. A scale rehearsal (2,544 waiting rows) on 0.3.4 stopped with
+  "stayed unconfirmed for 8 consecutive rounds" and left the brain paused.
+  Any counter moving now keeps the wait alive, and it ends only after fifteen
+  minutes with no movement at all, inside the six-hour limit that already
+  bounds the phase. The waiting line prints what is submitted and in flight.
+
 ## 0.3.4
 
 **Your brain cannot get quietly stuck any more, and updates stop making you wait.**
