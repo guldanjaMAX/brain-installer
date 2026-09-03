@@ -384,7 +384,8 @@ function renewWranglerSessionToken() {
 
 function isExpiredSessionRejection(error) {
   const message = String(error?.message || "");
-  return /failed \((401|403)\)/.test(message) && /\b(9109|10000)\b/.test(message);
+  return /failed \((401|403)\)/.test(message) &&
+    (/\b(9109|10000)\b/.test(message) || /invalid access token|authentication error/i.test(message));
 }
 
 export function cloudflareTokenAvailable() {
@@ -12089,10 +12090,11 @@ function crash(err) {
       console.error("  This credential came from this computer's `wrangler login` session, which has");
       console.error("  expired (they last about an hour) and could not be renewed. Nobody typed a token.");
       console.error("  Run `npx wrangler@4 login`, then re-run the same command; it resumes where it stopped.");
+      console.error("\n  Anything created before the refusal is still there and is reused on the re-run.");
     } else {
       console.error("  " + CF_TOKEN_REJECTED_REMEDY.split("\n").join("\n  "));
+      console.error("\n  Nothing was created or half-written. Re-run once the token is right.");
     }
-    console.error("\n  Nothing was created or half-written. Re-run once the token is right.");
     printSupportReceipt(supportEventId, (line) => console.error(line));
     process.exit(1);
   }
