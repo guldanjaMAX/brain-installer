@@ -14,6 +14,14 @@ the brain, not for whoever built it: what changed for them, and what to check.
   Any counter moving now keeps the wait alive, and it ends only after fifteen
   minutes with no movement at all, inside the six-hour limit that already
   bounds the phase. The waiting line prints what is submitted and in flight.
+- A brain that loaded a lot before updating no longer spends the update
+  pushing its waiting rows through the index one hundred at a time. Queued
+  upserts are handed to the bulk rebuild, which re-embeds every chunk in
+  provider-sized batches; only deletions still go one by one, first. On a
+  brain with 205,791 waiting rows that is about two hours instead of a day,
+  and the brain accepts new material again as soon as it finishes.
+- One interrupted poll during the rebuild no longer ends the update. The
+  request is retried eight times with backoff inside the movement budget.
 
 ## 0.3.4
 

@@ -2760,6 +2760,20 @@ export async function acceleratedVectorBootstrap(env, options = {}) {
   // Finish at most one schema-12 residue page before establishing the bulk-v2
   // boundary. This handles a 0.1.14 update interrupted after queue or submit.
   if (state.protocol !== ACCELERATED_BOOTSTRAP_PROTOCOL) {
+    // Queued UPSERT rows are superseded by the bulk projection, which re-embeds
+    // every chunk from D1 in provider-sized batches with per-batch receipts.
+    // Draining them here instead means one 100-row confirmation at a time:
+    // about a day on a brain that loaded 205,791 rows before updating
+    // (2026-09-03), with the brain refusing new material the whole time. Drop
+    // them and walk the corpus. DELETE rows still have to reach the provider
+    // and nothing else will send them, so they drain first, serially.
+    const superseded = await env.DB.prepare(
+      "DELETE FROM vector_outbox WHERE op='upsert'"
+    ).run();
+    if (drainLeaseChanges(superseded) > 0) {
+      await resetVectorProjectionBootstrap(env);
+      state = await bootstrapStateV2(env);
+    }
     const residue = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
     if (Number(residue?.n || 0) > 0) {
       await drainOutbox(env, {

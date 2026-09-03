@@ -3411,6 +3411,13 @@ export async function runAcceleratedBootstrap({
         }
       }
     }, {
+      // A poll that embeds a provider-sized batch can meet a 503 or a timeout
+      // once in a two-hour rebuild; three tries two seconds apart ended a real
+      // one on 2026-09-03. The movement budget above already bounds a Worker
+      // that stays unreachable.
+      attempts: 8,
+      delayMs: 2_000,
+      maxDelayMs: 60_000,
       shouldRetry: (error) => error?.retryable === true,
       sleep,
       onRetry: () => info("the accelerated bootstrap request was interrupted; retrying durable progress"),
