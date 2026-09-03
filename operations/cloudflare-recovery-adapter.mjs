@@ -1406,7 +1406,7 @@ async function exactFetch(fetchImpl, base, path, options = {}, timeoutMs = 180_0
 const BOOTSTRAP_PHASES = new Set(["legacy_drain", "building", "waiting", "complete"]);
 const BOOTSTRAP_RECEIPT_FIELDS = Object.freeze([
   "protocol", "phase", "epoch", "total", "confirmed", "queued", "submitted",
-  "remaining", "in_flight_batches", "failed", "complete", "vector_ready",
+  "remaining", "in_flight_batches", "failed", "retrying", "complete", "vector_ready",
   "expected_vectors", "actual_vectors",
 ]);
 const BOOTSTRAP_BUSY_FIELDS = Object.freeze([
