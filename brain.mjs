@@ -121,7 +121,7 @@ import {
 import { guardBrainAdminFetch } from "./components/brain-http.mjs";
 import { confidenceLine } from "./worker/src/lib/confidence.js";
 import { retrievalUnavailable, unavailableNotice } from "./worker/src/lib/retrieval-status.js";
-import { readWranglerOAuthToken } from "./operations/wrangler-oauth.mjs";
+import { readWranglerOAuthToken, refreshWranglerSession } from "./operations/wrangler-oauth.mjs";
 import {
   adminKeyPersistencePlan,
   parseAdminKeySecretReference,
@@ -356,7 +356,35 @@ const cloudflareTokenSession = new AsyncLocalStorage();
 function activeCloudflareToken() {
   if (process.env.CLOUDFLARE_API_TOKEN) return process.env.CLOUDFLARE_API_TOKEN;
   const scoped = cloudflareTokenSession.getStore();
-  return scoped ? scoped.toString("ascii") : null;
+  return scoped ? scoped.buffer.toString("ascii") : null;
+}
+
+// Cloudflare rejected the credential mid-run. If it came from this computer's
+// wrangler login session, the session has expired: wrangler renews only an
+// expired token (whoami on a still-valid one changes nothing), so this is the
+// first moment a refresh can succeed. A rehearsal on 2026-09-02 started with
+// 2m38s left on the hour and died 2.5 minutes into provisioning with
+// "403 9109 Invalid access token", blamed on a token the owner never typed.
+// Returns true when a different token is now in place.
+function renewWranglerSessionToken() {
+  if (process.env.CLOUDFLARE_API_TOKEN) return false;
+  const holder = cloudflareTokenSession.getStore();
+  if (!holder || holder.source !== "wrangler-session" || typeof holder.renew !== "function") return false;
+  let next = null;
+  try {
+    next = holder.renew();
+  } catch {
+    next = null;
+  }
+  if (!next || String(next) === holder.buffer.toString("ascii")) return false;
+  holder.buffer.fill(0);
+  holder.buffer = Buffer.from(String(next), "ascii");
+  return true;
+}
+
+function isExpiredSessionRejection(error) {
+  const message = String(error?.message || "");
+  return /failed \((401|403)\)/.test(message) && /\b(9109|10000)\b/.test(message);
 }
 
 export function cloudflareTokenAvailable() {
@@ -386,7 +414,14 @@ export async function withWranglerSessionIfNeeded(run, options = {}) {
     token = null; // one credential source among several; absence is ordinary
   }
   if (!token) return run();
-  const buffer = Buffer.from(token, "ascii");
+  const holder = {
+    buffer: Buffer.from(token, "ascii"),
+    source: "wrangler-session",
+    renew: options.renewSessionToken ?? (() => {
+      const read = options.readWranglerOAuthToken ?? readWranglerOAuthToken;
+      return (options.refreshWranglerSession ?? refreshWranglerSession)() ? read() : null;
+    }),
+  };
   // Name the identity, because wrangler authenticating as the wrong person is
   // how an operator provisions into their own account instead of the client's,
   // and it is silent when it happens.
@@ -396,11 +431,11 @@ export async function withWranglerSessionIfNeeded(run, options = {}) {
   // object into a syntax error for whatever is reading it.
   const machineReadable = (options.argv ?? process.argv).includes("--json");
   if (!machineReadable) ok("using this computer's `wrangler login` session for Cloudflare");
-  return cloudflareTokenSession.run(buffer, async () => {
+  return cloudflareTokenSession.run(holder, async () => {
     try {
       return await run();
     } finally {
-      buffer.fill(0);
+      holder.buffer.fill(0);
     }
   });
 }
@@ -630,7 +665,24 @@ function token() {
   return t;
 }
 
-async function cf(path, { method = "GET", body, raw } = {}) {
+async function cf(path, options = {}) {
+  try {
+    return await cfOnce(path, options);
+  } catch (error) {
+    if (isExpiredSessionRejection(error) && renewWranglerSessionToken()) return cfOnce(path, options);
+    if (
+      isExpiredSessionRejection(error) && !process.env.CLOUDFLARE_API_TOKEN &&
+      cloudflareTokenSession.getStore()?.source === "wrangler-session"
+    ) {
+      error.credentialSource = "wrangler-session";
+    }
+    throw error;
+  }
+}
+
+export { cf as cloudflareApiRequest };
+
+async function cfOnce(path, { method = "GET", body, raw } = {}) {
   const res = await http(API + path, {
     method,
     headers: {
@@ -12033,7 +12085,13 @@ function crash(err) {
   // that stops the owner from fixing it (bench, 2026-08-28).
   if (isCredentialRejection(err)) {
     console.error(`\n${c.red("fail")}  Cloudflare refused the credential: ${msg}`);
-    console.error("  " + CF_TOKEN_REJECTED_REMEDY.split("\n").join("\n  "));
+    if (err && err.credentialSource === "wrangler-session") {
+      console.error("  This credential came from this computer's `wrangler login` session, which has");
+      console.error("  expired (they last about an hour) and could not be renewed. Nobody typed a token.");
+      console.error("  Run `npx wrangler@4 login`, then re-run the same command; it resumes where it stopped.");
+    } else {
+      console.error("  " + CF_TOKEN_REJECTED_REMEDY.split("\n").join("\n  "));
+    }
     console.error("\n  Nothing was created or half-written. Re-run once the token is right.");
     printSupportReceipt(supportEventId, (line) => console.error(line));
     process.exit(1);

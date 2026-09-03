@@ -51,6 +51,12 @@ the brain, not for whoever built it: what changed for them, and what to check.
   Worker version against the update target instead of comparing two values
   captured before the update, which had certified a stale pair.
 
+- A `wrangler login` session that expires partway through a setup or update
+  is renewed once and the interrupted request repeated, instead of stopping
+  with "Invalid access token" worded as if the owner had typed a bad token.
+  When renewal does not help, the message now says the session expired and
+  to run `npx wrangler@4 login` before re-running the same command.
+
 ## 0.3.3
 
 **Connect your assistants with one command, instead of copying one.**
