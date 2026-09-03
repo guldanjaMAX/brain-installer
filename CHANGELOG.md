@@ -36,8 +36,10 @@ the brain, not for whoever built it: what changed for them, and what to check.
   just-written work: an unrecognised keystroke fell through to discard, a bare
   Enter on the title did the same, and a free-text source wrote a broken file.
   Each now confirms, defaults to keeping the work, and validates the source.
-- A setup or update that cannot read the database now says why. The three
-  preflight reads used to report only that they could not verify the brain,
+- A setup or update that cannot read the database now says why, on install day
+  as much as on update day: a fresh `brain setup` stopped at the same live-check
+  with no reason attached, and the cause was only recoverable by editing the
+  installer. The five preflight reads used to report only that they could not verify the brain,
   discarding the provider's message, so an account that had hit Cloudflare's
   daily D1 limit produced a line nobody could act on. The cause is quoted, and
   a quota refusal names whose limit it is, when it resets, and that nothing was
