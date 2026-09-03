@@ -2536,6 +2536,33 @@ async function appliedVersions(acctId, dbId, queryDatabase = d1Query) {
   }
 }
 
+/**
+ * Say why a database read failed, instead of only that it did.
+ *
+ * These three preflight reads used to `catch { die("could not verify ...") }`,
+ * throwing the provider's own message away. On 2026-09-03 that turned a
+ * Cloudflare account hitting D1's daily row-read limit into a line nobody
+ * could act on, and grepping the logs for the cause found nothing because the
+ * CLI had discarded it. The provider's error text is API diagnostics about the
+ * account, not anything from the corpus, so it belongs on the operator's
+ * screen with the next action named.
+ */
+export function databaseReadFailureDetail(error) {
+  const message = String(error?.message ?? error ?? "").replace(/\s+/g, " ").trim().slice(0, 240);
+  if (!message) return "      The database did not say why. Re-run the same command; nothing was changed.";
+  const quota = /free tier daily row (read|write) limit/i.test(message);
+  const lines = [`      The database said: ${message}`];
+  if (quota) {
+    lines.push(
+      "      That is this Cloudflare account's daily D1 allowance, not a fault in the brain and not anything you did.",
+      "      It resets at midnight UTC, and the Workers Paid plan removes the daily cap. Nothing was changed here.",
+    );
+  } else {
+    lines.push("      Nothing was changed. Re-run the same command once that is addressed.");
+  }
+  return lines.join("\n");
+}
+
 export async function cmdMigrate(manifestPath, options = {}) {
   const { silent = false } = options;
   const resolveMigrateAccount = options.resolveAccount ?? resolveAccount;
@@ -2585,8 +2612,9 @@ export async function cmdMigrate(manifestPath, options = {}) {
         dbId,
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'install_state'",
       );
-    } catch {
-      die("migration could not verify whether this brain is already live. Nothing was migrated.");
+    } catch (error) {
+      die("migration could not verify whether this brain is already live. Nothing was migrated.\n" +
+        databaseReadFailureDetail(error));
     }
     if (!installTable || !Array.isArray(installTable.results) || installTable.results.length > 1) {
       die("migration received an ambiguous install-state inventory. Nothing was migrated.");
@@ -2610,8 +2638,9 @@ export async function cmdMigrate(manifestPath, options = {}) {
         `SELECT COUNT(*) AS user_table_count FROM sqlite_master
           WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> '_cf_KV'`,
       );
-    } catch {
-      die("migration could not prove that this database is a fresh empty resource. Nothing was migrated.");
+    } catch (error) {
+      die("migration could not prove that this database is a fresh empty resource. Nothing was migrated.\n" +
+        databaseReadFailureDetail(error));
     }
     if (!inventory || !Array.isArray(inventory.results) || inventory.results.length !== 1 ||
         Number(inventory.results[0]?.user_table_count) !== 0) {
@@ -3596,8 +3625,9 @@ export async function cmdUpgrade(manifestPath, options = {}) {
         dbId,
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'install_state'",
       );
-    } catch {
-      die("update stopped because D1 install state could not be read. Nothing was changed.");
+    } catch (error) {
+      die("update stopped because D1 install state could not be read. Nothing was changed.\n" +
+        databaseReadFailureDetail(error));
     }
     assertStageFiles("install-state preflight");
     if (!tableResponse || !Array.isArray(tableResponse.results) ||
@@ -3609,14 +3639,16 @@ export async function cmdUpgrade(manifestPath, options = {}) {
       let stateResponse;
       try {
         stateResponse = await queryDatabase(accountId, dbId, "SELECT * FROM install_state WHERE id = 1");
-      } catch {
-        die("update stopped because D1 install state could not be read. Nothing was changed.");
+      } catch (error) {
+        die("update stopped because D1 install state could not be read. Nothing was changed.\n" +
+          databaseReadFailureDetail(error));
       }
       assertStageFiles("install-state preflight");
       try {
         before = installStateRow(stateResponse);
-      } catch {
-        die("update stopped because D1 install state was unreadable or ambiguous. Nothing was changed.");
+      } catch (error) {
+        die("update stopped because D1 install state was unreadable or ambiguous. Nothing was changed.\n" +
+          databaseReadFailureDetail(error));
       }
     }
     if (before && initialManifest.client?.slug && before.client_slug && before.client_slug !== initialManifest.client.slug) {

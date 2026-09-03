@@ -22,6 +22,12 @@ the brain, not for whoever built it: what changed for them, and what to check.
   and the brain accepts new material again as soon as it finishes.
 - One interrupted poll during the rebuild no longer ends the update. The
   request is retried eight times with backoff inside the movement budget.
+- A setup or update that cannot read the database now says why. The three
+  preflight reads used to report only that they could not verify the brain,
+  discarding the provider's message, so an account that had hit Cloudflare's
+  daily D1 limit produced a line nobody could act on. The cause is quoted, and
+  a quota refusal names whose limit it is, when it resets, and that nothing was
+  changed.
 - `brain schedule` on Windows or Linux now says plainly that the installer
   does not create the automatic refresh there yet, that everything else
   works, and prints the scheduled-task or cron recipe to use instead. It used
