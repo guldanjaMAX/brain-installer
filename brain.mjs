@@ -2364,6 +2364,40 @@ async function d1Query(acctId, dbId, sql, params = []) {
   return Array.isArray(res) ? res[0] : res;
 }
 
+/**
+ * Refuse an update whose release has never seen the schema already on the brain.
+ *
+ * The version guard below compares recorded product-version STRINGS, and a
+ * brain built from a working branch can record a LOWER string than any
+ * published release while running a HIGHER schema. James's own brain on
+ * 2026-09-03: install_state says product_version 0.1.16 and schema_version 32,
+ * while the release ships 22 migrations. compareSemver reads 0.1.16 -> 0.3.5 as
+ * an upgrade and lets it proceed, and the migration renumbering that follows is
+ * the one failure in this system with no clean repair.
+ *
+ * The number that catches it is the one nothing looked at. A brain whose schema
+ * is ahead of every migration in this package has run code this package has
+ * never seen, which is a downgrade whatever the version strings say.
+ *
+ * Returns a refusal message, or null when the update may proceed. Unreadable or
+ * absent values proceed: this guard exists to catch a specific provable state,
+ * not to invent a new way for an ordinary update to stop.
+ */
+export function schemaAheadOfReleaseRefusal(installedSchemaVersion, migrations, releaseVersion = PRODUCT_VERSION) {
+  const installed = Number(installedSchemaVersion);
+  if (!Number.isSafeInteger(installed) || installed <= 0) return null;
+  const versions = (Array.isArray(migrations) ? migrations : [])
+    .map((migration) => Number(migration?.version))
+    .filter((version) => Number.isSafeInteger(version));
+  if (!versions.length) return null;
+  const highest = Math.max(...versions);
+  if (installed <= highest) return null;
+  return `update refused: this brain's database is at schema ${installed}, and ${releaseVersion} only knows schema ${highest}. Nothing was changed.\n` +
+    "      A brain is only ever ahead like this when it was built from a working branch rather than a\n" +
+    "      published release, so this update would remove tables its own migrations have never seen.\n" +
+    "      Install the build this brain came from, or leave it where it is.";
+}
+
 function loadMigrations() {
   const dir = join(HERE, "migrations", "d1");
   if (!existsSync(dir)) return [];
@@ -3676,6 +3710,8 @@ export async function cmdUpgrade(manifestPath, options = {}) {
         if (!newestRecordedVersion || compareSemver(recordedVersion, newestRecordedVersion) > 0) {
           newestRecordedVersion = recordedVersion;
         }
+        const schemaRefusal = schemaAheadOfReleaseRefusal(before?.schema_version, loadMigrations(), toVersion);
+        if (schemaRefusal) die(schemaRefusal);
         const direction = compareSemver(recordedVersion, toVersion);
         if (direction > 0) {
           die(
