@@ -195,6 +195,8 @@ import {
   buildDriveRemovalPlan,
   classifyActiveDriveSkip,
   isTrustedDriveVersion,
+  describeDriveRemovalPlan,
+  renderDriveRemovalReview,
 } from "./operations/drive-removal-plan.mjs";
 import {
   discoverInstalledManifest,
@@ -211,6 +213,8 @@ export {
   DRIVE_REMOVAL_MAX_RATIO,
   DriveRemovalReviewRequired,
   assertDriveRemovalPlanSafe,
+  describeDriveRemovalPlan,
+  renderDriveRemovalReview,
   buildDriveRemovalPlan,
   classifyActiveDriveSkip,
   isTrustedDriveVersion,
@@ -9725,6 +9729,18 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         intentionalCandidates: intentionalRemovalUids,
       });
       saveState(statePath, state);
+      if (driveRemovalPlan.tooLarge && removalApproval !== driveRemovalPlan.fingerprint) {
+        // The refusal below prints only totals. Write the per-document list
+        // beside the progress file so the owner can read what would go before
+        // approving the fingerprint. Nothing is removed on this path.
+        const pathByUid = new Map(files.map((f) => [`${sourceName}:${f.id}`, [pathOf(f), f.name].filter(Boolean).join("/") || f.id]));
+        const reasonByUid = new Map(Object.entries(state.skipped || {}));
+        const description = describeDriveRemovalPlan(driveRemovalPlan, { pathByUid, reasonByUid });
+        const reviewBase = statePath.replace(/\.json$/, "");
+        writeFileSync(`${reviewBase}.removal-review.json`, JSON.stringify(description, null, 2) + "\n");
+        writeFileSync(`${reviewBase}.removal-review.md`, renderDriveRemovalReview(description) + "\n");
+        info(`Drive cleanup review written: ${reviewBase}.removal-review.md`);
+      }
       assertDriveRemovalPlanSafe(driveRemovalPlan, removalApproval);
 
       const currentlyPlanned = new Set(Object.values(driveRemovalPlan.targets).flat());

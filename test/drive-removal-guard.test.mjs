@@ -13,6 +13,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   assertDriveRemovalPlanSafe,
+  describeDriveRemovalPlan,
+  renderDriveRemovalReview,
   buildDriveRemovalPlan,
   classifyActiveDriveSkip,
   clearRetainedDriveDocumentState,
@@ -1107,5 +1109,32 @@ assert.match(
   /stillStored[\s\S]*state\.removed[\s\S]*throw new Error/,
   "a failed local deletion readback must retain retry state and fail the source run",
 );
+
+{
+  // An over-limit plan must be readable per document before the owner approves it.
+  const plan = buildDriveRemovalPlan({
+    storedFamilies: ["drive:a", "drive:b", "drive:c", "drive:d"],
+    activeFamilies: ["drive:a", "drive:b", "drive:d"],
+    policyCandidates: ["drive:a"],
+    vanishedCandidates: ["drive:c"],
+    intentionalCandidates: ["drive:d"],
+  }, { maxCount: 1 });
+  assert.equal(plan.tooLarge, true);
+  const description = describeDriveRemovalPlan(plan, {
+    pathByUid: new Map([["drive:a", "Personal/Taxes/2025 return.pdf"], ["drive:d", "Old/notes.txt"]]),
+    reasonByUid: new Map([["drive:a", "excluded by source policy: Personal/"], ["drive:d", "no extractor for .txt files"]]),
+  });
+  assert.equal(description.fingerprint, plan.fingerprint);
+  assert.equal(description.total, 3);
+  assert.deepEqual(description.categories.source_policy, [{ uid: "drive:a", path: "Personal/Taxes/2025 return.pdf", reason: "excluded by source policy: Personal/" }]);
+  assert.deepEqual(description.categories.source_deleted, [{ uid: "drive:c", path: null, reason: "no longer listed in the Drive source" }]);
+  assert.deepEqual(description.categories.intentional_skip, [{ uid: "drive:d", path: "Old/notes.txt", reason: "no extractor for .txt files" }]);
+  const md = renderDriveRemovalReview(description);
+  assert.match(md, /--approve-removals [0-9a-f]{64}/, "review names the approval fingerprint");
+  assert.match(md, /Personal\/Taxes\/2025 return\.pdf/, "review lists the display path");
+  assert.match(md, /No longer found in Drive \(1\)/, "review groups vanished files");
+  assert.match(md, /Nothing has been removed/, "review says nothing was removed");
+  assert.throws(() => describeDriveRemovalPlan({}), /invalid/);
+}
 
 console.log("drive removal guard: all focused tests passed");

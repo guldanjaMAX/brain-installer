@@ -154,6 +154,51 @@ export function buildDriveRemovalPlan(input = {}, options = {}) {
 }
 
 /** Refuse a surprising plan without disclosing any source identifier. */
+/**
+ * Owner-readable description of a removal plan: one row per document, grouped
+ * by category, with the display path and the reason the installer recorded.
+ * Pure so the review file can be tested without Drive or a worker.
+ */
+export function describeDriveRemovalPlan(plan, { pathByUid = new Map(), reasonByUid = new Map() } = {}) {
+  if (!plan || typeof plan !== "object" || !plan.targets) throw new TypeError("Drive removal plan is invalid");
+  const categories = {};
+  for (const [category] of CATEGORY_INPUTS) {
+    const uids = Array.isArray(plan.targets[category]) ? [...plan.targets[category]].sort() : [];
+    categories[category] = uids.map((uid) => ({
+      uid,
+      path: pathByUid.get(uid) ?? null,
+      reason: reasonByUid.get(uid) ?? (category === "source_deleted" ? "no longer listed in the Drive source" : null),
+    }));
+  }
+  return {
+    fingerprint: plan.fingerprint,
+    total: plan.total,
+    stored: plan.stored,
+    percent: Number(((plan.ratio || 0) * 100).toFixed(1)),
+    categories,
+  };
+}
+
+export function renderDriveRemovalReview(description) {
+  const labels = { source_policy: "Excluded by the Drive source policy", source_deleted: "No longer found in Drive", intentional_skip: "Now skipped on purpose" };
+  const lines = [
+    "# Drive cleanup review",
+    "",
+    `${description.total} of ${description.stored} stored documents (${description.percent}%) would be removed from the brain.`,
+    "Nothing has been removed. Approve this exact plan with:",
+    "",
+    `    --approve-removals ${description.fingerprint}`,
+    "",
+  ];
+  for (const [category, rows] of Object.entries(description.categories)) {
+    lines.push(`## ${labels[category] || category} (${rows.length})`, "");
+    if (!rows.length) lines.push("(none)", "");
+    for (const row of rows) lines.push(`- ${row.path || row.uid}${row.reason ? ` — ${row.reason}` : ""}`);
+    if (rows.length) lines.push("");
+  }
+  return lines.join("\n");
+}
+
 export function assertDriveRemovalPlanSafe(plan, approval) {
   if (!plan || typeof plan !== "object" || !/^[0-9a-f]{64}$/.test(String(plan.fingerprint || ""))) {
     throw new TypeError("Drive removal plan is invalid");
