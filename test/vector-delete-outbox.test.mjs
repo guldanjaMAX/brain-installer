@@ -1472,9 +1472,8 @@ for (const reportedChanges of [0, 9]) {
     JSON.stringify({ submitted, submittedRows, sizes: upsertBatches.map((batch) => batch.length) }));
   check("bootstrap responses expose aggregate progress only",
     JSON.stringify(Object.keys(submitted).sort()) === JSON.stringify([
-      "actual_vectors", "complete", "confirmed", "epoch", "expected_vectors", "failed",
-      "in_flight_batches", "phase", "protocol", "queued", "remaining", "submitted",
-      "total", "vector_ready",
+      
+      "actual_vectors", "complete", "confirmed", "epoch", "expected_vectors", "failed", "in_flight_batches", "phase", "protocol", "queued", "remaining", "retrying", "submitted", "total", "vector_ready",
     ]) && !JSON.stringify(submitted).includes("drive:accelerated-bootstrap"),
     JSON.stringify(submitted));
 

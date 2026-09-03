@@ -316,6 +316,121 @@ export async function checkVectorizeApi(accountId, cloudflareToken = process.env
   }
 }
 
+/**
+ * Whether the account is on Workers Paid, checked BEFORE install — without
+ * guessing.
+ *
+ * What this can and cannot see was measured, not assumed (2026-08-31, live):
+ * with a token holding exactly the four install scopes (CF_TOKEN_SCOPES),
+ * GET /accounts/{id}/subscriptions answers success:false, errors[0].code
+ * 10000 "Authentication error" — the standard subscription surface needs a
+ * billing scope the install token deliberately does not carry. A much broader
+ * Workers-operations token gave the same refusal, and
+ * /workers/account-settings (which IS readable) reports the same
+ * default_usage_model on Free and Paid accounts alike, so it carries no plan
+ * signal either. There is therefore NO reliable plan read inside the install
+ * scopes, and this check says so plainly rather than inventing a verdict:
+ * unreadable is a WARN with the dashboard path, never a FAIL and never a
+ * pretend OK. A token that CAN read subscriptions (a client's own broader
+ * token) gets the definitive line automatically.
+ */
+export async function checkWorkersPaidPlan(
+  accountId,
+  cloudflareToken = process.env.CLOUDFLARE_API_TOKEN,
+  fetchImpl = fetch,
+) {
+  const name = "Workers plan";
+  if (!cloudflareToken) {
+    return check(name, WARN, "not checked: Cloudflare token is missing",
+      "Run `brain setup` or `brain update` in an interactive terminal for hidden token entry.\n" + CF_PLAN_NOTE);
+  }
+  if (!accountId) {
+    return check(name, WARN, "not checked: Cloudflare account id is not known yet",
+      "Run `brain doctor <manifest>` after setup has written the account id.\n" + CF_PLAN_NOTE);
+  }
+  let payload = null;
+  let status = 0;
+  try {
+    const res = await fetchImpl(`https://api.cloudflare.com/client/v4/accounts/${accountId}/subscriptions`, {
+      headers: { authorization: `Bearer ${cloudflareToken}` },
+      signal: AbortSignal.timeout(20_000),
+    });
+    status = res.status;
+    try { payload = await res.json(); } catch { /* judged below */ }
+  } catch (e) {
+    return check(name, WARN, `not checked: probe failed (${String(e.message).slice(0, 80)})`,
+      "Transient network trouble is the usual cause; re-run doctor.\n" + CF_PLAN_NOTE);
+  }
+
+  const errorText = (payload?.errors || []).map((x) => `${x.code} ${x.message}`).join("; ");
+  const scopeRefused =
+    payload?.success === false &&
+    (/\b(10000|9109)\b/.test(errorText) || /authentication|authori[sz]/i.test(errorText) || status === 401 || status === 403);
+  if (scopeRefused) {
+    return check(
+      name,
+      WARN,
+      "cannot be read with this token's scopes, so it is not verified here",
+      "This is expected with the standard install token: reading the plan needs a\n" +
+        "  billing scope it deliberately does not carry, and it should not be widened\n" +
+        "  for a check. Confirm the plan by eye instead:\n" +
+        "    Cloudflare dashboard > Workers & Pages > Plans\n" + CF_PLAN_NOTE,
+    );
+  }
+  if (payload?.success && Array.isArray(payload.result)) {
+    const describe = (sub) =>
+      String(sub?.rate_plan?.public_name || sub?.rate_plan?.id || sub?.product?.name || "unnamed plan");
+    const workers = payload.result.filter((sub) =>
+      /worker/i.test(JSON.stringify([sub?.product?.name, sub?.rate_plan?.id, sub?.rate_plan?.public_name])));
+    const paid = workers.find((sub) => !/free/i.test(describe(sub)));
+    if (paid) return check(name, OK, `Workers subscription is active: ${describe(paid).slice(0, 60)}`);
+    const seen = payload.result.map(describe).filter(Boolean).slice(0, 4).join(", ") || "none";
+    return check(
+      name,
+      WARN,
+      `no Workers subscription is visible on this account (saw: ${seen.slice(0, 80)})`,
+      "The account may be on the Free plan. Confirm before install:\n" +
+        "    Cloudflare dashboard > Workers & Pages > Plans\n" + CF_PLAN_NOTE,
+    );
+  }
+  return check(name, WARN, `not checked: unexpected response (HTTP ${status})`,
+    "Re-run doctor; if it persists, confirm the plan in the dashboard:\n" +
+      "    Cloudflare dashboard > Workers & Pages > Plans\n" + CF_PLAN_NOTE);
+}
+
+/**
+ * The priority slice, checked while there is still time to choose one.
+ *
+ * ingest.priority_slice is the install-day ordering decision: the single
+ * folder the owner already said would be worth it, loaded and proven FIRST,
+ * with the long tail streaming in behind. Nothing enforces it mechanically —
+ * it drives which `brain ingest --path` runs first — so an empty slice fails
+ * silently: the first load happens in whatever order someone picks under
+ * install-day pressure, usually chronological, and the first impression is
+ * made by the archive instead of the working set. After handoff the ordering
+ * decision is spent, so a completed install stops warning.
+ */
+export function checkPrioritySlice(manifest) {
+  const name = "priority slice";
+  if (manifest?.handoff?.handoff_completed_at) {
+    return check(name, OK, "handoff is complete; first-load ordering no longer applies");
+  }
+  const slice = manifest?.ingest?.priority_slice;
+  const source = typeof slice?.source === "string" ? slice.source.trim() : "";
+  if (source) {
+    return check(name, OK, `first load is pinned to "${source.slice(0, 48)}"${slice?.since ? ` since ${slice.since}` : ""}`);
+  }
+  return check(
+    name,
+    WARN,
+    "ingest.priority_slice is not set, so the first load has no agreed order",
+    "Before the first load, put the folder from intake 2.4 into ingest.priority_slice\n" +
+      "  (templates/brain.manifest.json carries a filled _example to copy). Loading the\n" +
+      "  priority slice first and proving it beats chronological order: a first\n" +
+      "  impression made by the archive is how an install loses the room.",
+  );
+}
+
 export function checkVectorize(accountId) {
   const env = cfEnv(accountId);
   const r = run("npx", ["wrangler@4", "vectorize", "list"], {
@@ -663,15 +778,19 @@ export async function runAll({
     if (onResult) onResult(x);
     return x;
   };
+  // Every check goes through push(), never out.push(): the first three used
+  // push() and the rest bypassed it, so a healthy machine printed three lines
+  // out of ten and looked truncated to anyone watching a screen share.
   push(checkNode());
   push(checkWrangler(localRun));
   push(await checkNetwork());
-  out.push(await checkCfToken(cloudflareToken));
-  out.push(await checkVectorizeApi(accountId, cloudflareToken));
-  out.push(checkAnthropicKey());
-  out.push(checkClaudeCode({ runCommand: localRun, required: requireClaudeCode }));
-  out.push(checkCodex());
-  out.push(checkGoogleConnection(googleStorageStatus));
+  push(await checkCfToken(cloudflareToken));
+  push(await checkVectorizeApi(accountId, cloudflareToken));
+  push(await checkWorkersPaidPlan(accountId, cloudflareToken));
+  push(checkAnthropicKey());
+  push(checkClaudeCode({ runCommand: localRun, required: requireClaudeCode }));
+  push(checkCodex());
+  push(checkGoogleConnection(googleStorageStatus));
   return out;
 }
 
