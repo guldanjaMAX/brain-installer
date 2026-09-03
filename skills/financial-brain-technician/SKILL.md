@@ -77,6 +77,18 @@ absolute test-kit and manifest paths.
 - Read WHICH lines fail at the end of an update. If every FAIL begins with
   `freshness:`, the update succeeded and a source needs attention; anything
   else is a stop. Keep the output either way.
+- One line during an update is a wait, not a stop: "N vector(s) accepted but
+  not yet visible; waiting for Vectorize". The index has the vectors and has
+  not exposed them yet; the update polls and finishes on its own. On builds
+  before 0.3.4 the same state ended the update with "reported N failed
+  aggregate operation(s)"; nothing was lost, and re-running the same update a
+  minute later resumes the same step.
+- Start the credential hour fresh. The `wrangler login` session lasts about an
+  hour and is renewed only after it has run out, so an update begun near the
+  end of that hour can stop partway with `403 9109 Invalid access token`,
+  worded as if the owner typed a bad token. Have the owner run
+  `npx wrangler@4 login` right before `brain update`, and again before
+  re-running if that line appears.
 - Before calling a brain proven, count `testing.probe_questions` in the
   manifest. An empty list means the retrieval tier was not exercised.
 - For a loading or scoring call, start read-only: two `brain health`
