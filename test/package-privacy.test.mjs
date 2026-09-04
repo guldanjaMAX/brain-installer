@@ -447,6 +447,7 @@ const expected = [
   "operations/claude-workspace.mjs",
   "operations/claude-skill.mjs",
   "operations/cloudflare-token-store.mjs",
+  "operations/self-update.mjs",
   "operations/session-signing-key.mjs",
   "operations/technician-setup.mjs",
   "operations/rag-proxy-key.mjs",
