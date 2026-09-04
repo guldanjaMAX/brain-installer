@@ -2749,6 +2749,43 @@ async function confirmAcceleratedBootstrapBatch(env, batch, now) {
  * Re-project legacy vectors in provider-sized, disjoint batches while every
  * ordinary corpus writer remains blocked by the upgrade compatibility Worker.
  */
+/**
+ * Clear vector-outbox residue that no bootstrap batch owns, while paused.
+ * Back-ported to the 0.3.x line from 0db6c83.
+ *
+ * DIFFERENCE FROM UPSTREAM: the 0.4.x original also refuses when the residue is
+ * entirely quarantined, reading vector_outbox_retry_state. That table arrives in
+ * migration 0028 and this line ends at 0022, so no quarantined row can exist and
+ * the residue count is taken directly. Do not re-add the join without 0028.
+ */
+async function drainPausedBootstrapResidue(env, state, options) {
+  const ledger = await env.DB.prepare(
+    `SELECT (SELECT count(*) FROM vector_outbox) AS residue,
+            (SELECT count(*) FROM vector_bootstrap_batches
+              WHERE epoch=?1 AND status IN ('queued','submitted')) AS owned`
+  ).bind(state.epoch).first();
+  const residue = Number(ledger?.residue);
+  const owned = Number(ledger?.owned);
+  if (![residue, owned].every((value) => Number.isSafeInteger(value) && value >= 0)) {
+    throw new Error("the paused bootstrap residue receipt is invalid");
+  }
+  if (residue === 0 || owned > 0) return { attempted: false, remaining: residue };
+  await drainOutbox(env, {
+    ...options,
+    allowPausedBootstrap: true,
+    disableBootstrapAdvance: true,
+    maxBatches: 10,
+  });
+  const after = await env.DB.prepare(
+    "SELECT count(*) AS total FROM vector_outbox"
+  ).first();
+  const total = Number(after?.total);
+  if (!Number.isSafeInteger(total) || total < 0) {
+    throw new Error("the paused bootstrap residue receipt is invalid");
+  }
+  return { attempted: true, remaining: total };
+}
+
 export async function acceleratedVectorBootstrap(env, options = {}) {
   if (env?.VECTOR_DRAIN_MODE !== "paused-for-upgrade") {
     throw new Error("the accelerated vector bootstrap requires the verified upgrade pause");
@@ -2799,6 +2836,12 @@ export async function acceleratedVectorBootstrap(env, options = {}) {
       ).bind(ACCELERATED_BOOTSTRAP_PROTOCOL).run();
       return acceleratedBootstrapReceipt(env, "legacy_drain");
     }
+  }
+
+  const residue = await drainPausedBootstrapResidue(env, state, options);
+  if (residue.attempted) {
+    if (residue.remaining > 0) return acceleratedBootstrapReceipt(env, "legacy_drain");
+    state = await bootstrapStateV2(env);
   }
 
   if (state.status === "pending") {

@@ -1922,6 +1922,9 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
               };
             }
             if (/^SELECT count\(\*\) AS n FROM chunks/.test(sql.trim())) return { n: 0 };
+            // The paused residue probe: nothing queued before the pause, and no
+            // batch of this epoch owns an outbox row. A read, never a write.
+            if (/\) AS residue,/.test(sql)) return { residue: 0, owned: 0 };
             if (/sum\(CASE WHEN submitted_mutation_id IS NULL/.test(sql)) {
               return { n: 0, queued: 0, submitted: 0, failed: 0 };
             }
@@ -1991,6 +1994,9 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
               return { held: 1, schema_ready: 1, expires_at: Date.now() + 180_000 };
             }
             if (/^SELECT count\(\*\) AS n FROM chunks/.test(sql.trim())) return { n: 0 };
+            // The paused residue probe: nothing queued before the pause, and no
+            // batch of this epoch owns an outbox row. A read, never a write.
+            if (/\) AS residue,/.test(sql)) return { residue: 0, owned: 0 };
             if (/sum\(CASE WHEN submitted_mutation_id IS NULL/.test(sql)) {
               return { n: 0, queued: 0, submitted: 0, failed: 0 };
             }

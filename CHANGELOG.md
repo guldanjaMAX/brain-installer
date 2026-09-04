@@ -4,6 +4,20 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.3.6
+
+- An update that paused your brain could leave it paused for good. If a single
+  document arrived in the moment before the pause began, the update would sit
+  at the rebuilding step reporting no progress, and running it again did the
+  same thing. Two brains were left refusing new material this way on 4
+  September. The rebuild now clears that one waiting document itself, while
+  the brain stays paused to everything else, so the update finishes instead of
+  waiting for something that could never happen. Your brain keeps answering
+  questions throughout, exactly as before; what changes is that it comes back.
+- If your brain is paused right now after an update that stopped, this is the
+  release that clears it. Install it and run the update again. Nothing you
+  loaded was lost while it was paused.
+
 ## 0.3.5
 
 - The index rebuild during an update no longer gives up two minutes after it
