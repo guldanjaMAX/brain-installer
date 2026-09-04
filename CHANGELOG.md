@@ -20,6 +20,13 @@ the brain, not for whoever built it: what changed for them, and what to check.
   trust line, and the MCP server carries the confidence, the gate reason and the
   documents it did find, so "I found four documents and could not write a
   supported answer from them" stops reading as "nothing recorded".
+- The test-brain teardown script's two guards both failed open. Its name check
+  was unanchored, so `my-production-testbed` and even `latest-greatest` counted
+  as test resources because they contain the letters t-e-s-t; and its
+  live-resource lock read a list from the environment that, unset, was empty
+  and silent. The match is anchored to a real prefix, the script refuses to run
+  at all until the lock is set, and both guards are now importable and pinned
+  by a test instead of living inline in a script nobody ran.
 - `/health` reports `schema_version`. Whether a brain may take a published
   update is decided by that integer, and until now it could only be read by
   standing at the owner's machine. A fleet is now checkable from one place. The
