@@ -2,7 +2,7 @@
  * A brain whose schema is ahead of every migration in the release has run code
  * this release has never seen. The version guard cannot catch it: it compares
  * recorded product-version STRINGS, and a brain built from a working branch can
- * record a lower string while running a higher schema. James's own brain on
+ * record a lower string while running a higher schema. The maintainer's own brain on
  * 2026-09-03 recorded product_version 0.1.16 with schema_version 32 while the
  * release shipped 22 migrations, so the update would have read it as an upgrade
  * and renumbered a schema with no clean repair.

@@ -28,7 +28,7 @@ the brain, not for whoever built it: what changed for them, and what to check.
 - The test-brain teardown script's two guards both failed open. Its name check
   was unanchored, so anything containing the letters t-e-s-t counted as a test
   resource: `my-production-testbed`, `latest-greatest`, `contest-results`, and
-  worst of the set, `brain-latest` and `james-latest-backup`. Those last two are
+  worst of the set, `brain-latest` and `owner-latest-backup`. Those last two are
   the names a person reaches for when copying something before doing anything
   risky, so the safety copy was the thing the guard protected least. Nothing was
   ever lost to it, and reaching it needed someone to type the name themselves

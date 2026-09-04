@@ -49,7 +49,7 @@ the receipt said so, and the release notes did not claim delete coverage.
 
 Browser sign-in, no token, a clean prefix, `--no-connect`. Mac on every
 candidate. Windows, in the VM bench, on every candidate that touches
-provisioning, credentials or paths, and weekly otherwise: Chet's install failed
+provisioning, credentials or paths, and weekly otherwise: a field install failed
 on Windows for two hours on 2026-09-02 and nobody could read why.
 
 Induced conditions, each of which must name its cause on screen rather than
@@ -72,7 +72,7 @@ or both names, so the person reading it can act:
 - a version-string downgrade is refused;
 - a migration ledger with a gap is refused;
 - teardown refuses a protected name, refuses an unanchored match such as
-  `james-latest-backup`, refuses to run with the protected list unset, and
+  `owner-latest-backup`, refuses to run with the protected list unset, and
   prints the rule behind every allow and every refuse;
 - a database quota refusal reaches the screen as a quota refusal, with the
   reset time and the plan that removes it, not as "could not verify".
@@ -84,8 +84,8 @@ field), product version, schema version, last update, safe to update. Refreshed
 by one command against `/health` once `schema_version` ships there, by
 `brain status` until then. The floor in section 2 is read from this table, not
 from memory. The release note names, by brain, anything that must NOT take the
-update; on 2026-09-03 that is james-brain-shadow and brain-test-jay-ui, and
-Jay's real brains stay listed as unread until someone reads them.
+update; on 2026-09-03 that is the maintainer's own brain and the partner UI test brain,
+and a partner's real brains stay listed as unread until someone reads them.
 
 ## 8. The path is the gate; the rate is a warning
 
@@ -107,7 +107,7 @@ rather than from a fixed number, because any number derived from today's
 biggest client is stale the day a bigger one arrives, and warn when the
 projection exceeds half the six-hour deadline.
 
-Reference points measured 2026-09-03: bulk rebuild ~1,740 rows/min (James's
+Reference points measured 2026-09-03: bulk rebuild ~1,740 rows/min (the maintainer's
 epoch 1, 736,049 rows in 7h03m); legacy drain ~150 rows/min; the drain's own
 steady state ~100 rows/min, one batch per confirmation.
 
@@ -153,7 +153,7 @@ steady state ~100 rows/min, one batch per confirmation.
 - **Teardown by exact resource name with the protected list set, then a 404
   on the worker's health URL.** "3 already gone" for a bare slug looks exactly
   like a successful teardown of the suffixed name.
-- **The bench account is on Workers Paid and holds no live brain.** Until Jay's
+- **The bench account is on Workers Paid and holds no live brain.** Until the partner's
   preview brain moves off it, it is on the protected list by name.
 
 ## 10. The repoint is verified by reading what is served

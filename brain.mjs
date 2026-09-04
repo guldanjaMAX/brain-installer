@@ -2377,7 +2377,7 @@ async function d1Query(acctId, dbId, sql, params = []) {
  *
  * The version guard below compares recorded product-version STRINGS, and a
  * brain built from a working branch can record a LOWER string than any
- * published release while running a HIGHER schema. James's own brain on
+ * published release while running a HIGHER schema. The maintainer's own brain on
  * 2026-09-03: install_state says product_version 0.1.16 and schema_version 32,
  * while the release ships 22 migrations. compareSemver reads 0.1.16 -> 0.3.5 as
  * an upgrade and lets it proceed, and the migration renumbering that follows is

@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { looksDisposable, protectedListMissing, teardownDecision } from "../scripts/teardown-test-brain.mjs";
 
 // Disposable, by an anchored prefix only.
-for (const name of ["brain-test-run-1", "brain-test-jay-ui", "test-scratch", "TEST-UPPER", "brain-test"]) {
+for (const name of ["brain-test-run-1", "brain-test-partner-ui", "test-scratch", "TEST-UPPER", "brain-test"]) {
   assert.equal(looksDisposable(name), true, `${name} should be deletable`);
 }
 
@@ -22,14 +22,14 @@ for (const name of [
   "my-production-testbed",
   "latest-greatest",             // "latest" contains test
   "brain-latest",                // and so does the name of a safety copy
-  "james-latest-backup",         // the backup made before a risky operation
+  "owner-latest-backup",         // the backup made before a risky operation
   "protest-archive",
   "fastest-brain",
   "greatest-hits",
   "contest-results",
-  "financial-brain-jay-preview-brain",
-  "james-brain-shadow",
-  "lvc-brain",
+  "financial-brain-partner-preview-brain",
+  "owner-brain-shadow",
+  "client-brain",
   "brain-attestation",
 ]) {
   assert.equal(looksDisposable(name), false, `${name} must NOT be deletable by name`);
@@ -44,24 +44,24 @@ for (const bad of ["", null, undefined, "   ", 0]) {
 assert.equal(protectedListMissing(""), true, "an unset list is missing");
 assert.equal(protectedListMissing(undefined), true, "an absent list is missing");
 assert.equal(protectedListMissing("  , ,, "), true, "a list of separators is still empty");
-assert.equal(protectedListMissing("lvc-brain"), false, "one name is a list");
-assert.equal(protectedListMissing("lvc-brain,james-brain-shadow"), false, "several names are a list");
+assert.equal(protectedListMissing("client-brain"), false, "one name is a list");
+assert.equal(protectedListMissing("client-brain,owner-brain-shadow"), false, "several names are a list");
 
 // A decision must carry its evidence. "would delete" looked the same whether
 // one guard passed or three did, which is how a thin guard passes for a strong
 // one; the same shape as a database error that said only "could not verify".
 {
-  const prefixes = [/^lvc-brain/i, /^james-brain-shadow/i];
-  const opts = { protectedPrefixes: prefixes, protectedRaw: "lvc-brain,james-brain-shadow" };
+  const prefixes = [/^client-brain/i, /^owner-brain-shadow/i];
+  const opts = { protectedPrefixes: prefixes, protectedRaw: "client-brain,owner-brain-shadow" };
 
   const allowed = teardownDecision("brain-test-run-1", opts);
   assert.equal(allowed.allowed, true);
   assert.match(allowed.reason, /disposable prefix/, "an allow says which rule let it through");
   assert.match(allowed.reason, /protected list of 2/, "an allow says how many names it was checked against");
 
-  const onList = teardownDecision("lvc-brain", opts);
+  const onList = teardownDecision("client-brain", opts);
   assert.equal(onList.allowed, false);
-  assert.match(onList.reason, /protected list \(\^lvc-brain\)/, "a refusal names the pattern that stopped it");
+  assert.match(onList.reason, /protected list \(\^client-brain\)/, "a refusal names the pattern that stopped it");
 
   const wrongShape = teardownDecision("latest-greatest", opts);
   assert.equal(wrongShape.allowed, false);
