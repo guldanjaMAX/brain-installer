@@ -282,3 +282,51 @@ by construction and none of the three fixes above can change it.
 
 None of the five blocks the schema-32 rehearsal, which is the acceptance
 for updating a brain already on the field line.
+
+
+## The paused-bootstrap deadlock, found by updating a real brain (2026-09-04)
+
+Updating the author's own 926,323-chunk brain to 0.4.0 deadlocked. `brain update`
+sat at "vector projection convergence" printing
+`905143/926323 legacy vector(s) confirmed; 21180 remain` on every poll, the
+number never moving. It took four attempts and manual intervention.
+
+**The mechanism.** `acceleratedVectorBootstrap` has two branches. The LEGACY one
+(protocol other than `bootstrap-v2`) already clears outbox residue while paused
+with `drainOutbox(env, { allowPausedBootstrap: true, ... })`. The `bootstrap-v2`
+branch, which is every current brain, did not. So ONE chunk queued by ordinary
+ingest in the seconds before the pause could never be projected: the outbox never
+emptied, `markProjectionVerifiedIfExact` could never take its exact cut, the
+status never reached `verified`, the base-count escape hatch never fired, and
+convergence compared a stale base from an earlier epoch against a grown chunk
+count forever.
+
+Draining the vector outbox is projection work, not a corpus write.
+`VECTOR_DRAIN_MODE` is untouched and every ordinary corpus writer stays blocked,
+exactly as in the legacy branch. `markProjectionVerifiedIfExact` is byte
+identical: the fix works by making its existing exactness preconditions
+reachable again, never by weakening them.
+
+The residue drain is eligible only when no batch of the current epoch is queued
+or submitted, because those rows belong to the batch receipts. It is bounded at
+ten batches like the legacy branch. And if what remains is entirely
+quarantined, it now throws a named error pointing at the vector-retry route
+rather than hanging again under a new name.
+
+`test/vector-bootstrap-paused-strand.test.mjs` reproduces the exact live shape
+and fails without the fix.
+
+### Still open: a SECOND lane into the identical hang
+
+The adversarial review found that the escape hatch's
+`NOT EXISTS (batches for the current epoch)` guard blocks the base-count refresh
+whenever the current epoch has CONFIRMED batches, with no outbox residue needed
+at all. That is a different route to the same never-moving receipt, and it is
+the shape recorded from the 2026-08-31 incident on the same brain.
+
+It is NOT fixed here, deliberately. `base_count` is set to `count(*) FROM chunks`
+while `confirmed = base_count + sum(confirmed batch row_count)`, so simply
+admitting confirmed batches would double-count every one of their rows.
+Narrowing it correctly also requires retiring the epoch's batch ledger, which is
+a materially riskier change that does not belong in the same commit as an
+incident fix. Do it next, with its own test.

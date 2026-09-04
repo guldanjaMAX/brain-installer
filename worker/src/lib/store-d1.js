@@ -2905,6 +2905,77 @@ export async function installedSchemaVersion(env) {
   }
 }
 
+/**
+ * Clear vector-outbox residue that no bootstrap batch owns, while paused.
+ *
+ * The legacy branch of acceleratedVectorBootstrap already drains its residue
+ * under allowPausedBootstrap. The bootstrap-v2 branch did not, and on
+ * 2026-09-04 that asymmetry stranded a live 926,323-chunk brain: ONE chunk
+ * queued by ordinary ingest in the moment before the pause could never be
+ * projected, so the outbox never emptied, markProjectionVerifiedIfExact could
+ * never take its exact cut, the status never reached 'verified', the
+ * base-count escape hatch below never fired, and convergence compared a stale
+ * base from an earlier epoch against a grown chunk count for the rest of time.
+ *
+ * Draining the outbox is projection work, not a corpus write. VECTOR_DRAIN_MODE
+ * is untouched and every ordinary corpus writer stays blocked, exactly as in
+ * the legacy branch.
+ *
+ * Only residue is eligible. While any batch of the current epoch is queued or
+ * submitted, its outbox rows belong to submitAcceleratedBootstrapBatch and
+ * confirmAcceleratedBootstrapBatch, whose exact per-batch receipts a general
+ * drain would invalidate by deleting rows they still count.
+ */
+async function drainPausedBootstrapResidue(env, state, options) {
+  const ledger = await env.DB.prepare(
+    `SELECT (SELECT count(*) FROM vector_outbox) AS residue,
+            (SELECT count(*) FROM vector_bootstrap_batches
+              WHERE epoch=?1 AND status IN ('queued','submitted')) AS owned`
+  ).bind(state.epoch).first();
+  const residue = Number(ledger?.residue);
+  const owned = Number(ledger?.owned);
+  if (![residue, owned].every((value) => Number.isSafeInteger(value) && value >= 0)) {
+    throw new Error("the paused bootstrap residue receipt is invalid");
+  }
+  if (residue === 0 || owned > 0) return { attempted: false, remaining: residue };
+
+  // Bounded exactly like the legacy branch. One request drains what it can and
+  // reports; the caller polls. An unbounded drain would hold a single Worker
+  // invocation open for a whole backlog and time out with nothing durable.
+  const drained = await drainOutbox(env, {
+    ...options,
+    allowPausedBootstrap: true,
+    disableBootstrapAdvance: true,
+    maxBatches: 10,
+  });
+
+  const after = await env.DB.prepare(
+    `SELECT count(*) AS total,
+            COALESCE(sum(CASE WHEN s.quarantined_at IS NULL THEN 1 ELSE 0 END),0) AS drainable
+       FROM vector_outbox o
+       LEFT JOIN vector_outbox_retry_state s
+         ON s.chunk_uid=o.chunk_uid AND s.generation=o.generation`
+  ).first();
+  const total = Number(after?.total);
+  const drainable = Number(after?.drainable);
+  if (![total, drainable].every((value) => Number.isSafeInteger(value) && value >= 0) ||
+      drainable > total) {
+    throw new Error("the paused bootstrap residue receipt is invalid");
+  }
+  // Every drain candidate query excludes quarantined rows, so residue that is
+  // entirely quarantined can never be projected by any amount of waiting. Say
+  // so once, loudly, rather than hanging again under a new name. A busy receipt
+  // means another leaseholder ran instead of us and proves nothing either way.
+  if (drained.busy !== true && total > 0 && drainable === 0) {
+    throw new Error(
+      `the vector outbox holds ${total} quarantined row(s) that the paused drain cannot ` +
+      "project, so the projection can never reach its verified cut. Release them with " +
+      "POST /api/admin/brain/vector-retry {\"confirm\":true}, then re-run `brain update <manifest>`.",
+    );
+  }
+  return { attempted: true, remaining: total };
+}
+
 export async function acceleratedVectorBootstrap(env, options = {}) {
   if (env?.VECTOR_DRAIN_MODE !== "paused-for-upgrade") {
     throw new Error("the accelerated vector bootstrap requires the verified upgrade pause");
@@ -2955,6 +3026,17 @@ export async function acceleratedVectorBootstrap(env, options = {}) {
       ).bind(ACCELERATED_BOOTSTRAP_PROTOCOL).run();
       return acceleratedBootstrapReceipt(env, "legacy_drain");
     }
+  }
+
+  // Residue queued by ordinary ingest in the moment before the pause belongs to
+  // no batch ledger, and under bootstrap-v2 nothing else will ever send it.
+  const residue = await drainPausedBootstrapResidue(env, state, options);
+  if (residue.attempted) {
+    // Rows still held are accepted-but-not-yet-visible. Report progress and let
+    // the next bounded request confirm them: queueing a bulk batch now would
+    // collide with the chunk_uid primary key the outbox still holds.
+    if (residue.remaining > 0) return acceleratedBootstrapReceipt(env, "legacy_drain");
+    state = await bootstrapStateV2(env);
   }
 
   if (state.status === "pending") {
