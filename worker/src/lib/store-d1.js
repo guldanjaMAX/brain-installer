@@ -32,6 +32,15 @@
  */
 
 import { currentEvidenceCandidates } from "./query-intent.js";
+import {
+  PUBLIC_INSTALL_SMOKE_CHUNK,
+  PUBLIC_INSTALL_SMOKE_DOC_UID,
+  PUBLIC_INSTALL_SMOKE_ID,
+  PUBLIC_INSTALL_SMOKE_METADATA,
+  PUBLIC_INSTALL_SMOKE_SOURCE,
+  PUBLIC_INSTALL_SMOKE_TITLE,
+  publicInstallSmokeContentHash,
+} from "./install-smoke.js";
 
 const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
@@ -3486,4 +3495,120 @@ export async function forgetFamilies(env, { families = [], dryRun = true } = {})
     stale.push(...rows.map((row) => row.uid).filter((uid) => !keep.has(uid)));
   }
   return forget(env, { docUids: [...new Set(stale)], dryRun });
+}
+
+async function requireVectorRetryStateTable(env) {
+  try {
+    await env.DB.prepare("SELECT 1 FROM vector_outbox_retry_state LIMIT 1").first();
+  } catch {
+    throw new Error(
+      "vector retry state schema is unavailable; run `brain migrate <manifest>` before vector operations",
+    );
+  }
+}
+
+/** Privacy-safe retry state for owner alerts and operator receipts. */
+export async function vectorRetrySummary(env, now = Date.now()) {
+  await requireVectorRetryStateTable(env);
+  const row = await env.DB.prepare(
+    `SELECT count(*) AS tracked,
+            sum(CASE WHEN quarantined_at IS NOT NULL THEN 1 ELSE 0 END) AS quarantined,
+            sum(CASE WHEN quarantined_at IS NULL AND next_attempt_at > ? THEN 1 ELSE 0 END) AS delayed,
+            min(CASE WHEN quarantined_at IS NULL THEN next_attempt_at END) AS next_attempt_at
+       FROM vector_outbox_retry_state s
+      WHERE EXISTS (
+        SELECT 1 FROM vector_outbox o
+         WHERE o.chunk_uid=s.chunk_uid AND o.generation=s.generation
+      )`
+  ).bind(now).first();
+  return {
+    tracked: Number(row?.tracked || 0),
+    quarantined: Number(row?.quarantined || 0),
+    delayed: Number(row?.delayed || 0),
+    next_attempt_at: row?.next_attempt_at ?? null,
+  };
+}
+
+/** Explicit operator preview/confirm for quarantined vector generations. */
+export async function retryQuarantinedVectorOps(env, { confirm = false, limit = 100 } = {}) {
+  await requireVectorRetryStateTable(env);
+  const bounded = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  const total = await env.DB.prepare(
+    `SELECT count(*) AS n FROM vector_outbox_retry_state s
+      WHERE s.quarantined_at IS NOT NULL
+        AND EXISTS (SELECT 1 FROM vector_outbox o
+          WHERE o.chunk_uid=s.chunk_uid AND o.generation=s.generation)`
+  ).first();
+  const quarantined = Number(total?.n || 0);
+  if (!confirm || quarantined === 0) {
+    return { quarantined, selected: Math.min(quarantined, bounded), retried: 0, dry_run: true };
+  }
+  const { results: rows } = await env.DB.prepare(
+    `SELECT s.chunk_uid, s.generation
+       FROM vector_outbox_retry_state s
+       JOIN vector_outbox o ON o.chunk_uid=s.chunk_uid AND o.generation=s.generation
+      WHERE s.quarantined_at IS NOT NULL
+      ORDER BY s.quarantined_at, s.chunk_uid LIMIT ?`
+  ).bind(bounded).all();
+  const statements = [];
+  for (const row of rows || []) {
+    statements.push(env.DB.prepare(
+      "DELETE FROM vector_outbox_retry_state WHERE chunk_uid=? AND generation=? AND quarantined_at IS NOT NULL"
+    ).bind(row.chunk_uid, row.generation));
+    statements.push(env.DB.prepare(
+      "UPDATE vector_outbox SET attempts=0,last_error=NULL WHERE chunk_uid=? AND generation=?"
+    ).bind(row.chunk_uid, row.generation));
+  }
+  if (statements.length) await env.DB.batch(statements);
+  return {
+    quarantined,
+    selected: (rows || []).length,
+    retried: (rows || []).length,
+    dry_run: false,
+    remaining_quarantined: Math.max(0, quarantined - (rows || []).length),
+  };
+}
+
+/** Prove the one exact live fixed public document without returning its contents. */
+export async function fixedPublicSmokeState(env) {
+  const expectedContentHash = await publicInstallSmokeContentHash(env);
+  const row = await env.DB.prepare(
+    `SELECT
+       (SELECT count(*) FROM documents
+         WHERE source=?1 AND deleted_at IS NULL) live_document_count,
+       d.doc_uid,d.source,d.source_id,d.title,d.content_hash,d.meta,
+       (SELECT count(*) FROM chunks c
+         WHERE c.doc_uid=?2) chunk_count,
+       (SELECT count(*) FROM chunks c
+         WHERE c.doc_uid=?2 AND c.chunk_uid=?3 AND c.chunk_ix=0
+           AND c.text=?4 AND c.source=?1 AND c.title=?5) exact_chunk_count
+       FROM (SELECT 1) seed
+       LEFT JOIN documents d ON d.doc_uid=?2 AND d.deleted_at IS NULL`
+  ).bind(
+    PUBLIC_INSTALL_SMOKE_SOURCE,
+    PUBLIC_INSTALL_SMOKE_DOC_UID,
+    `${PUBLIC_INSTALL_SMOKE_DOC_UID}#0`,
+    PUBLIC_INSTALL_SMOKE_CHUNK,
+    PUBLIC_INSTALL_SMOKE_TITLE,
+  ).first();
+  const documents = Number(row?.live_document_count || 0);
+  const identityExact = documents === 1 && row?.doc_uid === PUBLIC_INSTALL_SMOKE_DOC_UID &&
+    row?.source === PUBLIC_INSTALL_SMOKE_SOURCE && row?.source_id === PUBLIC_INSTALL_SMOKE_ID &&
+    row?.title === PUBLIC_INSTALL_SMOKE_TITLE && Number(row?.chunk_count) === 1 &&
+    Number(row?.exact_chunk_count) === 1 && row?.content_hash === expectedContentHash;
+  let metadata;
+  try { metadata = JSON.parse(String(row?.meta || "{}")); } catch { metadata = null; }
+  const metadataKeys = metadata && !Array.isArray(metadata)
+    ? Object.keys(metadata).sort()
+    : [];
+  const metadataExact = metadataKeys.length === 3 &&
+    metadataKeys.join("|") === "contains_customer_data|proof_kind|schema_version" &&
+    metadata.proof_kind === PUBLIC_INSTALL_SMOKE_METADATA.proof_kind &&
+    metadata.contains_customer_data === PUBLIC_INSTALL_SMOKE_METADATA.contains_customer_data &&
+    metadata.schema_version === PUBLIC_INSTALL_SMOKE_METADATA.schema_version;
+  return { proven: Boolean(identityExact && metadataExact), documents };
+}
+
+export async function fixedPublicSmokeProof(env) {
+  return (await fixedPublicSmokeState(env)).proven;
 }

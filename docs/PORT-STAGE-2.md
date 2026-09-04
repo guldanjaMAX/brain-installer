@@ -148,3 +148,31 @@ That is one test, and it is a recovery DRILL fixture rather than a product
 path, so it does not block the schema-32 rehearsal. It does block calling the
 port finished, because the recovery drill is what proves a client could be
 restored.
+
+
+## store-d1.js: the four exports are in, the drain behaviour is not (2026-09-04 06:30)
+
+Appended verbatim from the field tree, with the `install-smoke.js` import they
+need: `requireVectorRetryStateTable`, `vectorRetrySummary`,
+`retryQuarantinedVectorOps`, `fixedPublicSmokeState`, `fixedPublicSmokeProof`.
+Our own `installedSchemaVersion` and the whole 0.3.x bootstrap and drain body
+are untouched, and `worker/test/store-d1.test.mjs` still passes.
+
+`test/vector-drain-recovery.test.mjs` has moved from "cannot import
+vectorRetrySummary" to 19 checks with 4 failing, which is the real remaining
+work in this file and is NOT an append:
+
+    FAIL  T3b every attempt after the rejection is a single row  [3,3,3,3,...]
+    FAIL  T3b the two healthy rows confirmed and left the queue
+    FAIL  T3b only the rejected row quarantined
+
+The field line changed the drain's behaviour INSIDE the existing functions:
+after Vectorize rejects a row, it drops to one row per attempt, confirms the
+healthy rows, and quarantines only the offender into `vector_outbox_retry_state`.
+Ours still retries the whole batch. That is a genuine three-way merge in the
+same functions the 0.3.x work rewrote, and it is the piece to do with a clear
+head rather than at the end of a long night.
+
+Appending the exports was still worth doing on its own: it turns an import
+error into four specific behavioural assertions, which is a far better
+description of what is missing than "the module does not load".
