@@ -1,0 +1,116 @@
+# The CLI is tested on Windows. The GUIDE is not, and that is where the last
+# three client-facing Windows defects lived: a PATH line pointing at npm's
+# default prefix when the CLI is installed somewhere else, an install command
+# with no --prefix that leaves the documented path on the old version, and a
+# `brain --version` check for a flag that has never existed. Every one was
+# found by a client on a call, because a guide is code we ship and nothing ran
+# it.
+#
+# This job runs the commands the update guide actually serves, on the platform
+# it serves them for. It asserts on the SERVED bytes rather than on the
+# markdown in Drive, because the served page is the one a person is given.
+
+name: windows-guide
+
+on:
+  push:
+    paths: ['.github/workflows/windows-guide.yml']
+  workflow_dispatch:
+  schedule:
+    # The guide is deployed independently of this repo, so it can drift green
+    # to red without a commit here. Check it daily.
+    - cron: '17 14 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  guide:
+    name: the update guide's own Windows commands
+    runs-on: windows-latest
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      # Fetch the guide a client is given. If the page moves or dies, this job
+      # fails before it can pass for the wrong reason.
+      - name: fetch the served guide
+        shell: pwsh
+        run: |
+          $g = Invoke-WebRequest -UseBasicParsing -Uri "https://fb-install-errors.james-d13.workers.dev/update-guide"
+          if ($g.Content.Length -lt 8000) { throw "guide is $($g.Content.Length) bytes, too short to be the real page" }
+          $g.Content | Out-File -Encoding utf8 guide.md
+          "guide: $($g.Content.Length) bytes"
+
+      # The commands below are asserted to still BE in the guide. If someone
+      # rewrites the Windows block, this fails as stale rather than testing a
+      # document nobody is reading any more.
+      - name: the guide still contains the commands this job tests
+        shell: pwsh
+        run: |
+          $g = Get-Content guide.md -Raw
+          $need = @('LOCALAPPDATA\FinancialBrain', 'npm install -g --prefix', 'npm ls -g --prefix', 'Get-Command brain')
+          $missing = $need | Where-Object { -not $g.Contains($_) }
+          if ($missing) { throw "guide no longer contains: $($missing -join ', ')" }
+          "all $($need.Count) tested commands are still in the served guide"
+
+      # A client whose CLI was installed outside npm's default prefix. This is
+      # Malini's real layout, measured on her machine 2026-09-03.
+      - name: install 0.3.5 the way the guide says, into a non-default prefix
+        shell: pwsh
+        run: |
+          $fb = "$env:LOCALAPPDATA\FinancialBrain"
+          New-Item -ItemType Directory -Force -Path $fb | Out-Null
+          Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.3.5/brain-installer-0.3.5.tgz" -OutFile "$HOME\brain-installer-0.3.5.tgz"
+          npm install -g --prefix "$fb" "$HOME\brain-installer-0.3.5.tgz"
+          if (-not (Test-Path "$fb\brain.cmd")) { throw "brain.cmd is NOT at $fb after --prefix install; the guide's install line does not land where it claims" }
+          "brain.cmd landed at $fb"
+
+      # The PATH line from Step 1, verbatim in shape. The bug it exists to
+      # catch: adding Roaming\npm when the CLI is in Local\FinancialBrain, so
+      # `brain` is never found and the client is told to check their PATH.
+      - name: the guide's PATH line makes brain resolve to that install
+        shell: pwsh
+        run: |
+          $fb = "$env:LOCALAPPDATA\FinancialBrain"
+          if (Test-Path "$fb\brain.cmd") { $env:Path = "$fb;$env:Path" } else { $env:Path = "$env:APPDATA\npm;$env:Path" }
+          $src = (Get-Command brain -ErrorAction SilentlyContinue).Source
+          if (-not $src) { throw "brain does not resolve after the guide's PATH line" }
+          if ($src -notlike "$fb*") { throw "brain resolves to $src, not the install at $fb" }
+          "brain resolves to $src"
+
+      # Step 2b's proof that the client is not about to re-run the old version.
+      - name: the version check prints the version it promises
+        shell: pwsh
+        run: |
+          $fb = "$env:LOCALAPPDATA\FinancialBrain"
+          $out = (npm ls -g --prefix "$fb" --depth=0 2>$null | Out-String)
+          if ($out -notmatch 'brain-installer@0\.3\.5') { throw "version check did not print brain-installer@0.3.5. It printed:`n$out" }
+          "version check prints brain-installer@0.3.5"
+
+      # `brain --version` does not exist and falls through to the help banner.
+      # The guide now says so. This asserts the DEFECT still behaves as
+      # documented, so that when 0.3.6 adds a real flag, this fails and the
+      # guide gets updated with it rather than silently going stale.
+      - name: brain --version still has no version flag (documented defect)
+        shell: pwsh
+        run: |
+          $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
+          $out = (brain --version 2>&1 | Out-String)
+          if ($out -match '^\s*0\.3\.5\s*$') { throw "brain --version now works. Remove the warning from the guide and switch Step 2b back." }
+          "confirmed: --version prints the help banner, as the guide warns"
+
+      # With no credentials, the schema gate must REFUSE and say how to fix it.
+      # A crash here is what Malini's session hit as AUTH_REQUIRED with no
+      # explanation, and a silent success would be far worse.
+      - name: with no credentials, the schema gate refuses and explains
+        shell: pwsh
+        run: |
+          $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
+          $env:BRAIN_NO_WRANGLER_LOGIN = "1"
+          $out = (brain status "$HOME\nope\brain.manifest.json" 2>&1 | Out-String)
+          $ok = $out -match 'wrangler@4 login' -or $out -match 'no Cloudflare credential'
+          if (-not $ok) { throw "no-credential run did not explain itself. It printed:`n$out" }
+          "refuses and points at the browser sign-in"
