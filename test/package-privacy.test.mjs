@@ -447,6 +447,13 @@ const expected = [
   "operations/claude-workspace.mjs",
   "operations/claude-skill.mjs",
   "operations/cloudflare-token-store.mjs",
+  // brain check: the provenance tiering, the contradiction sweep, its probe
+  // catalogue, and the run. Reviewed 2026-09-04: no identity, no client
+  // details, no credentials. The probes are categories, never a person.
+  "operations/provenance.mjs",
+  "operations/contradiction-sweep.mjs",
+  "operations/check-probes.mjs",
+  "operations/check-run.mjs",
   "operations/session-signing-key.mjs",
   "operations/technician-setup.mjs",
   "operations/rag-proxy-key.mjs",
