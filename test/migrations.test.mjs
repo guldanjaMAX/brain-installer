@@ -706,9 +706,13 @@ check("restart guard refuses an existing migration column with the wrong contrac
        (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fin_transactions') ledger_table,
        (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='document_access_grants') document_grants_table`,
   ).get();
-  check("the published schema-16 access release upgrades cleanly through product schema 22",
+  // The receipt count is "every migration in this tree", not a fixed 22. The
+  // port raised it to 32; pinning the literal would make this assertion a
+  // record of what the tree used to hold rather than a check that a published
+  // schema-16 brain arrives at the current one.
+  check("the published schema-16 access release upgrades cleanly to the current schema",
     publishedUpgrade?.schema_version === LATEST_SCHEMA &&
-      publishedUpgrade.receipts === 22 &&
+      publishedUpgrade.receipts === LATEST_SCHEMA &&
       publishedUpgrade.grants_table === 1 &&
       publishedUpgrade.ledger_table === 1 &&
       publishedUpgrade.document_grants_table === 1,

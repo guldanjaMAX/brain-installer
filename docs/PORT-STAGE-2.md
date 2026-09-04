@@ -85,3 +85,31 @@ A file copy can silently drop any change that lives inside a shared file and
 has no test. That is why the field's own tests came across: they are the only
 thing that refuses to let it happen quietly. **A ported test that cannot pass
 gets a written reason, not a deletion.**
+
+
+## Four pre-existing tests the port breaks, and why (measured 2026-09-03 22:30)
+
+Stage 1's commit message reported the 23 failing PORTED tests. It did not
+report that the port also breaks four tests that were passing, because the npm
+chain short-circuits at the first failure and never reached them. Corrected
+here.
+
+| Test | Cause | State |
+|---|---|---|
+| `test/migrations.test.mjs` | Pinned the literal `22` as the receipt count for a full upgrade. The port makes it 32. | **Fixed.** Follows `LATEST_SCHEMA` now, so it checks that a published schema-16 brain reaches the current schema rather than recording what the tree used to hold. |
+| `worker/test/fin-routes.test.mjs` | `freshDb({throughLedger:false})` skips `0017_financial_ledger.sql` to model a brain with no ledger. `0026_plaid_durability.sql` alters the tables 0017 creates, so it fails with "no such table: fin_accounts". | **Open.** Skipping 0026 as well moves the failure to "no such table: plaid_sync_windows", because later ported migrations depend on 0026. The dependency is transitive and a hand-kept skip list will not hold. |
+| `worker/test/fin-d1.test.mjs` | Same shape, its own no-ledger helper. | **Open**, same root cause. |
+| `test/bank-import-path.test.mjs` | Same shape. | **Open**, same root cause. |
+
+The real finding is one sentence: **the ported migrations assume the financial
+ledger exists, and three tests model a brain where it does not.** That is a
+genuine product question, not a test problem. Either the ledger stops being
+optional at schema 32, or migrations 0026 onward have to tolerate its absence.
+Decide that before patching any of the three, because a skip list encodes the
+answer silently and the transitive chain will outgrow it.
+
+A note on measuring this: running these three in a loop gave different results
+from running them one at a time, twice, which sent me chasing a phantom
+"not idempotent" bug for ten minutes. They are deterministic. The loop was
+reading a working tree I was concurrently changing. Measure a tree you are not
+editing.
