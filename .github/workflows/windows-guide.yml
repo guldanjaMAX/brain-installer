@@ -114,7 +114,14 @@ jobs:
         run: |
           $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
           $env:BRAIN_NO_WRANGLER_LOGIN = "1"
-          $out = (brain status "$HOME\nope\brain.manifest.json" 2>&1 | Out-String)
+          # A REAL manifest is required to reach the credential check at all:
+          # the manifest is read first, so pointing at a missing file tests the
+          # config error, not the credential path. `brain init` writes one with
+          # no network and no token, which is exactly what it is for.
+          $m = "$env:RUNNER_TEMP\brain.manifest.json"
+          brain init $m --name "CI Probe" --slug "ci-probe" --account "00000000000000000000000000000000" | Out-Null
+          if (-not (Test-Path $m)) { throw "brain init did not write a manifest at $m" }
+          $out = (brain status $m 2>&1 | Out-String)
           $ok = $out -match 'wrangler@4 login' -or $out -match 'no Cloudflare credential'
           if (-not $ok) { throw "no-credential run did not explain itself. It printed:`n$out" }
           "refuses and points at the browser sign-in"
