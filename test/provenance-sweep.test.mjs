@@ -163,3 +163,57 @@ assert.equal(tierOf({ source: env.source }).tier, "T1");
 ok("the written record is primary, because the owner made it about the present on purpose");
 
 console.log(`\n${pass} passed`);
+
+// --- the command itself, with the brain, the prompt and the write injected ---
+const { cmdCheck } = await import("../brain.mjs");
+const { writeFileSync, mkdtempSync } = await import("node:fs");
+const { join: joinPath } = await import("node:path");
+const { tmpdir } = await import("node:os");
+
+const dir = mkdtempSync(joinPath(tmpdir(), "brain-check-"));
+const manifestPath = joinPath(dir, "brain.manifest.json");
+writeFileSync(manifestPath, JSON.stringify({
+  client: { slug: "fixture", display_name: "Fixture" },
+  brain: { version: "0.3.5", domain: "fixture.invalid", worker_name: "fixture-brain" },
+  infrastructure: { cloudflare: { account_id: "a".repeat(32), storage: "d1", d1_database_name: "fixture-brain" } },
+}, null, 2));
+
+const searchStub = async ({ q }) => rowsFor(q);
+
+// read-only by default: it must not write, whatever it finds
+let wrote = false;
+const readOnly = await cmdCheck(manifestPath, {
+  adminKey: "test", baseUrl: "https://fixture.invalid", flags: {},
+  search: searchStub, write: async () => { wrote = true; },
+});
+assert.equal(readOnly.wrote, false);
+assert.equal(wrote, false);
+assert.ok(readOnly.conflicts >= 1, "it still found the conflict");
+ok("brain check is read-only without --set, even when it finds something");
+
+// --set with an answer writes exactly one record, and it is primary
+let envelope = null;
+const set = await cmdCheck(manifestPath, {
+  adminKey: "test", baseUrl: "https://fixture.invalid", flags: { set: true },
+  search: searchStub, ask: async () => "2",
+  write: async (e) => { envelope = e; return { ok: true }; },
+});
+assert.equal(set.wrote, true);
+assert.ok(envelope, "a confirmation was written");
+assert.equal(envelope.source, "owner-confirmed");
+assert.match(envelope.content, /Operative value:/);
+assert.match(envelope.content, /Supersedes:/);
+ok("--set writes one dated primary record carrying what it supersedes");
+
+// --set where the owner is unsure must write NOTHING
+let wroteOnUnsure = false;
+const unsureRun = await cmdCheck(manifestPath, {
+  adminKey: "test", baseUrl: "https://fixture.invalid", flags: { set: true },
+  search: searchStub, ask: async () => "",
+  write: async () => { wroteOnUnsure = true; },
+});
+assert.equal(unsureRun.wrote, false);
+assert.equal(wroteOnUnsure, false, "silence must never become a written fact");
+ok("--set writes nothing when the owner resolves nothing");
+
+console.log(`\n${pass} passed`);
