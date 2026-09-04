@@ -130,6 +130,13 @@ import {
   hasStoredCloudflareToken,
   storedTokenReference,
 } from "./operations/cloudflare-token-store.mjs";
+import {
+  fetchLatestRelease,
+  installPrefixOf,
+  installedEntry,
+  releaseTarballUrl,
+  selfUpdateDecision,
+} from "./operations/self-update.mjs";
 import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
 import { deriveSessionSigningKey } from "./operations/session-signing-key.mjs";
 import {
@@ -13426,7 +13433,81 @@ async function cmdToken(manifestPath) {
 }
 
 /** Beginner update path: verify custody first, then run the fully gated upgrade. */
+/**
+ * Put the current release on this machine before updating anything with it.
+ *
+ * `brain update` used to upgrade a brain to whatever installer happened to be
+ * sitting on the computer, so a written step existed to tell a human to
+ * install the release first. On 2026-09-03 that step was missed on a live
+ * install and the stranded 0.3.4 was re-run against itself; the repair cost
+ * two hours on a call. A step that must never be skipped does not belong in a
+ * document.
+ *
+ * Deliberately quiet when there is nothing to do, loud when it acts, and never
+ * silent when it cannot check.
+ */
+export async function selfUpdateBeforeUpdate(options = {}) {
+  const decide = options.selfUpdateDecision ?? selfUpdateDecision;
+  const latest = options.latest !== undefined
+    ? options.latest
+    : await (options.fetchLatestRelease ?? fetchLatestRelease)();
+  const entry = options.entryPath ?? fileURLToPath(import.meta.url);
+  const decision = decide({
+    running: options.running ?? PRODUCT_VERSION,
+    latest,
+    prefix: options.prefix !== undefined ? options.prefix : installPrefixOf(entry),
+    optedOut: options.optedOut ?? process.argv.includes("--no-self-update"),
+    alreadyReexeced: options.alreadyReexeced ?? process.env.BRAIN_SELF_UPDATED === "1",
+  });
+
+  if (decision.action === "current" || decision.action === "skip") return decision;
+  if (decision.action === "warn") {
+    // Not fatal. A client who cannot reach GitHub but can reach Cloudflare must
+    // still be able to finish a stranded update. But say it, because running
+    // the wrong version is exactly how the stranding happened.
+    warn(`could not confirm this is the current installer (${decision.reason}); continuing with ${PRODUCT_VERSION}`);
+    return decision;
+  }
+
+  const prefix = options.prefix !== undefined ? options.prefix : installPrefixOf(entry);
+  info(`installing the current release first: ${decision.reason}`);
+  const run = options.spawnSync ?? spawnSync;
+  const installed = run(
+    "npm",
+    ["install", "-g", "--prefix", prefix, releaseTarballUrl(decision.version)],
+    { stdio: "inherit", shell: process.platform === "win32" },
+  );
+  if (installed.status !== 0) {
+    die(
+      `could not install release ${decision.version} into ${prefix}.\n` +
+        "      Nothing was changed. Install it by hand and run the same command again:\n" +
+        `        npm install -g --prefix "${prefix}" ${releaseTarballUrl(decision.version)}`,
+    );
+  }
+
+  const next = (options.installedEntry ?? installedEntry)(prefix);
+  if (!next) {
+    die(
+      `release ${decision.version} installed into ${prefix}, but its entry point was not found there.\n` +
+        "      Nothing was changed. Run the same command again and it will use the new version.",
+    );
+  }
+
+  ok(`now running ${decision.version}`);
+  const again = run(process.execPath, [next, ...process.argv.slice(2)], {
+    stdio: "inherit",
+    env: { ...process.env, BRAIN_SELF_UPDATED: "1" },
+  });
+  return { action: "reexeced", status: again.status ?? 1, version: decision.version };
+}
+
 export async function cmdUpdate(manifestPath, options = {}) {
+  // Before anything is read or changed: make sure the program about to do the
+  // upgrading is the published one. A re-exec ends this process.
+  if (options.selfUpdate !== false) {
+    const self = await (options.selfUpdateBeforeUpdate ?? selfUpdateBeforeUpdate)(options.selfUpdateOptions || {});
+    if (self.action === "reexeced") return process.exit(self.status);
+  }
   let installed;
   try {
     const discoverManifest = options.discoverInstalledManifest ?? discoverInstalledManifest;
