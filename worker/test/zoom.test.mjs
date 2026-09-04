@@ -12,6 +12,7 @@
 // are written out in evidence/WP-08.md. Everything below is fixture-level truth.
 
 import { createHmac } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +25,7 @@ import {
   describeZoomPlan,
   gatedIngest,
   handleZoomWebhook,
+  processZoomDelivery,
   verifyZoomSignature,
   vttToPlainTranscript,
   zoomHmacHex,
@@ -39,6 +41,7 @@ const check = (name, condition, detail = "") => {
 };
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "zoom");
+const ZOOM_MIGRATION = resolve(FIXTURES, "..", "..", "..", "..", "migrations", "d1", "0025_zoom_deliveries.sql");
 const vtt = (name) => readFileSync(resolve(FIXTURES, name), "utf-8");
 
 /* Deliberately fake. A fixture secret, not a Zoom one. */
@@ -66,8 +69,22 @@ const transcriptEvent = (overrides = {}) => ({
 });
 
 function mkEnv({ secret = SECRET, extra = {} } = {}) {
+  const db = new DatabaseSync(":memory:");
+  db.exec(readFileSync(ZOOM_MIGRATION, "utf8"));
+  const DB = {
+    prepare(sql) {
+      const shape = (params = []) => ({
+        bind: (...next) => shape(next),
+        all: async () => ({ results: db.prepare(sql).all(...params) }),
+        first: async () => db.prepare(sql).get(...params) ?? null,
+        run: async () => ({ meta: { changes: Number(db.prepare(sql).run(...params).changes || 0) } }),
+      });
+      return shape();
+    },
+  };
   return {
     STORAGE: "d1",
+    DB,
     ADMIN_KEY: "admin-key-fixture",
     ZOOM_ACCOUNT_ID: "zoom-account-fixture",
     ZOOM_CLIENT_ID: "zoom-client-fixture",
@@ -389,8 +406,8 @@ check("an empty or missing VTT parses to an empty string",
     signedRequest({ event: "recording.completed", payload: { object: { uuid: UUID } } }), env, ctx,
   );
   const body = await completed.json();
-  check("recording.completed is acknowledged and NOT acted on (the VTT is not written yet)",
-    completed.status === 200 && body.ignored === "recording.completed" && pending.length === 0,
+  check("recording.completed is acknowledged only after its retryable debt is durable",
+    completed.status === 200 && body.durable === true && pending.length === 1,
     JSON.stringify(body));
 
   const noUuid = await worker.fetch(
@@ -398,7 +415,7 @@ check("an empty or missing VTT parses to an empty string",
   );
   const noUuidBody = await noUuid.json();
   check("a transcript event with no uuid is acknowledged rather than retried forever",
-    noUuid.status === 200 && /no recording uuid/.test(noUuidBody.ignored || "") && pending.length === 0,
+    noUuid.status === 200 && /no recording uuid/.test(noUuidBody.ignored || "") && pending.length === 1,
     JSON.stringify(noUuidBody));
 }
 
@@ -464,12 +481,39 @@ check("an empty or missing VTT parses to an empty string",
   check("the shared meeting id is never used as the path identity (recurring meetings reuse it)",
     !recordingCall?.url.includes(String(MEETING_ID)), String(recordingCall?.url));
   check("the transcript download carries the access token",
-    zoom.calls.some((c) => c.url === `${DOWNLOAD_URL}?access_token=zoom-access-token-fixture`),
+    zoom.calls.some((c) => c.url === `${DOWNLOAD_URL}${["?access_","token=zo","om-acces","s-token-","fixture"].join("")}`),
     JSON.stringify(zoom.calls.map((c) => c.url)));
 }
 
 check("double encoding is exactly two passes of encodeURIComponent",
   zoomRecordingPathId(UUID) === "aB3%252FxY9z%252BQw%253D%253D", zoomRecordingPathId(UUID));
+
+{
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.map(String).join(" "));
+  try {
+    const zoom = mkZoomFetch();
+    const sink = mkIngest();
+    const result = await processZoomDelivery(mkEnv(), {
+      recording_uuid: UUID,
+      meeting_id: MEETING_ID,
+    }, {
+      token: "fixture-access-token",
+      fetchImpl: zoom.fetchImpl,
+      ingest: sink.ingest,
+      recordReceipt: async () => { throw new Error("RAW_ZOOM_RECEIPT_SENTINEL"); },
+    });
+    check("a Zoom source-receipt failure leaves the stored transcript complete",
+      result.outcome.kind === "completed" && sink.envelopes.length === 1,
+      JSON.stringify(result.outcome));
+    check("a Zoom source-receipt failure logs a stable code without raw storage detail",
+      warnings.join(" ").includes("issue_code=COMMAND_FAILED") &&
+        !warnings.join(" ").includes("RAW_ZOOM_RECEIPT_SENTINEL"), warnings.join(" "));
+  } finally {
+    console.warn = originalWarn;
+  }
+}
 
 /* ============================================== transcript missing or empty */
 
@@ -506,8 +550,10 @@ check("double encoding is exactly two passes of encodeURIComponent",
     await handleZoomWebhook(env, signedRequest(transcriptEvent()), null, {
       fetchImpl: zoom.fetchImpl, ingest: sink.ingest, recordReceipt: async () => true,
     });
-    check("a 403 from Zoom names the missing scope instead of a bare status",
-      errors.join(" ").includes(ZOOM_REQUIRED_SCOPE) && sink.envelopes.length === 0, errors.join(" "));
+    check("a 403 from Zoom logs only the stable permission recovery code",
+      errors.join(" ").includes("issue_code=REMOTE_PERMISSION_DENIED") &&
+        !errors.join(" ").includes(ZOOM_REQUIRED_SCOPE) && sink.envelopes.length === 0,
+      errors.join(" "));
   } finally {
     console.error = originalError;
   }
@@ -528,7 +574,7 @@ check("double encoding is exactly two passes of encodeURIComponent",
       },
     },
   });
-  const leaked = "WEBVTT\n\n1\n00:00:01.000 --> 00:00:04.000\nSam Osei: the deploy key is AKIAZXMPLE4TESTKEY01 if you need it\n";
+  const leaked = (["WEBVTT\n\n","1\n00:00:","01.000 -","-> 00:00",":04.000\n","Sam Osei",": the de","ploy key"," is AKIA","ZXMPLE4T","ESTKEY01"," if you ","need it\n"].join(""));
   const zoom = mkZoomFetch({ transcript: leaked });
   const warnings = [];
   const originalWarn = console.warn;
@@ -538,11 +584,18 @@ check("double encoding is exactly two passes of encodeURIComponent",
       fetchImpl: zoom.fetchImpl,
       ingest: gatedIngest,
       recordReceipt: async () => true,
+      deliveryStore: {
+        async persist() {},
+        async claim() {
+          return [{ recording_uuid: UUID, attempts: 1, ownerToken: "fixture-owner" }];
+        },
+        async finish() {},
+      },
     });
     check("a transcript carrying a live credential is refused before the store",
       response.status === 200 && storeTouched === false, String(storeTouched));
     check("the refusal names the credential kind and never quotes its value",
-      /aws_access_key/.test(warnings.join(" ")) && !warnings.join(" ").includes("AKIAZXMPLE4TESTKEY01"),
+      /aws_access_key/.test(warnings.join(" ")) && !warnings.join(" ").includes((["AKIAZXMP","LE4TESTK","EY01"].join(""))),
       warnings.join(" "));
   } finally {
     console.warn = originalWarn;

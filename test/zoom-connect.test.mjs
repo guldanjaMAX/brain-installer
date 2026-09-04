@@ -35,18 +35,13 @@ const check = (name, condition, detail = "") => {
 };
 
 /**
- * A minimal Response stand-in.
- *
- * Carries both `text()` and `json()` because a real fetch Response does, and a
- * stub that offered only the one the code happens to call today would turn any
- * future switch between them into a test-only crash.
+ * Use a real streaming Response so the probe exercises the same bounded body
+ * reader used for provider traffic in production.
  */
-const reply = (status, body) => ({
-  ok: status >= 200 && status < 300,
-  status,
-  text: async () => (typeof body === "string" ? body : JSON.stringify(body ?? {})),
-  json: async () => (typeof body === "string" ? JSON.parse(body) : (body ?? {})),
-});
+const reply = (status, body) => new Response(
+  typeof body === "string" ? body : JSON.stringify(body ?? {}),
+  { status, headers: { "content-type": "application/json" } },
+);
 
 const GOOD = Object.freeze({
   ZOOM_ACCOUNT_ID: "account-abc",
@@ -65,7 +60,8 @@ function zoomFetch(routes) {
     calls.push({ url: String(url), init });
     for (const [fragment, responder] of Object.entries(routes)) {
       if (String(url).includes(fragment)) {
-        return typeof responder === "function" ? responder(String(url), init) : responder;
+        if (typeof responder === "function") return responder(String(url), init);
+        return typeof responder?.clone === "function" ? responder.clone() : responder;
       }
     }
     return reply(404, { message: "unscripted" });
@@ -128,10 +124,11 @@ const TOKEN_OK = reply(200, { access_token: "tok-live", expires_in: 3600 });
   const subscription = zoomEventSubscriptionSteps("https://brain.example.test/api/webhooks/zoom").join("\n");
   check("the subscription steps carry the exact URL the worker answers on",
     subscription.includes("https://brain.example.test/api/webhooks/zoom"));
-  check("the subscribed event is recording.transcript_completed",
+  check("the subscription records early debt and transcript-ready delivery",
+    subscription.includes("recording.completed") &&
     subscription.includes("recording.transcript_completed"));
-  check("and recording.completed is named as the wrong one, with the reason",
-    /Not recording\.completed/.test(subscription) && /before the/.test(subscription));
+  check("the steps explain why both events are required",
+    /durable work debt/.test(subscription) && /transcript is ready/.test(subscription));
   check("the subscription steps explain that clicking Validate calls the URL live",
     /Zoom calls that URL right now/.test(subscription));
   check("the subscription steps state the cloud-recording-with-transcript prerequisite",
@@ -235,10 +232,13 @@ const TOKEN_OK = reply(200, { access_token: "tok-live", expires_in: 3600 });
     "/users/me/recordings": reply(200, { meetings: [] }),
     "/users/me": () => { throw new Error("socket hang up"); },
   });
-  const probe = await probeZoomAccount(GOOD, { fetchImpl: impl });
+  const probe = await probeZoomAccount(GOOD, {
+    fetchImpl: impl,
+    requestOptions: { maxAttempts: 2, sleepImpl: async () => {} },
+  });
   const summary = summarizeZoomProbe(probe);
   check("a thrown plan check is caught and named, not left to crash the connect",
-    !probe.plan.confirmed && /socket hang up/.test(probe.plan.reason || "") && summary.ok,
+    !probe.plan.confirmed && /could not be reached/.test(probe.plan.reason || "") && summary.ok,
     probe.plan.reason);
 }
 
