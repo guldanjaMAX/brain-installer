@@ -25,7 +25,7 @@ into the not-yet-visible shape, then updated with the candidate. Required legs:
 
 The floor is a fact about the field, not a preference. It moves up only when
 the last client on that version has updated. As of 2026-09-03 it is **0.2.0**
-(Lindsay). Brains built from a working branch are excluded by definition: no
+(a founding client). Brains built from a working branch are excluded by definition: no
 published release can update them, and the schema guard refuses them.
 
 A third leg from the oldest published tarball is worth running occasionally,
