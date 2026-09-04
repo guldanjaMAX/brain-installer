@@ -450,6 +450,7 @@ const expected = [
   // brain check: the provenance tiering, the contradiction sweep, its probe
   // catalogue, and the run. Reviewed 2026-09-04: no identity, no client
   // details, no credentials. The probes are categories, never a person.
+  "operations/backup.mjs",
   "operations/provenance.mjs",
   "operations/contradiction-sweep.mjs",
   "operations/check-probes.mjs",
