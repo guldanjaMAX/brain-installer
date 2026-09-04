@@ -130,6 +130,21 @@ import {
   hasStoredCloudflareToken,
   storedTokenReference,
 } from "./operations/cloudflare-token-store.mjs";
+import {
+  backupArgs,
+  renderBackupPlan,
+  renderBackupReceipt,
+  sidecarFor,
+  verifyBackup,
+} from "./operations/backup.mjs";
+import { RECOVERY_EXPORT_TABLES } from "./operations/cloudflare-recovery-adapter.mjs";
+import {
+  collectAnswers,
+  confirmationEnvelope,
+  gather,
+  renderConfirmations,
+  renderReport,
+} from "./operations/check-run.mjs";
 import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
 import { deriveSessionSigningKey } from "./operations/session-signing-key.mjs";
 import {
@@ -2609,6 +2624,131 @@ export async function cmdMigrate(manifestPath, options = {}) {
   );
   if (!silent) ok(`schema at version ${schemaVersion}`);
   return { applied: pending.length, schemaVersion };
+}
+
+/**
+ * `brain check` — ask the corpus where it disagrees with itself.
+ *
+ * A brain scores independent agreement as strength. For a fact that never
+ * changes that is right; for one that does it inverts, because a value that
+ * stopped being true keeps collecting agreeing copies while the current value
+ * has one source or none. So this looks for the disagreements and hands each
+ * one to the owner, who is the only party that can say which is current.
+ *
+ * Read-only without `--set`. With `--set` it writes ONE dated record of the
+ * owner's own answers, and it writes nothing at all if they resolved nothing.
+ */
+/**
+ * `brain backup` — one file the owner keeps, containing their own documents.
+ *
+ * Data only, because `wrangler d1 export` refuses this schema outright over the
+ * FTS5 search table and `--no-schema` is the way through. That loses nothing:
+ * the index stores no copy of the text and is rebuilt from the documents.
+ *
+ * Reads and writes exactly one file. It cannot change the brain.
+ */
+export async function cmdBackup(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const flags = options.flags ?? parseFlags(process.argv.slice(4));
+  const acct = options.account ?? await (options.resolveAccount ?? resolveAccount)(m);
+  const databaseName = m.infrastructure?.cloudflare?.d1_database_name;
+  const dbId = m.infrastructure?.cloudflare?.d1_database_id;
+  if (!databaseName || !dbId) die("no D1 database in the manifest. Run `brain provision` first.");
+
+  const today = (options.now ?? (() => new Date()))().toISOString();
+  const out = String(flags.out || options.out ||
+    join(dirname(manifestPath), `brain-backup-${today.slice(0, 10)}.sql`));
+  const tables = [...RECOVERY_EXPORT_TABLES];
+
+  // What is installed decides what a restore must rebuild first, so read it
+  // before the export rather than guessing afterwards.
+  let schemaVersion = null;
+  let productVersion = null;
+  try {
+    const state = await (options.d1Query ?? d1Query)(acct.id, dbId,
+      "SELECT schema_version, product_version FROM install_state WHERE id = 1");
+    const row = state?.results?.[0];
+    schemaVersion = row?.schema_version ?? null;
+    productVersion = row?.product_version ?? null;
+  } catch (error) {
+    warn(`could not read the schema version (${String(error?.message || error).slice(0, 120)}); the backup will say so`);
+  }
+
+  console.log("");
+  console.log(renderBackupPlan({ databaseName, out, tables, schemaVersion }));
+  console.log("");
+  if (!flags.yes) {
+    const go = String(await (options.ask ?? ask)("Take the backup now? (y/n)", "n")).trim().toLowerCase();
+    if (go !== "y" && go !== "yes") { info("nothing was done."); return { taken: false }; }
+  }
+
+  const run = options.wrangler ?? wrangler;
+  await run({ accountId: acct.id, databaseName }, backupArgs({ databaseName, out, tables }));
+  const bytes = (options.statBytes ?? ((p) => statSync(p).size))(out);
+  const verified = verifyBackup({ bytes, tables });
+  if (!verified.ok) die(`the backup did not complete: ${verified.reason}. Nothing was left behind that could be mistaken for one.`);
+
+  const sidecar = sidecarFor({
+    databaseName, schemaVersion, productVersion, tables, bytes,
+    migrations: options.migrations ?? [], when: today,
+  });
+  const sidecarPath = `${out}.json`;
+  (options.writeFile ?? writeFileSync)(sidecarPath, JSON.stringify(sidecar, null, 2));
+  console.log("");
+  console.log(renderBackupReceipt({ out, sidecar, verified }));
+  return { taken: true, out, sidecarPath, bytes, schemaVersion };
+}
+
+export async function cmdCheck(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const acct = m.brain?.domain ? null : await (options.resolveAccount ?? resolveAccount)(m);
+  const base = options.baseUrl ?? await (options.resolveBaseUrl ?? resolveBaseUrl)(m, acct);
+  const adminKey = options.adminKey ?? resolveAdminKey(manifestPath);
+  if (!adminKey) die("no admin key found: re-run `brain setup` so this Brain can be opened safely.");
+  const request = options.http ?? http;
+  const flags = options.flags ?? parseFlags(process.argv.slice(4));
+
+  const search = options.search ?? (async (body) => {
+    const response = await request(`${base}/api/rag/unified`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }, { timeoutMs: 60_000, what: "the search" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  });
+
+  info("reading your records. Nothing is written unless you say so.");
+  const gathered = await gather(search);
+  const report = renderReport(gathered);
+  console.log("");
+  console.log(report.text);
+
+  if (!flags.set) return { conflicts: report.assessed.filter((a) => a.conflict).length, wrote: false };
+
+  const conflicts = report.assessed.filter((a) => a.conflict);
+  if (!conflicts.length) { ok("nothing to confirm."); return { conflicts: 0, wrote: false }; }
+
+  console.log("");
+  const { answers, unresolved } = await collectAnswers(conflicts, options.ask ?? ask);
+  if (unresolved.length) {
+    info(`left unresolved, and NOT guessed: ${unresolved.join(", ")}`);
+  }
+  const markdown = renderConfirmations(answers);
+  if (!markdown) { info("you resolved none of them, so nothing was written."); return { conflicts: conflicts.length, wrote: false }; }
+
+  const write = options.write ?? (async (envelope) => {
+    const response = await request(`${base}/api/admin/brain/ingest`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify(envelope),
+    }, { timeoutMs: 60_000, what: "the confirmation" });
+    if (!response.ok) die(`the confirmation could not be saved (HTTP ${response.status}). Nothing was changed.`);
+    return response.json();
+  });
+  await write(confirmationEnvelope(markdown));
+  ok(`recorded ${answers.length} confirmation(s). They now outrank the records they supersede.`);
+  return { conflicts: conflicts.length, wrote: true, confirmed: answers.length };
 }
 
 async function cmdStatus(manifestPath) {
@@ -13784,6 +13924,8 @@ const commands = {
   load: cmdLoad,
   connect: cmdConnect,
   disconnect: cmdDisconnect,
+  backup: cmdBackup,
+  check: cmdCheck,
   status: cmdStatus,
   sources: cmdSources,
   forget: cmdForget,
@@ -13828,6 +13970,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain drain      <manifest>            finish the vector embedding now, with a live ETA
     brain reindex    <manifest>            rebuild the vector index from D1, no source files needed
     brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
+    brain check      <manifest>            where your records disagree with themselves; --set records your answers
+    brain backup     <manifest>            one file with your documents in it; --out <path>, --yes to skip the prompt
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it
     brain token      <manifest>            is a Cloudflare token remembered on this Mac? --forget removes it
