@@ -672,7 +672,10 @@ const call = (env, path) => {
     },
   });
   const body = await (await call(env, "/api/rag/think?q=What+were+the+amount+and+the+deadline%3F")).json();
-  check("an incomplete multi-part answer fails closed", body.answer === "The documents do not answer the question." && body.evidence_gate?.complete === false, JSON.stringify(body));
+  check("an incomplete multi-part answer keeps the supported part and names the gap",
+    body.answer !== "The documents do not answer the question." && /\$5,000 \[1\]/.test(body.answer) &&
+      /Not covered by the documents: the deadline was silently omitted\./.test(body.answer) &&
+      body.evidence_gate?.complete === false && body.evidence_gate?.partial === true, JSON.stringify(body));
   check("the completeness refusal preserves the verifier reason", /deadline was silently omitted/.test(body.evidence_gate?.reason || ""), JSON.stringify(body.evidence_gate));
 }
 
@@ -1837,8 +1840,8 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   // only be read by standing at the owner's machine. /health reports it so a
   // fleet is checkable from one place. A D1 that cannot answer must not take
   // /health down with it: the field is simply absent.
-  check("a brain whose database cannot answer still reports health, without the schema field",
-    !("schema_version" in health), JSON.stringify(health));
+  check("a paused brain reports health without reading its database for the schema",
+    !("schema_version" in health) && forbiddenCalls === 0, JSON.stringify({ health, forbiddenCalls }));
 
   {
     const readable = {
@@ -2436,3 +2439,42 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
 
 console.log(fail ? `\n${fail} FAILURES` : `\nroutes: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);
+
+/* ---- supported but incomplete keeps the supported part and names the gap ---- */
+{
+  const rows = [{ ...ROW, chunk_uid: "lease:1#0", doc_uid: "lease:1", title: "Office lease 2026", client: null,
+    text: "The lease renews on 2027-03-01. The landlord is Acme Holdings." }];
+  const { env } = mkEnv(rows, { extra: { AI: { run: async (model, input) => model.includes("bge-")
+    ? ({ data: [[0.1, 0.2, 0.3]] })
+    : String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+      ? ({ response: { supported: true, complete: false, evidence: [1], reason: "does not state the notice period" }, usage: {} })
+      : ({ response: "The lease renews on 2027-03-01 [1]. The landlord is Acme Holdings [1].", usage: {} }) } } });
+  const body = await (await call(env, "/api/rag/think?q=When+does+the+lease+renew+and+what+is+the+notice+period")).json();
+  check("supported-but-incomplete no longer collapses to the refusal",
+    body.answer !== "The documents do not answer the question." && /renews on 2027-03-01 \[1\]/.test(body.answer), JSON.stringify(body));
+  check("the uncovered part is named in one plain sentence",
+    /Not covered by the documents: does not state the notice period\./.test(body.answer), body.answer);
+  check("partial is flagged on the gate and citations are the approved ones only",
+    body.evidence_gate?.partial === true && body.evidence_gate?.supported === true && body.citations?.length === 1, JSON.stringify(body.evidence_gate));
+  check("confidence says the answer is partial and scores below a complete one",
+    Array.isArray(body.confidence?.basis) && body.confidence.basis.some((b) => /^answer is partial/.test(b)) && body.confidence.percent < 75, JSON.stringify(body.confidence));
+}
+
+/* ---- unsupported still produces the verbatim refusal, with its reason beside it ---- */
+{
+  const rows = [{ ...ROW, chunk_uid: "policy:1#0", doc_uid: "policy:1", title: "Other Co handbook", client: null,
+    text: "Other Co offers twelve weeks of parental leave." }];
+  const { env } = mkEnv(rows, { extra: { AI: { run: async (model, input) => model.includes("bge-")
+    ? ({ data: [[0.1, 0.2, 0.3]] })
+    : String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+      ? ({ response: { supported: false, complete: false, evidence: [], reason: "cites another company's policy" }, usage: {} })
+      : ({ response: "You offer twelve weeks of parental leave [1].", usage: {} }) } } });
+  const body = await (await call(env, "/api/rag/think?q=What+is+our+parental+leave+policy")).json();
+  check("true absence keeps the verbatim refusal sentence",
+    body.answer === "The documents do not answer the question." && body.citations?.length === 0, JSON.stringify(body));
+  check("the refusal reason rides beside the sentence, never inside it",
+    /another company/.test(body.evidence_gate?.reason || "") && body.evidence_gate?.partial !== true, JSON.stringify(body.evidence_gate));
+}
+
+console.log(`\n${ran} checks, ${fail} failed`);
+if (fail) process.exit(1);

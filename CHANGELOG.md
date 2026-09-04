@@ -10,6 +10,16 @@ the brain, not for whoever built it: what changed for them, and what to check.
   naming both numbers. The version guard compared version strings only, and a
   brain built from a working branch records a lower string while running a
   higher schema, so the one number that mattered was the one nothing looked at.
+- An answer the verifier judged supported but incomplete no longer collapses to
+  "The documents do not answer the question." The sentences whose citations were
+  approved are kept, one line names what the documents did not cover, and the
+  answer is marked partial and scored ten points lower. A refusal that is still
+  a refusal is unchanged, word for word. Three of the four confidently wrong or
+  missing answers found in the 2026-09-03 triage were this shape.
+- A refusal now says why. `brain ask` prints the verifier's reason under the
+  trust line, and the MCP server carries the confidence, the gate reason and the
+  documents it did find, so "I found four documents and could not write a
+  supported answer from them" stops reading as "nothing recorded".
 - `/health` reports `schema_version`. Whether a brain may take a published
   update is decided by that integer, and until now it could only be read by
   standing at the owner's machine. A fleet is now checkable from one place. The

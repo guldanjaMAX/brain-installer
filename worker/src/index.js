@@ -810,9 +810,35 @@ async function handleThink(env, request, access = null, grantScope = { all: true
               evidenceGate.reason = temporalFailure;
             }
           }
-          if (!evidenceGate.supported || !evidenceGate.complete || !allowed.size) {
+          if (!evidenceGate.supported || !allowed.size) {
             answer = unsupportedAnswer;
             approvedDocs = [];
+          } else if (!evidenceGate.complete) {
+            // Supported but incomplete used to be thrown away whole. The
+            // verifier said every cited claim holds and one requested part is
+            // missing. Keep the sentences the verifier approved, drop any
+            // sentence that leans on an unapproved citation, and say in one
+            // plain sentence what the documents do not cover. A true absence
+            // still produces the verbatim refusal above; this path never does.
+            const headsUpAt = answer.search(/\n\s*Heads up:/i);
+            const bodyText = headsUpAt >= 0 ? answer.slice(0, headsUpAt) : answer;
+            const headsUp = headsUpAt >= 0 ? answer.slice(headsUpAt).trim() : "";
+            const kept = (bodyText.match(/[^.!?\n]+[.!?]+(?:\s*\[\d+\])*|[^.!?\n]+$/g) || [])
+              .map((sentence) => sentence.trim())
+              .filter((sentence) => {
+                const cites = [...sentence.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1]));
+                return cites.length > 0 && cites.every((n) => allowed.has(n));
+              });
+            if (!kept.length) {
+              answer = unsupportedAnswer;
+              approvedDocs = [];
+              evidenceGate.reason = evidenceGate.reason || "no sentence survived the citation check";
+            } else {
+              const missing = String(evidenceGate.reason || "one part of the question").replace(/\.$/, "");
+              answer = `${kept.join(" ")}\n\nNot covered by the documents: ${missing}.${headsUp ? `\n\n${headsUp}` : ""}`;
+              approvedDocs = citedDocs.filter((doc) => allowed.has(doc.n));
+              evidenceGate.partial = true;
+            }
           } else {
             approvedDocs = citedDocs.filter((doc) => allowed.has(doc.n));
           }
@@ -838,7 +864,7 @@ async function handleThink(env, request, access = null, grantScope = { all: true
           resultCount: results.length,
           sources: [...new Set(results.map((r) => r.source).filter(Boolean))],
         })
-      : computeAnswerConfidence({ approvedDocs, gaps, degraded });
+      : computeAnswerConfidence({ approvedDocs, gaps, degraded, partial: evidenceGate?.partial === true ? (evidenceGate.reason || "one part not covered") : null });
 
   return jsonResponse({
     mode: "think",
@@ -1552,7 +1578,13 @@ export default {
       // Which migrations this brain has run. The number that decides whether a
       // published update may touch it, readable without a key so a fleet can be
       // checked from one place instead of one machine at a time.
-      const schemaVersion = backendOf(env) === D1 ? await installedSchemaVersion(env) : null;
+      //
+      // NOT while paused. A cutover pause means this Worker touches no database
+      // at all, and health is the one route that must answer during it; buying
+      // an integer at the cost of that invariant is the wrong trade, and a
+      // paused brain is not a candidate for an update anyway. Caught by the
+      // route suite's zero-call assertion rather than by review.
+      const schemaVersion = !paused && backendOf(env) === D1 ? await installedSchemaVersion(env) : null;
       return jsonResponse({
         ok: !paused,
         status: paused ? "paused-for-upgrade" : "ok",

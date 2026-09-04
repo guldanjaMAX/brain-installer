@@ -2337,6 +2337,14 @@ export async function cmdAsk(manifestPath, options = {}) {
     refused: /^The documents do not answer/i.test(answer),
   });
   if (trust) console.log(`  ${c.dim(trust)}\n`);
+  // Say WHY when the answer was refused or cut short. The gate already
+  // records it; hiding it left the owner with one sentence that meant five
+  // different things.
+  const gate = body.evidence_gate && typeof body.evidence_gate === "object" ? body.evidence_gate : null;
+  const gateReason = gate && typeof gate.reason === "string" ? gate.reason.replace(/\s+/g, " ").trim().slice(0, 240) : "";
+  if (gateReason && (/^The documents do not answer/i.test(answer) || gate.partial === true)) {
+    console.log(`  ${c.dim(gate.partial === true ? "Not covered" : "Why")}: ${gateReason}\n`);
+  }
   if (body.answer_error) warn(`answer generation reported: ${String(body.answer_error).slice(0, 160)}`);
   if (body.degraded) warn(`search is degraded: ${String(body.degraded).slice(0, 80)}`);
   const citations = Array.isArray(body.citations) ? body.citations : [];
