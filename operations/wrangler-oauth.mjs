@@ -24,22 +24,30 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { win32 as pathWin32, posix as pathPosix } from "node:path";
 
 /** Every place wrangler is known to keep its config, newest layout first. */
 export function wranglerConfigCandidates(env = process.env, platform = process.platform) {
   const home = env.HOME || env.USERPROFILE || homedir();
-  const rel = join(".wrangler", "config", "default.toml");
+  // Join for the platform being ASKED about, not the one running. The platform
+  // argument exists so Windows path layout can be checked from a Mac and the
+  // reverse; with the host's `join` the answer silently depended on the runner,
+  // so the Windows assertions only ever held on Windows and the POSIX ones only
+  // on POSIX. Caught by CI on 2026-09-04, on the first Windows run that got far
+  // enough down the chain to reach this file.
+  const j = (platform === "win32" ? pathWin32 : pathPosix).join;
+  const rel = j(".wrangler", "config", "default.toml");
   const out = [];
   if (platform === "win32") {
     if (env.APPDATA) {
-      out.push(join(env.APPDATA, "xdg.config", rel));
-      out.push(join(env.APPDATA, rel));
+      out.push(j(env.APPDATA, "xdg.config", rel));
+      out.push(j(env.APPDATA, rel));
     }
-    if (env.LOCALAPPDATA) out.push(join(env.LOCALAPPDATA, rel));
+    if (env.LOCALAPPDATA) out.push(j(env.LOCALAPPDATA, rel));
   }
-  if (env.XDG_CONFIG_HOME) out.push(join(env.XDG_CONFIG_HOME, rel));
-  out.push(join(home, ".config", rel));
-  out.push(join(home, rel));
+  if (env.XDG_CONFIG_HOME) out.push(j(env.XDG_CONFIG_HOME, rel));
+  out.push(j(home, ".config", rel));
+  out.push(j(home, rel));
   return out;
 }
 
