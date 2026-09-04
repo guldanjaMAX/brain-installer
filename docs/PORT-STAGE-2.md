@@ -46,10 +46,31 @@ So this test fails for a reason, not from an omission. Drop the test with that
 reason recorded, do not port the feature to satisfy it, and do not delete it
 quietly. Every other failing test is a real gap.
 
+## How hard each shared file actually is, measured
+
+Lines the RELEASE line has that the field line does not. That is the content a
+wholesale copy would destroy, so it is the real difficulty of each merge:
+
+| File | Ours-only lines | Verdict |
+|---|---|---|
+| `worker/src/lib/fin-import.js` | 4 | **Done.** The field's version was strictly ahead: a clean split of `importBankExport` into a pure planner plus a thin wrapper. Taken wholesale, both the new and the existing tests pass. |
+| `worker/src/lib/bank-feed.js` | 50 | Real merge |
+| `worker/src/index.js` | 102 | Real merge, and it carries the four missing routes |
+| `worker/src/lib/zoom.js` | 116 | Real merge |
+| `worker/src/lib/store-d1.js` | 123 | Real merge; ours is the 0.3.x bootstrap and drain work |
+| `brain.mjs` | 623 | Real merge, the slowest |
+
+A file with zero ours-only lines can be taken wholesale after checking the
+reverse diff. A file with any is a three-way merge with no common ancestor,
+which is why these six are the whole job and the other 62 shared files are not.
+
 ## Order of work
 
-1. The four worker libs first. They are small and additive, and each one has a
-   ported test that goes green the moment its export exists.
+1. ~~fin-import.js~~ done. The remaining three worker libs next: bank-feed,
+   zoom, store-d1. Each has a ported test that goes green when its export
+   exists. Note `owner-bank-import.test.mjs` now fails on a 404 rather than a
+   missing import, which is the route, not the module: modules first, wiring
+   second, and the failure text tells you which you are looking at.
 2. `store-d1.js` next: 352 added lines against 124 removed, and the removals
    are where the 0.3.x bootstrap and drain work lives. Merge, do not overwrite.
 3. `brain.mjs` last and slowest: 4,026 added against 623 removed. Everything
