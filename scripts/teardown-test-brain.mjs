@@ -58,6 +58,33 @@ export function protectedListMissing(raw = PROTECTED_RAW) {
   return String(raw || "").split(",").map((x) => x.trim()).filter(Boolean).length === 0;
 }
 
+/**
+ * Why this name was allowed or refused, not just whether it was.
+ *
+ * Every near-miss on 2026-09-03 came from a check that reported its conclusion
+ * without its evidence: a swallowed database error that said only "could not
+ * verify", an acceptance run that said "passed" without saying what it never
+ * tested, and this script printing "would delete" whether one guard passed or
+ * three did. A thin guard and a strong one look identical until the reasoning
+ * is on screen, so the decision carries its reason and the dry run prints it.
+ */
+export function teardownDecision(name, { protectedPrefixes = [], protectedRaw = PROTECTED_RAW } = {}) {
+  const subject = String(name || "");
+  if (!subject) return { allowed: false, reason: "no name was given" };
+  if (protectedListMissing(protectedRaw)) {
+    return { allowed: false, reason: "the live-resource lock (BRAIN_TEARDOWN_PROTECTED) is not set" };
+  }
+  const hit = protectedPrefixes.find((re) => re.test(subject));
+  if (hit) return { allowed: false, reason: `it matches the protected list (${hit.source})` };
+  if (!looksDisposable(subject)) {
+    return { allowed: false, reason: 'it does not start with "brain-test" or "test"' };
+  }
+  return {
+    allowed: true,
+    reason: `it starts with a disposable prefix, and it is not in the protected list of ${protectedPrefixes.length}`,
+  };
+}
+
 function arg(flag, fallback = null) {
   const i = process.argv.indexOf(flag);
   return i !== -1 && process.argv[i + 1] && !process.argv[i + 1].startsWith("--")
@@ -160,7 +187,9 @@ if (RUN_DIRECTLY) {
     return r.ok;
   }
 
-  console.log(`\n  ${COMMIT ? "DELETING" : "DRY RUN — nothing will be deleted"}: ${name}\n`);
+  const decision = teardownDecision(name, { protectedPrefixes: PROTECTED });
+  console.log(`\n  ${COMMIT ? "DELETING" : "DRY RUN — nothing will be deleted"}: ${name}`);
+  console.log(`  allowed because ${decision.reason}\n`);
 
   let deleted = 0, missing = 0, failed = 0;
   for (const t of targets) {

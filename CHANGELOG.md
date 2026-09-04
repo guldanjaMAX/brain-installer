@@ -26,7 +26,9 @@ the brain, not for whoever built it: what changed for them, and what to check.
   live-resource lock read a list from the environment that, unset, was empty
   and silent. The match is anchored to a real prefix, the script refuses to run
   at all until the lock is set, and both guards are now importable and pinned
-  by a test instead of living inline in a script nobody ran.
+  by a test instead of living inline in a script nobody ran. Its dry run now
+  prints WHICH rule allowed or refused the name, because "would delete" read
+  the same whether one guard passed or three did.
 - `/health` reports `schema_version`. Whether a brain may take a published
   update is decided by that integer, and until now it could only be read by
   standing at the owner's machine. A fleet is now checkable from one place. The
