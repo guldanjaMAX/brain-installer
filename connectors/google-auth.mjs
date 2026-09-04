@@ -1203,10 +1203,15 @@ export function loadTokens(value) {
     const path = filePath(options);
     const state = readFileStoreState(path, { ...options, strict: platform === "win32" });
     if (!state) return {};
-    if (platform === "win32" && !state.encrypted) {
+    if (platform === "win32" && !state.encrypted && options.migrateLegacy !== false) {
       // A pre-DPAPI Windows file remains readable, but never remains plaintext
       // after a successful use. The transactional writer retains or restores
       // its credential record if encryption cannot be verified.
+      //
+      // migrateLegacy:false is how a STATUS read or an ordinary inspection says
+      // "tell me what is there, do not rewrite it". The migration is a write,
+      // and a write belongs to the one caller holding the shared lock, not to
+      // every reader that happens to glance at the file first.
       return writeFileStore(path, state.store, options);
     }
     return state.store;

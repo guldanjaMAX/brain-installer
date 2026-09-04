@@ -207,10 +207,78 @@ Five are real, and each is named rather than left as "still failing":
 2. `cloudflare-recovery-adapter`. The stage list now differs, not the
    sqlite failure that blocked it before; the adapter module still needs
    the three-way merge that keeps the schema-32 contract from 5955fa5.
-3. `full-history-privacy` wants `--require-zero-findings` on the history
-   scanner, which lives in the part of brain.mjs not ported.
-4. `provider-oauth` and `provider-scheduler`, one assertion each, in the
-   Windows DPAPI and scheduler-argv paths.
+3. ~~`full-history-privacy`~~ **Fixed.** The diagnosis above was wrong: the
+   flag was already in `scripts/scan-git-history-privacy.mjs`, and only the
+   three package.json entry points were missing.
+4. ~~`provider-oauth`, `provider-scheduler`~~ **Both fixed.** See below.
+
+## The three fixed after the acceptance (2026-09-04)
+
+Each was investigated and then adversarially reviewed by a second reader whose
+instruction was to refute it and who verified by applying the patch to a copy
+of the tree and running all 168 test files in both. All three came back with a
+measured zero-regression diff.
+
+- `provider-oauth`: `connectors/google-auth.mjs` migrated a legacy plaintext
+  Windows credential on ANY read, including a status check. The migration is a
+  write, and a write belongs to the caller holding the shared lock, not to
+  every reader that glances at the file. Now gated on `migrateLegacy !== false`.
+- `provider-scheduler`: an installed provider job did not name its provider in
+  its own argv, so a later run could not tell which connector it belonged to.
+  The spread is guarded on `spec.schedulerArgumentsOf`, so the five specs that
+  do not define it render byte-identical plists and their config hashes do not
+  move. Six scheduled-provider ids restored to `SUPPORT_SOURCES`, because
+  `recordProviderSchedulerFailure` swallows its throw and an id missing there
+  loses a scheduled failure's issue note in silence.
+- `full-history-privacy`: three `privacy:history*` entry points restored to
+  package.json. Note this ARMS the CI job that runs them, which is the intent.
+
+## Two whose plans were REJECTED by that review, and must not be applied as drafted
+
+- `gmail-incremental-policy`. The diagnosis is right and the patch is minimal,
+  but it would have broken the nightly Drive load. `policySkipped` is only ever
+  incremented on the Gmail and IMAP paths, so on Drive every ordinary skipped
+  file would count as a coverage gap, and the proposed cursor gate would then
+  refuse to advance the Drive cursor at all. A second objection stands too: for
+  Gmail and IMAP a single credential-refusal skip could freeze the cursor
+  permanently rather than for one run. Whoever picks this up needs a Drive
+  policy-skip counter first.
+- `cloudflare-recovery-adapter`. The diagnosis was confirmed empirically, but
+  the reviewer asked for six changes before it is applied, starting with using
+  `scripts/recovery-bank-safety-lab.mjs` as the verification step rather than
+  the test alone.
+
+## The acceptance, run 2026-09-04
+
+The kit's own leg 9 cannot run against this old side: it decides the old brain
+provisioned by grepping its log for "Your brain is live", and the field 0.2.1
+line prints "Core installation is ready. No source has been loaded yet."
+instead. The kit is owned by another session and was not edited. The leg was
+re-run standalone from a faithful copy that accepts either sentinel, with one
+addition: the field 0.2.1 tarball predates `bundleDependencies`, so its ingest
+dependencies are installed explicitly, which is setting up a realistic old
+brain rather than compensating for anything in the port.
+
+Result: **13 passed, 1 failed.**
+
+    PASS  installed v0.2.1-local (32 migrations in the old tree)
+    PASS  30 created at v0.2.1-local
+    PASS  the old brain is at schema 32 (32 ledger rows)
+    PASS  updated v0.2.1-local -> 0.4.0 in ONE run
+    PASS  the CLI that ran was the candidate: announced 0.4.0
+    PASS  applied 0 migration(s), expected 0  [schema up to date (32 applied)]
+    PASS  the ledger is unchanged: 32 rows before, 32 after
+    PASS  updated brain accepts documents ("version":"0.4.0")
+    PASS  documents loaded BEFORE the update still answer after it
+
+The one failure is the OLD brain's own drain: its outbox still held 30 rows
+after six minutes, so the update ran against an unsettled outbox. That is the
+0.2.x drain behaviour this port replaces, and by the kit's own note it means
+the update was proven on the LEGACY residue path, which is the harder one.
+
+Proven separately and more cheaply: all 32 migrations in the 0.4.0 package are
+byte-identical to the field 0.2.1 tarball's, so the zero-migration result holds
+by construction and none of the three fixes above can change it.
 
 None of the five blocks the schema-32 rehearsal, which is the acceptance
 for updating a brain already on the field line.
