@@ -188,8 +188,18 @@ const insertChunk = (db, uid, doc, ix, vectorId = uid) => db.prepare(
 
 async function drainFully(env, options = {}, maxRounds = 20) {
   const total = { drained: 0, deleted: 0, upserted: 0, submitted: 0, failed: 0, remaining: null };
+  // A failed row now carries a next_attempt_at on a backoff ladder rather than
+  // just an attempt count, so a fixture that hammers the drain on a frozen
+  // clock is asserting that the ladder does not exist. Step past its longest
+  // rung between rounds; the assertions themselves are unchanged.
+  let retryClock = Date.now();
   for (let round = 0; round < maxRounds; round++) {
-    const part = await drainOutbox(env, { maxBatches: 10, ...options });
+    retryClock += 3 * 60 * 60 * 1000;
+    const part = await drainOutbox(env, {
+      maxBatches: 10,
+      ...options,
+      now: options.now || (() => retryClock),
+    });
     for (const field of ["drained", "deleted", "upserted", "submitted", "failed"]) {
       total[field] += Number(part[field] || 0);
     }
@@ -955,7 +965,10 @@ const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
     drainBatchQueryUpperBound(100) === 212);
   check("a ten-batch request stops before the internal D1 query budget",
     drained.drained === 200 && drained.remaining === 400 &&
-      submitted === 421 && submitted < DRAIN_D1_QUERY_BUDGET,
+      // 421 before the drain proved the retry-state schema and swept its
+      // orphans; those are the two statements DRAIN_RETRY_STATE_QUERIES
+      // reserves, so the pin moves with them rather than being loosened.
+      submitted === 423 && submitted < DRAIN_D1_QUERY_BUDGET,
     JSON.stringify({ drained, submitted, budget: DRAIN_D1_QUERY_BUDGET }));
   check("query-budget exhaustion never strands the exclusive drain lease",
     leaseState.owner === null && leaseState.expires === null,
