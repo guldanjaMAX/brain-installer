@@ -22,6 +22,12 @@
 import { jsonResponse, privateNoStore, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
 import { resolvePrincipal, principalMay } from "./lib/grants.js";
 import { handleBankFeed } from "./lib/bank-feed.js";
+import { handlePlaidWebhook } from "./lib/plaid-bank-feed.js";
+import { handleSupportAccess } from "./lib/support-access.js";
+import {
+  AGENT_DELETION_PATH_PREFIX, handleAgentDeletion,
+} from "./lib/agent-action-receipts.js";
+import { ownerReliabilityAlerts } from "./lib/reliability-alerts.js";
 import { handleBankExportImport, BANK_IMPORT_PATH } from "./lib/fin-upload.js";
 import { handleFinApi, FIN_PATH_PREFIX } from "./lib/fin-api.js";
 import {
@@ -34,7 +40,7 @@ import {
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { installedSchemaVersion, acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import { installedSchemaVersion, acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, retryQuarantinedVectorOps, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
@@ -1547,6 +1553,7 @@ const PAUSED_CORPUS_MUTATION_PATHS = new Set([
   "/api/admin/brain/source-expectation",
   "/api/admin/brain/forget",
   "/api/admin/brain/reindex",
+  "/api/admin/brain/vector-retry",
   "/api/admin/brain/drain",
   // The ledger is not the corpus, but a paused upgrade means a migration is in
   // flight, and financial rows written against a half-migrated schema are the
@@ -1616,7 +1623,20 @@ export default {
     if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/") ||
         path.startsWith("/brand/") || path.startsWith("/app/assets/")) {
       const response = await handleOwnerAuth(env, request, url, path);
-      return path.startsWith("/api/app/") ? privateNoStore(response) : response;
+      // /auth/ carries WebAuthn challenges and the session cookie itself. A
+      // cached challenge is a replayable one, so it is no-store alongside the
+      // app's API rather than treated as an ordinary page.
+      return path.startsWith("/api/app/") || path.startsWith("/auth/")
+        ? privateNoStore(response)
+        : response;
+    }
+
+    // Support access is its own ceremony with its own short-lived session. Its
+    // cookie and companion header are not understood by owner, retrieval,
+    // financial, connector, OAuth, or admin routes. Every response, including
+    // ceremony errors, is private and non-cacheable.
+    if (path.startsWith("/api/support/")) {
+      return privateNoStore(await handleSupportAccess(env, request, url, path));
     }
 
     // The bank feed's owner surface sits in FRONT of the key gate for exactly
@@ -1653,6 +1673,21 @@ export default {
         },
       ));
       return handleOwnerActions(env, request, path, { ingestEnvelope });
+    }
+
+    // Destructive corpus execution is deliberately separate from ordinary
+    // owner actions. Its receipt and fresh passkey ceremony are enforced by a
+    // dedicated state machine before the shared D1-first forget primitive is
+    // reachable.
+    if (path.startsWith(AGENT_DELETION_PATH_PREFIX)) {
+      return handleAgentDeletion(env, request, path, { forget });
+    }
+
+    // Plaid signs the exact raw body with a short-lived ES256 verification JWT.
+    // The handler fetches only the named public key, records no payload, and
+    // turns the notification into durable reconciliation debt.
+    if (path === "/api/webhooks/plaid") {
+      return handlePlaidWebhook(env, request);
     }
 
     // The Zoom webhook sits in FRONT of the key gate because Zoom cannot send
@@ -1851,6 +1886,21 @@ export default {
       }
       if (path === "/api/admin/brain/documents" && request.method === "GET") {
         return privateNoStore(await handleDocuments(env));
+      }
+      if (path === "/api/admin/brain/reliability-alerts" && request.method === "GET") {
+        if (backendOf(env) !== D1) return jsonResponse({ error: "reliability alerts apply to the d1 backend only" }, 400);
+        return privateNoStore(jsonResponse(await ownerReliabilityAlerts(env)));
+      }
+      // Quarantined vector generations are released by an explicit operator
+      // decision, never automatically: a row that spent its attempts did so for
+      // a reason, and the preview names how many before anything is retried.
+      if (path === "/api/admin/brain/vector-retry" && request.method === "POST") {
+        if (backendOf(env) !== D1) return jsonResponse({ error: "vector retry applies to the d1 backend only" }, 400);
+        const body = await request.json().catch(() => ({}));
+        return jsonResponse(await retryQuarantinedVectorOps(env, {
+          confirm: body.confirm === true,
+          limit: body.limit,
+        }));
       }
       // Per-source freshness. Separate from /documents on purpose: that endpoint
       // answers "how much is in here", this one answers "how much of it is

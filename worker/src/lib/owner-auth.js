@@ -19,10 +19,10 @@ import { diagnose, freshnessReport, vectorReadiness } from "./store-d1.js";
 import { jsonResponse, validateAdminKey } from "./core.js";
 import { verifyRegistration, verifyAssertion, b64uDecode } from "./webauthn.js";
 import {
-  mintSessionCookie, readSessionCookie, clearSessionCookie,
+  mintSessionCookie, readSessionCookie, clearSessionCookie, credentialMatchesSessionRef,
 } from "./sessions.js";
 import {
-  issueChallenge, consumeChallenge,
+  issueChallenge, peekChallenge, consumeChallenge,
   issueEnrollmentCode, peekEnrollmentCode, consumeEnrollmentCode,
   storePasskey, findPasskey, recordPasskeyUse,
   listPasskeys, renamePasskey, revokePasskey,
@@ -41,6 +41,11 @@ import {
 } from "./document-access.js";
 import { appPageHtml, brandOgSvg } from "./app-page.js";
 import { APP_JS, APP_CSS } from "./app-assets.js";
+import {
+  createSupportSession, listSupportSessions, reissueSupportInvite,
+  revokeSupportSession, SupportAccessError,
+} from "./support-access.js";
+import { readUpdateStatus } from "./update-status.js";
 
 const APP_HEADER = "X-Brain-App";
 
@@ -71,16 +76,21 @@ export async function validateOwnerSession(request, env) {
   return principal !== null && principal.denied !== true;
 }
 
-/**
- * Resolve who is behind the passkey session instead of flattening identity to
- * a boolean. Owner-write routes must use this function and require kind=owner
- * plus grantId=null. That positive check remains fail-closed when scoped
- * passkeys are added later.
- */
-export async function ownerSessionPrincipal(request, env) {
-  if (!appRequest(request)) return null;
+async function resolveOwnerSessionPrincipal(request, env, { requireAppHeader = true } = {}) {
+  if (requireAppHeader && !appRequest(request)) return null;
   const session = await readSessionCookie(request, env, await sessionGeneration(env));
   if (!session) return null;
+  const devices = await listPasskeys(env);
+  let sessionDevice = null;
+  for (const device of devices) {
+    if (await credentialMatchesSessionRef(env, device.credential_id, session.credentialRef)) {
+      sessionDevice = device;
+      break;
+    }
+  }
+  if (!sessionDevice) return null;
+  const deviceGrantId = sessionDevice.document_grant_id ?? sessionDevice.grant_id ?? null;
+  if (deviceGrantId !== session.grantId) return null;
   if (session.grantId === null) {
     return {
       kind: "owner",
@@ -90,6 +100,29 @@ export async function ownerSessionPrincipal(request, env) {
     };
   }
   return grantSubjectPrincipal(env, session.grantId);
+}
+
+/**
+ * Resolve who is behind the passkey session instead of flattening identity to
+ * a boolean. Owner-write routes must use this function and require kind=owner
+ * plus grantId=null. That positive check remains fail-closed when scoped
+ * passkeys are added later.
+ */
+export async function ownerSessionPrincipal(request, env) {
+  return resolveOwnerSessionPrincipal(request, env, { requireAppHeader: true });
+}
+
+/**
+ * Resolve a passkey session for a read-only top-level page navigation.
+ *
+ * Browsers cannot attach X-Brain-App to an address-bar navigation. This seam
+ * is therefore limited to GET page handlers. Every API read and write must
+ * continue to use ownerSessionPrincipal so the companion CSRF header remains
+ * mandatory.
+ */
+export async function ownerNavigationPrincipal(request, env) {
+  if (request.method !== "GET") return null;
+  return resolveOwnerSessionPrincipal(request, env, { requireAppHeader: false });
 }
 
 async function grantSubjectPrincipal(env, grantId) {
@@ -149,6 +182,17 @@ function documentAccessErrorResponse(error) {
     code: error.code,
     detail: error.message,
   }, error.status);
+}
+
+function supportAccessErrorResponse(error) {
+  const status = error instanceof SupportAccessError ? error.status : 503;
+  const code = error instanceof SupportAccessError ? error.code : "support_access_unavailable";
+  const label = status === 400 ? "invalid_request"
+    : status === 403 ? "forbidden"
+      : status === 404 ? "not_found"
+        : status === 409 ? "conflict"
+          : "unavailable";
+  return jsonResponse({ error: label, code }, status);
 }
 
 async function observePasskey(env, event) {
@@ -264,7 +308,7 @@ export async function handleAdminDevices(env, request, path) {
 
 /* ------------------------------------------------------------ owner plane */
 
-export async function handleOwnerAuth(env, request, url, path) {
+export async function handleOwnerAuth(env, request, url, path, options = {}) {
   const requestStartedAt = Date.now();
   // The link-preview image. Public and cacheable by design: a scraper fetching
   // it must never need a credential, and it contains only the brain's own name.
@@ -375,7 +419,13 @@ export async function handleOwnerAuth(env, request, url, path) {
     }
     if (viaSession?.denied) return scopedForbidden();
     const challenge = challengeFromClientData(payload.clientDataJSON);
-    if (!challenge || !(await consumeChallenge(env, challenge, "register"))) {
+    let challengeLive = false;
+    try {
+      challengeLive = challenge ? await peekChallenge(env, challenge, "register") : false;
+    } catch {
+      return unavailable("passkey_auth_unavailable");
+    }
+    if (!challengeLive) {
       const telemetryError = await observePasskey(env, {
         rpId, ceremony: "registration", stage: "verify", outcome: "forbidden",
         reasonCode: "challenge_invalid", durationMs: Date.now() - requestStartedAt,
@@ -388,7 +438,7 @@ export async function handleOwnerAuth(env, request, url, path) {
     let invitation = null;
     if (!viaSession) {
       try {
-        invitation = await consumeEnrollmentCode(env, String(payload.code || ""));
+        invitation = await peekEnrollmentCode(env, String(payload.code || ""));
       } catch {
         return unavailable("passkey_auth_unavailable");
       }
@@ -438,6 +488,33 @@ export async function handleOwnerAuth(env, request, url, path) {
       if (telemetryError) return telemetryError;
       return jsonResponse({ error: String(error?.message || error) }, 400);
     }
+    // Neither the challenge nor invite is burned by a failed authenticator
+    // gesture. After cryptographic verification, each conditional mutation is
+    // the single-use decision. Concurrent valid ceremonies can reach here,
+    // but exactly one can consume each row.
+    try {
+      if (!(await consumeChallenge(env, challenge, "register"))) {
+        return jsonResponse({ error: "unknown, expired, or already used challenge" }, 403);
+      }
+      if (!viaSession) {
+        const consumed = await consumeEnrollmentCode(env, String(payload.code || ""));
+        if (!consumed) {
+          const telemetryError = await observePasskey(env, {
+            rpId, ceremony: "registration", stage: "verify", outcome: "forbidden",
+            reasonCode: "enrollment_invalid", durationMs: Date.now() - requestStartedAt,
+            principalKind: "unknown",
+          });
+          if (telemetryError) return telemetryError;
+          return jsonResponse({ error: "the enrollment link is invalid, expired, or already used" }, 403);
+        }
+        if (consumed.grantId !== invitation.grantId ||
+            consumed.documentGrantId !== invitation.documentGrantId) {
+          return unavailable("passkey_auth_unavailable");
+        }
+      }
+    } catch {
+      return unavailable("passkey_auth_unavailable");
+    }
     try {
       await storePasskey(env, {
         ...verified,
@@ -456,7 +533,9 @@ export async function handleOwnerAuth(env, request, url, path) {
     } catch {
       return unavailable("passkey_auth_unavailable");
     }
-    const cookie = await mintSessionCookie(env, await sessionGeneration(env), { grantId });
+    const cookie = await mintSessionCookie(env, await sessionGeneration(env), {
+      grantId, credentialId: verified.credentialId,
+    });
     return withCookie(jsonResponse({ enrolled: true, credential_id: verified.credentialId }), cookie);
   }
 
@@ -479,7 +558,13 @@ export async function handleOwnerAuth(env, request, url, path) {
     const payload = await body(request);
     if (!payload) return jsonResponse({ error: "invalid body" }, 400);
     const challenge = challengeFromClientData(payload.clientDataJSON);
-    if (!challenge || !(await consumeChallenge(env, challenge, "login"))) {
+    let challengeLive = false;
+    try {
+      challengeLive = challenge ? await peekChallenge(env, challenge, "login") : false;
+    } catch {
+      return unavailable("passkey_auth_unavailable");
+    }
+    if (!challengeLive) {
       const telemetryError = await observePasskey(env, {
         rpId, ceremony: "authentication", stage: "verify", outcome: "forbidden",
         reasonCode: "challenge_invalid", durationMs: Date.now() - requestStartedAt, principalKind: "unknown",
@@ -546,15 +631,25 @@ export async function handleOwnerAuth(env, request, url, path) {
       return jsonResponse({ error: "this passkey looks cloned (its counter went backwards); sign in from another device and revoke it" }, 403);
     }
     try {
-      await recordPasskeyUse(env, credential.credential_id, verdict.signCount, {
+      if (!(await consumeChallenge(env, challenge, "login"))) {
+        return jsonResponse({ error: "unknown, expired, or already used challenge" }, 403);
+      }
+      const recorded = await recordPasskeyUse(
+        env, credential.credential_id, Number(credential.sign_count || 0), verdict.signCount, {
         rpId, ceremony: "authentication", stage: "verify", outcome: "succeeded",
         reasonCode: "passkey_used", durationMs: Date.now() - requestStartedAt,
         principalKind: grantId ? "grant" : "owner", grantId,
-      });
+        },
+      );
+      if (!recorded) {
+        return jsonResponse({ error: "the passkey changed or was revoked; start sign-in again" }, 403);
+      }
     } catch {
       return unavailable("passkey_auth_unavailable");
     }
-    const cookie = await mintSessionCookie(env, await sessionGeneration(env), { grantId });
+    const cookie = await mintSessionCookie(env, await sessionGeneration(env), {
+      grantId, credentialId: credential.credential_id,
+    });
     return withCookie(jsonResponse({ signed_in: true }), cookie);
   }
 
@@ -591,6 +686,7 @@ export async function handleOwnerAuth(env, request, url, path) {
   }
 
   // Everything below requires a live session.
+  const supportAccessOwnerPath = path.startsWith("/api/app/support-access/");
   let principal;
   try {
     principal = await ownerSessionPrincipal(request, env);
@@ -598,7 +694,9 @@ export async function handleOwnerAuth(env, request, url, path) {
     return unavailable("owner_auth_unavailable");
   }
   if (!principal) {
-    return jsonResponse({ error: "unauthorized" }, 401);
+    return supportAccessOwnerPath
+      ? jsonResponse({ error: "unauthorized", code: "session_required" }, 401)
+      : jsonResponse({ error: "unauthorized" }, 401);
   }
   if (principal.denied) {
     return withCookie(jsonResponse({
@@ -724,6 +822,60 @@ export async function handleOwnerAuth(env, request, url, path) {
   // A scoped session may read only its exact granted documents and its own
   // minimal identity above. Unlisted future routes therefore fail owner-only.
   if (!ownerRequired(principal)) return scopedForbidden();
+
+  // A rollback restores the database underneath the paused Worker. Support
+  // authority is unavailable for that entire window, including owner reads,
+  // so neither an old cookie nor a newly written invite can cross the restore.
+  if (supportAccessOwnerPath && env.VECTOR_DRAIN_MODE === "paused-for-upgrade") {
+    return unavailable("support_access_unavailable");
+  }
+
+  if (path === "/api/app/support-access/status") {
+    try {
+      return jsonResponse(await listSupportSessions(env));
+    } catch (error) {
+      return supportAccessErrorResponse(error);
+    }
+  }
+  if (path === "/api/app/support-access/create") {
+    const payload = await body(request);
+    try {
+      const { enrollment_url_code: code, ...receipt } = await createSupportSession(env, payload);
+      return jsonResponse({
+        ...receipt,
+        enrollment_url: code ? `${url.origin}/app#support-enroll=${code}` : null,
+      });
+    } catch (error) {
+      return supportAccessErrorResponse(error);
+    }
+  }
+  if (path === "/api/app/support-access/reissue") {
+    const payload = await body(request);
+    try {
+      const { enrollment_url_code: code, ...receipt } = await reissueSupportInvite(env, payload);
+      return jsonResponse({
+        ...receipt,
+        enrollment_url: code ? `${url.origin}/app#support-enroll=${code}` : null,
+      });
+    } catch (error) {
+      return supportAccessErrorResponse(error);
+    }
+  }
+  if (path === "/api/app/support-access/revoke") {
+    const payload = await body(request);
+    try {
+      return jsonResponse(await revokeSupportSession(env, payload));
+    } catch (error) {
+      return supportAccessErrorResponse(error);
+    }
+  }
+  if (path === "/api/app/update-status") {
+    const result = await readUpdateStatus({
+      installedVersion: env.BRAIN_VERSION,
+      fetchImpl: options.fetchImpl || fetch,
+    });
+    return jsonResponse(result, result.status === "unavailable" ? 503 : 200);
+  }
 
   if (path === "/api/app/document-access/status") {
     try {

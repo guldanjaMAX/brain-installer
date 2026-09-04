@@ -96,8 +96,24 @@ const post = (path, body, headers = {}) => new Request(`https://brain.invalid${p
   body: JSON.stringify(body ?? {}),
 });
 
+// A session now names the passkey device behind it, so the row has to exist
+// before a cookie minted against it will resolve. That is the point of the
+// change: a revoked device's cookie stops working instead of outliving it.
+const FIXTURE_CREDENTIAL_ID = "fixture-owner-passkey";
+
+function insertSessionPasskey(db, credentialId) {
+  db.prepare(
+    `INSERT INTO owner_passkeys
+       (credential_id, public_key_jwk, alg, sign_count, nickname, created_at,
+        grant_id, document_grant_id)
+     VALUES (?, '{}', -7, 0, 'Fixture session', ?, NULL, NULL)`,
+  ).run(credentialId, Date.now());
+}
+
 async function ownerHeaders(env) {
-  const cookie = await mintSessionCookie(env, 1);
+  const cookie = await mintSessionCookie(env, 1, {
+    grantId: null, credentialId: FIXTURE_CREDENTIAL_ID,
+  });
   return { Cookie: cookie.split(";")[0], "X-Brain-App": "1" };
 }
 
@@ -107,6 +123,7 @@ const keysAre = (value, expected) =>
 
 const db = freshDb();
 const env = d1Environment(db);
+insertSessionPasskey(db, FIXTURE_CREDENTIAL_ID);
 const headers = await ownerHeaders(env);
 const commonIngest = (envelope) => worker.fetch(post(
   "/api/admin/brain/ingest", envelope, { "X-Admin-Key": env.ADMIN_KEY },

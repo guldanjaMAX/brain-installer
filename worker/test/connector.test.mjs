@@ -16,7 +16,7 @@ const ORIGIN = "https://brain.example.com";
 function connectorDb() {
   const tables = {
     clients: new Map(), codes: new Map(), tokens: new Map(),
-    documents: new Map(), chunks: [],
+    documents: new Map(), chunks: [], passkeys: new Map(),
     state: { session_generation: 1 },
   };
   return {
@@ -36,6 +36,12 @@ function connectorDb() {
         async all() {
           if (/FROM chunks WHERE doc_uid/.test(sql)) {
             return { results: tables.chunks.filter((c) => c.doc_uid === bound[0]) };
+          }
+          // A session now names the passkey device behind it, so resolving one
+          // reads the device list. Without this branch every owner cookie
+          // resolves to nobody and the approval step silently 401s.
+          if (/FROM owner_passkeys ORDER BY/.test(sql)) {
+            return { results: [...tables.passkeys.values()] };
           }
           return { results: [] };
         },
@@ -127,7 +133,13 @@ test("the full connector journey, register through revocation", async () => {
   // Approval requires the owner's passkey session.
   const denied = await worker.fetch(jsonPost(`/oauth/authorize/decision?${authorizeQuery}`, {}, { "X-Brain-App": "1" }), testEnv);
   assert.equal(denied.status, 401);
-  const cookie = (await mintSessionCookie(testEnv, 1)).split(";")[0];
+  db.tables.passkeys.set("connector-owner-passkey", {
+    credential_id: "connector-owner-passkey", alg: -7, nickname: "Connector owner",
+    grant_id: null, document_grant_id: null, created_at: Date.now(), last_used_at: null,
+  });
+  const cookie = (await mintSessionCookie(testEnv, 1, {
+    grantId: null, credentialId: "connector-owner-passkey",
+  })).split(";")[0];
   const approved = await (await worker.fetch(jsonPost(`/oauth/authorize/decision?${authorizeQuery}`, {}, {
     Cookie: cookie, "X-Brain-App": "1",
   }), testEnv)).json();

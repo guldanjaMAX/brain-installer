@@ -49,8 +49,24 @@ function freshDb({ throughLedger = true } = {}) {
     if (!throughLedger && file >= LEDGER_MIGRATION) break;
     for (const statement of statementsFor(file)) db.exec(statement);
   }
+  if (!throughLedger) {
+    // Withhold the LEDGER, not the whole schema. A brain serving this code has
+    // the current passkey shape whatever its ledger state, and the session
+    // layer reads document_grant_id (0022) on every owner request. Freezing the
+    // fixture at schema 16 made "no ledger" indistinguishable from "database
+    // unreachable", which is the opposite of what these five checks assert.
+    db.exec("ALTER TABLE owner_passkeys ADD COLUMN document_grant_id TEXT");
+  }
   db.exec(`INSERT INTO install_state (id, client_slug, product_version, installed_at)
            VALUES (1, 'fixture', '0.0.0-test', '2020-01-01T00:00:00Z')`);
+  // A session names the passkey device behind it, so the row is part of the
+  // fixture database rather than something ownerHeaders writes: it must exist
+  // even for the deliberately broken env that refuses every query.
+  db.prepare(
+    `INSERT OR IGNORE INTO owner_passkeys
+       (credential_id, public_key_jwk, alg, sign_count, nickname, created_at)
+     VALUES (?, '{}', -7, 0, 'Fixture session', ?)`,
+  ).run(FIXTURE_CREDENTIAL_ID, Date.now());
   return db;
 }
 
@@ -92,8 +108,15 @@ const post = (path, body, headers = {}) => new Request(`https://brain.invalid${p
   body: typeof body === "string" ? body : JSON.stringify(body ?? {}),
 });
 
+// A session now names the passkey device behind it, so the device row has to
+// exist before a cookie minted against it resolves. That is the point of the
+// change: a revoked device's cookie stops working instead of outliving it.
+const FIXTURE_CREDENTIAL_ID = "fixture-owner-passkey";
+
 async function ownerHeaders(env) {
-  const cookie = await mintSessionCookie(env, 1);
+  const cookie = await mintSessionCookie(env, 1, {
+    grantId: null, credentialId: FIXTURE_CREDENTIAL_ID,
+  });
   return { Cookie: cookie.split(";")[0], "X-Brain-App": "1" };
 }
 
