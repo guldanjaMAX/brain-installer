@@ -4,6 +4,46 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.3.6 (unreleased)
+
+- The release gate is written down in `docs/RELEASE-GATE.md`: the update
+  rehearsal legs a release must pass, the rule for which old version to
+  rehearse from, the requirement that the published bytes are the tested bytes,
+  and the harness rules that cost us hours to learn.
+
+- An update refuses a brain whose database schema is ahead of the release,
+  naming both numbers. The version guard compared version strings only, and a
+  brain built from a working branch records a lower string while running a
+  higher schema, so the one number that mattered was the one nothing looked at.
+- An answer the verifier judged supported but incomplete no longer collapses to
+  "The documents do not answer the question." The sentences whose citations were
+  approved are kept, one line names what the documents did not cover, and the
+  answer is marked partial and scored ten points lower. A refusal that is still
+  a refusal is unchanged, word for word. Three of the four confidently wrong or
+  missing answers found in the 2026-09-03 triage were this shape.
+- A refusal now says why. `brain ask` prints the verifier's reason under the
+  trust line, and the MCP server carries the confidence, the gate reason and the
+  documents it did find, so "I found four documents and could not write a
+  supported answer from them" stops reading as "nothing recorded".
+- The test-brain teardown script's two guards both failed open. Its name check
+  was unanchored, so anything containing the letters t-e-s-t counted as a test
+  resource: `my-production-testbed`, `latest-greatest`, `contest-results`, and
+  worst of the set, `brain-latest` and `owner-latest-backup`. Those last two are
+  the names a person reaches for when copying something before doing anything
+  risky, so the safety copy was the thing the guard protected least. Nothing was
+  ever lost to it, and reaching it needed someone to type the name themselves
+  with a token for that account; and its
+  live-resource lock read a list from the environment that, unset, was empty
+  and silent. The match is anchored to a real prefix, the script refuses to run
+  at all until the lock is set, and both guards are now importable and pinned
+  by a test instead of living inline in a script nobody ran. Its dry run now
+  prints WHICH rule allowed or refused the name, because "would delete" read
+  the same whether one guard passed or three did.
+- `/health` reports `schema_version`. Whether a brain may take a published
+  update is decided by that integer, and until now it could only be read by
+  standing at the owner's machine. A fleet is now checkable from one place. The
+  field is omitted rather than guessed when the database cannot answer.
+
 ## 0.3.5
 
 - The index rebuild during an update no longer gives up two minutes after it
@@ -36,8 +76,10 @@ the brain, not for whoever built it: what changed for them, and what to check.
   just-written work: an unrecognised keystroke fell through to discard, a bare
   Enter on the title did the same, and a free-text source wrote a broken file.
   Each now confirms, defaults to keeping the work, and validates the source.
-- A setup or update that cannot read the database now says why. The three
-  preflight reads used to report only that they could not verify the brain,
+- A setup or update that cannot read the database now says why, on install day
+  as much as on update day: a fresh `brain setup` stopped at the same live-check
+  with no reason attached, and the cause was only recoverable by editing the
+  installer. The five preflight reads used to report only that they could not verify the brain,
   discarding the provider's message, so an account that had hit Cloudflare's
   daily D1 limit produced a line nobody could act on. The cause is quoted, and
   a quota refusal names whose limit it is, when it resets, and that nothing was

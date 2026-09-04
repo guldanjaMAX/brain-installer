@@ -2337,6 +2337,14 @@ export async function cmdAsk(manifestPath, options = {}) {
     refused: /^The documents do not answer/i.test(answer),
   });
   if (trust) console.log(`  ${c.dim(trust)}\n`);
+  // Say WHY when the answer was refused or cut short. The gate already
+  // records it; hiding it left the owner with one sentence that meant five
+  // different things.
+  const gate = body.evidence_gate && typeof body.evidence_gate === "object" ? body.evidence_gate : null;
+  const gateReason = gate && typeof gate.reason === "string" ? gate.reason.replace(/\s+/g, " ").trim().slice(0, 240) : "";
+  if (gateReason && (/^The documents do not answer/i.test(answer) || gate.partial === true)) {
+    console.log(`  ${c.dim(gate.partial === true ? "Not covered" : "Why")}: ${gateReason}\n`);
+  }
   if (body.answer_error) warn(`answer generation reported: ${String(body.answer_error).slice(0, 160)}`);
   if (body.degraded) warn(`search is degraded: ${String(body.degraded).slice(0, 80)}`);
   const citations = Array.isArray(body.citations) ? body.citations : [];
@@ -2362,6 +2370,40 @@ async function d1Query(acctId, dbId, sql, params = []) {
     body: { sql, params },
   });
   return Array.isArray(res) ? res[0] : res;
+}
+
+/**
+ * Refuse an update whose release has never seen the schema already on the brain.
+ *
+ * The version guard below compares recorded product-version STRINGS, and a
+ * brain built from a working branch can record a LOWER string than any
+ * published release while running a HIGHER schema. The maintainer's own brain on
+ * 2026-09-03: install_state says product_version 0.1.16 and schema_version 32,
+ * while the release ships 22 migrations. compareSemver reads 0.1.16 -> 0.3.5 as
+ * an upgrade and lets it proceed, and the migration renumbering that follows is
+ * the one failure in this system with no clean repair.
+ *
+ * The number that catches it is the one nothing looked at. A brain whose schema
+ * is ahead of every migration in this package has run code this package has
+ * never seen, which is a downgrade whatever the version strings say.
+ *
+ * Returns a refusal message, or null when the update may proceed. Unreadable or
+ * absent values proceed: this guard exists to catch a specific provable state,
+ * not to invent a new way for an ordinary update to stop.
+ */
+export function schemaAheadOfReleaseRefusal(installedSchemaVersion, migrations, releaseVersion = PRODUCT_VERSION) {
+  const installed = Number(installedSchemaVersion);
+  if (!Number.isSafeInteger(installed) || installed <= 0) return null;
+  const versions = (Array.isArray(migrations) ? migrations : [])
+    .map((migration) => Number(migration?.version))
+    .filter((version) => Number.isSafeInteger(version));
+  if (!versions.length) return null;
+  const highest = Math.max(...versions);
+  if (installed <= highest) return null;
+  return `update refused: this brain's database is at schema ${installed}, and ${releaseVersion} only knows schema ${highest}. Nothing was changed.\n` +
+    "      A brain is only ever ahead like this when it was built from a working branch rather than a\n" +
+    "      published release, so this update would remove tables its own migrations have never seen.\n" +
+    "      Install the build this brain came from, or leave it where it is.";
 }
 
 function loadMigrations() {
@@ -3676,6 +3718,8 @@ export async function cmdUpgrade(manifestPath, options = {}) {
         if (!newestRecordedVersion || compareSemver(recordedVersion, newestRecordedVersion) > 0) {
           newestRecordedVersion = recordedVersion;
         }
+        const schemaRefusal = schemaAheadOfReleaseRefusal(before?.schema_version, loadMigrations(), toVersion);
+        if (schemaRefusal) die(schemaRefusal);
         const direction = compareSemver(recordedVersion, toVersion);
         if (direction > 0) {
           die(

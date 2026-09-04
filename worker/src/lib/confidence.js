@@ -69,7 +69,7 @@ function gapAdjustments(gaps, degraded) {
  * approvedDocs are the citations the verifier explicitly endorsed — the only
  * documents the reader is shown. Independent agreement is counted over those.
  */
-export function computeAnswerConfidence({ approvedDocs = [], gaps = [], degraded = null } = {}) {
+export function computeAnswerConfidence({ approvedDocs = [], gaps = [], degraded = null, partial = null } = {}) {
   const basis = [];
   // A surviving answer has, by construction, passed citation checks and the
   // second-model evidence gate. That baseline is what the 65 encodes.
@@ -113,6 +113,14 @@ export function computeAnswerConfidence({ approvedDocs = [], gaps = [], degraded
       `${all ? "every" : `${ocrDocs.length} of ${approvedDocs.length}`} cited document was read by OCR from a scanned image` +
       (partial ? ", and at least one has pages that could not be read" : ""),
     );
+  }
+
+  // A partial answer is an honest one: every kept sentence passed the gate,
+  // and the missing part is named beside it rather than hidden inside a
+  // refusal. It is still weaker than a complete answer, and the basis says so.
+  if (partial) {
+    score -= 10;
+    basis.push(`answer is partial: ${String(partial).replace(/\.$/, "")}`);
   }
 
   const adjust = gapAdjustments(gaps, degraded);
