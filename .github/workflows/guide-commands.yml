@@ -169,9 +169,13 @@ jobs:
         shell: bash
         run: |
           export PATH="$HOME/.npm-global/bin:$PATH"
-          M=$(ls ~/Desktop/financial-brain/brain.manifest.json ~/financial-brain/brain.manifest.json 2>/dev/null | head -1)
+          # `ls` of a missing path exits non-zero, and under `-o pipefail` that
+          # is the pipeline's status, so under `set -e` this first line aborts
+          # the whole preflight before it prints anything. Found by this job on
+          # 2026-09-04. The guide's own copy needs the same `|| true`.
+          M=$(ls ~/Desktop/financial-brain/brain.manifest.json ~/financial-brain/brain.manifest.json 2>/dev/null | head -1 || true)
           [ -z "$M" ] && M=$(find "$HOME" -maxdepth 4 -name brain.manifest.json \
-                -not -path "*/node_modules/*" -not -path "*/templates/*" -not -path "*/.*/*" 2>/dev/null | head -1)
+                -not -path "*/node_modules/*" -not -path "*/templates/*" -not -path "*/.*/*" 2>/dev/null | head -1 || true)
           { echo "manifest:       ${M:-NOT FOUND}"
             if [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then echo "token in shell: present"; else echo "token in shell: none"; fi
             echo "installer:      $(npm ls -g --prefix "$HOME/.npm-global" --depth=0 2>/dev/null | sed -n 's/.* \(brain-installer@.*\)/\1/p')"
