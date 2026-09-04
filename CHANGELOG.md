@@ -21,8 +21,13 @@ the brain, not for whoever built it: what changed for them, and what to check.
   documents it did find, so "I found four documents and could not write a
   supported answer from them" stops reading as "nothing recorded".
 - The test-brain teardown script's two guards both failed open. Its name check
-  was unanchored, so `my-production-testbed` and even `latest-greatest` counted
-  as test resources because they contain the letters t-e-s-t; and its
+  was unanchored, so anything containing the letters t-e-s-t counted as a test
+  resource: `my-production-testbed`, `latest-greatest`, `contest-results`, and
+  worst of the set, `brain-latest` and `james-latest-backup`. Those last two are
+  the names a person reaches for when copying something before doing anything
+  risky, so the safety copy was the thing the guard protected least. Nothing was
+  ever lost to it, and reaching it needed someone to type the name themselves
+  with a token for that account; and its
   live-resource lock read a list from the environment that, unset, was empty
   and silent. The match is anchored to a real prefix, the script refuses to run
   at all until the lock is set, and both guards are now importable and pinned

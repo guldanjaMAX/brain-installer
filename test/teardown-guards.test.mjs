@@ -19,8 +19,12 @@ for (const name of ["brain-test-run-1", "brain-test-jay-ui", "test-scratch", "TE
 
 // The regression: "test" in the middle of a word is not a test resource.
 for (const name of [
-  "my-production-testbed",       // the peer's example
+  "my-production-testbed",
   "latest-greatest",             // "latest" contains test
+  "brain-latest",                // and so does the name of a safety copy
+  "james-latest-backup",         // the backup made before a risky operation
+  "protest-archive",
+  "fastest-brain",
   "greatest-hits",
   "contest-results",
   "financial-brain-jay-preview-brain",
