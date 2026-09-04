@@ -34,7 +34,7 @@ import {
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import { installedSchemaVersion, acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
@@ -1549,6 +1549,10 @@ export default {
       // purpose, because update's own paused-mode probe has to succeed while
       // the pause is deliberately in force.
       const paused = env.VECTOR_DRAIN_MODE === "paused-for-upgrade";
+      // Which migrations this brain has run. The number that decides whether a
+      // published update may touch it, readable without a key so a fleet can be
+      // checked from one place instead of one machine at a time.
+      const schemaVersion = backendOf(env) === D1 ? await installedSchemaVersion(env) : null;
       return jsonResponse({
         ok: !paused,
         status: paused ? "paused-for-upgrade" : "ok",
@@ -1562,6 +1566,7 @@ export default {
           : { accepting_documents: true }),
         brain: env.BRAIN_NAME || "brain",
         version: env.BRAIN_VERSION || "0.1.0",
+        ...(schemaVersion === null ? {} : { schema_version: schemaVersion }),
         vector_writer_protocol: "lease-v1",
         vector_drain_mode: paused ? "paused-for-upgrade" : "active",
         ts: new Date().toISOString(),

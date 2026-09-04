@@ -4,6 +4,17 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.3.6 (unreleased)
+
+- An update refuses a brain whose database schema is ahead of the release,
+  naming both numbers. The version guard compared version strings only, and a
+  brain built from a working branch records a lower string while running a
+  higher schema, so the one number that mattered was the one nothing looked at.
+- `/health` reports `schema_version`. Whether a brain may take a published
+  update is decided by that integer, and until now it could only be read by
+  standing at the owner's machine. A fleet is now checkable from one place. The
+  field is omitted rather than guessed when the database cannot answer.
+
 ## 0.3.5
 
 - The index rebuild during an update no longer gives up two minutes after it

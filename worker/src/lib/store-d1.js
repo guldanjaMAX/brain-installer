@@ -2749,6 +2749,30 @@ async function confirmAcceleratedBootstrapBatch(env, batch, now) {
  * Re-project legacy vectors in provider-sized, disjoint batches while every
  * ordinary corpus writer remains blocked by the upgrade compatibility Worker.
  */
+/**
+ * The brain's own schema version, for /health.
+ *
+ * Whether a brain may take a published update is decided by this integer, not
+ * by its version string: a brain built from a working branch records a LOWER
+ * version while running a HIGHER schema. Until 2026-09-03 the only way to read
+ * it was to be at the owner's machine running `brain status`, so the guard
+ * depended on a person remembering to look. An unauthenticated integer saying
+ * which migrations ran leaks nothing the version string does not, and makes
+ * every brain in the field checkable with one request.
+ *
+ * Fail-soft: any error returns null, because /health must answer even when D1
+ * cannot.
+ */
+export async function installedSchemaVersion(env) {
+  try {
+    const row = await env.DB.prepare("SELECT schema_version FROM install_state WHERE id = 1").first();
+    const version = Number(row?.schema_version);
+    return Number.isSafeInteger(version) && version > 0 ? version : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function acceleratedVectorBootstrap(env, options = {}) {
   if (env?.VECTOR_DRAIN_MODE !== "paused-for-upgrade") {
     throw new Error("the accelerated vector bootstrap requires the verified upgrade pause");

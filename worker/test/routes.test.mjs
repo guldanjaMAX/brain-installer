@@ -1832,6 +1832,30 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
     health.version === "fixture-version" && health.vector_writer_protocol === "lease-v1" &&
       health.vector_drain_mode === "paused-for-upgrade", JSON.stringify(health));
 
+  // Whether a published update may touch a brain is decided by its schema
+  // version, not its version string, and until 2026-09-03 that number could
+  // only be read by standing at the owner's machine. /health reports it so a
+  // fleet is checkable from one place. A D1 that cannot answer must not take
+  // /health down with it: the field is simply absent.
+  check("a brain whose database cannot answer still reports health, without the schema field",
+    !("schema_version" in health), JSON.stringify(health));
+
+  {
+    const readable = {
+      ...env,
+      VECTOR_DRAIN_MODE: undefined,
+      DB: { prepare: () => ({ first: async () => ({ schema_version: 32 }), bind: () => ({ first: async () => ({ schema_version: 32 }) }) }) },
+    };
+    const live = await (await worker.fetch(new Request("https://b.example/health"), readable, {})).json();
+    check("health reports the schema version, so a brain ahead of a release is visible remotely",
+      live.schema_version === 32 && live.ok === true, JSON.stringify(live));
+
+    const broken = { ...readable, DB: { prepare: () => ({ first: async () => ({ schema_version: "not a number" }) }) } };
+    const soft = await (await worker.fetch(new Request("https://b.example/health"), broken, {})).json();
+    check("an unreadable schema version is omitted rather than guessed",
+      soft.ok === true && !("schema_version" in soft), JSON.stringify(soft));
+  }
+
   const manual = await post(env, "/api/admin/brain/drain", {});
   const manualBody = await manual.json();
   check("a manual drain fails closed while an upgrade cutover is paused",
