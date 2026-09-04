@@ -101,6 +101,10 @@ jobs:
           $out = (brain --version 2>&1 | Out-String)
           if ($out -match '^\s*0\.3\.5\s*$') { throw "brain --version now works. Remove the warning from the guide and switch Step 2b back." }
           "confirmed: --version prints the help banner, as the guide warns"
+          # `brain --version` exits 1. pwsh steps fail on a trailing non-zero
+          # $LASTEXITCODE, so without this the step reports failure having
+          # just printed its own PASS line. Seen 2026-09-04, first run.
+          exit 0
 
       # With no credentials, the schema gate must REFUSE and say how to fix it.
       # A crash here is what Malini's session hit as AUTH_REQUIRED with no
@@ -114,3 +118,5 @@ jobs:
           $ok = $out -match 'wrangler@4 login' -or $out -match 'no Cloudflare credential'
           if (-not $ok) { throw "no-credential run did not explain itself. It printed:`n$out" }
           "refuses and points at the browser sign-in"
+          # Same trailing-exit-code trap: refusing is the expected outcome.
+          exit 0
