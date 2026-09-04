@@ -113,3 +113,38 @@ from running them one at a time, twice, which sent me chasing a phantom
 "not idempotent" bug for ten minutes. They are deterministic. The loop was
 reading a working tree I was concurrently changing. Measure a tree you are not
 editing.
+
+
+## The recovery contract, and where its last failure now sits (2026-09-04 05:30)
+
+`RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION` was 22, and the adapter REFUSES to
+export any tree whose last migration is a different number. That is the point
+of it: a recovery drill against an unreviewed schema could omit a durable table
+without saying so. The port raises the schema, so the pin had to be raised
+deliberately, together with the tables.
+
+Done in this branch:
+
+- 23 durable tables from migrations 0023 to 0032 added to
+  `RECOVERY_DURABLE_TABLES`, with a `SCHEMA_nn_TABLES` constant and version
+  gate for each of the nine migrations that create tables. 0029 creates none.
+- The pin raised 22 to 32, with the rule written next to it: never raise this
+  without adding the new tables, because a durable table absent from this
+  contract is one a recovery export omits silently.
+- Verified separately that all 32 migrations replay cleanly through the plain
+  `sqlite3` CLI, both as one stream and as the ten applied on top of the
+  release's 22. A migration that cannot replay in sqlite would break recovery
+  from an export, and none of them do.
+
+**Still failing, and it has moved two stages forward.** The test now gets past
+`export_d1` and fails at `RECOVERY_LOCAL_SQLITE_FAILED`, which is the child
+`sqlite3` process exiting non-zero while verifying a synthetic artifact the
+test builds from the migration set plus 6,000 fixture documents. The migrations
+themselves are not the cause, since they replay clean on their own. The next
+step is to capture that artifact and run it by hand to see which statement the
+CLI rejects, rather than inferring it.
+
+That is one test, and it is a recovery DRILL fixture rather than a product
+path, so it does not block the schema-32 rehearsal. It does block calling the
+port finished, because the recovery drill is what proves a client could be
+restored.
