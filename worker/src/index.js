@@ -21,8 +21,8 @@
 
 import { jsonResponse, privateNoStore, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
 import { resolvePrincipal, principalMay } from "./lib/grants.js";
-import { handleBankFeed } from "./lib/bank-feed.js";
-import { handlePlaidWebhook } from "./lib/plaid-bank-feed.js";
+import { handleBankFeed, bankFeedEnabled } from "./lib/bank-feed.js";
+import { handlePlaidWebhook, runPlaidMaintenance } from "./lib/plaid-bank-feed.js";
 import { handleSupportAccess } from "./lib/support-access.js";
 import {
   AGENT_DELETION_PATH_PREFIX, handleAgentDeletion,
@@ -55,7 +55,7 @@ import {
 import {
   findGrantByCredentialHash, recordPasskeySecurityEvent, sourcesInScope,
 } from "./lib/auth-store.js";
-import { handleZoomWebhook } from "./lib/zoom.js";
+import { handleZoomWebhook, runZoomDeliveryMaintenance } from "./lib/zoom.js";
 import {
   handleOAuthMetadata, handleProtectedResourceMetadata, handleRegister,
   handleAuthorizePage, handleAuthorizeDecision, handleToken, validateConnectorToken,
@@ -2080,7 +2080,9 @@ export default {
    */
   async scheduled(event, env, ctx) {
     if (backendOf(env) !== D1) return;
-    ctx.waitUntil(
+    // Promise.all, not three arguments: waitUntil takes ONE promise and would
+    // silently drop the rest, leaving both maintenance passes floating.
+    ctx.waitUntil(Promise.all([
       (async () => {
         // Bounded, because a Worker invocation has a wall clock and an unbounded
         // loop on a large backfill would be killed mid-batch every time.
@@ -2096,7 +2098,27 @@ export default {
         else if (!r.paused && !r.busy && !r.submitted && Number(r.waiting) > 0) {
           console.log(`vector outbox: waiting on confirmation, ${r.remaining} queued`);
         }
-      })()
-    );
+      })(),
+      // Both durable queues need a scheduled pass or their retry ladders never
+      // advance: a webhook writes the debt, but only this clears it when the
+      // first attempt failed and no further webhook is coming.
+      runZoomDeliveryMaintenance(env).then((result) => {
+        const deliveries = Number(result?.deliveries?.claimed || 0);
+        const discovered = Number(result?.reconciliation?.recordings || 0);
+        if (deliveries || discovered) {
+          console.log(`zoom delivery maintenance: ${discovered} discovered, ${deliveries} claimed`);
+        }
+        if (!result?.skipped && result?.outcome?.kind !== "completed") {
+          console.warn(`zoom delivery maintenance: ${result?.outcome?.kind || "unavailable"}`);
+        }
+      }),
+      env.BANK_FEED_PROVIDER === "plaid" && bankFeedEnabled(env)
+        ? runPlaidMaintenance(env).then((result) => {
+          const synced = Number(result?.sync?.ran || 0);
+          const revoked = Number(result?.revocations?.ran || 0);
+          if (synced || revoked) console.log(`plaid maintenance: ${synced} synced, ${revoked} revocations`);
+        })
+        : Promise.resolve(),
+    ]));
   },
 };

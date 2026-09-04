@@ -18,28 +18,32 @@
     "timezone": "America/Phoenix"
   },
   "brain": {
-    "version": "0.3.5",
+    "version": "0.4.0",
     "domain": "brain.acme.com",
     "worker_name": "acme-brain"
   },
   "infrastructure": {
-    "_comment": "Client-owned. We hold a scoped, expiring token and nothing else.",
+    "_comment": "Client-owned. The ordinary installer uses this Brain's named Wrangler browser sign-in in the owner's protected operating-system credential store. The manifest stores only its non-secret profile label.",
     "cloudflare": {
       "_token_scopes": [
-        "The API token the client issues us needs exactly these, no more:",
+        "The normal path is a separate named Wrangler browser sign-in for this Brain.",
+        "If browser sign-in is unavailable and the owner approves the recovery-only",
+        "API-token path, that temporary token needs exactly these permissions:",
         "  Account > Workers Scripts: Edit",
         "  Account > D1: Edit",
         "  Account > Vectorize: Edit",
         "  Account > Workers R2 Storage: Edit   (only if r2_bucket is set)",
         "  Account > Workers AI: Read",
         "Vectorize Edit was verified on 2026-08-23 for index creation and every",
-        "metadata index. `npx wrangler@4 login` is only a fallback for an older",
-        "token that does not carry that permission.",
+        "metadata index. `brain doctor` checks this Brain's exact saved browser",
+        "profile and account without opening a browser. A recovery token remains",
+        "separate and can be removed without removing the named browser profile.",
         "",
         "The account must ALSO be on the Workers Paid plan, 5 USD a month minimum.",
         "Free can create Vectorize, but its vector, daily-write, and Worker CPU limits are prototype-scale. Paid is the supported production baseline."
       ],
       "account_id": "REQUIRED_client_account_id",
+      "_auth_profile_comment": "Filled by the beginner installer after Cloudflare browser sign-in. This is a non-secret local profile name, not a token. One Cloudflare account may safely own many Brains; every Brain still receives its own Worker, D1 database, Vectorize index, secrets, and manifest resource IDs. The browser grant has account-wide control-plane authority, so separate resources prevent accidental overlap but are not a separate permission boundary.",
       "storage": "d1",
       "_storage_options": "d1 | supabase",
       "d1_database_name": "REPLACE-WITH-slug-brain",
@@ -88,7 +92,8 @@
   "corpora": {
     "_comment": "Which sources this install ingests. Each maps to a connector.",
     "google_drive": {
-      "enabled": true,
+      "enabled": false,
+      "root_folder_ids": [],
       "exclude_paths": [],
       "exclude_name_parts": [],
       "exclude_file_ids": [],
@@ -153,16 +158,88 @@
       "enabled": false
     },
     "slack": {
+      "_comment": [
+        "Read-only conversation history through the owner's own Slack app.",
+        "OAuth credentials stay in the local provider credential store and are",
+        "never placed in this manifest. Optionally restrict the load to exact",
+        "channel_ids. Removed-message authority remains an explicit gap."
+      ],
       "enabled": false,
+      "channel_ids": [],
+      "include_thread_replies": true,
       "bot_token_secret": "secret://SLACK_BOT_TOKEN"
     },
     "notion": {
+      "_comment": [
+        "Read-only pages explicitly shared with the owner's Notion integration.",
+        "OAuth credentials stay in the local provider credential store. Pages",
+        "outside the integration share boundary cannot be inventoried."
+      ],
       "enabled": false,
       "token_secret": "secret://NOTION_TOKEN"
     },
+    "quickbooks": {
+      "_comment": [
+        "QuickBooks Online runtime queries are read-only, but Intuit's one",
+        "Accounting OAuth scope grants broader read and update permission.",
+        "This release connects sandbox companies only. Register the exact",
+        "http://localhost:47812/ redirect shown by the technician command.",
+        "OAuth credentials and the selected company id stay in the local",
+        "provider credential store. Disconnect retains imported documents;",
+        "removal needs a separately reviewed forget preview."
+      ],
+      "enabled": false,
+      "environment": "sandbox",
+      "redirect_host": "localhost",
+      "entities": [
+        "Account",
+        "Customer",
+        "Vendor",
+        "Invoice",
+        "Payment",
+        "Bill",
+        "Purchase",
+        "JournalEntry",
+        "Deposit",
+        "Transfer",
+        "CreditMemo",
+        "BillPayment",
+        "Estimate",
+        "SalesReceipt",
+        "RefundReceipt"
+      ]
+    },
+    "microsoft": {
+      "_comment": [
+        "Microsoft 365 Outlook plus selected OneDrive or SharePoint drives.",
+        "Graph delta links carry exact message and file tombstones. Add exact",
+        "drive_ids or site_ids after reviewing the tenant selection."
+      ],
+      "enabled": false,
+      "mail_folder_ids": [
+        "inbox"
+      ],
+      "drive_ids": [],
+      "site_ids": [],
+      "include_personal_drive": true
+    },
+    "dropbox": {
+      "_comment": "Recursive Dropbox body sync with exact cursor tombstones.",
+      "enabled": false,
+      "root_path": ""
+    },
+    "hubspot": {
+      "_comment": "Read-only contacts, companies, and deals. Hard deletion remains an explicit gap.",
+      "enabled": false,
+      "object_types": [
+        "contacts",
+        "companies",
+        "deals"
+      ]
+    },
     "upload": {
-      "_comment": "Manual drop zone. Always on: it is the fallback for anything with no connector.",
-      "enabled": true
+      "_comment": "Manual drop zone. Setup enables and records it after a folder is chosen; until then there is no folder to load.",
+      "enabled": false
     },
     "local_folder": {
       "_comment": [
@@ -181,7 +258,29 @@
       ],
       "enabled": false,
       "path": null,
-      "source": "documents"
+      "source": "watched_documents"
+    },
+    "bank_feed": {
+      "_comment": [
+        "Plaid is the reviewed bank-feed profile. Keep this off until the",
+        "client has a Plaid account, Sandbox credentials have been entered",
+        "through the hidden prompt, the independent bank wrapping key is in",
+        "reviewed owner recovery custody, and the exact return and webhook URLs are",
+        "registered in that Plaid environment. Credentials never go here.",
+        "The account holder completes Link themselves. This brain requests only",
+        "read-only Transactions and never sees bank login credentials. Scheduled",
+        "reconciliation remains active because webhooks are not a sole source of truth.",
+        "After Link, assign each masked account to its owning entity. Plaid never",
+        "defaults every account at one institution to a primary entity."
+      ],
+      "enabled": false,
+      "provider": "plaid",
+      "environment": "sandbox",
+      "registered_redirect_uris": [],
+      "country_codes": [
+        "US"
+      ],
+      "reconciliation_interval_minutes": 360
     },
     "whatsapp": {
       "_comment": [
@@ -222,7 +321,7 @@
     ],
     "daily_llm_spend_cap_usd": 10,
     "ocr": {
-      "_comment": "Read scanned PDFs by sending each page image to a vision model through THIS brain's own Workers AI binding. OFF by default on purpose: it spends money on the client's own Cloudflare account, once per scanned page, and nobody should discover that after the fact. Every page still passes the daily spend cap, and every document read this way is MARKED as OCR so an answer resting on it says so.",
+      "_comment": "Read scanned PDFs by sending each page image to a vision model through THIS brain's own Workers AI binding. OFF by default on purpose: it spends money on the client's own Cloudflare account, once per scanned page, and nobody should discover that after the fact. Every page must atomically reserve a conservative amount from the daily estimated-spend budget, and every document read this way is MARKED as OCR so an answer resting on it says so.",
       "enabled": false,
       "model": "@cf/google/gemma-4-26b-a4b-it",
       "_model_note": "Must be a Cloudflare @cf/ model. OCR refuses anything else rather than send a picture of a client document to a provider this manifest does not name.",
@@ -244,6 +343,22 @@
     ],
     "ingest_cron": "0 9 * * *",
     "folder_ingest_cron": "0 * * * *",
+    "provider_crons": {
+      "quickbooks": "0 2 * * *",
+      "slack": "15 2 * * *",
+      "notion": "30 2 * * *",
+      "microsoft": "0 * * * *",
+      "dropbox": "15 * * * *",
+      "hubspot": "45 2 * * *"
+    },
+    "provider_token_stores": {
+      "quickbooks": "auto",
+      "slack": "auto",
+      "notion": "auto",
+      "microsoft": "auto",
+      "dropbox": "auto",
+      "hubspot": "auto"
+    },
     "admin_key_secret": null,
     "google_token_store": "auto",
     "health_cron": "0 13 * * *",

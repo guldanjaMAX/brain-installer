@@ -72,7 +72,13 @@
           "properties": {
             "account_id": {
               "type": "string",
-              "minLength": 8
+              "pattern": "^(?:[A-Fa-f0-9]{32}|REQUIRED_client_account_id)$",
+              "description": "Exact 32-hex Cloudflare account id. The explicit REQUIRED_client_account_id value is allowed only in the unconfigured package template and must be replaced before account-bound control-plane work."
+            },
+            "auth_profile": {
+              "type": "string",
+              "pattern": "^financial-brain-[a-f0-9]{24}$",
+              "description": "Non-secret local Wrangler OAuth profile used for this install's Cloudflare control-plane ceremony. The credential itself remains in Wrangler's OS-keyring-backed encrypted store and is never written to this manifest."
             },
             "storage": {
               "enum": [
@@ -129,14 +135,47 @@
     },
     "corpora": {
       "type": "object",
-      "description": "Source declarations. Google Drive policy is enforced by brain ingest --from drive. Other connector declarations may remain descriptive until their command is documented.",
+      "description": "Source declarations. Enabled connectors are enforced by their documented connect, ingest, schedule, disconnect, and forget commands.",
       "properties": {
         "google_drive": {
           "type": "object",
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "enabled"
+                ]
+              },
+              "then": {
+                "required": [
+                  "root_folder_ids"
+                ],
+                "properties": {
+                  "root_folder_ids": {
+                    "minItems": 1
+                  }
+                }
+              }
+            }
+          ],
           "properties": {
             "enabled": {
               "type": "boolean",
               "default": false
+            },
+            "root_folder_ids": {
+              "type": "array",
+              "description": "Exact reviewed folder ids that bound Drive ingestion. Only these folders and their descendants are traversed; shortcuts are not followed outside them.",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
             },
             "exclude_paths": {
               "type": "array",
@@ -221,6 +260,208 @@
             }
           }
         },
+        "quickbooks": {
+          "type": "object",
+          "description": "QuickBooks Online accounting records queried read-only at runtime. Intuit's Accounting OAuth consent can authorize broader read and update access. Sandbox localhost OAuth is available; production stops before credential or browser access until the client-owned HTTPS callback is implemented. OAuth credentials and raw company identity remain in the local provider store. Disconnect retains imported documents, and query snapshots do not prove hard deletion.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "environment": {
+              "enum": [
+                "sandbox",
+                "production"
+              ],
+              "default": "sandbox"
+            },
+            "redirect_host": {
+              "enum": [
+                "localhost",
+                "127.0.0.1"
+              ],
+              "default": "localhost",
+              "description": "Exact sandbox callback host. Intuit documents localhost. The callback server always binds 127.0.0.1 and this value cannot broaden listener scope."
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]*$",
+              "maxLength": 64,
+              "default": "quickbooks"
+            },
+            "minor_version": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 999
+            },
+            "entities": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "Account",
+                  "Customer",
+                  "Vendor",
+                  "Invoice",
+                  "Payment",
+                  "Bill",
+                  "Purchase",
+                  "JournalEntry",
+                  "Deposit",
+                  "Transfer",
+                  "CreditMemo",
+                  "BillPayment",
+                  "Estimate",
+                  "SalesReceipt",
+                  "RefundReceipt"
+                ]
+              }
+            }
+          }
+        },
+        "slack": {
+          "type": "object",
+          "description": "Read-only Slack conversation history using an owner-authorized user token in the local provider credential store. History pagination and bounded thread replies are read, but Slack does not provide an authoritative removal stream for all deleted messages, so deletion authority remains explicit rather than inferred.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]*$",
+              "maxLength": 64,
+              "default": "slack"
+            },
+            "channel_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "include_thread_replies": {
+              "type": "boolean",
+              "default": true
+            }
+          }
+        },
+        "notion": {
+          "type": "object",
+          "description": "Read-only Notion pages shared with the owner-authorized integration. Every visible page is paginated and its readable child blocks are recursively materialized. Unshared and hard-deleted pages are outside the integration's inventory, so deletion authority is reported as unavailable.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]*$",
+              "maxLength": 64,
+              "default": "notion"
+            }
+          }
+        },
+        "microsoft": {
+          "type": "object",
+          "description": "Read-only Microsoft 365 Outlook, OneDrive, and selected SharePoint drives using Graph delta links. Message and drive tombstones are authoritative, and supported file bodies are downloaded to the owner machine for the common extraction path before a terminal delta link may advance.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]*$",
+              "maxLength": 64,
+              "default": "microsoft"
+            },
+            "mail_folder_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "default": [
+                "inbox"
+              ]
+            },
+            "drive_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "site_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "include_personal_drive": {
+              "type": "boolean",
+              "default": true
+            }
+          }
+        },
+        "dropbox": {
+          "type": "object",
+          "description": "Read-only Dropbox recursive file sync with opaque cursors, exact deleted-path tombstones, and supported file bodies downloaded to the owner machine for common extraction. An expired cursor triggers a full reconciliation rather than guessing at missed changes.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]*$",
+              "maxLength": 64,
+              "default": "dropbox"
+            },
+            "root_path": {
+              "type": "string",
+              "default": ""
+            }
+          }
+        },
+        "hubspot": {
+          "type": "object",
+          "description": "Read-only HubSpot CRM snapshots for selected object types. Active and archived records are enumerated separately, but hard deletion has no complete incremental stream, so every run reports its deletion-authority gap instead of inferring absence.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]*$",
+              "maxLength": 64,
+              "default": "hubspot"
+            },
+            "object_types": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "contacts",
+                  "companies",
+                  "deals"
+                ]
+              },
+              "default": [
+                "contacts",
+                "companies",
+                "deals"
+              ]
+            }
+          }
+        },
         "local_folder": {
           "type": "object",
           "description": "A local folder that reloads itself on a schedule, enforced by brain schedule <manifest> --install --folder and run by brain ingest <manifest> --path. This is what makes \"drop it in a folder you already ingest\" true for a folder that is not inside Google Drive. Each tick reuses the local ingest's content-hash resume state, so a new file is added, a changed file is re-sent, an unchanged file costs one read, and a file that is gone is removed through the same aggregate removal plan every other source uses. The schedule knob is operations.folder_ingest_cron (default: hourly). macOS only today: it installs as a per-user LaunchAgent.",
@@ -247,11 +488,19 @@
         },
         "bank_feed": {
           "type": "object",
-          "description": "A hosted, read-only bank connection the ACCOUNT HOLDER authorises themselves, in their own browser, on their own bank's screen. No password, one-time code, or bank credential is ever seen, requested, handled, or stored by the operator or by this codebase; what the brain receives is a read-only reference for fetching transaction history, and it is stored encrypted in the client's own D1. Setting enabled:true is also what makes BANK_FEED_CLIENT_ID and BANK_FEED_SECRET eligible worker secrets: with it false they are DELETED by the next `brain secrets` run, which is the intended behaviour for a brain that does not use the feed. Recommended posture is per-client credentials in the client's own provider account, so one leaked worker secret is one client's exposure. Start in sandbox so an install can be rehearsed the same day, before the client's production approval lands. `brain doctor` fails when registered_redirect_uris does not contain this brain's own return address, because that registration cannot be fixed while a client is sitting in front of you mid-authorisation.",
+          "description": "A hosted, read-only bank connection the ACCOUNT HOLDER authorises themselves, in their own browser, on their own bank's screen. No password, one-time code, or bank credential is ever seen, requested, handled, or stored by the operator or by this codebase; what the brain receives is a read-only reference for fetching transaction history, and it is stored encrypted in the client's own D1. Setting enabled:true makes BANK_FEED_CLIENT_ID, BANK_FEED_SECRET, and the independently held BANK_FEED_WRAPPING_KEY_V2 eligible Worker secrets. The wrapping key is never derived from provider, admin, or session credentials and remains owner custody needed for recovery. With enabled:false they are DELETED by the next `brain secrets` run, which is the intended behaviour for a brain that does not use the feed. Recommended posture is per-client credentials in the client's own provider account, so one leaked worker secret is one client's exposure. Start Plaid in sandbox so an install can be rehearsed before the client's production approval lands. `brain doctor` fails when registered_redirect_uris does not contain this brain's own return address, because that registration cannot be fixed while a client is sitting in front of you mid-authorisation.",
           "properties": {
             "enabled": {
               "type": "boolean",
               "default": false
+            },
+            "provider": {
+              "enum": [
+                "plaid",
+                "custom"
+              ],
+              "default": "plaid",
+              "description": "plaid selects the reviewed public endpoint profile. custom preserves an explicitly configured compatible bank-feed provider. Credentials never belong in this manifest."
             },
             "environment": {
               "enum": [
@@ -263,16 +512,16 @@
             "api_base": {
               "type": "string",
               "format": "uri",
-              "description": "The provider's HTTPS API origin for the selected environment. Deployed as the BANK_FEED_API_BASE worker var. There is deliberately no default in code: a missing host must fail at the operator, never reach an unintended endpoint."
+              "description": "The HTTPS API origin for provider:custom. The named Plaid profile pins its own public sandbox and production origins and does not accept this override."
             },
             "link_sdk_url": {
               "type": "string",
               "format": "uri",
-              "description": "The provider's browser SDK URL. The connect page's Content-Security-Policy is widened to exactly this URL's origin and to nothing else."
+              "description": "The browser SDK URL for provider:custom. The named Plaid profile pins its reviewed Link SDK URL. The connect page's Content-Security-Policy is widened to exactly this URL's origin and to nothing else."
             },
             "link_global": {
               "type": "string",
-              "description": "The global name the provider's SDK installs on window."
+              "description": "The browser global for provider:custom. The named Plaid profile pins Plaid."
             },
             "registered_redirect_uris": {
               "type": "array",
@@ -284,9 +533,87 @@
             },
             "entity_slug": {
               "type": "string",
-              "description": "Which fin_entities scope feed rows belong to. Defaults to primary."
+              "description": "Legacy custom-provider scope only. Plaid ignores this Item-level value: every discovered Plaid account remains staged until the owner assigns that exact masked account to one active owned fin_entities scope."
+            },
+            "country_codes": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Z]{2}$"
+              },
+              "default": [
+                "US"
+              ],
+              "description": "Plaid institution countries shown in Link. Defaults to US."
+            },
+            "reconciliation_interval_minutes": {
+              "type": "integer",
+              "minimum": 15,
+              "maximum": 1440,
+              "default": 360,
+              "description": "Scheduled Transactions Sync fallback interval. Webhooks request prompt reconciliation, but are never the only delivery path."
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "provider": {
+                    "const": "plaid"
+                  }
+                },
+                "required": [
+                  "provider"
+                ]
+              },
+              "then": {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "api_base"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "link_sdk_url"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "link_global"
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  },
+                  "provider": {
+                    "const": "custom"
+                  }
+                },
+                "required": [
+                  "enabled",
+                  "provider"
+                ]
+              },
+              "then": {
+                "required": [
+                  "api_base",
+                  "link_sdk_url",
+                  "link_global"
+                ]
+              }
+            }
+          ]
         }
       }
     },
@@ -355,11 +682,12 @@
         },
         "daily_llm_spend_cap_usd": {
           "type": "number",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Legacy field name for the daily estimated LLM spend budget in USD. Calls reserve a conservative estimate atomically before provider use. It is a runaway-spend guard, not an invoice-exact ceiling because provider prices and receipts can change."
         },
         "ocr": {
           "type": "object",
-          "description": "Read scanned PDFs by sending each page image to a vision model through THIS brain's own Workers AI binding. Off by default because it costs money on the client's own Cloudflare account, once per scanned page, and every page still passes the daily spend cap.",
+          "description": "Read scanned PDFs by sending each page image to a vision model through THIS brain's own Workers AI binding. Off by default because it costs money on the client's own Cloudflare account, once per scanned page, and every page must reserve from the daily estimated-spend budget.",
           "properties": {
             "enabled": {
               "type": "boolean",
@@ -396,6 +724,14 @@
           ],
           "pattern": "^keychain://[^/]+/.+$",
           "description": "Optional non-secret macOS Keychain locator, keychain://<service>/<account>, for the brain admin key used by unattended ingest. Standard setup fills a deterministic locator automatically on macOS when no legacy adjacent .brain-admin-key exists. Windows keeps the adjacent key under DPAPI CurrentUser; Linux uses an owner-only adjacent file. brain secrets exactly verifies durable desired state before applying it to the Worker. A failed remote write can be retried with no ADMIN_KEY export. The secret value never enters the manifest or plist."
+        },
+        "recovery_artifact_key_secret": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^keychain://[^/]+/.+$",
+          "description": "Optional non-secret macOS Keychain locator, keychain://<service>/<account>, for the independent key that encrypts durable verified-recovery artifacts. The key value never enters the manifest, plan, state, command line, or artifact directory. The Cloudflare recovery field gate requires this locator on its target manifest."
         },
         "recovery_field_gate": {
           "type": "object",
@@ -444,6 +780,92 @@
           ],
           "default": "auto",
           "description": "Durable Google OAuth token-store choice for unattended ingest. auto uses macOS Keychain; file preserves an explicit BRAIN_GOOGLE_TOKEN_STORE=file connection choice across sparse LaunchAgent environments."
+        },
+        "provider_crons": {
+          "type": "object",
+          "description": "Five-field cron schedules for locally stored OAuth provider connectors. Incremental Microsoft and Dropbox lanes default to hourly; full-snapshot lanes default to daily. Each installs as its own per-user macOS LaunchAgent.",
+          "properties": {
+            "quickbooks": {
+              "type": "string",
+              "minLength": 9
+            },
+            "slack": {
+              "type": "string",
+              "minLength": 9
+            },
+            "notion": {
+              "type": "string",
+              "minLength": 9
+            },
+            "microsoft": {
+              "type": "string",
+              "minLength": 9
+            },
+            "dropbox": {
+              "type": "string",
+              "minLength": 9
+            },
+            "hubspot": {
+              "type": "string",
+              "minLength": 9
+            }
+          },
+          "additionalProperties": false
+        },
+        "provider_token_stores": {
+          "type": "object",
+          "description": "Durable per-provider OAuth token-store choice for unattended ingest. auto uses macOS Keychain and the platform default elsewhere; file preserves an explicit owner-only file choice.",
+          "properties": {
+            "quickbooks": {
+              "enum": [
+                "auto",
+                "keychain",
+                "file"
+              ],
+              "default": "auto"
+            },
+            "slack": {
+              "enum": [
+                "auto",
+                "keychain",
+                "file"
+              ],
+              "default": "auto"
+            },
+            "notion": {
+              "enum": [
+                "auto",
+                "keychain",
+                "file"
+              ],
+              "default": "auto"
+            },
+            "microsoft": {
+              "enum": [
+                "auto",
+                "keychain",
+                "file"
+              ],
+              "default": "auto"
+            },
+            "dropbox": {
+              "enum": [
+                "auto",
+                "keychain",
+                "file"
+              ],
+              "default": "auto"
+            },
+            "hubspot": {
+              "enum": [
+                "auto",
+                "keychain",
+                "file"
+              ],
+              "default": "auto"
+            }
+          },
+          "additionalProperties": false
         },
         "health_cron": {
           "type": "string",

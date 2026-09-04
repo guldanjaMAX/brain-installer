@@ -118,16 +118,55 @@ test("owner routes require the positive session principal and publish exact uplo
     assert.equal(capabilities.status, 200);
     assertPrivate(capabilities);
     assert.deepEqual(await capabilities.json(), {
-      supported_media_types: ["text/plain", "text/markdown"],
-      supported_extensions: [".txt", ".md", ".markdown"],
+      supported_media_types: [
+        "text/plain", "text/markdown", "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel", "message/rfc822", "image/png", "image/jpeg",
+      ],
+      text_media_types: ["text/plain", "text/markdown"],
+      binary_media_types: [
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel", "message/rfc822", "image/png", "image/jpeg",
+      ],
+      supported_extensions: [
+        ".txt", ".md", ".markdown", ".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".eml", ".png", ".jpg", ".jpeg",
+      ],
       media_type_extensions: {
         "text/plain": [".txt"],
         "text/markdown": [".md", ".markdown"],
+        "application/pdf": [".pdf"],
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation": [".pptx"],
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+        "application/vnd.ms-excel": [".xls"],
+        "message/rfc822": [".eml"],
+        "image/png": [".png"],
+        "image/jpeg": [".jpg", ".jpeg"],
       },
       max_content_bytes: 1_000_000,
+      max_binary_bytes: 8 * 1024 * 1024,
+      max_ocr_image_bytes: 3_000_000,
+      media_type_max_bytes: {
+        "text/plain": 1_000_000,
+        "text/markdown": 1_000_000,
+        "application/pdf": 8 * 1024 * 1024,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": 8 * 1024 * 1024,
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation": 8 * 1024 * 1024,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": 8 * 1024 * 1024,
+        "application/vnd.ms-excel": 8 * 1024 * 1024,
+        "message/rfc822": 8 * 1024 * 1024,
+        "image/png": 3_000_000,
+        "image/jpeg": 3_000_000,
+      },
       content_encoding: "utf-8",
       empty_media_type_supported: false,
-      normalization: "decode UTF-8 strictly, remove one leading UTF-8 BOM if present, preserve all remaining text exactly",
+      normalization: "text is decoded as strict UTF-8; documents use bounded native extraction; PNG and JPEG use private OCR",
+      scanned_pdf_ocr_supported: false,
     });
 
     fixture.env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
@@ -155,11 +194,17 @@ test("owner upload refuses unsafe media, size, scope, and credentials before mut
     assert.deepEqual(before(), { documents: 0, receipts: 0, activity: 0 });
 
     const unsupported = await json(await ownerPost(fixture, "/api/owner/uploads", uploadBody("bad-media", {
-      media_type: "application/pdf", file_name: "statement.pdf",
+      media_type: "application/zip", file_name: "statement.zip",
     })));
     assert.equal(unsupported.response.status, 415);
     assert.equal(unsupported.body.uploaded, false);
     assert.equal(unsupported.body.unsupported_media, true);
+
+    const invalidBinaryTransport = await json(await ownerPost(fixture, "/api/owner/uploads", uploadBody("bad-binary-transport", {
+      media_type: "application/pdf", file_name: "statement.pdf", envelope: { content: "%PDF" },
+    })));
+    assert.equal(invalidBinaryTransport.response.status, 400);
+    assert.equal(invalidBinaryTransport.body.code, "binary_content_must_be_base64");
 
     const mismatch = await json(await ownerPost(fixture, "/api/owner/uploads", uploadBody("bad-extension", {
       media_type: "text/markdown", file_name: "note.txt",

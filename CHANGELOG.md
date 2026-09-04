@@ -4,6 +4,33 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.4.0
+
+This release joins two code lines that had drifted apart. Some brains were
+running a backend that never shipped, and could not be updated without going
+backwards. They can be updated now.
+
+- Bank connections are protected by their own key. It is a separate secret,
+  never derived from your admin or sign-in material, so restoring or rotating
+  those can no longer strand a working bank connection. Existing connections
+  keep working and move across one at a time. YOU MUST SET the new key before
+  a NEW bank can be connected; existing ones are unaffected until then.
+- Signing in again once, on every device. Sessions now name the passkey they
+  came from, so revoking a device immediately ends its sessions instead of
+  leaving them alive. Your existing sign-in does not carry across the update.
+- Zoom transcripts are no longer lost when Zoom is slow. A recording that is
+  not ready yet used to be recorded as permanently gone. The webhook now writes
+  down the work before attempting it, and a scheduled pass finishes anything the
+  first attempt could not.
+- One bad row no longer holds up the queue behind it. A document the vector
+  index refuses is retried on its own, on a backoff, and set aside after five
+  attempts, while everything healthy keeps moving.
+- Uploads accept PDFs and images, not only text, and read scanned pages when
+  you turn that on. A document read that way is marked, so an answer resting
+  on it says so.
+- The recovery drill's export is encrypted rather than plain SQL, and it now
+  counts the state of every bank reference it restored.
+
 ## 0.3.6 (unreleased)
 
 - The release gate is written down in `docs/RELEASE-GATE.md`: the update
