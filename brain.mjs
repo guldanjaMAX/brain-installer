@@ -8469,6 +8469,10 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   let runClosed = false;
 
   const skips = [];
+  // A skip the policy INTENDED (a promotion, an excluded mailbox role) is not a
+  // gap in coverage, and a receipt that cannot tell them apart makes a working
+  // sync look like a failing one. Counted here, reported on the receipt.
+  let policySkipped = 0;
   let unchanged = 0;
   let scanned = 0;
   let prepared = 0;
@@ -8859,6 +8863,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       const r = await gmail.toEnvelope(getToken, id, { sourceName });
       if (r.skip) {
         state.skipped[key] = r.skip.reason;
+        if (r.policy_skip === true) policySkipped++;
         intentionalRemovalUids.push(key);
         return { skip: r.skip };
       }
@@ -8931,6 +8936,9 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       const mailFolders = folders.length - containers.length;
       info(`${mailFolders} mail folder(s) on this mailbox; reading ${included.length}: ${included.map((f) => f.name).join(", ") || "none"}`);
       if (skippedRoles.length) {
+        // Excluded by policy, so these count as intended skips rather than as
+        // mail the sync failed to reach.
+        policySkipped += skippedRoles.length;
         info(`  not read, by policy: ${skippedRoles.map((f) => `${f.name} (${f.role})`).join(", ")}`);
       }
       if (unlisted.length) {
@@ -8985,6 +8993,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
           if (r.skip) {
             const key = `${sourceName}:${folder.name}#${message.uid}`;
             state.skipped[key] = r.skip.reason;
+            if (/^bulk mail:/i.test(r.skip.reason || "")) policySkipped++;
             return { skip: r.skip };
           }
           const key = `${sourceName}:${r.envelope.source_id}`;
@@ -9082,18 +9091,30 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   } else if (pendingCursor && tally.failed) {
     warn(`${tally.failed} document(s) failed, so the source cursor was NOT advanced; the next run will retry them`);
   }
-  const finalStatus = tally.failed ? "error" : "ready";
+  // A skip nobody intended is a hole in coverage, and a run that reports
+  // "ready" over one teaches the owner to trust a number that is not true.
+  // Refused input and unintended skips close the run as an error, exactly like
+  // a failed document, so the cursor is withheld and the next run retries.
+  const coverageGaps = Math.max(0, skips.length - policySkipped);
+  const hasRemoteGap = tally.failed > 0 || tally.refused > 0 || coverageGaps > 0;
+  const finalStatus = hasRemoteGap ? "error" : "ready";
   await postSourceReceipt(base, adminKey, {
     source: sourceName, kind: which, status: finalStatus, run_id: runId,
     lane, started_at: runStartedAt, completed_at: new Date().toISOString(),
     complete_sweep: which === "drive" && !incremental,
-    walk_complete: tally.failed === 0,
+    walk_complete: !hasRemoteGap,
     files_seen: scanned,
     docs_added: tally.created,
     docs_updated: tally.updated,
     docs_unchanged: unchanged + tally.unchanged,
-    detail: `${which} ${lane} sync ${finalStatus === "ready" ? "completed" : "completed with document failures"}; skipped=${skips.length}`,
-    ...(tally.failed ? { error: `${tally.failed} document(s) failed; the source cursor was not advanced` } : {}),
+    // One shape or the other, never both: a receipt carrying a human detail AND
+    // an issue code invites a reader to believe the happier of the two.
+    ...(hasRemoteGap
+      ? { issue_code: tally.refused > 0 ? "INPUT_REFUSED" : "INGEST_FAILED" }
+      : {
+          detail: `${which} ${lane} sync completed; skipped=${skips.length}; ` +
+            `policy_skipped=${policySkipped}; coverage_gaps=${coverageGaps}`,
+        }),
   });
   runClosed = true;
 

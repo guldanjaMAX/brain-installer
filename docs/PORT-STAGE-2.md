@@ -176,3 +176,41 @@ head rather than at the end of a long night.
 Appending the exports was still worth doing on its own: it turns an import
 error into four specific behavioural assertions, which is a far better
 description of what is missing than "the module does not load".
+
+
+## Where it stands after the ingest and connector merges (2026-09-04)
+
+144 of 153 chain invocations pass, from 130 at the start of this session.
+Every step was measured against a tree that was not being edited, and no
+regression survived a step.
+
+Nine remain. Four are NOT code gaps:
+
+| Test | Why it fails | Decision |
+|---|---|---|
+| `cloudflare-oauth-session` | Wants the field's account-first Cloudflare OAuth installer. | Refused BY DESIGN, as stage 1 recorded. The release's browser sign-in stays. |
+| `client-experience-packet` | Reads `onboarding/client-experience/README.md`, which stage 1 did not port. | A missing document, not a missing behaviour. |
+| `packed-fresh-setup` | Pins the release's no-credential error wording; the merged tree prints the field's. | Wording, and the field's text is the one clients were given. |
+| `agent-authority-deletion` | Expects "cannot delete"; the tree says "this connection can only read. Reconnect and approve write access to use forget." | Same refusal, better sentence. |
+
+Five are real, and each is named rather than left as "still failing":
+
+1. `gmail-incremental-policy`, one assertion of three. The receipt now
+   separates a deliberate policy skip from a coverage gap
+   (`policy_skipped=`, `coverage_gaps=`), and an unintended skip closes the
+   run as an error with an `issue_code` instead of a cheerful `detail`. What
+   is missing is the stronger contract the field line also holds: when ANY
+   message lacks label evidence, the whole run refuses, so a classified
+   message sitting beside an unclassified one is not indexed either. That is
+   buffer-then-commit, not a counter, and it is the one piece of this file
+   left to do.
+2. `cloudflare-recovery-adapter`. The stage list now differs, not the
+   sqlite failure that blocked it before; the adapter module still needs
+   the three-way merge that keeps the schema-32 contract from 5955fa5.
+3. `full-history-privacy` wants `--require-zero-findings` on the history
+   scanner, which lives in the part of brain.mjs not ported.
+4. `provider-oauth` and `provider-scheduler`, one assertion each, in the
+   Windows DPAPI and scheduler-argv paths.
+
+None of the five blocks the schema-32 rehearsal, which is the acceptance
+for updating a brain already on the field line.

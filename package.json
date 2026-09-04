@@ -66,6 +66,7 @@
     "report-html.mjs",
     "report.mjs",
     "scripts/",
+    "scripts/windows-dpapi-release-gate.mjs",
     "skills/",
     "support-journal.mjs",
     "support-recovery.mjs",

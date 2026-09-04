@@ -399,7 +399,9 @@ const gm = await import("../connectors/gmail.mjs");
   check("the thread is kept", r.envelope.metadata.thread_id === "T1");
 }
 {
-  const r = await gm.toEnvelope(tok, "M2", {}, { fetchImpl: async () => json({ internalDate: "1" }), sleep: async () => {} });
+  const r = await gm.toEnvelope(tok, "M2", {}, { fetchImpl: async () => json({ internalDate: "1", labelIds: ["INBOX"] }), sleep: async () => {} });
+  // labelIds present, body absent: the skip under test is "no content", and a
+  // response with no label evidence is a DIFFERENT skip that would mask it.
   check("a message with no content is a reasoned skip", !!r.skip && /no content/.test(r.skip.reason), r.skip?.reason);
 }
 {
