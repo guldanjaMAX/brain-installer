@@ -33,7 +33,14 @@ import {
   classifyItemError, encryptAccessReference, decryptAccessReference,
   createLinkToken, exchangePublicToken, runFeedSlice, syncItemSlice, feedStatus,
   disconnectItem, connectPageHtml, handleBankFeed,
+  BANK_ACCESS_WRAPPING_KEY_SECRET, BANK_ACCESS_WRAPPING_KEY_VERSION,
+  LEGACY_BANK_ACCESS_KEY_VERSION,
 } from "../src/lib/bank-feed.js";
+import { generateBankAccessWrappingKey } from "../../operations/bank-access-wrapping-key.mjs";
+
+// One key per brain, not one per env: two fixtures over the same database must
+// be able to read each other's rows, exactly as one install does.
+const FIXTURE_WRAPPING_KEY = generateBankAccessWrappingKey();
 import { ledgerCashPosition, ledgerAccounts } from "../src/lib/fin-d1.js";
 
 let fail = 0, ran = 0;
@@ -78,6 +85,9 @@ function d1(db, extra = {}) {
     BANK_FEED_API_BASE: "https://sandbox.provider.invalid",
     BANK_FEED_LINK_SDK_URL: "https://cdn.provider.invalid/link/v2/link.js",
     BANK_FEED_LINK_GLOBAL: "ProviderLink",
+    // Storing a connection now needs the dedicated v2 wrapping key, not the
+    // session or admin secret. Every fixture that reaches a write carries one.
+    [BANK_ACCESS_WRAPPING_KEY_SECRET]: FIXTURE_WRAPPING_KEY,
     ...extra,
   };
 }
@@ -287,6 +297,11 @@ const refuses = (db, sql, params = []) => {
 
 /* ============ custody of the access reference ============ */
 {
+  // The v2 wrapping key is a DEDICATED worker secret, never derived from
+  // session or admin material. That is the whole point of version 2: restoring
+  // or rotating SESSION_SIGNING_KEY can no longer strand a bank connection,
+  // and a copy of the database plus the admin key is still not a copy of the
+  // bank connections.
   const env = d1(freshDb());
   const reference = "access-sandbox-11111111-2222-3333-4444-555555555555";
   const sealed = await encryptAccessReference(env, reference);
@@ -297,9 +312,19 @@ const refuses = (db, sql, params = []) => {
   check("it round-trips exactly", await decryptAccessReference(env, sealed) === reference, "");
   check("two encryptions of the same value differ, so the ciphertext leaks nothing by comparison",
     (await encryptAccessReference(env, reference)).ciphertext !== sealed.ciphertext, "");
-  check("a version is stored with it so the key can be rotated", sealed.keyVersion === 1, String(sealed.keyVersion));
+  check("a version is stored with it so the key can be rotated",
+    sealed.keyVersion === BANK_ACCESS_WRAPPING_KEY_VERSION, String(sealed.keyVersion));
+  const legacyEnv = { ...env, SESSION_SIGNING_KEY: "legacy-fixture-signing-key" };
+  const legacySealed = await encryptAccessReference(
+    legacyEnv, reference, { keyVersion: LEGACY_BANK_ACCESS_KEY_VERSION },
+  );
+  check("a reference sealed under the legacy version still opens, so no connection is stranded",
+    legacySealed.keyVersion === LEGACY_BANK_ACCESS_KEY_VERSION &&
+    await decryptAccessReference(legacyEnv, legacySealed) === reference, "");
   let refused = false;
-  try { await encryptAccessReference({ DB: env.DB }, reference); } catch (e) { refused = /will not be stored/.test(e.message); }
+  try { await encryptAccessReference({ DB: env.DB }, reference); } catch (e) {
+    refused = e.code === "BANK_ACCESS_WRAPPING_KEY_UNAVAILABLE";
+  }
   check("with no key material available it FAILS CLOSED rather than storing plaintext", refused, "");
 }
 
@@ -394,9 +419,9 @@ const refuses = (db, sql, params = []) => {
   const env = d1(db);
   const sealed = await encryptAccessReference(env, "access-sandbox-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
   db.prepare(`INSERT INTO bank_feed_items
-    (tenant_id, item_ref, institution_label, access_ciphertext, access_iv, environment, connected_at)
-    VALUES ('primary','item-fixture','Fixture Mutual Bank',?,?,'sandbox',?)`)
-    .run(sealed.ciphertext, sealed.iv, NOW);
+    (tenant_id, item_ref, institution_label, access_ciphertext, access_iv, key_version, environment, connected_at)
+    VALUES ('primary','item-fixture','Fixture Mutual Bank',?,?,?,'sandbox',?)`)
+    .run(sealed.ciphertext, sealed.iv, sealed.keyVersion, NOW);
   db.prepare(`INSERT INTO bank_feed_backfill (tenant_id, item_ref, requested_days, state, queued_at)
     VALUES ('primary','item-fixture',730,'queued',?)`).run(NOW);
 
@@ -473,8 +498,9 @@ const refuses = (db, sql, params = []) => {
   const env = d1(db);
   const sealed = await encryptAccessReference(env, "access-sandbox-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
   db.prepare(`INSERT INTO bank_feed_items
-    (tenant_id, item_ref, institution_label, access_ciphertext, access_iv, environment, connected_at)
-    VALUES ('primary','item-broken','Fixture Mutual Bank',?,?,'sandbox',?)`).run(sealed.ciphertext, sealed.iv, NOW);
+    (tenant_id, item_ref, institution_label, access_ciphertext, access_iv, key_version, environment, connected_at)
+    VALUES ('primary','item-broken','Fixture Mutual Bank',?,?,?,'sandbox',?)`)
+    .run(sealed.ciphertext, sealed.iv, sealed.keyVersion, NOW);
   const provider = async (url) => new Response(JSON.stringify({
     error_code: "ITEM_LOGIN_REQUIRED",
     error_message: "the item access-sandbox-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee needs re-authorisation",

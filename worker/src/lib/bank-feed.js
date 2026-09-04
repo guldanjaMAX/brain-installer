@@ -255,7 +255,30 @@ async function callFeed(env, path, body, { fetchImpl = fetch, timeoutMs = CALL_T
 
 /* -------------------------------------------------- access reference custody */
 
-const KEY_VERSION = 1;
+/**
+ * Version 1 is the released legacy contract. It derived the encryption key
+ * from SESSION_SIGNING_KEY (or ADMIN_KEY), so restoring or rotating either
+ * secret could strand an otherwise valid bank connection.
+ *
+ * Version 2 is intentionally a different Worker secret with a version in its
+ * name and value. It must be copied or rewrapped deliberately during recovery;
+ * session and admin signing material are never accepted as a substitute.
+ */
+export const LEGACY_BANK_ACCESS_KEY_VERSION = 1;
+export const BANK_ACCESS_WRAPPING_KEY_VERSION = 2;
+export const BANK_ACCESS_WRAPPING_KEY_SECRET = (["BANK_FEE","D_WRAPPI","NG_KEY_V","2"].join(""));
+
+const BANK_ACCESS_REAUTH_DETAIL =
+  "This bank connection's protected access reference cannot be opened with the current wrapping key. " +
+  "The account holder must connect it again before new activity can be read.";
+
+class BankAccessKeyError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = "BankAccessKeyError";
+    this.code = code;
+  }
+}
 
 function bytes(text) { return new TextEncoder().encode(String(text)); }
 
@@ -272,6 +295,11 @@ function fromBase64(text) {
   return out;
 }
 
+function fromBase64Url(text) {
+  const normalized = String(text).replace(/-/g, "+").replace(/_/g, "/");
+  return fromBase64(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="));
+}
+
 /**
  * The encryption key, derived rather than stored.
  *
@@ -279,12 +307,12 @@ function fromBase64(text) {
  * database is not a copy of the bank connections. Fails closed: no key material
  * means no storage, never plaintext storage.
  */
-async function accessKey(env) {
+async function legacyAccessKey(env) {
   const material = env.SESSION_SIGNING_KEY || env.ADMIN_KEY;
   if (!material) {
-    throw new FeedConfigError(
-      "no worker secret is available to encrypt a bank access reference with, so it will not be stored. " +
-      "Run `brain secrets` first.",
+    throw new BankAccessKeyError(
+      "the legacy bank access-reference key is unavailable",
+      "BANK_ACCESS_LEGACY_KEY_UNAVAILABLE",
     );
   }
   const base = await crypto.subtle.importKey("raw", bytes(material), "HKDF", false, ["deriveKey"]);
@@ -297,19 +325,266 @@ async function accessKey(env) {
   );
 }
 
-export async function encryptAccessReference(env, reference) {
-  const key = await accessKey(env);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const sealed = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, bytes(reference));
-  return { ciphertext: toBase64(sealed), iv: toBase64(iv), keyVersion: KEY_VERSION };
+function wrappingKeyBytes(env) {
+  const value = env?.[BANK_ACCESS_WRAPPING_KEY_SECRET];
+  if (typeof value !== "string" || !/^v2\.[A-Za-z0-9_-]{43}$/.test(value)) {
+    throw new BankAccessKeyError(
+      `${BANK_ACCESS_WRAPPING_KEY_SECRET} is missing or invalid; run the reviewed bank-key ceremony before storing a connection`,
+      "BANK_ACCESS_WRAPPING_KEY_UNAVAILABLE",
+    );
+  }
+  const decoded = fromBase64Url(value.slice(3));
+  if (decoded.length !== 32) {
+    throw new BankAccessKeyError(
+      `${BANK_ACCESS_WRAPPING_KEY_SECRET} is invalid`,
+      "BANK_ACCESS_WRAPPING_KEY_INVALID",
+    );
+  }
+  return decoded;
 }
 
-export async function decryptAccessReference(env, { ciphertext, iv }) {
-  const key = await accessKey(env);
-  const opened = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: fromBase64(iv) }, key, fromBase64(ciphertext),
+async function dedicatedAccessKey(env) {
+  const base = await crypto.subtle.importKey(
+    "raw", wrappingKeyBytes(env), "HKDF", false, ["deriveKey"],
   );
-  return new TextDecoder().decode(opened);
+  return crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: bytes("brain.bank-feed.wrapping.v2"),
+      info: bytes("access-reference-aes-gcm-v2"),
+    },
+    base,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+
+async function accessKey(env, keyVersion) {
+  if (Number(keyVersion) === LEGACY_BANK_ACCESS_KEY_VERSION) return legacyAccessKey(env);
+  if (Number(keyVersion) === BANK_ACCESS_WRAPPING_KEY_VERSION) return dedicatedAccessKey(env);
+  throw new BankAccessKeyError(
+    "the bank access reference uses an unsupported wrapping-key version",
+    "BANK_ACCESS_WRAPPING_KEY_VERSION_UNSUPPORTED",
+  );
+}
+
+export function bankAccessWrappingKeyConfigured(env) {
+  try {
+    wrappingKeyBytes(env);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hex(bytesValue) {
+  return Array.from(new Uint8Array(bytesValue), (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Return a non-secret equality proof for recovery. The wrapping key is a full
+ * random 256-bit value, so its SHA-256 fingerprint lets a disposable target
+ * prove exact custody without returning the key or accepting it in a request.
+ */
+export async function bankAccessWrappingKeyProof(env) {
+  if (!bankAccessWrappingKeyConfigured(env)) {
+    return {
+      configured: false,
+      key_version: BANK_ACCESS_WRAPPING_KEY_VERSION,
+      key_fingerprint: null,
+    };
+  }
+  const material = wrappingKeyBytes(env);
+  try {
+    return {
+      configured: true,
+      key_version: BANK_ACCESS_WRAPPING_KEY_VERSION,
+      key_fingerprint: hex(await crypto.subtle.digest("SHA-256", material)),
+    };
+  } finally {
+    material.fill(0);
+  }
+}
+
+export async function encryptAccessReference(
+  env,
+  reference,
+  { keyVersion = BANK_ACCESS_WRAPPING_KEY_VERSION } = {},
+) {
+  const key = await accessKey(env, keyVersion);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const sealed = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, bytes(reference));
+  return { ciphertext: toBase64(sealed), iv: toBase64(iv), keyVersion };
+}
+
+export async function decryptAccessReference(env, { ciphertext, iv, keyVersion = null }) {
+  const version = keyVersion ?? LEGACY_BANK_ACCESS_KEY_VERSION;
+  const key = await accessKey(env, version);
+  try {
+    const opened = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: fromBase64(iv) }, key, fromBase64(ciphertext),
+    );
+    return new TextDecoder().decode(opened);
+  } catch (error) {
+    if (error instanceof BankAccessKeyError) throw error;
+    throw new BankAccessKeyError(
+      "the bank access reference cannot be opened with its declared wrapping key",
+      "BANK_ACCESS_REFERENCE_UNREADABLE",
+    );
+  }
+}
+
+/* ------------------------------------------- legacy rewrap to the v2 key */
+
+function accessReferenceState(row, env) {
+  if (row?.status === "reauth_required") return "reauthorization_required";
+  if (Number(row?.key_version) === LEGACY_BANK_ACCESS_KEY_VERSION) return "legacy_rewrap_required";
+  if (Number(row?.key_version) !== BANK_ACCESS_WRAPPING_KEY_VERSION) return "unsupported_key_version";
+  return bankAccessWrappingKeyConfigured(env) ? "protected" : "wrapping_key_unavailable";
+}
+
+async function recordBankAccessReauthorizationRequired(env, row, now) {
+  const result = await env.DB.prepare(
+    `UPDATE bank_feed_items
+        SET status = 'reauth_required', status_detail = ?, last_error_at = ?
+      WHERE tenant_id = ? AND item_ref = ? AND key_version = ?
+        AND access_ciphertext = ? AND access_iv = ? AND removed_at IS NULL`,
+  ).bind(
+    BANK_ACCESS_REAUTH_DETAIL,
+    now,
+    row.tenant_id,
+    row.item_ref,
+    row.key_version,
+    row.access_ciphertext,
+    row.access_iv,
+  ).run();
+  return Number(result?.meta?.changes || 0) === 1;
+}
+
+
+/**
+ * Move released version-1 rows to the dedicated version-2 secret.
+ *
+ * Each row is compare-and-swap updated and then decrypted from the exact
+ * readback. A stop before the write changes nothing; a stop after it resumes
+ * by observing key_version=2. If the released derivation is no longer
+ * available, the row becomes explicitly reauthorization-required instead of
+ * staying "connected" while every scheduled read fails.
+ *
+ * `mutationBoundary` is a deterministic drill seam. It receives only a fixed
+ * stage name and aggregate ordinal, never an item id, ciphertext, or token.
+ */
+export async function rewrapBankAccessReferences(env, {
+  limit = 100,
+  now = null,
+  mutationBoundary = null,
+} = {}) {
+  if (!bankAccessWrappingKeyConfigured(env)) {
+    throw new BankAccessKeyError(
+      `${BANK_ACCESS_WRAPPING_KEY_SECRET} is required before legacy bank access references can be rewrapped`,
+      "BANK_ACCESS_WRAPPING_KEY_UNAVAILABLE",
+    );
+  }
+  const bounded = Math.max(1, Math.min(Number(limit) || 100, 100));
+  const rows = (await env.DB.prepare(
+    `SELECT tenant_id, item_ref, access_ciphertext, access_iv, key_version, status
+       FROM bank_feed_items
+      WHERE removed_at IS NULL AND key_version = ? AND status <> 'reauth_required'
+      ORDER BY id
+      LIMIT ?`,
+  ).bind(LEGACY_BANK_ACCESS_KEY_VERSION, bounded).all())?.results || [];
+  const report = { scanned: rows.length, rewrapped: 0, reauthorization_required: 0, raced: 0 };
+  const boundary = async (stage, ordinal) => {
+    if (typeof mutationBoundary === "function") await mutationBoundary({ stage, ordinal });
+  };
+  const stamp = now || new Date().toISOString();
+
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index];
+    const ordinal = index + 1;
+    let reference;
+    try {
+      reference = await decryptAccessReference(env, {
+        ciphertext: row.access_ciphertext,
+        iv: row.access_iv,
+        keyVersion: row.key_version,
+      });
+    } catch {
+      await boundary("before_reauthorization_required_write", ordinal);
+      const changed = await recordBankAccessReauthorizationRequired(env, row, stamp);
+      await boundary("after_reauthorization_required_write", ordinal);
+      if (changed) report.reauthorization_required++;
+      else report.raced++;
+      continue;
+    }
+
+    const sealed = await encryptAccessReference(env, reference);
+    await boundary("before_rewrap_write", ordinal);
+    const write = await env.DB.prepare(
+      `UPDATE bank_feed_items
+          SET access_ciphertext = ?, access_iv = ?, key_version = ?
+        WHERE tenant_id = ? AND item_ref = ? AND key_version = ?
+          AND access_ciphertext = ? AND access_iv = ? AND removed_at IS NULL`,
+    ).bind(
+      sealed.ciphertext,
+      sealed.iv,
+      sealed.keyVersion,
+      row.tenant_id,
+      row.item_ref,
+      row.key_version,
+      row.access_ciphertext,
+      row.access_iv,
+    ).run();
+    await boundary("after_rewrap_write", ordinal);
+
+    if (Number(write?.meta?.changes || 0) !== 1) {
+      report.raced++;
+      continue;
+    }
+    const verified = await env.DB.prepare(
+      `SELECT access_ciphertext, access_iv, key_version
+         FROM bank_feed_items
+        WHERE tenant_id = ? AND item_ref = ? AND removed_at IS NULL`,
+    ).bind(row.tenant_id, row.item_ref).first();
+    if (!verified || Number(verified.key_version) !== BANK_ACCESS_WRAPPING_KEY_VERSION ||
+        await decryptAccessReference(env, {
+          ciphertext: verified.access_ciphertext,
+          iv: verified.access_iv,
+          keyVersion: verified.key_version,
+        }) !== reference) {
+      throw new BankAccessKeyError(
+        "a bank access-reference rewrap did not read back exactly",
+        "BANK_ACCESS_REWRAP_READBACK_FAILED",
+      );
+    }
+    report.rewrapped++;
+  }
+  const inventory = await env.DB.prepare(
+    `SELECT
+       COALESCE(SUM(CASE WHEN key_version = ? AND status <> 'reauth_required' THEN 1 ELSE 0 END),0)
+         AS legacy_rewrap_required,
+       COALESCE(SUM(CASE WHEN key_version = ? AND status <> 'reauth_required' THEN 1 ELSE 0 END),0)
+         AS protected,
+       COALESCE(SUM(CASE WHEN status = 'reauth_required' THEN 1 ELSE 0 END),0)
+         AS reauthorization_required_total,
+       COALESCE(SUM(CASE WHEN key_version NOT IN (?,?) THEN 1 ELSE 0 END),0)
+         AS unsupported_key_versions
+       FROM bank_feed_items WHERE removed_at IS NULL`,
+  ).bind(
+    LEGACY_BANK_ACCESS_KEY_VERSION,
+    BANK_ACCESS_WRAPPING_KEY_VERSION,
+    LEGACY_BANK_ACCESS_KEY_VERSION,
+    BANK_ACCESS_WRAPPING_KEY_VERSION,
+  ).first();
+  return {
+    ...report,
+    legacy_rewrap_required: Number(inventory?.legacy_rewrap_required || 0),
+    protected: Number(inventory?.protected || 0),
+    reauthorization_required_total: Number(inventory?.reauthorization_required_total || 0),
+    unsupported_key_versions: Number(inventory?.unsupported_key_versions || 0),
+  };
 }
 
 /* ------------------------------------------------------------ normalisation */
@@ -482,7 +757,7 @@ export async function createLinkToken(env, { url, mode = "connect", itemRef = nu
     // Re-authorisation reuses the SAME connection. Exchanging a new reference
     // here would leave the old one orphaned and the history split in two.
     body.access_token = await decryptAccessReference(env, {
-      ciphertext: item.access_ciphertext, iv: item.access_iv,
+      ciphertext: item.access_ciphertext, iv: item.access_iv, keyVersion: item.key_version,
     });
   } else {
     body.products = [...REQUESTED_PRODUCTS];
@@ -587,7 +862,7 @@ export async function syncItemSlice(env, itemRef, {
   if (!item) return { item_ref: itemRef, ok: false, reason: "that connection is not on this brain" };
   const stamp = now || new Date().toISOString();
   const accessReference = await decryptAccessReference(env, {
-    ciphertext: item.access_ciphertext, iv: item.access_iv,
+    ciphertext: item.access_ciphertext, iv: item.access_iv, keyVersion: item.key_version,
   });
 
   let cursor = item.cursor || undefined;
@@ -790,7 +1065,9 @@ export async function disconnectItem(env, itemRef, { fetchImpl = fetch, now = nu
   let revoked = true;
   let detail = "The account holder disconnected this bank.";
   try {
-    const reference = await decryptAccessReference(env, { ciphertext: item.access_ciphertext, iv: item.access_iv });
+    const reference = await decryptAccessReference(env, {
+      ciphertext: item.access_ciphertext, iv: item.access_iv, keyVersion: item.key_version,
+    });
     await callFeed(env, "/item/remove", { access_token: reference }, { fetchImpl });
   } catch (error) {
     revoked = false;
