@@ -352,7 +352,11 @@ const runImport = (b, flags) => captured(() => cmdImportBank(manifest, manifestP
   const db = new DatabaseSync(":memory:");
   // 0021 intentionally depends on the financial ledger introduced by 0017.
   // This fixture proves the pre-ledger refusal, so omit both migrations.
-  for (const file of migrationFiles.filter((f) => !f.startsWith("0017") && !f.startsWith("0021"))) {
+  // A brain that has not REACHED the ledger, which is any install below
+  // schema 17. Not a brain that skipped 17 and kept going: migrations apply
+  // in order, so that brain cannot exist, and since 0026 alters the ledger
+  // tables, building one now fails with "no such table: fin_accounts".
+  for (const file of migrationFiles.filter((f) => f < "0017")) {
     for (const statement of splitStatements(readFileSync(join(MIGRATIONS, file), "utf-8"))) db.exec(statement);
   }
   const env = { STORAGE: "d1", ADMIN_KEY, DB: d1(db) };
