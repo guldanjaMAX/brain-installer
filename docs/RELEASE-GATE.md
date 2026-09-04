@@ -155,3 +155,14 @@ steady state ~100 rows/min, one batch per confirmation.
   like a successful teardown of the suffixed name.
 - **The bench account is on Workers Paid and holds no live brain.** Until Jay's
   preview brain moves off it, it is on the protected list by name.
+
+## 10. The repoint is verified by reading what is served
+
+Moving the pin is not the same as having moved it. On 2026-09-03 `repoint-kit.sh`
+updated the install guide, reported "guide pins: v0.3.5", passed its own check,
+and left the UPDATE guide telling clients to download the previous release. The
+only thing that caught it was fetching the live document and looking.
+
+So: after any repoint, fetch every served guide and assert the version in the
+document, then follow its download link and hash what comes back against the
+tested tarball. Trust the artifact, never the script's report of itself.
