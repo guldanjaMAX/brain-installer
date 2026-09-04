@@ -10,11 +10,11 @@
 # it serves them for. It asserts on the SERVED bytes rather than on the
 # markdown in Drive, because the served page is the one a person is given.
 
-name: windows-guide
+name: guide-commands
 
 on:
   push:
-    paths: ['.github/workflows/windows-guide.yml']
+    paths: ['.github/workflows/guide-commands.yml']
   workflow_dispatch:
   schedule:
     # The guide is deployed independently of this repo, so it can drift green
@@ -26,8 +26,13 @@ permissions:
 
 jobs:
   guide:
-    name: the update guide's own Windows commands
-    runs-on: windows-latest
+    name: the update guide's own ${{ matrix.os }} commands
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Never cancel one platform because the other failed. Both are shipped to.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
     steps:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -51,7 +56,7 @@ jobs:
         shell: pwsh
         run: |
           $g = Get-Content guide.md -Raw
-          $need = @('LOCALAPPDATA\FinancialBrain', 'npm install -g --prefix', 'npm ls -g --prefix', 'Get-Command brain')
+          $need = @('LOCALAPPDATA\FinancialBrain', 'npm install -g --prefix', 'npm ls -g --prefix', 'Get-Command brain', '$HOME/.npm-global')
           $missing = $need | Where-Object { -not $g.Contains($_) }
           if ($missing) { throw "guide no longer contains: $($missing -join ', ')" }
           "all $($need.Count) tested commands are still in the served guide"
@@ -59,6 +64,7 @@ jobs:
       # A client whose CLI was installed outside npm's default prefix. This is
       # Malini's real layout, measured on her machine 2026-09-03.
       - name: install 0.3.5 the way the guide says, into a non-default prefix
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $fb = "$env:LOCALAPPDATA\FinancialBrain"
@@ -72,6 +78,7 @@ jobs:
       # catch: adding Roaming\npm when the CLI is in Local\FinancialBrain, so
       # `brain` is never found and the client is told to check their PATH.
       - name: the guide's PATH line makes brain resolve to that install
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $fb = "$env:LOCALAPPDATA\FinancialBrain"
@@ -83,6 +90,7 @@ jobs:
 
       # Step 2b's proof that the client is not about to re-run the old version.
       - name: the version check prints the version it promises
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $fb = "$env:LOCALAPPDATA\FinancialBrain"
@@ -95,6 +103,7 @@ jobs:
       # documented, so that when 0.3.6 adds a real flag, this fails and the
       # guide gets updated with it rather than silently going stale.
       - name: brain --version still has no version flag (documented defect)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
@@ -110,6 +119,7 @@ jobs:
       # A crash here is what Malini's session hit as AUTH_REQUIRED with no
       # explanation, and a silent success would be far worse.
       - name: with no credentials, the schema gate refuses and explains
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
@@ -127,3 +137,87 @@ jobs:
           "refuses and points at the browser sign-in"
           # Same trailing-exit-code trap: refusing is the expected outcome.
           exit 0
+
+      # ---- macOS. Lindsay and every Mac client take this path, and until
+      # 2026-09-04 it had been run only by hand in someone's shell. ----
+
+      - name: mac, install 0.3.5 exactly as the guide's Mac lines say
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sL -o ~/brain-installer-0.3.5.tgz \
+            https://github.com/guldanjaMAX/brain-installer/releases/download/v0.3.5/brain-installer-0.3.5.tgz
+          npm install -g --prefix "$HOME/.npm-global" ~/brain-installer-0.3.5.tgz
+          test -x "$HOME/.npm-global/bin/brain" || { echo "::error::brain is not at \$HOME/.npm-global/bin after the guide's install line"; exit 1; }
+          echo "brain installed at $HOME/.npm-global/bin/brain"
+
+      - name: mac, the version check prints the version it promises
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          out=$(npm ls -g --prefix "$HOME/.npm-global" --depth=0 2>/dev/null | grep brain-installer || true)
+          echo "$out"
+          echo "$out" | grep -q 'brain-installer@0.3.5' \
+            || { echo "::error::version check did not print brain-installer@0.3.5"; exit 1; }
+
+      # Step 1's preflight, the one command Claude runs on the call. It must
+      # report every line the rest of the guide branches on, and must never
+      # print a token value.
+      - name: mac, the Step 1 preflight reports what the guide branches on
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          M=$(ls ~/Desktop/financial-brain/brain.manifest.json ~/financial-brain/brain.manifest.json 2>/dev/null | head -1)
+          [ -z "$M" ] && M=$(find "$HOME" -maxdepth 4 -name brain.manifest.json \
+                -not -path "*/node_modules/*" -not -path "*/templates/*" -not -path "*/.*/*" 2>/dev/null | head -1)
+          { echo "manifest:       ${M:-NOT FOUND}"
+            if [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then echo "token in shell: present"; else echo "token in shell: none"; fi
+            echo "installer:      $(npm ls -g --prefix "$HOME/.npm-global" --depth=0 2>/dev/null | sed -n 's/.* \(brain-installer@.*\)/\1/p')"
+          } > preflight.txt
+          cat preflight.txt
+          grep -q '^manifest:' preflight.txt || { echo "::error::preflight printed no manifest line"; exit 1; }
+          grep -q '^token in shell:' preflight.txt || { echo "::error::preflight printed no token line"; exit 1; }
+          grep -q 'brain-installer@0.3.5' preflight.txt || { echo "::error::preflight did not report the installed version"; exit 1; }
+
+      # The token liveness check the preflight uses to decide whether to trust
+      # an existing credential. A dead token MUST NOT read as usable: the
+      # installer prefers the env var over the browser session and disables its
+      # own renewal while it is set, so trusting a dead one is a hard 403
+      # mid-run that blames the client.
+      - name: mac, a dead token reads as rejected, not as usable
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -m 12 https://api.cloudflare.com/client/v4/accounts \
+                 -H "Authorization: Bearer definitely-not-a-real-token-000")
+          echo "dead token -> http $code"
+          [ "$code" = "200" ] && { echo "::error::a dead token reported usable"; exit 1; }
+          echo "correctly not 200, so the preflight would tell them to sign in instead"
+
+      - name: mac, brain --version still has no version flag (documented defect)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          out=$(brain --version 2>&1 || true)
+          echo "$out" | head -2
+          echo "$out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            && { echo "::error::--version now works. Update the guide and this test together."; exit 1; }
+          echo "confirmed: --version prints the help banner, as the guide warns"
+
+      - name: mac, with no credentials the schema gate refuses and explains
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export BRAIN_NO_WRANGLER_LOGIN=1
+          M="$RUNNER_TEMP/brain.manifest.json"
+          brain init "$M" --name "CI Probe" --slug "ci-probe" --account "00000000000000000000000000000000" >/dev/null
+          test -f "$M" || { echo "::error::brain init wrote no manifest"; exit 1; }
+          out=$(brain status "$M" 2>&1 || true)
+          echo "$out" | head -5
+          echo "$out" | grep -qE 'wrangler@4 login|no Cloudflare credential' \
+            || { echo "::error::no-credential run did not explain itself"; exit 1; }
+          echo "refuses and points at the browser sign-in"
