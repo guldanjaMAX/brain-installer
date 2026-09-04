@@ -75,6 +75,7 @@ import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mj
 import {
   runAll as doctorRunAll,
   summarize as doctorSummarize,
+  bankFeedRedirectUri,
   checkBankFeedRedirect,
   checkPrioritySlice,
   checkClaudeCode,
@@ -202,6 +203,13 @@ const warn = (s) => console.log(`${c.yellow("warn")}  ${s}`);
  * vanish from the history.
  */
 class Fatal extends Error {}
+/** A Fatal whose message is a JSON receipt, for the --json command paths. */
+class JsonFatal extends Fatal {
+  constructor(payload) {
+    super(JSON.stringify(payload, null, 2));
+    this.payload = payload;
+  }
+}
 
 const die = (s) => {
   throw new Fatal(s);
@@ -210,6 +218,9 @@ const die = (s) => {
 const SUPPORT_REMOTE_COMMANDS = new Set([
   "deploy", "diagnose", "drain", "health", "migrate", "provision",
   "reindex", "rollback", "secrets", "update", "upgrade", "verify",
+]);
+export const PROVIDER_CONNECTOR_IDS = Object.freeze([
+  "quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot",
 ]);
 let currentSupportCommand = "";
 
@@ -14115,6 +14126,811 @@ async function dispatchDoctor(manifestPath) {
 }
 
 /* ------------------------------------------------- brain import bank ----- */
+
+/* ------------------------------------ the named connector providers: catalog,
+   connect, disconnect and one-off ingest. Every helper reaches connectors/
+   through a dynamic import, so nothing here is a new module-level
+   dependency. cmdConnect and cmdDisconnect, the dispatcher wrappers around
+   these, are deliberately NOT ported: they route through the field line's
+   account-first Cloudflare OAuth ceremony, which this port keeps out. */
+
+export function providerConfigurationFingerprint(provider, source, configuration, identity = null) {
+  const canonical = (value) => {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (value && typeof value === "object") {
+      return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+    }
+    return JSON.stringify(value);
+  };
+  // Preserve the released v1 bytes for every non-QuickBooks provider so this
+  // hardening cannot reset their cursors or configuration receipts. QBO alone
+  // adds the canonical company identity to its v2 fingerprint.
+  const payload = provider === "quickbooks"
+    ? {
+        version: 2,
+        provider,
+        source,
+        configuration,
+        qbo_company_fingerprint: identity?.qbo_company_fingerprint || null,
+      }
+    : { version: 1, provider, source, configuration };
+  return createHash("sha256").update(canonical(payload)).digest("hex");
+}
+
+async function providerSyncImplementation(provider) {
+  if (provider === "quickbooks") return (await import("./connectors/quickbooks-online.mjs")).syncQuickBooksOnline;
+  if (provider === "slack") return (await import("./connectors/slack.mjs")).syncSlack;
+  if (provider === "notion") return (await import("./connectors/notion.mjs")).syncNotion;
+  if (provider === "microsoft") return (await import("./connectors/microsoft-graph.mjs")).syncMicrosoftGraph;
+  if (provider === "dropbox") return (await import("./connectors/dropbox.mjs")).syncDropbox;
+  if (provider === "hubspot") return (await import("./connectors/hubspot.mjs")).syncHubSpot;
+  throw new TypeError(`unsupported provider connector ${provider}`);
+}
+
+function providerAdapterOptions(provider, configuration, connection) {
+  if (provider === "quickbooks") {
+    return {
+      realmId: connection?.provider_metadata?.realm_id,
+      apiBase: configuration.environment === "production"
+        ? "https://quickbooks.api.intuit.com"
+        : "https://sandbox-quickbooks.api.intuit.com",
+      entities: configuration.entities,
+      minorVersion: configuration.minor_version || null,
+      expectedCompanyFingerprint: connection?.provider_metadata?.qbo_company_fingerprint || null,
+    };
+  }
+  if (provider === "slack") return {
+    channelIds: configuration.channel_ids,
+    maxThreadsPerChannel: configuration.include_thread_replies === false ? 0 : 5_000,
+  };
+  if (provider === "microsoft") return {
+    mailFolderIds: configuration.mail_folder_ids,
+    driveIds: configuration.drive_ids,
+    siteIds: configuration.site_ids,
+    includePersonalDrive: configuration.include_personal_drive !== false,
+  };
+  if (provider === "dropbox") return { rootPath: configuration.root_path || "" };
+  if (provider === "hubspot") return { objectTypes: configuration.object_types };
+  return {};
+}
+
+/** Run one OAuth provider through common receipts, retries, tombstones, and cursor custody. */
+export async function cmdIngestProvider(m, manifestPath, flags, options = {}) {
+  const provider = String(flags.from || "").toLowerCase();
+  if (!PROVIDER_CONNECTOR_IDS.includes(provider)) throw new TypeError(`unsupported provider connector ${provider}`);
+  if (flags.limit) die(`--limit is unsafe for ${provider}; it would skip records covered by the provider cursor.`);
+  const configuration = m?.corpora?.[provider] || {};
+  if (configuration.enabled !== true) {
+    die(`corpora.${provider}.enabled is not true in this manifest. Enable it before connecting or ingesting.`);
+  }
+  const sourceName = assertSourceName(
+    flags.source === true || !flags.source ? configuration.source || provider : flags.source,
+  );
+  const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
+  const syncImpl = options.sync ?? await providerSyncImplementation(provider);
+  const loadAccess = (quickBooksBinding = null) => oauth.providerAccessToken(provider, {
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    ...(options.storage ? { storage: options.storage } : {}),
+    ...(quickBooksBinding ? { quickBooksBinding } : {}),
+  });
+  let preparedAccess = null;
+  let identity = null;
+  if (provider === "quickbooks") {
+    if (typeof oauth.assertQuickBooksSourceBinding !== "function" ||
+        typeof oauth.loadQuickBooksCredentials !== "function") {
+      throw new Error("the QuickBooks OAuth module cannot safely load and verify its company binding");
+    }
+    const expectedBinding = { source: sourceName, environment: configuration.environment };
+    const stored = await oauth.loadQuickBooksCredentials(options.storage || {});
+    if (stored) oauth.assertQuickBooksSourceBinding(stored, expectedBinding);
+    preparedAccess = await loadAccess(expectedBinding);
+    const binding = oauth.assertQuickBooksSourceBinding(preparedAccess.connection, {
+      source: sourceName,
+      environment: configuration.environment,
+    });
+    identity = { qbo_company_fingerprint: binding.qbo_company_fingerprint };
+  }
+  const fingerprint = providerConfigurationFingerprint(provider, sourceName, configuration, identity);
+  const resolveAccess = () => preparedAccess ? Promise.resolve(preparedAccess) : loadAccess();
+  const loadState = () => oauth.loadProviderSyncState(provider, sourceName, options.storage || {});
+  const saveState = (state) => oauth.saveProviderSyncState(provider, sourceName, state, options.storage || {});
+  const adapter = ({ cursor, access }) => syncImpl({
+    accessToken: access.accessToken,
+    connection: access.connection,
+    cursor,
+    ...providerAdapterOptions(provider, configuration, access.connection),
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+  });
+
+  if (flags["dry-run"]) {
+    const stored = flags.reset ? {} : await loadState();
+    const cursor = stored?.configuration_fingerprint === fingerprint ? stored.cursor ?? null : null;
+    const result = await adapter({ cursor, access: await resolveAccess() });
+    info(`${result.documents.length} document(s) would be sent; ${result.deletions.length} exact tombstone(s) would be applied.`);
+    for (const warning of result.warnings || []) warn(warning);
+    ok("dry run, no brain document, deletion, source receipt, or provider cursor was changed");
+    return { dry_run: true, result };
+  }
+
+  const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+  if (!adminKey) {
+    die("no durable admin key was found. Re-run `brain setup <manifest>` to generate and persist one.");
+  }
+  const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, m.brain?.domain ? null : await (options.resolveAccount ?? resolveAccount)(m));
+  const runtime = options.runtime ?? await import("./connectors/provider-runtime.mjs");
+  let result;
+  try {
+    result = await runtime.runProviderConnector({
+      provider,
+      source: sourceName,
+      kind: provider,
+      configurationFingerprint: fingerprint,
+      sync: async ({ cursor, accessToken, connection }) => adapter({
+        cursor,
+        access: { accessToken, connection },
+      }),
+      resolveAccess,
+      loadState,
+      saveState,
+      sendBatch: options.requestIngestBatch ?? requestIngestBatch,
+      removeDocuments: options.applyDriveRemovals ?? applyDriveRemovals,
+      listStoredFamilies: options.listStoredSourceFamilies ?? listStoredSourceFamilies,
+      postReceipt: options.postSourceReceipt ?? postSourceReceipt,
+      base,
+      adminKey,
+      reset: Boolean(flags.reset),
+      approvedSnapshotFingerprint: flags["approve-removals"] === true || !flags["approve-removals"]
+        ? null
+        : String(flags["approve-removals"]).toLowerCase(),
+    });
+  } catch (error) {
+    if (["provider_snapshot_removal_review_required", "provider_removal_review_required"].includes(error?.code)) die(error.message);
+    throw error;
+  }
+  const tally = result.tally;
+  ok(`${provider} sync: ${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged, ${result.removed} removed`);
+  if (result.outcome.kind !== "completed") warn(result.outcome.reason || `${provider} completed with an explicit coverage gap`);
+  info(result.cursor_advanced ? "the terminal provider cursor was saved" : "no provider cursor was advanced");
+  return result;
+}
+
+export async function cmdConnectProvider(provider, manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die(`usage: brain connect ${provider} <manifest> [--port <number>]`);
+  }
+  const { m } = loadManifest(manifestPath);
+  const configuration = m?.corpora?.[provider] || {};
+  if (configuration.enabled !== true) {
+    die(`corpora.${provider}.enabled is not true in this manifest. Enable it before connecting.`);
+  }
+  const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
+  const config = oauth.providerOAuthConfig(provider);
+  const storage = options.storage || {};
+  const prefix = provider.toUpperCase().replace(/-/g, "_");
+  const environment = options.environment || process.env;
+  const suppliedCredentials = options.credentials || {};
+  const source = assertSourceName(configuration.source || provider);
+  if (provider === "quickbooks" && !["sandbox", "production"].includes(configuration.environment)) {
+    const error = new Fatal("corpora.quickbooks.environment must explicitly be sandbox or production before connecting.");
+    error.code = "quickbooks_environment_required";
+    throw error;
+  }
+  if (provider === "quickbooks" && configuration.environment === "production") {
+    const error = new Fatal(
+      "QuickBooks production connection is not available in this release. Intuit production OAuth needs a client-owned HTTPS callback with a single-use local handoff; the loopback callback is sandbox-only. No credential or browser flow was opened.",
+    );
+    error.code = "quickbooks_production_callback_unavailable";
+    throw error;
+  }
+  const port = flags.port ? Number(flags.port) : oauth.PROVIDER_DEFAULT_PORT;
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) die("--port must be an integer from 1024 through 65535");
+  const redirectHost = provider === "quickbooks"
+    ? String(configuration.redirect_host || config.loopbackRedirectHost || "localhost").toLowerCase()
+    : "127.0.0.1";
+  if (provider === "quickbooks" && !["localhost", "127.0.0.1"].includes(redirectHost)) {
+    const error = new Fatal(
+      "corpora.quickbooks.redirect_host must be localhost or 127.0.0.1. The callback listener remains local-only.",
+    );
+    error.code = "quickbooks_redirect_host_invalid";
+    throw error;
+  }
+  if (provider === "quickbooks" && typeof oauth.quickBooksSandboxRedirectUri !== "function") {
+    throw new Error("the QuickBooks OAuth module cannot construct its sandbox callback");
+  }
+  const redirectUri = provider === "quickbooks"
+    ? oauth.quickBooksSandboxRedirectUri(port, redirectHost)
+    : oauth.providerRedirectUri(port);
+  const prior = provider === "quickbooks"
+    ? await oauth.loadQuickBooksCredentials(storage)
+    : oauth.loadProviderCredentials(provider, storage);
+  const clientId = suppliedCredentials.clientId || environment[`${prefix}_CLIENT_ID`] || prior?.client_id || null;
+  const clientSecret = suppliedCredentials.clientSecret || environment[`${prefix}_CLIENT_SECRET`] || prior?.client_secret || null;
+  if (!clientId || (config.clientSecretRequired && !clientSecret)) {
+    const required = [`${prefix}_CLIENT_ID`, ...(config.clientSecretRequired ? [`${prefix}_CLIENT_SECRET`] : [])];
+    die(
+      `${required.join(" and ")} ${required.length === 1 ? "is" : "are"} not available.\n` +
+        `      Create the OAuth app in the owner's ${config.label} account, register ` +
+        `${redirectUri}, and inject ` +
+        "the value through the approved local launcher. Do not put it in the manifest or command line."
+    );
+  }
+  if (!options.quiet && prior && !suppliedCredentials.clientId && !environment[`${prefix}_CLIENT_ID`]) {
+    info(`reusing the ${config.label} OAuth client already stored on this machine`);
+  }
+  if (!options.quiet && provider === "quickbooks") {
+    info(`QuickBooks environment: ${configuration.environment} (selected by corpora.quickbooks.environment)`);
+    info("Intuit's Accounting scope can read and update accounting data. Financial Brain uses only read/query calls, but the consent screen grants that broader provider permission.");
+  }
+  if (!options.quiet) info(`requesting the manifest-enabled ${config.label} connection in the owner's browser`);
+  const connection = await oauth.authorizeProvider(provider, {
+    clientId,
+    clientSecret,
+    port,
+    redirectHost,
+    redirectUri,
+    storage,
+    ...(provider === "quickbooks"
+      ? {
+          prepareConnection: (candidate, custody = {}) => {
+            if (typeof oauth.bindQuickBooksConnection !== "function") {
+              throw new Error("the QuickBooks OAuth module cannot bind the authorized company");
+            }
+            return oauth.bindQuickBooksConnection({
+              prior: custody.prior,
+              candidate,
+              source,
+              environment: configuration.environment,
+              sourceRegistry: custody.sourceRegistry,
+            });
+          },
+        }
+      : {}),
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    ...(options.openImpl ? { openImpl: options.openImpl } : {}),
+    ...(options.open === false ? { open: false } : {}),
+    ...(options.quiet ? { log: () => {} } : options.log ? { log: options.log } : {}),
+  });
+  if (provider === "quickbooks" && !connection?.provider_metadata?.realm_id) {
+    const error = new Fatal("QuickBooks did not return a company identity, so the connection cannot be used safely.");
+    error.code = "quickbooks_realm_missing";
+    throw error;
+  }
+  if (provider === "quickbooks") {
+    if (typeof oauth.assertQuickBooksSourceBinding !== "function") {
+      throw new Error("the QuickBooks OAuth module cannot verify the stored company binding");
+    }
+    oauth.assertQuickBooksSourceBinding(connection, {
+      source,
+      environment: configuration.environment,
+    });
+  }
+  if (!options.quiet) {
+    ok(`connected. Credential stored in ${oauth.providerCredentialDescription(provider, storage)} (on this machine only)`);
+    info(`now run: brain ingest ${manifestPath} --from ${provider} --dry-run`);
+    info(`after review: brain schedule ${manifestPath} --provider ${provider} --install`);
+  }
+  return { provider, connected: true, storage: oauth.providerCredentialDescription(provider, storage) };
+}
+
+export async function cmdDisconnectProvider(provider, manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die(`usage: brain disconnect ${provider} <manifest>`);
+  }
+  const { m } = loadManifest(manifestPath);
+  const configuration = m?.corpora?.[provider] || {};
+  const source = assertSourceName(configuration.source || provider);
+  const scheduler = options.scheduler ?? await import("./operations/provider-scheduler.mjs");
+  try {
+    const removed = scheduler.removeProviderScheduler(provider, manifestPath, options.schedulerOptions || {});
+    ok(removed.removed || removed.loaded
+      ? `${provider} refresh schedule removed`
+      : `${provider} refresh schedule was not installed`);
+  } catch (error) {
+    warn(`the ${provider} schedule could not be inspected or removed: ${String(error?.message || error).slice(0, 180)}`);
+  }
+
+  const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
+  const result = await oauth.disconnectProvider(provider, {
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    storage: options.storage || {},
+    ...(provider === "quickbooks"
+      ? { source, environment: configuration.environment }
+      : {}),
+  });
+  if (result.already_disconnected) ok(`${oauth.providerOAuthConfig(provider).label} was already disconnected locally`);
+  else if (result.remote_revoked) ok(`${oauth.providerOAuthConfig(provider).label} grant revoked, then local credentials removed`);
+  else ok(`${oauth.providerOAuthConfig(provider).label} local credentials removed`);
+  if (result.remote_revocation_required) {
+    warn(result.remote_revocation_note ||
+      `the provider has no dependable revoke call in this connector; remove the app grant in the owner's ${oauth.providerOAuthConfig(provider).label} account`);
+  }
+
+  try {
+    const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+    if (!adminKey) throw new Error("no admin key is available");
+    const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, null);
+    await (options.postSourceExpectation ?? postSourceExpectation)(base, adminKey, {
+      source, kind: provider, expected_refresh_seconds: null,
+    });
+    ok(`${source} freshness expectation cleared`);
+  } catch (error) {
+    warn(`the provider is disconnected, but its remote freshness expectation could not be cleared: ${String(error?.message || error).slice(0, 160)}`);
+  }
+  info(
+    `imported documents remain in the brain. When removal is wanted, separately review the preview from: ` +
+    `brain forget ${manifestPath} --source ${source}`,
+  );
+  if (provider === "quickbooks") {
+    info(
+      `the local source name "${source}" remains reserved for this QuickBooks company; ` +
+      "a different company can be connected with a new source name",
+    );
+  }
+  return provider === "quickbooks"
+    ? {
+        ...result,
+        source,
+        imported_documents_retained: true,
+        forget_operation_required: true,
+        source_company_binding_retained: true,
+      }
+    : result;
+}
+
+export async function cmdConnectors(flags = parseFlags(process.argv.slice(3)), options = {}) {
+  const catalog = options.catalog ?? await import("./connectors/catalog.mjs");
+  const provider = flags.provider === true || !flags.provider ? null : String(flags.provider).toLowerCase();
+  let entries;
+  try {
+    entries = catalog.connectorCatalog({ provider });
+  } catch (error) {
+    die(error.message);
+  }
+  console.log(catalog.renderConnectorCatalog(entries));
+  if (!flags.rehearse) return { entries, rehearsal: null };
+
+  const rehearsal = options.rehearsal ?? await import("./connectors/offline-rehearsal.mjs");
+  const originalFetch = globalThis.fetch;
+  let globalFetchAttempts = 0;
+  globalThis.fetch = async () => {
+    globalFetchAttempts += 1;
+    throw Object.assign(new Error("offline rehearsal blocked an un-injected network request"), { code: "GLOBAL_FETCH_BLOCKED" });
+  };
+  let receipt;
+  try {
+    receipt = await rehearsal.runProviderRehearsal({ provider });
+  } catch (error) {
+    die(error.message);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  if (globalFetchAttempts) {
+    receipt = { ...receipt, passed: false, network_used: true };
+  }
+  console.log("\n" + rehearsal.renderProviderRehearsal(receipt));
+  if (!receipt.passed) die("one or more offline connector rehearsals failed");
+  return { entries, rehearsal: receipt };
+}
+
+/* ---------------------------------- QuickBooks reconciliation and the
+   owner-only bank connect page. Ported from the field line: every helper
+   these need already lives in connectors/, reached by dynamic import, so
+   this block carries no new module-level dependency. */
+
+function quickBooksReconciliationScope(flags) {
+  const required = ["account", "qbo-account", "from", "to", "direction"];
+  const missing = required.filter((name) => flags[name] === undefined || flags[name] === true || String(flags[name]).trim() === "");
+  if (missing.length) {
+    const error = new Fatal(`QuickBooks reconciliation needs ${missing.map((name) => `--${name} <value>`).join(", ")}.`);
+    error.code = "reconciliation_scope_required";
+    throw error;
+  }
+  return {
+    account_slug: String(flags.account),
+    qbo_account_id: String(flags["qbo-account"]),
+    period_start: String(flags.from),
+    period_end: String(flags.to),
+    direction: String(flags.direction).toLowerCase(),
+    currency: String(flags.currency === true || !flags.currency ? "USD" : flags.currency).toUpperCase(),
+  };
+}
+
+function renderQuickBooksReconciliation(result) {
+  console.log("");
+  console.log(`${c.bold("QuickBooks books reality check")}\n`);
+  info(`Status: ${result.status}`);
+  if (result.coverage) info(`Coverage: QuickBooks ${result.coverage.quickbooks}; bank ${result.coverage.bank}`);
+  if (Number.isInteger(result.qbo_total_minor) && Number.isInteger(result.bank_total_minor)) {
+    info(`Compared reference totals in minor units: QuickBooks ${result.qbo_total_minor}; bank ${result.bank_total_minor}`);
+  }
+  const counts = new Map();
+  for (const item of result.classifications || []) counts.set(item.classification, (counts.get(item.classification) || 0) + 1);
+  for (const [name, count] of counts) info(`${name}: ${count}`);
+  if (result.recovery) warn(result.recovery);
+  info("QuickBooks is an accounting-team reference, not financial authority. No source record or winning claim was changed.");
+}
+
+/**
+ * Compare one explicitly paired QuickBooks cash account and bank-ledger account.
+ * The live Intuit read stays on the owner machine; only normalized, cited money
+ * lines cross into the client's own Brain for an idempotent ledger comparison.
+ */
+export async function cmdReconcileQuickBooks(manifestPath, flags = {}, options = {}) {
+  assertKnownFlags(
+    flags,
+    ["account", "qbo-account", "from", "to", "direction", "currency", "json", "status", "retry"],
+    "brain reconcile quickbooks",
+  );
+  const scope = quickBooksReconciliationScope(flags);
+  try {
+    const { m } = loadManifest(manifestPath);
+    const configuration = m?.corpora?.quickbooks || {};
+    if (configuration.enabled !== true) {
+      const error = new Fatal("corpora.quickbooks.enabled is not true in this manifest. Enable and ingest it before reconciliation.");
+      error.code = "quickbooks_not_enabled";
+      throw error;
+    }
+    if (!["sandbox", "production"].includes(configuration.environment)) {
+      const error = new Fatal("corpora.quickbooks.environment must explicitly be sandbox or production.");
+      error.code = "quickbooks_environment_required";
+      throw error;
+    }
+    const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+    if (!adminKey) {
+      const error = new Fatal("no durable admin key was found for the client-owned Brain.");
+      error.code = "admin_key_unavailable";
+      throw error;
+    }
+    const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, null);
+    const post = options.postReconciliation || postQuickBooksBankReconciliation;
+    let payload = { ...scope };
+    if (flags.status) {
+      payload.action = "status";
+    } else {
+      const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
+      const qbo = options.quickbooks ?? await import("./connectors/quickbooks-online.mjs");
+      if (typeof oauth.assertQuickBooksSourceBinding !== "function" ||
+          typeof oauth.loadQuickBooksCredentials !== "function") {
+        throw new Error("the QuickBooks OAuth module cannot safely load and verify its company binding");
+      }
+      const sourceName = assertSourceName(configuration.source || "quickbooks");
+      const expectedBinding = { source: sourceName, environment: configuration.environment };
+      const stored = await oauth.loadQuickBooksCredentials(options.storage || {});
+      if (stored) oauth.assertQuickBooksSourceBinding(stored, expectedBinding);
+      const access = await oauth.providerAccessToken("quickbooks", {
+        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+        ...(options.storage ? { storage: options.storage } : {}),
+        quickBooksBinding: expectedBinding,
+      });
+      const binding = oauth.assertQuickBooksSourceBinding(access.connection, {
+        source: sourceName,
+        environment: configuration.environment,
+      });
+      const realmId = access.connection?.provider_metadata?.realm_id;
+      const companyFingerprint = qbo.quickBooksCompanyFingerprint(realmId);
+      if (binding.qbo_company_fingerprint !== companyFingerprint) {
+        const error = new Fatal("the QuickBooks source binding does not match the authorized company.");
+        error.code = "wrong_realm";
+        throw error;
+      }
+      const configured = Array.isArray(configuration.entities) ? configuration.entities : qbo.QBO_DEFAULT_ENTITIES;
+      const entities = qbo.QBO_RECONCILIATION_ENTITIES.filter((name) => configured.includes(name));
+      if (!entities.length) {
+        const error = new Fatal("the manifest enables no deterministic QuickBooks cash-account record types for reconciliation.");
+        error.code = "qbo_reconciliation_entities_unavailable";
+        throw error;
+      }
+      const snapshot = await qbo.syncQuickBooksOnline({
+        realmId,
+        accessToken: access.accessToken,
+        apiBase: configuration.environment === "production"
+          ? "https://quickbooks.api.intuit.com"
+          : "https://sandbox-quickbooks.api.intuit.com",
+        entities,
+        minorVersion: configuration.minor_version || null,
+        expectedCompanyFingerprint: companyFingerprint,
+        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      });
+      const lines = [];
+      for (const document of snapshot.documents || []) {
+        for (const line of document?.metadata?.reconciliation_lines || []) {
+          if (String(line.qbo_account_id) !== scope.qbo_account_id || line.direction !== scope.direction ||
+              String(line.currency).toUpperCase() !== scope.currency ||
+              line.posted_on < scope.period_start || line.posted_on > scope.period_end) continue;
+          lines.push({
+            ...line,
+            qbo_company_fingerprint: companyFingerprint,
+            source_doc_uid: `${sourceName}:${document.source_id}`,
+          });
+        }
+      }
+      payload = {
+        ...payload,
+        qbo_company_fingerprint: companyFingerprint,
+        qbo_coverage: "present_snapshot_partial",
+        qbo_lines: lines,
+      };
+    }
+    const result = await post({ base, adminKey, payload, fetchImpl: options.fetchImpl || fetch });
+    if (flags.json) console.log(JSON.stringify(result, null, 2));
+    else renderQuickBooksReconciliation(result);
+    return result;
+  } catch (error) {
+    if (flags.json) {
+      if (error instanceof JsonFatal) throw error;
+      const payload = error?.payload || {
+        schema_version: 1,
+        command: flags.status ? "reconcile.quickbooks_bank.status" : "reconcile.quickbooks_bank",
+        status: "error",
+        error_code: error?.code || "qbo_reconciliation_failed",
+        recovery: error?.code
+          ? String(error.message || error)
+          : "The bounded comparison failed without a trusted receipt. Verify the named connections and retry the exact same command.",
+        financial_authority: false,
+        mutated_source_records: false,
+      };
+      throw new JsonFatal(payload);
+    }
+    die(String(error?.message || error));
+  }
+}
+
+function readOwnerOnlyTaxClaim(path) {
+  const absolute = resolve(String(path || ""));
+  let pathBefore;
+  let fd;
+  try {
+    pathBefore = lstatSync(absolute);
+    fd = openSync(absolute, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+  } catch {
+    const error = new Fatal("the tax claim file could not be read");
+    error.code = "tax_claim_file_unavailable";
+    throw error;
+  }
+  try {
+    const before = fstatSync(fd);
+    if (!pathBefore.isFile() || pathBefore.isSymbolicLink() || !before.isFile() ||
+        pathBefore.dev !== before.dev || pathBefore.ino !== before.ino ||
+        before.size < 2 || before.size > 64 * 1024) {
+      const error = new Fatal("the tax claim must be a bounded regular file, not a link");
+      error.code = "tax_claim_file_unsafe";
+      throw error;
+    }
+    if (process.platform !== "win32" &&
+        ((before.mode & 0o777) !== 0o600 || (typeof process.getuid === "function" && before.uid !== process.getuid()))) {
+      const error = new Fatal("the tax claim file must be owned by the current user with mode 0600");
+      error.code = "tax_claim_file_not_owner_only";
+      throw error;
+    }
+    let parsed;
+    try { parsed = JSON.parse(readFileSync(fd, "utf8")); } catch {
+      const error = new Fatal("the tax claim file is not valid JSON");
+      error.code = "tax_claim_file_invalid";
+      throw error;
+    }
+    const after = fstatSync(fd);
+    const pathAfter = lstatSync(absolute);
+    if (!pathAfter.isFile() || pathAfter.isSymbolicLink() || pathAfter.dev !== before.dev ||
+        pathAfter.ino !== before.ino || after.dev !== before.dev || after.ino !== before.ino ||
+        after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+      const error = new Fatal("the tax claim file changed while it was being read");
+      error.code = "tax_claim_file_changed";
+      throw error;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      const error = new Fatal("the tax claim JSON must be one object");
+      error.code = "tax_claim_file_invalid";
+      throw error;
+    }
+    return parsed;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+async function postTaxQuickBooksReconciliation({ base, adminKey, payload, fetchImpl = fetch }) {
+  return retryTransient(async () => {
+    const res = await http(`${base}/api/fin/reconcile/tax-quickbooks`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }, { timeoutMs: 60_000, what: "the human-confirmed tax and QuickBooks comparison", fetchImpl });
+    let raw;
+    try {
+      raw = await res.text();
+    } catch (error) {
+      error.retryable = true;
+      throw error;
+    }
+    let body;
+    try { body = JSON.parse(raw); } catch {
+      const error = new Error("the brain returned an invalid tax comparison response");
+      error.retryable = res.status >= 500;
+      throw error;
+    }
+    if (!res.ok) {
+      const error = new Error(body.recovery || body.error || "the tax comparison was refused");
+      error.code = body.error_code || body.code || "tax_qbo_reconciliation_refused";
+      error.payload = body;
+      error.retryable = false;
+      throw error;
+    }
+    return body;
+  }, {
+    attempts: 3,
+    delayMs: 500,
+    maxDelayMs: 2_000,
+    shouldRetry: (error) => error?.retryable !== false,
+  });
+}
+
+function renderTaxQuickBooksReconciliation(result) {
+  console.log("");
+  console.log(`${c.bold("Human-confirmed tax and QuickBooks review")}\n`);
+  info(`Status: ${result.status}`);
+  if (result.recovery) warn(result.recovery);
+  info("Both values remain human-confirmed document claims. No extraction, tax finding, financial ruling, or source change was made.");
+}
+
+function taxQuickBooksCliReceipt(result = {}) {
+  return {
+    schema_version: 1,
+    command: "reconcile.tax_quickbooks",
+    status: result.status || "error",
+    error_code: result.error_code || null,
+    confirmation: result.confirmation || null,
+    reconciliation_uid: result.reconciliation_uid || null,
+    claim_count: Array.isArray(result.claim_uids) ? result.claim_uids.length : 0,
+    financial_authority: false,
+    ruling_selected: false,
+    wrote_reconciliation: result.wrote_reconciliation === true
+      ? true
+      : result.wrote_reconciliation === false
+        ? false
+        : null,
+    mutated_source_records: false,
+    retry_safe: result.retry_safe === true,
+    recovery: result.recovery || null,
+  };
+}
+
+/** Submit one owner-reviewed private claim file without parsing either document. */
+export async function cmdReconcileTaxQuickBooks(manifestPath, flags = {}, options = {}) {
+  assertKnownFlags(
+    flags,
+    ["claim-file", "confirm-reviewed-claims", "json", "retry"],
+    "brain reconcile tax-quickbooks",
+  );
+  try {
+    if (flags["confirm-reviewed-claims"] !== true) {
+      const error = new Fatal("the owner or technician must add --confirm-reviewed-claims after verifying both exact document locations and amounts");
+      error.code = "tax_qbo_human_confirmation_required";
+      throw error;
+    }
+    if (!options.claim && (!flags["claim-file"] || flags["claim-file"] === true)) {
+      const error = new Fatal("brain reconcile tax-quickbooks needs --claim-file <owner-only-json>");
+      error.code = "tax_claim_file_required";
+      throw error;
+    }
+    const { m } = loadManifest(manifestPath);
+    const configuration = m?.corpora?.quickbooks || {};
+    if (configuration.enabled !== true || !["sandbox", "production"].includes(configuration.environment)) {
+      const error = new Fatal("the manifest must enable QuickBooks and explicitly name sandbox or production before comparing its stored report evidence");
+      error.code = "quickbooks_configuration_required";
+      throw error;
+    }
+    const claim = options.claim || readOwnerOnlyTaxClaim(flags["claim-file"]);
+    const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+    if (!adminKey) {
+      const error = new Fatal("no durable admin key was found for the client-owned Brain");
+      error.code = "admin_key_unavailable";
+      throw error;
+    }
+    const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, null);
+    const post = options.postReconciliation || postTaxQuickBooksReconciliation;
+    const result = await post({ base, adminKey, payload: claim, fetchImpl: options.fetchImpl || fetch });
+    if (flags.json) console.log(JSON.stringify(taxQuickBooksCliReceipt(result), null, 2));
+    else renderTaxQuickBooksReconciliation(result);
+    return result;
+  } catch (error) {
+    if (flags.json) {
+      if (error instanceof JsonFatal) throw error;
+      const payload = error?.payload || {
+        schema_version: 1,
+        command: "reconcile.tax_quickbooks",
+        status: "error",
+        error_code: error?.code || "tax_qbo_reconciliation_failed",
+        recovery: error?.code
+          ? String(error.message || error)
+          : "The comparison failed without a trusted receipt. Verify the local claim file and stored evidence, then retry the exact same command.",
+        financial_authority: false,
+        wrote_reconciliation: false,
+        mutated_source_records: false,
+      };
+      throw new JsonFatal(payload);
+    }
+    die(String(error?.message || error));
+  }
+}
+
+async function cmdReconcile(target) {
+  const which = String(target || "").toLowerCase();
+  if (!["quickbooks", "tax-quickbooks"].includes(which)) {
+    die("brain reconcile supports quickbooks or tax-quickbooks");
+  }
+  const path = process.argv[4];
+  if (!path || path.startsWith("--")) {
+    die("usage: brain reconcile <quickbooks|tax-quickbooks> <manifest> [reviewed scope flags] [--json]");
+  }
+  const flags = parseFlags(process.argv.slice(4));
+  return which === "quickbooks"
+    ? cmdReconcileQuickBooks(path, flags)
+    : cmdReconcileTaxQuickBooks(path, flags);
+}
+
+/**
+ * brain connect google — the client authorises their OWN Google account.
+ *
+ * They register the OAuth client in their own Google Cloud project, and the
+ * refresh token is stored securely on their machine. We never see any of it. That is
+ * not only a custody preference: every Drive and Gmail read scope is RESTRICTED,
+ * so one vendor-owned OAuth client serving many customers would require Google
+ * verification plus a paid annual CASA security assessment.
+ */
+export async function cmdConnectBank(manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die("usage: brain connect bank <manifest> [--print]");
+  }
+  const unknownFlags = Object.keys(flags).filter((key) => key !== "print");
+  if (unknownFlags.length) die(`brain connect bank does not recognize --${unknownFlags[0]}`);
+  if (flags.print !== undefined && flags.print !== true) {
+    die("--print is a switch and does not take a value. Put it at the end of the command.");
+  }
+  const { m } = loadManifest(manifestPath);
+  const feed = m?.corpora?.bank_feed || {};
+  if (feed.enabled !== true) {
+    die("corpora.bank_feed.enabled is not true in this manifest. Enable the Plaid bank feed before opening its owner page.");
+  }
+  if (String(feed.provider || "").toLowerCase() !== "plaid") {
+    die("brain connect bank currently opens the reviewed Plaid owner flow. Set corpora.bank_feed.provider to plaid first.");
+  }
+  const domainValue = String(m?.brain?.domain || "").trim();
+  if (!domainValue) {
+    die("this Brain has no saved address yet. Run brain deploy first, then rerun brain connect bank.");
+  }
+  let domainUrl;
+  try {
+    domainUrl = new URL(domainValue.includes("://") ? domainValue : `https://${domainValue}`);
+  } catch {
+    die("brain.domain is not a valid deployed HTTPS hostname. Run brain doctor before opening the bank page.");
+  }
+  if (domainUrl.protocol !== "https:" || domainUrl.username || domainUrl.password || domainUrl.port ||
+      domainUrl.pathname !== "/" || domainUrl.search || domainUrl.hash) {
+    die("brain.domain must be one HTTPS hostname with no port, path, sign-in value, query, or fragment.");
+  }
+  const redirectCheck = checkBankFeedRedirect(m);
+  if (redirectCheck.status !== D_OK) {
+    die(
+      `${redirectCheck.detail}.\n` +
+      `      ${redirectCheck.fix || "Run brain doctor and finish the bank return-address setup first."}`
+    );
+  }
+  const url = bankFeedRedirectUri(domainUrl.host);
+  const shouldOpen = flags.print !== true && options.open !== false;
+  const opener = options.openImpl ?? openBrowser;
+  let opened = false;
+  if (shouldOpen) {
+    try { opened = opener(url) === true; } catch { opened = false; }
+  }
+
+  if (opened) ok("opened the owner-only bank connection page in the browser");
+  else if (shouldOpen) warn("the browser did not open automatically. Use the link below in the owner's browser.");
+  else info("browser opening was skipped. Use the owner-only link below when the account holder is ready.");
+  console.log(`\n  ${url}\n`);
+  info("The owner signs in with their Brain passkey, completes Plaid Link, and assigns each masked account to the business that owns it.");
+  info("Opening this page does not enter a Plaid credential, contact a bank, or prove the connector until the owner continues in the browser.");
+  return { provider: "plaid", url, opened, live_provider_proof: false };
+}
 
 /**
  * `brain import bank <manifest> --file <export>` — the operator's way in.

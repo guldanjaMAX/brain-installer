@@ -28,6 +28,13 @@ import {
   AGENT_DELETION_PATH_PREFIX, handleAgentDeletion,
 } from "./lib/agent-action-receipts.js";
 import { ownerReliabilityAlerts } from "./lib/reliability-alerts.js";
+import {
+  cleanupQuickBooksOAuthIntents,
+  handleQuickBooksOAuthRoute,
+  QUICKBOOKS_OAUTH_PATH_PREFIX,
+  QUICKBOOKS_OAUTH_PATHS,
+} from "./lib/quickbooks-oauth-callback.js";
+import { cleanupPublicAuthState, guardPublicRequest } from "./lib/public-request-guard.js";
 import { handleBankExportImport, BANK_IMPORT_PATH } from "./lib/fin-upload.js";
 import { handleFinApi, FIN_PATH_PREFIX } from "./lib/fin-api.js";
 import {
@@ -1631,6 +1638,28 @@ export default {
         : response;
     }
 
+    // The QuickBooks return leg. Intuit sends the owner back with a code in the
+    // query string, so the callback is reachable without the whole-install
+    // admin key and is rate-limited by the public guard instead. Callback
+    // failures redirect away from Intuit's query string; claim failures stay
+    // private JSON for the local polling client.
+    if (path === QUICKBOOKS_OAUTH_PATH_PREFIX || path.startsWith(`${QUICKBOOKS_OAUTH_PATH_PREFIX}/`)) {
+      if (path === QUICKBOOKS_OAUTH_PATHS.callback || path === QUICKBOOKS_OAUTH_PATHS.claim) {
+        const guarded = await guardPublicRequest(env, request, url, path);
+        if (guarded.response) {
+          if (path !== QUICKBOOKS_OAUTH_PATHS.callback) return guarded.response;
+          return handleQuickBooksOAuthRoute(env, request, url, path, {
+            publicGuardDenied: true,
+          });
+        }
+        request = guarded.request;
+      }
+      return handleQuickBooksOAuthRoute(env, request, url, path, {
+        adminAuthorized: path !== QUICKBOOKS_OAUTH_PATHS.callback &&
+          path !== QUICKBOOKS_OAUTH_PATHS.claim && validateAdminKey(request, env),
+      });
+    }
+
     // Support access is its own ceremony with its own short-lived session. Its
     // cookie and companion header are not understood by owner, retrieval,
     // financial, connector, OAuth, or admin routes. Every response, including
@@ -2080,23 +2109,46 @@ export default {
    */
   async scheduled(event, env, ctx) {
     if (backendOf(env) !== D1) return;
+    // A compatibility cutover is a whole-database mutation barrier. The drain
+    // already no-ops while paused, but the TTL cleanups and the two
+    // maintenance passes would still write, so the whole cycle stands down.
+    // Expired auth state is inert and can wait for the first active cron.
+    if (env.VECTOR_DRAIN_MODE === "paused-for-upgrade") return;
     // Promise.all, not three arguments: waitUntil takes ONE promise and would
     // silently drop the rest, leaving both maintenance passes floating.
     ctx.waitUntil(Promise.all([
       (async () => {
-        // Bounded, because a Worker invocation has a wall clock and an unbounded
-        // loop on a large backfill would be killed mid-batch every time.
-        const r = await drainOutbox(env, {
-          embed: (text) => embedText(env, text),
-          embedBatch: (texts) => embedTexts(env, texts),
-          maxBatches: 10,
-        });
-        if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
-        // A cycle that only waited used to log nothing at all, which let a
-        // stalled fence run silent for hours. Waiting a cycle or two is
-        // normal; the line exists so more than that is visible in a tail.
-        else if (!r.paused && !r.busy && !r.submitted && Number(r.waiting) > 0) {
-          console.log(`vector outbox: waiting on confirmation, ${r.remaining} queued`);
+        // Every job here is bounded, because a Worker invocation has a wall
+        // clock and an unbounded loop on a large backfill would be killed
+        // mid-batch every time. allSettled, not all: the TTL cleanups must
+        // still run when the vector provider is failing, and a cleanup error
+        // must not stop the durable vector queue.
+        const [drainResult, cleanupResult, quickbooksCleanupResult] = await Promise.allSettled([
+          drainOutbox(env, {
+            embed: (text) => embedText(env, text),
+            embedBatch: (texts) => embedTexts(env, texts),
+            maxBatches: 10,
+          }),
+          cleanupPublicAuthState(env),
+          cleanupQuickBooksOAuthIntents(env),
+        ]);
+        if (drainResult.status === "fulfilled") {
+          const r = drainResult.value;
+          if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
+          // A cycle that only waited used to log nothing at all, which let a
+          // stalled fence run silent for hours. Waiting a cycle or two is
+          // normal; the line exists so more than that is visible in a tail.
+          else if (!r.paused && !r.busy && !r.submitted && Number(r.waiting) > 0) {
+            console.log(`vector outbox: waiting on confirmation, ${r.remaining} queued`);
+          }
+        } else {
+          console.warn("vector outbox: scheduled drain failed");
+        }
+        if (cleanupResult.status === "rejected") {
+          console.warn("public auth state: scheduled TTL cleanup failed");
+        }
+        if (quickbooksCleanupResult.status === "rejected") {
+          console.warn("quickbooks oauth intents: scheduled TTL cleanup failed");
         }
       })(),
       // Both durable queues need a scheduled pass or their retry ladders never
