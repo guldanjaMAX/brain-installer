@@ -1,0 +1,6743 @@
+{
+  "schema_version": 1,
+  "finding_objects": [
+    {
+      "object_id": "02bc24ed40c3af29d85a5c579b88a2f2d53ae6b9",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "02c528ee895089776a04b5ed02b9f6c139a997be",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "065d628ce0e1cfd771c37e5dfb23becd61a9be68",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "06b53af53218ccbaa23e99f1cbfbcadf6261c46d",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "071e7c76cc2ebd7a877429524d30710d81364198",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "095419b57f97f4734587a1387e361d9afdb21a75",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "09d61bfd4db358d17edf70591ad6e4ec0f5492d1",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "family member first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "0aef8749510018f384b6d4c1036ea169d088719b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "0b2e7cc8cdda0b5172c83c9bf145e5028531d301",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "0d8a77398a75875c1f6b68b4bc794840192a8765",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "0dd85c27ae39ca487eb9d18a0d6a49366aa01262",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "0de4ffd08fc99b7fb5964d89b7120737377434b9",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "0ee8a10131becaf7ba573a524c34cf68a0abd4a5",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "0f0d051a7b98bb012552660af1c7745ef2f02e3b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "0f8a706d3fded559582f557c23b56c720a2ab7d2",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "0ff97585993b05e03633bcbcd4d02ab0e5da6199",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "google_oauth_secret"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "stripe_webhook_secret"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "0ff993a0e1f829d75612bdf612f693ad15c8b671",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "1097faacdd96869848b21bb39cffb284ed7b3364",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "109a5f3ab60f8a01c989224a954b92d14909a497",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "115d2502e05f0bfcde35f5d0794715f76ca254d7",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "121404180b5a98a4b98312bc9287fb4dee75c00b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "1271f9bf7b744adacf0b1026bc2808705d43dc72",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "12e8e3d2822f9933635f7a4abb973c5c6079eaeb",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "13c5861664291c671dd77e6597d2c4ebf0037b61",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "14b09e7cca4c22e284ff168752c9ab12afbb6c33",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "1506d650427f665eafdf5a374ae8b22d084ad659",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "150ec0bdc69db2d213fda5e5ec47b762e9b72119",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator client first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "1521d9a4b71b04d1a4ba13fc1454a72863126a73",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "15c74eb8d581c1cd1ccfcb37a11ea23659c29277",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "165099df03f5139bb6dc92289a64d7faa580fd84",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "16e434cab1e223d07d33ba0a662c81db241fd5d1",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "17d20798aff8957981ecef9f8375d294e0256308",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "186fd805852616e1669f73befc914ca19515204c",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "187c9b7cda06a72e50a2f24ffaeaeab31561240e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "18a5a1b202f850e21332fa861de77c08b6ae2177",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "19d7b441e208b13afc8141109884c0de73387867",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "1a927fe966a539a16fa70e95963667ee43b05bd8",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "1aa089c7202adaeb348d20ac4375f4e7ac7c4af8",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "1b5de00437d1b70a1fc803f820bd0213e0e25ab9",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "1bb4f6db8fddec2f123ddf28329e8aa5adad8ce0",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "anthropic_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "cloudflare_token_classic"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "connection_string"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "google_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "notion_token"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "private_key_header"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "resend_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "stripe_webhook_secret"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "supabase_pat"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "url_query_secret"
+        },
+        {
+          "kind": "known_revoked_credential",
+          "category": "revoked cloudflare api token"
+        },
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "cloudflare account id"
+        },
+        {
+          "kind": "privacy",
+          "category": "cloudflare zone id"
+        },
+        {
+          "kind": "privacy",
+          "category": "d1 database id"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        },
+        {
+          "kind": "privacy",
+          "category": "private repo commit sha"
+        },
+        {
+          "kind": "privacy",
+          "category": "stripe product id"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "1ca0c0b1e31b66a9c5d86515e1d1f767b243651e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "1d942805bcf040c989964a872d2d4857587806fb",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "1e15b10a14982518908ecd56f5f1ae1c85cecb54",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "1e791ef29f10d72cf9d5e74b8f428a182e012392",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator client first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "200c5d3c777205ba9376a6a1fc89c9f456696dd6",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "2088edd510cdd9a7297da3bb6dba7dfa95bab3c6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "22652c1bd5d86a1bf70456b9a8c2ef3230554efa",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "231c74a19cf539631751ceb791fef30967851398",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "23a4920d0fb76ae91c0da05e2dd9f6de72483d97",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "252cd422cdf9972d71980b73faf4b0f53896e7a5",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "257dccb53c59ae2c3032aee0575def47ba9412eb",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "25fed9f4b572135702a8a9fd7f92750287a8f51c",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "268b0d061100963d267a2e6b25dc15160196b785",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "2840f15c82e166f85ef1fab6f3f91afe32b30632",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "286fffcf2b8858e33dd2f8b7f02efb170e41ec06",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "28b339df87ab709443f6296c564d64b1ca303375",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "28ef45e2e819787bf34490891cf4120599e5128a",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "29f07133b62ff702b59fdb5647d833c22d444c08",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "2b859f4327b38b5473c996d88b0a7dcff0907bdc",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "2b9052444f46fcf87cc8206dd5f341adc07170ba",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "anthropic_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "cloudflare_token_classic"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "connection_string"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "google_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "notion_token"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "private_key_header"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "resend_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "stripe_webhook_secret"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "supabase_pat"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "url_query_secret"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "2bccf40528ce1392476ffd8a55035d4219b43a86",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "2bec9edb06766f283982faa4b021cb4cee68c4be",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "2c17869654ea128880560f6c2f6844326da22b90",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "2d19a2ff0138d6860f545d0e40d6558dd32ace80",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "2e4b0b1bbe982664aa5033de86ce3bec1e8e6619",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "2eb1277aa7638167ced3cad4360412c6b888b1f6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "2ecc09e8037ad8e1d5af71168f22d243788e2963",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "2edcdf619f6777108b1ec37a93b10fd6a1ee9c5b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "private_key_header"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "2f5e52290cd34cbe362f9017f0a90cc74d630825",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "cloudflare account id"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "30a2150a4d04e012e6eb1916d93fa003545622ff",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "316f5da95608062ac7fd6d95d7b78ea8939aaf55",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "aws_access_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "url_query_secret"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "32bd0e8d1f0f7e3b4d7438a1d4fae64cd2f1ce48",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "32c177c4bdd979c131a866f368e02459d85de8c3",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "aws_access_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "url_query_secret"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "32fea373c8b16c40b584f0c54d01576d48753506",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "family member first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "33769b96c4b309793a7296ce36acb7fbcf2ced2e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "cloudflare account id"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "348d8ddbf72d2ea46cf19370c5732c3be0325fcb",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "353787614e8ae13dacbb34d861c71311ed4f83bf",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner organization"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner organization short name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "3545c4d824d582be5ea1aedeafce638ad7fedef8",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "35542a067f0b424415fee3031ace0f095eab473b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "355dc9157289efa4ebe5a981f2d8376ad701b0df",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "37e17214f33e6378931757a903b928857fcb61f1",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "382c3f190c7238d764f619febdee7cc7a9a04555",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner organization"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner organization short name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "3830a92763f95927182f1e65a43b81fe713c4d29",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "389e8e85e76a31563ebbb0599c49773e4bc3a009",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "family member first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "38b15c929a51e7a3e39ba5961b5cf8a3258f7a97",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "396558d56730423a59404915d48a814b3f118876",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "family member first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "39a2a418c9be7efa864813e953a16d00e81e242a",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "3a91f662521dccdbb741f11578b513d6b7ab1929",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "3ab74ad1c63159ee8f47be921f88149ddc2f286b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "3b7d26ff3474fd11c7822ad6a2d08e5db7483726",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "3bb4992a1e709606cce1a7b996fa52a848c87e23",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "3bb54103bd17c312d5f3653e36851aba919bb26d",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "3c9e38716e10975b23ff808b3598551f030a4fc8",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "plaid_access_token"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "3cdbd21c1cf497e5467608c71379fa0ed0398ad6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "3d271f2f5ca843017cf60fb610e0fe58429f6392",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "3d583a79ee79af7cd913657a86dcfb19f45fbd43",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "4139fe51df56ce5181d7d04847f529b026f3b29e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "family member first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "418c7f50475e48a6a193507e1f89d6d5f1838bc8",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "41ea16182428cc7151595aad47acd488a940c011",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "41f058189cad8641a9319dbea0eade9588b80888",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "4236f611e5f2eb6e8ade20556e3f032db21d6787",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "42590421a11b28f16ddb8c0c6424f01e618184bc",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "42b4791b877464fe1e1ae35759549a0cff3c74ec",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "4492e3a96ec2a9384ddaab901d590a4412c7738e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "44d8d4126f34ecf5eae966772183aefc3a23d4f6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "46229daa61212bcbd7e0f4c62a1e094f07cc1c97",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "46a4792ac129fcb1f302402c17e9bd12b91fb28e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "48236bbbaade3c031ad51a970f7d2dceac4af750",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "48319bc68aa1b74078434389cbe7f41c370db371",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "4b6b17bd30e20e04666b50bcba635a4aecfbe235",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "4bbe3e4258cb2dffe61dac07d9a141c43d64efee",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "4c9057ec3eb55424c0fb460bcb6e3a7741b110f5",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "4d3d910462b4134d1248909776fa3c23fe61e263",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "4f001e8a2fa6d5fe33ea8d085d09943ed253a810",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "50fd95ef95e5d25909cffd1036d8ad0b12b3a3c8",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "51456c9eb921c0c206ef1596a78cb4f7a41b3cc4",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "517dc28728cdec415cf86a37bf1676f718e20ec3",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "51a324cbcb3da8406aa9095bd7001c1385a5cd1e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "530997a76f43ebd2230a15688fa3f41005194dd0",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "53b1dde98a865edbeaf26a1574d5a7407b053ad8",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "family member first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "54385a52af8cb71d2cd2cce1cc9df4e08294bff9",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "5467f5b71064590186893686a96a6806d82cff5f",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "family member first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "548610f3a2095ac3966006ad9bd0fef40f3081e9",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "5519c649b383e04845b9da16f0a470b6952589aa",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "555ac40f8f0b5a902e3537dc3f28eacc4ffe3aff",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "566afd314886f15d1b768fd3055948799ac19b49",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "56ca4be211daac0bf7483911a63ce8c6ee750c34",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "588532c85ec0ff9c798588c782517955f0fe7b15",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "588cc4a7ce48dca67e2085380eeb57e7635ed0b6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "58bdadf3425388d174d8c9f57cda90ed9f86f7a4",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "58bead37d7c0d2fb2093a691a99a9459a1877a87",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "58e5b5ae6d9e173af307c103fb5a9e296c0dd724",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "599cc675e188511b86b7ac64cf303e36953c5076",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "59e6460507222f2d907dfd6b3175100d32faf9eb",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator client first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "5b7d685340602fda8a77f6c2d090b081598c819d",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "5c632c7c39f5f2fcc0167add4296bc5086d8c1f3",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "5d1711d6adb9348420dc6e669a41803a82bc04b6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "5db649f45b305400e78d83b219e2c572a31fa8f3",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "5dc9972278be69fb07c529f0f58d9eb6a2f515d8",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "5e3cce0f9ba6a38fbf2e4c3a88a3ec40db55ac11",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "5e6c12fff25598b9ddffe83cfad0354f3be370d0",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "5f7ba21fdf1ed4b69a1f9c6919a82ca1f6c9bdbd",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "6144b07bb0ec4d6e1d90d6feafaba1571b931e39",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "61b9389ddc9254dd405d548746fe7a63bbb369fc",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6205c5252f9ee17b9d2f00b678e183d986f3bd7e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "631e699a1af6ea01663aed0d71c29fefdbf9ad43",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "63a05fc61dd5072a93f9ab060065b389d20a3c0a",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "63a2c3473e30002632238256ca9a881cab88d0ae",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "660f998bec001da17452af38f3b80ff5b47c8e7b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "66fa0990323dabb5c4c419c45268bec6cd3fd6fa",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6763a27a3845965c204bf915e0bd4603efc89942",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6771f24ae7a4e4e6f808054f4bb5e660340a00b0",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "67fb44fb50cbcac878ea9ede695e7cb4f21a4553",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "690b3811f20135c6850ec110a27632b92ed54190",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "69602122b57f131b8de24364a3e27e33d4e627dc",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "69a44e2a681c8512dc1c4a99b9e30231c8bb756e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "69cdc97ad07dc7be289fbbced4f62137e261a864",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "69e48f792b9a968805998e113ad48823f34913ae",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6aa10a87ff45464815985a45df1e09e4bee2ce03",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6c1fcc914422150e4ee5ae8903542f04a8738bf6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6c77b7fb5ffdbed27b0a49aebf7e39844323e662",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "anthropic_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "cloudflare_token_classic"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "connection_string"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "google_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "notion_token"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "private_key_header"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "resend_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "stripe_webhook_secret"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "supabase_pat"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "url_query_secret"
+        },
+        {
+          "kind": "known_revoked_credential",
+          "category": "revoked cloudflare api token"
+        },
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "cloudflare account id"
+        },
+        {
+          "kind": "privacy",
+          "category": "cloudflare zone id"
+        },
+        {
+          "kind": "privacy",
+          "category": "d1 database id"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        },
+        {
+          "kind": "privacy",
+          "category": "private repo commit sha"
+        },
+        {
+          "kind": "privacy",
+          "category": "stripe product id"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6c87ac4126815c8905c3e5e769297ef9a469ddb1",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6d0f4bfc10a7497ea11e7c2dea137b38e712f615",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6d913609959e0067ed2ac3061f0ee3ad6be01649",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6dfbf22e79f4ddeddc70c78648e3f5894c0d0460",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6e4fa332dec20693313c455844cd68e7547e7bd6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6f19c807ff94c4e5af998286943c73e926ab7b17",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6f3184963af651e5c7ed3892676440132c62bffd",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "6f9bf525b517c3dfacbb5fd610d156e679a34d39",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "70aa484550add0a2515ca58724805b6a8e3899e7",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "724e579848647da55a4d9f0cb907b681c8e58e42",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "7261254bf642872dcb1b775fe15f7e6d990a3c48",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "726a9ef96f55d296e3978f7a804e96ff81f118a6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "72fdf1dce2d9458e0e33eeea04901abe3af85f29",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "743f4cd41e8261fe3b6ceeff4e50eb096ce4e87e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "cloudflare account id"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "75822d5ec24ff871c0870204e576d5211c230d3c",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "google_oauth_secret"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "stripe_webhook_secret"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "787bc8bd589f324f1c437d4cabec72d79f12c81f",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "78bad72fdb4310d622e696a701b5927add818fd7",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "78f0229a2bb0a2302a54310a7e2889b60ae003e1",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "79eab00c5d92869292e2b5efcda2b2529ff270c2",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "7a04b98e6b53c84f8496987f2e39f425ed6c9e31",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "7c5ac29c8547e16daabd1b7a1058c7148acdc551",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "7d5919c647ba2cba650108f858e48bb1c4d3fa82",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "7db942622ccb6f344af6af2fee582c1844959657",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "810a614b6142355d76a3fe8a035400fa19194837",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8132f43dc032a32c6500ae0a6f65112590a58904",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "81b69f450a4789c18d9be0822c367849609f7405",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "cloudflare account id prefix"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8242f0502e462e98f7f2be2a6e03d459d367b012",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "824b6025be098fbe379e4c6d6833c510eb7b44f9",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "82957dfee649c194c4153a968580b7444e0e6803",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "google_oauth_secret"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "stripe_webhook_secret"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "8333628cf1c28e882cc6d3eccd0ca8e18da51f66",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "83d58b960e24524ec8e3ca98e8ba877e19d747d0",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "844bd3d3fef85fd7c139d9afdf0f702ea823e744",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "84af77718dab4aa8166cbe34f831b2a67a55f2b3",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "84d62c5c1a928f3f4331ea2aeafe1942e05adf32",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "85d1d27bb22a86622734e79ee44b0ec5884b309f",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "private_key_header"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8619254d8b2db0d4d6c5336d26d7830ab026ca52",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8621d9f02de2ee692914ccc4154880a88eb7bcf0",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "87709fb273031319072a3ababbff63fabc6b8bf3",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "87f011fdbf15fcfbba7d683d7da1d612240bd698",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "88892fb38e9b10d8c0b8f583a2f209d79b9e7c6b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "89cad3c50cc9d97d8d386382192c615ff75f4570",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "89e78c3088b90aadc99f3128cdbd012f04a19e66",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8a006e7fb24465144614e1313035e44f1afcbabd",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8a071bfc9efd66c9e2bc4256ec4c478a171389bd",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8a2dc31aff31f46c55c6f4ab531a9c0f7a16a506",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "8a4d1ce56efa1b7abd8b7dbe1ab01c22e07f1bec",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "private_key_header"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8a637e62c6ad9b941b5f4a6629f9606e7ca2e44c",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8bca39882d6e8ebb87e91877de240791ba90a2d0",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8be5d725e30ab68da3ce5314a2d008d5465d3b98",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8c2a62f19c9f51efb63c116114541e629c676c04",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "8ced20b2e5f1757983bdc6a0cfdfa11f20728791",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8de1333571d3e547a68716c605066a3847a2ca79",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8e18f419276a6052bbe752ec3a62ed73e8b45a5c",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8e27a98bd3633bdf29a6ed4ef9a5c4f9a6a59b8f",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "8ecddd5d7288550e46cabdc65d1a4cf7eba39649",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "906c6ee2f7170ee327eab54b5c67376c4be07f41",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "919d2fe981627c8dcf25eaf909acfdb5f0a17db6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "91cadb1933ff95137cdd47715f03b5e36f18a279",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "92be98d1e13aab8eec2aee81567ec79e00e04872",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "931cf939a4983c099cee9899e03efb6870eff1fb",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "936a7b24310d58e1733e6ddfb97588caca855354",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "938e03869c599a8292185c9a6b257884c169a185",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "93dcaaa2a48264617f640a54e8d875e74202bee3",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "944379daa337ebb8eb94f78364ca897c99bd06ca",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "94cfd5475a20fa2cf74a502893a12dc763588e24",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "96ea653ba704b6065fa929975daff0ba7e3c7596",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "97440ff8a412915bf83ef9209720c9246125da8f",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "98ab16d93aea6b1f111904d4080dea256753c2c0",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "992c299dde0ba2e50bf8298e435d689c604b6685",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "9a2be0830d1c8e4715cb206c30a8ab1508a35ebd",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "9ab439af0c6a7efc544eb76bc4325756228e9a01",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "9cbcce0b7cec1e8936b7b4e1974798726e0c1ae8",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "9cd1d3fbd0e66056d335d94749e013707f571875",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "9e0af7e74fc9f49d3f49a9ab6e28217f7498e43b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "9ea82878f92bdf2004a171b91a3dcaaa31d7fff2",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a02eb97df9e848f3da0b9568c1e9dd1f2dac59b6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a09c6a4e3f441a523fb715e373a2a9497f932479",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a0efe2ae663f17f797ca7fa1c82bbb1f8263d4ef",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a17a658e3f8542f9ee25c7cdc5c7f04732afe644",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "google_oauth_secret"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "stripe_webhook_secret"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "a1dbe64f6c8f6a9019324607161d774eade292ef",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "private_key_header"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a34539be254509f2ee5d2bd943e97e8885eee8c8",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a566829861a9fb6e2514bade572674b3106cd1c9",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a609dacae6236fc060719a2c14f4f9a0966c8b72",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "cloudflare account id"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a6263a73971a1ad62b8b1aec2a3e6a83ac23ebb4",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "google_oauth_secret"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "stripe_webhook_secret"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a69947cf019bcb463a9610812de0ad7782550231",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a69faa4dec3665b26ac282ef88bc284c0277bf9d",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a70dff81f616d9be01b6ed86a8e8f857e1cf1488",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a89658e76c9fbb6997da66243c64d6c48e277aab",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a92fa0c5daa24d4e90cc3832d88d93a9e2b5fdbd",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a9b9606008316771a358a24ad9a8066432b18da5",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "a9e1928781ba12b75eed7c6d43ebebe9f7c9ee23",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "aa83861cf8cf585cc74c570f5c841a97257b8405",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "ac9754c596b4d0a2527c54594eb038f5fefdd3d1",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "accb237733a0ca991f29e536d5536f9ef27c5ab9",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "acd53f700b773d1fd711c17699b992d7654fa671",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "ad1724277d582fe0c3aa2284ca1bccb1e280737d",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "af02d31f1f4dd71d4bff9f5e554d8b4d4b3ba6fe",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "af5464499c4f8068b28c001a7ea4cb7b2aa5be5b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "afab44107b89e5f2986db1a6d4bb2939f8942bd5",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "b088228bc4fa76cb78cd7df433763e16531659e7",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "aws_access_key"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "b0892c45e9b9899beb9d3239547d67f0ec538e09",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "b0ebf6b8753a4b43316936e1f2f3914cafe9c744",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "b0f7f5b47f5fb65980b67defa919a7a133715f56",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "b38b51c69021a5820b79e8a0cb15d4cd8791a13e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "b3c0058dcef76d63285c975613dde8d80a20f2a8",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "b42cff12a3935bfc3f4b3b47e5df0f1897ec5bea",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "b464a4d533b40e833c12468b6d62fece8a14e148",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "b482264229e5738044c374474871f62475f9199e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "b531d3d763611e7111567bf6f2fe3f921fa5370d",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "b7733ee7e706789e2a41dc2e641b47a7a499850f",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "b8b2cada4d058267781daa073d5197add6bfdba1",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "b8b46bbe7ab15f1cfc121e4200b16cf5c825df7c",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "family member first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "bbc363eba72fe2cb03c9a1256c1317eb37e45e76",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "bbebc979fa7794d7df6c2640d45e61b355d8e2e3",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "bc3126ff6ad75192d69e09cdb82249595bf8c791",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "bd1db3919a4cd477b6725ab669d0120e0ec60b6d",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "bd277e20c1d7179ed10c7e5e77ff9f102b21f472",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "be65a6f46a834a20053466b9b6478eb24557ed33",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "bf7ad920795c43a224726f1350e386514b846ff0",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "bf876bc9e5602fe0e3e257b53879cf9b1b132163",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c0601d700aa9e4d49b220b2219e67f4693685fd4",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner organization"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner organization short name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c06b13887b635dd6e20186e07c772ebd23e54de7",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c0fe10cb0889d68b56315dc9592db16f5668e65b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c1c783f7c7f0bcefe6e1cdc46cf8e3f8f8950b1c",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "c2a01c0e1da3246a8c0ca3159e6cd9d64ba508bc",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c2dd9186e8a48dfa01c1d191de543cfadf79f934",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c3730b3a0bca9622775a211a6bf9ec3a5a5c9362",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c3930768128939849b78accf4cc92ecd3e7dec69",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c4d769a03f17e3939ff786ece0c30707f8970bcc",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c4ff80d9a7c652734114c361eabdf2534312e166",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c552385c7ea5ebf70a03a6ff97784df500f95c02",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c5fa2dbed55d4f1810b88501d277fa839a876972",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c622341bf20c99568f5093b5a8a0f2999717983d",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "c8e8cc5ebb6fb8a8cdf39e48d1261cc63a0ae21c",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "ca2da17e2bc9e87557a3f5de2b11dffa61527b85",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "ca89805b398949985000fe54689097f7acc1accf",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "cad111a10199bac77912ae5492f93eddd7cded32",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "cee8d3ff374bc56ebe51a1b99010df32e80e0782",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "d06462236dd3f76476f2a2767f5bcbbc189ad323",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "d155604c851e0e734ab12b7f471ffd8886be1af8",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "d23f03b8b29c93ace30ad8b6f20612f9e3bb84ed",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "d27a3f7d733d749b98b61eab7f8c0a999f432f77",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "d347056685f2d3ead16bb19f2d5afd9970fc8f5a",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "d4800711f8e9db7b77ed9ee14ef5c5d0bc19dc6a",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "d4ec2893a40fc31af3f276868a3644137a4cf333",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "d8f13e1cd0eb68c5f0d454687c6e2c7ccbb9975a",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "daca2e004f530bf7450b8e2a9e4c4d84a5299189",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "plaid_access_token"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "dae7ad0fbc5d0a156472e69d3771aad6b588322b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "db8803afb416f5a6da9d2541710af08f3720ef93",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "dc9efb06fbb92b4a824a30e96981f1dc0dee9c58",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "dd277360a809b61782c2f08ca309800d5b2e0318",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "dda95822363208d4d5bc1221aa336b4cc1936ff6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "cloudflare account id"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "de5430bebfcb99ca71fde28c34d0b407bd276bdb",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "de864b228fe8423ab88e96298b912c9a69bca6f7",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "df9d7bae076726a3402b7c5ca93797d86802a779",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "dfeadc53f7705eefc3f0f3d45514b360926fa41d",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "e07b3e072cfbd4fd990b52527f798fa03b064552",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "e2487cd9af4b31ea1e3e97ee723e3afb2269ae9b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "e3b777825908e779a21c60842c68c1ada7ad81b5",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "e51d3a44d5a28f78400c358c5f098c3eaf2415af",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "e51fd3222d459564f2a9b3d2643c9be0a304789b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "e5ae9ad30661e4b1d01021c21642b0cc48347d20",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "cloudflare account id"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content",
+        "path"
+      ]
+    },
+    {
+      "object_id": "e5ba3f7a9b2965e6b00ff14293163fa2ea684344",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "e5bda76d39a3b53dfbbf2e9cfa52f085fc508e76",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "e626477b4eb30fd58d5a852a078268b2d15e1e60",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "e6ee32a3c69d47eec127d5ffc1f7def6d8542c9f",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "e7c2835601b7d84a047abff9d3f42384c8fa3010",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "e8811c6f28d506dc2c70d7417ff4dae62bda3d2b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "ea3634932c7a6d4bea2a96659f509dfd1560d0b6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "ea8dc38cfcd87d7b013571dd8e74e5efd9ffc4ac",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "anthropic_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "cloudflare_token_classic"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "connection_string"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "google_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "notion_token"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "private_key_header"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "resend_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "stripe_webhook_secret"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "supabase_pat"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "url_query_secret"
+        },
+        {
+          "kind": "known_revoked_credential",
+          "category": "revoked cloudflare api token"
+        },
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "cloudflare account id"
+        },
+        {
+          "kind": "privacy",
+          "category": "cloudflare zone id"
+        },
+        {
+          "kind": "privacy",
+          "category": "d1 database id"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        },
+        {
+          "kind": "privacy",
+          "category": "private repo commit sha"
+        },
+        {
+          "kind": "privacy",
+          "category": "stripe product id"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "eb33df36744a50b79d0bd02c4b95d6c25d267196",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "ec74b0032d5b7fe9ee81535ffb8ee2bc0c2c54a5",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "ec9ac90b2d2a56f3892f6e24c229f6a4ca0eb486",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "ecbce03cfc4ef24d5ec32bf6af1dc2aa1ff8462e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "ecd10109e8898fde15cd08e8e5d2420c6d58fd1c",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "ed7c08dc5428bba28cb982d6751ae2fca532950b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "edb1d387cea767ed89d22d529604c53ac82e9a70",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "ee617b64b3b9101fd94f1e4793920e2cdaedd24e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "eea800cc609485e8d4c71df970744217fe9be879",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "ef2ca766da7bd779bb34e37f3c59db58f9df4ba9",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f076912f11e76bb1a005ab014af2fe44107e1e0a",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f080d5db65fd4e6175328e502885ef09704dfc48",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f101ef904ac6235bb0ba96cd2df685e381311b48",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f1cba255b0a0094a8d7637f2ccb7dfb0e3df8f72",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f327e744c0b41d830ddd6142d5bf1957067711d6",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f4a8c3fd20a2ab966bc5cd402f66add99bc5a029",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "aws_access_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "url_query_secret"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f4aa61da2f571e46a8e1f1245e9a118a4b5bfddd",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "google_oauth_secret"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "stripe_webhook_secret"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f53d7ba0aaf37d893c1dd8ca0ba4d08ae89f9eeb",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f572e28c232568971c9fc3a98342086c8a2cc6a7",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f57848607dc78c6c94cc60a395c00291c1348f49",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f66f00bacfa470cf73e5a2b60b3343f26ea97124",
+      "object_type": "commit",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "message"
+      ]
+    },
+    {
+      "object_id": "f6c401c46a71f732baf5c7beac102157791427eb",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f6feec5aaa5ccec49c51451fae981fc466c6a250",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "family member first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f7655c49486725d861320c9b5f88f757d61f705c",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f786988093e56a6c834ac88932885fa77e66b29e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "f9bf179d68b615b71aeca5d22dd5655b3d34bf2e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "fb076678e3e98f1f171241845e987e98067bcd1b",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "fb67b9ef90c269ee181f578573af97b67722a9ad",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "fc154dd86337016a3b827a092038384497de7eee",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "fc81458a4dfbae99e9b2ade51b1090687a4f005e",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "fde0cfdea60d4a2f41d83204eacb74ddebd0bd56",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "fdf446ed4cd435abb13e61710043322409fcf5ca",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "credential_candidate",
+          "category": "anthropic_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "cloudflare_token_classic"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "connection_string"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "env_assignment"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "google_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "notion_token"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "private_key_header"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "resend_api_key"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "stripe_webhook_secret"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "supabase_pat"
+        },
+        {
+          "kind": "credential_candidate",
+          "category": "url_query_secret"
+        },
+        {
+          "kind": "known_revoked_credential",
+          "category": "revoked cloudflare api token"
+        },
+        {
+          "kind": "privacy",
+          "category": "client first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "cloudflare account id"
+        },
+        {
+          "kind": "privacy",
+          "category": "cloudflare zone id"
+        },
+        {
+          "kind": "privacy",
+          "category": "d1 database id"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        },
+        {
+          "kind": "privacy",
+          "category": "private repo commit sha"
+        },
+        {
+          "kind": "privacy",
+          "category": "stripe product id"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    },
+    {
+      "object_id": "fe752534c976dc20cdc787d8c9ba54bb2c9fb5e2",
+      "object_type": "blob",
+      "classifications": [
+        {
+          "kind": "privacy",
+          "category": "collaborator first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "collaborator surname"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner first name"
+        },
+        {
+          "kind": "privacy",
+          "category": "owner personal domain host"
+        }
+      ],
+      "locations": [
+        "content"
+      ]
+    }
+  ]
+}
