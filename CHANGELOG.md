@@ -6,6 +6,11 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## 0.3.6 (unreleased)
 
+- The release gate is written down in `docs/RELEASE-GATE.md`: the update
+  rehearsal legs a release must pass, the rule for which old version to
+  rehearse from, the requirement that the published bytes are the tested bytes,
+  and the harness rules that cost us hours to learn.
+
 - An update refuses a brain whose database schema is ahead of the release,
   naming both numbers. The version guard compared version strings only, and a
   brain built from a working branch records a lower string while running a
