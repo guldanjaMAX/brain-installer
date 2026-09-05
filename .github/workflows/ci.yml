@@ -217,7 +217,7 @@ jobs:
             package/tools/preflight.sh package/tools/preflight.ps1
           test -f .packaged-preflight/package/tools/preflight.sh
           test -f .packaged-preflight/package/tools/preflight.ps1
-          echo "both packaged preflight scripts extracted from $ARTIFACT_NAME"
+          echo "both packaged preflight scripts extracted from $(basename "$tarball")"
 
       # --ignore-scripts is what the client is told to run, so CI runs the same
       # thing. If a dependency needs a postinstall script, better to find out

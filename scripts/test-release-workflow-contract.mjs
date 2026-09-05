@@ -76,6 +76,10 @@ assert.ok(matrixDownloadIndex > 0 && matrixHashIndex > matrixDownloadIndex &&
   matrixPackageInstallIndex > matrixInstallIndex,
 "the matrix must hash the downloaded package and extract its preflight before any install");
 assert.match(testJob, /tar -xzf "\$tarball" -C \.packaged-preflight[\s\S]*?package\/tools\/preflight\.sh package\/tools\/preflight\.ps1/);
+const matrixPreflightExtract = testJob.slice(matrixPreflightExtractIndex, matrixInstallIndex);
+assert.match(matrixPreflightExtract, /basename "\$tarball"/);
+assert.doesNotMatch(matrixPreflightExtract, /\$ARTIFACT_NAME/,
+  "the extraction step must use variables exported to later steps rather than a prior step-local variable");
 assert.match(testJob, /- name: packaged preflight runs and prints \(Windows\)[\s\S]*?\.packaged-preflight\\package\\tools\\preflight\.ps1/);
 assert.match(testJob, /- name: packaged preflight runs and prints \(macOS and Linux\)[\s\S]*?bash \.packaged-preflight\/package\/tools\/preflight\.sh/);
 assert.doesNotMatch(testJob, /(?:bash |Resolve-Path \.\\)tools[\\/]preflight\.(?:sh|ps1)/,
