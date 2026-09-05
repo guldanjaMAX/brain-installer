@@ -8922,6 +8922,11 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     );
     const prepareGmail = async ({ id, fetched: r }) => {
       scanned++;
+      // Report the scan before any unchanged or skip return. A resumed first
+      // pass may recheck thousands of already-accepted messages before it
+      // reaches new mail; printing only for newly prepared documents made a
+      // healthy run look frozen during that whole recovery window.
+      if (scanned % 200 === 0) process.stdout.write(`\r  fetched ${scanned}...   `);
       const key = `${sourceName}:${id}`;
       if (r.skip) {
         state.skipped[key] = r.skip.reason;
@@ -8948,7 +8953,6 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         return { skip };
       }
       const envelopes = splitOversized(envelope);
-      if (scanned % 200 === 0) process.stdout.write(`\r  fetched ${scanned}...   `);
       return {
         hash: r.version, envelopes, rel: id, stateKey: key, deferState: true,
         familyPlan: {
