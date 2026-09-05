@@ -35,7 +35,7 @@ const adminKey = resolveAdminKey(manifestPath, { ignoreEnvironment: true });
 assert.match(String(adminKey || ""), /^[a-f0-9]{48}$/);
 const base = `https://${manifest.brain.domain}`;
 
-async function request(path, { method = "GET", body } = {}) {
+async function request(path, { method = "GET", body, allowError = false } = {}) {
   const response = await fetch(`${base}${path}`, {
     method,
     headers: {
@@ -53,10 +53,10 @@ async function request(path, { method = "GET", body } = {}) {
   } catch {
     throw new Error(`${path} returned non-JSON HTTP ${response.status}`);
   }
-  if (!response.ok) {
+  if (!response.ok && !allowError) {
     throw new Error(`${path} returned HTTP ${response.status}: ${String(parsed?.error || "unknown").slice(0, 160)}`);
   }
-  return { body: parsed, headers: response.headers };
+  return { body: parsed, headers: response.headers, status: response.status };
 }
 
 const envelope = (sourceId, content, title = `Synthetic ${sourceId}`, category = "batch") => ({
@@ -114,6 +114,29 @@ if (prior.body.families.length) {
   });
   await drainUntilEmpty();
 }
+
+// Exercise the deployed scanner through the single-document HTTP boundary.
+// Keep the secret-shaped value synthetic and out of both output and receipts.
+const syntheticAdminKey = `a${"3".repeat(63)}`;
+assert.equal(syntheticAdminKey.length, 64);
+const refusedSecret = await request("/api/admin/brain/ingest", {
+  method: "POST",
+  body: envelope("scanner-refusal", `admin_key: ${syntheticAdminKey}`, "Synthetic scanner refusal", "privacy"),
+  allowError: true,
+});
+assert.equal(refusedSecret.status, 422);
+assert.deepEqual(refusedSecret.body, {
+  error: "refused: content carries sensitive credential(s) or private identifier(s)",
+  labels: ["env_assignment"],
+  detail: "Remove or redact them, rotate any live credentials, then re-ingest. Nothing was written.",
+});
+assert.equal(JSON.stringify(refusedSecret.body).includes(syntheticAdminKey), false);
+const afterSecretRefusal = await request("/api/admin/brain/documents");
+assert.equal(
+  afterSecretRefusal.body.rows.some((entry) => entry.source_type === source && Number(entry.documents) > 0),
+  false,
+  "the rejected synthetic credential created a document",
+);
 
 const fifty = Array.from({ length: 50 }, (_, index) => envelope(
   `batch-${String(index).padStart(2, "0")}`,
@@ -214,6 +237,7 @@ console.log(JSON.stringify({
   embedding_submissions: vectorDrain.submitted,
   embedding_drain_rounds: vectorDrain.rounds,
   asynchronous_wait_observed: vectorDrain.waiting_observed,
+  secret_scanner_http_refusal: true,
   verified_documents: 53,
   cleanup_documents: removed.body.documents,
   deletion_drain_rounds: deleteDrain.rounds,

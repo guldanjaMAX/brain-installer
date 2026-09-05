@@ -47,6 +47,13 @@ the brain, not for whoever built it: what changed for them, and what to check.
   employer tax identifiers without echoing their digits. This is targeted
   taxpayer-ID protection, not a claim that every kind of personal data is
   recognized.
+- The ingest safety gate now recognizes every generated Brain admin key,
+  including labelled keys whose hexadecimal value begins with a letter.
+  Placeholder examples remain allowed, while a real key is refused before any
+  document is written.
+- Answer-service failures now return fixed recovery guidance. Raw provider
+  messages and private request details no longer appear in answer responses or
+  on the owner screen.
 
 ## 0.3.6
 

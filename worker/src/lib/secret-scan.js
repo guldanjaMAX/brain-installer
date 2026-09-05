@@ -1,5 +1,5 @@
 /**
- * secret-scan v5: credential, taxpayer-ID, and capability-link safety for ingest.
+ * secret-scan v6: credential, taxpayer-ID, and capability-link safety for ingest.
  *
  * The credential shapes began as a port of ~/CocoIndex/secret_scan.py v2. The
  * shipped connector and Worker now import this module directly, so both doors
@@ -31,10 +31,10 @@
 export const CONFIRMED = "confirmed";
 export const SUSPECTED = "suspected";
 export const CLEAN = "clean";
-// v5 adds high-confidence, context-anchored US taxpayer identifiers. The
-// durable version forces previously accepted content through the new gate on
-// the next complete source sweep.
-export const GATE_VERSION = 5;
+// v6 also recognizes the install's own 64-character hex admin keys when they
+// begin with a-f. The durable version forces previously accepted content
+// through the corrected gate on the next complete source sweep.
+export const GATE_VERSION = 6;
 
 // Some HTTPS links are credentials in URL form. Unlike a provider API key, a
 // private payment link normally appears inside useful billing prose, so
@@ -264,8 +264,10 @@ const STRUCTURAL = [
     // process.env.X, a function call, a placeholder, or an ordinary identifier.
     reject: (v) =>
       /^(process|env|config|opts|options|args|this|self)\b/i.test(v) ||
-      /^[a-z][A-Za-z0-9]*$/.test(v) ||
-      /^(your|the|a|some|placeholder|example|redacted|xxx+|changeme|todo)/i.test(v) ||
+      // A long hexadecimal value is a literal, even when it starts with a-f.
+      (/^[a-z][A-Za-z0-9]*$/.test(v) && !/^[0-9a-f]{24,}$/i.test(v)) ||
+      // Placeholder words must end before the first alphanumeric value byte.
+      /^(your|the|a|some|placeholder|example|redacted|xxx+|changeme|todo)(?![A-Za-z0-9])/i.test(v) ||
       /^<.*>$/.test(v) ||
       !/[0-9]/.test(v),
   },

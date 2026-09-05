@@ -154,7 +154,24 @@ chk("useful billing prose survives envelope sanitization",
   sensitiveEnvelope.content.includes("Billing is active.") && sensitiveEnvelope.content.includes("Follow up Friday."));
 chk("sanitized capability markers are clean to the refusal scanner",
   scanEnvelope(sensitiveEnvelope).verdict === CLEAN);
-chk("taxpayer-ID safety advances the durable gate version", GATE_VERSION === 5, String(GATE_VERSION));
+chk("admin-key safety advances the durable gate version", GATE_VERSION === 6, String(GATE_VERSION));
 
-console.log(fail ? `\n${fail} FAILURES` : "\nsecret-scan v5 (js): all tests passed");
+// Generated admin keys are 64 lowercase hex characters. The old identifier
+// and placeholder heuristics missed those beginning with a-f.
+{
+  const tail = "3f9b2c8e1d7a4b6c5e0f8a2d9c7b1e4f3a6d8b0c2e5f7a9b1d3c6e8f0a2b4c6";
+  for (const first of ["a", "b", "c", "d", "e", "f"]) {
+    const result = scan(`admin_key: ${first}${tail}`);
+    chk(`a 64-hex admin key starting with ${first} is caught`,
+      result.verdict === CONFIRMED, result.verdict);
+  }
+  chk("an underscored placeholder remains clean",
+    scan("admin_key: your_key_goes_here_1234").verdict === CLEAN);
+  chk("a hyphenated placeholder remains clean",
+    scan("api_key: example-token-abcdefghij").verdict === CLEAN);
+  chk("a camelCase identifier remains clean",
+    scan("api_key: someLongVariableNameHere").verdict === CLEAN);
+}
+
+console.log(fail ? `\n${fail} FAILURES` : "\nsecret-scan v6 (js): all tests passed");
 process.exit(fail ? 1 : 0);

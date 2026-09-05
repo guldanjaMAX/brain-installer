@@ -1,5 +1,6 @@
 import worker from "../src/index.js";
 import { filterSql, unsupportedFilters } from "../src/lib/store-d1.js";
+import { ANSWER_ERROR_MESSAGES } from "../src/lib/answer-render.js";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + d)); if (!c) fail++; };
@@ -138,6 +139,30 @@ const call = (env, path) => {
     b.results[0].date_reliable === true && b.results[0].date_source === "fixture:event_date", JSON.stringify(b.results[0]));
   check("and its client", b.results[0].client === "Acme");
   check("a hit exposes stable document identity, not its chunk id", b.results[0].ref_key === "123" && b.results[0].chunk_uid === "meeting:123#0", JSON.stringify(b.results[0]));
+}
+
+/* Provider diagnostics may be useful inside a protected system, but the raw
+   message must never cross the JSON boundary into an owner client. */
+{
+  const rawProviderFailure = "RAW_PROVIDER_FAILURE_SENTINEL fixture-private-trace-123";
+  const { env } = mkEnv([ROW], {
+    vectorIds: ["meeting:123#0"],
+    extra: {
+      AI: {
+        run: async (model) => {
+          if (String(model).includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          throw new Error(rawProviderFailure);
+        },
+      },
+    },
+  });
+  const response = await call(env, "/api/rag/think?q=retainer&limit=5");
+  const body = await response.json();
+  check("think replaces raw answer-provider errors before the JSON response",
+    response.status === 200 && body.answer === null &&
+      body.answer_error === ANSWER_ERROR_MESSAGES.unavailable &&
+      !JSON.stringify(body).includes(rawProviderFailure),
+    JSON.stringify(body).slice(0, 300));
 }
 
 /* The public source-weight contract is live on D1, including an explicit zero. */

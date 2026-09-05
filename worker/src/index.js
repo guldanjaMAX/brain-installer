@@ -39,6 +39,7 @@ import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
 import { emptyRetrievalDisclosure } from "./lib/retrieval-status.js";
+import { answerGenerationError } from "./lib/answer-render.js";
 import {
   handleOwnerAuth, handleAdminInvite, handleAdminDevices, handleAdminGrants, handleZones,
   ownerSessionPrincipal,
@@ -665,11 +666,7 @@ async function handleThink(env, request, access = null, grantScope = { all: true
       }
     }
   } catch (e) {
-    answerError = e.no_key
-      ? "no LLM key configured"
-      : e.llm_cap_exceeded
-        ? "daily LLM spend cap reached"
-        : e.message;
+    answerError = answerGenerationError(e);
   }
 
   // Retrieval always returns the nearest candidates, even when none answers
@@ -818,7 +815,7 @@ async function handleThink(env, request, access = null, grantScope = { all: true
           }
         } catch (e) {
           answer = null;
-          answerError = e.llm_cap_exceeded ? "daily LLM spend cap reached" : "evidence gate could not verify support";
+          answerError = answerGenerationError(e, { verification: true });
           approvedDocs = [];
           evidenceGate = { supported: false, complete: false, error: "verification unavailable" };
         }
