@@ -66,6 +66,8 @@ export class ScriptedImapServer {
     this.log = [];
     /** Set true to prove a failing send does not advance a cursor. */
     this.failNextFetch = false;
+    /** Omit one requested UID once, simulating SEARCH/FETCH race or incomplete FETCH. */
+    this.omitNextFetchUid = null;
     this.server = null;
     this.port = 0;
   }
@@ -180,10 +182,13 @@ export class ScriptedImapServer {
             const set = (args[1] || "").split(",").map(Number).filter(Boolean);
             const items = args.slice(2).join(" ").toUpperCase();
             const wantBody = items.includes("BODY.PEEK[]") || items.includes("BODY[]");
+            const omitUid = Number(this.omitNextFetchUid);
+            this.omitNextFetchUid = null;
             let seq = 0;
             for (const uid of set) {
               const message = selected.messages.get(uid);
               seq++;
+              if (uid === omitUid) continue;
               if (!message) continue;
               const head =
                 `* ${seq} FETCH (UID ${uid} INTERNALDATE "${message.internaldate}" RFC822.SIZE ${message.raw.length}`;

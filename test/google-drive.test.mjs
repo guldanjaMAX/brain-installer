@@ -281,6 +281,43 @@ const workbookBytes = (sheets) => {
     yielded.length === 0 && error instanceof DriveError && error.reason === "incompleteSearch",
     `${yielded.join(",")} ${error?.message || "no error"}`);
 }
+{
+  let calls = 0, error = null;
+  try {
+    for await (const _file of listFiles(tok, {
+      opts: {
+        fetchImpl: async () => { calls++; return json({ files: [], nextPageToken: "p1" }); },
+        sleep: async () => {},
+      },
+    })) { /* a repeated continuation must fail closed */ }
+  } catch (caught) { error = caught; }
+  check("a repeated Drive file-list token fails closed",
+    calls === 2 && error instanceof DriveError && error.reason === "repeatedPageToken", `${calls} ${error?.reason}`);
+}
+{
+  let error = null;
+  try {
+    for await (const _file of listFiles(tok, {
+      opts: { fetchImpl: async () => json({ files: [], nextPageToken: 42 }), sleep: async () => {} },
+    })) { /* provider tokens must remain opaque strings */ }
+  } catch (caught) { error = caught; }
+  check("a non-string Drive file-list token is refused",
+    error instanceof DriveError && error.reason === "invalidPageToken", error?.reason);
+}
+{
+  let calls = 0, error = null;
+  try {
+    for await (const _file of listFiles(tok, {
+      maxPages: 2,
+      opts: {
+        fetchImpl: async () => { calls++; return json({ files: [], nextPageToken: `page-${calls}` }); },
+        sleep: async () => {},
+      },
+    })) { /* unique pages remain bounded */ }
+  } catch (caught) { error = caught; }
+  check("unique Drive file-list tokens remain page-bounded",
+    calls === 2 && error instanceof DriveError && error.reason === "pageLimit", `${calls} ${error?.reason}`);
+}
 
 /* ================= changes feed ================= */
 {
@@ -296,6 +333,64 @@ const workbookBytes = (sheets) => {
   // the brain answering from a document the client believes they deleted.
   check("a trashed file counts as removed, not changed", r.removed.includes("c"), JSON.stringify(r));
   check("the next token is returned for the following run", r.nextToken === "T99");
+}
+{
+  let calls = 0, error = null;
+  await listChanges(tok, "T1", {
+    fetchImpl: async () => { calls++; return json({ changes: [], nextPageToken: "T1" }); },
+    sleep: async () => {},
+  }).catch((caught) => { error = caught; });
+  check("a repeated Drive changes token fails closed before another request",
+    calls === 1 && error instanceof DriveError && error.reason === "repeatedPageToken", `${calls} ${error?.reason}`);
+}
+{
+  let calls = 0, error = null;
+  await listChanges(tok, "T1", {
+    fetchImpl: async () => {
+      calls++;
+      return json({ changes: [], nextPageToken: calls === 1 ? "T2" : "T1" });
+    },
+    sleep: async () => {},
+  }).catch((caught) => { error = caught; });
+  check("a cyclic Drive changes token fails closed before replaying the first page",
+    calls === 2 && error instanceof DriveError && error.reason === "repeatedPageToken", `${calls} ${error?.reason}`);
+}
+{
+  let calls = 0, error = null;
+  await listChanges(tok, "T1", {
+    fetchImpl: async () => { calls++; return json({ changes: [], nextPageToken: 42 }); },
+    sleep: async () => {},
+  }).catch((caught) => { error = caught; });
+  check("a non-string Drive changes token is unavailable instead of being coerced",
+    calls === 1 && error instanceof DriveError && error.reason === "invalidPageToken", `${calls} ${error?.reason}`);
+}
+{
+  let error = null;
+  await listChanges(tok, "T1", {
+    fetchImpl: async () => json({ changes: [], newStartPageToken: "x".repeat(8_193) }),
+    sleep: async () => {},
+  }).catch((caught) => { error = caught; });
+  check("an oversized Drive terminal token is refused before cursor advancement",
+    error instanceof DriveError && error.reason === "invalidPageToken", error?.reason);
+}
+{
+  let error = null;
+  await listChanges(tok, "T1", {
+    fetchImpl: async () => json({ changes: [{ fileId: "seen", file: { id: "seen" } }] }),
+    sleep: async () => {},
+  }).catch((caught) => { error = caught; });
+  check("a Drive changes window cannot advance without a terminal newStartPageToken",
+    error instanceof DriveError && error.reason === "incompleteChangeFeed", error?.reason);
+}
+{
+  let calls = 0, error = null;
+  await listChanges(tok, "T1", {
+    maxPages: 2,
+    fetchImpl: async () => { calls++; return json({ changes: [], nextPageToken: `T${calls + 1}` }); },
+    sleep: async () => {},
+  }).catch((caught) => { error = caught; });
+  check("unique Drive change tokens remain page-bounded",
+    calls === 2 && error instanceof DriveError && error.reason === "pageLimit", `${calls} ${error?.reason}`);
 }
 
 /* ================= authoritative root boundary ================= */
@@ -590,9 +685,11 @@ const gm = await import("../connectors/gmail.mjs");
   const q = gm.DEFAULT_QUERY;
   // Volume alone lets bulk mail dominate retrieval; in a previous corpus
   // newsletter HTML took the top six citations on a real client question.
-  for (const c of ["promotions", "social", "forums", "updates"]) {
+  for (const c of ["promotions", "social", "forums"]) {
     check(`bulk mail category "${c}" is excluded by default`, q.includes(`-category:${c}`), q);
   }
+  check("Updates stays included because Gmail puts statements, confirmations, and reminders there",
+    !q.includes("-category:updates") && gm.gmailLabelDecision(["CATEGORY_UPDATES"]).allowed === true, q);
   check("chats and drafts are excluded", q.includes("-in:chats") && q.includes("-in:drafts"));
   check("spam and trash are excluded", q.includes("-in:spam") && q.includes("-in:trash"));
 }
@@ -602,6 +699,69 @@ const gm = await import("../connectors/gmail.mjs");
   const out = [];
   for await (const id of gm.listMessages(tok, { opts: { fetchImpl: async () => json(pages[i++]), sleep: async () => {} } })) out.push(id);
   check("message listing paginates", out.join(",") === "m1,m2,m3", out.join(","));
+}
+{
+  let calls = 0, error = null;
+  try {
+    for await (const _id of gm.listMessages(tok, {
+      opts: {
+        fetchImpl: async () => { calls++; return json({ messages: [{ id: `m${calls}` }], nextPageToken: "p1" }); },
+        sleep: async () => {},
+      },
+    })) { /* the repeated page must not loop forever */ }
+  } catch (caught) { error = caught; }
+  check("a repeated Gmail message-list page token fails closed without looping forever",
+    calls === 2 && error instanceof DriveError && error.reason === "repeatedPageToken", `${calls} ${error?.reason}`);
+}
+{
+  let calls = 0, error = null;
+  try {
+    for await (const _id of gm.listMessages(tok, {
+      opts: {
+        fetchImpl: async () => {
+          calls++;
+          return json({ messages: [], nextPageToken: calls === 1 ? "p1" : calls === 2 ? "p2" : "p1" });
+        },
+        sleep: async () => {},
+      },
+    })) { /* cyclic continuation must stop before replaying a page */ }
+  } catch (caught) { error = caught; }
+  check("a cyclic Gmail message-list page token fails closed",
+    calls === 3 && error instanceof DriveError && error.reason === "repeatedPageToken", `${calls} ${error?.reason}`);
+}
+{
+  let error = null;
+  try {
+    for await (const _id of gm.listMessages(tok, {
+      opts: { fetchImpl: async () => json({ messages: [], nextPageToken: 42 }), sleep: async () => {} },
+    })) { /* provider tokens must remain opaque strings */ }
+  } catch (caught) { error = caught; }
+  check("a non-string Gmail message-list token is refused",
+    error instanceof DriveError && error.reason === "invalidPageToken", error?.reason);
+}
+{
+  let error = null;
+  try {
+    for await (const _id of gm.listMessages(tok, {
+      opts: { fetchImpl: async () => json({ messages: [{ id: "" }] }), sleep: async () => {} },
+    })) { /* malformed ids are never yielded */ }
+  } catch (caught) { error = caught; }
+  check("a Gmail message list with an empty identity is unavailable, not healthy empty",
+    error instanceof DriveError && error.reason === "invalidMessageId", error?.reason);
+}
+{
+  let calls = 0, error = null;
+  try {
+    for await (const _id of gm.listMessages(tok, {
+      maxPages: 2,
+      opts: {
+        fetchImpl: async () => { calls++; return json({ messages: [], nextPageToken: `unique-${calls}` }); },
+        sleep: async () => {},
+      },
+    })) { /* unique empty pages must still be bounded */ }
+  } catch (caught) { error = caught; }
+  check("unique Gmail message-list tokens cannot run forever or grow without bound",
+    calls === 2 && error instanceof DriveError && error.reason === "pageLimit", `${calls} ${error?.reason}`);
 }
 {
   let i = 0;
@@ -629,9 +789,24 @@ const gm = await import("../connectors/gmail.mjs");
   check("the thread is kept", r.envelope.metadata.thread_id === "T1");
 }
 {
+  const raw = Buffer.from(
+    "From: bank@example.invalid\r\nTo: owner@example.invalid\r\nSubject: Monthly statement ready\r\n\r\n" +
+    "Your invented August account statement is ready for review, with a payment reminder due next week."
+  ).toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
+  const r = await gm.toEnvelope(tok, "statement", {}, {
+    fetchImpl: async () => json({ raw, historyId: "H10", labelIds: ["CATEGORY_UPDATES"] }),
+    sleep: async () => {},
+  });
+  check("a Gmail Updates statement remains searchable instead of becoming a silent policy skip",
+    !!r.envelope && /account statement is ready/.test(r.envelope.content) &&
+      r.envelope.metadata.labels.includes("CATEGORY_UPDATES"),
+    JSON.stringify(r.skip));
+}
+{
   const r = await gm.toEnvelope(tok, "M2", {}, { fetchImpl: async () => json({ internalDate: "1" }), sleep: async () => {} });
   check("a message with no label evidence is a coverage gap before its body can be trusted",
-    !!r.skip && /no label classification/.test(r.skip.reason) && r.policy_skip === false && r.retain_existing === true,
+    !!r.skip && /no label classification/.test(r.skip.reason) && r.policy_skip === false &&
+      r.retain_existing === true && r.cursor_blocking === true,
     JSON.stringify(r));
 }
 {
@@ -645,7 +820,8 @@ const gm = await import("../connectors/gmail.mjs");
     sleep: async () => {},
   });
   check("a message with no content is a reasoned skip, not a silent one",
-    !!r.skip && /no content/.test(r.skip.reason), JSON.stringify(r));
+    !!r.skip && /no content/.test(r.skip.reason) && r.retain_existing === true &&
+      r.cursor_blocking === false, JSON.stringify(r));
 }
 {
   const raw = Buffer.from(
@@ -657,7 +833,8 @@ const gm = await import("../connectors/gmail.mjs");
     sleep: async () => {},
   });
   check("incremental Gmail applies the same bulk-mail policy as a full query",
-    !!r.skip && r.policy_skip === true && r.retain_existing === false && /policy excludes/.test(r.skip.reason),
+    !!r.skip && r.policy_skip === true && r.retain_existing === false &&
+      r.cursor_blocking === false && /policy excludes/.test(r.skip.reason),
     JSON.stringify(r));
 }
 {
@@ -665,7 +842,24 @@ const gm = await import("../connectors/gmail.mjs");
     fetchImpl: async () => json({ error: { errors: [{ reason: "notFound" }], message: "Message not found" } }, 404),
     sleep: async () => {},
   });
-  check("a deleted message is the one fetch failure safe to skip", !!r.skip && r.skip.id === "gone" && /could not be fetched/.test(r.skip.reason), JSON.stringify(r));
+  check("a deleted message is the one fetch failure safe to skip",
+    !!r.skip && r.skip.id === "gone" && r.source_deleted === true &&
+      r.retain_existing === false && r.cursor_blocking === false && /could not be fetched/.test(r.skip.reason),
+    JSON.stringify(r));
+}
+{
+  let requested = null;
+  const r = await gm.messagePolicy(tok, "classified", {
+    fetchImpl: async (url) => {
+      requested = new URL(url);
+      return json({ id: "classified", labelIds: ["INBOX"] });
+    },
+    sleep: async () => {},
+  });
+  check("incremental Gmail can preflight labels without fetching a raw body",
+    r.allowed === true && requested?.searchParams.get("format") === "minimal" &&
+      requested?.searchParams.get("fields") === "id,labelIds",
+    `${JSON.stringify(r)} ${String(requested)}`);
 }
 {
   let calls = 0, e = null;
@@ -750,12 +944,139 @@ const gm = await import("../connectors/gmail.mjs");
 }
 {
   const r = await gm.listHistory(tok, "5", {
-    fetchImpl: async () => json({ history: [{ id: "7", messagesAdded: [{ message: { id: "n1" } }, { message: { id: "n2" } }] }] }),
+    fetchImpl: async () => json({ historyId: "7", history: [{ id: "7", messagesAdded: [{ message: { id: "n1" } }, { message: { id: "n2" } }] }] }),
     sleep: async () => {},
   });
   check("history returns only what was added", r.ids.sort().join(",") === "n1,n2", JSON.stringify(r.ids));
   check("and advances the history id", r.historyId === "7");
   check("and does not claim expiry", r.expired === false);
+}
+{
+  const r = await gm.listHistory(tok, "7", {
+    fetchImpl: async () => json({ historyId: "9", history: [] }),
+    sleep: async () => {},
+  });
+  check("an empty Gmail change window settles to the page-level history marker",
+    r.ids.length === 0 && r.historyId === "9" && r.expired === false,
+    JSON.stringify(r));
+}
+{
+  let calls = 0, error = null;
+  await gm.listHistory(tok, "5", {
+    fetchImpl: async () => {
+      calls++;
+      return json({ historyId: String(5 + calls), history: [], nextPageToken: "p1" });
+    },
+    sleep: async () => {},
+  }).catch((caught) => { error = caught; });
+  check("a repeated Gmail history page token fails closed before a third request",
+    calls === 2 && error instanceof DriveError && error.reason === "repeatedPageToken", `${calls} ${error?.reason}`);
+}
+{
+  let calls = 0;
+  const r = await gm.listHistory(tok, "5", {
+    fetchImpl: async () => {
+      calls++;
+      return calls === 1
+        ? json({ historyId: "6", nextPageToken: "p2", history: [
+          { messagesAdded: [{ message: { id: "later-deleted" } }] },
+          { messagesDeleted: [{ message: { id: "later-restored" } }] },
+        ] })
+        : json({ historyId: "7", history: [
+          { messagesDeleted: [{ message: { id: "later-deleted" } }] },
+          { labelsRemoved: [{ message: { id: "later-restored" }, labelIds: ["TRASH"] }] },
+        ] });
+    },
+    sleep: async () => {},
+  });
+  check("cross-page Gmail history keeps only each message's final chronological action",
+    r.deletedIds.join(",") === "later-deleted" && r.ids.join(",") === "later-restored" && r.historyId === "7",
+    JSON.stringify(r));
+}
+{
+  let calls = 0, error = null;
+  await gm.listHistory(tok, "5", {
+    maxPages: 2,
+    fetchImpl: async () => {
+      calls++;
+      return json({ history: [], historyId: String(5 + calls), nextPageToken: `unique-${calls}` });
+    },
+    sleep: async () => {},
+  }).catch((caught) => { error = caught; });
+  check("unique Gmail history tokens cannot accumulate forever",
+    calls === 2 && error instanceof DriveError && error.reason === "pageLimit", `${calls} ${error?.reason}`);
+}
+{
+  let requested = null;
+  const r = await gm.listHistory(tok, "9", {
+    fetchImpl: async (url) => {
+      requested = new URL(url);
+      return json({
+        historyId: "12",
+        history: [
+          {
+            id: "10",
+            messagesAdded: [{ message: { id: "later-deleted" } }],
+            messagesDeleted: [{ message: { id: "later-restored" } }],
+            labelsAdded: [{ message: { id: "relabeled" } }],
+          },
+          {
+            id: "11",
+            messagesDeleted: [{ message: { id: "later-deleted" } }],
+            labelsRemoved: [{ message: { id: "later-restored" } }],
+          },
+        ],
+      });
+    },
+    sleep: async () => {},
+  });
+  check("Gmail history keeps each message's final typed action across the window",
+    r.ids.sort().join(",") === "later-restored,relabeled" &&
+      r.deletedIds.join(",") === "later-deleted",
+    JSON.stringify(r));
+  check("Gmail history does not filter out delete or label events",
+    requested && !requested.searchParams.has("historyTypes"), String(requested));
+}
+{
+  let e = null;
+  await gm.currentHistoryId(tok, {
+    fetchImpl: async () => json({}),
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("a Gmail profile without a history marker is incomplete rather than a valid cursor",
+    /no valid history marker/i.test(e?.message || ""), e?.message);
+}
+{
+  let e = null;
+  await gm.listHistory(tok, "7", {
+    fetchImpl: async () => json({ history: [{ id: "9", messagesAdded: [] }] }),
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("a Gmail history response without its terminal marker cannot settle the window",
+    /no valid terminal history marker/i.test(e?.message || ""), e?.message);
+}
+{
+  let e = null;
+  await gm.listHistory(tok, "7", {
+    fetchImpl: async () => json({ history: [], historyId: "" }),
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("an empty Gmail terminal history marker cannot advance the cursor",
+    e instanceof DriveError && e.reason === "invalidHistoryId", e?.reason);
+}
+{
+  let calls = 0, e = null;
+  await gm.listHistory(tok, "5", {
+    fetchImpl: async () => {
+      calls++;
+      return calls === 1
+        ? json({ history: [], historyId: "6", nextPageToken: "p2" })
+        : json({ history: [{ messagesAdded: [{ message: { id: "tail" } }] }] });
+    },
+    sleep: async () => {},
+  }).catch((x) => (e = x));
+  check("only the terminal Gmail page may supply the cursor that closes the window",
+    calls === 2 && e instanceof DriveError && e.reason === "invalidHistoryId", `${calls} ${e?.reason}`);
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\ngoogle-drive: all ${ran} tests passed`);

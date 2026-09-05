@@ -95,10 +95,13 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
       lastFullSweepAt: "2026-08-23T00:00:00Z",
     }).incremental === false);
   check("credential scanner version is a durable rescan marker",
-    credentialScannerFingerprint(true, 3) !== credentialScannerFingerprint(true, 4));
+    credentialScannerFingerprint(true, 4) !== credentialScannerFingerprint(true, 5));
   const scannerV2 = credentialScannerFingerprint(true, 2);
   const scannerV3 = credentialScannerFingerprint(true, 3);
   const scannerV4 = credentialScannerFingerprint(true, 4);
+  const scannerV5 = credentialScannerFingerprint(true, 5);
+  check("the runtime defaults to the v5 scanner fingerprint",
+    credentialScannerFingerprint(true) === scannerV5);
   const interruptedScanner = { done: { "drive:file": "revision-1" } };
   ensureCredentialScannerProgress(interruptedScanner, scannerV2);
   recordCredentialScannerProgress(interruptedScanner, scannerV2, "drive:file", "revision-1");
@@ -121,6 +124,25 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     !hasCredentialScannerProgress(interruptedScanner, scannerV3, "drive:file", "revision-1") &&
       !hasCredentialScannerProgress(interruptedScanner, scannerV4, "drive:file", "revision-1"),
     JSON.stringify(interruptedScanner));
+  recordCredentialScannerProgress(interruptedScanner, scannerV4, "drive:file", "revision-1");
+  check("an accepted v4 revision is resumable only under v4",
+    hasCredentialScannerProgress(interruptedScanner, scannerV4, "drive:file", "revision-1") &&
+      !hasCredentialScannerProgress(interruptedScanner, scannerV5, "drive:file", "revision-1"),
+    JSON.stringify(interruptedScanner));
+  ensureCredentialScannerProgress(interruptedScanner, scannerV5);
+  check("v5 hex admin-key safety invalidates in-progress v4 accepted receipts",
+    !hasCredentialScannerProgress(interruptedScanner, scannerV4, "drive:file", "revision-1") &&
+      !hasCredentialScannerProgress(interruptedScanner, scannerV5, "drive:file", "revision-1"),
+    JSON.stringify(interruptedScanner));
+  const completedV4Scanner = {
+    done: { "drive:file": "revision-1" },
+    credential_scanner_fingerprint: scannerV4,
+  };
+  ensureCredentialScannerProgress(completedV4Scanner, scannerV5);
+  check("v5 hex admin-key safety invalidates a completed v4 scanner receipt",
+    completedV4Scanner.credential_scanner_fingerprint !== scannerV5 &&
+      !hasCredentialScannerProgress(completedV4Scanner, scannerV5, "drive:file", "revision-1"),
+    JSON.stringify(completedV4Scanner));
   const freshDecision = driveSyncDecision({
     syncToken: "cursor", policyFingerprint, savedPolicyFingerprint: policyFingerprint,
     lastFullSweepAt: "2026-08-22T12:00:00.000Z", now: Date.parse("2026-08-23T12:00:00.000Z"),
@@ -335,6 +357,9 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     ["dry run", { dry_run: true, documents: 1, chunks: 1, vectors: 1, targets: [] }],
     ["missing counts", { dry_run: false, targets: [] }],
     ["missing targets", { dry_run: false, documents: 0, chunks: 0, vectors: 0 }],
+    ["unacknowledged document count", { dry_run: false, documents: 1, chunks: 0, vectors: 0, targets: [] }],
+    ["duplicate target acknowledgement", { dry_run: false, documents: 2, chunks: 0, vectors: 0, targets: ["drive:one", "drive:one"] }],
+    ["invalid target acknowledgement", { dry_run: false, documents: 1, chunks: 0, vectors: 0, targets: [""] }],
   ]) {
     const invalid = await throws(() => validateForgetReceipt(receipt));
     check(`${label} cannot masquerade as a confirmed deletion`, invalid !== null, invalid);
@@ -754,11 +779,13 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   check("a limited local run cannot falsely commit a scanner migration",
     /scannerPolicyChanged && limitedMissesPrior/.test(local || "") &&
       /--limit cannot be used/.test(local || ""), String(local).slice(0, 1800));
-  const localCleanupConfirmed = String(local).indexOf('assertNoPendingRemovals(localRemoval');
+  const localCleanupConfirmed = String(local).indexOf('const afterLocalRemoval = await listStoredSourceFamilies');
+  const localCleanupReadbackApplied = String(local).indexOf('const stillStored = plannedLocalTargets.filter', localCleanupConfirmed);
   const localScannerCommitted = String(local).indexOf('state.credential_scanner_fingerprint = scannerFingerprint');
   check("local scanner policy commits only after confirmed refusal cleanup",
-    localCleanupConfirmed !== -1 && localScannerCommitted > localCleanupConfirmed,
-    `cleanup=${localCleanupConfirmed} commit=${localScannerCommitted}`);
+    localCleanupConfirmed !== -1 && localCleanupReadbackApplied > localCleanupConfirmed &&
+      localScannerCommitted > localCleanupReadbackApplied,
+    `inventory=${localCleanupConfirmed} proof=${localCleanupReadbackApplied} commit=${localScannerCommitted}`);
   check("remote ingest opens freshness through the Worker before reading Google",
     /status: "indexing"/.test(remote || "") && /postSourceReceipt/.test(remote || ""), String(remote).slice(0, 200));
   check("a thrown Drive or Gmail fetch posts an error receipt",
@@ -779,6 +806,9 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     /hasCredentialScannerProgress\([\s\S]*state\.done\[key\] === listedVersion/.test(remote || "") &&
       /recordCredentialScannerProgress\(state, scannerFingerprint, plan\.stateKey, plan\.hash\)/.test(remote || ""),
     String(remote).slice(0, 2200));
+  check("remote IMAP scanner upgrades force each saved folder through a full reread",
+    /folderSyncDecision\(\{[\s\S]*policyChanged: imapPolicyChanged,[\s\S]*scannerPolicyChanged,[\s\S]*\}\)/.test(remote || ""),
+    String(remote).slice(0, 2600));
   const remoteCleanupConfirmed = String(remote).indexOf('assertDriveRemovalPlanSafe(driveRemovalPlan');
   const remoteScannerCommitted = String(remote).indexOf('commitCredentialScannerProgress(state, scannerFingerprint)');
   check("remote scanner progress commits only after the aggregate Drive removal plan is approved",

@@ -311,7 +311,7 @@
     "_comment": "Non-negotiable defaults. The scanner is what makes 'we store nothing dangerous' true rather than aspirational.",
     "credential_scanner": {
       "enabled": true,
-      "gate_version": 4,
+      "gate_version": 5,
       "mode": "refuse",
       "_mode_options": "refuse | flag_only"
     },

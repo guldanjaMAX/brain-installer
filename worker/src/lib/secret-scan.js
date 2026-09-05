@@ -1,5 +1,5 @@
 /**
- * secret-scan v4 — credential and capability-link safety for ingest.
+ * secret-scan v5: credential and capability-link safety for ingest.
  *
  * The credential shapes began as a port of ~/CocoIndex/secret_scan.py v2. The
  * shipped connector and Worker now import this module directly, so both doors
@@ -31,10 +31,10 @@
 export const CONFIRMED = "confirmed";
 export const SUSPECTED = "suspected";
 export const CLEAN = "clean";
-// v4 adds content-preserving capability-link sanitization. The durable version
-// forces previously accepted content through the new transform on the next
-// complete source sweep.
-export const GATE_VERSION = 4;
+// v5 recognizes the install's own 64-character hex admin keys even when they
+// begin with a-f. The durable version forces previously accepted content
+// through the corrected scanner on the next complete source sweep.
+export const GATE_VERSION = 5;
 
 // Some HTTPS links are credentials in URL form. Unlike a provider API key, a
 // private payment link normally appears inside useful billing prose, so

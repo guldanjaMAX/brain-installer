@@ -46,6 +46,7 @@ export const EXPORTS = {
 /** Google's export ceiling. Past this it returns 403 exportSizeLimitExceeded. */
 export const EXPORT_LIMIT = 10 * 1024 * 1024;
 export const DOWNLOAD_LIMIT = 8 * 1024 * 1024;
+const GOOGLE_PAGE_TOKEN_MAX_LENGTH = 8_192;
 
 export const FOLDER_MIME = "application/vnd.google-apps.folder";
 export const SHORTCUT_MIME = "application/vnd.google-apps.shortcut";
@@ -65,6 +66,15 @@ export class DriveError extends Error {
     this.reason = reason;
     this.retryable = retryable;
   }
+}
+
+function googlePageToken(value, lane, { required = false } = {}) {
+  if (value == null && !required) return null;
+  const token = typeof value === "string" ? value.trim() : "";
+  if (!token || token.length > GOOGLE_PAGE_TOKEN_MAX_LENGTH) {
+    throw new DriveError(`Google Drive returned an invalid ${lane} page token`, 200, "invalidPageToken");
+  }
+  return token;
 }
 
 const retryDelay = (attempt) => Math.min(2 ** attempt * 1000, 32_000) + Math.random() * 1000;
@@ -196,9 +206,19 @@ export async function api(getAccessToken, path, {
  * listRootedFiles(), which proves every returned item's ancestry from one of
  * the manifest-owned roots before any content request is made.
  */
-export async function* listFiles(getAccessToken, { pageSize = 1000, query, opts = {} } = {}) {
+export async function* listFiles(getAccessToken, { pageSize = 1000, query, maxPages = 10_000, opts = {} } = {}) {
+  if (!Number.isInteger(maxPages) || maxPages < 1) throw new TypeError("Drive maxPages must be a positive integer");
   let pageToken;
+  let pages = 0;
+  const requestedPageTokens = new Set();
   do {
+    if (++pages > maxPages) throw new DriveError(`Google Drive listing exceeded ${maxPages} pages`, 200, "pageLimit");
+    if (pageToken) {
+      if (requestedPageTokens.has(pageToken)) {
+        throw new DriveError("Google Drive repeated a file-list page token", 200, "repeatedPageToken");
+      }
+      requestedPageTokens.add(pageToken);
+    }
     const page = await api(getAccessToken, "/files", {
       search: {
         pageSize,
@@ -225,8 +245,15 @@ export async function* listFiles(getAccessToken, { pageSize = 1000, query, opts 
         "incompleteSearch"
       );
     }
+    if (page.files != null && !Array.isArray(page.files)) {
+      throw new DriveError("Google Drive returned an invalid file list", 200, "invalidFileList");
+    }
+    const followingPageToken = googlePageToken(page.nextPageToken, "file-list");
+    if (followingPageToken && requestedPageTokens.has(followingPageToken)) {
+      throw new DriveError("Google Drive repeated a file-list page token", 200, "repeatedPageToken");
+    }
     for (const f of page.files || []) yield f;
-    pageToken = page.nextPageToken;
+    pageToken = followingPageToken;
   } while (pageToken);
 }
 
@@ -423,17 +450,30 @@ export async function startPageToken(getAccessToken, opts = {}) {
 /**
  * Everything that changed since a saved token.
  *
- * Returns { changed, removed, nextToken }. `removed` covers both deletion and
- * trashing, and also a file that merely left the token's view. All three mean
- * the same thing to a brain: stop answering from it.
+ * Returns { changed, removed, nextToken }. `removed` covers deletion, trashing,
+ * and a file that merely left this credential's view. The caller must classify
+ * a stored removed id with classifyScopedAbsence() before treating it as source
+ * deletion, because 403/404 cannot distinguish hard deletion from access loss.
  */
 export async function listChanges(getAccessToken, pageToken, opts = {}) {
   const changed = [];
   const removed = [];
-  let token = pageToken;
+  let token = googlePageToken(pageToken, "changes", { required: true });
   let nextToken = null;
+  let pages = 0;
+  const maxPages = opts.maxPages ?? 10_000;
+  if (!Number.isInteger(maxPages) || maxPages < 1) throw new TypeError("Drive maxPages must be a positive integer");
+  const apiOpts = { ...opts };
+  delete apiOpts.maxPages;
+  const requestedPageTokens = new Set();
 
   while (token) {
+    token = googlePageToken(token, "changes", { required: true });
+    if (requestedPageTokens.has(token)) {
+      throw new DriveError("Google Drive repeated a changes page token", 200, "repeatedPageToken");
+    }
+    requestedPageTokens.add(token);
+    if (++pages > maxPages) throw new DriveError(`Google Drive changes exceeded ${maxPages} pages`, 200, "pageLimit");
     const page = await api(getAccessToken, "/changes", {
       search: {
         pageToken: token,
@@ -443,17 +483,30 @@ export async function listChanges(getAccessToken, pageToken, opts = {}) {
         includeItemsFromAllDrives: true,
         includeRemoved: true,
       },
-      ...opts,
+      ...apiOpts,
     });
+    if (page.changes != null && !Array.isArray(page.changes)) {
+      throw new DriveError("Google Drive returned an invalid changes list", 200, "invalidChangeList");
+    }
     for (const c of page.changes || []) {
       if (c.removed || c.file?.trashed) removed.push(c.fileId);
       else if (c.file) changed.push(c.file);
     }
-    if (page.newStartPageToken) {
-      nextToken = page.newStartPageToken;
+    if (page.newStartPageToken != null) {
+      nextToken = googlePageToken(page.newStartPageToken, "terminal changes", { required: true });
       break;
     }
-    token = page.nextPageToken;
+    if (page.nextPageToken == null) {
+      throw new DriveError(
+        "Google Drive ended a changes window without a terminal start page token",
+        200,
+        "incompleteChangeFeed",
+      );
+    }
+    token = googlePageToken(page.nextPageToken, "changes", { required: true });
+  }
+  if (!nextToken) {
+    throw new DriveError("Google Drive returned no terminal changes token", 200, "incompleteChangeFeed");
   }
   return { changed, removed, nextToken };
 }

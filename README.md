@@ -193,16 +193,32 @@ brain will not know.
 Then drop `--dry-run` to load it for real. Large loads are resumable: if it is
 interrupted, run the same command again and it continues from where it stopped.
 
-A refresh may discover files that were deleted, newly excluded, or no longer
-readable. It combines every removal reason into one plan. Up to 100 documents
-and 10% of what that source loaded can be reconciled as routine source changes.
-A plan crossing either limit stops before deleting anything or advancing the
+Drive, Gmail, IMAP, and local-folder refreshes may discover material that was
+deleted, newly excluded, or no longer readable. Each refresh combines every
+removal reason into one plan. Up to 100 documents and 10% of what that source
+loaded can be reconciled as routine source changes. One current Gmail deletion
+or policy exclusion is also routine, so a small mailbox can converge. A plan
+crossing the applicable limit stops before deleting anything or advancing the
 source cursor. It prints aggregate counts and an opaque approval fingerprint,
 never filenames or document IDs. Review the cause, then add the exact
 `--approve-removals <fingerprint>` value only when the plan is expected.
+Drive treats an inaccessible file differently: a 403 or 404 cannot prove
+whether the file was deleted or access was revoked, so cleanup and cursor
+advancement stop until visible trash or a visible move outside the reviewed
+roots provides source proof.
 
-The same plan and the same limits now cover a local folder, because a folder
-that failed to mount looks exactly like a client who deleted everything in it.
+Gmail reads additions, deletions, and label changes from its typed history. A
+complete pass also compares the filtered mailbox snapshot with the live D1
+inventory, so a stale stored message cannot survive simply because history
+expired. Every planned Gmail removal is read back before its history cursor or
+credential-scanner version is marked complete. Scanner v5 makes local folders,
+Drive, Gmail, and IMAP recheck previously accepted documents with the corrected
+credential rules.
+Promotions, Social, and Forums are excluded by default. Updates stays included
+so statements, confirmations, and reminders are not silently missed.
+
+The local-folder guard matters because a folder that failed to mount looks
+exactly like a client who deleted everything in it.
 
 Ask directly in the terminal, even if you do not have Claude Code or Codex:
 
@@ -277,9 +293,11 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
 - **Google Drive OAuth and resumable partial real-account ingest are verified.**
   A complete no-limit first sweep and the live add, edit, refuse, recover,
   trash, and incremental-refresh cycle remain field gates. Gmail is covered by
-  the same OAuth and cursor-safety test harness but has not yet completed a
-  real-account production run. Each client registers their own Google OAuth
-  app, which takes about fifteen minutes.
+  the same OAuth and cursor-safety test harness, including typed deletion,
+  relabeling, guarded cleanup, and exact D1 readback. Promotions, Social, and
+  Forums are excluded by default; Updates remains searchable. Gmail has not yet
+  completed a real-account production run. Each client registers their own
+  Google OAuth app, which takes about fifteen minutes.
 - **Google Drive can refresh itself on macOS.** Its schedule is declared in the
   manifest and installed as a per-user LaunchAgent. Windows and Linux still
   require manually re-running the Drive refresh.

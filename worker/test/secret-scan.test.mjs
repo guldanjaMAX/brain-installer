@@ -136,7 +136,7 @@ chk("useful billing prose survives envelope sanitization",
   sensitiveEnvelope.content.includes("Billing is active.") && sensitiveEnvelope.content.includes("Follow up Friday."));
 chk("sanitized capability markers are clean to the refusal scanner",
   scanEnvelope(sensitiveEnvelope).verdict === CLEAN);
-chk("capability-link safety advances the durable gate version", GATE_VERSION === 4, String(GATE_VERSION));
+chk("hex admin-key safety advances the durable gate version", GATE_VERSION === 5, String(GATE_VERSION));
 
 // The gate's blindest spot, found 2026-09-05 by reviewing a live brain: this
 // product GENERATES a 64-character hex admin key, and the gate missed it
@@ -166,5 +166,5 @@ chk("capability-link safety advances the durable gate version", GATE_VERSION ===
     scan("api_key: someLongVariableNameHere").verdict === CLEAN);
 }
 
-console.log(fail ? `\n${fail} FAILURES` : "\nsecret-scan v4 (js): all tests passed");
+console.log(fail ? `\n${fail} FAILURES` : "\nsecret-scan v5 (js): all tests passed");
 process.exit(fail ? 1 : 0);

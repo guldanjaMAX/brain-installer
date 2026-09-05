@@ -253,8 +253,8 @@ An excluded document already present in the brain is removed rather than left
 stranded. Gmail has no folder path and does not use these rules.
 
 Flags: `--dry-run`, `--source <name>`, `--limit <n>`, `--reset`, and the
-exact-plan acknowledgement `--approve-removals <fingerprint>` when a cleanup —
-Drive's, or a local folder's — exceeds its routine safety limits.
+exact-plan acknowledgement `--approve-removals <fingerprint>` when a Drive,
+Gmail, IMAP, or local-folder cleanup exceeds its routine safety limits.
 
 ---
 
@@ -365,22 +365,42 @@ left in "Testing" is issued refresh tokens that expire after **seven days**, and
 the failure arrives a week later as an unattended sync that stopped working. A
 Google Workspace account should use "Internal" instead and avoids this entirely.
 
-**The second run is incremental.** Drive uses the changes feed, Gmail uses
-`historyId`, both saved in the same state file as the content hashes. That makes
-a re-sync proportional to what changed rather than to the corpus.
+**The second run is incremental.** Drive uses the changes feed. Gmail reads the
+complete typed history window and reduces each message to its final action:
+additions and label additions or removals are fetched and classified again,
+while deletions become removal candidates. The terminal `historyId` is saved in
+the same state file as the content hashes, so a re-sync is proportional to what
+changed rather than to the corpus. Promotions, Social, and Forums are excluded;
+Updates remains included because statements, confirmations, and reminders are
+commonly classified there.
 
-**Drive deletions are applied.** When a file is deleted or trashed in Drive, the
-next incremental sync removes it from the brain, chunks and vectors both. The
-sync first intersects policy, source-deletion, and intentional-skip candidates
-with the authenticated stored-family inventory, deduplicates them, and checks
-one aggregate plan. More than 100 removals or more than 10% of the stored Drive
-corpus stops before any planned deletion or cursor advancement. The refusal
-shows category counts and an opaque SHA-256 fingerprint, never source IDs. Only
-the exact `--approve-removals <fingerprint>` value can authorize that exact
-plan. A deletion that cannot be applied is kept in the state file and retried
-through the same aggregate gate rather than lost. **Gmail does not report
-deletions**, so a deleted message stays until the source is re-ingested with
-`--reset`.
+**Drive, Gmail, and IMAP deletions are applied.** Each connector intersects
+source-policy, source-deletion, and intentional-skip candidates with the
+authenticated stored-family inventory, deduplicates them, and checks one
+aggregate plan. More than 100 removals or more than 10% of the stored source
+corpus stops before any planned deletion or cursor advancement. One current
+typed Gmail deletion or policy exclusion remains routine so a small mailbox can
+converge. The refusal shows category counts and an opaque SHA-256 fingerprint,
+never source IDs. Only the exact `--approve-removals <fingerprint>` value can
+authorize that exact plan. Pending deletions return through the same gate, and
+a currently accepted message wins over a stale pending marker. A complete IMAP
+pass also compares its stable message identities with D1 and reads every planned
+removal back before committing folder watermarks.
+
+Drive never treats access loss as deletion evidence. Any account-wide changed
+item is rebuilt through the reviewed-root traversal before content is read. A
+stored file omitted from that traversal is removed only when Drive still shows
+visible trash or a visible move outside the reviewed roots. A 403, 404, or
+inconsistent in-scope omission stops cleanup and cursor advancement for review.
+
+A Gmail full pass is an authoritative snapshot. It compares every message
+allowed by the default query with the live D1 family inventory, so messages
+missed after history expiry, deletion, or relabeling are reconciled without
+trusting the local resume file. Planned removals are read back from D1 before the
+history cursor or credential-scanner fingerprint can commit. Scanner v5 forces
+local folders, Drive, Gmail, and IMAP through a complete recheck of previously
+accepted documents and does not mark that migration complete until the snapshot
+and cleanup both pass.
 
 Oversized Drive documents are reconciled as a family. A revision that changes
 from one document to several parts, changes its part count, or becomes small

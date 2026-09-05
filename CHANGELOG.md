@@ -30,6 +30,26 @@ backwards. They can be updated now.
   on it says so.
 - The recovery drill's export is encrypted rather than plain SQL, and it now
   counts the state of every bank reference it restored.
+- Credential screening now recognizes the install's 64-character admin keys
+  when they begin with a letter. The v5 safety marker makes local folders,
+  Drive, Gmail, and IMAP run a complete recheck of previously accepted
+  documents with the corrected scanner. For Gmail, the new marker commits only
+  after snapshot cleanup is proven.
+- Gmail refreshes now consume additions, deletions, and label changes from
+  typed history. A full pass also compares the filtered mailbox snapshot with
+  live D1 families. Large cleanup plans stop for their exact opaque approval
+  fingerprint, and every planned removal is read back before the Gmail history
+  cursor or scanner migration commits. Updates remains searchable so statements,
+  confirmations, and reminders are not silently skipped; the saved policy
+  fingerprint forces one complete sweep when this rule changes.
+- IMAP refreshes use the same aggregate cleanup guard and exact D1 readback.
+  Scanner or policy changes force a complete folder pass, and an incomplete
+  FETCH cannot advance the folder watermark past an unidentified message.
+- Drive change and listing cursors are bounded and validated. Any account-wide
+  changed item is checked through a complete reviewed-root walk before content
+  is read. Only visible trash or a visible move outside those roots can remove
+  an omitted family; ambiguous access loss preserves the indexed copy and
+  withholds the source cursor.
 
 ## 0.3.6 (unreleased)
 

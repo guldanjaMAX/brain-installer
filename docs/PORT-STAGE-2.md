@@ -184,7 +184,7 @@ description of what is missing than "the module does not load".
 Every step was measured against a tree that was not being edited, and no
 regression survived a step.
 
-Nine remain. Four are NOT code gaps:
+Nine remained at the stage acceptance. Four are NOT code gaps:
 
 | Test | Why it fails | Decision |
 |---|---|---|
@@ -193,17 +193,19 @@ Nine remain. Four are NOT code gaps:
 | `packed-fresh-setup` | Pins the release's no-credential error wording; the merged tree prints the field's. | Wording, and the field's text is the one clients were given. |
 | `agent-authority-deletion` | Expects "cannot delete"; the tree says "this connection can only read. Reconnect and approve write access to use forget." | Same refusal, better sentence. |
 
-Five are real, and each is named rather than left as "still failing":
+Five were real, and each is named rather than left as "still failing":
 
-1. `gmail-incremental-policy`, one assertion of three. The receipt now
-   separates a deliberate policy skip from a coverage gap
-   (`policy_skipped=`, `coverage_gaps=`), and an unintended skip closes the
-   run as an error with an `issue_code` instead of a cheerful `detail`. What
-   is missing is the stronger contract the field line also holds: when ANY
-   message lacks label evidence, the whole run refuses, so a classified
-   message sitting beside an unclassified one is not indexed either. That is
-   buffer-then-commit, not a counter, and it is the one piece of this file
-   left to do.
+1. ~~`gmail-incremental-policy`~~ **Fixed.** Incremental history ids now get a
+   label-only preflight before any document or pending removal is sent. A
+   missing classification refuses the complete window without buffering raw
+   mail, while deliberate policy skips and deterministic credential or quality
+   refusals remain visible without poisoning every later history window.
+   Typed history covers additions, deletions, and label changes. A full pass
+   reconciles the filtered Gmail snapshot against authenticated D1 families.
+   Large removal plans require their exact opaque approval fingerprint, and D1
+   readback must confirm every removal before the history cursor or scanner
+   migration can settle. Scanner v5 forces the complete recheck needed for the
+   corrected admin-key rule.
 2. `cloudflare-recovery-adapter`. The stage list now differs, not the
    sqlite failure that blocked it before; the adapter module still needs
    the three-way merge that keeps the schema-32 contract from 5955fa5.
@@ -235,14 +237,13 @@ measured zero-regression diff.
 
 ## Two whose plans were REJECTED by that review, and must not be applied as drafted
 
-- `gmail-incremental-policy`. The diagnosis is right and the patch is minimal,
-  but it would have broken the nightly Drive load. `policySkipped` is only ever
-  incremented on the Gmail and IMAP paths, so on Drive every ordinary skipped
-  file would count as a coverage gap, and the proposed cursor gate would then
-  refuse to advance the Drive cursor at all. A second objection stands too: for
-  Gmail and IMAP a single credential-refusal skip could freeze the cursor
-  permanently rather than for one run. Whoever picks this up needs a Drive
-  policy-skip counter first.
+- ~~`gmail-incremental-policy`.~~ The rejected generic cursor gate remains
+  rejected because it would still break Drive and poison mail cursors on
+  deterministic refusals. The implemented fix is Gmail-specific: it preflights
+  the complete incremental label window, reduces typed history to each
+  message's final action, and uses a full Gmail snapshot plus D1 inventory for
+  source reconciliation. The shared removal-plan guard and exact readback keep
+  the history cursor and scanner migration uncommitted until cleanup is proven.
 - `cloudflare-recovery-adapter`. The diagnosis was confirmed empirically, but
   the reviewer asked for six changes before it is applied, starting with using
   `scripts/recovery-bank-safety-lab.mjs` as the verification step rather than

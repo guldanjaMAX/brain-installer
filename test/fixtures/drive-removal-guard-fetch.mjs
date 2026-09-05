@@ -32,6 +32,7 @@ const initialEvidence = () => ({
   failedRemovalFamilies: 0,
   failureInjected: false,
   inventoryReads: 0,
+  absenceMetadataReads: 0,
   ingestBatchWrites: 0,
   receipts: { indexing: 0, error: 0, ready: 0 },
 });
@@ -120,6 +121,24 @@ globalThis.fetch = async (input, options = {}) => {
       mimeType: "application/vnd.google-apps.folder",
       trashed: false,
       parents: [],
+    });
+  }
+
+  const absentFamily = /^\/drive\/v3\/files\/guard-family-(\d{4})$/.exec(url.pathname);
+  if (url.hostname === "www.googleapis.com" && absentFamily) {
+    const index = Number(absentFamily[1]);
+    if (!Number.isInteger(index) || index < 0 || index >= FAMILY_COUNT) {
+      throw new Error("fixture received an invalid absence-classification request");
+    }
+    const evidence = readEvidence();
+    evidence.absenceMetadataReads++;
+    saveEvidence(evidence);
+    return json({
+      id: `guard-family-${absentFamily[1]}`,
+      name: "Deleted fixture file",
+      mimeType: "text/plain",
+      trashed: true,
+      parents: ["root-fixture"],
     });
   }
 
