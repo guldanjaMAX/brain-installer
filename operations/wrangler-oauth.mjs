@@ -23,23 +23,28 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, posix as posixPath, win32 as win32Path } from "node:path";
 
 /** Every place wrangler is known to keep its config, newest layout first. */
 export function wranglerConfigCandidates(env = process.env, platform = process.platform) {
   const home = env.HOME || env.USERPROFILE || homedir();
-  const rel = join(".wrangler", "config", "default.toml");
+  // Join with the separator of the platform being ASKED ABOUT, not the one this
+  // process happens to run on. Using the host's join made every POSIX answer
+  // come back with backslashes when the caller ran on Windows, which is why the
+  // Windows CI job for this module has been red while macOS was green.
+  const joinFor = platform === "win32" ? win32Path.join : posixPath.join;
+  const rel = joinFor(".wrangler", "config", "default.toml");
   const out = [];
   if (platform === "win32") {
     if (env.APPDATA) {
-      out.push(join(env.APPDATA, "xdg.config", rel));
-      out.push(join(env.APPDATA, rel));
+      out.push(joinFor(env.APPDATA, "xdg.config", rel));
+      out.push(joinFor(env.APPDATA, rel));
     }
-    if (env.LOCALAPPDATA) out.push(join(env.LOCALAPPDATA, rel));
+    if (env.LOCALAPPDATA) out.push(joinFor(env.LOCALAPPDATA, rel));
   }
-  if (env.XDG_CONFIG_HOME) out.push(join(env.XDG_CONFIG_HOME, rel));
-  out.push(join(home, ".config", rel));
-  out.push(join(home, rel));
+  if (env.XDG_CONFIG_HOME) out.push(joinFor(env.XDG_CONFIG_HOME, rel));
+  out.push(joinFor(home, ".config", rel));
+  out.push(joinFor(home, rel));
   return out;
 }
 
