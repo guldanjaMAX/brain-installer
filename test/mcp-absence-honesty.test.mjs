@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 const MCP = fileURLToPath(new URL("../components/brain-mcp.mjs", import.meta.url));
 
 /** Serve one canned /api/rag/think body, then report what the MCP made of it. */
-async function thinkReturns(body) {
+async function thinkReturns(body, tool = "brain_think") {
   const server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c) => (raw += c));
@@ -49,7 +49,7 @@ async function thinkReturns(body) {
         jsonrpc: "2.0",
         id: 1,
         method: "tools/call",
-        params: { name: "brain_think", arguments: { q: "anything" } },
+        params: { name: tool, arguments: { q: "anything" } },
       }) + "\n",
     );
     const code = await new Promise((r) => child.on("close", r));
@@ -83,7 +83,7 @@ const ABSENCE =
 // 2. The defect. Retrieval returned documents, the answer layer cited none.
 {
   const rows = [
-    { title: "Signed coaching agreement.md", ts: "2026-04-11T00:00:00.000Z", snippet: "Monthly fee: $5,000" },
+    { source: "upload", source_id: "signed-agreement", ref_key: "signed-agreement", uri: "https://files.example/signed-agreement", chunk_uid: "upload:signed-agreement#2", title: "Signed coaching agreement.md", ts: "2026-04-11T00:00:00.000Z", date_source: "filename", date_reliable: false, text_source: "ocr_partial", text_reliable: false, snippet: "Monthly fee: $5,000" },
     { title: "Covenant for the Work Ahead.docx", ts: "2026-04-11T00:00:00.000Z", snippet: "30 days written notice" },
     { title: "Intro email.md", ts: "2026-04-11T00:00:00.000Z", snippet: "First Stripe payment" },
   ];
@@ -102,6 +102,13 @@ const ABSENCE =
   // from and no way to check the claim.
   assert.equal(out.results?.length, 3, "raw rows must be attached when nothing was cited");
   assert.equal(out.results[0].title, "Signed coaching agreement.md");
+  assert.equal(out.results[0].ref, "signed-agreement", "stable document identity must survive the refusal path");
+  assert.equal(out.results[0].source_id, "signed-agreement");
+  assert.equal(out.results[0].uri, "https://files.example/signed-agreement");
+  assert.equal("chunk_uid" in out.results[0], false, "unstable chunk identity must stay internal");
+  assert.equal(out.results[0].date_reliable, false, "date trust must survive the MCP boundary");
+  assert.equal(out.results[0].text_source, "ocr_partial", "extraction provenance must survive the MCP boundary");
+  assert.equal(out.results[0].text_reliable, false, "extraction trust must survive the MCP boundary");
   console.log("PASS documents found but none cited is not reported as absence");
 }
 
@@ -116,6 +123,28 @@ const ABSENCE =
   assert.equal(out.note, undefined, "a cited answer must carry no note");
   assert.equal(out.results, undefined, "a cited answer must not duplicate the corpus back");
   console.log("PASS a cited answer is returned clean");
+}
+
+// 4. Raw search keeps the same provenance fields as the cited answer path.
+{
+  const out = await thinkReturns({
+    results: [{
+      source: "upload", ref: "statement-public-ref", source_id: "statement-source-id",
+      uri: "https://files.example/statement", chunk_uid: "upload:statement-source-id#4",
+      title: "Scanned statement", category: "upload",
+      ts: "2026-01-02T00:00:00.000Z", date_source: "filename", date_reliable: false,
+      text_source: "ocr_partial", text_reliable: false, snippet: "Balance shown on scan",
+    }],
+  }, "brain_search");
+  assert.equal(out.results[0].ref, "statement-public-ref");
+  assert.equal(out.results[0].source_id, "statement-source-id");
+  assert.equal(out.results[0].uri, "https://files.example/statement");
+  assert.equal("chunk_uid" in out.results[0], false, "raw search must expose document identity only");
+  assert.equal(out.results[0].date_source, "filename");
+  assert.equal(out.results[0].date_reliable, false);
+  assert.equal(out.results[0].text_source, "ocr_partial");
+  assert.equal(out.results[0].text_reliable, false);
+  console.log("PASS raw search keeps date and extraction provenance");
 }
 
 console.log("mcp-absence-honesty: all assertions passed");

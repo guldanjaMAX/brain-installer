@@ -734,6 +734,71 @@ check("restart guard refuses an existing migration column with the wrong contrac
     `${directError?.message}; mutations=${directFault.mutations}`);
   direct.close();
 
+  // 0033 replaces chunks_ai as two independently committed REST statements.
+  // A schema-32 Worker must therefore be behind the same whole-corpus write
+  // barrier as the older vector protocol migrations before direct migration is
+  // allowed to open the DROP/CREATE interval.
+  const makeSchema32 = () => {
+    const candidate = new DatabaseSync(":memory:");
+    for (const file of files.filter((name) => Number.parseInt(name, 10) <= 32)) {
+      const sql = readFileSync(join(DIR, file), "utf8");
+      for (const statement of splitStatements(sql)) candidate.exec(statement);
+      candidate.prepare(
+        `INSERT INTO schema_migrations (version,name,applied_at,checksum)
+         VALUES (?,?,?,?)`,
+      ).run(
+        Number.parseInt(file, 10),
+        file.replace(/\.sql$/, ""),
+        "2026-01-01T00:00:00Z",
+        createHash("sha256").update(sql).digest("hex").slice(0, 16),
+      );
+    }
+    candidate.exec(
+      `INSERT INTO install_state
+         (id,client_slug,product_version,schema_version,gate_version,installed_at,ring)
+       VALUES (1,'schema-32-fixture','0.4.0',32,0,'2026-01-01T00:00:00Z','test');
+       INSERT INTO sources (name,kind,status,created_at)
+       VALUES ('live','upload','ready','2026-01-01T00:00:00Z');
+       INSERT INTO documents (doc_uid,source,source_id,title,ingested_at,content_hash)
+       VALUES ('live:one','live','one','Live',1,'live-hash');
+       INSERT INTO chunks (chunk_uid,doc_uid,chunk_ix,text,source,title)
+       VALUES ('live:one#0','live:one',0,'live text','live','Live');`,
+    );
+    return candidate;
+  };
+
+  const schema32 = makeSchema32();
+  const schema32Fault = { after: null, mutations: 0 };
+  let schema32Error = null;
+  try {
+    await cmdMigrate(manifestPath, {
+      silent: true,
+      resolveAccount: async () => ({ id: "fixture-account" }),
+      d1Query: adapterFor(schema32, schema32Fault),
+    });
+  } catch (error) { schema32Error = error; }
+  check("direct migrate refuses a live schema-32 brain before dropping its FTS writer",
+    /0010-0013 or 0033.*brain update/is.test(schema32Error?.message || "") &&
+      schema32Fault.mutations === 0 &&
+      schema32.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='trigger' AND name='chunks_ai'").get().n === 1,
+    `${schema32Error?.message}; mutations=${schema32Fault.mutations}`);
+
+  const schema32QuiescedFault = { after: null, mutations: 0 };
+  await cmdMigrate(manifestPath, {
+    silent: true,
+    resolveAccount: async () => ({ id: "fixture-account" }),
+    d1Query: adapterFor(schema32, schema32QuiescedFault),
+    vectorDrainQuiesced: true,
+  });
+  const schema33Receipt = schema32.prepare(
+    "SELECT version FROM schema_migrations WHERE version=33",
+  ).get();
+  check("verified writer quiescence allows schema 33 and restores the FTS writer",
+    schema33Receipt?.version === 33 && schema32QuiescedFault.mutations > 0 &&
+      schema32.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='trigger' AND name='chunks_ai'").get().n === 1,
+    JSON.stringify({ schema33Receipt, mutations: schema32QuiescedFault.mutations }));
+  schema32.close();
+
   const noStateTable = new DatabaseSync(":memory:");
   noStateTable.exec("CREATE TABLE legacy_live_corpus (id INTEGER PRIMARY KEY, body TEXT)");
   const noStateFault = { after: null, mutations: 0 };

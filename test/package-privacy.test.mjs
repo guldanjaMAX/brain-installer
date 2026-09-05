@@ -486,6 +486,7 @@ const expected = [
   "migrations/d1/0030_plaid_account_entity_assignments.sql",
   "migrations/d1/0031_owner_bank_import.sql",
   "migrations/d1/0032_quickbooks_oauth_intents.sql",
+  "migrations/d1/0033_zone_inheritance.sql",
   "operations/bank-access-wrapping-key.mjs",
   "operations/bootstrap-status.mjs",
   "operations/cloudflare-account-bootstrap.mjs",

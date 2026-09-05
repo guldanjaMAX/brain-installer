@@ -343,10 +343,29 @@ so a result list by itself is not proof that the corpus answers the question.
 `/api/rag/think` is the owner-facing answer path: it generates an answer from
 retrieved evidence, requires citation discipline for claims, and reports gaps
 such as thin coverage, staleness, undated sources, or a single-corpus result.
+Every result and citation carries its source identity plus date and extraction
+provenance. The owner app, CLI, remote MCP tools, and verification report keep
+uncertain dates and OCR warnings beside the citation so stored trust metadata
+cannot disappear at the final reading surface.
+Ingest accepts `occurred_at` only as `YYYY-MM-DD` or an RFC 3339 instant and
+rejects ambiguous or impossible dates before any write. Calendar citations keep
+the event's local day, while a persisted RFC 3339 start with an explicit offset
+orders events within that day for current or latest questions.
 The optional read-only proxy key is accepted only on retrieval routes. The full
 admin key protects ingest and operator administration. The app uses passkey
 sessions plus the companion app header, and D1 applies exact owned-entity or
 exact-document scope before returning evidence.
+
+Coarse capability grants use the registered source's `sources.zone` value as
+their authorization authority. The source predicate is part of the D1 query
+that reads chunk text, and scoped writes must also name a source inside the
+grant's allowed zones. `documents.zone` and `chunks.zone` are derived
+projections. Migration 0033 keeps new rows aligned at insert time, while
+`brain diagnose` reports legacy projection drift and partial source assignment.
+Every `brain zone` assignment repairs up to 1,000 live documents and 1,000
+chunks in the same transaction as the source registry update, reports what
+remains, and can be repeated until the legacy projections converge. No retrieval
+path may trust those projections before that bounded repair completes.
 
 ## Local state and privacy boundaries
 

@@ -20,7 +20,7 @@
  */
 
 import { jsonResponse, privateNoStore, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
-import { resolvePrincipal, principalMay } from "./lib/grants.js";
+import { resolvePrincipal, principalMay, scopeIsUnrestricted } from "./lib/grants.js";
 import { handleBankFeed, bankFeedEnabled } from "./lib/bank-feed.js";
 import { handlePlaidWebhook, runPlaidMaintenance } from "./lib/plaid-bank-feed.js";
 import { handleSupportAccess } from "./lib/support-access.js";
@@ -46,10 +46,12 @@ import {
   scanEnvelope as scanEnvelopeSecrets,
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./lib/secret-scan.js";
-import { storeFor, backendOf, D1 } from "./lib/store.js";
+import { storeFor, backendOf, D1, TEXT_SOURCES } from "./lib/store.js";
 import { installedSchemaVersion, acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, retryQuarantinedVectorOps, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
-import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
+import {
+  hasExplicitCurrentIntent, newestCurrentEvidence, parseCanonicalEvidenceDate,
+} from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
 import { emptyRetrievalDisclosure } from "./lib/retrieval-status.js";
 import { answerGenerationError } from "./lib/answer-render.js";
@@ -159,7 +161,9 @@ function normalizeRetrievedDocuments(results) {
   return demoteScaffolding([...byKey.values()]);
 }
 
-async function unifiedRetrieve(env, url, { limit, access = null, scope = { all: true } }) {
+async function unifiedRetrieve(env, url, {
+  limit, access = null, scope = { all: true }, scopePrincipalKind = "owner",
+}) {
   const q = url.searchParams.get("q");
   const rrfK = Math.min(Math.max(parseInt(url.searchParams.get("rrf_k")) || 60, 1), 1e3);
 
@@ -189,8 +193,8 @@ async function unifiedRetrieve(env, url, { limit, access = null, scope = { all: 
     degradedReason: r.degraded_reason || null,
     retrievalScope: access?.kind === "grant"
       ? "exact_document_ids"
-      : scope && scope.all !== true
-        ? "zones"
+      : scopePrincipalKind !== "owner"
+        ? (scopeIsUnrestricted(scope) ? "all" : "zones")
         : "owner",
     access: access?.kind === "grant"
       ? {
@@ -199,8 +203,12 @@ async function unifiedRetrieve(env, url, { limit, access = null, scope = { all: 
         entity_slug: access.entitySlug,
         document_count: access.documentCount,
       }
-      : scope && scope.all !== true
-        ? { principal: "grant", scope: "zones" }
+      : scopePrincipalKind !== "owner"
+        ? {
+          principal: scopePrincipalKind,
+          scope: scopeIsUnrestricted(scope) ? "all" : "zones",
+          ...(scopePrincipalKind === "proxy" ? { read_only: true } : {}),
+        }
         : { principal: "owner" },
     // A filter the backend cannot apply is surfaced, never dropped. Silently
     // ignoring `client=` returns every client's documents while looking narrowed,
@@ -455,7 +463,9 @@ function hasMatchingAsOfDate(sentence, docs) {
 
 /* -------------------------------------------------------------- routes */
 
-async function handleUnified(env, request, access = null, grantScope = { all: true }) {
+async function handleUnified(
+  env, request, access = null, grantScope = { all: true }, scopePrincipalKind = "owner",
+) {
   const url = await privateRagParameters(request);
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
   const q = url.searchParams.get("q");
@@ -471,7 +481,7 @@ async function handleUnified(env, request, access = null, grantScope = { all: tr
 
   const {
     matches: retrieved, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
-  } = await unifiedRetrieve(env, url, { limit, access, scope: grantScope });
+  } = await unifiedRetrieve(env, url, { limit, access, scope: grantScope, scopePrincipalKind });
   const accessStatus = {
     retrieval_scope: retrievalScope,
     degraded_reason: degradedReason || undefined,
@@ -506,7 +516,9 @@ async function handleUnified(env, request, access = null, grantScope = { all: tr
   });
 }
 
-async function handleThink(env, request, access = null, grantScope = { all: true }) {
+async function handleThink(
+  env, request, access = null, grantScope = { all: true }, scopePrincipalKind = "owner",
+) {
   const unsupportedAnswer = "The documents do not answer the question.";
   const url = await privateRagParameters(request);
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
@@ -519,7 +531,7 @@ async function handleThink(env, request, access = null, grantScope = { all: true
 
   const {
     matches, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
-  } = await unifiedRetrieve(env, url, { limit, access, scope: grantScope });
+  } = await unifiedRetrieve(env, url, { limit, access, scope: grantScope, scopePrincipalKind });
   const results = Array.isArray(matches) ? matches : [];
 
   if (results.length === 0) {
@@ -576,10 +588,13 @@ async function handleThink(env, request, access = null, grantScope = { all: true
     });
   }
   if (degraded === "vector" || degraded === "scoped-vector") {
+    const scopedDetail = retrievalScope === "exact_document_ids"
+      ? "Exact document authorization was applied in D1. The unscoped semantic index was deliberately not queried, so differently phrased evidence inside the allowed documents may be missing; this is not proof that the allowed documents contain nothing."
+      : "Registered-source zone authorization was applied in D1. The unscoped semantic index was deliberately not queried, so differently phrased evidence inside the allowed zones may be missing; this is not proof that the allowed zones contain nothing.";
     gaps.unshift({
       type: degraded === "scoped-vector" ? "scoped_vector_unavailable" : "vector_unavailable",
       detail: degraded === "scoped-vector"
-        ? "Exact document authorization was applied in D1. The unscoped semantic index was deliberately not queried, so differently phrased evidence inside the allowed documents may be missing; this is not proof that the allowed documents contain nothing."
+        ? scopedDetail
         : "The vector index is not fully query-ready. Keyword evidence remains available, but new or differently phrased evidence may be missing until `brain drain` confirms the complete projection.",
     });
   }
@@ -589,6 +604,7 @@ async function handleThink(env, request, access = null, grantScope = { all: true
     source: r.source || "?",
     client: r.client || null,
     ts: r.ts || null,
+    occurred_at: r.occurred_at || null,
     date_reliable: r.date_reliable === true,
     date_source: r.date_source || null,
     text_source: r.text_source || "native",
@@ -901,6 +917,60 @@ async function handleThink(env, request, access = null, grantScope = { all: true
   });
 }
 
+// This is the same source-name contract enforced by the CLI and provider
+// runner. `doc_uid` joins source_type and source_id with a colon, so allowing a
+// colon in source_type makes distinct pairs such as a:b/c and a/b:c address the
+// same document. source_id stays otherwise unrestricted because provider ids,
+// paths and split-family ids legitimately contain punctuation.
+const INGEST_SOURCE_TYPE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const INGEST_DATE_SOURCE_MAX_CHARS = 200;
+const INGEST_DATE_SOURCE_CONTROL = /[\u0000-\u001f\u007f]/;
+
+function ingestEnvelopeValidationError(envelope) {
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+    return "ingest body must be a document object";
+  }
+  if (typeof envelope.source_type !== "string" || !INGEST_SOURCE_TYPE.test(envelope.source_type)) {
+    return "source_type must be 1-64 lowercase letters, digits, hyphens or underscores, starting with a letter or digit";
+  }
+  if (typeof envelope.source_id !== "string" || !envelope.source_id.trim()) {
+    return "source_id must be a non-empty string";
+  }
+  if (typeof envelope.content !== "string") return "content must be a string";
+
+  const occurredAt = envelope.occurred_at;
+  const hasOccurredAt = occurredAt !== undefined && occurredAt !== null;
+  if (hasOccurredAt &&
+      (typeof occurredAt !== "string" || parseCanonicalEvidenceDate(occurredAt) === null)) {
+    return "occurred_at must be YYYY-MM-DD, an RFC 3339 timestamp, or null";
+  }
+
+  const dateSource = envelope.date_source;
+  const hasDateSource = dateSource !== undefined && dateSource !== null;
+  if (hasDateSource &&
+      (typeof dateSource !== "string" || !dateSource.trim() ||
+       dateSource.length > INGEST_DATE_SOURCE_MAX_CHARS || INGEST_DATE_SOURCE_CONTROL.test(dateSource))) {
+    return `date_source must be a non-empty string of at most ${INGEST_DATE_SOURCE_MAX_CHARS} characters or null`;
+  }
+
+  if (envelope.date_reliable !== undefined && typeof envelope.date_reliable !== "boolean") {
+    return "date_reliable must be a boolean when provided";
+  }
+  if (envelope.date_reliable === true &&
+      (!hasOccurredAt || !hasDateSource || dateSource.trim().toLowerCase() === "none")) {
+    return "date_reliable true requires occurred_at and a specific date_source";
+  }
+
+  if (envelope.text_source !== undefined && envelope.text_source !== null &&
+      (typeof envelope.text_source !== "string" || !TEXT_SOURCES.has(envelope.text_source))) {
+    return "text_source must be native, ocr, ocr_partial or null";
+  }
+  if (envelope.text_reliable !== undefined && typeof envelope.text_reliable !== "boolean") {
+    return "text_reliable must be a boolean when provided";
+  }
+  return null;
+}
+
 async function handleIngest(env, request, scope = { all: true }) {
   // Checked BEFORE the body is read. The batch route documents exactly this
   // hazard and guards against it; this route, which is the one a client reaches
@@ -952,12 +1022,11 @@ async function handleIngest(env, request, scope = { all: true }) {
   }
 
   envelope = sanitizeIngestEnvelope(envelope);
-  const { source_type, source_id, content } = envelope || {};
-  if (!source_type || !source_id || typeof content !== "string") {
-    return jsonResponse({ error: "source_type, source_id and content (string) are required" }, 400);
-  }
+  const validationError = ingestEnvelopeValidationError(envelope);
+  if (validationError) return jsonResponse({ error: validationError }, 400);
+  const { source_type } = envelope;
 
-  if (scope && scope.all !== true) {
+  if (!scopeIsUnrestricted(scope)) {
     const allowed = await sourcesInScope(env, scope);
     if (!allowed.includes(String(source_type))) {
       return jsonResponse({
@@ -1035,7 +1104,7 @@ async function handleIngestBatch(env, request, scope = { all: true }) {
     );
   }
 
-  if (scope && scope.all !== true) {
+  if (!scopeIsUnrestricted(scope)) {
     const allowed = new Set(await sourcesInScope(env, scope));
     if (docs.some((doc) => !allowed.has(String(doc?.source_type || "")))) {
       return jsonResponse({
@@ -1094,9 +1163,10 @@ async function handleIngestBatch(env, request, scope = { all: true }) {
     const ref = envelope && envelope.source_id != null ? String(envelope.source_id) : null;
     const slot = { source_id: ref, source_type: envelope?.source_type ?? null };
 
-    if (!envelope?.source_type || envelope.source_id == null || typeof envelope.content !== "string") {
+    const validationError = ingestEnvelopeValidationError(envelope);
+    if (validationError) {
       tally.failed++;
-      results[inputIndex] = { ...slot, status: "failed", error: "source_type, source_id and content (string) are required" };
+      results[inputIndex] = { ...slot, status: "failed", error: validationError };
       continue;
     }
 
@@ -1775,10 +1845,15 @@ export default {
     }
 
     const readRoute = path === "/api/rag/unified" || path === "/api/rag/think";
-    const keyAuthorized = readRoute ? validateReadKey(request, env) : validateAdminKey(request, env);
+    const ownerKeyAuthorized = validateAdminKey(request, env);
+    const keyAuthorized = readRoute ? validateReadKey(request, env) : ownerKeyAuthorized;
     let authorized = keyAuthorized;
     let readAccess = null;
     let scope = { all: true };
+    // validateReadKey intentionally accepts both env-held keys on the fast
+    // path. Preserve which one matched so a read-only proxy receipt cannot
+    // claim the caller was the owner merely because no grant lookup ran.
+    let scopePrincipalKind = readRoute && keyAuthorized && !ownerKeyAuthorized ? "proxy" : "owner";
     if (!authorized && readRoute) {
       let sessionPrincipal;
       try {
@@ -1801,6 +1876,7 @@ export default {
         } else if (principalMay(sessionPrincipal, path)) {
           authorized = true;
           scope = sessionPrincipal.scope || { zones: [] };
+          scopePrincipalKind = sessionPrincipal.kind;
         }
         if (authorized) {
           try {
@@ -1843,6 +1919,7 @@ export default {
       if (principal && principalMay(principal, path)) {
         authorized = true;
         scope = principal.scope || { zones: [] };
+        scopePrincipalKind = principal.kind;
       }
     }
 
@@ -1865,10 +1942,10 @@ export default {
         }, 405));
       }
       if (path === "/api/rag/unified" && request.method === "POST") {
-        return privateNoStore(await handleUnified(env, request, readAccess, scope));
+        return privateNoStore(await handleUnified(env, request, readAccess, scope, scopePrincipalKind));
       }
       if (path === "/api/rag/think" && request.method === "POST") {
-        return privateNoStore(await handleThink(env, request, readAccess, scope));
+        return privateNoStore(await handleThink(env, request, readAccess, scope, scopePrincipalKind));
       }
       if (path === "/api/admin/auth/invite" && request.method === "POST") {
         return handleAdminInvite(env, url);
@@ -1948,7 +2025,7 @@ export default {
         // catalogue of the zones they cannot read, delivered by the health
         // endpoint. Refusing is honest; filtering findings one shape at a time
         // and getting one wrong is not.
-        if (scope && scope.all !== true) {
+        if (!scopeIsUnrestricted(scope)) {
           return jsonResponse({
             error: "diagnose reports on the whole corpus, including zones you cannot read. Ask the owner to run it.",
           }, 403);
@@ -1962,7 +2039,7 @@ export default {
         // unfiltered report names every source in the brain and hands over
         // `reason`, which is the raw connector error verbatim and routinely
         // contains paths and ids. Narrow it to what this caller can read.
-        if (scope && scope.all !== true && Array.isArray(report?.sources)) {
+        if (!scopeIsUnrestricted(scope) && Array.isArray(report?.sources)) {
           const allowed = new Set(await sourcesInScope(env, scope));
           return jsonResponse({ ...report, sources: report.sources.filter((r) => allowed.has(r.source ?? r.name)) });
         }
@@ -1990,13 +2067,21 @@ export default {
         if (!docUids.length && !families.length && !source) {
           return jsonResponse({ error: "pass doc_uids: [...], families: [...], or source: \"name\"" }, 400);
         }
-        if (scope && scope.all !== true) {
+        if (!scopeIsUnrestricted(scope)) {
+          // A source-scoped grant can safely delete one complete source after
+          // the registry proves that source is in scope. Document and family
+          // ids are separate union inputs to forget(), so accepting them beside
+          // an allowed source would let an arbitrary cross-zone id ride through
+          // the source check.
+          if (docUids.length || families.length) {
+            return jsonResponse({
+              error: "forgetting by document id or family needs access to every zone. Ask the owner.",
+            }, 403);
+          }
           const allowed = await sourcesInScope(env, scope);
           if (!source || !allowed.includes(source)) {
             return jsonResponse({
-              error: docUids.length || families.length
-                ? "forgetting by document id or family needs access to every zone. Ask the owner."
-                : `"${source}" is not in a zone you have access to.`,
+              error: `"${source}" is not in a zone you have access to.`,
             }, 403);
           }
         }

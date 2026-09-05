@@ -5,7 +5,7 @@ import {
   ANSWER_ERROR_MESSAGES, answerText,
 } from "../lib/answer-render.js";
 import { unavailableNotice } from "../lib/retrieval-status.js";
-import { EvidenceGateReason, evidenceGateNote } from "./Ask";
+import { CitationSources, EvidenceGateReason, citationMeta, evidenceGateNote } from "./Ask";
 
 describe("answer messages", () => {
   it("replaces an older Worker's raw provider error with reviewed copy", () => {
@@ -59,5 +59,44 @@ describe("evidence gate reason", () => {
     expect(evidenceGateNote(answer)).toBe(
       "What the records did not cover: the deadline was not established.",
     );
+  });
+});
+
+describe("citation provenance", () => {
+  it("labels uncertain dates and OCR beside the source", () => {
+    const meta = citationMeta({
+      n: 1,
+      title: "Scanned statement",
+      source: "gmail",
+      ts: "2024-02-03T12:00:00.000Z",
+      date_reliable: false,
+      text_source: "ocr_partial",
+      text_reliable: false,
+    });
+    expect(meta).toBe("Email · around Feb 3, 2024 · OCR text may be incomplete");
+  });
+
+  it("keeps a legacy citation with missing date trust uncertain", () => {
+    const meta = citationMeta({
+      n: 1,
+      title: "Legacy note",
+      source: "drive",
+      ts: "2024-02-03T00:00:00.000Z",
+    });
+    expect(meta).toBe("Google Drive · around Feb 3, 2024");
+  });
+
+  it("renders provenance on the citation instead of silently dropping it", () => {
+    const html = renderToStaticMarkup(<CitationSources citations={[{
+      n: 2,
+      title: "Native note",
+      source: "drive",
+      ts: "2024-04-05T00:00:00.000Z",
+      date_reliable: true,
+      text_source: "native",
+      text_reliable: true,
+    }]} />);
+    expect(html).toContain("Google Drive");
+    expect(html).toContain("Apr 5, 2024");
   });
 });

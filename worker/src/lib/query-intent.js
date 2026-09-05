@@ -28,6 +28,43 @@ const ENTITY_CONTEXT_LEADING_FILLER = new Set([
 ]);
 const OWNER_PRONOUN = /\b(?:i|me|mine|my|our|ours|us|we)\b/i;
 
+const ISO_DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
+const RFC3339_INSTANT =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/;
+
+const validCalendarDay = (year, month, day) => {
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1];
+};
+
+/**
+ * Parse only the two date shapes accepted by the evidence contract: an ISO
+ * calendar day or an RFC 3339 instant. Date.parse alone accepts ambiguous
+ * locale dates and silently rolls dates such as February 30 into March.
+ */
+export function parseCanonicalEvidenceDate(value) {
+  if (typeof value !== "string") return null;
+  let match = ISO_DAY.exec(value);
+  if (match) {
+    const [, year, month, day] = match.map(Number);
+    if (!validCalendarDay(year, month, day)) return null;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  match = RFC3339_INSTANT.exec(value);
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second, offsetHour, offsetMinute] = match;
+  if (!validCalendarDay(Number(year), Number(month), Number(day)) ||
+      Number(hour) > 23 || Number(minute) > 59 || Number(second) > 59 ||
+      (offsetHour !== undefined && (Number(offsetHour) > 23 || Number(offsetMinute) > 59))) {
+    return null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 const normalizedTokens = (value) => String(value || "")
   .toLowerCase()
   .replace(/[^a-z0-9]+/g, " ")
@@ -122,9 +159,46 @@ export function reliableDocumentTime(row) {
   const reliable = row?.date_reliable === true || row?.date_reliable === 1 || row?.date_reliable === "1";
   if (!reliable) return null;
   const raw = row?.document_date ?? row?.ts;
-  const value = typeof raw === "number" ? raw : Date.parse(String(raw || ""));
-  return Number.isFinite(value) ? value : null;
+  const value = typeof raw === "number" ? raw : parseCanonicalEvidenceDate(raw);
+  if (!Number.isFinite(value) || !Number.isFinite(new Date(value).getTime())) return null;
+  return value;
 }
+
+/**
+ * The citation day is the primary recency key. Calendar's exact start is a
+ * secondary key only inside that day, because comparing the absolute instants
+ * across different offsets can reverse two adjacent local calendar dates.
+ */
+function evidenceSortKey(row) {
+  const storedTime = reliableDocumentTime(row);
+  if (storedTime === null) return null;
+  const day = Date.parse(new Date(storedTime).toISOString().slice(0, 10));
+  const dateSource = row?.date_source;
+  // A Calendar day without a verified instant has day precision only. Giving
+  // an all-day event an invented UTC-midnight tie-breaker makes its order
+  // against timed events depend on whether their offsets cross UTC midnight.
+  let exact = dateSource === "calendar:event_start" || dateSource === "calendar:all_day_start"
+    ? null
+    : storedTime;
+  const occurredAt = row?.occurred_at;
+  if (dateSource === "calendar:event_start" && typeof occurredAt === "string" && occurredAt.includes("T")) {
+    const exactTime = parseCanonicalEvidenceDate(occurredAt);
+    if (exactTime !== null && occurredAt.slice(0, 10) === new Date(day).toISOString().slice(0, 10)) {
+      exact = exactTime;
+    }
+  }
+  return { day, exact };
+}
+
+const compareDocumentOrder = (a, b) => {
+  if (a.day !== b.day) return b.day - a.day;
+  if (a.exact === b.exact) return 0;
+  if (a.exact === null) return 1;
+  if (b.exact === null) return -1;
+  return b.exact - a.exact;
+};
+
+const sameDocumentOrder = (a, b) => a?.day === b?.day && a?.exact === b?.exact;
 
 export function matchesEntityAnchors(row, anchors) {
   if (!Array.isArray(anchors) || anchors.length === 0) return false;
@@ -143,9 +217,9 @@ export function currentEvidenceCandidates(query, rows, { filters = {}, owner = n
   const anchors = queryEntityAnchors(query, filters, { owner });
   if (!anchors.length) return [];
   return (Array.isArray(rows) ? rows : [])
-    .map((row, index) => ({ row, index, time: reliableDocumentTime(row) }))
-    .filter((entry) => entry.time !== null && matchesEntityAnchors(entry.row, anchors))
-    .sort((a, b) => b.time - a.time || a.index - b.index)
+    .map((row, index) => ({ row, index, order: evidenceSortKey(row) }))
+    .filter((entry) => entry.order !== null && matchesEntityAnchors(entry.row, anchors))
+    .sort((a, b) => compareDocumentOrder(a.order, b.order) || a.index - b.index)
     .map((entry) => entry.row);
 }
 
@@ -153,6 +227,6 @@ export function currentEvidenceCandidates(query, rows, { filters = {}, owner = n
 export function newestCurrentEvidence(query, rows, options = {}) {
   const candidates = currentEvidenceCandidates(query, rows, options);
   if (!candidates.length) return [];
-  const newest = reliableDocumentTime(candidates[0]);
-  return candidates.filter((row) => reliableDocumentTime(row) === newest);
+  const newest = evidenceSortKey(candidates[0]);
+  return candidates.filter((row) => sameDocumentOrder(evidenceSortKey(row), newest));
 }

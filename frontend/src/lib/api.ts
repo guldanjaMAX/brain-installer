@@ -47,7 +47,17 @@ export function ownerError(error: unknown): { status: number | null; message: st
   return { status: null, message: error instanceof Error ? error.message : String(error) };
 }
 
-export type Citation = { n: number; title: string; source?: string; ts?: string | null };
+export type Citation = {
+  n: number;
+  title: string;
+  source?: string;
+  ref?: string | null;
+  ts?: string | null;
+  date_source?: string | null;
+  date_reliable?: boolean;
+  text_source?: string;
+  text_reliable?: boolean;
+};
 export type Confidence = { percent: number; band: string; basis: string[] };
 export type EntityScopeEcho = { entity_slug: string | null; applied: boolean };
 export type EvidenceGate = {
@@ -151,7 +161,9 @@ export type WorkspaceAllowlist = {
   preferences: boolean;
 };
 export type RetrievalAccess = {
-  principal: "owner" | "grant";
+  principal: "owner" | "grant" | "proxy";
+  scope?: "all" | "zones";
+  read_only?: boolean;
   grant_id?: string;
   entity_slug?: string | null;
   document_count?: number;

@@ -8,8 +8,10 @@ import {
   grantIsLive,
   hashToken,
   parseCapabilities,
+  parseScope,
   principalMay,
   resolvePrincipal,
+  scopeIsUnrestricted,
 } from "../src/lib/grants.js";
 
 const ENV = { ADMIN_KEY: "owner-key-value", RAG_PROXY_KEY: "proxy-key-value" };
@@ -69,6 +71,34 @@ test("a typo in a capability list widens nothing", () => {
   assert.equal(parseCapabilities([]), null, "an empty grant is a mistake, not a grant");
   assert.equal(parseCapabilities("not json"), null);
   assert.equal(parseCapabilities(null), null);
+});
+
+test("all-zone scopes retain exclusions and only empty exclusions are unrestricted", () => {
+  const restricted = parseScope({
+    scope_include: '{"all":true}',
+    scope_exclude: '["medical","legal"]',
+  });
+  assert.deepEqual(restricted, { all: true, exclude: ["medical", "legal"] });
+  assert.equal(scopeIsUnrestricted(restricted), false);
+
+  const unrestricted = parseScope({
+    scope_include: '{"all":true}',
+    scope_exclude: "[]",
+  });
+  assert.deepEqual(unrestricted, { all: true, exclude: [] });
+  assert.equal(scopeIsUnrestricted(unrestricted), true);
+  assert.equal(scopeIsUnrestricted({ all: true }), true);
+  assert.equal(scopeIsUnrestricted(null), true);
+});
+
+test("a malformed all-zone exclusion fails closed", () => {
+  const malformed = parseScope({
+    scope_include: '{"all":true}',
+    scope_exclude: '{"zone":"medical"}',
+  });
+  assert.deepEqual(malformed, { zones: [] });
+  assert.equal(scopeIsUnrestricted(malformed), false);
+  assert.equal(scopeIsUnrestricted({ all: true, exclude: [null] }), false);
 });
 
 test("a grant credential resolves only while the grant is live", async () => {

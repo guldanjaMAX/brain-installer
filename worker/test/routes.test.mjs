@@ -115,7 +115,19 @@ const call = (env, path) => {
     headers: { "X-Admin-Key": "read-only", "Content-Type": "application/json" },
     body: JSON.stringify({ q: "x" }),
   }), env, {});
+  const readOnlyBody = await readOnly.json();
+  const readOnlyThink = await worker.fetch(new Request("https://b.example/api/rag/think", {
+    method: "POST",
+    headers: { "X-Admin-Key": "read-only", "Content-Type": "application/json" },
+    body: JSON.stringify({ q: "x" }),
+  }), env, {});
+  const readOnlyThinkBody = await readOnlyThink.json();
   check("read-only proxy key can query retrieval", readOnly.status === 200, String(readOnly.status));
+  check("read-only proxy retrieval identifies the proxy rather than claiming owner access",
+    [readOnlyBody, readOnlyThinkBody].every((body) =>
+      body.retrieval_scope === "all" && body.access?.principal === "proxy" &&
+      body.access?.scope === "all" && body.access?.read_only === true),
+    JSON.stringify({ unified: readOnlyBody, think: readOnlyThinkBody }));
   check("private retrieval responses cannot be cached",
     /private/.test(readOnly.headers.get("cache-control") || "") && /no-store/.test(readOnly.headers.get("cache-control") || ""),
     readOnly.headers.get("cache-control") || "missing");
@@ -380,6 +392,121 @@ const call = (env, path) => {
     think.answer?.includes("still an active client") && think.citations[0]?.ref === "taylor-current" &&
       think.citations[0]?.date_reliable === true && think.citations[0]?.date_source === "fixture:message_timestamp",
     JSON.stringify(think));
+}
+
+/* Calendar citations retain their local day, but two events on that day still
+   need their exact persisted starts to agree on which evidence is newest. */
+{
+  const day = Date.parse("2026-08-19T00:00:00Z");
+  const morning = {
+    ...ROW,
+    chunk_uid: "calendar-morning#0", doc_uid: "calendar-morning", source_id: "calendar-morning",
+    source: "calendar_event", title: "Taylor morning meeting", text: "Taylor morning meeting at 9:00 AM.",
+    document_date: day, occurred_at: "2026-08-19T09:00:00-07:00",
+    date_reliable: 1, date_source: "calendar:event_start",
+  };
+  const afternoon = {
+    ...morning,
+    chunk_uid: "calendar-afternoon#0", doc_uid: "calendar-afternoon", source_id: "calendar-afternoon",
+    title: "Taylor afternoon meeting", text: "Taylor afternoon meeting at 3:00 PM.",
+    occurred_at: "2026-08-19T15:00:00-07:00",
+  };
+  const prompts = [];
+  const { env } = mkEnv([morning, afternoon], {
+    vectorIds: [],
+    extra: {
+      AI: {
+        run: async (model, input) => {
+          if (model.includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          const prompt = (input?.messages || []).map((message) => String(message?.content || "")).join("\n");
+          prompts.push(prompt);
+          return prompt.includes("verify a proposed answer")
+            ? { response: { supported: true, complete: true, evidence: [1], reason: "latest exact event" }, usage: {} }
+            : { response: "As of 2026-08-19, Taylor's latest scheduled meeting is the afternoon meeting [1].", usage: {} };
+        },
+      },
+    },
+  });
+  const question = encodeURIComponent("What is Taylor's latest scheduled meeting?");
+  const unified = await (await call(env, `/api/rag/unified?q=${question}&limit=2`)).json();
+  const think = await (await call(env, `/api/rag/think?q=${question}&limit=2`)).json();
+  const generationPrompt = prompts.find((prompt) => prompt.includes("CURRENT-STATUS CHECK:")) || "";
+  check("same-day Calendar retrieval ranks the later exact event first while retaining its local day",
+    unified.results[0]?.ref_key === "calendar-afternoon" &&
+      unified.results[0]?.ts === "2026-08-19T00:00:00.000Z" &&
+      unified.results[0]?.occurred_at === "2026-08-19T15:00:00-07:00",
+    JSON.stringify(unified.results));
+  check("the answer gate sees only the later same-day event as newest evidence",
+    think.results[0]?.ref_key === "calendar-afternoon" &&
+      /document \[1\]\./.test(generationPrompt) && !/document \[1\] and \[2\]/.test(generationPrompt),
+    JSON.stringify({ think, prompts, generationPrompt }));
+}
+
+/* An all-day Calendar record has day precision only. Timed records on that
+   same local day must outrank it even when their offsets put the exact instant
+   on the previous or next UTC day. */
+{
+  const day = Date.parse("2026-08-19T00:00:00Z");
+  const allDay = {
+    ...ROW,
+    chunk_uid: "calendar-all-day#0", doc_uid: "calendar-all-day", source_id: "calendar-all-day",
+    source: "calendar_event", title: "Taylor all-day reminder", text: "Taylor all-day reminder.",
+    document_date: day, occurred_at: "2026-08-19",
+    date_reliable: 1, date_source: "calendar:all_day_start",
+  };
+  const plusFourteen = {
+    ...allDay,
+    chunk_uid: "calendar-plus-fourteen#0", doc_uid: "calendar-plus-fourteen",
+    source_id: "calendar-plus-fourteen", title: "Taylor timed event +14",
+    text: "Taylor timed event in UTC plus fourteen.",
+    occurred_at: "2026-08-19T00:30:00+14:00", date_source: "calendar:event_start",
+  };
+  const minusTwelve = {
+    ...plusFourteen,
+    chunk_uid: "calendar-minus-twelve#0", doc_uid: "calendar-minus-twelve",
+    source_id: "calendar-minus-twelve", title: "Taylor timed event -12",
+    text: "Taylor timed event in UTC minus twelve.",
+    occurred_at: "2026-08-19T23:30:00-12:00",
+  };
+  const { env } = mkEnv([allDay, plusFourteen, minusTwelve], { vectorIds: [] });
+  const question = encodeURIComponent("What is Taylor's latest scheduled meeting?");
+  const body = await (await call(env, `/api/rag/unified?q=${question}&limit=3`)).json();
+  check("timed Calendar events outrank an all-day record across +14 and -12 offsets",
+    body.results.map((row) => row.ref_key).join(",") ===
+      "calendar-minus-twelve,calendar-plus-fourteen,calendar-all-day" &&
+      body.results[2]?.occurred_at === null,
+    JSON.stringify(body.results));
+}
+
+/* Absolute UTC order must not reverse adjacent Calendar citation days. An Aug
+   19 event at UTC-12 occurs later in UTC than an Aug 20 event at UTC+14, while
+   the stored local day still makes Aug 20 the newer calendar evidence. */
+{
+  const previousLocalDay = {
+    ...ROW,
+    chunk_uid: "calendar-previous-day#0", doc_uid: "calendar-previous-day",
+    source_id: "calendar-previous-day", source: "calendar_event",
+    title: "Taylor late Aug 19 meeting", text: "Taylor meeting late on August 19.",
+    document_date: Date.parse("2026-08-19T00:00:00Z"),
+    occurred_at: "2026-08-19T23:30:00-12:00",
+    date_reliable: 1, date_source: "calendar:event_start",
+  };
+  const nextLocalDay = {
+    ...previousLocalDay,
+    chunk_uid: "calendar-next-day#0", doc_uid: "calendar-next-day",
+    source_id: "calendar-next-day", title: "Taylor early Aug 20 meeting",
+    text: "Taylor meeting early on August 20.",
+    document_date: Date.parse("2026-08-20T00:00:00Z"),
+    occurred_at: "2026-08-20T00:30:00+14:00",
+  };
+  const { env } = mkEnv([previousLocalDay, nextLocalDay], { vectorIds: [] });
+  const question = encodeURIComponent("What is Taylor's latest scheduled meeting?");
+  const body = await (await call(env, `/api/rag/unified?q=${question}&limit=2`)).json();
+  check("the later local Calendar day wins even when opposing offsets reverse absolute UTC order",
+    body.results[0]?.ref_key === "calendar-next-day" &&
+      body.results[0]?.ts === "2026-08-20T00:00:00.000Z" &&
+      body.results[0]?.occurred_at === "2026-08-20T00:30:00+14:00",
+    JSON.stringify(body.results));
 }
 
 /* Co-citing a newest billing event cannot refresh an older relationship claim. */
@@ -1377,6 +1504,173 @@ const post = (env, path, body) =>
 const doc = (id, content = "some ordinary meeting content about the retainer") =>
   ({ source_type: "meeting", source_id: id, title: `T${id}`, content });
 
+/* Ingest identity is one namespace plus an otherwise opaque provider/path id.
+   A colon in source_type used to let a:b/c overwrite a/b:c because both became
+   doc_uid a:b:c. Reject the unsafe namespace before any D1 statement while
+   retaining punctuation inside the source_id itself. */
+{
+  const single = mkBatchEnv();
+  const response = await post(single.env, "/api/admin/brain/ingest", {
+    source_type: "a:b", source_id: "c", content: "First synthetic body.",
+  });
+  const receipt = await response.json();
+  check("single ingest rejects a source_type that can collide across the doc_uid delimiter",
+    response.status === 400 && /source_type/.test(receipt.error || ""), JSON.stringify(receipt));
+  check("an invalid single-ingest identity performs zero D1 calls or writes",
+    single.calls.remote === 0 && single.calls.submitted_statements === 0 &&
+      single.written.length === 0 && single.storedTexts.length === 0 && single.documents.size === 0,
+    JSON.stringify(single.calls));
+
+  const invalidBatch = mkBatchEnv();
+  const invalidReceipt = await (await post(invalidBatch.env, "/api/admin/brain/ingest/batch", {
+    docs: [
+      { source_type: "a:b", source_id: "c", content: "First synthetic body." },
+      { source_type: "a", source_id: { opaque: "c" }, content: "Second synthetic body." },
+    ],
+  })).json();
+  check("batch ingest rejects ambiguous namespaces and non-string source ids in their own result slots",
+    invalidReceipt.failed === 2 && invalidReceipt.results.every((row) => row.status === "failed") &&
+      /source_type/.test(invalidReceipt.results[0]?.error || "") &&
+      /source_id/.test(invalidReceipt.results[1]?.error || ""), JSON.stringify(invalidReceipt));
+  check("an all-invalid identity batch performs zero D1 calls or writes",
+    invalidBatch.calls.remote === 0 && invalidBatch.calls.submitted_statements === 0 &&
+      invalidBatch.written.length === 0 && invalidBatch.storedTexts.length === 0 && invalidBatch.documents.size === 0,
+    JSON.stringify(invalidBatch.calls));
+
+  const collision = mkBatchEnv();
+  const collisionReceipt = await (await post(collision.env, "/api/admin/brain/ingest/batch", {
+    docs: [
+      { source_type: "a:b", source_id: "c", content: "First synthetic body." },
+      { source_type: "a", source_id: "b:c", content: "Second synthetic body." },
+    ],
+  })).json();
+  const storedCollisionUid = collision.documents.get("a:b:c");
+  check("the former collision pair rejects only its unsafe namespace and accepts the opaque colon id",
+    collisionReceipt.failed === 1 && collisionReceipt.created === 1 &&
+      collisionReceipt.results.map((row) => row.status).join(",") === "failed,created",
+    JSON.stringify(collisionReceipt));
+  check("the accepted half of the former collision owns a consistent document row",
+    collision.documents.size === 1 && storedCollisionUid?.source === "a" && storedCollisionUid?.source_id === "b:c" &&
+      collision.storedTexts.length === 1 && /Second synthetic body/.test(collision.storedTexts[0]),
+    JSON.stringify(storedCollisionUid));
+}
+
+/* Date trust is optional, but every supplied claim must be type-safe. A true
+   reliability flag is meaningful only beside a parseable date and a named
+   provenance source. */
+{
+  const single = mkBatchEnv();
+  const response = await post(single.env, "/api/admin/brain/ingest", {
+    ...doc("bad-single-date"),
+    // Date.parse normalizes this to March 2. The ingest boundary must reject
+    // the impossible source claim rather than silently changing its meaning.
+    occurred_at: "2026-02-30",
+    date_source: "synthetic:provider_timestamp",
+    date_reliable: true,
+  });
+  const receipt = await response.json();
+  check("single ingest rejects a rolled-over claimed document date",
+    response.status === 400 && /occurred_at/.test(receipt.error || ""), JSON.stringify(receipt));
+  check("invalid single-ingest date provenance performs zero D1 calls or writes",
+    single.calls.remote === 0 && single.calls.submitted_statements === 0 &&
+      single.written.length === 0 && single.storedTexts.length === 0 && single.documents.size === 0,
+    JSON.stringify(single.calls));
+
+  const invalidDates = [
+    { ...doc("date-number"), occurred_at: 1750000000000 },
+    { ...doc("date-empty"), occurred_at: "" },
+    { ...doc("date-ambiguous-short"), occurred_at: "1" },
+    { ...doc("date-ambiguous-locale"), occurred_at: "01/02/03" },
+    { ...doc("date-rolled-day"), occurred_at: "2026-02-30" },
+    { ...doc("date-local-time-without-zone"), occurred_at: "2026-06-12T09:00:00" },
+    { ...doc("reliable-string"), occurred_at: "2026-06-12T09:00:00-07:00", date_source: "calendar:event_start", date_reliable: "yes" },
+    { ...doc("reliable-undated"), occurred_at: null, date_source: "provider:event_start", date_reliable: true },
+    { ...doc("reliable-unsourced"), occurred_at: "2026-06-12T09:00:00-07:00", date_reliable: true },
+    { ...doc("reliable-none"), occurred_at: "2026-06-12T09:00:00-07:00", date_source: "none", date_reliable: true },
+    { ...doc("source-number"), occurred_at: null, date_source: 7, date_reliable: false },
+    { ...doc("source-control"), occurred_at: null, date_source: "provider\nheader", date_reliable: false },
+    { ...doc("source-long"), occurred_at: null, date_source: "x".repeat(201), date_reliable: false },
+  ];
+  const batch = mkBatchEnv();
+  const batchReceipt = await (await post(batch.env, "/api/admin/brain/ingest/batch", { docs: invalidDates })).json();
+  check("batch ingest rejects malformed or incoherent date provenance per document",
+    batchReceipt.failed === invalidDates.length && batchReceipt.results.every((row) => row.status === "failed"),
+    JSON.stringify(batchReceipt));
+  check("an all-invalid date batch performs zero D1 calls or writes",
+    batch.calls.remote === 0 && batch.calls.submitted_statements === 0 &&
+      batch.written.length === 0 && batch.storedTexts.length === 0 && batch.documents.size === 0,
+    JSON.stringify(batch.calls));
+
+  const invalidText = mkBatchEnv();
+  const invalidTextReceipt = await (await post(invalidText.env, "/api/admin/brain/ingest/batch", {
+    docs: [
+      { ...doc("unknown-text-source"), text_source: "ocr_unverified", text_reliable: false },
+      { ...doc("string-text-trust"), text_source: "ocr", text_reliable: "false" },
+    ],
+  })).json();
+  check("batch ingest rejects unknown extraction sources and non-boolean text trust",
+    invalidTextReceipt.failed === 2 && invalidTextReceipt.results.every((row) => row.status === "failed") &&
+      /text_source/.test(invalidTextReceipt.results[0]?.error || "") &&
+      /text_reliable/.test(invalidTextReceipt.results[1]?.error || ""),
+    JSON.stringify(invalidTextReceipt));
+  check("an all-invalid extraction provenance batch performs zero D1 calls or writes",
+    invalidText.calls.remote === 0 && invalidText.calls.submitted_statements === 0 &&
+      invalidText.written.length === 0 && invalidText.storedTexts.length === 0 && invalidText.documents.size === 0,
+    JSON.stringify(invalidText.calls));
+}
+
+/* Current built-in producer shapes remain valid, and a legacy Calendar client
+   that predates explicit trust fields is still accepted. Drive/provider dates
+   name their provenance and local uploads can explicitly say that no reliable
+   date was found. */
+{
+  const calendar = mkBatchEnv();
+  const calendarResponse = await post(calendar.env, "/api/admin/brain/ingest", {
+    source_type: "calendar_event",
+    source_id: "gcal:primary:evt_kickoff_001",
+    title: "Project kickoff",
+    content: "A calendar event with enough ordinary context to store.",
+    occurred_at: "2026-06-12T09:00:00-07:00",
+  });
+  const calendarReceipt = await calendarResponse.json();
+  check("single ingest accepts a legacy Calendar envelope with omitted trust fields",
+    calendarResponse.status === 200 && calendarReceipt.doc_uid === "calendar_event:gcal:primary:evt_kickoff_001",
+    JSON.stringify(calendarReceipt));
+
+  const builtIns = mkBatchEnv();
+  const builtInDocs = [
+    {
+      source_type: "calendar_event", source_id: "gcal:primary:evt_local_day", title: "Local-day event",
+      content: "A Calendar event whose citation must retain its local calendar day.",
+      occurred_at: "2026-06-12", date_source: "calendar:event_start", date_reliable: true,
+    },
+    {
+      source_type: "drive", source_id: "drive:item:root/F1", title: "Board notes",
+      content: "A Drive document with a filename-derived date.",
+      occurred_at: "2026-03-14T00:00:00.000Z", date_source: "filename", date_reliable: true,
+    },
+    {
+      source_type: "upload", source_id: "Clients/Acme/notes.pdf#part1of2", title: "Notes",
+      content: "A local document whose source contains path and split punctuation.",
+      occurred_at: null, date_source: "none", date_reliable: false,
+    },
+    {
+      source_type: "hubspot", source_id: "deals:123", title: "Deal",
+      content: "A provider record carrying a provider timestamp.",
+      occurred_at: "2026-06-12T16:00:00.000Z", date_source: "hubspot:provider_timestamp", date_reliable: true,
+    },
+  ];
+  const builtInReceipt = await (await post(builtIns.env, "/api/admin/brain/ingest/batch", { docs: builtInDocs })).json();
+  check("batch ingest accepts built-in path, split-family and provider identity shapes",
+    builtInReceipt.created === builtInDocs.length && builtInReceipt.failed === 0 &&
+      builtInReceipt.results.every((row) => row.status === "created"), JSON.stringify(builtInReceipt));
+  check("valid built-in source ids remain byte-for-byte inside their document identities",
+    builtIns.documents.has("drive:drive:item:root/F1") &&
+      builtIns.documents.has("upload:Clients/Acme/notes.pdf#part1of2") &&
+      builtIns.documents.has("hubspot:deals:123"),
+    JSON.stringify([...builtIns.documents.keys()]));
+}
+
 {
   const { env, storedTexts, documents } = mkBatchEnv();
   const paymentToken = "Qz8Lm4".repeat(8);
@@ -2269,6 +2563,23 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   check("an explicit all-zones scope is also unrestricted",
     all.clause === "" && all.params.length === 0, JSON.stringify(all));
 
+  const allExceptMedical = scopeSql({ all: true, exclude: ["medical"] }, "c", 1);
+  check("all zones with an exclusion emits a source-authoritative exclusion predicate",
+    allExceptMedical.clause ===
+      " AND c.source IN (SELECT name FROM sources WHERE zone IS NOT NULL AND trim(zone) != '' AND zone NOT IN (?1))" &&
+      JSON.stringify(allExceptMedical.params) === '["medical"]' &&
+      allExceptMedical.nextParam === 2,
+    JSON.stringify(allExceptMedical));
+  check("all zones with an exclusion cannot match an unregistered or unzoned source",
+    /c\.source IN \(SELECT name FROM sources/.test(allExceptMedical.clause) &&
+      /zone IS NOT NULL/.test(allExceptMedical.clause) && /trim\(zone\) != ''/.test(allExceptMedical.clause),
+    allExceptMedical.clause);
+
+  const malformedAll = scopeSql({ all: true, exclude: [null] }, "c", 1);
+  check("a malformed all-zone exclusion reads nothing instead of widening",
+    malformedAll.clause === " AND 1 = 0" && malformedAll.params.length === 0,
+    JSON.stringify(malformedAll));
+
   const books = scopeSql({ zones: ["books"] }, "c", 1);
   check("a scoped principal is restricted through its source's zone",
     /c\.source IN \(SELECT name FROM sources WHERE zone IN \(\?1\)\)/.test(books.clause)
@@ -2308,7 +2619,7 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
 
   const kw = seen.sql.find((sql) => /chunks_fts MATCH/.test(sql));
   check("a scoped read narrows the keyword query",
-    /c\.source IN \(SELECT name FROM sources/.test(kw || ""), String(kw));
+    /d\.source IN \(SELECT name FROM sources/.test(kw || ""), String(kw));
 
   const hydration = seen.sql.find(
     (sql) => /FROM chunks c JOIN documents d/.test(sql) && /c\.chunk_uid IN/.test(sql));
@@ -2367,16 +2678,191 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
     headers: { "X-Admin-Key": token, "Content-Type": "application/json" },
     body: JSON.stringify({ q: "retainer" }),
   }), env, { waitUntil() {} });
+  const body = await res.json();
 
   check("a scoped grant is admitted to the ask route", res.status !== 401, String(res.status));
 
   const kw = seen.sql.find((sql) => /chunks_fts MATCH/.test(sql));
   check("and its zone reaches the keyword SQL through the real request path",
-    /c\.source IN \(SELECT name FROM sources/.test(kw || ""), String(kw));
+    /d\.source IN \(SELECT name FROM sources/.test(kw || ""), String(kw));
 
   const bound = seen.binds.find((b) => b.includes("books"));
   check("and the zone from the GRANT ROW is what gets bound",
     !!bound, JSON.stringify(seen.binds));
+  const scopedGap = body.gaps?.find((gap) => gap.type === "scoped_vector_unavailable");
+  check("zone-scoped think explains registered-source zone authorization rather than exact-document access",
+    /Registered-source zone authorization/.test(scopedGap?.detail || "") &&
+      /allowed zones/.test(scopedGap?.detail || "") &&
+      !/Exact document authorization/.test(scopedGap?.detail || ""),
+    JSON.stringify(scopedGap));
+}
+
+
+/* ---- all zones EXCEPT one remains scoped through the real request path ---- */
+{
+  const { hashToken } = await import("../src/lib/grants.js");
+  const token = "all-except-medical-reader";
+  const hash = await hashToken(token);
+  let embeddingCalls = 0;
+  const base = mkEnv([ROW], {
+    vectorIds: ["meeting:123#0"],
+    extra: {
+      AI: { run: async () => { embeddingCalls++; return { data: [[0.1, 0.2]] }; } },
+    },
+  });
+  const grantRow = {
+    grant_id: "g-all-except-medical", capabilities: '["ask"]',
+    expires_at: null, revoked_at: null, credential_revoked_at: null,
+    scope_include: '{"all":true}', scope_exclude: '["medical"]',
+  };
+  const env = { ...base.env, DB: {
+    ...base.env.DB,
+    prepare(sql) {
+      const stmt = base.env.DB.prepare(sql);
+      if (!/FROM grant_credentials/.test(sql)) return stmt;
+      return { bind: (...b) => ({
+        async first() { return b[0] === hash ? grantRow : null; },
+        async all() { return { results: [] }; },
+        async run() { return { meta: { changes: 0 } }; },
+      }) };
+    },
+  } };
+
+  const response = await worker.fetch(new Request("https://b.example/api/rag/unified", {
+    method: "POST",
+    headers: { "X-Admin-Key": token, "Content-Type": "application/json" },
+    body: JSON.stringify({ q: "retainer" }),
+  }), env, { waitUntil() {} });
+  const body = await response.json();
+
+  check("an all-with-exclusions grant stays zone-scoped through authentication and retrieval",
+    response.status === 200 && body.retrieval_scope === "zones" &&
+      body.access?.principal === "grant" && body.access?.scope === "zones",
+    JSON.stringify(body));
+  const keywordSql = base.seen.sql.find((sql) => /chunks_fts MATCH/.test(sql));
+  check("its exclusion reaches the SQL statement that reads text",
+    /d\.source IN \(SELECT name FROM sources WHERE zone IS NOT NULL AND trim\(zone\) != '' AND zone NOT IN \(\?3\)\)/.test(keywordSql || "") &&
+      base.seen.binds.some((binds) => binds.includes("medical")),
+    JSON.stringify({ sql: keywordSql, binds: base.seen.binds }));
+  check("it never embeds or queries unscoped Vectorize and reports the keyword-only boundary",
+    embeddingCalls === 0 && base.seen.vectorQueries.length === 0 &&
+      body.degraded === "scoped-vector" && body.degraded_reason === "zone-scope-keyword-only",
+    JSON.stringify({ embeddingCalls, vectorQueries: base.seen.vectorQueries, body }));
+}
+
+
+/* ---- an unrestricted capability grant is still identified as a grant ---- */
+{
+  const { hashToken } = await import("../src/lib/grants.js");
+  const token = "full-scope-grant-reader";
+  const hash = await hashToken(token);
+  const base = mkEnv([ROW], { vectorIds: [] });
+  const grantRow = {
+    grant_id: "g-full-scope", capabilities: '["ask"]',
+    expires_at: null, revoked_at: null, credential_revoked_at: null,
+    scope_include: '{"all":true}', scope_exclude: "[]",
+  };
+  const env = { ...base.env, DB: {
+    ...base.env.DB,
+    prepare(sql) {
+      const stmt = base.env.DB.prepare(sql);
+      if (!/FROM grant_credentials/.test(sql)) return stmt;
+      return { bind: (...b) => ({
+        async first() { return b[0] === hash ? grantRow : null; },
+        async all() { return { results: [] }; },
+        async run() { return { meta: { changes: 0 } }; },
+      }) };
+    },
+  } };
+  const body = await (await worker.fetch(new Request("https://b.example/api/rag/unified", {
+    method: "POST",
+    headers: { "X-Admin-Key": token, "Content-Type": "application/json" },
+    body: JSON.stringify({ q: "retainer" }),
+  }), env, { waitUntil() {} })).json();
+
+  check("an unrestricted capability grant reports grant identity and all scope",
+    body.retrieval_scope === "all" && body.access?.principal === "grant" && body.access?.scope === "all",
+    JSON.stringify(body));
+}
+
+
+/* ---- exclusions also bind write, deletion, freshness and diagnostic routes ---- */
+{
+  const { hashToken } = await import("../src/lib/grants.js");
+  const token = "all-except-medical-operator";
+  const hash = await hashToken(token);
+  const grantRow = {
+    grant_id: "g-all-except-medical-operator",
+    capabilities: '["ask","file","destroy","diagnose"]',
+    expires_at: null, revoked_at: null, credential_revoked_at: null,
+    scope_include: '{"all":true}', scope_exclude: '["medical"]',
+  };
+  const freshnessRows = [
+    { name: "books", kind: "drive", status: "ready", document_count: 2 },
+    { name: "medical", kind: "drive", status: "error", stale_reason: "private fixture reason", document_count: 3 },
+    { name: "inbox", kind: "gmail", status: "ready", document_count: 4 },
+  ];
+  const base = mkEnv([], { vectorIds: [] });
+  const env = { ...base.env, DB: {
+    ...base.env.DB,
+    prepare(sql) {
+      if (/FROM grant_credentials/.test(sql)) {
+        return { bind: (...b) => ({
+          async first() { return b[0] === hash ? grantRow : null; },
+          async all() { return { results: [] }; },
+          async run() { return { meta: { changes: 0 } }; },
+        }) };
+      }
+      if (/SELECT name FROM sources WHERE zone IS NOT NULL AND trim\(zone\) != '' AND zone NOT IN/.test(sql)) {
+        return { bind: (...binds) => ({
+          async all() {
+            return { results: binds.includes("medical") ? [{ name: "books" }] : [] };
+          },
+          async first() { return null; },
+          async run() { return { meta: { changes: 0 } }; },
+        }) };
+      }
+      if (/FROM sources s/.test(sql)) {
+        return {
+          async all() { return { results: freshnessRows }; },
+          bind() { return this; },
+          async first() { return null; },
+          async run() { return { meta: { changes: 0 } }; },
+        };
+      }
+      return base.env.DB.prepare(sql);
+    },
+  } };
+  const request = (path, payload, method = "POST") => worker.fetch(new Request(`https://b.example${path}`, {
+    method,
+    headers: { "X-Admin-Key": token, ...(method === "POST" ? { "Content-Type": "application/json" } : {}) },
+    ...(method === "POST" ? { body: JSON.stringify(payload) } : {}),
+  }), env, { waitUntil() {} });
+
+  const ingest = await request("/api/admin/brain/ingest", {
+    source_type: "medical", source_id: "excluded-write", content: "synthetic body",
+  });
+  const batch = await request("/api/admin/brain/ingest/batch", { docs: [
+    { source_type: "books", source_id: "allowed", content: "synthetic body" },
+    { source_type: "medical", source_id: "excluded", content: "synthetic body" },
+  ] });
+  const forget = await request("/api/admin/brain/forget", { source: "medical" });
+  const diagnose = await request("/api/admin/brain/diagnose", null, "GET");
+  const freshness = await request("/api/admin/brain/freshness", null, "GET");
+  const freshnessBody = await freshness.json();
+
+  check("all-with-exclusions blocks single and batch writes into an excluded source",
+    ingest.status === 403 && batch.status === 403,
+    JSON.stringify({ ingest: ingest.status, batch: batch.status }));
+  check("all-with-exclusions blocks even a dry-run delete against an excluded source",
+    forget.status === 403, String(forget.status));
+  check("all-with-exclusions cannot request a whole-corpus diagnostic",
+    diagnose.status === 403, String(diagnose.status));
+  check("freshness removes excluded source names and their raw connector reasons",
+    freshness.status === 200 &&
+      freshnessBody.sources?.map((row) => row.name).join(",") === "books" &&
+      !JSON.stringify(freshnessBody).includes("private fixture reason"),
+    JSON.stringify(freshnessBody));
 }
 
 
@@ -2394,7 +2880,7 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   // `books` is in the grant's zone; `medical` is not.
   const scopedEnv = () => {
     const base = mkEnv([ROW], { vectorIds: [] });
-    return { ...base.env, DB: {
+    const env = { ...base.env, DB: {
       prepare(sql) {
         if (/FROM grant_credentials/.test(sql)) {
           return { bind: (...b) => ({ async first() { return b[0] === hash ? grantRow : null; },
@@ -2407,13 +2893,14 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
         return base.env.DB.prepare(sql);
       },
     } };
+    return { env, seen: base.seen };
   };
 
-  const post = (path, payload) => worker.fetch(new Request(`https://b.example${path}`, {
+  const post = (path, payload, fixture = scopedEnv()) => worker.fetch(new Request(`https://b.example${path}`, {
     method: "POST",
     headers: { "X-Admin-Key": token, "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  }), scopedEnv(), { waitUntil() {} });
+  }), fixture.env, { waitUntil() {} });
 
   // The reconnaissance hole: forget's DRY RUN is the default and returned the
   // full doc_uid list of any source, which is real file ids and paths.
@@ -2431,6 +2918,17 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   const own = await post("/api/admin/brain/forget", { source: "books" });
   check("but its OWN zone is still reachable, so the check is a boundary not a wall",
     own.status !== 403, String(own.status));
+
+  const mixedFixture = scopedEnv();
+  const mixed = await post("/api/admin/brain/forget", {
+    source: "books", doc_uids: ["medical:private-record"], confirm: true,
+  }, mixedFixture);
+  const mixedCorpusSql = mixedFixture.seen.sql.filter((sql) =>
+    /(?:FROM|DELETE FROM) (?:documents|chunks)\b|INSERT INTO vector_outbox/.test(sql));
+  check("a scoped destroy cannot smuggle an arbitrary document id beside an allowed source",
+    mixed.status === 403, String(mixed.status));
+  check("the mixed-target refusal occurs before target enumeration or corpus writes",
+    mixedCorpusSql.length === 0, mixedCorpusSql.join("\n"));
 
   // The write hole: source_type is caller-chosen and decides the zone.
   const plant = await post("/api/admin/brain/ingest",

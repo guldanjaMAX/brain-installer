@@ -317,8 +317,16 @@ async function runTool(name, args = {}) {
       // so the consumer can say what WAS found instead of "nothing".
       if (!d.answer || refused) {
         out.results = (d.results ?? []).map((r) => ({
+          source: r.source,
+          ref: r.ref ?? r.ref_key ?? r.source_id ?? null,
+          source_id: r.source_id ?? null,
+          uri: r.uri ?? null,
           title: r.title,
           ts: r.ts,
+          date_source: r.date_source ?? null,
+          date_reliable: r.date_reliable === true,
+          text_source: r.text_source || "native",
+          text_reliable: r.text_reliable !== false,
           snippet: String(r.snippet ?? "").slice(0, 700),
         }));
       }
@@ -369,9 +377,16 @@ async function runTool(name, args = {}) {
         search_status: unavailable ? "search_unavailable" : undefined,
         results: rows.map((r) => ({
           source: r.source,
+          ref: r.ref ?? r.ref_key ?? r.source_id ?? null,
+          source_id: r.source_id ?? null,
+          uri: r.uri ?? null,
           title: r.title,
           category: r.category,
           ts: r.ts,
+          date_source: r.date_source ?? null,
+          date_reliable: r.date_reliable === true,
+          text_source: r.text_source || "native",
+          text_reliable: r.text_reliable !== false,
           snippet: String(r.snippet ?? "").slice(0, 900),
         })),
         ...(unavailable

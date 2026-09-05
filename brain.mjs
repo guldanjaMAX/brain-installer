@@ -2366,7 +2366,22 @@ export async function cmdAsk(manifestPath, options = {}) {
       const number = Number.isInteger(citation?.n) ? `[${citation.n}]` : "[ ]";
       const title = String(citation?.title || "Untitled").replace(/\s+/g, " ").slice(0, 140);
       const source = String(citation?.source || "source").replace(/\s+/g, " ").slice(0, 40);
-      console.log(`  ${number} ${title} (${source})`);
+      const provenance = [source];
+      if (citation?.ts) {
+        const day = String(citation.ts).slice(0, 10);
+        provenance.push(citation.date_reliable === true ? day : `possible date ${day}`);
+      }
+      if (citation?.text_source === "ocr_partial") {
+        provenance.push("OCR text may be incomplete");
+      } else if (citation?.text_source === "ocr") {
+        provenance.push("OCR text, verify key details");
+      } else if (citation?.text_reliable === false) {
+        provenance.push("text may be incomplete");
+      }
+      if (citation?.ref) {
+        provenance.push(`reference ${source}:${String(citation.ref).replace(/\s+/g, " ").slice(0, 160)}`);
+      }
+      console.log(`  ${number} ${title} (${provenance.join("; ")})`);
     }
     console.log("");
   }
@@ -2651,13 +2666,17 @@ export async function cmdMigrate(manifestPath, options = {}) {
     if (!silent) ok(`schema up to date (${all.length} migration(s) applied)`);
   }
 
-  // 0010-0013 change the protocol used by every Vectorize writer. A public
-  // `brain migrate` against an already-running pre-lease Worker would recreate
-  // the rolling race that update's paused compatibility deployment prevents.
-  // The private option is passed only by the verified setup/update cutover; it
-  // is intentionally not a CLI flag.
+  // 0010-0013 change the protocol used by every Vectorize writer. Migration
+  // 0033 replaces the live FTS insert trigger across two independently
+  // committed D1 statements. A public `brain migrate` against an active Worker
+  // could therefore race either the vector protocol change or the interval
+  // between DROP TRIGGER and CREATE TRIGGER. The private option keeps its
+  // historical name, but it is passed only after setup/update has deployed the
+  // whole-corpus write barrier and waited out older invocations. It is
+  // intentionally not a CLI flag.
+  const writerQuiescenceMigrations = new Set([10, 11, 12, 13, 33]);
   if ((m.infrastructure?.cloudflare?.storage || "d1") === "d1" &&
-      pending.some((migration) => [10, 11, 12, 13].includes(migration.version)) &&
+      pending.some((migration) => writerQuiescenceMigrations.has(migration.version)) &&
       options.vectorDrainQuiesced !== true) {
     let installTable;
     try {
@@ -2680,8 +2699,8 @@ export async function cmdMigrate(manifestPath, options = {}) {
       // eligible for the direct fresh-install path; every other prefix must use
       // setup/update's paused-worker quiescence protocol.
       die(
-        "this existing brain needs the verified vector-writer cutover before migrations 0010-0013.\n" +
-          "      Run `brain update` instead; direct migrate was stopped before changing D1.",
+        "this existing brain needs the verified paused-writer cutover before migrations 0010-0013 or 0033.\n" +
+        "      Run `brain update` instead; direct migrate was stopped before changing D1.",
       );
     }
     let inventory;
@@ -2699,8 +2718,8 @@ export async function cmdMigrate(manifestPath, options = {}) {
     if (!inventory || !Array.isArray(inventory.results) || inventory.results.length !== 1 ||
         Number(inventory.results[0]?.user_table_count) !== 0) {
       die(
-        "this database is not provably fresh, so migrations 0010-0013 require the verified writer cutover.\n" +
-          "      Run `brain update` instead; direct migrate was stopped before changing D1.",
+        "this database is not provably fresh, so migrations 0010-0013 or 0033 require the verified paused-writer cutover.\n" +
+        "      Run `brain update` instead; direct migrate was stopped before changing D1.",
       );
     }
   }
@@ -4538,6 +4557,7 @@ export const VALUE_FLAGS = new Set([
   "path", "source", "limit", "from", "manifest", "scopes", "port", "host", "user", "run", "confirm-host", "kind", "add", "bookmark", "export", "explain", "backup",
   "golden", "profile", "k", "repeat", "baseline", "save", "artifacts",
   "corpus-contract", "approve-removals", "only", "skip",
+  "can", "zones", "exclude-zones", "until", "as",
   // brain import bank. `--file` with no value must die saying so rather than
   // being read as a boolean and then reported as "needs --file".
   "file", "format", "account", "account-kind", "name", "slug", "institution", "currency", "entity", "entity-label",
@@ -14577,13 +14597,16 @@ async function cmdGrant(manifestPath) {
     : [];
   if (!displayName || !capabilities.length) {
     die(
-      "usage: brain grant <manifest> --name \"Their name\" --can ask,file [--zones books,legal] [--until YYYY-MM-DD]\n" +
+      "usage: brain grant <manifest> --name \"Their name\" --can ask,file [--zones books,legal] [--exclude-zones medical] [--until YYYY-MM-DD]\n" +
       "      capabilities: ask, file, diagnose, destroy",
     );
   }
   const zones = typeof flags.zones === "string" && flags.zones.trim()
     ? flags.zones.split(",").map((value) => value.trim()).filter(Boolean)
     : null;
+  const excludeZones = typeof flags["exclude-zones"] === "string" && flags["exclude-zones"].trim()
+    ? flags["exclude-zones"].split(",").map((value) => value.trim()).filter(Boolean)
+    : [];
   let expiresAt = null;
   if (typeof flags.until === "string" && flags.until.trim()) {
     expiresAt = Date.parse(`${flags.until.trim()}T23:59:59Z`);
@@ -14603,6 +14626,7 @@ async function cmdGrant(manifestPath) {
       relationship: typeof flags.as === "string" ? flags.as : null,
       capabilities,
       zones,
+      exclude_zones: excludeZones,
       expires_at: expiresAt,
     }),
   }, { timeoutMs: 30_000, what: "the access grant" });
@@ -14646,7 +14670,15 @@ async function cmdGrants(manifestPath) {
     const state = grant.revoked_at ? "revoked" : grant.expires_at && Number(grant.expires_at) <= Date.now() ? "expired" : "active";
     let capabilities = grant.capabilities;
     try { capabilities = JSON.parse(grant.capabilities).join(", "); } catch { /* display stored value */ }
-    console.log(`  ${state}  ${grant.display_name}  ${capabilities}  ${grant.grant_id}`);
+    const included = grant.scope?.all === true
+      ? "all zones"
+      : Array.isArray(grant.scope?.zones) && grant.scope.zones.length
+        ? grant.scope.zones.join(",")
+        : "no zones";
+    const excluded = Array.isArray(grant.scope?.exclude) && grant.scope.exclude.length
+      ? ` except ${grant.scope.exclude.join(",")}`
+      : "";
+    console.log(`  ${state}  ${grant.display_name}  ${capabilities}  scope: ${included}${excluded}  ${grant.grant_id}`);
   }
   return result;
 }
@@ -14672,9 +14704,25 @@ async function cmdZone(manifestPath) {
   const result = await response.json();
   if (result.zones) {
     if (!result.zones.length) info("Nothing is loaded yet, so there are no zones.");
-    for (const row of result.zones) console.log(`  ${row.zone}  ${row.chunks} chunk(s) from ${row.sources} source(s)`);
+    for (const row of result.zones) {
+      console.log(`  ${row.zone}  ${row.documents || 0} document(s), ${row.chunks} chunk(s) from ${row.sources} source(s)`);
+    }
   } else {
-    ok(`"${result.source}" is now in zone "${result.zone}" (${result.documents} document(s), ${result.chunks} chunk(s))`);
+    ok(`Access for "${result.source}" now uses zone "${result.zone}" (${result.documents} document(s), ${result.chunks} chunk(s))`);
+    const repaired = result.projection_repaired || {};
+    const repairedDocuments = Number(repaired.documents || 0);
+    const repairedChunks = Number(repaired.chunks || 0);
+    if (result.projection_repair_required) {
+      const pending = result.projection_pending || {};
+      warn(
+        `Access is active from the source registry. This pass repaired ${repairedDocuments} document and ` +
+        `${repairedChunks} chunk projection(s); ${Number(pending.documents || 0)} document and ` +
+        `${Number(pending.chunks || 0)} chunk projection(s) remain. Rerun this same ` +
+        "`brain zone` command until none remain."
+      );
+    } else if (repairedDocuments || repairedChunks) {
+      ok(`Zone projection repair is complete (${repairedDocuments} document(s), ${repairedChunks} chunk(s) repaired in this pass)`);
+    }
   }
   return result;
 }

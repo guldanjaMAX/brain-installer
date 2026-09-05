@@ -825,10 +825,12 @@ export function buildEnvelope(event, { calendar, config } = {}) {
   const end = readEventTime(event.end);
   const conf = conferenceInfo(event);
 
-  // occurred_at keeps the ORIGINAL offset rather than a UTC normalisation, so
-  // slicing the first ten characters yields the local calendar date. A 6pm
-  // Phoenix meeting normalised to UTC would file itself under the next day.
-  const occurred_at = start.allDay ? start.date : start.raw;
+  // `document_date` is stored as an epoch and returned as UTC, so persisting
+  // the exact offset timestamp can move an evening event to the next day in a
+  // citation. The corpus date is the event's local calendar day. Exact time,
+  // offset and zone remain in metadata.start/time_zone and in the rendered
+  // text where a reader can verify them.
+  const occurred_at = start.date;
 
   return {
     kind: "upsert",
@@ -839,6 +841,9 @@ export function buildEnvelope(event, { calendar, config } = {}) {
       source_id,
       source_subtype: SOURCE_SUBTYPE,
       occurred_at,
+      date_source: start.allDay ? "calendar:all_day_start" : "calendar:event_start",
+      date_reliable: true,
+      uri: event.htmlLink || null,
       title: `${(event.summary || "(untitled event)").trim()} — ${start.date}`,
       content,
       metadata: {

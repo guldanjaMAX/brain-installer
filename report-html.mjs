@@ -401,7 +401,18 @@ function renderCitations(citations) {
   if (!list.length) return "";
   const items = list
     .map((c) => {
-      const meta = [c.source, isoDay(c.ts)].filter(Boolean).join(", ");
+      const day = isoDay(c.ts);
+      const date = day
+        ? c.date_reliable === true ? day : `possible date ${day}`
+        : null;
+      const text = c.text_source === "ocr_partial"
+        ? "OCR text may be incomplete"
+        : c.text_source === "ocr"
+          ? "OCR text, verify key details"
+          : c.text_reliable === false
+            ? "text may be incomplete"
+            : null;
+      const meta = [c.source, date, text].filter(Boolean).join(", ");
       const ref = c.ref ? `<span class="cite-ref">${h(c.ref)}</span>` : "";
       return (
         `<li><span class="cite-n">${h(c.n)}</span>` +

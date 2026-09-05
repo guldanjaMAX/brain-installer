@@ -13,6 +13,7 @@
  */
 
 import { ownerActivityStatement } from "./owner-activity.js";
+import { parseScope, scopeIsUnrestricted } from "./grants.js";
 
 const MIGRATION_HINT = "passkey tables are missing; run `brain setup <manifest>` to apply migration 0014";
 
@@ -213,10 +214,13 @@ export async function listGrants(env) {
   try {
     const { results } = await env.DB.prepare(
       `SELECT grant_id, display_name, relationship, capabilities, expires_at,
-              created_at, revoked_at, last_used_at
+              created_at, revoked_at, last_used_at, scope_include, scope_exclude
          FROM grants ORDER BY created_at DESC`,
     ).all();
-    return results || [];
+    return (results || []).map((row) => {
+      const { scope_include: _include, scope_exclude: _exclude, ...grant } = row;
+      return { ...grant, scope: parseScope(row) };
+    });
   } catch (error) {
     guard(error);
   }
@@ -517,22 +521,76 @@ export async function passkeySecurityStatus(env, rpId) {
 
 /* --------------------------------------------------------------- zones */
 
+export const ZONE_PROJECTION_REPAIR_BATCH_SIZE = 1000;
+
 export async function assignZone(env, { source, zone }) {
   try {
     const now = Date.now();
-    await env.DB.prepare(
-      "INSERT INTO zones (zone, label, created_at) VALUES (?, ?, ?) ON CONFLICT(zone) DO NOTHING",
-    ).bind(zone, zone, now).run();
-    await env.DB.prepare("UPDATE sources SET zone = ? WHERE name = ?").bind(zone, source).run();
-    const docs = await env.DB.prepare("UPDATE documents SET zone = ? WHERE source = ?")
-      .bind(zone, source).run();
-    const chunks = await env.DB.prepare("UPDATE chunks SET zone = ? WHERE source = ?")
-      .bind(zone, source).run();
+    // sources.zone is the authorization authority used by both reads and
+    // writes. Keep its small mutation atomic with zone registration, and make
+    // the insert conditional so a typo cannot create an orphan zone. Existing
+    // document and chunk projections are repaired in bounded pages: a mature
+    // source can contain millions of chunks, so one unbounded UPDATE would
+    // exceed a Worker request. Repeating the same idempotent command converges
+    // old rows, while migration 0033 keeps newly inserted rows in step.
+    const results = await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO zones (zone, label, created_at)
+         SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM sources WHERE name = ?)
+         ON CONFLICT(zone) DO NOTHING`,
+      ).bind(zone, zone, now, source),
+      env.DB.prepare("UPDATE sources SET zone = ? WHERE name = ?").bind(zone, source),
+      env.DB.prepare(
+        `UPDATE documents SET zone = ?
+          WHERE doc_uid IN (
+            SELECT doc_uid FROM documents
+             WHERE source = ? AND deleted_at IS NULL AND zone IS NOT ?
+               AND EXISTS (SELECT 1 FROM sources WHERE name = ?)
+             ORDER BY doc_uid LIMIT ${ZONE_PROJECTION_REPAIR_BATCH_SIZE}
+          )`,
+      ).bind(zone, source, zone, source),
+      env.DB.prepare(
+        `UPDATE chunks SET zone = ?
+          WHERE id IN (
+            SELECT id FROM chunks
+             WHERE source = ? AND zone IS NOT ?
+               AND EXISTS (SELECT 1 FROM sources WHERE name = ?)
+             ORDER BY id LIMIT ${ZONE_PROJECTION_REPAIR_BATCH_SIZE}
+          )`,
+      ).bind(zone, source, zone, source),
+      env.DB.prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM documents WHERE source = ? AND deleted_at IS NULL) AS documents,
+           (SELECT COUNT(*) FROM chunks WHERE source = ?) AS chunks,
+           (SELECT COUNT(*) FROM documents WHERE source = ? AND deleted_at IS NULL AND zone IS NOT ?) AS projection_documents,
+           (SELECT COUNT(*) FROM chunks WHERE source = ? AND zone IS NOT ?) AS projection_chunks`,
+      ).bind(source, source, source, zone, source, zone),
+    ]);
+    const sourceUpdate = results?.[1];
+    if (Number(sourceUpdate?.meta?.changes || 0) !== 1) {
+      const error = new Error("source is not registered");
+      error.code = "ZONE_SOURCE_NOT_FOUND";
+      throw error;
+    }
+    const repairedDocuments = Number(results?.[2]?.meta?.changes || 0);
+    const repairedChunks = Number(results?.[3]?.meta?.changes || 0);
+    const counts = results?.[4]?.results?.[0] || {};
+    const projectionDocuments = Number(counts.projection_documents || 0);
+    const projectionChunks = Number(counts.projection_chunks || 0);
     return {
       source,
       zone,
-      documents: docs?.meta?.changes ?? 0,
-      chunks: chunks?.meta?.changes ?? 0,
+      documents: Number(counts.documents || 0),
+      chunks: Number(counts.chunks || 0),
+      projection_repaired: {
+        documents: repairedDocuments,
+        chunks: repairedChunks,
+      },
+      projection_pending: {
+        documents: projectionDocuments,
+        chunks: projectionChunks,
+      },
+      projection_repair_required: projectionDocuments > 0 || projectionChunks > 0,
     };
   } catch (error) {
     guard(error);
@@ -542,9 +600,25 @@ export async function assignZone(env, { source, zone }) {
 export async function listZones(env) {
   try {
     const { results } = await env.DB.prepare(
-      `SELECT COALESCE(c.zone, '(unzoned)') AS zone, COUNT(*) AS chunks,
-              COUNT(DISTINCT c.source) AS sources
-         FROM chunks c GROUP BY COALESCE(c.zone, '(unzoned)') ORDER BY chunks DESC`,
+      `WITH document_counts AS (
+         SELECT source, COUNT(*) AS documents
+           FROM documents
+          WHERE deleted_at IS NULL
+          GROUP BY source
+       ), chunk_counts AS (
+         SELECT source, COUNT(*) AS chunks
+           FROM chunks
+          GROUP BY source
+       )
+       SELECT COALESCE(s.zone, '(unzoned)') AS zone,
+              COUNT(*) AS sources,
+              COALESCE(SUM(d.documents), 0) AS documents,
+              COALESCE(SUM(c.chunks), 0) AS chunks
+         FROM sources s
+         LEFT JOIN document_counts d ON d.source = s.name
+         LEFT JOIN chunk_counts c ON c.source = s.name
+        GROUP BY COALESCE(s.zone, '(unzoned)')
+        ORDER BY chunks DESC, zone`,
     ).all();
     return results || [];
   } catch (error) {
@@ -552,8 +626,22 @@ export async function listZones(env) {
   }
 }
 
+/** Zone names that currently protect at least one registered source. */
+export async function assignedZoneNames(env) {
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT DISTINCT zone FROM sources
+        WHERE zone IS NOT NULL AND trim(zone) != ''
+        ORDER BY zone`,
+    ).all();
+    return (results || []).map((row) => row.zone);
+  } catch (error) {
+    guard(error);
+  }
+}
+
 export async function sourcesInScope(env, scope) {
-  if (!scope || scope.all === true) {
+  if (scopeIsUnrestricted(scope)) {
     try {
       const { results } = await env.DB.prepare("SELECT name FROM sources").all();
       return (results || []).map((row) => row.name);
@@ -562,8 +650,21 @@ export async function sourcesInScope(env, scope) {
     }
   }
   const include = Array.isArray(scope.zones) ? scope.zones.filter(Boolean) : [];
-  if (!include.length) return [];
   const exclude = Array.isArray(scope.exclude) ? scope.exclude.filter(Boolean) : [];
+  if (scope.all === true) {
+    // Invalid exclusions must not turn an explicitly scoped grant into all.
+    if (!exclude.length) return [];
+    try {
+      const sql =
+        `SELECT name FROM sources ` +
+        `WHERE zone IS NOT NULL AND trim(zone) != '' AND zone NOT IN (${exclude.map(() => "?").join(",")})`;
+      const { results } = await env.DB.prepare(sql).bind(...exclude).all();
+      return (results || []).map((row) => row.name);
+    } catch (error) {
+      guard(error);
+    }
+  }
+  if (!include.length) return [];
   try {
     const inList = include.map(() => "?").join(",");
     let sql = `SELECT name FROM sources WHERE zone IN (${inList})`;

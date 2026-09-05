@@ -30,9 +30,17 @@
 import * as d1 from "./store-d1.js";
 import { embedText, supabaseRpc } from "./supabase.js";
 import { sanitizeEnvelope, sanitizeSensitiveLinks } from "./secret-scan.js";
+import { scopeIsUnrestricted } from "./grants.js";
+import { parseCanonicalEvidenceDate } from "./query-intent.js";
 
 export const D1 = "d1";
 export const SUPABASE = "supabase";
+
+const exactOccurredAt = (value, dateSource) =>
+  dateSource === "calendar:event_start" && typeof value === "string" && value.includes("T") &&
+    parseCanonicalEvidenceDate(value) !== null
+    ? value
+    : null;
 
 export function backendOf(env) {
   const declared = (env.STORAGE || "").toLowerCase();
@@ -396,7 +404,7 @@ const d1Backend = {
 
   async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60, access = null, scope = null }) {
     let embedding = null;
-    if (access?.kind !== "grant" && (!scope || scope.all === true)) {
+    if (access?.kind !== "grant" && scopeIsUnrestricted(scope)) {
       try {
         embedding = await embedText(env, query);
       } catch {
@@ -429,6 +437,12 @@ const d1Backend = {
           top_folder: x.top_folder ?? null,
           platform: x.platform ?? null,
           ts: x.document_date ? new Date(Number(x.document_date)).toISOString() : null,
+          // Some sources keep a precise event instant in metadata while the
+          // citation date intentionally stays on its local calendar day.
+          // Metadata is deliberately not part of the public retrieval shape.
+          // Emit only the canonical exact instant needed for same-day ordering,
+          // never an arbitrary value stored under a provider's `start` key.
+          occurred_at: exactOccurredAt(x.occurred_at, x.date_source),
           date_reliable: x.date_reliable === true || x.date_reliable === 1 || x.date_reliable === "1",
           date_source: x.date_source || null,
           // How this evidence was READ. Travels beside how it was DATED,
@@ -808,7 +822,7 @@ const d1Backend = {
 
 const supabaseBackend = {
   async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60, access = null, scope = null }) {
-    if (access?.kind === "grant" || (scope && scope.all !== true)) {
+    if (access?.kind === "grant" || !scopeIsUnrestricted(scope)) {
       return {
         results: [],
         degraded: "document-access-unavailable",

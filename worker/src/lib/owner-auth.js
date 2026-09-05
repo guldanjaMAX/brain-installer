@@ -29,7 +29,7 @@ import {
   sessionGeneration, bumpSessionGeneration,
   recordPasskeySecurityEvent, passkeySecurityStatus,
   randomToken, createGrant, addGrantCredential, listGrants, revokeGrant,
-  assignZone, listZones, findGrantById,
+  assignZone, assignedZoneNames, listZones, findGrantById,
 } from "./auth-store.js";
 import {
   CAPABILITIES, OWNER_CAPABILITIES, parseCapabilities, parseScope, grantIsLive, hashToken,
@@ -245,14 +245,38 @@ export async function handleAdminGrants(env, request, path) {
     if (expiresAt !== null && (!Number.isFinite(expiresAt) || expiresAt <= Date.now())) {
       return jsonResponse({ error: "expires_at must be a future unix ms timestamp, or null" }, 400);
     }
-    const zones = Array.isArray(payload?.zones)
-      ? payload.zones.map((zone) => String(zone).trim()).filter(Boolean)
-      : null;
-    const exclude = Array.isArray(payload?.exclude_zones)
-      ? payload.exclude_zones.map((zone) => String(zone).trim()).filter(Boolean)
-      : [];
+    const zoneName = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+    if (payload?.zones !== undefined && payload?.zones !== null && !Array.isArray(payload.zones)) {
+      return jsonResponse({ error: "zones must be an array of zone names, or omitted to mean every zone" }, 400);
+    }
+    if (payload?.exclude_zones !== undefined && payload?.exclude_zones !== null
+      && !Array.isArray(payload.exclude_zones)) {
+      return jsonResponse({ error: "exclude_zones must be an array of zone names" }, 400);
+    }
+    const rawZones = Array.isArray(payload?.zones) ? payload.zones : null;
+    const rawExclude = Array.isArray(payload?.exclude_zones) ? payload.exclude_zones : [];
+    if (rawZones?.some((zone) => typeof zone !== "string" || !zoneName.test(zone.trim()))
+      || rawExclude.some((zone) => typeof zone !== "string" || !zoneName.test(zone.trim()))) {
+      return jsonResponse({
+        error: "zone names use lowercase letters, digits, dashes or underscores, up to 64 characters",
+      }, 400);
+    }
+    const zones = rawZones ? [...new Set(rawZones.map((zone) => zone.trim()))] : null;
+    const exclude = [...new Set(rawExclude.map((zone) => zone.trim()))];
     if (zones && zones.length === 0) {
       return jsonResponse({ error: "zones was given but empty; omit it to mean every zone" }, 400);
+    }
+    const requestedZones = [...new Set([...(zones || []), ...exclude])];
+    if (requestedZones.length) {
+      const assigned = new Set(await assignedZoneNames(env));
+      const unknown = requestedZones.filter((zone) => !assigned.has(zone));
+      if (unknown.length) {
+        return jsonResponse({
+          error: "every included or excluded zone must already be assigned to a registered source",
+          code: "unknown_zone",
+          unknown_zones: unknown,
+        }, 400);
+      }
     }
     const grantId = `g_${randomToken(8)}`.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
     const token = randomToken(32);
@@ -273,6 +297,8 @@ export async function handleAdminGrants(env, request, path) {
       capabilities,
       expires_at: expiresAt,
       zones: zones || "all",
+      exclude_zones: exclude,
+      scope: zones ? { zones, exclude } : { all: true, exclude },
       token,
       note: "This token is shown once and is not recoverable. Share it over a channel you trust.",
     });
@@ -291,7 +317,17 @@ export async function handleZones(env, request) {
         error: "a zone name uses lowercase letters, digits, dashes or underscores, up to 64 characters",
       }, 400);
     }
-    return jsonResponse(await assignZone(env, { source, zone }));
+    try {
+      return jsonResponse(await assignZone(env, { source, zone }));
+    } catch (error) {
+      if (error?.code === "ZONE_SOURCE_NOT_FOUND") {
+        return jsonResponse({
+          error: "source is not registered",
+          code: "zone_source_not_found",
+        }, 404);
+      }
+      throw error;
+    }
   }
   return jsonResponse({ zones: await listZones(env) });
 }

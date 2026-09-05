@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ApiError, api, type Answer, type GrantPrincipal } from "../lib/api";
+import { ApiError, api, type Answer, type Citation, type GrantPrincipal } from "../lib/api";
 // Shared with the Worker: the rule that an incomplete search must never render
 // as an absence is a product rule, not a rendering detail, so both surfaces
 // derive it from one module instead of each writing their own.
@@ -8,6 +8,60 @@ import { Attention, TruthNote } from "./ui";
 import { FinanceScopeBar, useFinanceScope } from "./FinanceScope";
 import { scopedAnswerLabel } from "../lib/owner";
 import { scopedRetrievalConfirmed } from "../lib/security";
+import { sourceLabel } from "../lib/words";
+
+/** Citation timestamps are normalized to UTC by the retrieval API. Format the
+ *  stored calendar day in UTC so a midnight value cannot move to yesterday in
+ *  browsers west of UTC. */
+function citationDateLabel(ts: string | null | undefined, reliable?: boolean): string | null {
+  if (!ts) return null;
+  const ms = Date.parse(ts);
+  if (!Number.isFinite(ms)) return null;
+  const date = new Date(ms);
+  const sameYear = date.getUTCFullYear() === new Date().getUTCFullYear();
+  const text = date.toLocaleDateString(undefined, {
+    month: "short", day: "numeric", ...(sameYear ? {} : { year: "numeric" }), timeZone: "UTC",
+  });
+  return reliable === true ? text : `around ${text}`;
+}
+
+/** Keep the evidence quality beside the citation it qualifies. Older Workers
+ *  omitted these optional fields, so missing date trust remains uncertain. */
+export function citationMeta(citation: Citation): string {
+  const parts: string[] = [];
+  if (citation.source) parts.push(sourceLabel(citation.source));
+  const date = citationDateLabel(citation.ts, citation.date_reliable);
+  if (date) parts.push(date);
+  if (citation.text_source === "ocr_partial") {
+    parts.push("OCR text may be incomplete");
+  } else if (citation.text_source === "ocr") {
+    parts.push("OCR text, verify key details");
+  } else if (citation.text_reliable === false) {
+    parts.push("Text may be incomplete");
+  }
+  return parts.join(" · ");
+}
+
+export function CitationSources({ citations }: { citations: Citation[] }) {
+  return (
+    <div className="mt-4 pt-4 border-t border-line">
+      <h2 className="text-[12px] uppercase tracking-wider text-ink-soft font-semibold">
+        Sources
+      </h2>
+      <ul className="mt-2 space-y-1.5">
+        {citations.map((citation) => {
+          const meta = citationMeta(citation);
+          return (
+            <li key={citation.n} className="text-[13.5px] text-ink-soft leading-snug">
+              <span className="text-accent font-medium">[{citation.n}]</span> {citation.title}
+              {meta && <span className="block pl-7 text-[12.5px] opacity-75">{meta}</span>}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
 
 /** Turn the Worker's evidence decision into one short sentence beside the answer. */
 export function evidenceGateNote(answer: Answer): string | null {
@@ -150,21 +204,7 @@ export function Ask() {
           <p className="whitespace-pre-wrap leading-relaxed">{answerText(answer)}</p>
           <EvidenceGateReason answer={answer} />
           <Trust answer={answer} />
-          {!!answer.citations?.length && (
-            <div className="mt-4 pt-4 border-t border-line">
-              <h2 className="text-[12px] uppercase tracking-wider text-ink-soft font-semibold">
-                Sources
-              </h2>
-              <ul className="mt-2 space-y-1.5">
-                {answer.citations.map((c) => (
-                  <li key={c.n} className="text-[13.5px] text-ink-soft leading-snug">
-                    <span className="text-accent font-medium">[{c.n}]</span> {c.title}
-                    {c.ts && <span className="opacity-70"> · {String(c.ts).slice(0, 10)}</span>}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
+          {!!answer.citations?.length && <CitationSources citations={answer.citations} />}
         </article>
       )}
       </div>
@@ -253,19 +293,7 @@ export function ScopedAsk({ principal, onAccessEnded }: {
             <p className="whitespace-pre-wrap leading-relaxed">{answerText(answer)}</p>
             <EvidenceGateReason answer={answer} />
             <Trust answer={answer} />
-            {!!answer.citations?.length && (
-              <div className="mt-4 pt-4 border-t border-line">
-                <h2 className="text-[12px] uppercase tracking-wider text-ink-soft font-semibold">Sources</h2>
-                <ul className="mt-2 space-y-1.5">
-                  {answer.citations.map((citation) => (
-                    <li key={citation.n} className="text-[13.5px] text-ink-soft leading-snug">
-                      <span className="text-accent font-medium">[{citation.n}]</span> {citation.title}
-                      {citation.ts && <span className="opacity-70"> · {String(citation.ts).slice(0, 10)}</span>}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
+            {!!answer.citations?.length && <CitationSources citations={answer.citations} />}
           </article>
         )}
       </div>

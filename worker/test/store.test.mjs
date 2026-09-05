@@ -14,6 +14,42 @@ check("vectorize and no supabase infers d1", backendOf({ VECTORIZE: {} }) === D1
 check("supabase creds infer supabase", backendOf({ SUPABASE_URL: "x" }) === SUPABASE);
 check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo", SUPABASE_URL: "x" }) === SUPABASE);
 
+/* ---- all-minus-one-zone remains scoped in both storage adapters ---- */
+{
+  let embeddings = 0;
+  let vectorQueries = 0;
+  const row = {
+    chunk_uid: "books:one#0", doc_uid: "books:one", source_id: "one",
+    text: "permitted text", source: "books", title: "Permitted",
+  };
+  const env = {
+    STORAGE: "d1",
+    AI: { run: async () => { embeddings++; return { data: [[0.1]] }; } },
+    VECTORIZE: { query: async () => { vectorQueries++; return { matches: [] }; } },
+    DB: {
+      prepare: () => ({
+        bind: () => ({ all: async () => ({ results: [row] }) }),
+      }),
+    },
+  };
+  const result = await storeFor(env).search(env, {
+    query: "permitted", limit: 5, scope: { all: true, exclude: ["medical"] },
+  });
+  check("D1 all-with-exclusions stays keyword-only and is labelled as zone-scoped",
+    embeddings === 0 && vectorQueries === 0 && result.degraded === "scoped-vector" &&
+      result.degraded_reason === "zone-scope-keyword-only",
+    JSON.stringify({ embeddings, vectorQueries, degraded: result.degraded, reason: result.degraded_reason }));
+
+  const legacy = await storeFor({ STORAGE: "supabase" }).search(
+    { STORAGE: "supabase" },
+    { query: "permitted", limit: 5, scope: { all: true, exclude: ["medical"] } },
+  );
+  check("the Supabase rollback adapter refuses all-with-exclusions because it cannot enforce zones",
+    legacy.results.length === 0 && legacy.degraded === "document-access-unavailable" &&
+      legacy.degraded_reason === "zone-scope-requires-d1",
+    JSON.stringify(legacy));
+}
+
 /* ---- chunking: geometry must match the Drive indexer ---- */
 {
   const body = "x".repeat(5000);
@@ -75,7 +111,23 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
     VECTORIZE: { query: async () => ({ matches: [] }) },
     AI: { run: async () => ({ data: [[0.1, 0.2]] }) },
     DB: { prepare: () => ({ bind: () => ({ all: async () => ({ results: [
-      { chunk_uid: "curated:x#0", doc_uid: "curated:x", source_id: "x", text: "body", source: "curated", title: "T", document_date: 1750000000000 },
+      {
+        chunk_uid: "curated:x#0", doc_uid: "curated:x", source_id: "x", text: "body",
+        source: "curated", title: "T", document_date: 1750000000000,
+        date_source: "calendar:event_start",
+        occurred_at: "2025-06-15T09:00:00-07:00",
+      },
+      {
+        chunk_uid: "curated:y#0", doc_uid: "curated:y", source_id: "y", text: "body",
+        source: "curated", title: "Other", document_date: 1750000000000,
+        date_source: "calendar:event_start",
+        occurred_at: { private_provider_value: "must not become retrieval metadata" },
+      },
+      {
+        chunk_uid: "drive:z#0", doc_uid: "drive:z", source_id: "z", text: "body",
+        source: "drive", title: "Filename dated", document_date: 1750000000000,
+        date_source: "filename", occurred_at: "2025-06-15T23:59:59-07:00",
+      },
     ] }), first: async () => null, run: async () => ({}) }) }), batch: async () => {} },
   };
   const s = storeFor(env);
@@ -86,6 +138,14 @@ check("a nonsense value does not silently pick d1", backendOf({ STORAGE: "mongo"
     JSON.stringify(hit));
   check("the public ref is document-stable", hit.ref_key === "x" && hit.chunk_uid === "curated:x#0", JSON.stringify(hit));
   check("ts is an ISO document date, not an mtime", typeof hit.ts === "string" && hit.ts.startsWith("2025-"), String(hit.ts));
+  check("a precise occurrence survives beside the display date",
+    hit.occurred_at === "2025-06-15T09:00:00-07:00", JSON.stringify(hit));
+  const invalidOccurrence = r.results.find((row) => row.ref_key === "y");
+  check("arbitrary metadata.start values cannot enter the public occurrence field",
+    invalidOccurrence?.occurred_at === null, JSON.stringify(invalidOccurrence));
+  const filenameOccurrence = r.results.find((row) => row.ref_key === "z");
+  check("a valid metadata.start is not exposed without Calendar event-start provenance",
+    filenameOccurrence?.occurred_at === null, JSON.stringify(filenameOccurrence));
 }
 
 /* ---- a null document date must survive as null, never as "now" ---- */

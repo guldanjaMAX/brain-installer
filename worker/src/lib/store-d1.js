@@ -42,6 +42,7 @@ import {
   publicInstallSmokeContentHash,
 } from "./install-smoke.js";
 import { sourceReceiptOwnerMessage } from "./source-receipt.js";
+import { scopeIsUnrestricted } from "./grants.js";
 
 const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
@@ -301,9 +302,23 @@ export function documentAccessSql(access, chunkAlias = "c", documentAlias = "d",
 
 /** A coarse capability grant's zone boundary, applied where chunk text is read. */
 export function scopeSql(scope, alias = "c", nextParam = 1) {
-  if (!scope || scope.all === true) return { clause: "", params: [], nextParam };
+  if (scopeIsUnrestricted(scope)) return { clause: "", params: [], nextParam };
   const include = Array.isArray(scope.zones) ? scope.zones.filter(Boolean) : [];
   const exclude = Array.isArray(scope.exclude) ? scope.exclude.filter(Boolean) : [];
+  if (scope.all === true) {
+    // Reaching this branch with no usable exclusion means the scope was
+    // malformed. It must read nothing rather than silently become `all`.
+    if (!exclude.length) return { clause: " AND 1 = 0", params: [], nextParam };
+    const outList = exclude.map(() => `?${nextParam++}`).join(",");
+    return {
+      clause:
+        ` AND ${alias}.source IN (` +
+        `SELECT name FROM sources ` +
+        `WHERE zone IS NOT NULL AND trim(zone) != '' AND zone NOT IN (${outList}))`,
+      params: exclude,
+      nextParam,
+    };
+  }
   if (!include.length) return { clause: " AND 1 = 0", params: [], nextParam };
   const params = [];
   const inList = include.map(() => `?${nextParam++}`).join(",");
@@ -427,13 +442,15 @@ export async function searchKeyword(env, query, { limit, filters = {}, access = 
   if (!terms) return [];
 
   const f = filterSql(filters, "c", 3);
-  const sc = scopeSql(scope, "c", f.nextParam);
+  const sc = scopeSql(scope, "d", f.nextParam);
   const a = documentAccessSql(access, "c", "d", sc.nextParam);
   const sql = `
-    SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
+    SELECT c.chunk_uid, c.doc_uid, c.text, d.source AS source, c.title, c.document_date,
            c.client, c.category, c.top_folder, c.platform,
            d.source_id, d.uri, d.entity_slug, d.content_hash, d.date_source, d.date_reliable,
            d.text_source, d.text_reliable,
+           CASE WHEN d.date_source = 'calendar:event_start' AND json_valid(d.meta)
+                THEN json_extract(d.meta, '$.start') END AS occurred_at,
            bm25(chunks_fts) AS score
     FROM chunks_fts
     JOIN chunks c ON c.id = chunks_fts.rowid
@@ -499,19 +516,21 @@ export async function searchVector(env, embedding, { limit, filters = {}, scope 
   // hydration fail and search silently degrade to keyword-only. Partition ids
   // after reserving bind slots for every filter, then restore Vectorize order.
   const f0 = filterSql(filters, "c", 1);
-  const filterParameterCount = f0.params.length + scopeSql(scope, "c", f0.nextParam).params.length;
+  const filterParameterCount = f0.params.length + scopeSql(scope, "d", f0.nextParam).params.length;
   const hydrationBatchSize = Math.max(1, D1_QUERY_BIND_LIMIT - filterParameterCount);
   const results = [];
   for (let start = 0; start < resolved.length; start += hydrationBatchSize) {
     const batch = resolved.slice(start, start + hydrationBatchSize);
     const placeholders = batch.map((_, i) => "?" + (i + 1)).join(",");
     const f = filterSql(filters, "c", batch.length + 1);
-    const sc = scopeSql(scope, "c", f.nextParam);
+    const sc = scopeSql(scope, "d", f.nextParam);
     const { results: hydrated } = await env.DB.prepare(
-      `SELECT c.chunk_uid, c.doc_uid, c.text, c.source, c.title, c.document_date,
+      `SELECT c.chunk_uid, c.doc_uid, c.text, d.source AS source, c.title, c.document_date,
               c.client, c.category, c.top_folder, c.platform,
               d.source_id, d.uri, d.entity_slug, d.content_hash, d.date_source, d.date_reliable,
-              d.text_source, d.text_reliable
+              d.text_source, d.text_reliable,
+              CASE WHEN d.date_source = 'calendar:event_start' AND json_valid(d.meta)
+                   THEN json_extract(d.meta, '$.start') END AS occurred_at
        FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid
        WHERE c.chunk_uid IN (${placeholders})${f.clause}${sc.clause}`
     )
@@ -540,7 +559,7 @@ export async function search(env, {
 
   const [kw, vec, projection] = await Promise.all([
     searchKeyword(env, query, { limit: pool, filters, access, scope }).catch(() => []),
-    embedding && access?.kind !== "grant" && (!scope || scope.all === true)
+    embedding && access?.kind !== "grant" && scopeIsUnrestricted(scope)
       ? searchVector(env, embedding, { limit: pool, filters, scope }).catch(() => [])
       : Promise.resolve([]),
     // Vectorize may return some old/current candidates while a newer accepted
@@ -548,7 +567,7 @@ export async function search(env, {
     // not prove the complete D1 corpus is query-visible. Reuse the exact
     // readiness contract that gates health and acceptance so every answer
     // advertises partial projection instead of looking fully healthy.
-    embedding && access?.kind !== "grant" && (!scope || scope.all === true)
+    embedding && access?.kind !== "grant" && scopeIsUnrestricted(scope)
       ? vectorReadiness(env).catch(() => ({ ready: false }))
       : Promise.resolve(null),
   ]);
@@ -569,7 +588,7 @@ export async function search(env, {
   if (access?.kind === "grant") {
     degraded = "scoped-vector";
     degradedReason = "document-scope-keyword-only";
-  } else if (scope && scope.all !== true) {
+  } else if (!scopeIsUnrestricted(scope)) {
     degraded = "scoped-vector";
     degradedReason = "zone-scope-keyword-only";
   } else if (embedding && projection?.ready !== true) {
@@ -582,7 +601,7 @@ export async function search(env, {
     degraded = "no-embedding";
     degradedReason = "embedding-unavailable";
   }
-  if (filters.entity_slug && access?.kind !== "grant" && (!scope || scope.all === true)) {
+  if (filters.entity_slug && access?.kind !== "grant" && scopeIsUnrestricted(scope)) {
     degraded = "vector";
     degradedReason = "entity-vector-authority-unindexed";
   }
@@ -2003,6 +2022,64 @@ export async function diagnose(env, {
       title: `source "${r.name}" is registered but holds nothing`,
       detail: "Either it was never loaded, or a load failed and left no trace.",
       action: "Run its ingest, or remove the registration so it stops implying coverage that does not exist." });
+  });
+
+  await safe("zone_assignment", async () => {
+    const row = await q1(env,
+      `SELECT count(*) AS sources,
+              sum(CASE WHEN zone IS NULL OR trim(zone) = '' THEN 1 ELSE 0 END) AS unzoned,
+              sum(CASE WHEN zone IS NOT NULL AND trim(zone) != '' THEN 1 ELSE 0 END) AS zoned
+         FROM sources`);
+    const sources = Number(row?.sources || 0);
+    const unzoned = Number(row?.unzoned || 0);
+    const zoned = Number(row?.zoned || 0);
+    // An owner-only brain does not need zones. Once one source is assigned,
+    // however, a partial assignment is an access-readiness gap rather than an
+    // implicit decision that the remaining sources belong to the owner only.
+    if (!zoned) return;
+    if (unzoned) {
+      add({ id: "zone_assignment", area: "coverage", severity: "warn", count: unzoned,
+        title: `${unzoned} of ${sources} source(s) have no zone assignment`,
+        detail: "Unzoned sources remain owner-only and are excluded from every named zone grant. A partially zoned corpus can therefore look complete to the owner while a scoped person cannot search most of it.",
+        action: "Run `brain sources <manifest>` to review the registered sources, then assign each intended source with `brain zone <manifest> --source NAME --zone ZONE`." });
+      return;
+    }
+    add({ id: "zone_assignment", area: "coverage", severity: "ok", count: sources,
+      title: `all ${sources} registered source(s) have a zone assignment`,
+      detail: "Every registered source participates in the coarse grant boundary.", action: null });
+  });
+
+  await safe("zone_projection", async () => {
+    const row = await q1(env,
+      `SELECT
+         (SELECT count(*)
+            FROM documents d JOIN sources s ON s.name = d.source
+           WHERE d.deleted_at IS NULL AND d.zone IS NOT s.zone) AS documents,
+         (SELECT count(*)
+            FROM chunks c JOIN sources s ON s.name = c.source
+           WHERE c.zone IS NOT s.zone) AS chunks,
+         (SELECT count(*) FROM sources
+           WHERE zone IS NOT NULL AND trim(zone) != '') AS zoned_sources`);
+    if (!Number(row?.zoned_sources || 0)) return;
+    const documents = Number(row?.documents || 0);
+    const chunks = Number(row?.chunks || 0);
+    if (!documents && !chunks) return;
+    add({ id: "zone_projection", area: "integrity", severity: "warn", count: documents + chunks,
+      title: `zone projection is behind for ${documents} document(s) and ${chunks} chunk(s)`,
+      detail: "Access still follows the registered source's zone, so this drift does not widen a scoped grant. The denormalized document and chunk fields are not ready to become authorization inputs until the legacy rows are repaired.",
+      action: "Keep retrieval source-authoritative. Rerun `brain zone <manifest> --source NAME --zone ZONE` for each assigned source; every pass repairs at most 1,000 documents and 1,000 chunks. Repeat until the command reports no pending rows, then rerun `brain diagnose <manifest>`." });
+  });
+
+  await safe("chunk_document_source_mismatch", async () => {
+    const count = Number((await q1(env,
+      `SELECT count(*) AS n
+         FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid
+        WHERE c.source IS NOT d.source`))?.n || 0);
+    if (!count) return;
+    add({ id: "chunk_document_source_mismatch", area: "integrity", severity: "warn", count,
+      title: `${count} chunk(s) disagree with their owning document's source`,
+      detail: "Authorization follows the document source, so this drift does not widen access. Source filters and provenance can still be misleading until the chunk projection is repaired.",
+      action: "Reingest the affected registered source. If the mismatch remains, run `brain update <manifest>` before relying on source-filtered results." });
   });
 
   /* ---------------- INTEGRITY: is it stored correctly ---------------- */

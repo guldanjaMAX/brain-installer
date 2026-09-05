@@ -61,9 +61,9 @@ const chunk = (db, uid, docUid, text = "some text", ix = null) =>
   db.prepare(`INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source) VALUES (?,?,?,?,?)`)
     .run(uid, docUid, ix === null ? _ix++ : ix, text, "documents");
 
-const source = (db, name) =>
-  db.prepare(`INSERT INTO sources (name, kind, status, created_at) VALUES (?,?,?,?)`)
-    .run(name, "upload", "ready", new Date().toISOString());
+const source = (db, name, zone = null) =>
+  db.prepare(`INSERT INTO sources (name, kind, status, created_at, zone) VALUES (?,?,?,?,?)`)
+    .run(name, "upload", "ready", new Date().toISOString(), zone);
 
 const find = (r, id) => (r.findings || []).find((f) => f.id === id);
 
@@ -147,6 +147,50 @@ const find = (r, id) => (r.findings || []).find((f) => f.id === id);
   source(env._db, "gmail");
   const f = find(await diagnose(env), "empty_source");
   check("a registered source holding nothing is caught", f?.severity === "warn", JSON.stringify(f));
+}
+
+/* ---- once zoning starts, a partially assigned source registry is visible ---- */
+{
+  const env = makeEnv({ vectorCount: 1 });
+  source(env._db, "documents", "books");
+  source(env._db, "archive");
+  doc(env._db, "d1"); chunk(env._db, "d1#0", "d1");
+  const f = find(await diagnose(env), "zone_assignment");
+  check("a partially zoned source registry is caught", f?.severity === "warn" && f.count === 1, JSON.stringify(f));
+  check("the zone assignment finding stays aggregate-only",
+    f && !("samples" in f) && !/\"documents\"|\"archive\"/.test(JSON.stringify(f)), JSON.stringify(f));
+  check("and it names the commands that complete the assignment",
+    /brain sources/.test(f?.action || "") && /brain zone/.test(f?.action || ""), f?.action);
+}
+
+/* ---- legacy row projections cannot silently look ready for row-local auth ---- */
+{
+  const env = makeEnv({ vectorCount: 1 });
+  source(env._db, "documents", "books");
+  doc(env._db, "d1"); chunk(env._db, "d1#0", "d1");
+  env._db.prepare("UPDATE documents SET zone = NULL WHERE doc_uid = 'd1'").run();
+  env._db.prepare("UPDATE chunks SET zone = NULL WHERE chunk_uid = 'd1#0'").run();
+  const r = await diagnose(env);
+  const f = find(r, "zone_projection");
+  check("document and chunk zone projection drift is counted", f?.severity === "warn" && f.count === 2, JSON.stringify(f));
+  check("the finding states that current source authorization remains intact",
+    /does not widen/.test(f?.detail || "") && /source-authoritative/.test(f?.action || ""), JSON.stringify(f));
+  check("projection drift makes the overall diagnosis usable with gaps",
+    r.verdict === "usable_with_gaps", r.verdict);
+}
+
+/* ---- a chunk cannot silently claim a different source than its document ---- */
+{
+  const env = makeEnv({ vectorCount: 1 });
+  source(env._db, "documents", "books");
+  source(env._db, "medical", "medical");
+  doc(env._db, "d1"); chunk(env._db, "d1#0", "d1");
+  env._db.prepare("UPDATE chunks SET source = 'medical' WHERE chunk_uid = 'd1#0'").run();
+  const f = find(await diagnose(env), "chunk_document_source_mismatch");
+  check("chunk and document source drift is caught",
+    f?.severity === "warn" && f.count === 1, JSON.stringify(f));
+  check("the mismatch finding states that document-source authorization still holds",
+    /does not widen access/.test(f?.detail || "") && /Reingest/.test(f?.action || ""), JSON.stringify(f));
 }
 
 /* ---- chunks whose document is gone ---- */

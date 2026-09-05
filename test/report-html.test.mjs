@@ -71,7 +71,7 @@ const goodSeeds = [
     answer:
       "The contract was ended in March after two missed delivery windows [1]. Billing disputes over the second invoice were the trigger [2].\n\nHeads up: the newest source here is 41 days old.",
     citations: [
-      { n: 1, title: "Vendor review call", source: "meeting", ref: "meetings/2026-03-04", ts: "2026-03-04T00:00:00Z" },
+      { n: 1, title: "Vendor review call", source: "meeting", ref: "meetings/2026-03-04", ts: "2026-03-04T00:00:00Z", date_reliable: false, text_source: "ocr_partial", text_reliable: false },
       { n: 2, title: "Invoice dispute thread", source: "message", ref: "gmail/18f2", ts: "2026-03-11T00:00:00Z" },
     ],
     gaps: [{ type: "stale", detail: "Newest source is 41 days old." }],
@@ -117,6 +117,11 @@ const cleanReport = renderReportHtml({
   base: "https://brain.acme.com",
   generatedAt: new Date("2026-08-16T12:00:00Z"),
 });
+
+check("citation date and extraction provenance is visible",
+  has(cleanReport, "possible date 2026-03-04") && has(cleanReport, "OCR text may be incomplete"));
+check("a legacy citation without date trust stays uncertain",
+  has(cleanReport, "possible date 2026-03-11"));
 
 /* ---------------------------------------------------- 1. escaping works */
 
