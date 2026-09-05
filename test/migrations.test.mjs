@@ -873,6 +873,22 @@ check("restart guard refuses an existing migration column with the wrong contrac
     JSON.stringify({ failed, failedSource, successfulAt }));
   check("the real source registry keeps the logical count and failure reason",
     failedSource.document_count === 2 && /Drive API unavailable/.test(failedSource.stale_reason || ""), JSON.stringify(failedSource));
+
+  const review = await (await post({
+    source: "drive", kind: "drive", status: "error", run_id: "real_run_review",
+    lane: "incremental", issue_code: "SAFETY_REVIEW_REQUIRED",
+  })).json();
+  const reviewFreshness = await (await worker.fetch(new Request("https://brain.example/api/admin/brain/freshness", {
+    headers: { "X-Admin-Key": "k" },
+  }), env, {})).json();
+  check("a real safety-review receipt retains its stable issue code",
+    review.issue_code === "SAFETY_REVIEW_REQUIRED" &&
+      db.prepare("SELECT stale_reason FROM sources WHERE name='drive'").get().stale_reason === "SAFETY_REVIEW_REQUIRED",
+    JSON.stringify(review));
+  check("the real freshness route presents a safety stop as review instead of broken",
+    reviewFreshness.sources?.[0]?.state === "review" &&
+      /paused for a safety review/i.test(reviewFreshness.sources[0].reason || ""),
+    JSON.stringify(reviewFreshness));
 }
 
 console.log(fail ? `\n${fail} FAILURES` : `\nmigrations: all ${ran} checks passed`);

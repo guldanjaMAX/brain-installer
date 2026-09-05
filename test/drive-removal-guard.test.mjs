@@ -423,6 +423,11 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     assert.equal(evidence.removalRequests, 0, "an unapproved plan made a removal write");
     assert.equal(evidence.reconciliationRequests, 0, "an unapproved plan made a reconciliation write");
     assert.equal(evidence.ingestBatchWrites, 0, "the empty Drive walk unexpectedly wrote an ingest batch");
+    assert.deepEqual(evidence.lastErrorReceipt, {
+      issue_code: "SAFETY_REVIEW_REQUIRED",
+      has_error: false,
+      has_detail: false,
+    }, "the real Drive catch did not preserve the safety stop as a private-text-free review receipt");
 
     const wrongApproval = `${initialApproval.slice(0, -1)}${initialApproval.endsWith("0") ? "1" : "0"}`;
     const wrong = run(["--approve-removals", wrongApproval]);

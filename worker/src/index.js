@@ -1213,6 +1213,7 @@ async function handleIngestBatch(env, request, scope = { all: true }) {
 
 const SOURCE_RECEIPT_STATUSES = new Set(["indexing", "ready", "error"]);
 const SOURCE_RUN_LANES = new Set(["incremental", "sweep", "manual"]);
+const SOURCE_REVIEW_ISSUE_CODE = "SAFETY_REVIEW_REQUIRED";
 const SOURCE_KINDS = new Set([
   "drive", "gmail", "calendar", "imessage", "whatsapp", "zoom",
   // A one-time history load out of an iPhone backup. Deliberately its own
@@ -1324,8 +1325,12 @@ async function handleSourceReceipt(env, request) {
   // false drift for both large files and message exports.
   const documents = Number(countRow?.logical_documents || 0);
   const storedDocuments = Number(countRow?.stored_documents || 0);
+  const reviewRequired = status === "error" &&
+    String(body?.issue_code || "").trim().toUpperCase() === SOURCE_REVIEW_ISSUE_CODE;
   const errorReason = status === "error"
-    ? String(body?.error || body?.reason || detail || "sync failed").replace(/\s+/g, " ").slice(0, 500)
+    ? reviewRequired
+      ? SOURCE_REVIEW_ISSUE_CODE
+      : String(body?.error || body?.reason || detail || "sync failed").replace(/\s+/g, " ").slice(0, 500)
     : null;
   const walkComplete = body?.walk_complete === true || (
     status === "ready" && body?.walk_complete === undefined && body?.complete_sweep === true
@@ -1389,7 +1394,7 @@ async function handleSourceReceipt(env, request) {
     source, kind, status, documents, logical_documents: documents,
     stored_documents: storedDocuments, completed_at: completedAt,
     ...(runId ? { run_id: runId } : {}),
-    ...(errorReason ? { error: errorReason } : {}),
+    ...(reviewRequired ? { issue_code: SOURCE_REVIEW_ISSUE_CODE } : errorReason ? { error: errorReason } : {}),
   });
 }
 
@@ -1617,9 +1622,10 @@ export default {
     }
 
     // Owner surface: /app and the passkey ceremonies sit in FRONT of the key
-    // gate — their auth is the ceremony itself, or the session cookie a
-    // ceremony earned. Nothing routed there reaches past the read-only
-    // privilege class (see owner-auth.mjs).
+    // gate because their auth is the ceremony itself or the session cookie it
+    // earned. That cookie is a write-capable owner credential for the guarded
+    // owner routes below. It does not bypass /api/admin routes or execute corpus
+    // deletion without a fresh passkey ceremony (see owner-auth.js).
     // /brand/* is deliberately public and unauthenticated: it is the link
     // preview image, and the scraper that fetches it holds no credential.
     // It sat behind the key gate at first, so every shared invite would have

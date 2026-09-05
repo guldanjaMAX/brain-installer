@@ -874,6 +874,22 @@ const call = (env, path) => {
   check("a failed receipt closes the sync run with its error",
     seen.sql.some((sql) => /INSERT INTO sync_runs[\s\S]*finished_at[\s\S]*error/.test(sql)), JSON.stringify(seen.sql));
 
+  const review = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
+    method: "POST",
+    headers: { "X-Admin-Key": "k", "content-type": "application/json" },
+    body: JSON.stringify({
+      source: "drive", kind: "drive", status: "error", run_id: "run_drive_review",
+      lane: "incremental", issue_code: "SAFETY_REVIEW_REQUIRED",
+    }),
+  }), env, {});
+  const reviewBody = await review.json();
+  const reviewSourceBind = seen.binds.find((values) =>
+    values.length === 5 && values.at(-1) === "SAFETY_REVIEW_REQUIRED");
+  check("a safety-review receipt preserves its review semantics for freshness",
+    review.status === 200 && reviewBody.issue_code === "SAFETY_REVIEW_REQUIRED" &&
+      !("error" in reviewBody) && !!reviewSourceBind,
+    JSON.stringify({ reviewBody, reviewSourceBind }));
+
   const generated = await worker.fetch(new Request("https://b.example/api/admin/brain/source-receipt", {
     method: "POST",
     headers: { "X-Admin-Key": "k", "content-type": "application/json" },

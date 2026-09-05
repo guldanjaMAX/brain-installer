@@ -8,10 +8,11 @@
  * passkey reference on every use makes deleting one passkey invalidate only
  * that passkey's cookies immediately.
  *
- * A session carries exactly the read-only privilege class (the two retrieval
- * routes plus the owner's own device screen). It can never ingest, purge,
- * reindex, drain, or reach admin routes — a stolen cookie is a reading
- * credential with an expiry, nothing more.
+ * An owner session authenticates retrieval, the owner app and device controls,
+ * financial views, and guarded owner writes such as document upload. It never
+ * bypasses /api/admin routes, and destructive corpus execution also requires a
+ * dedicated fresh-passkey ceremony. Treat the cookie as a write-capable owner
+ * credential until it expires or its passkey or session is revoked.
  */
 
 const te = new TextEncoder();

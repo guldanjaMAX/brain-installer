@@ -64,6 +64,22 @@ const DAILY = 86400;
     g[0]?.type === "sync_broken" && /last sync reported an error/.test(g[0]?.detail || ""), JSON.stringify(g));
 }
 
+/* ---- a deliberate safety stop needs review; it is not a broken sync ---- */
+{
+  const rows = [{
+    name: "drive", kind: "drive", status: "error", last_ingest_at: daysAgo(0.1),
+    stale_reason: "SAFETY_REVIEW_REQUIRED", expected_refresh_seconds: DAILY,
+  }];
+  const f = await freshnessReport(mk(rows), { now: NOW });
+  check("a safety-review receipt is surfaced as review instead of broken",
+    f.sources[0]?.state === "review", JSON.stringify(f.sources[0]));
+  check("a safety-review source carries reviewed owner guidance",
+    /paused for a safety review/i.test(f.sources[0]?.reason || ""), JSON.stringify(f.sources[0]));
+  const g = await coverageGaps(mk(rows), { now: NOW });
+  check("a fresh source awaiting review does not invent a broken-coverage gap",
+    g.length === 0, JSON.stringify(g));
+}
+
 /* ---- a live run is distinct from a crashed or stuck run ---- */
 {
   const active = {

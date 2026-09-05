@@ -842,7 +842,7 @@ const DIAGNOSTIC_CODES = Object.freeze({
  * samples, paths, URLs, and actions have no field in this output shape. */
 export function supportSystemProjection(status) {
   const unavailableAllowlist = new Set(["health", "diagnose", "freshness", "vectors", "install_state"]);
-  const stateAllowlist = new Set(["ok", "never_synced", "stale", "broken", "indexing", "unknown"]);
+  const stateAllowlist = new Set(["ok", "never_synced", "stale", "broken", "review", "indexing", "unknown"]);
   const kindAllowlist = new Set([
     "upload", "drive", "message", "email", "calendar", "quickbooks", "slack",
     "notion", "microsoft", "dropbox", "hubspot",

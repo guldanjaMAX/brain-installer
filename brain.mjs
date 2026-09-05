@@ -367,6 +367,13 @@ const cloudflareTokenSession = new AsyncLocalStorage();
 function activeCloudflareToken() {
   if (process.env.CLOUDFLARE_API_TOKEN) return process.env.CLOUDFLARE_API_TOKEN;
   const scoped = cloudflareTokenSession.getStore();
+  // A Wrangler session is prepared for the whole invocation, but most routine
+  // commands never use Cloudflare's control plane. Announce it only when code
+  // actually asks for that credential, once, and keep JSON output clean.
+  if (scoped?.source === "wrangler-session" && !scoped.machineReadable && !scoped.announced) {
+    scoped.announced = true;
+    info("Cloudflare access is using the account signed in on this computer");
+  }
   return scoped ? scoped.buffer.toString("ascii") : null;
 }
 
@@ -426,23 +433,17 @@ export async function withWranglerSessionIfNeeded(run, options = {}) {
     token = null; // one credential source among several; absence is ordinary
   }
   if (!token) return run();
+  const machineReadable = (options.argv ?? process.argv).includes("--json");
   const holder = {
     buffer: Buffer.from(token, "ascii"),
     source: "wrangler-session",
+    machineReadable,
+    announced: false,
     renew: options.renewSessionToken ?? (() => {
       const read = options.readWranglerOAuthToken ?? readWranglerOAuthToken;
       return (options.refreshWranglerSession ?? refreshWranglerSession)() ? read() : null;
     }),
   };
-  // Name the identity, because wrangler authenticating as the wrong person is
-  // how an operator provisions into their own account instead of the client's,
-  // and it is silent when it happens.
-  //
-  // Never on a --json run. Machine-readable output is the whole contract of
-  // those commands, and one friendly line on stdout ahead of it turns a parsed
-  // object into a syntax error for whatever is reading it.
-  const machineReadable = (options.argv ?? process.argv).includes("--json");
-  if (!machineReadable) ok("using this computer's `wrangler login` session for Cloudflare");
   return cloudflareTokenSession.run(holder, async () => {
     try {
       return await run();
@@ -5397,6 +5398,7 @@ async function reportFreshness(m, acct, manifestPath) {
     ok: () => c.green("current"),
     stale: (s) => c.red(`STALE, ${s.days_since_ingest}d since last read`),
     broken: (s) => c.red(`BROKEN: ${s.reason || "the last sync failed"}`),
+    review: (s) => c.yellow(`REVIEW REQUIRED: ${s.reason || "the latest update paused for review"}`),
     indexing: (s) => c.yellow(`indexing, ${s.hours_indexing ?? 0}h elapsed`),
     never_synced: () => c.red("never synced"),
     unscheduled: () => c.yellow("no refresh scheduled"),
@@ -9870,12 +9872,17 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     // of lingering as a green or anonymous `indexing` row.
     if (runOpened && !runClosed) {
       try {
+        const reviewRequired = error instanceof DriveRemovalReviewRequired;
         await postSourceReceipt(base, adminKey, {
           source: sourceName, kind: which, status: "error", run_id: runId,
           lane, started_at: runStartedAt, completed_at: new Date().toISOString(),
           walk_complete: false, files_seen: scanned,
-          error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
-          detail: `${which} ${lane} sync aborted before its cursor could advance`,
+          ...(reviewRequired
+            ? { issue_code: "SAFETY_REVIEW_REQUIRED" }
+            : {
+                error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
+                detail: `${which} ${lane} sync aborted before its cursor could advance`,
+              }),
         });
         runClosed = true;
       } catch (receiptError) {
@@ -15938,8 +15945,22 @@ const commands = {
   technician: cmdTechnicianInteractive,
 };
 
-if (IS_MAIN && (!cmd || !commands[cmd])) {
-  console.log(`${c.bold("brain")} — provision and manage a client-owned brain install
+const HELP_ARGUMENTS = new Set(["--help", "-h", "help"]);
+const VERSION_ARGUMENTS = new Set(["--version", "-v", "version"]);
+const helpRequested = HELP_ARGUMENTS.has(cmd);
+const versionRequested = VERSION_ARGUMENTS.has(cmd);
+
+if (IS_MAIN && versionRequested) {
+  console.log(PRODUCT_VERSION);
+  process.exit(0);
+}
+
+if (IS_MAIN && (!cmd || helpRequested || !commands[cmd])) {
+  if (cmd && !helpRequested) {
+    const shownCommand = String(cmd).replace(/[^\x20-\x7e]/g, "?").slice(0, 80);
+    console.log(`Unknown command: ${shownCommand}\n`);
+  }
+  console.log(`${c.bold("brain")}: provision and manage a client-owned brain install
 
   install
     brain init       <manifest>            write the manifest and stop: no network, no token,
@@ -16051,7 +16072,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
   Provisioning and deployment require CLOUDFLARE_API_TOKEN. Routine source
   refresh and health commands use the brain's domain and admin key instead.
 `);
-  process.exit(cmd ? 1 : 0);
+  process.exit(cmd && !helpRequested ? 1 : 0);
 }
 
 if (IS_MAIN) {

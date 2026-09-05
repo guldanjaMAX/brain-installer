@@ -214,7 +214,7 @@ test("invite -> enroll -> sign in -> settings, end to end", async () => {
   }), testEnv);
   assert.equal(replay.status, 403, "challenges are single use");
 
-  // The session is exactly the read-only privilege class.
+  // The session opens owner retrieval but never substitutes for the admin key.
   const think = await worker.fetch(post("/api/rag/think", { q: "hello" }, { Cookie: cookie, "X-Brain-App": "1" }), testEnv);
   assert.notEqual(think.status, 401, "a session opens the read routes");
   const thinkNoHeader = await worker.fetch(post("/api/rag/think", { q: "hello" }, { Cookie: cookie }), testEnv);

@@ -4,10 +4,10 @@
  * Everything here serves the OWNER surface (/app): enrollment gated by a
  * single-use invite code or an existing session, sign-in by passkey
  * assertion, and a small device-management API. These routes sit in front of
- * the key gate because their auth IS the ceremony (or the session cookie a
- * ceremony earned) — but nothing here can reach past the read-only privilege
- * class: ingest, purge, reindex, drain and every /api/admin route still
- * demand the admin key.
+ * the key gate because their auth IS the ceremony or the session cookie a
+ * ceremony earned. That owner principal also reaches guarded owner writes such
+ * as document upload elsewhere in the router. It never bypasses /api/admin
+ * routes, and destructive corpus execution requires a fresh passkey ceremony.
  *
  * CSRF: session-authenticated requests must carry `X-Brain-App: 1` on top of
  * the SameSite=Strict cookie. Both are set only by the app page itself.

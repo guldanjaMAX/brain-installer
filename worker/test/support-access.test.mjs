@@ -973,11 +973,17 @@ test("support diagnostic projection strips raw canaries and unknown identifiers"
       },
       { id: "backlog", area: "integrity", severity: "warn", count: 2 },
     ],
-    sources: [{
-      label: canary, kind: canary, state: canary, documents: 3,
-      days_since_ingest: 1, reason: canary, name: canary, account_id: canary,
-      automatable: true,
-    }],
+    sources: [
+      {
+        label: canary, kind: canary, state: canary, documents: 3,
+        days_since_ingest: 1, reason: canary, name: canary, account_id: canary,
+        automatable: true,
+      },
+      {
+        label: "Google Drive", kind: "drive", state: "review", documents: 3,
+        days_since_ingest: 0, reason: "private review reason", automatable: true,
+      },
+    ],
     vectors: { ready: false, expected: 8, visible: 4, pending: 4, percent_visible: 50 },
     unavailable: ["diagnose", canary],
   });
@@ -989,5 +995,6 @@ test("support diagnostic projection strips raw canaries and unknown identifiers"
   assert.equal(projected.sources[0].label, "Another source");
   assert.equal(projected.sources[0].kind, "other");
   assert.equal(projected.sources[0].state, "unknown");
+  assert.equal(projected.sources[1].state, "review");
   assert.deepEqual(projected.unavailable, ["diagnose"]);
 });

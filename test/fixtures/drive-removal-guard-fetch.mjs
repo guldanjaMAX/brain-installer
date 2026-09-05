@@ -35,6 +35,7 @@ const initialEvidence = () => ({
   absenceMetadataReads: 0,
   ingestBatchWrites: 0,
   receipts: { indexing: 0, error: 0, ready: 0 },
+  lastErrorReceipt: null,
 });
 
 function readEvidence() {
@@ -215,6 +216,13 @@ globalThis.fetch = async (input, options = {}) => {
     const receipt = parseBody(options);
     const evidence = readEvidence();
     if (Object.hasOwn(evidence.receipts, receipt.status)) evidence.receipts[receipt.status]++;
+    if (receipt.status === "error") {
+      evidence.lastErrorReceipt = {
+        issue_code: receipt.issue_code || null,
+        has_error: Object.hasOwn(receipt, "error"),
+        has_detail: Object.hasOwn(receipt, "detail"),
+      };
+    }
     saveEvidence(evidence);
     return json({ source: receipt.source, status: receipt.status, run_id: receipt.run_id });
   }

@@ -17,6 +17,17 @@ const savedFetch = globalThis.fetch;
 const savedToken = process.env.CLOUDFLARE_API_TOKEN;
 delete process.env.CLOUDFLARE_API_TOKEN;
 
+async function capturedLogs(action) {
+  const savedLog = console.log;
+  const lines = [];
+  console.log = (...parts) => lines.push(parts.join(" "));
+  try {
+    return { value: await action(), lines };
+  } finally {
+    console.log = savedLog;
+  }
+}
+
 function stubFetch(script) {
   const calls = [];
   globalThis.fetch = async (url, opts = {}) => {
@@ -29,6 +40,41 @@ function stubFetch(script) {
 const session = (renew, read = () => A) => ({ env: {}, argv: ["--json"], readWranglerOAuthToken: read, renewSessionToken: renew });
 
 try {
+  // Local commands may inherit the session wrapper, but they should say
+  // nothing about Cloudflare when they never use its control plane.
+  {
+    const { value, lines } = await capturedLogs(() => withWranglerSessionIfNeeded(
+      () => "local result",
+      { env: {}, argv: [], readWranglerOAuthToken: () => A },
+    ));
+    assert.equal(value, "local result");
+    assert.deepEqual(lines, [], "an unused Wrangler session stays silent");
+  }
+  // The first real API use gets one neutral, owner-facing line without CLI
+  // implementation jargon; later calls in the same command stay quiet.
+  {
+    const calls = stubFetch([
+      { status: 200, body: granted },
+      { status: 200, body: granted },
+    ]);
+    const { lines } = await capturedLogs(() => withWranglerSessionIfNeeded(async () => {
+      await cloudflareApiRequest("/accounts");
+      await cloudflareApiRequest("/accounts");
+    }, { env: {}, argv: [], readWranglerOAuthToken: () => A }));
+    assert.equal(calls.length, 2);
+    assert.equal(lines.length, 1, "the credential source is announced once");
+    assert.match(lines[0], /Cloudflare access is using the account signed in on this computer/);
+    assert.doesNotMatch(lines[0], /wrangler/i);
+  }
+  // Machine-readable commands never gain a banner before their JSON.
+  {
+    stubFetch([{ status: 200, body: granted }]);
+    const { lines } = await capturedLogs(() => withWranglerSessionIfNeeded(
+      () => cloudflareApiRequest("/accounts"),
+      session(() => B),
+    ));
+    assert.deepEqual(lines, []);
+  }
   // An expired session: renew once, repeat the same request with the new token.
   {
     const calls = stubFetch([{ status: 403, body: denied }, { status: 200, body: granted }]);

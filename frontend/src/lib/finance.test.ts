@@ -146,6 +146,7 @@ describe("owner-facing finance states", () => {
     expect(sourceOutcome("unscheduled")).toBeNull();
     expect(sourceOutcome("ok")).toBe("CURRENT");
     expect(sourceOutcome("indexing")).toBe("WORKING");
+    expect(sourceOutcome("review")).toBe("NEEDS");
     expect(sourceOutcome("never_synced")).toBe("PROBLEM");
   });
 

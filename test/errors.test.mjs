@@ -401,11 +401,27 @@ function ingestExitCli(scenario) {
 {
   const r = cli(["definitelynotacommand"]);
   check("an unknown command prints usage", /brain setup/.test(r.out), r.out.slice(0, 160));
+  check("an unknown command is named", /Unknown command: definitelynotacommand/.test(r.out), r.out.slice(0, 160));
   check("and exits non-zero", r.code === 1, String(r.code));
 }
 {
   const r = cli([]);
   check("no arguments prints usage and exits 0", /brain setup/.test(r.out) && r.code === 0, String(r.code));
+}
+for (const helpArgument of ["--help", "-h", "help"]) {
+  const r = cli([helpArgument]);
+  check(`${helpArgument} prints usage and exits 0`,
+    /brain setup/.test(r.out) && !/Unknown command:/.test(r.out) && r.code === 0,
+    `${r.code}: ${r.out.slice(0, 160)}`);
+}
+{
+  const expectedVersion = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8")).version;
+  for (const versionArgument of ["--version", "-v", "version"]) {
+    const r = cli([versionArgument]);
+    check(`${versionArgument} prints only the package version and exits 0`,
+      r.out.trim() === expectedVersion && r.code === 0,
+      `${r.code}: ${r.out.slice(0, 160)}`);
+  }
 }
 
 /* ---- doctor must never be the thing that breaks ---- */

@@ -41,6 +41,7 @@ import {
   PUBLIC_INSTALL_SMOKE_TITLE,
   publicInstallSmokeContentHash,
 } from "./install-smoke.js";
+import { sourceReceiptOwnerMessage } from "./source-receipt.js";
 
 const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
@@ -2227,6 +2228,7 @@ export async function diagnose(env, {
  *    a limit of the architecture.
  */
 const INDEXING_STUCK_MS = 6 * 60 * 60 * 1000;
+const SOURCE_REVIEW_ISSUE_CODE = "SAFETY_REVIEW_REQUIRED";
 
 function timestampMs(value) {
   if (value === null || value === undefined || value === "") return NaN;
@@ -2247,6 +2249,13 @@ function operationalFreshness(s, now) {
   const started = timestampMs(s.indexing_started_at);
   const indexingMs = Number.isFinite(started) ? Math.max(0, now - started) : null;
 
+  if (String(s.stale_reason || "").trim().toUpperCase() === SOURCE_REVIEW_ISSUE_CODE) {
+    return {
+      state: "review",
+      reason: sourceReceiptOwnerMessage(SOURCE_REVIEW_ISSUE_CODE),
+      indexingMs,
+    };
+  }
   if (s.stale_reason) {
     return { state: "broken", reason: String(s.stale_reason), indexingMs };
   }
