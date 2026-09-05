@@ -14687,7 +14687,7 @@ if (IS_MAIN && (cmd === "--version" || cmd === "-v" || cmd === "version")) {
   process.exit(0);
 }
 
-if (IS_MAIN && (!cmd || !commands[cmd])) {
+if (IS_MAIN && (!cmd || cmd === "--help" || cmd === "-h" || cmd === "help" || !commands[cmd])) {
   console.log(renderCliCommands(`${c.bold("brain")}: provision and manage a client-owned brain install
 
   install
@@ -14799,7 +14799,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
   a scoped Cloudflare token. Routine source refresh and health commands use the
   brain's domain and admin key instead.
 `));
-  process.exit(cmd ? 1 : 0);
+  process.exit(!cmd || cmd === "--help" || cmd === "-h" || cmd === "help" ? 0 : 1);
 }
 
 if (IS_MAIN) {

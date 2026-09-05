@@ -312,17 +312,20 @@ git push origin "v$RELEASE_VERSION"
 The tag starts `.github/workflows/release.yml`. Do not run `gh release create`
 by hand. The release workflow:
 
-1. Calls `.github/workflows/ci.yml` at the tagged commit and waits for the full
-   Windows, macOS, and Linux Node 22 and 24 matrix plus `preflight-traps`.
-2. Proves that the event, checkout, semantic version, tag, and a commit reachable
+1. Calls `.github/workflows/ci.yml` at the tagged commit. CI packs once, uploads
+   the raw tarball with an immutable artifact ID, and records its SHA-256.
+2. Downloads and hashes those exact bytes in the Windows, macOS, and Linux Node
+   22 and 24 matrix. Every lane installs that shared package. The separate
+   `preflight-traps` job must also pass.
+3. Proves that the event, checkout, semantic version, tag, and a commit reachable
    from `main` agree.
-3. Proves immutable releases are enabled before it creates anything.
-4. Packs once, copies those bytes to `brain-installer.tgz`, and passes both
-   `brain-installer-<version>.tgz` and `brain-installer.tgz` to one
-   `gh release create --draft` operation.
-5. Checks the draft's exact asset set, byte counts, SHA-256 digests, upload
+4. Proves immutable releases are enabled before it creates anything.
+5. Downloads the artifact already tested by CI, copies those bytes to
+   `brain-installer.tgz`, and passes both `brain-installer-<version>.tgz` and
+   `brain-installer.tgz` to one `gh release create --draft` operation.
+6. Checks the draft's exact asset set, byte counts, SHA-256 digests, upload
    states, and downloaded bytes before publication.
-6. Publishes the verified draft, then requires GitHub to report
+7. Publishes the verified draft, then requires GitHub to report
    `isImmutable: true`. It downloads both public assets without credentials,
    compares them again, and starts the CLI from a clean install of the public
    canonical asset.

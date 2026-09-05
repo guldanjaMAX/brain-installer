@@ -42,7 +42,7 @@ import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -528,6 +528,7 @@ const dependencyMismatch = SCAN_ONLY ? [] : [...reviewedBundles].filter(([name, 
   !files.includes(`node_modules/${name}/package.json`)
 );
 const requiredGitIgnored = [
+  "node_modules",
   ".brain-admin-key",
   ".brain-admin-key.tmp-deadbeef",
   ".brain-curated-sync-plan.json",
@@ -554,6 +555,7 @@ const gitIgnoreFailures = requiredGitIgnored.filter((path) =>
 const tracked = spawnSync("git", ["ls-files", "-z"], { cwd: ROOT, encoding: "utf-8", maxBuffer: 64 * 1024 * 1024 });
 const trackedFiles = tracked.status === 0 ? tracked.stdout.split("\0").filter(Boolean) : [];
 const trackedEnumerationFailed = tracked.status !== 0 || trackedFiles.length === 0;
+const trackedRootNodeModules = trackedFiles.includes("node_modules");
 
 // "Is this text?" instead of "is this one of the extensions somebody thought
 // of?". The extension allowlist this replaces missed 27 tracked fixtures -
@@ -580,9 +582,21 @@ const privateTextMatches = [];
 const privatePathMatches = [];
 for (const path of privateScanPaths) {
   for (const label of scanPath(path)) privatePathMatches.push(`${path} (path names: ${label})`);
+  const absolutePath = resolve(ROOT, path);
+  try {
+    if (lstatSync(absolutePath).isSymbolicLink()) {
+      const target = readlinkSync(absolutePath);
+      for (const label of scanText(target, index)) {
+        privateTextMatches.push(`${path} (symbolic-link target: ${label})`);
+      }
+      continue;
+    }
+  } catch {
+    continue; // listed in `expected` but not on disk: `missing` already reports it
+  }
   let buffer;
   try {
-    buffer = readFileSync(resolve(ROOT, path));
+    buffer = readFileSync(absolutePath);
   } catch {
     continue; // listed in `expected` but not on disk: `missing` already reports it
   }
@@ -660,7 +674,7 @@ if (packageProbeDirectory) try {
 
 if (packed.status !== 0 || (!SCAN_ONLY && !files.length) || forbidden.length || missing.length || unexpected.length ||
     bundleConfigMismatch || dependencyMismatch.length || gitIgnoreFailures.length ||
-    canaryFailures.length || trackedEnumerationFailed ||
+    canaryFailures.length || trackedEnumerationFailed || trackedRootNodeModules ||
     privateTextMatches.length || privatePathMatches.length ||
     packedAdapterImportFailed) {
   console.error("FAIL  published package privacy allowlist");
@@ -675,6 +689,9 @@ if (packed.status !== 0 || (!SCAN_ONLY && !files.length) || forbidden.length || 
   }
   if (trackedEnumerationFailed) {
     console.error(`git ls-files returned no tracked files, so nothing was scanned: ${String(tracked.stderr || "").trim()}`);
+  }
+  if (trackedRootNodeModules) {
+    console.error("the repository root node_modules entry is tracked; it must remain local and ignored");
   }
   if (forbidden.length) console.error(`private paths would ship: ${forbidden.join(", ")}`);
   if (missing.length) console.error(`required product paths are missing: ${missing.join(", ")}`);

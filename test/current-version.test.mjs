@@ -56,4 +56,13 @@ assert.equal(versionRun.status, 0, `brain --version failed: ${versionRun.stderr 
 assert.equal(versionRun.stdout.trim(), version, "brain --version must print only the running package version");
 assert.equal(versionRun.stderr, "", "brain --version must not emit diagnostics");
 
+for (const helpFlag of ["--help", "-h", "help"]) {
+  const helpRun = spawnSync(process.execPath, [resolve(ROOT, "brain.mjs"), helpFlag], {
+    encoding: "utf8",
+  });
+  assert.equal(helpRun.status, 0, `brain ${helpFlag} failed: ${helpRun.stderr || helpRun.stdout}`);
+  assert.match(helpRun.stdout, /brain setup/, `brain ${helpFlag} must print the full usage`);
+  assert.equal(helpRun.stderr, "", `brain ${helpFlag} must not emit diagnostics`);
+}
+
 console.log(`current version alignment: package, lockfile, template, changelog, packaged guides, and ${releaseLinks.length} install links all use ${version}`);

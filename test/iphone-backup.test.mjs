@@ -67,7 +67,7 @@ import {
 } from "../connectors/iphone-backup.mjs";
 import { fetchMessagesSince, rowToSessionRow } from "../connectors/imessage.mjs";
 import { MessageSessionizer } from "../ingest/message-session.mjs";
-import { cmdIngestIphoneBackup } from "../brain.mjs";
+import { cmdIngestIphoneBackup, renderCliCommands } from "../brain.mjs";
 import { forget } from "../worker/src/lib/store-d1.js";
 
 let fail = 0, ran = 0;
@@ -895,7 +895,7 @@ let cliDocs = [];
   check("the output names the device and when the backup was taken, so the snapshot has a date",
     /iPhone|iOS 18\.3\.1/.test(output) && /2026-03-03T04:15:00.000Z/.test(output), output.slice(0, 400));
   check("the output hands over the exact undo command",
-    output.includes(`brain forget ${manifestPath} --source iphone-backup`), output.slice(-300));
+    output.includes(renderCliCommands(`brain forget ${manifestPath} --source iphone-backup`)), output.slice(-300));
 
   // Idempotency at the command level: the same backup, run again.
   const second = makeBrainFakes({ script: () => "unchanged" });

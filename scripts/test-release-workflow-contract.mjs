@@ -21,11 +21,58 @@ const workflowFiles = readdirSync(workflowsDir)
 assert.match(ci, /^  push:\n    branches:\n      - "\*\*"$/m);
 assert.match(ci, /^  pull_request:$/m);
 assert.match(ci, /^  workflow_dispatch:$/m);
-assert.match(ci, /^  workflow_call:$/m);
+assert.match(ci, /^  workflow_call:\n    outputs:/m);
+assert.match(ci, /value: \$\{\{ jobs\.package\.outputs\.artifact_id \}\}/);
+assert.match(ci, /value: \$\{\{ jobs\.package\.outputs\.artifact_name \}\}/);
+assert.match(ci, /value: \$\{\{ jobs\.package\.outputs\.package_sha256 \}\}/);
 assert.match(ci, /os: \[windows-latest, macos-latest, ubuntu-latest\]/);
 assert.match(ci, /node: \['22', '24'\]/);
 assert.match(ci, /^  preflight-traps:$/m);
 assert.match(release, /^  push:\n    tags:\n      - "v\*\.\*\.\*"$/m);
+
+// One Node 24 job creates the package. All operating-system jobs resolve the
+// immutable artifact ID and verify the producer's raw SHA before installing it.
+const packageIndex = ci.indexOf("  package:");
+const testIndex = ci.indexOf("  test:");
+const trapIndex = ci.indexOf("  preflight-traps:");
+assert.ok(packageIndex > 0 && testIndex > packageIndex && trapIndex > testIndex,
+  "the build-once package job must precede the test matrix");
+const packageJob = ci.slice(packageIndex, testIndex);
+const testJob = ci.slice(testIndex, trapIndex);
+assert.match(packageJob, /node-version: '24'/);
+assert.match(packageJob, /artifact_id: \$\{\{ steps\.upload\.outputs\.artifact-id \}\}/);
+assert.match(packageJob, /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/);
+assert.match(packageJob, /^          name: \$\{\{ steps\.pack\.outputs\.artifact_name \}\}$/m);
+assert.match(packageJob, /^          path: \$\{\{ steps\.pack\.outputs\.package_path \}\}$/m);
+assert.match(packageJob, /^          archive: false$/m);
+assert.match(packageJob, /^          overwrite: true$/m);
+assert.match(packageJob, /ARTIFACT_ID: \$\{\{ steps\.upload\.outputs\.artifact-id \}\}/);
+assert.match(packageJob, /UPLOAD_DIGEST: \$\{\{ steps\.upload\.outputs\.artifact-digest \}\}/);
+assert.match(packageJob, /uploaded_sha256="\$\{UPLOAD_DIGEST#sha256:\}"/);
+assert.equal([...ci.matchAll(/^\s+npm pack\b/gm)].length, 1,
+  "CI must package exactly once");
+const privacyScanIndex = packageJob.indexOf("node test/package-privacy.test.mjs --scan-only");
+const packCommandIndex = packageJob.indexOf("npm pack --json");
+const uploadActionIndex = packageJob.indexOf("actions/upload-artifact@");
+assert.ok(privacyScanIndex > 0 && packCommandIndex > privacyScanIndex && uploadActionIndex > packCommandIndex,
+  "private inputs must be rejected before packaging or upload");
+
+assert.match(testJob, /^    needs: package$/m);
+assert.match(testJob, /actions\/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c/);
+assert.match(testJob, /artifact-ids: \$\{\{ needs\.package\.outputs\.artifact_id \}\}/);
+assert.match(testJob, /^          skip-decompress: true$/m);
+assert.match(testJob, /^          digest-mismatch: error$/m);
+assert.match(testJob, /ARTIFACT_NAME: \$\{\{ needs\.package\.outputs\.artifact_name \}\}/);
+assert.match(testJob, /EXPECTED_SHA256: \$\{\{ needs\.package\.outputs\.package_sha256 \}\}/);
+assert.doesNotMatch(testJob, /^\s+npm pack\b/m);
+const matrixDownloadIndex = testJob.indexOf("- name: download the one shared raw package");
+const matrixHashIndex = testJob.indexOf("- name: verify exact shared package bytes");
+const matrixInstallIndex = testJob.indexOf("- name: install");
+const matrixPackageInstallIndex = testJob.indexOf('npm install -g "$TARBALL"');
+assert.ok(matrixDownloadIndex > 0 && matrixHashIndex > matrixDownloadIndex &&
+  matrixInstallIndex > matrixHashIndex && matrixPackageInstallIndex > matrixInstallIndex,
+"the matrix must hash the downloaded package before any install");
+assert.match(testJob, /- name: Windows PowerShell user-prefix command works[\s\S]*?PACKAGE_FILENAME: \$\{\{ needs\.package\.outputs\.artifact_name \}\}[\s\S]*?shell: pwsh[\s\S]*?Join-Path '\.release-package' \$env:PACKAGE_FILENAME/);
 
 const gateIndex = release.indexOf("  gate:");
 const publishIndex = release.indexOf("  publish:");
@@ -35,6 +82,26 @@ const publish = release.slice(publishIndex);
 assert.match(gate, /uses: \.\/\.github\/workflows\/ci\.yml/);
 assert.match(publish, /^    needs: gate$/m);
 assert.match(publish, /^    permissions:\n      contents: write$/m);
+
+const releaseDownloadIndex = release.indexOf("- name: download the package already tested by CI");
+const releaseBindIndex = release.indexOf("- name: bind the tested bytes to both release names");
+assert.ok(releaseDownloadIndex > publishIndex && releaseBindIndex > releaseDownloadIndex,
+  "release must retrieve and bind the artifact tested by its CI gate");
+const releaseArtifactBinding = release.slice(releaseDownloadIndex, release.indexOf("gh release create"));
+assert.match(releaseArtifactBinding, /actions\/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c/);
+assert.match(releaseArtifactBinding, /artifact-ids: \$\{\{ needs\.gate\.outputs\.artifact_id \}\}/);
+assert.match(releaseArtifactBinding, /TESTED_ARTIFACT_NAME: \$\{\{ needs\.gate\.outputs\.artifact_name \}\}/);
+assert.match(releaseArtifactBinding, /TESTED_PACKAGE_SHA256: \$\{\{ needs\.gate\.outputs\.package_sha256 \}\}/);
+assert.doesNotMatch(releaseArtifactBinding, /^          (?:github-token|repository|run-id):/m,
+  "same-run downloads must use the Actions runtime without cross-run API inputs");
+assert.match(releaseArtifactBinding, /^          skip-decompress: true$/m);
+assert.match(releaseArtifactBinding, /^          digest-mismatch: error$/m);
+assert.match(releaseArtifactBinding, /actual_sha256=.*createHash\("sha256"\)/s);
+assert.match(releaseArtifactBinding, /actual_sha256.*!=.*TESTED_PACKAGE_SHA256/s);
+assert.match(releaseArtifactBinding, /cp "\$downloaded" "\$versioned"/);
+assert.match(releaseArtifactBinding, /cp "\$versioned" "\$canonical"/);
+assert.doesNotMatch(release, /^\s+npm (?:ci|pack)\b/m,
+  "release must consume the tested artifact without rebuilding it");
 
 const createCommands = [...release.matchAll(/^\s+gh release create /gm)];
 assert.equal(createCommands.length, 1, "release assets must have one creation operation");
@@ -68,7 +135,6 @@ assert.match(release.slice(createIndex, draftVerifyIndex), /--verify-tag/);
 assert.match(release.slice(createIndex, draftVerifyIndex), /--latest/);
 assert.match(release.slice(0, createIndex), /secrets\.RELEASE_ADMIN_READ_TOKEN/);
 assert.match(release.slice(0, createIndex), /"repos\/\$GITHUB_REPOSITORY\/immutable-releases"/);
-assert.match(release.slice(0, createIndex), /npm ci --ignore-scripts/);
 assert.match(release.slice(publishCommandIndex), /isImmutable/);
 assert.match(release.slice(publishCommandIndex), /installed_status=\$\?/);
 assert.doesNotMatch(release.slice(publishCommandIndex), /bin\/brain"\s*\|/);
@@ -174,4 +240,4 @@ try {
   rmSync(sandbox, { recursive: true, force: true });
 }
 
-console.log("release workflow contract: exact CI gate, tag-preserving draft recovery, two identical assets, immutable publication");
+console.log("release workflow contract: one exact package across CI and release, tag-preserving draft recovery, immutable publication");

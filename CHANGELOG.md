@@ -6,6 +6,9 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## 0.3.7
 
+- The release package is now built once and those same bytes are installed on
+  both Mac and Windows before publication. `brain --help`, `brain -h`, and
+  `brain help` also print the full guide and exit successfully.
 - Updates now resume safely after a previous index rebuild, delayed search-index
   visibility, an overlapping recovery request, or a queued document at the
   pause boundary. Writes from connected AI tools respect the same update pause.

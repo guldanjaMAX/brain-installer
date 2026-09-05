@@ -99,30 +99,60 @@ jobs:
             if (value.enabled !== true) throw new Error("immutable releases are not enabled");
           ' "$RUNNER_TEMP/immutable-releases.json"
 
-      - name: build two byte-identical package names
+      - name: download the package already tested by CI
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.gate.outputs.artifact_id }}
+          path: ${{ runner.temp }}/tested-package
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: bind the tested bytes to both release names
+        env:
+          TESTED_ARTIFACT_ID: ${{ needs.gate.outputs.artifact_id }}
+          TESTED_ARTIFACT_NAME: ${{ needs.gate.outputs.artifact_name }}
+          TESTED_PACKAGE_SHA256: ${{ needs.gate.outputs.package_sha256 }}
         shell: bash
         run: |
           set -euo pipefail
-          npm ci --ignore-scripts
+          if [[ ! "$TESTED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::tested artifact ID is malformed"
+            exit 1
+          fi
+
+          expected_name="brain-installer-$RELEASE_VERSION.tgz"
+          if [[ "$TESTED_ARTIFACT_NAME" != "$expected_name" ]]; then
+            echo "::error::tested artifact $TESTED_ARTIFACT_NAME does not match $expected_name"
+            exit 1
+          fi
+          if [[ ! "$TESTED_PACKAGE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::tested package SHA-256 is malformed"
+            exit 1
+          fi
+
+          downloaded="$RUNNER_TEMP/tested-package/$TESTED_ARTIFACT_NAME"
+          actual_sha256="$(node -e '
+            const fs = require("node:fs");
+            const crypto = require("node:crypto");
+            process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"));
+          ' "$downloaded")"
+          if [[ "$actual_sha256" != "$TESTED_PACKAGE_SHA256" ]]; then
+            echo "::error::downloaded package digest does not match the bytes tested by CI"
+            exit 1
+          fi
+
           release_dir="$RUNNER_TEMP/release"
           mkdir -p "$release_dir"
-          npm pack --json --ignore-scripts --pack-destination "$release_dir" \
-            > "$release_dir/npm-pack.json"
-
-          versioned="$release_dir/brain-installer-$RELEASE_VERSION.tgz"
+          versioned="$release_dir/$expected_name"
           canonical="$release_dir/brain-installer.tgz"
-          node -e '
-            const fs = require("node:fs");
-            const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-            if (report.length !== 1 || report[0].filename !== process.argv[2]) {
-              throw new Error(`npm packed ${report[0]?.filename ?? "nothing"}, expected ${process.argv[2]}`);
-            }
-          ' "$release_dir/npm-pack.json" "$(basename "$versioned")"
+          cp "$downloaded" "$versioned"
           cp "$versioned" "$canonical"
           cmp --silent "$versioned" "$canonical"
 
           echo "VERSIONED_TARBALL=$versioned" >> "$GITHUB_ENV"
           echo "CANONICAL_TARBALL=$canonical" >> "$GITHUB_ENV"
+          echo "RELEASE_PACKAGE_SHA256=$TESTED_PACKAGE_SHA256" >> "$GITHUB_ENV"
+          echo "releasing artifact $TESTED_ARTIFACT_ID at sha256:$TESTED_PACKAGE_SHA256"
 
       # Both names are arguments to this one creation command. gh holds the
       # release as a draft while it uploads the assets, so a partial upload or
