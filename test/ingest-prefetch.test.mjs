@@ -12,6 +12,12 @@
 // every future run. So the first block asserts that a slow early item is still
 // yielded before a fast later one.
 import { prefetch, batchStream } from "../ingest/run.mjs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { credentialScannerFingerprint } from "../brain.mjs";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 240))); if (!c) fail++; };
@@ -94,6 +100,71 @@ const collect = async (it) => { const out = []; for await (const v of it) out.pu
   for (const bad of [0, -3, NaN, "x", undefined]) {
     const out = await collect(prefetch([1, 2], async (v) => v, { concurrency: bad }));
     check(`concurrency ${String(bad)} still yields everything`, JSON.stringify(out) === "[1,2]", JSON.stringify(out));
+  }
+}
+
+// 8. A resumed first pass must report the recovery scan even when every item
+//    returns through the unchanged or policy-skip paths. This is the real shape
+//    that looked frozen on a 193k-message mailbox: the old progress marker sat
+//    after both early returns, so eighteen thousand active fetches printed
+//    nothing for twenty minutes.
+{
+  const here = dirname(fileURLToPath(import.meta.url));
+  const root = join(here, "..");
+  const fixture = pathToFileURL(join(here, "fixtures", "gmail-incremental-policy-fetch.mjs")).href;
+  const directory = mkdtempSync(join(tmpdir(), "brain-gmail-resume-progress-"));
+  try {
+    const manifestPath = join(directory, "fixture.manifest.json");
+    const statePath = join(directory, ".brain-ingest-gmail.json");
+    const evidencePath = join(directory, "evidence.json");
+    const userRoot = join(directory, "isolated-user-root");
+    const tokenRoot = join(userRoot, ".brain");
+    mkdirSync(tokenRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(manifestPath, JSON.stringify({
+      client: { slug: "fixture" },
+      brain: { domain: "fixture.invalid" },
+      infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
+      safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
+    }));
+    writeFileSync(join(tokenRoot, "google-tokens.json"), JSON.stringify({
+      google: { client_id: "fixture-client", client_secret: null, refresh_token: "fixture-refresh", scopes: ["gmail"] },
+    }), { mode: 0o600 });
+    const accepted = Object.fromEntries(Array.from(
+      { length: 100 },
+      (_, i) => [`gmail:resume-accepted-${i}`, "resume-v1"],
+    ));
+    const fingerprint = credentialScannerFingerprint(true);
+    writeFileSync(statePath, JSON.stringify({
+      version: 1,
+      done: { ...accepted },
+      skipped: {},
+      credential_scanner_progress: { fingerprint, accepted: { ...accepted } },
+    }), { mode: 0o600 });
+    const environment = {};
+    for (const name of ["PATH", "Path", "PATHEXT", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR"]) {
+      if (process.env[name] !== undefined) environment[name] = process.env[name];
+    }
+    Object.assign(environment, {
+      NO_COLOR: "1",
+      BRAIN_GOOGLE_TOKEN_STORE: "file",
+      BRAIN_GMAIL_POLICY_MODE: "resume-progress",
+      BRAIN_GMAIL_POLICY_EVIDENCE: evidencePath,
+      BRAIN_GMAIL_POLICY_USER_ROOT: userRoot,
+    });
+    const result = spawnSync(process.execPath, [
+      "--import", fixture, join(root, "brain.mjs"), "ingest", manifestPath,
+      "--from", "gmail", "--dry-run", "--limit", "200",
+    ], { encoding: "utf8", env: environment, timeout: 30_000 });
+    const output = String(`${result.stdout || ""}${result.stderr || ""}`).replace(/\x1b\[[0-9;]*m/g, "");
+    check("a resumed Gmail first pass finishes its synthetic recovery scan",
+      result.error === undefined && result.signal === null && result.status === 0,
+      output.slice(-500));
+    check("unchanged and skipped recovery work reports progress before returning",
+      /fetched 200\.\.\./.test(output) &&
+        /200 scanned; 0 document\(s\) prepared in 0 batch\(es\); 100 unchanged; 100 skipped/.test(output),
+      output.slice(-500));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 }
 

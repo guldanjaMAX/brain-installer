@@ -7,7 +7,7 @@ import { syncBuiltinESMExports } from "node:module";
 const evidencePath = String(process.env.BRAIN_GMAIL_POLICY_EVIDENCE || "");
 const userRoot = String(process.env.BRAIN_GMAIL_POLICY_USER_ROOT || "");
 const mode = String(process.env.BRAIN_GMAIL_POLICY_MODE || "");
-if (!evidencePath || !userRoot || !["mixed", "unclassified"].includes(mode)) {
+if (!evidencePath || !userRoot || !["mixed", "unclassified", "resume-progress"].includes(mode)) {
   throw new Error("the Gmail policy fixture is not configured");
 }
 
@@ -49,8 +49,30 @@ globalThis.fetch = async (input, options = {}) => {
       history: [{ id: "history-current", messagesAdded: ids.map((id) => ({ message: { id } })) }],
     });
   }
+  if (url.hostname === "gmail.googleapis.com" && url.pathname === "/gmail/v1/users/me/messages") {
+    if (mode !== "resume-progress") throw new Error("the incremental fixture must use Gmail history");
+    return json({
+      messages: [
+        ...Array.from({ length: 100 }, (_, i) => ({ id: `resume-accepted-${i}` })),
+        ...Array.from({ length: 100 }, (_, i) => ({ id: `resume-skipped-${i}` })),
+      ],
+    });
+  }
   if (url.hostname === "gmail.googleapis.com" && url.pathname.startsWith("/gmail/v1/users/me/messages/")) {
     const id = url.pathname.split("/").at(-1);
+    if (id.startsWith("resume-accepted-")) {
+      return json({
+        id, historyId: "resume-v1", internalDate: "1788030000000", labelIds: ["INBOX"],
+        raw: rawMail("Previously accepted mail", "This invented message was accepted during an earlier part of the same resumable first pass."),
+      });
+    }
+    if (id.startsWith("resume-skipped-")) {
+      return json({
+        id, historyId: "resume-v1", internalDate: "1788030000000",
+        labelIds: ["CATEGORY_PROMOTIONS"],
+        raw: rawMail("Previously skipped promotion", "This invented promotion remains excluded by the Gmail source policy."),
+      });
+    }
     if (id === "promotion") {
       return json({
         id, historyId: "history-current", internalDate: "1788030000000",

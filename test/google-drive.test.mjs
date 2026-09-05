@@ -62,10 +62,9 @@ const workbookBytes = (sheets) => {
   check("a later call after the shared refresh is still served from cache", (await get()) === "shared1" && calls === 1);
 }
 {
-  // A token POST that connects but never answers used to hang forever: this was
-  // the ONE Google call with no timeout, and on 2026-09-05 it stalled a real
-  // Gmail sync for twelve minutes with nothing in the log. Every caller sharing
-  // one refresh makes bounding it essential, not optional.
+  // A token POST that connects but never answers used to have no bound. Every
+  // caller sharing one refresh makes bounding that potential failure essential:
+  // one unresolved request must not leave the whole fetch window waiting.
   const get = createTokenProvider({
     clientId: "c", refreshToken: "r", requestTimeoutMs: 40,
     fetchImpl: (_u, opts) => new Promise((_resolve, reject) => {

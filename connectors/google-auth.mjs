@@ -1365,9 +1365,9 @@ export function createTokenProvider({
   clientId, clientSecret, refreshToken, fetchImpl = fetch, skewMs = 60_000,
   // Every other Google call in this codebase bounds itself (connectors/
   // google-drive.mjs api() uses 60s). This one did not, and a token POST that
-  // connects but never answers therefore hung forever, with no timeout to fire
-  // and nothing in the log. Observed 2026-09-05 on a real Gmail sync: the
-  // process sat idle in kevent for twelve minutes until it was killed.
+  // connects but never answers could therefore hang forever. Sharing a refresh
+  // across concurrent callers makes that missing bound especially costly: one
+  // unresolved request would hold every caller waiting on the shared result.
   requestTimeoutMs = 30_000,
 } = {}) {
   let cached = null;
