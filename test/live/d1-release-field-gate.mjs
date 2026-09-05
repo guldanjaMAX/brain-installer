@@ -117,7 +117,7 @@ if (prior.body.families.length) {
 
 // Exercise the deployed scanner through the single-document HTTP boundary.
 // Keep the secret-shaped value synthetic and out of both output and receipts.
-const syntheticAdminKey = `a${"3".repeat(63)}`;
+const syntheticAdminKey = `a${"3f9b2c8e1d7a4b6c5e0f8a2d9c7b1e4f3a6d8b0c2e5f7a9b1d3c6e8f0a2b4c6"}`;
 assert.equal(syntheticAdminKey.length, 64);
 const refusedSecret = await request("/api/admin/brain/ingest", {
   method: "POST",
