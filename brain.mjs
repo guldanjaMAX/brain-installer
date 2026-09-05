@@ -4434,8 +4434,10 @@ export async function cmdMcpConfig(manifestPath, options = {}) {
       `    -- ${shellQuote(command)} ${args.map(shellQuote).join(" ")}\n`
   );
   console.log(
-    "  If this name already exists, run brain setup to reconcile it safely. Do not use\n" +
-      "  a config-display command on an older entry because it may print the retired key.\n"
+    renderCliCommands(
+      "  If this name already exists, run brain setup to reconcile it safely. Do not use\n" +
+        "  a config-display command on an older entry because it may print the retired key.\n"
+    )
   );
 
   console.log(`${c.bold("Claude Desktop")}: add this to your config file:\n`);
@@ -5783,7 +5785,9 @@ async function cmdForget(manifestPath) {
 
   if (!flags.yes) {
     console.log(`\n  ${c.bold("Nothing has been removed.")} Re-run with --yes to actually do it:\n`);
-    console.log(`    node brain.mjs forget ${manifestPath} --source ${name} --yes\n`);
+    console.log(renderCliCommands(
+      `    brain forget ${commandPath(displayPath(manifestPath))} --source ${commandPath(name)} --yes\n`
+    ));
     return;
   }
 
@@ -10983,7 +10987,8 @@ async function cmdDoctor(manifestPath) {
     console.log(`  ${c.bold("What to do")}\n`);
     for (const x of needFix) {
       console.log(`  ${x.status === D_FAIL ? c.red(x.name) : c.yellow(x.name)}`);
-      console.log(`    ${x.fix.split("\n").join("\n    ")}\n`);
+      const fix = renderCliCommands(x.fix);
+      console.log(`    ${fix.split("\n").join("\n    ")}\n`);
     }
   }
 
@@ -11374,7 +11379,10 @@ export async function cmdSetup(manifestPath, options = {}) {
   const fatal = checks.filter((x) => x.status === D_FAIL);
   if (fatal.length) {
     console.log("");
-    for (const x of fatal) console.log(`  ${c.red(x.name)}\n    ${x.fix.split("\n").join("\n    ")}\n`);
+    for (const x of fatal) {
+      const fix = renderCliCommands(x.fix);
+      console.log(`  ${c.red(x.name)}\n    ${fix.split("\n").join("\n    ")}\n`);
+    }
     closePrompts();
     // Only offer `brain init` when there is genuinely no manifest. Suggesting it
     // to someone who already has one sends them hunting for a second problem.
@@ -11722,10 +11730,10 @@ export async function cmdSetup(manifestPath, options = {}) {
   const outstanding = await countBacklog(target).catch(() => 0);
   console.log(`\n  ${c.green(c.bold("Your brain is live."))}\n`);
   if (outstanding > 0) {
-    console.log(
+    console.log(renderCliCommands(
       `  ${c.yellow("Keyword search works now.")} ${outstanding} chunk(s) are still embedding, so\n` +
         `  meaning-based search is incomplete until they finish. Run:\n    brain drain ${shownTarget}\n`
-    );
+    ));
   }
   console.log(renderCliCommands(`  Ask it directly with: brain ask ${shownTarget}`));
   if (wired.length) {
@@ -12536,7 +12544,8 @@ function crash(err) {
       console.error("  Run `npx " + WRANGLER_SPEC + " login`, then re-run the same command; it resumes where it stopped.");
       console.error("\n  Anything created before the refusal is still there and is reused on the re-run.");
     } else {
-      console.error("  " + CF_TOKEN_REJECTED_REMEDY.split("\n").join("\n  "));
+      const remedy = renderCliCommands(CF_TOKEN_REJECTED_REMEDY);
+      console.error("  " + remedy.split("\n").join("\n  "));
       console.error("\n  Nothing was created or half-written. Re-run once the token is right.");
     }
     printSupportReceipt(supportEventId, (line) => console.error(line));
@@ -12794,7 +12803,7 @@ async function cmdWhatsnew(manifestPath) {
     return;
   }
   // Printed rather than paged: a client on Windows should not meet a pager.
-  console.log(readFileSync(path, "utf-8").trimEnd());
+  console.log(renderCliCommands(readFileSync(path, "utf-8").trimEnd()));
   console.log("");
 }
 
@@ -12901,7 +12910,7 @@ async function reportBacklog(manifestPath) {
  * Dry runs by default, like forget, and arms with --yes.
  */
 /** Render a diagnosis for a human. Exported so it can be exercised without a network. */
-export function renderDiagnosis(r) {
+export function renderDiagnosis(r, renderOptions = {}) {
   console.log(`\n  ${c.bold("what is in the brain")}`);
   console.log(`    ${num(r.totals.documents).padStart(9)}  documents`);
   console.log(`    ${num(r.totals.chunks).padStart(9)}  chunks`);
@@ -12923,7 +12932,7 @@ export function renderDiagnosis(r) {
       console.log(`    ${MARK[f.severity] || "  "}  ${f.title}`);
       if (f.detail) console.log(`         ${c.dim(f.detail)}`);
       for (const sm of (f.samples || []).slice(0, 5)) console.log(`           ${c.dim("- " + String(sm).slice(0, 96))}`);
-      if (f.action) console.log(`         ${c.bold("do:")} ${f.action}`);
+      if (f.action) console.log(`         ${c.bold("do:")} ${renderCliCommands(f.action, renderOptions)}`);
     }
   }
 
@@ -13089,7 +13098,7 @@ async function cmdEval(manifestPath) {
       die(`could not create the private evaluation set safely: ${error.message}`);
     }
     ok(`wrote ${relative(process.cwd(), goldenPath)}`);
-    console.log(
+    console.log(renderCliCommands(
       "\n  Fill it in, and do it in this order, because the order is what makes the\n" +
       "  result mean anything:\n\n" +
       `    1. Write the questions FIRST, from memory, without opening your files.\n` +
@@ -13099,9 +13108,9 @@ async function cmdEval(manifestPath) {
       `    2. THEN find which document should answer each one and name it.\n\n` +
       `    3. Add 4 or 5 questions you KNOW it cannot answer, marked unanswerable.\n` +
       `       These are the most valuable entries in the file.\n\n` +
-      `  Then run:  brain eval ${relative(process.cwd(), manifestPath || "brain.manifest.json")}\n` +
+      `  Then run:  brain eval ${commandPath(relative(process.cwd(), manifestPath || "brain.manifest.json"))}\n` +
       `  Or build it in a guided session instead:  --golden-20\n`
-    );
+    ));
     return;
   }
 
@@ -13588,7 +13597,7 @@ async function cmdSupport() {
     const recovery = supportRecovery(flags.explain);
     process.stdout.write(flags.json
       ? `${JSON.stringify(recovery, null, 2)}\n`
-      : renderSupportRecovery(recovery));
+      : renderCliCommands(renderSupportRecovery(recovery)));
     return recovery;
   }
 
@@ -13901,7 +13910,7 @@ export async function cmdTechnician(manifestPath, flags = {}, options = {}) {
   const step = flags.run ? String(flags.run).trim().toLowerCase() : null;
   if (!step) {
     if (flags.json) console.log(JSON.stringify(plan, null, 2));
-    else console.log(renderTechnicianPlan(plan));
+    else console.log(renderCliCommands(renderTechnicianPlan(plan)));
     return plan;
   }
   if (flags.json) die("--json is read-only and cannot be combined with --run");
@@ -14027,7 +14036,8 @@ export async function cmdLocalTools(options = {}) {
   if (failed.length) {
     console.log(`\n  ${c.bold("What to do")}\n`);
     for (const item of failed) {
-      console.log(`  ${c.red(item.name)}\n    ${item.fix.split("\n").join("\n    ")}\n`);
+      const fix = renderCliCommands(item.fix);
+      console.log(`  ${c.red(item.name)}\n    ${fix.split("\n").join("\n    ")}\n`);
     }
     die("the required local tools are not ready. Fix those items and rerun `brain tools`.");
   }
@@ -14151,10 +14161,10 @@ async function cmdGrant(manifestPath) {
   const grant = await response.json();
   ok(`access granted to ${grant.display_name}: ${grant.capabilities.join(", ")}`);
   console.log(`\n  ${grant.token}\n`);
-  console.log(
+  console.log(renderCliCommands(
     "  This token is shown once. Share it over a channel you trust. If it is lost,\n" +
-    `  create a replacement and revoke this one with: brain grants ${displayPath(manifestPath)} --revoke ${grant.grant_id}\n`,
-  );
+    `  create a replacement and revoke this one with: brain grants ${commandPath(displayPath(manifestPath))} --revoke ${grant.grant_id}\n`,
+  ));
   return grant;
 }
 

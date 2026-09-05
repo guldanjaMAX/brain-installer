@@ -36,6 +36,22 @@ $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
 The full command path below is deliberate. It keeps working after Terminal is
 closed, without `sudo`, administrator access, or a shell-profile change.
 
+Run the packaged read-only preflight before setup. It checks the Node version,
+network access, Cloudflare sign-in files, duplicate CLI copies, and existing
+manifests without installing or changing anything.
+
+Mac or Linux:
+
+```bash
+bash "$HOME/.financial-brain/lib/node_modules/brain-installer/tools/preflight.sh"
+```
+
+Windows PowerShell:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\FinancialBrain\node_modules\brain-installer\tools\preflight.ps1"
+```
+
 An approved automation launcher can explicitly supply `CLOUDFLARE_API_TOKEN` to
 the process; when present, it has first priority and the command announces that
 choice. Otherwise setup and updates look for an existing pinned `wrangler login`

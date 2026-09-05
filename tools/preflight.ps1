@@ -14,7 +14,7 @@ $node = Get-Command node -ErrorAction SilentlyContinue
 if ($node) {
   $nv = (& node -v); Write-Host "  node            $nv ($($node.Source))"
   $maj = [int](($nv -replace '^v','') -split '\.')[0]
-  if ($maj -lt 20) { Stop_ "node $nv is too old; the installer needs 20 or newer" }
+  if ($maj -lt 22) { Stop_ "node $nv is too old; the installer needs 22 or newer" }
 } else { Stop_ "node is not installed" }
 if (Get-Command npm.cmd -ErrorAction SilentlyContinue) { Write-Host ("  npm             " + (& npm.cmd -v)) }
 else { Stop_ "npm.cmd not found" }
@@ -61,9 +61,27 @@ if ($env:CLOUDFLARE_API_TOKEN) {
     if ($r.StatusCode -eq 200) { Ok "CLOUDFLARE_API_TOKEN is set and works" } else { Stop_ "CLOUDFLARE_API_TOKEN set but rejected ($($r.StatusCode)). Unset it." }
   } catch { Stop_ "CLOUDFLARE_API_TOKEN is set but REJECTED. It beats the browser sign-in and disables renewal. Remove-Item Env:\CLOUDFLARE_API_TOKEN" }
 } else { Ok "no CLOUDFLARE_API_TOKEN in the environment (browser sign-in will be used)" }
-$cfg = @("$env:APPDATA\xdg.config\.wrangler\config","$env:USERPROFILE\.wrangler\config") | Where-Object { Test-Path $_ } | Select-Object -First 1
-if ($cfg -and (Test-Path "$cfg\default.toml")) { Ok "wrangler session found (default.toml, the format the installer reads)" }
-elseif ($cfg -and (Test-Path "$cfg\default.enc")) { Stop_ "wrangler wrote default.enc, which the installer cannot read. Sign in with: npx.cmd wrangler@4.73.0 login" }
+$cfgCandidates = @()
+if ($env:APPDATA) {
+  $cfgCandidates += Join-Path $env:APPDATA "xdg.config\.wrangler\config"
+  $cfgCandidates += Join-Path $env:APPDATA ".wrangler\config"
+}
+if ($env:LOCALAPPDATA) { $cfgCandidates += Join-Path $env:LOCALAPPDATA ".wrangler\config" }
+if ($env:XDG_CONFIG_HOME) { $cfgCandidates += Join-Path $env:XDG_CONFIG_HOME ".wrangler\config" }
+$homeDir = if ($env:HOME) { $env:HOME } elseif ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+if ($homeDir) {
+  $cfgCandidates += Join-Path $homeDir ".config\.wrangler\config"
+  $cfgCandidates += Join-Path $homeDir ".wrangler\config"
+}
+$session = $null
+foreach ($cfg in $cfgCandidates) {
+  $toml = Join-Path $cfg "default.toml"
+  $enc = Join-Path $cfg "default.enc"
+  if (Test-Path $toml) { $session = @{ Path = $toml; Format = "toml" }; break }
+  if (Test-Path $enc) { $session = @{ Path = $enc; Format = "encrypted" }; break }
+}
+if ($session -and $session.Format -eq "toml") { Ok "wrangler session found (default.toml, the format the installer reads)" }
+elseif ($session -and $session.Format -eq "encrypted") { Stop_ "wrangler wrote default.enc, which the installer cannot read. Sign in with: npx.cmd wrangler@4.73.0 login" }
 else { Warn "no wrangler session yet. Sign in with: npx.cmd wrangler@4.73.0 login" }
 Write-Host ""
 

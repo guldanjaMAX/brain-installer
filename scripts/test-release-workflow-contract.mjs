@@ -39,6 +39,7 @@ assert.ok(packageIndex > 0 && testIndex > packageIndex && trapIndex > testIndex,
   "the build-once package job must precede the test matrix");
 const packageJob = ci.slice(packageIndex, testIndex);
 const testJob = ci.slice(testIndex, trapIndex);
+const preflightTrapJob = ci.slice(trapIndex);
 assert.match(packageJob, /node-version: '24'/);
 assert.match(packageJob, /artifact_id: \$\{\{ steps\.upload\.outputs\.artifact-id \}\}/);
 assert.match(packageJob, /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/);
@@ -67,12 +68,24 @@ assert.match(testJob, /EXPECTED_SHA256: \$\{\{ needs\.package\.outputs\.package_
 assert.doesNotMatch(testJob, /^\s+npm pack\b/m);
 const matrixDownloadIndex = testJob.indexOf("- name: download the one shared raw package");
 const matrixHashIndex = testJob.indexOf("- name: verify exact shared package bytes");
+const matrixPreflightExtractIndex = testJob.indexOf("- name: extract preflight from exact package");
 const matrixInstallIndex = testJob.indexOf("- name: install");
 const matrixPackageInstallIndex = testJob.indexOf('npm install -g "$TARBALL"');
 assert.ok(matrixDownloadIndex > 0 && matrixHashIndex > matrixDownloadIndex &&
-  matrixInstallIndex > matrixHashIndex && matrixPackageInstallIndex > matrixInstallIndex,
-"the matrix must hash the downloaded package before any install");
+  matrixPreflightExtractIndex > matrixHashIndex && matrixInstallIndex > matrixPreflightExtractIndex &&
+  matrixPackageInstallIndex > matrixInstallIndex,
+"the matrix must hash the downloaded package and extract its preflight before any install");
+assert.match(testJob, /tar -xzf "\$tarball" -C \.packaged-preflight[\s\S]*?package\/tools\/preflight\.sh package\/tools\/preflight\.ps1/);
+assert.match(testJob, /- name: packaged preflight runs and prints \(Windows\)[\s\S]*?\.packaged-preflight\\package\\tools\\preflight\.ps1/);
+assert.match(testJob, /- name: packaged preflight runs and prints \(macOS and Linux\)[\s\S]*?bash \.packaged-preflight\/package\/tools\/preflight\.sh/);
+assert.doesNotMatch(testJob, /(?:bash |Resolve-Path \.\\)tools[\\/]preflight\.(?:sh|ps1)/,
+  "the matrix must run preflight from the exact package rather than the checkout");
 assert.match(testJob, /- name: Windows PowerShell user-prefix command works[\s\S]*?PACKAGE_FILENAME: \$\{\{ needs\.package\.outputs\.artifact_name \}\}[\s\S]*?shell: pwsh[\s\S]*?Join-Path '\.release-package' \$env:PACKAGE_FILENAME/);
+assert.match(preflightTrapJob, /trap 4: an empty earlier Wrangler directory cannot mask a later session/);
+assert.match(preflightTrapJob, /New-Item -ItemType Directory -Force -Path \(Join-Path \$env:APPDATA 'xdg\.config\\\.wrangler\\config'\)[\s\S]*?Set-Content \(Join-Path \$session 'default\.toml'\)[\s\S]*?ok\\s\+wrangler session found/,
+  "Windows CI must prove an empty earlier Wrangler directory cannot hide a later session file");
+assert.match(preflightTrapJob, /trap 5: Node 21 is below the supported minimum[\s\S]*?node\.cmd[\s\S]*?installer needs 22 or newer/,
+  "Windows CI must refuse Node 21 rather than only testing supported runtimes");
 
 const gateIndex = release.indexOf("  gate:");
 const publishIndex = release.indexOf("  publish:");

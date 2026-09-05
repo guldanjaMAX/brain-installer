@@ -477,6 +477,8 @@ const expected = [
   "support-journal.mjs",
   "support-recovery.mjs",
   "templates/brain.manifest.json",
+  "tools/preflight.ps1",
+  "tools/preflight.sh",
   "worker/src/index.js",
   "worker/src/lib/answer-render.js",
   "worker/src/lib/app-assets.js",

@@ -1,5 +1,5 @@
 /**
- * Every tracked test file is actually in the test chain.
+ * Every tracked test file is actually in the npm test lifecycle.
  *
  * WHY THIS EXISTS. `npm test` is a hardcoded `&&` chain of ~116 commands, not a
  * discovery run. That is a deliberate choice (explicit ordering, explicit
@@ -46,8 +46,9 @@ const check = (name, ok, detail = "") => {
   if (!ok) fail++;
 };
 
-const chain = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).scripts?.test || "";
-check("package.json defines a test chain", chain.length > 0);
+const scripts = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).scripts || {};
+const chain = `${scripts.pretest || ""} ${scripts.test || ""}`;
+check("package.json defines a test lifecycle", Boolean(scripts.test) && chain.length > 0);
 
 // Tracked, not on disk: a file someone deleted but left in the chain is a
 // different bug, and the chain itself will fail loudly on that, so it needs no

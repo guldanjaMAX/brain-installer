@@ -13,13 +13,15 @@ printf "  os              %s %s\n" "$(uname -s)" "$(uname -r)"
 if command -v node >/dev/null 2>&1; then
   NV=$(node -v); NMAJ=${NV#v}; NMAJ=${NMAJ%%.*}
   printf "  node            %s (%s)\n" "$NV" "$(command -v node)"
-  [ "$NMAJ" -ge 20 ] 2>/dev/null || stop "node $NV is too old; the installer needs 20 or newer"
+  [ "$NMAJ" -ge 22 ] 2>/dev/null || stop "node $NV is too old; the installer needs 22 or newer"
 else stop "node is not installed"; fi
 command -v npm >/dev/null 2>&1 && printf "  npm             %s\n" "$(npm -v 2>/dev/null)" || stop "npm is not installed"
 echo
 
 echo "THE BRAIN CLI"
-COPIES=$(command -v -a brain 2>/dev/null | sort -u)
+# This script is Bash, so use Bash's portable all-PATH lookup. `command -v -a`
+# is not a valid Bash command and silently made every machine look fresh.
+COPIES=$(type -a -P brain 2>/dev/null | sort -u)
 N=$(printf "%s" "$COPIES" | grep -c . )
 if [ "$N" -eq 0 ]; then
   FRESH=1; warn "no 'brain' on PATH (fine before a first install; call it by full path otherwise)"
@@ -42,10 +44,20 @@ if [ -n "$CLOUDFLARE_API_TOKEN" ]; then
   if [ "$CODE" = "200" ]; then ok "CLOUDFLARE_API_TOKEN is set and works"
   else stop "CLOUDFLARE_API_TOKEN is set but REJECTED (http $CODE). It beats the browser sign-in and disables session renewal. Unset it."; fi
 else ok "no CLOUDFLARE_API_TOKEN in the environment (browser sign-in will be used)"; fi
-WCFG="$HOME/.wrangler/config"
-[ -d "$WCFG" ] || WCFG="$HOME/.config/.wrangler/config"
-if [ -f "$WCFG/default.toml" ]; then ok "wrangler session found (default.toml, the format the installer reads)"
-elif [ -f "$WCFG/default.enc" ]; then stop "wrangler wrote default.enc, which the installer cannot read. Sign in with: npx wrangler@4.73.0 login"
+WFORMAT=""
+# Match operations/wrangler-oauth.mjs exactly. Inspect files, not merely an
+# earlier directory, so an empty directory cannot hide a usable later session.
+WCFG_CANDIDATES=("$HOME/.config/.wrangler/config" "$HOME/.wrangler/config")
+if [ -n "$XDG_CONFIG_HOME" ]; then
+  WCFG_CANDIDATES=("$XDG_CONFIG_HOME/.wrangler/config" "${WCFG_CANDIDATES[@]}")
+fi
+for WCFG in "${WCFG_CANDIDATES[@]}"; do
+  if [ -f "$WCFG/default.toml" ]; then WFORMAT="toml"; break
+  elif [ -f "$WCFG/default.enc" ]; then WFORMAT="encrypted"; break
+  fi
+done
+if [ "$WFORMAT" = "toml" ]; then ok "wrangler session found (default.toml, the format the installer reads)"
+elif [ "$WFORMAT" = "encrypted" ]; then stop "wrangler wrote default.enc, which the installer cannot read. Sign in with: npx wrangler@4.73.0 login"
 else warn "no wrangler session yet. Sign in with: npx wrangler@4.73.0 login"; fi
 echo
 

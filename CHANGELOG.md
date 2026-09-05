@@ -6,6 +6,13 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## 0.3.7
 
+- The downloaded package now contains the same read-only Mac and Windows
+  preflight checked by release CI. It requires Node 22, finds every visible CLI
+  copy, and checks the same Wrangler session locations the installer reads.
+  Windows recovery steps remain runnable from the install shell even before a
+  new terminal has picked up the CLI path.
+- Disposable test cleanup now refuses to run unless the resource name begins
+  with an explicit test prefix and a protected live-name list is present.
 - The release package is now built once and those same bytes are installed on
   both Mac and Windows before publication. `brain --help`, `brain -h`, and
   `brain help` also print the full guide and exit successfully.

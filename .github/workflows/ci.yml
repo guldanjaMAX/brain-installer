@@ -201,6 +201,24 @@ jobs:
           echo "TARBALL=$tgz" >> "$GITHUB_ENV"
           echo "verified $ARTIFACT_NAME at sha256:$EXPECTED_SHA256"
 
+      # The operator runs preflight from the installed release, not from a
+      # source checkout. Extract both scripts from the one shared artifact so
+      # every matrix job proves those exact bytes were actually packaged.
+      - name: extract preflight from exact package
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$TARBALL"
+          if command -v cygpath >/dev/null 2>&1; then
+            tarball=$(cygpath -u "$tarball")
+          fi
+          mkdir -p .packaged-preflight
+          tar -xzf "$tarball" -C .packaged-preflight \
+            package/tools/preflight.sh package/tools/preflight.ps1
+          test -f .packaged-preflight/package/tools/preflight.sh
+          test -f .packaged-preflight/package/tools/preflight.ps1
+          echo "both packaged preflight scripts extracted from $ARTIFACT_NAME"
+
       # --ignore-scripts is what the client is told to run, so CI runs the same
       # thing. If a dependency needs a postinstall script, better to find out
       # here than on someone's laptop.
@@ -217,27 +235,37 @@ jobs:
       - name: unit and integration suite
         run: npm test
 
-      # The preflight is what an operator runs on a client machine before an
-      # install. It reads the machine and changes nothing, so CI's job is to
-      # prove it RUNS and prints on every platform, not that it is all-clear:
-      # a runner legitimately has no wrangler session and no manifest.
-      - name: preflight runs and prints (Windows)
+      # A runner may legitimately have no Wrangler session or manifest, so the
+      # exit may be diagnostic. Require the packaged script to parse, execute,
+      # and print its identifying header.
+      - name: packaged preflight runs and prints (Windows)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          .\tools\preflight.ps1
-          Write-Host "preflight exit: $LASTEXITCODE"
+          $path = Resolve-Path .\.packaged-preflight\package\tools\preflight.ps1
+          $out = powershell -NoProfile -ExecutionPolicy Bypass -File $path 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          Write-Host "preflight exit: $code"
+          if ($out -notmatch 'Financial Brain preflight') { throw 'packaged preflight did not run' }
           $e=$null; $t=$null
-          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\tools\preflight.ps1), [ref]$t, [ref]$e) | Out-Null
+          [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$t, [ref]$e) | Out-Null
           if ($e.Count -gt 0) { $e | ForEach-Object { Write-Host $_ }; exit 1 }
           Write-Host "preflight.ps1 parsed clean"
 
-      - name: preflight runs and prints (macOS and Linux)
+      - name: packaged preflight runs and prints (macOS and Linux)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          bash tools/preflight.sh; echo "preflight exit: $?"
-          bash -n tools/preflight.sh && echo "preflight.sh parsed clean"
+          set +e
+          out=$(bash .packaged-preflight/package/tools/preflight.sh 2>&1)
+          code=$?
+          set -e
+          printf '%s\n' "$out"
+          echo "preflight exit: $code"
+          printf '%s\n' "$out" | grep -q 'Financial Brain preflight' || { echo "::error::packaged preflight did not run"; exit 1; }
+          bash -n .packaged-preflight/package/tools/preflight.sh
+          echo "preflight.sh parsed clean"
 
       # The CLI must START. On Windows a symlinked bin, a percent-encoded path
       # or a .cmd shim can make it exit 0 having done nothing, which is worse
@@ -406,6 +434,37 @@ jobs:
           if ($code -ne 1) { Write-Host "::error::a STOP must exit 1, got $code"; exit 1 }
           Write-Host "TRAP 3 DETECTED, exit 1 as required"
           # The child correctly exited 1; do not let that leak out as this step's verdict.
+          exit 0
+
+      - name: "trap 4: an empty earlier Wrangler directory cannot mask a later session"
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'wrangler-layout'
+          $env:APPDATA = Join-Path $root 'roaming'
+          $env:LOCALAPPDATA = Join-Path $root 'local'
+          $env:XDG_CONFIG_HOME = Join-Path $root 'xdg'
+          $env:HOME = Join-Path $root 'home'
+          $env:USERPROFILE = Join-Path $root 'profile'
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:APPDATA 'xdg.config\.wrangler\config') | Out-Null
+          $session = New-Item -ItemType Directory -Force -Path (Join-Path $env:APPDATA '.wrangler\config')
+          Set-Content (Join-Path $session 'default.toml') 'fixture session marker only'
+          $out = powershell -NoProfile -File .\tools\preflight.ps1 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'ok\s+wrangler session found') { Write-Host "::error::an empty earlier directory masked the later Wrangler session"; exit 1 }
+          Write-Host "TRAP 4 DETECTED"
+
+      - name: "trap 5: Node 21 is below the supported minimum"
+        shell: powershell
+        run: |
+          $shim = New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\node-21" -Force
+          Set-Content "$shim\node.cmd" "@echo off`r`necho v21.9.0"
+          $env:Path = "$shim;$env:Path"
+          $out = powershell -NoProfile -File .\tools\preflight.ps1 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($out -notmatch 'STOP.*node v21\.9\.0 is too old; the installer needs 22 or newer') { Write-Host "::error::preflight accepted unsupported Node 21"; exit 1 }
+          if ($code -ne 1) { Write-Host "::error::unsupported Node must exit 1, got $code"; exit 1 }
+          Write-Host "TRAP 5 DETECTED, exit 1 as required"
           exit 0
 
       - name: "control: a clean machine is told plainly that nothing is wrong"
