@@ -191,6 +191,7 @@ if (SCENARIO) {
   const HERE = dirname(fileURLToPath(import.meta.url));
   const CLI = join(HERE, "..", "brain.mjs");
   const THIS_FILE = import.meta.url;
+  const { renderCliCommands } = await import("../brain.mjs");
   let fail = 0;
   let ran = 0;
   const check = (name, condition, detail = "") => {
@@ -296,14 +297,16 @@ if (SCENARIO) {
   // the manual runner is slower. Health must describe the state and must not
   // send the operator to make it worse.
   check("health never INSTRUCTS a manual drain, and warns against it when stalled",
-    !/(Clear it now with|Finish and confirm visibility with|Re-run `brain drain)/i.test(stalled.output + processing.output) &&
-      /Do NOT run `brain drain`/.test(stalled.output),
+    !/(Clear it now with|Finish and confirm visibility with)/i.test(stalled.output + processing.output) &&
+      !(stalled.output + processing.output).includes(`Re-run \`${renderCliCommands("brain drain")}`) &&
+      stalled.output.includes(`Do NOT run \`${renderCliCommands("brain drain")}\``),
     processing.output + "\n---\n" + stalled.output);
 
   const countMismatch = runScenario("health-vector-count-mismatch", "health", { adminKey: true });
   check("health rejects an empty queue when Vectorize is still missing vectors",
     countMismatch.code === 1 && /Vectorize holds 0 vector\(s\), but D1 requires 10/is.test(countMismatch.output) &&
-      /brain diagnose/.test(countMismatch.output) && /brain reindex/.test(countMismatch.output),
+      countMismatch.output.includes(renderCliCommands("brain diagnose")) &&
+      countMismatch.output.includes(renderCliCommands("brain reindex")),
     countMismatch.output);
 
   const countExcess = runScenario("health-vector-count-excess", "health", { adminKey: true });

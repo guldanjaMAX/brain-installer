@@ -21,6 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { renderCliCommands } from "../brain.mjs";
 import { previewSupportJournal } from "../support-journal.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -226,7 +227,9 @@ function ingestExitCli(scenario) {
   const events = journalEvents(r.journal);
   check("a missing token is an explained failure", r.code === 1 && /CLOUDFLARE_API_TOKEN/.test(r.out), r.out.slice(0, 160));
   check("and it gives a safe next step instead of a shell-history command",
-    /brain setup.*brain update.*hidden token entry/is.test(r.out) &&
+    r.out.includes(renderCliCommands("brain setup")) &&
+      r.out.includes(renderCliCommands("brain update")) &&
+      /hidden token entry/is.test(r.out) &&
       !/export\s+CLOUDFLARE_API_TOKEN|CLOUDFLARE_API_TOKEN\s*=\s*['\"]/i.test(r.out), r.out.slice(0, 400));
   // Fatal is anticipated, so it must NOT be dressed up as an installer bug.
   check("an anticipated failure is not reported as a bug", !/This is a bug in the installer/.test(r.out));
@@ -415,12 +418,13 @@ function ingestExitCli(scenario) {
 /* ---- unknown input is guided, not dumped ---- */
 {
   const r = cli(["definitelynotacommand"]);
-  check("an unknown command prints usage", /brain setup/.test(r.out), r.out.slice(0, 160));
+  check("an unknown command prints usage", r.out.includes(renderCliCommands("brain setup")), r.out.slice(0, 160));
   check("and exits non-zero", r.code === 1, String(r.code));
 }
 {
   const r = cli([]);
-  check("no arguments prints usage and exits 0", /brain setup/.test(r.out) && r.code === 0, String(r.code));
+  check("no arguments prints usage and exits 0",
+    r.out.includes(renderCliCommands("brain setup")) && r.code === 0, String(r.code));
 }
 
 /* ---- doctor must never be the thing that breaks ---- */
