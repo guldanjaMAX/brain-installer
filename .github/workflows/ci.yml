@@ -189,3 +189,61 @@ jobs:
             exit 1
           fi
           echo "clean"
+
+  # The preflight exists to catch three Windows traps. A clean runner has none
+  # of them, so the job above proves only that it RUNS. This job plants each
+  # trap and proves the preflight SAYS SO. A smoke detector that has never
+  # smelled smoke is not known to work.
+  preflight-traps:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: "trap 1: default execution policy blocks the .ps1 shims"
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy -Scope CurrentUser Restricted -Force
+          $out = powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\preflight.ps1 2>&1 | Out-String
+          Set-ExecutionPolicy -Scope CurrentUser Undefined -Force
+          Write-Host $out
+          if ($out -notmatch 'WARN.*brain\.cmd, npm\.cmd and npx\.cmd') { Write-Host "::error::preflight did not warn about the .ps1 shim block"; exit 1 }
+          Write-Host "TRAP 1 DETECTED"
+
+      - name: "trap 2: running inside the Claude MSIX sandbox"
+        shell: powershell
+        run: |
+          $env:APPDATA = "C:\Users\x\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming"
+          $out = powershell -NoProfile -File .\tools\preflight.ps1 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($out -notmatch 'STOP.*MSIX sandbox') { Write-Host "::error::preflight did not stop on the MSIX sandbox"; exit 1 }
+          if ($code -ne 1) { Write-Host "::error::a STOP must exit 1, got $code"; exit 1 }
+          Write-Host "TRAP 2 DETECTED, exit 1 as required"
+
+      - name: "trap 3: more than one copy of the CLI on PATH"
+        shell: powershell
+        run: |
+          $a = New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\cli-a" -Force
+          $b = New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\cli-b" -Force
+          Set-Content "$a\brain.cmd" "@echo off`r`necho fake-a"
+          Set-Content "$b\brain.cmd" "@echo off`r`necho fake-b"
+          $env:Path = "$a;$b;$env:Path"
+          $out = powershell -NoProfile -File .\tools\preflight.ps1 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($out -notmatch 'STOP.*2 copies of the CLI') { Write-Host "::error::preflight did not stop on duplicate CLIs"; exit 1 }
+          if ($code -ne 1) { Write-Host "::error::a STOP must exit 1, got $code"; exit 1 }
+          Write-Host "TRAP 3 DETECTED, exit 1 as required"
+
+      - name: "control: a clean machine is told plainly that nothing is wrong"
+        shell: powershell
+        run: |
+          $out = powershell -NoProfile -File .\tools\preflight.ps1 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'Nothing is wrong here') { Write-Host "::error::clean machine should read as clean"; exit 1 }
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::clean machine should exit 0"; exit 1 }
+          Write-Host "CONTROL PASSED"

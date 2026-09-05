@@ -21,8 +21,14 @@ else { Stop_ "npm.cmd not found" }
 Write-Host ""
 
 Write-Host "WINDOWS TRAPS"
-$pol = Get-ExecutionPolicy
-Write-Host "  execution policy $pol"
+# Read the scopes a fresh normal PowerShell window inherits, not this process's
+# effective policy: a launch with -ExecutionPolicy Bypass (or a CI runner) would
+# otherwise hide the very setting that blocks the client's own shell.
+$scopes = Get-ExecutionPolicy -List
+$user = ($scopes | Where-Object Scope -eq 'CurrentUser').ExecutionPolicy
+$machine = ($scopes | Where-Object Scope -eq 'LocalMachine').ExecutionPolicy
+$pol = if ($user -ne 'Undefined') { $user } elseif ($machine -ne 'Undefined') { $machine } else { 'Undefined' }
+Write-Host "  execution policy $pol  (CurrentUser=$user, LocalMachine=$machine)"
 if ($pol -in @('Restricted','AllSigned','Undefined')) {
   Warn "the bare 'brain', 'npm' and 'npx' resolve to blocked .ps1 shims under this policy. Use brain.cmd, npm.cmd and npx.cmd."
 } else { Ok "policy allows the .ps1 shims (the .cmd forms are still safe to use)" }
