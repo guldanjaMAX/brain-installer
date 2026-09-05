@@ -32,6 +32,15 @@
  */
 
 import { currentEvidenceCandidates } from "./query-intent.js";
+import {
+  PUBLIC_INSTALL_SMOKE_CHUNK,
+  PUBLIC_INSTALL_SMOKE_DOC_UID,
+  PUBLIC_INSTALL_SMOKE_ID,
+  PUBLIC_INSTALL_SMOKE_METADATA,
+  PUBLIC_INSTALL_SMOKE_SOURCE,
+  PUBLIC_INSTALL_SMOKE_TITLE,
+  publicInstallSmokeContentHash,
+} from "./install-smoke.js";
 
 const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
@@ -944,7 +953,89 @@ const DRAIN_LEASE_ACQUIRE_QUERIES = 1;
 const DRAIN_LEASE_RELEASE_QUERIES = 1;
 const DRAIN_PROJECTION_VERIFY_QUERIES = 1;
 const DRAIN_INITIAL_DEPTH_QUERIES = 1;
+const DRAIN_RETRY_STATE_QUERIES = 2;
 const DRAIN_BATCH_SIZE_MAX = 100;
+export const VECTOR_RETRY_MAX_ATTEMPTS = 5;
+const VECTOR_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
+
+/**
+ * Drop retry state whose outbox row is gone. The retry table is keyed by
+ * (chunk_uid, generation) and a newer ingest bumps the generation, so without
+ * this a re-ingested chunk would inherit the previous generation's attempt
+ * count and backoff. Bounded per call so it can never dominate the drain's
+ * query budget.
+ */
+async function cleanupVectorRetryState(env, limit = 500) {
+  await env.DB.prepare(
+    `DELETE FROM vector_outbox_retry_state
+      WHERE rowid IN (
+        SELECT s.rowid FROM vector_outbox_retry_state s
+         WHERE NOT EXISTS (
+           SELECT 1 FROM vector_outbox o
+            WHERE o.chunk_uid=s.chunk_uid AND o.generation=s.generation
+         )
+         LIMIT ?
+      )`
+  ).bind(limit).run();
+}
+
+function vectorRetryDelay(attempt) {
+  return VECTOR_RETRY_DELAYS_MS[Math.min(Math.max(attempt - 1, 0), VECTOR_RETRY_DELAYS_MS.length - 1)];
+}
+
+/**
+ * Record one failed attempt per row: bump the attempt count, push the next
+ * eligible time out along the backoff ladder, and quarantine the row once it
+ * has spent its attempts.
+ *
+ * This replaced a bare `attempts = attempts + 1` on the outbox row. Counting
+ * attempts without also recording WHEN the row may be tried again is what let
+ * a single failing row be re-selected as the head of every batch, so the whole
+ * queue advanced at that row's failure rate.
+ */
+async function scheduleVectorFailures(env, rows, {
+  failureCode,
+  error,
+  now = Date.now(),
+} = {}) {
+  if (!rows.length) return { scheduled: 0, quarantined: 0 };
+  const detail = String(error || "vector operation failed").slice(0, 300);
+  const statements = [];
+  let quarantined = 0;
+  for (const row of rows) {
+    const attempt = Math.max(0, Number(row.attempts || 0)) + 1;
+    // A visibility mismatch is a systemic confirmation artifact, never a
+    // property of the row: quarantining on it strands healthy rows behind an
+    // operator ceremony after any stall lasting a few cycles. The backoff
+    // ladder still applies (capped at its last rung), so these rows retry
+    // forever instead of dying.
+    const quarantineAt = failureCode !== "visibility_mismatch" &&
+      attempt >= VECTOR_RETRY_MAX_ATTEMPTS ? now : null;
+    if (quarantineAt !== null) quarantined++;
+    const nextAttemptAt = quarantineAt === null ? now + vectorRetryDelay(attempt) : now;
+    statements.push(env.DB.prepare(
+      `INSERT INTO vector_outbox_retry_state
+         (chunk_uid,generation,attempts,next_attempt_at,last_attempt_at,quarantined_at,failure_code,last_error)
+       VALUES (?,?,?,?,?,?,?,?)
+       ON CONFLICT(chunk_uid,generation) DO UPDATE SET
+         attempts=excluded.attempts,
+         next_attempt_at=excluded.next_attempt_at,
+         last_attempt_at=excluded.last_attempt_at,
+         quarantined_at=excluded.quarantined_at,
+         failure_code=excluded.failure_code,
+         last_error=excluded.last_error`
+    ).bind(
+      row.chunk_uid, row.generation, attempt, nextAttemptAt, now,
+      quarantineAt, failureCode, detail,
+    ));
+    statements.push(env.DB.prepare(
+      `UPDATE vector_outbox SET attempts=?, last_error=?
+       WHERE chunk_uid=? AND generation=?`
+    ).bind(attempt, detail, row.chunk_uid, row.generation));
+  }
+  await env.DB.batch(statements);
+  return { scheduled: rows.length - quarantined, quarantined };
+}
 
 // One two-phase slice either submits or confirms. The largest path is an upsert
 // submission: queue/fence/delete/upsert reads plus the durable fence, final
@@ -1180,18 +1271,52 @@ async function projectionFenceState(env) {
   return { mutationId, submittedAt };
 }
 
-async function projectionFenceProcessed(env, fence) {
-  if (!fence?.mutationId) return true;
-  const info = await env.VECTORIZE.describe();
+const VECTOR_FENCE_CLOCK_SKEW_MS = 5 * 60_000;
+
+/**
+ * True when the index has processed at least up to the recorded fence.
+ *
+ * The watermark id is opaque, so a differing id alone is ambiguous: not yet
+ * ours, or already past ours. Requiring exact equality turned that ambiguity
+ * into a permanent stall the moment any mutation this fence did not record
+ * processed after ours - a crash between the provider accepting a changeset
+ * and the fence write landing, or any out-of-band mutation. The watermark can
+ * then never equal the recorded id again, so every drain cycle waits forever
+ * while ingest keeps queueing behind it. The brain stays up, answers
+ * questions, and reports healthy the entire time.
+ *
+ * The mutation log is totally ordered and FIFO-applied, which is the
+ * precondition for a single high-water mark to mean anything at all, so a
+ * processed mutation dated a full skew margin after our recorded submission
+ * proves ours is behind it. Row-level truth still comes from the getByIds
+ * proofs in confirmSubmittedVectors: a delete is only ever confirmed by
+ * absence, so an open fence confirms nothing by itself.
+ *
+ * Returns true (covered), false (not yet), or null when the provider response
+ * carries no usable watermark shape - each caller keeps its own contract
+ * error for that case.
+ */
+function fenceWatermarkCovers(fence, info) {
   const processed = info?.processedUpToMutation;
   // A brand-new index legitimately reports no processed watermark while its
   // first accepted changeset is still pending. That is "not yet", not a
   // malformed response. Other shapes still fail closed.
   if (processed === null || processed === undefined || processed === "") return false;
-  if (typeof processed !== "string" && typeof processed !== "number") {
+  if (typeof processed !== "string" && typeof processed !== "number") return null;
+  if (String(processed) === fence.mutationId) return true;
+  const processedAt = Date.parse(String(info?.processedUpToDatetime ?? ""));
+  return Number.isFinite(processedAt) &&
+    Number.isSafeInteger(fence.submittedAt) &&
+    processedAt >= fence.submittedAt + VECTOR_FENCE_CLOCK_SKEW_MS;
+}
+
+async function projectionFenceProcessed(env, fence) {
+  if (!fence?.mutationId) return true;
+  const covered = fenceWatermarkCovers(fence, await env.VECTORIZE.describe());
+  if (covered === null) {
     throw new Error("Vectorize did not expose its processed mutation watermark");
   }
-  return String(processed) === fence.mutationId;
+  return covered;
 }
 
 /** Mark the full projection verified only across one exact, empty-queue cut. */
@@ -1204,7 +1329,7 @@ async function markProjectionVerifiedIfExact(env) {
   const fence = await projectionFenceState(env);
   const processed = fence.mutationId === null
     ? true
-    : String(description?.processedUpToMutation ?? "") === fence.mutationId;
+    : fenceWatermarkCovers(fence, description) === true;
   if (!processed) return false;
   const result = await env.DB.prepare(
     `UPDATE install_state
@@ -1296,26 +1421,24 @@ async function confirmSubmittedVectors(env, rows) {
   }
   if (retrying.length) {
     const detail = "accepted Vectorize mutation was processed but the exact vector state was not query-visible; retrying";
-    const changes = await env.DB.batch(retrying.map((row) => row.op === "delete"
-      ? env.DB.prepare(
-        `UPDATE vector_outbox
-            SET submitted_mutation_id = NULL, submitted_at = NULL,
-                attempts = attempts + 1, last_error = ?5
-          WHERE chunk_uid = ?1 AND op = 'delete'
-            AND COALESCE(vector_id, chunk_uid) = ?2 AND generation = ?3
-            AND submitted_mutation_id = ?4`
-      ).bind(row.chunk_uid, row.provider_vector_id, row.generation, row.submitted_mutation_id, detail)
-      : env.DB.prepare(
-        `UPDATE vector_outbox
-            SET submitted_mutation_id = NULL, submitted_at = NULL,
-                attempts = attempts + 1, last_error = ?4
-          WHERE chunk_uid = ?1 AND op = 'upsert' AND generation = ?2
-            AND submitted_mutation_id = ?3`
-      ).bind(row.chunk_uid, row.generation, row.submitted_mutation_id, detail)));
+    // Clear the submitted receipt first, then record the failure against only
+    // the rows whose compare-and-swap actually won. chunk_uid is the outbox
+    // primary key, so (chunk_uid, generation, submitted_mutation_id) already
+    // identifies the row exactly and the op/vector_id branches added nothing.
+    const changes = await env.DB.batch(retrying.map((row) => env.DB.prepare(
+      `UPDATE vector_outbox
+          SET submitted_mutation_id = NULL, submitted_at = NULL
+        WHERE chunk_uid = ? AND generation = ? AND submitted_mutation_id = ?`
+    ).bind(row.chunk_uid, row.generation, row.submitted_mutation_id)));
     if (!Array.isArray(changes) || changes.length !== retrying.length) {
       throw new Error("the vector retry receipts were ambiguous");
     }
     retrying = retrying.filter((_, index) => drainLeaseChanges(changes[index]) === 1);
+    await scheduleVectorFailures(env, retrying, {
+      failureCode: "visibility_mismatch",
+      error: detail,
+      now: Date.now(),
+    });
   }
   return {
     confirmed: confirmed.length,
@@ -1334,11 +1457,11 @@ async function submitQueuedDeletes(env, rows, lease) {
     return (await recordSubmittedMutation(env, rows, "delete", receipt)).submitted;
   } catch (error) {
     const detail = String(error?.message || error).slice(0, 300);
-    await env.DB.batch(rows.map((row) => env.DB.prepare(
-      `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
-        WHERE chunk_uid = ?1 AND op = 'delete'
-          AND COALESCE(vector_id, chunk_uid) = ?3 AND generation = ?4`
-    ).bind(row.chunk_uid, detail, row.vector_id || row.chunk_uid, row.generation))).catch(() => {});
+    await scheduleVectorFailures(env, rows, {
+      failureCode: "delete_provider_failure",
+      error: detail,
+      now: lease.now(),
+    }).catch(() => {});
     const wrapped = new Error(`the vector index could not durably accept this delete batch: ${detail}`);
     wrapped.vectorDeleteFailed = true;
     throw wrapped;
@@ -1353,6 +1476,19 @@ async function submitQueuedDeletes(env, rows, lease) {
  * pretending the write completed inline would make read-after-write look
  * broken. Draining separately makes the lag a visible queue instead.
  */
+// Retry classes that may ride in a full batch. visibility_mismatch means the
+// mutation was accepted but its effect was not yet query-visible: a systemic
+// condition, never a property of the row - the fence stall that creates these
+// rows en masse would otherwise serialize the whole queue to one row per
+// cycle behind them. embedding_failure is already isolated per-row inside the
+// embed loop below. Every other class (provider batch rejections, and legacy
+// rows carrying no recorded class) keeps the exclusive head slice, which is
+// how one poison row proves itself alone.
+const VECTOR_BATCH_SAFE_RETRY_CODES = new Set(["visibility_mismatch", "embedding_failure"]);
+const headRetryNeedsIsolation = (row) =>
+  Number(row?.attempts || 0) > 0 &&
+  !VECTOR_BATCH_SAFE_RETRY_CODES.has(String(row?.failure_code || ""));
+
 async function drainOutboxBatch(env, {
   embed,
   embedBatch,
@@ -1365,8 +1501,11 @@ async function drainOutboxBatch(env, {
   // stale confirmation can never acknowledge the newer operation.
   const { results: submittedRows } = await env.DB.prepare(
     `SELECT o.chunk_uid, COALESCE(o.vector_id, c.vector_id, o.chunk_uid) AS vector_id,
-            o.op, o.queued_at, o.generation, o.submitted_mutation_id, o.submitted_at
+            o.op, o.queued_at, o.generation, o.submitted_mutation_id, o.submitted_at,
+            COALESCE(s.attempts, o.attempts, 0) AS attempts
        FROM vector_outbox o LEFT JOIN chunks c ON c.chunk_uid = o.chunk_uid
+       LEFT JOIN vector_outbox_retry_state s
+         ON s.chunk_uid=o.chunk_uid AND s.generation=o.generation
       WHERE o.submitted_mutation_id IS NOT NULL
       ORDER BY o.queued_at LIMIT ?1`
   ).bind(batchSize).all();
@@ -1401,13 +1540,22 @@ async function drainOutboxBatch(env, {
   // Delete first. Orphans still consume Vectorize candidate slots even though
   // D1 hydration makes them unreachable, so leaving them behind damages recall.
   const { results: deletePending } = await env.DB.prepare(
-    `SELECT chunk_uid, COALESCE(vector_id, chunk_uid) AS vector_id, queued_at, generation
-       FROM vector_outbox
-      WHERE op = 'delete' AND submitted_mutation_id IS NULL
-      ORDER BY queued_at LIMIT ?1`
-  ).bind(batchSize).all();
+    `SELECT o.chunk_uid, COALESCE(o.vector_id, o.chunk_uid) AS vector_id,
+            o.queued_at, o.generation, COALESCE(s.attempts,o.attempts,0) AS attempts,
+            s.failure_code
+       FROM vector_outbox o
+       LEFT JOIN vector_outbox_retry_state s
+         ON s.chunk_uid=o.chunk_uid AND s.generation=o.generation
+      WHERE o.op = 'delete' AND o.submitted_mutation_id IS NULL
+        AND s.quarantined_at IS NULL
+        AND COALESCE(s.next_attempt_at,0) <= ?1
+      ORDER BY o.queued_at LIMIT ?2`
+  ).bind(lease.now(), batchSize).all();
   if (deletePending?.length) {
-    const submitted = await submitQueuedDeletes(env, deletePending, lease);
+    const selected = headRetryNeedsIsolation(deletePending[0])
+      ? deletePending.slice(0, 1)
+      : deletePending;
+    const submitted = await submitQueuedDeletes(env, selected, lease);
     const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
     return {
       drained: 0, deleted: 0, upserted: 0, submitted, waiting: submitted,
@@ -1417,13 +1565,19 @@ async function drainOutboxBatch(env, {
 
   const { results: pending } = await env.DB.prepare(
     `SELECT o.chunk_uid, o.queued_at, o.generation,
+            COALESCE(s.attempts,o.attempts,0) AS attempts,
+            s.failure_code,
             c.text, c.source, c.doc_uid, c.document_date,
             c.client, c.category, c.top_folder, c.platform
      FROM vector_outbox o JOIN chunks c ON c.chunk_uid = o.chunk_uid
+     LEFT JOIN vector_outbox_retry_state s
+       ON s.chunk_uid=o.chunk_uid AND s.generation=o.generation
      WHERE o.op = 'upsert' AND o.submitted_mutation_id IS NULL
-     ORDER BY o.queued_at LIMIT ?1`
+       AND s.quarantined_at IS NULL
+       AND COALESCE(s.next_attempt_at,0) <= ?1
+     ORDER BY o.queued_at LIMIT ?2`
   )
-    .bind(batchSize)
+    .bind(lease.now(), batchSize)
     .all();
 
   if (!pending?.length) {
@@ -1434,6 +1588,13 @@ async function drainOutboxBatch(env, {
     };
   }
 
+  // Bisection: once the head row is retrying for a reason the provider owns,
+  // it takes the slice alone. Sending it back inside a full batch would make
+  // its next rejection reject its healthy neighbours too, which is how one bad
+  // row stalls a whole queue instead of proving itself.
+  const selectedPending = headRetryNeedsIsolation(pending[0])
+    ? pending.slice(0, 1)
+    : pending;
   const vectors = [];
   const idToChunk = new Map();
   // Capture every selected token before embedding starts. A poison row can
@@ -1441,7 +1602,7 @@ async function drainOutboxBatch(env, {
   // exact generation CAS. Building this map only after a successful embed
   // would silently leave those rows at attempts=0 forever.
   const chunkGeneration = new Map(
-    pending.map((row) => [row.chunk_uid, row.generation])
+    selectedPending.map((row) => [row.chunk_uid, row.generation])
   );
   const poisoned = [];
 
@@ -1452,10 +1613,10 @@ async function drainOutboxBatch(env, {
   // A failed group falls back to embedding its members one at a time. That keeps
   // the poison-isolation guarantee exactly as it was: a single bad chunk
   // quarantines itself rather than taking the other 49 down with it.
-  const embedded = new Array(pending.length).fill(undefined);
+  const embedded = new Array(selectedPending.length).fill(undefined);
   if (embedBatch) {
-    for (let i = 0; i < pending.length; i += embedGroup) {
-      const group = pending.slice(i, i + embedGroup);
+    for (let i = 0; i < selectedPending.length; i += embedGroup) {
+      const group = selectedPending.slice(i, i + embedGroup);
       try {
         const out = await embedBatch(group.map((r) => r.text));
         if (!Array.isArray(out) || out.length !== group.length) {
@@ -1474,8 +1635,8 @@ async function drainOutboxBatch(env, {
     }
   }
 
-  for (let idx = 0; idx < pending.length; idx++) {
-    const row = pending[idx];
+  for (let idx = 0; idx < selectedPending.length; idx++) {
+    const row = selectedPending[idx];
     let values = embedded[idx];
     if (values === undefined) {
       if (embedBatch && poisoned.some((p) => p.chunk_uid === row.chunk_uid)) continue;
@@ -1512,14 +1673,15 @@ async function drainOutboxBatch(env, {
       // Acceptance and its D1 receipt are one phase. If either fails, leave the
       // row queued so a later idempotent upsert creates a newer ordering fence.
       const err = String(e.message || e).slice(0, 300);
-      await env.DB.batch(
-        vectors.map((v) =>
-          env.DB.prepare(
-            `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
-             WHERE chunk_uid = ?1 AND op = 'upsert' AND generation = ?3`
-          ).bind(idToChunk.get(v.id), err, chunkGeneration.get(idToChunk.get(v.id)))
-        )
-      ).catch(() => {});
+      await scheduleVectorFailures(env, vectors.map((vector) => ({
+        chunk_uid: idToChunk.get(vector.id),
+        generation: chunkGeneration.get(idToChunk.get(vector.id)),
+        attempts: selectedPending.find((row) => row.chunk_uid === idToChunk.get(vector.id))?.attempts || 0,
+      })), {
+        failureCode: "upsert_provider_failure",
+        error: err,
+        now: lease.now(),
+      }).catch(() => {});
       const e2 = new Error(`the vector index could not durably accept this batch: ${err}`);
       e2.vectorUpsertFailed = true;
       throw e2;
@@ -1530,14 +1692,15 @@ async function drainOutboxBatch(env, {
   // queue. Accepted rows also stay queued, now in submitted state, until a later
   // invocation observes the exact generation through getByIds().
   if (poisoned.length) {
-    await env.DB.batch(
-      poisoned.map((p) =>
-        env.DB.prepare(
-          `UPDATE vector_outbox SET attempts = attempts + 1, last_error = ?2
-           WHERE chunk_uid = ?1 AND op = 'upsert' AND generation = ?3`
-        ).bind(p.chunk_uid, p.error, chunkGeneration.get(p.chunk_uid))
-      )
-    ).catch(() => {});
+    await Promise.all(poisoned.map((poison) => scheduleVectorFailures(env, [{
+      chunk_uid: poison.chunk_uid,
+      generation: chunkGeneration.get(poison.chunk_uid),
+      attempts: selectedPending.find((row) => row.chunk_uid === poison.chunk_uid)?.attempts || 0,
+    }], {
+      failureCode: "embedding_failure",
+      error: poison.error,
+      now: lease.now(),
+    }))).catch(() => {});
   }
 
   const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
@@ -1574,6 +1737,8 @@ export async function drainOutbox(env, options = {}) {
       remaining: 0, errors: [], busy: false, paused: true,
     };
   }
+  await requireVectorRetryStateTable(env);
+  await cleanupVectorRetryState(env);
   const rawMaxBatches = Number(options.maxBatches ?? 1);
   const maxBatches = Number.isInteger(rawMaxBatches)
     ? Math.min(10, Math.max(1, rawMaxBatches))
@@ -1621,7 +1786,8 @@ export async function drainOutbox(env, options = {}) {
   };
   let operationError = null;
   let reservedQueries = DRAIN_LEASE_ACQUIRE_QUERIES + DRAIN_LEASE_RELEASE_QUERIES +
-    DRAIN_PROJECTION_VERIFY_QUERIES + DRAIN_INITIAL_DEPTH_QUERIES;
+    DRAIN_PROJECTION_VERIFY_QUERIES + DRAIN_INITIAL_DEPTH_QUERIES +
+    DRAIN_RETRY_STATE_QUERIES;
   const batchQueryUpperBound = drainBatchQueryUpperBound(batchSize);
   try {
     for (let batch = 0; batch < maxBatches; batch++) {
@@ -2405,7 +2571,8 @@ async function acceleratedBootstrapReceipt(env, phase) {
       `SELECT count(*) AS n,
               sum(CASE WHEN submitted_mutation_id IS NULL THEN 1 ELSE 0 END) AS queued,
               sum(CASE WHEN submitted_mutation_id IS NOT NULL THEN 1 ELSE 0 END) AS submitted,
-              sum(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS failed
+              sum(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS failed,
+              sum(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS retrying
          FROM vector_outbox`
     ).first(),
     env.DB.prepare(
@@ -2441,6 +2608,9 @@ async function acceleratedBootstrapReceipt(env, phase) {
     remaining: total - confirmed,
     in_flight_batches: inFlight,
     failed,
+    // Same count under its honest name: outbox rows attempted at least once and
+    // still queued, i.e. accepted by Vectorize but not yet visible. Not lost.
+    retrying: failed,
     complete,
     vector_ready: readiness.ready === true,
     expected_vectors: readiness.expected_vectors,
@@ -2711,6 +2881,101 @@ async function confirmAcceleratedBootstrapBatch(env, batch, now) {
  * Re-project legacy vectors in provider-sized, disjoint batches while every
  * ordinary corpus writer remains blocked by the upgrade compatibility Worker.
  */
+/**
+ * The brain's own schema version, for /health.
+ *
+ * Whether a brain may take a published update is decided by this integer, not
+ * by its version string: a brain built from a working branch records a LOWER
+ * version while running a HIGHER schema. Until 2026-09-03 the only way to read
+ * it was to be at the owner's machine running `brain status`, so the guard
+ * depended on a person remembering to look. An unauthenticated integer saying
+ * which migrations ran leaks nothing the version string does not, and makes
+ * every brain in the field checkable with one request.
+ *
+ * Fail-soft: any error returns null, because /health must answer even when D1
+ * cannot.
+ */
+export async function installedSchemaVersion(env) {
+  try {
+    const row = await env.DB.prepare("SELECT schema_version FROM install_state WHERE id = 1").first();
+    const version = Number(row?.schema_version);
+    return Number.isSafeInteger(version) && version > 0 ? version : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Clear vector-outbox residue that no bootstrap batch owns, while paused.
+ *
+ * The legacy branch of acceleratedVectorBootstrap already drains its residue
+ * under allowPausedBootstrap. The bootstrap-v2 branch did not, and on
+ * 2026-09-04 that asymmetry stranded a live 926,323-chunk brain: ONE chunk
+ * queued by ordinary ingest in the moment before the pause could never be
+ * projected, so the outbox never emptied, markProjectionVerifiedIfExact could
+ * never take its exact cut, the status never reached 'verified', the
+ * base-count escape hatch below never fired, and convergence compared a stale
+ * base from an earlier epoch against a grown chunk count for the rest of time.
+ *
+ * Draining the outbox is projection work, not a corpus write. VECTOR_DRAIN_MODE
+ * is untouched and every ordinary corpus writer stays blocked, exactly as in
+ * the legacy branch.
+ *
+ * Only residue is eligible. While any batch of the current epoch is queued or
+ * submitted, its outbox rows belong to submitAcceleratedBootstrapBatch and
+ * confirmAcceleratedBootstrapBatch, whose exact per-batch receipts a general
+ * drain would invalidate by deleting rows they still count.
+ */
+async function drainPausedBootstrapResidue(env, state, options) {
+  const ledger = await env.DB.prepare(
+    `SELECT (SELECT count(*) FROM vector_outbox) AS residue,
+            (SELECT count(*) FROM vector_bootstrap_batches
+              WHERE epoch=?1 AND status IN ('queued','submitted')) AS owned`
+  ).bind(state.epoch).first();
+  const residue = Number(ledger?.residue);
+  const owned = Number(ledger?.owned);
+  if (![residue, owned].every((value) => Number.isSafeInteger(value) && value >= 0)) {
+    throw new Error("the paused bootstrap residue receipt is invalid");
+  }
+  if (residue === 0 || owned > 0) return { attempted: false, remaining: residue };
+
+  // Bounded exactly like the legacy branch. One request drains what it can and
+  // reports; the caller polls. An unbounded drain would hold a single Worker
+  // invocation open for a whole backlog and time out with nothing durable.
+  const drained = await drainOutbox(env, {
+    ...options,
+    allowPausedBootstrap: true,
+    disableBootstrapAdvance: true,
+    maxBatches: 10,
+  });
+
+  const after = await env.DB.prepare(
+    `SELECT count(*) AS total,
+            COALESCE(sum(CASE WHEN s.quarantined_at IS NULL THEN 1 ELSE 0 END),0) AS drainable
+       FROM vector_outbox o
+       LEFT JOIN vector_outbox_retry_state s
+         ON s.chunk_uid=o.chunk_uid AND s.generation=o.generation`
+  ).first();
+  const total = Number(after?.total);
+  const drainable = Number(after?.drainable);
+  if (![total, drainable].every((value) => Number.isSafeInteger(value) && value >= 0) ||
+      drainable > total) {
+    throw new Error("the paused bootstrap residue receipt is invalid");
+  }
+  // Every drain candidate query excludes quarantined rows, so residue that is
+  // entirely quarantined can never be projected by any amount of waiting. Say
+  // so once, loudly, rather than hanging again under a new name. A busy receipt
+  // means another leaseholder ran instead of us and proves nothing either way.
+  if (drained.busy !== true && total > 0 && drainable === 0) {
+    throw new Error(
+      `the vector outbox holds ${total} quarantined row(s) that the paused drain cannot ` +
+      "project, so the projection can never reach its verified cut. Release them with " +
+      "POST /api/admin/brain/vector-retry {\"confirm\":true}, then re-run `brain update <manifest>`.",
+    );
+  }
+  return { attempted: true, remaining: total };
+}
+
 export async function acceleratedVectorBootstrap(env, options = {}) {
   if (env?.VECTOR_DRAIN_MODE !== "paused-for-upgrade") {
     throw new Error("the accelerated vector bootstrap requires the verified upgrade pause");
@@ -2722,6 +2987,20 @@ export async function acceleratedVectorBootstrap(env, options = {}) {
   // Finish at most one schema-12 residue page before establishing the bulk-v2
   // boundary. This handles a 0.1.14 update interrupted after queue or submit.
   if (state.protocol !== ACCELERATED_BOOTSTRAP_PROTOCOL) {
+    // Queued UPSERT rows are superseded by the bulk projection, which re-embeds
+    // every chunk from D1 in provider-sized batches with per-batch receipts.
+    // Draining them here instead means one 100-row confirmation at a time:
+    // about a day on a brain that loaded 205,791 rows before updating
+    // (2026-09-03), with the brain refusing new material the whole time. Drop
+    // them and walk the corpus. DELETE rows still have to reach the provider
+    // and nothing else will send them, so they drain first, serially.
+    const superseded = await env.DB.prepare(
+      "DELETE FROM vector_outbox WHERE op='upsert'"
+    ).run();
+    if (drainLeaseChanges(superseded) > 0) {
+      await resetVectorProjectionBootstrap(env);
+      state = await bootstrapStateV2(env);
+    }
     const residue = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
     if (Number(residue?.n || 0) > 0) {
       await drainOutbox(env, {
@@ -2747,6 +3026,17 @@ export async function acceleratedVectorBootstrap(env, options = {}) {
       ).bind(ACCELERATED_BOOTSTRAP_PROTOCOL).run();
       return acceleratedBootstrapReceipt(env, "legacy_drain");
     }
+  }
+
+  // Residue queued by ordinary ingest in the moment before the pause belongs to
+  // no batch ledger, and under bootstrap-v2 nothing else will ever send it.
+  const residue = await drainPausedBootstrapResidue(env, state, options);
+  if (residue.attempted) {
+    // Rows still held are accepted-but-not-yet-visible. Report progress and let
+    // the next bounded request confirm them: queueing a bulk batch now would
+    // collide with the chunk_uid primary key the outbox still holds.
+    if (residue.remaining > 0) return acceleratedBootstrapReceipt(env, "legacy_drain");
+    state = await bootstrapStateV2(env);
   }
 
   if (state.status === "pending") {
@@ -3041,7 +3331,10 @@ export async function vectorReadiness(env) {
     } else if (typeof processed !== "string" && typeof processed !== "number") {
       throw new Error("the vector index did not expose its processed mutation watermark");
     } else {
-      mutationProcessed = String(processed) === mutationId;
+      mutationProcessed = fenceWatermarkCovers(
+        { mutationId, submittedAt: Number(state.mutation_submitted_at) },
+        description,
+      ) === true;
     }
   }
 
@@ -3407,4 +3700,120 @@ export async function forgetFamilies(env, { families = [], dryRun = true } = {})
     stale.push(...rows.map((row) => row.uid).filter((uid) => !keep.has(uid)));
   }
   return forget(env, { docUids: [...new Set(stale)], dryRun });
+}
+
+async function requireVectorRetryStateTable(env) {
+  try {
+    await env.DB.prepare("SELECT 1 FROM vector_outbox_retry_state LIMIT 1").first();
+  } catch {
+    throw new Error(
+      "vector retry state schema is unavailable; run `brain migrate <manifest>` before vector operations",
+    );
+  }
+}
+
+/** Privacy-safe retry state for owner alerts and operator receipts. */
+export async function vectorRetrySummary(env, now = Date.now()) {
+  await requireVectorRetryStateTable(env);
+  const row = await env.DB.prepare(
+    `SELECT count(*) AS tracked,
+            sum(CASE WHEN quarantined_at IS NOT NULL THEN 1 ELSE 0 END) AS quarantined,
+            sum(CASE WHEN quarantined_at IS NULL AND next_attempt_at > ? THEN 1 ELSE 0 END) AS delayed,
+            min(CASE WHEN quarantined_at IS NULL THEN next_attempt_at END) AS next_attempt_at
+       FROM vector_outbox_retry_state s
+      WHERE EXISTS (
+        SELECT 1 FROM vector_outbox o
+         WHERE o.chunk_uid=s.chunk_uid AND o.generation=s.generation
+      )`
+  ).bind(now).first();
+  return {
+    tracked: Number(row?.tracked || 0),
+    quarantined: Number(row?.quarantined || 0),
+    delayed: Number(row?.delayed || 0),
+    next_attempt_at: row?.next_attempt_at ?? null,
+  };
+}
+
+/** Explicit operator preview/confirm for quarantined vector generations. */
+export async function retryQuarantinedVectorOps(env, { confirm = false, limit = 100 } = {}) {
+  await requireVectorRetryStateTable(env);
+  const bounded = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  const total = await env.DB.prepare(
+    `SELECT count(*) AS n FROM vector_outbox_retry_state s
+      WHERE s.quarantined_at IS NOT NULL
+        AND EXISTS (SELECT 1 FROM vector_outbox o
+          WHERE o.chunk_uid=s.chunk_uid AND o.generation=s.generation)`
+  ).first();
+  const quarantined = Number(total?.n || 0);
+  if (!confirm || quarantined === 0) {
+    return { quarantined, selected: Math.min(quarantined, bounded), retried: 0, dry_run: true };
+  }
+  const { results: rows } = await env.DB.prepare(
+    `SELECT s.chunk_uid, s.generation
+       FROM vector_outbox_retry_state s
+       JOIN vector_outbox o ON o.chunk_uid=s.chunk_uid AND o.generation=s.generation
+      WHERE s.quarantined_at IS NOT NULL
+      ORDER BY s.quarantined_at, s.chunk_uid LIMIT ?`
+  ).bind(bounded).all();
+  const statements = [];
+  for (const row of rows || []) {
+    statements.push(env.DB.prepare(
+      "DELETE FROM vector_outbox_retry_state WHERE chunk_uid=? AND generation=? AND quarantined_at IS NOT NULL"
+    ).bind(row.chunk_uid, row.generation));
+    statements.push(env.DB.prepare(
+      "UPDATE vector_outbox SET attempts=0,last_error=NULL WHERE chunk_uid=? AND generation=?"
+    ).bind(row.chunk_uid, row.generation));
+  }
+  if (statements.length) await env.DB.batch(statements);
+  return {
+    quarantined,
+    selected: (rows || []).length,
+    retried: (rows || []).length,
+    dry_run: false,
+    remaining_quarantined: Math.max(0, quarantined - (rows || []).length),
+  };
+}
+
+/** Prove the one exact live fixed public document without returning its contents. */
+export async function fixedPublicSmokeState(env) {
+  const expectedContentHash = await publicInstallSmokeContentHash(env);
+  const row = await env.DB.prepare(
+    `SELECT
+       (SELECT count(*) FROM documents
+         WHERE source=?1 AND deleted_at IS NULL) live_document_count,
+       d.doc_uid,d.source,d.source_id,d.title,d.content_hash,d.meta,
+       (SELECT count(*) FROM chunks c
+         WHERE c.doc_uid=?2) chunk_count,
+       (SELECT count(*) FROM chunks c
+         WHERE c.doc_uid=?2 AND c.chunk_uid=?3 AND c.chunk_ix=0
+           AND c.text=?4 AND c.source=?1 AND c.title=?5) exact_chunk_count
+       FROM (SELECT 1) seed
+       LEFT JOIN documents d ON d.doc_uid=?2 AND d.deleted_at IS NULL`
+  ).bind(
+    PUBLIC_INSTALL_SMOKE_SOURCE,
+    PUBLIC_INSTALL_SMOKE_DOC_UID,
+    `${PUBLIC_INSTALL_SMOKE_DOC_UID}#0`,
+    PUBLIC_INSTALL_SMOKE_CHUNK,
+    PUBLIC_INSTALL_SMOKE_TITLE,
+  ).first();
+  const documents = Number(row?.live_document_count || 0);
+  const identityExact = documents === 1 && row?.doc_uid === PUBLIC_INSTALL_SMOKE_DOC_UID &&
+    row?.source === PUBLIC_INSTALL_SMOKE_SOURCE && row?.source_id === PUBLIC_INSTALL_SMOKE_ID &&
+    row?.title === PUBLIC_INSTALL_SMOKE_TITLE && Number(row?.chunk_count) === 1 &&
+    Number(row?.exact_chunk_count) === 1 && row?.content_hash === expectedContentHash;
+  let metadata;
+  try { metadata = JSON.parse(String(row?.meta || "{}")); } catch { metadata = null; }
+  const metadataKeys = metadata && !Array.isArray(metadata)
+    ? Object.keys(metadata).sort()
+    : [];
+  const metadataExact = metadataKeys.length === 3 &&
+    metadataKeys.join("|") === "contains_customer_data|proof_kind|schema_version" &&
+    metadata.proof_kind === PUBLIC_INSTALL_SMOKE_METADATA.proof_kind &&
+    metadata.contains_customer_data === PUBLIC_INSTALL_SMOKE_METADATA.contains_customer_data &&
+    metadata.schema_version === PUBLIC_INSTALL_SMOKE_METADATA.schema_version;
+  return { proven: Boolean(identityExact && metadataExact), documents };
+}
+
+export async function fixedPublicSmokeProof(env) {
+  return (await fixedPublicSmokeState(env)).proven;
 }

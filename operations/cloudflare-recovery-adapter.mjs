@@ -174,6 +174,29 @@ export const RECOVERY_DURABLE_TABLES = Object.freeze([
   "document_access_requests",
   "document_access_events",
   "passkey_security_events",
+  "support_access_events",
+  "support_access_requests",
+  "support_auth_challenges",
+  "support_enrollment_codes",
+  "support_passkeys",
+  "support_sessions",
+  "agent_action_receipts",
+  "zoom_deliveries",
+  "zoom_reconciliation",
+  "plaid_link_operations",
+  "plaid_reconciliation",
+  "plaid_revocation_outbox",
+  "plaid_sync_stage_accounts",
+  "plaid_sync_stage_transactions",
+  "plaid_sync_windows",
+  "plaid_webhook_events",
+  "plaid_webhook_keys",
+  "public_request_quotas",
+  "vector_outbox_retry_state",
+  "plaid_account_entity_assignments",
+  "owner_bank_import_commits",
+  "owner_bank_import_previews",
+  "quickbooks_oauth_intents",
 ]);
 
 /**
@@ -269,7 +292,13 @@ const INSTALL_STATE_ZERO_NORMALIZED_COLUMNS = Object.freeze([
 // contract tracks the EXACT current schema by design: a drill against a
 // database one migration behind would export a table or column set that does
 // not match the reviewed list. Bumping this is required for every migration.
-const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 22;
+// The schema this recovery contract has been reviewed against. The adapter
+// REFUSES to export a tree whose last migration is anything else, which is
+// the point: a recovery drill against an unreviewed schema could omit a
+// durable table silently. Raised to 32 by the 2026-09-04 port, with the ten
+// ported migrations' tables added to RECOVERY_DURABLE_TABLES in the same
+// change. Never raise this without adding the new tables.
+const RECOVERY_VECTOR_PROTOCOL_SCHEMA_VERSION = 32;
 
 function quoteIdentifier(value) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
@@ -326,6 +355,51 @@ const SCHEMA_22_TABLES = Object.freeze([
   "document_access_requests",
   "document_access_events",
   "passkey_security_events",
+]);
+
+// Ported from the field line 2026-09-04, migrations 0023 to 0032. A durable
+// table absent from this contract is a table a recovery export omits SILENTLY,
+// so every CREATE TABLE in a new migration belongs here.
+const SCHEMA_23_TABLES = Object.freeze([
+  "support_access_events",
+  "support_access_requests",
+  "support_auth_challenges",
+  "support_enrollment_codes",
+  "support_passkeys",
+  "support_sessions",
+]);
+const SCHEMA_24_TABLES = Object.freeze([
+  "agent_action_receipts",
+]);
+const SCHEMA_25_TABLES = Object.freeze([
+  "zoom_deliveries",
+  "zoom_reconciliation",
+]);
+const SCHEMA_26_TABLES = Object.freeze([
+  "plaid_link_operations",
+  "plaid_reconciliation",
+  "plaid_revocation_outbox",
+  "plaid_sync_stage_accounts",
+  "plaid_sync_stage_transactions",
+  "plaid_sync_windows",
+  "plaid_webhook_events",
+  "plaid_webhook_keys",
+]);
+const SCHEMA_27_TABLES = Object.freeze([
+  "public_request_quotas",
+]);
+const SCHEMA_28_TABLES = Object.freeze([
+  "vector_outbox_retry_state",
+]);
+const SCHEMA_30_TABLES = Object.freeze([
+  "plaid_account_entity_assignments",
+]);
+const SCHEMA_31_TABLES = Object.freeze([
+  "owner_bank_import_commits",
+  "owner_bank_import_previews",
+]);
+const SCHEMA_32_TABLES = Object.freeze([
+  "quickbooks_oauth_intents",
 ]);
 
 const AGGREGATE_FIELDS = Object.freeze([
@@ -1104,7 +1178,16 @@ function expectedRecoveryTables(migrations) {
     (latest >= 18 || !SCHEMA_18_TABLES.includes(table)) &&
     (latest >= 19 || !SCHEMA_19_TABLES.includes(table)) &&
     (latest >= 21 || !SCHEMA_21_TABLES.includes(table)) &&
-    (latest >= 22 || !SCHEMA_22_TABLES.includes(table)));
+    (latest >= 22 || !SCHEMA_22_TABLES.includes(table)) &&
+    (latest >= 23 || !SCHEMA_23_TABLES.includes(table)) &&
+    (latest >= 24 || !SCHEMA_24_TABLES.includes(table)) &&
+    (latest >= 25 || !SCHEMA_25_TABLES.includes(table)) &&
+    (latest >= 26 || !SCHEMA_26_TABLES.includes(table)) &&
+    (latest >= 27 || !SCHEMA_27_TABLES.includes(table)) &&
+    (latest >= 28 || !SCHEMA_28_TABLES.includes(table)) &&
+    (latest >= 30 || !SCHEMA_30_TABLES.includes(table)) &&
+    (latest >= 31 || !SCHEMA_31_TABLES.includes(table)) &&
+    (latest >= 32 || !SCHEMA_32_TABLES.includes(table)));
 }
 
 function assertExpectedTables(rows, migrations) {
@@ -1413,9 +1496,13 @@ const BOOTSTRAP_BUSY_FIELDS = Object.freeze([
   "protocol", "busy", "remaining", "retry_after_seconds",
 ]);
 
+// Workers from 0.3.4 also report the not-yet-visible count as `retrying`;
+// older Workers do not. Either shape is the same aggregate-only contract.
+const OPTIONAL_RECEIPT_FIELDS = new Set(["retrying"]);
+
 function exactAggregateReceiptFields(body, expected, code) {
   if (!body || typeof body !== "object" || Array.isArray(body)) refuse(code);
-  const actual = Object.keys(body).sort();
+  const actual = Object.keys(body).filter((field) => !(OPTIONAL_RECEIPT_FIELDS.has(field) && expected.includes("failed"))).sort();
   const wanted = [...expected].sort();
   if (actual.length !== wanted.length || actual.some((field, index) => field !== wanted[index])) {
     // Do not echo fields or values. This endpoint is allowed to return aggregate

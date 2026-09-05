@@ -10,12 +10,40 @@
 
 name: ci
 
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
   workflow_dispatch:
 
 jobs:
+  history-privacy:
+    name: public git history zero findings
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # The scanner verifies the server-advertised refs with git ls-remote.
+          # A private repository therefore needs the job's ephemeral, read-only
+          # GITHUB_TOKEN until this step finishes; checkout removes it afterward.
+          persist-credentials: true
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      # Scan every server-visible head and tag plus the checked-out commit. The
+      # explicit HEAD covers a first push and pull-request merge commits that
+      # are not yet advertised as ordinary origin refs. Zero means zero: this
+      # clean lineage has no incident baseline or finding disposition path.
+      - name: require zero findings in public and candidate history
+        run: npm run privacy:history:remote
+
   test:
     name: ${{ matrix.os }} / node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
@@ -30,6 +58,8 @@ jobs:
       # Pin third-party actions to reviewed commits. A mutable major tag can
       # change underneath an otherwise identical installer release.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -44,12 +74,34 @@ jobs:
       - name: install
         run: npm ci --ignore-scripts
 
-      # Fixed bytes only. This isolates the built-in C# compiler, private helper
-      # staging, Windows profile, stdin framing, and DPAPI availability without
-      # ever putting a credential in CI output.
-      - name: Windows DPAPI stage probe
+      # The browser installer, Settings update notice, owner workspace, and
+      # connector recovery states live in a separate React dependency graph.
+      # Backend tests cannot prove that graph compiles or that its interaction
+      # contracts still pass, so install and exercise it explicitly.
+      - name: install owner app
+        run: npm ci --prefix frontend --ignore-scripts
+
+      - name: owner app tests
+        run: npm --prefix frontend test
+
+      # build-to-worker.mjs must reproduce the reviewed tracked bundle exactly.
+      # A dirty diff means the shipped Worker UI is stale even if React tests
+      # passed against newer source files.
+      - name: owner app production bundle parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix frontend run build
+          git diff --exit-code -- worker/src/lib/app-assets.js
+
+      # Fresh random bytes exercise 25 protect/unprotect round trips through one
+      # private process-scoped compiled helper, followed by exact captured-identity
+      # cleanup. The wrapper emits stable stage codes and counts only, never input,
+      # ciphertext, child output, or a credential. This is release evidence, not
+      # the supervised client gate.
+      - name: Windows DPAPI 25-round release gate
         if: runner.os == 'Windows'
-        run: node test/fixtures/windows-dpapi-probe.mjs
+        run: node scripts/windows-dpapi-release-gate.mjs
 
       - name: unit and integration suite
         run: npm test
@@ -124,6 +176,19 @@ jobs:
           out=$("$bin")
           echo "$out"
           echo "$out" | grep -q "brain setup" || { echo "::error::user-prefix bin did not run"; exit 1; }
+
+      # The checkout probe above catches source-tree regressions. Release proof
+      # must also come from the exact globally installed tarball, including
+      # synthetic admin-key create, read, rotation, and ciphertext inspection.
+      - name: packed Windows DPAPI and admin-key release gate
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/financial-brain-cli"
+          package_root="$(npm root --global --prefix "$prefix")/brain-installer"
+          test -f "$package_root/scripts/windows-dpapi-release-gate.mjs"
+          node "$package_root/scripts/windows-dpapi-release-gate.mjs"
 
       # PowerShell can block npm.ps1/npx.ps1 under its default execution
       # policy. The website therefore uses the .cmd shims explicitly on

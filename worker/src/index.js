@@ -21,7 +21,20 @@
 
 import { jsonResponse, privateNoStore, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
 import { resolvePrincipal, principalMay } from "./lib/grants.js";
-import { handleBankFeed } from "./lib/bank-feed.js";
+import { handleBankFeed, bankFeedEnabled } from "./lib/bank-feed.js";
+import { handlePlaidWebhook, runPlaidMaintenance } from "./lib/plaid-bank-feed.js";
+import { handleSupportAccess } from "./lib/support-access.js";
+import {
+  AGENT_DELETION_PATH_PREFIX, handleAgentDeletion,
+} from "./lib/agent-action-receipts.js";
+import { ownerReliabilityAlerts } from "./lib/reliability-alerts.js";
+import {
+  cleanupQuickBooksOAuthIntents,
+  handleQuickBooksOAuthRoute,
+  QUICKBOOKS_OAUTH_PATH_PREFIX,
+  QUICKBOOKS_OAUTH_PATHS,
+} from "./lib/quickbooks-oauth-callback.js";
+import { cleanupPublicAuthState, guardPublicRequest } from "./lib/public-request-guard.js";
 import { handleBankExportImport, BANK_IMPORT_PATH } from "./lib/fin-upload.js";
 import { handleFinApi, FIN_PATH_PREFIX } from "./lib/fin-api.js";
 import {
@@ -34,7 +47,7 @@ import {
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./lib/secret-scan.js";
 import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import { installedSchemaVersion, acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, retryQuarantinedVectorOps, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
@@ -49,7 +62,7 @@ import {
 import {
   findGrantByCredentialHash, recordPasskeySecurityEvent, sourcesInScope,
 } from "./lib/auth-store.js";
-import { handleZoomWebhook } from "./lib/zoom.js";
+import { handleZoomWebhook, runZoomDeliveryMaintenance } from "./lib/zoom.js";
 import {
   handleOAuthMetadata, handleProtectedResourceMetadata, handleRegister,
   handleAuthorizePage, handleAuthorizeDecision, handleToken, validateConnectorToken,
@@ -810,9 +823,35 @@ async function handleThink(env, request, access = null, grantScope = { all: true
               evidenceGate.reason = temporalFailure;
             }
           }
-          if (!evidenceGate.supported || !evidenceGate.complete || !allowed.size) {
+          if (!evidenceGate.supported || !allowed.size) {
             answer = unsupportedAnswer;
             approvedDocs = [];
+          } else if (!evidenceGate.complete) {
+            // Supported but incomplete used to be thrown away whole. The
+            // verifier said every cited claim holds and one requested part is
+            // missing. Keep the sentences the verifier approved, drop any
+            // sentence that leans on an unapproved citation, and say in one
+            // plain sentence what the documents do not cover. A true absence
+            // still produces the verbatim refusal above; this path never does.
+            const headsUpAt = answer.search(/\n\s*Heads up:/i);
+            const bodyText = headsUpAt >= 0 ? answer.slice(0, headsUpAt) : answer;
+            const headsUp = headsUpAt >= 0 ? answer.slice(headsUpAt).trim() : "";
+            const kept = (bodyText.match(/[^.!?\n]+[.!?]+(?:\s*\[\d+\])*|[^.!?\n]+$/g) || [])
+              .map((sentence) => sentence.trim())
+              .filter((sentence) => {
+                const cites = [...sentence.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1]));
+                return cites.length > 0 && cites.every((n) => allowed.has(n));
+              });
+            if (!kept.length) {
+              answer = unsupportedAnswer;
+              approvedDocs = [];
+              evidenceGate.reason = evidenceGate.reason || "no sentence survived the citation check";
+            } else {
+              const missing = String(evidenceGate.reason || "one part of the question").replace(/\.$/, "");
+              answer = `${kept.join(" ")}\n\nNot covered by the documents: ${missing}.${headsUp ? `\n\n${headsUp}` : ""}`;
+              approvedDocs = citedDocs.filter((doc) => allowed.has(doc.n));
+              evidenceGate.partial = true;
+            }
           } else {
             approvedDocs = citedDocs.filter((doc) => allowed.has(doc.n));
           }
@@ -838,7 +877,7 @@ async function handleThink(env, request, access = null, grantScope = { all: true
           resultCount: results.length,
           sources: [...new Set(results.map((r) => r.source).filter(Boolean))],
         })
-      : computeAnswerConfidence({ approvedDocs, gaps, degraded });
+      : computeAnswerConfidence({ approvedDocs, gaps, degraded, partial: evidenceGate?.partial === true ? (evidenceGate.reason || "one part not covered") : null });
 
   return jsonResponse({
     mode: "think",
@@ -1521,6 +1560,7 @@ const PAUSED_CORPUS_MUTATION_PATHS = new Set([
   "/api/admin/brain/source-expectation",
   "/api/admin/brain/forget",
   "/api/admin/brain/reindex",
+  "/api/admin/brain/vector-retry",
   "/api/admin/brain/drain",
   // The ledger is not the corpus, but a paused upgrade means a migration is in
   // flight, and financial rows written against a half-migrated schema are the
@@ -1549,6 +1589,16 @@ export default {
       // purpose, because update's own paused-mode probe has to succeed while
       // the pause is deliberately in force.
       const paused = env.VECTOR_DRAIN_MODE === "paused-for-upgrade";
+      // Which migrations this brain has run. The number that decides whether a
+      // published update may touch it, readable without a key so a fleet can be
+      // checked from one place instead of one machine at a time.
+      //
+      // NOT while paused. A cutover pause means this Worker touches no database
+      // at all, and health is the one route that must answer during it; buying
+      // an integer at the cost of that invariant is the wrong trade, and a
+      // paused brain is not a candidate for an update anyway. Caught by the
+      // route suite's zero-call assertion rather than by review.
+      const schemaVersion = !paused && backendOf(env) === D1 ? await installedSchemaVersion(env) : null;
       return jsonResponse({
         ok: !paused,
         status: paused ? "paused-for-upgrade" : "ok",
@@ -1562,6 +1612,7 @@ export default {
           : { accepting_documents: true }),
         brain: env.BRAIN_NAME || "brain",
         version: env.BRAIN_VERSION || "0.1.0",
+        ...(schemaVersion === null ? {} : { schema_version: schemaVersion }),
         vector_writer_protocol: "lease-v1",
         vector_drain_mode: paused ? "paused-for-upgrade" : "active",
         ts: new Date().toISOString(),
@@ -1579,7 +1630,42 @@ export default {
     if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/") ||
         path.startsWith("/brand/") || path.startsWith("/app/assets/")) {
       const response = await handleOwnerAuth(env, request, url, path);
-      return path.startsWith("/api/app/") ? privateNoStore(response) : response;
+      // /auth/ carries WebAuthn challenges and the session cookie itself. A
+      // cached challenge is a replayable one, so it is no-store alongside the
+      // app's API rather than treated as an ordinary page.
+      return path.startsWith("/api/app/") || path.startsWith("/auth/")
+        ? privateNoStore(response)
+        : response;
+    }
+
+    // The QuickBooks return leg. Intuit sends the owner back with a code in the
+    // query string, so the callback is reachable without the whole-install
+    // admin key and is rate-limited by the public guard instead. Callback
+    // failures redirect away from Intuit's query string; claim failures stay
+    // private JSON for the local polling client.
+    if (path === QUICKBOOKS_OAUTH_PATH_PREFIX || path.startsWith(`${QUICKBOOKS_OAUTH_PATH_PREFIX}/`)) {
+      if (path === QUICKBOOKS_OAUTH_PATHS.callback || path === QUICKBOOKS_OAUTH_PATHS.claim) {
+        const guarded = await guardPublicRequest(env, request, url, path);
+        if (guarded.response) {
+          if (path !== QUICKBOOKS_OAUTH_PATHS.callback) return guarded.response;
+          return handleQuickBooksOAuthRoute(env, request, url, path, {
+            publicGuardDenied: true,
+          });
+        }
+        request = guarded.request;
+      }
+      return handleQuickBooksOAuthRoute(env, request, url, path, {
+        adminAuthorized: path !== QUICKBOOKS_OAUTH_PATHS.callback &&
+          path !== QUICKBOOKS_OAUTH_PATHS.claim && validateAdminKey(request, env),
+      });
+    }
+
+    // Support access is its own ceremony with its own short-lived session. Its
+    // cookie and companion header are not understood by owner, retrieval,
+    // financial, connector, OAuth, or admin routes. Every response, including
+    // ceremony errors, is private and non-cacheable.
+    if (path.startsWith("/api/support/")) {
+      return privateNoStore(await handleSupportAccess(env, request, url, path));
     }
 
     // The bank feed's owner surface sits in FRONT of the key gate for exactly
@@ -1616,6 +1702,21 @@ export default {
         },
       ));
       return handleOwnerActions(env, request, path, { ingestEnvelope });
+    }
+
+    // Destructive corpus execution is deliberately separate from ordinary
+    // owner actions. Its receipt and fresh passkey ceremony are enforced by a
+    // dedicated state machine before the shared D1-first forget primitive is
+    // reachable.
+    if (path.startsWith(AGENT_DELETION_PATH_PREFIX)) {
+      return handleAgentDeletion(env, request, path, { forget });
+    }
+
+    // Plaid signs the exact raw body with a short-lived ES256 verification JWT.
+    // The handler fetches only the named public key, records no payload, and
+    // turns the notification into durable reconciliation debt.
+    if (path === "/api/webhooks/plaid") {
+      return handlePlaidWebhook(env, request);
     }
 
     // The Zoom webhook sits in FRONT of the key gate because Zoom cannot send
@@ -1815,6 +1916,21 @@ export default {
       if (path === "/api/admin/brain/documents" && request.method === "GET") {
         return privateNoStore(await handleDocuments(env));
       }
+      if (path === "/api/admin/brain/reliability-alerts" && request.method === "GET") {
+        if (backendOf(env) !== D1) return jsonResponse({ error: "reliability alerts apply to the d1 backend only" }, 400);
+        return privateNoStore(jsonResponse(await ownerReliabilityAlerts(env)));
+      }
+      // Quarantined vector generations are released by an explicit operator
+      // decision, never automatically: a row that spent its attempts did so for
+      // a reason, and the preview names how many before anything is retried.
+      if (path === "/api/admin/brain/vector-retry" && request.method === "POST") {
+        if (backendOf(env) !== D1) return jsonResponse({ error: "vector retry applies to the d1 backend only" }, 400);
+        const body = await request.json().catch(() => ({}));
+        return jsonResponse(await retryQuarantinedVectorOps(env, {
+          confirm: body.confirm === true,
+          limit: body.limit,
+        }));
+      }
       // Per-source freshness. Separate from /documents on purpose: that endpoint
       // answers "how much is in here", this one answers "how much of it is
       // current", and conflating them is how staleness stayed invisible.
@@ -1993,17 +2109,68 @@ export default {
    */
   async scheduled(event, env, ctx) {
     if (backendOf(env) !== D1) return;
-    ctx.waitUntil(
+    // A compatibility cutover is a whole-database mutation barrier. The drain
+    // already no-ops while paused, but the TTL cleanups and the two
+    // maintenance passes would still write, so the whole cycle stands down.
+    // Expired auth state is inert and can wait for the first active cron.
+    if (env.VECTOR_DRAIN_MODE === "paused-for-upgrade") return;
+    // Promise.all, not three arguments: waitUntil takes ONE promise and would
+    // silently drop the rest, leaving both maintenance passes floating.
+    ctx.waitUntil(Promise.all([
       (async () => {
-        // Bounded, because a Worker invocation has a wall clock and an unbounded
-        // loop on a large backfill would be killed mid-batch every time.
-        const r = await drainOutbox(env, {
-          embed: (text) => embedText(env, text),
-          embedBatch: (texts) => embedTexts(env, texts),
-          maxBatches: 10,
-        });
-        if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
-      })()
-    );
+        // Every job here is bounded, because a Worker invocation has a wall
+        // clock and an unbounded loop on a large backfill would be killed
+        // mid-batch every time. allSettled, not all: the TTL cleanups must
+        // still run when the vector provider is failing, and a cleanup error
+        // must not stop the durable vector queue.
+        const [drainResult, cleanupResult, quickbooksCleanupResult] = await Promise.allSettled([
+          drainOutbox(env, {
+            embed: (text) => embedText(env, text),
+            embedBatch: (texts) => embedTexts(env, texts),
+            maxBatches: 10,
+          }),
+          cleanupPublicAuthState(env),
+          cleanupQuickBooksOAuthIntents(env),
+        ]);
+        if (drainResult.status === "fulfilled") {
+          const r = drainResult.value;
+          if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
+          // A cycle that only waited used to log nothing at all, which let a
+          // stalled fence run silent for hours. Waiting a cycle or two is
+          // normal; the line exists so more than that is visible in a tail.
+          else if (!r.paused && !r.busy && !r.submitted && Number(r.waiting) > 0) {
+            console.log(`vector outbox: waiting on confirmation, ${r.remaining} queued`);
+          }
+        } else {
+          console.warn("vector outbox: scheduled drain failed");
+        }
+        if (cleanupResult.status === "rejected") {
+          console.warn("public auth state: scheduled TTL cleanup failed");
+        }
+        if (quickbooksCleanupResult.status === "rejected") {
+          console.warn("quickbooks oauth intents: scheduled TTL cleanup failed");
+        }
+      })(),
+      // Both durable queues need a scheduled pass or their retry ladders never
+      // advance: a webhook writes the debt, but only this clears it when the
+      // first attempt failed and no further webhook is coming.
+      runZoomDeliveryMaintenance(env).then((result) => {
+        const deliveries = Number(result?.deliveries?.claimed || 0);
+        const discovered = Number(result?.reconciliation?.recordings || 0);
+        if (deliveries || discovered) {
+          console.log(`zoom delivery maintenance: ${discovered} discovered, ${deliveries} claimed`);
+        }
+        if (!result?.skipped && result?.outcome?.kind !== "completed") {
+          console.warn(`zoom delivery maintenance: ${result?.outcome?.kind || "unavailable"}`);
+        }
+      }),
+      env.BANK_FEED_PROVIDER === "plaid" && bankFeedEnabled(env)
+        ? runPlaidMaintenance(env).then((result) => {
+          const synced = Number(result?.sync?.ran || 0);
+          const revoked = Number(result?.revocations?.ran || 0);
+          if (synced || revoked) console.log(`plaid maintenance: ${synced} synced, ${revoked} revocations`);
+        })
+        : Promise.resolve(),
+    ]));
   },
 };

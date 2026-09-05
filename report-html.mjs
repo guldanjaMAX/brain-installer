@@ -236,7 +236,7 @@ const STATUS_COPY = {
 
 /* -------------------------------------------------------------- verdict */
 
-function computeVerdict({ acceptance, acceptanceError, seeds }) {
+export function computeVerdict({ acceptance, acceptanceError, seeds }) {
   const counts = acceptance?.counts || null;
   const answered = seeds.filter((s) => classifyAnswer(s) === "answered").length;
   const sourced = seeds.filter((s) => classifyAnswer(s) !== "no_sources" && classifyAnswer(s) !== "error").length;
@@ -297,6 +297,19 @@ function computeVerdict({ acceptance, acceptanceError, seeds }) {
       state: "attention",
       line: "The checks pass, but none of your questions came back with an answer from your documents yet.",
       detail: parts.join(" "),
+    };
+  }
+  // A run whose retrieval tier never executed cannot read "ready": every
+  // check that ran passed, and the capability the client is paying for went
+  // untested. The questions section already explains the gap; the verdict
+  // must not contradict it.
+  if (Array.isArray(acceptance.untested) && acceptance.untested.includes("retrieval")) {
+    return {
+      state: "attention",
+      line: "The checks that ran passed, but retrieval was never tested: this install has no probe questions yet.",
+      detail:
+        `${parts.join(" ")} Add the owner's own questions to testing.probe_questions ` +
+        "in the manifest and re-run this report.".trim(),
     };
   }
   if (counts.warn > 0 || sourced < seeds.length) {

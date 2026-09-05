@@ -264,6 +264,9 @@ try {
       internalDate: "1756051200000",
       threadId: "T-1",
       historyId: "H-1",
+      // A real messages.get always classifies. Without it the label policy
+      // refuses the message, and this parity check would compare nothing.
+      labelIds: ["INBOX"],
     }),
     sleep: async () => {},
   });

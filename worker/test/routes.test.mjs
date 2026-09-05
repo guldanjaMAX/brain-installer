@@ -672,7 +672,10 @@ const call = (env, path) => {
     },
   });
   const body = await (await call(env, "/api/rag/think?q=What+were+the+amount+and+the+deadline%3F")).json();
-  check("an incomplete multi-part answer fails closed", body.answer === "The documents do not answer the question." && body.evidence_gate?.complete === false, JSON.stringify(body));
+  check("an incomplete multi-part answer keeps the supported part and names the gap",
+    body.answer !== "The documents do not answer the question." && /\$5,000 \[1\]/.test(body.answer) &&
+      /Not covered by the documents: the deadline was silently omitted\./.test(body.answer) &&
+      body.evidence_gate?.complete === false && body.evidence_gate?.partial === true, JSON.stringify(body));
   check("the completeness refusal preserves the verifier reason", /deadline was silently omitted/.test(body.evidence_gate?.reason || ""), JSON.stringify(body.evidence_gate));
 }
 
@@ -1832,6 +1835,30 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
     health.version === "fixture-version" && health.vector_writer_protocol === "lease-v1" &&
       health.vector_drain_mode === "paused-for-upgrade", JSON.stringify(health));
 
+  // Whether a published update may touch a brain is decided by its schema
+  // version, not its version string, and until 2026-09-03 that number could
+  // only be read by standing at the owner's machine. /health reports it so a
+  // fleet is checkable from one place. A D1 that cannot answer must not take
+  // /health down with it: the field is simply absent.
+  check("a paused brain reports health without reading its database for the schema",
+    !("schema_version" in health) && forbiddenCalls === 0, JSON.stringify({ health, forbiddenCalls }));
+
+  {
+    const readable = {
+      ...env,
+      VECTOR_DRAIN_MODE: undefined,
+      DB: { prepare: () => ({ first: async () => ({ schema_version: 32 }), bind: () => ({ first: async () => ({ schema_version: 32 }) }) }) },
+    };
+    const live = await (await worker.fetch(new Request("https://b.example/health"), readable, {})).json();
+    check("health reports the schema version, so a brain ahead of a release is visible remotely",
+      live.schema_version === 32 && live.ok === true, JSON.stringify(live));
+
+    const broken = { ...readable, DB: { prepare: () => ({ first: async () => ({ schema_version: "not a number" }) }) } };
+    const soft = await (await worker.fetch(new Request("https://b.example/health"), broken, {})).json();
+    check("an unreadable schema version is omitted rather than guessed",
+      soft.ok === true && !("schema_version" in soft), JSON.stringify(soft));
+  }
+
   const manual = await post(env, "/api/admin/brain/drain", {});
   const manualBody = await manual.json();
   check("a manual drain fails closed while an upgrade cutover is paused",
@@ -1922,6 +1949,9 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
               };
             }
             if (/^SELECT count\(\*\) AS n FROM chunks/.test(sql.trim())) return { n: 0 };
+            // The paused residue probe: nothing queued before the pause, and no
+            // batch of this epoch owns an outbox row. A read, never a write.
+            if (/\) AS residue,/.test(sql)) return { residue: 0, owned: 0 };
             if (/sum\(CASE WHEN submitted_mutation_id IS NULL/.test(sql)) {
               return { n: 0, queued: 0, submitted: 0, failed: 0 };
             }
@@ -1957,8 +1987,8 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
       receipt.phase === "complete" && receipt.complete === true &&
       JSON.stringify(Object.keys(receipt).sort()) === JSON.stringify([
         "actual_vectors", "complete", "confirmed", "epoch", "expected_vectors", "failed",
-        "in_flight_batches", "phase", "protocol", "queued", "remaining", "submitted",
-        "total", "vector_ready",
+        "in_flight_batches", "phase", "protocol", "queued", "remaining", "retrying",
+        "submitted", "total", "vector_ready",
       ]),
     JSON.stringify(receipt));
   check("an empty bootstrap performs no embedding or vector write",
@@ -1991,6 +2021,9 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
               return { held: 1, schema_ready: 1, expires_at: Date.now() + 180_000 };
             }
             if (/^SELECT count\(\*\) AS n FROM chunks/.test(sql.trim())) return { n: 0 };
+            // The paused residue probe: nothing queued before the pause, and no
+            // batch of this epoch owns an outbox row. A read, never a write.
+            if (/\) AS residue,/.test(sql)) return { residue: 0, owned: 0 };
             if (/sum\(CASE WHEN submitted_mutation_id IS NULL/.test(sql)) {
               return { n: 0, queued: 0, submitted: 0, failed: 0 };
             }
@@ -2412,3 +2445,42 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
 
 console.log(fail ? `\n${fail} FAILURES` : `\nroutes: all ${ran} tests passed`);
 process.exit(fail ? 1 : 0);
+
+/* ---- supported but incomplete keeps the supported part and names the gap ---- */
+{
+  const rows = [{ ...ROW, chunk_uid: "lease:1#0", doc_uid: "lease:1", title: "Office lease 2026", client: null,
+    text: "The lease renews on 2027-03-01. The landlord is Acme Holdings." }];
+  const { env } = mkEnv(rows, { extra: { AI: { run: async (model, input) => model.includes("bge-")
+    ? ({ data: [[0.1, 0.2, 0.3]] })
+    : String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+      ? ({ response: { supported: true, complete: false, evidence: [1], reason: "does not state the notice period" }, usage: {} })
+      : ({ response: "The lease renews on 2027-03-01 [1]. The landlord is Acme Holdings [1].", usage: {} }) } } });
+  const body = await (await call(env, "/api/rag/think?q=When+does+the+lease+renew+and+what+is+the+notice+period")).json();
+  check("supported-but-incomplete no longer collapses to the refusal",
+    body.answer !== "The documents do not answer the question." && /renews on 2027-03-01 \[1\]/.test(body.answer), JSON.stringify(body));
+  check("the uncovered part is named in one plain sentence",
+    /Not covered by the documents: does not state the notice period\./.test(body.answer), body.answer);
+  check("partial is flagged on the gate and citations are the approved ones only",
+    body.evidence_gate?.partial === true && body.evidence_gate?.supported === true && body.citations?.length === 1, JSON.stringify(body.evidence_gate));
+  check("confidence says the answer is partial and scores below a complete one",
+    Array.isArray(body.confidence?.basis) && body.confidence.basis.some((b) => /^answer is partial/.test(b)) && body.confidence.percent < 75, JSON.stringify(body.confidence));
+}
+
+/* ---- unsupported still produces the verbatim refusal, with its reason beside it ---- */
+{
+  const rows = [{ ...ROW, chunk_uid: "policy:1#0", doc_uid: "policy:1", title: "Other Co handbook", client: null,
+    text: "Other Co offers twelve weeks of parental leave." }];
+  const { env } = mkEnv(rows, { extra: { AI: { run: async (model, input) => model.includes("bge-")
+    ? ({ data: [[0.1, 0.2, 0.3]] })
+    : String(input?.messages?.[0]?.content || "").includes("verify a proposed answer")
+      ? ({ response: { supported: false, complete: false, evidence: [], reason: "cites another company's policy" }, usage: {} })
+      : ({ response: "You offer twelve weeks of parental leave [1].", usage: {} }) } } });
+  const body = await (await call(env, "/api/rag/think?q=What+is+our+parental+leave+policy")).json();
+  check("true absence keeps the verbatim refusal sentence",
+    body.answer === "The documents do not answer the question." && body.citations?.length === 0, JSON.stringify(body));
+  check("the refusal reason rides beside the sentence, never inside it",
+    /another company/.test(body.evidence_gate?.reason || "") && body.evidence_gate?.partial !== true, JSON.stringify(body.evidence_gate));
+}
+
+console.log(`\n${ran} checks, ${fail} failed`);
+if (fail) process.exit(1);

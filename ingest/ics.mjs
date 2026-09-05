@@ -166,6 +166,7 @@ export function parseIcs(text) {
   let current = null;
   let malformed = 0;
   let depth = 0;
+  let calendarClosed = false;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -191,6 +192,10 @@ export function parseIcs(text) {
       depth = 0;
       continue;
     }
+    if (/^END:VCALENDAR$/i.test(trimmed)) {
+      calendarClosed = true;
+      continue;
+    }
     if (/^X-WR-CALNAME[;:]/i.test(trimmed)) {
       const property = parseProperty(trimmed);
       if (property) calendarName = unescapeText(property.value);
@@ -199,5 +204,5 @@ export function parseIcs(text) {
   // An unterminated final VEVENT is a truncated file, not an event.
   if (current) malformed++;
 
-  return { isCalendar, events, malformed, calendarName };
+  return { isCalendar, events, malformed, calendarName, calendarClosed };
 }

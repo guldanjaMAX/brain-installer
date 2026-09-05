@@ -1,14 +1,26 @@
 import {
-  api, listFiles, listChanges, startPageToken, triage, toEnvelope, DriveError, EXPORTS,
-  updateFolderIndex, folderPathFor, exclusionReason, driveVersion,
+  api, listFiles, listRootedFiles, listChanges, startPageToken, triage, toEnvelope, DriveError, EXPORTS,
+  updateFolderIndex, folderPathFor, exclusionReason, driveVersion, classifyScopedAbsence, FOLDER_MIME, EXPORT_LIMIT,
 } from "../connectors/google-drive.mjs";
 import { buildAuthUrl, pkce, exchangeCode, createTokenProvider, redirectUri } from "../connectors/google-auth.mjs";
+import * as XLSX from "@e965/xlsx";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 240))); if (!c) fail++; };
 const tok = async () => "at-1";
 const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body, arrayBuffer: async () => new TextEncoder().encode(body).buffer });
 const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () => ({}), arrayBuffer: async () => new TextEncoder().encode(s).buffer });
+const binary = (body, status = 200) => {
+  const exact = Uint8Array.from(body);
+  return { ok: status < 400, status, json: async () => ({}), arrayBuffer: async () => exact.buffer };
+};
+const workbookBytes = (sheets) => {
+  const workbook = XLSX.utils.book_new();
+  for (const [name, rows] of sheets) {
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(rows), name);
+  }
+  return XLSX.write(workbook, { bookType: "xlsx", type: "buffer" });
+};
 
 /* ================= auth ================= */
 {
@@ -38,6 +50,68 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   check("first call fetches", (await get()) === "a1");
   check("second call is cached, not a second round trip", (await get()) === "a1" && calls === 1);
   check("force bypasses the cache", (await get({ force: true })) === "a2");
+}
+{
+  // Several fetches in flight (the Gmail lane) notice an expired token at the
+  // same moment. They must share ONE refresh, not fire eight.
+  let calls = 0;
+  const get = createTokenProvider({ clientId: "c", refreshToken: "r", fetchImpl: async () => { calls++; await new Promise((r) => setTimeout(r, 5)); return json({ access_token: "shared" + calls, expires_in: 3600 }); } });
+  const tokens = await Promise.all(Array.from({ length: 8 }, () => get()));
+  check("eight concurrent callers share a single refresh round trip", calls === 1, `calls=${calls}`);
+  check("and all eight receive the same token", tokens.every((v) => v === "shared1"), JSON.stringify(tokens));
+  check("a later call after the shared refresh is still served from cache", (await get()) === "shared1" && calls === 1);
+}
+{
+  // A token POST that connects but never answers used to have no bound. Every
+  // caller sharing one refresh makes bounding that potential failure essential:
+  // one unresolved request must not leave the whole fetch window waiting.
+  const get = createTokenProvider({
+    clientId: "c", refreshToken: "r", requestTimeoutMs: 40,
+    fetchImpl: (_u, opts) => new Promise((_resolve, reject) => {
+      // Never answers. Only the caller's own signal can end it.
+      // The keepalive timer matters: AbortSignal.timeout() uses an UNREF'd
+      // timer, so with nothing else pending the loop would simply drain and the
+      // abort would never fire. A real request holds a socket, which is what
+      // keeps the loop alive in production; this stands in for that socket.
+      const keepalive = setTimeout(() => reject(new Error("test keepalive expired without an abort")), 5_000);
+      opts?.signal?.addEventListener?.("abort", () => {
+        clearTimeout(keepalive);
+        reject(Object.assign(new Error("aborted"), { name: "TimeoutError" }));
+      });
+    }),
+  });
+  const started = Date.now();
+  let err = null;
+  await get().catch((e) => (err = e));
+  const waited = Date.now() - started;
+  check("a token refresh that never answers times out instead of hanging", err !== null, "no error thrown");
+  check("and it gives up near the configured bound, not minutes later", waited < 2000, `waited ${waited}ms`);
+  check("and the message names the timeout rather than blaming the network", /did not answer within/.test(err?.message || ""), (err?.message || "").slice(0, 90));
+  check("and it is marked retryable so the caller's retry budget applies", err?.retryable === true);
+}
+{
+  // The shared-refresh dedupe must not turn one failure into a permanently
+  // poisoned provider: the next caller has to be able to try again.
+  let calls = 0;
+  const get = createTokenProvider({
+    clientId: "c", refreshToken: "r", requestTimeoutMs: 40,
+    fetchImpl: async () => { calls++; if (calls === 1) throw new Error("transient"); return json({ access_token: "recovered", expires_in: 3600 }); },
+  });
+  let first = null;
+  await get().catch((e) => (first = e));
+  check("the first refresh fails", first !== null);
+  check("a later call retries rather than replaying the failure", (await get()) === "recovered", `calls=${calls}`);
+}
+{
+  // Concurrent callers must all be released when the shared refresh fails.
+  // Waiting on a promise that only one of them observes is the hang this
+  // whole block exists to prevent.
+  const get = createTokenProvider({
+    clientId: "c", refreshToken: "r", requestTimeoutMs: 40,
+    fetchImpl: async () => { throw new Error("down"); },
+  });
+  const results = await Promise.allSettled(Array.from({ length: 6 }, () => get()));
+  check("all six concurrent callers are released on a failed shared refresh", results.every((r) => r.status === "rejected"), JSON.stringify(results.map((r) => r.status)));
 }
 {
   const get = createTokenProvider({ clientId: "c", refreshToken: "dead", fetchImpl: async () => json({ error: "invalid_grant" }, 400) });
@@ -223,6 +297,100 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   check("a trashed file counts as removed, not changed", r.removed.includes("c"), JSON.stringify(r));
   check("the next token is returned for the following run", r.nextToken === "T99");
 }
+
+/* ================= authoritative root boundary ================= */
+{
+  const calls = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(input);
+    calls.push(url);
+    const id = decodeURIComponent(url.pathname.split("/").pop());
+    if (url.pathname !== "/drive/v3/files") {
+      if (id === "root-a") return json({ id, name: "Approved", mimeType: FOLDER_MIME, parents: ["my-drive"] });
+      if (id === "shared-root") return json({ id, name: "Shared Approved", mimeType: FOLDER_MIME, driveId: "shared-1" });
+      return json({ error: { message: "not found" } }, 404);
+    }
+    const q = url.searchParams.get("q") || "";
+    if (q.includes("'root-a' in parents")) return json({ files: [
+      { id: "inside-a", name: "inside.txt", mimeType: "text/plain", parents: ["root-a"] },
+      { id: "nested", name: "Nested", mimeType: FOLDER_MIME, parents: ["root-a"] },
+      { id: "shortcut-out", name: "Outside shortcut", mimeType: "application/vnd.google-apps.shortcut",
+        parents: ["root-a"], shortcutDetails: { targetId: "outside-secret", targetMimeType: "text/plain" } },
+    ] });
+    if (q.includes("'nested' in parents")) return json({ files: [
+      { id: "inside-nested", name: "nested.txt", mimeType: "text/plain", parents: ["nested"] },
+    ] });
+    if (q.includes("'shared-root' in parents")) return json({ files: [
+      { id: "inside-shared", name: "shared.txt", mimeType: "text/plain", parents: ["shared-root"], driveId: "shared-1" },
+    ] });
+    return json({ files: [{ id: "outside-secret", name: "must-not-appear.txt" }] });
+  };
+  const files = [];
+  for await (const file of listRootedFiles(tok, {
+    rootFolderIds: ["shared-root", "root-a", "root-a"],
+    opts: { fetchImpl, sleep: async () => {} },
+  })) files.push(file);
+  const ids = files.map((file) => file.id).sort();
+  check("root traversal includes nested files under every reviewed root",
+    ["inside-a", "inside-nested", "inside-shared", "nested", "root-a", "shared-root", "shortcut-out"]
+      .every((id) => ids.includes(id)), ids.join(","));
+  check("an unrelated visible file is excluded by construction", !ids.includes("outside-secret"), ids.join(","));
+  check("every listing is a direct-parent query rather than an account sweep",
+    calls.filter((url) => url.pathname === "/drive/v3/files").every((url) => / in parents/.test(url.searchParams.get("q") || "")));
+  check("Shared Drive traversal keeps allDrives support on every child query",
+    calls.filter((url) => url.pathname === "/drive/v3/files").every((url) =>
+      url.searchParams.get("corpora") === "allDrives" &&
+      url.searchParams.get("includeItemsFromAllDrives") === "true" &&
+      url.searchParams.get("supportsAllDrives") === "true"));
+  check("a shortcut is observed but its out-of-scope target is never followed",
+    calls.every((url) => !url.pathname.endsWith("/outside-secret")) &&
+      triage(files.find((file) => file.id === "shortcut-out")).skipCode === "shortcut_not_followed");
+  check("root provenance names the exact reviewed root on every file",
+    files.find((file) => file.id === "inside-shared").scope_root_ids.join(",") === "shared-root" &&
+      files.find((file) => file.id === "inside-nested").scope_root_ids.join(",") === "root-a");
+}
+{
+  let error = null;
+  const fetchImpl = async (input) => {
+    const url = new URL(input);
+    if (url.pathname.endsWith("/root")) return json({ id: "root", name: "Root", mimeType: FOLDER_MIME });
+    return json({ files: [], nextPageToken: "same-token" });
+  };
+  try {
+    for await (const _file of listRootedFiles(tok, {
+      rootFolderIds: ["root"], opts: { fetchImpl, sleep: async () => {} },
+    })) { /* collect only after the complete traversal */ }
+  } catch (caught) { error = caught; }
+  check("a repeated rooted pagination cursor is refused before yielding partial scope",
+    error instanceof DriveError && error.reason === "repeatedPageToken", error?.message);
+}
+{
+  let error = null, yielded = 0;
+  try {
+    for await (const _file of listRootedFiles(tok, {
+      rootFolderIds: ["revoked-root"],
+      opts: { fetchImpl: async () => json({ error: { message: "not found" } }, 404), sleep: async () => {} },
+    })) yielded++;
+  } catch (caught) { error = caught; }
+  check("a missing or permission-lost root is unavailable, never an empty authoritative corpus",
+    yielded === 0 && error instanceof DriveError && error.reason === "rootUnavailable", error?.message);
+}
+{
+  const scopedFolderIds = new Set(["root", "nested"]);
+  const classify = (body, status = 200) => classifyScopedAbsence(tok, "old", {
+    scopedFolderIds,
+    opts: { fetchImpl: async () => json(body, status), sleep: async () => {} },
+  });
+  const moved = await classify({ id: "old", name: "old.txt", parents: ["outside"] });
+  const trashed = await classify({ id: "old", name: "old.txt", parents: ["root"], trashed: true });
+  const ambiguous = await classify({ error: { message: "not found" } }, 404);
+  const inconsistent = await classify({ id: "old", name: "old.txt", parents: ["nested"] });
+  check("a visible move out of scope is authoritative removal evidence", moved.kind === "left_scope");
+  check("visible trash is authoritative deletion evidence", trashed.kind === "source_deleted");
+  check("permission loss is not guessed to be hard deletion", ambiguous.kind === "unresolved" && ambiguous.retryable);
+  check("an item still parented inside scope but missing from the walk blocks tombstones",
+    inconsistent.kind === "unresolved" && inconsistent.retryable);
+}
 {
   const t = await startPageToken(tok, { fetchImpl: async () => json({ startPageToken: "T1" }), sleep: async () => {} });
   check("a start token can be fetched before the first walk", t === "T1");
@@ -232,12 +400,22 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
 {
   check("a folder is neither indexed nor an error", triage({ mimeType: "application/vnd.google-apps.folder" }).folder === true);
   check("a Google Doc is exported, not downloaded", triage({ mimeType: "application/vnd.google-apps.document", name: "x" }).export.mime === "text/plain");
-  check("a Sheet exports as CSV, which the extractor renders header-aware", triage({ mimeType: "application/vnd.google-apps.spreadsheet", name: "x" }).export.mime === "text/csv");
+  const sheetPlan = triage({ mimeType: "application/vnd.google-apps.spreadsheet", name: "x" }).export;
+  check("a Sheet exports as one XLSX workbook so every tab survives",
+    sheetPlan.mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" && sheetPlan.ext === ".xlsx",
+    JSON.stringify(sheetPlan));
   check("a Google Form is skipped with a reason", /cannot be exported/.test(triage({ mimeType: "application/vnd.google-apps.form", name: "f" }).skip));
+  check("an unsupported Google type has a stable skip code",
+    triage({ mimeType: "application/vnd.google-apps.form", name: "f" }).skipCode === "unsupported_google_type");
   check("an image is skipped before spending a request", /carries no text/.test(triage({ mimeType: "image/png", name: "a.png" }).skip));
+  check("a no-text media skip is typed", triage({ mimeType: "image/png", name: "a.png" }).skipCode === "non_text_media");
   check("an unsupported extension is skipped", /no extractor/.test(triage({ mimeType: "application/octet-stream", name: "a.bin" }).skip));
+  check("an unsupported extension skip is typed",
+    triage({ mimeType: "application/octet-stream", name: "a.bin" }).skipCode === "unsupported_extension");
   check("a PDF is downloaded", triage({ mimeType: "application/pdf", name: "a.pdf", size: "1000" }).download === true);
   check("an oversized file is skipped with its size", /over the/.test(triage({ mimeType: "application/pdf", name: "a.pdf", size: String(99 * 1048576) }).skip));
+  check("an oversized-file skip is typed",
+    triage({ mimeType: "application/pdf", name: "a.pdf", size: String(99 * 1048576) }).skipCode === "download_limit");
   check("trashed is skipped", /trash/.test(triage({ trashed: true, name: "a.md" }).skip));
 }
 
@@ -277,6 +455,16 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   check("the web link is kept for citations", r.envelope.uri === "https://drive/F1");
 }
 {
+  const file = { id: "F-provenance", name: "notes.txt", mimeType: "text/plain", size: "400",
+    createdTime: "2020-01-01T00:00:00Z", scope_root_ids: ["root-b", "root-a"] };
+  const r = await toEnvelope(tok, file, {}, {
+    fetchImpl: async () => bytes("A rooted Drive document with enough readable content for deterministic provenance testing."),
+    sleep: async () => {},
+  });
+  check("the ingest envelope preserves exact reviewed-root provenance",
+    r.envelope.metadata.root_folder_ids.join(",") === "root-a,root-b", JSON.stringify(r.envelope.metadata));
+}
+{
   const file = { id: "F-folder", name: "visit.txt", mimeType: "text/plain", size: "400",
     createdTime: "2020-01-01T00:00:00Z", parents: ["medical"] };
   const r = await toEnvelope(tok, file, { pathOf: () => "Provider Records/2025" }, {
@@ -297,17 +485,58 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
 {
   const file = { id: "F3", name: "Budget", mimeType: "application/vnd.google-apps.spreadsheet", size: "500", createdTime: "2026-01-01T00:00:00Z" };
   let exported = null;
+  const workbook = workbookBytes([
+    ["Accounts", [["Account", "Balance"], ["Checking", 15234.11]]],
+    ["Forecast", [["Quarter", "Projected Revenue"], ["Q4", 98250]]],
+  ]);
   const r = await toEnvelope(tok, file, {}, {
-    fetchImpl: async (url) => { exported = url; return bytes("Account,Balance\nChecking,15234.11\n"); }, sleep: async () => {},
+    fetchImpl: async (url) => { exported = url; return binary(workbook); }, sleep: async () => {},
   });
-  check("a Sheet is exported as CSV", new URL(exported).searchParams.get("mimeType") === "text/csv", String(exported));
-  check("and rendered header-aware, so a value is retrievable", /Account: Checking/.test(r.envelope.content), r.envelope?.content);
+  check("a native Sheet requests Google's whole-workbook XLSX export",
+    new URL(exported).searchParams.get("mimeType") === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    String(exported));
+  check("content from the first worksheet remains retrievable",
+    /Sheet: Accounts \(Budget\.xlsx\)/.test(r.envelope?.content || "") && /Account: Checking/.test(r.envelope?.content || ""),
+    r.envelope?.content);
+  check("content from a second worksheet remains retrievable",
+    /Sheet: Forecast \(Budget\.xlsx\)/.test(r.envelope?.content || "") && /Quarter: Q4/.test(r.envelope?.content || ""),
+    r.envelope?.content);
+  check("a complete multi-tab workbook is not mislabeled incomplete",
+    r.incomplete !== true && r.envelope?.metadata?.extraction_incomplete !== true, JSON.stringify(r));
+}
+{
+  const file = { id: "F3-tiny", name: "A", mimeType: "application/vnd.google-apps.spreadsheet", size: "100", createdTime: "2026-01-01T00:00:00Z" };
+  const tiny = workbookBytes([["S", [["x"]]]]);
+  const r = await toEnvelope(tok, file, {}, { fetchImpl: async () => binary(tiny), sleep: async () => {} });
+  check("a workbook with too little useful text is refused by the normal quality gate",
+    r.skip?.code === "quality_refused" && !r.envelope, JSON.stringify(r));
+}
+{
+  const file = { id: "F3-corrupt", name: "Broken", mimeType: "application/vnd.google-apps.spreadsheet", size: "100", createdTime: "2026-01-01T00:00:00Z" };
+  const r = await toEnvelope(tok, file, {}, {
+    fetchImpl: async () => binary(Buffer.from("this is not an XLSX workbook")), sleep: async () => {},
+  });
+  check("a corrupt workbook is an explicit extraction refusal, never a green empty Sheet",
+    r.skip?.code === "extraction_refused" && !r.envelope, JSON.stringify(r));
+}
+{
+  let fetched = false;
+  const file = {
+    id: "F3-oversized", name: "Huge", mimeType: "application/vnd.google-apps.spreadsheet",
+    size: String(EXPORT_LIMIT + 1), createdTime: "2026-01-01T00:00:00Z",
+  };
+  const r = await toEnvelope(tok, file, {}, {
+    fetchImpl: async () => { fetched = true; return binary(new Uint8Array()); }, sleep: async () => {},
+  });
+  check("an export beyond Google's byte ceiling is refused before downloading",
+    fetched === false && r.skip?.code === "file_unavailable" && /export limit/.test(r.skip?.reason || ""), JSON.stringify(r));
 }
 {
   const file = { id: "F4", name: "junk.txt", mimeType: "text/plain", size: "50", createdTime: "2026-01-01T00:00:00Z" };
   const r = await toEnvelope(tok, file, {}, { fetchImpl: async () => bytes("hi"), sleep: async () => {} });
   check("a file with too little text is skipped, not indexed empty", !!r.skip && !r.envelope, JSON.stringify(r));
   check("and the skip carries the Drive id so it can be chased", r.skip.id === "F4");
+  check("a quality refusal carries its stable policy code", r.skip.code === "quality_refused", JSON.stringify(r.skip));
 }
 {
   const file = { id: "F5", name: "locked.pdf", mimeType: "application/pdf", size: "1000", createdTime: "2026-01-01T00:00:00Z" };
@@ -315,6 +544,7 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
     fetchImpl: async () => json({ error: { errors: [{ reason: "insufficientFilePermissions" }], message: "no access" } }, 403), sleep: async () => {},
   });
   check("a permanent per-file permission failure is a reasoned skip", !!r.skip && /could not be fetched/.test(r.skip.reason), r.skip?.reason);
+  check("a permanent per-file permission failure is typed", r.skip.code === "file_unavailable", JSON.stringify(r.skip));
 }
 {
   const file = { id: "F5-export", name: "locked doc", mimeType: "application/vnd.google-apps.document", createdTime: "2026-01-01T00:00:00Z" };
@@ -400,7 +630,35 @@ const gm = await import("../connectors/gmail.mjs");
 }
 {
   const r = await gm.toEnvelope(tok, "M2", {}, { fetchImpl: async () => json({ internalDate: "1" }), sleep: async () => {} });
-  check("a message with no content is a reasoned skip", !!r.skip && /no content/.test(r.skip.reason), r.skip?.reason);
+  check("a message with no label evidence is a coverage gap before its body can be trusted",
+    !!r.skip && /no label classification/.test(r.skip.reason) && r.policy_skip === false && r.retain_existing === true,
+    JSON.stringify(r));
+}
+{
+  // Carried over from the release line's version of this file, which the field
+  // version does not assert. connectors/gmail.mjs still refuses an empty
+  // message by name, and a reason nothing checks is a reason that quietly
+  // becomes something else. Labels present so the classification gate above
+  // cannot mask the skip under test.
+  const r = await gm.toEnvelope(tok, "M3", {}, {
+    fetchImpl: async () => json({ internalDate: "1", labelIds: ["INBOX"] }),
+    sleep: async () => {},
+  });
+  check("a message with no content is a reasoned skip, not a silent one",
+    !!r.skip && /no content/.test(r.skip.reason), JSON.stringify(r));
+}
+{
+  const raw = Buffer.from(
+    "From: sender@example.invalid\r\nTo: owner@example.invalid\r\nSubject: Sale\r\n\r\n" +
+    "This invented promotion is deliberately excluded from the customer Brain."
+  ).toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
+  const r = await gm.toEnvelope(tok, "bulk", {}, {
+    fetchImpl: async () => json({ raw, labelIds: ["CATEGORY_PROMOTIONS"], historyId: "H10" }),
+    sleep: async () => {},
+  });
+  check("incremental Gmail applies the same bulk-mail policy as a full query",
+    !!r.skip && r.policy_skip === true && r.retain_existing === false && /policy excludes/.test(r.skip.reason),
+    JSON.stringify(r));
 }
 {
   const r = await gm.toEnvelope(tok, "gone", {}, {

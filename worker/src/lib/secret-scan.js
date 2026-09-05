@@ -234,8 +234,19 @@ const STRUCTURAL = [
     // process.env.X, a function call, a placeholder, or an ordinary identifier.
     reject: (v) =>
       /^(process|env|config|opts|options|args|this|self)\b/i.test(v) ||
-      /^[a-z][A-Za-z0-9]*$/.test(v) ||
-      /^(your|the|a|some|placeholder|example|redacted|xxx+|changeme|todo)/i.test(v) ||
+      // An identifier is a NAME someone typed, so it is short and pronounceable.
+      // The bare `^[a-z][A-Za-z0-9]*$` test also matched this product's OWN
+      // 64-character hex admin key whenever it happened to start with a letter,
+      // which is about 37% of the keys it generates: `admin_key: 7f3a...` was
+      // caught and `admin_key: a7f3...` was waved through as a variable name.
+      // A long hex run is never an identifier, so it no longer qualifies.
+      (/^[a-z][A-Za-z0-9]*$/.test(v) && !/^[0-9a-f]{24,}$/i.test(v)) ||
+      // The placeholder words must be WHOLE words. Without the lookahead the
+      // bare `a` matched every value beginning with the letter "a", so a real
+      // 64-hex admin key starting with "a" was dismissed as the placeholder
+      // word "a" and passed straight through the gate. `your_key` and
+      // `example-token` still match, because `_` and `-` are not alphanumeric.
+      /^(your|the|a|some|placeholder|example|redacted|xxx+|changeme|todo)(?![A-Za-z0-9])/i.test(v) ||
       /^<.*>$/.test(v) ||
       !/[0-9]/.test(v),
   },

@@ -53,12 +53,10 @@ const CREDS = Object.freeze({
   ZOOM_WEBHOOK_SECRET_TOKEN: "secrettoken-northwind",
 });
 
-const reply = (status, body) => ({
-  ok: status >= 200 && status < 300,
-  status,
-  text: async () => (typeof body === "string" ? body : JSON.stringify(body ?? {})),
-  json: async () => (typeof body === "string" ? JSON.parse(body) : (body ?? {})),
-});
+const reply = (status, body) => new Response(
+  typeof body === "string" ? body : JSON.stringify(body ?? {}),
+  { status, headers: { "content-type": "application/json" } },
+);
 
 /** Zoom, scripted. `planType` drives the tier check; `scope` the recordings read. */
 function zoomApi({ planType = 2, recordingsStatus = 200 } = {}) {
@@ -208,8 +206,8 @@ try {
     check("the webhook URL is printed only now, after all of that",
       output.includes("https://brain.northwind-example.test/api/webhooks/zoom") &&
       result?.webhookUrl === "https://brain.northwind-example.test/api/webhooks/zoom");
-    check("the event to subscribe to is the transcript one",
-      output.includes("recording.transcript_completed") && /Not recording\.completed/.test(output));
+    check("the two delivery events are both named",
+      output.includes("recording.completed") && output.includes("recording.transcript_completed"));
     check("zoom is registered as a named source with no refresh cadence",
       expectations.length === 1 && expectations[0].body.source === "zoom" &&
       expectations[0].body.kind === "zoom" && expectations[0].body.expected_refresh_seconds === null,

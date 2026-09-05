@@ -32,6 +32,15 @@ import {
   writeVerifiedRecoveryPlan,
   writeVerifiedRecoveryState,
 } from "../operations/verified-recovery.mjs";
+import {
+  BACKUP_RPO_HOURS,
+  BACKUP_RTO_HOURS,
+  RETENTION_CLASSES,
+  buildRestoreEvidence,
+  decryptOffProviderBackup,
+  encryptOffProviderBackup,
+  restoreEvidenceStatus,
+} from "../operations/off-provider-backup.mjs";
 
 const sandbox = mkdtempSync(join(tmpdir(), "brain-verified-recovery-"));
 const sourcePath = join(sandbox, "source.manifest.json");
@@ -146,6 +155,19 @@ function evidenceFor(stage, context, override = {}) {
       chunk_count: 5,
       fts_count: 5,
     },
+    reconcile_security: {
+      integrity: "ok",
+      schema_fingerprint: schemaHash,
+      aggregate_fingerprint: aggregateHash,
+      content_fingerprint: contentHash,
+      document_count: 3,
+      chunk_count: 5,
+      fts_count: 5,
+      bank_protected: 0,
+      bank_reauthorization_required: 0,
+      bank_legacy_rewrap_required: 0,
+      bank_unsupported_key_versions: 0,
+    },
     rebuild_vectorize: {
       chunk_count: 5,
       vector_count: 5,
@@ -187,8 +209,8 @@ try {
   assert.equal(plan.created_at, createdAt.toISOString());
   assert.match(plan.plan_fingerprint, /^[0-9a-f]{64}$/);
   assert.deepEqual(plan.stages, VERIFIED_RECOVERY_STAGES);
-  assert.equal(plan.artifact.format, "cloudflare_d1_full_sql");
-  assert.equal(plan.artifact.relative_name, ".brain-recovery-export.sql");
+  assert.equal(plan.artifact.format, "financial_brain_recovery_ciphertext_v1");
+  assert.equal(plan.artifact.relative_name, ".brain-recovery-export.sql.fbrenc");
   assert.equal(plan.artifact.owner_only, true);
   assert.equal(plan.isolation.required_initial_user_tables, 0);
   assert.equal(plan.isolation.required_initial_vectors, 0);
@@ -357,7 +379,7 @@ try {
   );
   assert.equal(checkpointResumed.ok, true);
   assert.deepEqual(checkpointResumeCalls, [
-    "verify_d1", "rebuild_vectorize", "verify_health", "verify_eval",
+    "verify_d1", "reconcile_security", "rebuild_vectorize", "verify_health", "verify_eval",
   ]);
   assert.equal(checkpointedState.status, "complete");
 
@@ -441,7 +463,7 @@ try {
   );
   assert.equal(resumed.ok, true);
   assert.deepEqual(resumedCalls, [
-    "restore_d1", "verify_d1", "rebuild_vectorize", "verify_health", "verify_eval",
+    "restore_d1", "verify_d1", "reconcile_security", "rebuild_vectorize", "verify_health", "verify_eval",
   ]);
 
   let restoreCalls = 0;
@@ -507,7 +529,7 @@ try {
     stage_status: "failed",
     attempt: 1,
     completed_stages: 3,
-    total_stages: 8,
+    total_stages: 9,
     failure_code: "RECOVERY_RESTORE_D1_FAILED",
   });
   const statusText = JSON.stringify(status);
@@ -576,7 +598,58 @@ try {
   assert.equal(existsSync(partialPlan), false);
   assert.equal(readFileSync(occupiedState, "utf8"), "preserve me\n");
 
-  console.log("PASS  verified recovery is isolated, resumable, privacy-safe, and fully gated");
+  const backupPlaintext = Buffer.from(`synthetic durable SQL ${sentinel}`);
+  const backupKey = Buffer.alloc(32, 7);
+  const artifactCreated = new Date("2026-08-30T00:00:00Z");
+  const encryptedArtifact = encryptOffProviderBackup(backupPlaintext, {
+    key: backupKey,
+    createdAt: artifactCreated,
+    retentionClass: "daily",
+    randomBytesImpl: () => Buffer.alloc(12, 3),
+  });
+  assert.equal(encryptedArtifact.includes(backupPlaintext), false, "encrypted artifact contains no plaintext corpus bytes");
+  assert.equal(encryptedArtifact.includes(backupKey), false, "encrypted artifact never contains its out-of-band key");
+  const decrypted = decryptOffProviderBackup(encryptedArtifact, { key: backupKey });
+  assert.deepEqual(decrypted.plaintext, backupPlaintext);
+  assert.equal(decrypted.metadata.retention_class, "daily");
+  assert.deepEqual(RETENTION_CLASSES.daily, { cadence_hours: 24, copies: 14 });
+  const tampered = Buffer.from(encryptedArtifact);
+  tampered[tampered.length - 8] ^= 1;
+  assert.throws(
+    () => decryptOffProviderBackup(tampered, { key: backupKey }),
+    /authentication failed|valid encrypted envelope/,
+  );
+
+  const restoreEvidence = buildRestoreEvidence({
+    artifactMetadata: decrypted.metadata,
+    startedAt: "2026-08-30T01:00:00Z",
+    completedAt: "2026-08-30T03:00:00Z",
+    sourceCounts: { documents: 12, chunks: 34 },
+    restoredCounts: { documents: 12, chunks: 34 },
+    restoredSha256: decrypted.metadata.plaintext_sha256,
+    schemaVersion: 22,
+    evaluationPassed: true,
+  });
+  assert.equal(restoreEvidence.status, "passed");
+  assert.equal(restoreEvidence.objectives.rpo_hours, BACKUP_RPO_HOURS);
+  assert.equal(restoreEvidence.objectives.rto_hours, BACKUP_RTO_HOURS);
+  const evidenceText = JSON.stringify(restoreEvidence);
+  for (const forbidden of [sentinel, sourcePath, targetPath, backupPlaintext.toString("utf8")]) {
+    assert.equal(evidenceText.includes(forbidden), false);
+  }
+  assert.equal(restoreEvidenceStatus(restoreEvidence, { now: "2026-11-28T03:00:00Z" }).current, true);
+  assert.deepEqual(
+    restoreEvidenceStatus(restoreEvidence, { now: "2026-11-30T03:00:00Z" }),
+    {
+      current: false,
+      due: true,
+      reason: "restore_drill_due",
+      age_days: 92,
+      next_due_at: "2026-11-28T03:00:00.000Z",
+    },
+  );
+
+  console.log("PASS  verified recovery plus encrypted off-provider artifacts, RPO/RTO, and recurring evidence are gated");
 } finally {
   rmSync(sandbox, { recursive: true, force: true });
 }

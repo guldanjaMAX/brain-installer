@@ -112,6 +112,44 @@ const cutoverBody = (v, mode, protocol = "lease-v1") => JSON.stringify({
     rendered,
   );
 }
+/* ---- with a probe, the pause ends as soon as the brain proves it is quiet ---- */
+{
+  const quiet = { leaseFree: true, inFlight: 0 };
+  const busy = { leaseFree: false, inFlight: 3 };
+  const silence = () => { const prior = console.log; console.log = () => {}; return () => { console.log = prior; }; };
+
+  let restore = silence();
+  let clock = 0;
+  const waiter = async (ms) => { clock += ms; };
+  const readings = [quiet, quiet];
+  const r1 = await waitForVectorDrainCutover(waiter, { probe: async () => readings.shift() ?? quiet, now: () => clock, pollMs: 15_000 });
+  restore();
+  check("an idle brain is released after two quiet readings, not twenty minutes",
+    r1.proven === true && r1.waitedMs === 15_000, JSON.stringify(r1));
+
+  restore = silence();
+  clock = 0;
+  const seq = [busy, busy, quiet, busy, quiet, quiet];
+  const r2 = await waitForVectorDrainCutover(waiter, { probe: async () => seq.shift() ?? quiet, now: () => clock, pollMs: 15_000 });
+  restore();
+  check("a busy brain keeps waiting and a single quiet reading does not count",
+    r2.proven === true && r2.waitedMs === 5 * 15_000, JSON.stringify(r2));
+
+  restore = silence();
+  clock = 0;
+  const r3 = await waitForVectorDrainCutover(waiter, { probe: async () => busy, now: () => clock, pollMs: 60_000 });
+  restore();
+  check("a brain that never goes quiet still gets exactly the full grace",
+    r3.proven === false && r3.waitedMs === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS, JSON.stringify(r3));
+
+  restore = silence();
+  clock = 0;
+  const r4 = await waitForVectorDrainCutover(waiter, { probe: async () => { throw new Error("D1 unavailable"); }, now: () => clock });
+  restore();
+  check("a probe that cannot read falls back to the full grace rather than shortening it",
+    r4.proven === false && r4.waitedMs === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS, JSON.stringify(r4));
+}
+
 const manifestFixture = (version = "0.1.9") => ({
   client: { slug: "fixture" },
   brain: { worker_name: "fixture-brain", version },
@@ -339,11 +377,17 @@ const bootstrapCompletion = () => ({
 
   let noProgressError = null;
   try {
-    const same = validateAcceleratedBootstrapReceipt(bootstrapReceipt());
+    const same = validateAcceleratedBootstrapReceipt(bootstrapReceipt({ submitted: 0, in_flight_batches: 0, queued: 2_000 }));
     validateAcceleratedBootstrapProgress(same, same);
   } catch (error) { noProgressError = error; }
   check("a building response cannot claim progress while every aggregate is unchanged",
     /without aggregate progress/.test(noProgressError?.message || ""), noProgressError?.message);
+  {
+    const busy = validateAcceleratedBootstrapReceipt(bootstrapReceipt({ submitted: 100, in_flight_batches: 1, queued: 1_900 }));
+    let busyError = null;
+    try { validateAcceleratedBootstrapProgress(busy, busy); } catch (error) { busyError = error; }
+    check("identical receipts with a batch in flight are a wait, not a stall claim", busyError === null, busyError?.message);
+  }
 }
 
 /* ---- receipt transport, busy ownership, and legacy stalls are bounded ---- */

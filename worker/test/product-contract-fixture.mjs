@@ -171,9 +171,20 @@ export async function createProductFixture(options = {}) {
   const first = (sql, ...params) => sqlite.prepare(sql).get(...params) ?? null;
 
   const ownerHeaders = async (options = {}) => {
-    const cookie = Object.keys(options).length
-      ? await product.mintSessionCookie(env, 1, options)
-      : await product.mintSessionCookie(env, 1);
+    const grantId = options.grantId ?? null;
+    const credentialId = options.credentialId ||
+      (grantId === null ? "fixture-owner-passkey" : `fixture-${grantId}-passkey`);
+    raw(
+      `INSERT OR IGNORE INTO owner_passkeys
+         (credential_id, public_key_jwk, alg, sign_count, nickname, created_at, grant_id, document_grant_id)
+       VALUES (?, '{}', -7, 0, 'Fixture passkey', ?, ?, ?)`,
+      credentialId, Date.now(),
+      grantId && !String(grantId).startsWith("dg_") ? grantId : null,
+      grantId && String(grantId).startsWith("dg_") ? grantId : null,
+    );
+    const cookie = await product.mintSessionCookie(env, 1, {
+      ...options, grantId, credentialId,
+    });
     return { Cookie: cookie.split(";")[0], "X-Brain-App": "1" };
   };
   const waitUntil = [];

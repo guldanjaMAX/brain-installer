@@ -286,6 +286,9 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
   const priorFullSweep = "2000-01-01T00:00:00.000Z";
   const scannerFingerprint = credentialScannerFingerprint(true);
   const policyFingerprint = drivePolicyFingerprint({
+    // Must match the manifest below: reviewed roots are part of the policy
+    // identity now, so a fingerprint computed without them is a different one.
+    rootFolderIds: ["root-fixture"],
     excludeFileIds: [],
     excludePaths: [],
     excludeNameParts: [],
@@ -352,7 +355,7 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
       brain: { domain: "fixture.invalid" },
       infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
       safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
-      corpora: { google_drive: {} },
+      corpora: { google_drive: { root_folder_ids: ["root-fixture"] } },
     }));
     writeFileSync(join(tokenRoot, "google-tokens.json"), JSON.stringify({
       google: {
