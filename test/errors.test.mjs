@@ -152,7 +152,10 @@ function ingestExitCli(scenario) {
     brain: { domain: "fixture.invalid" },
     infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
     safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
-    corpora: { google_drive: {} },
+    corpora: {
+      google_drive: { root_folder_ids: ["fixture-allowed-root"] },
+      upload: { enabled: true, folders: [source] },
+    },
   }));
   writeFileSync(join(userRoot, ".brain", "google-tokens.json"), JSON.stringify({
     google: {
@@ -172,8 +175,10 @@ function ingestExitCli(scenario) {
   };
   delete env.CLOUDFLARE_API_TOKEN;
   delete env.BRAIN_DEBUG;
-  const args = scenario.startsWith("drive")
-    ? ["ingest", manifest, "--from", "drive"]
+  const args = scenario === "drive-preview-limit"
+    ? ["ingest", manifest, "--from", "drive", "--dry-run", "--limit", "1"]
+    : scenario.startsWith("drive")
+      ? ["ingest", manifest, "--from", "drive"]
     : ["ingest", manifest, "--path", source];
   const result = spawnSync("node", ["--import", INGEST_EXIT_FETCH, CLI, ...args], {
     encoding: "utf-8", env, timeout: 30_000,
@@ -309,6 +314,16 @@ function ingestExitCli(scenario) {
       journalEvents(r.journal)[0]?.error_code === "INGEST_FAILED" &&
       journalEvents(r.journal)[0]?.source === "drive" &&
       !r.journal.includes("fixture-file-one"), r.journal);
+  rmSync(r.dir, { recursive: true, force: true });
+}
+{
+  const r = ingestExitCli("drive-preview-limit");
+  check("a limited Drive preview applies its limit after the approved-root decision",
+    r.code === 0 && /TEST_DRIVE_APPROVED_PREVIEW_DOWNLOADED/.test(r.out) &&
+      /1 document\(s\) prepared/.test(r.out) && /dry run, nothing was sent/.test(r.out),
+    r.out.slice(-900));
+  check("a limited Drive preview never downloads the earlier out-of-root item",
+    !/TEST_DRIVE_OUTSIDE_PREVIEW_DOWNLOADED/.test(r.out), r.out.slice(-900));
   rmSync(r.dir, { recursive: true, force: true });
 }
 {

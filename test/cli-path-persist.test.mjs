@@ -7,7 +7,7 @@
 // profile a Mac or Linux box reads, idempotently, and names the folder on
 // Windows rather than touching PATH with setx.
 
-import { persistCliPath, runningCliBinDir } from "../brain.mjs";
+import { brainCliPrefix, persistCliPath, renderCliCommands, runningCliBinDir } from "../brain.mjs";
 
 let fail = 0, ran = 0;
 const check = (name, condition, detail = "") => {
@@ -70,6 +70,26 @@ check("a Windows global install resolves to its prefix",
     "C:/Users/client/AppData/Roaming/npm");
 check("a source checkout has no bin directory to persist",
   runningCliBinDir("/Users/dev/brain-installer/brain.mjs", "darwin") === null);
+
+{
+  const options = {
+    platform: "win32",
+    nodePath: "C:\\Program Files\\nodejs\\node.exe",
+    scriptPath: "C:\\Users\\client\\AppData\\Roaming\\npm\\node_modules\\brain-installer\\brain.mjs",
+  };
+  const prefix = brainCliPrefix(options);
+  const rendered = renderCliCommands(
+    "Re-run `brain update <manifest>`; then use brain doctor <manifest> --repair.",
+    options,
+  );
+  check("Windows recovery commands use the running Node and CLI paths",
+    rendered.includes(`${prefix} update <manifest>`) && rendered.includes(`${prefix} doctor <manifest> --repair`),
+    rendered);
+  check("Windows recovery output contains no PATH-dependent bare brain command",
+    !/\bbrain\s+(?:update|doctor)\b/.test(rendered), rendered);
+  check("non-Windows recovery commands keep the short installed command",
+    renderCliCommands("brain update <manifest>", { ...options, platform: "darwin" }) === "brain update <manifest>");
+}
 
 console.log(`\ncli path persistence: ${ran - fail}/${ran} passed`);
 process.exit(fail ? 1 : 0);

@@ -32,6 +32,7 @@
  */
 
 import { currentEvidenceCandidates } from "./query-intent.js";
+import { scopeIsRestricted } from "./grants.js";
 
 const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
@@ -291,9 +292,18 @@ export function documentAccessSql(access, chunkAlias = "c", documentAlias = "d",
 
 /** A coarse capability grant's zone boundary, applied where chunk text is read. */
 export function scopeSql(scope, alias = "c", nextParam = 1) {
-  if (!scope || scope.all === true) return { clause: "", params: [], nextParam };
-  const include = Array.isArray(scope.zones) ? scope.zones.filter(Boolean) : [];
+  if (!scope) return { clause: "", params: [], nextParam };
   const exclude = Array.isArray(scope.exclude) ? scope.exclude.filter(Boolean) : [];
+  if (scope.all === true) {
+    if (!exclude.length) return { clause: "", params: [], nextParam };
+    const outList = exclude.map(() => `?${nextParam++}`).join(",");
+    return {
+      clause: ` AND ${alias}.zone IS NOT NULL AND ${alias}.zone NOT IN (${outList})`,
+      params: exclude,
+      nextParam,
+    };
+  }
+  const include = Array.isArray(scope.zones) ? scope.zones.filter(Boolean) : [];
   if (!include.length) return { clause: " AND 1 = 0", params: [], nextParam };
   const params = [];
   const inList = include.map(() => `?${nextParam++}`).join(",");
@@ -530,7 +540,7 @@ export async function search(env, {
 
   const [kw, vec, projection] = await Promise.all([
     searchKeyword(env, query, { limit: pool, filters, access, scope }).catch(() => []),
-    embedding && access?.kind !== "grant" && (!scope || scope.all === true)
+    embedding && access?.kind !== "grant" && !scopeIsRestricted(scope)
       ? searchVector(env, embedding, { limit: pool, filters, scope }).catch(() => [])
       : Promise.resolve([]),
     // Vectorize may return some old/current candidates while a newer accepted
@@ -538,7 +548,7 @@ export async function search(env, {
     // not prove the complete D1 corpus is query-visible. Reuse the exact
     // readiness contract that gates health and acceptance so every answer
     // advertises partial projection instead of looking fully healthy.
-    embedding && access?.kind !== "grant" && (!scope || scope.all === true)
+    embedding && access?.kind !== "grant" && !scopeIsRestricted(scope)
       ? vectorReadiness(env).catch(() => ({ ready: false }))
       : Promise.resolve(null),
   ]);
@@ -559,7 +569,7 @@ export async function search(env, {
   if (access?.kind === "grant") {
     degraded = "scoped-vector";
     degradedReason = "document-scope-keyword-only";
-  } else if (scope && scope.all !== true) {
+  } else if (scopeIsRestricted(scope)) {
     degraded = "scoped-vector";
     degradedReason = "zone-scope-keyword-only";
   } else if (embedding && projection?.ready !== true) {
@@ -572,7 +582,7 @@ export async function search(env, {
     degraded = "no-embedding";
     degradedReason = "embedding-unavailable";
   }
-  if (filters.entity_slug && access?.kind !== "grant" && (!scope || scope.all === true)) {
+  if (filters.entity_slug && access?.kind !== "grant" && !scopeIsRestricted(scope)) {
     degraded = "vector";
     degradedReason = "entity-vector-authority-unindexed";
   }
@@ -717,25 +727,25 @@ export async function upsertChunks(env, chunks, { expectedContentHash = null } =
     c.vector_id = await vectorIdFor(c.chunk_uid);
     const chunkStatement = env.DB.prepare(
       guarded
-        ? `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id)
-           SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12
-           WHERE EXISTS (
-             SELECT 1 FROM documents WHERE doc_uid = ?2 AND content_hash = ?13
-           )
+        ? `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id, zone)
+           SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,documents.zone
+           FROM documents
+           WHERE documents.doc_uid = ?2 AND documents.content_hash = ?13
            ON CONFLICT(chunk_uid) DO UPDATE SET
              text = excluded.text, title = excluded.title,
              document_date = excluded.document_date,
              client = excluded.client, category = excluded.category,
              top_folder = excluded.top_folder, platform = excluded.platform,
-             vector_id = excluded.vector_id`
-        : `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+             vector_id = excluded.vector_id, zone = excluded.zone`
+        : `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id, zone)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,
+                   (SELECT zone FROM documents WHERE doc_uid = ?2))
            ON CONFLICT(chunk_uid) DO UPDATE SET
              text = excluded.text, title = excluded.title,
              document_date = excluded.document_date,
              client = excluded.client, category = excluded.category,
              top_folder = excluded.top_folder, platform = excluded.platform,
-             vector_id = excluded.vector_id`
+             vector_id = excluded.vector_id, zone = excluded.zone`
     ).bind(
       c.chunk_uid, c.doc_uid, c.chunk_ix, c.text, c.source, c.title ?? null,
       c.document_date ?? null, c.client ?? null, c.category ?? null,
@@ -842,9 +852,10 @@ export async function stageDocumentRevision(env, {
     chunk.vector_id = await vectorIdFor(chunk.chunk_uid);
     requiredWriteIndexes.push(statements.length);
     statements.push(env.DB.prepare(
-      `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id)
+      `INSERT INTO chunks (chunk_uid, doc_uid, chunk_ix, text, source, title, document_date, client, category, top_folder, platform, vector_id, zone)
        SELECT ?1,?2,?3,?4,?5,?6,?7,
-              documents.client, documents.category, documents.top_folder, documents.platform, ?8
+              documents.client, documents.category, documents.top_folder, documents.platform, ?8,
+              documents.zone
        FROM documents
        WHERE documents.doc_uid = ?2 AND documents.content_hash = ?9
        ON CONFLICT(chunk_uid) DO UPDATE SET
@@ -852,7 +863,7 @@ export async function stageDocumentRevision(env, {
          document_date = excluded.document_date,
          client = excluded.client, category = excluded.category,
          top_folder = excluded.top_folder, platform = excluded.platform,
-         vector_id = excluded.vector_id`
+         vector_id = excluded.vector_id, zone = excluded.zone`
     ).bind(
       chunk.chunk_uid, chunk.doc_uid, chunk.chunk_ix, chunk.text, chunk.source,
       chunk.title ?? null, chunk.document_date ?? null, chunk.vector_id,
@@ -942,7 +953,9 @@ export const DRAIN_LEASE_TTL_MS = 20 * 60 * 1000;
 export const DRAIN_D1_QUERY_BUDGET = 900;
 const DRAIN_LEASE_ACQUIRE_QUERIES = 1;
 const DRAIN_LEASE_RELEASE_QUERIES = 1;
-const DRAIN_PROJECTION_VERIFY_QUERIES = 1;
+// Exact projection verification reads the durable fence, then conditionally
+// updates install_state against the empty outbox and exact chunk count.
+const DRAIN_PROJECTION_VERIFY_QUERIES = 2;
 const DRAIN_INITIAL_DEPTH_QUERIES = 1;
 const DRAIN_BATCH_SIZE_MAX = 100;
 
@@ -1587,6 +1600,77 @@ async function drainOutboxBatch(env, {
   };
 }
 
+async function drainOutboxWithLease(env, options, lease) {
+  const rawMaxBatches = Number(options.maxBatches ?? 1);
+  const maxBatches = Number.isInteger(rawMaxBatches)
+    ? Math.min(10, Math.max(1, rawMaxBatches))
+    : 1;
+  const rawBatchSize = Number(options.batchSize ?? DRAIN_BATCH_SIZE_MAX);
+  const batchSize = Number.isInteger(rawBatchSize)
+    ? Math.min(DRAIN_BATCH_SIZE_MAX, Math.max(1, rawBatchSize))
+    : DRAIN_BATCH_SIZE_MAX;
+  const now = typeof options.now === "function" ? options.now : Date.now;
+  const maxInvocationMs = Number.isSafeInteger(options.maxInvocationMs)
+    ? Math.min(DRAIN_LEASE_TTL_MS - 60_000, Math.max(1_000, options.maxInvocationMs))
+    : 10 * 60 * 1_000;
+  const startedAt = lease.startedAt;
+
+  const initialDepth = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+  const initialRemaining = Number(initialDepth?.n);
+  if (!Number.isSafeInteger(initialRemaining) || initialRemaining < 0) {
+    throw new Error("vector drain initial backlog is invalid");
+  }
+  let result = {
+    drained: 0, deleted: 0, upserted: 0, submitted: 0, waiting: 0, failed: 0,
+    remaining: initialRemaining, errors: [], busy: false,
+  };
+  let reservedQueries = DRAIN_LEASE_ACQUIRE_QUERIES + DRAIN_LEASE_RELEASE_QUERIES +
+    DRAIN_PROJECTION_VERIFY_QUERIES + DRAIN_INITIAL_DEPTH_QUERIES;
+  const batchQueryUpperBound = drainBatchQueryUpperBound(batchSize);
+  for (let batch = 0; batch < maxBatches; batch++) {
+    if (now() - startedAt >= maxInvocationMs) break;
+    // Never begin provider work unless every possible D1 receipt/remap for
+    // that batch fits alongside the already-reserved lease release. This
+    // prevents a Vectorize write from landing only to hit D1's invocation
+    // query limit before its durable acknowledgement can be recorded.
+    if (reservedQueries + batchQueryUpperBound > DRAIN_D1_QUERY_BUDGET) break;
+    reservedQueries += batchQueryUpperBound;
+    const part = await drainOutboxBatch(env, {
+      ...options,
+      batchSize,
+      lease: { ownerToken: lease.ownerToken, now },
+    });
+    result.drained += Number(part.drained || 0);
+    result.deleted += Number(part.deleted || 0);
+    result.upserted += Number(part.upserted || 0);
+    result.submitted += Number(part.submitted || 0);
+    result.waiting = Number(part.waiting || 0);
+    result.failed += Number(part.failed || 0);
+    result.remaining = Number(part.remaining || 0);
+    result.errors.push(...(part.errors || []).slice(0, Math.max(0, 3 - result.errors.length)));
+    if (result.remaining === 0 && options.disableBootstrapAdvance !== true) {
+      const bootstrap = await bootstrapVectorProjectionPage(env, { now: now() });
+      result.remaining = bootstrap.pending;
+      if (bootstrap.pending > 0) {
+        result.waiting = 0;
+        continue;
+      }
+    }
+    // One immediate confirmation check is useful when a small changeset has
+    // already become visible. Once that check reports waiting, stop rather
+    // than spinning inside one Worker invocation. A later manual/cron call
+    // confirms it without another embedding bill.
+    if (!result.remaining) break;
+    if (part.waiting && !part.submitted) break;
+    if (!part.drained && !part.submitted) break;
+  }
+
+  if (result.remaining === 0) {
+    result.projection_verified = await markProjectionVerifiedIfExact(env);
+  }
+  return result;
+}
+
 /**
  * Drain one bounded invocation under an exclusive D1-backed Vectorize lease.
  *
@@ -1608,18 +1692,7 @@ export async function drainOutbox(env, options = {}) {
       remaining: 0, errors: [], busy: false, paused: true,
     };
   }
-  const rawMaxBatches = Number(options.maxBatches ?? 1);
-  const maxBatches = Number.isInteger(rawMaxBatches)
-    ? Math.min(10, Math.max(1, rawMaxBatches))
-    : 1;
-  const rawBatchSize = Number(options.batchSize ?? DRAIN_BATCH_SIZE_MAX);
-  const batchSize = Number.isInteger(rawBatchSize)
-    ? Math.min(DRAIN_BATCH_SIZE_MAX, Math.max(1, rawBatchSize))
-    : DRAIN_BATCH_SIZE_MAX;
   const now = typeof options.now === "function" ? options.now : Date.now;
-  const maxInvocationMs = Number.isSafeInteger(options.maxInvocationMs)
-    ? Math.min(DRAIN_LEASE_TTL_MS - 60_000, Math.max(1_000, options.maxInvocationMs))
-    : 10 * 60 * 1_000;
   const startedAt = now();
   const lease = await acquireDrainLease(env, { now: startedAt });
   if (!lease.acquired) {
@@ -1643,68 +1716,16 @@ export async function drainOutbox(env, options = {}) {
     };
   }
 
-  const initialDepth = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
-  const initialRemaining = Number(initialDepth?.n);
-  if (!Number.isSafeInteger(initialRemaining) || initialRemaining < 0) {
-    try { await releaseDrainLease(env, lease.ownerToken); } catch { /* expiry remains the fallback */ }
-    throw new Error("vector drain initial backlog is invalid");
-  }
-  let result = {
-    drained: 0, deleted: 0, upserted: 0, submitted: 0, waiting: 0, failed: 0,
-    remaining: initialRemaining, errors: [], busy: false,
-  };
+  let result;
   let operationError = null;
-  let reservedQueries = DRAIN_LEASE_ACQUIRE_QUERIES + DRAIN_LEASE_RELEASE_QUERIES +
-    DRAIN_PROJECTION_VERIFY_QUERIES + DRAIN_INITIAL_DEPTH_QUERIES;
-  const batchQueryUpperBound = drainBatchQueryUpperBound(batchSize);
   try {
-    for (let batch = 0; batch < maxBatches; batch++) {
-      if (now() - startedAt >= maxInvocationMs) break;
-      // Never begin provider work unless every possible D1 receipt/remap for
-      // that batch fits alongside the already-reserved lease release. This
-      // prevents a Vectorize write from landing only to hit D1's invocation
-      // query limit before its durable acknowledgement can be recorded.
-      if (reservedQueries + batchQueryUpperBound > DRAIN_D1_QUERY_BUDGET) break;
-      reservedQueries += batchQueryUpperBound;
-      const part = await drainOutboxBatch(env, {
-        ...options,
-        batchSize,
-        lease: { ownerToken: lease.ownerToken, now },
-      });
-      result.drained += Number(part.drained || 0);
-      result.deleted += Number(part.deleted || 0);
-      result.upserted += Number(part.upserted || 0);
-      result.submitted += Number(part.submitted || 0);
-      result.waiting = Number(part.waiting || 0);
-      result.failed += Number(part.failed || 0);
-      result.remaining = Number(part.remaining || 0);
-      result.errors.push(...(part.errors || []).slice(0, Math.max(0, 3 - result.errors.length)));
-      if (result.remaining === 0 && options.disableBootstrapAdvance !== true) {
-        const bootstrap = await bootstrapVectorProjectionPage(env, { now: now() });
-        result.remaining = bootstrap.pending;
-        if (bootstrap.pending > 0) {
-          result.waiting = 0;
-          continue;
-        }
-      }
-      // One immediate confirmation check is useful when a small changeset has
-      // already become visible. Once that check reports waiting, stop rather
-      // than spinning inside one Worker invocation. A later manual/cron call
-      // confirms it without another embedding bill.
-      if (!result.remaining) break;
-      if (part.waiting && !part.submitted) break;
-      if (!part.drained && !part.submitted) break;
-    }
+    result = await drainOutboxWithLease(env, options, {
+      ownerToken: lease.ownerToken,
+      now,
+      startedAt,
+    });
   } catch (error) {
     operationError = error;
-  }
-
-  if (!operationError && result.remaining === 0) {
-    try {
-      result.projection_verified = await markProjectionVerifiedIfExact(env);
-    } catch (error) {
-      operationError = error;
-    }
   }
 
   let released = false;
@@ -2758,7 +2779,7 @@ async function confirmAcceleratedBootstrapBatch(env, batch, now) {
  * migration 0028 and this line ends at 0022, so no quarantined row can exist and
  * the residue count is taken directly. Do not re-add the join without 0028.
  */
-async function drainPausedBootstrapResidue(env, state, options) {
+async function drainPausedBootstrapResidue(env, state, options, lease) {
   const ledger = await env.DB.prepare(
     `SELECT (SELECT count(*) FROM vector_outbox) AS residue,
             (SELECT count(*) FROM vector_bootstrap_batches
@@ -2770,16 +2791,12 @@ async function drainPausedBootstrapResidue(env, state, options) {
     throw new Error("the paused bootstrap residue receipt is invalid");
   }
   if (residue === 0 || owned > 0) return { attempted: false, remaining: residue };
-  // Keep the receipt. A busy lease here means another drain holds it, which is
-  // contention, not stalled progress. Discarding it returns a plain
-  // zero-movement result and the CLI counts the wait against its stall timer
-  // instead of backing off against the documented 409 busy contract.
-  const drained = await drainOutbox(env, {
+  await drainOutboxWithLease(env, {
     ...options,
     allowPausedBootstrap: true,
     disableBootstrapAdvance: true,
     maxBatches: 10,
-  });
+  }, lease);
   const after = await env.DB.prepare(
     "SELECT count(*) AS total FROM vector_outbox"
   ).first();
@@ -2787,17 +2804,60 @@ async function drainPausedBootstrapResidue(env, state, options) {
   if (!Number.isSafeInteger(total) || total < 0) {
     throw new Error("the paused bootstrap residue receipt is invalid");
   }
-  return { attempted: true, remaining: total, busy: drained.busy === true };
+  return { attempted: true, remaining: total };
 }
 
-export async function acceleratedVectorBootstrap(env, options = {}) {
-  if (env?.VECTOR_DRAIN_MODE !== "paused-for-upgrade") {
-    throw new Error("the accelerated vector bootstrap requires the verified upgrade pause");
+async function rebaseVerifiedAcceleratedBootstrap(env, state) {
+  const ledger = await env.DB.prepare(
+    `SELECT count(*) AS batches,
+            sum(CASE WHEN status<>'confirmed' THEN 1 ELSE 0 END) AS unfinished
+       FROM vector_bootstrap_batches WHERE epoch=?1`,
+  ).bind(state.epoch).first();
+  const batches = Number(ledger?.batches || 0);
+  const unfinished = Number(ledger?.unfinished || 0);
+  if (![batches, unfinished].every((value) => Number.isSafeInteger(value) && value >= 0) ||
+      unfinished > batches) {
+    throw new Error("the accelerated vector bootstrap history is invalid");
   }
-  let state = await bootstrapStateV2(env);
-  if (!["bootstrap_required", "pending", "verified"].includes(String(state.status))) {
-    throw new Error("the accelerated vector bootstrap state is unavailable");
+  if (unfinished > 0) {
+    throw new Error("a verified vector projection retained unfinished bootstrap batches");
   }
+  if (batches > 0 && state.epoch >= Number.MAX_SAFE_INTEGER) {
+    throw new Error("the accelerated vector bootstrap epoch is exhausted");
+  }
+  const result = batches > 0
+    ? await env.DB.prepare(
+      `UPDATE install_state
+          SET vector_projection_bootstrap_epoch=vector_projection_bootstrap_epoch+1,
+              vector_projection_bootstrap_cursor=(SELECT MAX(chunk_uid) FROM chunks),
+              vector_projection_bootstrap_high_water=(SELECT MAX(chunk_uid) FROM chunks),
+              vector_projection_bootstrap_protocol=?2,
+              vector_projection_bootstrap_base_count=(SELECT count(*) FROM chunks)
+        WHERE id=1 AND schema_version>=13
+          AND vector_projection_status='verified'
+          AND vector_projection_bootstrap_epoch=?1
+          AND NOT EXISTS (SELECT 1 FROM vector_outbox)
+          AND NOT EXISTS (
+            SELECT 1 FROM vector_bootstrap_batches
+             WHERE epoch=?1 AND status<>'confirmed'
+          )`,
+    ).bind(state.epoch, ACCELERATED_BOOTSTRAP_PROTOCOL).run()
+    : await env.DB.prepare(
+      `UPDATE install_state
+          SET vector_projection_bootstrap_protocol=?2,
+              vector_projection_bootstrap_base_count=(SELECT count(*) FROM chunks)
+        WHERE id=1 AND schema_version>=13
+          AND vector_projection_status='verified'
+          AND vector_projection_bootstrap_epoch=?1
+          AND NOT EXISTS (SELECT 1 FROM vector_outbox)`,
+    ).bind(state.epoch, ACCELERATED_BOOTSTRAP_PROTOCOL).run();
+  if (drainLeaseChanges(result) !== 1) {
+    throw new Error("the accelerated vector bootstrap verified cut changed before it was rebased");
+  }
+  return bootstrapStateV2(env);
+}
+
+async function acceleratedVectorBootstrapWithLease(env, state, options, lease) {
   // Finish at most one schema-12 residue page before establishing the bulk-v2
   // boundary. This handles a 0.1.14 update interrupted after queue or submit.
   if (state.protocol !== ACCELERATED_BOOTSTRAP_PROTOCOL) {
@@ -2817,12 +2877,12 @@ export async function acceleratedVectorBootstrap(env, options = {}) {
     }
     const residue = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
     if (Number(residue?.n || 0) > 0) {
-      await drainOutbox(env, {
+      await drainOutboxWithLease(env, {
         ...options,
         allowPausedBootstrap: true,
         disableBootstrapAdvance: true,
         maxBatches: 10,
-      });
+      }, lease);
       // A pending schema-12 last page can become fully verified in that drain.
       // Adopt it only when no v2 batch exists, or its rows would be counted
       // once as the base and again by their durable batch receipts.
@@ -2842,13 +2902,8 @@ export async function acceleratedVectorBootstrap(env, options = {}) {
     }
   }
 
-  const residue = await drainPausedBootstrapResidue(env, state, options);
+  const residue = await drainPausedBootstrapResidue(env, state, options, lease);
   if (residue.attempted) {
-    if (residue.busy) {
-      // Surface contention as the lease contract, not as a stalled bootstrap.
-      const receipt = await acceleratedBootstrapReceipt(env, "legacy_drain");
-      return { ...receipt, busy: true };
-    }
     if (residue.remaining > 0) return acceleratedBootstrapReceipt(env, "legacy_drain");
     state = await bootstrapStateV2(env);
   }
@@ -2858,99 +2913,116 @@ export async function acceleratedVectorBootstrap(env, options = {}) {
     state = await bootstrapStateV2(env);
   }
   if (state.status === "verified") {
-    await env.DB.prepare(
-      `UPDATE install_state
-          SET vector_projection_bootstrap_protocol=?1,
-              vector_projection_bootstrap_base_count=(SELECT count(*) FROM chunks)
-        WHERE id=1 AND schema_version>=13
-          AND vector_projection_status='verified'
-          AND NOT EXISTS (SELECT 1 FROM vector_outbox)
-          AND NOT EXISTS (
-            SELECT 1 FROM vector_bootstrap_batches
-             WHERE epoch=vector_projection_bootstrap_epoch
-          )`
-    ).bind(ACCELERATED_BOOTSTRAP_PROTOCOL).run();
+    state = await rebaseVerifiedAcceleratedBootstrap(env, state);
     return acceleratedBootstrapReceipt(env, "waiting");
   }
   if (state.status !== "bootstrap_required") {
     return acceleratedBootstrapReceipt(env, "waiting");
   }
 
+  const now = lease.now;
+  let phase = "waiting";
+  state = await activateAcceleratedBootstrap(env, state);
+  if (!state) throw new Error("the accelerated bootstrap boundary changed; retry from durable state");
+
+  const submitted = await env.DB.prepare(
+    `SELECT * FROM vector_bootstrap_batches
+      WHERE epoch=?1 AND status='submitted' ORDER BY batch_no`
+  ).bind(state.epoch).all();
+  for (const batch of submitted?.results || []) {
+    if (await confirmAcceleratedBootstrapBatch(env, batch, now())) phase = "building";
+  }
+
+  let inFlight = await env.DB.prepare(
+    `SELECT count(*) AS n FROM vector_bootstrap_batches
+      WHERE epoch=?1 AND status IN ('queued','submitted')`
+  ).bind(state.epoch).first();
+  const durableInFlight = Number(inFlight?.n || 0);
+  if (!Number.isSafeInteger(durableInFlight) || durableInFlight < 0 ||
+      durableInFlight > ACCELERATED_BOOTSTRAP_WINDOW) {
+    throw new Error("the accelerated bootstrap in-flight window is invalid");
+  }
+  while (Number(inFlight?.n || 0) < ACCELERATED_BOOTSTRAP_WINDOW) {
+    state = await bootstrapStateV2(env);
+    if (!state.highWater || state.cursor === state.highWater) break;
+    if (!await queueAcceleratedBootstrapBatch(env, state, now())) break;
+    phase = "building";
+    inFlight = { n: Number(inFlight?.n || 0) + 1 };
+  }
+
+  const queued = await env.DB.prepare(
+    `SELECT * FROM vector_bootstrap_batches
+      WHERE epoch=?1 AND status='queued' ORDER BY batch_no`
+  ).bind(state.epoch).all();
+  for (const batch of queued?.results || []) {
+    await submitAcceleratedBootstrapBatch(
+      env,
+      batch,
+      { ownerToken: lease.ownerToken, now },
+      {
+        embed: options.embed,
+        embedBatch: options.embedBatch,
+        embedGroup: options.embedGroup || 50,
+      },
+    );
+    phase = "building";
+  }
+
+  state = await bootstrapStateV2(env);
+  const unfinished = await env.DB.prepare(
+    `SELECT count(*) AS n FROM vector_bootstrap_batches
+      WHERE epoch=?1 AND status<>'confirmed'`
+  ).bind(state.epoch).first();
+  const outbox = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
+  if (state.cursor === state.highWater && Number(unfinished?.n || 0) === 0 &&
+      Number(outbox?.n || 0) === 0) {
+    await env.DB.prepare(
+      `UPDATE install_state SET vector_projection_status='pending'
+        WHERE id=1 AND schema_version>=13
+          AND vector_projection_status='bootstrap_required'
+          AND COALESCE(vector_projection_bootstrap_cursor,'')=
+              COALESCE(vector_projection_bootstrap_high_water,'')`
+    ).run();
+    if (await markProjectionVerifiedIfExact(env)) phase = "complete";
+  }
+  return acceleratedBootstrapReceipt(env, phase);
+}
+
+export async function acceleratedVectorBootstrap(env, options = {}) {
+  if (env?.VECTOR_DRAIN_MODE !== "paused-for-upgrade") {
+    throw new Error("the accelerated vector bootstrap requires the verified upgrade pause");
+  }
+  let state = await bootstrapStateV2(env);
+  if (!["bootstrap_required", "pending", "verified"].includes(String(state.status))) {
+    throw new Error("the accelerated vector bootstrap state is unavailable");
+  }
   const now = typeof options.now === "function" ? options.now : Date.now;
-  const lease = await acquireDrainLease(env, { now: now() });
+  const startedAt = now();
+  const lease = await acquireDrainLease(env, { now: startedAt });
   if (!lease.acquired) {
     const receipt = await acceleratedBootstrapReceipt(env, "waiting");
     return { ...receipt, busy: true, retry_after_seconds: lease.retryAfterSeconds };
   }
-  let phase = "waiting";
+
+  let receipt;
   let operationError = null;
   try {
-    state = await activateAcceleratedBootstrap(env, state);
-    if (!state) throw new Error("the accelerated bootstrap boundary changed; retry from durable state");
-
-    const submitted = await env.DB.prepare(
-      `SELECT * FROM vector_bootstrap_batches
-        WHERE epoch=?1 AND status='submitted' ORDER BY batch_no`
-    ).bind(state.epoch).all();
-    for (const batch of submitted?.results || []) {
-      if (await confirmAcceleratedBootstrapBatch(env, batch, now())) phase = "building";
-    }
-
-    let inFlight = await env.DB.prepare(
-      `SELECT count(*) AS n FROM vector_bootstrap_batches
-        WHERE epoch=?1 AND status IN ('queued','submitted')`
-    ).bind(state.epoch).first();
-    const durableInFlight = Number(inFlight?.n || 0);
-    if (!Number.isSafeInteger(durableInFlight) || durableInFlight < 0 ||
-        durableInFlight > ACCELERATED_BOOTSTRAP_WINDOW) {
-      throw new Error("the accelerated bootstrap in-flight window is invalid");
-    }
-    while (Number(inFlight?.n || 0) < ACCELERATED_BOOTSTRAP_WINDOW) {
-      state = await bootstrapStateV2(env);
-      if (!state.highWater || state.cursor === state.highWater) break;
-      if (!await queueAcceleratedBootstrapBatch(env, state, now())) break;
-      phase = "building";
-      inFlight = { n: Number(inFlight?.n || 0) + 1 };
-    }
-
-    const queued = await env.DB.prepare(
-      `SELECT * FROM vector_bootstrap_batches
-        WHERE epoch=?1 AND status='queued' ORDER BY batch_no`
-    ).bind(state.epoch).all();
-    for (const batch of queued?.results || []) {
-      await submitAcceleratedBootstrapBatch(
-        env,
-        batch,
-        { ownerToken: lease.ownerToken, now },
-        {
-          embed: options.embed,
-          embedBatch: options.embedBatch,
-          embedGroup: options.embedGroup || 50,
-        },
-      );
-      phase = "building";
-    }
-
+    // A caller may have observed the legacy protocol before the current lease
+    // holder established v2. Re-read only after ownership, before any delete,
+    // reset, batch insert, or Vectorize mutation.
     state = await bootstrapStateV2(env);
-    const unfinished = await env.DB.prepare(
-      `SELECT count(*) AS n FROM vector_bootstrap_batches
-        WHERE epoch=?1 AND status<>'confirmed'`
-    ).bind(state.epoch).first();
-    const outbox = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
-    if (state.cursor === state.highWater && Number(unfinished?.n || 0) === 0 &&
-        Number(outbox?.n || 0) === 0) {
-      await env.DB.prepare(
-        `UPDATE install_state SET vector_projection_status='pending'
-          WHERE id=1 AND schema_version>=13
-            AND vector_projection_status='bootstrap_required'
-            AND COALESCE(vector_projection_bootstrap_cursor,'')=
-                COALESCE(vector_projection_bootstrap_high_water,'')`
-      ).run();
-      if (await markProjectionVerifiedIfExact(env)) phase = "complete";
+    if (!["bootstrap_required", "pending", "verified"].includes(String(state.status))) {
+      throw new Error("the accelerated vector bootstrap state is unavailable");
     }
+    receipt = await acceleratedVectorBootstrapWithLease(env, state, options, {
+      ownerToken: lease.ownerToken,
+      now,
+      startedAt,
+    });
   } catch (error) {
     operationError = error;
   }
+
   let releaseError = null;
   try {
     if (!await releaseDrainLease(env, lease.ownerToken)) {
@@ -2959,9 +3031,14 @@ export async function acceleratedVectorBootstrap(env, options = {}) {
   } catch (error) {
     releaseError = error;
   }
-  if (operationError) throw operationError;
+  if (operationError) {
+    if (releaseError && operationError && typeof operationError === "object") {
+      operationError.leaseReleaseFailed = true;
+    }
+    throw operationError;
+  }
   if (releaseError) throw releaseError;
-  return acceleratedBootstrapReceipt(env, phase);
+  return receipt;
 }
 
 /** Start a whole-corpus bootstrap, or resume the current durable epoch. */

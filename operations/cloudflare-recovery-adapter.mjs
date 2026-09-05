@@ -1455,12 +1455,12 @@ function validateBootstrapReceipt(body, expectedTotal) {
       receipt.actualVectors > expectedTotal || receipt.inFlightBatches > 3 ||
       receipt.confirmed > receipt.total ||
       receipt.remaining !== receipt.total - receipt.confirmed ||
-      receipt.queued + receipt.submitted > receipt.remaining || receipt.failed !== 0 ||
+      receipt.queued + receipt.submitted > receipt.remaining ||
       (receipt.phase === "complete") !== receipt.complete ||
       (!receipt.complete && receipt.vectorReady) ||
       (receipt.complete && (
         receipt.remaining !== 0 || receipt.queued !== 0 || receipt.submitted !== 0 ||
-        receipt.inFlightBatches !== 0 || !receipt.vectorReady ||
+        receipt.inFlightBatches !== 0 || receipt.failed !== 0 || !receipt.vectorReady ||
         receipt.actualVectors !== expectedTotal
       ))) {
     refuse(code);
@@ -1483,12 +1483,19 @@ function validateBootstrapBusyReceipt(body, previousRemaining) {
 
 function validateBootstrapProgress(previous, current) {
   if (!previous) return current;
-  if (current.epoch !== previous.epoch || current.total !== previous.total ||
-      current.confirmed < previous.confirmed || current.remaining > previous.remaining ||
-      (previous.phase !== "legacy_drain" && current.phase === "legacy_drain")) {
+  const verifiedRebase = current.complete === true &&
+    current.epoch === previous.epoch + 1 && current.total === previous.total;
+  if ((!verifiedRebase && current.epoch !== previous.epoch) || current.total !== previous.total ||
+      current.confirmed < previous.confirmed || current.remaining > previous.remaining) {
     refuse("RECOVERY_BOOTSTRAP_PROGRESS_INVALID");
   }
-  if (current.phase === "building" && [
+  // A processed provider mutation can remain temporarily invisible and be
+  // re-queued as residue. Both `failed` and a return to legacy_drain are
+  // bounded retry states; exact completion still requires zero queue, zero
+  // failures, count parity, and query-visible readiness.
+  const idle = current.submitted === 0 && current.inFlightBatches === 0 &&
+    previous.submitted === 0 && previous.inFlightBatches === 0;
+  if (current.phase === "building" && current.failed === 0 && idle && [
     "confirmed", "remaining", "queued", "submitted", "inFlightBatches", "actualVectors",
   ].every((field) => current[field] === previous[field])) {
     refuse("RECOVERY_BOOTSTRAP_STALLED");

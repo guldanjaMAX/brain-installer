@@ -5,7 +5,11 @@ import { run, localToolEnvironment, cloudflareCliEnvironment,
          checkWorkersPaidPlan, checkPrioritySlice,
          summarize, runAll, OK, WARN, FAIL } from "../doctor.mjs";
 import { readFileSync } from "node:fs";
-import { WRANGLER_SPEC } from "../operations/wrangler-oauth.mjs";
+import {
+  WRANGLER_SESSION_ABSENT,
+  WRANGLER_SESSION_ENCRYPTED_UNSUPPORTED,
+  WRANGLER_SPEC,
+} from "../operations/wrangler-oauth.mjs";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
 
@@ -141,12 +145,26 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 
 /* ---- the standard token owns Vectorize; browser login is only a fallback ---- */
 {
-  const l = checkWranglerLogin("0000");
-  if (l.status !== OK) {
-    check("wrangler login is described as a fallback", l.status === WARN && /fallback/i.test(l.fix), l.fix);
-  } else {
-    check("wrangler login reports signed in cleanly", !/\\.$/.test(l.detail.trim()), l.detail);
-  }
+  const l = checkWranglerLogin("0000", {
+    readWranglerOAuthSession: () => ({ type: WRANGLER_SESSION_ABSENT }),
+    runCommand: () => ({ ok: false, out: "fixture signed out" }),
+  });
+  check("wrangler login is described as a fallback", l.status === WARN && /fallback/i.test(l.fix), l.fix);
+
+  let encryptedWhoamiCalls = 0;
+  const encrypted = checkWranglerLogin("0000", {
+    readWranglerOAuthSession: () => ({ type: WRANGLER_SESSION_ENCRYPTED_UNSUPPORTED }),
+    runCommand: () => { encryptedWhoamiCalls++; return { ok: false, out: "must not run" }; },
+  });
+  check("an encrypted Wrangler session is detected without probing it",
+    encrypted.status === WARN && encryptedWhoamiCalls === 0 && /encrypted Wrangler session detected/i.test(encrypted.detail),
+    JSON.stringify(encrypted));
+  check("the encrypted-session warning does not claim the owner is signed out",
+    !/not signed in/i.test(encrypted.detail), encrypted.detail);
+  check("the encrypted-session remedy gives pinned re-login and hidden token fallbacks",
+    encrypted.fix.includes(`npx ${WRANGLER_SPEC} login`) &&
+      /brain setup.*brain update.*hidden prompt/is.test(encrypted.fix) &&
+      /does not mean it is signed out/i.test(encrypted.fix), encrypted.fix);
   check("the scoped token includes Vectorize Edit", CF_TOKEN_SCOPES.includes("Vectorize: Edit"), JSON.stringify(CF_TOKEN_SCOPES));
 }
 {
@@ -381,9 +399,17 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   // straight through, deleting the client's own exported account id and leaving
   // wrangler unable to choose between their accounts.
   process.env.CLOUDFLARE_ACCOUNT_ID = "USERSET";
-  const l = checkWranglerLogin(undefined);
+  let whoamiEnv = null;
+  const l = checkWranglerLogin(undefined, {
+    readWranglerOAuthSession: () => ({ type: WRANGLER_SESSION_ABSENT }),
+    runCommand: (_command, _args, options) => {
+      whoamiEnv = options.env;
+      return { ok: false, out: "fixture signed out" };
+    },
+  });
   check("checking login without a manifest does not clobber the user's account id",
-    process.env.CLOUDFLARE_ACCOUNT_ID === "USERSET" && !!l.status);
+    process.env.CLOUDFLARE_ACCOUNT_ID === "USERSET" &&
+      whoamiEnv.CLOUDFLARE_ACCOUNT_ID === "USERSET" && !!l.status);
   const probe = run("node", ["-e", "console.log(process.env.CLOUDFLARE_ACCOUNT_ID || '(absent)')"], {
     inheritEnv: false,
     env: cloudflareCliEnvironment(undefined),

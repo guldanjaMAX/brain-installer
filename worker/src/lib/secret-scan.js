@@ -1,5 +1,5 @@
 /**
- * secret-scan v4 — credential and capability-link safety for ingest.
+ * secret-scan v5: credential, taxpayer-ID, and capability-link safety for ingest.
  *
  * The credential shapes began as a port of ~/CocoIndex/secret_scan.py v2. The
  * shipped connector and Worker now import this module directly, so both doors
@@ -31,10 +31,10 @@
 export const CONFIRMED = "confirmed";
 export const SUSPECTED = "suspected";
 export const CLEAN = "clean";
-// v4 adds content-preserving capability-link sanitization. The durable version
-// forces previously accepted content through the new transform on the next
-// complete source sweep.
-export const GATE_VERSION = 4;
+// v5 adds high-confidence, context-anchored US taxpayer identifiers. The
+// durable version forces previously accepted content through the new gate on
+// the next complete source sweep.
+export const GATE_VERSION = 5;
 
 // Some HTTPS links are credentials in URL form. Unlike a provider API key, a
 // private payment link normally appears inside useful billing prose, so
@@ -194,6 +194,36 @@ const PROVIDER = [
 ].map(([label, pattern]) => ({ label, pattern, severity: CONFIRMED, group: 0, allowlist: false }));
 
 const STRUCTURAL = [
+  {
+    label: "us_social_security_number",
+    // Nine digits occur in ordinary documents, so the shape alone is not
+    // enough. An explicit SSN or Social Security label must introduce it.
+    pattern:
+      /\b(?:ssn|social[ -]?security(?:[ -]?(?:number|no\.?))?|tin|(?:taxpayer|tax)[ -]?identification(?:[ -]?(?:number|no\.?))?)\b[^0-9]{0,24}(\d{3}[- ]?\d{2}[- ]?\d{4})\b/gi,
+    severity: CONFIRMED,
+    group: 1,
+    allowlist: false,
+    privateIdentity: true,
+    reject: (value) => {
+      const digits = String(value).replace(/\D/g, "");
+      return /^(?:000|666|9\d{2})/.test(digits) ||
+        digits.slice(3, 5) === "00" ||
+        digits.slice(5) === "0000" ||
+        /^(\d)\1{8}$/.test(digits);
+    },
+  },
+  {
+    label: "us_employer_identification_number",
+    // EIN-shaped values are refused only beside an explicit employer-tax label;
+    // an unlabelled 2-7 digit split is common in invoice and order numbers.
+    pattern:
+      /\b(?:ein|employer[ -]?identification(?:[ -]?(?:number|no\.?))?|federal[ -]?tax[ -]?id|tin|(?:taxpayer|tax)[ -]?identification(?:[ -]?(?:number|no\.?))?)\b[^0-9]{0,24}(\d{2}-?\d{7})\b/gi,
+    severity: CONFIRMED,
+    group: 1,
+    allowlist: false,
+    privateIdentity: true,
+    reject: (value) => /^(\d)\1{8}$/.test(String(value).replace(/\D/g, "")),
+  },
   {
     label: "connection_string",
     // Only group 2 (the password) is redacted, so host and user stay searchable.
@@ -403,7 +433,9 @@ export function scan(text) {
   const findings = hits.map((h) => ({
     label: h.rule.label,
     severity: h.rule.severity,
-    preview: mask(h.value),
+    preview: h.rule.privateIdentity
+      ? `[redacted private identifier; len=${String(h.value).replace(/\D/g, "").length}]`
+      : mask(h.value),
   }));
   const hasConfirmed = findings.some((f) => f.severity === CONFIRMED);
   return {

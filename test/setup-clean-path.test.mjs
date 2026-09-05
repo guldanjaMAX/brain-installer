@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import {
   mkdtempSync,
+  mkdirSync,
   lstatSync,
   readdirSync,
   readFileSync,
@@ -19,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   chooseSetupAccount,
+  cmdIngestLocal,
   cmdMigrate,
   cmdSetup,
   persistWorkersDevDomain,
@@ -77,15 +79,23 @@ try {
   };
   const events = [];
   const key = `fixture-${"k".repeat(40)}`;
+  const firstSourceFolder = join(sandbox, "first-source");
+  mkdirSync(firstSourceFolder);
+  writeFileSync(join(firstSourceFolder, "first-note.txt"), "A synthetic note loaded by fresh setup.\n");
+  const canonicalFirstSource = realpathSync.native(firstSourceFolder);
   const prompt = async (question, fallback) => {
     if (/what is this brain for/i.test(question)) return "Clean Brain";
     if (/short name/i.test(question)) return "clean-brain";
     if (/folder to load/i.test(question)) return "";
     return fallback || "";
   };
+  const freshSetupPrompt = async (question, fallback) => {
+    if (/folder to load/i.test(question)) return firstSourceFolder;
+    return prompt(question, fallback);
+  };
   await cmdSetup(target, {
     setupWorkerScriptExists: async () => false,
-    ask: prompt,
+    ask: freshSetupPrompt,
     doctorRunAll: async (options) => {
       assert.equal(options.requireClaudeCode, true);
       return [];
@@ -136,10 +146,25 @@ try {
       assert.ok(options.nodePath);
       return { path: join(sandbox, "Financial Brain", "CLAUDE.md"), status: "written" };
     },
+    cmdIngestLocal: async (manifest, path, flags) => {
+      events.push("ingest");
+      assert.equal(path, target);
+      assert.deepEqual(flags, { path: canonicalFirstSource, source: "documents" });
+      const persisted = JSON.parse(readFileSync(target, "utf8"));
+      assert.deepEqual(persisted.corpora.upload.folders, [{
+        path: canonicalFirstSource,
+        source: "documents",
+      }], "fresh setup must commit the approved root before invoking ingest");
+      assert.deepEqual(manifest.corpora.upload.folders, persisted.corpora.upload.folders);
+      const preview = await cmdIngestLocal(manifest, path, { ...flags, "dry-run": true });
+      assert.equal(preview.dry_run, true);
+      assert.equal(preview.would_send, 1,
+        "the first setup ingest must pass the exact-root gate and reach the real folder");
+    },
     backlogCount: async () => 0,
     installedManifestOptions,
   });
-  assert.deepEqual(events, ["verify", "provision", "migrate", "deploy", "secrets", "drain", "health", "wire", "claude-guide"]);
+  assert.deepEqual(events, ["verify", "provision", "migrate", "deploy", "secrets", "drain", "health", "wire", "claude-guide", "ingest"]);
   const saved = JSON.parse(readFileSync(target, "utf8"));
   assert.equal(saved.infrastructure.cloudflare.account_id, oneAccount.id);
   assert.equal(saved.brain.domain, "clean-brain.owner-subdomain.workers.dev");

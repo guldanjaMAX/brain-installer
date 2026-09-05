@@ -61,14 +61,20 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   check("a migration receipt yields a unique exact Drive exclusion list",
     driveExclusionIdsOf(receipt).join(",") === "bad-1,dup-2", JSON.stringify(driveExclusionIdsOf(receipt)));
   const cfg = driveConnectorConfig({
-    corpora: { google_drive: { exclude_file_ids: ["inline-1"], exclude_file_ids_file: "receipt.json", exclude_paths: ["Legal/Sealed"] } },
+    corpora: { google_drive: { root_folder_ids: ["allowed-root"], exclude_file_ids: ["inline-1"], exclude_file_ids_file: "receipt.json", exclude_paths: ["Legal/Sealed"] } },
     safety: { private_path_prefixes: ["_private"] },
   }, "/tmp/client/brain.manifest.json", () => JSON.stringify(receipt));
   check("inline and receipt exclusions are combined", cfg.excludeFileIds.join(",") === "bad-1,dup-2,inline-1", JSON.stringify(cfg));
   check("Drive receives path and private-prefix policy from the standard manifest",
     cfg.excludePaths[0] === "Legal/Sealed" && cfg.privatePrefixes[0] === "_private", JSON.stringify(cfg));
+  check("Drive receives a positive stable-folder boundary from the manifest",
+    cfg.rootFolderIds.join(",") === "allowed-root", JSON.stringify(cfg));
+  check("Drive refuses a missing positive folder boundary before any sync",
+    /root_folder_ids must be an array/.test(await throws(() => driveConnectorConfig({ corpora: { google_drive: {} } }, "/tmp/brain.manifest.json"))));
 
   const policyFingerprint = drivePolicyFingerprint(cfg);
+  check("changing an allowed Drive root forces a new source-policy identity",
+    policyFingerprint !== drivePolicyFingerprint({ ...cfg, rootFolderIds: ["different-root"] }));
   check("credential scanner mode is part of Drive policy identity",
     drivePolicyFingerprint(cfg, true) !== drivePolicyFingerprint(cfg, false));
   check("credential scanner version is a durable rescan marker",

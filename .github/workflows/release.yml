@@ -1,0 +1,383 @@
+# A version tag is a request to test a release candidate, not permission to
+# publish untested bytes. The only route to the publish job passes through the
+# same six-job CI matrix and planted Windows traps used on pull requests.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: exact tagged commit / full CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: publish verified immutable assets
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: prove tag, package, tested SHA, and main agree
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="$GITHUB_REF_NAME"
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tag must be an exact vMAJOR.MINOR.PATCH tag"
+            exit 1
+          fi
+
+          release_version="$(node -p "require('./package.json').version")"
+          if [[ "$release_tag" != "v$release_version" ]]; then
+            echo "::error::tag $release_tag does not match package version $release_version"
+            exit 1
+          fi
+
+          tag_commit="$(git rev-parse "refs/tags/$release_tag^{commit}")"
+          event_commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          checkout_commit="$(git rev-parse 'HEAD^{commit}')"
+          if [[ "$tag_commit" != "$event_commit" || "$tag_commit" != "$checkout_commit" ]]; then
+            echo "::error::tag, event, and checked-out commit do not agree"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "::error::tagged commit is not reachable from origin/main"
+            exit 1
+          fi
+
+          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=$release_version" >> "$GITHUB_ENV"
+          echo "RELEASE_COMMIT=$tag_commit" >> "$GITHUB_ENV"
+
+      # GitHub exposes this repository setting through an administration-read
+      # endpoint. GITHUB_TOKEN cannot receive that permission, so a separate
+      # one-repository, read-only credential is required. Failing this check
+      # leaves no draft or public release behind.
+      - name: require immutable releases before creating a draft
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::RELEASE_ADMIN_READ_TOKEN is not configured"
+            exit 1
+          fi
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            > "$RUNNER_TEMP/immutable-releases.json"
+          node -e '
+            const fs = require("node:fs");
+            const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            if (value.enabled !== true) throw new Error("immutable releases are not enabled");
+          ' "$RUNNER_TEMP/immutable-releases.json"
+
+      - name: build two byte-identical package names
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+          release_dir="$RUNNER_TEMP/release"
+          mkdir -p "$release_dir"
+          npm pack --json --ignore-scripts --pack-destination "$release_dir" \
+            > "$release_dir/npm-pack.json"
+
+          versioned="$release_dir/brain-installer-$RELEASE_VERSION.tgz"
+          canonical="$release_dir/brain-installer.tgz"
+          node -e '
+            const fs = require("node:fs");
+            const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            if (report.length !== 1 || report[0].filename !== process.argv[2]) {
+              throw new Error(`npm packed ${report[0]?.filename ?? "nothing"}, expected ${process.argv[2]}`);
+            }
+          ' "$release_dir/npm-pack.json" "$(basename "$versioned")"
+          cp "$versioned" "$canonical"
+          cmp --silent "$versioned" "$canonical"
+
+          echo "VERSIONED_TARBALL=$versioned" >> "$GITHUB_ENV"
+          echo "CANONICAL_TARBALL=$canonical" >> "$GITHUB_ENV"
+
+      # Both names are arguments to this one creation command. gh holds the
+      # release as a draft while it uploads the assets, so a partial upload or
+      # failed verification cannot expose a public release.
+      - name: create one draft with both assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing_release="$RUNNER_TEMP/existing-release.json"
+          existing_error="$RUNNER_TEMP/existing-release.err"
+          set +e
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            > "$existing_release" 2> "$existing_error"
+          existing_status=$?
+          set -e
+          if [[ $existing_status -eq 0 ]]; then
+            existing_record="$(node -e '
+              const fs = require("node:fs");
+              const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+              if (value.tag_name !== process.argv[2]) throw new Error("existing release tag does not match the requested tag");
+              if (!Number.isSafeInteger(value.id)) throw new Error("existing release did not report a numeric id");
+              const state = value.draft === true ? "draft" : value.draft === false ? "published" : null;
+              if (!state) throw new Error("existing release did not report its draft state");
+              const owned = /<!-- brain-release-run:[0-9]+:[0-9]+ -->/.test(String(value.body || ""));
+              process.stdout.write(`${state}\t${value.id}\t${owned ? "owned" : "unowned"}`);
+            ' "$existing_release" "$RELEASE_TAG")"
+            IFS=$'\t' read -r existing_state existing_id existing_owner <<< "$existing_record"
+            if [[ "$existing_state" == "draft" ]]; then
+              if [[ "$existing_owner" != "owned" ]]; then
+                echo "::error::an unowned draft already exists for $RELEASE_TAG; refusing to delete it"
+                exit 1
+              fi
+              echo "removing the incomplete draft for $RELEASE_TAG; its git tag is preserved"
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$existing_id"
+            else
+              echo "::error::a published release already exists for $RELEASE_TAG"
+              exit 1
+            fi
+          elif grep -q "HTTP 404" "$existing_error"; then
+            : # No release exists for this exact tag. Keep the tag and continue.
+          else
+            cat "$existing_error" >&2
+            echo "::error::could not determine whether a release already exists for $RELEASE_TAG"
+            exit 1
+          fi
+
+          # The marker is part of the release-creation API call, before gh makes
+          # its separate asset-upload calls. Cleanup later compares this exact
+          # run marker and numeric release id, so it cannot delete a draft that
+          # another actor created after the preflight check.
+          release_marker="brain-release-run:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+          echo "RELEASE_DRAFT_MARKER=$release_marker" >> "$GITHUB_ENV"
+          gh release create "$RELEASE_TAG" \
+            "$VERSIONED_TARBALL" "$CANONICAL_TARBALL" \
+            --draft \
+            --verify-tag \
+            --fail-on-no-commits \
+            --latest \
+            --title "Brain Installer $RELEASE_VERSION" \
+            --notes "<!-- $release_marker -->" \
+            --generate-notes
+
+          # Resolve the draft exactly once after creation and bind every later
+          # operation to its numeric id. A tag lookup on the publish step could
+          # otherwise select a different draft if another writer replaced this
+          # one after its assets were verified.
+          created_release="$RUNNER_TEMP/created-release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$created_release"
+          created_id="$(node -e '
+            const fs = require("node:fs");
+            const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const expectedMarker = `<!-- ${process.argv[3]} -->`;
+            if (value.tag_name !== process.argv[2]) throw new Error("created release tag does not match the requested tag");
+            if (value.draft !== true) throw new Error("created release is not a draft");
+            if (!Number.isSafeInteger(value.id)) throw new Error("created release did not report a numeric id");
+            if (!String(value.body || "").includes(expectedMarker)) {
+              throw new Error("created release does not carry this run marker");
+            }
+            process.stdout.write(String(value.id));
+          ' "$created_release" "$RELEASE_TAG" "$release_marker")"
+          echo "RELEASE_DRAFT_ID=$created_id" >> "$GITHUB_ENV"
+
+      - name: verify the private draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" \
+            --json tagName,isDraft,isImmutable,assets,url \
+            > "$RUNNER_TEMP/draft-release.json"
+          node scripts/verify-release-assets.mjs draft \
+            "$RUNNER_TEMP/draft-release.json" "$RELEASE_TAG" \
+            "$VERSIONED_TARBALL" "$CANONICAL_TARBALL"
+
+          draft_download="$RUNNER_TEMP/draft-download"
+          mkdir -p "$draft_download"
+          gh release download "$RELEASE_TAG" --dir "$draft_download"
+          cmp --silent "$VERSIONED_TARBALL" "$draft_download/brain-installer-$RELEASE_VERSION.tgz"
+          cmp --silent "$CANONICAL_TARBALL" "$draft_download/brain-installer.tgz"
+
+      - name: publish the verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_DRAFT_ID:-}" =~ ^[0-9]+$ || -z "${RELEASE_DRAFT_MARKER:-}" ]]; then
+            echo "::error::the verified draft identity is unavailable"
+            exit 1
+          fi
+
+          # Re-read the exact numeric release immediately before publication.
+          # This validates ownership and the server-computed asset digests on
+          # the same release id that the PATCH below publishes.
+          prepublish_release="$RUNNER_TEMP/prepublish-release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_DRAFT_ID" > "$prepublish_release"
+          node -e '
+            const fs = require("node:fs");
+            const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const expectedId = Number(process.argv[2]);
+            const expectedMarker = `<!-- ${process.argv[4]} -->`;
+            if (value.id !== expectedId) throw new Error("prepublish release id changed");
+            if (value.tag_name !== process.argv[3]) throw new Error("prepublish release tag changed");
+            if (value.draft !== true) throw new Error("prepublish release is no longer a draft");
+            if (!String(value.body || "").includes(expectedMarker)) {
+              throw new Error("prepublish release is not owned by this run");
+            }
+          ' "$prepublish_release" "$RELEASE_DRAFT_ID" "$RELEASE_TAG" "$RELEASE_DRAFT_MARKER"
+          node scripts/verify-release-assets.mjs draft \
+            "$prepublish_release" "$RELEASE_TAG" \
+            "$VERSIONED_TARBALL" "$CANONICAL_TARBALL"
+
+          published_operation="$RUNNER_TEMP/published-operation.json"
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_DRAFT_ID" \
+            -F draft=false > "$published_operation"
+          node -e '
+            const fs = require("node:fs");
+            const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const expectedId = Number(process.argv[2]);
+            const expectedMarker = `<!-- ${process.argv[4]} -->`;
+            if (value.id !== expectedId) throw new Error("published release id changed");
+            if (value.tag_name !== process.argv[3]) throw new Error("published release tag changed");
+            if (value.draft !== false) throw new Error("numeric release publish did not complete");
+            if (!String(value.body || "").includes(expectedMarker)) {
+              throw new Error("published release lost this run marker");
+            }
+          ' "$published_operation" "$RELEASE_DRAFT_ID" "$RELEASE_TAG" "$RELEASE_DRAFT_MARKER"
+
+      - name: verify public bytes and enforced immutability
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" \
+            --json tagName,isDraft,isImmutable,assets,url \
+            > "$RUNNER_TEMP/published-release.json"
+          node scripts/verify-release-assets.mjs published \
+            "$RUNNER_TEMP/published-release.json" "$RELEASE_TAG" \
+            "$VERSIONED_TARBALL" "$CANONICAL_TARBALL"
+
+          public_download="$RUNNER_TEMP/public-download"
+          mkdir -p "$public_download"
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            --retry 5 --retry-delay 2 --retry-all-errors \
+            "$base/brain-installer-$RELEASE_VERSION.tgz" \
+            --output "$public_download/brain-installer-$RELEASE_VERSION.tgz"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            --retry 5 --retry-delay 2 --retry-all-errors \
+            "$base/brain-installer.tgz" \
+            --output "$public_download/brain-installer.tgz"
+          cmp --silent "$VERSIONED_TARBALL" "$public_download/brain-installer-$RELEASE_VERSION.tgz"
+          cmp --silent "$CANONICAL_TARBALL" "$public_download/brain-installer.tgz"
+
+          npm install --global --prefix "$RUNNER_TEMP/published-install" \
+            --ignore-scripts --no-audit --no-fund \
+            "$public_download/brain-installer.tgz"
+          set +e
+          installed_output="$("$RUNNER_TEMP/published-install/bin/brain" 2>&1)"
+          installed_status=$?
+          set -e
+          printf '%s\n' "$installed_output"
+          if [[ $installed_status -ne 0 ]]; then
+            echo "::error::installed public CLI exited $installed_status"
+            exit 1
+          fi
+          if [[ "$installed_output" != *"brain setup"* ]]; then
+            echo "::error::installed public CLI did not print usage"
+            exit 1
+          fi
+
+          sha256sum "$VERSIONED_TARBALL" "$CANONICAL_TARBALL" >> "$GITHUB_STEP_SUMMARY"
+          printf '\nCommit: `%s`\n' "$RELEASE_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Canonical URL: `https://github.com/%s/releases/latest/download/brain-installer.tgz`\n' \
+            "$GITHUB_REPOSITORY" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: remove a failed draft without deleting its tag
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${RELEASE_DRAFT_MARKER:-}" ]]; then
+            echo "this run did not start release creation; nothing to clean up"
+            exit 0
+          fi
+
+          cleanup_tag="${RELEASE_TAG:-$GITHUB_REF_NAME}"
+          if [[ ! "$cleanup_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::refusing cleanup because the event does not name an exact release tag"
+            exit 1
+          fi
+
+          cleanup_release="$RUNNER_TEMP/cleanup-release.json"
+          cleanup_error="$RUNNER_TEMP/cleanup-release.err"
+          set +e
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$cleanup_tag" \
+            > "$cleanup_release" 2> "$cleanup_error"
+          cleanup_status=$?
+          set -e
+          if [[ $cleanup_status -ne 0 ]]; then
+            if grep -q "HTTP 404" "$cleanup_error"; then
+              echo "no draft remains for $cleanup_tag"
+              exit 0
+            fi
+            cat "$cleanup_error" >&2
+            echo "::error::could not inspect the failed run's release for safe cleanup"
+            exit 1
+          fi
+
+          cleanup_record="$(node -e '
+            const fs = require("node:fs");
+            const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            if (value.tag_name !== process.argv[2]) throw new Error("cleanup release tag does not match the event tag");
+            if (!Number.isSafeInteger(value.id)) throw new Error("cleanup release did not report a numeric id");
+            const state = value.draft === true ? "draft" : value.draft === false ? "published" : null;
+            if (!state) throw new Error("cleanup release did not report its draft state");
+            const marker = `<!-- ${process.argv[3]} -->`;
+            const owned = String(value.body || "").includes(marker);
+            process.stdout.write(`${state}\t${value.id}\t${owned ? "owned" : "unowned"}`);
+          ' "$cleanup_release" "$cleanup_tag" "$RELEASE_DRAFT_MARKER")"
+          IFS=$'\t' read -r cleanup_state cleanup_id cleanup_owner <<< "$cleanup_record"
+          if [[ "$cleanup_state" == "draft" ]]; then
+            if [[ "$cleanup_owner" != "owned" ]]; then
+              echo "a different actor owns the draft for $cleanup_tag; leaving it and its tag untouched"
+              exit 0
+            fi
+            echo "removing failed draft for $cleanup_tag; its git tag is preserved"
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$cleanup_id"
+          else
+            echo "release $cleanup_tag is published; leaving it and its tag untouched"
+          fi

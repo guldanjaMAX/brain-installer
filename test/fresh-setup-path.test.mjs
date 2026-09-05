@@ -14,6 +14,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { setupInvocation } from "../brain.mjs";
+
 const CLI = resolve(dirname(fileURLToPath(import.meta.url)), "..", "brain.mjs");
 const dir = mkdtempSync(join(tmpdir(), "brain-fresh-setup-"));
 const missing = join(dir, "never-written", "brain.manifest.json");
@@ -32,4 +34,27 @@ assert.doesNotMatch(out, /git worktree/i,
 assert.equal(existsSync(missing), false, "nothing was written by a run that could not continue");
 assert.notEqual(r.status, 0, "with no terminal and no token the run still stops, but on its own terms");
 
-console.log("fresh setup: a missing manifest reaches setup's own first-install handling");
+const source = join(dir, "approved-source");
+const explicit = join(dir, "explicit", "brain.manifest.json");
+assert.deepEqual(
+  setupInvocation("--no-connect", ["--no-connect"]),
+  { manifestPath: null, flags: { "no-connect": true } },
+  "a flag-first --no-connect setup must keep the default manifest rather than create a file named after the flag",
+);
+assert.deepEqual(
+  setupInvocation("--path", ["--path", source]),
+  { manifestPath: null, flags: { path: source } },
+  "a flag-first first-folder setup must keep the default manifest and preserve the approved source path",
+);
+assert.deepEqual(
+  setupInvocation("--manifest", ["--manifest", explicit, "--no-connect"]),
+  { manifestPath: explicit, flags: { manifest: explicit, "no-connect": true } },
+  "--manifest must supply the setup target when no positional manifest is present",
+);
+assert.deepEqual(
+  setupInvocation(missing, [missing, "--path", source]),
+  { manifestPath: missing, flags: { path: source } },
+  "an explicit positional manifest must remain authoritative when setup also names its first folder",
+);
+
+console.log("fresh setup: missing and flag-first manifests reach setup's own first-install handling");

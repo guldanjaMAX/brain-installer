@@ -38,6 +38,7 @@ function makeEnv({
   autoProcessVectorMutations = true,
   deleteThrows = false,
   enforceD1PatternLimit = false,
+  getByIdsVisibilityLag = 0,
   invalidGetByIdsPage = null,
   malformedAcceleratedVectorIdReadback = false,
   skipAcceleratedVectorIdUpdate = false,
@@ -59,6 +60,7 @@ function makeEnv({
   const visible = new Map();
   let mutationSequence = 0;
   let processedUpToMutation = null;
+  let visibilityLagRemaining = getByIdsVisibilityLag;
   const pendingVectorMutations = [];
   const getByIdsCalls = [];
   const accept = (apply) => {
@@ -108,6 +110,7 @@ function makeEnv({
     _db: db,
     _acceptVectorMutation: accept,
     _visibleVectors: visible,
+    _setGetByIdsVisibilityLag: (calls) => { visibilityLagRemaining = calls; },
     _processNextVectorMutation: () => {
       const mutation = pendingVectorMutations.shift();
       if (!mutation) return null;
@@ -165,6 +168,10 @@ function makeEnv({
         getByIdsCalls.push([...ids]);
         if (ids.length > 20) throw new Error("Vectorize getByIds accepts at most 20 ids");
         if (getByIdsCalls.length === invalidGetByIdsPage) return { invalid: true };
+        if (visibilityLagRemaining > 0) {
+          visibilityLagRemaining--;
+          return [];
+        }
         return ids.map((id) => visible.get(id)).filter(Boolean);
       },
       describe: async () => ({
@@ -197,6 +204,39 @@ async function drainFully(env, options = {}, maxRounds = 20) {
     if (part.remaining === 0) return total;
   }
   throw new Error(`fixture drain did not settle: ${JSON.stringify(total)}`);
+}
+
+const acceleratedOptions = (start = 50_000) => {
+  let clock = start;
+  return {
+    now: () => ++clock,
+    embed: async () => [0.1],
+    embedBatch: async (texts) => texts.map(() => [0.1]),
+  };
+};
+
+async function completeRealAcceleratedBootstrap(env, db, {
+  epoch = 20,
+  options = acceleratedOptions(),
+} = {}) {
+  db.prepare(
+    `UPDATE install_state
+        SET schema_version=13,vector_projection_status='bootstrap_required',
+            vector_projection_bootstrap_epoch=?1,
+            vector_projection_bootstrap_cursor=NULL,
+            vector_projection_bootstrap_high_water=(SELECT MAX(chunk_uid) FROM chunks),
+            vector_projection_bootstrap_protocol=NULL,
+            vector_projection_bootstrap_base_count=0,
+            vector_projection_mutation_id=NULL,
+            vector_projection_submitted_at=NULL
+      WHERE id=1`,
+  ).run(epoch);
+  let receipt = null;
+  for (let round = 0; round < 8 && !receipt?.complete; round++) {
+    receipt = await acceleratedVectorBootstrap(env, options);
+  }
+  if (!receipt?.complete) throw new Error(`fixture bootstrap did not complete: ${JSON.stringify(receipt)}`);
+  return { receipt, options };
 }
 
 const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
@@ -1484,6 +1524,180 @@ for (const reportedChanges of [0, 9]) {
       retained,
       upsertBatches: upsertBatches.length,
     }));
+}
+
+/* A later upgrade must not count one completed bootstrap's durable batch
+   history against a new exact verified cut. This fixture reaches the shape
+   through the real coordinator first; a hand-seeded empty ledger missed the
+   regression. */
+{
+  const { env, db } = makeEnv();
+  env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
+  insertDocument(db, "drive:completed-history");
+  insertChunk(db, "drive:completed-history#0", "drive:completed-history", 0);
+  insertChunk(db, "drive:completed-history#1", "drive:completed-history", 1);
+  const { receipt: completed, options } = await completeRealAcceleratedBootstrap(env, db, {
+    epoch: 20,
+    options: acceleratedOptions(50_000),
+  });
+  const confirmedHistory = db.prepare(
+    "SELECT count(*) AS n FROM vector_bootstrap_batches WHERE epoch=20 AND status='confirmed'",
+  ).get();
+
+  insertDocument(db, "drive:after-completed-history");
+  insertChunk(db, "drive:after-completed-history#0", "drive:after-completed-history", 0);
+  db.prepare(
+    `INSERT INTO vector_outbox (chunk_uid,vector_id,op,queued_at)
+     VALUES ('drive:after-completed-history#0','drive:after-completed-history#0','upsert',51000)`,
+  ).run();
+  const upgraded = await acceleratedVectorBootstrap(env, options);
+  const state = db.prepare(
+    `SELECT vector_projection_status AS status,
+            vector_projection_bootstrap_epoch AS epoch,
+            vector_projection_bootstrap_base_count AS base,
+            (SELECT count(*) FROM vector_bootstrap_batches
+              WHERE epoch=vector_projection_bootstrap_epoch) AS current_batches,
+            (SELECT count(*) FROM vector_bootstrap_batches) AS all_batches
+       FROM install_state WHERE id=1`,
+  ).get();
+  check("a completed bootstrap fixture contains confirmed durable batch history",
+    completed.complete === true && Number(confirmedHistory.n) > 0,
+    JSON.stringify({ completed, confirmedHistory }));
+  check("a later paused upgrade rebases completed history and converges",
+    upgraded.complete === true && upgraded.total === 3 && upgraded.confirmed === 3 &&
+      upgraded.remaining === 0 && state.status === "verified" && Number(state.epoch) === 21 &&
+      Number(state.base) === 3 && Number(state.current_batches) === 0 &&
+      Number(state.all_batches) === Number(confirmedHistory.n),
+    JSON.stringify({ upgraded, state }));
+}
+
+/* A provider watermark can advance before getByIds exposes the accepted
+   generation. That is retryable progress, including during supervised
+   recovery; it must neither erase completed history nor strand the next cut. */
+{
+  const { env, db } = makeEnv();
+  env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
+  insertDocument(db, "drive:visibility-history");
+  insertChunk(db, "drive:visibility-history#0", "drive:visibility-history", 0);
+  const { options } = await completeRealAcceleratedBootstrap(env, db, {
+    epoch: 30,
+    options: acceleratedOptions(60_000),
+  });
+  const history = db.prepare(
+    "SELECT count(*) AS n FROM vector_bootstrap_batches WHERE epoch=30 AND status='confirmed'",
+  ).get();
+
+  insertDocument(db, "drive:visibility-lag");
+  insertChunk(db, "drive:visibility-lag#0", "drive:visibility-lag", 0);
+  db.prepare(
+    `INSERT INTO vector_outbox (chunk_uid,vector_id,op,queued_at)
+     VALUES ('drive:visibility-lag#0','drive:visibility-lag#0','upsert',61000)`,
+  ).run();
+  env._setGetByIdsVisibilityLag(1);
+  const retrying = await acceleratedVectorBootstrap(env, options);
+  const settled = await acceleratedVectorBootstrap(env, options);
+  check("delayed exact visibility is reported as retryable aggregate progress",
+    Number(history.n) > 0 && retrying.phase === "legacy_drain" && retrying.failed === 1 &&
+      retrying.retrying === 1 && retrying.complete === false,
+    JSON.stringify({ history, retrying }));
+  check("a rerun after delayed visibility completes the next verified cut",
+    settled.complete === true && settled.total === 2 && settled.confirmed === 2 &&
+      settled.remaining === 0,
+    JSON.stringify(settled));
+}
+
+/* Contention while paused residue exists uses the same exact four-field busy
+   contract as ordinary bootstrap work. In particular, the retry delay cannot
+   disappear when the residue helper discovers the held lease. */
+{
+  const { env, db } = makeEnv();
+  env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
+  insertDocument(db, "drive:busy-history");
+  insertChunk(db, "drive:busy-history#0", "drive:busy-history", 0);
+  const { options } = await completeRealAcceleratedBootstrap(env, db, {
+    epoch: 40,
+    options: acceleratedOptions(70_000),
+  });
+  insertDocument(db, "drive:busy-residue");
+  insertChunk(db, "drive:busy-residue#0", "drive:busy-residue", 0);
+  db.prepare(
+    `INSERT INTO vector_outbox (chunk_uid,vector_id,op,queued_at)
+     VALUES ('drive:busy-residue#0','drive:busy-residue#0','upsert',71000)`,
+  ).run();
+  const held = await acquireDrainLease(env, {
+    ownerToken: "accelerated-residue-owner",
+    now: 80_000,
+    ttlMs: 10_000,
+  });
+  const busy = await acceleratedVectorBootstrap(env, options);
+  check("paused residue preserves the bounded busy retry delay",
+    held.acquired === true && busy.busy === true && busy.retry_after_seconds >= 1 &&
+      busy.retry_after_seconds <= 20 && busy.remaining === 1 &&
+      !JSON.stringify(busy).includes("accelerated-residue-owner"),
+    JSON.stringify({ held, busy }));
+  await releaseDrainLease(env, "accelerated-residue-owner");
+}
+
+/* Two first calls can both observe the legacy protocol. The loser must acquire
+   the writer lease and re-read that boundary before it can delete superseded
+   upserts, or it can erase the winner's freshly queued bootstrap batch. */
+{
+  const { env, db, upsertBatches } = makeEnv({ autoProcessVectorMutations: false });
+  env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
+  insertDocument(db, "drive:overlap-bootstrap");
+  insertChunk(db, "drive:overlap-bootstrap#0", "drive:overlap-bootstrap", 0);
+  db.prepare(
+    `UPDATE install_state
+        SET schema_version=13,vector_projection_status='bootstrap_required',
+            vector_projection_bootstrap_epoch=50,
+            vector_projection_bootstrap_cursor=NULL,
+            vector_projection_bootstrap_high_water=(SELECT MAX(chunk_uid) FROM chunks),
+            vector_projection_bootstrap_protocol=NULL,
+            vector_projection_bootstrap_base_count=0
+      WHERE id=1`,
+  ).run();
+
+  const originalPrepare = env.DB.prepare;
+  let releaseStaleRead;
+  let staleReadCaptured;
+  const staleReadReady = new Promise((resolve) => { staleReadCaptured = resolve; });
+  const staleReadBarrier = new Promise((resolve) => { releaseStaleRead = resolve; });
+  let blockOneStateRead = true;
+  env.DB.prepare = (sql) => {
+    const statement = originalPrepare(sql);
+    if (blockOneStateRead && /SELECT schema_version, vector_projection_status AS status/.test(sql)) {
+      blockOneStateRead = false;
+      return {
+        ...statement,
+        first: async () => {
+          const stale = await statement.first();
+          staleReadCaptured();
+          await staleReadBarrier;
+          return stale;
+        },
+      };
+    }
+    return statement;
+  };
+
+  const options = acceleratedOptions(80_000);
+  const staleRequest = acceleratedVectorBootstrap(env, options);
+  await staleReadReady;
+  const winner = await acceleratedVectorBootstrap(env, options);
+  releaseStaleRead();
+  let overlapError = null;
+  try { await staleRequest; } catch (error) { overlapError = error; }
+  const ledger = db.prepare(
+    `SELECT (SELECT count(*) FROM vector_bootstrap_batches WHERE epoch=50) AS batches,
+            (SELECT count(*) FROM vector_outbox WHERE bootstrap_epoch=50) AS owned_rows,
+            (SELECT COALESCE(sum(row_count),0) FROM vector_bootstrap_batches WHERE epoch=50) AS expected_rows
+       FROM install_state WHERE id=1`,
+  ).get();
+  check("an overlapping legacy observer cannot erase a newly queued bootstrap batch",
+    winner.submitted === 1 && overlapError === null && upsertBatches.length === 1 &&
+      Number(ledger.batches) === 1 && Number(ledger.owned_rows) === Number(ledger.expected_rows) &&
+      Number(ledger.owned_rows) === 1,
+    JSON.stringify({ winner, message: overlapError?.message, ledger, upserts: upsertBatches.length }));
 }
 
 /* Schema 13 fills a provider-sized three-mutation window, then resumes from

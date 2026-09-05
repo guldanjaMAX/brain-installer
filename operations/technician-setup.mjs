@@ -26,9 +26,9 @@ export const TECHNICIAN_STEPS = Object.freeze([
   Object.freeze({
     id: "cloudflare",
     title: "Install the private Brain",
-    dashboard_url: "https://dash.cloudflare.com/profile/api-tokens",
-    human_boundary: "The owner signs in, completes 2FA, and creates the least-privilege token. The hidden terminal prompt is ready when it is time to enter the token.",
-    automated_proof: "The installer verifies the token, provisions the exact account, deploys, migrates, and runs health checks.",
+    dashboard_url: "https://dash.cloudflare.com/",
+    human_boundary: "The owner signs in, completes 2FA, confirms Workers Paid, and chooses the announced Cloudflare access path. An approved launcher may deliberately supply a least-privilege scoped token; otherwise setup uses an existing pinned Wrangler 4.73.0 session or asks for the scoped token in a hidden prompt.",
+    automated_proof: "The installer announces and verifies the active Cloudflare credential, provisions the exact account, deploys, migrates, and runs health checks.",
   }),
   Object.freeze({
     id: "google",

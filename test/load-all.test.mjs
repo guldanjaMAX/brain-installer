@@ -35,6 +35,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   cmdLoad,
+  cmdIngestLocal,
   planLoad,
   loadSourceRegistry,
   normalizeLoadKey,
@@ -53,6 +54,7 @@ const check = (n, c, d = "") => {
 
 const sandbox = mkdtempSync(join(tmpdir(), "brain-load-all-"));
 const strip = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, "");
+const DRIVE_ENABLED = { enabled: true, root_folder_ids: ["fixture-allowed-root"] };
 
 /** Run cmdLoad with console.log captured, so the report itself can be asserted on. */
 async function runLoad(manifestPath, options) {
@@ -152,7 +154,10 @@ try {
   // other case here scripts `legs` and never exercises the table's own wiring.
   {
     const dir = mkdtempSync(join(sandbox, "wiring-"));
-    const manifestPath = writeManifest(dir, { upload: { enabled: true, folders: ["/tmp/wiring"] } });
+    const manifestPath = writeManifest(dir, {
+      upload: { enabled: true, folders: ["/tmp/wiring"] },
+      google_drive: DRIVE_ENABLED,
+    });
     const m = JSON.parse(readFileSync(manifestPath, "utf8"));
     const seen = [];
     const spy = (name) => async (_m, _path, flags) => { seen.push({ name, flags }); return { created: 0, updated: 0, unchanged: 0 }; };
@@ -192,7 +197,7 @@ try {
   {
     const dir = mkdtempSync(join(sandbox, "order-"));
     const manifestPath = writeManifest(dir, {
-      google_drive: { enabled: true }, gmail: { enabled: true }, calendar: { enabled: true },
+      google_drive: DRIVE_ENABLED, gmail: { enabled: true }, calendar: { enabled: true },
       imessage: { enabled: true }, upload: { enabled: true, folders: ["/tmp/x"] },
       whatsapp: { enabled: true }, iphone_backup: { enabled: true },
     });
@@ -220,7 +225,7 @@ try {
       imessage: { enabled: true },
       upload: { enabled: true, folders: ["/tmp/does-not-matter-scripted"] },
       gmail: { enabled: true },
-      google_drive: { enabled: true },
+      google_drive: DRIVE_ENABLED,
       whatsapp: { enabled: true },
       zoom: { enabled: true },
       slack: { enabled: true },
@@ -353,7 +358,7 @@ try {
   {
     const dir = mkdtempSync(join(sandbox, "select-"));
     const manifestPath = writeManifest(dir, {
-      calendar: { enabled: true }, gmail: { enabled: true }, google_drive: { enabled: true },
+      calendar: { enabled: true }, gmail: { enabled: true }, google_drive: DRIVE_ENABLED,
     });
     const behaviour = {
       calendar: () => ({ sent: { created: 1, updated: 0, unchanged: 0, refused: [], errors: [] } }),
@@ -404,7 +409,7 @@ try {
   {
     const dir = mkdtempSync(join(sandbox, "dry-"));
     const manifestPath = writeManifest(dir, {
-      calendar: { enabled: true }, gmail: { enabled: true }, google_drive: { enabled: true },
+      calendar: { enabled: true }, gmail: { enabled: true }, google_drive: DRIVE_ENABLED,
     });
     let sends = 0;
     const preview = ({ flags }) => {
@@ -432,7 +437,7 @@ try {
   /* ------------------------------------------------------------------ resume */
   {
     const dir = mkdtempSync(join(sandbox, "resume-"));
-    const manifestPath = writeManifest(dir, { google_drive: { enabled: true } });
+    const manifestPath = writeManifest(dir, { google_drive: DRIVE_ENABLED });
     const statePath = join(dir, ".brain-ingest-drive.json");
     const UNITS = ["a", "b", "c"];
     const processedThisRun = [];
@@ -543,6 +548,51 @@ try {
       reportSection(run.text, "NOT LOADED — failed"));
   }
 
+  /* ---------------------- exact positive roots guard every local walk -------- */
+  {
+    const dir = mkdtempSync(join(sandbox, "local-boundary-"));
+    const allowed = join(dir, "approved");
+    const outside = join(dir, "outside");
+    mkdirSync(allowed);
+    mkdirSync(outside);
+    writeFileSync(join(allowed, "approved.md"), "An approved document with enough useful words to pass the extraction quality floor.");
+    writeFileSync(join(outside, "outside.md"), "This document sits outside the source root named in the manifest and must never be read.");
+    const manifestPath = writeManifest(dir, {
+      upload: { enabled: true, folders: [{ path: allowed, source: "documents" }] },
+    });
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    let denied = null;
+    try {
+      await cmdIngestLocal(manifest, manifestPath, { path: outside, source: "documents", "dry-run": true });
+    } catch (error) {
+      denied = error;
+    }
+    check("manual ingest refuses an existing local root that the manifest did not approve",
+      /not an allowed source root/.test(denied?.message || ""), denied?.message);
+    check("the refused local root is never walked or recorded",
+      !existsSync(join(dir, ".brain-ingest-documents.json")));
+
+    const accepted = await cmdIngestLocal(manifest, manifestPath, {
+      path: allowed, source: "documents", "dry-run": true,
+    });
+    check("manual ingest accepts the exact canonical root declared under corpora.upload.folders",
+      accepted.dry_run === true && accepted.would_send === 1, JSON.stringify(accepted));
+  }
+
+  {
+    const dir = mkdtempSync(join(sandbox, "watched-boundary-"));
+    const watched = join(dir, "watched");
+    mkdirSync(watched);
+    writeFileSync(join(watched, "drop.md"), "A watched folder document with enough ordinary words to clear the quality floor.");
+    const manifestPath = writeManifest(dir, {
+      local_folder: { enabled: true, path: watched, source: "documents" },
+    });
+    const run = await runLoad(manifestPath, { flags: { "dry-run": true } });
+    check("brain load runs an enabled watched folder through the same positive root gate",
+      run.error === null && /Watched folder on this machine/.test(reportSection(run.text, "WOULD LOAD")) &&
+        /1 document\(s\) WOULD be sent/.test(run.text), run.error?.message || run.text);
+  }
+
   /* ------ isolation one level deeper: one folder fails, the next still loads --- */
   {
     const dir = mkdtempSync(join(sandbox, "legs-"));
@@ -608,6 +658,19 @@ try {
       /the manifest names no folder for it to read/.test(run.text) &&
       /corpora.upload/.test(run.text) && /1 unavailable source outcome/.test(run.error?.message || ""),
       reportSection(run.text, "NOT LOADED — unavailable"));
+  }
+
+  /* ------------ Drive is unavailable until a positive stable-id root exists -- */
+  {
+    const dir = mkdtempSync(join(sandbox, "drive-no-root-"));
+    const manifestPath = writeManifest(dir, { google_drive: { enabled: true } });
+    const run = await runLoad(manifestPath, {
+      flags: { "dry-run": true }, probes: { google_drive: connected },
+    });
+    check("brain load refuses an enabled Drive source with no stable folder-id allowlist",
+      /root_folder_ids must be an array of stable Google Drive folder ids/.test(run.text) &&
+        /1 unavailable source outcome/.test(run.error?.message || ""),
+      run.error?.message || run.text);
   }
 
   /* --------- a source that cannot size itself in advance says so, never 0 or undefined */

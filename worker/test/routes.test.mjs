@@ -1856,6 +1856,32 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   check("paused mode rejects every corpus, outbox, and source mutation route",
     everyMutationPaused, JSON.stringify(pauseDetails));
 
+  let bankWaitUntilCalls = 0;
+  const pausedBankMutations = [
+    ["/api/bank-feed/link-token", { mode: "connect" }],
+    ["/api/bank-feed/exchange", { public_token: "must-not-reach-provider" }],
+    ["/api/bank-feed/sync", {}],
+    ["/api/bank-feed/disconnect", { item_ref: "must-not-reach-provider" }],
+  ];
+  let everyBankMutationPaused = true;
+  const bankPauseDetails = [];
+  for (const [path, body] of pausedBankMutations) {
+    const response = await worker.fetch(new Request("https://b.example" + path, {
+      method: "POST",
+      headers: { "X-Admin-Key": "k", "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }), env, {
+      waitUntil() { bankWaitUntilCalls++; },
+      passThroughOnException() {},
+    });
+    const receipt = await response.json();
+    bankPauseDetails.push({ path, status: response.status, receipt });
+    if (response.status !== 503 || receipt.paused !== true) everyBankMutationPaused = false;
+  }
+  check("paused mode rejects every bank-feed mutation before auth, provider, D1, or background work",
+    everyBankMutationPaused && bankWaitUntilCalls === 0,
+    JSON.stringify({ bankPauseDetails, bankWaitUntilCalls }));
+
   let readOnlyD1Calls = 0;
   const readOnlyEnv = {
     ...env,
@@ -1964,8 +1990,8 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
         "submitted", "total", "vector_ready",
       ]),
     JSON.stringify(receipt));
-  check("an empty bootstrap performs no embedding or vector write",
-    aiCalls === 0 && vectorWrites === 0 && d1Writes === 1,
+  check("an empty bootstrap performs only lease and verified-cut D1 writes",
+    aiCalls === 0 && vectorWrites === 0 && d1Writes === 3,
     JSON.stringify({ aiCalls, vectorWrites, d1Writes }));
 
   const busyEnv = {
@@ -2200,6 +2226,13 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   const all = scopeSql({ all: true }, "c", 1);
   check("an explicit all-zones scope is also unrestricted",
     all.clause === "" && all.params.length === 0, JSON.stringify(all));
+
+  const allMinusPrivate = scopeSql({ all: true, exclude: ["private"] }, "c", 4);
+  check("an all-zones scope keeps its exclusions at the text-reading query",
+    /c\.zone IS NOT NULL AND c\.zone NOT IN \(\?4\)/.test(allMinusPrivate.clause)
+      && allMinusPrivate.params[0] === "private"
+      && allMinusPrivate.nextParam === 5,
+    JSON.stringify(allMinusPrivate));
 
   const books = scopeSql({ zones: ["books"] }, "c", 1);
   check("a scoped principal is restricted through its source's zone",

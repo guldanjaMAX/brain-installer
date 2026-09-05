@@ -20,7 +20,7 @@
  */
 
 import { jsonResponse, privateNoStore, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
-import { resolvePrincipal, principalMay } from "./lib/grants.js";
+import { resolvePrincipal, principalMay, scopeIsRestricted } from "./lib/grants.js";
 import { handleBankFeed } from "./lib/bank-feed.js";
 import { handleBankExportImport, BANK_IMPORT_PATH } from "./lib/fin-upload.js";
 import { handleFinApi, FIN_PATH_PREFIX } from "./lib/fin-api.js";
@@ -175,7 +175,7 @@ async function unifiedRetrieve(env, url, { limit, access = null, scope = { all: 
     degradedReason: r.degraded_reason || null,
     retrievalScope: access?.kind === "grant"
       ? "exact_document_ids"
-      : scope && scope.all !== true
+      : scopeIsRestricted(scope)
         ? "zones"
         : "owner",
     access: access?.kind === "grant"
@@ -185,7 +185,7 @@ async function unifiedRetrieve(env, url, { limit, access = null, scope = { all: 
         entity_slug: access.entitySlug,
         document_count: access.documentCount,
       }
-      : scope && scope.all !== true
+      : scopeIsRestricted(scope)
         ? { principal: "grant", scope: "zones" }
         : { principal: "owner" },
     // A filter the backend cannot apply is surfaced, never dropped. Silently
@@ -921,7 +921,7 @@ async function handleIngest(env, request, scope = { all: true }) {
     return jsonResponse({ error: "source_type, source_id and content (string) are required" }, 400);
   }
 
-  if (scope && scope.all !== true) {
+  if (scopeIsRestricted(scope)) {
     const allowed = await sourcesInScope(env, scope);
     if (!allowed.includes(String(source_type))) {
       return jsonResponse({
@@ -930,17 +930,17 @@ async function handleIngest(env, request, scope = { all: true }) {
     }
   }
 
-  // THE GATE. Nothing carrying a live provider credential enters the index,
-  // whichever door it arrives through. Named, never quoted: the refusal must
-  // be actionable without becoming its own leak.
+  // THE GATE. Nothing carrying a sensitive credential or private identifier
+  // enters the index, whichever door it arrives through. Named, never quoted:
+  // the refusal must be actionable without becoming its own leak.
   if (env.CREDENTIAL_SCANNER !== "off") {
     const secrets = scanEnvelopeSecrets(envelope);
     if (secrets.shouldRefuse) {
       return jsonResponse(
         {
-          error: "refused: content carries live credential(s)",
+          error: "refused: content carries sensitive credential(s) or private identifier(s)",
           labels: secrets.labels,
-          detail: "Rotate them, strip them from the source, then re-ingest. Nothing was written.",
+          detail: "Remove or redact them, rotate any live credentials, then re-ingest. Nothing was written.",
         },
         422
       );
@@ -999,7 +999,7 @@ async function handleIngestBatch(env, request, scope = { all: true }) {
     );
   }
 
-  if (scope && scope.all !== true) {
+  if (scopeIsRestricted(scope)) {
     const allowed = new Set(await sourcesInScope(env, scope));
     if (docs.some((doc) => !allowed.has(String(doc?.source_type || "")))) {
       return jsonResponse({
@@ -1528,6 +1528,17 @@ const PAUSED_CORPUS_MUTATION_PATHS = new Set([
   BANK_IMPORT_PATH,
 ]);
 
+// These owner routes are dispatched before the admin-key gate, so they need
+// the same barrier before their handlers authenticate, call a provider, write
+// D1, or schedule background work. Keep this list exact: the bank status and
+// connection page remain useful read-only surfaces during an upgrade.
+const PAUSED_PRE_GATE_MUTATION_PATHS = new Set([
+  "/api/bank-feed/link-token",
+  "/api/bank-feed/exchange",
+  "/api/bank-feed/sync",
+  "/api/bank-feed/disconnect",
+]);
+
 function corpusWritesPaused(env, path, method) {
   return env.VECTOR_DRAIN_MODE === "paused-for-upgrade" &&
     method === "POST" && PAUSED_CORPUS_MUTATION_PATHS.has(path);
@@ -1589,6 +1600,13 @@ export default {
     // reindex and drain. Operator-only routes inside the handler still take the
     // admin key; nothing here widens the key gate.
     if (path === "/app/connect/bank" || path.startsWith("/api/bank-feed/")) {
+      if (env.VECTOR_DRAIN_MODE === "paused-for-upgrade" &&
+          request.method === "POST" && PAUSED_PRE_GATE_MUTATION_PATHS.has(path)) {
+        return jsonResponse({
+          error: "brain writes are paused for a verified upgrade or rollback",
+          paused: true,
+        }, 503);
+      }
       return handleBankFeed(env, request, url, path, ctx);
     }
 
@@ -1655,6 +1673,11 @@ export default {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
+      const refusePausedConnectorWrite = () => {
+        if (env.VECTOR_DRAIN_MODE === "paused-for-upgrade") {
+          throw new Error("brain corpus writes are paused for a verified upgrade or rollback");
+        }
+      };
       return handleMcp(env, request, url, {
         grant,
         think: async (body) => (await handleThink(env, internalJson("/api/rag/think", body))).json(),
@@ -1662,11 +1685,17 @@ export default {
         // Writes take the ordinary ingest door rather than a private one, so
         // the credential scanner, the statement budget and every other guard
         // apply to a connector exactly as they do to a folder or a Drive sync.
-        write: async (envelope) => (await handleIngest(env, internalJson("/api/admin/brain/ingest", envelope))).json(),
+        write: async (envelope) => {
+          refusePausedConnectorWrite();
+          return (await handleIngest(env, internalJson("/api/admin/brain/ingest", envelope))).json();
+        },
         // Deletes PREVIEW by default. dryRun is only lifted when the caller
         // passes confirm, so a model acting on text it read cannot remove a
         // client's records in one step.
-        forget: async ({ docUids, confirm }) => forget(env, { docUids, dryRun: !confirm }),
+        forget: async ({ docUids, confirm }) => {
+          refusePausedConnectorWrite();
+          return forget(env, { docUids, dryRun: !confirm });
+        },
       });
     }
 
@@ -1829,7 +1858,7 @@ export default {
         // catalogue of the zones they cannot read, delivered by the health
         // endpoint. Refusing is honest; filtering findings one shape at a time
         // and getting one wrong is not.
-        if (scope && scope.all !== true) {
+        if (scopeIsRestricted(scope)) {
           return jsonResponse({
             error: "diagnose reports on the whole corpus, including zones you cannot read. Ask the owner to run it.",
           }, 403);
@@ -1843,7 +1872,7 @@ export default {
         // unfiltered report names every source in the brain and hands over
         // `reason`, which is the raw connector error verbatim and routinely
         // contains paths and ids. Narrow it to what this caller can read.
-        if (scope && scope.all !== true && Array.isArray(report?.sources)) {
+        if (scopeIsRestricted(scope) && Array.isArray(report?.sources)) {
           const allowed = new Set(await sourcesInScope(env, scope));
           return jsonResponse({ ...report, sources: report.sources.filter((r) => allowed.has(r.source ?? r.name)) });
         }
@@ -1871,9 +1900,9 @@ export default {
         if (!docUids.length && !families.length && !source) {
           return jsonResponse({ error: "pass doc_uids: [...], families: [...], or source: \"name\"" }, 400);
         }
-        if (scope && scope.all !== true) {
+        if (scopeIsRestricted(scope)) {
           const allowed = await sourcesInScope(env, scope);
-          if (!source || !allowed.includes(source)) {
+          if (docUids.length || families.length || !source || !allowed.includes(source)) {
             return jsonResponse({
               error: docUids.length || families.length
                 ? "forgetting by document id or family needs access to every zone. Ask the owner."

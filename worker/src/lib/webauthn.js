@@ -303,9 +303,10 @@ export async function verifyAssertion({
   );
   if (!valid) throw new Error("signature verification failed");
 
-  // Synced passkeys report 0 forever; that is normal. A counter that is
-  // nonzero but failed to advance is the cloned-authenticator signal.
+  // A credential that started at 0 may keep reporting 0. Once either the
+  // stored or reported counter is nonzero, WebAuthn requires monotonic growth;
+  // accepting a later 0 would erase the clone signal already established.
   const stored = Number(credential.sign_count || 0);
-  const cloneSuspected = parsed.signCount !== 0 && parsed.signCount <= stored && stored !== 0;
+  const cloneSuspected = (parsed.signCount !== 0 || stored !== 0) && parsed.signCount <= stored;
   return { signCount: parsed.signCount, cloneSuspected };
 }

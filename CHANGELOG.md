@@ -4,6 +4,40 @@ Read by `brain whatsnew`, so a client sees this in their terminal rather than
 having to be told. Newest first. Each entry is written for the person who OWNS
 the brain, not for whoever built it: what changed for them, and what to check.
 
+## 0.3.7
+
+- Updates now resume safely after a previous index rebuild, delayed search-index
+  visibility, an overlapping recovery request, or a queued document at the
+  pause boundary. Writes from connected AI tools respect the same update pause.
+- Browser sessions now belong to the exact passkey that created them. Removing
+  a device ends its sessions immediately, restricted passkeys cannot count as
+  owner backups, and the final owner passkey cannot be removed by two
+  simultaneous requests. Existing browser sessions ask for one sign-in after
+  this update because older cookies cannot prove which passkey created them.
+- Shared access now enforces "all except" exclusions everywhere. A restricted
+  delete cannot include document IDs from another source beside an allowed
+  source, and corrupt scope data fails closed.
+- Passkey invites and challenges are consumed by one successful ceremony, not
+  by a failed signature attempt or two requests racing each other. The browser
+  consent page keeps every query parameter intact, so Approve and Cancel work.
+- Local folder reads now require the exact absolute root in
+  `corpora.upload.folders` or `corpora.local_folder.path`. Drive reads require
+  owner-approved stable folder IDs in `corpora.google_drive.root_folder_ids`.
+  Unknown Drive ancestry is refused before download, and a moved or removed
+  ancestor triggers a complete comparison before cleanup. Fresh templates keep
+  Drive off until those roots are chosen.
+- Windows token entry now sends the actual credential, `brain --version` prints
+  the installed version, and recovery guidance uses a runnable PowerShell
+  command even before npm has updated PATH. A newer encrypted Wrangler session
+  is detected and gets a precise pinned-login or hidden-token remedy.
+- Bank refresh refuses a transaction page whose account list is incomplete, so
+  its cursor cannot skip money. Bounded financial views now report truncation
+  at every supported limit, and totals cover only the rows shown.
+- The ingest safety gate now refuses context-labelled US Social Security and
+  employer tax identifiers without echoing their digits. This is targeted
+  taxpayer-ID protection, not a claim that every kind of personal data is
+  recognized.
+
 ## 0.3.6
 
 - An update that paused your brain could leave it paused for good. If a single

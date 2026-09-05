@@ -133,10 +133,44 @@
       "properties": {
         "google_drive": {
           "type": "object",
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "enabled"
+                ]
+              },
+              "then": {
+                "required": [
+                  "root_folder_ids"
+                ],
+                "properties": {
+                  "root_folder_ids": {
+                    "minItems": 1
+                  }
+                }
+              }
+            }
+          ],
           "properties": {
             "enabled": {
               "type": "boolean",
               "default": false
+            },
+            "root_folder_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_-]+$"
+              },
+              "description": "Required positive source boundary for Drive ingest. Each value is the stable folder id from an allowed Google Drive folder URL. Files are downloaded only when their complete, single-parent ancestry reaches one of these ids. Unknown or ambiguous ancestry is refused."
             },
             "exclude_paths": {
               "type": "array",
@@ -165,6 +199,47 @@
                 "null"
               ],
               "description": "Optional local JSON exclusion list, resolved relative to the manifest. It may also be a completed Supabase migration receipt."
+            }
+          }
+        },
+        "upload": {
+          "type": "object",
+          "description": "Manual local-folder source roots. brain ingest --path and brain load refuse every local root not declared here or by an enabled corpora.local_folder block.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "folders": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "path"
+                    ],
+                    "properties": {
+                      "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Exact absolute local folder root allowed for ingest."
+                      },
+                      "source": {
+                        "type": "string",
+                        "pattern": "^[a-z0-9][a-z0-9_-]*$",
+                        "maxLength": 64
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              }
             }
           }
         },

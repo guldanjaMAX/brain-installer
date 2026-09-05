@@ -73,7 +73,7 @@ test("a really-signed assertion verifies; a tampered one does not", async () => 
   }), /signature/);
 });
 
-test("a nonzero counter that fails to advance flags a clone; synced-passkey zero does not", async () => {
+test("a nonzero counter must advance, while a credential that stays at zero is allowed", async () => {
   const credential = await makeCredential({ rpId: RP });
   const registered = await verifyRegistration({
     attestationObject: attestationObject(credential.authData),
@@ -94,5 +94,12 @@ test("a nonzero counter that fails to advance flags a clone; synced-passkey zero
   const syncedVerdict = await verifyAssertion({
     ...synced, expectedChallenge: "eQ", expectedOrigin: ORIGIN, rpId: RP, credential: stored,
   });
-  assert.equal(syncedVerdict.cloneSuspected, false, "synced passkeys legitimately report zero forever");
+  assert.equal(syncedVerdict.cloneSuspected, true,
+    "zero cannot erase a nonzero stored counter and its clone signal");
+  const alwaysZeroVerdict = await verifyAssertion({
+    ...synced, expectedChallenge: "eQ", expectedOrigin: ORIGIN, rpId: RP,
+    credential: { ...stored, sign_count: 0 },
+  });
+  assert.equal(alwaysZeroVerdict.cloneSuspected, false,
+    "a synced passkey that has always reported zero remains valid");
 });

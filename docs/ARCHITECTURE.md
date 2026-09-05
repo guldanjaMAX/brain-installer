@@ -25,11 +25,13 @@ Cloudflare Worker in the owner's account
       +---- FTS5 keyword index
 ```
 
-The installer uses a scoped Cloudflare token only for control-plane work such
-as verification, provisioning, deployment, migration, and Worker secrets.
-Routine use goes through the deployed Worker with the brain's own admin key.
-At handoff, the control-plane token can be revoked without disabling retrieval,
-health, ingest through a configured domain, evaluation, drain, or reindex.
+The installer uses an existing pinned `wrangler login` session or a scoped
+Cloudflare token for control-plane work such as verification, provisioning,
+deployment, migration, and Worker secrets. The Wrangler session is account-wide
+and remains in its local profile until logout. Routine use goes through the
+deployed Worker with the brain's own admin key. At handoff, the active
+control-plane credential can be removed without disabling retrieval, health,
+ingest through a configured domain, evaluation, drain, or reindex.
 
 The standard backend is D1 plus Vectorize. Legacy Supabase adapters and
 migration tools remain so an existing corpus can be moved or temporarily
@@ -81,7 +83,7 @@ live path.
    technician-machine install keeps Claude advisory on that machine.
 2. Create or resume the manifest, declare durable admin-key storage, and
    prepare the exact desired key before remote changes.
-3. Verify the scoped token and account, then provision D1 and Vectorize. A new
+3. Verify the active Cloudflare credential and account, then provision D1 and Vectorize. A new
    install with no existing Worker can migrate and deploy directly. A resumed
    D1 install with an existing Worker first captures a required bookmark,
    deploys and verifies the paused compatibility Worker, waits the declared
@@ -226,8 +228,8 @@ without exposing source identifiers.
 
 | Source | Current path |
 |---|---|
-| Local folders, including an Obsidian vault | Built through `--path`; Obsidian is file ingest, not a separate connector |
-| Google Drive | Built, resumable, incremental, deletion-aware, and schedulable on macOS |
+| Local folders, including an Obsidian vault | Built through `--path`; the exact canonical root must be declared in the manifest; Obsidian is file ingest, not a separate connector |
+| Google Drive | Built, positively scoped by stable folder IDs, resumable, incremental, deletion-aware, and schedulable on macOS |
 | Gmail | Built with cursor safety; full real-account production validation remains a field gate |
 | Google Calendar | Built and wired through `brain ingest --from calendar`; row and receipt namespaces match, and event failure, refusal, or pending cancellation cleanup withholds the Google sync token; real-account validation remains a field gate |
 | Local watched folder | Built through the ordinary resumable folder ingest path and schedulable on macOS; multi-cycle field proof remains open |
@@ -247,6 +249,15 @@ logs after the lock-holding ingest exits. The iMessage capture lane and the
 watched local folder lane are the same machinery with a different connector
 spec, so all three share that hardening rather than each re-deriving it.
 Windows and Linux do not yet have an equivalent unattended source scheduler.
+
+Source discovery is not source authority. Local authority comes from exact
+canonical roots in `corpora.upload.folders` and the enabled watched-folder path.
+Drive download and ingest authority comes from
+`corpora.google_drive.root_folder_ids`; folder names and reconstructed paths are
+metadata for citations and secondary exclusions. Google OAuth can enumerate
+metadata and read content for every Drive file the connected account can
+access, so this is an application boundary rather than an OAuth permission
+boundary. Unknown or ambiguous Drive ancestry never reaches a content download.
 
 ## D1, FTS5, Vectorize, and the outbox
 

@@ -39,7 +39,18 @@ I would rather lose a sale to an honest table than win one and spend week three 
 
 ### Google Drive
 
-Connected with **read-only** access. It can look at documents. It cannot change, move, or delete anything, and that is enforced by the permission itself rather than by good behavior.
+Connected with Google's **read-only** Drive permission. Google allows the
+connector to list metadata and read content for every Drive file the connected
+account can access. It cannot change, move, or delete anything.
+
+The folder boundary is enforced by the installer, not by the Google permission.
+Before ingest, add each owner-approved folder ID to
+`corpora.google_drive.root_folder_ids`. The ID is the final segment of a Drive
+folder URL. Content is downloaded and ingested only when the file's complete,
+single-parent ancestry reaches one of those IDs. Unknown or ambiguous ancestry
+is refused. Folder names, reconstructed paths, `_Private` prefixes, and
+exclusion rules remain useful policy, but they are not substitutes for the
+positive ID boundary.
 
 **What it reads:**
 
@@ -139,7 +150,7 @@ It reads your manifest, works out which sources you actually have, runs every on
 
 - It does not connect anything. If a source is switched on in your manifest but not yet authorized on this machine, it is skipped with the exact command that would connect it. Connecting is a decision, not something a load should do on your behalf.
 - It does not load Zoom, ever, and this is not a gap. Zoom **pushes**: a finished cloud recording calls your brain's own webhook and the transcript loads itself. There is nothing for a sweep to fetch, so it says so rather than printing a reassuring line for work it did not do.
-- It does not reach anything your manifest does not name. Folders on your machine are read only if you list them under `corpora.upload.folders`.
+- It does not ingest anything your manifest does not name. Folders on your machine are read only if you list their exact absolute roots under `corpora.upload.folders` or enable the matching `corpora.local_folder.path`. Google OAuth can list metadata for every Drive file the account can access, but content is downloaded and ingested only under the stable folder IDs in `corpora.google_drive.root_folder_ids`.
 - It does not make a source work that is not built. A corpus your manifest declares that this version has no loader for is reported as exactly that, out loud.
 
 **Options.**

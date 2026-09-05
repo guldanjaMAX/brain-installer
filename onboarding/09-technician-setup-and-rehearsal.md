@@ -106,10 +106,14 @@ technician plan.
 brain technician "$HOME/Financial Brain/brain.manifest.json" --run cloudflare
 ```
 
-The owner signs in, confirms Workers Paid, creates the scoped installation
-token, and enters it into the hidden prompt. The existing setup command performs
-the account check, provisioning, migrations, deploy, key persistence, and
-health proof. It is safe to rerun after an interruption.
+The owner signs in and confirms Workers Paid. An approved launcher can
+deliberately supply a least-privilege scoped installation token to `brain setup`;
+that explicit process credential has first priority. Otherwise setup announces
+and uses an existing pinned Wrangler 4.73.0 session. If neither is available, it
+asks the owner for the scoped token in a hidden prompt. The setup command then
+performs the account check, provisioning, migrations, deploy, key persistence,
+and health proof. It is safe to rerun after an interruption. Never put the token
+in the command itself.
 
 ### 3. Google
 

@@ -316,6 +316,71 @@ export function folderPathFor(file, folders = {}) {
   return parts.join("/");
 }
 
+/**
+ * Prove that one Drive file descends from a manifest-declared folder id.
+ *
+ * Folder names and paths are presentation data. They can be renamed, collide,
+ * and are not an authority boundary. Parent ids are stable, but the chain is
+ * usable only when every hop is known and single-parented. Any missing hop,
+ * cycle, parentless item, or multiple-parent shape fails closed before content
+ * is downloaded.
+ */
+export function sourceRootDecision(file, folders = {}, rootFolderIds = []) {
+  const roots = new Set((rootFolderIds || []).map((value) => String(value || "").trim()).filter(Boolean));
+  if (!roots.size) {
+    return { allowed: false, reason: "the manifest declares no allowed Google Drive root folder id" };
+  }
+
+  let parents = [...new Set((Array.isArray(file?.parents) ? file.parents : [])
+    .map((value) => String(value || "").trim()).filter(Boolean))];
+  if (parents.length !== 1) {
+    return {
+      allowed: false,
+      reason: parents.length > 1
+        ? "Google Drive ancestry is ambiguous, so the item is outside the allowed source boundary"
+        : "Google Drive ancestry is unknown, so the item is outside the allowed source boundary",
+    };
+  }
+
+  const seen = new Set();
+  let id = parents[0];
+  while (id) {
+    if (roots.has(id)) return { allowed: true, rootFolderId: id };
+    if (seen.has(id)) {
+      return { allowed: false, reason: "Google Drive ancestry contains a cycle, so the item is outside the allowed source boundary" };
+    }
+    seen.add(id);
+
+    const folder = folders?.[id];
+    if (!folder) {
+      return { allowed: false, reason: "Google Drive ancestry is unknown, so the item is outside the allowed source boundary" };
+    }
+    parents = [...new Set((Array.isArray(folder.parents) ? folder.parents : [])
+      .map((value) => String(value || "").trim()).filter(Boolean))];
+    if (parents.length !== 1) {
+      return {
+        allowed: false,
+        reason: parents.length > 1
+          ? "Google Drive ancestry is ambiguous, so the item is outside the allowed source boundary"
+          : "Google Drive ancestry ends outside the configured roots, so the item is outside the allowed source boundary",
+      };
+    }
+    id = parents[0];
+  }
+
+  return { allowed: false, reason: "Google Drive ancestry is unknown, so the item is outside the allowed source boundary" };
+}
+
+/** A folder change or removal invalidates every descendant ancestry decision. */
+export function ancestryChangesRequireFullSweep(changes = {}, folders = {}, rootFolderIds = []) {
+  if ((changes.changed || []).some((file) => file?.mimeType === FOLDER_MIME)) return true;
+  const roots = new Set((rootFolderIds || []).map((value) => String(value || "").trim()).filter(Boolean));
+  return (changes.removed || []).some((value) => {
+    const id = String(value || "").trim();
+    return Boolean(id && (roots.has(id) || Object.prototype.hasOwnProperty.call(folders || {}, id)));
+  });
+}
+
 const pathSegments = (value) => String(value || "").replace(/\\/g, "/").split("/").map((x) => x.trim()).filter(Boolean);
 const normalPath = (value) => pathSegments(value).join("/").toLowerCase();
 
@@ -401,9 +466,22 @@ export async function fetchContent(getAccessToken, file, plan, opts = {}) {
  * Deliberately mirrors ingest/run.mjs prepare() so a Drive document and a local
  * one are judged by exactly the same rules.
  */
-export async function toEnvelope(getAccessToken, file, { sourceName = SOURCE_TYPE, pathOf = () => "", ocr = null } = {}, opts = {}) {
+export async function toEnvelope(getAccessToken, file, {
+  sourceName = SOURCE_TYPE,
+  pathOf = () => "",
+  folders = {},
+  rootFolderIds = [],
+  ocr = null,
+} = {}, opts = {}) {
   const plan = triage(file);
   if (plan.folder) return null;
+  const root = sourceRootDecision(file, folders, rootFolderIds);
+  if (!root.allowed) {
+    return {
+      skip: { path: "Drive item", id: file?.id, reason: root.reason },
+      sourcePolicy: "root_allowlist",
+    };
+  }
   if (plan.skip) return { skip: { path: file.name, id: file.id, reason: plan.skip } };
 
   let buf;

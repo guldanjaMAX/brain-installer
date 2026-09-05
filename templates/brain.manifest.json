@@ -18,23 +18,23 @@
     "timezone": "America/Phoenix"
   },
   "brain": {
-    "version": "0.3.6",
+    "version": "0.3.7",
     "domain": "brain.acme.com",
     "worker_name": "acme-brain"
   },
   "infrastructure": {
-    "_comment": "Client-owned. We hold a scoped, expiring token and nothing else.",
+    "_comment": "Client-owned. Control-plane access uses an announced account-wide Wrangler session or a narrower scoped token; neither belongs in this manifest.",
     "cloudflare": {
       "_token_scopes": [
-        "The API token the client issues us needs exactly these, no more:",
+        "When no Wrangler login session is used, the scoped API token needs exactly these:",
         "  Account > Workers Scripts: Edit",
         "  Account > D1: Edit",
         "  Account > Vectorize: Edit",
         "  Account > Workers R2 Storage: Edit   (only if r2_bucket is set)",
         "  Account > Workers AI: Read",
         "Vectorize Edit was verified on 2026-08-23 for index creation and every",
-        "metadata index. `npx wrangler@4 login` is only a fallback for an older",
-        "token that does not carry that permission.",
+        "metadata index. An existing `npx wrangler@4 login` session is",
+        "account-wide and remains in Wrangler's local profile until logout.",
         "",
         "The account must ALSO be on the Workers Paid plan, 5 USD a month minimum.",
         "Free can create Vectorize, but its vector, daily-write, and Worker CPU limits are prototype-scale. Paid is the supported production baseline."
@@ -88,7 +88,13 @@
   "corpora": {
     "_comment": "Which sources this install ingests. Each maps to a connector.",
     "google_drive": {
-      "enabled": true,
+      "enabled": false,
+      "_root_folder_ids_comment": [
+        "Required before Drive ingest. Add only folder IDs the owner approved.",
+        "For https://drive.google.com/drive/folders/1AbC_example the ID is 1AbC_example.",
+        "The connector downloads a file only when its complete, single-parent ancestry reaches one of these IDs."
+      ],
+      "root_folder_ids": [],
       "exclude_paths": [],
       "exclude_name_parts": [],
       "exclude_file_ids": [],
@@ -161,8 +167,12 @@
       "token_secret": "secret://NOTION_TOKEN"
     },
     "upload": {
-      "_comment": "Manual drop zone. Always on: it is the fallback for anything with no connector.",
-      "enabled": true
+      "_comment": [
+        "Manual drop zones. Local ingest refuses every root not listed here or in an enabled corpora.local_folder block.",
+        "Use an exact absolute path. Name each source when several folders are declared so each remains separately reversible."
+      ],
+      "enabled": true,
+      "folders": []
     },
     "local_folder": {
       "_comment": [
@@ -212,7 +222,7 @@
     "_comment": "Non-negotiable defaults. The scanner is what makes 'we store nothing dangerous' true rather than aspirational.",
     "credential_scanner": {
       "enabled": true,
-      "gate_version": 4,
+      "gate_version": 5,
       "mode": "refuse",
       "_mode_options": "refuse | flag_only"
     },

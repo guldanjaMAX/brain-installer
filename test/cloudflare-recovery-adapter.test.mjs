@@ -453,6 +453,7 @@ function providerHarness({
   bootstrapMutatesCorpus = false,
   bootstrapBusyOnce = false,
   bootstrapPageSize = 3_000,
+  bootstrapResidueRetryAfterProgress = false,
   bootstrapReceiptTransform = (receipt) => receipt,
   busyReceiptTransform = (receipt) => receipt,
   deploymentChangesDuringEval = false,
@@ -497,6 +498,8 @@ function providerHarness({
   let bootstrapFailuresRemaining = failBootstrapOnce ? 1 : 0;
   let postProgressBootstrapFailuresRemaining = failBootstrapAfterProgressOnce ? 1 : 0;
   let bootstrapBusyRemaining = bootstrapBusyOnce ? 1 : 0;
+  let bootstrapResidueRetryRemaining = bootstrapResidueRetryAfterProgress ? 1 : 0;
+  let bootstrapRebaseWaitingRemaining = 0;
   let readinessLagRemaining = readinessLagAfterBootstrap ? 1 : 0;
   let promotionFailuresRemaining = failPromotionAfterApplyOnce ? 1 : 0;
   let bootstrapCalls = 0;
@@ -805,6 +808,55 @@ function providerHarness({
           remaining: targetChunkCount - bootstrapConfirmed,
           retry_after_seconds: 2,
         }), 409);
+      }
+      if (bootstrapResidueRetryRemaining > 0 && bootstrapConfirmed > 0 &&
+          bootstrapConfirmed < targetChunkCount) {
+        bootstrapResidueRetryRemaining--;
+        const retryReceipt = bootstrapReceiptTransform({
+          protocol: "bootstrap-v2",
+          phase: "legacy_drain",
+          epoch: bootstrapEpoch,
+          total: targetChunkCount,
+          confirmed: bootstrapConfirmed,
+          queued: 1,
+          submitted: 0,
+          remaining: targetChunkCount - bootstrapConfirmed,
+          in_flight_batches: 0,
+          failed: 1,
+          retrying: 1,
+          complete: false,
+          vector_ready: false,
+          expected_vectors: targetChunkCount,
+          actual_vectors: vectorCount,
+        });
+        // The real coordinator advances to a fresh exact-cut epoch after the
+        // residue becomes visible, retaining the earlier batch history under
+        // its old epoch. The count can become visible one request after the
+        // row receipt, while the verified epoch rebase follows on the next.
+        bootstrapRebaseWaitingRemaining = 1;
+        return response(retryReceipt);
+      }
+      if (bootstrapRebaseWaitingRemaining > 0) {
+        bootstrapRebaseWaitingRemaining--;
+        vectorCount = targetChunkCount;
+        const waitingReceipt = bootstrapReceiptTransform({
+          protocol: "bootstrap-v2",
+          phase: "waiting",
+          epoch: bootstrapEpoch,
+          total: targetChunkCount,
+          confirmed: bootstrapConfirmed,
+          queued: 0,
+          submitted: 0,
+          remaining: targetChunkCount - bootstrapConfirmed,
+          in_flight_batches: 0,
+          failed: 0,
+          complete: false,
+          vector_ready: false,
+          expected_vectors: targetChunkCount,
+          actual_vectors: vectorCount,
+        });
+        bootstrapEpoch++;
+        return response(waitingReceipt);
       }
       if (bootstrapRequired && bootstrapConfirmed < targetChunkCount) {
         bootstrapConfirmed = Math.min(
@@ -1715,6 +1767,25 @@ try {
   assert.equal(laggedVisibilityHarness.bootstrapCalls, 2);
   assert.equal(laggedVisibilityHarness.sleepCalls, 1);
 
+  const residueRetryHarness = providerHarness({
+    initialTargetRestored: true,
+    bootstrapPageSize: 3,
+    bootstrapResidueRetryAfterProgress: true,
+  });
+  const residueRetryGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    residueRetryHarness.dependencies,
+  );
+  const residueRetry = await residueRetryGate.adapters.rebuild_vectorize({
+    ...rebuildContext,
+    attempt: 1,
+  });
+  assert.equal(residueRetry.vector_count, 5);
+  assert.equal(residueRetryHarness.bootstrapCalls, 4,
+    "accepted residue, visibility wait, and verified rebase must all be polled");
+  assert.equal(residueRetryHarness.sleepCalls, 3);
+  assert.equal(residueRetryHarness.promotionCalls, 1);
+
   // The old active /drain loop could submit at most 79,200 restored rows. The
   // paused schema-13 bootstrap advances its durable provider-receipt cursor
   // until exact completion, with no corpus-sized adapter ceiling.
@@ -1767,6 +1838,22 @@ try {
     (error) => error.code === "RECOVERY_BOOTSTRAP_RECEIPT_INVALID",
   );
   assert.equal(malformedReceiptHarness.promotionCalls, 0);
+
+  const failedCompleteReceiptHarness = providerHarness({
+    initialTargetRestored: true,
+    bootstrapReceiptTransform: (receipt) => receipt.complete
+      ? { ...receipt, failed: 1 }
+      : receipt,
+  });
+  const failedCompleteReceiptGate = createCloudflareRecoveryFieldGateAdapters(
+    approvedAdapterConfig,
+    failedCompleteReceiptHarness.dependencies,
+  );
+  await assert.rejects(
+    failedCompleteReceiptGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 }),
+    (error) => error.code === "RECOVERY_BOOTSTRAP_RECEIPT_INVALID",
+  );
+  assert.equal(failedCompleteReceiptHarness.promotionCalls, 0);
 
   const malformedBusyHarness = providerHarness({
     initialTargetRestored: true,

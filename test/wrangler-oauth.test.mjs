@@ -9,10 +9,15 @@
 import assert from "node:assert/strict";
 import {
   findWranglerConfig,
+  findWranglerSessionConfig,
   parseWranglerSession,
+  readWranglerOAuthSession,
   readWranglerOAuthToken,
   refreshWranglerSession,
   wranglerConfigCandidates,
+  WRANGLER_SESSION_AVAILABLE,
+  WRANGLER_SESSION_ENCRYPTED_UNSUPPORTED,
+  WRANGLER_SESSION_UNREADABLE,
 } from "../operations/wrangler-oauth.mjs";
 
 const HOUR = 3_600_000;
@@ -34,6 +39,45 @@ assert.equal(
   "/h/.wrangler/config/default.toml",
 );
 assert.equal(findWranglerConfig({ env: { HOME: "/h" }, platform: "darwin", existsSync: () => false }), null);
+
+// New Wrangler stores its browser session in default.enc. Detect that layout
+// without reading the encrypted bytes or reaching into an OS keyring.
+let encryptedReads = 0;
+const encryptedOnly = {
+  env: { HOME: "/fixture-home" },
+  platform: "darwin",
+  existsSync: (path) => path.endsWith("default.enc"),
+  readFileSync: () => { encryptedReads++; throw new Error("encrypted bytes must not be read"); },
+};
+const encryptedSession = readWranglerOAuthSession(encryptedOnly);
+assert.equal(encryptedSession.type, WRANGLER_SESSION_ENCRYPTED_UNSUPPORTED);
+assert.equal(encryptedSession.token, null);
+assert.equal(encryptedReads, 0, "detecting default.enc must not read or decrypt it");
+assert.equal(readWranglerOAuthToken(encryptedOnly), null, "the compatibility token reader still falls through quietly");
+assert.equal(encryptedReads, 0, "the token wrapper must not read default.enc either");
+
+// A readable supported session wins when both files exist in one config
+// location. This lets a pinned re-login recover without deleting default.enc.
+const both = {
+  env: { HOME: "/fixture-home" },
+  platform: "darwin",
+  existsSync: (path) => /default\.(?:toml|enc)$/.test(path),
+  readFileSync: () => cfg("supported-session", Date.now() + HOUR),
+};
+assert.equal(findWranglerSessionConfig(both).format, "toml");
+assert.equal(readWranglerOAuthSession(both).type, WRANGLER_SESSION_AVAILABLE);
+assert.equal(readWranglerOAuthToken(both), "supported-session");
+
+// A present TOML file that cannot be opened is different from no session and
+// different from the encrypted layout. The typed surface preserves that fact.
+const unreadable = readWranglerOAuthSession({
+  env: { HOME: "/fixture-home" },
+  platform: "darwin",
+  existsSync: (path) => path.endsWith("default.toml"),
+  readFileSync: () => { throw new Error("fixture EACCES"); },
+});
+assert.equal(unreadable.type, WRANGLER_SESSION_UNREADABLE);
+assert.equal(unreadable.reason, "read-failed");
 
 // Parsing never throws on junk; a missing token is just "no session".
 assert.equal(parseWranglerSession("").token, null);

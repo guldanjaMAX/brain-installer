@@ -841,7 +841,8 @@ function seed(db) {
   check("a non-numeric limit becomes the default rather than reaching SQL as NaN",
     __testing.boundedLimit("abc") === 200 && __testing.boundedLimit("0") === 200 &&
       __testing.boundedLimit("-5") === 200);
-  check("a limit is clamped rather than trusted", __testing.boundedLimit("99999") === 1000);
+  check("a limit is clamped with room for one internal truncation sentinel",
+    __testing.boundedLimit("99999") === 1001);
   check("a sane limit survives", __testing.boundedLimit("25") === 25);
   check("malformed stored JSON renders as nothing rather than breaking a page",
     __testing.parseJsonList("{not json") .length === 0 &&

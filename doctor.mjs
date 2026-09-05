@@ -17,7 +17,11 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { WRANGLER_SPEC } from "./operations/wrangler-oauth.mjs";
+import {
+  readWranglerOAuthSession,
+  WRANGLER_SESSION_ENCRYPTED_UNSUPPORTED,
+  WRANGLER_SPEC,
+} from "./operations/wrangler-oauth.mjs";
 import { existsSync } from "node:fs";
 import { platform } from "node:os";
 import { tokenStorageStatus, verifyTokenStorageReadable } from "./connectors/google-auth.mjs";
@@ -255,9 +259,25 @@ function cfEnv(accountId) {
   return cloudflareCliEnvironment(accountId);
 }
 
-export function checkWranglerLogin(accountId) {
+export function checkWranglerLogin(accountId, options = {}) {
+  const readSession = options.readWranglerOAuthSession ?? readWranglerOAuthSession;
+  const session = readSession(options.sessionOptions);
+  if (session?.type === WRANGLER_SESSION_ENCRYPTED_UNSUPPORTED) {
+    return check(
+      "wrangler login",
+      WARN,
+      "encrypted Wrangler session detected; this installer cannot read that session format",
+      "Run: npx " + WRANGLER_SPEC + " login\n" +
+        "  The pinned Wrangler creates the session format this installer supports.\n" +
+        "  Or run `brain setup` or `brain update` in an interactive terminal and enter\n" +
+        "  an account-scoped token at the hidden prompt. The encrypted session was\n" +
+        "  detected; this warning does not mean it is signed out."
+    );
+  }
+
   const env = cfEnv(accountId);
-  const r = run("npx", [WRANGLER_SPEC, "whoami"], {
+  const runCommand = options.runCommand ?? run;
+  const r = runCommand("npx", [WRANGLER_SPEC, "whoami"], {
     timeout: 120_000,
     inheritEnv: false,
     env,

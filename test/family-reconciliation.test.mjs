@@ -434,7 +434,9 @@ function runIngest({ label, files, env: extraEnv = {}, dbPath = null, dir = null
     brain: { domain: "fixture.invalid" },
     infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
     safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
-    corpora: {},
+    corpora: {
+      upload: { enabled: true, folders: [source] },
+    },
   }));
 
   const env = { ...process.env };

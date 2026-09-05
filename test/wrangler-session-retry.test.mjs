@@ -56,16 +56,30 @@ try {
     await assert.rejects(withWranglerSessionIfNeeded(() => cloudflareApiRequest("/accounts"), session(() => { renewed++; return B; })));
     assert.equal(renewed, 0); assert.equal(calls.length, 1);
   }
-  // An explicit CLOUDFLARE_API_TOKEN is never silently swapped for a session.
+  // An explicit process token has first priority over a local session.
   {
     process.env.CLOUDFLARE_API_TOKEN = "x".repeat(40);
     const calls = stubFetch([{ status: 403, body: denied }]);
     let renewed = 0;
-    await assert.rejects(
-      withWranglerSessionIfNeeded(() => cloudflareApiRequest("/accounts"), session(() => { renewed++; return B; })),
-      (error) => /failed \(403\)/.test(error.message) && error.credentialSource === undefined,
-    );
+    let sessionReads = 0;
+    const logs = [];
+    const savedLog = console.log;
+    console.log = (...values) => logs.push(values.join(" "));
+    try {
+      await assert.rejects(
+        withWranglerSessionIfNeeded(
+          () => cloudflareApiRequest("/accounts"),
+          { ...session(() => { renewed++; return B; }, () => { sessionReads++; return A; }), argv: [] },
+        ),
+        (error) => /failed \(403\)/.test(error.message) && error.credentialSource === undefined,
+      );
+    } finally {
+      console.log = savedLog;
+    }
     assert.equal(renewed, 0); assert.equal(calls.length, 1);
+    assert.equal(sessionReads, 0, "the explicit process token bypasses local Wrangler discovery");
+    assert.ok(logs.some((line) => /CLOUDFLARE_API_TOKEN supplied to this process/.test(line)),
+      "the winning credential source is announced before account lookup");
     delete process.env.CLOUDFLARE_API_TOKEN;
   }
 } finally {

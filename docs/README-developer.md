@@ -2,15 +2,20 @@
 
 Provisions a retrieval brain into a **client's own Cloudflare account**. Text and
 keyword search live in D1, vectors live in Vectorize, and the Worker fuses them.
-Nothing runs on our infrastructure, and nothing but a scoped token is held during
-the engagement.
+Nothing runs on our infrastructure. An approved secret launcher can explicitly
+inject a scoped token into the process, and that choice has first priority.
+Otherwise Cloudflare access comes from an existing account-wide `wrangler login`
+session or a scoped token supplied through a hidden prompt. On macOS the owner
+can explicitly store that scoped token per account in the login Keychain. None
+of these credentials belongs in this repository, the manifest, command
+arguments, logs, or issue notes.
 
-**Status: 0.2.0 release candidate.** Provisioning, retrieval, resumable ingest,
+**Status: 0.3.7 local release candidate.** Provisioning, retrieval, resumable ingest,
 guarded deletion, owner actions, exact entity scope, document grants, passkey
 observability, financial imports, and restart-safe migrations are covered by
 the complete local product and contract suites. Earlier releases have real
 Cloudflare synthetic-service proof, and Google Drive has partial real-data
-proof. A fresh 0.2.0 Cloudflare field gate, the physical passkey ceremony on the
+proof. A fresh 0.3.7 Cloudflare field gate, the physical passkey ceremony on the
 final domain, the named connector lifecycle tests, and a real-account Windows
 install are still outside proof. See "What is not built" and
 `CONNECTOR-BACKLOG.md` before promising anything to anyone.
@@ -31,14 +36,16 @@ release, owner-update, rollback, credential, and issue-evidence workflow.
   Vectorize has a Free allowance, but its vector capacity, D1 daily-write limit,
   and Worker CPU limit are prototype-scale. Paid is this product's supported
   production baseline.
-- A Cloudflare API token created in the client's own account with: Workers
-  Scripts Edit, D1 Edit, Vectorize Edit and Workers AI Read. It drives verify,
-  provisioning, migrations, deploy and secrets. Add Workers R2 Storage Edit only
-  when the manifest actually sets an R2 bucket.
+- Cloudflare control-plane access from either an existing pinned `wrangler login`
+  session or a scoped API token created in the client's own account with Workers
+  Scripts Edit, D1 Edit, Vectorize Edit and Workers AI Read. The Wrangler session
+  is account-wide and persists until logout. Add Workers R2 Storage Edit to a
+  scoped token only when the manifest actually sets an R2 bucket.
 
 Vectorize Edit was verified end to end on 2026-08-23: an account-scoped token
-created the index and all six metadata indexes through the API. `wrangler login`
-remains a compatibility fallback for an older token, not an install requirement.
+created the index and all six metadata indexes through the API. Setup announces
+an explicitly injected process token first. Without one, it announces and uses
+a pinned `wrangler login` session before asking for a scoped token.
 
 ---
 
@@ -238,6 +245,12 @@ CSV and TSV are rendered row-wise as `Header: value` rather than as a bare grid,
 because `15234.11` on its own is unretrievable while `Balance: 15234.11` answers
 a question about a balance.
 
+A local-folder run first proves that its exact canonical root is positively
+declared under `corpora.upload.folders` or by an enabled
+`corpora.local_folder.path`. Relative paths and undeclared roots are refused
+before the walk starts, including for `--dry-run`. This keeps a copied command,
+an agent, or a scheduler from widening the read boundary beyond the manifest.
+
 A local-folder run also reconciles DELETIONS: a file this source loaded before
 and can no longer find is removed, through the same aggregate removal plan and
 the same safety limits Drive uses. The plan denominator comes from the
@@ -247,8 +260,16 @@ deletions re-enter the current plan rather than bypassing it. Suppressed under
 `--limit`, where an unexamined file is not a deleted one.
 
 **`safety.private_path_prefixes` is enforced on local-folder and Google Drive
-ingest**, per path segment. Drive also enforces `corpora.google_drive` exact
-file-id, path-prefix and filename-part exclusions before downloading content.
+ingest**, per path segment. Those exclusions are secondary defense. The
+positive boundary is the exact local root above and the stable folder IDs in
+`corpora.google_drive.root_folder_ids`. Google OAuth uses `drive.readonly`, so
+it can enumerate metadata and read content for every Drive file the connected
+account can access. The root-ID rule is an application download and ingest
+boundary, not an OAuth permission boundary. Drive downloads a file only when
+every known single-parent hop reaches an allowed folder ID; missing, parentless,
+cyclic, or multiple-parent ancestry is refused before content fetch. Drive also
+enforces exact file-id, path-prefix and filename-part exclusions before
+downloading content.
 An excluded document already present in the brain is removed rather than left
 stranded. Gmail has no folder path and does not use these rules.
 
@@ -286,6 +307,14 @@ node brain.mjs ingest ./acme.manifest.json --from drive --dry-run
 node brain.mjs ingest ./acme.manifest.json --from drive
 node brain.mjs ingest ./acme.manifest.json --from gmail
 ```
+
+Before either Drive command, add at least one approved folder ID to
+`corpora.google_drive.root_folder_ids`. For a folder URL ending in
+`/drive/folders/1AbC_example`, the ID is `1AbC_example`. A policy change forces
+a full comparison before the connector resumes incremental changes. An update
+of an existing manifest with Drive enabled stops before any Cloudflare change
+until the folder IDs are added. Drive planning and ingest enforce the same
+rule; doctor, setup, and unrelated connector commands do not read it.
 
 For a mailbox that is not Gmail:
 
@@ -338,8 +367,9 @@ Not only a custody preference: every Drive and Gmail read scope is *restricted*,
 so one vendor-owned OAuth client serving many customers would require Google
 verification plus a paid annual CASA security assessment. `brain connect google`
 prints the full console walkthrough when `GOOGLE_CLIENT_ID` is unset. The refresh
-token is stored in the local macOS login Keychain by default and never
-transmitted. The Keychain item is deliberately identifiable as service
+token is stored in the local macOS login Keychain by default. It is never sent
+to the installer operator; refresh sends it only to Google's OAuth token
+endpoint. The Keychain item is deliberately identifiable as service
 `brain-installer.google-oauth`, account `local-google-connection`. Windows uses
 an atomically replaced, read-back-verified file at
 `~/.brain/google-tokens.json`, encrypted for the current Windows user with

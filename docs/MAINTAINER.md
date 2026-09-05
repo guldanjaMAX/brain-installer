@@ -1,7 +1,7 @@
 # Shared Brain maintainer guide
 
 This is the operating guide for engineers who maintain the shared installer.
-It describes the current 0.2.x product line, how to change and release it safely, and
+It describes the current 0.3.x product line, how to change and release it safely, and
 how to update an owner's existing Brain. It is not an instance handoff. Never
 put an owner's manifest, resource identifiers, source details, private golden
 set, support export, or credentials in this repository.
@@ -167,9 +167,10 @@ release artifact verification, and each install's private release evaluation.
 
 The code line is not a release merely because `package.json` names a version. A
 release exists only when its exact reviewed commit is tagged, all six CI jobs
-pass, required live field gates have evidence, GitHub publishes one immutable
-asset with the verified digest, and the public install and update pages point
-to that exact asset.
+and the planted preflight traps pass on that tag, required live field gates
+have evidence, GitHub publishes both immutable package names with verified
+digests and sizes, and the public install and update pages point to that exact
+release.
 
 ## Make a product change safely
 
@@ -209,6 +210,7 @@ the full release gate.
 | Worker data plane | `node worker/test/routes.test.mjs`, `node worker/test/store.test.mjs`, and `node worker/test/store-d1.test.mjs` |
 | Evaluation | `npm run test:eval` |
 | Published package privacy | `node test/package-privacy.test.mjs` |
+| Release automation | `node scripts/test-release-workflow-contract.mjs` |
 
 Required offline release checks:
 
@@ -272,10 +274,31 @@ Inspect the complete tar listing. It must contain only the package allowlist,
 with no instance files, private golden sets, baselines, support exports,
 credentials, or local receipts. The installed command must print its usage.
 
-### 3. Merge and tag the reviewed commit
+### 3. Configure the repository gate once
+
+The release workflow requires two repository controls before it can create a
+draft:
+
+1. Enable immutable releases in the repository settings.
+2. Add an Actions secret named `RELEASE_ADMIN_READ_TOKEN`. Use a fine-grained
+   token restricted to this repository with only `Administration: read`. The
+   normal `GITHUB_TOKEN` publishes the release; this separate read-only token
+   can only prove that GitHub will enforce immutability before publication.
+
+Do not replace the second check with a repository variable or a written
+assertion. Those can say `true` after the setting has been disabled. The
+workflow calls GitHub's immutable-release status endpoint and fails before
+creating a draft when the credential is missing or the setting is off.
+
+The workflow grants `contents: write` only to its final release job. Branch,
+pull-request, and reusable CI jobs have `contents: read`. Every external action
+is pinned to a reviewed full commit SHA.
+
+### 4. Merge and tag the reviewed commit
 
 Use a reviewed pull request or a fast-forward-only integration. Never force
-push a release. After `main` contains the candidate:
+push a release. Complete the approved field gates before tagging. After `main`
+contains the candidate:
 
 ```bash
 git switch main
@@ -286,37 +309,53 @@ git push origin main
 git push origin "v$RELEASE_VERSION"
 ```
 
-Require the tag, `main`, the tested commit, and the six green CI jobs to name
-the same source. If any executable code changes, rebuild the tarball and rerun
-every applicable gate.
+The tag starts `.github/workflows/release.yml`. Do not run `gh release create`
+by hand. The release workflow:
 
-### 4. Publish and verify once
+1. Calls `.github/workflows/ci.yml` at the tagged commit and waits for the full
+   Windows, macOS, and Linux Node 22 and 24 matrix plus `preflight-traps`.
+2. Proves that the event, checkout, semantic version, tag, and a commit reachable
+   from `main` agree.
+3. Proves immutable releases are enabled before it creates anything.
+4. Packs once, copies those bytes to `brain-installer.tgz`, and passes both
+   `brain-installer-<version>.tgz` and `brain-installer.tgz` to one
+   `gh release create --draft` operation.
+5. Checks the draft's exact asset set, byte counts, SHA-256 digests, upload
+   states, and downloaded bytes before publication.
+6. Publishes the verified draft, then requires GitHub to report
+   `isImmutable: true`. It downloads both public assets without credentials,
+   compares them again, and starts the CLI from a clean install of the public
+   canonical asset.
 
-Create a draft first because a published immutable release cannot be repaired:
+Watch the exact run and inspect the final receipt:
 
 ```bash
-gh release create "v$RELEASE_VERSION" "$RELEASE_TARBALL" \
-  --draft --verify-tag --title "Brain Installer $RELEASE_VERSION" \
-  --generate-notes
+gh run list --workflow release.yml --limit 5
+RELEASE_RUN_ID="$(gh run list --workflow release.yml --limit 1 \
+  --json databaseId --jq '.[0].databaseId')"
+gh run view "$RELEASE_RUN_ID" --exit-status
 gh release view "v$RELEASE_VERSION" \
   --json tagName,targetCommitish,isDraft,isImmutable,assets,url
 ```
 
-Confirm there is exactly one asset, its name is
-`brain-installer-<version>.tgz`, and its reported SHA-256 matches the local
-tarball. Then publish and require GitHub to report the release immutable:
+The final release must contain exactly two assets. Their sizes and digests must
+match, and `isDraft` must be false while `isImmutable` is true. If a failure
+leaves a private draft, inspect that draft and the run before removing it and
+rerunning the tag workflow. Never upload or replace assets on a published
+release.
 
-```bash
-gh release edit "v$RELEASE_VERSION" --draft=false
-gh release view "v$RELEASE_VERSION" \
-  --json tagName,targetCommitish,isDraft,isImmutable,assets,url
-```
-
-Download the public asset independently, compare its digest again, install it
-in a fresh user-owned prefix, and run the installed `brain` command. Only after
-that succeeds may `financialbrain.ai/install` and `financialbrain.ai/update`
-be changed to the new immutable URL. Verify both pages at desktop and mobile
-widths after deployment.
+The install and update pages live in a different repository. This repository's
+`GITHUB_TOKEN` cannot update or deploy them, and the scheduled drift check only
+reports disagreement. The smallest safe completion step is one authorized,
+reviewed change in the site repository after this workflow succeeds. Point its
+package download to
+`https://github.com/guldanjaMAX/brain-installer/releases/latest/download/brain-installer.tgz`
+so the fixed asset name removes future binary-URL pin edits, update any visible
+version metadata, then verify both live pages at desktop and mobile widths.
+Visible version metadata still needs synchronization unless the site reads the
+release API. Full automation would need a receiving workflow in the site
+repository plus a narrowly scoped cross-repository GitHub App or token; do not
+give this release workflow that access merely to remove a manual step.
 
 ## Update an existing Brain
 
@@ -419,11 +458,15 @@ Add Workers R2 Storage Edit only if the manifest really provisions R2. Scope
 the token to the intended account, give it an expiry, and revoke it when the
 control-plane work is finished.
 
-The supported setup and update flows request the token in a hidden terminal
-prompt. The token must not be placed in source, a manifest, an argument, shell
-history, a support note, a log, or a shared message. Low-level automation must
-use an approved secret-manager-backed launcher that resolves the secret only
-at execution time and passes a minimal environment to the child process.
+The supported setup and update flows give first priority to a scoped token
+explicitly injected by an approved secret-manager-backed launcher, and announce
+that choice. Without one, they use and announce an existing pinned
+`wrangler login` session. Otherwise they request the scoped token in a hidden
+terminal prompt. On macOS, the owner may explicitly remember it per account in
+the login Keychain. The token must not be placed in source, a manifest, an
+argument, shell history, a support note, a log, or a shared message. The
+launcher resolves the secret only at execution time and passes a minimal
+environment to the child process.
 
 The Brain admin key is a different credential. It grants operator access to the
 whole Brain and lives only in the install's declared durable store. Routine
@@ -433,8 +476,9 @@ configuration, release job, maintainer password manager, or Cloudflare token
 store.
 
 Repository permission grants no Cloudflare or corpus permission. A maintainer
-needs a fresh, owner-approved scoped token only for a specific live operation.
-There is no shared master credential and no support backdoor.
+needs owner-approved control-plane access for each live operation, through the
+owner's confirmed Wrangler session or a fresh scoped token. There is no shared
+master credential and no support backdoor.
 
 ## Issue-note collection and regression tracking
 

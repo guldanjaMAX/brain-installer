@@ -31,7 +31,7 @@ writeFileSync(manifestPath, JSON.stringify({
   client: { slug: "fixture" },
   brain: { domain: "brain.fixture.test" },
   corpora: {
-    google_drive: { enabled: true },
+    google_drive: { enabled: true, root_folder_ids: ["fixture-allowed-root"] },
     gmail: { enabled: true },
     calendar: { enabled: true },
     zoom: { enabled: true },
@@ -108,6 +108,7 @@ test("setup can create an owner-only Claude workspace guide with locators but no
   assert.ok(content.startsWith(CLAUDE_WORKSPACE_MARKER));
   assert.ok(content.includes(`${JSON.stringify(safeNodePath)} ${JSON.stringify(safeBrainPath)}`));
   assert.match(content, /claude --add-dir <approved-folder>/);
+  assert.match(content, /corpora\.upload\.folders/);
   assert.ok(content.includes(`npx ${WRANGLER_SPEC}`), "workspace doc must name the pinned wrangler");
   assert.match(content, /normal approval prompts enabled/i);
   assert.doesNotMatch(content, /CLOUDFLARE_API_TOKEN|ADMIN_KEY|client_secret|app_password/);

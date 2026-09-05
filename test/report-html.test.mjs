@@ -39,7 +39,7 @@ const cleanManifest = {
   brain: { version: "0.2.0", domain: "brain.acme.com" },
   corpora: {
     _comment: "ignored",
-    google_drive: { enabled: true, exclude_paths: ["Legal/Sealed"] },
+    google_drive: { enabled: true, root_folder_ids: ["fixture-allowed-root"], exclude_paths: ["Legal/Sealed"] },
     gmail: { enabled: false },
     calendar: { enabled: false },
     upload: { enabled: true },
@@ -126,7 +126,7 @@ const ATTR = '" onload="alert(2)';
 const hostileReport = renderReportHtml({
   manifest: {
     client: { display_name: `Acme ${XSS}` },
-    corpora: { google_drive: { enabled: true, exclude_paths: [XSS] } },
+    corpora: { google_drive: { enabled: true, root_folder_ids: ["fixture-allowed-root"], exclude_paths: [XSS] } },
     safety: { private_path_prefixes: [ATTR] },
   },
   acceptance: {
@@ -283,7 +283,10 @@ check("an unanswered question is named in the gap list", has(hollow, "No sources
 /* ------------------------- 4. empty seed set degrades gracefully */
 
 const noSeeds = renderReportHtml({
-  manifest: { client: { display_name: "Acme Consulting" }, corpora: { google_drive: { enabled: true } } },
+  manifest: {
+    client: { display_name: "Acme Consulting" },
+    corpora: { google_drive: { enabled: true, root_folder_ids: ["fixture-allowed-root"] } },
+  },
   acceptance: passingAcceptance,
   seedAnswers: [],
   expectedToFail: [],

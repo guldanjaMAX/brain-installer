@@ -20,7 +20,7 @@ asset and installs into a folder owned by your user account, so it needs no Git,
 Mac or Linux:
 
 ```bash
-npm install --global --ignore-scripts --no-audit --no-fund --prefix "$HOME/.financial-brain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.3.6/brain-installer-0.3.6.tgz"
+npm install --global --ignore-scripts --no-audit --no-fund --prefix "$HOME/.financial-brain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.3.7/brain-installer-0.3.7.tgz"
 # Optional: makes the shorter `brain` examples work in this Terminal window.
 export PATH="$HOME/.financial-brain/bin:$PATH"
 ```
@@ -28,7 +28,7 @@ export PATH="$HOME/.financial-brain/bin:$PATH"
 Windows PowerShell:
 
 ```powershell
-npm.cmd install --global --ignore-scripts --no-audit --no-fund --prefix "$env:LOCALAPPDATA\FinancialBrain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.3.6/brain-installer-0.3.6.tgz"
+npm.cmd install --global --ignore-scripts --no-audit --no-fund --prefix "$env:LOCALAPPDATA\FinancialBrain" "https://github.com/guldanjaMAX/brain-installer/releases/download/v0.3.7/brain-installer-0.3.7.tgz"
 # Optional: makes the shorter `brain` examples work in this PowerShell window.
 $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
 ```
@@ -36,9 +36,16 @@ $env:Path = "$env:LOCALAPPDATA\FinancialBrain;$env:Path"
 The full command path below is deliberate. It keeps working after Terminal is
 closed, without `sudo`, administrator access, or a shell-profile change.
 
-Setup and updates ask for the scoped Cloudflare token
-inside a hidden terminal prompt. The token exists only for that command and is
-kept out of files, command arguments, logs, and issue notes.
+An approved automation launcher can explicitly supply `CLOUDFLARE_API_TOKEN` to
+the process; when present, it has first priority and the command announces that
+choice. Otherwise setup and updates look for an existing pinned `wrangler login`
+session. When one is present, the command says so and uses that account-wide
+session; Wrangler keeps it in its own local profile until the owner logs out.
+Without either, the installer asks for a scoped Cloudflare token in a hidden
+terminal prompt. That token stays only in memory for the command unless, on
+macOS, the owner accepts the explicit offer to remember it per account in the
+login Keychain. These paths keep the token out of command arguments, logs,
+issue notes, and the manifest.
 
 Mac or Linux:
 
@@ -94,9 +101,12 @@ Plans: Paid** in the dashboard yourself before a production install.
    Cloudflare now lets Free accounts create the meaning-search index, but Free
    has prototype-scale vector, daily database-write, and Worker CPU limits. Paid
    is the supported production baseline so a real corpus does not hard-stop.
-3. **A Cloudflare API token**, created in your own account, with exactly four
-   permissions: Workers Scripts Edit, D1 Edit, Vectorize Edit and Workers AI
-   Read. The token can be limited to your account and given an expiry.
+3. **Cloudflare control-plane access.** An explicitly injected process token has
+   first priority. Otherwise setup uses an existing pinned `wrangler login`
+   session, which is account-wide and remains until logout. If neither exists,
+   create a narrower API token in your own account with Workers Scripts Edit,
+   D1 Edit, Vectorize Edit and Workers AI Read. The token can be limited to your
+   account and given an expiry.
 
 Written answers use Cloudflare Workers AI through the same account. There is no
 second AI-provider account or API key to create.
@@ -182,8 +192,21 @@ restoring would discard newer writes.
 
 ## Load your documents
 
+First declare each exact local root the owner approved. A manual `--path` is
+refused unless it matches one of these entries or the path in an enabled
+`corpora.local_folder` block:
+
+```json
+"corpora": {
+  "upload": {
+    "enabled": true,
+    "folders": [{ "path": "/absolute/path/to/approved-documents", "source": "documents" }]
+  }
+}
+```
+
 ```bash
-brain ingest ./brain.manifest.json --path "/a/folder/that/matters" --dry-run
+brain ingest ./brain.manifest.json --path "/absolute/path/to/approved-documents" --dry-run
 ```
 
 The dry run sends nothing. It reports what it **would** load, and more usefully,
@@ -203,6 +226,17 @@ never filenames or document IDs. Review the cause, then add the exact
 
 The same plan and the same limits now cover a local folder, because a folder
 that failed to mount looks exactly like a client who deleted everything in it.
+
+Google OAuth can list metadata and read content for every Drive file the
+connected account can access. The connector cannot change, move, or delete
+those files. Its separate application boundary controls content ingestion.
+Before the first load, copy each approved folder ID from the folder URL into
+`corpora.google_drive.root_folder_ids`. The connector downloads only files
+whose complete, single-parent ancestry reaches one of those IDs. A missing,
+unknown, or ambiguous ancestry is refused before content is fetched. An update
+of an existing manifest with Drive enabled stops before any Cloudflare change
+until the folder IDs are added. Drive planning and ingest enforce the same rule;
+doctor, setup, and unrelated connector commands keep working.
 
 Ask directly in the terminal, even if you do not have Claude Code or Codex:
 
@@ -279,7 +313,9 @@ Shows you exactly what would be removed. Nothing goes until you add `--yes`.
   trash, and incremental-refresh cycle remain field gates. Gmail is covered by
   the same OAuth and cursor-safety test harness but has not yet completed a
   real-account production run. Each client registers their own Google OAuth
-  app, which takes about fifteen minutes.
+  app, which takes about fifteen minutes. Drive ingest also requires at least
+  one owner-approved folder ID under `corpora.google_drive.root_folder_ids`;
+  names and path text are never used as the access boundary.
 - **Google Drive can refresh itself on macOS.** Its schedule is declared in the
   manifest and installed as a per-user LaunchAgent. Windows and Linux still
   require manually re-running the Drive refresh.

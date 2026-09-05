@@ -8,9 +8,12 @@ import {
   grantIsLive,
   hashToken,
   parseCapabilities,
+  parseScope,
   principalMay,
   resolvePrincipal,
+  scopeIsRestricted,
 } from "../src/lib/grants.js";
+import { sourcesInScope } from "../src/lib/auth-store.js";
 
 const ENV = { ADMIN_KEY: "owner-key-value", RAG_PROXY_KEY: "proxy-key-value" };
 const req = (key) => ({ headers: { get: (name) => (name === "X-Admin-Key" ? key : null) } });
@@ -69,6 +72,48 @@ test("a typo in a capability list widens nothing", () => {
   assert.equal(parseCapabilities([]), null, "an empty grant is a mistake, not a grant");
   assert.equal(parseCapabilities("not json"), null);
   assert.equal(parseCapabilities(null), null);
+});
+
+test("all-zone scope preserves exclusions and malformed exclusions fail closed", () => {
+  assert.deepEqual(parseScope({
+    scope_include: '{"all":true}', scope_exclude: '["private"]',
+  }), { all: true, exclude: ["private"] });
+  for (const scope_exclude of ["not json", "{}", "null", "[1]", '[""]', '["Private"]']) {
+    assert.deepEqual(parseScope({ scope_include: '{"all":true}', scope_exclude }), { zones: [] },
+      `malformed exclusion ${scope_exclude} must not turn all-minus into all`);
+  }
+  for (const scope_include of ["null", "[]", '{}', '{"all":true,"zones":["books"]}',
+    '{"zones":[1]}', '{"zones":["Private"]}']) {
+    assert.deepEqual(parseScope({ scope_include, scope_exclude: "[]" }), { zones: [] },
+      `malformed include ${scope_include} must read nothing`);
+  }
+  assert.deepEqual(parseScope({
+    scope_include: '{"zones":["books","books"]}', scope_exclude: "[]",
+  }), { zones: ["books"], exclude: [] });
+  assert.equal(scopeIsRestricted({ all: true }), false);
+  assert.equal(scopeIsRestricted({ all: true, exclude: ["private"] }), true);
+  assert.equal(scopeIsRestricted({ zones: ["books"] }), true);
+});
+
+test("source enumeration applies exclusions to all-zone grants", async () => {
+  const seen = [];
+  const fakeEnv = {
+    DB: {
+      prepare(sql) {
+        let binds = [];
+        return {
+          bind(...values) { binds = values; return this; },
+          async all() {
+            seen.push({ sql, binds });
+            return { results: [{ name: "books" }] };
+          },
+        };
+      },
+    },
+  };
+  assert.deepEqual(await sourcesInScope(fakeEnv, { all: true, exclude: ["private"] }), ["books"]);
+  assert.match(seen[0].sql, /WHERE zone IS NULL OR zone NOT IN \(\?\)/);
+  assert.deepEqual(seen[0].binds, ["private"]);
 });
 
 test("a grant credential resolves only while the grant is live", async () => {
