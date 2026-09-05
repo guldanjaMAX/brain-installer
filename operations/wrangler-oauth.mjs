@@ -25,6 +25,24 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, posix as posixPath, win32 as win32Path } from "node:path";
 
+/**
+ * The one wrangler the product spawns and the one it tells operators to run.
+ *
+ * Pinned because wrangler 4.129 (npm "latest" as of 2026-09-04) stores the
+ * browser sign-in in an encrypted default.enc with the key in the OS keyring,
+ * and this module reads default.toml. Unpinned, `npx wrangler@4` resolves to
+ * 4.129 on every machine, so: the mid-run session renewal below re-reads a file
+ * that was never rewritten and returns null; the CLI refuses to start in the
+ * last five minutes of every session hour; and `brain doctor` reports "not
+ * signed in" against a valid session and prints a login command that writes
+ * the unreadable format. Two client installs lost time to this on 2026-09-04.
+ *
+ * Lift the pin only when this module reads the encrypted store. The test
+ * test/wrangler-spec-pinned.test.mjs fails on any bare "wrangler@4" in product
+ * code so the pin cannot silently drift back out.
+ */
+export const WRANGLER_SPEC = "wrangler@4.73.0";
+
 /** Every place wrangler is known to keep its config, newest layout first. */
 export function wranglerConfigCandidates(env = process.env, platform = process.platform) {
   const home = env.HOME || env.USERPROFILE || homedir();
@@ -85,7 +103,7 @@ export function refreshWranglerSession(options = {}) {
   const env = { ...(options.env ?? process.env) };
   delete env.CLOUDFLARE_API_TOKEN;
   delete env.CLOUDFLARE_API_KEY;
-  const result = run("npx", ["wrangler@4", "whoami"], {
+  const result = run("npx", [WRANGLER_SPEC, "whoami"], {
     encoding: "utf8",
     timeout: options.timeoutMs ?? 120_000,
     env,

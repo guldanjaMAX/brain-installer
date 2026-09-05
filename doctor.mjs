@@ -17,6 +17,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { WRANGLER_SPEC } from "./operations/wrangler-oauth.mjs";
 import { existsSync } from "node:fs";
 import { platform } from "node:os";
 import { tokenStorageStatus, verifyTokenStorageReadable } from "./connectors/google-auth.mjs";
@@ -54,7 +55,7 @@ export const CF_PLAN_NOTE =
 export const VECTORIZE_REMEDY =
   "  Recreate the account-scoped token with Vectorize: Edit. That is the standard\n" +
   "  path and has been verified for index and metadata-index creation.\n" +
-  "  Temporary fallback: run `npx wrangler@4 login` in the account owner's browser.\n" +
+  "  Temporary fallback: run `npx " + WRANGLER_SPEC + " login` in the account owner's browser.\n" +
   "  Provision can use that session for Vectorize while the API token drives the\n" +
   "  remaining steps.\n" +
   CF_PLAN_NOTE;
@@ -220,7 +221,7 @@ export function checkNode() {
 }
 
 export function checkWrangler(runCommand = run) {
-  const r = runCommand("npx", ["wrangler@4", "--version"], {
+  const r = runCommand("npx", [WRANGLER_SPEC, "--version"], {
     timeout: 120_000,
     inheritEnv: false,
     env: localToolEnvironment(),
@@ -233,7 +234,7 @@ export function checkWrangler(runCommand = run) {
     "wrangler",
     FAIL,
     r.ok && version ? `returned ${version[0]}, but major version 4 is required` : "could not be run",
-    "wrangler is fetched on demand by npx, so this usually means no network or a blocked npm registry.\n  Test with: npx wrangler@4 --version"
+    "wrangler is fetched on demand by npx, so this usually means no network or a blocked npm registry.\n  Test with: npx " + WRANGLER_SPEC + " --version"
   );
 }
 
@@ -256,7 +257,7 @@ function cfEnv(accountId) {
 
 export function checkWranglerLogin(accountId) {
   const env = cfEnv(accountId);
-  const r = run("npx", ["wrangler@4", "whoami"], {
+  const r = run("npx", [WRANGLER_SPEC, "whoami"], {
     timeout: 120_000,
     inheritEnv: false,
     env,
@@ -270,7 +271,7 @@ export function checkWranglerLogin(accountId) {
     "wrangler login",
     WARN,
     "not signed in",
-    "Run: npx wrangler@4 login\n" +
+    "Run: npx " + WRANGLER_SPEC + " login\n" +
       "  This opens the browser and the session belongs to whoever signs in.\n" +
       "  This is only a fallback when the scoped API token cannot reach Vectorize."
   );
@@ -433,7 +434,7 @@ export function checkPrioritySlice(manifest) {
 
 export function checkVectorize(accountId) {
   const env = cfEnv(accountId);
-  const r = run("npx", ["wrangler@4", "vectorize", "list"], {
+  const r = run("npx", [WRANGLER_SPEC, "vectorize", "list"], {
     timeout: 120_000,
     inheritEnv: false,
     env,
