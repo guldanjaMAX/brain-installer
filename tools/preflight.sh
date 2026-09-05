@@ -4,8 +4,8 @@
 ok(){ printf "  ok    %s\n" "$1"; }
 warn(){ printf "  WARN  %s\n" "$1"; WARNED=$((WARNED+1)); }
 stop(){ printf "  STOP  %s\n" "$1"; STOPPED=$((STOPPED+1)); }
-WARNED=0; STOPPED=0
-echo "Financial Brain preflight  ·  $(date '+%Y-%m-%d %H:%M')"
+WARNED=0; STOPPED=0; FRESH=0; NOMANIFEST=0
+echo "Financial Brain preflight  -  $(date '+%Y-%m-%d %H:%M')"
 echo
 
 echo "MACHINE"
@@ -22,7 +22,7 @@ echo "THE BRAIN CLI"
 COPIES=$(command -v -a brain 2>/dev/null | sort -u)
 N=$(printf "%s" "$COPIES" | grep -c . )
 if [ "$N" -eq 0 ]; then
-  warn "no 'brain' on PATH (fine before a first install; call it by full path otherwise)"
+  FRESH=1; warn "no 'brain' on PATH (fine before a first install; call it by full path otherwise)"
 elif [ "$N" -eq 1 ]; then
   ok "resolves to $COPIES"
 else
@@ -69,7 +69,7 @@ echo
 echo "MANIFESTS"
 MF=$(find "$HOME" -maxdepth 4 -name brain.manifest.json -not -path "*/node_modules/*" -not -path "*/templates/*" -not -path "*/.*/*" 2>/dev/null)
 MN=$(printf "%s" "$MF" | grep -c .)
-if [ "$MN" -eq 0 ]; then ok "no manifest yet (expected before a first install)"
+if [ "$MN" -eq 0 ]; then NOMANIFEST=1; ok "no manifest yet (expected before a first install)"
 elif [ "$MN" -eq 1 ]; then
   ok "one manifest: $MF"
   DOM=$(grep -o '"domain": *"[^"]*"' "$MF" 2>/dev/null | head -1 | cut -d'"' -f4)
@@ -90,6 +90,10 @@ else
 fi
 echo
 echo "-----"
-if [ "$STOPPED" -gt 0 ]; then printf "%d STOP, %d WARN. Clear the STOP lines before starting.\n" "$STOPPED" "$WARNED"; exit 1;
-elif [ "$WARNED" -gt 0 ]; then printf "0 STOP, %d WARN. Read them, then carry on.\n" "$WARNED"; exit 0;
+if [ "$STOPPED" -gt 0 ]; then printf "%d thing(s) will stop the install, and %d worth knowing.\nClear the STOP lines first. Each one says what to do.\n" "$STOPPED" "$WARNED"; exit 1;
+elif [ "$WARNED" -gt 0 ]; then
+  if [ "$FRESH" = 1 ] && [ "$NOMANIFEST" = 1 ]; then
+    printf "Nothing is wrong here. This is a machine before its first install,\nand every line above says so. Go ahead and start.\n";
+  else printf "%d thing(s) to be aware of, none of them blocking. Read them, then carry on.\n" "$WARNED"; fi
+  exit 0;
 else echo "All clear."; exit 0; fi

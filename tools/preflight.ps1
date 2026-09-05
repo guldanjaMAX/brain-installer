@@ -1,10 +1,10 @@
 # Financial Brain preflight (Windows). Reads the machine, changes nothing.
-$script:Warned = 0; $script:Stopped = 0
+$script:Warned = 0; $script:Stopped = 0; $script:Fresh = $false; $script:NoManifest = $false
 function Ok  ($m){ Write-Host "  ok    $m" }
 function Warn($m){ Write-Host "  WARN  $m"; $script:Warned++ }
 function Stop_($m){ Write-Host "  STOP  $m"; $script:Stopped++ }
 
-Write-Host "Financial Brain preflight  ·  $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+Write-Host "Financial Brain preflight  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
 Write-Host ""
 
 Write-Host "MACHINE"
@@ -38,7 +38,7 @@ foreach ($n in @('brain','brain.cmd')) {
   if ($c) { $copies += ($c | ForEach-Object { $_.Source }) }
 }
 $copies = $copies | Where-Object { $_ } | Sort-Object -Unique
-if ($copies.Count -eq 0) { Warn "no 'brain' on PATH (fine before a first install; call it by full path otherwise)" }
+if ($copies.Count -eq 0) { $script:Fresh = $true; Warn "no 'brain' on PATH (fine before a first install; call it by full path otherwise)" }
 elseif ($copies.Count -eq 1) { Ok "resolves to $($copies[0])" }
 else {
   Stop_ "$($copies.Count) copies of the CLI are visible; the first wins and it may not be the one you updated"
@@ -78,7 +78,7 @@ Write-Host ""
 Write-Host "MANIFESTS"
 $mf = @(Get-ChildItem -Path $HOME -Recurse -Depth 4 -Filter brain.manifest.json -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch 'node_modules|templates' })
-if ($mf.Count -eq 0) { Ok "no manifest yet (expected before a first install)" }
+if ($mf.Count -eq 0) { $script:NoManifest = $true; Ok "no manifest yet (expected before a first install)" }
 elseif ($mf.Count -eq 1) {
   Ok "one manifest: $($mf[0].FullName)"
   try {
@@ -97,6 +97,14 @@ elseif ($mf.Count -eq 1) {
 }
 Write-Host ""
 Write-Host "-----"
-if ($script:Stopped -gt 0) { Write-Host "$($script:Stopped) STOP, $($script:Warned) WARN. Clear the STOP lines before starting."; exit 1 }
-elseif ($script:Warned -gt 0) { Write-Host "0 STOP, $($script:Warned) WARN. Read them, then carry on."; exit 0 }
+if ($script:Stopped -gt 0) { Write-Host "$($script:Stopped) thing(s) will stop the install, and $($script:Warned) worth knowing."; Write-Host "Clear the STOP lines first. Each one says what to do."; exit 1 }
+elseif ($script:Warned -gt 0) {
+  if ($script:Fresh -and $script:NoManifest) {
+    Write-Host "Nothing is wrong here. This is a machine before its first install,"
+    Write-Host "and every line above says so. Go ahead and start."
+  } else {
+    Write-Host "$($script:Warned) thing(s) to be aware of, none of them blocking. Read them, then carry on."
+  }
+  exit 0
+}
 else { Write-Host "All clear."; exit 0 }
