@@ -1,0 +1,27 @@
+name: preflight-smoke
+on:
+  push:
+    branches: [ci/preflight-windows]
+  workflow_dispatch:
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: preflight on a clean Windows machine
+        shell: powershell
+        run: |
+          .\tools\preflight.ps1
+          Write-Host "exit code: $LASTEXITCODE"
+      - name: syntax parse check
+        shell: powershell
+        run: |
+          $e=$null; $t=$null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\tools\preflight.ps1), [ref]$t, [ref]$e) | Out-Null
+          if ($e.Count -gt 0) { $e | ForEach-Object { Write-Host $_ }; exit 1 }
+          Write-Host "parsed clean, 0 syntax errors"
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tools/preflight.sh; echo "exit code: $?"
