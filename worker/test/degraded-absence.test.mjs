@@ -262,6 +262,10 @@ const unified = async (env, q = "the") => {
     emptyRetrievalDisclosure("something-new-in-2027").unavailable === true &&
       !assertsAbsence(unavailableNotice("something-new-in-2027")),
     unavailableNotice("something-new-in-2027"));
+  check("the unavailable notice states the non-empty conclusion in the right direction",
+    /This does not mean your brain is empty/.test(unavailableNotice("vector")) &&
+      !/Nothing here means your brain is empty/.test(unavailableNotice("vector")),
+    unavailableNotice("vector"));
   check("and its cause names the unknown subsystem rather than guessing",
     /reported "something-new-in-2027"/.test(degradedCause("something-new-in-2027")),
     String(degradedCause("something-new-in-2027")));
@@ -499,6 +503,17 @@ const EMPTY_DEGRADED_THINK = {
   check("/app: the confidence line does not claim confidence in an absence",
     !/Confidence nothing is recorded/.test(render.confidenceText(degradedBody)),
     render.confidenceText(degradedBody));
+
+  const rawProviderFailure = "Workers AI request failed with private upstream trace fixture-123";
+  check("/app: an older Worker's raw model error is replaced with reviewed copy",
+    render.answerText({ answer: null, answer_error: rawProviderFailure }) ===
+      render.ANSWER_ERROR_MESSAGES.unavailable &&
+      !render.answerText({ answer: null, answer_error: rawProviderFailure }).includes(rawProviderFailure),
+    render.answerText({ answer: null, answer_error: rawProviderFailure }));
+  check("/app: a reviewed model error keeps its specific recovery message",
+    render.answerText({ answer: null, answer_error: render.ANSWER_ERROR_MESSAGES.dailyLimit }) ===
+      render.ANSWER_ERROR_MESSAGES.dailyLimit,
+    render.answerText({ answer: null, answer_error: render.ANSWER_ERROR_MESSAGES.dailyLimit }));
 
   // Version skew again: a page cached from a newer worker, talking to an older
   // one that sends `degraded` but no status or notice.

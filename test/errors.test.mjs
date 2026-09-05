@@ -579,6 +579,119 @@ function ingestExitCli(scenario) {
   });
   check("an ingest batch does not retry credential or other ordinary 4xx responses",
     authCalls === 1 && authResponse.res.status === 401, `calls=${authCalls} status=${authResponse.res.status}`);
+
+  const familyPlan = [{
+    base_doc_uid: "upload:synthetic-family",
+    keep_doc_uids: ["upload:synthetic-family#part1of2", "upload:synthetic-family#part2of2"],
+  }];
+  const emptyForgetReceipt = JSON.stringify({
+    dry_run: false,
+    documents: 0,
+    chunks: 0,
+    vectors: 0,
+    targets: [],
+  });
+  let reconciliationCalls = 0;
+  const reconciliationBodies = [];
+  const reconciliationWaits = [];
+  const reconciliationRetries = [];
+  const reconciled = await mod.reconcileDocumentFamilies({
+    families: familyPlan,
+    base: "https://brain.invalid",
+    adminKey: "synthetic-admin-key",
+    timeoutMs: 5_000,
+    fetchImpl: async (_url, options) => {
+      reconciliationCalls++;
+      reconciliationBodies.push(String(options.body));
+      if (reconciliationCalls === 1) {
+        // The exact family mutation reached the server, but its response was
+        // lost. A repeat is safe and returns the now-current family as a no-op.
+        return {
+          ok: true,
+          status: 200,
+          redirected: false,
+          url: "",
+          text: async () => {
+            const error = new Error("RAW_RECONCILIATION_RESPONSE_SENTINEL");
+            error.name = "TimeoutError";
+            throw error;
+          },
+        };
+      }
+      return new Response(emptyForgetReceipt, { status: 200 });
+    },
+    sleep: async (ms) => { reconciliationWaits.push(ms); },
+    onRetry: (error) => { reconciliationRetries.push(error.message); },
+  });
+  check("a lost reconciliation response retries the same exact family plan and completes",
+    reconciled === 0 && reconciliationCalls === 2 &&
+      reconciliationBodies[0] === reconciliationBodies[1] &&
+      JSON.stringify(reconciliationWaits) === JSON.stringify([2_000]),
+    `removed=${reconciled} calls=${reconciliationCalls} waits=${JSON.stringify(reconciliationWaits)}`);
+  check("the reconciliation response timeout is translated before retry reporting",
+    reconciliationRetries.length === 1 && /timed out after 5s/.test(reconciliationRetries[0]) &&
+      !reconciliationRetries[0].includes("RAW_RECONCILIATION_RESPONSE_SENTINEL"),
+    reconciliationRetries.join(" | "));
+
+  let terminalReconciliationCalls = 0;
+  const terminalReconciliationWaits = [];
+  let terminalReconciliation = null;
+  try {
+    await mod.reconcileDocumentFamilies({
+      families: familyPlan,
+      base: "https://brain.invalid",
+      adminKey: "synthetic-admin-key",
+      timeoutMs: 7_000,
+      fetchImpl: async () => {
+        terminalReconciliationCalls++;
+        const error = new Error("RAW_RECONCILIATION_TIMEOUT_SENTINEL");
+        error.name = "TimeoutError";
+        throw error;
+      },
+      sleep: async (ms) => { terminalReconciliationWaits.push(ms); },
+      onRetry: () => {},
+    });
+  } catch (error) {
+    terminalReconciliation = error;
+  }
+  check("family reconciliation timeout retries remain bounded",
+    terminalReconciliationCalls === 3 &&
+      JSON.stringify(terminalReconciliationWaits) === JSON.stringify([2_000, 4_000]),
+    `calls=${terminalReconciliationCalls} waits=${JSON.stringify(terminalReconciliationWaits)}`);
+  check("an exhausted reconciliation retry withholds the source cursor and stays resumable",
+    /timed out after 7s/.test(terminalReconciliation?.message || "") &&
+      /cursor was not advanced/.test(terminalReconciliation?.message || "") &&
+      /Re-running the same ingest is safe/.test(terminalReconciliation?.message || "") &&
+      !String(terminalReconciliation?.message || "").includes("RAW_RECONCILIATION_TIMEOUT_SENTINEL"),
+    terminalReconciliation?.message);
+
+  let invalidReconciliationCalls = 0;
+  let invalidReconciliation = null;
+  try {
+    await mod.reconcileDocumentFamilies({
+      families: familyPlan,
+      base: "https://brain.invalid",
+      adminKey: "synthetic-admin-key",
+      fetchImpl: async () => {
+        invalidReconciliationCalls++;
+        return new Response(JSON.stringify({
+          dry_run: true,
+          documents: 0,
+          chunks: 0,
+          vectors: 0,
+          targets: [],
+        }), { status: 200 });
+      },
+      sleep: async () => { throw new Error("an invalid receipt must not retry"); },
+    });
+  } catch (error) {
+    invalidReconciliation = error;
+  }
+  check("family reconciliation still requires the exact destructive receipt",
+    invalidReconciliationCalls === 1 &&
+      /did not confirm a real deletion/.test(invalidReconciliation?.message || "") &&
+      /cursor was not advanced/.test(invalidReconciliation?.message || ""),
+    `calls=${invalidReconciliationCalls} error=${invalidReconciliation?.message}`);
 }
 {
   // A hang is worse than a failure: every network call must have a deadline.

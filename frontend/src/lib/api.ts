@@ -50,6 +50,13 @@ export function ownerError(error: unknown): { status: number | null; message: st
 export type Citation = { n: number; title: string; source?: string; ts?: string | null };
 export type Confidence = { percent: number; band: string; basis: string[] };
 export type EntityScopeEcho = { entity_slug: string | null; applied: boolean };
+export type EvidenceGate = {
+  supported?: boolean;
+  complete?: boolean;
+  partial?: boolean;
+  reason?: string;
+  error?: string;
+};
 export type Answer = {
   answer: string | null;
   answer_error?: string;
@@ -61,6 +68,7 @@ export type Answer = {
   results?: unknown[];
   confidence?: Confidence;
   citations?: Citation[];
+  evidence_gate?: EvidenceGate;
   entity_scope?: EntityScopeEcho;
   filter_not_applied?: boolean;
   retrieval_scope?: "owner" | "exact_document_ids" | string;

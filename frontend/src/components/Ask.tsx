@@ -9,6 +9,24 @@ import { FinanceScopeBar, useFinanceScope } from "./FinanceScope";
 import { scopedAnswerLabel } from "../lib/owner";
 import { scopedRetrievalConfirmed } from "../lib/security";
 
+/** Turn the Worker's evidence decision into one short sentence beside the answer. */
+export function evidenceGateNote(answer: Answer): string | null {
+  const rawReason = answer.evidence_gate?.reason;
+  if (typeof rawReason !== "string") return null;
+  const reason = rawReason.replace(/\s+/g, " ").trim().slice(0, 240);
+  if (!reason) return null;
+  const punctuated = /[.!?]$/.test(reason) ? reason : `${reason}.`;
+  if (answer.evidence_gate?.partial) return `What the records did not cover: ${punctuated}`;
+  if (answer.evidence_gate?.supported === false) return `Why no answer was shown: ${punctuated}`;
+  return `Why this answer was shown: ${punctuated}`;
+}
+
+export function EvidenceGateReason({ answer }: { answer: Answer }) {
+  const note = evidenceGateNote(answer);
+  if (!note) return null;
+  return <div className="mt-4"><TruthNote>{note}</TruthNote></div>;
+}
+
 /** How sure the brain is, and why. The basis is shown rather than summarised:
  *  a bare percentage is a number to argue with, a percentage with its reasons
  *  is something a person can actually judge. */
@@ -130,6 +148,7 @@ export function Ask() {
             </div>
           )}
           <p className="whitespace-pre-wrap leading-relaxed">{answerText(answer)}</p>
+          <EvidenceGateReason answer={answer} />
           <Trust answer={answer} />
           {!!answer.citations?.length && (
             <div className="mt-4 pt-4 border-t border-line">
@@ -232,6 +251,7 @@ export function ScopedAsk({ principal, onAccessEnded }: {
               Exact shared documents only
             </p>
             <p className="whitespace-pre-wrap leading-relaxed">{answerText(answer)}</p>
+            <EvidenceGateReason answer={answer} />
             <Trust answer={answer} />
             {!!answer.citations?.length && (
               <div className="mt-4 pt-4 border-t border-line">

@@ -6527,8 +6527,7 @@ export function validateForgetReceipt(body) {
   return body;
 }
 
-async function parseForgetResponse(res) {
-  const raw = await res.text();
+function parseForgetResponseBody(res, raw) {
   let body = null;
   try { body = JSON.parse(raw); } catch { /* validated below */ }
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${body?.error || raw.slice(0, 160) || "forget failed"}`);
@@ -6537,6 +6536,10 @@ async function parseForgetResponse(res) {
   } catch (error) {
     throw new Error(`${error.message}; received HTTP ${res.status}`);
   }
+}
+
+async function parseForgetResponse(res) {
+  return parseForgetResponseBody(res, await res.text());
 }
 
 export function assertNoPendingRemovals(result, label = "source deletion") {
@@ -6653,26 +6656,72 @@ async function applyDriveRemovals({ uids, base, adminKey, state, dryRun, label =
   return { applied, pending };
 }
 
-/** Remove obsolete oversized parts only after every replacement part landed. */
-async function reconcileDocumentFamilies({ families, base, adminKey }) {
+/**
+ * Remove obsolete oversized parts only after every replacement part landed.
+ *
+ * Repeating one exact family plan is safe: the Worker keeps every named current
+ * part and removes only stale siblings, so a committed first request whose
+ * response was lost becomes a no-op on retry. Keep this boundary local rather
+ * than making every destructive HTTP request retry automatically.
+ */
+export async function reconcileDocumentFamilies({
+  families,
+  base,
+  adminKey,
+  attempts = 3,
+  delayMs = 2_000,
+  maxDelayMs = 30_000,
+  timeoutMs = 60_000,
+  fetchImpl = fetch,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  onRetry = (_error, attempt, totalAttempts) => info(
+    `the split-document cleanup connection was interrupted. Retrying ${attempt}/${totalAttempts - 1}; ` +
+      "the exact family plan is safe to repeat."
+  ),
+}) {
   let removed = 0;
   for (let i = 0; i < families.length; i += 50) {
     const group = families.slice(i, i + 50);
-    const res = await http(`${base}/api/admin/brain/forget`, {
-      method: "POST",
-      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
-      body: JSON.stringify({ families: group, confirm: true }),
-    });
-    let out;
+    const url = `${base}/api/admin/brain/forget`;
     try {
-      out = await parseForgetResponse(res);
+      const out = await retryTransient(async () => {
+        const res = await http(url, {
+          method: "POST",
+          headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+          body: JSON.stringify({ families: group, confirm: true }),
+        }, { timeoutMs, what: "the split-document cleanup", fetchImpl });
+        let raw;
+        try {
+          raw = await res.text();
+        } catch (error) {
+          const translated = translatedHttpFailure(error, url, {
+            timeoutMs,
+            what: "the split-document cleanup response",
+          });
+          if (!res.ok && !isRetryableHttpStatus(res.status)) translated.retryable = false;
+          throw translated;
+        }
+        try {
+          return parseForgetResponseBody(res, raw);
+        } catch (error) {
+          if (isRetryableHttpStatus(res.status)) error.retryable = true;
+          throw error;
+        }
+      }, {
+        attempts,
+        delayMs,
+        maxDelayMs,
+        sleep,
+        shouldRetry: (error) => error?.retryable === true,
+        onRetry,
+      });
+      removed += Number(out.documents || 0);
     } catch (error) {
       die(
-        `Drive split-document cleanup failed (${res.status}): ${error.message}. The sync cursor was not advanced.\n` +
+        `split-document cleanup failed: ${error.message}. The sync cursor was not advanced.\n` +
         "      Re-running the same ingest is safe and will retry the cleanup."
       );
     }
-    removed += Number(out.documents || 0);
   }
   return removed;
 }

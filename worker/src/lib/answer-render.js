@@ -28,6 +28,40 @@ import { SEARCH_UNAVAILABLE, unavailableNotice } from "./retrieval-status.js";
 const GENERIC_UNAVAILABLE_NOTICE = unavailableNotice("unknown");
 
 /**
+ * Reviewed owner-facing replacements for model and provider failures.
+ *
+ * Provider errors can contain request identifiers, implementation details, or
+ * fragments copied from an upstream response. They are useful in protected
+ * diagnostics, but they are not safe answer copy and must never ride the
+ * public response into the app or CLI.
+ */
+export const ANSWER_ERROR_MESSAGES = Object.freeze({
+  notConfigured: "Answer generation is not configured yet. Ask your installer to finish setup.",
+  dailyLimit: "Answer generation has reached its daily limit. Try again after the limit resets.",
+  verificationUnavailable: "The evidence check could not verify support, so no answer was shown. Try again in a moment.",
+  unavailable: "Answer generation is unavailable right now. Try again in a moment.",
+});
+
+const REVIEWED_ANSWER_ERRORS = new Set(Object.values(ANSWER_ERROR_MESSAGES));
+
+/** Convert a caught model failure to copy that is safe on every answer surface. */
+export function answerGenerationError(error, { verification = false } = {}) {
+  if (error?.no_key) return ANSWER_ERROR_MESSAGES.notConfigured;
+  if (error?.llm_cap_exceeded) return ANSWER_ERROR_MESSAGES.dailyLimit;
+  return verification
+    ? ANSWER_ERROR_MESSAGES.verificationUnavailable
+    : ANSWER_ERROR_MESSAGES.unavailable;
+}
+
+/** Defend a newer page against an older Worker that returned a raw error. */
+export function safeAnswerErrorText(error) {
+  const candidate = typeof error === "string" ? error.trim() : "";
+  return REVIEWED_ANSWER_ERRORS.has(candidate)
+    ? candidate
+    : ANSWER_ERROR_MESSAGES.unavailable;
+}
+
+/**
  * Did the search fail to complete?
  *
  * The status field is the modern signal. The `degraded` fallback defends a
@@ -41,7 +75,7 @@ export function unavailableSearch(r) {
 
 export function answerText(r) {
   if (unavailableSearch(r)) return r.notice || GENERIC_UNAVAILABLE_NOTICE;
-  return r.answer || (r.answer_error ? "No answer: " + r.answer_error : "The documents do not answer the question.");
+  return r.answer || (r.answer_error ? safeAnswerErrorText(r.answer_error) : "The documents do not answer the question.");
 }
 
 export function confidenceText(r) {
