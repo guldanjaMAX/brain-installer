@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { WRANGLER_SPEC } from "../operations/wrangler-oauth.mjs";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -62,7 +63,7 @@ test("local tool readiness proves Claude sign-in, pinned Wrangler, and the inter
     claude_doctor: "passed",
   });
   assert.ok(calls.some((call) => call.command === "claude" && call.args.join(" ") === "auth status"));
-  assert.ok(calls.some((call) => call.command === "npx" && call.args.join(" ") === "wrangler@4 --version"));
+  assert.ok(calls.some((call) => call.command === "npx" && call.args.join(" ") === `${WRANGLER_SPEC} --version`));
   assert.ok(calls.every((call) => call.options.inheritEnv === false));
 });
 
@@ -107,7 +108,7 @@ test("setup can create an owner-only Claude workspace guide with locators but no
   assert.ok(content.startsWith(CLAUDE_WORKSPACE_MARKER));
   assert.ok(content.includes(`${JSON.stringify(safeNodePath)} ${JSON.stringify(safeBrainPath)}`));
   assert.match(content, /claude --add-dir <approved-folder>/);
-  assert.match(content, /npx wrangler@4/);
+  assert.ok(content.includes(`npx ${WRANGLER_SPEC}`), "workspace doc must name the pinned wrangler");
   assert.match(content, /normal approval prompts enabled/i);
   assert.doesNotMatch(content, /CLOUDFLARE_API_TOKEN|ADMIN_KEY|client_secret|app_password/);
   // POSIX mode bits can prove the owner-only file mode directly. Windows does

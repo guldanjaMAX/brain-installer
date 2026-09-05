@@ -5,6 +5,7 @@ import { run, localToolEnvironment, cloudflareCliEnvironment,
          checkWorkersPaidPlan, checkPrioritySlice,
          summarize, runAll, OK, WARN, FAIL } from "../doctor.mjs";
 import { readFileSync } from "node:fs";
+import { WRANGLER_SPEC } from "../operations/wrangler-oauth.mjs";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
 
@@ -41,7 +42,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   const missingTool = () => ({ ok: false, out: "not found", missing: true });
   const healthyTool = (_command, args) => ({
     ok: true,
-    out: args.includes("wrangler@4") ? "wrangler 4.34.0" :
+    out: args.includes(WRANGLER_SPEC) ? "wrangler 4.73.0" :
       args.includes("status") ? "" : "2.1.63 (Claude Code)",
   });
   check("Claude Code is a blocking owner-install requirement",
