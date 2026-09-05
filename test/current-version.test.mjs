@@ -61,7 +61,7 @@ for (const helpFlag of ["--help", "-h", "help"]) {
     encoding: "utf8",
   });
   assert.equal(helpRun.status, 0, `brain ${helpFlag} failed: ${helpRun.stderr || helpRun.stdout}`);
-  assert.match(helpRun.stdout, /brain setup/, `brain ${helpFlag} must print the full usage`);
+  assert.match(helpRun.stdout, /setup\s+\[manifest\]/, `brain ${helpFlag} must print the full usage`);
   assert.equal(helpRun.stderr, "", `brain ${helpFlag} must not emit diagnostics`);
 }
 
