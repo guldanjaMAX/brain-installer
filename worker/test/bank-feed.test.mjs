@@ -467,6 +467,58 @@ const refuses = (db, sql, params = []) => {
     accounts.accounts.length === 1 && accounts.accounts[0].coverage_status === "partial", JSON.stringify(accounts).slice(0, 250));
 }
 
+/* ============ a transaction waits for its missing account ============ */
+{
+  const db = freshDb();
+  const env = d1(db);
+  const sealed = await encryptAccessReference(env, "access-sandbox-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+  db.prepare(`INSERT INTO bank_feed_items
+    (tenant_id, item_ref, institution_label, access_ciphertext, access_iv, environment, connected_at)
+    VALUES ('primary','item-account-race','Fixture Mutual Bank',?,?,'sandbox',?)`)
+    .run(sealed.ciphertext, sealed.iv, NOW);
+
+  let includeAccount = false;
+  const provider = async (url) => {
+    const path = new URL(url).pathname;
+    const body = (value) => new Response(JSON.stringify(value), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+    if (path === "/accounts/get") {
+      return body({ accounts: includeAccount ? [{
+        account_id: "acct-late", name: "Late account", mask: "0011", type: "depository",
+        subtype: "checking", balances: { current: 100, available: 100, iso_currency_code: "USD" },
+      }] : [] });
+    }
+    if (path === "/transactions/sync") {
+      return body({
+        added: [{
+          transaction_id: "late-transaction", account_id: "acct-late", date: "2026-08-27",
+          amount: 12.34, name: "FIXTURE PURCHASE",
+        }],
+        modified: [], removed: [], next_cursor: "cursor-after-late-account", has_more: false,
+      });
+    }
+    throw new Error(`no fixture for ${path}`);
+  };
+
+  const refused = await syncItemSlice(env, "item-account-race", { fetchImpl: provider, now: NOW });
+  check("a page with a transaction for an absent account is refused",
+    refused.ok === false && refused.status === "error" && /ACCOUNT_LIST_INCOMPLETE/.test(refused.reason),
+    JSON.stringify(refused));
+  check("the refused page does not advance its durable cursor or lose the row",
+    db.prepare("SELECT cursor FROM bank_feed_items WHERE item_ref = 'item-account-race'").get().cursor === null &&
+    db.prepare("SELECT count(*) c FROM fin_transactions WHERE external_id = 'late-transaction'").get().c === 0,
+    JSON.stringify(db.prepare("SELECT cursor FROM bank_feed_items WHERE item_ref = 'item-account-race'").get()));
+
+  includeAccount = true;
+  const retried = await syncItemSlice(env, "item-account-race", { fetchImpl: provider, now: NOW });
+  check("the same page imports and advances after the account list catches up",
+    retried.ok === true &&
+    db.prepare("SELECT cursor FROM bank_feed_items WHERE item_ref = 'item-account-race'").get().cursor === "cursor-after-late-account" &&
+    db.prepare("SELECT count(*) c FROM fin_transactions WHERE external_id = 'late-transaction'").get().c === 1,
+    JSON.stringify(retried));
+}
+
 /* ============ a broken connection says so ============ */
 {
   const db = freshDb();

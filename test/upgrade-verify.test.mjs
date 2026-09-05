@@ -40,6 +40,7 @@ import {
   cmdUpgrade as cmdUpgradeWithRealQuiescence,
   commitManifestVersion,
   compareSemver,
+  assertUpgradeSourceCompatibility,
   healthProbeVerdict,
   runAcceleratedBootstrap,
   validateAcceleratedBootstrapBusyReceipt,
@@ -112,6 +113,44 @@ const cutoverBody = (v, mode, protocol = "lease-v1") => JSON.stringify({
     rendered,
   );
 }
+/* ---- with a probe, the pause ends as soon as the brain proves it is quiet ---- */
+{
+  const quiet = { leaseFree: true, inFlight: 0 };
+  const busy = { leaseFree: false, inFlight: 3 };
+  const silence = () => { const prior = console.log; console.log = () => {}; return () => { console.log = prior; }; };
+
+  let restore = silence();
+  let clock = 0;
+  const waiter = async (ms) => { clock += ms; };
+  const readings = [quiet, quiet];
+  const r1 = await waitForVectorDrainCutover(waiter, { probe: async () => readings.shift() ?? quiet, now: () => clock, pollMs: 15_000 });
+  restore();
+  check("an idle brain is released after two quiet readings, not twenty minutes",
+    r1.proven === true && r1.waitedMs === 15_000, JSON.stringify(r1));
+
+  restore = silence();
+  clock = 0;
+  const seq = [busy, busy, quiet, busy, quiet, quiet];
+  const r2 = await waitForVectorDrainCutover(waiter, { probe: async () => seq.shift() ?? quiet, now: () => clock, pollMs: 15_000 });
+  restore();
+  check("a busy brain keeps waiting and a single quiet reading does not count",
+    r2.proven === true && r2.waitedMs === 5 * 15_000, JSON.stringify(r2));
+
+  restore = silence();
+  clock = 0;
+  const r3 = await waitForVectorDrainCutover(waiter, { probe: async () => busy, now: () => clock, pollMs: 60_000 });
+  restore();
+  check("a brain that never goes quiet still gets exactly the full grace",
+    r3.proven === false && r3.waitedMs === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS, JSON.stringify(r3));
+
+  restore = silence();
+  clock = 0;
+  const r4 = await waitForVectorDrainCutover(waiter, { probe: async () => { throw new Error("D1 unavailable"); }, now: () => clock });
+  restore();
+  check("a probe that cannot read falls back to the full grace rather than shortening it",
+    r4.proven === false && r4.waitedMs === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS, JSON.stringify(r4));
+}
+
 const manifestFixture = (version = "0.1.9") => ({
   client: { slug: "fixture" },
   brain: { worker_name: "fixture-brain", version },
@@ -123,6 +162,21 @@ const manifestFixture = (version = "0.1.9") => ({
     },
   },
   retrieval: { answer_model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", rerank: false },
+});
+
+// The exact Drive shape shipped by 0.3.6: enabled, with exclusion policy, but
+// before a positive root-folder boundary existed in the manifest contract.
+const legacyDriveManifestFixture = () => ({
+  ...manifestFixture("0.3.6"),
+  corpora: {
+    google_drive: {
+      enabled: true,
+      exclude_paths: [],
+      exclude_name_parts: [],
+      exclude_file_ids: [],
+      exclude_file_ids_file: null,
+    },
+  },
 });
 
 const bootstrapReceipt = (overrides = {}) => ({
@@ -339,11 +393,63 @@ const bootstrapCompletion = () => ({
 
   let noProgressError = null;
   try {
-    const same = validateAcceleratedBootstrapReceipt(bootstrapReceipt());
+    const same = validateAcceleratedBootstrapReceipt(bootstrapReceipt({ submitted: 0, in_flight_batches: 0, queued: 2_000 }));
     validateAcceleratedBootstrapProgress(same, same);
   } catch (error) { noProgressError = error; }
   check("a building response cannot claim progress while every aggregate is unchanged",
     /without aggregate progress/.test(noProgressError?.message || ""), noProgressError?.message);
+  {
+    const busy = validateAcceleratedBootstrapReceipt(bootstrapReceipt({ submitted: 100, in_flight_batches: 1, queued: 1_900 }));
+    let busyError = null;
+    try { validateAcceleratedBootstrapProgress(busy, busy); } catch (error) { busyError = error; }
+    check("identical receipts with a batch in flight are a wait, not a stall claim", busyError === null, busyError?.message);
+  }
+  {
+    const bulk = validateAcceleratedBootstrapReceipt(bootstrapReceipt());
+    const residueRetry = validateAcceleratedBootstrapReceipt(bootstrapReceipt({
+      phase: "legacy_drain",
+      queued: 1,
+      submitted: 0,
+      in_flight_batches: 0,
+      failed: 1,
+      retrying: 1,
+    }));
+    let residueError = null;
+    try { validateAcceleratedBootstrapProgress(bulk, residueRetry); } catch (error) { residueError = error; }
+    check("a bounded residue retry can follow bulk work without a phase-regression abort",
+      residueError === null, residueError?.message);
+    const visibilityWaiting = validateAcceleratedBootstrapReceipt(bootstrapReceipt({
+      phase: "waiting",
+      confirmed: 1_000,
+      queued: 0,
+      submitted: 0,
+      remaining: 2_000,
+      in_flight_batches: 0,
+      failed: 0,
+      actual_vectors: 3_000,
+    }));
+    let visibilityError = null;
+    try { validateAcceleratedBootstrapProgress(residueRetry, visibilityWaiting); } catch (error) { visibilityError = error; }
+    check("exact row visibility may precede the verified epoch rebase",
+      visibilityError === null, visibilityError?.message);
+    const rebasedComplete = validateAcceleratedBootstrapReceipt(bootstrapReceipt({
+      phase: "complete",
+      epoch: 2,
+      confirmed: 3_000,
+      queued: 0,
+      submitted: 0,
+      remaining: 0,
+      in_flight_batches: 0,
+      failed: 0,
+      complete: true,
+      vector_ready: true,
+      actual_vectors: 3_000,
+    }));
+    let rebaseError = null;
+    try { validateAcceleratedBootstrapProgress(visibilityWaiting, rebasedComplete); } catch (error) { rebaseError = error; }
+    check("a visibility wait can finish on the next exact verified epoch",
+      rebaseError === null, rebaseError?.message);
+  }
 }
 
 /* ---- receipt transport, busy ownership, and legacy stalls are bounded ---- */
@@ -686,10 +792,63 @@ const bootstrapCompletion = () => ({
 
 /* ---- a normal upgrade reconciles provider secrets before health passes ---- */
 {
+  const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-upgrade-legacy-drive-")));
+  try {
+    const manifestPath = join(sandbox, "brain.manifest.json");
+    const cases = [
+      ["missing", legacyDriveManifestFixture()],
+      ["empty", {
+        ...legacyDriveManifestFixture(),
+        corpora: { google_drive: { ...legacyDriveManifestFixture().corpora.google_drive, root_folder_ids: [] } },
+      }],
+      ["invalid", {
+        ...legacyDriveManifestFixture(),
+        corpora: { google_drive: { ...legacyDriveManifestFixture().corpora.google_drive, root_folder_ids: ["https://drive.google.com/not-an-id"] } },
+      }],
+    ];
+    let remoteCalls = 0;
+    const remote = async () => {
+      remoteCalls++;
+      throw new Error("legacy Drive preflight reached a remote boundary");
+    };
+    const errors = [];
+    for (const [label, value] of cases) {
+      writeFileSync(manifestPath, JSON.stringify(value));
+      try {
+        await cmdUpgrade(manifestPath, {
+          resolveAccount: remote,
+          d1Query: remote,
+          cf: remote,
+          cmdMigrate: remote,
+          cmdDeploy: remote,
+          cmdHealth: remote,
+          cmdTest: remote,
+          reconcileWorkerProviderSecrets: remote,
+        });
+      } catch (error) {
+        errors.push([label, String(error?.message || error)]);
+      }
+    }
+    check("a v0.3.6 Drive manifest stops before every remote update action until valid roots are declared",
+      remoteCalls === 0 && errors.length === cases.length &&
+        errors.every(([, message]) => /corpora\.google_drive\.root_folder_ids/.test(message) &&
+          /Nothing was changed/.test(message)),
+      JSON.stringify({ remoteCalls, errors }));
+    const repaired = legacyDriveManifestFixture();
+    repaired.corpora.google_drive.root_folder_ids = ["fixture-drive-root"];
+    check("the legacy Drive upgrade preflight accepts an exact declared root",
+      assertUpgradeSourceCompatibility(repaired) === true);
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+}
+
+{
   const sandbox = realpathSync.native(mkdtempSync(join(tmpdir(), "brain-upgrade-provider-")));
   try {
     const manifestPath = join(sandbox, "brain.manifest.json");
-    const keychainManifest = manifestFixture();
+    const keychainManifest = legacyDriveManifestFixture();
+    keychainManifest.corpora.google_drive.root_folder_ids = ["fixture-drive-root"];
     keychainManifest.operations = {
       admin_key_secret: "keychain://fixture-brain-admin/owner-fixture",
     };
@@ -700,7 +859,7 @@ const bootstrapCompletion = () => ({
     const executionPaths = new Set();
     let privateExecutionPath = null;
     let privateExecutionDirectory = null;
-    let d1Version = "0.1.9";
+    let d1Version = keychainManifest.brain.version;
     await cmdUpgrade(manifestPath, {
       resolveAccount: async () => {
         accountChecks++;
@@ -748,7 +907,7 @@ const bootstrapCompletion = () => ({
             !executionBytes.includes(syntheticKeychainValue), executionBytes);
         const originalDuringUpdate = JSON.parse(readFileSync(manifestPath, "utf8"));
         check("the original synced manifest remains separately pinned during remote stages",
-          originalDuringUpdate.brain.version === "0.1.9" &&
+          originalDuringUpdate.brain.version === keychainManifest.brain.version &&
             originalDuringUpdate.operations.admin_key_secret === keychainManifest.operations.admin_key_secret,
           JSON.stringify(originalDuringUpdate));
       },
@@ -843,6 +1002,8 @@ const bootstrapCompletion = () => ({
         !readdirSync(sandbox).some((name) => name.includes(".brain-update-")),
     );
     const committedManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    check("a v0.3.6 Drive manifest completes the verified upgrade once its root is declared",
+      committedManifest.corpora.google_drive.root_folder_ids[0] === "fixture-drive-root");
     check("the original manifest commit preserves its Keychain locator without copying a credential",
       committedManifest.brain.version === RUNNING_VERSION &&
         committedManifest.operations.admin_key_secret === keychainManifest.operations.admin_key_secret &&

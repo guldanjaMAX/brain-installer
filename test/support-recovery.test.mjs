@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { supportErrorCode } from "../brain.mjs";
+import { renderCliCommands, supportErrorCode } from "../brain.mjs";
 import { SUPPORT_ERROR_CODES } from "../support-journal.mjs";
 import {
   SUPPORT_RECOVERY_CATALOG,
@@ -87,7 +87,7 @@ test("an ordinary command failure shows its stable code and recovery command", (
     const output = `${result.stdout || ""}${result.stderr || ""}`;
     assert.equal(result.status, 1);
     assert.match(output, /Issue code: CONFIG_INVALID/);
-    assert.match(output, /brain support --explain CONFIG_INVALID/);
+    assert.ok(output.includes(renderCliCommands("brain support --explain CONFIG_INVALID")), output);
     assert.doesNotMatch(output, /\bat .*\.mjs:\d+/);
   } finally {
     rmSync(isolatedHome, { recursive: true, force: true });

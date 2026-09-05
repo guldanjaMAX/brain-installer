@@ -13,6 +13,8 @@ import {
   DocumentAccessUnavailableError,
 } from "../src/lib/document-access.js";
 import { consumeEnrollmentCode } from "../src/lib/auth-store.js";
+import { hashToken } from "../src/lib/grants.js";
+import { searchKeyword } from "../src/lib/store-d1.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS = join(HERE, "..", "..", "migrations", "d1");
@@ -87,6 +89,19 @@ function insertDocument(db, id, entitySlug, text, index = 0) {
       category, top_folder, platform)
      VALUES (?, ?, 0, ?, 'drive', ?, ?, 'Acme', 'meeting', 'Clients', 'imessage')`,
   ).run(`${id}#0`, id, text, id, Date.parse("2026-08-20T00:00:00Z") + index);
+}
+
+function insertSessionPasskey(db, credentialId, grantId = null) {
+  db.prepare(
+    `INSERT INTO owner_passkeys
+       (credential_id, public_key_jwk, alg, sign_count, nickname, created_at,
+        grant_id, document_grant_id)
+     VALUES (?, '{}', -7, 0, 'Fixture session', ?, ?, ?)`,
+  ).run(
+    credentialId, Date.now(),
+    grantId && !String(grantId).startsWith("dg_") ? grantId : null,
+    grantId && String(grantId).startsWith("dg_") ? grantId : null,
+  );
 }
 
 const envFor = (db, vectorCalls = { count: 0 }) => ({
@@ -164,7 +179,10 @@ test("100 exact documents plus every public filter stay authoritative and skip u
 
   const vectorCalls = { count: 0 };
   const env = envFor(db, vectorCalls);
-  const ownerCookie = (await mintSessionCookie(env, 1, { grantId: null })).split(";")[0];
+  insertSessionPasskey(db, "fixture-owner-passkey");
+  const ownerCookie = (await mintSessionCookie(env, 1, {
+    grantId: null, credentialId: "fixture-owner-passkey",
+  })).split(";")[0];
   const created = await worker.fetch(post("/api/app/document-access/create", {
     request_id: "grant-max-boundary-0001",
     subject_label: "Contract reviewer",
@@ -193,7 +211,10 @@ test("100 exact documents plus every public filter stay authoritative and skip u
     detail: "at most 100 document_ids may be granted at once",
   });
 
-  const scopedCookie = (await mintSessionCookie(env, 1, { grantId: receipt.grant_id })).split(";")[0];
+  insertSessionPasskey(db, "fixture-scoped-passkey", receipt.grant_id);
+  const scopedCookie = (await mintSessionCookie(env, 1, {
+    grantId: receipt.grant_id, credentialId: "fixture-scoped-passkey",
+  })).split(";")[0];
   const request = {
     q: "needle",
     limit: 10,
@@ -304,7 +325,9 @@ test("revocation immediately closes reads and scoped sessions cannot reach owner
         grant_id, document_grant_id)
      VALUES (?, '{}', -7, 0, ?, ?, NULL, NULL, NULL)`,
   ).run("owner-device", "Owner device", Date.now() + 1);
-  const scopedCookie = (await mintSessionCookie(env, 1, { grantId: grant.grant_id })).split(";")[0];
+  const scopedCookie = (await mintSessionCookie(env, 1, {
+    grantId: grant.grant_id, credentialId: "scoped-device",
+  })).split(";")[0];
 
   const me = await worker.fetch(post("/api/app/me", {}, scopedCookie), env, {});
   const meBody = await me.json();
@@ -336,7 +359,9 @@ test("revocation immediately closes reads and scoped sessions cannot reach owner
 
   const allowedRead = await worker.fetch(post("/api/rag/unified", { q: "needle" }, scopedCookie), env, {});
   assert.equal(allowedRead.status, 200);
-  const ownerCookie = (await mintSessionCookie(env, 1, { grantId: null })).split(";")[0];
+  const ownerCookie = (await mintSessionCookie(env, 1, {
+    grantId: null, credentialId: "owner-device",
+  })).split(";")[0];
   const statusResponse = await worker.fetch(post("/api/app/passkeys/status", {}, ownerCookie), env, {});
   const status = await statusResponse.json();
   assert.equal(status.status, "ready");
@@ -385,4 +410,78 @@ test("revocation immediately closes reads and scoped sessions cannot reach owner
   assert.equal(inactiveBody.signed_in, false);
   assert.equal(inactiveBody.clear_session, true);
   assert.match(inactiveMe.headers.get("Set-Cookie") || "", /Max-Age=0/);
+});
+
+test("an all-except-private destroy grant cannot smuggle foreign ids beside an allowed source", async () => {
+  const db = realDb();
+  const env = envFor(db);
+  db.exec(`
+    INSERT INTO sources (name,kind,status,created_at,zone) VALUES
+      ('books','upload','ready','2026-09-05T00:00:00Z','books'),
+      ('medical','upload','ready','2026-09-05T00:00:00Z','medical');
+  `);
+  insertDocument(db, "books:allowed", null, "allowed bookkeeping record");
+  insertDocument(db, "medical:secret", null, "private medical record", 1);
+  db.exec(`
+    UPDATE documents SET source='books' WHERE doc_uid='books:allowed';
+    UPDATE chunks SET source='books' WHERE doc_uid='books:allowed';
+    UPDATE documents SET source='medical' WHERE doc_uid='medical:secret';
+    UPDATE chunks SET source='medical' WHERE doc_uid='medical:secret';
+  `);
+
+  const token = "fixture-zone-destroy-token";
+  const tokenHash = await hashToken(token);
+  db.prepare(
+    `INSERT INTO grants
+       (grant_id,display_name,relationship,capabilities,expires_at,created_at,created_by,
+        revoked_at,last_used_at,scope_include,scope_exclude)
+     VALUES ('g-books','Bookkeeper',NULL,'["destroy"]',NULL,1,'owner',NULL,NULL,
+             '{"all":true}','["medical"]')`,
+  ).run();
+  db.prepare(
+    `INSERT INTO grant_credentials (token_hash,grant_id,created_at,revoked_at)
+     VALUES (?,'g-books',1,NULL)`,
+  ).run(tokenHash);
+
+  const response = await worker.fetch(new Request(`${ORIGIN}/api/admin/brain/forget`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Admin-Key": token },
+    body: JSON.stringify({
+      source: "books",
+      doc_uids: ["medical:secret"],
+      confirm: true,
+    }),
+  }), env, {});
+
+  assert.equal(response.status, 403);
+  assert.deepEqual(
+    db.prepare("SELECT doc_uid FROM documents ORDER BY doc_uid").all().map((row) => row.doc_uid),
+    ["books:allowed", "medical:secret"],
+    "the rejected mixed selector leaves both the allowed and foreign rows intact",
+  );
+});
+
+test("all-minus scope trusts the chunk text row when the source registry disagrees", async () => {
+  const db = realDb();
+  const env = envFor(db);
+  db.exec(`
+    INSERT INTO sources (name,kind,status,created_at,zone) VALUES
+      ('public-source','upload','ready','2026-09-05T00:00:00Z','books'),
+      ('stale-private-source','upload','ready','2026-09-05T00:00:00Z','books');
+  `);
+  insertDocument(db, "public:allowed", null, "boundaryneedle public record");
+  insertDocument(db, "private:secret", null, "boundaryneedle private record", 1);
+  db.exec(`
+    UPDATE documents SET source='public-source', zone='books' WHERE doc_uid='public:allowed';
+    UPDATE chunks SET source='public-source', zone='books' WHERE doc_uid='public:allowed';
+    UPDATE documents SET source='stale-private-source', zone='private' WHERE doc_uid='private:secret';
+    UPDATE chunks SET source='stale-private-source', zone='private' WHERE doc_uid='private:secret';
+  `);
+
+  const rows = await searchKeyword(env, "boundaryneedle", {
+    limit: 10,
+    scope: { all: true, exclude: ["private"] },
+  });
+  assert.deepEqual(rows.map((row) => row.doc_uid), ["public:allowed"],
+    "the excluded chunk stays unreadable even when its source registry row is stale");
 });

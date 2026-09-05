@@ -43,7 +43,10 @@ function freshDb({ throughLedger = true } = {}) {
     for (const statement of statementsFor(file)) db.exec(statement);
   }
   db.exec(`INSERT INTO install_state (id, client_slug, product_version, installed_at)
-           VALUES (1, 'fixture', '0.0.0-test', '2020-01-01T00:00:00Z')`);
+           VALUES (1, 'fixture', '0.0.0-test', '2020-01-01T00:00:00Z');
+           INSERT INTO owner_passkeys
+             (credential_id,public_key_jwk,alg,sign_count,nickname,created_at,grant_id,document_grant_id)
+           VALUES ('fixture-owner-passkey','{}',-7,0,'Fixture owner',1,NULL,NULL)`);
   return db;
 }
 
@@ -86,7 +89,9 @@ const post = (path, body, headers = {}) => new Request(`https://brain.invalid${p
 });
 
 async function ownerHeaders(env) {
-  const cookie = await mintSessionCookie(env, 1);
+  const cookie = await mintSessionCookie(env, 1, {
+    grantId: null, credentialId: "fixture-owner-passkey",
+  });
   return { Cookie: cookie.split(";")[0], "X-Brain-App": "1" };
 }
 
@@ -226,6 +231,54 @@ const bodyOf = async (r) => await r.json();
     "16. asking for one section costs fewer queries than asking for all",
     few.n < all.n, `one=${few.n} all=${all.n}`,
   );
+}
+
+/* ----------------------------------------------- 17-19 bounded collections */
+{
+  const env = d1(freshDb());
+  const insert = env.DB.prepare(`INSERT INTO fin_obligations
+    (tenant_id, obligation_uid, entity_slug, kind, balance_minor, balance_as_of,
+     currency, personal_guarantee, personal_guarantee_state, provenance, basis_state, recorded_at)
+    VALUES ('primary', ?, 'fixture', 'loan', 100, '2026-09-05', 'USD', 0,
+            'none_found', 'owner_stated', 'confirmed', '2026-09-05T00:00:00Z')`);
+  for (let i = 1; i <= 1001; i++) await insert.bind(`fixture-${String(i).padStart(4, "0")}`).run();
+  const headers = { "X-Admin-Key": "test-admin-key" };
+
+  const defaultPage = await bodyOf(await call(env, "/api/fin/snapshot", {
+    sections: ["obligations"],
+  }, headers));
+  check("17. a default-limited snapshot reports truncation",
+    defaultPage.obligations.length === 200 && defaultPage.truncated.obligations === true &&
+    defaultPage.obligation_exposure.covers_all_obligations === false,
+    JSON.stringify({ rows: defaultPage.obligations.length, truncated: defaultPage.truncated,
+      exposure: defaultPage.obligation_exposure }));
+
+  const boundaryPage = await bodyOf(await call(env, "/api/fin/snapshot", {
+    sections: ["obligations"], limits: { obligations: 1000 },
+  }, headers));
+  check("18. the 1000-row public limit keeps its hidden sentinel",
+    boundaryPage.obligations.length === 1000 && boundaryPage.truncated.obligations === true &&
+    boundaryPage.obligation_exposure.covers_all_obligations === false,
+    JSON.stringify({ rows: boundaryPage.obligations.length, truncated: boundaryPage.truncated,
+      exposure: boundaryPage.obligation_exposure }));
+
+  const clampedPage = await bodyOf(await call(env, "/api/fin/snapshot", {
+    sections: ["obligations"], limits: { obligations: 99999 },
+  }, headers));
+  check("18b. a limit above the public maximum is clamped before the sentinel query",
+    clampedPage.obligations.length === 1000 && clampedPage.truncated.obligations === true &&
+    clampedPage.obligation_exposure.covers_all_obligations === false,
+    JSON.stringify({ rows: clampedPage.obligations.length, truncated: clampedPage.truncated,
+      exposure: clampedPage.obligation_exposure }));
+
+  const oneRow = await bodyOf(await call(env, "/api/fin/snapshot", {
+    sections: ["obligations"], limits: { obligations: 1 },
+  }, headers));
+  check("19. exposure describes the visible page, never its hidden sentinel",
+    oneRow.obligations.length === 1 && oneRow.obligation_exposure.obligations_total === 1 &&
+    oneRow.obligation_exposure.balance_minor === 100 &&
+    oneRow.obligation_exposure.obligations_with_balance === 1,
+    JSON.stringify(oneRow.obligation_exposure));
 }
 
 /* ------------------------------------------------------------- 20 headers */

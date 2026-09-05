@@ -54,6 +54,56 @@ globalThis.fetch = async (input, options = {}) => {
   }
 
   if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files") {
+    if (scenario === "drive-preview-limit") {
+      return json({
+        // Content deliberately precedes its folder metadata. The first item is
+        // outside the approved root; --limit 1 must still reach the second.
+        files: [
+          {
+            id: "fixture-outside-file",
+            name: "outside-note.txt",
+            mimeType: "text/plain",
+            size: "128",
+            createdTime: "2026-08-20T12:00:00.000Z",
+            modifiedTime: "2026-08-20T12:00:00.000Z",
+            md5Checksum: "fixture-outside-revision",
+            trashed: false,
+            parents: ["fixture-outside-folder"],
+          },
+          {
+            id: "fixture-inside-file",
+            name: "inside-note.txt",
+            mimeType: "text/plain",
+            size: "128",
+            createdTime: "2026-08-20T12:00:00.000Z",
+            modifiedTime: "2026-08-20T12:00:00.000Z",
+            md5Checksum: "fixture-inside-revision",
+            trashed: false,
+            parents: ["fixture-inside-folder"],
+          },
+          {
+            id: "fixture-inside-folder",
+            name: "Inside",
+            mimeType: "application/vnd.google-apps.folder",
+            parents: ["fixture-allowed-root"],
+          },
+          {
+            id: "fixture-outside-folder",
+            name: "Outside",
+            mimeType: "application/vnd.google-apps.folder",
+            parents: ["fixture-other-root"],
+          },
+          {
+            id: "fixture-other-root",
+            name: "Other root",
+            mimeType: "application/vnd.google-apps.folder",
+            parents: [],
+          },
+        ],
+        nextPageToken: null,
+        incompleteSearch: false,
+      });
+    }
     return json({
       files: [{
         id: "fixture-file-one",
@@ -64,7 +114,7 @@ globalThis.fetch = async (input, options = {}) => {
         modifiedTime: "2026-08-20T12:00:00.000Z",
         md5Checksum: "fixture-revision",
         trashed: false,
-        parents: [],
+        parents: ["fixture-allowed-root"],
         webViewLink: "https://drive.example/fixture-file-one",
       }],
       nextPageToken: null,
@@ -77,6 +127,22 @@ globalThis.fetch = async (input, options = {}) => {
       "This fixture note has enough ordinary prose to pass extraction quality and reach the ingest receipt boundary safely.",
       { status: 200, headers: { "content-type": "text/plain" } },
     );
+  }
+
+  if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files/fixture-inside-file") {
+    console.log("TEST_DRIVE_APPROVED_PREVIEW_DOWNLOADED");
+    return new Response(
+      "This approved fixture note has enough ordinary prose to pass extraction quality and prove the bounded preview reached it.",
+      { status: 200, headers: { "content-type": "text/plain" } },
+    );
+  }
+
+  if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files/fixture-outside-file") {
+    console.log("TEST_DRIVE_OUTSIDE_PREVIEW_DOWNLOADED");
+    return new Response("This out-of-root content must never be read.", {
+      status: 200,
+      headers: { "content-type": "text/plain" },
+    });
   }
 
   if (url.hostname === "fixture.invalid" && url.pathname === "/api/admin/brain/ingest/batch") {

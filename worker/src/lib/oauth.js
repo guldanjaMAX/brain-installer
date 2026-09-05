@@ -208,7 +208,15 @@ export async function handleAuthorizePage(env, url) {
   const brain = esc(owner
     ? (/s$/i.test(owner) ? `${owner}' brain` : `${owner}'s brain`)
     : (env.BRAIN_NAME || "your brain"));
-  const query = esc(url.search.slice(1));
+  // This value is JavaScript source inside a <script> raw-text element, not
+  // HTML text. HTML entity escaping would leave literal `&amp;` bytes in the
+  // script and rename every parameter after the first one. JSON quoting keeps
+  // the query exact; escaping `<` prevents a future raw value from ending the
+  // script element.
+  const scriptQuery = JSON.stringify(url.search.slice(1))
+    .replace(/</g, "\\u003c")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
   const page = `<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Connect ${name} to ${brain}</title>
@@ -242,7 +250,7 @@ export async function handleAuthorizePage(env, url) {
 <script>
 (() => {
   "use strict";
-  const q = "${query}";
+  const q = ${scriptQuery};
   const b64uToBytes = (s) => Uint8Array.from(atob(s.replace(/-/g,"+").replace(/_/g,"/") + "=".repeat((4 - s.length % 4) % 4)), c => c.charCodeAt(0));
   const bytesToB64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/,"");
   const api = (path, payload) => fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Brain-App": "1" }, body: JSON.stringify(payload || {}) })
@@ -346,14 +354,15 @@ export async function handleToken(env, request) {
   let row;
   try {
     row = await env.DB.prepare(
-      "SELECT client_id, redirect_uri, code_challenge, scope, expires_at, used_at FROM oauth_codes WHERE code_hash = ?",
+      `DELETE FROM oauth_codes WHERE code_hash = ?
+       RETURNING client_id, redirect_uri, code_challenge, scope, expires_at, used_at`,
     ).bind(codeHash).first();
-    // Single use, deleted on sight: a replayed code proves interception and
-    // must not stay replayable while anyone reasons about it.
-    await env.DB.prepare("DELETE FROM oauth_codes WHERE code_hash = ?").bind(codeHash).run();
   } catch (error) {
     guard(error);
   }
+  // The delete itself chooses the only winner. Invalid client, redirect, or
+  // verifier data still burns a presented code on sight, preserving the
+  // interception-safe behavior without a read/delete race.
   if (!row || row.used_at || Number(row.expires_at) <= Date.now() ||
       String(row.client_id) !== String(params.get("client_id") || "") ||
       String(row.redirect_uri) !== String(params.get("redirect_uri") || "")) {

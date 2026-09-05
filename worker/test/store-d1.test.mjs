@@ -667,6 +667,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("one chunk writes two statements", batched.length === 2, String(batched.length));
   check("chunk row is written", batched[0]._sql.includes("INSERT INTO chunks"));
   check("chunk row carries top_folder and platform", batched[0]._sql.includes("top_folder") && batched[0]._sql.includes("platform"));
+  check("chunk row inherits its authoritative document zone", /SELECT zone FROM documents/.test(batched[0]._sql));
   check("and a vector is queued", batched[1]._sql.includes("vector_outbox"));
   check("reports what it queued", out.queued === 1);
   check("empty input writes nothing", (await upsertChunks(env, [])).written === 0);
@@ -761,7 +762,8 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     batches[0].slice(1).every((statement) => statement._sql.includes("content_hash") && statement._args.includes(marker)),
     batches[0].slice(1).map((statement) => statement._sql).join("\n"));
   check("atomic chunks inherit the merged durable filter metadata",
-    /documents\.client/.test(batches[0][3]._sql) && /documents\.platform/.test(batches[0][3]._sql), batches[0][3]._sql);
+    /documents\.client/.test(batches[0][3]._sql) && /documents\.platform/.test(batches[0][3]._sql) &&
+      /documents\.zone/.test(batches[0][3]._sql), batches[0][3]._sql);
   check("atomic staging reports its exact durable and queued rows", staged.written === 1 && staged.queued === 1);
   check("trigger-amplified positive D1 change counts prove guarded revision ownership",
     [0, 3, 4].map((index) => lastBatchResults[index]?.meta?.changes).join(",") === "2,4,3");

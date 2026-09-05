@@ -44,6 +44,7 @@ import {
   DEFAULT_TENANT, ledgerInstalled, ledgerEntities, ledgerAccounts, ledgerDocuments,
   ledgerStatements, ledgerExceptions, ledgerDeadlines, ledgerOpenItems,
   ledgerReconciliations, ledgerObligations, ledgerCashPosition, ledgerUnsortedSpending,
+  summarizeObligations,
 } from "./fin-d1.js";
 
 export const FIN_PATH_PREFIX = "/api/fin/";
@@ -56,18 +57,30 @@ export const FIN_PATH_PREFIX = "/api/fin/";
 const SECTIONS = {
   entities: { read: (env, o) => ledgerEntities(env, { tenantId: o.tenantId }), pick: (r) => r.entities },
   accounts: { read: (env, o) => ledgerAccounts(env, o), pick: (r) => r.accounts },
-  documents: { read: (env, o) => ledgerDocuments(env, o), pick: (r) => r.documents },
-  statements: { read: (env, o) => ledgerStatements(env, o), pick: (r) => r.statements },
-  exceptions: { read: (env, o) => ledgerExceptions(env, o), pick: (r) => r.exceptions },
-  deadlines: { read: (env, o) => ledgerDeadlines(env, o), pick: (r) => r.deadlines },
-  open_items: { read: (env, o) => ledgerOpenItems(env, o), pick: (r) => r.open_items },
-  reconciliations: { read: (env, o) => ledgerReconciliations(env, o), pick: (r) => r.reconciliations },
-  obligations: { read: (env, o) => ledgerObligations(env, o), pick: (r) => r.obligations, extra: (r) => ({ obligation_exposure: r.exposure }) },
+  documents: { read: (env, o) => ledgerDocuments(env, o), pick: (r) => r.documents, defaultLimit: 200 },
+  statements: { read: (env, o) => ledgerStatements(env, o), pick: (r) => r.statements, defaultLimit: 200 },
+  exceptions: { read: (env, o) => ledgerExceptions(env, o), pick: (r) => r.exceptions, defaultLimit: 200 },
+  deadlines: { read: (env, o) => ledgerDeadlines(env, o), pick: (r) => r.deadlines, defaultLimit: 200 },
+  open_items: { read: (env, o) => ledgerOpenItems(env, o), pick: (r) => r.open_items, defaultLimit: 100 },
+  reconciliations: { read: (env, o) => ledgerReconciliations(env, o), pick: (r) => r.reconciliations, defaultLimit: 200 },
+  obligations: {
+    read: (env, o) => ledgerObligations(env, o),
+    pick: (r) => r.obligations,
+    defaultLimit: 200,
+    extra: (_result, rows) => ({ obligation_exposure: summarizeObligations(rows) }),
+  },
   cash: { read: (env, o) => ledgerCashPosition(env, o), pick: (r) => r, whole: true },
   unsorted_spending: { read: (env, o) => ledgerUnsortedSpending(env, o), pick: (r) => r.by_account },
 };
 
 const SECTION_NAMES = Object.keys(SECTIONS);
+const MAX_VISIBLE_ROWS = 1000;
+
+function collectionLimit(value, fallback) {
+  const asked = Number(value);
+  if (!Number.isFinite(asked) || asked <= 0) return fallback;
+  return Math.min(Math.max(1, Math.floor(asked)), MAX_VISIBLE_ROWS);
+}
 
 async function readJson(request) {
   try {
@@ -184,20 +197,20 @@ async function snapshot(env, install, body, entitySlug) {
     // Ask for one more than requested: hitting a limit is otherwise
     // indistinguishable from having exactly that many rows, and there is no
     // total or cursor anywhere in the query layer to appeal to.
-    const limit = Number(limits[name]);
-    if (Number.isFinite(limit) && limit > 0) options.limit = limit + 1;
+    const limit = spec.defaultLimit ? collectionLimit(limits[name], spec.defaultLimit) : null;
+    if (limit !== null) options.limit = limit + 1;
     return { name, spec, limit, result: await spec.read(env, options) };
   }));
 
   for (const { name, spec, limit, result } of reads) {
     if (result.unavailable) { unavailableSections.push(name); continue; }
     let rows = spec.pick(result);
-    if (Number.isFinite(limit) && limit > 0 && Array.isArray(rows)) {
+    if (limit !== null && Array.isArray(rows)) {
       truncated[name] = rows.length > limit;
       if (rows.length > limit) rows = rows.slice(0, limit);
     }
     out[name] = rows;
-    if (spec.extra) Object.assign(out, spec.extra(result));
+    if (spec.extra) Object.assign(out, spec.extra(result, rows));
     returned.push(name);
   }
 
@@ -222,8 +235,7 @@ async function snapshot(env, install, body, entitySlug) {
 }
 
 async function documents(env, install, body, entitySlug) {
-  const asked = Number(body.limit);
-  const limit = Number.isFinite(asked) && asked > 0 ? Math.min(asked, 1000) : 200;
+  const limit = collectionLimit(body.limit, 200);
   const result = await ledgerDocuments(env, {
     tenantId: DEFAULT_TENANT, entitySlug, limit: limit + 1,
   });

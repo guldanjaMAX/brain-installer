@@ -9,6 +9,11 @@ import { FinanceScopeBar, useFinanceScope } from "./FinanceScope";
 import { scopedAnswerLabel } from "../lib/owner";
 import { scopedRetrievalConfirmed } from "../lib/security";
 
+/** The answer-copy boundary is exported so privacy regressions reach rendered UI tests. */
+export function AnswerCopy({ answer }: { answer: Answer }) {
+  return <p className="whitespace-pre-wrap leading-relaxed">{answerText(answer)}</p>;
+}
+
 /** How sure the brain is, and why. The basis is shown rather than summarised:
  *  a bare percentage is a number to argue with, a percentage with its reasons
  *  is something a person can actually judge. */
@@ -129,7 +134,7 @@ export function Ask() {
               </Attention>
             </div>
           )}
-          <p className="whitespace-pre-wrap leading-relaxed">{answerText(answer)}</p>
+          <AnswerCopy answer={answer} />
           <Trust answer={answer} />
           {!!answer.citations?.length && (
             <div className="mt-4 pt-4 border-t border-line">
@@ -231,7 +236,7 @@ export function ScopedAsk({ principal, onAccessEnded }: {
             <p className="text-[12px] uppercase tracking-wider text-ink-soft font-semibold mb-3">
               Exact shared documents only
             </p>
-            <p className="whitespace-pre-wrap leading-relaxed">{answerText(answer)}</p>
+            <AnswerCopy answer={answer} />
             <Trust answer={answer} />
             {!!answer.citations?.length && (
               <div className="mt-4 pt-4 border-t border-line">

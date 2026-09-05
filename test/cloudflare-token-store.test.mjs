@@ -9,6 +9,7 @@ import {
   storedTokenReference,
 } from "../operations/cloudflare-token-store.mjs";
 import {
+  cloudflareApiRequest,
   cloudflareTokenAvailable,
   withAvailableCloudflareToken,
   withCloudflareToken,
@@ -150,6 +151,43 @@ test("without a named account the store is never consulted", async () => {
     readCloudflareToken: () => Promise.resolve(Buffer.from(TOKEN)),
   });
   assert.equal(loaded, false, "a keyless lookup could hand back the wrong account's token");
+});
+
+async function authorizationUsedBy(run) {
+  const originalFetch = globalThis.fetch;
+  let authorization = null;
+  globalThis.fetch = async (_url, options) => {
+    authorization = options?.headers?.Authorization ?? null;
+    return new Response('{"success":true,"result":{}}', {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  try {
+    await run(() => cloudflareApiRequest("/user/tokens/verify"));
+    return authorization;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+test("prompted and stored token paths send the token bytes in Authorization", async () => {
+  const prompted = await authorizationUsedBy((action) => withCloudflareToken(action, {
+    readCloudflareToken: async () => Buffer.from(TOKEN),
+  }));
+  assert.equal(prompted, `Bearer ${TOKEN}`);
+
+  const stored = await authorizationUsedBy((action) => withCloudflareToken(action, {
+    accountId: ACCOUNT,
+    loadStoredCloudflareToken: () => Buffer.from(TOKEN),
+  }));
+  assert.equal(stored, `Bearer ${TOKEN}`);
+
+  const diagnostic = await authorizationUsedBy((action) => withAvailableCloudflareToken(action, {
+    accountId: ACCOUNT,
+    loadStoredCloudflareToken: () => Buffer.from(TOKEN),
+  }));
+  assert.equal(diagnostic, `Bearer ${TOKEN}`);
 });
 
 console.log("cloudflare token store: all focused tests passed");

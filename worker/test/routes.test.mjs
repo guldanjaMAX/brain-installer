@@ -1,5 +1,6 @@
 import worker from "../src/index.js";
 import { filterSql, unsupportedFilters } from "../src/lib/store-d1.js";
+import { ANSWER_ERROR_MESSAGES } from "../src/lib/answer-render.js";
 
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + d)); if (!c) fail++; };
@@ -138,6 +139,30 @@ const call = (env, path) => {
     b.results[0].date_reliable === true && b.results[0].date_source === "fixture:event_date", JSON.stringify(b.results[0]));
   check("and its client", b.results[0].client === "Acme");
   check("a hit exposes stable document identity, not its chunk id", b.results[0].ref_key === "123" && b.results[0].chunk_uid === "meeting:123#0", JSON.stringify(b.results[0]));
+}
+
+/* Provider diagnostics may be useful inside a protected system, but the raw
+   message must never cross the JSON boundary into an owner client. */
+{
+  const rawProviderFailure = "RAW_PROVIDER_FAILURE_SENTINEL fixture-private-trace-123";
+  const { env } = mkEnv([ROW], {
+    vectorIds: ["meeting:123#0"],
+    extra: {
+      AI: {
+        run: async (model) => {
+          if (String(model).includes("bge-")) return { data: [[0.1, 0.2, 0.3]] };
+          throw new Error(rawProviderFailure);
+        },
+      },
+    },
+  });
+  const response = await call(env, "/api/rag/think?q=retainer&limit=5");
+  const body = await response.json();
+  check("think replaces raw answer-provider errors before the JSON response",
+    response.status === 200 && body.answer === null &&
+      body.answer_error === ANSWER_ERROR_MESSAGES.unavailable &&
+      !JSON.stringify(body).includes(rawProviderFailure),
+    JSON.stringify(body).slice(0, 300));
 }
 
 /* The public source-weight contract is live on D1, including an explicit zero. */
@@ -1856,6 +1881,32 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   check("paused mode rejects every corpus, outbox, and source mutation route",
     everyMutationPaused, JSON.stringify(pauseDetails));
 
+  let bankWaitUntilCalls = 0;
+  const pausedBankMutations = [
+    ["/api/bank-feed/link-token", { mode: "connect" }],
+    ["/api/bank-feed/exchange", { public_token: "must-not-reach-provider" }],
+    ["/api/bank-feed/sync", {}],
+    ["/api/bank-feed/disconnect", { item_ref: "must-not-reach-provider" }],
+  ];
+  let everyBankMutationPaused = true;
+  const bankPauseDetails = [];
+  for (const [path, body] of pausedBankMutations) {
+    const response = await worker.fetch(new Request("https://b.example" + path, {
+      method: "POST",
+      headers: { "X-Admin-Key": "k", "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }), env, {
+      waitUntil() { bankWaitUntilCalls++; },
+      passThroughOnException() {},
+    });
+    const receipt = await response.json();
+    bankPauseDetails.push({ path, status: response.status, receipt });
+    if (response.status !== 503 || receipt.paused !== true) everyBankMutationPaused = false;
+  }
+  check("paused mode rejects every bank-feed mutation before auth, provider, D1, or background work",
+    everyBankMutationPaused && bankWaitUntilCalls === 0,
+    JSON.stringify({ bankPauseDetails, bankWaitUntilCalls }));
+
   let readOnlyD1Calls = 0;
   const readOnlyEnv = {
     ...env,
@@ -1922,6 +1973,9 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
               };
             }
             if (/^SELECT count\(\*\) AS n FROM chunks/.test(sql.trim())) return { n: 0 };
+            // The paused residue probe: nothing queued before the pause, and no
+            // batch of this epoch owns an outbox row. A read, never a write.
+            if (/\) AS residue,/.test(sql)) return { residue: 0, owned: 0 };
             if (/sum\(CASE WHEN submitted_mutation_id IS NULL/.test(sql)) {
               return { n: 0, queued: 0, submitted: 0, failed: 0 };
             }
@@ -1957,12 +2011,12 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
       receipt.phase === "complete" && receipt.complete === true &&
       JSON.stringify(Object.keys(receipt).sort()) === JSON.stringify([
         "actual_vectors", "complete", "confirmed", "epoch", "expected_vectors", "failed",
-        "in_flight_batches", "phase", "protocol", "queued", "remaining", "submitted",
-        "total", "vector_ready",
+        "in_flight_batches", "phase", "protocol", "queued", "remaining", "retrying",
+        "submitted", "total", "vector_ready",
       ]),
     JSON.stringify(receipt));
-  check("an empty bootstrap performs no embedding or vector write",
-    aiCalls === 0 && vectorWrites === 0 && d1Writes === 1,
+  check("an empty bootstrap performs only lease and verified-cut D1 writes",
+    aiCalls === 0 && vectorWrites === 0 && d1Writes === 3,
     JSON.stringify({ aiCalls, vectorWrites, d1Writes }));
 
   const busyEnv = {
@@ -1991,6 +2045,9 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
               return { held: 1, schema_ready: 1, expires_at: Date.now() + 180_000 };
             }
             if (/^SELECT count\(\*\) AS n FROM chunks/.test(sql.trim())) return { n: 0 };
+            // The paused residue probe: nothing queued before the pause, and no
+            // batch of this epoch owns an outbox row. A read, never a write.
+            if (/\) AS residue,/.test(sql)) return { residue: 0, owned: 0 };
             if (/sum\(CASE WHEN submitted_mutation_id IS NULL/.test(sql)) {
               return { n: 0, queued: 0, submitted: 0, failed: 0 };
             }
@@ -2194,6 +2251,13 @@ function mkForgetEnv({ vectorThrows = false } = {}) {
   const all = scopeSql({ all: true }, "c", 1);
   check("an explicit all-zones scope is also unrestricted",
     all.clause === "" && all.params.length === 0, JSON.stringify(all));
+
+  const allMinusPrivate = scopeSql({ all: true, exclude: ["private"] }, "c", 4);
+  check("an all-zones scope keeps its exclusions at the text-reading query",
+    /c\.zone IS NOT NULL AND c\.zone NOT IN \(\?4\)/.test(allMinusPrivate.clause)
+      && allMinusPrivate.params[0] === "private"
+      && allMinusPrivate.nextParam === 5,
+    JSON.stringify(allMinusPrivate));
 
   const books = scopeSql({ zones: ["books"] }, "c", 1);
   check("a scoped principal is restricted through its source's zone",

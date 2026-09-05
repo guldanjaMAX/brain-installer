@@ -319,6 +319,15 @@ export const DRIVE_SCHEDULER_SPEC = Object.freeze({
     if (manifest?.corpora?.google_drive?.enabled !== true) {
       throw new Error("corpora.google_drive.enabled must be true before its scheduler can be installed");
     }
+    const roots = manifest?.corpora?.google_drive?.root_folder_ids;
+    if (!Array.isArray(roots) || !roots.some((value) => String(value || "").trim())) {
+      throw new Error(
+        "corpora.google_drive.root_folder_ids must name at least one allowed Drive folder before its scheduler can be installed"
+      );
+    }
+    if (roots.some((value) => !/^[A-Za-z0-9_-]+$/.test(String(value || "").trim()))) {
+      throw new Error("corpora.google_drive.root_folder_ids contains a value that is not a Google Drive folder id");
+    }
   },
   domainMissingError:
     "brain.domain is required for unattended Drive ingest because the scheduled child intentionally receives no Cloudflare deployment token",

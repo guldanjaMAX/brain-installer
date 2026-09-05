@@ -110,7 +110,7 @@ try {
     },
     brain: { version: "0.1.20", domain: "brain.acme-example.test", worker_name: "acme-brain" },
     corpora: {
-      google_drive: { enabled: true },
+      google_drive: { enabled: true, root_folder_ids: ["fixture-allowed-root"] },
       gmail: { enabled: true, oauth_secret: "secret://GMAIL_OAUTH" },
       calendar: { enabled: true, oauth_secret: "secret://GCAL_OAUTH" },
       upload: { enabled: true },
@@ -197,9 +197,12 @@ try {
   const DRIVE_FILE = {
     id: "drive-rehearsal-01", name: "2026 Client Services Agreement.txt", mimeType: "text/plain", size: "500",
     createdTime: "2026-01-05T00:00:00Z", webViewLink: "https://drive.acme-example.test/drive-rehearsal-01",
+    parents: ["fixture-allowed-root"],
   };
   const DRIVE_BODY = "The services agreement renews automatically each January unless either party gives thirty days notice. The current monthly rate is locked through the end of the year.";
-  const driveResult = await driveToEnvelope(async () => "at-drive-1", DRIVE_FILE, {}, {
+  const driveResult = await driveToEnvelope(async () => "at-drive-1", DRIVE_FILE, {
+    rootFolderIds: ["fixture-allowed-root"], folders: {},
+  }, {
     fetchImpl: async () => driveBytes(DRIVE_BODY), sleep: async () => {},
   });
   check("connect Drive: the real toEnvelope() turned a scripted Drive file into an envelope",

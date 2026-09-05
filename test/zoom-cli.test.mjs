@@ -21,7 +21,7 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { cmdConnectZoom, cmdDisconnectZoom } from "../brain.mjs";
+import { cmdConnectZoom, cmdDisconnectZoom, renderCliCommands } from "../brain.mjs";
 import * as zoomConnector from "../connectors/zoom.mjs";
 import { handleZoomWebhook } from "../worker/src/lib/zoom.js";
 
@@ -327,7 +327,7 @@ try {
     check("it names the Zoom-side step it cannot do for the client",
       /marketplace\.zoom\.us/.test(output) && /Remove the Event Subscription/.test(output));
     check("and points at forget for the transcripts already loaded",
-      /brain forget .* --source zoom/.test(output));
+      output.includes(renderCliCommands(`brain forget ${manifestPath} --source zoom`)));
     check("the result reports what it removed", result?.removed?.length === 4);
   }
   {

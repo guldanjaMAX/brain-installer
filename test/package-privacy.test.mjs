@@ -42,7 +42,7 @@ import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -137,6 +137,11 @@ const RULES = [
     sha: "68d85a0a124d90d9eea4b9e3b436db429c8223911d52076d70aef4b78d9686c5" },
   { label: "family member first name", mode: "word", cs: false, words: 1, len: 6, fnv: 995860805,
     sha: "b675f2f6f1f675bb7be2e6694f55af82c76d063fcdf8c4606839d32bf505ef23" },
+  // A client's BUSINESS name. It sat in a test fixture from v0.2.3 through
+  // v0.3.3 and this scanner passed every time, because the vocabulary was
+  // people: first names and surnames. A company name is an identity too.
+  { label: "client business name", mode: "word", cs: false, words: 2, len: 12, fnv: 3350984447,
+    sha: "01fad92f4806db6af9ba16fef1c4b985c57fb629c5c0552e56c1deb735be30c7" },
   // Real infrastructure ids that were committed to this repo as fixtures and
   // have since been replaced by same-shape synthetic values.
   { label: "cloudflare account id", mode: "any", cs: false, words: 1, len: 32, fnv: 3998430869,
@@ -472,6 +477,8 @@ const expected = [
   "support-journal.mjs",
   "support-recovery.mjs",
   "templates/brain.manifest.json",
+  "tools/preflight.ps1",
+  "tools/preflight.sh",
   "worker/src/index.js",
   "worker/src/lib/answer-render.js",
   "worker/src/lib/app-assets.js",
@@ -523,6 +530,7 @@ const dependencyMismatch = SCAN_ONLY ? [] : [...reviewedBundles].filter(([name, 
   !files.includes(`node_modules/${name}/package.json`)
 );
 const requiredGitIgnored = [
+  "node_modules",
   ".brain-admin-key",
   ".brain-admin-key.tmp-deadbeef",
   ".brain-curated-sync-plan.json",
@@ -549,6 +557,7 @@ const gitIgnoreFailures = requiredGitIgnored.filter((path) =>
 const tracked = spawnSync("git", ["ls-files", "-z"], { cwd: ROOT, encoding: "utf-8", maxBuffer: 64 * 1024 * 1024 });
 const trackedFiles = tracked.status === 0 ? tracked.stdout.split("\0").filter(Boolean) : [];
 const trackedEnumerationFailed = tracked.status !== 0 || trackedFiles.length === 0;
+const trackedRootNodeModules = trackedFiles.includes("node_modules");
 
 // "Is this text?" instead of "is this one of the extensions somebody thought
 // of?". The extension allowlist this replaces missed 27 tracked fixtures -
@@ -575,9 +584,21 @@ const privateTextMatches = [];
 const privatePathMatches = [];
 for (const path of privateScanPaths) {
   for (const label of scanPath(path)) privatePathMatches.push(`${path} (path names: ${label})`);
+  const absolutePath = resolve(ROOT, path);
+  try {
+    if (lstatSync(absolutePath).isSymbolicLink()) {
+      const target = readlinkSync(absolutePath);
+      for (const label of scanText(target, index)) {
+        privateTextMatches.push(`${path} (symbolic-link target: ${label})`);
+      }
+      continue;
+    }
+  } catch {
+    continue; // listed in `expected` but not on disk: `missing` already reports it
+  }
   let buffer;
   try {
-    buffer = readFileSync(resolve(ROOT, path));
+    buffer = readFileSync(absolutePath);
   } catch {
     continue; // listed in `expected` but not on disk: `missing` already reports it
   }
@@ -655,7 +676,7 @@ if (packageProbeDirectory) try {
 
 if (packed.status !== 0 || (!SCAN_ONLY && !files.length) || forbidden.length || missing.length || unexpected.length ||
     bundleConfigMismatch || dependencyMismatch.length || gitIgnoreFailures.length ||
-    canaryFailures.length || trackedEnumerationFailed ||
+    canaryFailures.length || trackedEnumerationFailed || trackedRootNodeModules ||
     privateTextMatches.length || privatePathMatches.length ||
     packedAdapterImportFailed) {
   console.error("FAIL  published package privacy allowlist");
@@ -670,6 +691,9 @@ if (packed.status !== 0 || (!SCAN_ONLY && !files.length) || forbidden.length || 
   }
   if (trackedEnumerationFailed) {
     console.error(`git ls-files returned no tracked files, so nothing was scanned: ${String(tracked.stderr || "").trim()}`);
+  }
+  if (trackedRootNodeModules) {
+    console.error("the repository root node_modules entry is tracked; it must remain local and ignored");
   }
   if (forbidden.length) console.error(`private paths would ship: ${forbidden.join(", ")}`);
   if (missing.length) console.error(`required product paths are missing: ${missing.join(", ")}`);

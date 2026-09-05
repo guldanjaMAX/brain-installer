@@ -35,6 +35,20 @@ for (const [n, t] of [
   ["notion", "ntn_1234567890abcdefghijklmnopqrstuvwxyzABCDEF"],
 ]) chk("refuse: " + n, scan(t).verdict === CONFIRMED, JSON.stringify(scan(t).labels));
 
+for (const [n, t, label] of [
+  ["labelled SSN", "Employee record | SSN: 123-45-6789", "us_social_security_number"],
+  ["compact labelled SSN", "Social Security number 123456789", "us_social_security_number"],
+  ["line-broken labelled SSN", "Social Security number\n123-45-6789", "us_social_security_number"],
+  ["W-9 taxpayer ID in SSN format", "W-9 Taxpayer identification number: 123-45-6789", "us_social_security_number"],
+  ["labelled EIN", "W-9 Employer Identification Number: 12-3456789", "us_employer_identification_number"],
+]) {
+  const result = scan(t);
+  chk("refuse private identifier: " + n,
+    result.verdict === CONFIRMED && result.labels.includes(label), JSON.stringify(result.labels));
+  chk("private identifier preview never carries its digits",
+    !JSON.stringify(result.findings).includes(t.match(/\d[\d-]{7,}/)?.[0] || "fixture-missing"), JSON.stringify(result.findings));
+}
+
 // Must stay CLEAN.
 for (const [n, t] of [
   ["cf account id", "Cloudflare Account ID: 0123456789abcdef0123456789abcdef"],
@@ -47,6 +61,8 @@ for (const [n, t] of [
   ["underscore words", "the share_link and signature_block and picture_frame"],
   ["prose", "Priya Nair flagged the spring workshop needs a waitlist first."],
   ["stripe product", "Starter Plan | prod_Sy7Fixture0Abc | $19"],
+  ["unlabelled order number", "Order 123-45-6789 shipped Friday"],
+  ["impossible SSN placeholder", "SSN: 000-00-0000"],
 ]) chk("clean: " + n, scan(t).verdict === CLEAN, JSON.stringify(scan(t).labels));
 
 // lastIndex reuse: global regexes must not skip on repeat calls.
@@ -60,6 +76,8 @@ const r = redact("k=re_2QKY3kyq_AbCdEfGhIjKlMnOpQrStUvWx done");
 chk("redact removes", !r.includes("2QKY3kyq"), r);
 chk("redact labels", r.includes("[REDACTED:"), r);
 chk("redact keeps public id", redact("zone abcdef0123456789abcdef0123456789") === "zone abcdef0123456789abcdef0123456789");
+chk("redact removes a labelled SSN",
+  redact("SSN: 123-45-6789") === "SSN: [REDACTED:us_social_security_number]");
 chk("preview never leaks", !JSON.stringify(scan(s).findings).includes("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"));
 chk("empty", scan("").verdict === CLEAN);
 chk("null", scan(null).verdict === CLEAN);
@@ -136,7 +154,24 @@ chk("useful billing prose survives envelope sanitization",
   sensitiveEnvelope.content.includes("Billing is active.") && sensitiveEnvelope.content.includes("Follow up Friday."));
 chk("sanitized capability markers are clean to the refusal scanner",
   scanEnvelope(sensitiveEnvelope).verdict === CLEAN);
-chk("capability-link safety advances the durable gate version", GATE_VERSION === 4, String(GATE_VERSION));
+chk("admin-key safety advances the durable gate version", GATE_VERSION === 6, String(GATE_VERSION));
 
-console.log(fail ? `\n${fail} FAILURES` : "\nsecret-scan v4 (js): all tests passed");
+// Generated admin keys are 64 lowercase hex characters. The old identifier
+// and placeholder heuristics missed those beginning with a-f.
+{
+  const tail = "3f9b2c8e1d7a4b6c5e0f8a2d9c7b1e4f3a6d8b0c2e5f7a9b1d3c6e8f0a2b4c6";
+  for (const first of ["a", "b", "c", "d", "e", "f"]) {
+    const result = scan(`admin_key: ${first}${tail}`);
+    chk(`a 64-hex admin key starting with ${first} is caught`,
+      result.verdict === CONFIRMED, result.verdict);
+  }
+  chk("an underscored placeholder remains clean",
+    scan("admin_key: your_key_goes_here_1234").verdict === CLEAN);
+  chk("a hyphenated placeholder remains clean",
+    scan("api_key: example-token-abcdefghij").verdict === CLEAN);
+  chk("a camelCase identifier remains clean",
+    scan("api_key: someLongVariableNameHere").verdict === CLEAN);
+}
+
+console.log(fail ? `\n${fail} FAILURES` : "\nsecret-scan v6 (js): all tests passed");
 process.exit(fail ? 1 : 0);

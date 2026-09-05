@@ -27,7 +27,10 @@ You are not going to watch me type into a terminal. You are going to read a repo
 
 ## 0:00, what you are looking at
 
-Your brain runs inside accounts you own. It read the material you pointed it at and nothing else. I hold no copy of any of it.
+Your brain runs inside accounts you own. It downloaded and ingested content only
+from the folders you approved. Google's read-only permission can enumerate
+metadata across the connected Drive; I hold no copy of either the content or
+that metadata.
 
 You will see one report. Everything in it was produced by running live checks against your own infrastructure, and you can produce the same report yourself at any time, including after today.
 

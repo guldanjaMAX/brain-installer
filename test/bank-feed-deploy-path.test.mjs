@@ -16,7 +16,10 @@ const nameOf = (bindings) => new Set(bindings.map((b) => b.name));
 const valueOf = (bindings, name) => bindings.find((b) => b.name === name)?.text;
 
 // A brain that does not use the feed carries no bank configuration at all.
-const off = workerBindings({ ...base, corpora: { google_drive: { enabled: true } } }, cfg);
+const off = workerBindings({
+  ...base,
+  corpora: { google_drive: { enabled: true, root_folder_ids: ["fixture-allowed-root"] } },
+}, cfg);
 for (const n of [...nameOf(off)]) {
   assert.ok(!n.startsWith("BANK_FEED_"), `a disabled feed must emit no ${n}`);
 }

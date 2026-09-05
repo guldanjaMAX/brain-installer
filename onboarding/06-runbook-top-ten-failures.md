@@ -19,11 +19,14 @@ Written so you can fix it yourself. Every entry has what you see, why it happens
 
 The installer reads the brain admin key from its durable local storage. Keep
 `.brain-admin-key` in that storage rather than copying it into your shell. On Windows that file is a DPAPI
-CurrentUser ciphertext envelope, not the key itself. A Cloudflare token is
-needed only for account-changing commands such as verify, provision, deploy,
-and secrets. The supported `brain setup` and `brain update` paths ask for it in
-a hidden terminal prompt. Low-level automation uses an approved secret manager,
-so the token or key stays out of shell commands and history.
+CurrentUser ciphertext envelope, not the key itself. A Cloudflare control-plane
+credential is needed only for account-changing commands such as verify,
+provision, deploy, and secrets. A scoped token deliberately injected by an
+approved launcher has first priority. Otherwise the supported `brain setup` and
+`brain update` paths announce and use an existing pinned Wrangler 4.73.0
+session. If neither is available, they ask for a scoped token in a hidden
+terminal prompt. Prefer the scoped token when least-privilege access is
+appropriate, and keep every token or key out of command arguments and history.
 
 When the installer prints an issue code, start with its short recovery guide:
 
@@ -107,10 +110,12 @@ brain setup <manifest>
 brain health <manifest>
 ```
 
-`brain setup` prompts for the Cloudflare token without echo, reuses the
-manifest's verified durable admin key, and applies that durable value to the
-Worker. Keeping the key change inside `brain setup` preserves the local and
-Worker verification as one step.
+`brain setup` announces the Cloudflare credential it uses: a scoped token
+deliberately supplied by an approved launcher has first priority, followed by an
+existing pinned Wrangler 4.73.0 session. If neither is available, setup asks for
+the scoped token without echo. It then reuses the manifest's verified durable
+admin key and applies that durable value to the Worker. Keeping the key change
+inside `brain setup` preserves the local and Worker verification as one step.
 
 If the remote update fails, the durable value stays as the desired state.
 Rerun `brain setup <manifest>` and it will apply that same durable value again.
@@ -176,25 +181,30 @@ node brain.mjs health <manifest>
 **You see:**
 
 ```
-the manifest declares account 1a2b3c..., but this token can only see:
+the manifest declares account 1a2b3c..., but this Cloudflare credential can only see:
         4d5e6f...  Some Other Account
 Refusing to provision into a different account than the manifest names.
 ```
 
-Or, when the token can see several:
+Or, when the Cloudflare credential can see several:
 
 ```
-this token can see more than one account and the manifest does not say which:
+this Cloudflare credential can see more than one account and the manifest does not say which:
 ```
 
-**Why:** the token in your shell belongs to a different Cloudflare account than the one your brain lives in. This is the one mistake with no clean undo, so the tool stops rather than guessing.
+**Why:** the active Cloudflare credential belongs to a different account than the one your brain lives in. This is the one mistake with no clean undo, so the tool stops rather than guessing.
 
-**Fix:** issue a token from the correct account, or, if the account ID in the manifest is genuinely wrong, correct that instead.
+**Fix:** deliberately supply a least-privilege scoped token from the correct
+account through an approved launcher, or sign the pinned Wrangler 4.73.0 session
+into the correct account. If the account ID in the manifest is genuinely wrong,
+correct that instead.
 
 Run `brain setup <manifest>` or `brain update <manifest>` in an interactive
-terminal and enter the replacement token at the hidden prompt. If you need the
-low-level `verify` command by itself, use an approved secret-manager-backed
-launcher so the token stays out of shell commands and history.
+terminal. The command announces an explicitly supplied launcher token first,
+otherwise an existing Wrangler session, and asks for the scoped token in a
+hidden prompt only when neither is available. If you need the low-level `verify`
+command by itself, use an approved secret-manager-backed launcher so the token
+stays out of shell commands and history.
 
 Keep the account line in the manifest. Deleting it would remove the guard that
 caught the mismatch rather than resolve which account is intended.
@@ -244,10 +254,12 @@ brain setup <manifest>
 brain health <manifest>
 ```
 
-Setup prompts for the Cloudflare token without echo and reuses the durable
-admin key. If that durable copy is missing or is not the intended value, stop
-and use the installer/operator's approved no-history credential launcher with
-`brain secrets`, keeping the admin key out of shell commands and history.
+Setup announces a scoped token deliberately supplied by an approved launcher
+first, otherwise an existing pinned Wrangler 4.73.0 session. If neither is
+available, it asks for the scoped token without echo. It reuses the durable admin
+key. If that durable copy is missing or is not the intended value, stop and use
+the installer/operator's approved no-history credential launcher with `brain
+secrets`, keeping the admin key out of shell commands and history.
 
 **Prevention:** deploy with `node brain.mjs deploy`. That is what it is for.
 
@@ -461,7 +473,10 @@ First look at what changed. This reads and prints, and changes nothing:
 node brain.mjs doctor <manifest> --repair-checksum
 ```
 
-It reads your database, so like `brain setup` and `brain update` it asks for the Cloudflare token at a hidden prompt, or reuses the one this machine already remembers.
+It reads your database, so it uses the same announced credential ladder as
+`brain setup` and `brain update`: a scoped token deliberately supplied by an
+approved launcher, otherwise an existing pinned Wrangler 4.73.0 session, and
+otherwise a scoped token entered at the hidden prompt.
 
 For every migration that no longer matches, it prints when it was applied, both checksums, the current file's size in lines and bytes, and whether the difference is only line endings. That last line is a proof rather than a guess: it converts the current file to LF and to CRLF and checks each against the recorded checksum. If neither reproduces it, it says `not confirmable as a pure line-ending change` and tells you to review the file by hand, because the bytes that originally ran were never kept, only their checksum was.
 

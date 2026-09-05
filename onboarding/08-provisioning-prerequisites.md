@@ -17,7 +17,7 @@ account alone.
 | 2 | Node.js 22 or newer | 5 min | Runs the Brain CLI and the pinned Wrangler 4 command |
 | 3 | A Cloudflare account | 5 min | Everything lives here. Theirs, not ours |
 | 4 | **Workers Paid plan on it** | 2 min | 5 USD/month minimum. The Free plan is prototype-scale, not a supported production home for a real corpus |
-| 5 | An account-scoped, expiring API token | 5 min | One token drives every Cloudflare step |
+| 5 | Cloudflare control-plane access | 5 min | An existing account-wide Wrangler session or a narrower expiring API token drives the Cloudflare steps |
 
 No Supabase, database password, or separate answer-model API key is required.
 The Claude account is for the owner's Claude Code client, not for Worker answers.
@@ -65,10 +65,18 @@ Current limits:
 
 ---
 
-## Credential: one scoped API token
+## Cloudflare credential
 
-The client issues a token at dash.cloudflare.com, My Profile, API Tokens,
-Create Token, Custom token, with exactly these permissions:
+An approved automation launcher can explicitly inject a scoped token into the
+process, and that choice has first priority. Without one, setup looks for a
+pinned `wrangler login` session on this computer. If it finds one, it announces
+that choice and uses the session. The session is account-wide and remains in
+Wrangler's local profile until the owner logs out.
+
+The narrower alternative is a scoped API token. To use it, sign out of an
+unwanted Wrangler session first. The client issues the token at
+dash.cloudflare.com, My Profile, API Tokens, Create Token, Custom token, with
+exactly these permissions:
 
     Account > Workers Scripts        Edit
     Account > D1                     Edit
@@ -91,30 +99,26 @@ whichever is missing before making account changes. Run the appropriate path as
 soon as the account owner has created the token, not at the start of a support
 session.
 
-### Compatibility fallback
+### Browser sign-in
 
-If an older token cannot reach Vectorize, create a correctly scoped replacement
-and enter it at the hidden `brain setup` or `brain update` prompt. Do not leave
-the old value in a shell environment.
-
-For a temporary compatibility test of an older account, the account owner can
-instead run:
+The account owner can establish the Wrangler session with:
 
 ```bash
 npx wrangler@4 login
 ```
 
-They approve in their own browser. Provision uses that local OAuth session only
-for Vectorize. New installs should fix the scoped token and use hidden prompt
-entry so every client follows the same supported path.
+They approve in their own browser. The Brain uses that local OAuth session for
+Cloudflare control-plane commands and says so at command start. New installs can
+instead use the narrower scoped token through hidden prompt entry; on macOS the
+owner may explicitly save it per account in the login Keychain.
 
 ---
 
 ## Verify before you start
 
 Run `node brain.mjs setup <manifest>` for a new install or
-`node brain.mjs update <manifest>` for an existing install. Enter the scoped
-token only when the hidden prompt asks for it.
+`node brain.mjs update <manifest>` for an existing install. Confirm the announced
+Wrangler identity, or enter the scoped token only when the hidden prompt asks.
 
 The preflight should show five green lines: account resolved, R2, D1, Workers,
 Vectorize. A

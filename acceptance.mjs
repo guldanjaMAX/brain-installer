@@ -230,18 +230,38 @@ export function freshnessVerdicts({ ok, status, payload, expectedBackend = "d1" 
 }
 
 export class Acceptance {
-  constructor({ base, adminKey, manifest, expectVersion = null, fetchImpl = fetch }) {
+  constructor({ base, adminKey, manifest, expectVersion = null, fetchImpl = fetch, tolerateStaleSources = false }) {
     this.base = String(base).replace(/\/+$/, "");
     this.key = adminKey;
     this.m = manifest || {};
     this.fetch = fetchImpl;
     this.expectVersion = expectVersion;
+    // Freshness is a fact about a SOURCE, not about the brain or a release.
+    // An update runs this suite after the new code is already live, and a
+    // Google grant that lapsed last week made every such update report
+    // UPGRADE_FAILED and leave the version stamp unrecorded. The update asks
+    // for stale sources as warnings; a standalone `brain test` keeps them as
+    // failures, because there the question is "is this brain proven".
+    this.tolerateStaleSources = tolerateStaleSources === true;
     this.results = [];
     this.tierFailed = null;
+    // Capabilities the run could not exercise at all. A skip inside a tier is
+    // a detail; a whole capability going untested changes what "passed" means,
+    // so the summary carries it and the verdict has to say it.
+    this.untested = [];
+  }
+
+  static isFreshnessCheck(name) {
+    return name === "every source expected to refresh is current" || String(name).startsWith("freshness: ");
   }
 
   record(tier, name, status, detail) {
-    this.results.push({ tier, name, status, detail });
+    let downgraded = false;
+    if (status === FAIL && this.tolerateStaleSources && Acceptance.isFreshnessCheck(name)) {
+      status = WARN;
+      downgraded = true;
+    }
+    this.results.push(downgraded ? { tier, name, status, detail, downgraded } : { tier, name, status, detail });
     if (status === FAIL && this.tierFailed === null) this.tierFailed = tier;
     return status;
   }
@@ -283,6 +303,7 @@ export class Acceptance {
       const h = await this.get("/health", { auth: false });
       if (!h.ok) return this.record(t, "health responds", FAIL, `HTTP ${h.status}`);
       const observedVersion = h.json?.version ?? null;
+      this.observedVersion = observedVersion;
       if (this.expectVersion && observedVersion !== this.expectVersion) {
         return this.record(
           t,
@@ -411,6 +432,7 @@ export class Acceptance {
     // ones. A brain that returns results for "test" but nothing for "what did
     // we agree with our biggest customer" has passed a meaningless check.
     if (!probes || !probes.length) {
+      this.untested.push("retrieval");
       return this.record(
         t,
         "retrieval probes",
@@ -589,13 +611,26 @@ export class Acceptance {
       Number(installState.gate_version) >= 2 ? PASS : WARN,
       `gate version ${installState.gate_version}`
     );
-    const declared = this.m.brain?.version;
-    if (declared) {
+    // Compare what is LIVE against what the operator asked for. On 2026-09-03 a
+    // 0.2.0 -> 0.3.4 update printed "install 0.2.0, manifest 0.2.0" as a PASS
+    // because both values were read before the update; the live Worker said
+    // 0.3.4. A check that never looks at the artifact certifies nothing.
+    const target = this.expectVersion || this.m.brain?.version || null;
+    const live = this.observedVersion ?? null;
+    if (target) {
       this.record(
         t,
         "deployed version matches the manifest",
-        installState.product_version === declared ? PASS : WARN,
-        `install ${installState.product_version}, manifest ${declared}`
+        live && live === target ? PASS : WARN,
+        `live ${live ?? "unknown"}, expected ${target}`
+      );
+    }
+    if (live && installState.product_version && installState.product_version !== live) {
+      this.record(
+        t,
+        "install state records the running version",
+        WARN,
+        `install state ${installState.product_version}, live ${live}; the version commit has not landed yet`
       );
     }
     const cap = this.m.safety?.daily_llm_spend_cap_usd;
@@ -629,6 +664,37 @@ export class Acceptance {
       counts,
       passed: counts.fail === 0,
       stoppedAtTier: this.tierFailed,
+      untested: [...this.untested],
     };
   }
+}
+
+/**
+ * The one-line verdict a person reads last, with any honesty qualifiers.
+ *
+ * A suite that skipped its whole retrieval tier has not proven the thing the
+ * client actually bought, and an unqualified "passed" is how a false green
+ * reaches a kickoff call: reach, data, safety and operations were checked,
+ * and nobody asked the brain a single question. The headline itself changes,
+ * not just a detail line above it, because the headline is the sentence that
+ * gets read aloud and pasted into a thread.
+ *
+ * Exit semantics are the caller's and stay unchanged: a failed suite still
+ * fails, a passed-but-unqualified suite still exits clean.
+ */
+export function acceptanceVerdict(summary) {
+  if (!summary?.passed) return { headline: "acceptance suite FAILED", warnings: [] };
+  const untested = Array.isArray(summary.untested) ? summary.untested : [];
+  if (untested.includes("retrieval")) {
+    return {
+      headline: "acceptance suite passed — but retrieval was NOT tested",
+      warnings: [
+        "retrieval was NOT tested: testing.probe_questions is empty in the manifest.",
+        "Reach, data, safety and operations were checked; nobody asked this brain a",
+        "single question. Fill testing.probe_questions from the intake — the client's",
+        "own words, not tidied English — then re-run: brain test <manifest>",
+      ],
+    };
+  }
+  return { headline: "acceptance suite passed", warnings: [] };
 }

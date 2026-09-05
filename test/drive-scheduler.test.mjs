@@ -56,7 +56,7 @@ const baseManifest = {
   client: { slug: "acme-brain", display_name: "Acme", timezone: "America/Phoenix" },
   brain: { version: "0.1.0", domain: "brain.acme.test" },
   infrastructure: { cloudflare: { account_id: "account-123" } },
-  corpora: { google_drive: { enabled: true } },
+  corpora: { google_drive: { enabled: true, root_folder_ids: ["fixture-allowed-root"] } },
   operations: {
     ingest_cron: "0 9 * * *",
     admin_key_secret: "keychain://acme-brain-admin/owner",
@@ -140,6 +140,17 @@ try {
   }
 
   /* ================= plan and plist ================= */
+  {
+    const path = join(directory, "missing-root-boundary", "brain.manifest.json");
+    writeManifest({
+      ...baseManifest,
+      corpora: { google_drive: { enabled: true } },
+    }, path);
+    let error = null;
+    try { buildDriveSchedulerPlan(path, opts()); } catch (caught) { error = caught; }
+    check("Drive scheduling refuses to install without an allowed root folder id",
+      /root_folder_ids must name at least one allowed Drive folder/.test(error?.message), error?.message);
+  }
   {
     const plan = buildDriveSchedulerPlan(manifestPath, opts());
     check("the label is standard and client-scoped", plan.label === "com.brain-installer.acme-brain.drive-ingest", plan.label);

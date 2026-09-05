@@ -35,7 +35,7 @@ const adminKey = resolveAdminKey(manifestPath, { ignoreEnvironment: true });
 assert.match(String(adminKey || ""), /^[a-f0-9]{48}$/);
 const base = `https://${manifest.brain.domain}`;
 
-async function request(path, { method = "GET", body } = {}) {
+async function request(path, { method = "GET", body, allowError = false } = {}) {
   const response = await fetch(`${base}${path}`, {
     method,
     headers: {
@@ -53,10 +53,10 @@ async function request(path, { method = "GET", body } = {}) {
   } catch {
     throw new Error(`${path} returned non-JSON HTTP ${response.status}`);
   }
-  if (!response.ok) {
+  if (!response.ok && !allowError) {
     throw new Error(`${path} returned HTTP ${response.status}: ${String(parsed?.error || "unknown").slice(0, 160)}`);
   }
-  return { body: parsed, headers: response.headers };
+  return { body: parsed, headers: response.headers, status: response.status };
 }
 
 const envelope = (sourceId, content, title = `Synthetic ${sourceId}`, category = "batch") => ({
@@ -76,6 +76,28 @@ async function ingest(docs) {
   return { ...response.body, elapsed_ms: Math.round(performance.now() - started) };
 }
 
+// Vectorize V2 acknowledges a mutation before it becomes query-visible. Match
+// the shipped `brain drain` cadence instead of spending a fixed number of
+// immediate requests while every accepted row is still waiting on the same
+// provider mutation.
+async function drainUntilEmpty({ maxRounds = 120, delayMs = 3_000 } = {}) {
+  let drained = 0;
+  let submitted = 0;
+  let remaining = null;
+  let waitingObserved = false;
+  for (let round = 1; round <= maxRounds; round++) {
+    const receipt = await request("/api/admin/brain/drain", { method: "POST", body: {} });
+    drained += Number(receipt.body.drained || 0);
+    submitted += Number(receipt.body.submitted || 0);
+    remaining = Number(receipt.body.remaining || 0);
+    const waiting = Number(receipt.body.waiting || 0);
+    waitingObserved ||= waiting > 0;
+    if (remaining === 0) return { drained, submitted, remaining, rounds: round, waiting_observed: waitingObserved };
+    if (round < maxRounds) await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  assert.equal(remaining, 0, `vector drain still had ${remaining} operation(s) after ${maxRounds} bounded rounds`);
+}
+
 const health = await request("/health");
 assert.equal(health.body.version, expectedVersion);
 
@@ -90,11 +112,31 @@ if (prior.body.families.length) {
     method: "POST",
     body: { source, confirm: true },
   });
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const receipt = await request("/api/admin/brain/drain", { method: "POST", body: {} });
-    if (Number(receipt.body.remaining || 0) === 0) break;
-  }
+  await drainUntilEmpty();
 }
+
+// Exercise the deployed scanner through the single-document HTTP boundary.
+// Keep the secret-shaped value synthetic and out of both output and receipts.
+const syntheticAdminKey = `a${"3f9b2c8e1d7a4b6c5e0f8a2d9c7b1e4f3a6d8b0c2e5f7a9b1d3c6e8f0a2b4c6"}`;
+assert.equal(syntheticAdminKey.length, 64);
+const refusedSecret = await request("/api/admin/brain/ingest", {
+  method: "POST",
+  body: envelope("scanner-refusal", `admin_key: ${syntheticAdminKey}`, "Synthetic scanner refusal", "privacy"),
+  allowError: true,
+});
+assert.equal(refusedSecret.status, 422);
+assert.deepEqual(refusedSecret.body, {
+  error: "refused: content carries sensitive credential(s) or private identifier(s)",
+  labels: ["env_assignment"],
+  detail: "Remove or redact them, rotate any live credentials, then re-ingest. Nothing was written.",
+});
+assert.equal(JSON.stringify(refusedSecret.body).includes(syntheticAdminKey), false);
+const afterSecretRefusal = await request("/api/admin/brain/documents");
+assert.equal(
+  afterSecretRefusal.body.rows.some((entry) => entry.source_type === source && Number(entry.documents) > 0),
+  false,
+  "the rejected synthetic credential created a document",
+);
 
 const fifty = Array.from({ length: 50 }, (_, index) => envelope(
   `batch-${String(index).padStart(2, "0")}`,
@@ -150,15 +192,7 @@ assert.equal(row.documents, 53);
 assert.ok(row.chunks >= 112);
 assert.ok(Number(inventory.body.vector_backlog?.pending || 0) >= 1);
 
-let drained = 0;
-let remaining = null;
-for (let attempt = 0; attempt < 8; attempt++) {
-  const receipt = await request("/api/admin/brain/drain", { method: "POST", body: {} });
-  drained += Number(receipt.body.drained || 0);
-  remaining = Number(receipt.body.remaining || 0);
-  if (remaining === 0) break;
-}
-assert.equal(remaining, 0);
+const vectorDrain = await drainUntilEmpty();
 
 const search = await request("/api/rag/unified", {
   method: "POST",
@@ -184,13 +218,7 @@ const removed = await request("/api/admin/brain/forget", {
 });
 assert.equal(removed.body.documents, 53);
 
-let deleteRemaining = null;
-for (let attempt = 0; attempt < 8; attempt++) {
-  const receipt = await request("/api/admin/brain/drain", { method: "POST", body: {} });
-  deleteRemaining = Number(receipt.body.remaining || 0);
-  if (deleteRemaining === 0) break;
-}
-assert.equal(deleteRemaining, 0);
+const deleteDrain = await drainUntilEmpty();
 
 const after = await request("/api/admin/brain/source-families", {
   method: "POST", body: { source, limit: 1000 },
@@ -205,8 +233,13 @@ console.log(JSON.stringify({
   mixed_batch_ms: mixed.elapsed_ms,
   concurrent_receipts: races.map((receipt) => receipt.results[0]?.status || "failed"),
   large_document_chunks: large.results[0].chunks,
-  embedded_operations: drained,
+  embedded_operations: vectorDrain.drained,
+  embedding_submissions: vectorDrain.submitted,
+  embedding_drain_rounds: vectorDrain.rounds,
+  asynchronous_wait_observed: vectorDrain.waiting_observed,
+  secret_scanner_http_refusal: true,
   verified_documents: 53,
   cleanup_documents: removed.body.documents,
-  final_vector_backlog: deleteRemaining,
+  deletion_drain_rounds: deleteDrain.rounds,
+  final_vector_backlog: deleteDrain.remaining,
 }, null, 2));

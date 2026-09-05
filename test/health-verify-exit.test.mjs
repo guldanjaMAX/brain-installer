@@ -191,6 +191,7 @@ if (SCENARIO) {
   const HERE = dirname(fileURLToPath(import.meta.url));
   const CLI = join(HERE, "..", "brain.mjs");
   const THIS_FILE = import.meta.url;
+  const { renderCliCommands } = await import("../brain.mjs");
   let fail = 0;
   let ran = 0;
   const check = (name, condition, detail = "") => {
@@ -288,13 +289,24 @@ if (SCENARIO) {
   const processing = runScenario("health-vector-processing", "health", { adminKey: true });
   check("health cannot green an accepted mutation before query visibility",
     processing.code === 1 && /not query-visible yet.*accepted by Vectorize/is.test(processing.output) &&
-      /brain drain/.test(processing.output) && !/vector index is query-ready/.test(processing.output),
+      !/vector index is query-ready/.test(processing.output),
     processing.output);
+  // This assertion used to require the words "brain drain" here, which pinned
+  // in place advice three separate reviews called harmful: a manual drain takes
+  // the same lease the scheduled one holds, so the two exclude each other and
+  // the manual runner is slower. Health must describe the state and must not
+  // send the operator to make it worse.
+  check("health never INSTRUCTS a manual drain, and warns against it when stalled",
+    !/(Clear it now with|Finish and confirm visibility with)/i.test(stalled.output + processing.output) &&
+      !(stalled.output + processing.output).includes(`Re-run \`${renderCliCommands("brain drain")}`) &&
+      stalled.output.includes(`Do NOT run \`${renderCliCommands("brain drain")}\``),
+    processing.output + "\n---\n" + stalled.output);
 
   const countMismatch = runScenario("health-vector-count-mismatch", "health", { adminKey: true });
   check("health rejects an empty queue when Vectorize is still missing vectors",
     countMismatch.code === 1 && /Vectorize holds 0 vector\(s\), but D1 requires 10/is.test(countMismatch.output) &&
-      /brain diagnose/.test(countMismatch.output) && /brain reindex/.test(countMismatch.output),
+      countMismatch.output.includes(renderCliCommands("brain diagnose")) &&
+      countMismatch.output.includes(renderCliCommands("brain reindex")),
     countMismatch.output);
 
   const countExcess = runScenario("health-vector-count-excess", "health", { adminKey: true });
@@ -340,7 +352,8 @@ if (SCENARIO) {
   const optionalWarnings = runScenario("verify-optional-warnings", "verify", { cloudflareToken: true });
   check("optional R2 and Vectorize access remain warnings",
     optionalWarnings.code === 0 && /R2 is not ready/.test(optionalWarnings.output) &&
-      /Provision can use wrangler login as a temporary fallback/.test(optionalWarnings.output) &&
+      /active Cloudflare credential cannot reach Vectorize/.test(optionalWarnings.output) &&
+      /wrangler login session must belong to the intended account/.test(optionalWarnings.output) &&
       /D1 is reachable/.test(optionalWarnings.output) && /Workers is reachable/.test(optionalWarnings.output),
     optionalWarnings.output);
 

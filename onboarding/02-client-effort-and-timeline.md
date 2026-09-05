@@ -54,9 +54,12 @@ account or credential. Plus one grant:
 
 | | What | Your time |
 |---|---|---|
-| 3 | **Read-only access** to the folders you named at intake | 10 min |
+| 3 | **Read-only Google Drive access**, then approved ingest folder IDs in the manifest | 10 min |
 
-That access is genuinely read-only. It can look at documents. It cannot change, move, or delete anything.
+Google's permission can list metadata and read content for every Drive file the
+connected account can access. It cannot change, move, or delete anything. The
+manifest folder IDs are the installer's separate boundary on what content it
+downloads and ingests.
 
 **Do all three in one sitting.** They take about 25 minutes together and much
 longer when split across several days, because each unfinished item has to be
@@ -119,7 +122,7 @@ Print this, or forward it to whoever is doing the setup.
 - [ ] Intake sheet returned, including all ten questions in section 6
 - [ ] Cloudflare account created, and I have been told which email it is under
 - [ ] Cloudflare account upgraded to Workers Paid (verify in the Cloudflare dashboard; `node brain.mjs doctor` separately proves Vectorize access)
-- [ ] Read-only access granted to the folders named at intake
+- [ ] Read-only Google Drive access connected, with the approved ingest folder IDs recorded in the manifest
 - [ ] Workspace or personal gmail.com question answered, and if personal, the publishing step scheduled
 - [ ] Anything from section 3 (what it must never see) confirmed in writing
 - [ ] Kickoff booked for day 8, 60 minutes, both of us

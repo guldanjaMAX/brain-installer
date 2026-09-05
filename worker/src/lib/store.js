@@ -30,6 +30,7 @@
 import * as d1 from "./store-d1.js";
 import { embedText, supabaseRpc } from "./supabase.js";
 import { sanitizeEnvelope, sanitizeSensitiveLinks } from "./secret-scan.js";
+import { scopeIsRestricted } from "./grants.js";
 
 export const D1 = "d1";
 export const SUPABASE = "supabase";
@@ -396,7 +397,7 @@ const d1Backend = {
 
   async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60, access = null, scope = null }) {
     let embedding = null;
-    if (access?.kind !== "grant" && (!scope || scope.all === true)) {
+    if (access?.kind !== "grant" && !scopeIsRestricted(scope)) {
       try {
         embedding = await embedText(env, query);
       } catch {
@@ -493,8 +494,9 @@ const d1Backend = {
       `INSERT INTO documents (doc_uid, source, source_id, title, uri, document_date,
                               date_source, date_reliable, client, category,
                               top_folder, platform, ingested_at, content_hash, meta,
-                              text_source, text_reliable, entity_slug)
-       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?22,?23,?24)
+                              text_source, text_reliable, entity_slug, zone)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?22,?23,?24,
+               (SELECT zone FROM sources WHERE name = ?2))
        ON CONFLICT(doc_uid) DO UPDATE SET
          title=COALESCE(excluded.title, documents.title),
          uri=COALESCE(excluded.uri, documents.uri),
@@ -511,6 +513,7 @@ const d1Backend = {
          category=CASE WHEN ?17 = 1 THEN excluded.category ELSE documents.category END,
          top_folder=CASE WHEN ?18 = 1 THEN excluded.top_folder ELSE documents.top_folder END,
          platform=CASE WHEN ?19 = 1 THEN excluded.platform ELSE documents.platform END,
+         zone=excluded.zone,
          ingested_at=excluded.ingested_at, content_hash=excluded.content_hash,
          -- Last write wins, unlike the filter columns above. Provenance
          -- describes THIS extraction, so preserving an older value would keep
@@ -558,8 +561,8 @@ const d1Backend = {
       // Small changed documents are the dominant email/message migration case.
       // Stage one document per D1 transaction so a bad row cannot roll back a
       // neighbour. Chunk INSERT ... SELECT statements read the just-merged
-      // document metadata inside that transaction, preserving rich migrated
-      // filters without the previous extra service-binding read.
+      // document metadata and source zone inside that transaction, preserving
+      // rich migrated filters without the previous extra service-binding read.
       w = await d1.stageDocumentRevision(env, {
         documentStatement,
         docUid,
@@ -808,7 +811,7 @@ const d1Backend = {
 
 const supabaseBackend = {
   async search(env, { query, limit, filters = {}, weights = {}, rrfK = 60, access = null, scope = null }) {
-    if (access?.kind === "grant" || (scope && scope.all !== true)) {
+    if (access?.kind === "grant" || scopeIsRestricted(scope)) {
       return {
         results: [],
         degraded: "document-access-unavailable",

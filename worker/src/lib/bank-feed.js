@@ -391,9 +391,20 @@ export function normaliseFeedPage({ itemRef, accounts = [], added = [], modified
     });
   }
 
-  for (const raw of [...added, ...modified]) {
+  const changed = [...added, ...modified];
+  const missingAccountCount = changed.filter((raw) => !byId.has(raw?.account_id)).length;
+  if (missingAccountCount > 0) {
+    // The transaction cursor is durable, so silently discarding even one row
+    // makes the loss permanent after this page commits. Refuse the whole page
+    // and retry it when the provider's account list is complete.
+    throw new FeedError(
+      `the account list omitted the account for ${missingAccountCount} transaction(s) on this page`,
+      "ACCOUNT_LIST_INCOMPLETE",
+    );
+  }
+
+  for (const raw of changed) {
     const account = byId.get(raw.account_id);
-    if (!account) continue;
     const rawMinor = minorUnits(raw.amount, account.currency);
     const postedOn = /^\d{4}-\d{2}-\d{2}$/.test(String(raw.date || "")) ? raw.date : null;
     if (rawMinor === null || postedOn === null) {

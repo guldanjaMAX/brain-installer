@@ -2,7 +2,14 @@ import { run, localToolEnvironment, cloudflareCliEnvironment,
          checkNode, checkClaudeCode, checkCodex, checkAnthropicKey, checkGoogleConnection,
          checkWrangler,
          checkWranglerLogin, checkVectorize, checkVectorizeApi, checkCfToken, CF_TOKEN_SCOPES,
+         checkWorkersPaidPlan, checkPrioritySlice,
          summarize, runAll, OK, WARN, FAIL } from "../doctor.mjs";
+import { readFileSync } from "node:fs";
+import {
+  WRANGLER_SESSION_ABSENT,
+  WRANGLER_SESSION_ENCRYPTED_UNSUPPORTED,
+  WRANGLER_SPEC,
+} from "../operations/wrangler-oauth.mjs";
 let fail = 0, ran = 0;
 const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") + n + (c ? "" : "  " + String(d).slice(0, 220))); if (!c) fail++; };
 
@@ -19,6 +26,19 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   check("each check says what it saw", all.every((x) => typeof x.detail === "string" && x.detail.length));
 }
 
+/* ---- every check is printed as it completes, not just the first three ---- */
+{
+  const seen = [];
+  const all = await runAll({
+    accountId: "0000",
+    googleStorageStatus: { exists: false, description: "fixture secure storage" },
+    onResult: (x) => seen.push(x.name),
+  });
+  check("doctor reports every check to the caller as it finishes",
+    seen.length === all.length && all.every((x, i) => seen[i] === x.name),
+    `${seen.length} reported of ${all.length}: ${JSON.stringify(seen)}`);
+}
+
 /* ---- the severity split is the whole point: fatal blocks, optional does not ---- */
 {
   const node = checkNode();
@@ -26,7 +46,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   const missingTool = () => ({ ok: false, out: "not found", missing: true });
   const healthyTool = (_command, args) => ({
     ok: true,
-    out: args.includes("wrangler@4") ? "wrangler 4.34.0" :
+    out: args.includes(WRANGLER_SPEC) ? "wrangler 4.73.0" :
       args.includes("status") ? "" : "2.1.63 (Claude Code)",
   });
   check("Claude Code is a blocking owner-install requirement",
@@ -125,12 +145,26 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 
 /* ---- the standard token owns Vectorize; browser login is only a fallback ---- */
 {
-  const l = checkWranglerLogin("0000");
-  if (l.status !== OK) {
-    check("wrangler login is described as a fallback", l.status === WARN && /fallback/i.test(l.fix), l.fix);
-  } else {
-    check("wrangler login reports signed in cleanly", !/\\.$/.test(l.detail.trim()), l.detail);
-  }
+  const l = checkWranglerLogin("0000", {
+    readWranglerOAuthSession: () => ({ type: WRANGLER_SESSION_ABSENT }),
+    runCommand: () => ({ ok: false, out: "fixture signed out" }),
+  });
+  check("wrangler login is described as a fallback", l.status === WARN && /fallback/i.test(l.fix), l.fix);
+
+  let encryptedWhoamiCalls = 0;
+  const encrypted = checkWranglerLogin("0000", {
+    readWranglerOAuthSession: () => ({ type: WRANGLER_SESSION_ENCRYPTED_UNSUPPORTED }),
+    runCommand: () => { encryptedWhoamiCalls++; return { ok: false, out: "must not run" }; },
+  });
+  check("an encrypted Wrangler session is detected without probing it",
+    encrypted.status === WARN && encryptedWhoamiCalls === 0 && /encrypted Wrangler session detected/i.test(encrypted.detail),
+    JSON.stringify(encrypted));
+  check("the encrypted-session warning does not claim the owner is signed out",
+    !/not signed in/i.test(encrypted.detail), encrypted.detail);
+  check("the encrypted-session remedy gives pinned re-login and hidden token fallbacks",
+    encrypted.fix.includes(`npx ${WRANGLER_SPEC} login`) &&
+      /brain setup.*brain update.*hidden prompt/is.test(encrypted.fix) &&
+      /does not mean it is signed out/i.test(encrypted.fix), encrypted.fix);
   check("the scoped token includes Vectorize Edit", CF_TOKEN_SCOPES.includes("Vectorize: Edit"), JSON.stringify(CF_TOKEN_SCOPES));
 }
 {
@@ -177,6 +211,107 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   } else {
     check("Vectorize reachable on this machine", v.status === OK);
   }
+}
+
+
+/* ---- the Workers plan is checked BEFORE install, and never guessed ---- */
+{
+  const jsonResponse = (payload, status = 200) => async () => ({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => payload,
+  });
+
+  const missing = await checkWorkersPaidPlan(undefined, undefined, async () => { throw new Error("no fetch expected"); });
+  check("plan check without a token warns instead of probing", missing.status === WARN && /token/i.test(missing.detail), JSON.stringify(missing));
+  const noAccount = await checkWorkersPaidPlan(undefined, "cf_token", async () => { throw new Error("no fetch expected"); });
+  check("plan check without an account id warns instead of probing", noAccount.status === WARN, JSON.stringify(noAccount));
+
+  // Verified live 2026-08-31 with a token holding exactly the four install
+  // scopes: GET /accounts/{id}/subscriptions returns success:false with
+  // errors[0].code 10000 "Authentication error". The check must present that
+  // as a scope limit with a dashboard path, never as a plan verdict and never
+  // by telling anyone to widen the deliberately narrow install token.
+  const scopeLimited = await checkWorkersPaidPlan("a".repeat(32), "cf_token", jsonResponse({
+    success: false,
+    errors: [{ code: 10000, message: "Authentication error" }],
+    result: null,
+  }, 403));
+  check("a scope-limited token warns that the plan is not verifiable",
+    scopeLimited.status === WARN && /cannot|not.*(readable|verifiable)/i.test(scopeLimited.detail),
+    JSON.stringify(scopeLimited));
+  check("the scope-limited fix points at the dashboard plans page",
+    /Workers & Pages/i.test(scopeLimited.fix) && /Workers Paid/i.test(scopeLimited.fix), scopeLimited.fix);
+  check("the scope-limited fix never suggests widening the install token",
+    !/Billing.*(Edit|Read)|recreate.*token/i.test(scopeLimited.fix), scopeLimited.fix);
+
+  const paid = await checkWorkersPaidPlan("a".repeat(32), "cf_token", jsonResponse({
+    success: true,
+    errors: [],
+    result: [
+      { id: "sub1", state: "Paid", product: { name: "workers" }, rate_plan: { id: "workers_paid", public_name: "Workers Paid" } },
+    ],
+  }));
+  check("a readable Workers Paid subscription passes and names the plan",
+    paid.status === OK && /workers.?paid|Workers Paid/i.test(paid.detail), JSON.stringify(paid));
+
+  const freeOnly = await checkWorkersPaidPlan("a".repeat(32), "cf_token", jsonResponse({
+    success: true,
+    errors: [],
+    result: [{ id: "sub2", product: { name: "page_rules" }, rate_plan: { id: "cf_free" } }],
+  }));
+  check("a readable account with no Workers subscription warns and says what it saw",
+    freeOnly.status === WARN && /no Workers subscription/i.test(freeOnly.detail), JSON.stringify(freeOnly));
+  check("the no-subscription warning names the plan baseline",
+    /Workers Paid/i.test(freeOnly.fix), freeOnly.fix);
+
+  const flaky = await checkWorkersPaidPlan("a".repeat(32), "cf_token", async () => { throw new Error("socket hang up"); });
+  check("a failed probe warns rather than failing the install", flaky.status === WARN, JSON.stringify(flaky));
+}
+
+/* ---- the priority slice: warned about while there is still time ---- */
+{
+  const unset = checkPrioritySlice({ ingest: { priority_slice: { source: null, since: null, note: "template" } } });
+  check("a first install with no priority slice warns", unset.status === WARN, JSON.stringify(unset));
+  check("the warning names the manifest field", /priority_slice/.test(unset.detail + unset.fix), JSON.stringify(unset));
+  check("the warning says what goes wrong without one",
+    /first|chronolog|archive|impression/i.test(unset.fix), unset.fix);
+
+  const missing = checkPrioritySlice({});
+  check("a manifest with no ingest block warns the same way", missing.status === WARN, JSON.stringify(missing));
+
+  const filled = checkPrioritySlice({ ingest: { priority_slice: { source: "client-files", since: "2025-01-01" } } });
+  check("a filled slice passes", filled.status === OK, JSON.stringify(filled));
+
+  const done = checkPrioritySlice({
+    ingest: { priority_slice: { source: null, since: null } },
+    handoff: { handoff_completed_at: "2026-08-01T00:00:00Z" },
+  });
+  check("a handed-off install no longer nags about load order", done.status === OK, JSON.stringify(done));
+
+  // The template's example must itself satisfy the check it advertises, and
+  // must stay fictional: a public repo carries no client names.
+  const template = JSON.parse(readFileSync(new URL("../templates/brain.manifest.json", import.meta.url), "utf8"));
+  const example = template?.ingest?.priority_slice?._example;
+  check("the template ships a concrete priority-slice example", !!example && typeof example.source === "string" && example.source.length > 0, JSON.stringify(example));
+  check("the example since is a real date", /^\d{4}-\d{2}-\d{2}$/.test(String(example?.since)), JSON.stringify(example));
+  check("the example itself would pass the check",
+    checkPrioritySlice({ ingest: { priority_slice: { source: example?.source, since: example?.since } } }).status === OK);
+  check("the template slice itself still ships unset",
+    template?.ingest?.priority_slice?.source === null && template?.ingest?.priority_slice?.since === null,
+    JSON.stringify(template?.ingest?.priority_slice));
+}
+
+/* ---- both new checks ride along in runAll / doctor wiring ---- */
+{
+  const saved = process.env.CLOUDFLARE_API_TOKEN;
+  delete process.env.CLOUDFLARE_API_TOKEN;
+  const all = await runAll({
+    accountId: undefined,
+    googleStorageStatus: { exists: false, description: "fixture secure storage" },
+  });
+  check("runAll includes the Workers plan check", all.some((x) => /workers plan/i.test(x.name)), JSON.stringify(all.map((x) => x.name)));
+  if (saved) process.env.CLOUDFLARE_API_TOKEN = saved;
 }
 
 /* ---- summary ---- */
@@ -264,9 +399,17 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   // straight through, deleting the client's own exported account id and leaving
   // wrangler unable to choose between their accounts.
   process.env.CLOUDFLARE_ACCOUNT_ID = "USERSET";
-  const l = checkWranglerLogin(undefined);
+  let whoamiEnv = null;
+  const l = checkWranglerLogin(undefined, {
+    readWranglerOAuthSession: () => ({ type: WRANGLER_SESSION_ABSENT }),
+    runCommand: (_command, _args, options) => {
+      whoamiEnv = options.env;
+      return { ok: false, out: "fixture signed out" };
+    },
+  });
   check("checking login without a manifest does not clobber the user's account id",
-    process.env.CLOUDFLARE_ACCOUNT_ID === "USERSET" && !!l.status);
+    process.env.CLOUDFLARE_ACCOUNT_ID === "USERSET" &&
+      whoamiEnv.CLOUDFLARE_ACCOUNT_ID === "USERSET" && !!l.status);
   const probe = run("node", ["-e", "console.log(process.env.CLOUDFLARE_ACCOUNT_ID || '(absent)')"], {
     inheritEnv: false,
     env: cloudflareCliEnvironment(undefined),

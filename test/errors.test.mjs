@@ -21,6 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { renderCliCommands } from "../brain.mjs";
 import { previewSupportJournal } from "../support-journal.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -152,7 +153,10 @@ function ingestExitCli(scenario) {
     brain: { domain: "fixture.invalid" },
     infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
     safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
-    corpora: { google_drive: {} },
+    corpora: {
+      google_drive: { root_folder_ids: ["fixture-allowed-root"] },
+      upload: { enabled: true, folders: [source] },
+    },
   }));
   writeFileSync(join(userRoot, ".brain", "google-tokens.json"), JSON.stringify({
     google: {
@@ -172,8 +176,10 @@ function ingestExitCli(scenario) {
   };
   delete env.CLOUDFLARE_API_TOKEN;
   delete env.BRAIN_DEBUG;
-  const args = scenario.startsWith("drive")
-    ? ["ingest", manifest, "--from", "drive"]
+  const args = scenario === "drive-preview-limit"
+    ? ["ingest", manifest, "--from", "drive", "--dry-run", "--limit", "1"]
+    : scenario.startsWith("drive")
+      ? ["ingest", manifest, "--from", "drive"]
     : ["ingest", manifest, "--path", source];
   const result = spawnSync("node", ["--import", INGEST_EXIT_FETCH, CLI, ...args], {
     encoding: "utf-8", env, timeout: 30_000,
@@ -221,7 +227,9 @@ function ingestExitCli(scenario) {
   const events = journalEvents(r.journal);
   check("a missing token is an explained failure", r.code === 1 && /CLOUDFLARE_API_TOKEN/.test(r.out), r.out.slice(0, 160));
   check("and it gives a safe next step instead of a shell-history command",
-    /brain setup.*brain update.*hidden token entry/is.test(r.out) &&
+    r.out.includes(renderCliCommands("brain setup")) &&
+      r.out.includes(renderCliCommands("brain update")) &&
+      /hidden token entry/is.test(r.out) &&
       !/export\s+CLOUDFLARE_API_TOKEN|CLOUDFLARE_API_TOKEN\s*=\s*['\"]/i.test(r.out), r.out.slice(0, 400));
   // Fatal is anticipated, so it must NOT be dressed up as an installer bug.
   check("an anticipated failure is not reported as a bug", !/This is a bug in the installer/.test(r.out));
@@ -309,6 +317,16 @@ function ingestExitCli(scenario) {
       journalEvents(r.journal)[0]?.error_code === "INGEST_FAILED" &&
       journalEvents(r.journal)[0]?.source === "drive" &&
       !r.journal.includes("fixture-file-one"), r.journal);
+  rmSync(r.dir, { recursive: true, force: true });
+}
+{
+  const r = ingestExitCli("drive-preview-limit");
+  check("a limited Drive preview applies its limit after the approved-root decision",
+    r.code === 0 && /TEST_DRIVE_APPROVED_PREVIEW_DOWNLOADED/.test(r.out) &&
+      /1 document\(s\) prepared/.test(r.out) && /dry run, nothing was sent/.test(r.out),
+    r.out.slice(-900));
+  check("a limited Drive preview never downloads the earlier out-of-root item",
+    !/TEST_DRIVE_OUTSIDE_PREVIEW_DOWNLOADED/.test(r.out), r.out.slice(-900));
   rmSync(r.dir, { recursive: true, force: true });
 }
 {
@@ -400,12 +418,13 @@ function ingestExitCli(scenario) {
 /* ---- unknown input is guided, not dumped ---- */
 {
   const r = cli(["definitelynotacommand"]);
-  check("an unknown command prints usage", /brain setup/.test(r.out), r.out.slice(0, 160));
+  check("an unknown command prints usage", r.out.includes(renderCliCommands("brain setup")), r.out.slice(0, 160));
   check("and exits non-zero", r.code === 1, String(r.code));
 }
 {
   const r = cli([]);
-  check("no arguments prints usage and exits 0", /brain setup/.test(r.out) && r.code === 0, String(r.code));
+  check("no arguments prints usage and exits 0",
+    r.out.includes(renderCliCommands("brain setup")) && r.code === 0, String(r.code));
 }
 
 /* ---- doctor must never be the thing that breaks ---- */

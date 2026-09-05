@@ -738,6 +738,26 @@ export async function ledgerDeadlines(
  * owner they carry no personal guarantee on the strength of a pass that never
  * ran.
  */
+export function summarizeObligations(obligations = []) {
+  const withBalance = obligations.filter((o) => o.balance_minor !== null);
+  const currencies = new Set(withBalance.map((o) => o.currency));
+  return {
+    // Same refusal as the cash figure: a total across units that are not the
+    // same unit is not a total.
+    balance_minor: currencies.size === 1 && withBalance.length
+      ? withBalance.reduce((sum, o) => sum + o.balance_minor, 0)
+      : null,
+    currency: currencies.size === 1 && withBalance.length ? [...currencies][0] : null,
+    obligations_with_balance: withBalance.length,
+    obligations_total: obligations.length,
+    guaranteed: obligations.filter((o) => o.personal_guarantee).length,
+    guarantee_none_found: obligations.filter((o) => o.personal_guarantee_state === "none_found").length,
+    // The honest headline number on this summary. Not zero: unexamined.
+    guarantee_not_examined: obligations.filter((o) => o.personal_guarantee_state === "not_examined").length,
+    guarantee_unreadable: obligations.filter((o) => o.personal_guarantee_state === "unreadable").length,
+  };
+}
+
 export async function ledgerObligations(
   env,
   { tenantId = DEFAULT_TENANT, entitySlug = null, limit = 200 } = {},
@@ -787,26 +807,10 @@ export async function ledgerObligations(
     ...provenanceOf(row),
   }));
 
-  const withBalance = obligations.filter((o) => o.balance_minor !== null);
-  const currencies = new Set(withBalance.map((o) => o.currency));
   return {
     unavailable,
     obligations,
-    exposure: {
-      // Same refusal as the cash figure: a total across units that are not the
-      // same unit is not a total.
-      balance_minor: currencies.size === 1 && withBalance.length
-        ? withBalance.reduce((sum, o) => sum + o.balance_minor, 0)
-        : null,
-      currency: currencies.size === 1 && withBalance.length ? [...currencies][0] : null,
-      obligations_with_balance: withBalance.length,
-      obligations_total: obligations.length,
-      guaranteed: obligations.filter((o) => o.personal_guarantee).length,
-      guarantee_none_found: obligations.filter((o) => o.personal_guarantee_state === "none_found").length,
-      // The honest headline number on this summary. Not zero: unexamined.
-      guarantee_not_examined: obligations.filter((o) => o.personal_guarantee_state === "not_examined").length,
-      guarantee_unreadable: obligations.filter((o) => o.personal_guarantee_state === "unreadable").length,
-    },
+    exposure: summarizeObligations(obligations),
   };
 }
 
@@ -1030,7 +1034,7 @@ export async function ledgerSnapshot(env, { tenantId = DEFAULT_TENANT, entitySlu
  * which is a 500 from a query string rather than a bad request. Anything
  * unparseable becomes the default.
  */
-function boundedLimit(value, { fallback = 200, max = 1000 } = {}) {
+function boundedLimit(value, { fallback = 200, max = 1001 } = {}) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.min(parsed, max);

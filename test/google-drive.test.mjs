@@ -1,6 +1,7 @@
 import {
-  api, listFiles, listChanges, startPageToken, triage, toEnvelope, DriveError, EXPORTS,
-  updateFolderIndex, folderPathFor, exclusionReason, driveVersion,
+  api, listFiles, listChanges, startPageToken, triage, toEnvelope as convertDriveEnvelope, DriveError, EXPORTS,
+  updateFolderIndex, folderPathFor, exclusionReason, driveVersion, sourceRootDecision,
+  ancestryChangesRequireFullSweep,
 } from "../connectors/google-drive.mjs";
 import { buildAuthUrl, pkce, exchangeCode, createTokenProvider, redirectUri } from "../connectors/google-auth.mjs";
 
@@ -9,6 +10,14 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
 const tok = async () => "at-1";
 const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body, arrayBuffer: async () => new TextEncoder().encode(body).buffer });
 const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () => ({}), arrayBuffer: async () => new TextEncoder().encode(s).buffer });
+const ALLOWED_ROOT = "allowed-root-id";
+const DEFAULT_FOLDERS = { medical: { name: "Provider Records", parents: [ALLOWED_ROOT] } };
+const toEnvelope = (getAccessToken, file, options = {}, opts = {}) => convertDriveEnvelope(
+  getAccessToken,
+  { ...file, parents: Array.isArray(file?.parents) ? file.parents : [ALLOWED_ROOT] },
+  { folders: DEFAULT_FOLDERS, rootFolderIds: [ALLOWED_ROOT], ...options },
+  opts,
+);
 
 /* ================= auth ================= */
 {
@@ -260,6 +269,49 @@ const bytes = (s, status = 200) => ({ ok: status < 400, status, json: async () =
   check("private prefixes apply to Drive path segments", /private path/.test(exclusionReason(file, "Clients/_private", { privatePrefixes: ["_private"] })));
   check("Drive private prefixes match the local walker's starts-with contract",
     /private path/.test(exclusionReason(file, "Clients/_private-legal", { privatePrefixes: ["_private"] })));
+}
+{
+  const fullFolders = updateFolderIndex([
+    { id: "inside", name: "Inside", mimeType: "application/vnd.google-apps.folder", parents: [ALLOWED_ROOT] },
+    { id: "outside", name: "Outside", mimeType: "application/vnd.google-apps.folder", parents: ["other-root"] },
+    { id: "other-root", name: "Other root", mimeType: "application/vnd.google-apps.folder", parents: [] },
+  ]);
+  const file = { id: "bounded", name: "bounded.txt", mimeType: "text/plain", parents: ["inside"] };
+  check("a full Drive folder index admits a descendant of an exact configured root id",
+    sourceRootDecision(file, fullFolders, [ALLOWED_ROOT]).allowed === true);
+  check("a known path that ends outside every configured root is refused",
+    sourceRootDecision({ ...file, parents: ["outside"] }, fullFolders, [ALLOWED_ROOT]).allowed === false);
+  check("unknown Drive ancestry fails closed",
+    /unknown/.test(sourceRootDecision({ ...file, parents: ["missing"] }, fullFolders, [ALLOWED_ROOT]).reason));
+  check("multiple Drive parents fail closed as ambiguous",
+    /ambiguous/.test(sourceRootDecision({ ...file, parents: ["inside", "outside"] }, fullFolders, [ALLOWED_ROOT]).reason));
+  check("a removed saved ancestor forces incremental Drive into a full comparison",
+    ancestryChangesRequireFullSweep({ changed: [], removed: ["inside"] }, fullFolders, [ALLOWED_ROOT]) === true);
+  check("a removed configured root forces incremental Drive into a full comparison",
+    ancestryChangesRequireFullSweep({ changed: [], removed: [ALLOWED_ROOT] }, fullFolders, [ALLOWED_ROOT]) === true);
+  check("an unrelated removed file does not force an ancestry rebuild",
+    ancestryChangesRequireFullSweep({ changed: [], removed: ["ordinary-file"] }, fullFolders, [ALLOWED_ROOT]) === false);
+
+  // Incremental state merges changed folders into the last complete index. A
+  // move outside the approved root therefore revokes access before content is
+  // fetched even though the file bytes and its own name did not change.
+  const incrementalFolders = updateFolderIndex([
+    { id: "inside", name: "Inside", mimeType: "application/vnd.google-apps.folder", parents: ["outside"] },
+  ], fullFolders);
+  check("an incremental ancestor move outside the allowlist revokes the descendant",
+    sourceRootDecision(file, incrementalFolders, [ALLOWED_ROOT]).allowed === false);
+
+  let downloads = 0;
+  const refused = await convertDriveEnvelope(tok, file, {
+    folders: incrementalFolders,
+    rootFolderIds: [ALLOWED_ROOT],
+  }, {
+    fetchImpl: async () => { downloads++; return bytes("must not be read"); },
+    sleep: async () => {},
+  });
+  check("a Drive item outside the configured roots is refused before download",
+    downloads === 0 && refused.sourcePolicy === "root_allowlist" && /outside the allowed source boundary/.test(refused.skip?.reason),
+    JSON.stringify({ downloads, refused }));
 }
 {
   const file = { id: "F1", name: "2026-03-14 board notes.txt", mimeType: "text/plain", size: "400",

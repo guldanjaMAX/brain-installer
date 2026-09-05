@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import {
   mkdtempSync,
+  mkdirSync,
   lstatSync,
   readdirSync,
   readFileSync,
@@ -19,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   chooseSetupAccount,
+  cmdIngestLocal,
   cmdMigrate,
   cmdSetup,
   persistWorkersDevDomain,
@@ -77,15 +79,23 @@ try {
   };
   const events = [];
   const key = `fixture-${"k".repeat(40)}`;
+  const firstSourceFolder = join(sandbox, "first-source");
+  mkdirSync(firstSourceFolder);
+  writeFileSync(join(firstSourceFolder, "first-note.txt"), "A synthetic note loaded by fresh setup.\n");
+  const canonicalFirstSource = realpathSync.native(firstSourceFolder);
   const prompt = async (question, fallback) => {
     if (/what is this brain for/i.test(question)) return "Clean Brain";
     if (/short name/i.test(question)) return "clean-brain";
     if (/folder to load/i.test(question)) return "";
     return fallback || "";
   };
+  const freshSetupPrompt = async (question, fallback) => {
+    if (/folder to load/i.test(question)) return firstSourceFolder;
+    return prompt(question, fallback);
+  };
   await cmdSetup(target, {
     setupWorkerScriptExists: async () => false,
-    ask: prompt,
+    ask: freshSetupPrompt,
     doctorRunAll: async (options) => {
       assert.equal(options.requireClaudeCode, true);
       return [];
@@ -136,10 +146,25 @@ try {
       assert.ok(options.nodePath);
       return { path: join(sandbox, "Financial Brain", "CLAUDE.md"), status: "written" };
     },
+    cmdIngestLocal: async (manifest, path, flags) => {
+      events.push("ingest");
+      assert.equal(path, target);
+      assert.deepEqual(flags, { path: canonicalFirstSource, source: "documents" });
+      const persisted = JSON.parse(readFileSync(target, "utf8"));
+      assert.deepEqual(persisted.corpora.upload.folders, [{
+        path: canonicalFirstSource,
+        source: "documents",
+      }], "fresh setup must commit the approved root before invoking ingest");
+      assert.deepEqual(manifest.corpora.upload.folders, persisted.corpora.upload.folders);
+      const preview = await cmdIngestLocal(manifest, path, { ...flags, "dry-run": true });
+      assert.equal(preview.dry_run, true);
+      assert.equal(preview.would_send, 1,
+        "the first setup ingest must pass the exact-root gate and reach the real folder");
+    },
     backlogCount: async () => 0,
     installedManifestOptions,
   });
-  assert.deepEqual(events, ["verify", "provision", "migrate", "deploy", "secrets", "drain", "health", "wire", "claude-guide"]);
+  assert.deepEqual(events, ["verify", "provision", "migrate", "deploy", "secrets", "drain", "health", "wire", "claude-guide", "ingest"]);
   const saved = JSON.parse(readFileSync(target, "utf8"));
   assert.equal(saved.infrastructure.cloudflare.account_id, oneAccount.id);
   assert.equal(saved.brain.domain, "clean-brain.owner-subdomain.workers.dev");
@@ -155,6 +180,7 @@ try {
       assert.notEqual(path, target);
       return true;
     },
+    probeExistingWorkerHealth: async () => null,
     captureSetupD1Bookmark: async (path) => {
       assert.equal(path, resumedPinnedPath);
       resumedEvents.push("bookmark");
@@ -210,6 +236,62 @@ try {
     "health:durable",
     "wire",
   ]);
+
+  // A finished brain on the lease protocol is not a cutover candidate. Setup
+  // used to pause it and walk it back into the cutover purely because the
+  // Worker existed, and every error message in that state suggested setup.
+  const runningVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+  const liveEvents = [];
+  await cmdSetup(target, {
+    ask: prompt,
+    doctorRunAll: async () => [],
+    setupWorkerScriptExists: async () => true,
+    probeExistingWorkerHealth: async () => ({ version: runningVersion, acceptingDocuments: true }),
+    captureSetupD1Bookmark: async () => { liveEvents.push("bookmark"); return "never"; },
+    waitForVectorDrainQuiescence: async () => { liveEvents.push("wait"); },
+    configureStandardAdminKeyStorage: () => ({ changed: false }),
+    prepareSetupAdminKey: async () => ({ source: "durable", value: key, plan: { backend: "file" } }),
+    cmdVerify: async () => { liveEvents.push("verify"); },
+    cmdProvision: async () => { liveEvents.push("provision"); },
+    cmdMigrate: async () => { liveEvents.push("migrate"); },
+    cmdDeploy: async () => { liveEvents.push("deploy"); },
+    cmdSecrets: async () => { liveEvents.push("secrets"); },
+    cmdDrain: async () => { liveEvents.push("drain"); },
+    cmdHealth: async (_path, options) => { liveEvents.push(options.reachOnly ? `health:${options.expectDrainMode}` : "health:durable"); },
+    wireAgents: async () => { liveEvents.push("wire"); return { wired: [], failures: [], skipped: [] }; },
+    backlogCount: async () => 0,
+    installedManifestOptions,
+  });
+  assert.deepEqual(liveEvents, ["verify", "provision", "secrets", "drain", "health:durable", "wire"],
+    "a live brain on this release is neither paused, migrated nor redeployed by setup");
+
+  // On another release, setup names the right tool and touches nothing.
+  const otherEvents = [];
+  await assert.rejects(
+    () => cmdSetup(target, {
+      ask: prompt,
+      doctorRunAll: async () => [],
+      setupWorkerScriptExists: async () => true,
+      probeExistingWorkerHealth: async () => ({ version: "0.0.1", acceptingDocuments: true }),
+      captureSetupD1Bookmark: async () => { otherEvents.push("bookmark"); return "never"; },
+      waitForVectorDrainQuiescence: async () => { otherEvents.push("wait"); },
+      configureStandardAdminKeyStorage: () => ({ changed: false }),
+      prepareSetupAdminKey: async () => ({ source: "durable", value: key, plan: { backend: "file" } }),
+      cmdVerify: async () => { otherEvents.push("verify"); },
+      cmdProvision: async () => { otherEvents.push("provision"); },
+      cmdMigrate: async () => { otherEvents.push("migrate"); },
+      cmdDeploy: async () => { otherEvents.push("deploy"); },
+      cmdSecrets: async () => { otherEvents.push("secrets"); },
+      cmdDrain: async () => { otherEvents.push("drain"); },
+      cmdHealth: async () => { otherEvents.push("health"); },
+      wireAgents: async () => { otherEvents.push("wire"); return { wired: [], failures: [], skipped: [] }; },
+      backlogCount: async () => 0,
+      installedManifestOptions,
+    }),
+    (error) => /already installed and live on version 0\.0\.1/.test(String(error?.message || error)) &&
+      /brain update/.test(String(error?.message || error)),
+  );
+  assert.deepEqual(otherEvents, ["verify", "provision"], "nothing after the check runs on a brain from another release");
 
   // An interrupted projection bootstrap is a durable partial success: setup
   // stops before full health/wiring, and a rerun invokes the same drain again

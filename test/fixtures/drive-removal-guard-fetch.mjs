@@ -111,6 +111,16 @@ globalThis.fetch = async (input, options = {}) => {
     return json({ startPageToken: "fixture-next-cursor" });
   }
 
+  if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/changes") {
+    // The configured root disappeared from the change feed. The command must
+    // expand this incremental tick to a complete comparison before it may use
+    // absence as deletion evidence or advance the cursor.
+    return json({
+      changes: [{ fileId: "fixture-allowed-root", removed: true }],
+      newStartPageToken: "fixture-change-cursor",
+    });
+  }
+
   if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files") {
     return json({ files: [], nextPageToken: null, incompleteSearch: false });
   }

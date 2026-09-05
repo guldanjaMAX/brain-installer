@@ -17,15 +17,16 @@ absolute test-kit and manifest paths.
 
 ## Start here
 
-1. Ask for the path to the Financial Brain test kit and the installed
-   `brain.manifest.json` if they were not supplied in `$ARGUMENTS`.
-2. Read `release.json` in the test kit. Stop if `ready_to_send` is not `true`,
-   the installed version or digest differs, or the intended hostname is empty.
-3. Read the start-here, before-starting, accounts-and-permissions,
-   connector-status, and results-template guides from that same kit. Their
-   filenames may include the owner's name; keep that instance detail out of the
-   installed shared skill.
-4. Run the read-only plan:
+1. Ask whether this is a fresh install, an update, or a checkup. Ask for the
+   absolute `brain.manifest.json` path, creating no file yet when this is fresh.
+2. Run `brain --version` and the packaged read-only preflight. Use the full
+   installed command path from the install page if `brain` is not on PATH.
+   Stop on any preflight `STOP` line.
+3. If a private test kit was supplied, read its `release.json`. Stop if
+   `ready_to_send` is not `true`, its version or archive digest differs from the
+   installed package, or its intended hostname is empty. A test kit is helpful
+   for a supervised client handoff, but is not required for a fresh install.
+4. Run the read-only plan, even before the manifest exists:
 
    ```bash
    brain technician "/absolute/path/to/brain.manifest.json" --json
@@ -64,6 +65,38 @@ absolute test-kit and manifest paths.
 - Preview every deletion or forget plan and wait for exact approval before the
   command that mutates data.
 
+## Updates and checkups
+
+- For an existing brain, start with `brain doctor`. When the installed package
+  and Worker versions differ, use `brain update`, which resumes from its saved
+  bookmark. Setup on an already current brain only reconciles keys, health, and
+  local tool wiring; it does not repeat the migration cutover.
+- An update is its own appointment, not part of a loading session: the brain
+  refuses new material during its cutover pause. Run it in the foreground and
+  leave the window open. On a quiet brain the pause ends in under a minute;
+  on a busy one it can take the full twenty, and it says which.
+- Read WHICH lines fail at the end of an update. If every FAIL begins with
+  `freshness:`, the update succeeded and a source needs attention; anything
+  else is a stop. Keep the output either way.
+- One line during an update is a wait, not a stop: "N vector(s) accepted but
+  not yet visible; waiting for Vectorize". The index has the vectors and has
+  not exposed them yet; the update polls and finishes on its own. On builds
+  before 0.3.4 the same state ended the update with "reported N failed
+  aggregate operation(s)"; nothing was lost, and re-running the same update a
+  minute later resumes the same step.
+- Start the credential hour fresh. The `wrangler login` session lasts about an
+  hour and is renewed only after it has run out, so an update begun near the
+  end of that hour can stop partway with `403 9109 Invalid access token`,
+  worded as if the owner typed a bad token. Have the owner run
+  `npx wrangler@4.73.0 login` right before `brain update`, and again before
+  re-running if that line appears.
+- Before calling a brain proven, count `testing.probe_questions` in the
+  manifest. An empty list means the retrieval tier was not exercised.
+- For a loading or scoring call, start read-only: two `brain health`
+  readings two minutes apart, then `brain sources`. Pending falling means the
+  index is keeping up; pending and the vector count both flat means it is
+  paused, which the next release clears and a hand repair must not.
+
 ## Recovery and completion
 
 - A failed technician step is ready to retry after its named prerequisite is
@@ -75,7 +108,19 @@ absolute test-kit and manifest paths.
   ```
 
 - Finish with the preflight script and results template supplied in the test
-  kit. Record counts, timestamps, proof level, and sanitized evidence. Keep
+  kit when one was supplied. Otherwise rerun the packaged preflight directly:
+
+  ```bash
+  bash "$HOME/.financial-brain/lib/node_modules/brain-installer/tools/preflight.sh"
+  ```
+
+  On Windows PowerShell:
+
+  ```powershell
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\FinancialBrain\node_modules\brain-installer\tools\preflight.ps1"
+  ```
+
+  Record counts, timestamps, proof level, and sanitized evidence. Keep
   credentials and raw private source content out of that record.
 - Report anything that still requires Cloudflare, provider, operating-system,
   physical-device, or real-export proof. Fixture success does not close a live

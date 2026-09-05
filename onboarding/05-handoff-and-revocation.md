@@ -19,12 +19,15 @@ At **[TIME] on [DATE]**, with you watching:
 |---|---|---|
 | My Cloudflare API token for your account | Deleted | I can no longer see, deploy to, or delete anything in your Cloudflare account |
 | The stored copy of that token on my computer | Removed with `brain token <manifest> --forget`, with you watching | My machine's keychain holds nothing for your account — a revoked token must also stop existing locally, not linger as clutter |
+| The pinned Wrangler session on my computer, if setup announced one | Removed with `npx wrangler@4.73.0 logout`; `npx wrangler@4.73.0 whoami` then confirms no authenticated account | No account-wide Cloudflare browser session remains on my machine |
 | My access to your [Google Drive folders / source] | Removed by you | I can no longer read any of your source material |
 | Your admin key | Rotated by you, to a value I have never seen | I cannot query your brain, even at its public address |
 
-The Cloudflare and admin credentials used during the build are rotated or
-revoked at handoff. Written answers use the Cloudflare AI binding, so there is
-no separate model-provider key to transfer or revoke.
+The Cloudflare and admin credentials used during the build are rotated, revoked,
+or removed at handoff. If setup announced a Wrangler session, its logout row
+must be completed before claiming access is gone. Written answers use the
+Cloudflare AI binding, so there is no separate model-provider key to transfer or
+revoke.
 
 Once those steps are done I hold **no credential of any kind** to your infrastructure, your material, or your brain.
 
@@ -32,9 +35,9 @@ This is not a policy I am promising to follow. It is a fact about what keys exis
 
 ### Verify it yourself, today
 
-Do not take my word for any of the above. All three are checkable in about five minutes:
+Do not take my word for any of the above. All three areas are checkable in about five minutes:
 
-1. **Cloudflare.** Log in, go to **My Profile, then API Tokens**. The token named `[TOKEN NAME]` should not be listed. If it is, delete it now and tell me.
+1. **Cloudflare.** Log in, go to **My Profile, then API Tokens**. The token named `[TOKEN NAME]` should not be listed. If it is, delete it now and tell me. If setup announced a Wrangler session on my computer, `npx wrangler@4.73.0 whoami` there must also report no authenticated account.
 2. **Google.** Open the sharing settings on the folders you granted, or the service account list at [LOCATION]. My access should not appear.
 3. **Your admin key.** You rotated it during our session. I was not shown the new value and it exists only in your own store.
 After all three, run `node brain.mjs test <manifest>` yourself. If the brain
@@ -57,7 +60,7 @@ Everything. Here it is written down, because "you own it" is worthless if nobody
 | Search index | Cloudflare Vectorize index `[VECTORIZE_INDEX]`, in YOUR account | The meaning of your material, as vectors |
 | Text and keywords | Cloudflare D1 database `[D1_NAME]`, in YOUR account | Your material itself, and the keyword index over it |
 | Answer model | Cloudflare Workers AI in [ACCOUNT EMAIL] | Writes the answers in the same account, capped at $[CAP] per day |
-| Source access | [GOOGLE SERVICE ACCOUNT / OAUTH CLIENT] | Read-only access to your own folders |
+| Source access | [GOOGLE SERVICE ACCOUNT / OAUTH CLIENT] | Read-only access to every Drive file this Google account can access; manifest folder IDs limit what content is downloaded and ingested |
 | Admin key | [WHERE YOU STORED IT] | The password to your brain. Treat it like one |
 | Your manifest | `[PATH / REPO]` | The one file that describes your install. Contains no secrets |
 | The installer and its tools | `[PATH / REPO]` | Everything needed to verify, update, or rebuild |
@@ -70,10 +73,12 @@ Everything. Here it is written down, because "you own it" is worthless if nobody
 
 Routine checks use the admin key from the manifest's durable local storage, so
 you do not need to copy it into your shell. For account-changing work, run the
-supported `brain setup` or `brain update` path in an interactive terminal and
-enter the scoped Cloudflare token at its hidden prompt. Low-level automation
-must inject that token through an approved secret manager. Never paste a token
-into a shell command or leave it in shell history.
+supported `brain setup` or `brain update` path. A scoped token deliberately
+injected by an approved launcher has first priority. Otherwise the command
+announces and uses an existing pinned Wrangler 4.73.0 session. If neither is
+available, it asks for the scoped token in a hidden prompt. Prefer the scoped
+token when least-privilege access is appropriate. Never paste a token into a
+shell command or leave it in shell history.
 
 Then, from the installer folder:
 

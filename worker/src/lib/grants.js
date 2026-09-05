@@ -36,6 +36,12 @@ export const CAPABILITIES = Object.freeze([
 ]);
 
 const CAPABILITY_SET = new Set(CAPABILITIES);
+const ZONE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+/** Zone ids are shared by the owner API and stored grant parser. */
+export function validZoneId(value) {
+  return typeof value === "string" && ZONE_ID.test(value);
+}
 
 /** The owner, and anyone holding the full admin key, can do all five. */
 export const OWNER_CAPABILITIES = Object.freeze([...CAPABILITIES]);
@@ -116,14 +122,31 @@ export function parseScope(row) {
   try {
     include = typeof row?.scope_include === "string" ? JSON.parse(row.scope_include) : row?.scope_include;
   } catch { return { zones: [] }; }
-  if (include?.all === true) return { all: true };
-  const zones = Array.isArray(include?.zones) ? include.zones.filter((z) => typeof z === "string") : [];
-  let exclude = [];
+  let rawExclude;
   try {
-    const raw = typeof row?.scope_exclude === "string" ? JSON.parse(row.scope_exclude) : row?.scope_exclude;
-    if (Array.isArray(raw)) exclude = raw.filter((z) => typeof z === "string");
+    rawExclude = typeof row?.scope_exclude === "string" ? JSON.parse(row.scope_exclude) : row?.scope_exclude;
   } catch { return { zones: [] }; }
+  if (!Array.isArray(rawExclude) || !rawExclude.every(validZoneId)) return { zones: [] };
+  const exclude = [...new Set(rawExclude)];
+  if (!include || typeof include !== "object" || Array.isArray(include)) return { zones: [] };
+  const keys = Object.keys(include);
+  // Exclusions win even when the include side says "all". Returning early for
+  // all-zones grants would silently turn "everything except private" into
+  // unrestricted access, and a malformed exclusion must fail closed too.
+  if (include.all === true && keys.length === 1 && keys[0] === "all") {
+    return { all: true, exclude };
+  }
+  if (keys.length !== 1 || keys[0] !== "zones" || !Array.isArray(include.zones) ||
+      !include.zones.every(validZoneId)) return { zones: [] };
+  const zones = [...new Set(include.zones)];
   return { zones, exclude };
+}
+
+/** True when a grant omits at least one zone and therefore needs filtering. */
+export function scopeIsRestricted(scope) {
+  if (!scope) return false;
+  const exclude = Array.isArray(scope.exclude) ? scope.exclude.filter(Boolean) : [];
+  return scope.all !== true || exclude.length > 0;
 }
 
 /** A grant row is usable only while it is neither revoked nor expired. */

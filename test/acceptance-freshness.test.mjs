@@ -259,3 +259,22 @@ const named = (suite, needle) =>
 
 console.log(`\nacceptance freshness: ${ran - fail}/${ran} passed`);
 if (fail) process.exit(1);
+
+/* ---- an update treats stale sources as warnings; a standalone test does not ---- */
+{
+  const strict = new Acceptance({ base: "http://fixture", adminKey: "k", manifest: {} });
+  strict.record(2, "freshness: drive", "fail", "STALE");
+  check("standalone: a stale source is still a failure", strict.results[0].status === "fail" && strict.tierFailed === 2);
+
+  const update = new Acceptance({ base: "http://fixture", adminKey: "k", manifest: {}, tolerateStaleSources: true });
+  update.record(2, "every source expected to refresh is current", "fail", "2 of 4 stopped");
+  update.record(2, "freshness: whatsapp", "fail", "STALE");
+  update.record(2, "semantic index is query-ready", "fail", "pending 12");
+  const [headline, source, other] = update.results;
+  check("update: the freshness headline is downgraded to a warning", headline.status === "warn" && headline.downgraded === true);
+  check("update: a per-source freshness line is downgraded to a warning", source.status === "warn" && source.downgraded === true);
+  check("update: any other failure stays a failure", other.status === "fail" && other.downgraded === undefined);
+  check("update: the tier only fails on the real failure", update.tierFailed === 2 && update.results.filter((r) => r.status === "fail").length === 1);
+  const summary = update.summary();
+  check("the summary counts the downgraded checks as warnings", summary.counts.warn === 2 && summary.counts.fail === 1);
+}

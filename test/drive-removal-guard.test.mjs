@@ -283,9 +283,10 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
   const userRoot = join(directory, "isolated-user-root");
   const tokenRoot = join(userRoot, ".brain");
   const priorCursor = "fixture-prior-cursor";
-  const priorFullSweep = "2000-01-01T00:00:00.000Z";
+  const priorFullSweep = new Date().toISOString();
   const scannerFingerprint = credentialScannerFingerprint(true);
   const policyFingerprint = drivePolicyFingerprint({
+    rootFolderIds: ["fixture-allowed-root"],
     excludeFileIds: [],
     excludePaths: [],
     excludeNameParts: [],
@@ -352,7 +353,7 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
       brain: { domain: "fixture.invalid" },
       infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
       safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
-      corpora: { google_drive: {} },
+      corpora: { google_drive: { root_folder_ids: ["fixture-allowed-root"] } },
     }));
     writeFileSync(join(tokenRoot, "google-tokens.json"), JSON.stringify({
       google: {
@@ -376,6 +377,7 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     assert.equal(stopped.code, 1, safeDiagnostic(stopped.output));
     assertNoFamilyLeak(stopped.output);
     assert.match(stopped.output, /review required/i);
+    assert.match(stopped.output, /folder ancestry changed.*full comparison/i);
     assert.doesNotMatch(stopped.output, /unexpected error|This is a bug in the installer/i);
     const initialApproval = approvalFrom(stopped.output);
     const supportBytes = previewSupportJournal({ root: userRoot });
