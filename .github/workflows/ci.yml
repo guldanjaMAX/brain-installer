@@ -247,7 +247,7 @@ jobs:
         run: |
           out=$(node brain.mjs)
           echo "$out"
-          echo "$out" | grep -q "brain setup" || { echo "::error::usage did not print"; exit 1; }
+          echo "$out" | grep -Eq 'setup[[:space:]]+\[manifest\]' || { echo "::error::usage did not print"; exit 1; }
 
       # doctor must RUN and report, with no Cloudflare credentials present. It
       # is expected to report failures here; what is NOT acceptable is a crash,
@@ -285,7 +285,7 @@ jobs:
 
           out=$("$bin")
           echo "$out"
-          echo "$out" | grep -q "brain setup" || { echo "::error::installed bin ran but printed nothing"; exit 1; }
+          echo "$out" | grep -Eq 'setup[[:space:]]+\[manifest\]' || { echo "::error::installed bin ran but printed nothing"; exit 1; }
 
       # The public guide uses a user-owned prefix. That avoids sudo/EACCES on
       # Mac and Linux and keeps Windows inside the current profile. Exercise
@@ -301,7 +301,7 @@ jobs:
           else echo "::error::no user-prefix brain bin found"; exit 1; fi
           out=$("$bin")
           echo "$out"
-          echo "$out" | grep -q "brain setup" || { echo "::error::user-prefix bin did not run"; exit 1; }
+          echo "$out" | grep -Eq 'setup[[:space:]]+\[manifest\]' || { echo "::error::user-prefix bin did not run"; exit 1; }
 
       # PowerShell can block npm.ps1/npx.ps1 under its default execution
       # policy. The website therefore uses the .cmd shims explicitly on
@@ -317,7 +317,7 @@ jobs:
           npm.cmd install --global --prefix $prefix --ignore-scripts --no-audit --no-fund $tarball
           $out = & (Join-Path $prefix 'brain.cmd') | Out-String
           $out
-          if ($out -notmatch 'brain setup') { throw 'PowerShell user-prefix bin did not run' }
+          if ($out -notmatch 'setup\s+\[manifest\]') { throw 'PowerShell user-prefix bin did not run' }
 
       # An install must never carry the author's own client data. package.json
       # uses an allowlist; this fails loudly if a future edit turns it into a

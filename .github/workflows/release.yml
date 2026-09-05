@@ -344,7 +344,7 @@ jobs:
             echo "::error::installed public CLI exited $installed_status"
             exit 1
           fi
-          if [[ "$installed_output" != *"brain setup"* ]]; then
+          if ! grep -Eq 'setup[[:space:]]+\[manifest\]' <<<"$installed_output"; then
             echo "::error::installed public CLI did not print usage"
             exit 1
           fi
