@@ -53,6 +53,18 @@ globalThis.fetch = async (input, options = {}) => {
     return json({ startPageToken: "fixture-next-cursor" });
   }
 
+  // The rooted walk proves each reviewed root is a live folder before it reads
+  // anything under it, so the fixture has to answer for the root id too.
+  if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files/root-fixture") {
+    return json({
+      id: "root-fixture",
+      name: "Reviewed Root",
+      mimeType: "application/vnd.google-apps.folder",
+      trashed: false,
+      parents: [],
+    });
+  }
+
   if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files") {
     return json({
       files: [{

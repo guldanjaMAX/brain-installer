@@ -4561,6 +4561,24 @@ export function driveExclusionIdsOf(raw) {
  */
 export function driveConnectorConfig(m, manifestPath, read = (path) => readFileSync(path, "utf-8")) {
   const declared = m?.corpora?.google_drive || {};
+  // Drive must be told what it may read. Without roots the walk enumerates
+  // every file the token can see INCLUDING SHARED DRIVES, which on a real
+  // install was 468,697 files against a My Drive of about 43,000: roughly 70%
+  // of it images, video and web assets that can never be indexed. Google
+  // aborts an enumeration that long, so the pass never reaches its watermark
+  // and the source stalls permanently, re-walking from the start every night.
+  // Exclusions cannot fix it, because they filter AFTER enumeration.
+  if (!Array.isArray(declared.root_folder_ids)) {
+    throw new Error("corpora.google_drive.root_folder_ids must be a non-empty array before Drive can run");
+  }
+  const rootFolderIds = [...new Set(
+    declared.root_folder_ids.map((value) => String(value || "").trim()).filter(Boolean)
+  )].sort();
+  if (!rootFolderIds.length) {
+    throw new Error(
+      "Google Drive is disabled until corpora.google_drive.root_folder_ids names at least one reviewed folder"
+    );
+  }
   let fileIds = driveExclusionIdsOf(declared.exclude_file_ids || []);
   if (declared.exclude_file_ids_file) {
     const filePath = resolve(dirname(resolve(manifestPath)), String(declared.exclude_file_ids_file));
@@ -4573,12 +4591,18 @@ export function driveConnectorConfig(m, manifestPath, read = (path) => readFileS
     fileIds = [...new Set([...fileIds, ...driveExclusionIdsOf(parsed)])].sort();
   }
   return {
+    rootFolderIds,
     excludeFileIds: fileIds,
     excludePaths: Array.isArray(declared.exclude_paths) ? declared.exclude_paths.map(String) : [],
     excludeNameParts: Array.isArray(declared.exclude_name_parts) ? declared.exclude_name_parts.map(String) : [],
     privatePrefixes: Array.isArray(m?.safety?.private_path_prefixes) ? m.safety.private_path_prefixes.map(String) : [],
   };
 }
+
+// Bump when Drive extraction support changes in a way that should reconsider an
+// unchanged file. Deliberately independent of the credential-scanner gate: it
+// forces one full Drive comparison without re-sending the whole corpus.
+export const DRIVE_EXTRACTOR_POLICY_VERSION = 2;
 
 /** Stable identity for the policy that decides which Drive files may be indexed. */
 export function credentialScannerFingerprint(enabled = true, gateVersion = CREDENTIAL_GATE_VERSION) {
@@ -4632,12 +4656,23 @@ export function commitCredentialScannerProgress(state, fingerprint) {
   return state;
 }
 
-export function drivePolicyFingerprint(config = {}, scannerEnabled = true, ocrEnabled = false) {
+export function drivePolicyFingerprint(
+  config = {},
+  scannerEnabled = true,
+  ocrEnabled = false,
+  extractorPolicyVersion = DRIVE_EXTRACTOR_POLICY_VERSION,
+) {
   const normalized = {};
-  for (const key of ["excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
+  // rootFolderIds belongs here for the same reason OCR does: changing which
+  // folders Drive may read changes what it is allowed to see. Without it, a
+  // newly added root would only ever surface files that CHANGED after the
+  // change token was taken, so everything already sitting in that folder would
+  // stay invisible. A fingerprint mismatch forces one full comparison.
+  for (const key of ["rootFolderIds", "excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
     normalized[key] = [...new Set((config[key] || []).map((value) => String(value)))].sort();
   }
   normalized.credentialScanner = credentialScannerFingerprint(scannerEnabled);
+  normalized.extractorPolicyVersion = Number(extractorPolicyVersion);
   // Turning OCR on changes what Drive is ALLOWED TO READ, so it belongs in the
   // source policy. Without it, a scanned PDF refused a month ago never
   // reappears: once a change token exists the incremental feed only returns
@@ -8641,8 +8676,10 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       }
     }
     if (!incremental) {
-      info("full walk of Drive");
-      for await (const f of drive.listFiles(getToken)) {
+      info(`full walk of ${sourcePolicy.rootFolderIds.length} reviewed Drive root folder(s)`);
+      for await (const f of drive.listRootedFiles(getToken, {
+        rootFolderIds: sourcePolicy.rootFolderIds,
+      })) {
         files.push(f);
         if (files.length >= limit) break;
       }

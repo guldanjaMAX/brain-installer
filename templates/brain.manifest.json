@@ -360,10 +360,7 @@
       "hubspot": "auto"
     },
     "admin_key_secret": null,
-    "google_token_store": "auto",
-    "health_cron": "0 13 * * *",
-    "health_report_email": "owner@acme.com",
-    "alert_webhook_secret": "secret://ALERT_WEBHOOK_URL"
+    "google_token_store": "auto"
   },
   "testing": {
     "_comment": [

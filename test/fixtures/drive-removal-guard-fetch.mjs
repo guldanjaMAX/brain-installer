@@ -111,6 +111,18 @@ globalThis.fetch = async (input, options = {}) => {
     return json({ startPageToken: "fixture-next-cursor" });
   }
 
+  // The rooted walk proves each reviewed root is a live folder first. This
+  // fixture models an EMPTY Drive, so the root exists and holds nothing.
+  if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files/root-fixture") {
+    return json({
+      id: "root-fixture",
+      name: "Reviewed Root",
+      mimeType: "application/vnd.google-apps.folder",
+      trashed: false,
+      parents: [],
+    });
+  }
+
   if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files") {
     return json({ files: [], nextPageToken: null, incompleteSearch: false });
   }
