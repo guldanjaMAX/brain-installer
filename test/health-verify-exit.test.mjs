@@ -295,8 +295,9 @@ if (SCENARIO) {
   // the same lease the scheduled one holds, so the two exclude each other and
   // the manual runner is slower. Health must describe the state and must not
   // send the operator to make it worse.
-  check("health never tells the operator to run a manual drain",
-    !/brain drain/.test(processing.output) && !/brain drain/.test(stalled.output),
+  check("health never INSTRUCTS a manual drain, and warns against it when stalled",
+    !/(Clear it now with|Finish and confirm visibility with|Re-run `brain drain)/i.test(stalled.output + processing.output) &&
+      /Do NOT run `brain drain`/.test(stalled.output),
     processing.output + "\n---\n" + stalled.output);
 
   const countMismatch = runScenario("health-vector-count-mismatch", "health", { adminKey: true });
