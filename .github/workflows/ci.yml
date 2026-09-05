@@ -223,6 +223,8 @@ jobs:
           if ($out -notmatch 'STOP.*MSIX sandbox') { Write-Host "::error::preflight did not stop on the MSIX sandbox"; exit 1 }
           if ($code -ne 1) { Write-Host "::error::a STOP must exit 1, got $code"; exit 1 }
           Write-Host "TRAP 2 DETECTED, exit 1 as required"
+          # The child correctly exited 1; do not let that leak out as this step's verdict.
+          exit 0
 
       - name: "trap 3: more than one copy of the CLI on PATH"
         shell: powershell
@@ -238,6 +240,8 @@ jobs:
           if ($out -notmatch 'STOP.*2 copies of the CLI') { Write-Host "::error::preflight did not stop on duplicate CLIs"; exit 1 }
           if ($code -ne 1) { Write-Host "::error::a STOP must exit 1, got $code"; exit 1 }
           Write-Host "TRAP 3 DETECTED, exit 1 as required"
+          # The child correctly exited 1; do not let that leak out as this step's verdict.
+          exit 0
 
       - name: "control: a clean machine is told plainly that nothing is wrong"
         shell: powershell
