@@ -54,6 +54,28 @@ jobs:
       - name: unit and integration suite
         run: npm test
 
+      # The preflight is what an operator runs on a client machine before an
+      # install. It reads the machine and changes nothing, so CI's job is to
+      # prove it RUNS and prints on every platform, not that it is all-clear:
+      # a runner legitimately has no wrangler session and no manifest.
+      - name: preflight runs and prints (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          .\tools\preflight.ps1
+          Write-Host "preflight exit: $LASTEXITCODE"
+          $e=$null; $t=$null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\tools\preflight.ps1), [ref]$t, [ref]$e) | Out-Null
+          if ($e.Count -gt 0) { $e | ForEach-Object { Write-Host $_ }; exit 1 }
+          Write-Host "preflight.ps1 parsed clean"
+
+      - name: preflight runs and prints (macOS and Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bash tools/preflight.sh; echo "preflight exit: $?"
+          bash -n tools/preflight.sh && echo "preflight.sh parsed clean"
+
       # The CLI must START. On Windows a symlinked bin, a percent-encoded path
       # or a .cmd shim can make it exit 0 having done nothing, which is worse
       # than crashing because every exit-code check passes.
