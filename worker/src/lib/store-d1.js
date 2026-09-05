@@ -2770,7 +2770,11 @@ async function drainPausedBootstrapResidue(env, state, options) {
     throw new Error("the paused bootstrap residue receipt is invalid");
   }
   if (residue === 0 || owned > 0) return { attempted: false, remaining: residue };
-  await drainOutbox(env, {
+  // Keep the receipt. A busy lease here means another drain holds it, which is
+  // contention, not stalled progress. Discarding it returns a plain
+  // zero-movement result and the CLI counts the wait against its stall timer
+  // instead of backing off against the documented 409 busy contract.
+  const drained = await drainOutbox(env, {
     ...options,
     allowPausedBootstrap: true,
     disableBootstrapAdvance: true,
@@ -2783,7 +2787,7 @@ async function drainPausedBootstrapResidue(env, state, options) {
   if (!Number.isSafeInteger(total) || total < 0) {
     throw new Error("the paused bootstrap residue receipt is invalid");
   }
-  return { attempted: true, remaining: total };
+  return { attempted: true, remaining: total, busy: drained.busy === true };
 }
 
 export async function acceleratedVectorBootstrap(env, options = {}) {
@@ -2840,6 +2844,11 @@ export async function acceleratedVectorBootstrap(env, options = {}) {
 
   const residue = await drainPausedBootstrapResidue(env, state, options);
   if (residue.attempted) {
+    if (residue.busy) {
+      // Surface contention as the lease contract, not as a stalled bootstrap.
+      const receipt = await acceleratedBootstrapReceipt(env, "legacy_drain");
+      return { ...receipt, busy: true };
+    }
     if (residue.remaining > 0) return acceleratedBootstrapReceipt(env, "legacy_drain");
     state = await bootstrapStateV2(env);
   }
