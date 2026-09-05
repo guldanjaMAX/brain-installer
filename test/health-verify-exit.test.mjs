@@ -288,8 +288,16 @@ if (SCENARIO) {
   const processing = runScenario("health-vector-processing", "health", { adminKey: true });
   check("health cannot green an accepted mutation before query visibility",
     processing.code === 1 && /not query-visible yet.*accepted by Vectorize/is.test(processing.output) &&
-      /brain drain/.test(processing.output) && !/vector index is query-ready/.test(processing.output),
+      !/vector index is query-ready/.test(processing.output),
     processing.output);
+  // This assertion used to require the words "brain drain" here, which pinned
+  // in place advice three separate reviews called harmful: a manual drain takes
+  // the same lease the scheduled one holds, so the two exclude each other and
+  // the manual runner is slower. Health must describe the state and must not
+  // send the operator to make it worse.
+  check("health never tells the operator to run a manual drain",
+    !/brain drain/.test(processing.output) && !/brain drain/.test(stalled.output),
+    processing.output + "\n---\n" + stalled.output);
 
   const countMismatch = runScenario("health-vector-count-mismatch", "health", { adminKey: true });
   check("health rejects an empty queue when Vectorize is still missing vectors",

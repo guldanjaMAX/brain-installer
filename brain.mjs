@@ -2235,17 +2235,21 @@ async function cmdHealth(manifestPath, {
             die(
               `${backlog.pending} vector operation(s) are stalled` +
                 ` (${backlog.upserts} upsert, ${backlog.deletes} delete, ${backlog.submitted} accepted), oldest queued ${oldest} min ago.` + "\n" +
-                "      Older than 30 minutes means the drain cron is not keeping up. Upserts are" + "\n" +
-                "      keyword-only; deletes leave stale vectors competing. Clear it now with:" + "\n" +
-                "      brain drain <manifest>" + "\n" +
-                "      If it returns, inspect the Worker schedule in the Cloudflare dashboard."
+                "      Older than 30 minutes means the scheduled drain is not keeping up. Upserts are" + "\n" +
+                "      keyword-only; deletes leave stale vectors competing." + "\n" +
+                "      Do NOT run `brain drain` to hurry it: that takes the same lease the" + "\n" +
+                "      scheduled drain holds, so the two exclude each other rather than adding up," + "\n" +
+                "      and the manual runner is the slower of the two." + "\n" +
+                "      A large backlog is cleared by `brain update`, which rebuilds in bulk." + "\n" +
+                "      If the count never moves at all, that is a stall rather than a queue:" + "\n" +
+                "      check the Worker schedule in the Cloudflare dashboard and report it."
             );
           }
           die(
             `${backlog.pending} vector operation(s) are not query-visible yet` +
               ` (${backlog.submitted} accepted by Vectorize), oldest queued ${oldest} min ago.` + "\n" +
-              "      Provider acceptance is not completion. Finish and confirm visibility with:" + "\n" +
-              "      brain drain <manifest>"
+              "      Provider acceptance is not completion. This resolves on its own, usually" + "\n" +
+              "      within a couple of minutes; re-run `brain health` rather than forcing it."
           );
         }
         if (!readiness.ready || readiness.actual_vectors !== readiness.expected_vectors) {
