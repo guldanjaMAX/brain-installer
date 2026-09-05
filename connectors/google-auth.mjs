@@ -1361,18 +1361,53 @@ export function tokenStorageStatus(value) {
  * while Gmail scopes are attached. The message says so, because "400" alone
  * sends people looking in the wrong place.
  */
-export function createTokenProvider({ clientId, clientSecret, refreshToken, fetchImpl = fetch, skewMs = 60_000 }) {
+export function createTokenProvider({
+  clientId, clientSecret, refreshToken, fetchImpl = fetch, skewMs = 60_000,
+  // Every other Google call in this codebase bounds itself (connectors/
+  // google-drive.mjs api() uses 60s). This one did not, and a token POST that
+  // connects but never answers therefore hung forever, with no timeout to fire
+  // and nothing in the log. Observed 2026-09-05 on a real Gmail sync: the
+  // process sat idle in kevent for twelve minutes until it was killed.
+  requestTimeoutMs = 30_000,
+} = {}) {
   let cached = null;
   let expiresAt = 0;
-  return async function getAccessToken({ force = false } = {}) {
-    if (!force && cached && Date.now() < expiresAt - skewMs) return cached;
+  // One refresh at a time. The Gmail lane now has several fetches in flight,
+  // and when the access token ages out they all notice in the same moment;
+  // without this each would POST its own refresh. Google tolerates that, but
+  // it is a burst of identical round trips for one answer, and any caller that
+  // arrives mid-refresh should simply share the result.
+  let inflight = null;
+  const refresh = async () => {
     const body = new URLSearchParams({ client_id: clientId, refresh_token: refreshToken, grant_type: "refresh_token" });
     if (clientSecret) body.set("client_secret", clientSecret);
-    const res = await fetchImpl(TOKEN_URL, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body,
-    });
+    const signal = Number(requestTimeoutMs) > 0 &&
+      typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(Number(requestTimeoutMs))
+      : undefined;
+    let res;
+    try {
+      res = await fetchImpl(TOKEN_URL, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body,
+        ...(signal ? { signal } : {}),
+      });
+    } catch (error) {
+      // A timeout here must SAY it was a timeout. "fetch failed" sent an
+      // operator looking for a network outage when the request was simply
+      // never answered.
+      const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
+      const e = new Error(
+        timedOut
+          ? `the Google token refresh did not answer within ${Math.round(Number(requestTimeoutMs) / 1000)}s. ` +
+            "This is usually a transient network fault; re-running the command is safe."
+          : `the Google token refresh could not be sent: ${error?.message || error}`
+      );
+      e.retryable = true;
+      e.cause = error;
+      throw e;
+    }
     const json = await res.json().catch(() => ({}));
     if (!res.ok) {
       if (json.error === "invalid_grant") {
@@ -1390,5 +1425,10 @@ export function createTokenProvider({ clientId, clientSecret, refreshToken, fetc
     cached = json.access_token;
     expiresAt = Date.now() + (json.expires_in || 3600) * 1000;
     return cached;
+  };
+  return async function getAccessToken({ force = false } = {}) {
+    if (!force && cached && Date.now() < expiresAt - skewMs) return cached;
+    if (!inflight) inflight = refresh().finally(() => { inflight = null; });
+    return inflight;
   };
 }

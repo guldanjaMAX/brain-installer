@@ -8390,6 +8390,18 @@ export async function cmdLoad(manifestPath, options = {}) {
  * and a folder document are refused, split, batched and reported by identical
  * code. The producers differ; the pipeline does not.
  */
+/**
+ * How many Gmail messages are fetched ahead, in order, during a sync. Eight
+ * measured seven times faster than serial on a 190k-message mailbox with zero
+ * errors; Gmail's per-user quota allows roughly fifty gets a second. The
+ * environment override exists so a client whose mailbox is throttled can be
+ * slowed down without waiting for a release; it is clamped to 1..32.
+ */
+const GMAIL_FETCH_CONCURRENCY = (() => {
+  const raw = Number.parseInt(process.env.BRAIN_GMAIL_FETCH_CONCURRENCY || "", 10);
+  return Number.isInteger(raw) ? Math.min(32, Math.max(1, raw)) : 8;
+})();
+
 async function cmdIngestRemote(m, manifestPath, flags) {
   const which = String(flags.from).toLowerCase();
   if (!["drive", "gmail", "imap"].includes(which)) {
@@ -8415,7 +8427,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   const adminKey = dry ? null : resolveAdminKey(manifestPath);
   if (!adminKey && !dry) die("no admin key found: not in the environment, and no .brain-admin-key file next to the manifest.");
 
-  const { batchStream, splitOversized, loadState, saveState } = await ingestLib();
+  const { batchStream, splitOversized, loadState, saveState, prefetch } = await ingestLib();
   // IMAP holds its own mailbox credential and never touches the Google store.
   // Resolving googleAuth unconditionally would refuse an IMAP sync on a machine
   // that has deliberately never connected Google, which is most of them.
@@ -8894,10 +8906,23 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       ids = gmail.listMessages(getToken, { max: limit });
     }
 
-    const prepareGmail = async (id) => {
+    // One `messages.get` per message, about 300 ms each. Awaited one at a time
+    // that is ~160 messages a minute, so a 190k-message mailbox took twenty
+    // hours regardless of how fast the brain accepted batches (measured on a
+    // real first pass, 2026-09-05). Fetching a bounded window ahead, in order,
+    // measured seven times faster with no errors at eight in flight. The Google
+    // helper already retries 429 and 5xx with backoff, and Gmail's per-user
+    // budget (250 units/s, 5 per get) sits well above eight concurrent gets.
+    // Only the fetch overlaps: the credential scan, batching and resume state
+    // below still see one message at a time, in source order, exactly as before.
+    const fetched = prefetch(
+      ids,
+      async (id) => ({ id, fetched: await gmail.toEnvelope(getToken, id, { sourceName }) }),
+      { concurrency: GMAIL_FETCH_CONCURRENCY },
+    );
+    const prepareGmail = async ({ id, fetched: r }) => {
       scanned++;
       const key = `${sourceName}:${id}`;
-      const r = await gmail.toEnvelope(getToken, id, { sourceName });
       if (r.skip) {
         state.skipped[key] = r.skip.reason;
         if (r.policy_skip === true) policySkipped++;
@@ -8937,7 +8962,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         },
       };
     };
-    for await (const group of batchStream(ids, prepareGmail, {
+    for await (const group of batchStream(fetched, prepareGmail, {
       onSkip: (skip) => skips.push(skip),
     })) {
       await consumeGroup(group);

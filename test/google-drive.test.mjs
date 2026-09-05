@@ -52,6 +52,69 @@ const workbookBytes = (sheets) => {
   check("force bypasses the cache", (await get({ force: true })) === "a2");
 }
 {
+  // Several fetches in flight (the Gmail lane) notice an expired token at the
+  // same moment. They must share ONE refresh, not fire eight.
+  let calls = 0;
+  const get = createTokenProvider({ clientId: "c", refreshToken: "r", fetchImpl: async () => { calls++; await new Promise((r) => setTimeout(r, 5)); return json({ access_token: "shared" + calls, expires_in: 3600 }); } });
+  const tokens = await Promise.all(Array.from({ length: 8 }, () => get()));
+  check("eight concurrent callers share a single refresh round trip", calls === 1, `calls=${calls}`);
+  check("and all eight receive the same token", tokens.every((v) => v === "shared1"), JSON.stringify(tokens));
+  check("a later call after the shared refresh is still served from cache", (await get()) === "shared1" && calls === 1);
+}
+{
+  // A token POST that connects but never answers used to hang forever: this was
+  // the ONE Google call with no timeout, and on 2026-09-05 it stalled a real
+  // Gmail sync for twelve minutes with nothing in the log. Every caller sharing
+  // one refresh makes bounding it essential, not optional.
+  const get = createTokenProvider({
+    clientId: "c", refreshToken: "r", requestTimeoutMs: 40,
+    fetchImpl: (_u, opts) => new Promise((_resolve, reject) => {
+      // Never answers. Only the caller's own signal can end it.
+      // The keepalive timer matters: AbortSignal.timeout() uses an UNREF'd
+      // timer, so with nothing else pending the loop would simply drain and the
+      // abort would never fire. A real request holds a socket, which is what
+      // keeps the loop alive in production; this stands in for that socket.
+      const keepalive = setTimeout(() => reject(new Error("test keepalive expired without an abort")), 5_000);
+      opts?.signal?.addEventListener?.("abort", () => {
+        clearTimeout(keepalive);
+        reject(Object.assign(new Error("aborted"), { name: "TimeoutError" }));
+      });
+    }),
+  });
+  const started = Date.now();
+  let err = null;
+  await get().catch((e) => (err = e));
+  const waited = Date.now() - started;
+  check("a token refresh that never answers times out instead of hanging", err !== null, "no error thrown");
+  check("and it gives up near the configured bound, not minutes later", waited < 2000, `waited ${waited}ms`);
+  check("and the message names the timeout rather than blaming the network", /did not answer within/.test(err?.message || ""), (err?.message || "").slice(0, 90));
+  check("and it is marked retryable so the caller's retry budget applies", err?.retryable === true);
+}
+{
+  // The shared-refresh dedupe must not turn one failure into a permanently
+  // poisoned provider: the next caller has to be able to try again.
+  let calls = 0;
+  const get = createTokenProvider({
+    clientId: "c", refreshToken: "r", requestTimeoutMs: 40,
+    fetchImpl: async () => { calls++; if (calls === 1) throw new Error("transient"); return json({ access_token: "recovered", expires_in: 3600 }); },
+  });
+  let first = null;
+  await get().catch((e) => (first = e));
+  check("the first refresh fails", first !== null);
+  check("a later call retries rather than replaying the failure", (await get()) === "recovered", `calls=${calls}`);
+}
+{
+  // Concurrent callers must all be released when the shared refresh fails.
+  // Waiting on a promise that only one of them observes is the hang this
+  // whole block exists to prevent.
+  const get = createTokenProvider({
+    clientId: "c", refreshToken: "r", requestTimeoutMs: 40,
+    fetchImpl: async () => { throw new Error("down"); },
+  });
+  const results = await Promise.allSettled(Array.from({ length: 6 }, () => get()));
+  check("all six concurrent callers are released on a failed shared refresh", results.every((r) => r.status === "rejected"), JSON.stringify(results.map((r) => r.status)));
+}
+{
   const get = createTokenProvider({ clientId: "c", refreshToken: "dead", fetchImpl: async () => json({ error: "invalid_grant" }, 400) });
   let e = null;
   await get().catch((x) => (e = x));

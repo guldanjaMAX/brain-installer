@@ -1101,6 +1101,81 @@ export async function* batchStream(files, prepareOne, { maxDocs = 50, maxBytes =
   if (cur.length) yield cur;
 }
 
+/**
+ * Run `fn` over an iterable with a bounded number in flight, yielding results
+ * in the ORIGINAL order.
+ *
+ * Why this exists: a remote connector's per-item fetch (one Gmail
+ * `messages.get`, about 300 ms) was awaited serially inside batchStream, so a
+ * 190k-message mailbox took about twenty hours no matter how quickly the brain
+ * accepted batches. Measured on that mailbox, eight in flight was seven times
+ * faster with no errors. Overlapping the fetches is the whole gain; everything
+ * downstream (credential scan, batching, resume state) still sees one item at a
+ * time, in order, exactly as before.
+ *
+ * Order is not cosmetic. Resume state and the document family plan reason
+ * about "everything before this batch has landed". An out-of-order yield could
+ * record a later item as done while an earlier one was still in flight, and an
+ * interrupt at that moment would skip the earlier item on every future run.
+ *
+ * Errors: a rejection surfaces when its item's turn comes, so the caller sees
+ * the same failure at the same position it would have seen serially. Items
+ * already in flight are allowed to settle first, so none is left behind as an
+ * unhandled rejection, and no further items are started.
+ */
+export async function* prefetch(items, fn, { concurrency = 8 } = {}) {
+  const width = Math.max(1, Math.floor(Number(concurrency) || 1));
+  const iter = items[Symbol.asyncIterator] ? items[Symbol.asyncIterator]() : items[Symbol.iterator]();
+  const window = [];
+  let sourceDone = false; // the source reported done: nothing left to pull
+  let stopping = false;   // an item failed: pull nothing more, let in-flight settle
+
+  const fill = async () => {
+    while (!stopping && !sourceDone && window.length < width) {
+      const next = await iter.next();
+      if (next.done) {
+        sourceDone = true;
+        break;
+      }
+      if (stopping) break;
+      const p = Promise.resolve(next.value).then(fn);
+      // Observed later, in order. Without this a rejection that has not yet
+      // reached the head of the window would be reported as unhandled.
+      p.catch(() => {});
+      window.push(p);
+    }
+  };
+
+  try {
+    await fill();
+    while (window.length) {
+      // The head stays IN the window while awaited, so it still counts toward
+      // the width. Shifting it out first let one extra fetch start, which the
+      // test for the bound caught on the first run.
+      let value;
+      try {
+        value = await window[0];
+      } catch (error) {
+        stopping = true;
+        await Promise.allSettled(window);
+        throw error;
+      }
+      window.shift();
+      // Refill BEFORE yielding, so the freed slot is already fetching while the
+      // consumer works on this value.
+      await fill();
+      yield value;
+    }
+  } finally {
+    // The consumer may stop early (a `break`, or its own error), or an item may
+    // have failed. Close the source so a paginating async generator does not
+    // keep listing pages for nobody.
+    if (!sourceDone && typeof iter.return === "function") {
+      try { await iter.return(); } catch { /* the source is being abandoned anyway */ }
+    }
+  }
+}
+
 export function loadState(path) {
   if (!existsSync(path)) return { version: 1, done: {}, skipped: {} };
   try {

@@ -138,5 +138,33 @@ chk("sanitized capability markers are clean to the refusal scanner",
   scanEnvelope(sensitiveEnvelope).verdict === CLEAN);
 chk("capability-link safety advances the durable gate version", GATE_VERSION === 4, String(GATE_VERSION));
 
+// The gate's blindest spot, found 2026-09-05 by reviewing a live brain: this
+// product GENERATES a 64-character hex admin key, and the gate missed it
+// whenever it began with a letter. `admin_key: 7f3a...` was CONFIRMED while
+// `admin_key: a7f3...` was CLEAN. Two separate rejects did it, and both had to
+// go: the identifier heuristic (`^[a-z][A-Za-z0-9]*$`, which a lowercase hex
+// run satisfies) and the placeholder list, whose bare `a` had no word boundary
+// and so matched every value starting with the letter "a". About 37% of
+// generated keys start with a-f, so roughly one brain in three had an admin key
+// its own credential gate could not see.
+{
+  const tail = "3f9b2c8e1d7a4b6c5e0f8a2d9c7b1e4f3a6d8b0c2e5f7a9b1d3c6e8f0a2b4c6";
+  for (const first of ["a", "b", "c", "d", "e", "f", "7", "0"]) {
+    chk(`a 64-hex admin key starting with "${first}" is caught`,
+      scan(`admin_key: ${first}${tail}`).verdict === CONFIRMED,
+      scan(`admin_key: ${first}${tail}`).verdict);
+  }
+  // The rejects still have to do their real job, or the gate becomes noise that
+  // refuses documentation and the product's own source.
+  chk("a variable reference is still not a secret",
+    scan("const adminKey = resolveAdminKeyFromManifest").verdict === CLEAN);
+  chk("an underscored placeholder is still not a secret",
+    scan("admin_key: your_key_goes_here_1234").verdict === CLEAN);
+  chk("a hyphenated placeholder is still not a secret",
+    scan("api_key: example-token-abcdefghij").verdict === CLEAN);
+  chk("a camelCase identifier value is still not a secret",
+    scan("api_key: someLongVariableNameHere").verdict === CLEAN);
+}
+
 console.log(fail ? `\n${fail} FAILURES` : "\nsecret-scan v4 (js): all tests passed");
 process.exit(fail ? 1 : 0);
