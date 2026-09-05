@@ -84,7 +84,7 @@ async function ingestLib() {
 async function ingestOcrLib() {
   return await import("./ingest/ocr.mjs");
 }
-import { authorize, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
+import { authorize, fetchConnectedAccountEmail, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
 import {
   redact as redactConfirmedSecrets,
   scanEnvelope as scanEnvelopeSecrets,
@@ -9025,6 +9025,22 @@ async function cmdConnect(target) {
     scopes: names.map((n) => SCOPES[n]),
     port,
   });
+
+  // Say WHICH account consented, before anything else: with two Google
+  // accounts in one browser, the wrong one gets picked silently, and the
+  // mistake is invisible until someone else's mailbox is in the brain. Read
+  // with the scopes just granted (userinfo needs a scope this product never
+  // requests), stored nowhere, and fail-soft: no echo failure may break a
+  // connect that succeeded.
+  const connectedAccount = await fetchConnectedAccountEmail(tokens.access_token, names).catch(() => null);
+  if (connectedAccount) {
+    ok(`Connected Google account: ${connectedAccount}`);
+    info("if that is not the account you meant, run this command again and pick the right one on the consent screen.");
+  } else if (!names.includes("drive") && !names.includes("gmail")) {
+    info("(calendar-only scope cannot read the account address; the consent screen was the only check)");
+  } else {
+    info("(could not read which account consented; the consent screen was the only check)");
+  }
 
   const store = loadTokens();
   store.google = {
