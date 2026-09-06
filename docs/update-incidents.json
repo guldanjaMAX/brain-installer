@@ -21,14 +21,15 @@
   {
     "id": "UPDATE-002",
     "title": "Frozen provider watermark strands the vector drain",
-    "status": "open",
+    "status": "local-only",
     "scopes": [
       "fresh",
       "upgrade",
       "recovery"
     ],
     "tests": [
-      "test/vector-fence-recovery.test.mjs"
+      "test/vector-fence-recovery.test.mjs",
+      "test/vector-fence-probe.test.mjs"
     ],
     "acceptance": "Bounded recovery with no externally invented provider mutation; exact generation and delete-absence proofs still required.",
     "findings": [
@@ -49,7 +50,8 @@
     ],
     "tests": [
       "test/vector-bootstrap-paused-strand.test.mjs",
-      "test/bootstrap-retrying.test.mjs"
+      "test/bootstrap-retrying.test.mjs",
+      "test/vector-delete-outbox.test.mjs"
     ],
     "acceptance": "Complete a real bootstrap, add and delete corpus rows, interrupt and resume with historical batch rows; verify exact reconciliation.",
     "findings": [

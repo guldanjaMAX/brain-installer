@@ -1,12 +1,12 @@
-// Intentionally exits nonzero until UPDATE-002 is fixed. This is a release
-// blocker reproduction, not a passing test that enshrines the broken behavior.
+// Regression reproduction for UPDATE-002. Recovery must empty both queue
+// shapes without an external nudge; progress alone is not completion.
 import assert from "node:assert/strict";
-import { makeEnv, seed, embed } from "../test/fixtures/vector-fence-env.mjs";
+import { makeEnv, seed, embed, remaining } from "../test/fixtures/vector-fence-env.mjs";
 import { drainOutbox } from "../worker/src/lib/store-d1.js";
 
 const failures = [];
 for (const queuedOnly of [false, true]) {
-const { env, db, control } = makeEnv();
+const { env, db, control, visible } = makeEnv();
 try {
   seed(db, 2);
   assert.equal((await drainOutbox(env, { embed })).submitted, 2);
@@ -27,6 +27,7 @@ try {
     control.processedAtMs = Number(fence.at) + minute * 60_000;
     while (env._processNextVectorMutation()) {}
   }
+  progressed = progressed && remaining(db) === 0 && visible.size === 2;
   const shape = queuedOnly ? "queued-only" : "submitted";
   console.log(`${progressed ? "PASS" : "BLOCKED"} UPDATE-002 ${shape}: bounded recovery without an external nudge`);
   if (!progressed) failures.push(shape);
@@ -34,4 +35,4 @@ try {
   db.close();
 }
 }
-assert.deepEqual(failures, [], "UPDATE-002: twenty cron invocations made zero progress behind an overtaken, frozen watermark");
+assert.deepEqual(failures, [], "UPDATE-002: twenty cron invocations did not reach exact completion behind an overtaken, frozen watermark");

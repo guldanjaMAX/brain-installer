@@ -63,25 +63,41 @@ Deleting a row, broadening an exception, increasing a timeout, or pointing to
 unrelated passing CI is not closure. Keep an old report's conclusion separate
 from what the present candidate actually proves.
 
-## Current frozen-watermark blocker
+## Frozen-watermark regression and candidate recovery
 
-Run `node --no-warnings scripts/reproduce-frozen-vector-fence.mjs`. It currently
-exits 1: an accepted mutation is overtaken, the provider's last processed time
-is only 123.6 seconds later, and twenty cron invocations cannot satisfy the
-five-minute skew margin. The provider time is the time of its last mutation,
-not a clock that advances merely because the client waits. The old regression
-advances it with an external mutation, concealing this idle-index failure.
+`node --no-warnings scripts/reproduce-frozen-vector-fence.mjs` now requires both
+submitted and queued-only shapes to empty with exact vector coverage. Before
+the candidate fix it exited 1: an accepted mutation was overtaken, the provider's
+last processed time was only 123.6 seconds later, and twenty cron invocations
+could not satisfy the five-minute skew margin. The provider time is the time of
+its last mutation, not a clock that advances merely because the client waits.
+The old regression advanced it with an external mutation, concealing the stall.
 
-The next fix should acquire the existing drain lease and submit a bounded,
-idempotent ordering probe after a persistently unresolved fence. It must record
-the new accepted mutation durably and wait for provider proof before normal
-work resumes. Verify no-op probe semantics on a disposable real index first.
-Never treat timeout as confirmation, acknowledge rows from counts alone, or
-discard the existing fence. Test delayed visibility, invalid receipts, lease
-loss, crashes around receipt persistence, repeated overtaking, queued-only and
-submitted rows, and unchanged delete/generation safety. Rate-limit probes and
-include their D1 work in the invocation budget. This fix is not implemented or
-field-proven in this branch.
+The candidate uses the existing exclusive writer lease. After ten minutes with
+an unresolved, overtaken fence and a usable provider timestamp, it checks a
+random probe ID is absent and submits its deletion. It persists the new receipt
+only if both the old fence and the unexpired lease still match. Acceptance does
+not acknowledge any row. A later invocation must observe provider processing,
+then independently confirm every exact generation or delete absence. A crash
+before persistence retains the old fence; a crash after it retains the new one.
+An accepted probe resets the ten-minute cooldown across invocations. A failed
+probe exits the invocation with the pending work intact. Probe SQL stays inside
+the existing smallest-batch query reservation.
+
+`test/vector-fence-probe.test.mjs` covers both queue shapes, cooldown/repeated
+overtaking, delayed or missing visibility, normal pending work, paused/busy
+writers, ambiguous absence, provider errors, invalid receipts, lease loss before
+and after acceptance, persistence failure and resumed recovery. It runs in both
+`npm test` and the independent incident audit. Completed bootstrap-history
+coverage lives in `test/vector-delete-outbox.test.mjs`; the incident registry
+must retain that suite rather than relying on a fixture with an empty ledger.
+
+UPDATE-002 remains `local-only` until its full field acceptance is reviewed.
+Disposable provider checks and accelerated-clock rehearsals must state their
+limits explicitly: they do not prove a deployed Worker/D1 recovery, physical
+Windows ARM64 behavior, large-corpus duration, or a customer's current state.
+Never treat a timeout or vector count alone as confirmation, restore a bookmark
+first, or clear the drain mode manually.
 
 ## Recovery handoff acceptance
 

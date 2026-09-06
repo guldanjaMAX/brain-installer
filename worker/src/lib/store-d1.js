@@ -33,6 +33,7 @@
 
 import { currentEvidenceCandidates } from "./query-intent.js";
 import { scopeIsRestricted } from "./grants.js";
+import { probeStalledVectorFence } from "./vector-fence-probe.js";
 
 const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
@@ -964,6 +965,8 @@ const DRAIN_BATCH_SIZE_MAX = 100;
 // depth, one submission receipt per row, and one legacy hashed-id remap per row.
 // Confirmation needs only one CAS statement per row. Reserving this bound before
 // provider work keeps the lease release inside the invocation budget.
+// A stalled-fence probe exits before row work: fence read, lease renewal and
+// fence CAS fit inside the same bound, including when the batch size is one.
 export function drainBatchQueryUpperBound(batchSize = DRAIN_BATCH_SIZE_MAX) {
   const bounded = Number.isInteger(batchSize)
     ? Math.min(DRAIN_BATCH_SIZE_MAX, Math.max(1, batchSize))
@@ -1232,11 +1235,17 @@ function fenceWatermarkCovers(fence, info) {
     processedAt >= fence.submittedAt + VECTOR_FENCE_CLOCK_SKEW_MS;
 }
 
-async function projectionFenceProcessed(env, fence) {
+async function projectionFenceProcessed(env, fence, lease) {
   if (!fence?.mutationId) return true;
-  const covered = fenceWatermarkCovers(fence, await env.VECTORIZE.describe());
+  const description = await env.VECTORIZE.describe();
+  const covered = fenceWatermarkCovers(fence, description);
   if (covered === null) {
     throw new Error("Vectorize did not expose its processed mutation watermark");
+  }
+  if (!covered && lease) {
+    await probeStalledVectorFence(env, { fence, description, lease, renewLease: renewDrainLease });
+    // Probe acceptance is not confirmation. A later invocation observes its
+    // processed receipt before any normal write or outbox acknowledgement.
   }
   return covered;
 }
@@ -1276,10 +1285,10 @@ async function markProjectionVerifiedIfExact(env) {
  */
 const VECTOR_GET_BY_IDS_LIMIT = 20;
 
-async function confirmSubmittedVectors(env, rows) {
+async function confirmSubmittedVectors(env, rows, lease) {
   if (!rows.length) return { confirmed: 0, confirmedDeletes: 0, confirmedUpserts: 0, retrying: 0, waiting: 0 };
   const fence = await projectionFenceState(env);
-  if (!await projectionFenceProcessed(env, fence)) {
+  if (!await projectionFenceProcessed(env, fence, lease)) {
     return { confirmed: 0, confirmedDeletes: 0, confirmedUpserts: 0, retrying: 0, waiting: rows.length };
   }
 
@@ -1418,7 +1427,7 @@ async function drainOutboxBatch(env, {
       ORDER BY o.queued_at LIMIT ?1`
   ).bind(batchSize).all();
   if (submittedRows?.length) {
-    const confirmed = await confirmSubmittedVectors(env, submittedRows);
+    const confirmed = await confirmSubmittedVectors(env, submittedRows, lease);
     const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
     return {
       drained: confirmed.confirmed,
@@ -1436,7 +1445,7 @@ async function drainOutboxBatch(env, {
   // every affected generation. The global fence must still process before any
   // newer provider write is accepted, or the older result could land last.
   const fence = await projectionFenceState(env);
-  if (!await projectionFenceProcessed(env, fence)) {
+  if (!await projectionFenceProcessed(env, fence, lease)) {
     const rest = await env.DB.prepare("SELECT count(*) AS n FROM vector_outbox").first();
     const remaining = Number(rest?.n || 0);
     return {

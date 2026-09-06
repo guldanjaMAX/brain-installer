@@ -6,6 +6,10 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## 0.3.7
 
+- Stalled search indexing can request a fresh provider confirmation after ten
+  minutes. Queued changes stay pending until their exact contents are visible.
+  After an update, check that the indexing backlog reaches zero.
+
 - macOS browser sign-in and preflight now find Wrangler's native Preferences
   folder without requiring an environment-variable workaround.
 
