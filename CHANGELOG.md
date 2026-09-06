@@ -6,6 +6,26 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## 0.3.7
 
+- The update safety check now recognizes the current credential refusal. A
+  correctly blocked test credential no longer stops the update because its
+  refusal message changed.
+
+- Updates now distinguish current documents from queued index deletions when
+  reporting rebuild progress. Adding, changing, or removing documents after an
+  earlier rebuild must not make a later update reject its progress totals.
+
+- Recovery verification now recognizes the normal installer configuration,
+  including OCR settings, the owner-session signing key, and the deliberate
+  paused health response. Changed settings and unexpected credentials still
+  stop recovery before it can proceed.
+
+- Stalled search indexing can request a fresh provider confirmation after ten
+  minutes. Queued changes stay pending until their exact contents are visible.
+  After an update, check that the indexing backlog reaches zero.
+
+- macOS browser sign-in and preflight now find Wrangler's native Preferences
+  folder without requiring an environment-variable workaround.
+
 - The downloaded package now contains the same read-only Mac and Windows
   preflight checked by release CI. It requires Node 22, finds every visible CLI
   copy, and checks the same Wrangler session locations the installer reads.

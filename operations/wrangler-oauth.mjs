@@ -68,6 +68,9 @@ export function wranglerConfigCandidates(env = process.env, platform = process.p
     if (env.LOCALAPPDATA) out.push(joinFor(env.LOCALAPPDATA, rel));
   }
   if (env.XDG_CONFIG_HOME) out.push(joinFor(env.XDG_CONFIG_HOME, rel));
+  // Wrangler 4.73.0's xdg-app-paths uses this native default on macOS.
+  // A developer's older ~/.config session masked its absence in our tests.
+  if (platform === "darwin") out.push(joinFor(home, "Library", "Preferences", rel));
   out.push(joinFor(home, ".config", rel));
   out.push(joinFor(home, rel));
   return out;

@@ -1455,7 +1455,11 @@ function validateBootstrapReceipt(body, expectedTotal) {
       receipt.actualVectors > expectedTotal || receipt.inFlightBatches > 3 ||
       receipt.confirmed > receipt.total ||
       receipt.remaining !== receipt.total - receipt.confirmed ||
-      receipt.queued + receipt.submitted > receipt.remaining ||
+      // Legacy residue can contain deletes of chunks no longer in the corpus.
+      // Queue operations therefore need not fit within unconfirmed live chunks.
+      // Completion below still requires zero queued/submitted work and exact
+      // provider visibility; no receipt can use this phase to claim completion.
+      (receipt.phase !== "legacy_drain" && receipt.queued + receipt.submitted > receipt.remaining) ||
       (receipt.phase === "complete") !== receipt.complete ||
       (!receipt.complete && receipt.vectorReady) ||
       (receipt.complete && (
@@ -1724,7 +1728,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     const requiredBindingNames = [
       "AI", "ANSWER_MODEL", "BRAIN_NAME", "BRAIN_OWNER", "BRAIN_VERSION",
       "CHUNK_OVERLAP", "CHUNK_SIZE", "CREDENTIAL_SCANNER", "DAILY_LLM_CAP_USD",
-      "DB", "STORAGE", "VECTORIZE",
+      "DB", "OCR_ENABLED", "OCR_MODEL", "STORAGE", "VECTORIZE",
     ];
     const actualNonSecretNames = bindings
       .filter((entry) => entry.type !== "secret_text" && entry.name !== "VECTOR_DRAIN_MODE")
@@ -1774,14 +1778,29 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     }
     plainText("BRAIN_OWNER");
     plainText("ANSWER_MODEL");
+    // Both immutable target versions must carry the reviewed manifest's OCR
+    // policy, including the disabled default. A matching pair of altered
+    // versions must not silently enable charges or select another model.
+    if (plainText("OCR_ENABLED") !== binding.ocrEnabled ||
+        plainText("OCR_MODEL") !== binding.ocrModel) {
+      refuse("RECOVERY_WORKER_BINDINGS_INVALID");
+    }
     const secretNames = bindings
       .filter((entry) => entry.type === "secret_text")
-      .map((entry) => String(entry.name || ""))
+      .map((entry) => {
+        if (typeof entry.name !== "string") refuse("RECOVERY_WORKER_BINDINGS_INVALID");
+        return exactString(entry.name, "RECOVERY_WORKER_BINDINGS_INVALID");
+      })
       .sort();
+    // Normal setup derives both restricted retrieval and owner-session keys
+    // from ADMIN_KEY. Their presence on a source is expected; recovery never
+    // removes them to make this inspection pass. The isolated target retains
+    // its separately reviewed ADMIN_KEY-only contract.
     const allowedSecrets = role === "source"
-      ? new Set(["ADMIN_KEY", "RAG_PROXY_KEY"])
+      ? new Set(["ADMIN_KEY", "RAG_PROXY_KEY", "SESSION_SIGNING_KEY"])
       : new Set(["ADMIN_KEY"]);
     if (!secretNames.includes("ADMIN_KEY") ||
+        new Set(secretNames).size !== secretNames.length ||
         secretNames.some((name) => !allowedSecrets.has(name)) ||
         (role === "target" && canonical(secretNames) !== canonical(["ADMIN_KEY"]))) {
       refuse("RECOVERY_WORKER_BINDINGS_INVALID");
@@ -2079,9 +2098,16 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       { method: "GET" },
       60_000,
     );
-    if (!response.ok) refuse("RECOVERY_HEALTH_FAILED");
+    if (response.status !== 200) refuse("RECOVERY_HEALTH_FAILED");
     const health = await boundedJsonResponse(response);
-    if (health?.ok !== true || health?.version !== pins.binding.target.productVersion ||
+    const active = expectedMode === "active";
+    // A paused Worker deliberately reports not-ok and refuses documents.
+    // Reachable paused code is the required compatibility boundary, not an
+    // active Brain; accepting ok:true here would hide a missing write barrier.
+    if (!["active", "paused-for-upgrade"].includes(expectedMode) ||
+        health?.ok !== active || health?.accepting_documents !== active ||
+        health?.status !== (active ? "ok" : "paused-for-upgrade") ||
+        health?.version !== pins.binding.target.productVersion ||
         health?.brain !== pins.binding.target.clientSlug ||
         health?.vector_writer_protocol !== "lease-v1" ||
         health?.vector_drain_mode !== expectedMode) {

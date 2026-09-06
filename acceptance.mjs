@@ -40,9 +40,9 @@ const FAIL = "fail";
 const WARN = "warn";
 const SKIP = "skip";
 
-const CREDENTIAL_GATE_ERROR = "refused: content carries live credential(s)";
+const CREDENTIAL_GATE_ERROR = "refused: content carries sensitive credential(s) or private identifier(s)";
 const CREDENTIAL_GATE_DETAIL =
-  "Rotate them, strip them from the source, then re-ingest. Nothing was written.";
+  "Remove or redact them, rotate any live credentials, then re-ingest. Nothing was written.";
 
 /**
  * Accept only the credential scanner's production refusal contract.

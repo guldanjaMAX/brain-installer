@@ -48,6 +48,9 @@ WFORMAT=""
 # Match operations/wrangler-oauth.mjs exactly. Inspect files, not merely an
 # earlier directory, so an empty directory cannot hide a usable later session.
 WCFG_CANDIDATES=("$HOME/.config/.wrangler/config" "$HOME/.wrangler/config")
+if [ "$(uname -s)" = "Darwin" ]; then
+  WCFG_CANDIDATES=("$HOME/Library/Preferences/.wrangler/config" "${WCFG_CANDIDATES[@]}")
+fi
 if [ -n "$XDG_CONFIG_HOME" ]; then
   WCFG_CANDIDATES=("$XDG_CONFIG_HOME/.wrangler/config" "${WCFG_CANDIDATES[@]}")
 fi

@@ -1,0 +1,329 @@
+[
+  {
+    "id": "UPDATE-001",
+    "title": "macOS native browser session discovery",
+    "status": "local-only",
+    "scopes": [
+      "fresh",
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "test/wrangler-oauth.test.mjs",
+      "test/preflight-posix.test.mjs"
+    ],
+    "acceptance": "Clean macOS login, refresh and encrypted-session diagnosis without a legacy session or XDG workaround.",
+    "findings": [
+      "F14"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-002",
+    "title": "Frozen provider watermark strands the vector drain",
+    "status": "local-only",
+    "scopes": [
+      "fresh",
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "test/vector-fence-recovery.test.mjs",
+      "test/vector-fence-probe.test.mjs"
+    ],
+    "acceptance": "Bounded recovery with no externally invented provider mutation; exact generation and delete-absence proofs still required.",
+    "findings": [
+      "FIELD-FROZEN-FENCE"
+    ],
+    "evidence": [],
+    "reproductions": [
+      "scripts/reproduce-frozen-vector-fence.mjs"
+    ]
+  },
+  {
+    "id": "UPDATE-003",
+    "title": "Completed bootstrap history, delayed visibility and overlapping retries",
+    "status": "local-only",
+    "scopes": [
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "test/vector-bootstrap-paused-strand.test.mjs",
+      "test/bootstrap-retrying.test.mjs",
+      "test/vector-delete-outbox.test.mjs"
+    ],
+    "acceptance": "Complete a real bootstrap, add, overwrite and delete corpus rows, interrupt and resume with historical batch rows and delayed provider visibility; pass every intermediate Worker receipt through the actual CLI validators, including deletion alone and deletion to an empty corpus, then verify exact reconciliation.",
+    "findings": [
+      "F1",
+      "F2",
+      "N4",
+      "N5",
+      "N6",
+      "FIELD-RESIDUE-RECEIPT"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-004",
+    "title": "Whole-corpus pause and safe recovery availability",
+    "status": "open",
+    "scopes": [
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "test/upgrade-repair.test.mjs",
+      "worker/test/worker.test.mjs"
+    ],
+    "acceptance": "Prove a bounded, documented recovery journey for a large paused corpus; do not unpause manually or promise active background bootstrap before it exists.",
+    "findings": [
+      "F3",
+      "F16"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-005",
+    "title": "Authentication formats, refresh and account selection",
+    "status": "local-only",
+    "scopes": [
+      "fresh",
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "test/cloudflare-token-prompt.test.mjs",
+      "test/wrangler-session-retry.test.mjs",
+      "test/wrangler-spec-pinned.test.mjs"
+    ],
+    "acceptance": "Exercise browser, account token, revoked token, expiry, conflicting environment identity and two-account selection on supported hosts.",
+    "findings": [
+      "F7",
+      "F14"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-006",
+    "title": "Windows CLI identity, MSIX paths and PowerShell shims",
+    "status": "local-only",
+    "scopes": [
+      "fresh",
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "test/cli-guidance-rendering.test.mjs",
+      "test/cli-path-persist.test.mjs"
+    ],
+    "acceptance": "Resolve actual executable and version before and after installing into one prefix; run pasted commands with restrictive PowerShell and redirected APPDATA.",
+    "findings": [
+      "F15"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-007",
+    "title": "Source boundaries and exclusions",
+    "status": "local-only",
+    "scopes": [
+      "fresh",
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "worker/test/document-access.test.mjs",
+      "worker/test/grants.test.mjs"
+    ],
+    "acceptance": "Mixed-source destructive requests and all-except grants cannot cross exclusions before, during or after upgrade.",
+    "findings": [
+      "F4",
+      "F5"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-008",
+    "title": "Passkeys, revocation, consent and single-use state",
+    "status": "local-only",
+    "scopes": [
+      "fresh",
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "worker/test/owner-auth.test.mjs",
+      "worker/test/owner-actions.test.mjs",
+      "worker/test/connector.test.mjs"
+    ],
+    "acceptance": "Physical owner ceremony plus concurrent consume, failed retry, final-owner guard, both consent actions and session revocation.",
+    "findings": [
+      "F10",
+      "F11",
+      "F12",
+      "F13",
+      "N3"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-009",
+    "title": "Financial cursor and completeness claims",
+    "status": "local-only",
+    "scopes": [
+      "fresh",
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "worker/test/bank-feed.test.mjs",
+      "worker/test/fin-routes.test.mjs"
+    ],
+    "acceptance": "Reject incomplete provider pages without advancing cursors; omitted, explicit, boundary and above-boundary limits and visible-row totals agree.",
+    "findings": [
+      "F8",
+      "F9",
+      "N1",
+      "N2"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-010",
+    "title": "Exact package publication only after every gate",
+    "status": "local-only",
+    "scopes": [
+      "fresh",
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "scripts/test-release-workflow-contract.mjs",
+      "test/package-privacy.test.mjs"
+    ],
+    "acceptance": "Before publication: one tested package, six completed OS/Node jobs, planted traps, reviewed field evidence, immutable releases enabled and a verified enforcing workflow; no release before CI finishes. After publication, verify immutable tag and asset bytes before URL promotion.",
+    "findings": [
+      "F6"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-011",
+    "title": "Recovery evidence and D1 versus Vectorize restoration",
+    "status": "open",
+    "scopes": [
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "test/verified-recovery.test.mjs",
+      "test/cloudflare-recovery-adapter.test.mjs"
+    ],
+    "acceptance": "Disposable restore rehearsal preserves authoritative documents and rebuilds derived vectors; no live D1 export or bookmark-first recovery.",
+    "findings": [
+      "HISTORY-RECOVERY"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-012",
+    "title": "Windows ARM64 Node 24 physical runtime",
+    "status": "open",
+    "scopes": [
+      "fresh",
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "test/fixtures/windows-dpapi-probe.mjs"
+    ],
+    "acceptance": "Run actual packaged CLI, DPAPI, login, update interruption and normal process exit on Windows ARM64 Node 24; x64 hosted CI is insufficient.",
+    "findings": [
+      "FIELD-ARM64"
+    ],
+    "evidence": [],
+    "testPlatform": "win32"
+  },
+  {
+    "id": "UPDATE-013",
+    "title": "Actual setup wrapper and repeat-setup behavior",
+    "status": "local-only",
+    "scopes": [
+      "fresh",
+      "recovery"
+    ],
+    "tests": [
+      "test/fresh-setup-path.test.mjs",
+      "test/setup-clean-path.test.mjs",
+      "test/technician-setup.test.mjs"
+    ],
+    "acceptance": "Exercise the actual packed CLI with missing manifest and existing active install; error remedies must not re-pause a working Brain.",
+    "findings": [
+      "HISTORY-SETUP"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-014",
+    "title": "Honest health, version and retrieval handoff",
+    "status": "local-only",
+    "scopes": [
+      "fresh",
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "test/health-verify-exit.test.mjs",
+      "worker/test/health-honesty.test.mjs",
+      "test/acceptance-version.test.mjs",
+      "test/upgrade-verify.test.mjs"
+    ],
+    "acceptance": "Record executable/package/manifest/worker/D1 versions separately; verify ingestion, paused state, backlog trend and cited retrieval, never infer recovery from HTTP 200.",
+    "findings": [
+      "HISTORY-FALSE-READY",
+      "FIELD-CREDENTIAL-CONTRACT"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-015",
+    "title": "Runbook, prerequisites and connector scope match the package",
+    "status": "open",
+    "scopes": [
+      "fresh",
+      "upgrade",
+      "recovery"
+    ],
+    "tests": [
+      "test/unknown-flags.test.mjs",
+      "test/drive-removal-guard.test.mjs",
+      "worker/test/secret-scan.test.mjs",
+      "test/acceptance-verdict.test.mjs"
+    ],
+    "acceptance": "Reconcile historical install-log sections 1, 3-7 with exact packaged commands, paid-plan failure point, supported connectors, approved folder and mail scopes, taxpayer-ID limits, deduplication, real retrieval questions and owner handoff. Unavailable sources must remain explicit.",
+    "findings": [
+      "HISTORY-RUNBOOK-SCOPE"
+    ],
+    "evidence": []
+  },
+  {
+    "id": "UPDATE-016",
+    "title": "Interrupted provisioning, schedules and durable credential pointers",
+    "status": "open",
+    "scopes": [
+      "fresh",
+      "recovery"
+    ],
+    "tests": [
+      "test/drain-cron-default.test.mjs",
+      "test/admin-key-file.test.mjs",
+      "test/setup-clean-path.test.mjs"
+    ],
+    "acceptance": "Interrupt each setup stage; retry an already-correct schedule; ensure manifest credential pointers resolve durably and deploy/status/source commands discover the same authorized credential. No remedy loops back into a needless pause.",
+    "findings": [
+      "HISTORY-SETUP-RECOVERY"
+    ],
+    "evidence": []
+  }
+]

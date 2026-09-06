@@ -17,6 +17,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { cmdSecrets, withCloudflareToken, workerBindings } from "../brain.mjs";
+import worker from "../worker/src/index.js";
 
 import {
   CloudflareRecoveryAdapterError,
@@ -53,6 +55,7 @@ const pausedWorkerVersionId = "fixture-paused-version-id";
 const activeWorkerVersionId = "fixture-active-version-id";
 const workerScriptEtag = "a".repeat(64);
 const sourceWorkerScriptEtag = "b".repeat(64);
+let sourceSecretNames = [];
 
 const sourceManifest = {
   manifest_version: 1,
@@ -461,11 +464,13 @@ function providerHarness({
   redirectInventory = false,
   extraTargetSecret = false,
   extraTargetBinding = false,
+  transformWorkerBindings = (bindings) => bindings,
   failBootstrapOnce = false,
   failBootstrapAfterProgressOnce = false,
   failPromotionAfterApplyOnce = false,
   healthModeOverride = null,
   healthProtocolOverride = null,
+  transformHealthReceipt = (receipt) => receipt,
   initialTargetRestored = false,
   initialVectorCount = 0,
   missingVectorCount = false,
@@ -600,29 +605,18 @@ function providerHarness({
             compatibility_date: "2026-01-01",
             usage_model: "standard",
           },
-          bindings: [
-            {
-              type: "d1",
-              name: "DB",
-              id: cloudflare.d1_database_id,
-              database_id: cloudflare.d1_database_id,
-            },
-            { type: "ai", name: "AI", project: "<catalog>" },
-            { type: "vectorize", name: "VECTORIZE", index_name: cloudflare.vectorize_index },
-            { type: "plain_text", name: "STORAGE", text: "d1" },
-            { type: "plain_text", name: "BRAIN_NAME", text: manifest.client.slug },
-            { type: "plain_text", name: "BRAIN_OWNER", text: manifest.client.display_name },
-            { type: "plain_text", name: "BRAIN_VERSION", text: manifest.brain.version },
-            { type: "plain_text", name: "CHUNK_SIZE", text: "1500" },
-            { type: "plain_text", name: "CHUNK_OVERLAP", text: "300" },
-            { type: "plain_text", name: "DAILY_LLM_CAP_USD", text: "10" },
-            {
-              type: "plain_text",
-              name: "ANSWER_MODEL",
-              text: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-            },
-            { type: "plain_text", name: "CREDENTIAL_SCANNER", text: "on" },
-            { type: "secret_text", name: "ADMIN_KEY" },
+          // Exercise the actual deploy contract instead of a second hand-written
+          // allowlist that can silently omit newly emitted bindings.
+          bindings: transformWorkerBindings([
+            ...workerBindings(manifest, cloudflare).map((entry) => {
+              if (entry.type === "d1") return { ...entry, database_id: entry.id };
+              if (entry.type === "ai") return { ...entry, project: "<catalog>" };
+              // This harness also models exact historical product versions.
+              if (entry.name === "BRAIN_VERSION") return { ...entry, text: manifest.brain.version };
+              return entry;
+            }),
+            ...(isSource ? sourceSecretNames : ["ADMIN_KEY"])
+              .map((name) => ({ type: "secret_text", name })),
             ...(!isSource && targetMode !== null
               ? [{ type: "plain_text", name: "VECTOR_DRAIN_MODE", text: targetMode }]
               : []),
@@ -632,7 +626,7 @@ function providerHarness({
             ...(!isSource && extraTargetBinding
               ? [{ type: "plain_text", name: "UNREVIEWED_MODE", text: "enabled" }]
               : []),
-          ],
+          ], { role: isSource ? "source" : "target", versionId: requestedVersionId }),
         },
       });
     }
@@ -782,14 +776,19 @@ function providerHarness({
     const path = parsedUrl.pathname;
     if (path === "/health") {
       if (redirectHealth) return response({}, 302, { location: "https://redirected.fixture.invalid/health" });
-      return response({
-        ok: true,
-        brain: "fixture-brain",
-        version: "0.1.12",
-        vector_drain_mode: healthModeOverride ??
-          (currentTargetVersionId === pausedWorkerVersionId ? "paused-for-upgrade" : "active"),
-        vector_writer_protocol: healthProtocolOverride ?? "lease-v1",
-      });
+      const health = await worker.fetch(new Request(String(url)), {
+        BRAIN_NAME: targetManifest.client.slug,
+        BRAIN_VERSION: targetManifest.brain.version,
+        ...(currentTargetVersionId === pausedWorkerVersionId
+          ? { VECTOR_DRAIN_MODE: "paused-for-upgrade" }
+          : {}),
+      }, {});
+      const receipt = await health.json();
+      return response(transformHealthReceipt({
+        ...receipt,
+        vector_drain_mode: healthModeOverride ?? receipt.vector_drain_mode,
+        vector_writer_protocol: healthProtocolOverride ?? receipt.vector_writer_protocol,
+      }));
     }
     if (path === "/api/admin/brain/bootstrap") {
       assert.equal(options.headers["X-Admin-Key"], fixtureAdminKey);
@@ -997,6 +996,49 @@ try {
 
   writePrivateJson(sourceManifestPath, sourceManifest);
   writePrivateJson(targetManifestPath, targetManifest);
+  // Collect names from the real secrets command using only injected local
+  // fakes. The source fixture must represent a normal product installation,
+  // even when setup adds another derived secret in a later release.
+  const previousFetch = globalThis.fetch;
+  const previousLog = console.log;
+  const previousToken = process.env.CLOUDFLARE_API_TOKEN;
+  delete process.env.CLOUDFLARE_API_TOKEN;
+  try {
+    console.log = () => {};
+    globalThis.fetch = async (url, options = {}) => {
+      const path = new URL(url).pathname;
+      let result;
+      if (path === "/client/v4/accounts" && (!options.method || options.method === "GET")) {
+        result = [{ id: sourceManifest.infrastructure.cloudflare.account_id, name: "Synthetic Fixture" }];
+      } else if (path === `/client/v4/accounts/${sourceManifest.infrastructure.cloudflare.account_id}/workers/scripts/${sourceManifest.brain.worker_name}/secrets`) {
+        if (options.method === "PUT") {
+          const body = JSON.parse(options.body);
+          assert.equal(body.type, "secret_text");
+          sourceSecretNames.push(body.name);
+          result = { name: body.name, type: body.type };
+        } else {
+          assert.equal(options.method === undefined || options.method === "GET", true);
+          result = [];
+        }
+      } else {
+        throw new Error("unexpected secrets-contract fixture request");
+      }
+      return response({ success: true, result });
+    };
+    await withCloudflareToken(() => cmdSecrets(sourceManifestPath, {
+      explicitAdminKey: null,
+      adminKeyPersistencePlan: () => ({ backend: "keychain", service: "fixture", account: "fixture" }),
+      readAdminKeyDurably: async () => "a".repeat(64),
+      reconcileExistingAgents: null,
+    }), { readCloudflareToken: async () => Buffer.from("fixture-control-plane-token"), interactive: false });
+    assert.equal(sourceSecretNames.includes("SESSION_SIGNING_KEY"), true);
+    assert.equal(new Set(sourceSecretNames).size, sourceSecretNames.length);
+  } finally {
+    globalThis.fetch = previousFetch;
+    console.log = previousLog;
+    if (previousToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN;
+    else process.env.CLOUDFLARE_API_TOKEN = previousToken;
+  }
   mkdirSync(artifactDirectory, { mode: 0o700 });
   if (process.platform !== "win32") chmodSync(artifactDirectory, 0o700);
   writeFileSync(wrapperPath, wrapperScript, { mode: 0o700 });
@@ -1559,6 +1601,108 @@ try {
     (error) => error.code === "RECOVERY_WORKER_BINDINGS_INVALID",
   );
 
+  // Equal active/paused settings are insufficient if both differ from the
+  // manifest. Reject enablement, model substitution, omission, and duplication
+  // before opening the data plane or reading its admin credential.
+  for (const changedRole of ["source", "target"]) for (const alter of [
+    (bindings) => bindings.map((entry) => entry.name === "OCR_ENABLED" ? { ...entry, text: "1" } : entry),
+    (bindings) => bindings.map((entry) => entry.name === "OCR_MODEL" ? { ...entry, text: "@cf/fixture/unreviewed" } : entry),
+    (bindings) => bindings.filter((entry) => entry.name !== "OCR_ENABLED"),
+    (bindings) => [...bindings, { type: "plain_text", name: "OCR_MODEL", text: "@cf/fixture/duplicate" }],
+  ]) {
+    const ocrHarness = providerHarness({
+      transformWorkerBindings: (bindings, { role }) => role === changedRole ? alter(bindings) : bindings,
+    });
+    const ocrGate = createCloudflareRecoveryFieldGateAdapters(approvedAdapterConfig, ocrHarness.dependencies);
+    const stage = changedRole === "source" ? "export_d1" : "prove_target_clean";
+    await assert.rejects(ocrGate.adapters[stage]({
+      stage,
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }), (error) => error.code === "RECOVERY_WORKER_BINDINGS_INVALID");
+    assert.equal(ocrHarness.adminReads, 0);
+    assert.equal(ocrHarness.fetchCalls.length, 0);
+  }
+
+  for (const changedRole of ["source", "target"]) for (const alter of [
+    (bindings) => [...bindings, { type: "secret_text", name: "UNREVIEWED_SECRET" }],
+    (bindings) => [...bindings, { type: "secret_text", name: "ADMIN_KEY" }],
+    (bindings) => bindings.map((entry) => entry.name === "ADMIN_KEY" ? { ...entry, name: ["ADMIN_KEY"] } : entry),
+    (bindings) => bindings.map((entry) => entry.name === "ADMIN_KEY" ? { ...entry, name: "ADMIN_KEY\n" } : entry),
+    (bindings) => bindings.filter((entry) => entry.name !== "ADMIN_KEY"),
+  ]) {
+    const secretHarness = providerHarness({
+      transformWorkerBindings: (bindings, { role }) => role === changedRole ? alter(bindings) : bindings,
+    });
+    const secretGate = createCloudflareRecoveryFieldGateAdapters(approvedAdapterConfig, secretHarness.dependencies);
+    const stage = changedRole === "source" ? "export_d1" : "prove_target_clean";
+    await assert.rejects(secretGate.adapters[stage]({
+      stage,
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }), (error) => error.code === "RECOVERY_WORKER_BINDINGS_INVALID");
+    assert.equal(secretHarness.adminReads, 0);
+    assert.equal(secretHarness.fetchCalls.length, 0);
+    assert.equal(secretHarness.wranglerCalls.some((call) => call.args[0] === "secret"), false);
+  }
+
+  for (const name of sourceSecretNames.filter((name) => name !== "ADMIN_KEY")) {
+    const secretHarness = providerHarness({
+      transformWorkerBindings: (bindings, { role }) => role === "target"
+        ? [...bindings, { type: "secret_text", name }]
+        : bindings,
+    });
+    const secretGate = createCloudflareRecoveryFieldGateAdapters(approvedAdapterConfig, secretHarness.dependencies);
+    await assert.rejects(secretGate.adapters.prove_target_clean({
+      stage: "prove_target_clean",
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [],
+    }), (error) => error.code === "RECOVERY_WORKER_BINDINGS_INVALID");
+  }
+
+  // Explicit opt-in uses the reviewed manifest values, not hard-coded disabled
+  // settings. A later manifest edit remains refused by the original plan.
+  targetManifest.safety = { ocr: { enabled: true, model: "@cf/fixture/reviewed-model" } };
+  writePrivateJson(targetManifestPath, targetManifest);
+  try {
+    const ocrPlanPath = join(sandbox, ".brain-recovery-ocr-plan.json");
+    const ocrStatePath = join(sandbox, ".brain-recovery-ocr-state.json");
+    const ocrInitialized = initializeVerifiedRecovery(
+      sourceManifestPath, targetManifestPath, ocrPlanPath, ocrStatePath,
+      { now: new Date("2026-08-25T12:45:00.000Z") },
+    );
+    const ocrConfig = { ...baseConfig, planPath: ocrPlanPath, statePath: ocrStatePath };
+    const ocrPreview = previewCloudflareRecoveryFieldGate(ocrConfig, { platform: "darwin" });
+    const ocrHarness = providerHarness();
+    const ocrGate = createCloudflareRecoveryFieldGateAdapters({
+      ...ocrConfig,
+      plan: ocrInitialized.plan,
+      approvePlan: ocrInitialized.plan.plan_fingerprint,
+      approveDisposableTarget: ocrPreview.target_approval_fingerprint,
+      approveTargetExecution: ocrPreview.target_execution_approval_fingerprint,
+      approveSourceExportBlocking: ocrPreview.source_export_blocking_approval_fingerprint,
+      approveWrapper: ocrPreview.wrapper_approval_fingerprint,
+      approveGolden: ocrPreview.golden_approval_fingerprint,
+    }, ocrHarness.dependencies);
+    const clean = await ocrGate.adapters.prove_target_clean({
+      stage: "prove_target_clean",
+      planFingerprint: ocrInitialized.plan.plan_fingerprint,
+      targetResourceFingerprint: ocrInitialized.plan.target_resource_fingerprint,
+      completed: [],
+    });
+    assert.equal(clean.user_table_count, 0);
+    assert.equal(clean.vector_count, 0);
+    assert.throws(() => createCloudflareRecoveryFieldGateAdapters(
+      approvedAdapterConfig, ocrHarness.dependencies,
+    ), /verified recovery manifest binding changed after plan review/);
+  } finally {
+    delete targetManifest.safety;
+    writePrivateJson(targetManifestPath, targetManifest);
+  }
+
   const mismatchedCodeHarness = providerHarness({
     activeScriptEtag: "c".repeat(64),
   });
@@ -1786,6 +1930,59 @@ try {
   assert.equal(residueRetryHarness.sleepCalls, 3);
   assert.equal(residueRetryHarness.promotionCalls, 1);
 
+  const mixedResidueHarness = providerHarness({
+    initialTargetRestored: true,
+    bootstrapPageSize: 3,
+    bootstrapResidueRetryAfterProgress: true,
+    bootstrapReceiptTransform: (receipt) => receipt.phase === "legacy_drain"
+      ? { ...receipt, queued: 2, submitted: 1 }
+      : receipt,
+  });
+  const mixedResidueGate = createCloudflareRecoveryFieldGateAdapters(approvedAdapterConfig, mixedResidueHarness.dependencies);
+  const mixedResidue = await mixedResidueGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 });
+  assert.equal(mixedResidue.vector_count, 5);
+  assert.equal(mixedResidueHarness.bootstrapCalls, 4,
+    "legacy deletes are queue operations, not unconfirmed current chunks");
+  assert.equal(mixedResidueHarness.promotionCalls, 1);
+
+  for (const chunkCount of [5, 0]) {
+    let firstReceipt = true;
+    const deleteResidueHarness = providerHarness({
+      initialTargetRestored: true,
+      targetChunkCount: chunkCount,
+      bootstrapReceiptTransform: (receipt) => {
+        if (!firstReceipt) return receipt;
+        firstReceipt = false;
+        return { ...receipt, phase: "legacy_drain", queued: 1, complete: false, vector_ready: false };
+      },
+    });
+    const deleteResidueGate = createCloudflareRecoveryFieldGateAdapters(approvedAdapterConfig, deleteResidueHarness.dependencies);
+    const deleteResidue = await deleteResidueGate.adapters.rebuild_vectorize({
+      ...rebuildContext, attempt: 1,
+      completed: [{ id: "verify_d1", evidence: snapshotForChunkCount(chunkCount) }],
+    });
+    assert.equal(deleteResidue.vector_count, chunkCount);
+    assert.equal(deleteResidueHarness.bootstrapCalls, 2,
+      "zero remaining chunks does not acknowledge an outstanding delete");
+    assert.equal(deleteResidueHarness.bootstrapEpoch, 1, "receipt validation does not reset the durable epoch");
+    assert.equal(deleteResidueHarness.promotionCalls, 1);
+  }
+
+  for (const phase of ["building", "waiting", "complete"]) {
+    const excessQueueHarness = providerHarness({
+      initialTargetRestored: true,
+      bootstrapReceiptTransform: (receipt) => ({
+        ...receipt, phase, queued: receipt.remaining + 1,
+        complete: phase === "complete", vector_ready: phase === "complete",
+      }),
+    });
+    const excessQueueGate = createCloudflareRecoveryFieldGateAdapters(approvedAdapterConfig, excessQueueHarness.dependencies);
+    await assert.rejects(excessQueueGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 }),
+      (error) => error.code === "RECOVERY_BOOTSTRAP_RECEIPT_INVALID");
+    assert.equal(excessQueueHarness.promotionCalls, 0,
+      "only an incomplete legacy drain may report more queue work than remaining chunks");
+  }
+
   // The old active /drain loop could submit at most 79,200 restored rows. The
   // paused schema-13 bootstrap advances its durable provider-receipt cursor
   // until exact completion, with no corpus-sized adapter ceiling.
@@ -1869,6 +2066,30 @@ try {
     (error) => error.code === "RECOVERY_BOOTSTRAP_BUSY_RECEIPT_INVALID",
   );
   assert.equal(malformedBusyHarness.promotionCalls, 0);
+
+  for (const active of [false, true]) for (const alter of [
+    (receipt) => ({ ...receipt, ok: !active }),
+    (receipt) => ({ ...receipt, accepting_documents: !active }),
+    (receipt) => ({ ...receipt, status: active ? "paused-for-upgrade" : "ok" }),
+    (receipt) => { const changed = { ...receipt }; delete changed.accepting_documents; return changed; },
+  ]) {
+    const dishonestHealthHarness = providerHarness({
+      targetVersionId: active ? activeWorkerVersionId : pausedWorkerVersionId,
+      transformHealthReceipt: alter,
+    });
+    const dishonestHealthGate = createCloudflareRecoveryFieldGateAdapters(
+      approvedAdapterConfig, dishonestHealthHarness.dependencies,
+    );
+    const stage = active ? "verify_health" : "prove_target_clean";
+    await assert.rejects(dishonestHealthGate.adapters[stage]({
+      stage,
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [{ id: "rebuild_vectorize", evidence: { chunk_count: 5 } }],
+    }), (error) => error.code === "RECOVERY_HEALTH_IDENTITY_MISMATCH");
+    assert.equal(dishonestHealthHarness.adminReads, 0);
+    assert.equal(dishonestHealthHarness.promotionCalls, 0);
+  }
 
   const mutatedCorpusHarness = providerHarness({
     initialTargetRestored: true,

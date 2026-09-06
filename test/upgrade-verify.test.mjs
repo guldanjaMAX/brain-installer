@@ -52,6 +52,7 @@ import {
 } from "../brain.mjs";
 import { DRAIN_LEASE_TTL_MS } from "../worker/src/lib/store-d1.js";
 import { Acceptance, credentialGateRefusalVerdict } from "../acceptance.mjs";
+import worker from "../worker/src/index.js";
 import {
   installedManifestPointerPath,
   readInstalledManifest,
@@ -149,6 +150,37 @@ const cutoverBody = (v, mode, protocol = "lease-v1") => JSON.stringify({
   restore();
   check("a probe that cannot read falls back to the full grace rather than shortening it",
     r4.proven === false && r4.waitedMs === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS, JSON.stringify(r4));
+}
+
+/* Accepted provider receipts can survive the invocation which created them.
+   Resuming a paused update must describe that wait honestly without shortening
+   its legacy writer-safety boundary or discarding the durable work. */
+{
+  const output = [];
+  const priorLog = console.log;
+  let clock = 0;
+  let result;
+  const durableReceipt = { leaseFree: true, inFlight: 1 };
+  try {
+    console.log = (...values) => output.push(values.map(String).join(" "));
+    result = await waitForVectorDrainCutover(async (ms) => { clock += ms; }, {
+      probe: async () => durableReceipt,
+      now: () => clock,
+      pollMs: 60_000,
+    });
+  } finally {
+    console.log = priorLog;
+  }
+  const rendered = output.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  check("a retained provider receipt is not described as an active writer and keeps the full safety pause",
+    result.proven === false && result.waitedMs === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS &&
+      clock === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS && durableReceipt.inFlight === 1 &&
+      /no active drain lease is recorded/i.test(rendered) &&
+      /1 accepted vector receipt\(s\) still await confirmation/i.test(rendered) &&
+      /full 20-minute safety pause/i.test(rendered) &&
+      /update will resume confirmation/i.test(rendered) &&
+      !/an older writer is still active/i.test(rendered),
+    JSON.stringify({ result, rendered: rendered.slice(0, 350) }));
 }
 
 const manifestFixture = (version = "0.1.9") => ({
@@ -1311,11 +1343,58 @@ const bootstrapCompletion = () => ({
 
 /* ---- the credential gate is proven by its exact structured contract ---- */
 {
-  const refusal = {
-    error: "refused: content carries live credential(s)",
-    labels: ["cloudflare_token_new", "env_assignment"],
-    detail: "Rotate them, strip them from the source, then re-ingest. Nothing was written.",
+  // Drive the shipped probe through the real deployed route. A handwritten
+  // refusal fixture previously agreed with stale CLI wording while the Worker
+  // correctly refused the probe, leaving a finished upgrade uncommitted.
+  let databaseTouches = 0;
+  let providerTouches = 0;
+  const refuseDatabaseAccess = () => {
+    databaseTouches++;
+    throw new Error("the credential probe must stop before database access");
   };
+  const refuseProviderAccess = () => {
+    providerTouches++;
+    throw new Error("the credential probe must stop before provider access");
+  };
+  const env = {
+    ADMIN_KEY: "fixture-admin-key",
+    STORAGE: "d1",
+    CREDENTIAL_SCANNER: "on",
+    DB: { prepare: refuseDatabaseAccess, batch: refuseDatabaseAccess, exec: refuseDatabaseAccess },
+    AI: { run: refuseProviderAccess },
+    VECTORIZE: { upsert: refuseProviderAccess, deleteByIds: refuseProviderAccess },
+  };
+  const calls = [];
+  let refusal;
+  let canary;
+  const suite = new Acceptance({
+    base: "https://fixture.invalid",
+    adminKey: env.ADMIN_KEY,
+    manifest: {},
+    fetchImpl: async (url, init) => {
+      const request = new Request(url, init);
+      const sent = await request.clone().json();
+      canary = sent.content.match(/CLOUDFLARE_API_TOKEN=([^ ]+)/)?.[1];
+      calls.push({ url: request.url, method: request.method, redirect: init.redirect,
+        authorized: request.headers.get("X-Admin-Key") === env.ADMIN_KEY,
+        contentType: request.headers.get("Content-Type"), sourceId: sent.source_id });
+      const response = await worker.fetch(request, env, {});
+      refusal = await response.clone().json();
+      return response;
+    },
+  });
+  await suite.tierSafety();
+  check("the shipped safety probe reaches the actual authenticated Worker ingest route",
+    calls.length === 1 && calls[0].url === "https://fixture.invalid/api/admin/brain/ingest" &&
+      calls[0].method === "POST" && calls[0].redirect === "error" && calls[0].authorized &&
+      calls[0].contentType === "application/json" && calls[0].sourceId === "acceptance/credential-gate-probe");
+  check("the actual Worker credential refusal passes both acceptance safety checks",
+    suite.results.length === 2 && suite.results.every(result => result.status === "pass") && suite.tierFailed === null);
+  check("the actual credential gate refuses before any database or provider access",
+    databaseTouches === 0 && providerTouches === 0);
+  check("the real refusal names the canary provider without echoing its value",
+    typeof canary === "string" && refusal.labels.includes("cloudflare_token_new") &&
+      !JSON.stringify(refusal).includes(canary));
   check(
     "credential acceptance requires the production HTTP 422 structure",
     credentialGateRefusalVerdict({ status: 422, text: JSON.stringify(refusal) }).accepted,
@@ -1336,6 +1415,32 @@ const bootstrapCompletion = () => ({
     "the right body on the wrong HTTP status is not accepted",
     !credentialGateRefusalVerdict({ status: 400, text: JSON.stringify(refusal) }).accepted,
   );
+  for (const [name, payload] of [
+    ["the obsolete live-credential error", { ...refusal, error: "refused: content carries live credential(s)" }],
+    ["the obsolete removal instruction", { ...refusal, detail: "Rotate them, strip them from the source, then re-ingest. Nothing was written." }],
+    ["a missing no-write assurance", { ...refusal, detail: undefined }],
+    ["labels encoded as a string", { ...refusal, labels: "cloudflare_token_new" }],
+    ["a private-identifier refusal without the canary provider", { ...refusal, labels: ["ssn"] }],
+    ["a JSON array", [refusal]],
+    ["a JSON null", null],
+  ]) {
+    check(`credential acceptance rejects ${name}`,
+      !credentialGateRefusalVerdict({ status: 422, text: JSON.stringify(payload) }).accepted);
+  }
+  // A structurally correct refusal can still leak. Keep that independent
+  // safety failure even when the provider/HTTP/no-write contract is correct.
+  const leaking = new Acceptance({
+    base: "https://fixture.invalid", adminKey: env.ADMIN_KEY, manifest: {},
+    fetchImpl: async (_url, init) => {
+      const content = JSON.parse(init.body).content;
+      return new Response(JSON.stringify({ ...refusal, echoed: content }), { status: 422 });
+    },
+  });
+  await leaking.tierSafety();
+  check("a correct refusal that echoes the canary still fails acceptance without logging the value",
+    leaking.tierFailed === 4 && leaking.results.some(result =>
+      result.name === "refusal does not echo the secret" && result.status === "fail") &&
+      !JSON.stringify(leaking.results).includes(canary));
 }
 
 /* ---- semantic-version ordering refuses a downgrade before mutation ---- */
