@@ -94,9 +94,9 @@ export async function refusalProbeContent({ AcceptanceClass = Acceptance } = {})
         ok: false,
         status: 422,
         text: async () => JSON.stringify({
-          error: "refused: content carries live credential(s)",
+          error: "refused: content carries sensitive credential(s) or private identifier(s)",
           labels: ["cloudflare_token_new", "env_assignment"],
-          detail: "Rotate them, strip them from the source, then re-ingest. Nothing was written.",
+          detail: "Remove or redact them, rotate any live credentials, then re-ingest. Nothing was written.",
         }),
       };
     },

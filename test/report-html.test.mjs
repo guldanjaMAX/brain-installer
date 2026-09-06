@@ -511,9 +511,9 @@ const fetchStub = async (url, init = {}) => {
   }
   if (u.pathname === "/api/admin/brain/ingest") {
     return reply(422, {
-      error: "refused: content carries live credential(s)",
+      error: "refused: content carries sensitive credential(s) or private identifier(s)",
       labels: ["cloudflare_token_new", "env_assignment"],
-      detail: "Rotate them, strip them from the source, then re-ingest. Nothing was written.",
+      detail: "Remove or redact them, rotate any live credentials, then re-ingest. Nothing was written.",
     });
   }
   if (u.pathname === "/api/rag/unified") {
