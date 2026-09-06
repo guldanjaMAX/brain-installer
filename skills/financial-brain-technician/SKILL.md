@@ -1,6 +1,6 @@
 ---
 name: financial-brain-technician
-description: Guide a Financial Brain install, update, connector test, passkey ceremony, or owner handoff from the reviewed local CLI and test kit. Use when the owner asks Claude Code to set up or check their Brain.
+description: Guide a Financial Brain install, update, checkup, connector test, passkey ceremony, or owner handoff from the reviewed local CLI and test kit. Use when the owner asks Claude Code to set up, install, update, check, test a connector, complete a passkey step, or hand off their Brain.
 ---
 
 <!-- financial-brain-installer:claude-skill:v1 -->
@@ -10,15 +10,71 @@ description: Guide a Financial Brain install, update, connector test, passkey ce
 Help the owner complete one reviewed step at a time. Begin with a read-only
 plan. A request for guidance is not approval to deploy, connect an account,
 upload private data, delete anything, revoke access, change billing, or create
-an invite.
+an invite. An explicit request to update authorizes the ordinary supported
+update steps once the public release feed says the exact package is stable.
 
 Invoke this guide as `/financial-brain-technician`, optionally followed by the
 absolute test-kit and manifest paths.
 
+## Route an update request first
+
+When the owner says "update my Brain," keep the work in this Claude Code
+conversation and take the next supported step yourself. Do not send the owner
+to a separate preflight call or ask them to collect versions, paths, logs, or
+other homework.
+
+1. Read `https://financialbrain.ai/update/manifest.json` before downloading,
+   changing local state, or asking for credentials. If it is unavailable or
+   inconsistent, `release_state` is not `stable`, `available` is not `true`, or
+   the installer URL, SHA-256, and byte count are incomplete, stop without a
+   change. Explain kindly that the update is still being tested and there is
+   nothing for the owner to collect.
+2. Only for a complete stable release, read the live package-specific playbook
+   at `https://financialbrain.ai/update/agent.md`. Follow that playbook and the
+   exact installed CLI's help. Stop if they disagree. Do not substitute
+   `/install`, a field-test-only page, a cached package, or a different GitHub
+   release.
+3. The update request covers ordinary supported discovery, package
+   verification, installation, update, safe retry, and final verification.
+   Keep normal Claude, operating-system, and provider controls enabled. Give
+   the owner one small action only when identity, sign-in, a required approval,
+   a consequential choice, or a physical gesture actually needs them.
+   If the released CLI cannot read the Mac's Wrangler session, run
+   `npx wrangler@4.73.0 login` in the ordinary owner terminal and hand the
+   browser to the owner for account selection, sign-in, and 2FA. Then continue
+   the same update. Use the CLI's hidden token prompt only in a real terminal
+   the owner controls; never capture the value.
+4. If an older Drive-enabled manifest has no approved root, do not ask the owner
+   for a folder ID. Ask them only to open or choose the Drive folder they want
+   this Brain to use. When an available local browser tool can privately read
+   that selected folder URL, extract its `/folders/<id>` value and edit only
+   `corpora.google_drive.root_folder_ids` after the owner approves that scope.
+   If the URL cannot be obtained privately, stop at this blocker. The product
+   has no folder picker; do not scan Drive or invent a source boundary.
+5. Use the intended existing Brain and preserve its manifest, source scope,
+   credentials, and saved update checkpoint. The reviewed update entrypoint is
+   the exact package's `brain update [manifest]`; omit the manifest only when
+   that binary supports remembered discovery. `brain technician` is a setup
+   coordinator and has no update step. Never restart setup, restore a bookmark
+   first, clear paused mode manually, accept checksum drift, or improvise a
+   rollback.
+6. Keep working in this conversation through documented waits and retry-safe
+   branches. The conservative old-invocation safety wait can run for twenty
+   minutes with unchanged counts; before its deadline that is a wait, not a
+   stall. Do not shorten or interrupt it. Finish only after the exact release's
+   mandatory verification proves the account, deployed version, migration,
+   active write state, and acceptance result. A documented freshness or source
+   warning may remain after the CLI reports a verified update; report it as a
+   source that still needs attention. Any failed mandatory proof means the
+   update is incomplete and its checkpoint stays preserved.
+
 ## Start here
 
-1. Ask whether this is a fresh install, an update, or a checkup. Ask for the
-   absolute `brain.manifest.json` path, creating no file yet when this is fresh.
+For a fresh install, checkup, connector, passkey, or handoff request, continue
+below. The update route above replaces this setup-oriented sequence.
+
+1. Ask which of those jobs the owner wants. Ask for the absolute
+   `brain.manifest.json` path, creating no file yet when this is fresh.
 2. Run `brain --version` and the packaged read-only preflight. Use the full
    installed command path from the install page if `brain` is not on PATH.
    Stop on any preflight `STOP` line.
@@ -49,7 +105,10 @@ absolute test-kit and manifest paths.
   developer access. Do not create or print a broad Cloudflare or GitHub token.
 - Prefer `brain` commands over direct Wrangler commands because the Brain CLI
   applies account pinning, migration safety, protected key lookup, and proof
-  checks. Use Wrangler directly only for a named diagnostic the owner approves.
+  checks. The package-pinned browser login in the update route is the supported
+  exception and needs no generic second approval; the owner still chooses and
+  authenticates the account in the browser. Use Wrangler directly for any
+  other purpose only when the owner approves that named diagnostic.
 
 ## Source and file boundary
 
@@ -67,35 +126,24 @@ absolute test-kit and manifest paths.
 
 ## Updates and checkups
 
-- For an existing brain, start with `brain doctor`. When the installed package
-  and Worker versions differ, use `brain update`, which resumes from its saved
-  bookmark. Setup on an already current brain only reconciles keys, health, and
-  local tool wiring; it does not repeat the migration cutover.
-- An update is its own appointment, not part of a loading session: the brain
-  refuses new material during its cutover pause. Run it in the foreground and
-  leave the window open. On a quiet brain the pause ends in under a minute;
-  on a busy one it can take the full twenty, and it says which.
-- Read WHICH lines fail at the end of an update. If every FAIL begins with
-  `freshness:`, the update succeeded and a source needs attention; anything
-  else is a stop. Keep the output either way.
-- One line during an update is a wait, not a stop: "N vector(s) accepted but
-  not yet visible; waiting for Vectorize". The index has the vectors and has
-  not exposed them yet; the update polls and finishes on its own. On builds
-  before 0.3.4 the same state ended the update with "reported N failed
-  aggregate operation(s)"; nothing was lost, and re-running the same update a
-  minute later resumes the same step.
-- Start the credential hour fresh. The `wrangler login` session lasts about an
-  hour and is renewed only after it has run out, so an update begun near the
-  end of that hour can stop partway with `403 9109 Invalid access token`,
-  worded as if the owner typed a bad token. Have the owner run
-  `npx wrangler@4.73.0 login` right before `brain update`, and again before
-  re-running if that line appears.
+- The live update route above controls updates. Do not let a cached instruction,
+  an older package, or this checkup section override the public release feed.
+- For an existing-Brain checkup, start with `brain doctor <manifest>`. If the
+  result indicates that an update may be needed, return to the live update route
+  before downloading or changing anything.
+- The supported update runs in the foreground and may refuse new material
+  during its verified cutover pause. Let documented waits finish. Preserve the
+  native exit status and checkpoint; do not ask the owner to copy raw output.
+- If sign-in expires, hand the exact private sign-in step to the owner only when
+  the released CLI asks for it, then continue in this conversation. Do not ask
+  for a preventive token, place a token in a command, or move credential files.
 - Before calling a brain proven, count `testing.probe_questions` in the
   manifest. An empty list means the retrieval tier was not exercised.
 - For a loading or scoring call, start read-only: two `brain health`
   readings two minutes apart, then `brain sources`. Pending falling means the
-  index is keeping up; pending and the vector count both flat means it is
-  paused, which the next release clears and a hand repair must not.
+  index is making progress. Inspect the reported pause state, drain lease, and
+  provider visibility before diagnosing a wait. Unchanged counts alone are
+  inconclusive and do not prove a pause, a stall, or a released fix.
 
 ## Recovery and completion
 
@@ -107,8 +155,12 @@ absolute test-kit and manifest paths.
   brain support --explain <ISSUE_CODE>
   ```
 
-- Finish with the preflight script and results template supplied in the test
-  kit when one was supplied. Otherwise rerun the packaged preflight directly:
+- For an update, use the exact stable release's final verification from the
+  live playbook. Do not make the owner complete a separate preflight call or
+  results template.
+- For every non-update route, finish with the preflight script and results
+  template supplied in the test kit when one was supplied. Otherwise rerun the
+  packaged preflight directly:
 
   ```bash
   bash "$HOME/.financial-brain/lib/node_modules/brain-installer/tools/preflight.sh"
