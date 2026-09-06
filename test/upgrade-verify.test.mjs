@@ -32,6 +32,7 @@ import { fileURLToPath } from "node:url";
 import {
   ACCELERATED_BOOTSTRAP_MAX_MS,
   ACCELERATED_BOOTSTRAP_MAX_ROUNDS,
+  brainCliPrefix,
   cloudflareTokenAvailable,
   cmdAcceleratedBootstrap,
   cmdRollback,
@@ -2232,7 +2233,8 @@ const bootstrapCompletion = () => ({
       "a failing skill warning reporter falls back safely without changing the update result",
       warningReporterResult === warningReporterUpgradeResult &&
         /warn\s+The Brain software update is verified/i.test(renderedWarningReporterOutput) &&
-        /do not rerun brain update/i.test(renderedWarningReporterOutput) &&
+        // The terminal renderer uses full PowerShell executable paths on Windows.
+        renderedWarningReporterOutput.includes(`Do not rerun ${brainCliPrefix()} update for this local guide warning.`) &&
         !renderedWarningReporterOutput.includes(sandbox) && !cloudflareTokenAvailable(),
       renderedWarningReporterOutput,
     );

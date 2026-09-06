@@ -74,6 +74,7 @@ test("the personal Claude technician skill installs exactly, verifies on rerun, 
   const content = readFileSync(first.path, "utf8");
   assert.match(content, new RegExp(CLAUDE_TECHNICIAN_SKILL_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(content, /\/financial-brain-technician/);
+  assert.match(content, /In Codex,\s+use `\$financial-brain-technician`/);
   assert.match(content, /brain technician/);
   const updateRouteStart = content.indexOf("## Route an update request first");
   const setupRouteStart = content.indexOf("## Start here");
@@ -91,8 +92,11 @@ test("the personal Claude technician skill installs exactly, verifies on rerun, 
   assert.match(updateRoute, /nothing for the owner to collect/i);
   assert.match(updateRoute, /brain technician.*no update step/is);
   assert.match(updateRoute, /preserve.*saved update checkpoint/is);
-  assert.ok(updateRoute.includes(`npx ${WRANGLER_SPEC} login`),
-    "the Mac browser-login remedy must use the package's pinned Wrangler");
+  assert.match(updateRoute, /documented package-pinned browser-login command/);
+  assert.match(updateRoute, /preserving any account or isolated-profile options/);
+  assert.match(updateRoute, /exact released CLI's guidance and matching live playbook/);
+  assert.doesNotMatch(updateRoute, /wrangler@\d/,
+    "the shared skill must not retain an older release's authentication pin");
   assert.match(updateRoute, /do not ask the owner\s+for a folder ID/i);
   assert.match(updateRoute, /no folder picker/i);
   assert.match(updateRoute, /twenty\s+minutes with unchanged counts.*wait, not a\s+stall/is);

@@ -14074,9 +14074,9 @@ export async function cmdLocalTools(options = {}) {
   for (const r of skillResults) {
     const label = r.root === ".codex" ? "Codex" : "Claude Code";
     if (r.status === "failed") warn(`${label} skill not installed: ${r.error}`);
-    else ok(`${label} skill /financial-brain-technician ${r.status}`);
+    else ok(`${label} Financial Brain guide ${r.status}`);
   }
-  info("In either tool, type `/financial-brain-technician` to begin the guided plan.");
+  info("In Claude Code, use `/financial-brain-technician`. In Codex, use `$financial-brain-technician` or ask to update your Brain.");
 
   // Persist the CLI's own bin directory before anything else can go wrong,
   // so a new terminal still has `brain` even if the rest of this stops.
@@ -14365,7 +14365,7 @@ export function refreshTechnicianSkillsAfterUpdate(options = {}) {
 
     for (const result of succeeded) {
       const label = updateSkillAgentLabel(result.root);
-      reportOk(`${label} /financial-brain-technician ${result.status} after update`);
+      reportOk(`${label} Financial Brain guide ${result.status} after update`);
     }
     for (const result of failed) {
       const label = updateSkillAgentLabel(result?.root);

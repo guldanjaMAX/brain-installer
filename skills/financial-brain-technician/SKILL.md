@@ -1,6 +1,6 @@
 ---
 name: financial-brain-technician
-description: Guide a Financial Brain install, update, checkup, connector test, passkey ceremony, or owner handoff from the reviewed local CLI and test kit. Use when the owner asks Claude Code to set up, install, update, check, test a connector, complete a passkey step, or hand off their Brain.
+description: Guide a Financial Brain install, update, checkup, connector test, passkey ceremony, or owner handoff from the reviewed local CLI and test kit. Use when the owner asks Claude Code or Codex to set up, install, update, check, test a connector, complete a passkey step, or hand off their Brain.
 ---
 
 <!-- financial-brain-installer:claude-skill:v1 -->
@@ -13,12 +13,13 @@ upload private data, delete anything, revoke access, change billing, or create
 an invite. An explicit request to update authorizes the ordinary supported
 update steps once the public release feed says the exact package is stable.
 
-Invoke this guide as `/financial-brain-technician`, optionally followed by the
-absolute test-kit and manifest paths.
+In Claude Code, invoke this guide as `/financial-brain-technician`. In Codex,
+use `$financial-brain-technician` or ask in plain language, such as "update my
+Brain." Supply the absolute test-kit and manifest paths only when needed.
 
 ## Route an update request first
 
-When the owner says "update my Brain," keep the work in this Claude Code
+When the owner says "update my Brain," keep the work in this assistant
 conversation and take the next supported step yourself. Do not send the owner
 to a separate preflight call or ask them to collect versions, paths, logs, or
 other homework.
@@ -36,14 +37,17 @@ other homework.
    release.
 3. The update request covers ordinary supported discovery, package
    verification, installation, update, safe retry, and final verification.
-   Keep normal Claude, operating-system, and provider controls enabled. Give
+   Keep normal assistant, operating-system, and provider controls enabled. Give
    the owner one small action only when identity, sign-in, a required approval,
    a consequential choice, or a physical gesture actually needs them.
-   If the released CLI cannot read the Mac's Wrangler session, run
-   `npx wrangler@4.73.0 login` in the ordinary owner terminal and hand the
-   browser to the owner for account selection, sign-in, and 2FA. Then continue
-   the same update. Use the CLI's hidden token prompt only in a real terminal
-   the owner controls; never capture the value.
+   If the released CLI reports that Cloudflare sign-in is needed, use its
+   documented package-pinned browser-login command in the ordinary owner
+   terminal, preserving any account or isolated-profile options. Obtain that
+   command from the exact released CLI's guidance and matching live playbook;
+   never substitute a remembered Wrangler version or an unpinned login command.
+   Hand the browser to the owner for account selection, sign-in, and 2FA, then
+   continue the same update. Use the CLI's hidden token prompt only in a real
+   terminal the owner controls; never capture the value.
 4. If an older Drive-enabled manifest has no approved root, do not ask the owner
    for a folder ID. Ask them only to open or choose the Drive folder they want
    this Brain to use. When an available local browser tool can privately read
