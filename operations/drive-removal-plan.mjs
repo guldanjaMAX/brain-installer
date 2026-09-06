@@ -59,24 +59,35 @@ export function buildDriveRemovalPlan(input = {}, options = {}) {
     for (const uid of targets[category]) assigned.add(uid);
   }
 
-  const stored = storedFamilies.size;
+  const inventoryStored = storedFamilies.size;
+  const stored = options.safetyBaselineCount ?? inventoryStored;
+  if (!Number.isInteger(stored) || stored < 0 || stored > inventoryStored) {
+    throw new TypeError("safetyBaselineCount must be a non-negative integer no larger than the stored inventory");
+  }
   const counts = Object.fromEntries(
     CATEGORY_INPUTS.map(([category]) => [category, targets[category].length])
   );
   const total = assigned.size;
-  const ratio = stored ? total / stored : 0;
+  const ratio = stored ? total / stored : total ? 1 : 0;
   const maxCount = options.maxCount ?? DRIVE_REMOVAL_MAX_COUNT;
   const maxRatio = options.maxRatio ?? DRIVE_REMOVAL_MAX_RATIO;
+  const ratioFloorCount = options.ratioFloorCount ?? 0;
+  const fingerprintContext = String(options.fingerprintContext || "default");
   if (!Number.isInteger(maxCount) || maxCount < 0) throw new TypeError("maxCount must be a non-negative integer");
   if (!Number.isFinite(maxRatio) || maxRatio < 0 || maxRatio > 1) {
     throw new TypeError("maxRatio must be between zero and one");
+  }
+  if (!Number.isInteger(ratioFloorCount) || ratioFloorCount < 0) {
+    throw new TypeError("ratioFloorCount must be a non-negative integer");
   }
 
   // Version and category assignment are part of the approval. Reclassifying a
   // target or changing the plan invalidates an earlier approval even when the
   // aggregate total happens to stay the same.
   const fingerprint = createHash("sha256").update(JSON.stringify({
-    version: 1,
+    version: 2,
+    context: fingerprintContext,
+    limits: { maxCount, maxRatio, ratioFloorCount },
     stored,
     targets: CATEGORY_INPUTS.map(([category]) => [category, targets[category]]),
   })).digest("hex");
@@ -88,20 +99,22 @@ export function buildDriveRemovalPlan(input = {}, options = {}) {
     counts,
     targets,
     fingerprint,
-    tooLarge: total > maxCount || ratio > maxRatio,
+    inventoryStored,
+    tooLarge: total > maxCount || (total > ratioFloorCount && ratio > maxRatio),
   };
 }
 
 /** Refuse a surprising plan without disclosing any source identifier. */
-export function assertDriveRemovalPlanSafe(plan, approval) {
+export function assertDriveRemovalPlanSafe(plan, approval, options = {}) {
+  const sourceLabel = String(options.sourceLabel || "Drive");
   if (!plan || typeof plan !== "object" || !/^[0-9a-f]{64}$/.test(String(plan.fingerprint || ""))) {
-    throw new TypeError("Drive removal plan is invalid");
+    throw new TypeError(`${sourceLabel} removal plan is invalid`);
   }
   if (!plan.tooLarge || approval === plan.fingerprint) return plan;
 
   const percent = (Number(plan.ratio || 0) * 100).toFixed(1);
   throw new DriveRemovalReviewRequired(
-    `Drive cleanup would remove ${plan.total} of ${plan.stored} stored documents (${percent}%).\n` +
+    `${sourceLabel} cleanup would remove ${plan.total} of ${plan.stored} stored documents (${percent}%).\n` +
       `      Aggregate reasons: source policy ${plan.counts.source_policy}; source deletion ${plan.counts.source_deleted}; intentional skip ${plan.counts.intentional_skip}.\n` +
       "      Nothing in this removal plan was removed. The source cursor was not advanced.\n" +
       "      Review the source and policy, then approve this exact plan by re-running with:\n" +

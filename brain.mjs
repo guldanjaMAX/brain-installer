@@ -29,27 +29,7 @@
  * manifest, logged, or passed as a command-line argument where `ps` could read it.
  */
 
-import {
-  chmodSync,
-  closeSync,
-  constants as fsConstants,
-  existsSync,
-  fstatSync,
-  fsyncSync,
-  lstatSync,
-  mkdtempSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  readdirSync,
-  realpathSync,
-  renameSync,
-  rmdirSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
-  writeSync,
-} from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, existsSync, fstatSync, fsyncSync, lstatSync, mkdtempSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync, appendFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, isAbsolute, join, dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -84,7 +64,7 @@ async function ingestLib() {
 async function ingestOcrLib() {
   return await import("./ingest/ocr.mjs");
 }
-import { authorize, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
+import { authorize, fetchConnectedAccountEmail, loadTokens, saveTokens, createTokenProvider, tokenStorageDescription, SCOPES, DEFAULT_PORT } from "./connectors/google-auth.mjs";
 import {
   redact as redactConfirmedSecrets,
   scanEnvelope as scanEnvelopeSecrets,
@@ -95,7 +75,9 @@ import { cloudflareCliEnvironment, localToolEnvironment, run } from "./doctor.mj
 import {
   runAll as doctorRunAll,
   summarize as doctorSummarize,
+  bankFeedRedirectUri,
   checkBankFeedRedirect,
+  checkPrioritySlice,
   checkClaudeCode,
   checkWrangler,
   OK as D_OK,
@@ -130,6 +112,17 @@ import {
   hasStoredCloudflareToken,
   storedTokenReference,
 } from "./operations/cloudflare-token-store.mjs";
+import {
+  assessZoneReadiness,
+  collectAnswers,
+  confirmationEnvelope,
+  gather,
+  normalizeCheckSubject,
+  renderConfirmations,
+  renderReport,
+  unavailableZoneReadiness,
+  validateConfirmationReceipt,
+} from "./operations/check-run.mjs";
 import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
 import { deriveSessionSigningKey } from "./operations/session-signing-key.mjs";
 import {
@@ -140,7 +133,7 @@ import {
 import { guardBrainAdminFetch } from "./components/brain-http.mjs";
 import { confidenceLine } from "./worker/src/lib/confidence.js";
 import { retrievalUnavailable, unavailableNotice } from "./worker/src/lib/retrieval-status.js";
-import { readWranglerOAuthToken } from "./operations/wrangler-oauth.mjs";
+import { readWranglerOAuthToken, refreshWranglerSession } from "./operations/wrangler-oauth.mjs";
 import {
   adminKeyPersistencePlan,
   parseAdminKeySecretReference,
@@ -221,14 +214,24 @@ const warn = (s) => console.log(`${c.yellow("warn")}  ${s}`);
  * vanish from the history.
  */
 class Fatal extends Error {}
+/** A Fatal whose message is a JSON receipt, for the --json command paths. */
+class JsonFatal extends Fatal {
+  constructor(payload) {
+    super(JSON.stringify(payload, null, 2));
+    this.payload = payload;
+  }
+}
 
 const die = (s) => {
   throw new Fatal(s);
 };
 
 const SUPPORT_REMOTE_COMMANDS = new Set([
-  "deploy", "diagnose", "drain", "health", "migrate", "provision",
+  "check", "deploy", "diagnose", "drain", "health", "migrate", "provision",
   "reindex", "rollback", "secrets", "update", "upgrade", "verify",
+]);
+export const PROVIDER_CONNECTOR_IDS = Object.freeze([
+  "quickbooks", "slack", "notion", "microsoft", "dropbox", "hubspot",
 ]);
 let currentSupportCommand = "";
 
@@ -375,7 +378,43 @@ const cloudflareTokenSession = new AsyncLocalStorage();
 function activeCloudflareToken() {
   if (process.env.CLOUDFLARE_API_TOKEN) return process.env.CLOUDFLARE_API_TOKEN;
   const scoped = cloudflareTokenSession.getStore();
-  return scoped ? scoped.toString("ascii") : null;
+  // A Wrangler session is prepared for the whole invocation, but most routine
+  // commands never use Cloudflare's control plane. Announce it only when code
+  // actually asks for that credential, once, and keep JSON output clean.
+  if (scoped?.source === "wrangler-session" && !scoped.machineReadable && !scoped.announced) {
+    scoped.announced = true;
+    info("Cloudflare access is using the account signed in on this computer");
+  }
+  return scoped ? scoped.buffer.toString("ascii") : null;
+}
+
+// Cloudflare rejected the credential mid-run. If it came from this computer's
+// wrangler login session, the session has expired: wrangler renews only an
+// expired token (whoami on a still-valid one changes nothing), so this is the
+// first moment a refresh can succeed. A rehearsal on 2026-09-02 started with
+// 2m38s left on the hour and died 2.5 minutes into provisioning with
+// "403 9109 Invalid access token", blamed on a token the owner never typed.
+// Returns true when a different token is now in place.
+function renewWranglerSessionToken() {
+  if (process.env.CLOUDFLARE_API_TOKEN) return false;
+  const holder = cloudflareTokenSession.getStore();
+  if (!holder || holder.source !== "wrangler-session" || typeof holder.renew !== "function") return false;
+  let next = null;
+  try {
+    next = holder.renew();
+  } catch {
+    next = null;
+  }
+  if (!next || String(next) === holder.buffer.toString("ascii")) return false;
+  holder.buffer.fill(0);
+  holder.buffer = Buffer.from(String(next), "ascii");
+  return true;
+}
+
+function isExpiredSessionRejection(error) {
+  const message = String(error?.message || "");
+  return /failed \((401|403)\)/.test(message) &&
+    (/\b(9109|10000)\b/.test(message) || /invalid access token|authentication error/i.test(message));
 }
 
 export function cloudflareTokenAvailable() {
@@ -405,21 +444,22 @@ export async function withWranglerSessionIfNeeded(run, options = {}) {
     token = null; // one credential source among several; absence is ordinary
   }
   if (!token) return run();
-  const buffer = Buffer.from(token, "ascii");
-  // Name the identity, because wrangler authenticating as the wrong person is
-  // how an operator provisions into their own account instead of the client's,
-  // and it is silent when it happens.
-  //
-  // Never on a --json run. Machine-readable output is the whole contract of
-  // those commands, and one friendly line on stdout ahead of it turns a parsed
-  // object into a syntax error for whatever is reading it.
   const machineReadable = (options.argv ?? process.argv).includes("--json");
-  if (!machineReadable) ok("using this computer's `wrangler login` session for Cloudflare");
-  return cloudflareTokenSession.run(buffer, async () => {
+  const holder = {
+    buffer: Buffer.from(token, "ascii"),
+    source: "wrangler-session",
+    machineReadable,
+    announced: false,
+    renew: options.renewSessionToken ?? (() => {
+      const read = options.readWranglerOAuthToken ?? readWranglerOAuthToken;
+      return (options.refreshWranglerSession ?? refreshWranglerSession)() ? read() : null;
+    }),
+  };
+  return cloudflareTokenSession.run(holder, async () => {
     try {
       return await run();
     } finally {
-      buffer.fill(0);
+      holder.buffer.fill(0);
     }
   });
 }
@@ -649,7 +689,24 @@ function token() {
   return t;
 }
 
-async function cf(path, { method = "GET", body, raw } = {}) {
+async function cf(path, options = {}) {
+  try {
+    return await cfOnce(path, options);
+  } catch (error) {
+    if (isExpiredSessionRejection(error) && renewWranglerSessionToken()) return cfOnce(path, options);
+    if (
+      isExpiredSessionRejection(error) && !process.env.CLOUDFLARE_API_TOKEN &&
+      cloudflareTokenSession.getStore()?.source === "wrangler-session"
+    ) {
+      error.credentialSource = "wrangler-session";
+    }
+    throw error;
+  }
+}
+
+export { cf as cloudflareApiRequest };
+
+async function cfOnce(path, { method = "GET", body, raw } = {}) {
   const res = await http(API + path, {
     method,
     headers: {
@@ -1556,19 +1613,50 @@ export async function cmdDeploy(manifestPath, options = {}) {
   // reports itself healthy the whole time because both systems are up.
   if ((cfg.storage || "d1") === "d1") {
     const schedule = cfg.drain_cron || "* * * * *";
+    // Read before writing. A schedule that already matches (a resumed setup, a
+    // redeploy, one added by hand after a failure) is success, not a reason to
+    // issue a PUT that can fail. This call was unconditional and died on a real
+    // install where the cron had been added in the dashboard minutes earlier.
+    let existing = null;
     try {
-      await cf(`/accounts/${acct.id}/workers/scripts/${scriptName}/schedules`, {
-        method: "PUT",
-        body: [{ cron: schedule }],
-      });
-      ok(`vector drain scheduled (${schedule})`);
-    } catch (e) {
-      die(
-        `could not set the drain cron: ${e.message.slice(0, 120)}\n` +
-          "  The Worker code was uploaded, but a D1 install without this required schedule\n" +
-          "  accumulates text that is keyword-searchable and NOT semantically searchable.\n" +
-          "  Fix Worker schedule access and re-run `brain deploy`; the upload is safe to repeat."
-      );
+      const current = await cf(`/accounts/${acct.id}/workers/scripts/${scriptName}/schedules`);
+      const crons = (current?.schedules || current || []).map((row) => String(row?.cron || ""));
+      if (crons.includes(schedule)) existing = schedule;
+    } catch {
+      existing = null; // unreadable is not "absent"; fall through to the PUT
+    }
+    if (existing) {
+      ok(`vector drain already scheduled (${schedule})`);
+    } else {
+      try {
+        await cf(`/accounts/${acct.id}/workers/scripts/${scriptName}/schedules`, {
+          method: "PUT",
+          body: [{ cron: schedule }],
+        });
+        ok(`vector drain scheduled (${schedule})`);
+      } catch (e) {
+        const message = String(e.message || e);
+        // The free plan allows everything up to this exact call. A client who
+        // reaches it has a complete brain except for the schedule, ten minutes
+        // in, and the fix is the plan, not a reinstall. Say that.
+        if (/10063|Workers Paid/i.test(message)) {
+          die(
+            "the drain cron needs the Cloudflare Workers Paid plan (about five dollars a month).\n" +
+              "  Everything else is in place: the database, the search index, the migrations and\n" +
+              "  the Worker are all deployed. Only this schedule is missing.\n" +
+              "  Upgrade the plan at dash.cloudflare.com (Workers & Pages, Plans), then run the same\n" +
+              "  command again; every step before this one is skipped as already done."
+          );
+        }
+        die(
+          `could not set the drain cron: ${message.slice(0, 120)}\n` +
+            "  The Worker code was uploaded, but a D1 install without this required schedule\n" +
+            "  accumulates text that is keyword-searchable and NOT semantically searchable.\n" +
+            "  Fix Worker schedule access, then run `brain setup` or `brain update` again in an\n" +
+            "  interactive terminal; those read your stored credential, and every completed step\n" +
+            "  is skipped. (`brain deploy` alone needs CLOUDFLARE_API_TOKEN in the environment.)"
+        );
+      }
     }
   }
   // Same reasoning as provision: suppressed when setup drives the step.
@@ -1745,9 +1833,10 @@ export async function cmdSecrets(manifestPath, options = {}) {
   if (!provided.length) {
     die(
       "no ADMIN_KEY was found in durable storage. Run `brain setup <manifest>` to generate,\n" +
-        "      persist, and verify one. A deliberate manual replacement must be injected by an\n" +
-        "      approved no-history credential launcher before `brain secrets`; never paste the key\n" +
-        "      into a shell command."
+        "      persist, and verify one. On a brain that is already live, setup checks that first and\n" +
+        "      goes straight to keys; it does not pause or migrate a finished brain. A deliberate\n" +
+        "      manual replacement must be injected by an approved no-history credential launcher\n" +
+        "      before `brain secrets`; never paste the key into a shell command."
     );
   }
 
@@ -2271,6 +2360,14 @@ export async function cmdAsk(manifestPath, options = {}) {
     refused: /^The documents do not answer/i.test(answer),
   });
   if (trust) console.log(`  ${c.dim(trust)}\n`);
+  // Say WHY when the answer was refused or cut short. The gate already
+  // records it; hiding it left the owner with one sentence that meant five
+  // different things.
+  const gate = body.evidence_gate && typeof body.evidence_gate === "object" ? body.evidence_gate : null;
+  const gateReason = gate && typeof gate.reason === "string" ? gate.reason.replace(/\s+/g, " ").trim().slice(0, 240) : "";
+  if (gateReason && (/^The documents do not answer/i.test(answer) || gate.partial === true)) {
+    console.log(`  ${c.dim(gate.partial === true ? "Not covered" : "Why")}: ${gateReason}\n`);
+  }
   if (body.answer_error) warn(`answer generation reported: ${String(body.answer_error).slice(0, 160)}`);
   if (body.degraded) warn(`search is degraded: ${String(body.degraded).slice(0, 80)}`);
   const citations = Array.isArray(body.citations) ? body.citations : [];
@@ -2280,7 +2377,22 @@ export async function cmdAsk(manifestPath, options = {}) {
       const number = Number.isInteger(citation?.n) ? `[${citation.n}]` : "[ ]";
       const title = String(citation?.title || "Untitled").replace(/\s+/g, " ").slice(0, 140);
       const source = String(citation?.source || "source").replace(/\s+/g, " ").slice(0, 40);
-      console.log(`  ${number} ${title} (${source})`);
+      const provenance = [source];
+      if (citation?.ts) {
+        const day = String(citation.ts).slice(0, 10);
+        provenance.push(citation.date_reliable === true ? day : `possible date ${day}`);
+      }
+      if (citation?.text_source === "ocr_partial") {
+        provenance.push("OCR text may be incomplete");
+      } else if (citation?.text_source === "ocr") {
+        provenance.push("OCR text, verify key details");
+      } else if (citation?.text_reliable === false) {
+        provenance.push("text may be incomplete");
+      }
+      if (citation?.ref) {
+        provenance.push(`reference ${source}:${String(citation.ref).replace(/\s+/g, " ").slice(0, 160)}`);
+      }
+      console.log(`  ${number} ${title} (${provenance.join("; ")})`);
     }
     console.log("");
   }
@@ -2296,6 +2408,40 @@ async function d1Query(acctId, dbId, sql, params = []) {
     body: { sql, params },
   });
   return Array.isArray(res) ? res[0] : res;
+}
+
+/**
+ * Refuse an update whose release has never seen the schema already on the brain.
+ *
+ * The version guard below compares recorded product-version STRINGS, and a
+ * brain built from a working branch can record a LOWER string than any
+ * published release while running a HIGHER schema. The maintainer's own brain on
+ * 2026-09-03: install_state says product_version 0.1.16 and schema_version 32,
+ * while the release ships 22 migrations. compareSemver reads 0.1.16 -> 0.3.5 as
+ * an upgrade and lets it proceed, and the migration renumbering that follows is
+ * the one failure in this system with no clean repair.
+ *
+ * The number that catches it is the one nothing looked at. A brain whose schema
+ * is ahead of every migration in this package has run code this package has
+ * never seen, which is a downgrade whatever the version strings say.
+ *
+ * Returns a refusal message, or null when the update may proceed. Unreadable or
+ * absent values proceed: this guard exists to catch a specific provable state,
+ * not to invent a new way for an ordinary update to stop.
+ */
+export function schemaAheadOfReleaseRefusal(installedSchemaVersion, migrations, releaseVersion = PRODUCT_VERSION) {
+  const installed = Number(installedSchemaVersion);
+  if (!Number.isSafeInteger(installed) || installed <= 0) return null;
+  const versions = (Array.isArray(migrations) ? migrations : [])
+    .map((migration) => Number(migration?.version))
+    .filter((version) => Number.isSafeInteger(version));
+  if (!versions.length) return null;
+  const highest = Math.max(...versions);
+  if (installed <= highest) return null;
+  return `update refused: this brain's database is at schema ${installed}, and ${releaseVersion} only knows schema ${highest}. Nothing was changed.\n` +
+    "      A brain is only ever ahead like this when it was built from a working branch rather than a\n" +
+    "      published release, so this update would remove tables its own migrations have never seen.\n" +
+    "      Install the build this brain came from, or leave it where it is.";
 }
 
 function loadMigrations() {
@@ -2470,6 +2616,33 @@ async function appliedVersions(acctId, dbId, queryDatabase = d1Query) {
   }
 }
 
+/**
+ * Say why a database read failed, instead of only that it did.
+ *
+ * These three preflight reads used to `catch { die("could not verify ...") }`,
+ * throwing the provider's own message away. On 2026-09-03 that turned a
+ * Cloudflare account hitting D1's daily row-read limit into a line nobody
+ * could act on, and grepping the logs for the cause found nothing because the
+ * CLI had discarded it. The provider's error text is API diagnostics about the
+ * account, not anything from the corpus, so it belongs on the operator's
+ * screen with the next action named.
+ */
+export function databaseReadFailureDetail(error) {
+  const message = String(error?.message ?? error ?? "").replace(/\s+/g, " ").trim().slice(0, 240);
+  if (!message) return "      The database did not say why. Re-run the same command; nothing was changed.";
+  const quota = /free tier daily row (read|write) limit/i.test(message);
+  const lines = [`      The database said: ${message}`];
+  if (quota) {
+    lines.push(
+      "      That is this Cloudflare account's daily D1 allowance, not a fault in the brain and not anything you did.",
+      "      It resets at midnight UTC, and the Workers Paid plan removes the daily cap. Nothing was changed here.",
+    );
+  } else {
+    lines.push("      Nothing was changed. Re-run the same command once that is addressed.");
+  }
+  return lines.join("\n");
+}
+
 export async function cmdMigrate(manifestPath, options = {}) {
   const { silent = false } = options;
   const resolveMigrateAccount = options.resolveAccount ?? resolveAccount;
@@ -2504,13 +2677,17 @@ export async function cmdMigrate(manifestPath, options = {}) {
     if (!silent) ok(`schema up to date (${all.length} migration(s) applied)`);
   }
 
-  // 0010-0013 change the protocol used by every Vectorize writer. A public
-  // `brain migrate` against an already-running pre-lease Worker would recreate
-  // the rolling race that update's paused compatibility deployment prevents.
-  // The private option is passed only by the verified setup/update cutover; it
-  // is intentionally not a CLI flag.
+  // 0010-0013 change the protocol used by every Vectorize writer. Migration
+  // 0033 replaces the live FTS insert trigger across two independently
+  // committed D1 statements. A public `brain migrate` against an active Worker
+  // could therefore race either the vector protocol change or the interval
+  // between DROP TRIGGER and CREATE TRIGGER. The private option keeps its
+  // historical name, but it is passed only after setup/update has deployed the
+  // whole-corpus write barrier and waited out older invocations. It is
+  // intentionally not a CLI flag.
+  const writerQuiescenceMigrations = new Set([10, 11, 12, 13, 33]);
   if ((m.infrastructure?.cloudflare?.storage || "d1") === "d1" &&
-      pending.some((migration) => [10, 11, 12, 13].includes(migration.version)) &&
+      pending.some((migration) => writerQuiescenceMigrations.has(migration.version)) &&
       options.vectorDrainQuiesced !== true) {
     let installTable;
     try {
@@ -2519,8 +2696,9 @@ export async function cmdMigrate(manifestPath, options = {}) {
         dbId,
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'install_state'",
       );
-    } catch {
-      die("migration could not verify whether this brain is already live. Nothing was migrated.");
+    } catch (error) {
+      die("migration could not verify whether this brain is already live. Nothing was migrated.\n" +
+        databaseReadFailureDetail(error));
     }
     if (!installTable || !Array.isArray(installTable.results) || installTable.results.length > 1) {
       die("migration received an ambiguous install-state inventory. Nothing was migrated.");
@@ -2532,8 +2710,8 @@ export async function cmdMigrate(manifestPath, options = {}) {
       // eligible for the direct fresh-install path; every other prefix must use
       // setup/update's paused-worker quiescence protocol.
       die(
-        "this existing brain needs the verified vector-writer cutover before migrations 0010-0013.\n" +
-          "      Run `brain update` instead; direct migrate was stopped before changing D1.",
+        "this existing brain needs the verified paused-writer cutover before migrations 0010-0013 or 0033.\n" +
+        "      Run `brain update` instead; direct migrate was stopped before changing D1.",
       );
     }
     let inventory;
@@ -2544,14 +2722,15 @@ export async function cmdMigrate(manifestPath, options = {}) {
         `SELECT COUNT(*) AS user_table_count FROM sqlite_master
           WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> '_cf_KV'`,
       );
-    } catch {
-      die("migration could not prove that this database is a fresh empty resource. Nothing was migrated.");
+    } catch (error) {
+      die("migration could not prove that this database is a fresh empty resource. Nothing was migrated.\n" +
+        databaseReadFailureDetail(error));
     }
     if (!inventory || !Array.isArray(inventory.results) || inventory.results.length !== 1 ||
         Number(inventory.results[0]?.user_table_count) !== 0) {
       die(
-        "this database is not provably fresh, so migrations 0010-0013 require the verified writer cutover.\n" +
-          "      Run `brain update` instead; direct migrate was stopped before changing D1.",
+        "this database is not provably fresh, so migrations 0010-0013 or 0033 require the verified paused-writer cutover.\n" +
+        "      Run `brain update` instead; direct migrate was stopped before changing D1.",
       );
     }
   }
@@ -2609,6 +2788,143 @@ export async function cmdMigrate(manifestPath, options = {}) {
   );
   if (!silent) ok(`schema at version ${schemaVersion}`);
   return { applied: pending.length, schemaVersion };
+}
+
+/**
+ * Read where the subject's returned records disagree and show access-zone
+ * readiness. Without --set this command cannot write. With --set it records
+ * only answers the owner supplies explicitly.
+ */
+export async function cmdCheck(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const flags = options.flags ?? parseFlags(process.argv.slice(4));
+  assertKnownFlags(flags, ["set", "subject"], "brain check");
+  if (Object.prototype.hasOwnProperty.call(flags, "set") && flags.set !== true) {
+    die("brain check --set is a switch and does not take a value.");
+  }
+  if (Object.prototype.hasOwnProperty.call(flags, "subject") && typeof flags.subject !== "string") {
+    die("brain check --subject needs a person or organization name.");
+  }
+  const subject = normalizeCheckSubject(
+    typeof flags.subject === "string"
+      ? flags.subject
+      : options.subject ?? m.client?.display_name,
+  );
+  if (!subject) {
+    die("brain check needs the person or organization being checked. Set client.display_name or pass --subject \"Name\".");
+  }
+
+  const acct = m.brain?.domain ? null : await (options.resolveAccount ?? resolveAccount)(m);
+  const base = options.baseUrl ?? await (options.resolveBaseUrl ?? resolveBaseUrl)(m, acct);
+  const adminKey = options.adminKey ?? resolveAdminKey(manifestPath);
+  if (!adminKey) {
+    die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
+  }
+  const request = options.http ?? http;
+
+  const search = options.search ?? (async (payload) => {
+    const response = await request(`${base}/api/rag/unified`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }, { timeoutMs: 60_000, what: "the provenance check" });
+    if (!response.ok) {
+      const detail = summariseResponseBody(await response.text());
+      throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+    }
+    return response.json();
+  });
+
+  const readZones = options.readZones ?? (async () => {
+    const response = await request(`${base}/api/admin/brain/zones`, {
+      method: "GET",
+      headers: { "X-Admin-Key": adminKey },
+    }, { timeoutMs: 60_000, what: "the access-zone inventory" });
+    if (!response.ok) {
+      const detail = summariseResponseBody(await response.text());
+      throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+    }
+    return response.json();
+  });
+
+  info(`reading returned records about ${subject} and the access-zone inventory. Nothing is written unless you say so.`);
+  const [gathered, zoneReadiness] = await Promise.all([
+    gather(search, { subject }),
+    (async () => {
+      try {
+        return assessZoneReadiness(await readZones());
+      } catch (error) {
+        return unavailableZoneReadiness(error);
+      }
+    })(),
+  ]);
+  const report = renderReport(gathered, { subject, zoneReadiness });
+  console.log("");
+  console.log(report.text);
+
+  const conflicts = report.assessed.filter((item) => item.conflict);
+  const resultBase = {
+    conflicts: conflicts.length,
+    zones_checked: zoneReadiness.checked === true,
+    zones_ready: zoneReadiness.checked === true ? zoneReadiness.ready : null,
+  };
+  if (!flags.set) return { ...resultBase, wrote: false };
+  if (!conflicts.length) {
+    ok("nothing to confirm from the returned records.");
+    return { ...resultBase, wrote: false };
+  }
+
+  console.log("");
+  let collected;
+  try {
+    collected = await collectAnswers(conflicts, options.ask ?? ask);
+  } finally {
+    closePrompts();
+  }
+  const { answers, unresolved } = collected;
+  if (unresolved.length) info(`left unresolved, and NOT guessed: ${unresolved.join(", ")}`);
+  if (!answers.length) {
+    info("you resolved none of them, so nothing was written.");
+    return { ...resultBase, wrote: false };
+  }
+
+  const confirmedAt = options.confirmedAt ?? new Date().toISOString();
+  const today = new Date(confirmedAt);
+  if (!Number.isFinite(today.getTime())) die("the confirmation time was invalid. Nothing was written.");
+  const markdown = renderConfirmations(answers, {
+    today: today.toISOString().slice(0, 10),
+    subject,
+  });
+  const envelope = confirmationEnvelope(markdown, {
+    confirmedAt: today.toISOString(),
+    confirmationId: options.confirmationId,
+    subject,
+  });
+  const write = options.write ?? (async (payload) => {
+    const response = await request(`${base}/api/admin/brain/ingest`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }, { timeoutMs: 60_000, what: "the owner confirmation" });
+    if (!response.ok) {
+      const detail = summariseResponseBody(await response.text());
+      die(
+        `the confirmation returned HTTP ${response.status}${detail ? `: ${detail}` : ""}. ` +
+        "The command cannot confirm whether it was stored; run `brain check` before trying again.",
+      );
+    }
+    return response.json();
+  });
+  const receipt = await write(envelope);
+  try {
+    validateConfirmationReceipt(receipt, envelope);
+  } catch (error) {
+    die(
+      `${error.message}. Nothing was declared saved; run \`brain check\` before trying again.`,
+    );
+  }
+  ok(`recorded ${answers.length} owner confirmation(s) with explicit provenance.`);
+  return { ...resultBase, wrote: true, confirmed: answers.length, doc_uid: receipt.doc_uid };
 }
 
 async function cmdStatus(manifestPath) {
@@ -2975,12 +3291,77 @@ export const VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS = 20 * 60 * 1000;
  * Field evidence showed that a silent wait looks exactly like a hung process,
  * which caused a correct paused cutover to be interrupted before migration.
  */
-export async function waitForVectorDrainCutover(waiter, { nextStep = "database migration" } = {}) {
+export const VECTOR_DRAIN_CUTOVER_POLL_MS = 15_000;
+
+/**
+ * Wait until no older writer can still be touching the vector index.
+ *
+ * Without a probe this is the full fixed grace: a brain from before the drain
+ * lease existed (schema < 11) cannot be asked whether it is done, so time is
+ * the only proof, and the paused Worker deployed just before this returns
+ * before ever taking the lease. That is the legacy contract and it stays.
+ *
+ * With a probe, the brain is asked instead of assumed. Every brain on the
+ * lease schema coordinates its writers through install_state, so "quiet" is
+ * observable: no lease held (or an expired one), and no accepted batch still
+ * waiting for its confirmation. Two consecutive quiet readings a poll apart
+ * are required, because a single reading can land between a release and the
+ * next acquire. The probe never shortens the grace below what it proves: a
+ * probe error, or a brain that stays busy, falls back to the full fixed wait.
+ * On an idle brain this turns a twenty-minute pause during which the brain
+ * refuses documents into about thirty seconds. Measured 2026-09-02: a live
+ * update sat the entire twenty minutes with the lease free and zero rows
+ * queued.
+ */
+export async function waitForVectorDrainCutover(waiter, {
+  nextStep = "database migration",
+  probe = null,
+  pollMs = VECTOR_DRAIN_CUTOVER_POLL_MS,
+  now = Date.now,
+} = {}) {
   const minutes = Math.ceil(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS / 60_000);
-  info(`safety pause: waiting ${minutes} minutes for older database writers to finish`);
+  if (typeof probe !== "function") {
+    info(`safety pause: waiting ${minutes} minutes for older database writers to finish`);
+    info(`Keep this window open. The Worker is safely paused, but ${nextStep} has not started yet.`);
+    await waiter(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS);
+    ok(`safety pause complete; starting ${nextStep}`);
+    return { waitedMs: VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS, proven: false };
+  }
+  info(`safety pause: checking that older database writers have finished (up to ${minutes} minutes)`);
   info(`Keep this window open. The Worker is safely paused, but ${nextStep} has not started yet.`);
-  await waiter(VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS);
-  ok(`safety pause complete; starting ${nextStep}`);
+  const startedAt = now();
+  const deadline = startedAt + VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS;
+  let quietReadings = 0;
+  let waitedMs = 0;
+  while (true) {
+    let reading;
+    try {
+      reading = await probe();
+    } catch (error) {
+      const remaining = Math.max(0, deadline - now());
+      info(`could not read the writer state (${String(error?.message || error).slice(0, 120)}); waiting the full pause instead`);
+      await waiter(remaining);
+      ok(`safety pause complete; starting ${nextStep}`);
+      return { waitedMs: waitedMs + remaining, proven: false };
+    }
+    const quiet = reading && reading.leaseFree === true && Number(reading.inFlight || 0) === 0;
+    quietReadings = quiet ? quietReadings + 1 : 0;
+    if (quietReadings >= 2) {
+      ok(`older database writers have finished; starting ${nextStep}`);
+      return { waitedMs, proven: true };
+    }
+    if (!quiet) {
+      info(`an older writer is still active (${Number(reading?.inFlight || 0)} accepted batch(es) awaiting confirmation); checking again`);
+    }
+    const remaining = deadline - now();
+    if (remaining <= 0) {
+      ok(`safety pause complete; starting ${nextStep}`);
+      return { waitedMs, proven: false };
+    }
+    const step = Math.min(pollMs, remaining);
+    await waiter(step);
+    waitedMs += step;
+  }
 }
 
 // A large legacy corpus can need hundreds of bulk bootstrap requests plus
@@ -2989,6 +3370,24 @@ export async function waitForVectorDrainCutover(waiter, { nextStep = "database m
 // resume the same epoch rather than keeping an installer alive indefinitely.
 export const ACCELERATED_BOOTSTRAP_MAX_MS = 6 * 60 * 60 * 1000;
 export const ACCELERATED_BOOTSTRAP_MAX_ROUNDS = 20_000;
+// A vector Vectorize accepted but has not yet exposed. Poll rather than abort;
+// abort only when this many consecutive rounds show no confirmations at all.
+// The Worker reports movement in several counters, and on a real backlog the
+// first CONFIRMATION can take longer than the first re-submission: on
+// 2026-09-03 a 2,544-row rebuild showed `failed` fall 2544 -> 2444 while
+// `confirmed` stayed 0 for two minutes, and an 8-round rule that only counted
+// confirmations killed the update and left the brain paused. Movement is now
+// any aggregate changing, and the budget is time, generous, inside the outer
+// six-hour deadline that already bounds the whole phase.
+export const ACCELERATED_BOOTSTRAP_STALL_MS = 15 * 60_000;
+export const BOOTSTRAP_MOVEMENT_FIELDS = Object.freeze([
+  "confirmed", "remaining", "failed", "queued", "submitted", "in_flight_batches", "actual_vectors",
+]);
+export function bootstrapReceiptMoved(previous, current) {
+  if (!previous) return true;
+  return BOOTSTRAP_MOVEMENT_FIELDS.some((field) => current[field] !== previous[field]);
+}
+const ACCELERATED_BOOTSTRAP_RETRY_WAIT_MS = 15_000;
 const ACCELERATED_BOOTSTRAP_POLL_MS = 3_000;
 const ACCELERATED_BOOTSTRAP_REQUEST_MAX_MS = 180_000;
 const BOOTSTRAP_PHASES = new Set(["legacy_drain", "building", "waiting", "complete"]);
@@ -3024,8 +3423,12 @@ const BOOTSTRAP_COMPLETION_FIELDS = Object.freeze([
   "vector_ready",
 ]);
 
+// Workers from 0.3.4 also report the not-yet-visible count as `retrying`;
+// older Workers do not. Either shape is the same aggregate-only contract.
+const OPTIONAL_RECEIPT_FIELDS = new Set(["retrying"]);
+
 function exactAggregateReceiptFields(body, expected, label) {
-  const actual = Object.keys(body).sort();
+  const actual = Object.keys(body).filter((field) => !(OPTIONAL_RECEIPT_FIELDS.has(field) && expected.includes("failed"))).sort();
   const wanted = [...expected].sort();
   if (actual.length !== wanted.length || actual.some((field, index) => field !== wanted[index])) {
     // Do not echo unexpected values or field names. This endpoint's privacy
@@ -3122,7 +3525,17 @@ export function validateAcceleratedBootstrapProgress(previous, current) {
   if (previous.phase !== "legacy_drain" && current.phase === "legacy_drain") {
     die("the accelerated bootstrap returned to legacy cleanup after bulk work began. Re-run `brain update <manifest>`; the Worker remains paused.");
   }
-  if (current.phase === "building") {
+  // A receipt with failed > 0 is the Worker saying "accepted by Vectorize, not
+  // yet visible, re-queued". Two such receipts in a row are the expected shape
+  // of that wait, not a stall; the runner bounds it with its own stall counter.
+  // Only a receipt that reports nothing retrying must show movement each round.
+  // A building Worker with batches submitted or in flight can answer two polls
+  // three seconds apart with identical aggregates while it waits on Vectorize;
+  // the runner's time budget covers that. Identical receipts with NOTHING
+  // submitted or in flight are the Worker claiming to build while idle.
+  const idle = current.submitted === 0 && current.in_flight_batches === 0 &&
+    previous.submitted === 0 && previous.in_flight_batches === 0;
+  if (current.phase === "building" && current.failed === 0 && idle) {
     const changed = [
       "confirmed",
       "remaining",
@@ -3190,6 +3603,7 @@ export async function runAcceleratedBootstrap({
   let previous = null;
   let lastRemaining = null;
   let rounds = 0;
+  let lastMovementAt = null;
 
   for (let round = 1; round <= roundLimit; round++) {
     const roundNow = Number(now());
@@ -3247,6 +3661,13 @@ export async function runAcceleratedBootstrap({
         }
       }
     }, {
+      // A poll that embeds a provider-sized batch can meet a 503 or a timeout
+      // once in a two-hour rebuild; three tries two seconds apart ended a real
+      // one on 2026-09-03. The movement budget above already bounds a Worker
+      // that stays unreachable.
+      attempts: 8,
+      delayMs: 2_000,
+      maxDelayMs: 60_000,
       shouldRetry: (error) => error?.retryable === true,
       sleep,
       onRetry: () => info("the accelerated bootstrap request was interrupted; retrying durable progress"),
@@ -3272,12 +3693,38 @@ export async function runAcceleratedBootstrap({
       die(`accelerated bootstrap failed with HTTP ${response.status}. No response content was printed. Re-run \`brain update <manifest>\`; the Worker remains paused.`);
     }
     const receipt = validateAcceleratedBootstrapReceipt(response.body);
+    // Older Workers report the not-yet-visible count only as `failed`; newer ones
+    // also name it `retrying`. Read either, the semantics are the same.
+    if (receipt && typeof receipt === "object" && receipt.retrying !== undefined) receipt.failed = Number(receipt.retrying);
     validateAcceleratedBootstrapProgress(previous, receipt);
     if (lastRemaining !== null && receipt.remaining > lastRemaining) {
       die("the accelerated bootstrap remaining count increased. Re-run `brain update <manifest>`; the Worker remains paused.");
     }
+    // `failed` on this receipt is the Worker's count of outbox rows with
+    // attempts > 0 that are still queued: vectors Vectorize ACCEPTED but has not
+    // yet made visible, re-queued for the next confirm. It is a retry signal, not
+    // a terminal one; the drain path labels the same number `retrying`. Dying on
+    // first sight of it aborted a live 0.2.0 -> 0.3.4 update twice on 2026-09-03
+    // while the Worker finished the job on its own a minute later. Keep polling
+    // within the existing deadline; give up only when it stops moving.
+    // Movement is any aggregate changing; a receipt identical to the last one
+    // for ACCELERATED_BOOTSTRAP_STALL_MS is the only thing that ends the wait.
+    const observedAt = Number(now());
+    if (lastMovementAt === null || bootstrapReceiptMoved(previous, receipt)) lastMovementAt = observedAt;
+    const quietMs = observedAt - lastMovementAt;
+    if (quietMs >= ACCELERATED_BOOTSTRAP_STALL_MS) {
+      die(`the accelerated bootstrap has not moved for ${Math.round(quietMs / 60_000)} minutes (${receipt.confirmed}/${receipt.total} confirmed, ${receipt.failed} unconfirmed, ${receipt.submitted} submitted, ${receipt.in_flight_batches} batch(es) in flight). Re-run \`brain update <manifest>\`; the Worker remains paused.`);
+    }
     if (receipt.failed > 0) {
-      die(`the accelerated bootstrap reported ${receipt.failed} failed aggregate operation(s). Re-run \`brain update <manifest>\`; the Worker remains paused.`);
+      info(`${receipt.failed} vector(s) accepted but not yet visible; waiting for Vectorize (${receipt.confirmed}/${receipt.total} confirmed, ${receipt.submitted} submitted, ${receipt.in_flight_batches} batch(es) in flight)`);
+      previous = receipt;
+      lastRemaining = receipt.remaining;
+      onProgress(receipt);
+      const remainingMs = Math.max(0, deadline - Number(now()));
+      const delayMs = Math.min(ACCELERATED_BOOTSTRAP_RETRY_WAIT_MS, remainingMs);
+      if (delayMs <= 0) break;
+      await sleep(delayMs);
+      continue;
     }
     previous = receipt;
     lastRemaining = receipt.remaining;
@@ -3399,8 +3846,9 @@ export async function cmdUpgrade(manifestPath, options = {}) {
         dbId,
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'install_state'",
       );
-    } catch {
-      die("update stopped because D1 install state could not be read. Nothing was changed.");
+    } catch (error) {
+      die("update stopped because D1 install state could not be read. Nothing was changed.\n" +
+        databaseReadFailureDetail(error));
     }
     assertStageFiles("install-state preflight");
     if (!tableResponse || !Array.isArray(tableResponse.results) ||
@@ -3412,14 +3860,16 @@ export async function cmdUpgrade(manifestPath, options = {}) {
       let stateResponse;
       try {
         stateResponse = await queryDatabase(accountId, dbId, "SELECT * FROM install_state WHERE id = 1");
-      } catch {
-        die("update stopped because D1 install state could not be read. Nothing was changed.");
+      } catch (error) {
+        die("update stopped because D1 install state could not be read. Nothing was changed.\n" +
+          databaseReadFailureDetail(error));
       }
       assertStageFiles("install-state preflight");
       try {
         before = installStateRow(stateResponse);
-      } catch {
-        die("update stopped because D1 install state was unreadable or ambiguous. Nothing was changed.");
+      } catch (error) {
+        die("update stopped because D1 install state was unreadable or ambiguous. Nothing was changed.\n" +
+          databaseReadFailureDetail(error));
       }
     }
     if (before && initialManifest.client?.slug && before.client_slug && before.client_slug !== initialManifest.client.slug) {
@@ -3447,6 +3897,8 @@ export async function cmdUpgrade(manifestPath, options = {}) {
         if (!newestRecordedVersion || compareSemver(recordedVersion, newestRecordedVersion) > 0) {
           newestRecordedVersion = recordedVersion;
         }
+        const schemaRefusal = schemaAheadOfReleaseRefusal(before?.schema_version, loadMigrations(), toVersion);
+        if (schemaRefusal) die(schemaRefusal);
         const direction = compareSemver(recordedVersion, toVersion);
         if (direction > 0) {
           die(
@@ -3532,8 +3984,30 @@ export async function cmdUpgrade(manifestPath, options = {}) {
             expectDrainMode: "paused-for-upgrade",
             reachOnly: true,
           }));
+        // A brain on the lease schema can be asked whether its writers are
+        // done instead of being made to wait the full grace. Older brains
+        // keep the fixed wait. The probe reads only, and any read failure
+        // falls back to the full wait inside waitForVectorDrainCutover.
+        const leaseAware = Number(before?.schema_version || 0) >= 11;
         await runStage("vector-drain quiescence", () =>
-          waitForVectorDrainCutover(waitForVectorDrainQuiescence));
+          waitForVectorDrainCutover(waitForVectorDrainQuiescence, {
+            probe: leaseAware ? async () => {
+              const r = await queryDatabase(accountId, dbId,
+                `SELECT vector_drain_lease_owner AS owner,
+                        vector_drain_lease_expires_at AS expires_at,
+                        (SELECT COUNT(*) FROM vector_outbox
+                          WHERE submitted_mutation_id IS NOT NULL) AS in_flight
+                   FROM install_state WHERE id = 1`);
+              const row = r?.results?.[0];
+              if (!row) throw new Error("install_state row missing");
+              const expires = Number(row.expires_at || 0);
+              return {
+                leaseFree: row.owner === null || row.owner === undefined || row.owner === "" ||
+                  (Number.isFinite(expires) && expires > 0 && expires < Date.now()),
+                inFlight: Number(row.in_flight || 0),
+              };
+            } : null,
+          }));
         await runStage("migration", () => migrate(executionPin.target, {
           vectorDrainQuiesced: true,
         }));
@@ -3591,7 +4065,7 @@ export async function cmdUpgrade(manifestPath, options = {}) {
           expectDrainMode: usesD1VectorOutbox ? "active" : null,
         }));
       await runStage("full acceptance test", () =>
-        verifyAcceptance(executionPin.target, { expectVersion: toVersion }));
+        verifyAcceptance(executionPin.target, { expectVersion: toVersion, staleSourcesAsWarnings: true }));
       await runStage("D1 version commit", () => queryDatabase(
         accountId,
         dbId,
@@ -3935,12 +4409,13 @@ export async function cmdTest(manifestPath, options = {}) {
     return;
   }
 
-  const { Acceptance } = await import("./acceptance.mjs");
+  const { Acceptance, acceptanceVerdict } = await import("./acceptance.mjs");
   const suite = new Acceptance({
     base,
     adminKey: key,
     manifest: m,
     expectVersion: options.expectVersion || null,
+    tolerateStaleSources: options.staleSourcesAsWarnings === true,
   });
   info(`acceptance suite against ${base}`);
   const out = await suite.run({
@@ -3967,13 +4442,23 @@ export async function cmdTest(manifestPath, options = {}) {
 
   const { pass, fail, warn: w, skip } = out.counts;
   console.log(`\n  ${pass} passed, ${fail} failed, ${w} warnings, ${skip} skipped`);
+  const stale = out.results.filter((r) => r.downgraded);
+  if (stale.length) {
+    warn(`${stale.length} source check(s) are stale and were counted as warnings, not failures: a source has not refreshed on schedule.`);
+    info("That is separate from this update. `brain sources` shows which, and the checkup guide covers reconnecting.");
+  }
   if (out.stoppedAtTier) {
     console.log(`  ${c.red(`stopped after tier ${out.stoppedAtTier}: later tiers would be noise`)}`);
   }
   if (!out.passed) {
     throw new Fatal("acceptance suite FAILED");
   }
-  ok("acceptance suite passed");
+  // The headline is qualified when a whole capability went untested, because
+  // "passed" unqualified is the sentence that reaches the client. Exit
+  // semantics are untouched: untested is not failed.
+  const verdict = acceptanceVerdict(out);
+  for (const line of verdict.warnings) warn(line);
+  ok(verdict.headline);
 }
 
 /* ----------------------------------------------------------- mcp-config */
@@ -4220,6 +4705,7 @@ export const VALUE_FLAGS = new Set([
   "path", "source", "limit", "from", "manifest", "scopes", "port", "host", "user", "run", "confirm-host", "kind", "add", "bookmark", "export", "explain", "backup",
   "golden", "profile", "k", "repeat", "baseline", "save", "artifacts",
   "corpus-contract", "approve-removals", "only", "skip",
+  "can", "zones", "exclude-zones", "until", "as", "subject",
   // brain import bank. `--file` with no value must die saying so rather than
   // being read as a boolean and then reported as "needs --file".
   "file", "format", "account", "account-kind", "name", "slug", "institution", "currency", "entity", "entity-label",
@@ -4244,6 +4730,24 @@ export function driveExclusionIdsOf(raw) {
  */
 export function driveConnectorConfig(m, manifestPath, read = (path) => readFileSync(path, "utf-8")) {
   const declared = m?.corpora?.google_drive || {};
+  // Drive must be told what it may read. Without roots the walk enumerates
+  // every file the token can see INCLUDING SHARED DRIVES, which on a real
+  // install was 468,697 files against a My Drive of about 43,000: roughly 70%
+  // of it images, video and web assets that can never be indexed. Google
+  // aborts an enumeration that long, so the pass never reaches its watermark
+  // and the source stalls permanently, re-walking from the start every night.
+  // Exclusions cannot fix it, because they filter AFTER enumeration.
+  if (!Array.isArray(declared.root_folder_ids)) {
+    throw new Error("corpora.google_drive.root_folder_ids must be a non-empty array before Drive can run");
+  }
+  const rootFolderIds = [...new Set(
+    declared.root_folder_ids.map((value) => String(value || "").trim()).filter(Boolean)
+  )].sort();
+  if (!rootFolderIds.length) {
+    throw new Error(
+      "Google Drive is disabled until corpora.google_drive.root_folder_ids names at least one reviewed folder"
+    );
+  }
   let fileIds = driveExclusionIdsOf(declared.exclude_file_ids || []);
   if (declared.exclude_file_ids_file) {
     const filePath = resolve(dirname(resolve(manifestPath)), String(declared.exclude_file_ids_file));
@@ -4256,12 +4760,18 @@ export function driveConnectorConfig(m, manifestPath, read = (path) => readFileS
     fileIds = [...new Set([...fileIds, ...driveExclusionIdsOf(parsed)])].sort();
   }
   return {
+    rootFolderIds,
     excludeFileIds: fileIds,
     excludePaths: Array.isArray(declared.exclude_paths) ? declared.exclude_paths.map(String) : [],
     excludeNameParts: Array.isArray(declared.exclude_name_parts) ? declared.exclude_name_parts.map(String) : [],
     privatePrefixes: Array.isArray(m?.safety?.private_path_prefixes) ? m.safety.private_path_prefixes.map(String) : [],
   };
 }
+
+// Bump when Drive extraction support changes in a way that should reconsider an
+// unchanged file. Deliberately independent of the credential-scanner gate: it
+// forces one full Drive comparison without re-sending the whole corpus.
+export const DRIVE_EXTRACTOR_POLICY_VERSION = 2;
 
 /** Stable identity for the policy that decides which Drive files may be indexed. */
 export function credentialScannerFingerprint(enabled = true, gateVersion = CREDENTIAL_GATE_VERSION) {
@@ -4315,12 +4825,23 @@ export function commitCredentialScannerProgress(state, fingerprint) {
   return state;
 }
 
-export function drivePolicyFingerprint(config = {}, scannerEnabled = true, ocrEnabled = false) {
+export function drivePolicyFingerprint(
+  config = {},
+  scannerEnabled = true,
+  ocrEnabled = false,
+  extractorPolicyVersion = DRIVE_EXTRACTOR_POLICY_VERSION,
+) {
   const normalized = {};
-  for (const key of ["excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
+  // rootFolderIds belongs here for the same reason OCR does: changing which
+  // folders Drive may read changes what it is allowed to see. Without it, a
+  // newly added root would only ever surface files that CHANGED after the
+  // change token was taken, so everything already sitting in that folder would
+  // stay invisible. A fingerprint mismatch forces one full comparison.
+  for (const key of ["rootFolderIds", "excludeFileIds", "excludePaths", "excludeNameParts", "privatePrefixes"]) {
     normalized[key] = [...new Set((config[key] || []).map((value) => String(value)))].sort();
   }
   normalized.credentialScanner = credentialScannerFingerprint(scannerEnabled);
+  normalized.extractorPolicyVersion = Number(extractorPolicyVersion);
   // Turning OCR on changes what Drive is ALLOWED TO READ, so it belongs in the
   // source policy. Without it, a scanned PDF refused a month ago never
   // reappears: once a change token exists the incremental feed only returns
@@ -5045,6 +5566,7 @@ async function reportFreshness(m, acct, manifestPath) {
     ok: () => c.green("current"),
     stale: (s) => c.red(`STALE, ${s.days_since_ingest}d since last read`),
     broken: (s) => c.red(`BROKEN: ${s.reason || "the last sync failed"}`),
+    review: (s) => c.yellow(`REVIEW REQUIRED: ${s.reason || "the latest update paused for review"}`),
     indexing: (s) => c.yellow(`indexing, ${s.hours_indexing ?? 0}h elapsed`),
     never_synced: () => c.red("never synced"),
     unscheduled: () => c.yellow("no refresh scheduled"),
@@ -5568,7 +6090,10 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   if (!existsSync(root)) die(`no such folder: ${root}`);
   const { walk, prepare, batchStream, splitOversized, loadState, saveState, removedSinceLastRun } = await ingestLib();
 
+  const sourceExplicit = typeof flags.source === "string" && flags.source.trim() !== "";
   const sourceName = assertSourceName(flags.source === true ? null : flags.source || "upload");
+  // What the content sniffer recognised, so the run can say so at the end.
+  const messageExportsSeen = new Set();
   // A dry run sends nothing, so it must not demand credentials it will never
   // use. Requiring a Cloudflare token to preview what WOULD be loaded turns the
   // safest command in the tool into one of the hardest to reach.
@@ -5704,6 +6229,7 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   const prepareOne = async (f) => {
     const r = await prepare(f, { sourceName, ocr: ocrCallback });
     if (r.note) notes.push({ path: f.rel, note: r.note });
+    if (r.messageExport) messageExportsSeen.add(r.messageExport);
 
     // A multi-document producer (a WhatsApp export, an SMS Backup & Restore
     // .xml, a Google Voice Takeout page, each sessionized into many
@@ -5993,15 +6519,14 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
     base, adminKey, state, dryRun: false, label: "local source truth",
   });
   saveState(statePath, state);
-  assertNoPendingRemovals(localRemoval, "local source truth removal");
 
   const vanishedTargets = localRemovalPlan.targets.source_deleted;
+  let vanishedRemoval = { applied: 0, pending: 0 };
   if (vanishedTargets.length) {
-    const vanishedRemoval = await applyDriveRemovals({
+    vanishedRemoval = await applyDriveRemovals({
       uids: vanishedTargets, base, adminKey, state, dryRun: false, label: "Drive deletion",
     });
     saveState(statePath, state);
-    assertNoPendingRemovals(vanishedRemoval, "deleted local file removal");
     if (vanishedRemoval.applied) ok(`${vanishedRemoval.applied} document(s) removed because their file is gone from the folder`);
   }
 
@@ -6015,23 +6540,22 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
       base, adminKey, source: sourceName,
     });
     const stillStored = plannedLocalTargets.filter((uid) => afterLocalRemoval.has(uid));
+    const failedAt = new Date().toISOString();
+    for (const uid of plannedLocalTargets) {
+      if (afterLocalRemoval.has(uid)) {
+        state.removed = { ...(state.removed || {}), [uid]: failedAt };
+      } else {
+        delete state.done[uid.slice(sourceName.length + 1)];
+        if (state.removed) delete state.removed[uid];
+      }
+    }
+    saveState(statePath, state);
     if (stillStored.length) {
-      const failedAt = new Date().toISOString();
-      state.removed = {
-        ...(state.removed || {}),
-        ...Object.fromEntries(stillStored.map((uid) => [uid, failedAt])),
-      };
-      saveState(statePath, state);
       throw new Error(
         `${stillStored.length} planned local folder removal(s) remained after exact source-inventory readback. ` +
           "No completed source state was recorded; re-running will retry them through the same approval gate."
       );
     }
-    for (const uid of plannedLocalTargets) {
-      delete state.done[uid.slice(sourceName.length + 1)];
-      if (state.removed) delete state.removed[uid];
-    }
-    saveState(statePath, state);
   }
 
   if (scannerRescanSkips.length) {
@@ -6085,6 +6609,22 @@ export async function cmdIngestLocal(m, manifestPath, flags) {
   if (tally.failed) info(summary);
   else ok(summary);
   if (tally.refused) warn(`${tally.refused} file(s) refused for carrying live credentials. They were NOT indexed.`);
+  if (messageExportsSeen.size) {
+    // A zone is a sensitivity boundary. A file format is not. One WhatsApp
+    // export routinely holds an accountant and an oncologist in the same file,
+    // so filing it as one source guarantees a wrong zone whichever way it is
+    // set. Nothing here guesses: it says what was recognised, says where it
+    // went, and leaves the split to the person who knows who is in it.
+    const found = [...messageExportsSeen].sort().join(", ");
+    info(`recognised and loaded as conversations: ${found}`);
+    info(`  filed under source "${sourceName}"${sourceExplicit ? "" : " (the default; --source names it)"}`);
+    warn(
+      "a message export usually spans more than one sensitivity zone, so one source\n" +
+      "  name may be the wrong unit for it. Splitting the export, or ingesting it under\n" +
+      "  its own --source, is what makes it zonable. Nothing was zoned automatically.\n" +
+      `  See what is unzoned: brain zone ${displayPath(manifestPath)}`,
+    );
+  }
   await reportSkips(skips);
 
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
@@ -6145,11 +6685,19 @@ export function validateForgetReceipt(body) {
     }
   }
   if (!Array.isArray(body.targets)) throw new Error("the forget response has no targets array");
+  if (body.targets.some((target) => typeof target !== "string" || !target)) {
+    throw new Error("the forget response has an invalid target");
+  }
+  if (new Set(body.targets).size !== body.targets.length) {
+    throw new Error("the forget response repeats a target");
+  }
+  if (Number(body.documents) !== body.targets.length) {
+    throw new Error("the forget response document count does not match its acknowledged targets");
+  }
   return body;
 }
 
-async function parseForgetResponse(res) {
-  const raw = await res.text();
+function parseForgetResponseBody(res, raw) {
   let body = null;
   try { body = JSON.parse(raw); } catch { /* validated below */ }
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${body?.error || raw.slice(0, 160) || "forget failed"}`);
@@ -6158,6 +6706,10 @@ async function parseForgetResponse(res) {
   } catch (error) {
     throw new Error(`${error.message}; received HTTP ${res.status}`);
   }
+}
+
+async function parseForgetResponse(res) {
+  return parseForgetResponseBody(res, await res.text());
 }
 
 export function assertNoPendingRemovals(result, label = "source deletion") {
@@ -6243,18 +6795,18 @@ async function applyDriveRemovals({ uids, base, adminKey, state, dryRun, label =
   // Bound the request and Worker CPU independently from D1's internal batches.
   for (let i = 0; i < targets.length; i += 50) {
     const group = targets.slice(i, i + 50);
-    const res = await http(`${base}/api/admin/brain/forget`, {
-      method: "POST",
-      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
-      // A Drive file may be stored as one document or as multiple oversized
-      // parts. Family deletion reaches both representations.
-      body: JSON.stringify({
-        families: group.map((baseDocUid) => ({ base_doc_uid: baseDocUid, keep_doc_uids: [] })),
-        confirm: true,
-      }),
-    });
     let out;
     try {
+      const res = await http(`${base}/api/admin/brain/forget`, {
+        method: "POST",
+        headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+        // A Drive file may be stored as one document or as multiple oversized
+        // parts. Family deletion reaches both representations.
+        body: JSON.stringify({
+          families: group.map((baseDocUid) => ({ base_doc_uid: baseDocUid, keep_doc_uids: [] })),
+          confirm: true,
+        }),
+      });
       out = await parseForgetResponse(res);
     } catch {
       state.removed = {
@@ -6264,36 +6816,82 @@ async function applyDriveRemovals({ uids, base, adminKey, state, dryRun, label =
       pending += group.length;
       continue;
     }
-    for (const uid of group) {
-      delete state.done[uid];
-      if (state.removed) delete state.removed[uid];
-    }
+    // The HTTP receipt is not the completion boundary. Keep local accepted and
+    // retry state intact until the caller reads the authenticated source-family
+    // inventory back and proves each planned family absent. If that readback is
+    // unavailable, a pending-only retry must still survive the aborted run.
     applied += Number(out.documents || 0);
   }
   if (pending) warn(`${pending} ${label}(s) could not be applied and were recorded for the next run`);
   return { applied, pending };
 }
 
-/** Remove obsolete oversized parts only after every replacement part landed. */
-async function reconcileDocumentFamilies({ families, base, adminKey }) {
+/**
+ * Remove obsolete oversized parts only after every replacement part landed.
+ *
+ * Repeating one exact family plan is safe: the Worker keeps every named current
+ * part and removes only stale siblings, so a committed first request whose
+ * response was lost becomes a no-op on retry. Keep this boundary local rather
+ * than making every destructive HTTP request retry automatically.
+ */
+export async function reconcileDocumentFamilies({
+  families,
+  base,
+  adminKey,
+  attempts = 3,
+  delayMs = 2_000,
+  maxDelayMs = 30_000,
+  timeoutMs = 60_000,
+  fetchImpl = fetch,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  onRetry = (_error, attempt, totalAttempts) => info(
+    `the split-document cleanup connection was interrupted. Retrying ${attempt}/${totalAttempts - 1}; ` +
+      "the exact family plan is safe to repeat."
+  ),
+}) {
   let removed = 0;
   for (let i = 0; i < families.length; i += 50) {
     const group = families.slice(i, i + 50);
-    const res = await http(`${base}/api/admin/brain/forget`, {
-      method: "POST",
-      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
-      body: JSON.stringify({ families: group, confirm: true }),
-    });
-    let out;
+    const url = `${base}/api/admin/brain/forget`;
     try {
-      out = await parseForgetResponse(res);
+      const out = await retryTransient(async () => {
+        const res = await http(url, {
+          method: "POST",
+          headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+          body: JSON.stringify({ families: group, confirm: true }),
+        }, { timeoutMs, what: "the split-document cleanup", fetchImpl });
+        let raw;
+        try {
+          raw = await res.text();
+        } catch (error) {
+          const translated = translatedHttpFailure(error, url, {
+            timeoutMs,
+            what: "the split-document cleanup response",
+          });
+          if (!res.ok && !isRetryableHttpStatus(res.status)) translated.retryable = false;
+          throw translated;
+        }
+        try {
+          return parseForgetResponseBody(res, raw);
+        } catch (error) {
+          if (isRetryableHttpStatus(res.status)) error.retryable = true;
+          throw error;
+        }
+      }, {
+        attempts,
+        delayMs,
+        maxDelayMs,
+        sleep,
+        shouldRetry: (error) => error?.retryable === true,
+        onRetry,
+      });
+      removed += Number(out.documents || 0);
     } catch (error) {
       die(
-        `Drive split-document cleanup failed (${res.status}): ${error.message}. The sync cursor was not advanced.\n` +
+        `split-document cleanup failed: ${error.message}. The sync cursor was not advanced.\n` +
         "      Re-running the same ingest is safe and will retry the cleanup."
       );
     }
-    removed += Number(out.documents || 0);
   }
   return removed;
 }
@@ -8018,6 +8616,18 @@ export async function cmdLoad(manifestPath, options = {}) {
  * and a folder document are refused, split, batched and reported by identical
  * code. The producers differ; the pipeline does not.
  */
+/**
+ * How many Gmail messages are fetched ahead, in order, during a sync. Eight
+ * measured seven times faster than serial on a 190k-message mailbox with zero
+ * errors; Gmail's per-user quota allows roughly fifty gets a second. The
+ * environment override exists so a client whose mailbox is throttled can be
+ * slowed down without waiting for a release; it is clamped to 1..32.
+ */
+const GMAIL_FETCH_CONCURRENCY = (() => {
+  const raw = Number.parseInt(process.env.BRAIN_GMAIL_FETCH_CONCURRENCY || "", 10);
+  return Number.isInteger(raw) ? Math.min(32, Math.max(1, raw)) : 8;
+})();
+
 async function cmdIngestRemote(m, manifestPath, flags) {
   const which = String(flags.from).toLowerCase();
   if (!["drive", "gmail", "imap"].includes(which)) {
@@ -8026,9 +8636,12 @@ async function cmdIngestRemote(m, manifestPath, flags) {
 
   const removalApproval = flags["approve-removals"];
   if (removalApproval !== undefined) {
-    if (which !== "drive") die("--approve-removals is only valid with --from drive.");
+    if (!["drive", "gmail", "imap"].includes(which)) {
+      die("--approve-removals is only valid with --from drive, --from gmail, or --from imap.");
+    }
     if (typeof removalApproval !== "string" || !/^[0-9a-f]{64}$/.test(removalApproval)) {
-      die("--approve-removals needs the exact 64-character lowercase fingerprint printed by the stopped Drive sync.");
+      const sourceLabel = which === "gmail" ? "Gmail" : which === "imap" ? "IMAP" : "Drive";
+      die(`--approve-removals needs the exact 64-character lowercase fingerprint printed by the stopped ${sourceLabel} sync.`);
     }
   }
 
@@ -8043,7 +8656,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   const adminKey = dry ? null : resolveAdminKey(manifestPath);
   if (!adminKey && !dry) die("no admin key found: not in the environment, and no .brain-admin-key file next to the manifest.");
 
-  const { batchStream, splitOversized, loadState, saveState } = await ingestLib();
+  const { batchStream, splitOversized, loadState, saveState, prefetch } = await ingestLib();
   // IMAP holds its own mailbox credential and never touches the Google store.
   // Resolving googleAuth unconditionally would refuse an IMAP sync on a machine
   // that has deliberately never connected Google, which is most of them.
@@ -8074,7 +8687,25 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   }
 
   const statePath = join(dirname(resolve(manifestPath)), `.brain-ingest-${sourceName}.json`);
-  const state = flags.reset ? { version: 1, done: {}, skipped: {} } : loadState(statePath);
+  const savedState = loadState(statePath);
+  const state = flags.reset
+    ? {
+        version: 1,
+        done: {},
+        skipped: {},
+        // Reset means re-read source truth. It is not permission to discard a
+        // prior failed removal or the stable denominator that made its exact
+        // approval meaningful.
+        ...(savedState.removed && Object.keys(savedState.removed).length
+          ? { removed: { ...savedState.removed } }
+          : {}),
+        ...Object.fromEntries(
+          ["drive_removal_safety_baseline", "gmail_removal_safety_baseline", "imap_removal_safety_baseline"]
+            .filter((key) => savedState[key] != null)
+            .map((key) => [key, savedState[key]])
+        ),
+      }
+    : savedState;
   const scannerOn = m.safety?.credential_scanner?.enabled !== false;
   const scannerFingerprint = credentialScannerFingerprint(scannerOn);
   const scannerPolicyChanged = state.credential_scanner_fingerprint !== scannerFingerprint;
@@ -8107,11 +8738,17 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     policyFingerprint = imapPolicyFingerprint(BULK_POLICY, BULK_POLICY.include_roles);
     imapPolicyChanged = state.imap_policy_fingerprint !== policyFingerprint;
   }
+  let gmailPolicyChanged = false;
+  if (which === "gmail") {
+    const { gmailPolicyFingerprint } = await import("./connectors/gmail.mjs");
+    policyFingerprint = gmailPolicyFingerprint({ credentialScannerFingerprint: scannerFingerprint });
+    gmailPolicyChanged = state.gmail_policy_fingerprint !== policyFingerprint;
+  }
   let incremental = which === "drive"
     ? driveDecision.incremental
     : which === "imap"
       ? !flags.reset && !scannerPolicyChanged && !imapPolicyChanged && !!state.imap_folders
-      : !flags.reset && !scannerPolicyChanged && Boolean(state.history_id);
+      : !flags.reset && !scannerPolicyChanged && !gmailPolicyChanged && Boolean(state.history_id);
   assertRemoteLimitSafe({
     source: which === "drive" ? "Drive" : which === "imap" ? "IMAP" : "Gmail",
     limit, dryRun: dry, incremental,
@@ -8132,6 +8769,27 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   let runClosed = false;
 
   const skips = [];
+  // A skip the policy INTENDED (a promotion, an excluded mailbox role) is not a
+  // gap in coverage, and a receipt that cannot tell them apart makes a working
+  // sync look like a failing one. Counted here, reported on the receipt.
+  let policySkipped = 0;
+  // IMAP also excludes whole folders by role. Folder counts and message skip
+  // counts use different units, so keep them separate: one excluded Spam
+  // folder must never cancel one unreadable message's coverage gap.
+  let folderPolicySkipped = 0;
+  let sourceResolvedSkipped = 0;
+  let localRefused = 0;
+  // Only missing policy evidence blocks a Gmail history window. Deterministic
+  // exclusions and credential refusals remain visible, but retrying that same
+  // immutable window forever cannot make either one indexable.
+  let gmailLabelGaps = 0;
+  let gmailHistoryMarkerMissing = 0;
+  let gmailPendingRemovalGaps = 0;
+  let imapSnapshotGaps = 0;
+  // A scanner migration is complete only when every previously accepted item
+  // was either rechecked or deliberately removed. A transient unreadable item
+  // may keep its old Brain copy, but it must also keep the migration pending.
+  let scannerProgressCanCommit = true;
   let unchanged = 0;
   let scanned = 0;
   let prepared = 0;
@@ -8150,16 +8808,19 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     for (const key of Object.keys(tally)) tally[key] += Number(part?.[key] || 0);
   };
 
-  const flushIntentionalRemovals = async ({ strict = true } = {}) => {
-    const uids = intentionalRemovalUids.splice(0);
-    if (!uids.length) return { applied: 0, pending: 0 };
-    const result = await applyDriveRemovals({
-      uids, base, adminKey, state, dryRun: dry, label: "intentional source skip",
-    });
-    if (result.applied) ok(`${result.applied} previously-indexed document(s) removed because the source now skips them`);
-    if (!dry) saveState(statePath, state);
-    if (strict) assertNoPendingRemovals(result, "intentional source skip");
-    return result;
+  const recordRemovalSafetyBaseline = ({ stateKey, key, inventory }) => {
+    if (!(inventory instanceof Set)) throw new TypeError("removal safety baseline needs a source inventory");
+    const existing = state[stateKey];
+    // A policy or scanner upgrade can happen between a stopped review and its
+    // retry. Keep the smallest still-valid denominator until a whole run
+    // commits; changing policy may change the plan and approval digest, but it
+    // must never dilute the original safety boundary with newly ingested data.
+    const stored = Number.isInteger(existing?.stored) && existing.stored >= 0
+      ? Math.min(existing.stored, inventory.size)
+      : inventory.size;
+    state[stateKey] = { key, stored };
+    saveState(statePath, state);
+    return stored;
   };
 
   /**
@@ -8235,18 +8896,9 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     });
     runOpened = true;
 
-    // Gmail retains the historical immediate-retry path. Drive pending work is
-    // deliberately held for the single aggregate plan below, otherwise a
-    // failed large cleanup could bypass the new approval gate on its next run.
-    const pending = Object.keys(state.removed || {});
-    if (which !== "drive" && pending.length) {
-      const retried = await applyDriveRemovals({
-        uids: pending, base, adminKey, state, dryRun: false, label: "pending source removal",
-      });
-      if (retried.applied) ok(`${retried.applied} previously-pending removal(s) applied`);
-      saveState(statePath, state);
-      assertNoPendingRemovals(retried, "pending source removal");
-    }
+    // Pending removals stay behind each source's aggregate inventory and
+    // approval gate. Retrying one before current source truth is known could
+    // delete a restored document or bypass a large-removal review.
   }
 
   if (which === "drive") {
@@ -8288,11 +8940,12 @@ async function cmdIngestRemote(m, manifestPath, flags) {
           sourceDeletedUids.push(...ch.removed.map((id) => `${sourceName}:${id}`));
         }
 
-        // Drive emits the changed ancestor folder, not synthetic changes for
-        // all descendants. Expand now so a move under a private or excluded
-        // path cannot leave the subtree searchable until next week.
-        if (ch.changed.some((file) => file.mimeType === "application/vnd.google-apps.folder")) {
-          warn("a Drive folder changed, so this run is expanding to a full comparison of its descendants");
+        // The changes feed is account-wide and does not prove that a returned
+        // file still descends from one of the reviewed roots. Any changed item
+        // therefore turns this into a rooted comparison before content bytes
+        // can be read. This also expands changed folders through descendants.
+        if (ch.changed.length) {
+          warn("Drive reported changed items, so this run is using a rooted full comparison before reading content");
           incremental = false;
           lane = "sweep";
           files = [];
@@ -8300,18 +8953,84 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       }
     }
     if (!incremental) {
-      info("full walk of Drive");
-      for await (const f of drive.listFiles(getToken)) {
+      info(`full walk of ${sourcePolicy.rootFolderIds.length} reviewed Drive root folder(s)`);
+      for await (const f of drive.listRootedFiles(getToken, {
+        rootFolderIds: sourcePolicy.rootFolderIds,
+      })) {
         files.push(f);
         if (files.length >= limit) break;
       }
     }
+
+    const pendingDriveAtStart = Object.keys(state.removed || {}).filter(
+      (uid) => uid.startsWith(`${sourceName}:`)
+    );
+    const needsDrivePreInventory = !dry && (
+      !incremental || files.length > 0 || sourceDeletedUids.length > 0 || pendingDriveAtStart.length > 0
+    );
+    const driveStoredBeforeProcessing = needsDrivePreInventory
+      ? await listStoredSourceFamilies({ base, adminKey, source: sourceName })
+      : null;
+    const driveRemovalSafetyCount = driveStoredBeforeProcessing
+      ? recordRemovalSafetyBaseline({
+          stateKey: "drive_removal_safety_baseline",
+          key: JSON.stringify({ policy_fingerprint: policyFingerprint }),
+          inventory: driveStoredBeforeProcessing,
+        })
+      : null;
 
     // Resolve paths only after the complete page set has been seen. Drive does
     // not return parents before children, and API order must not decide policy.
     state.drive_folders = drive.updateFolderIndex(files, incremental ? (state.drive_folders || {}) : {});
     const pathOf = (file) => drive.folderPathFor(file, state.drive_folders);
     const excludedUids = [];
+
+    const seenDriveUids = new Set(files.map((file) => `${sourceName}:${file.id}`));
+    const confirmedDriveAbsenceUids = [];
+    if (!dry && driveStoredBeforeProcessing) {
+      const uidPrefix = `${sourceName}:`;
+      const absenceCandidates = new Set(
+        sourceDeletedUids.filter((uid) =>
+          driveStoredBeforeProcessing.has(uid) && !seenDriveUids.has(uid)
+        )
+      );
+      if (!incremental) {
+        for (const uid of driveStoredBeforeProcessing) {
+          if (!seenDriveUids.has(uid)) absenceCandidates.add(uid);
+        }
+      }
+
+      // The current rooted traversal is the authority for which folder ids are
+      // in scope. A visible file outside this set is a confirmed move; a file
+      // that Drive hides with 403/404 is deliberately ambiguous because hard
+      // deletion and permission loss are indistinguishable to this credential.
+      const scopedFolderIds = new Set([
+        ...sourcePolicy.rootFolderIds,
+        ...Object.keys(state.drive_folders || {}),
+      ]);
+      for (const uid of [...absenceCandidates].sort()) {
+        const fileId = uid.startsWith(uidPrefix) ? uid.slice(uidPrefix.length) : "";
+        if (!fileId) {
+          throw new drive.DriveError(
+            "a stored Drive family had no source file id, so cleanup was withheld and the source cursor was not advanced",
+            0,
+            "unresolvedScopedAbsence",
+            { retryable: true },
+          );
+        }
+        const classification = await drive.classifyScopedAbsence(getToken, fileId, { scopedFolderIds });
+        if (classification.kind === "source_deleted" || classification.kind === "left_scope") {
+          confirmedDriveAbsenceUids.push(uid);
+          continue;
+        }
+        throw new drive.DriveError(
+          "at least one stored Drive item was absent from the reviewed-root walk, but Drive could not distinguish deletion from permission loss; cleanup was withheld and the source cursor was not advanced",
+          0,
+          "unresolvedScopedAbsence",
+          { retryable: true },
+        );
+      }
+    }
 
     const prepareDrive = async (f) => {
       scanned++;
@@ -8334,7 +9053,10 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       const scannerResumeAccepted = hasCredentialScannerProgress(
         state, scannerFingerprint, key, listedVersion
       );
-      if ((!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === listedVersion) {
+      const storedFamilyConfirmed = driveStoredBeforeProcessing == null ||
+        driveStoredBeforeProcessing.has(key);
+      if (storedFamilyConfirmed &&
+          (!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === listedVersion) {
         recordAcceptedDocumentState(state, {
           stateKey: key, hash: listedVersion, skipKeys: [f.id], legacyPartRoot: f.id,
         });
@@ -8394,23 +9116,21 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       });
       intentionalRemovalUids.length = 0;
     } else {
-      // Inventory after every accepted batch, then make one decision covering
-      // policy, source deletion, and quality refusal. No planned delete call is
-      // allowed above this assertion.
-      const seenUids = new Set(files.map((file) => `${sourceName}:${file.id}`));
-      const explicitlyDeletedUids = sourceDeletedUids.filter((uid) => !seenUids.has(uid));
-      const pendingDriveUids = Object.keys(state.removed || {});
+      // The pre-ingest inventory keeps the safety denominator stable and also
+      // repairs a locally remembered family that is absent from D1. A fresh
+      // post-delete inventory below remains the completion proof.
+      const seenUids = seenDriveUids;
+      const pendingDriveUids = Object.keys(state.removed || {}).filter(
+        (uid) => uid.startsWith(`${sourceName}:`)
+      );
       // A no-change incremental refresh has nothing destructive to decide and
       // should not page through a large corpus merely to prove zero. Full
       // sweeps always inventory because absence itself is a deletion signal.
       const needsStoredInventory = !incremental || excludedUids.length ||
-        explicitlyDeletedUids.length || intentionalRemovalUids.length || pendingDriveUids.length;
+        confirmedDriveAbsenceUids.length || intentionalRemovalUids.length || pendingDriveUids.length;
       const storedUids = needsStoredInventory
-        ? await listStoredSourceFamilies({ base, adminKey, source: sourceName })
+        ? (driveStoredBeforeProcessing || await listStoredSourceFamilies({ base, adminKey, source: sourceName }))
         : new Set();
-      const vanishedUids = incremental
-        ? explicitlyDeletedUids
-        : [...explicitlyDeletedUids, ...[...storedUids].filter((uid) => !seenUids.has(uid))];
 
       // A valid prior forget may have reached the Worker even if its response
       // was lost. Inventory is authoritative; clear only local retry markers
@@ -8426,8 +9146,11 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         storedFamilies: storedUids,
         activeFamilies: seenUids,
         policyCandidates: excludedUids,
-        vanishedCandidates: [...vanishedUids, ...pendingDriveUids],
+        vanishedCandidates: [...confirmedDriveAbsenceUids, ...pendingDriveUids],
         intentionalCandidates: intentionalRemovalUids,
+      }, {
+        safetyBaselineCount: driveRemovalSafetyCount ?? storedUids.size,
+        fingerprintContext: "drive-strict",
       });
       saveState(statePath, state);
       assertDriveRemovalPlanSafe(driveRemovalPlan, removalApproval);
@@ -8459,19 +9182,22 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         });
         if (result.applied) ok(`${result.applied} ${success}`);
         if (driveRemovalPlan.targets[category].length) saveState(statePath, state);
-        assertNoPendingRemovals(result, label);
       }
       if (driveRemovalPlan.total) {
         const afterRemoval = await listStoredSourceFamilies({ base, adminKey, source: sourceName });
         const plannedTargets = Object.values(driveRemovalPlan.targets).flat();
         const stillStored = plannedTargets.filter((uid) => afterRemoval.has(uid));
+        const failedAt = new Date().toISOString();
+        for (const uid of plannedTargets) {
+          if (afterRemoval.has(uid)) {
+            state.removed = { ...(state.removed || {}), [uid]: failedAt };
+          } else {
+            if (state.done) delete state.done[uid];
+            if (state.removed) delete state.removed[uid];
+          }
+        }
+        saveState(statePath, state);
         if (stillStored.length) {
-          const failedAt = new Date().toISOString();
-          state.removed = {
-            ...(state.removed || {}),
-            ...Object.fromEntries(stillStored.map((uid) => [uid, failedAt])),
-          };
-          saveState(statePath, state);
           throw new Error(
             `${stillStored.length} planned Drive removal(s) remained after exact source-inventory readback. ` +
               "The source cursor was not advanced; re-running will retry them through the same approval gate."
@@ -8494,44 +9220,172 @@ async function cmdIngestRemote(m, manifestPath, flags) {
             credential_scanner_fingerprint: scannerFingerprint,
           }
         : { credential_scanner_fingerprint: scannerFingerprint },
+      deleteKeysOnScannerCommit: ["drive_removal_safety_baseline"],
     };
   } else if (which === "gmail") {
     const gmail = await import("./connectors/gmail.mjs");
     let nextHistory = null;
-    try {
-      nextHistory = await gmail.currentHistoryId(getToken);
-    } catch { /* a full list still works without it */ }
-
     let ids;
+    let policyById = null;
+    let storedBeforeSweep = null;
+    let authoritativeSnapshot = !incremental;
+    const gmailActiveUids = new Set();
+    const gmailAcceptedUids = new Set();
+    const gmailPolicyUids = [];
+    const gmailDeletedUids = [];
+    const gmailIntentionalUids = [];
+
+    const capturePrewalkHistory = async () => {
+      try {
+        nextHistory = await gmail.currentHistoryId(getToken);
+      } catch {
+        // The data can still be streamed and saved resumably, but a full sweep
+        // cannot declare completion without a marker captured before the walk.
+        // A marker captured after it could skip mail that arrived mid-sweep.
+        gmailHistoryMarkerMissing = 1;
+      }
+    };
+
     if (incremental) {
       const h = await gmail.listHistory(getToken, state.history_id);
       if (h.expired) {
         warn("the saved Gmail history id is too old to answer from, so this is a full pass");
+        incremental = false;
+        lane = "sweep";
+        authoritativeSnapshot = true;
+        await capturePrewalkHistory();
         ids = gmail.listMessages(getToken, { max: limit });
       } else {
-        info(`incremental: ${h.ids.length} new message(s)`);
+        info(`incremental: ${h.ids.length} changed message(s), ${h.deletedIds.length} deleted message(s)`);
+        gmailDeletedUids.push(...h.deletedIds.map((id) => `${sourceName}:${id}`));
+        nextHistory = h.historyId || nextHistory;
+        gmailHistoryMarkerMissing = nextHistory ? 0 : 1;
         ids = h.ids.slice(0, limit);
+
+        // History.list cannot apply DEFAULT_QUERY. Classify the complete window
+        // using label-only reads before any document or removal is sent. This is
+        // the atomicity boundary: buffering raw mail would recreate the multi-GB
+        // first-sync failure that batchStream was built to avoid.
+        policyById = new Map();
+        for await (const item of prefetch(
+          ids,
+          async (id) => ({ id, policy: await gmail.messagePolicy(getToken, id) }),
+          { concurrency: GMAIL_FETCH_CONCURRENCY },
+        )) {
+          policyById.set(item.id, item.policy);
+          if (item.policy.cursor_blocking === true) gmailLabelGaps++;
+        }
+        if (gmailLabelGaps) {
+          scanned = ids.length;
+          for (const [id, policy] of policyById) {
+            if (policy.cursor_blocking !== true) continue;
+            const key = `${sourceName}:${id}`;
+            state.skipped[key] = policy.skip.reason;
+            skips.push(policy.skip);
+          }
+          if (!dry) saveState(statePath, state);
+          warn(
+            `${gmailLabelGaps} Gmail message(s) had no trustworthy label classification, so this history window was refused before any message or removal was sent`,
+          );
+          ids = [];
+        }
       }
     } else {
+      await capturePrewalkHistory();
       ids = gmail.listMessages(getToken, { max: limit });
     }
 
-    const prepareGmail = async (id) => {
+    // Capture the pre-run inventory before new mail expands it. It is both the
+    // authority for scanner migration and the removal-plan denominator. Using
+    // a post-ingest count could let a wrong-account sweep dilute removal of the
+    // entire prior corpus below the unattended ratio limit.
+    const gmailHasPotentialRemovalWork = authoritativeSnapshot ||
+      (Array.isArray(ids) && ids.length > 0) ||
+      gmailDeletedUids.length > 0 ||
+      Object.keys(state.removed || {}).some((uid) => uid.startsWith(`${sourceName}:`));
+    let gmailRemovalSafetyCount = null;
+    if (!dry && gmailLabelGaps === 0 && gmailHasPotentialRemovalWork) {
+      storedBeforeSweep = await listStoredSourceFamilies({ base, adminKey, source: sourceName });
+      const baselineKey = JSON.stringify({
+        policy_fingerprint: policyFingerprint,
+      });
+      gmailRemovalSafetyCount = recordRemovalSafetyBaseline({
+        stateKey: "gmail_removal_safety_baseline",
+        key: baselineKey,
+        inventory: storedBeforeSweep,
+      });
+    }
+
+    // One `messages.get` per message, about 300 ms each. Awaited one at a time
+    // that is ~160 messages a minute, so a 190k-message mailbox took twenty
+    // hours regardless of how fast the brain accepted batches (measured on a
+    // real first pass, 2026-09-05). Fetching a bounded window ahead, in order,
+    // measured seven times faster with no errors at eight in flight. The Google
+    // helper already retries 429 and 5xx with backoff, and Gmail's per-user
+    // budget (250 units/s, 5 per get) sits well above eight concurrent gets.
+    // Only the fetch overlaps: the credential scan, batching and resume state
+    // below still see one message at a time, in source order, exactly as before.
+    const fetched = prefetch(
+      ids,
+      async (id) => {
+        const policy = policyById?.get(id);
+        if (policy && !policy.allowed) return { id, fetched: policy };
+        return {
+          id,
+          fetched: await gmail.toEnvelope(getToken, id, {
+            sourceName,
+            // A full-list id matched DEFAULT_QUERY. An incremental id reached
+            // this point only after its label-only preflight allowed it.
+            trustedEligible: !incremental || policy?.allowed === true,
+          }),
+        };
+      },
+      { concurrency: GMAIL_FETCH_CONCURRENCY },
+    );
+    const prepareGmail = async ({ id, fetched: r }) => {
       scanned++;
+      // Report the scan before any unchanged or skip return. A resumed first
+      // pass may recheck thousands of already-accepted messages before it
+      // reaches new mail; printing only for newly prepared documents made a
+      // healthy run look frozen during that whole recovery window.
+      if (scanned % 200 === 0) process.stdout.write(`\r  fetched ${scanned}...   `);
       const key = `${sourceName}:${id}`;
-      const r = await gmail.toEnvelope(getToken, id, { sourceName });
+      gmailActiveUids.add(key);
       if (r.skip) {
+        const previouslyAccepted = storedBeforeSweep
+          ? storedBeforeSweep.has(key)
+          : Object.prototype.hasOwnProperty.call(state.done || {}, key);
         state.skipped[key] = r.skip.reason;
-        intentionalRemovalUids.push(key);
+        if (r.policy_skip === true) {
+          policySkipped++;
+          gmailPolicyUids.push(key);
+        } else if (r.source_deleted === true) {
+          sourceResolvedSkipped++;
+          gmailActiveUids.delete(key);
+          gmailDeletedUids.push(key);
+        } else if (r.retain_existing !== true) {
+          gmailIntentionalUids.push(key);
+        }
+        if (r.cursor_blocking === true) gmailLabelGaps++;
+        if (scannerPolicyChanged && previouslyAccepted && r.retain_existing === true) {
+          scannerProgressCanCommit = false;
+        }
         return { skip: r.skip };
       }
       const scannerResumeAccepted = hasCredentialScannerProgress(
         state, scannerFingerprint, key, r.version
       );
-      if ((!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === r.version) {
+      // Local resume state cannot prove that the family still exists in D1.
+      // When this run has the authoritative source inventory, a missing family
+      // is repaired by re-posting even if its revision and scanner receipt are
+      // unchanged locally.
+      const storedFamilyConfirmed = storedBeforeSweep == null || storedBeforeSweep.has(key);
+      if (storedFamilyConfirmed &&
+          (!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === r.version) {
         recordAcceptedDocumentState(state, {
           stateKey: key, hash: r.version, skipKeys: [id], legacyPartRoot: id,
         });
+        gmailAcceptedUids.add(key);
         unchanged++;
         return { unchanged: true };
       }
@@ -8540,11 +9394,11 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       if (refusal) {
         const skip = { path: safeIngestDisplay(envelope.title, id), id, reason: refusal.reason };
         state.skipped[key] = refusal.reason;
-        intentionalRemovalUids.push(key);
+        localRefused++;
+        gmailIntentionalUids.push(key);
         return { skip };
       }
       const envelopes = splitOversized(envelope);
-      if (scanned % 200 === 0) process.stdout.write(`\r  fetched ${scanned}...   `);
       return {
         hash: r.version, envelopes, rel: id, stateKey: key, deferState: true,
         familyPlan: {
@@ -8558,18 +9412,203 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         },
       };
     };
-    for await (const group of batchStream(ids, prepareGmail, {
+    for await (const group of batchStream(fetched, prepareGmail, {
       onSkip: (skip) => skips.push(skip),
     })) {
       await consumeGroup(group);
+      for (const item of group) {
+        if (item?.familyPlan?.stateKey && state.done?.[item.familyPlan.stateKey] === item.familyPlan.hash) {
+          gmailAcceptedUids.add(item.familyPlan.stateKey);
+        }
+      }
     }
+
+    const currentGmailRemovalUids = new Set([
+      ...gmailPolicyUids,
+      ...gmailDeletedUids,
+      ...gmailIntentionalUids,
+      ...intentionalRemovalUids,
+    ]);
+    // A prior forget can commit while its response or follow-up inventory is
+    // lost. Pre-run D1 truth settles that ambiguity. Clear an absent pending
+    // family before counting active unreadable messages as unresolved; keep a
+    // newly accepted re-post's fresh done marker intact.
+    if (storedBeforeSweep) {
+      for (const uid of Object.keys(state.removed || {})) {
+        if (!uid.startsWith(`${sourceName}:`) || storedBeforeSweep.has(uid)) continue;
+        delete state.removed[uid];
+        if (!gmailAcceptedUids.has(uid) && state.done) delete state.done[uid];
+      }
+    }
+    const pendingGmailUids = Object.keys(state.removed || {}).filter((uid) =>
+      uid.startsWith(`${sourceName}:`) &&
+      !gmailAcceptedUids.has(uid) &&
+      // A visible message whose current read is incomplete is not deletion
+      // proof. Preserve its existing family until a successful replacement or
+      // a current typed policy/deletion decision resolves it.
+      (!gmailActiveUids.has(uid) || currentGmailRemovalUids.has(uid))
+    );
+    const unresolvedActivePendingUids = Object.keys(state.removed || {}).filter((uid) =>
+      uid.startsWith(`${sourceName}:`) &&
+      gmailActiveUids.has(uid) &&
+      !gmailAcceptedUids.has(uid) &&
+      !currentGmailRemovalUids.has(uid)
+    );
+    // A timestamp-only legacy pending marker does not say whether it came from
+    // a source deletion or a security refusal. Visibility alone cannot safely
+    // clear it. Keep the marker and replay this Gmail window until the message
+    // is accepted or a current typed decision resolves the removal.
+    gmailPendingRemovalGaps = unresolvedActivePendingUids.length;
+    for (const uid of gmailAcceptedUids) {
+      if (state.removed) delete state.removed[uid];
+    }
+
+    if (dry) {
+      await applyDriveRemovals({
+        uids: gmailPolicyUids, base, adminKey, state, dryRun: true, label: "source policy",
+      });
+      await applyDriveRemovals({
+        uids: gmailDeletedUids, base, adminKey, state, dryRun: true, label: "Gmail source deletion",
+      });
+      await applyDriveRemovals({
+        uids: [...gmailIntentionalUids, ...intentionalRemovalUids],
+        base, adminKey, state, dryRun: true, label: "intentional source skip",
+      });
+    } else if (gmailLabelGaps === 0 && gmailHistoryMarkerMissing === 0) {
+      const needsGmailInventory = authoritativeSnapshot || gmailPolicyUids.length ||
+        gmailDeletedUids.length || gmailIntentionalUids.length ||
+        pendingGmailUids.length || intentionalRemovalUids.length;
+      if (needsGmailInventory) {
+        const storedGmailUids = new Set(storedBeforeSweep || []);
+        const currentRemovalCandidates = new Set([
+          ...gmailPolicyUids,
+          ...gmailDeletedUids,
+          ...gmailIntentionalUids,
+          ...pendingGmailUids,
+          ...intentionalRemovalUids,
+        ]);
+        const currentDeletedCandidates = new Set(gmailDeletedUids);
+        for (const uid of currentRemovalCandidates) {
+          if (storedGmailUids.has(uid)) continue;
+          if (state.done) delete state.done[uid];
+          if (state.removed) delete state.removed[uid];
+          if (currentDeletedCandidates.has(uid) && state.skipped) delete state.skipped[uid];
+        }
+
+        const vanishedSnapshotUids = authoritativeSnapshot
+          ? [...storedGmailUids].filter((uid) => !gmailActiveUids.has(uid))
+          : [];
+        const currentTypedRemovalUids = new Set([
+          ...gmailPolicyUids,
+          ...gmailDeletedUids,
+        ]);
+        const unrelatedPendingGmailUids = pendingGmailUids.filter(
+          (uid) => !currentTypedRemovalUids.has(uid)
+        );
+        const oneTypedRoutineRemoval = !authoritativeSnapshot &&
+          unrelatedPendingGmailUids.length === 0 &&
+          gmailIntentionalUids.length === 0 &&
+          intentionalRemovalUids.length === 0 &&
+          currentTypedRemovalUids.size === 1;
+        const gmailRemovalPlan = buildDriveRemovalPlan({
+          storedFamilies: storedGmailUids,
+          activeFamilies: gmailActiveUids,
+          policyCandidates: gmailPolicyUids,
+          vanishedCandidates: [...gmailDeletedUids, ...vanishedSnapshotUids],
+          intentionalCandidates: [
+            ...gmailIntentionalUids,
+            ...pendingGmailUids,
+            ...intentionalRemovalUids,
+          ],
+        }, {
+          safetyBaselineCount: gmailRemovalSafetyCount ?? storedGmailUids.size,
+          ratioFloorCount: oneTypedRoutineRemoval ? 1 : 0,
+          fingerprintContext: oneTypedRoutineRemoval ? "gmail-current-typed" : "gmail-strict",
+        });
+        assertDriveRemovalPlanSafe(gmailRemovalPlan, removalApproval, { sourceLabel: "Gmail" });
+
+        if (gmailRemovalPlan.total) {
+          const percent = (gmailRemovalPlan.ratio * 100).toFixed(1);
+          const disposition = gmailRemovalPlan.tooLarge ? "approved" : "within the unattended safety limits";
+          info(`Gmail cleanup plan ${disposition}: ${gmailRemovalPlan.total} of ${gmailRemovalPlan.stored} stored documents (${percent}%)`);
+        }
+        const categories = [
+          ["source_policy", "Gmail source policy", "message(s) removed to enforce the Gmail source policy"],
+          ["source_deleted", "Gmail source deletion", "message(s) removed to match Gmail source truth"],
+          ["intentional_skip", "intentional Gmail skip", "message(s) removed because the current source revision is ineligible"],
+        ];
+        for (const [category, label, success] of categories) {
+          const result = await applyDriveRemovals({
+            uids: gmailRemovalPlan.targets[category], base, adminKey, state, dryRun: false, label,
+          });
+          if (result.applied) ok(`${result.applied} ${success}`);
+          if (gmailRemovalPlan.targets[category].length) saveState(statePath, state);
+        }
+        if (gmailRemovalPlan.total) {
+          const afterRemoval = await listStoredSourceFamilies({ base, adminKey, source: sourceName });
+          const plannedTargets = Object.values(gmailRemovalPlan.targets).flat();
+          const stillStored = plannedTargets.filter((uid) => afterRemoval.has(uid));
+          const failedAt = new Date().toISOString();
+          for (const uid of plannedTargets) {
+            if (afterRemoval.has(uid)) {
+              state.removed = { ...(state.removed || {}), [uid]: failedAt };
+            } else {
+              if (state.done) delete state.done[uid];
+              if (state.removed) delete state.removed[uid];
+              if (gmailRemovalPlan.targets.source_deleted.includes(uid)) delete state.skipped[uid];
+            }
+          }
+          saveState(statePath, state);
+          if (stillStored.length) {
+            throw new Error(
+              `${stillStored.length} planned Gmail removal(s) remained after exact source-inventory readback. ` +
+                "The history cursor and scanner migration were not committed; re-running will retry them through the same approval gate."
+            );
+          }
+        }
+      }
+      saveState(statePath, state);
+    }
+    intentionalRemovalUids.length = 0;
     pendingCursor = {
       key: "history_id",
       value: nextHistory || state.history_id,
-      statePatch: { credential_scanner_fingerprint: scannerFingerprint },
+      statePatch: {
+        gmail_policy_fingerprint: policyFingerprint,
+        credential_scanner_fingerprint: scannerFingerprint,
+      },
+      deleteKeysOnScannerCommit: ["gmail_removal_safety_baseline"],
     };
   } else {
     const imap = await import("./connectors/imap.mjs");
+    const imapAuthoritativeSnapshot = !incremental;
+    const imapActiveUids = new Set();
+    const imapAcceptedUids = new Set();
+    const imapPolicyUids = [];
+    let imapUnidentifiedSkips = 0;
+    let imapUnidentifiedCursorGaps = 0;
+    let imapStoredBeforeSweep = null;
+    let imapRemovalSafetyCount = null;
+    const imapBaselineKey = JSON.stringify({
+      policy_fingerprint: policyFingerprint,
+      scanner_fingerprint: scannerFingerprint,
+    });
+    const captureImapInventory = async () => {
+      if (imapStoredBeforeSweep) return imapStoredBeforeSweep;
+      imapStoredBeforeSweep = await listStoredSourceFamilies({ base, adminKey, source: sourceName });
+      imapRemovalSafetyCount = recordRemovalSafetyBaseline({
+        stateKey: "imap_removal_safety_baseline",
+        key: imapBaselineKey,
+        inventory: imapStoredBeforeSweep,
+      });
+      return imapStoredBeforeSweep;
+    };
+    const pendingImapAtStart = Object.keys(state.removed || {}).filter(
+      (uid) => uid.startsWith(`${sourceName}:`)
+    );
+    if (!dry && (imapAuthoritativeSnapshot || pendingImapAtStart.length)) {
+      await captureImapInventory();
+    }
     const credentials = imap.loadImapCredentials({ sourceName });
     if (!credentials) {
       die(
@@ -8594,6 +9633,9 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       const mailFolders = folders.length - containers.length;
       info(`${mailFolders} mail folder(s) on this mailbox; reading ${included.length}: ${included.map((f) => f.name).join(", ") || "none"}`);
       if (skippedRoles.length) {
+        // These are folders, not message-level skips. Preserve their count for
+        // the receipt without subtracting them from message coverage below.
+        folderPolicySkipped += skippedRoles.length;
         info(`  not read, by policy: ${skippedRoles.map((f) => `${f.name} (${f.role})`).join(", ")}`);
       }
       if (unlisted.length) {
@@ -8634,6 +9676,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
           lastUid: saved?.last_uid ?? 0,
           reset: !!flags.reset,
           policyChanged: imapPolicyChanged,
+          scannerPolicyChanged,
         });
         // Never silent. A resync that just happens is indistinguishable from a
         // bug, and this is the same posture as the Gmail history-expiry warning.
@@ -8646,16 +9689,42 @@ async function cmdIngestRemote(m, manifestPath, flags) {
           if (message.uid > highest) highest = message.uid;
           const r = await imap.toEnvelope(message, { sourceName, host: credentials.host });
           if (r.skip) {
-            const key = `${sourceName}:${folder.name}#${message.uid}`;
+            const key = r.source_id
+              ? `${sourceName}:${r.source_id}`
+              : `${sourceName}:${folder.name}#${message.uid}`;
+            if (r.source_id) imapActiveUids.add(key);
+            else {
+              imapUnidentifiedSkips++;
+              // SEARCH saw this UID but FETCH could no longer return enough
+              // evidence to identify it. During an incremental pass, advancing
+              // beyond that UID would make a transient incomplete FETCH
+              // permanent, so retain the old watermark for a retry.
+              if (r.source_deleted === true && !imapAuthoritativeSnapshot) {
+                imapUnidentifiedCursorGaps++;
+              }
+            }
             state.skipped[key] = r.skip.reason;
+            if (r.source_deleted === true) sourceResolvedSkipped++;
+            if (r.policy_skip === true || /^bulk mail:/i.test(r.skip.reason || "")) {
+              policySkipped++;
+              if (r.source_id) imapPolicyUids.push(key);
+            }
+            if (scannerPolicyChanged && r.source_id && r.retain_existing === true &&
+                imapStoredBeforeSweep?.has(key)) {
+              scannerProgressCanCommit = false;
+            }
             return { skip: r.skip };
           }
           const key = `${sourceName}:${r.envelope.source_id}`;
+          imapActiveUids.add(key);
           const scannerResumeAccepted = hasCredentialScannerProgress(state, scannerFingerprint, key, r.version);
-          if ((!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === r.version) {
+          const storedFamilyConfirmed = imapStoredBeforeSweep == null || imapStoredBeforeSweep.has(key);
+          if (storedFamilyConfirmed &&
+              (!scannerPolicyChanged || scannerResumeAccepted) && state.done[key] === r.version) {
             recordAcceptedDocumentState(state, {
               stateKey: key, hash: r.version, skipKeys: [r.envelope.source_id], legacyPartRoot: r.envelope.source_id,
             });
+            imapAcceptedUids.add(key);
             unchanged++;
             return { unchanged: true };
           }
@@ -8666,6 +9735,7 @@ async function cmdIngestRemote(m, manifestPath, flags) {
             // app password. The gate names the kind and never quotes the value.
             const skip = { path: safeIngestDisplay(envelope.title, key), id: key, reason: refusal.reason };
             state.skipped[key] = refusal.reason;
+            localRefused++;
             intentionalRemovalUids.push(key);
             return { skip };
           }
@@ -8694,6 +9764,11 @@ async function cmdIngestRemote(m, manifestPath, flags) {
           onSkip: (skip) => skips.push(skip),
         })) {
           await consumeGroup(group);
+          for (const item of group) {
+            if (item?.familyPlan?.stateKey && state.done?.[item.familyPlan.stateKey] === item.familyPlan.hash) {
+              imapAcceptedUids.add(item.familyPlan.stateKey);
+            }
+          }
         }
 
         // Re-EXAMINE before recording anything. A server may roll UIDVALIDITY
@@ -8708,6 +9783,145 @@ async function cmdIngestRemote(m, manifestPath, flags) {
       await client.logout().catch(() => {});
     }
 
+    const currentImapRemovalUids = new Set([
+      ...imapPolicyUids,
+      ...intentionalRemovalUids,
+    ]);
+    // Pending-only retries are reconciled against the inventory captured before
+    // mailbox writes. If the family is already absent, a lost earlier receipt
+    // has completed and must not make a current unreadable message hold this
+    // cursor forever. Preserve a fresh accepted re-post's done marker.
+    if (imapStoredBeforeSweep) {
+      for (const uid of Object.keys(state.removed || {})) {
+        if (!uid.startsWith(`${sourceName}:`) || imapStoredBeforeSweep.has(uid)) continue;
+        delete state.removed[uid];
+        if (!imapAcceptedUids.has(uid) && state.done) delete state.done[uid];
+      }
+    }
+    let pendingImapUids = Object.keys(state.removed || {}).filter((uid) =>
+      uid.startsWith(`${sourceName}:`) &&
+      !imapAcceptedUids.has(uid) &&
+      (!imapActiveUids.has(uid) || currentImapRemovalUids.has(uid))
+    );
+    // An unidentified current message may be a restored copy of a pending
+    // family. Visibility cannot clear or confirm that old removal until the
+    // current message has a stable identity. Current typed policy/refusal
+    // evidence remains independently safe to plan.
+    const ambiguousPendingImapUids = imapUnidentifiedSkips > 0
+      ? pendingImapUids.filter((uid) => !currentImapRemovalUids.has(uid))
+      : [];
+    if (ambiguousPendingImapUids.length) {
+      const ambiguousPending = new Set(ambiguousPendingImapUids);
+      pendingImapUids = pendingImapUids.filter((uid) => !ambiguousPending.has(uid));
+    }
+    const unresolvedActivePendingUids = Object.keys(state.removed || {}).filter((uid) =>
+      uid.startsWith(`${sourceName}:`) &&
+      imapActiveUids.has(uid) &&
+      !imapAcceptedUids.has(uid) &&
+      !currentImapRemovalUids.has(uid)
+    );
+    for (const uid of imapAcceptedUids) {
+      if (state.removed) delete state.removed[uid];
+    }
+
+    if (dry) {
+      await applyDriveRemovals({
+        uids: imapPolicyUids, base, adminKey, state, dryRun: true, label: "IMAP source policy",
+      });
+      await applyDriveRemovals({
+        uids: intentionalRemovalUids, base, adminKey, state, dryRun: true, label: "intentional IMAP skip",
+      });
+    } else {
+      const needsImapInventory = imapAuthoritativeSnapshot || imapPolicyUids.length ||
+        intentionalRemovalUids.length || pendingImapUids.length || unresolvedActivePendingUids.length;
+      const storedImapUids = needsImapInventory
+        ? await captureImapInventory()
+        : new Set();
+      const unmatchedStoredUids = imapAuthoritativeSnapshot
+        ? [...storedImapUids].filter((uid) => !imapActiveUids.has(uid))
+        : [];
+      const ambiguousSnapshot = imapUnidentifiedSkips > 0 && unmatchedStoredUids.length > 0;
+      const imapSnapshotGapUids = new Set([
+        ...unresolvedActivePendingUids,
+        ...ambiguousPendingImapUids.filter((uid) => storedImapUids.has(uid)),
+      ]);
+      if (ambiguousSnapshot) {
+        for (const uid of unmatchedStoredUids) imapSnapshotGapUids.add(uid);
+        warn(
+          `${unmatchedStoredUids.length} stored IMAP document(s) could not be matched while ` +
+          `${imapUnidentifiedSkips} current message(s) lacked stable identity; no absence-based removal was attempted`
+        );
+      }
+      imapSnapshotGaps = imapSnapshotGapUids.size + imapUnidentifiedCursorGaps;
+      if (imapSnapshotGaps) {
+        scannerProgressCanCommit = false;
+      }
+
+      const currentImapCandidates = new Set([
+        ...imapPolicyUids,
+        ...intentionalRemovalUids,
+        ...pendingImapUids,
+      ]);
+      for (const uid of currentImapCandidates) {
+        if (storedImapUids.has(uid)) continue;
+        if (state.done) delete state.done[uid];
+        if (state.removed) delete state.removed[uid];
+      }
+
+      const imapRemovalPlan = buildDriveRemovalPlan({
+        storedFamilies: storedImapUids,
+        activeFamilies: imapActiveUids,
+        policyCandidates: imapPolicyUids,
+        vanishedCandidates: ambiguousSnapshot ? [] : unmatchedStoredUids,
+        intentionalCandidates: [...intentionalRemovalUids, ...pendingImapUids],
+      }, {
+        safetyBaselineCount: imapRemovalSafetyCount ?? storedImapUids.size,
+        fingerprintContext: "imap-strict",
+      });
+      assertDriveRemovalPlanSafe(imapRemovalPlan, removalApproval, { sourceLabel: "IMAP" });
+
+      if (imapRemovalPlan.total) {
+        const percent = (imapRemovalPlan.ratio * 100).toFixed(1);
+        const disposition = imapRemovalPlan.tooLarge ? "approved" : "within the unattended safety limits";
+        info(`IMAP cleanup plan ${disposition}: ${imapRemovalPlan.total} of ${imapRemovalPlan.stored} stored documents (${percent}%)`);
+      }
+      const categories = [
+        ["source_policy", "IMAP source policy", "message(s) removed to enforce the IMAP source policy"],
+        ["source_deleted", "IMAP source deletion", "message(s) removed to match the complete IMAP snapshot"],
+        ["intentional_skip", "intentional IMAP skip", "message(s) removed because the current source revision is ineligible"],
+      ];
+      for (const [category, label, success] of categories) {
+        const result = await applyDriveRemovals({
+          uids: imapRemovalPlan.targets[category], base, adminKey, state, dryRun: false, label,
+        });
+        if (result.applied) ok(`${result.applied} ${success}`);
+        if (imapRemovalPlan.targets[category].length) saveState(statePath, state);
+      }
+      if (imapRemovalPlan.total) {
+        const afterRemoval = await listStoredSourceFamilies({ base, adminKey, source: sourceName });
+        const plannedTargets = Object.values(imapRemovalPlan.targets).flat();
+        const stillStored = plannedTargets.filter((uid) => afterRemoval.has(uid));
+        const failedAt = new Date().toISOString();
+        for (const uid of plannedTargets) {
+          if (afterRemoval.has(uid)) {
+            state.removed = { ...(state.removed || {}), [uid]: failedAt };
+          } else {
+            if (state.done) delete state.done[uid];
+            if (state.removed) delete state.removed[uid];
+          }
+        }
+        saveState(statePath, state);
+        if (stillStored.length) {
+          throw new Error(
+            `${stillStored.length} planned IMAP removal(s) remained after exact source-inventory readback. ` +
+            "The folder cursor and scanner migration were not committed; re-running will retry them through the same approval gate."
+          );
+        }
+      }
+      saveState(statePath, state);
+    }
+    intentionalRemovalUids.length = 0;
+
     // ONE object, merged connector-side. Per-folder positions cannot be a
     // scalar assign, and the new UIDVALIDITY is never written apart from the
     // watermark it belongs to: a half-finished resync leaves the OLD pair in
@@ -8720,13 +9934,15 @@ async function cmdIngestRemote(m, manifestPath, flags) {
         imap_policy_fingerprint: policyFingerprint,
         credential_scanner_fingerprint: scannerFingerprint,
       },
+      deleteKeysOnScannerCommit: ["imap_removal_safety_baseline"],
     };
   }
   process.stdout.write("\r");
 
-  if (which !== "drive") await flushIntentionalRemovals();
-
   info(`${scanned} scanned; ${prepared} document(s) prepared in ${batchNo} batch(es); ${unchanged} unchanged; ${skips.length} skipped`);
+
+  const coverageGaps = Math.max(0, skips.length - policySkipped - sourceResolvedSkipped) +
+    gmailHistoryMarkerMissing + imapSnapshotGaps;
 
   if (dry) {
     ok("dry run, nothing was sent");
@@ -8737,44 +9953,83 @@ async function cmdIngestRemote(m, manifestPath, flags) {
   // Every batch landed, so it is now safe to say "we have everything up to
   // here". sendBatches dies rather than returning on a failure, so reaching
   // this line is the proof.
-  if (pendingCursor && sourceCursorCanAdvance(tally)) {
+  const cursorCanAdvance = sourceCursorCanAdvance(tally) &&
+    !(which === "gmail" &&
+      (gmailLabelGaps > 0 || gmailHistoryMarkerMissing > 0 || gmailPendingRemovalGaps > 0)) &&
+    !(which === "imap" && imapSnapshotGaps > 0);
+  if (pendingCursor && cursorCanAdvance) {
     state[pendingCursor.key] = pendingCursor.value;
-    Object.assign(state, pendingCursor.statePatch || {});
-    commitCredentialScannerProgress(state, scannerFingerprint);
+    const statePatch = { ...(pendingCursor.statePatch || {}) };
+    if (!scannerProgressCanCommit) delete statePatch.credential_scanner_fingerprint;
+    Object.assign(state, statePatch);
+    if (scannerProgressCanCommit) {
+      commitCredentialScannerProgress(state, scannerFingerprint);
+      for (const key of pendingCursor.deleteKeysOnScannerCommit || []) delete state[key];
+    }
     saveState(statePath, state);
-  } else if (pendingCursor && tally.failed) {
-    warn(`${tally.failed} document(s) failed, so the source cursor was NOT advanced; the next run will retry them`);
+  } else if (pendingCursor) {
+    const reason = which === "gmail" &&
+      (gmailLabelGaps || gmailHistoryMarkerMissing || gmailPendingRemovalGaps)
+      ? `${gmailLabelGaps} message(s) lacked label evidence, ${gmailHistoryMarkerMissing} pre-sweep history marker(s) were unavailable, and ${gmailPendingRemovalGaps} active message(s) had unresolved pending removals`
+      : which === "imap" && imapSnapshotGaps
+        ? `${imapSnapshotGaps} IMAP source snapshot gap(s) remained unresolved`
+        : `${tally.failed} document(s) failed`;
+    warn(`${reason}, so the source cursor was NOT advanced; the next run will retry them`);
   }
-  const finalStatus = tally.failed ? "error" : "ready";
+  // A non-policy skip remains visible as incomplete coverage. Gmail still
+  // advances past deterministic credential, parse and quality outcomes so one
+  // immutable message cannot poison every later history run. Only missing
+  // label evidence, an incomplete scanner sweep, or a missing history marker
+  // withholds its cursor above.
+  const totalRefused = tally.refused + localRefused;
+  const hasRemoteGap = tally.failed > 0 || totalRefused > 0 || coverageGaps > 0;
+  const finalStatus = hasRemoteGap ? "error" : "ready";
   await postSourceReceipt(base, adminKey, {
     source: sourceName, kind: which, status: finalStatus, run_id: runId,
     lane, started_at: runStartedAt, completed_at: new Date().toISOString(),
-    complete_sweep: which === "drive" && !incremental,
-    walk_complete: tally.failed === 0,
+    complete_sweep: ["drive", "gmail"].includes(which) && !incremental,
+    walk_complete: !hasRemoteGap,
     files_seen: scanned,
     docs_added: tally.created,
     docs_updated: tally.updated,
     docs_unchanged: unchanged + tally.unchanged,
-    detail: `${which} ${lane} sync ${finalStatus === "ready" ? "completed" : "completed with document failures"}; skipped=${skips.length}`,
-    ...(tally.failed ? { error: `${tally.failed} document(s) failed; the source cursor was not advanced` } : {}),
+    // One shape or the other, never both: a receipt carrying a human detail AND
+    // an issue code invites a reader to believe the happier of the two.
+    ...(hasRemoteGap
+      ? { issue_code: totalRefused > 0 ? "INPUT_REFUSED" : "INGEST_FAILED" }
+      : {
+          detail: `${which} ${lane} sync completed; skipped=${skips.length}; ` +
+            `policy_skipped=${policySkipped}; coverage_gaps=${coverageGaps}` +
+            (which === "imap" ? `; folder_policy_skipped=${folderPolicySkipped}` : ""),
+        }),
   });
   runClosed = true;
 
   const summary = `${tally.created} created, ${tally.updated} updated, ${unchanged + tally.unchanged} unchanged`;
   if (tally.failed) info(summary);
   else ok(summary);
-  if (tally.refused) warn(`${tally.refused} document(s) refused for carrying live credentials.`);
+  if (totalRefused) warn(`${totalRefused} document(s) refused for carrying live credentials.`);
   await reportSkips(skips);
   info(`progress saved to ${relative(process.cwd(), statePath)}`);
   assertNoIngestFailures(tally);
   await reportBacklog(manifestPath);
+  if (which === "gmail" && hasRemoteGap) {
+    const disposition = tally.created + tally.updated + unchanged + tally.unchanged > 0
+      ? "partial coverage"
+      : "refused coverage";
+    die(
+      `${disposition}: ${coverageGaps} Gmail message(s) were not indexed` +
+        (totalRefused ? `, including ${totalRefused} credential refusal(s)` : "") + ".\n" +
+        "      Progress was saved. The cursor advances only when every message had trustworthy policy evidence.",
+    );
+  }
   // Returned for the same reason the local walker returns its tally: a sweep
   // that ran this leg can then report real counts rather than "unknown".
   return {
     created: tally.created,
     updated: tally.updated,
     unchanged: unchanged + tally.unchanged,
-    refused: tally.refused,
+    refused: totalRefused,
     scanned,
     skipped: skips.length,
   };
@@ -8783,21 +10038,19 @@ async function cmdIngestRemote(m, manifestPath, flags) {
     // every batch and Drive family cleanup succeeds above. A thrown Drive/Gmail
     // fetch therefore stays retryable and is also visible immediately instead
     // of lingering as a green or anonymous `indexing` row.
-    if (which !== "drive" && intentionalRemovalUids.length && !dry) {
-      try {
-        await flushIntentionalRemovals({ strict: false });
-      } catch (cleanupError) {
-        warn(`the sync failed and source-skip cleanup could not finish: ${String(cleanupError?.message || cleanupError).slice(0, 160)}`);
-      }
-    }
     if (runOpened && !runClosed) {
       try {
+        const reviewRequired = error instanceof DriveRemovalReviewRequired;
         await postSourceReceipt(base, adminKey, {
           source: sourceName, kind: which, status: "error", run_id: runId,
           lane, started_at: runStartedAt, completed_at: new Date().toISOString(),
           walk_complete: false, files_seen: scanned,
-          error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
-          detail: `${which} ${lane} sync aborted before its cursor could advance`,
+          ...(reviewRequired
+            ? { issue_code: "SAFETY_REVIEW_REQUIRED" }
+            : {
+                error: String(error?.message || error).replace(/\s+/g, " ").slice(0, 500),
+                detail: `${which} ${lane} sync aborted before its cursor could advance`,
+              }),
         });
         runClosed = true;
       } catch (receiptError) {
@@ -9025,6 +10278,22 @@ async function cmdConnect(target) {
     scopes: names.map((n) => SCOPES[n]),
     port,
   });
+
+  // Say WHICH account consented, before anything else: with two Google
+  // accounts in one browser, the wrong one gets picked silently, and the
+  // mistake is invisible until someone else's mailbox is in the brain. Read
+  // with the scopes just granted (userinfo needs a scope this product never
+  // requests), stored nowhere, and fail-soft: no echo failure may break a
+  // connect that succeeded.
+  const connectedAccount = await fetchConnectedAccountEmail(tokens.access_token, names).catch(() => null);
+  if (connectedAccount) {
+    ok(`Connected Google account: ${connectedAccount}`);
+    info("if that is not the account you meant, run this command again and pick the right one on the consent screen.");
+  } else if (!names.includes("drive") && !names.includes("gmail")) {
+    info("(calendar-only scope cannot read the account address; the consent screen was the only check)");
+  } else {
+    info("(could not read which account consented; the consent screen was the only check)");
+  }
 
   const store = loadTokens();
   store.google = {
@@ -10351,6 +11620,16 @@ async function cmdDoctor(manifestPath) {
       const feedMark = feedCheck.status === D_OK ? c.green("ok  ") : feedCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
       console.log(`  ${feedMark}  ${feedCheck.name.padEnd(18)}  ${feedCheck.detail}`);
     } catch { /* doctor must work without a valid manifest */ }
+
+    // Offline and cheap, like the bank-feed check: the first-load ordering
+    // decision only helps while it can still be made, so doctor surfaces it
+    // before install rather than letting the report discover it after.
+    try {
+      const sliceCheck = checkPrioritySlice(loadManifest(manifestPath).m);
+      checks.push(sliceCheck);
+      const sliceMark = sliceCheck.status === D_OK ? c.green("ok  ") : sliceCheck.status === D_WARN ? c.yellow("warn") : c.red("FAIL");
+      console.log(`  ${sliceMark}  ${sliceCheck.name.padEnd(18)}  ${sliceCheck.detail}`);
+    } catch { /* doctor must work without a valid manifest */ }
   }
 
   const s = doctorSummarize(checks);
@@ -10561,6 +11840,35 @@ export async function prepareSetupAdminKey(manifestPath, manifest, options = {})
 }
 
 /** Read whether setup is resuming over an already deployed Worker. */
+/**
+ * Is the Worker that already exists a live brain on the current writer
+ * protocol? Read-only, and null on any doubt.
+ *
+ * Setup's paused cutover exists for a Worker deployed by an OLDER package,
+ * one that cannot honour the drain lease. It was applied to every Worker
+ * that merely existed, so re-running setup on a healthy, finished brain
+ * paused it and walked it back into the same cutover. On a real install
+ * that happened after the cutover had already failed once, and every error
+ * message in that state pointed at `brain setup`. This is how setup tells a
+ * finished brain from an unfinished one before deciding.
+ */
+export async function probeExistingWorkerHealth(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const domain = m.brain?.domain;
+  if (!domain) return null;
+  const fetchHealth = options.http ?? http;
+  try {
+    const res = await fetchHealth(`https://${domain}/health`, {}, { timeoutMs: 15_000, what: "the health check" });
+    if (!res?.ok) return null;
+    const body = JSON.parse(await res.text());
+    if (body?.ok !== true) return null;
+    if (body.vector_writer_protocol !== "lease-v1" || body.vector_drain_mode !== "active") return null;
+    return { version: String(body.version || ""), acceptingDocuments: body.accepting_documents === true };
+  } catch {
+    return null;
+  }
+}
+
 export async function setupWorkerScriptExists(manifestPath, options = {}) {
   const { m } = loadManifest(manifestPath);
   const resolveSetupAccount = options.resolveAccount ?? resolveAccount;
@@ -10804,13 +12112,35 @@ export async function cmdSetup(manifestPath, options = {}) {
     return result;
   };
   let workerAlreadyExisted;
+  let liveLeaseBrain = null;
   try {
     workerAlreadyExisted = await runPinnedSetupStage(
       "setup Worker inventory",
       (pinnedPath) => detectExistingWorker(pinnedPath),
     );
-    if (workerAlreadyExisted &&
-        (setupExecutionPin.manifest.infrastructure?.cloudflare?.storage || "d1") === "d1") {
+    const usesD1 = (setupExecutionPin.manifest.infrastructure?.cloudflare?.storage || "d1") === "d1";
+    if (workerAlreadyExisted && usesD1) {
+      const probeLiveWorker = options.probeExistingWorkerHealth ?? probeExistingWorkerHealth;
+      liveLeaseBrain = await runPinnedSetupStage(
+        "setup live Worker check",
+        (pinnedPath) => probeLiveWorker(pinnedPath),
+      );
+    }
+    if (liveLeaseBrain) {
+      // A finished brain on the lease protocol is not a cutover candidate. If
+      // it is on another release, setup is the wrong tool and says so before
+      // touching anything; if it is on this one, there is nothing to migrate
+      // or deploy, and setup continues with keys and health, which is what a
+      // resumed setup on a finished brain actually needs.
+      if (liveLeaseBrain.version && liveLeaseBrain.version !== PRODUCT_VERSION) {
+        die(
+          `this brain is already installed and live on version ${liveLeaseBrain.version}; this package is ${PRODUCT_VERSION}.\n` +
+            `      Run \`brain update ${shownTarget}\` to bring it forward. Setup does not update a live brain,\n` +
+            "      and rerunning it here would pause a working one. Nothing was changed."
+        );
+      }
+      ok(`this brain is already installed and live on ${PRODUCT_VERSION}; no cutover, migration or deploy needed`);
+    } else if (workerAlreadyExisted && usesD1) {
       // A resumed setup can encounter a Worker deployed by an older package.
       // Quiesce it with the same compatibility protocol as `brain update`
       // before any new lease columns are applied.
@@ -10873,7 +12203,9 @@ export async function cmdSetup(manifestPath, options = {}) {
     removePinnedExecutionManifest(setupExecutionPin);
     setupExecutionPin = null;
   }
-  if (!workerAlreadyExisted ||
+  if (liveLeaseBrain) {
+    // Already installed, already this release: keys and health come next.
+  } else if (!workerAlreadyExisted ||
       (setupOriginalPin.manifest.infrastructure?.cloudflare?.storage || "d1") !== "d1") {
     // Do not claim quiescence merely because one manifest script name was not
     // found. A genuinely fresh D1 has no install_state row and migrates normally;
@@ -10996,6 +12328,13 @@ export async function cmdSetup(manifestPath, options = {}) {
 
   /* --- 6. the first thing worth looking at --- */
   console.log(`\n  ${c.bold("Step 6 of 6")}  loading something in\n`);
+  // The one moment the first-load order can still be chosen. After this the
+  // archive has already made the first impression, or the slice has.
+  const sliceCheck = checkPrioritySlice(m);
+  if (sliceCheck.status !== D_OK) {
+    warn(sliceCheck.detail);
+    for (const line of sliceCheck.fix.split("\n")) console.log(`  ${c.dim(line.trim() ? "  " + line.trim() : "")}`);
+  }
   const folder = flags.path || (await prompt("A folder to load now (blank to skip)", ""));
   if (folder && existsSync(folder)) {
     process.argv = [process.argv[0], process.argv[1], "ingest", target, "--path", folder, "--source", "documents"];
@@ -11042,6 +12381,32 @@ export async function cmdSetup(manifestPath, options = {}) {
     console.log(`  No AI tool registration was reported. Verify Claude Code with \`brain tools\`, then run:`);
     console.log(`    brain mcp-config ${shownTarget}\n`);
   }
+
+  const probeWarning = emptyProbeQuestionsWarning(m, shownTarget);
+  if (probeWarning) {
+    console.log("");
+    for (const line of probeWarning) warn(line);
+    console.log("");
+  }
+}
+
+/**
+ * Lines warning that an install carries no probe questions, or null when it
+ * has real ones. Without probes the acceptance suite skips its retrieval tier
+ * and can pass without anyone asking the brain a single question, so setup —
+ * the moment someone is present who can still collect the questions — says so
+ * loudly instead of leaving it to be discovered on the report.
+ */
+export function emptyProbeQuestionsWarning(manifest, manifestPath = "brain.manifest.json") {
+  const probes = manifest?.testing?.probe_questions;
+  if (Array.isArray(probes) && probes.some((q) => String(q || "").trim())) return null;
+  return [
+    "testing.probe_questions is EMPTY. The acceptance suite will skip its whole",
+    "retrieval tier, so nothing will ever prove this brain answers the owner's",
+    "questions — a test run can read green without anyone asking it anything.",
+    `Fill testing.probe_questions in ${manifestPath} with the owner's own`,
+    `questions from the intake, then run: brain test ${manifestPath}`,
+  ];
 }
 
 /** Keep install-account custody separate from edits to the operator's machine. */
@@ -11808,8 +13173,15 @@ function crash(err) {
   // that stops the owner from fixing it (bench, 2026-08-28).
   if (isCredentialRejection(err)) {
     console.error(`\n${c.red("fail")}  Cloudflare refused the credential: ${msg}`);
-    console.error("  " + CF_TOKEN_REJECTED_REMEDY.split("\n").join("\n  "));
-    console.error("\n  Nothing was created or half-written. Re-run once the token is right.");
+    if (err && err.credentialSource === "wrangler-session") {
+      console.error("  This credential came from this computer's `wrangler login` session, which has");
+      console.error("  expired (they last about an hour) and could not be renewed. Nobody typed a token.");
+      console.error("  Run `npx wrangler@4 login`, then re-run the same command; it resumes where it stopped.");
+      console.error("\n  Anything created before the refusal is still there and is reused on the re-run.");
+    } else {
+      console.error("  " + CF_TOKEN_REJECTED_REMEDY.split("\n").join("\n  "));
+      console.error("\n  Nothing was created or half-written. Re-run once the token is right.");
+    }
     printSupportReceipt(supportEventId, (line) => console.error(line));
     process.exit(1);
   }
@@ -12150,7 +13522,9 @@ async function reportBacklog(manifestPath) {
     warn(
       `${pending} chunk(s) are queued or awaiting visibility. Until confirmed they are findable` + "\n" +
         "        by keyword and INVISIBLE to meaning-based search, and nothing else reports that." + "\n" +
-        `        Finish it now instead of waiting for the cron:  brain drain ${rel}`
+        "        The scheduled drain finishes this on its own, roughly fifty a minute, and" + "\n" +
+        "        `brain health` shows it moving. Do not run `brain drain` while the cron is" + "\n" +
+        "        scheduled: the two share one lease and a manual run only waits on it."
     );
   } catch {
     // Never fail an ingest because the follow-up report could not be fetched.
@@ -12972,7 +14346,36 @@ async function cmdScheduleFolder(m, manifestPath, action) {
 }
 
 /** Install, inspect, or remove the standard per-client Drive scheduler. */
-async function cmdSchedule(manifestPath) {
+/**
+ * The scheduler is a macOS LaunchAgent. On any other platform the honest
+ * answer is a plain limitation plus the recipe the owner can use instead; a
+ * Windows owner used to get "unexpected error, this is a bug in the installer"
+ * here and concluded the whole system was Apple-only (2026-09-03).
+ */
+export function schedulePlatformLimitation(platform = process.platform, manifestPath = "<manifest>") {
+  if (platform === "darwin") return null;
+  const name = platform === "win32" ? "Windows" : platform;
+  const lines = [
+    `automatic refresh is not scheduled by the installer on ${name} yet; the brain itself, the install, the update and the checkup all work here.`,
+    "      Everything loads when you run it. To make it unattended, create one scheduled task that runs the refresh every hour.",
+  ];
+  if (platform === "win32") {
+    const q = '\\"'; // an escaped quote inside schtasks' /TR string
+    lines.push(
+      "      Find the command first:   where.exe brain",
+      `      Then (fill in both paths): schtasks /Create /F /SC HOURLY /TN "Financial Brain refresh" /TR "cmd /c ${q}${q}<path to brain.cmd>${q} load ${q}${manifestPath}${q} --only drive,calendar,upload${q}"`,
+      `      Run it once by hand first:  brain load "${manifestPath}" --only drive,calendar,upload`,
+    );
+  } else {
+    lines.push(`      For example with cron:     0 * * * * brain load "${manifestPath}" --only drive,calendar,upload`);
+  }
+  lines.push("      Confirm on the next check that `brain sources <manifest>` shows the last-ingest time moving.");
+  return lines.join("\n");
+}
+
+async function cmdSchedule(manifestPath, options = {}) {
+  const limitation = schedulePlatformLimitation(options.platform ?? process.platform, manifestPath);
+  if (limitation) die(limitation);
   if (!manifestPath) {
     die("usage: brain schedule <manifest> [--install|--status|--remove] [--folder]");
   }
@@ -13067,11 +14470,14 @@ function manifestAccountId(manifestPath) {
   try {
     manifest = loadManifest(manifestPath).m;
   } catch (error) {
+    const inWorktree = /[\\/]\.git[\\/]worktrees[\\/]/.test(String(manifestPath || ""));
     die(
       `could not read the install manifest at ${manifestPath || "brain.manifest.json"}: ${error?.message || error}\n` +
         "      Every provisioning command needs it, and nothing has been changed.\n" +
-        "      If you are working in a git worktree, instance files live only in the main checkout:\n" +
-        "      pass the full path to the manifest there."
+        (inWorktree
+          ? "      Instance files live only in the main checkout, not in a git worktree:\n" +
+            "      pass the full path to the manifest there."
+          : "      Check the path, or run `brain init <path>` to write a new manifest with no network and no token.")
     );
   }
   return manifest?.infrastructure?.cloudflare?.account_id || null;
@@ -13079,14 +14485,41 @@ function manifestAccountId(manifestPath) {
 
 async function cmdSetupInteractive(manifestPath) {
   const flags = parseFlags(process.argv.slice(3));
+  // A first install has no manifest yet: cmdSetup writes one from three
+  // questions (or brain init already did). Reading it here, before setup ever
+  // ran, refused every fresh install with CONFIG_INVALID and a hint about git
+  // worktrees, on a laptop that had never seen git. Only an EXISTING manifest
+  // is read for its account; a missing one is setup's job to create.
+  const pending = manifestPath || flags.manifest || "./brain.manifest.json";
   return withCloudflareToken(
     () => cmdSetup(manifestPath, { flags }),
-    { accountId: manifestAccountId(manifestPath) },
+    { accountId: existsSync(pending) ? manifestAccountId(pending) : null },
   );
 }
 
 async function cmdUpgradeInteractive(manifestPath) {
   return withCloudflareToken(() => cmdUpgrade(manifestPath), { accountId: manifestAccountId(manifestPath) });
+}
+
+/**
+ * Give a provisioning command the same credential ladder setup and update
+ * have: an environment token, the browser sign-in session, the credential
+ * stored for this brain's account, and only then a hidden prompt.
+ *
+ * deploy, provision, status and sources read only the first two. On a real
+ * install the failure message after a cron error said "re-run brain deploy",
+ * deploy then said the token was not set and to run setup, and setup was the
+ * one command that would have paused the brain. A dead end made of three
+ * correct sentences. The stored credential existed the whole time.
+ */
+const withStoredCloudflareToken = (command) => (manifestPath) =>
+  withCloudflareToken(() => command(manifestPath), { accountId: manifestAccountId(manifestPath) });
+
+/** A custom domain needs no Cloudflare control-plane credential to run check. */
+async function cmdCheckInteractive(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  if (m.brain?.domain) return cmdCheck(manifestPath);
+  return withStoredCloudflareToken(cmdCheck)(manifestPath);
 }
 
 /**
@@ -13152,6 +14585,69 @@ async function cmdTechnicianInteractive(manifestPath) {
  * caller really has a TTY. This keeps release tests deterministic while still
  * giving the owner Anthropic's own installation diagnosis on install day.
  */
+
+/**
+ * Make `brain` survive a new terminal.
+ *
+ * The install puts the CLI under a user npm prefix (no sudo on a Mac), and the
+ * page has the client export that prefix's bin for the current session only.
+ * Close the terminal and `brain` is gone, which on a real install read as the
+ * product having uninstalled itself, twice, on one machine. Login and
+ * non-login shells read different files, so all three are written: zsh reads
+ * .zshrc, a login bash reads .bash_profile, an interactive non-login bash
+ * reads .bashrc. Idempotent: a file that already names the directory is left
+ * alone. Windows has no profile to append to; the folder is named instead.
+ */
+export function persistCliPath({
+  binDir,
+  home = process.env.HOME || "",
+  platform = process.platform,
+  existsSync: exists = existsSync,
+  readFileSync: read = readFileSync,
+  appendFileSync: append = appendFileSync,
+} = {}) {
+  if (!binDir) return { action: "skipped", reason: "no bin directory" };
+  if (platform === "win32") {
+    return { action: "manual", reason: `add ${binDir} to PATH through System Properties, Environment Variables (never setx)` };
+  }
+  // Only a user prefix needs this. /usr/local/bin and Homebrew are on PATH already.
+  if (!/npm-global/.test(binDir)) return { action: "skipped", reason: "system prefix is already on PATH" };
+  const line = `export PATH="${binDir}:$PATH"`;
+  const written = [];
+  const present = [];
+  for (const name of [".zshrc", ".bash_profile", ".bashrc"]) {
+    const file = join(home, name);
+    let current = "";
+    try { current = exists(file) ? read(file, "utf8") : ""; } catch { current = ""; }
+    if (current.includes(binDir)) { present.push(name); continue; }
+    try {
+      append(file, `${current && !current.endsWith("\n") ? "\n" : ""}\n# Financial Brain CLI (added by brain tools)\n${line}\n`);
+      written.push(name);
+    } catch (error) {
+      return { action: "failed", reason: `${name}: ${String(error?.message || error).slice(0, 120)}`, written, present };
+    }
+  }
+  return { action: written.length ? "written" : "present", written, present, line };
+}
+
+/** The bin directory this running CLI was launched from, or null. */
+export function runningCliBinDir(argv1 = process.argv[1], platform = process.platform) {
+  if (!argv1) return null;
+  let real = argv1;
+  try { real = realpathSync(argv1); } catch { /* keep the given path */ }
+  // Normalise both separator styles: a Windows path is examined on a Mac in
+  // tests, and a resolved path can mix them.
+  const normalised = real.replace(/\\/g, "/");
+  const marker = "/lib/node_modules/";
+  const at = normalised.indexOf(marker);
+  if (at === -1) {
+    // Windows global installs live directly under the prefix.
+    const win = normalised.indexOf("/node_modules/");
+    return platform === "win32" && win !== -1 ? normalised.slice(0, win) : null;
+  }
+  return `${normalised.slice(0, at)}/bin`;
+}
+
 export async function cmdLocalTools(options = {}) {
   const runCommand = options.runCommand ?? run;
   const claude = checkClaudeCode({ runCommand, required: true });
@@ -13196,6 +14692,19 @@ export async function cmdLocalTools(options = {}) {
     else ok(`${label} skill /financial-brain-technician ${r.status}`);
   }
   info("In either tool, type `/financial-brain-technician` to begin the guided plan.");
+
+  // Persist the CLI's own bin directory before anything else can go wrong,
+  // so a new terminal still has `brain` even if the rest of this stops.
+  const pathResult = (options.persistCliPath ?? persistCliPath)({
+    binDir: options.cliBinDir ?? runningCliBinDir(),
+  });
+  if (pathResult.action === "written") {
+    ok(`brain will be on PATH in new terminals (${pathResult.written.join(", ")})`);
+  } else if (pathResult.action === "manual") {
+    info(`so brain works in a new terminal: ${pathResult.reason}`);
+  } else if (pathResult.action === "failed") {
+    warn(`could not persist the CLI path: ${pathResult.reason}`);
+  }
 
   const hasTty = options.isTTY ?? (process.stdin.isTTY === true && process.stdout.isTTY === true);
   if (!hasTty) {
@@ -13243,13 +14752,16 @@ async function cmdGrant(manifestPath) {
     : [];
   if (!displayName || !capabilities.length) {
     die(
-      "usage: brain grant <manifest> --name \"Their name\" --can ask,file [--zones books,legal] [--until YYYY-MM-DD]\n" +
+      "usage: brain grant <manifest> --name \"Their name\" --can ask,file [--zones books,legal] [--exclude-zones medical] [--until YYYY-MM-DD]\n" +
       "      capabilities: ask, file, diagnose, destroy",
     );
   }
   const zones = typeof flags.zones === "string" && flags.zones.trim()
     ? flags.zones.split(",").map((value) => value.trim()).filter(Boolean)
     : null;
+  const excludeZones = typeof flags["exclude-zones"] === "string" && flags["exclude-zones"].trim()
+    ? flags["exclude-zones"].split(",").map((value) => value.trim()).filter(Boolean)
+    : [];
   let expiresAt = null;
   if (typeof flags.until === "string" && flags.until.trim()) {
     expiresAt = Date.parse(`${flags.until.trim()}T23:59:59Z`);
@@ -13269,6 +14781,7 @@ async function cmdGrant(manifestPath) {
       relationship: typeof flags.as === "string" ? flags.as : null,
       capabilities,
       zones,
+      exclude_zones: excludeZones,
       expires_at: expiresAt,
     }),
   }, { timeoutMs: 30_000, what: "the access grant" });
@@ -13312,7 +14825,15 @@ async function cmdGrants(manifestPath) {
     const state = grant.revoked_at ? "revoked" : grant.expires_at && Number(grant.expires_at) <= Date.now() ? "expired" : "active";
     let capabilities = grant.capabilities;
     try { capabilities = JSON.parse(grant.capabilities).join(", "); } catch { /* display stored value */ }
-    console.log(`  ${state}  ${grant.display_name}  ${capabilities}  ${grant.grant_id}`);
+    const included = grant.scope?.all === true
+      ? "all zones"
+      : Array.isArray(grant.scope?.zones) && grant.scope.zones.length
+        ? grant.scope.zones.join(",")
+        : "no zones";
+    const excluded = Array.isArray(grant.scope?.exclude) && grant.scope.exclude.length
+      ? ` except ${grant.scope.exclude.join(",")}`
+      : "";
+    console.log(`  ${state}  ${grant.display_name}  ${capabilities}  scope: ${included}${excluded}  ${grant.grant_id}`);
   }
   return result;
 }
@@ -13338,9 +14859,25 @@ async function cmdZone(manifestPath) {
   const result = await response.json();
   if (result.zones) {
     if (!result.zones.length) info("Nothing is loaded yet, so there are no zones.");
-    for (const row of result.zones) console.log(`  ${row.zone}  ${row.chunks} chunk(s) from ${row.sources} source(s)`);
+    for (const row of result.zones) {
+      console.log(`  ${row.zone}  ${row.documents || 0} document(s), ${row.chunks} chunk(s) from ${row.sources} source(s)`);
+    }
   } else {
-    ok(`"${result.source}" is now in zone "${result.zone}" (${result.documents} document(s), ${result.chunks} chunk(s))`);
+    ok(`Access for "${result.source}" now uses zone "${result.zone}" (${result.documents} document(s), ${result.chunks} chunk(s))`);
+    const repaired = result.projection_repaired || {};
+    const repairedDocuments = Number(repaired.documents || 0);
+    const repairedChunks = Number(repaired.chunks || 0);
+    if (result.projection_repair_required) {
+      const pending = result.projection_pending || {};
+      warn(
+        `Access is active from the source registry. This pass repaired ${repairedDocuments} document and ` +
+        `${repairedChunks} chunk projection(s); ${Number(pending.documents || 0)} document and ` +
+        `${Number(pending.chunks || 0)} chunk projection(s) remain. Rerun this same ` +
+        "`brain zone` command until none remain."
+      );
+    } else if (repairedDocuments || repairedChunks) {
+      ok(`Zone projection repair is complete (${repairedDocuments} document(s), ${repairedChunks} chunk(s) repaired in this pass)`);
+    }
   }
   return result;
 }
@@ -13540,6 +15077,811 @@ async function dispatchDoctor(manifestPath) {
 }
 
 /* ------------------------------------------------- brain import bank ----- */
+
+/* ------------------------------------ the named connector providers: catalog,
+   connect, disconnect and one-off ingest. Every helper reaches connectors/
+   through a dynamic import, so nothing here is a new module-level
+   dependency. cmdConnect and cmdDisconnect, the dispatcher wrappers around
+   these, are deliberately NOT ported: they route through the field line's
+   account-first Cloudflare OAuth ceremony, which this port keeps out. */
+
+export function providerConfigurationFingerprint(provider, source, configuration, identity = null) {
+  const canonical = (value) => {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (value && typeof value === "object") {
+      return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+    }
+    return JSON.stringify(value);
+  };
+  // Preserve the released v1 bytes for every non-QuickBooks provider so this
+  // hardening cannot reset their cursors or configuration receipts. QBO alone
+  // adds the canonical company identity to its v2 fingerprint.
+  const payload = provider === "quickbooks"
+    ? {
+        version: 2,
+        provider,
+        source,
+        configuration,
+        qbo_company_fingerprint: identity?.qbo_company_fingerprint || null,
+      }
+    : { version: 1, provider, source, configuration };
+  return createHash("sha256").update(canonical(payload)).digest("hex");
+}
+
+async function providerSyncImplementation(provider) {
+  if (provider === "quickbooks") return (await import("./connectors/quickbooks-online.mjs")).syncQuickBooksOnline;
+  if (provider === "slack") return (await import("./connectors/slack.mjs")).syncSlack;
+  if (provider === "notion") return (await import("./connectors/notion.mjs")).syncNotion;
+  if (provider === "microsoft") return (await import("./connectors/microsoft-graph.mjs")).syncMicrosoftGraph;
+  if (provider === "dropbox") return (await import("./connectors/dropbox.mjs")).syncDropbox;
+  if (provider === "hubspot") return (await import("./connectors/hubspot.mjs")).syncHubSpot;
+  throw new TypeError(`unsupported provider connector ${provider}`);
+}
+
+function providerAdapterOptions(provider, configuration, connection) {
+  if (provider === "quickbooks") {
+    return {
+      realmId: connection?.provider_metadata?.realm_id,
+      apiBase: configuration.environment === "production"
+        ? "https://quickbooks.api.intuit.com"
+        : "https://sandbox-quickbooks.api.intuit.com",
+      entities: configuration.entities,
+      minorVersion: configuration.minor_version || null,
+      expectedCompanyFingerprint: connection?.provider_metadata?.qbo_company_fingerprint || null,
+    };
+  }
+  if (provider === "slack") return {
+    channelIds: configuration.channel_ids,
+    maxThreadsPerChannel: configuration.include_thread_replies === false ? 0 : 5_000,
+  };
+  if (provider === "microsoft") return {
+    mailFolderIds: configuration.mail_folder_ids,
+    driveIds: configuration.drive_ids,
+    siteIds: configuration.site_ids,
+    includePersonalDrive: configuration.include_personal_drive !== false,
+  };
+  if (provider === "dropbox") return { rootPath: configuration.root_path || "" };
+  if (provider === "hubspot") return { objectTypes: configuration.object_types };
+  return {};
+}
+
+/** Run one OAuth provider through common receipts, retries, tombstones, and cursor custody. */
+export async function cmdIngestProvider(m, manifestPath, flags, options = {}) {
+  const provider = String(flags.from || "").toLowerCase();
+  if (!PROVIDER_CONNECTOR_IDS.includes(provider)) throw new TypeError(`unsupported provider connector ${provider}`);
+  if (flags.limit) die(`--limit is unsafe for ${provider}; it would skip records covered by the provider cursor.`);
+  const configuration = m?.corpora?.[provider] || {};
+  if (configuration.enabled !== true) {
+    die(`corpora.${provider}.enabled is not true in this manifest. Enable it before connecting or ingesting.`);
+  }
+  const sourceName = assertSourceName(
+    flags.source === true || !flags.source ? configuration.source || provider : flags.source,
+  );
+  const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
+  const syncImpl = options.sync ?? await providerSyncImplementation(provider);
+  const loadAccess = (quickBooksBinding = null) => oauth.providerAccessToken(provider, {
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    ...(options.storage ? { storage: options.storage } : {}),
+    ...(quickBooksBinding ? { quickBooksBinding } : {}),
+  });
+  let preparedAccess = null;
+  let identity = null;
+  if (provider === "quickbooks") {
+    if (typeof oauth.assertQuickBooksSourceBinding !== "function" ||
+        typeof oauth.loadQuickBooksCredentials !== "function") {
+      throw new Error("the QuickBooks OAuth module cannot safely load and verify its company binding");
+    }
+    const expectedBinding = { source: sourceName, environment: configuration.environment };
+    const stored = await oauth.loadQuickBooksCredentials(options.storage || {});
+    if (stored) oauth.assertQuickBooksSourceBinding(stored, expectedBinding);
+    preparedAccess = await loadAccess(expectedBinding);
+    const binding = oauth.assertQuickBooksSourceBinding(preparedAccess.connection, {
+      source: sourceName,
+      environment: configuration.environment,
+    });
+    identity = { qbo_company_fingerprint: binding.qbo_company_fingerprint };
+  }
+  const fingerprint = providerConfigurationFingerprint(provider, sourceName, configuration, identity);
+  const resolveAccess = () => preparedAccess ? Promise.resolve(preparedAccess) : loadAccess();
+  const loadState = () => oauth.loadProviderSyncState(provider, sourceName, options.storage || {});
+  const saveState = (state) => oauth.saveProviderSyncState(provider, sourceName, state, options.storage || {});
+  const adapter = ({ cursor, access }) => syncImpl({
+    accessToken: access.accessToken,
+    connection: access.connection,
+    cursor,
+    ...providerAdapterOptions(provider, configuration, access.connection),
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+  });
+
+  if (flags["dry-run"]) {
+    const stored = flags.reset ? {} : await loadState();
+    const cursor = stored?.configuration_fingerprint === fingerprint ? stored.cursor ?? null : null;
+    const result = await adapter({ cursor, access: await resolveAccess() });
+    info(`${result.documents.length} document(s) would be sent; ${result.deletions.length} exact tombstone(s) would be applied.`);
+    for (const warning of result.warnings || []) warn(warning);
+    ok("dry run, no brain document, deletion, source receipt, or provider cursor was changed");
+    return { dry_run: true, result };
+  }
+
+  const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+  if (!adminKey) {
+    die("no durable admin key was found. Re-run `brain setup <manifest>` to generate and persist one.");
+  }
+  const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, m.brain?.domain ? null : await (options.resolveAccount ?? resolveAccount)(m));
+  const runtime = options.runtime ?? await import("./connectors/provider-runtime.mjs");
+  let result;
+  try {
+    result = await runtime.runProviderConnector({
+      provider,
+      source: sourceName,
+      kind: provider,
+      configurationFingerprint: fingerprint,
+      sync: async ({ cursor, accessToken, connection }) => adapter({
+        cursor,
+        access: { accessToken, connection },
+      }),
+      resolveAccess,
+      loadState,
+      saveState,
+      sendBatch: options.requestIngestBatch ?? requestIngestBatch,
+      removeDocuments: options.applyDriveRemovals ?? applyDriveRemovals,
+      listStoredFamilies: options.listStoredSourceFamilies ?? listStoredSourceFamilies,
+      postReceipt: options.postSourceReceipt ?? postSourceReceipt,
+      base,
+      adminKey,
+      reset: Boolean(flags.reset),
+      approvedSnapshotFingerprint: flags["approve-removals"] === true || !flags["approve-removals"]
+        ? null
+        : String(flags["approve-removals"]).toLowerCase(),
+    });
+  } catch (error) {
+    if (["provider_snapshot_removal_review_required", "provider_removal_review_required"].includes(error?.code)) die(error.message);
+    throw error;
+  }
+  const tally = result.tally;
+  ok(`${provider} sync: ${tally.created} created, ${tally.updated} updated, ${tally.unchanged} unchanged, ${result.removed} removed`);
+  if (result.outcome.kind !== "completed") warn(result.outcome.reason || `${provider} completed with an explicit coverage gap`);
+  info(result.cursor_advanced ? "the terminal provider cursor was saved" : "no provider cursor was advanced");
+  return result;
+}
+
+export async function cmdConnectProvider(provider, manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die(`usage: brain connect ${provider} <manifest> [--port <number>]`);
+  }
+  const { m } = loadManifest(manifestPath);
+  const configuration = m?.corpora?.[provider] || {};
+  if (configuration.enabled !== true) {
+    die(`corpora.${provider}.enabled is not true in this manifest. Enable it before connecting.`);
+  }
+  const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
+  const config = oauth.providerOAuthConfig(provider);
+  const storage = options.storage || {};
+  const prefix = provider.toUpperCase().replace(/-/g, "_");
+  const environment = options.environment || process.env;
+  const suppliedCredentials = options.credentials || {};
+  const source = assertSourceName(configuration.source || provider);
+  if (provider === "quickbooks" && !["sandbox", "production"].includes(configuration.environment)) {
+    const error = new Fatal("corpora.quickbooks.environment must explicitly be sandbox or production before connecting.");
+    error.code = "quickbooks_environment_required";
+    throw error;
+  }
+  if (provider === "quickbooks" && configuration.environment === "production") {
+    const error = new Fatal(
+      "QuickBooks production connection is not available in this release. Intuit production OAuth needs a client-owned HTTPS callback with a single-use local handoff; the loopback callback is sandbox-only. No credential or browser flow was opened.",
+    );
+    error.code = "quickbooks_production_callback_unavailable";
+    throw error;
+  }
+  const port = flags.port ? Number(flags.port) : oauth.PROVIDER_DEFAULT_PORT;
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) die("--port must be an integer from 1024 through 65535");
+  const redirectHost = provider === "quickbooks"
+    ? String(configuration.redirect_host || config.loopbackRedirectHost || "localhost").toLowerCase()
+    : "127.0.0.1";
+  if (provider === "quickbooks" && !["localhost", "127.0.0.1"].includes(redirectHost)) {
+    const error = new Fatal(
+      "corpora.quickbooks.redirect_host must be localhost or 127.0.0.1. The callback listener remains local-only.",
+    );
+    error.code = "quickbooks_redirect_host_invalid";
+    throw error;
+  }
+  if (provider === "quickbooks" && typeof oauth.quickBooksSandboxRedirectUri !== "function") {
+    throw new Error("the QuickBooks OAuth module cannot construct its sandbox callback");
+  }
+  const redirectUri = provider === "quickbooks"
+    ? oauth.quickBooksSandboxRedirectUri(port, redirectHost)
+    : oauth.providerRedirectUri(port);
+  const prior = provider === "quickbooks"
+    ? await oauth.loadQuickBooksCredentials(storage)
+    : oauth.loadProviderCredentials(provider, storage);
+  const clientId = suppliedCredentials.clientId || environment[`${prefix}_CLIENT_ID`] || prior?.client_id || null;
+  const clientSecret = suppliedCredentials.clientSecret || environment[`${prefix}_CLIENT_SECRET`] || prior?.client_secret || null;
+  if (!clientId || (config.clientSecretRequired && !clientSecret)) {
+    const required = [`${prefix}_CLIENT_ID`, ...(config.clientSecretRequired ? [`${prefix}_CLIENT_SECRET`] : [])];
+    die(
+      `${required.join(" and ")} ${required.length === 1 ? "is" : "are"} not available.\n` +
+        `      Create the OAuth app in the owner's ${config.label} account, register ` +
+        `${redirectUri}, and inject ` +
+        "the value through the approved local launcher. Do not put it in the manifest or command line."
+    );
+  }
+  if (!options.quiet && prior && !suppliedCredentials.clientId && !environment[`${prefix}_CLIENT_ID`]) {
+    info(`reusing the ${config.label} OAuth client already stored on this machine`);
+  }
+  if (!options.quiet && provider === "quickbooks") {
+    info(`QuickBooks environment: ${configuration.environment} (selected by corpora.quickbooks.environment)`);
+    info("Intuit's Accounting scope can read and update accounting data. Financial Brain uses only read/query calls, but the consent screen grants that broader provider permission.");
+  }
+  if (!options.quiet) info(`requesting the manifest-enabled ${config.label} connection in the owner's browser`);
+  const connection = await oauth.authorizeProvider(provider, {
+    clientId,
+    clientSecret,
+    port,
+    redirectHost,
+    redirectUri,
+    storage,
+    ...(provider === "quickbooks"
+      ? {
+          prepareConnection: (candidate, custody = {}) => {
+            if (typeof oauth.bindQuickBooksConnection !== "function") {
+              throw new Error("the QuickBooks OAuth module cannot bind the authorized company");
+            }
+            return oauth.bindQuickBooksConnection({
+              prior: custody.prior,
+              candidate,
+              source,
+              environment: configuration.environment,
+              sourceRegistry: custody.sourceRegistry,
+            });
+          },
+        }
+      : {}),
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    ...(options.openImpl ? { openImpl: options.openImpl } : {}),
+    ...(options.open === false ? { open: false } : {}),
+    ...(options.quiet ? { log: () => {} } : options.log ? { log: options.log } : {}),
+  });
+  if (provider === "quickbooks" && !connection?.provider_metadata?.realm_id) {
+    const error = new Fatal("QuickBooks did not return a company identity, so the connection cannot be used safely.");
+    error.code = "quickbooks_realm_missing";
+    throw error;
+  }
+  if (provider === "quickbooks") {
+    if (typeof oauth.assertQuickBooksSourceBinding !== "function") {
+      throw new Error("the QuickBooks OAuth module cannot verify the stored company binding");
+    }
+    oauth.assertQuickBooksSourceBinding(connection, {
+      source,
+      environment: configuration.environment,
+    });
+  }
+  if (!options.quiet) {
+    ok(`connected. Credential stored in ${oauth.providerCredentialDescription(provider, storage)} (on this machine only)`);
+    info(`now run: brain ingest ${manifestPath} --from ${provider} --dry-run`);
+    info(`after review: brain schedule ${manifestPath} --provider ${provider} --install`);
+  }
+  return { provider, connected: true, storage: oauth.providerCredentialDescription(provider, storage) };
+}
+
+export async function cmdDisconnectProvider(provider, manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die(`usage: brain disconnect ${provider} <manifest>`);
+  }
+  const { m } = loadManifest(manifestPath);
+  const configuration = m?.corpora?.[provider] || {};
+  const source = assertSourceName(configuration.source || provider);
+  const scheduler = options.scheduler ?? await import("./operations/provider-scheduler.mjs");
+  try {
+    const removed = scheduler.removeProviderScheduler(provider, manifestPath, options.schedulerOptions || {});
+    ok(removed.removed || removed.loaded
+      ? `${provider} refresh schedule removed`
+      : `${provider} refresh schedule was not installed`);
+  } catch (error) {
+    warn(`the ${provider} schedule could not be inspected or removed: ${String(error?.message || error).slice(0, 180)}`);
+  }
+
+  const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
+  const result = await oauth.disconnectProvider(provider, {
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    storage: options.storage || {},
+    ...(provider === "quickbooks"
+      ? { source, environment: configuration.environment }
+      : {}),
+  });
+  if (result.already_disconnected) ok(`${oauth.providerOAuthConfig(provider).label} was already disconnected locally`);
+  else if (result.remote_revoked) ok(`${oauth.providerOAuthConfig(provider).label} grant revoked, then local credentials removed`);
+  else ok(`${oauth.providerOAuthConfig(provider).label} local credentials removed`);
+  if (result.remote_revocation_required) {
+    warn(result.remote_revocation_note ||
+      `the provider has no dependable revoke call in this connector; remove the app grant in the owner's ${oauth.providerOAuthConfig(provider).label} account`);
+  }
+
+  try {
+    const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+    if (!adminKey) throw new Error("no admin key is available");
+    const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, null);
+    await (options.postSourceExpectation ?? postSourceExpectation)(base, adminKey, {
+      source, kind: provider, expected_refresh_seconds: null,
+    });
+    ok(`${source} freshness expectation cleared`);
+  } catch (error) {
+    warn(`the provider is disconnected, but its remote freshness expectation could not be cleared: ${String(error?.message || error).slice(0, 160)}`);
+  }
+  info(
+    `imported documents remain in the brain. When removal is wanted, separately review the preview from: ` +
+    `brain forget ${manifestPath} --source ${source}`,
+  );
+  if (provider === "quickbooks") {
+    info(
+      `the local source name "${source}" remains reserved for this QuickBooks company; ` +
+      "a different company can be connected with a new source name",
+    );
+  }
+  return provider === "quickbooks"
+    ? {
+        ...result,
+        source,
+        imported_documents_retained: true,
+        forget_operation_required: true,
+        source_company_binding_retained: true,
+      }
+    : result;
+}
+
+export async function cmdConnectors(flags = parseFlags(process.argv.slice(3)), options = {}) {
+  const catalog = options.catalog ?? await import("./connectors/catalog.mjs");
+  const provider = flags.provider === true || !flags.provider ? null : String(flags.provider).toLowerCase();
+  let entries;
+  try {
+    entries = catalog.connectorCatalog({ provider });
+  } catch (error) {
+    die(error.message);
+  }
+  console.log(catalog.renderConnectorCatalog(entries));
+  if (!flags.rehearse) return { entries, rehearsal: null };
+
+  const rehearsal = options.rehearsal ?? await import("./connectors/offline-rehearsal.mjs");
+  const originalFetch = globalThis.fetch;
+  let globalFetchAttempts = 0;
+  globalThis.fetch = async () => {
+    globalFetchAttempts += 1;
+    throw Object.assign(new Error("offline rehearsal blocked an un-injected network request"), { code: "GLOBAL_FETCH_BLOCKED" });
+  };
+  let receipt;
+  try {
+    receipt = await rehearsal.runProviderRehearsal({ provider });
+  } catch (error) {
+    die(error.message);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  if (globalFetchAttempts) {
+    receipt = { ...receipt, passed: false, network_used: true };
+  }
+  console.log("\n" + rehearsal.renderProviderRehearsal(receipt));
+  if (!receipt.passed) die("one or more offline connector rehearsals failed");
+  return { entries, rehearsal: receipt };
+}
+
+/* ---------------------------------- QuickBooks reconciliation and the
+   owner-only bank connect page. Ported from the field line: every helper
+   these need already lives in connectors/, reached by dynamic import, so
+   this block carries no new module-level dependency. */
+
+function quickBooksReconciliationScope(flags) {
+  const required = ["account", "qbo-account", "from", "to", "direction"];
+  const missing = required.filter((name) => flags[name] === undefined || flags[name] === true || String(flags[name]).trim() === "");
+  if (missing.length) {
+    const error = new Fatal(`QuickBooks reconciliation needs ${missing.map((name) => `--${name} <value>`).join(", ")}.`);
+    error.code = "reconciliation_scope_required";
+    throw error;
+  }
+  return {
+    account_slug: String(flags.account),
+    qbo_account_id: String(flags["qbo-account"]),
+    period_start: String(flags.from),
+    period_end: String(flags.to),
+    direction: String(flags.direction).toLowerCase(),
+    currency: String(flags.currency === true || !flags.currency ? "USD" : flags.currency).toUpperCase(),
+  };
+}
+
+function renderQuickBooksReconciliation(result) {
+  console.log("");
+  console.log(`${c.bold("QuickBooks books reality check")}\n`);
+  info(`Status: ${result.status}`);
+  if (result.coverage) info(`Coverage: QuickBooks ${result.coverage.quickbooks}; bank ${result.coverage.bank}`);
+  if (Number.isInteger(result.qbo_total_minor) && Number.isInteger(result.bank_total_minor)) {
+    info(`Compared reference totals in minor units: QuickBooks ${result.qbo_total_minor}; bank ${result.bank_total_minor}`);
+  }
+  const counts = new Map();
+  for (const item of result.classifications || []) counts.set(item.classification, (counts.get(item.classification) || 0) + 1);
+  for (const [name, count] of counts) info(`${name}: ${count}`);
+  if (result.recovery) warn(result.recovery);
+  info("QuickBooks is an accounting-team reference, not financial authority. No source record or winning claim was changed.");
+}
+
+/**
+ * Compare one explicitly paired QuickBooks cash account and bank-ledger account.
+ * The live Intuit read stays on the owner machine; only normalized, cited money
+ * lines cross into the client's own Brain for an idempotent ledger comparison.
+ */
+export async function cmdReconcileQuickBooks(manifestPath, flags = {}, options = {}) {
+  assertKnownFlags(
+    flags,
+    ["account", "qbo-account", "from", "to", "direction", "currency", "json", "status", "retry"],
+    "brain reconcile quickbooks",
+  );
+  const scope = quickBooksReconciliationScope(flags);
+  try {
+    const { m } = loadManifest(manifestPath);
+    const configuration = m?.corpora?.quickbooks || {};
+    if (configuration.enabled !== true) {
+      const error = new Fatal("corpora.quickbooks.enabled is not true in this manifest. Enable and ingest it before reconciliation.");
+      error.code = "quickbooks_not_enabled";
+      throw error;
+    }
+    if (!["sandbox", "production"].includes(configuration.environment)) {
+      const error = new Fatal("corpora.quickbooks.environment must explicitly be sandbox or production.");
+      error.code = "quickbooks_environment_required";
+      throw error;
+    }
+    const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+    if (!adminKey) {
+      const error = new Fatal("no durable admin key was found for the client-owned Brain.");
+      error.code = "admin_key_unavailable";
+      throw error;
+    }
+    const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, null);
+    const post = options.postReconciliation || postQuickBooksBankReconciliation;
+    let payload = { ...scope };
+    if (flags.status) {
+      payload.action = "status";
+    } else {
+      const oauth = options.oauth ?? await import("./connectors/provider-oauth.mjs");
+      const qbo = options.quickbooks ?? await import("./connectors/quickbooks-online.mjs");
+      if (typeof oauth.assertQuickBooksSourceBinding !== "function" ||
+          typeof oauth.loadQuickBooksCredentials !== "function") {
+        throw new Error("the QuickBooks OAuth module cannot safely load and verify its company binding");
+      }
+      const sourceName = assertSourceName(configuration.source || "quickbooks");
+      const expectedBinding = { source: sourceName, environment: configuration.environment };
+      const stored = await oauth.loadQuickBooksCredentials(options.storage || {});
+      if (stored) oauth.assertQuickBooksSourceBinding(stored, expectedBinding);
+      const access = await oauth.providerAccessToken("quickbooks", {
+        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+        ...(options.storage ? { storage: options.storage } : {}),
+        quickBooksBinding: expectedBinding,
+      });
+      const binding = oauth.assertQuickBooksSourceBinding(access.connection, {
+        source: sourceName,
+        environment: configuration.environment,
+      });
+      const realmId = access.connection?.provider_metadata?.realm_id;
+      const companyFingerprint = qbo.quickBooksCompanyFingerprint(realmId);
+      if (binding.qbo_company_fingerprint !== companyFingerprint) {
+        const error = new Fatal("the QuickBooks source binding does not match the authorized company.");
+        error.code = "wrong_realm";
+        throw error;
+      }
+      const configured = Array.isArray(configuration.entities) ? configuration.entities : qbo.QBO_DEFAULT_ENTITIES;
+      const entities = qbo.QBO_RECONCILIATION_ENTITIES.filter((name) => configured.includes(name));
+      if (!entities.length) {
+        const error = new Fatal("the manifest enables no deterministic QuickBooks cash-account record types for reconciliation.");
+        error.code = "qbo_reconciliation_entities_unavailable";
+        throw error;
+      }
+      const snapshot = await qbo.syncQuickBooksOnline({
+        realmId,
+        accessToken: access.accessToken,
+        apiBase: configuration.environment === "production"
+          ? "https://quickbooks.api.intuit.com"
+          : "https://sandbox-quickbooks.api.intuit.com",
+        entities,
+        minorVersion: configuration.minor_version || null,
+        expectedCompanyFingerprint: companyFingerprint,
+        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      });
+      const lines = [];
+      for (const document of snapshot.documents || []) {
+        for (const line of document?.metadata?.reconciliation_lines || []) {
+          if (String(line.qbo_account_id) !== scope.qbo_account_id || line.direction !== scope.direction ||
+              String(line.currency).toUpperCase() !== scope.currency ||
+              line.posted_on < scope.period_start || line.posted_on > scope.period_end) continue;
+          lines.push({
+            ...line,
+            qbo_company_fingerprint: companyFingerprint,
+            source_doc_uid: `${sourceName}:${document.source_id}`,
+          });
+        }
+      }
+      payload = {
+        ...payload,
+        qbo_company_fingerprint: companyFingerprint,
+        qbo_coverage: "present_snapshot_partial",
+        qbo_lines: lines,
+      };
+    }
+    const result = await post({ base, adminKey, payload, fetchImpl: options.fetchImpl || fetch });
+    if (flags.json) console.log(JSON.stringify(result, null, 2));
+    else renderQuickBooksReconciliation(result);
+    return result;
+  } catch (error) {
+    if (flags.json) {
+      if (error instanceof JsonFatal) throw error;
+      const payload = error?.payload || {
+        schema_version: 1,
+        command: flags.status ? "reconcile.quickbooks_bank.status" : "reconcile.quickbooks_bank",
+        status: "error",
+        error_code: error?.code || "qbo_reconciliation_failed",
+        recovery: error?.code
+          ? String(error.message || error)
+          : "The bounded comparison failed without a trusted receipt. Verify the named connections and retry the exact same command.",
+        financial_authority: false,
+        mutated_source_records: false,
+      };
+      throw new JsonFatal(payload);
+    }
+    die(String(error?.message || error));
+  }
+}
+
+function readOwnerOnlyTaxClaim(path) {
+  const absolute = resolve(String(path || ""));
+  let pathBefore;
+  let fd;
+  try {
+    pathBefore = lstatSync(absolute);
+    fd = openSync(absolute, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+  } catch {
+    const error = new Fatal("the tax claim file could not be read");
+    error.code = "tax_claim_file_unavailable";
+    throw error;
+  }
+  try {
+    const before = fstatSync(fd);
+    if (!pathBefore.isFile() || pathBefore.isSymbolicLink() || !before.isFile() ||
+        pathBefore.dev !== before.dev || pathBefore.ino !== before.ino ||
+        before.size < 2 || before.size > 64 * 1024) {
+      const error = new Fatal("the tax claim must be a bounded regular file, not a link");
+      error.code = "tax_claim_file_unsafe";
+      throw error;
+    }
+    if (process.platform !== "win32" &&
+        ((before.mode & 0o777) !== 0o600 || (typeof process.getuid === "function" && before.uid !== process.getuid()))) {
+      const error = new Fatal("the tax claim file must be owned by the current user with mode 0600");
+      error.code = "tax_claim_file_not_owner_only";
+      throw error;
+    }
+    let parsed;
+    try { parsed = JSON.parse(readFileSync(fd, "utf8")); } catch {
+      const error = new Fatal("the tax claim file is not valid JSON");
+      error.code = "tax_claim_file_invalid";
+      throw error;
+    }
+    const after = fstatSync(fd);
+    const pathAfter = lstatSync(absolute);
+    if (!pathAfter.isFile() || pathAfter.isSymbolicLink() || pathAfter.dev !== before.dev ||
+        pathAfter.ino !== before.ino || after.dev !== before.dev || after.ino !== before.ino ||
+        after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+      const error = new Fatal("the tax claim file changed while it was being read");
+      error.code = "tax_claim_file_changed";
+      throw error;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      const error = new Fatal("the tax claim JSON must be one object");
+      error.code = "tax_claim_file_invalid";
+      throw error;
+    }
+    return parsed;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+async function postTaxQuickBooksReconciliation({ base, adminKey, payload, fetchImpl = fetch }) {
+  return retryTransient(async () => {
+    const res = await http(`${base}/api/fin/reconcile/tax-quickbooks`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }, { timeoutMs: 60_000, what: "the human-confirmed tax and QuickBooks comparison", fetchImpl });
+    let raw;
+    try {
+      raw = await res.text();
+    } catch (error) {
+      error.retryable = true;
+      throw error;
+    }
+    let body;
+    try { body = JSON.parse(raw); } catch {
+      const error = new Error("the brain returned an invalid tax comparison response");
+      error.retryable = res.status >= 500;
+      throw error;
+    }
+    if (!res.ok) {
+      const error = new Error(body.recovery || body.error || "the tax comparison was refused");
+      error.code = body.error_code || body.code || "tax_qbo_reconciliation_refused";
+      error.payload = body;
+      error.retryable = false;
+      throw error;
+    }
+    return body;
+  }, {
+    attempts: 3,
+    delayMs: 500,
+    maxDelayMs: 2_000,
+    shouldRetry: (error) => error?.retryable !== false,
+  });
+}
+
+function renderTaxQuickBooksReconciliation(result) {
+  console.log("");
+  console.log(`${c.bold("Human-confirmed tax and QuickBooks review")}\n`);
+  info(`Status: ${result.status}`);
+  if (result.recovery) warn(result.recovery);
+  info("Both values remain human-confirmed document claims. No extraction, tax finding, financial ruling, or source change was made.");
+}
+
+function taxQuickBooksCliReceipt(result = {}) {
+  return {
+    schema_version: 1,
+    command: "reconcile.tax_quickbooks",
+    status: result.status || "error",
+    error_code: result.error_code || null,
+    confirmation: result.confirmation || null,
+    reconciliation_uid: result.reconciliation_uid || null,
+    claim_count: Array.isArray(result.claim_uids) ? result.claim_uids.length : 0,
+    financial_authority: false,
+    ruling_selected: false,
+    wrote_reconciliation: result.wrote_reconciliation === true
+      ? true
+      : result.wrote_reconciliation === false
+        ? false
+        : null,
+    mutated_source_records: false,
+    retry_safe: result.retry_safe === true,
+    recovery: result.recovery || null,
+  };
+}
+
+/** Submit one owner-reviewed private claim file without parsing either document. */
+export async function cmdReconcileTaxQuickBooks(manifestPath, flags = {}, options = {}) {
+  assertKnownFlags(
+    flags,
+    ["claim-file", "confirm-reviewed-claims", "json", "retry"],
+    "brain reconcile tax-quickbooks",
+  );
+  try {
+    if (flags["confirm-reviewed-claims"] !== true) {
+      const error = new Fatal("the owner or technician must add --confirm-reviewed-claims after verifying both exact document locations and amounts");
+      error.code = "tax_qbo_human_confirmation_required";
+      throw error;
+    }
+    if (!options.claim && (!flags["claim-file"] || flags["claim-file"] === true)) {
+      const error = new Fatal("brain reconcile tax-quickbooks needs --claim-file <owner-only-json>");
+      error.code = "tax_claim_file_required";
+      throw error;
+    }
+    const { m } = loadManifest(manifestPath);
+    const configuration = m?.corpora?.quickbooks || {};
+    if (configuration.enabled !== true || !["sandbox", "production"].includes(configuration.environment)) {
+      const error = new Fatal("the manifest must enable QuickBooks and explicitly name sandbox or production before comparing its stored report evidence");
+      error.code = "quickbooks_configuration_required";
+      throw error;
+    }
+    const claim = options.claim || readOwnerOnlyTaxClaim(flags["claim-file"]);
+    const adminKey = (options.resolveAdminKey ?? resolveAdminKey)(manifestPath);
+    if (!adminKey) {
+      const error = new Fatal("no durable admin key was found for the client-owned Brain");
+      error.code = "admin_key_unavailable";
+      throw error;
+    }
+    const base = await (options.resolveBaseUrl ?? resolveBaseUrl)(m, null);
+    const post = options.postReconciliation || postTaxQuickBooksReconciliation;
+    const result = await post({ base, adminKey, payload: claim, fetchImpl: options.fetchImpl || fetch });
+    if (flags.json) console.log(JSON.stringify(taxQuickBooksCliReceipt(result), null, 2));
+    else renderTaxQuickBooksReconciliation(result);
+    return result;
+  } catch (error) {
+    if (flags.json) {
+      if (error instanceof JsonFatal) throw error;
+      const payload = error?.payload || {
+        schema_version: 1,
+        command: "reconcile.tax_quickbooks",
+        status: "error",
+        error_code: error?.code || "tax_qbo_reconciliation_failed",
+        recovery: error?.code
+          ? String(error.message || error)
+          : "The comparison failed without a trusted receipt. Verify the local claim file and stored evidence, then retry the exact same command.",
+        financial_authority: false,
+        wrote_reconciliation: false,
+        mutated_source_records: false,
+      };
+      throw new JsonFatal(payload);
+    }
+    die(String(error?.message || error));
+  }
+}
+
+async function cmdReconcile(target) {
+  const which = String(target || "").toLowerCase();
+  if (!["quickbooks", "tax-quickbooks"].includes(which)) {
+    die("brain reconcile supports quickbooks or tax-quickbooks");
+  }
+  const path = process.argv[4];
+  if (!path || path.startsWith("--")) {
+    die("usage: brain reconcile <quickbooks|tax-quickbooks> <manifest> [reviewed scope flags] [--json]");
+  }
+  const flags = parseFlags(process.argv.slice(4));
+  return which === "quickbooks"
+    ? cmdReconcileQuickBooks(path, flags)
+    : cmdReconcileTaxQuickBooks(path, flags);
+}
+
+/**
+ * brain connect google — the client authorises their OWN Google account.
+ *
+ * They register the OAuth client in their own Google Cloud project, and the
+ * refresh token is stored securely on their machine. We never see any of it. That is
+ * not only a custody preference: every Drive and Gmail read scope is RESTRICTED,
+ * so one vendor-owned OAuth client serving many customers would require Google
+ * verification plus a paid annual CASA security assessment.
+ */
+export async function cmdConnectBank(manifestPath, flags = {}, options = {}) {
+  if (!manifestPath || String(manifestPath).startsWith("--")) {
+    die("usage: brain connect bank <manifest> [--print]");
+  }
+  const unknownFlags = Object.keys(flags).filter((key) => key !== "print");
+  if (unknownFlags.length) die(`brain connect bank does not recognize --${unknownFlags[0]}`);
+  if (flags.print !== undefined && flags.print !== true) {
+    die("--print is a switch and does not take a value. Put it at the end of the command.");
+  }
+  const { m } = loadManifest(manifestPath);
+  const feed = m?.corpora?.bank_feed || {};
+  if (feed.enabled !== true) {
+    die("corpora.bank_feed.enabled is not true in this manifest. Enable the Plaid bank feed before opening its owner page.");
+  }
+  if (String(feed.provider || "").toLowerCase() !== "plaid") {
+    die("brain connect bank currently opens the reviewed Plaid owner flow. Set corpora.bank_feed.provider to plaid first.");
+  }
+  const domainValue = String(m?.brain?.domain || "").trim();
+  if (!domainValue) {
+    die("this Brain has no saved address yet. Run brain deploy first, then rerun brain connect bank.");
+  }
+  let domainUrl;
+  try {
+    domainUrl = new URL(domainValue.includes("://") ? domainValue : `https://${domainValue}`);
+  } catch {
+    die("brain.domain is not a valid deployed HTTPS hostname. Run brain doctor before opening the bank page.");
+  }
+  if (domainUrl.protocol !== "https:" || domainUrl.username || domainUrl.password || domainUrl.port ||
+      domainUrl.pathname !== "/" || domainUrl.search || domainUrl.hash) {
+    die("brain.domain must be one HTTPS hostname with no port, path, sign-in value, query, or fragment.");
+  }
+  const redirectCheck = checkBankFeedRedirect(m);
+  if (redirectCheck.status !== D_OK) {
+    die(
+      `${redirectCheck.detail}.\n` +
+      `      ${redirectCheck.fix || "Run brain doctor and finish the bank return-address setup first."}`
+    );
+  }
+  const url = bankFeedRedirectUri(domainUrl.host);
+  const shouldOpen = flags.print !== true && options.open !== false;
+  const opener = options.openImpl ?? openBrowser;
+  let opened = false;
+  if (shouldOpen) {
+    try { opened = opener(url) === true; } catch { opened = false; }
+  }
+
+  if (opened) ok("opened the owner-only bank connection page in the browser");
+  else if (shouldOpen) warn("the browser did not open automatically. Use the link below in the owner's browser.");
+  else info("browser opening was skipped. Use the owner-only link below when the account holder is ready.");
+  console.log(`\n  ${url}\n`);
+  info("The owner signs in with their Brain passkey, completes Plaid Link, and assigns each masked account to the business that owns it.");
+  info("Opening this page does not enter a Plaid credential, contact a bank, or prove the connector until the owner continues in the browser.");
+  return { provider: "plaid", url, opened, live_provider_proof: false };
+}
 
 /**
  * `brain import bank <manifest> --file <export>` — the operator's way in.
@@ -13772,8 +16114,8 @@ const commands = {
   doctor: dispatchDoctor,
   whatsnew: cmdWhatsnew,
   verify: cmdVerify,
-  provision: cmdProvision,
-  deploy: cmdDeploy,
+  provision: withStoredCloudflareToken(cmdProvision),
+  deploy: withStoredCloudflareToken(cmdDeploy),
   secrets: cmdSecrets,
   health: cmdHealth,
   test: cmdTest,
@@ -13784,12 +16126,13 @@ const commands = {
   load: cmdLoad,
   connect: cmdConnect,
   disconnect: cmdDisconnect,
-  status: cmdStatus,
-  sources: cmdSources,
+  status: withStoredCloudflareToken(cmdStatus),
+  sources: withStoredCloudflareToken(cmdSources),
   forget: cmdForget,
   drain: cmdDrain,
   reindex: cmdReindex,
   diagnose: cmdDiagnose,
+  check: cmdCheckInteractive,
   eval: cmdEval,
   grant: cmdGrant,
   grants: cmdGrants,
@@ -13806,8 +16149,22 @@ const commands = {
   technician: cmdTechnicianInteractive,
 };
 
-if (IS_MAIN && (!cmd || !commands[cmd])) {
-  console.log(`${c.bold("brain")} — provision and manage a client-owned brain install
+const HELP_ARGUMENTS = new Set(["--help", "-h", "help"]);
+const VERSION_ARGUMENTS = new Set(["--version", "-v", "version"]);
+const helpRequested = HELP_ARGUMENTS.has(cmd);
+const versionRequested = VERSION_ARGUMENTS.has(cmd);
+
+if (IS_MAIN && versionRequested) {
+  console.log(PRODUCT_VERSION);
+  process.exit(0);
+}
+
+if (IS_MAIN && (!cmd || helpRequested || !commands[cmd])) {
+  if (cmd && !helpRequested) {
+    const shownCommand = String(cmd).replace(/[^\x20-\x7e]/g, "?").slice(0, 80);
+    console.log(`Unknown command: ${shownCommand}\n`);
+  }
+  console.log(`${c.bold("brain")}: provision and manage a client-owned brain install
 
   install
     brain init       <manifest>            write the manifest and stop: no network, no token,
@@ -13828,6 +16185,9 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
     brain drain      <manifest>            finish the vector embedding now, with a live ETA
     brain reindex    <manifest>            rebuild the vector index from D1, no source files needed
     brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
+    brain check      <manifest>            read-only provenance conflicts and access-zone readiness;
+                                           --set records only the owner's explicit answers;
+                                           --subject NAME overrides the manifest owner
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it
     brain token      <manifest>            is a Cloudflare token remembered on this Mac? --forget removes it
@@ -13848,6 +16208,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
                                            enabled, connected source, one report at the end
     brain ingest     <manifest> --path <dir>  load a folder into the brain
     brain ingest     <manifest> --from drive  load from a connected remote source
+    brain ingest     <manifest> --from gmail  sync connected Gmail (--dry-run to preview)
     brain ingest     <manifest> --from calendar  sync Google Calendar (--dry-run to preview)
     brain ingest     <manifest> --from imap  sync a connected IMAP mailbox (--dry-run to preview)
     brain ingest     <manifest> --from imessage  one incremental Messages capture pass (Mac only)
@@ -13887,7 +16248,8 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
 
   brain ingest takes --source <name>, --limit <n>, --dry-run, and --reset. It is
   resumable: re-run the same command to continue an interrupted load. A large
-  Drive cleanup stops first and prints the exact --approve-removals fingerprint.
+  Drive, Gmail, or IMAP cleanup stops first and prints the exact
+  --approve-removals fingerprint.
 
   brain load is install day in one command. It reads the manifest, runs every
   source that is both enabled AND connected, and skips the rest with a stated
@@ -13917,7 +16279,7 @@ if (IS_MAIN && (!cmd || !commands[cmd])) {
   Provisioning and deployment require CLOUDFLARE_API_TOKEN. Routine source
   refresh and health commands use the brain's domain and admin key instead.
 `);
-  process.exit(cmd ? 1 : 0);
+  process.exit(cmd && !helpRequested ? 1 : 0);
 }
 
 if (IS_MAIN) {

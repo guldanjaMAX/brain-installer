@@ -37,6 +37,9 @@ function freshDb() {
        'owner_stated','confirmed','2026-01-01T00:00:00.000Z'),
       ('primary','buyer','Buyer Fixture LLC','Buyer','business','active','counterparty',
        'owner_stated','confirmed','2026-01-01T00:00:00.000Z');
+    INSERT INTO owner_passkeys
+      (credential_id,public_key_jwk,alg,sign_count,nickname,created_at,grant_id,document_grant_id)
+    VALUES ('fixture-owner-passkey','{}',-7,0,'Fixture owner',1,NULL,NULL);
   `);
   return db;
 }
@@ -97,7 +100,9 @@ const post = (path, body, headers = {}) => new Request(`https://brain.invalid${p
 });
 
 async function ownerHeaders(env) {
-  const cookie = await mintSessionCookie(env, 1);
+  const cookie = await mintSessionCookie(env, 1, {
+    grantId: null, credentialId: "fixture-owner-passkey",
+  });
   return { Cookie: cookie.split(";")[0], "X-Brain-App": "1" };
 }
 
@@ -124,16 +129,19 @@ const call = (path, body, options = {}) => handleOwnerActions(
   check("owner routes require a passkey session and app header", unauthorised.status === 401);
 
   const capabilities = await bodyOf(await call("/api/owner/uploads/capabilities", {}));
-  check("capabilities declare exact text-only MIME types",
-    JSON.stringify(capabilities.supported_media_types) === JSON.stringify(["text/plain", "text/markdown"]));
+  check("capabilities declare text, documents, email, and private image OCR",
+    capabilities.supported_media_types.includes("application/pdf") &&
+    capabilities.supported_media_types.includes("image/jpeg") && capabilities.binary_media_types.length === 8);
   check("capabilities declare the exact UTF-8 content cap", capabilities.max_content_bytes === 1_000_000);
+  check("capabilities keep private OCR images inside the OCR route request cap",
+    capabilities.max_ocr_image_bytes === 3_000_000 && capabilities.media_type_max_bytes["image/jpeg"] === 3_000_000);
 
   const binary = await call("/api/owner/uploads", {
     request_id: "binary_1", document_id: "statement_1", entity_slug: "acme",
     media_type: "application/pdf", file_name: "statement.pdf", envelope: { content: "%PDF" },
   });
   const binaryBody = await bodyOf(binary);
-  check("PDF is an explicit unsupported-media outcome", binary.status === 415 && binaryBody.unsupported_media === true);
+  check("binary documents require the base64 transport", binary.status === 400 && binaryBody.code === "binary_content_must_be_base64");
 
   const clientIdentity = await call("/api/owner/uploads", {
     request_id: "identity_1", document_id: "note_1", entity_slug: "acme",
@@ -142,6 +150,7 @@ const call = (path, body, options = {}) => handleOwnerActions(
   });
   check("client-supplied corpus identity is refused", clientIdentity.status === 400 &&
     (await bodyOf(clientIdentity)).code === "server_owned_document_identity");
+
 }
 
 /* ---------------- upload commits, response disappears, and retry recovers */
@@ -173,7 +182,7 @@ const uploadBody = {
     recoveredBody.document.action === "created" && recoveredBody.replayed === true);
   check("upload receipt has the exact frozen keys", keysAre(recoveredBody, [
     "uploaded", "request_id", "document_id", "entity_scope", "media_type", "file_name",
-    "document", "changed", "activity_event_id", "replayed",
+    "extraction", "document", "changed", "activity_event_id", "replayed",
   ]), JSON.stringify(recoveredBody));
   check("recovered upload has exactly one human event",
     db.prepare("SELECT count(*) n FROM owner_activity_events WHERE event_type='upload_completed'").get().n === 1);
@@ -216,6 +225,55 @@ const uploadBody = {
   );
   check("owner upload binds authoritative document and vector candidate scope",
     document.entity_slug === "acme" && document.client === "acme", JSON.stringify(document));
+}
+
+/* -------- binary extraction commits once and a lost response does not rerun OCR */
+{
+  const binaryBody = {
+    request_id: "upload_binary_retry_1",
+    document_id: "scan_receipt",
+    entity_slug: "acme",
+    media_type: "image/jpeg",
+    file_name: "receipt.jpg",
+    content_base64: "AQIDBA==",
+    envelope: { title: "Receipt image" },
+  };
+  let extractionCalls = 0;
+  const extractUpload = async () => {
+    extractionCalls++;
+    return {
+      content: "Receipt total 42.00",
+      title: "Receipt image",
+      occurredAt: null,
+      textSource: "ocr",
+      textReliable: false,
+      metadata: {
+        extracted_as: "image/jpeg", extraction_method: "ocr",
+        original_bytes: 4, extracted_text_bytes: 19,
+      },
+    };
+  };
+  const lost = await call("/api/owner/uploads", binaryBody, {
+    extractUpload,
+    afterIngest: async () => { throw new Error("drop binary response after ingest commit"); },
+  });
+  check("binary failure injection lands after common ingest", lost.status === 503 && extractionCalls === 1);
+
+  const recovered = await bodyOf(await call("/api/owner/uploads", binaryBody, {
+    extractUpload: async () => { throw new Error("OCR must not run after exact committed recovery"); },
+  }));
+  check("binary retry finalizes the exact committed revision without rerunning OCR",
+    recovered.replayed === true && recovered.document.action === "created" &&
+    recovered.extraction.text_source === "ocr" && extractionCalls === 1,
+    JSON.stringify(recovered));
+  const stored = db.prepare("SELECT text_source,text_reliable,meta FROM documents WHERE doc_uid=?").get(
+    "upload:owner:acme:scan_receipt",
+  );
+  const storedMeta = JSON.parse(stored.meta);
+  check("binary storage carries extraction and original-byte provenance",
+    stored.text_source === "ocr" && stored.text_reliable === 0 &&
+    /^[a-f0-9]{64}$/.test(storedMeta.original_binary_sha256) &&
+    /^[a-f0-9]{64}$/.test(storedMeta.owner_upload_payload_hash));
 }
 
 /* ------------------------------------------- exact entity-scoped retrieval */
@@ -428,6 +486,47 @@ const uploadBody = {
   catch { approvalDeleteRefused = true; }
   check("activity history refuses UPDATE", activityUpdateRefused);
   check("approval history refuses DELETE", approvalDeleteRefused);
+}
+
+
+/* ------- carried over from the release line's upload test, which this replaced */
+{
+  // The behaviour is still in the module; without these two checks nothing
+  // guards it, and a text-normalisation regression stays invisible until a
+  // client's first document reads wrong. Placed last on purpose: both write a
+  // document, and the event-count assertions above are order-sensitive.
+  // Both carried over from the release line's upload test, which this file
+  // replaced. The behaviour is still in the module; without these two checks
+  // nothing guards it, and a text-normalisation regression is invisible until
+  // a client's first document reads wrong.
+  const blank = await call("/api/owner/uploads", {
+    request_id: "blank_1", document_id: "blank_note", entity_slug: "acme",
+    media_type: "text/plain", file_name: "blank.txt", envelope: { content: "   \n\t " },
+  });
+  const blankBody = await bodyOf(blank);
+  check("content that is only whitespace is refused, not stored empty",
+    blank.status === 400 && blankBody.code === "empty_upload_content",
+    JSON.stringify(blankBody));
+
+  const bom = await call("/api/owner/uploads", {
+    request_id: "bom_1", document_id: "bom_note", entity_slug: "acme",
+    media_type: "text/plain", file_name: "bom.txt",
+    envelope: { content: "\uFEFFledger opening balance" },
+  });
+  const bomBody = await bodyOf(bom);
+  check("one leading byte-order mark is removed and the rest preserved exactly",
+    bom.status === 201 &&
+    // 22 ASCII bytes. With the mark still attached it would be 25, so this
+    // measures the strip rather than trusting the receipt's own wording.
+    bomBody.extraction?.original_bytes === 22 &&
+    // The chunk carries a "[file name]" header, so this checks the stored body
+    // rather than the whole cell: the mark is gone and nothing else moved.
+    (() => {
+      const text = db.prepare("SELECT text FROM chunks WHERE doc_uid LIKE ?")
+        .get("%bom_note%")?.text || "";
+      return text.endsWith("ledger opening balance") && !text.includes("\uFEFF");
+    })(),
+    JSON.stringify(bomBody));
 }
 
 console.log(`\nowner actions: ${ran - failed}/${ran} checks passed`);

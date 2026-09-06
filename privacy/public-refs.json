@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "remote": "origin",
+  "captured_utc": "2026-08-30",
+  "refs": [
+    { "public_ref": "refs/heads/codex/client-update-status", "local_ref": "refs/remotes/origin/codex/client-update-status", "tip_object": "f3f818659d8dbb76acfd2c220034e1ccf704ff52" },
+    { "public_ref": "refs/heads/codex/cloudflare-brain-phase2", "local_ref": "refs/remotes/origin/codex/cloudflare-brain-phase2", "tip_object": "19aac8e578b378eb40ee3d3ab9a7d2ade768bdf1" },
+    { "public_ref": "refs/heads/codex/cloudflare-brain-v0.1.12", "local_ref": "refs/remotes/origin/codex/cloudflare-brain-v0.1.12", "tip_object": "28c1af24a7f5f46e3f758d3413c304a0d1494beb" },
+    { "public_ref": "refs/heads/codex/release-v0.2.0", "local_ref": "refs/remotes/origin/codex/release-v0.2.0", "tip_object": "074f31bae42a57918c9fbd93613b5329d953c16c" },
+    { "public_ref": "refs/heads/codex/technician-setup", "local_ref": "refs/remotes/origin/codex/technician-setup", "tip_object": "8a9641efe0005750bcdb42d46830be99b96cba81" },
+    { "public_ref": "refs/heads/feat/golden20-backlog-guard", "local_ref": "refs/remotes/origin/feat/golden20-backlog-guard", "tip_object": "6f8cf703f073d3323cb9c3251ecb4d7be0b12aea" },
+    { "public_ref": "refs/heads/main", "local_ref": "refs/remotes/origin/main", "tip_object": "074f31bae42a57918c9fbd93613b5329d953c16c" },
+    { "public_ref": "refs/heads/wave0/connector-gaps", "local_ref": "refs/remotes/origin/wave0/connector-gaps", "tip_object": "30e25b075f2643f9f96e6ea3a46bdf3ae88391cd" },
+    { "public_ref": "refs/tags/v0.1.10", "local_ref": "refs/tags/v0.1.10", "tip_object": "45e7ebe45421ac47cae696f609a71a00afdd3146" },
+    { "public_ref": "refs/tags/v0.1.11", "local_ref": "refs/tags/v0.1.11", "tip_object": "b5080526f2ccb0fc4e1da22a77903fd9a5cfea15" },
+    { "public_ref": "refs/tags/v0.1.12", "local_ref": "refs/tags/v0.1.12", "tip_object": "28c1af24a7f5f46e3f758d3413c304a0d1494beb" },
+    { "public_ref": "refs/tags/v0.1.15", "local_ref": "refs/tags/v0.1.15", "tip_object": "f1c2b10a2480f2423f87c8abcc79f7389f554ef5" },
+    { "public_ref": "refs/tags/v0.1.16", "local_ref": "refs/tags/v0.1.16", "tip_object": "4b4403612a43d40da8ba2655e7094e41e7bc3adb" },
+    { "public_ref": "refs/tags/v0.1.17", "local_ref": "refs/tags/v0.1.17", "tip_object": "179ef3a65aa034410383c8bbbef8e53044151803" },
+    { "public_ref": "refs/tags/v0.1.18", "local_ref": "refs/tags/v0.1.18", "tip_object": "d0831ebc9cc45af1a55d5caee1e70f60472112c0" },
+    { "public_ref": "refs/tags/v0.1.19", "local_ref": "refs/tags/v0.1.19", "tip_object": "98e126ad369866a5a790b4d50386906f96560381" },
+    { "public_ref": "refs/tags/v0.1.20", "local_ref": "refs/tags/v0.1.20", "tip_object": "ac75c4d263dac02212a8924ce3c62094555eba09" },
+    { "public_ref": "refs/tags/v0.1.21", "local_ref": "refs/tags/v0.1.21", "tip_object": "25d2e04b09cb5c1fd7fc665f5e266613f42abb42" },
+    { "public_ref": "refs/tags/v0.1.22", "local_ref": "refs/tags/v0.1.22", "tip_object": "8be06d4e6551354992a8928d14a6be85910f02e4" },
+    { "public_ref": "refs/tags/v0.1.23", "local_ref": "refs/tags/v0.1.23", "tip_object": "46b24988de2fd0833ffd07beb43812e1bcfb4e69" },
+    { "public_ref": "refs/tags/v0.2.0", "local_ref": "refs/tags/v0.2.0", "tip_object": "78c329c9a82da1c34a542b21dbdb31c82cf354b5" }
+  ]
+}

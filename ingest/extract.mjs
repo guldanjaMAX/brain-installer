@@ -67,7 +67,19 @@ for (const ext of [".html", ".htm", ".xhtml"]) {
   register(ext, (buf) => stripMarkup(dec(buf)), "html");
 }
 
-register(".xml", (buf) => stripMarkup(dec(buf)), "xml");
+// Generic XML is data, not presentation markup. Stripping tags here used to
+// erase the exact facts many business exports put in element names and
+// attributes (for example customer="Acme" and amount="1200") while still
+// reporting a complete ingest. Preserve it as written. Specialized XML
+// producers such as SMS Backup & Restore are detected earlier by prepare().
+register(".xml", (buf) => dec(buf), "xml");
+
+// YAML is prose-shaped configuration. The product promises to read it "as
+// written", so preserve its keys, indentation and scalar values rather than
+// flattening it through a parser that could silently reinterpret types.
+for (const ext of [".yaml", ".yml"]) {
+  register(ext, (buf) => dec(buf), "yaml");
+}
 
 /* -------------------------------------------------------------- delimited */
 
@@ -85,6 +97,7 @@ function parseDelimited(text, delim) {
   let row = [];
   let cell = "";
   let quoted = false;
+  let malformed = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (quoted) {
@@ -94,14 +107,23 @@ function parseDelimited(text, delim) {
       } else cell += c;
       continue;
     }
-    if (c === '"') { quoted = true; continue; }
+    if (c === '"') {
+      // A quote inside an already-started unquoted value is not valid CSV.
+      // Continue parsing so the useful prefix can still be indexed, but carry
+      // a structured incomplete signal rather than claiming the file was read
+      // perfectly.
+      if (cell.length) malformed = true;
+      quoted = true;
+      continue;
+    }
     if (c === delim) { row.push(cell); cell = ""; continue; }
     if (c === "\n") { row.push(cell); rows.push(row); row = []; cell = ""; continue; }
     if (c === "\r") continue;
     cell += c;
   }
+  if (quoted) malformed = true;
   if (cell.length || row.length) { row.push(cell); rows.push(row); }
-  return rows;
+  return { rows, malformed };
 }
 
 // Ceiling on rows rendered. A 200,000-row export is a database, not a document,
@@ -109,10 +131,37 @@ function parseDelimited(text, delim) {
 // embed. The cap is stated in the output so the truncation is visible.
 const MAX_ROWS = 5000;
 
-export function renderTable(rows, { label = "" } = {}) {
-  if (!rows.length) return "";
+/**
+ * Render one bounded table and retain the omission count separately.
+ *
+ * `renderTable()` stays string-compatible for existing callers. Extractors use
+ * this richer result so a visible prose marker is never the only evidence that
+ * rows were left out.
+ */
+export function renderTableResult(rows, { label = "" } = {}) {
+  if (!rows.length) return { text: "", omittedRows: 0, note: null };
   const header = rows[0].map((h) => String(h).trim());
-  const looksLikeHeader = header.some((h) => h && !/^-?[\d.,$%()]+$/.test(h));
+  // Treat row 1 as a header only when it looks like a row of field names and
+  // later rows provide affirmative type evidence. The old "contains any
+  // text" test turned an ordinary headerless transaction such as
+  // `2026-01-01,Coffee,5.00` into column names, silently deleted it, and then
+  // mislabeled the next transaction. Ambiguity must preserve data.
+  const scalarKind = (value) => {
+    const raw = String(value ?? "").trim();
+    if (!raw) return "empty";
+    if (/^[+-]?(?:[$£€]\s*)?\(?\d[\d,]*(?:\.\d+)?\)?%?$/.test(raw)) return "number";
+    if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T\s].*)?$/.test(raw) ||
+        /^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}(?:[T\s].*)?$/.test(raw)) return "date";
+    if (/^(?:true|false|yes|no)$/i.test(raw)) return "boolean";
+    return "text";
+  };
+  const simpleFieldName = (value) => /^[A-Za-z][A-Za-z0-9 _./()-]{0,79}$/.test(String(value ?? "").trim());
+  const later = rows.slice(1, Math.min(rows.length, 26));
+  const hasTypedContrast = header.some((value, index) =>
+    scalarKind(value) === "text" && later.some((candidate) =>
+      ["number", "date", "boolean"].includes(scalarKind(candidate[index]))));
+  const looksLikeHeader = later.length > 0 && header.some((value) => String(value).trim()) &&
+    header.every((value) => !String(value).trim() || simpleFieldName(value)) && hasTypedContrast;
   const body = looksLikeHeader ? rows.slice(1) : rows;
   const out = [];
   if (label) out.push(label);
@@ -130,14 +179,35 @@ export function renderTable(rows, { label = "" } = {}) {
       .filter(Boolean);
     if (pairs.length) out.push(pairs.join(" | "));
   }
-  if (body.length > shown.length) {
-    out.push(`[${body.length - shown.length} further rows were not indexed; this file exceeds the ${MAX_ROWS} row limit]`);
-  }
-  return out.join("\n");
+  const omittedRows = body.length - shown.length;
+  const note = omittedRows
+    ? `${omittedRows} further rows were not indexed; this file exceeds the ${MAX_ROWS} row limit`
+    : null;
+  if (note) out.push(`[${note}]`);
+  return { text: out.join("\n"), omittedRows, note };
 }
 
-register(".csv", (buf, { name } = {}) => renderTable(parseDelimited(dec(buf), ","), { label: name ? `Table: ${name}` : "" }), "csv");
-register(".tsv", (buf, { name } = {}) => renderTable(parseDelimited(dec(buf), "\t"), { label: name ? `Table: ${name}` : "" }), "tsv");
+export function renderTable(rows, options = {}) {
+  return renderTableResult(rows, options).text;
+}
+
+function extractDelimited(buf, delim, name) {
+  const parsed = parseDelimited(dec(buf), delim);
+  const rendered = renderTableResult(parsed.rows, {
+    label: name ? `Table: ${name}` : "",
+  });
+  const notes = [];
+  if (rendered.note) notes.push(rendered.note);
+  if (parsed.malformed) notes.push("the delimited file contains an unterminated or misplaced quoted field; readable rows were indexed but the result may be incomplete");
+  const note = notes.length ? notes.join("; ") : null;
+  return {
+    text: rendered.text,
+    ...(note ? { note, incomplete: true } : {}),
+  };
+}
+
+register(".csv", (buf, { name } = {}) => extractDelimited(buf, ",", name), "csv");
+register(".tsv", (buf, { name } = {}) => extractDelimited(buf, "\t", name), "tsv");
 
 /* ------------------------------------------------------------------- json */
 
@@ -145,19 +215,43 @@ register(".tsv", (buf, { name } = {}) => renderTable(parseDelimited(dec(buf), "\
  * JSON is flattened to "path: value" lines rather than pretty-printed, because
  * braces and brackets embed as noise while the leaf paths carry the meaning.
  */
+const MAX_JSON_VALUES = 20_000;
+
 register(".json", (buf) => {
   const raw = dec(buf);
   let parsed;
-  try { parsed = JSON.parse(raw); } catch { return raw; }
+  try { parsed = JSON.parse(raw); } catch {
+    return {
+      text: null,
+      error: "the JSON is incomplete or malformed; refusing to index a partially copied structure",
+    };
+  }
   const lines = [];
-  const walk = (v, path) => {
-    if (lines.length > 20000) return;
-    if (v === null || typeof v !== "object") { lines.push(`${path}: ${String(v)}`); return; }
-    if (Array.isArray(v)) { v.forEach((x, i) => walk(x, `${path}[${i}]`)); return; }
-    for (const [k, x] of Object.entries(v)) walk(x, path ? `${path}.${k}` : k);
-  };
-  walk(parsed, "");
-  return lines.join("\n");
+  const pending = [{ value: parsed, path: "" }];
+  while (pending.length && lines.length < MAX_JSON_VALUES) {
+    const current = pending.pop();
+    const value = current.value;
+    if (value === null || typeof value !== "object") {
+      lines.push(`${current.path}: ${String(value)}`);
+      continue;
+    }
+    const entries = Array.isArray(value)
+      ? value.map((child, index) => [index, child])
+      : Object.entries(value);
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const [key, child] = entries[index];
+      pending.push({
+        value: child,
+        path: Array.isArray(value)
+          ? `${current.path}[${key}]`
+          : current.path ? `${current.path}.${key}` : String(key),
+      });
+    }
+  }
+  if (!pending.length) return lines.join("\n");
+  const note = `additional JSON values were not indexed; this file exceeds the ${MAX_JSON_VALUES} value limit`;
+  lines.push(`[${note}]`);
+  return { text: lines.join("\n"), note, incomplete: true };
 }, "json");
 
 /* ------------------------------------------------------------ transcripts */
@@ -207,14 +301,20 @@ for (const [ext, toText, label] of [
 register(".ics", async (buf, { name } = {}) => {
   const raw = dec(buf);
   const { parseIcs, MAX_EVENTS } = await import("./ics.mjs");
-  const { isCalendar, events, malformed, calendarName } = parseIcs(raw);
+  const { isCalendar, events, malformed, calendarName, calendarClosed } = parseIcs(raw);
   if (!isCalendar) return { text: null, error: "this .ics file is not an iCalendar document (no BEGIN:VCALENDAR)" };
   if (!events.length) {
     return {
       text: null,
+      // Three distinct refusals, because "0 unreadable entries" reads as a
+      // contradiction and tells the owner nothing about what to fix. An
+      // unterminated file is truncated; a file with malformed entries names
+      // how many; a well-formed calendar carrying no events says so.
       error: malformed
         ? `no readable events: ${malformed} calendar entr${malformed === 1 ? "y is" : "ies are"} missing a start time or truncated`
-        : "this calendar has no events in it (it may hold only tasks, free/busy blocks or timezone definitions)",
+        : !calendarClosed
+          ? "no readable events: the calendar export is truncated (it never closes with END:VCALENDAR)"
+          : "this calendar has no events in it (it may hold only tasks, free/busy blocks or timezone definitions)",
     };
   }
   const { renderEvent } = await import("../connectors/google-calendar.mjs");
@@ -224,9 +324,11 @@ register(".ics", async (buf, { name } = {}) => {
   const notes = [];
   if (events.length > shown.length) notes.push(`${events.length - shown.length} further event(s) were not indexed; this export exceeds the ${MAX_EVENTS} event limit`);
   if (malformed) notes.push(`${malformed} calendar entr${malformed === 1 ? "y" : "ies"} could not be read and ${malformed === 1 ? "was" : "were"} left out`);
+  if (!calendarClosed) notes.push("the calendar export ended before END:VCALENDAR and may be truncated");
   return {
     text: `Calendar export: ${label}\n\n${rendered.join("\n\n")}`,
     note: notes.length ? notes.join("; ") : undefined,
+    ...(notes.length ? { incomplete: true } : {}),
   };
 }, "calendar");
 
@@ -272,7 +374,16 @@ for (const ext of [".ofx", ".qfx"]) {
     if (unreadable) {
       notes.unshift(`${unreadable} line(s) in this export could not be read and are recorded as unread rather than dropped`);
     }
-    return { text, note: notes.join("; ") };
+    return {
+      text,
+      note: notes.join("; "),
+      // The searchable prose did land, but ordinary folder ingestion does not
+      // populate balances or transactions in the structured financial ledger.
+      // Treat that missing product surface as follow-up, even when every OFX
+      // row parsed, so setup cannot imply that dropping a bank export into a
+      // folder completed the financial import.
+      incomplete: true,
+    };
   }, "bank export");
 }
 
@@ -329,16 +440,16 @@ export function canExtract(name) {
  * ASYNC because PDF extraction is. Everything else stays synchronous internally;
  * awaiting a plain string costs nothing and keeps one call site for all formats.
  *
- * An extractor may also return { text, note } to report something true but
- * degraded — a scanned PDF, a truncated sheet — which the caller surfaces rather
- * than swallowing.
+ * An extractor may also return { text, note, incomplete } to report something
+ * true but degraded. `incomplete: true` is reserved for known source omission;
+ * a note by itself may be informational and must not be interpreted as loss.
  *
  * It may also return `provenance`, which says how the text was OBTAINED rather
  * than what it says. This has to be forwarded explicitly: it used to die here,
  * inside the one function every ingest path funnels through, so a document read
  * by OCR reached the corpus looking exactly like one read from a text layer.
  *
- * @returns {Promise<{ text: string|null, how: string|null, unsupported?: true, error?: string, note?: string, provenance?: object }>}
+ * @returns {Promise<{ text: string|null, how: string|null, unsupported?: true, error?: string, note?: string, incomplete?: true, provenance?: object }>}
  */
 export async function extract(buf, name, opts = {}) {
   const ext = extensionOf(name);
@@ -347,7 +458,14 @@ export async function extract(buf, name, opts = {}) {
   try {
     const out = await entry.fn(buf, { name, ...opts });
     if (out && typeof out === "object" && !Array.isArray(out)) {
-      return { text: out.text ?? null, how: entry.label, note: out.note, error: out.error, provenance: out.provenance };
+      return {
+        text: out.text ?? null,
+        how: entry.label,
+        note: out.note,
+        error: out.error,
+        provenance: out.provenance,
+        ...(out.incomplete === true ? { incomplete: true } : {}),
+      };
     }
     return { text: out, how: entry.label };
   } catch (e) {

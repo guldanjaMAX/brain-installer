@@ -16,7 +16,7 @@ const ORIGIN = "https://brain.example.com";
 function connectorDb() {
   const tables = {
     clients: new Map(), codes: new Map(), tokens: new Map(),
-    documents: new Map(), chunks: [],
+    documents: new Map(), chunks: [], passkeys: new Map(),
     state: { session_generation: 1 },
   };
   return {
@@ -36,6 +36,12 @@ function connectorDb() {
         async all() {
           if (/FROM chunks WHERE doc_uid/.test(sql)) {
             return { results: tables.chunks.filter((c) => c.doc_uid === bound[0]) };
+          }
+          // A session now names the passkey device behind it, so resolving one
+          // reads the device list. Without this branch every owner cookie
+          // resolves to nobody and the approval step silently 401s.
+          if (/FROM owner_passkeys ORDER BY/.test(sql)) {
+            return { results: [...tables.passkeys.values()] };
           }
           return { results: [] };
         },
@@ -127,7 +133,13 @@ test("the full connector journey, register through revocation", async () => {
   // Approval requires the owner's passkey session.
   const denied = await worker.fetch(jsonPost(`/oauth/authorize/decision?${authorizeQuery}`, {}, { "X-Brain-App": "1" }), testEnv);
   assert.equal(denied.status, 401);
-  const cookie = (await mintSessionCookie(testEnv, 1)).split(";")[0];
+  db.tables.passkeys.set("connector-owner-passkey", {
+    credential_id: "connector-owner-passkey", alg: -7, nickname: "Connector owner",
+    grant_id: null, document_grant_id: null, created_at: Date.now(), last_used_at: null,
+  });
+  const cookie = (await mintSessionCookie(testEnv, 1, {
+    grantId: null, credentialId: "connector-owner-passkey",
+  })).split(";")[0];
   const approved = await (await worker.fetch(jsonPost(`/oauth/authorize/decision?${authorizeQuery}`, {}, {
     Cookie: cookie, "X-Brain-App": "1",
   }), testEnv)).json();
@@ -181,7 +193,12 @@ test("the full connector journey, register through revocation", async () => {
   assert.deepEqual(searchedBody.results, []);
   assert.match(searchedBody.note || "", /could not be completed/i);
 
-  db.tables.documents.set("drive:doc-1", { title: "Fixture doc", uri: null });
+  db.tables.documents.set("drive:doc-1", {
+    title: "Fixture doc", uri: null, source: "drive",
+    document_date: Date.parse("2026-01-02T00:00:00Z"),
+    date_source: "provider_timestamp", date_reliable: 0,
+    text_source: "ocr_partial", text_reliable: 0,
+  });
   db.tables.chunks.push({ doc_uid: "drive:doc-1", text: "the fixture body" });
   const fetched = await (await worker.fetch(jsonPost("/mcp", {
     jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "fetch", arguments: { id: "drive:doc-1" } },
@@ -189,19 +206,77 @@ test("the full connector journey, register through revocation", async () => {
   const fetchedBody = JSON.parse(fetched.result.content[0].text);
   assert.equal(fetchedBody.title, "Fixture doc");
   assert.match(fetchedBody.text, /fixture body/);
+  assert.deepEqual(fetchedBody.metadata, {
+    chunks: 1,
+    source: "drive",
+    date: "2026-01-02T00:00:00.000Z",
+    date_source: "provider_timestamp",
+    date_reliable: false,
+    text_source: "ocr_partial",
+    text_reliable: false,
+  });
 
   // ask flows through the REAL think handler; with no LLM key configured the
   // plumbing still answers deterministically instead of fabricating.
   const asked = await (await worker.fetch(jsonPost("/mcp", {
     jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "ask", arguments: { question: "hello?" } },
   }, bearer), testEnv)).json();
-  assert.ok(asked.result.isError || /do not answer|nothing/i.test(asked.result.content[0].text),
+  assert.ok(asked.result.isError || /do not answer|nothing|could not be completed/i.test(asked.result.content[0].text),
     JSON.stringify(asked.result).slice(0, 200));
 
   // The owner's sign-out-everywhere kills connector tokens too.
   db.tables.state.session_generation = 2;
   const afterBump = await worker.fetch(jsonPost("/mcp", { jsonrpc: "2.0", id: 6, method: "ping" }, bearer), testEnv);
   assert.equal(afterBump.status, 401, "one revocation story: generation bump ends connectors");
+});
+
+test("MCP ask and search keep evidence provenance", async () => {
+  const { handleMcp } = await import("../src/lib/mcp-endpoint.js");
+  const citation = {
+    n: 1, title: "Scanned statement", source: "upload",
+    ref: "statement-1",
+    ts: "2026-01-02T00:00:00.000Z", date_source: "filename", date_reliable: false,
+    text_source: "ocr_partial", text_reliable: false,
+  };
+  const legacyCitation = {
+    n: 2, title: "Legacy statement", source: "upload",
+    ts: "2025-12-31T00:00:00.000Z",
+  };
+  const result = {
+    answer: "The balance is recorded [1].",
+    confidence: { percent: 61, band: "moderate", basis: ["OCR evidence"] },
+    citations: [citation, legacyCitation],
+    results: [{ ...citation, ref_key: "statement-1" }],
+  };
+  const deps = { think: async () => result, search: async () => result };
+
+  const ask = await (await handleMcp(env(connectorDb()), jsonPost("/mcp", {
+    jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "ask", arguments: { question: "balance" } },
+  }), new URL(ORIGIN + "/mcp"), deps)).json();
+  const askText = ask.result.content[0].text;
+  assert.match(askText, /upload · possible date 2026-01-02 · OCR text may be incomplete/);
+  assert.match(askText, /reference upload:statement-1/);
+  assert.match(askText, /Legacy statement · upload · possible date 2025-12-31/,
+    "missing date trust must not be presented as confirmed");
+
+  const search = await (await handleMcp(env(connectorDb()), jsonPost("/mcp", {
+    jsonrpc: "2.0", id: 2, method: "tools/call",
+    params: { name: "search", arguments: { query: "balance" } },
+  }), new URL(ORIGIN + "/mcp"), deps)).json();
+  const searchBody = JSON.parse(search.result.content[0].text);
+  assert.deepEqual({
+    id: searchBody.results[0].id,
+    title: searchBody.results[0].title,
+    url: searchBody.results[0].url,
+  }, {
+    id: "upload:statement-1",
+    title: "Scanned statement",
+    url: `${ORIGIN}/app`,
+  }, "a populated search result must retain the deep-research id/title/url contract");
+  assert.equal(searchBody.results[0].date_reliable, false);
+  assert.equal(searchBody.results[0].text_source, "ocr_partial");
+  assert.equal(searchBody.results[0].text_reliable, false);
 });
 
 test("a degraded search never reaches a phone as an absence claim", async () => {

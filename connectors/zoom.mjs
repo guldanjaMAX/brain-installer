@@ -34,11 +34,13 @@
 
 import {
   ZOOM_REQUIRED_SCOPE,
+  ZOOM_RECORDING_EVENT,
   ZOOM_TRANSCRIPT_EVENT,
   describeZoomPlan,
   getZoomAccessToken,
   zoomHmacHex,
 } from "../worker/src/lib/zoom.js";
+import { ProviderSyncError, providerJson } from "./provider-sync.mjs";
 
 /** The route the worker template serves. One place, so it cannot drift. */
 export const ZOOM_WEBHOOK_PATH = "/api/webhooks/zoom";
@@ -130,9 +132,11 @@ export function zoomEventSubscriptionSteps(webhookUrl) {
     "  3. Click Validate. Zoom calls that URL right now and refuses to save it",
     "     unless it answers correctly. Your brain is already holding the Secret",
     "     Token, and the answer was verified above, so this should pass.",
-    `  4. Add exactly one event: ${ZOOM_TRANSCRIPT_EVENT}`,
-    "     Not recording.completed — the audio file is written before the",
-    "     transcript is, so that event fires while there is nothing to read yet.",
+    "  4. Add exactly these two events:",
+    `       ${ZOOM_RECORDING_EVENT}`,
+    `       ${ZOOM_TRANSCRIPT_EVENT}`,
+    "     The first records durable work debt as soon as the recording exists.",
+    "     The second wakes that debt when the transcript is ready.",
     "  5. Save, then Activate the app again if Zoom asks.",
     "",
     "  Cloud recording with an audio transcript must also be on for the meetings",
@@ -198,27 +202,41 @@ async function readJsonQuietly(response) {
  * Returns findings rather than printing or exiting, so the CLI decides what is
  * fatal and the tests can assert on the findings themselves.
  */
-export async function probeZoomAccount(credentials, { fetchImpl = fetch } = {}) {
+export async function probeZoomAccount(credentials, { fetchImpl = fetch, requestOptions = {} } = {}) {
   const token = await getZoomAccessToken({
     accountId: credentials.ZOOM_ACCOUNT_ID,
     clientId: credentials.ZOOM_CLIENT_ID,
     clientSecret: credentials.ZOOM_CLIENT_SECRET,
-  }, { fetchImpl });
+  }, { fetchImpl, requestOptions });
 
-  const authed = (path) => fetchImpl(`https://api.zoom.us/v2${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const authed = async (path) => {
+    try {
+      const { data, response } = await providerJson(
+        "zoom",
+        `https://api.zoom.us/v2${path}`,
+        { accessToken: token, fetchImpl, ...requestOptions },
+      );
+      return { ok: true, status: response.status, data, error: null };
+    } catch (error) {
+      if (!(error instanceof ProviderSyncError)) throw error;
+      return {
+        ok: false,
+        status: error.status,
+        data: null,
+        error,
+      };
+    }
+  };
 
   // The one call that proves the one required scope.
   const recordingsResponse = await authed("/users/me/recordings?page_size=1");
-  const recordingsBody = recordingsResponse.ok ? null : await readJsonQuietly(recordingsResponse);
   const recordings = recordingsResponse.ok
     ? { ok: true, status: recordingsResponse.status, scopeMissing: false }
     : {
       ok: false,
       status: recordingsResponse.status,
-      scopeMissing: isScopeRefusal(recordingsResponse.status, recordingsBody),
-      message: String(recordingsBody?.message || "").slice(0, 200) || null,
+      scopeMissing: isScopeRefusal(recordingsResponse.status, { code: recordingsResponse.error?.code }),
+      message: String(recordingsResponse.error?.message || "").slice(0, 200) || null,
     };
 
   // The plan tier. Optional scope, so a refusal here is a named unknown and
@@ -227,16 +245,17 @@ export async function probeZoomAccount(credentials, { fetchImpl = fetch } = {}) 
   try {
     const userResponse = await authed("/users/me");
     if (userResponse.ok) {
-      const user = await readJsonQuietly(userResponse);
+      const user = userResponse.data;
       plan = { confirmed: true, plan: describeZoomPlan(user?.type), reason: null };
     } else {
-      const body = await readJsonQuietly(userResponse);
       plan = {
         confirmed: false,
         plan: describeZoomPlan(null),
-        reason: isScopeRefusal(userResponse.status, body)
+        reason: isScopeRefusal(userResponse.status, { code: userResponse.error?.code })
           ? `the optional ${ZOOM_OPTIONAL_PLAN_SCOPE} scope is not granted, so the plan tier could not be read`
-          : `Zoom would not report the plan tier (HTTP ${userResponse.status})`,
+          : userResponse.error?.outcome?.kind === "retryable"
+            ? String(userResponse.error.message || "Zoom could not be reached").slice(0, 160)
+            : `Zoom would not report the plan tier (HTTP ${userResponse.status})`,
       };
     }
   } catch (error) {

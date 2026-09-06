@@ -297,6 +297,7 @@ async function runTool(name, args = {}) {
       // response that has it, answered or not. Without it this tool hands the
       // model an empty result and no way to tell the two apart.
       const unavailable = retrievalUnavailable(d);
+      const refused = typeof d.answer === "string" && /^The documents do not answer/i.test(d.answer);
       const out = {
         answer: d.answer ?? null,
         answer_error: d.answer_error ?? undefined,
@@ -304,11 +305,28 @@ async function runTool(name, args = {}) {
         search_status: unavailable ? "search_unavailable" : undefined,
         gaps: d.gaps ?? [],
         citations: d.citations ?? [],
+        // Trust metadata rides beside the answer. The worker computes a
+        // deterministic confidence rubric with a plain-words basis list, and
+        // the evidence gate records WHY an answer was refused or cut short.
+        // Dropping both here made every refusal look identical to the
+        // consumer, which is the opposite of citing your source.
+        confidence: d.confidence ?? undefined,
+        evidence_gate: d.evidence_gate ?? undefined,
       };
-      if (!d.answer) {
+      // A refusal is not absence. When the worker refused, carry the raw rows
+      // so the consumer can say what WAS found instead of "nothing".
+      if (!d.answer || refused) {
         out.results = (d.results ?? []).map((r) => ({
+          source: r.source,
+          ref: r.ref ?? r.ref_key ?? r.source_id ?? null,
+          source_id: r.source_id ?? null,
+          uri: r.uri ?? null,
           title: r.title,
           ts: r.ts,
+          date_source: r.date_source ?? null,
+          date_reliable: r.date_reliable === true,
+          text_source: r.text_source || "native",
+          text_reliable: r.text_reliable !== false,
           snippet: String(r.snippet ?? "").slice(0, 700),
         }));
       }
@@ -327,6 +345,14 @@ async function runTool(name, args = {}) {
       } else if (!out.citations.length && !out.results?.length) {
         out.note =
           "The brain has nothing on this. Report that as the finding, in those terms. Do not substitute inference.";
+      } else if (refused && out.results?.length) {
+        const n = out.results.length;
+        out.note =
+          `The brain FOUND ${n} document${n === 1 ? "" : "s"} but could not write a supported answer from them. ` +
+          `This is NOT "nothing recorded". Report what was found (titles are in results) and the reason in evidence_gate.reason.`;
+      } else if (out.evidence_gate?.partial === true) {
+        out.note =
+          "This answer is PARTIAL. Every sentence in it passed the evidence gate; the part the documents do not cover is named at the end. Relay both.";
       }
       return out;
     }
@@ -351,9 +377,16 @@ async function runTool(name, args = {}) {
         search_status: unavailable ? "search_unavailable" : undefined,
         results: rows.map((r) => ({
           source: r.source,
+          ref: r.ref ?? r.ref_key ?? r.source_id ?? null,
+          source_id: r.source_id ?? null,
+          uri: r.uri ?? null,
           title: r.title,
           category: r.category,
           ts: r.ts,
+          date_source: r.date_source ?? null,
+          date_reliable: r.date_reliable === true,
+          text_source: r.text_source || "native",
+          text_reliable: r.text_reliable !== false,
           snippet: String(r.snippet ?? "").slice(0, 900),
         })),
         ...(unavailable

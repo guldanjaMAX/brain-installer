@@ -40,7 +40,14 @@ const statementsFor = (file) => splitStatements(readFileSync(join(MIGRATIONS, fi
 function freshDb({ throughLedger = true } = {}) {
   const db = new DatabaseSync(":memory:");
   for (const file of migrationFiles) {
-    if (!throughLedger && [LEDGER_MIGRATION, OWNER_WORKSPACE_MIGRATION].includes(file)) continue;
+    // `throughLedger: false` means a brain that has not REACHED the ledger yet,
+    // which is a real brain: any install below schema 17, and any install caught
+    // mid-migration. It does not mean a brain that skipped 17 and kept going,
+    // which cannot exist, because migrations apply in order. Skipping only 17
+    // used to be indistinguishable from stopping before it, since nothing after
+    // 17 touched the ledger. Migration 0026 does, so the difference now shows up
+    // as "no such table: fin_accounts" from a fixture, not from the product.
+    if (!throughLedger && file >= LEDGER_MIGRATION) break;
     for (const statement of statementsFor(file)) db.exec(statement);
   }
   return db;

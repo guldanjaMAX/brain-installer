@@ -9,15 +9,13 @@
  * ingest door uses. Nothing here belongs to us: the Zoom app, the Cloudflare
  * worker, the recordings and the four secrets are all in the client's accounts.
  *
- * WHAT THIS DELIBERATELY IS NOT. The reference implementation this was ported
- * from runs a webhook AND a 15-minute cron against the same recordings, so it
- * needs a poll-style sweep, a claim-row table and a 30-minute TTL to stop the
- * two racing each other into duplicate documents. There is no cron here. The
- * webhook names the exact recording in its own payload, so this fetches that
- * one recording and writes one document, and the brain's existing
- * (source_type, source_id) plus content-hash idempotency handles a redelivered
- * webhook for free. It also does no call analysis, no filing and no CRM work.
- * A transcript becomes a searchable, citable, forgettable document. That is all.
+ * DURABLE DELIVERY. A verified transcript or recording-completed event is
+ * written to D1 before the route acknowledges it. A short lease drives safe
+ * retries, and a bounded scheduled sweep lists recent recordings so a webhook
+ * that never arrives still leaves recoverable debt. The brain's existing
+ * (source_type, source_id) plus content-hash idempotency makes replay safe. This
+ * still does no call analysis, filing, or CRM work. A transcript becomes a
+ * searchable, citable, forgettable document. That is all.
  *
  * FAIL CLOSED. With no ZOOM_WEBHOOK_SECRET_TOKEN set, every request is refused
  * before the body is even parsed. An unauthenticated endpoint that triggers
@@ -26,24 +24,41 @@
 
 import { jsonResponse } from "./core.js";
 import {
+  ProviderSyncError,
+  createPaginationGuard,
+  providerJson,
+  providerText,
+} from "./provider-sync.js";
+import { ingestionOutcome } from "./ingestion-outcome.js";
+import {
   hasSensitiveTransportIdentity,
   scanEnvelope as scanEnvelopeSecrets,
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./secret-scan.js";
 import { storeFor, backendOf, D1 } from "./store.js";
 import { vttToPlainTranscript } from "./vtt.js";
+import {
+  ZOOM_RECONCILE_INTERVAL_MS,
+  zoomDeliveryStore,
+} from "./zoom-deliveries.js";
 
 /** The one Zoom scope this connector needs. Anything more is over-asking. */
 export const ZOOM_REQUIRED_SCOPE = "cloud_recording:read:admin";
 
-/**
- * The only event subscribed to.
- *
- * NOT `recording.completed`: the audio file lands first and the VTT is written
- * afterwards, so acting on `completed` fetches a recording that has no
- * transcript yet and produces an empty document.
- */
+/** The transcript-ready event wakes existing debt immediately. */
 export const ZOOM_TRANSCRIPT_EVENT = "recording.transcript_completed";
+
+/** Early recording debt is useful even though its transcript may not exist yet. */
+export const ZOOM_RECORDING_EVENT = "recording.completed";
+
+export const ZOOM_DELIVERY_EVENTS = Object.freeze(new Set([
+  ZOOM_TRANSCRIPT_EVENT,
+  ZOOM_RECORDING_EVENT,
+]));
+
+export const ZOOM_RECONCILE_MAX_PAGES = 5;
+export const ZOOM_RECONCILE_OVERLAP_DAYS = 2;
+export const ZOOM_RECONCILE_INITIAL_DAYS = 30;
 
 /** Zoom's own replay window. A body older than this is refused. */
 export const ZOOM_REPLAY_WINDOW_MS = 5 * 60 * 1000;
@@ -95,12 +110,10 @@ export function constantTimeEquals(a, b) {
  * outside the replay window and be rejected, forever, with a 401 that looks
  * exactly like an attacker being turned away.
  *
- * The reference could afford that ambiguity because it also runs a 15-minute
- * cron that sweeps for recordings, so a webhook rejecting everything would be
- * silently covered by the poll. This connector is webhook-only by design, so
- * the same mistake here is total silent failure with nothing behind it. Both
- * units are therefore accepted: 1e11 sits between any plausible epoch-seconds
- * value (~1.8e9 today) and any plausible epoch-milliseconds one (~1.8e12).
+ * The bounded reconciliation path can recover a missed delivery, but it should
+ * not be used to conceal a verifier that rejects every real webhook. Both units
+ * are therefore accepted: 1e11 sits between any plausible epoch-seconds value
+ * (~1.8e9 today) and any plausible epoch-milliseconds one (~1.8e12).
  *
  * This widens only the REPLAY window. The signature is always computed over
  * the header's exact original characters, because that is what Zoom signed.
@@ -167,7 +180,7 @@ export function zoomRecordingPathId(uuid) {
  */
 export async function getZoomAccessToken(
   { accountId, clientId, clientSecret },
-  { fetchImpl = fetch } = {},
+  { fetchImpl = fetch, requestOptions = {} } = {},
 ) {
   if (!accountId || !clientId || !clientSecret) {
     const error = new Error("Zoom is not configured on this brain: account id, client id and client secret must all be set.");
@@ -175,27 +188,30 @@ export async function getZoomAccessToken(
     throw error;
   }
   const credentials = btoa(`${clientId}:${clientSecret}`);
-  const response = await fetchImpl("https://zoom.us/oauth/token", {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${credentials}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: `grant_type=account_credentials&account_id=${encodeURIComponent(accountId)}`,
-  });
-  if (!response.ok) {
-    const detail = (await response.text()).slice(0, 200);
-    const error = new Error(
-      response.status === 401
-        ? "Zoom rejected these credentials. Check the Account ID, Client ID and Client Secret, and that the Server-to-Server OAuth app is Activated."
-        : `Zoom token exchange failed (HTTP ${response.status}): ${detail}`,
-    );
-    error.zoom_status = response.status;
+  let data;
+  try {
+    ({ data } = await providerJson("zoom", "https://zoom.us/oauth/token", {
+      fetchImpl,
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: `grant_type=account_credentials&account_id=${encodeURIComponent(accountId)}`,
+      maxResponseBytes: 256 * 1024,
+      ...requestOptions,
+    }));
+  } catch (error) {
+    if (error instanceof ProviderSyncError && error.status === 401) {
+      error.message = "zoom: check the Account ID, Client ID and Client Secret, and confirm the Server-to-Server OAuth app is Activated";
+    }
     throw error;
   }
-  const data = await response.json();
   if (!data?.access_token) {
-    throw new Error("Zoom returned a token response with no access token. The Server-to-Server OAuth app may need reactivating.");
+    throw new ProviderSyncError("zoom", "the token response carried no access token", {
+      kind: "unavailable",
+      code: "missing_access_token",
+    });
   }
   return data.access_token;
 }
@@ -211,30 +227,36 @@ export async function getZoomAccessToken(
  */
 export async function fetchZoomTranscript(
   { token, uuid },
-  { fetchImpl = fetch } = {},
+  { fetchImpl = fetch, requestOptions = {} } = {},
 ) {
-  const response = await fetchImpl(
-    `https://api.zoom.us/v2/meetings/${zoomRecordingPathId(uuid)}/recordings`,
-    { headers: { Authorization: `Bearer ${token}` } },
-  );
-  if (!response.ok) {
-    const detail = (await response.text()).slice(0, 200);
-    const error = new Error(
-      response.status === 404
-        ? "Zoom has no recording under that identifier. It may have been deleted from cloud storage."
-        : response.status === 403
-          ? `Zoom refused the recording read. The Server-to-Server OAuth app needs the ${ZOOM_REQUIRED_SCOPE} scope.`
-          : `Zoom recording lookup failed (HTTP ${response.status}): ${detail}`,
-    );
-    error.zoom_status = response.status;
+  let recording;
+  try {
+    ({ data: recording } = await providerJson(
+      "zoom",
+      `https://api.zoom.us/v2/meetings/${zoomRecordingPathId(uuid)}/recordings`,
+      { accessToken: token, fetchImpl, ...requestOptions },
+    ));
+  } catch (error) {
+    if (error instanceof ProviderSyncError) {
+      if (error.status === 403) {
+        error.message = `zoom: the recording read needs the ${ZOOM_REQUIRED_SCOPE} scope`;
+      } else if (error.status === 404) {
+        throw new ProviderSyncError("zoom", "the recording is not available yet under this occurrence UUID", {
+          kind: "retryable",
+          status: 404,
+          code: "recording_not_ready",
+          cause: error,
+        });
+      }
+    }
     throw error;
   }
-  const recording = await response.json();
   const files = Array.isArray(recording?.recording_files) ? recording.recording_files : [];
   const transcriptFile = files.find((file) => file?.file_type === "TRANSCRIPT");
 
   if (!transcriptFile?.download_url) {
     return {
+      meetingId: recording?.id || null,
       topic: recording?.topic || null,
       startTime: recording?.start_time || null,
       duration: recording?.duration ?? null,
@@ -249,27 +271,53 @@ export async function fetchZoomTranscript(
 
   // Zoom's download URLs are signed but still require the bearer token; the
   // documented way to pass it on a download is the query parameter.
-  const download = await fetchImpl(`${transcriptFile.download_url}?access_token=${token}`);
-  if (!download.ok) {
-    return {
-      topic: recording?.topic || null,
-      startTime: recording?.start_time || null,
-      duration: recording?.duration ?? null,
-      hostEmail: recording?.host_email || null,
-      hasTranscript: true,
-      transcript: "",
-      reason: `the transcript file could not be downloaded (HTTP ${download.status}). Zoom may still be writing it.`,
-    };
+  const separator = String(transcriptFile.download_url).includes("?") ? "&" : "?";
+  let transcriptText;
+  try {
+    ({ data: transcriptText } = await providerText(
+      "zoom",
+      `${transcriptFile.download_url}${separator}access_token=${encodeURIComponent(token)}`,
+      { fetchImpl, maxResponseBytes: 32 * 1024 * 1024, ...requestOptions },
+    ));
+  } catch (error) {
+    if (error instanceof ProviderSyncError && error.status === 404) {
+      throw new ProviderSyncError("zoom", "the transcript file is not available yet", {
+        kind: "retryable",
+        status: 404,
+        code: "transcript_not_ready",
+        cause: error,
+      });
+    }
+    throw error;
   }
 
   return {
+    meetingId: recording?.id || null,
     topic: recording?.topic || null,
     startTime: recording?.start_time || null,
     duration: recording?.duration ?? null,
     hostEmail: recording?.host_email || null,
     hasTranscript: true,
-    transcript: vttToPlainTranscript(await download.text()),
+    transcript: vttToPlainTranscript(transcriptText),
     reason: null,
+  };
+}
+
+/** List one bounded reconciliation page of recent cloud recordings. */
+export async function listZoomRecordingsPage({ token, from, to, nextPageToken = null }, {
+  fetchImpl = fetch,
+  requestOptions = {},
+} = {}) {
+  const query = new URLSearchParams({ from, to, page_size: "100" });
+  if (nextPageToken) query.set("next_page_token", nextPageToken);
+  const { data } = await providerJson(
+    "zoom",
+    `https://api.zoom.us/v2/users/me/recordings?${query}`,
+    { accessToken: token, fetchImpl, ...requestOptions },
+  );
+  return {
+    meetings: Array.isArray(data?.meetings) ? data.meetings : [],
+    nextPageToken: String(data?.next_page_token || "").trim() || null,
   };
 }
 
@@ -393,6 +441,260 @@ export function buildZoomEnvelope({ uuid, meetingId, topic, startTime, duration,
   };
 }
 
+function zoomFailureOutcome(error) {
+  if (error?.zoom_not_configured) {
+    return ingestionOutcome("unavailable", { reason: "Zoom credentials are not configured" });
+  }
+  if (error instanceof ProviderSyncError && error.outcome) return error.outcome;
+  return ingestionOutcome("retryable", { reason: "Zoom delivery processing was interrupted" });
+}
+
+function zoomFailureCode(error) {
+  return String(error?.code || error?.provider_code || error?.zoom_status || error?.name || "processing_error")
+    .replace(/[^a-zA-Z0-9_.:-]/g, "_")
+    .slice(0, 100);
+}
+
+function zoomOperationalIssueCode(error, fallback) {
+  if (error?.zoom_not_configured) return "AUTH_REQUIRED";
+  if (error instanceof ProviderSyncError) {
+    if (error.status === 401 || error.status === 403) return "REMOTE_PERMISSION_DENIED";
+    if (error.status === 429) return "RATE_LIMITED";
+    if (error.outcome?.kind === "unavailable" || error.outcome?.kind === "retryable") {
+      return "REMOTE_UNAVAILABLE";
+    }
+  }
+  return fallback;
+}
+
+/** Fetch, gate, and ingest one claimed recording without changing its debt row. */
+export async function processZoomDelivery(env, delivery, deps = {}) {
+  const fetchImpl = deps.fetchImpl || fetch;
+  const ingest = deps.ingest || gatedIngest;
+  const receipt = deps.recordReceipt || recordZoomSourceReceipt;
+  try {
+    const token = deps.token || await getZoomAccessToken({
+      accountId: env.ZOOM_ACCOUNT_ID,
+      clientId: env.ZOOM_CLIENT_ID,
+      clientSecret: env.ZOOM_CLIENT_SECRET,
+    }, { fetchImpl, requestOptions: deps.requestOptions });
+    const detail = await fetchZoomTranscript(
+      { token, uuid: delivery.recording_uuid },
+      { fetchImpl, requestOptions: deps.requestOptions },
+    );
+    if (!detail.transcript || !detail.transcript.trim()) {
+      console.warn(`[zoom] no transcript text for this recording: ${detail.reason || "the transcript was empty"}`);
+      return {
+        outcome: ingestionOutcome("retryable", { reason: detail.reason || "the transcript is not ready" }),
+        code: "transcript_not_ready",
+      };
+    }
+    const result = await ingest(env, buildZoomEnvelope({
+      uuid: delivery.recording_uuid,
+      meetingId: detail.meetingId || delivery.meeting_id,
+      topic: detail.topic,
+      startTime: detail.startTime,
+      duration: detail.duration,
+      hostEmail: detail.hostEmail,
+      transcript: detail.transcript,
+    }));
+    if (result?.refused) {
+      console.warn(`[zoom] transcript refused by the credential gate: ${(result.labels || []).join(", ")}`);
+      return {
+        outcome: ingestionOutcome("refused", { reason: "the transcript was refused by the credential gate" }),
+        code: "credential_gate_refused",
+      };
+    }
+    try {
+      await receipt(env, { detail: `zoom transcript ${result?.action || "stored"}` });
+    } catch (error) {
+      // The document is already written. A receipt failure makes `brain
+      // sources` thinner, not the brain wrong.
+      console.warn("[zoom] source receipt failed; issue_code=COMMAND_FAILED");
+    }
+    return { outcome: ingestionOutcome("completed"), code: null, result };
+  } catch (error) {
+    console.error(`[zoom] transcript ingest failed; issue_code=${zoomOperationalIssueCode(error, "INGEST_FAILED")}`);
+    return { outcome: zoomFailureOutcome(error), code: zoomFailureCode(error), error };
+  }
+}
+
+/** Claim and settle a bounded batch of durable Zoom delivery debt. */
+export async function drainZoomDeliveries(env, deps = {}) {
+  const store = deps.deliveryStore || zoomDeliveryStore;
+  const nowMs = deps.now ? deps.now() : Date.now();
+  const claimed = await store.claim(env, {
+    nowMs,
+    limit: deps.limit || 5,
+    ...(deps.ownerToken ? { ownerToken: deps.ownerToken } : {}),
+  });
+  if (!claimed.length) {
+    return { claimed: 0, completed: 0, outcome: ingestionOutcome("completed") };
+  }
+
+  let token = null;
+  let tokenError = null;
+  try {
+    token = await getZoomAccessToken({
+      accountId: env.ZOOM_ACCOUNT_ID,
+      clientId: env.ZOOM_CLIENT_ID,
+      clientSecret: env.ZOOM_CLIENT_SECRET,
+    }, { fetchImpl: deps.fetchImpl || fetch, requestOptions: deps.requestOptions });
+  } catch (error) {
+    tokenError = error;
+  }
+
+  const outcomes = [];
+  for (const delivery of claimed) {
+    const processed = tokenError
+      ? { outcome: zoomFailureOutcome(tokenError), code: zoomFailureCode(tokenError), error: tokenError }
+      : await processZoomDelivery(env, delivery, { ...deps, token });
+    await store.finish(env, delivery, {
+      outcome: processed.outcome,
+      errorCode: processed.code,
+      nowMs: deps.now ? deps.now() : Date.now(),
+      randomImpl: deps.randomImpl,
+    });
+    outcomes.push(processed.outcome);
+  }
+
+  const completed = outcomes.filter((outcome) => outcome.kind === "completed").length;
+  const refused = outcomes.filter((outcome) => outcome.kind === "refused").length;
+  const unavailable = outcomes.filter((outcome) => outcome.kind === "unavailable").length;
+  const retryable = outcomes.filter((outcome) => outcome.kind === "retryable").length;
+  let outcome;
+  if (completed === outcomes.length) outcome = ingestionOutcome("completed");
+  else if (completed > 0 || refused > 0) {
+    outcome = ingestionOutcome("partial", { reason: "some Zoom delivery debt remains unsettled" });
+  } else if (retryable > 0) {
+    outcome = ingestionOutcome("retryable", { reason: "Zoom delivery debt is scheduled for another attempt" });
+  } else {
+    outcome = ingestionOutcome("unavailable", { reason: "the Zoom connection is unavailable" });
+  }
+  return { claimed: claimed.length, completed, refused, unavailable, retryable, outcome };
+}
+
+function utcDate(ms) {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+/** Reconcile recent recordings so a missing webhook cannot become silent loss. */
+export async function reconcileZoomRecordings(env, deps = {}) {
+  const store = deps.deliveryStore || zoomDeliveryStore;
+  const nowMs = deps.now ? deps.now() : Date.now();
+  const lease = await store.claimReconciliation(env, {
+    nowMs,
+    ...(deps.reconcileOwnerToken ? { ownerToken: deps.reconcileOwnerToken } : {}),
+  });
+  if (!lease.acquired) return { acquired: false, pages: 0, recordings: 0, outcome: ingestionOutcome("completed") };
+
+  const initialFrom = utcDate(nowMs - (ZOOM_RECONCILE_INITIAL_DAYS * 24 * 60 * 60 * 1000));
+  const from = /^\d{4}-\d{2}-\d{2}$/.test(String(lease.window_from || "")) ? lease.window_from : initialFrom;
+  const to = utcDate(nowMs);
+  let nextPageToken = lease.next_page_token || null;
+  let pages = 0;
+  let recordings = 0;
+  try {
+    const token = await getZoomAccessToken({
+      accountId: env.ZOOM_ACCOUNT_ID,
+      clientId: env.ZOOM_CLIENT_ID,
+      clientSecret: env.ZOOM_CLIENT_SECRET,
+    }, { fetchImpl: deps.fetchImpl || fetch, requestOptions: deps.requestOptions });
+    const guard = createPaginationGuard("zoom", { maxPages: deps.maxPages || ZOOM_RECONCILE_MAX_PAGES });
+    while (pages < (deps.maxPages || ZOOM_RECONCILE_MAX_PAGES)) {
+      guard.visit(nextPageToken ? `cursor:${nextPageToken}` : `initial:${from}:${to}`);
+      const page = await listZoomRecordingsPage({ token, from, to, nextPageToken }, {
+        fetchImpl: deps.fetchImpl || fetch,
+        requestOptions: deps.requestOptions,
+      });
+      pages++;
+      for (const meeting of page.meetings) {
+        if (!meeting?.uuid) {
+          throw new ProviderSyncError("zoom", "a recordings page carried an item without an occurrence UUID", {
+            kind: "retryable",
+            code: "recording_uuid_missing",
+          });
+        }
+        await store.persist(env, {
+          uuid: meeting.uuid,
+          eventType: ZOOM_RECORDING_EVENT,
+          meetingId: meeting.id,
+          receivedAtMs: nowMs,
+        });
+        recordings++;
+      }
+      nextPageToken = page.nextPageToken;
+      if (!nextPageToken) break;
+      if (pages < (deps.maxPages || ZOOM_RECONCILE_MAX_PAGES)) {
+        await store.checkpointReconciliation(env, lease, {
+          nextPageToken,
+          windowFrom: from,
+          nextRunAtMs: nowMs,
+          status: "processing",
+          nowMs,
+          release: false,
+        });
+      }
+    }
+
+    const completeWindow = !nextPageToken;
+    const nextWindowFrom = completeWindow
+      ? utcDate(nowMs - (ZOOM_RECONCILE_OVERLAP_DAYS * 24 * 60 * 60 * 1000))
+      : from;
+    await store.checkpointReconciliation(env, lease, {
+      nextPageToken,
+      windowFrom: nextWindowFrom,
+      nextRunAtMs: completeWindow ? nowMs + ZOOM_RECONCILE_INTERVAL_MS : nowMs,
+      status: "idle",
+      nowMs,
+      release: true,
+    });
+    return { acquired: true, pages, recordings, completeWindow, outcome: ingestionOutcome("completed") };
+  } catch (error) {
+    const outcome = zoomFailureOutcome(error);
+    await store.checkpointReconciliation(env, lease, {
+      nextPageToken,
+      windowFrom: from,
+      nextRunAtMs: nowMs + ZOOM_RECONCILE_INTERVAL_MS,
+      status: outcome.kind === "refused" ? "refused" : outcome.kind === "unavailable" ? "unavailable" : "retryable",
+      errorCode: zoomFailureCode(error),
+      nowMs,
+      release: true,
+    });
+    return { acquired: true, pages, recordings, outcome, error };
+  }
+}
+
+/** Scheduled entrypoint: discover missed recordings, then settle due debt. */
+export async function runZoomDeliveryMaintenance(env, deps = {}) {
+  if (env.VECTOR_DRAIN_MODE === "paused-for-upgrade") {
+    return { outcome: ingestionOutcome("retryable", { reason: "brain corpus writes are paused" }) };
+  }
+  const configuredValues = [
+    env.ZOOM_ACCOUNT_ID,
+    env.ZOOM_CLIENT_ID,
+    env.ZOOM_CLIENT_SECRET,
+    env.ZOOM_WEBHOOK_SECRET_TOKEN,
+  ].filter(Boolean);
+  if (!configuredValues.length) {
+    return { skipped: "not_configured", outcome: ingestionOutcome("completed") };
+  }
+  const reconciliation = await reconcileZoomRecordings(env, deps);
+  const deliveries = await drainZoomDeliveries(env, deps);
+  const kinds = [reconciliation.outcome.kind, deliveries.outcome.kind];
+  const acceptedWork = Number(reconciliation.recordings || 0) > 0 || Number(deliveries.completed || 0) > 0;
+  const outcome = kinds.every((kind) => kind === "completed")
+    ? ingestionOutcome("completed")
+    : acceptedWork || kinds.includes("partial")
+      ? ingestionOutcome("partial", { reason: "Zoom maintenance left durable work for a later attempt" })
+      : kinds.includes("retryable")
+        ? ingestionOutcome("retryable", { reason: "Zoom maintenance will retry" })
+        : kinds.includes("unavailable")
+          ? ingestionOutcome("unavailable", { reason: "the Zoom connection is unavailable" })
+          : ingestionOutcome("refused", { reason: "Zoom maintenance was refused" });
+  return { reconciliation, deliveries, outcome };
+}
+
 /* --------------------------------------------------------------- route */
 
 /**
@@ -404,15 +706,14 @@ export function buildZoomEnvelope({ uuid, meetingId, topic, startTime, duration,
  * why it fails closed on a missing secret, verifies in constant time, and
  * refuses anything outside a five-minute window.
  *
- * Zoom retries any slow or non-2xx response and disables an endpoint that keeps
- * failing, so a verified event is acknowledged immediately and the fetch and
- * ingest run on ctx.waitUntil.
+ * Zoom retries non-2xx responses. A verified delivery event is acknowledged
+ * only after its recording UUID is durable in D1. Fetch and ingest can then run
+ * on ctx.waitUntil because a crash leaves reclaimable debt.
  */
 export async function handleZoomWebhook(env, request, ctx, deps = {}) {
   const fetchImpl = deps.fetchImpl || fetch;
   const now = deps.now ? deps.now() : Date.now();
-  const ingest = deps.ingest || gatedIngest;
-  const receipt = deps.recordReceipt || recordZoomSourceReceipt;
+  const deliveryStore = deps.deliveryStore || zoomDeliveryStore;
   const secret = env.ZOOM_WEBHOOK_SECRET_TOKEN;
 
   // Fail closed BEFORE reading the body. An endpoint that triggers outbound
@@ -467,10 +768,9 @@ export async function handleZoomWebhook(env, request, ctx, deps = {}) {
     }, 503);
   }
 
-  if (event !== ZOOM_TRANSCRIPT_EVENT) {
-    // Acknowledged, not acted on. Zoom disables endpoints that keep failing, so
-    // an unsubscribed event gets a 200 rather than an error. recording.completed
-    // arrives before the VTT exists and is ignored here deliberately.
+  if (!ZOOM_DELIVERY_EVENTS.has(event)) {
+    // An unsubscribed event gets a 200 so an accidental subscription does not
+    // disable the endpoint. Only the two recording events can create debt.
     return jsonResponse({ ok: true, ignored: event || "unknown" });
   }
 
@@ -478,47 +778,30 @@ export async function handleZoomWebhook(env, request, ctx, deps = {}) {
   const uuid = object?.uuid || "";
   if (!uuid) {
     // Retrying will not add a uuid, so this is acknowledged rather than failed.
-    return jsonResponse({ ok: true, ignored: "transcript event carried no recording uuid" });
+    return jsonResponse({ ok: true, ignored: "recording event carried no recording uuid" });
   }
 
-  const work = (async () => {
-    try {
-      const token = await getZoomAccessToken({
-        accountId: env.ZOOM_ACCOUNT_ID,
-        clientId: env.ZOOM_CLIENT_ID,
-        clientSecret: env.ZOOM_CLIENT_SECRET,
-      }, { fetchImpl });
-      const detail = await fetchZoomTranscript({ token, uuid }, { fetchImpl });
-      if (!detail.transcript || !detail.transcript.trim()) {
-        console.warn(`[zoom] no transcript text for this recording: ${detail.reason || "the transcript was empty"}`);
-        return;
-      }
-      const result = await ingest(env, buildZoomEnvelope({
-        uuid,
-        meetingId: object?.id,
-        topic: detail.topic || object?.topic || null,
-        startTime: detail.startTime || object?.start_time || null,
-        duration: detail.duration ?? object?.duration ?? null,
-        hostEmail: detail.hostEmail || object?.host_email || null,
-        transcript: detail.transcript,
-      }));
-      if (result?.refused) {
-        console.warn(`[zoom] transcript refused by the credential gate: ${(result.labels || []).join(", ")}`);
-        return;
-      }
-      try {
-        await receipt(env, { detail: `zoom transcript ${result?.action || "stored"}` });
-      } catch (error) {
-        // The document is already written. A receipt failure makes `brain
-        // sources` thinner, not the brain wrong.
-        console.warn(`[zoom] source receipt failed: ${String(error?.message || error).slice(0, 200)}`);
-      }
-    } catch (error) {
-      console.error(`[zoom] transcript ingest failed: ${String(error?.message || error).slice(0, 300)}`);
-    }
-  })();
+  try {
+    await deliveryStore.persist(env, { uuid, eventType: event, meetingId: object?.id, receivedAtMs: now });
+  } catch (error) {
+    console.error("[zoom] delivery debt could not be persisted; issue_code=INGEST_FAILED");
+    return jsonResponse({
+      error: "the Zoom delivery could not be made durable",
+      retryable: true,
+    }, 503);
+  }
+
+  const work = drainZoomDeliveries(env, {
+    ...deps,
+    fetchImpl,
+    deliveryStore,
+  }).catch((error) => {
+    // Persistence already succeeded. A crash or claim failure leaves the row
+    // for the scheduled maintenance path or the next webhook to reclaim.
+    console.error("[zoom] durable delivery drain failed; issue_code=SCHEDULE_RUN_FAILED");
+  });
 
   if (ctx?.waitUntil) ctx.waitUntil(work);
   else await work;
-  return jsonResponse({ ok: true, event, accepted: true });
+  return jsonResponse({ ok: true, event, accepted: true, durable: true });
 }

@@ -116,14 +116,32 @@ export function parseScope(row) {
   try {
     include = typeof row?.scope_include === "string" ? JSON.parse(row.scope_include) : row?.scope_include;
   } catch { return { zones: [] }; }
-  if (include?.all === true) return { all: true };
-  const zones = Array.isArray(include?.zones) ? include.zones.filter((z) => typeof z === "string") : [];
-  let exclude = [];
+  let rawExclude = [];
   try {
-    const raw = typeof row?.scope_exclude === "string" ? JSON.parse(row.scope_exclude) : row?.scope_exclude;
-    if (Array.isArray(raw)) exclude = raw.filter((z) => typeof z === "string");
+    rawExclude = typeof row?.scope_exclude === "string" ? JSON.parse(row.scope_exclude) : row?.scope_exclude;
   } catch { return { zones: [] }; }
+  if (rawExclude === undefined || rawExclude === null) rawExclude = [];
+  if (!Array.isArray(rawExclude) || rawExclude.some((z) => typeof z !== "string")) {
+    return { zones: [] };
+  }
+  const exclude = rawExclude;
+  if (include?.all === true) return { all: true, exclude };
+  const zones = Array.isArray(include?.zones) ? include.zones.filter((z) => typeof z === "string") : [];
   return { zones, exclude };
+}
+
+/**
+ * Whether a scope can use whole-corpus paths without any zone predicate.
+ *
+ * `all` means all zones before exclusions. Keeping this decision in one helper
+ * prevents an all-minus-medical grant from accidentally taking owner paths in
+ * retrieval, writes, deletion, freshness or diagnostics.
+ */
+export function scopeIsUnrestricted(scope) {
+  if (!scope) return true;
+  if (scope.all !== true) return false;
+  if (scope.exclude === undefined || scope.exclude === null) return true;
+  return Array.isArray(scope.exclude) && scope.exclude.length === 0;
 }
 
 /** A grant row is usable only while it is neither revoked nor expired. */

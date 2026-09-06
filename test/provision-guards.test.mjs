@@ -61,21 +61,47 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   check("a migration receipt yields a unique exact Drive exclusion list",
     driveExclusionIdsOf(receipt).join(",") === "bad-1,dup-2", JSON.stringify(driveExclusionIdsOf(receipt)));
   const cfg = driveConnectorConfig({
-    corpora: { google_drive: { exclude_file_ids: ["inline-1"], exclude_file_ids_file: "receipt.json", exclude_paths: ["Legal/Sealed"] } },
+    corpora: { google_drive: {
+      root_folder_ids: ["root-b", " root-a ", "root-b"],
+      exclude_file_ids: ["inline-1"], exclude_file_ids_file: "receipt.json", exclude_paths: ["Legal/Sealed"],
+    } },
     safety: { private_path_prefixes: ["_private"] },
   }, "/tmp/client/brain.manifest.json", () => JSON.stringify(receipt));
   check("inline and receipt exclusions are combined", cfg.excludeFileIds.join(",") === "bad-1,dup-2,inline-1", JSON.stringify(cfg));
   check("Drive receives path and private-prefix policy from the standard manifest",
     cfg.excludePaths[0] === "Legal/Sealed" && cfg.privatePrefixes[0] === "_private", JSON.stringify(cfg));
+  check("Drive roots are required, normalized, and stable",
+    cfg.rootFolderIds.join(",") === "root-a,root-b", JSON.stringify(cfg));
+  let missingRootError = null;
+  try {
+    driveConnectorConfig({ corpora: { google_drive: { enabled: true } } }, "/tmp/client/brain.manifest.json");
+  } catch (error) { missingRootError = error; }
+  check("Drive cannot run without a reviewed root boundary",
+    /root_folder_ids/.test(missingRootError?.message || ""), missingRootError?.message);
 
   const policyFingerprint = drivePolicyFingerprint(cfg);
   check("credential scanner mode is part of Drive policy identity",
     drivePolicyFingerprint(cfg, true) !== drivePolicyFingerprint(cfg, false));
+  check("reviewed Drive roots are part of durable policy identity",
+    drivePolicyFingerprint(cfg) !== drivePolicyFingerprint({ ...cfg, rootFolderIds: ["root-a"] }));
+  const priorExtractorFingerprint = drivePolicyFingerprint(cfg, true, false, 1);
+  check("the current extractor support is a durable Drive rescan marker",
+    policyFingerprint !== priorExtractorFingerprint);
+  check("an extractor support upgrade forces an immediate complete Drive comparison",
+    driveSyncDecision({
+      syncToken: "cursor",
+      policyFingerprint,
+      savedPolicyFingerprint: priorExtractorFingerprint,
+      lastFullSweepAt: "2026-08-23T00:00:00Z",
+    }).incremental === false);
   check("credential scanner version is a durable rescan marker",
-    credentialScannerFingerprint(true, 3) !== credentialScannerFingerprint(true, 4));
+    credentialScannerFingerprint(true, 4) !== credentialScannerFingerprint(true, 5));
   const scannerV2 = credentialScannerFingerprint(true, 2);
   const scannerV3 = credentialScannerFingerprint(true, 3);
   const scannerV4 = credentialScannerFingerprint(true, 4);
+  const scannerV5 = credentialScannerFingerprint(true, 5);
+  check("the runtime defaults to the v5 scanner fingerprint",
+    credentialScannerFingerprint(true) === scannerV5);
   const interruptedScanner = { done: { "drive:file": "revision-1" } };
   ensureCredentialScannerProgress(interruptedScanner, scannerV2);
   recordCredentialScannerProgress(interruptedScanner, scannerV2, "drive:file", "revision-1");
@@ -98,6 +124,25 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     !hasCredentialScannerProgress(interruptedScanner, scannerV3, "drive:file", "revision-1") &&
       !hasCredentialScannerProgress(interruptedScanner, scannerV4, "drive:file", "revision-1"),
     JSON.stringify(interruptedScanner));
+  recordCredentialScannerProgress(interruptedScanner, scannerV4, "drive:file", "revision-1");
+  check("an accepted v4 revision is resumable only under v4",
+    hasCredentialScannerProgress(interruptedScanner, scannerV4, "drive:file", "revision-1") &&
+      !hasCredentialScannerProgress(interruptedScanner, scannerV5, "drive:file", "revision-1"),
+    JSON.stringify(interruptedScanner));
+  ensureCredentialScannerProgress(interruptedScanner, scannerV5);
+  check("v5 hex admin-key safety invalidates in-progress v4 accepted receipts",
+    !hasCredentialScannerProgress(interruptedScanner, scannerV4, "drive:file", "revision-1") &&
+      !hasCredentialScannerProgress(interruptedScanner, scannerV5, "drive:file", "revision-1"),
+    JSON.stringify(interruptedScanner));
+  const completedV4Scanner = {
+    done: { "drive:file": "revision-1" },
+    credential_scanner_fingerprint: scannerV4,
+  };
+  ensureCredentialScannerProgress(completedV4Scanner, scannerV5);
+  check("v5 hex admin-key safety invalidates a completed v4 scanner receipt",
+    completedV4Scanner.credential_scanner_fingerprint !== scannerV5 &&
+      !hasCredentialScannerProgress(completedV4Scanner, scannerV5, "drive:file", "revision-1"),
+    JSON.stringify(completedV4Scanner));
   const freshDecision = driveSyncDecision({
     syncToken: "cursor", policyFingerprint, savedPolicyFingerprint: policyFingerprint,
     lastFullSweepAt: "2026-08-22T12:00:00.000Z", now: Date.parse("2026-08-23T12:00:00.000Z"),
@@ -312,6 +357,9 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     ["dry run", { dry_run: true, documents: 1, chunks: 1, vectors: 1, targets: [] }],
     ["missing counts", { dry_run: false, targets: [] }],
     ["missing targets", { dry_run: false, documents: 0, chunks: 0, vectors: 0 }],
+    ["unacknowledged document count", { dry_run: false, documents: 1, chunks: 0, vectors: 0, targets: [] }],
+    ["duplicate target acknowledgement", { dry_run: false, documents: 2, chunks: 0, vectors: 0, targets: ["drive:one", "drive:one"] }],
+    ["invalid target acknowledgement", { dry_run: false, documents: 1, chunks: 0, vectors: 0, targets: [""] }],
   ]) {
     const invalid = await throws(() => validateForgetReceipt(receipt));
     check(`${label} cannot masquerade as a confirmed deletion`, invalid !== null, invalid);
@@ -609,6 +657,13 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   for (const [name, txt] of [["README.md", readme], ["templates/brain.manifest.json", tmpl]])
     check(`${name} includes Vectorize Edit in the scoped token`, /Vectorize(?::)?\s+(?:Edit|edit)/.test(txt), `${name} omitted it`);
 
+  const templateManifest = JSON.parse(tmpl);
+  check("the public template does not imply automatic email or webhook alerts exist",
+    !("health_report_email" in templateManifest.operations) &&
+      !("alert_webhook_secret" in templateManifest.operations) &&
+      !("health_cron" in templateManifest.operations),
+    JSON.stringify(templateManifest.operations));
+
   check("the installer does not claim tokens cannot reach Vectorize", !/no API token can reach Vectorize/i.test(brain));
 
   check("the Vectorize remedy exists in exactly one place", (doctor.match(/export const VECTORIZE_REMEDY/g) || []).length === 1);
@@ -724,11 +779,13 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
   check("a limited local run cannot falsely commit a scanner migration",
     /scannerPolicyChanged && limitedMissesPrior/.test(local || "") &&
       /--limit cannot be used/.test(local || ""), String(local).slice(0, 1800));
-  const localCleanupConfirmed = String(local).indexOf('assertNoPendingRemovals(localRemoval');
+  const localCleanupConfirmed = String(local).indexOf('const afterLocalRemoval = await listStoredSourceFamilies');
+  const localCleanupReadbackApplied = String(local).indexOf('const stillStored = plannedLocalTargets.filter', localCleanupConfirmed);
   const localScannerCommitted = String(local).indexOf('state.credential_scanner_fingerprint = scannerFingerprint');
   check("local scanner policy commits only after confirmed refusal cleanup",
-    localCleanupConfirmed !== -1 && localScannerCommitted > localCleanupConfirmed,
-    `cleanup=${localCleanupConfirmed} commit=${localScannerCommitted}`);
+    localCleanupConfirmed !== -1 && localCleanupReadbackApplied > localCleanupConfirmed &&
+      localScannerCommitted > localCleanupReadbackApplied,
+    `inventory=${localCleanupConfirmed} proof=${localCleanupReadbackApplied} commit=${localScannerCommitted}`);
   check("remote ingest opens freshness through the Worker before reading Google",
     /status: "indexing"/.test(remote || "") && /postSourceReceipt/.test(remote || ""), String(remote).slice(0, 200));
   check("a thrown Drive or Gmail fetch posts an error receipt",
@@ -749,6 +806,9 @@ check("older document receipts still have a count", documentCountOf({ total: 42 
     /hasCredentialScannerProgress\([\s\S]*state\.done\[key\] === listedVersion/.test(remote || "") &&
       /recordCredentialScannerProgress\(state, scannerFingerprint, plan\.stateKey, plan\.hash\)/.test(remote || ""),
     String(remote).slice(0, 2200));
+  check("remote IMAP scanner upgrades force each saved folder through a full reread",
+    /folderSyncDecision\(\{[\s\S]*policyChanged: imapPolicyChanged,[\s\S]*scannerPolicyChanged,[\s\S]*\}\)/.test(remote || ""),
+    String(remote).slice(0, 2600));
   const remoteCleanupConfirmed = String(remote).indexOf('assertDriveRemovalPlanSafe(driveRemovalPlan');
   const remoteScannerCommitted = String(remote).indexOf('commitCredentialScannerProgress(state, scannerFingerprint)');
   check("remote scanner progress commits only after the aggregate Drive removal plan is approved",

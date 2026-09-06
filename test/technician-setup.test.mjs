@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { cmdLocalTools } from "../brain.mjs";
+import { WRANGLER_PACKAGE } from "../doctor.mjs";
 
 import {
   TECHNICIAN_RUN_STEPS,
@@ -47,7 +48,9 @@ test("local tool readiness proves Claude sign-in, pinned Wrangler, and the inter
     isTTY: true,
     runCommand: (command, args, options) => {
       calls.push({ command, args, options });
-      if (command === "npx") return { ok: true, out: "wrangler 4.34.0" };
+      // 4.127+ is the floor now: isolated Wrangler auth profiles need it, and
+      // the version the fixture reports is the version the check judges.
+      if (command === "npx") return { ok: true, out: "wrangler 4.127.1" };
       if (args[0] === "--version") return { ok: true, out: "2.1.63 (Claude Code)" };
       if (args.join(" ") === "auth status") return { ok: true, out: "fixture status intentionally hidden" };
       return { ok: false, out: "unexpected fixture command" };
@@ -62,7 +65,8 @@ test("local tool readiness proves Claude sign-in, pinned Wrangler, and the inter
     claude_doctor: "passed",
   });
   assert.ok(calls.some((call) => call.command === "claude" && call.args.join(" ") === "auth status"));
-  assert.ok(calls.some((call) => call.command === "npx" && call.args.join(" ") === "wrangler@4 --version"));
+  assert.ok(calls.some((call) => call.command === "npx" &&
+    call.args.join(" ") === `${WRANGLER_PACKAGE} --version`));
   assert.ok(calls.every((call) => call.options.inheritEnv === false));
 });
 

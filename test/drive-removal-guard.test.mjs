@@ -25,6 +25,7 @@ import { previewSupportJournal } from "../support-journal.mjs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = join(HERE, "..", "brain.mjs");
 const DRIVE_GUARD_FETCH = pathToFileURL(join(HERE, "fixtures", "drive-removal-guard-fetch.mjs")).href;
+const DRIVE_SCOPE_FETCH = pathToFileURL(join(HERE, "fixtures", "drive-scope-boundary-fetch.mjs")).href;
 
 const CATEGORIES = ["source_policy", "source_deleted", "intentional_skip"];
 
@@ -231,6 +232,29 @@ assert.equal(ratioLimitedPlan.total, 2);
 assert.equal(ratioLimitedPlan.ratio, 0.20);
 assert.equal(ratioLimitedPlan.tooLarge, true);
 
+const oneTypedPlan = buildDriveRemovalPlan({
+  storedFamilies: ["gmail:one"],
+  policyCandidates: [],
+  vanishedCandidates: ["gmail:one"],
+  intentionalCandidates: [],
+}, { ratioFloorCount: 1, fingerprintContext: "gmail-current-typed" });
+assert.equal(oneTypedPlan.ratio, 1);
+assert.equal(oneTypedPlan.tooLarge, false);
+assert.notEqual(oneTypedPlan.fingerprint, buildDriveRemovalPlan({
+  storedFamilies: ["gmail:one"],
+  policyCandidates: [],
+  vanishedCandidates: ["gmail:one"],
+  intentionalCandidates: [],
+}, { fingerprintContext: "gmail-strict" }).fingerprint);
+
+let gmailRefusal = null;
+try {
+  assertDriveRemovalPlanSafe(ratioLimitedPlan, null, { sourceLabel: "Gmail" });
+} catch (error) {
+  gmailRefusal = error.message;
+}
+assert.match(gmailRefusal || "", /^Gmail cleanup would remove/);
+
 /* A refusal is aggregate-only and tells the operator how to approve this exact plan. */
 const rawUids = {
   source_policy: "drive:RAW_POLICY_UID_DO_NOT_PRINT",
@@ -286,6 +310,9 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
   const priorFullSweep = "2000-01-01T00:00:00.000Z";
   const scannerFingerprint = credentialScannerFingerprint(true);
   const policyFingerprint = drivePolicyFingerprint({
+    // Must match the manifest below: reviewed roots are part of the policy
+    // identity now, so a fingerprint computed without them is a different one.
+    rootFolderIds: ["root-fixture"],
     excludeFileIds: [],
     excludePaths: [],
     excludeNameParts: [],
@@ -352,7 +379,7 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
       brain: { domain: "fixture.invalid" },
       infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
       safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
-      corpora: { google_drive: {} },
+      corpora: { google_drive: { root_folder_ids: ["root-fixture"] } },
     }));
     writeFileSync(join(tokenRoot, "google-tokens.json"), JSON.stringify({
       google: {
@@ -396,6 +423,11 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     assert.equal(evidence.removalRequests, 0, "an unapproved plan made a removal write");
     assert.equal(evidence.reconciliationRequests, 0, "an unapproved plan made a reconciliation write");
     assert.equal(evidence.ingestBatchWrites, 0, "the empty Drive walk unexpectedly wrote an ingest batch");
+    assert.deepEqual(evidence.lastErrorReceipt, {
+      issue_code: "SAFETY_REVIEW_REQUIRED",
+      has_error: false,
+      has_detail: false,
+    }, "the real Drive catch did not preserve the safety stop as a private-text-free review receipt");
 
     const wrongApproval = `${initialApproval.slice(0, -1)}${initialApproval.endsWith("0") ? "1" : "0"}`;
     const wrong = run(["--approve-removals", wrongApproval]);
@@ -454,6 +486,149 @@ for (const malformed of [undefined, true, "", "not-a-sha256", wrongFingerprint, 
     assert.equal(evidence.receipts.ready, 1, "only the completed run should close as ready");
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+/*
+ * Drive changes are account-wide. Changed files must be re-enumerated through
+ * reviewed roots, while removed or omitted stored files need typed metadata
+ * evidence before they can enter the deletion plan.
+ */
+{
+  const scannerFingerprint = credentialScannerFingerprint(true);
+  const policyFingerprint = drivePolicyFingerprint({
+    rootFolderIds: ["root-fixture"],
+    excludeFileIds: [],
+    excludePaths: [],
+    excludeNameParts: [],
+    privatePrefixes: [],
+  }, true);
+  const stripAnsi = (value) => String(value || "").replace(/\x1b\[[0-9;]*m/g, "");
+
+  const runScopeScenario = (mode, { full = false } = {}) => {
+    const directory = mkdtempSync(join(tmpdir(), `brain-drive-scope-${mode}-`));
+    const manifestPath = join(directory, "fixture.manifest.json");
+    const statePath = join(directory, ".brain-ingest-drive.json");
+    const evidencePath = join(directory, "scope-evidence.json");
+    const userRoot = join(directory, "isolated-user-root");
+    const tokenRoot = join(userRoot, ".brain");
+    const priorCursor = `fixture-prior-${mode}`;
+    const priorFullSweep = full ? "2000-01-01T00:00:00.000Z" : new Date().toISOString();
+    const environment = {};
+    for (const name of ["PATH", "Path", "PATHEXT", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR"]) {
+      if (process.env[name] !== undefined) environment[name] = process.env[name];
+    }
+    Object.assign(environment, {
+      NO_COLOR: "1",
+      BRAIN_GOOGLE_TOKEN_STORE: "file",
+      BRAIN_DRIVE_SCOPE_USER_ROOT: userRoot,
+      BRAIN_DRIVE_SCOPE_EVIDENCE: evidencePath,
+      BRAIN_DRIVE_SCOPE_MODE: mode,
+      ADMIN_KEY: "fixture-admin",
+    });
+
+    mkdirSync(tokenRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(manifestPath, JSON.stringify({
+      client: { slug: "fixture" },
+      brain: { domain: "fixture.invalid" },
+      infrastructure: { cloudflare: { account_id: "fixture-account", d1_database_id: "fixture-db" } },
+      safety: { credential_scanner: { enabled: true }, private_path_prefixes: [] },
+      corpora: { google_drive: { root_folder_ids: ["root-fixture"] } },
+    }));
+    writeFileSync(join(tokenRoot, "google-tokens.json"), JSON.stringify({
+      google: {
+        client_id: "fixture-client",
+        client_secret: null,
+        refresh_token: "fixture-refresh",
+        scopes: ["drive"],
+      },
+    }), { mode: 0o600 });
+    writeFileSync(statePath, JSON.stringify({
+      version: 1,
+      done: {},
+      skipped: {},
+      sync_token: priorCursor,
+      drive_policy_fingerprint: policyFingerprint,
+      credential_scanner_fingerprint: scannerFingerprint,
+      drive_last_full_sweep_at: priorFullSweep,
+      drive_folders: {
+        "root-fixture": { name: "Reviewed Root", parents: [] },
+      },
+    }), { mode: 0o600 });
+
+    const result = spawnSync(process.execPath, [
+      "--import", DRIVE_SCOPE_FETCH,
+      CLI, "ingest", manifestPath, "--from", "drive",
+    ], { encoding: "utf8", env: environment, timeout: 30_000 });
+    assert.equal(result.error, undefined, String(result.error || ""));
+    assert.equal(result.signal, null, `Drive scope CLI was terminated by ${result.signal}`);
+    return {
+      code: result.status,
+      output: stripAnsi(`${result.stdout || ""}${result.stderr || ""}`),
+      priorCursor,
+      priorFullSweep,
+      state: () => JSON.parse(readFileSync(statePath, "utf8")),
+      evidence: () => JSON.parse(readFileSync(evidencePath, "utf8")),
+      cleanup: () => rmSync(directory, { recursive: true, force: true }),
+    };
+  };
+
+  const changedOutside = runScopeScenario("changed-outside");
+  try {
+    assert.equal(changedOutside.code, 0, changedOutside.output);
+    assert.match(changedOutside.output, /rooted full comparison before reading content/i);
+    const evidence = changedOutside.evidence();
+    assert.equal(evidence.changesReads, 1);
+    assert.equal(evidence.rootedWalks, 1, "an account-wide changed item did not trigger a rooted walk");
+    assert.equal(evidence.outsideContentReads, 0, "an out-of-root changed file reached the content boundary");
+    assert.equal(evidence.ingestBatchWrites, 0, "an out-of-root changed file reached ingest");
+    assert.equal(evidence.forgetRequests, 0);
+    const state = changedOutside.state();
+    assert.equal(state.sync_token, "fixture-next-changed-outside");
+    assert.notEqual(state.drive_last_full_sweep_at, changedOutside.priorFullSweep);
+  } finally {
+    changedOutside.cleanup();
+  }
+
+  for (const [mode, full] of [["full-unresolved", true], ["incremental-unresolved", false]]) {
+    const unresolved = runScopeScenario(mode, { full });
+    try {
+      assert.equal(unresolved.code, 1, unresolved.output);
+      assert.match(unresolved.output, /could not distinguish deletion from permission loss/i);
+      assert.equal(unresolved.output.includes("missing-sensitive"), false, "ambiguous Drive id leaked to CLI output");
+      const evidence = unresolved.evidence();
+      assert.equal(evidence.absenceMetadataReads, 1, `${mode} did not classify the missing stored file`);
+      assert.equal(evidence.rootedWalks, full ? 1 : 0);
+      assert.equal(evidence.ingestBatchWrites, 0, "ambiguous absence allowed content writes");
+      assert.equal(evidence.forgetRequests, 0, "ambiguous absence reached the destructive endpoint");
+      assert.equal(evidence.receipts.error, 1, "ambiguous absence did not close its receipt as an error");
+      const state = unresolved.state();
+      assert.equal(state.sync_token, unresolved.priorCursor, "ambiguous absence advanced the Drive cursor");
+      assert.equal(state.drive_last_full_sweep_at, unresolved.priorFullSweep,
+        "ambiguous absence completed a full-sweep checkpoint");
+    } finally {
+      unresolved.cleanup();
+    }
+  }
+
+  for (const mode of ["incremental-trash", "incremental-left-scope"]) {
+    const confirmed = runScopeScenario(mode);
+    try {
+      assert.equal(confirmed.code, 0, confirmed.output);
+      const evidence = confirmed.evidence();
+      assert.equal(evidence.absenceMetadataReads, 1, `${mode} did not classify the removed file`);
+      assert.equal(evidence.rootedWalks, 0, `${mode} unexpectedly required a full walk`);
+      assert.equal(evidence.forgetRequests, 1, `${mode} did not reach the guarded removal plan`);
+      assert.equal(evidence.removedFamilies, 1);
+      assert.equal(evidence.inventoryReads, 2, "confirmed removal lacked exact inventory readback");
+      assert.equal(evidence.ingestBatchWrites, 0);
+      const state = confirmed.state();
+      assert.equal(state.sync_token, `fixture-next-${mode}`);
+      assert.equal(state.drive_last_full_sweep_at, confirmed.priorFullSweep,
+        "an incremental classified removal rewrote the full-sweep checkpoint");
+    } finally {
+      confirmed.cleanup();
+    }
   }
 }
 
@@ -528,8 +703,8 @@ const outerCatch = remote.slice(outerCatchIndex);
 if (/flushIntentionalRemovals/.test(outerCatch)) {
   assert.match(
     outerCatch,
-    /if\s*\(\s*which\s*!==\s*"drive"[^)]*\)\s*\{[\s\S]*?flushIntentionalRemovals/,
-    "Drive failure cleanup must not bypass the aggregate guard by deleting intentional skips",
+    /if\s*\(\s*which\s*===\s*"imap"[^)]*\)\s*\{[\s\S]*?flushIntentionalRemovals/,
+    "Drive and Gmail failure cleanup must not bypass their aggregate guards by deleting intentional skips",
   );
 }
 

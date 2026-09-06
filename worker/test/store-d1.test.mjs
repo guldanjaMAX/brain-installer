@@ -43,6 +43,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
   }));
   const byId = new Map(vectorRows.map((row) => [row.chunk_uid, row]));
   const hydrationBinds = [];
+  const hydrationSql = [];
   const env = {
     DB: {
       prepare: (sql) => ({
@@ -50,6 +51,7 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
           all: async () => {
             if (!/FROM chunks c JOIN documents d/.test(sql)) return { results: [] };
             hydrationBinds.push(values.length);
+            hydrationSql.push(sql);
             return { results: values.map((value) => byId.get(value)).filter(Boolean) };
           },
         }),
@@ -71,6 +73,10 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     hydrated.length === RETRIEVAL_CANDIDATE_DEPTH && hydrationBinds.length === 2 &&
       hydrationBinds.every((count) => count <= D1_QUERY_BIND_LIMIT),
     JSON.stringify({ hydrated: hydrated.length, hydrationBinds }));
+  check("vector hydration projects the same precise occurrence metadata as keyword retrieval",
+    hydrationSql.length > 0 && hydrationSql.every((sql) =>
+      /d\.date_source = 'calendar:event_start'.*json_valid\(d\.meta\).*json_extract\(d\.meta, '\$\.start'\).*AS occurred_at/s.test(sql)),
+    hydrationSql.join("\n"));
 }
 
 /* ---- Vectorize metadata must be exact and use the same encoding at query time ---- */
@@ -355,8 +361,12 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     document_date: day("2026-08-26"), date_reliable: 0, score: -0.3,
   };
   const rows = [stale, ...distractors, current, unrelatedRecent, unreliableFuture];
+  let currentKeywordSql = "";
   const env = {
-    DB: { prepare: () => ({ bind: () => ({ all: async () => ({ results: rows }) }) }) },
+    DB: { prepare: (sql) => {
+      if (/FROM chunks_fts/.test(sql)) currentKeywordSql = sql;
+      return { bind: () => ({ all: async () => ({ results: rows }) }) };
+    } },
   };
   const currentQuery = "What is going on with billing with Taylor? Are they still a client?";
   const ranked = await search(env, { query: currentQuery, embedding: null, limit: rows.length });
@@ -369,6 +379,101 @@ const check = (n, c, d = "") => { ran++; console.log((c ? "PASS  " : "FAIL  ") +
     Math.abs(unrelated.rrf_score - 1 / 71) < 1e-9, String(unrelated.rrf_score));
   check("an unreliable date receives no currentness credit",
     Math.abs(unreliable.rrf_score - 1 / 72) < 1e-9, String(unreliable.rrf_score));
+  check("keyword retrieval projects a precise occurrence from bounded persisted metadata",
+    /d\.date_source = 'calendar:event_start'.*json_valid\(d\.meta\).*json_extract\(d\.meta, '\$\.start'\).*AS occurred_at/s.test(currentKeywordSql),
+    currentKeywordSql);
+
+  const morning = {
+    ...current,
+    chunk_uid: "calendar-morning#0", doc_uid: "calendar-morning", source_id: "calendar-morning",
+    source: "calendar_event", title: "Taylor morning meeting",
+    text: "Taylor morning meeting at 9:00 AM.",
+    document_date: day("2026-08-19"), occurred_at: "2026-08-19T09:00:00-07:00",
+    date_source: "calendar:event_start",
+  };
+  const afternoon = {
+    ...morning,
+    chunk_uid: "calendar-afternoon#0", doc_uid: "calendar-afternoon", source_id: "calendar-afternoon",
+    title: "Taylor afternoon meeting", text: "Taylor afternoon meeting at 3:00 PM.",
+    occurred_at: "2026-08-19T15:00:00-07:00",
+  };
+  const sameDay = currentEvidenceCandidates(currentQuery, [morning, afternoon]);
+  check("precise Calendar starts order reliable evidence within one local citation day",
+    sameDay.map((row) => row.doc_uid).join(",") === "calendar-afternoon,calendar-morning",
+    JSON.stringify(sameDay));
+  const allDay = {
+    ...morning,
+    chunk_uid: "calendar-all-day#0", doc_uid: "calendar-all-day",
+    title: "Taylor all-day reminder", text: "Taylor all-day reminder.",
+    occurred_at: "2026-08-19", date_source: "calendar:all_day_start",
+  };
+  const plusFourteen = {
+    ...morning,
+    chunk_uid: "calendar-plus-fourteen#0", doc_uid: "calendar-plus-fourteen",
+    title: "Taylor timed event +14", occurred_at: "2026-08-19T00:30:00+14:00",
+  };
+  const minusTwelve = {
+    ...morning,
+    chunk_uid: "calendar-minus-twelve#0", doc_uid: "calendar-minus-twelve",
+    title: "Taylor timed event -12", occurred_at: "2026-08-19T23:30:00-12:00",
+  };
+  const mixedPrecision = currentEvidenceCandidates(currentQuery, [allDay, plusFourteen, minusTwelve]);
+  check("timed Calendar evidence outranks an all-day event across extreme positive and negative offsets",
+    mixedPrecision.map((row) => row.doc_uid).join(",") ===
+      "calendar-minus-twelve,calendar-plus-fourteen,calendar-all-day",
+    JSON.stringify(mixedPrecision));
+  const inconsistent = { ...morning, occurred_at: "2099-01-01T09:00:00Z" };
+  const boundedExact = currentEvidenceCandidates(currentQuery, [inconsistent, afternoon]);
+  check("a precise metadata timestamp cannot move evidence outside its stored citation day",
+    boundedExact[0]?.doc_uid === "calendar-afternoon", JSON.stringify(boundedExact));
+
+  // These absolute instants run in the opposite order: Aug 19 at UTC-12 is
+  // later in UTC than Aug 20 at UTC+14. The user's local citation day remains
+  // the primary fact, so Aug 20 must still rank first.
+  const previousLocalDay = {
+    ...morning,
+    chunk_uid: "calendar-previous-local-day#0", doc_uid: "calendar-previous-local-day",
+    document_date: day("2026-08-19"), occurred_at: "2026-08-19T23:30:00-12:00",
+  };
+  const nextLocalDay = {
+    ...morning,
+    chunk_uid: "calendar-next-local-day#0", doc_uid: "calendar-next-local-day",
+    document_date: day("2026-08-20"), occurred_at: "2026-08-20T00:30:00+14:00",
+  };
+  const adjacentDays = currentEvidenceCandidates(currentQuery, [previousLocalDay, nextLocalDay]);
+  check("a later local Calendar day outranks an earlier day across opposing UTC offsets",
+    adjacentDays[0]?.doc_uid === "calendar-next-local-day", JSON.stringify(adjacentDays));
+
+  const filenameMorning = {
+    ...morning,
+    chunk_uid: "drive-filename-morning#0", doc_uid: "drive-filename-morning", source: "drive",
+    date_source: "filename", occurred_at: "2026-08-19T09:00:00-07:00",
+  };
+  const filenameAfternoon = {
+    ...filenameMorning,
+    chunk_uid: "drive-filename-afternoon#0", doc_uid: "drive-filename-afternoon",
+    occurred_at: "2026-08-19T15:00:00-07:00",
+  };
+  const filenameOrder = currentEvidenceCandidates(currentQuery, [filenameMorning, filenameAfternoon]);
+  check("a valid metadata.start cannot add recency precision to filename-dated Drive evidence",
+    filenameOrder.map((row) => row.doc_uid).join(",") === "drive-filename-morning,drive-filename-afternoon",
+    JSON.stringify(filenameOrder));
+
+  const messageMorning = {
+    ...morning,
+    chunk_uid: "message-morning#0", doc_uid: "message-morning", source: "message",
+    date_source: "message:timestamp", document_date: Date.parse("2026-08-19T09:00:00Z"),
+    occurred_at: null,
+  };
+  const messageAfternoon = {
+    ...messageMorning,
+    chunk_uid: "message-afternoon#0", doc_uid: "message-afternoon",
+    document_date: Date.parse("2026-08-19T15:00:00Z"),
+  };
+  const messageOrder = currentEvidenceCandidates(currentQuery, [messageMorning, messageAfternoon]);
+  check("ordinary reliable timestamps retain same-day precision without Calendar metadata",
+    messageOrder.map((row) => row.doc_uid).join(",") === "message-afternoon,message-morning",
+    JSON.stringify(messageOrder));
 
   const historical = await search(env, {
     query: "Was Taylor still a client in May 2025?", embedding: null, limit: rows.length,

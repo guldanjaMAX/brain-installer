@@ -20,10 +20,11 @@
  */
 
 import {
-  readFileSync, readdirSync, statSync, writeFileSync, existsSync, mkdirSync,
-  renameSync, chmodSync, rmSync,
+  closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync,
+  readdirSync, realpathSync, writeFileSync, existsSync, mkdirSync, renameSync,
+  chmodSync, rmSync,
 } from "node:fs";
-import { join, relative, sep, basename, dirname } from "node:path";
+import { isAbsolute, join, relative, resolve, sep, basename, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { extract, canExtract, extensionOf, isBinaryFormat } from "./extract.mjs";
 import {
@@ -44,8 +45,9 @@ import {
   detectFacebookMessengerExport, isFacebookMessengerExportFilename,
   parseFacebookMessengerExport,
 } from "./facebook-messenger-export.mjs";
+import { parseLinkedInArchive } from "./linkedin-export.mjs";
 import { MessageSessionizer } from "./message-session.mjs";
-import { splitMbox, mboxMessageKey } from "./mbox.mjs";
+import { MboxStreamSplitter, mboxMessageKey } from "./mbox.mjs";
 // The one mail reader. Imported by name rather than reached through the
 // registry because an archive's messages need their own subjects and dates,
 // and a second parser beside the first is how the two start disagreeing.
@@ -73,29 +75,342 @@ const JUNK_FILES = new Set(["thumbs.db", "desktop.ini", "icon\r", ".ds_store", "
 export const MAX_FILE_BYTES = 8 * 1024 * 1024;
 
 /**
- * The same ceiling for a file that is not one document.
+ * The same in-memory/scan ceiling for a file that is not one document.
  *
  * A mail archive is a folder of hundreds of messages, and a real one is
- * routinely tens of megabytes. Judging it by the single-document limit would
- * skip the common case of the very thing the README tells clients to export,
- * which is how a limit turns into a false promise. It still has a ceiling:
- * the whole archive is read into memory to be split.
+ * routinely larger than this. Local mbox ingest streams the complete file for
+ * a stable content hash and parses only complete messages inside this window;
+ * crossing it is reported as incomplete. Buffered archives such as ZIP still
+ * use it as a hard file ceiling.
  */
 export const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
 
-/** Extensions that hold many documents, and get the archive ceiling. */
-const ARCHIVE_EXTENSIONS = new Set([".mbox"]);
+/** One malformed or attachment-heavy email cannot own the whole process. */
+export const MAX_MBOX_MESSAGE_BYTES = MAX_FILE_BYTES;
+
+/** Buffered multi-document containers that still get the hard archive ceiling. */
+const BUFFERED_ARCHIVE_EXTENSIONS = new Set([".zip"]);
 
 export const fileSizeLimitFor = (name, maxBytes, archiveBytes) =>
-  (ARCHIVE_EXTENSIONS.has(extensionOf(name)) || isFacebookMessengerExportFilename(name)
-    ? archiveBytes
-    : maxBytes);
+  extensionOf(name) === ".mbox"
+    ? Number.MAX_SAFE_INTEGER
+    : (BUFFERED_ARCHIVE_EXTENSIONS.has(extensionOf(name)) || isFacebookMessengerExportFilename(name)
+      ? archiveBytes
+      : maxBytes);
+
+class LocalFileSafetyError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "LocalFileSafetyError";
+    this.code = code;
+  }
+}
+
+const localFileFail = (code, message) => {
+  throw new LocalFileSafetyError(code, message);
+};
+
+const nativeRealpath = realpathSync.native || realpathSync;
+
+const comparablePath = (value) => {
+  const normalized = resolve(String(value));
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+};
+
+function pathIsWithin(root, candidate) {
+  const rel = relative(comparablePath(root), comparablePath(candidate));
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+function regularFileSnapshot(st) {
+  return {
+    dev: String(st.dev),
+    ino: String(st.ino),
+    size: String(st.size),
+    mtimeNs: String(st.mtimeNs ?? BigInt(Math.trunc(Number(st.mtimeMs) * 1e6))),
+    ctimeNs: String(st.ctimeNs ?? BigInt(Math.trunc(Number(st.ctimeMs) * 1e6))),
+  };
+}
+
+const sameFileIdentity = (left, right) => left.dev === right.dev && left.ino === right.ino;
+
+const sameFileVersion = (left, right) =>
+  sameFileIdentity(left, right) && left.size === right.size &&
+  left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+
+function inspectRegularPath(path) {
+  let st;
+  try {
+    st = lstatSync(path, { bigint: true });
+  } catch (error) {
+    localFileFail("LOCAL_FILE_METADATA_UNAVAILABLE", `file metadata could not be read: ${error.code || "unavailable"}`);
+  }
+  if (st.isSymbolicLink()) {
+    localFileFail("LOCAL_FILE_LINK_REFUSED", "symbolic links and junctions are not ingested");
+  }
+  if (!st.isFile()) localFileFail("LOCAL_FILE_NOT_REGULAR", "the path is not a regular file");
+  return regularFileSnapshot(st);
+}
+
+function approveLocalRoot(root) {
+  const rootPath = resolve(String(root));
+  let st;
+  try {
+    st = lstatSync(rootPath, { bigint: true });
+  } catch (error) {
+    localFileFail("LOCAL_ROOT_METADATA_UNAVAILABLE", `folder metadata could not be read: ${error.code || "unavailable"}`);
+  }
+  if (st.isSymbolicLink()) {
+    localFileFail("LOCAL_ROOT_LINK_REFUSED", "the ingest root is a symbolic link or junction");
+  }
+  if (!st.isDirectory()) localFileFail("LOCAL_ROOT_NOT_DIRECTORY", "the ingest root is not a directory");
+  let rootReal;
+  try {
+    rootReal = nativeRealpath(rootPath);
+  } catch (error) {
+    localFileFail("LOCAL_ROOT_REALPATH_UNAVAILABLE", `folder identity could not be resolved: ${error.code || "unavailable"}`);
+  }
+  return { rootPath, rootReal };
+}
+
+function approveWalkedFile(full, rootApproval) {
+  const fullPath = resolve(String(full));
+  const identity = inspectRegularPath(fullPath);
+  let fileReal;
+  try {
+    fileReal = nativeRealpath(fullPath);
+  } catch (error) {
+    localFileFail("LOCAL_FILE_REALPATH_UNAVAILABLE", `file identity could not be resolved: ${error.code || "unavailable"}`);
+  }
+  if (!pathIsWithin(rootApproval.rootReal, fileReal)) {
+    localFileFail("LOCAL_FILE_OUTSIDE_ROOT", "the file resolves outside the approved ingest root");
+  }
+  return { rootPath: rootApproval.rootPath, rootReal: rootApproval.rootReal, identity };
+}
+
+function localReadApproval(file) {
+  if (file?._localApproval?.rootReal && file?._localApproval?.identity) return file._localApproval;
+
+  // A few format fixtures call prepare() directly. Give those calls the same
+  // link-refusing descriptor read, with the containing directory as the narrow
+  // root. Production folder ingest always supplies walk()'s earlier identity.
+  const fullPath = resolve(String(file?.full || ""));
+  const rootPath = resolve(fullPath, "..");
+  let rootReal;
+  try {
+    rootReal = nativeRealpath(rootPath);
+  } catch (error) {
+    localFileFail("LOCAL_ROOT_REALPATH_UNAVAILABLE", `folder identity could not be resolved: ${error.code || "unavailable"}`);
+  }
+  return { rootPath, rootReal, identity: inspectRegularPath(fullPath) };
+}
+
+function openLocalNoFollow(path) {
+  // POSIX exposes O_NOFOLLOW. Windows does not expose the equivalent reparse
+  // flag through Node, so descriptor identity is checked before any byte read.
+  const noFollow = process.platform === "win32" ? 0 : (constants.O_NOFOLLOW || 0);
+  try {
+    return openSync(path, constants.O_RDONLY | noFollow | (constants.O_CLOEXEC || 0));
+  } catch (error) {
+    if (error?.code === "ELOOP") {
+      localFileFail("LOCAL_FILE_LINK_REFUSED", "symbolic links and junctions are not ingested");
+    }
+    localFileFail("LOCAL_FILE_OPEN_REFUSED", `the approved file could not be opened: ${error.code || "unavailable"}`);
+  }
+}
+
+function readBoundedLocalFile(fd, maxBytes) {
+  const chunks = [];
+  let total = 0;
+  while (total <= maxBytes) {
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - total));
+    let count;
+    try {
+      count = readSync(fd, chunk, 0, chunk.length, total);
+    } catch (error) {
+      localFileFail("LOCAL_FILE_READ_FAILED", `the approved file could not be read: ${error.code || "unavailable"}`);
+    }
+    if (count === 0) break;
+    chunks.push(chunk.subarray(0, count));
+    total += count;
+  }
+  if (total > maxBytes) {
+    localFileFail("LOCAL_FILE_TOO_LARGE", `the file changed and is now over the ${(maxBytes / 1048576).toFixed(0)}MB limit`);
+  }
+  return Buffer.concat(chunks, total);
+}
+
+/** Read only the regular file identity approved by walk(), within its root. */
+function readApprovedLocalFile(file, { maxBytes }) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    localFileFail("LOCAL_FILE_LIMIT_INVALID", "the local file size limit is invalid");
+  }
+  const fullPath = resolve(String(file?.full || ""));
+  const approval = localReadApproval(file);
+  const pathBefore = inspectRegularPath(fullPath);
+  if (!sameFileIdentity(pathBefore, approval.identity)) {
+    localFileFail("LOCAL_FILE_IDENTITY_CHANGED", "the file changed after the folder was scanned; retry the ingest");
+  }
+  let realBefore;
+  try {
+    realBefore = nativeRealpath(fullPath);
+  } catch (error) {
+    localFileFail("LOCAL_FILE_REALPATH_UNAVAILABLE", `file identity could not be resolved: ${error.code || "unavailable"}`);
+  }
+  if (!pathIsWithin(approval.rootReal, realBefore)) {
+    localFileFail("LOCAL_FILE_OUTSIDE_ROOT", "the file resolves outside the approved ingest root");
+  }
+
+  const fd = openLocalNoFollow(fullPath);
+  try {
+    let before;
+    try {
+      const st = fstatSync(fd, { bigint: true });
+      if (!st.isFile()) localFileFail("LOCAL_FILE_NOT_REGULAR", "the opened path is not a regular file");
+      before = regularFileSnapshot(st);
+    } catch (error) {
+      if (error instanceof LocalFileSafetyError) throw error;
+      localFileFail("LOCAL_FILE_METADATA_UNAVAILABLE", `opened-file metadata could not be read: ${error.code || "unavailable"}`);
+    }
+    if (!sameFileIdentity(before, approval.identity) || !sameFileIdentity(before, pathBefore)) {
+      localFileFail("LOCAL_FILE_IDENTITY_CHANGED", "the file changed while it was being opened; retry the ingest");
+    }
+    if (BigInt(before.size) > BigInt(maxBytes)) {
+      localFileFail("LOCAL_FILE_TOO_LARGE", `the file changed and is now over the ${(maxBytes / 1048576).toFixed(0)}MB limit`);
+    }
+
+    const bytes = readBoundedLocalFile(fd, maxBytes);
+    let after;
+    try {
+      after = regularFileSnapshot(fstatSync(fd, { bigint: true }));
+    } catch (error) {
+      localFileFail("LOCAL_FILE_METADATA_UNAVAILABLE", `opened-file metadata could not be rechecked: ${error.code || "unavailable"}`);
+    }
+    if (!sameFileVersion(before, after) || BigInt(after.size) !== BigInt(bytes.length)) {
+      localFileFail("LOCAL_FILE_CHANGED_DURING_READ", "the file changed while it was being read; retry the ingest");
+    }
+
+    const pathAfter = inspectRegularPath(fullPath);
+    let realAfter;
+    try {
+      realAfter = nativeRealpath(fullPath);
+    } catch (error) {
+      localFileFail("LOCAL_FILE_REALPATH_UNAVAILABLE", `file identity could not be rechecked: ${error.code || "unavailable"}`);
+    }
+    if (!sameFileIdentity(pathAfter, after) || !pathIsWithin(approval.rootReal, realAfter)) {
+      localFileFail("LOCAL_FILE_IDENTITY_CHANGED", "the file path changed while it was being read; retry the ingest");
+    }
+    return bytes;
+  } finally {
+    try { closeSync(fd); } catch { /* the safety result above is authoritative */ }
+  }
+}
+
+/**
+ * Stream the same approved regular-file identity while retaining the complete
+ * post-read stability proof used by the bounded reader above.
+ *
+ * The consumer must exhaust this iterator before using any derived result. If
+ * the path, inode, size, mtime, or ctime changes while bytes are being read,
+ * the final iteration throws and the caller discards everything it prepared.
+ */
+function* streamApprovedLocalFile(file) {
+  const fullPath = resolve(String(file?.full || ""));
+  const approval = localReadApproval(file);
+  const pathBefore = inspectRegularPath(fullPath);
+  if (!sameFileIdentity(pathBefore, approval.identity)) {
+    localFileFail("LOCAL_FILE_IDENTITY_CHANGED", "the file changed after the folder was scanned; retry the ingest");
+  }
+  let realBefore;
+  try {
+    realBefore = nativeRealpath(fullPath);
+  } catch (error) {
+    localFileFail("LOCAL_FILE_REALPATH_UNAVAILABLE", `file identity could not be resolved: ${error.code || "unavailable"}`);
+  }
+  if (!pathIsWithin(approval.rootReal, realBefore)) {
+    localFileFail("LOCAL_FILE_OUTSIDE_ROOT", "the file resolves outside the approved ingest root");
+  }
+
+  const fd = openLocalNoFollow(fullPath);
+  try {
+    let before;
+    try {
+      const st = fstatSync(fd, { bigint: true });
+      if (!st.isFile()) localFileFail("LOCAL_FILE_NOT_REGULAR", "the opened path is not a regular file");
+      before = regularFileSnapshot(st);
+    } catch (error) {
+      if (error instanceof LocalFileSafetyError) throw error;
+      localFileFail("LOCAL_FILE_METADATA_UNAVAILABLE", `opened-file metadata could not be read: ${error.code || "unavailable"}`);
+    }
+    if (!sameFileIdentity(before, approval.identity) || !sameFileIdentity(before, pathBefore)) {
+      localFileFail("LOCAL_FILE_IDENTITY_CHANGED", "the file changed while it was being opened; retry the ingest");
+    }
+    if (BigInt(before.size) > BigInt(Number.MAX_SAFE_INTEGER)) {
+      localFileFail("LOCAL_FILE_TOO_LARGE", "the mail archive is too large for this runtime to address safely");
+    }
+
+    let total = 0;
+    while (true) {
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      let count;
+      try {
+        count = readSync(fd, chunk, 0, chunk.length, null);
+      } catch (error) {
+        localFileFail("LOCAL_FILE_READ_FAILED", `the approved file could not be read: ${error.code || "unavailable"}`);
+      }
+      if (count === 0) break;
+      total += count;
+      if (!Number.isSafeInteger(total)) {
+        localFileFail("LOCAL_FILE_TOO_LARGE", "the mail archive is too large for this runtime to address safely");
+      }
+      yield chunk.subarray(0, count);
+    }
+
+    let after;
+    try {
+      after = regularFileSnapshot(fstatSync(fd, { bigint: true }));
+    } catch (error) {
+      localFileFail("LOCAL_FILE_METADATA_UNAVAILABLE", `opened-file metadata could not be rechecked: ${error.code || "unavailable"}`);
+    }
+    if (!sameFileVersion(before, after) || BigInt(after.size) !== BigInt(total)) {
+      localFileFail("LOCAL_FILE_CHANGED_DURING_READ", "the file changed while it was being read; retry the ingest");
+    }
+
+    const pathAfter = inspectRegularPath(fullPath);
+    let realAfter;
+    try {
+      realAfter = nativeRealpath(fullPath);
+    } catch (error) {
+      localFileFail("LOCAL_FILE_REALPATH_UNAVAILABLE", `file identity could not be rechecked: ${error.code || "unavailable"}`);
+    }
+    if (!sameFileIdentity(pathAfter, after) || !pathIsWithin(approval.rootReal, realAfter)) {
+      localFileFail("LOCAL_FILE_IDENTITY_CHANGED", "the file path changed while it was being read; retry the ingest");
+    }
+  } finally {
+    try { closeSync(fd); } catch { /* the safety result above is authoritative */ }
+  }
+}
+
+const localFileSafetyReason = (error) => error instanceof LocalFileSafetyError
+  ? error.message
+  : `could not safely inspect the local file: ${error?.code || "unavailable"}`;
 
 export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES, archiveBytes = MAX_ARCHIVE_BYTES } = {}) {
   const files = [];
   const skipped = [];
   let complete = true;
   const prefixes = privatePrefixes.map((p) => p.toLowerCase());
+
+  let rootApproval;
+  try {
+    rootApproval = approveLocalRoot(root);
+  } catch (error) {
+    return {
+      files,
+      skipped: [{ path: root, reason: localFileSafetyReason(error) }],
+      complete: false,
+    };
+  }
 
   const isPrivate = (rel) =>
     rel.split(/[\\/]/).some((seg) => prefixes.some((p) => seg.toLowerCase().startsWith(p)));
@@ -114,6 +429,14 @@ export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES, ar
     for (const e of entries) {
       const full = join(dir, e.name);
       const rel = relative(root, full);
+      if (e.isSymbolicLink()) {
+        skipped.push({ path: rel, reason: "symbolic links and junctions are not ingested" });
+        // A link can stand in for one prior file or an entire prior subtree.
+        // Treating the walk as complete could therefore turn a refused link
+        // into deletion evidence for children that were never enumerated.
+        complete = false;
+        continue;
+      }
       if (e.isDirectory()) {
         if (SKIP_DIRS.has(e.name) || e.name.startsWith(".")) continue;
         if (isPrivate(rel)) {
@@ -135,19 +458,34 @@ export function walk(root, { privatePrefixes = [], maxBytes = MAX_FILE_BYTES, ar
         skipped.push({ path: rel, reason: "matched a private path prefix from the manifest" });
         continue;
       }
-      let st;
-      try { st = statSync(full); } catch (error) {
-        skipped.push({ path: rel, reason: `file metadata could not be read: ${error.code || error.message}` });
+      let approval;
+      try {
+        approval = approveWalkedFile(full, rootApproval);
+      } catch (error) {
+        skipped.push({ path: rel, reason: localFileSafetyReason(error) });
+        // Any identity or containment failure means the walk did not establish
+        // a complete deletion boundary, so no ingest or removal may run.
         complete = false;
         continue;
       }
-      if (st.size === 0) { skipped.push({ path: rel, reason: "file is empty" }); continue; }
-      const sizeLimit = fileSizeLimitFor(e.name, maxBytes, archiveBytes);
-      if (st.size > sizeLimit) {
-        skipped.push({ path: rel, reason: `file is ${(st.size / 1048576).toFixed(1)}MB, over the ${(sizeLimit / 1048576).toFixed(0)}MB limit` });
+      const size = Number(approval.identity.size);
+      if (!Number.isSafeInteger(size) || size < 0) {
+        skipped.push({ path: rel, reason: "file size could not be represented safely" });
+        complete = false;
         continue;
       }
-      files.push({ full, rel, name: e.name, size: st.size });
+      if (size === 0) { skipped.push({ path: rel, reason: "file is empty" }); continue; }
+      const sizeLimit = fileSizeLimitFor(e.name, maxBytes, archiveBytes);
+      if (size > sizeLimit) {
+        skipped.push({ path: rel, reason: `file is ${(size / 1048576).toFixed(1)}MB, over the ${(sizeLimit / 1048576).toFixed(0)}MB limit` });
+        continue;
+      }
+      files.push({
+        full, rel, name: e.name, size, sizeLimit, _localApproval: approval,
+        // Unlike a ZIP, an mbox can be admitted without buffering its complete
+        // file. Keep the caller's archive bound as its parsing window instead.
+        ...(extensionOf(e.name) === ".mbox" ? { mboxScanBytes: archiveBytes } : {}),
+      });
     }
   };
 
@@ -241,7 +579,16 @@ async function prepareWhatsAppExport(file, buf, hash, { sourceName }) {
   for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
   envelopes.push(...sessionizer.finish());
 
-  return { hash, envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)) };
+  return {
+    hash,
+    envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)),
+    ...(parsed.skippedMedia
+      ? {
+          note: `${parsed.skippedMedia} media or deleted-message placeholder(s) were not represented`,
+          incomplete: true,
+        }
+      : {}),
+  };
 }
 
 /**
@@ -253,7 +600,12 @@ async function prepareWhatsAppExport(file, buf, hash, { sourceName }) {
  */
 function prepareSmsBackupXml(file, buf, hash, { sourceName }) {
   const text = decodeText(buf);
-  const parsed = parseSmsBackupXml(text, { sourceLabel: sourceName });
+  // A customer may load several overlapping phone-backup snapshots. Include
+  // the export file identity in every thread id so two files cannot generate
+  // the same document uid and silently overwrite each other's family.
+  const parsed = parseSmsBackupXml(text, {
+    sourceLabel: sourceFileFamilyUid(file, sourceName),
+  });
 
   if (!parsed.rows.length) {
     return {
@@ -270,7 +622,26 @@ function prepareSmsBackupXml(file, buf, hash, { sourceName }) {
   const envelopes = [];
   for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
   envelopes.push(...sessionizer.finish());
-  return { hash, envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)) };
+  const omissions = parsed.skippedEmpty + parsed.skippedMms;
+  const integrityNotes = [
+    !parsed.rootClosed ? "the export ended before </smses>" : null,
+    parsed.malformed ? `${parsed.malformed} malformed SMS entr${parsed.malformed === 1 ? "y was" : "ies were"} detected` : null,
+    parsed.countMismatch
+      ? `the export declared ${parsed.declaredCount} entries but ${parsed.entriesSeen} were present`
+      : null,
+  ].filter(Boolean);
+  return {
+    hash,
+    envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)),
+    ...(omissions || parsed.incomplete
+      ? {
+          note: `${parsed.skippedEmpty} empty or unreadable SMS entr${parsed.skippedEmpty === 1 ? "y" : "ies"} and ` +
+            `${parsed.skippedMms} MMS entr${parsed.skippedMms === 1 ? "y was" : "ies were"} not represented` +
+            (integrityNotes.length ? `; ${integrityNotes.join("; ")}` : ""),
+          incomplete: true,
+        }
+      : {}),
+  };
 }
 
 /** One Google Voice Takeout conversation page, many documents. */
@@ -295,7 +666,16 @@ function prepareGoogleVoiceTakeout(file, buf, hash, { sourceName }) {
   const envelopes = [];
   for (const row of parsed.rows) envelopes.push(...sessionizer.push(row));
   envelopes.push(...sessionizer.finish());
-  return { hash, envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)) };
+  return {
+    hash,
+    envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)),
+    ...(parsed.skippedNonMessage
+      ? {
+          note: `${parsed.skippedNonMessage} call, voicemail, empty, or malformed entr${parsed.skippedNonMessage === 1 ? "y was" : "ies were"} not represented`,
+          incomplete: true,
+        }
+      : {}),
+  };
 }
 
 /** One Meta Download Your Information thread file, many bounded sessions. */
@@ -326,6 +706,36 @@ function prepareFacebookMessengerExport(file, buf, hash, { sourceName }) {
       parsed.skippedUnavailable ? `${parsed.skippedUnavailable} unavailable or unsent message(s) not represented` : null,
       parsed.skippedMalformed ? `${parsed.skippedMalformed} malformed message(s) not represented` : null,
     ].filter(Boolean).join("; ") || null,
+    ...(parsed.skippedMedia || parsed.skippedUnavailable || parsed.skippedMalformed
+      ? { incomplete: true }
+      : {}),
+  };
+}
+
+/** One LinkedIn account-owner export ZIP, one document per recognized CSV. */
+function prepareLinkedInExport(file, buf, hash, { sourceName }) {
+  const parsed = parseLinkedInArchive(buf, { sourceName, archivePath: file.rel });
+  if (parsed.error || !parsed.envelopes.length) {
+    return {
+      hash,
+      skip: { path: file.rel, reason: parsed.error || "the LinkedIn export contains no readable data rows" },
+    };
+  }
+  const omittedRows = parsed.envelopes.reduce(
+    (total, envelope) => total + Math.max(0, Number(envelope?.metadata?.omitted_row_count || 0)),
+    0,
+  );
+  const notes = [
+    parsed.skipped.length
+      ? `${parsed.skipped.length} recognized LinkedIn CSV file(s) were empty or unreadable`
+      : null,
+    omittedRows ? `${omittedRows} LinkedIn row(s) beyond the per-file limit were not represented` : null,
+  ].filter(Boolean);
+  return {
+    hash,
+    envelopes: declareFamily(parsed.envelopes, sourceFileFamilyUid(file, sourceName)),
+    note: notes.join("; ") || null,
+    ...(parsed.skipped.length || omittedRows ? { incomplete: true } : {}),
   };
 }
 
@@ -341,41 +751,41 @@ function prepareFacebookMessengerExport(file, buf, hash, { sourceName }) {
  * uses, so nothing about MIME, encoded subjects or multipart bodies is decided
  * twice.
  */
-async function prepareMboxArchive(file, buf, hash, { sourceName }) {
-  const messages = splitMbox(buf.toString("utf-8"));
-  if (!messages.length) {
-    return {
-      hash,
-      skip: {
-        path: file.rel,
-        reason: "this .mbox file has no message separator line in it, so it is not a mail archive",
-      },
-    };
-  }
-
+async function prepareMboxArchive(file, { sourceName, scanBytes }) {
+  const splitter = new MboxStreamSplitter({
+    maxScanBytes: scanBytes,
+    maxMessageBytes: MAX_MBOX_MESSAGE_BYTES,
+  });
+  const hasher = createHash("sha256");
   const relPath = file.rel.split(sep).join("/");
   const envelopes = [];
   let unreadable = 0;
-  for (let index = 0; index < messages.length; index++) {
+  let oversized = 0;
+
+  const accept = async (item) => {
+    if (item.oversized) {
+      oversized++;
+      return;
+    }
     let parsed;
     try {
-      parsed = await parseEmailMessage(Buffer.from(messages[index], "utf-8"));
+      parsed = await parseEmailMessage(item.message);
     } catch {
       unreadable++;
-      continue;
+      return;
     }
     const text = parsed.error ? "" : String(parsed.text || "").trim();
     // The same floor every other document clears. A message that is only
     // headers is not worth an embedding and would dilute the ones that are.
     if (!textQuality(text).ok) {
       unreadable++;
-      continue;
+      return;
     }
-    const key = mboxMessageKey(relPath, parsed.messageId, index + 1);
+    const key = mboxMessageKey(relPath, parsed.messageId, item.ordinal);
     envelopes.push({
       source_type: sourceName,
       source_id: key,
-      title: parsed.subject || `Message ${index + 1} from ${basename(file.name)}`,
+      title: parsed.subject || `Message ${item.ordinal} from ${basename(file.name)}`,
       content: text,
       // The message's own Date header, which is the one date about an email
       // that is neither a guess nor a filesystem artefact.
@@ -387,21 +797,64 @@ async function prepareMboxArchive(file, buf, hash, { sourceName }) {
         category: sourceName,
         extracted_as: "email",
         archive: relPath,
-        message_number: index + 1,
+        message_number: item.ordinal,
         ...(parsed.from ? { sender: parsed.from } : {}),
       },
     });
+  };
+
+  // Every byte contributes to the resume hash, including bytes beyond the
+  // bounded parsing window. A same-size edit late in a large archive therefore
+  // cannot reuse stale `done` state. The splitter itself retains at most one
+  // bounded message plus the accepted envelopes, never the raw archive.
+  for (const chunk of streamApprovedLocalFile(file)) {
+    hasher.update(chunk);
+    for (const item of splitter.push(chunk)) await accept(item);
   }
+  for (const item of splitter.finish()) await accept(item);
+
+  const hash = hasher.digest("hex");
+  const stats = splitter.stats;
+  const incomplete = unreadable > 0 || oversized > 0 || stats.truncated;
 
   if (!envelopes.length) {
+    let reason;
+    if (stats.truncated) {
+      reason =
+        `no complete readable message was found inside the first ${(scanBytes / 1048576).toFixed(0)}MB ` +
+        "of this mail archive; later bytes were not indexed";
+    } else if (!stats.separatorLines) {
+      reason = "this .mbox file has no message separator line in it, so it is not a mail archive";
+    } else {
+      reason = `none of the ${stats.messageCount} message(s) in this mail archive could be read`;
+    }
     return {
       hash,
       skip: {
         path: file.rel,
-        reason: `none of the ${messages.length} message(s) in this mail archive could be read`,
+        reason,
       },
+      ...(incomplete ? { incomplete: true } : {}),
     };
   }
+
+  const note = [
+    `${envelopes.length} message(s) loaded from this archive`,
+    unreadable ? `${unreadable} complete message(s) could not be read` : null,
+    oversized
+      ? `${oversized} message(s) exceeded the ${(MAX_MBOX_MESSAGE_BYTES / 1048576).toFixed(0)}MB per-message limit`
+      : null,
+    stats.truncated
+      ? `only complete messages ending inside the first ${(scanBytes / 1048576).toFixed(0)}MB were considered; later messages were not indexed`
+      : null,
+  ].filter(Boolean).join("; ");
+
+  const prepared = incomplete
+    ? envelopes.map((envelope) => ({
+      ...envelope,
+      metadata: { ...envelope.metadata, extraction_incomplete: true },
+    }))
+    : envelopes;
   return {
     hash,
     // Every OTHER multi-document producer stamps its family here, and this one
@@ -409,10 +862,9 @@ async function prepareMboxArchive(file, buf, hash, { sourceName }) {
     // a multi-envelope result carries no declaration, so a single .mbox
     // anywhere under an ingested folder aborted the WHOLE run, dry run
     // included, and took every unrelated file in that folder with it.
-    envelopes: declareFamily(envelopes, sourceFileFamilyUid(file, sourceName)),
-    note: unreadable
-      ? `${envelopes.length} message(s) loaded from this archive; ${unreadable} could not be read`
-      : `${envelopes.length} message(s) loaded from this archive`,
+    envelopes: declareFamily(prepared, sourceFileFamilyUid(file, sourceName)),
+    note,
+    ...(incomplete ? { incomplete: true } : {}),
   };
 }
 
@@ -441,14 +893,34 @@ export function removedSinceLastRun(knownKeys, present) {
  * Read one file and turn it into an ingest envelope, or into a reasoned skip.
  */
 export async function prepare(file, { sourceName, ocr = null }) {
-  let buf;
-  try {
-    buf = readFileSync(file.full);
-  } catch (e) {
-    return { skip: { path: file.rel, reason: `could not read the file: ${e.code || e.message}` } };
-  }
-  const hash = sha(buf);
   const ext = extensionOf(file.name);
+
+  // Local mbox archives are admitted independently of their total size. The
+  // stream reader hashes every byte for resume integrity while the parser keeps
+  // only complete messages inside a bounded window. Do this before the generic
+  // whole-file read, otherwise the old 64MB allocation/refusal path still wins.
+  if (ext === ".mbox") {
+    const scanBytes = Number.isSafeInteger(file?.mboxScanBytes) && file.mboxScanBytes > 0
+      ? file.mboxScanBytes
+      : MAX_ARCHIVE_BYTES;
+    try {
+      return await prepareMboxArchive(file, { sourceName, scanBytes });
+    } catch (error) {
+      return { skip: { path: file.rel, reason: localFileSafetyReason(error) } };
+    }
+  }
+
+  let buf;
+  const sizeLimit = Number.isSafeInteger(file?.sizeLimit)
+    ? file.sizeLimit
+    : fileSizeLimitFor(file?.name, MAX_FILE_BYTES, MAX_ARCHIVE_BYTES);
+  try {
+    buf = readApprovedLocalFile(file, { maxBytes: sizeLimit });
+  } catch (e) {
+    return { skip: { path: file.rel, reason: localFileSafetyReason(e) } };
+  }
+  let hash = sha(buf);
+  let actualBytes = buf.length;
 
   // Content-sniffed, not extension-alone: most files with these extensions
   // are not a message export, and the ordinary extractor below is exactly
@@ -479,10 +951,11 @@ export async function prepare(file, { sourceName, ocr = null }) {
     }
   }
 
-  // One file, many documents: the archive is split before the single-document
-  // path can flatten it into one.
-  if (ext === ".mbox") {
-    return prepareMboxArchive(file, buf, hash, { sourceName });
+  // LinkedIn's supported path is the account owner's Download Your Data ZIP.
+  // Every ZIP is safety-validated here; an unrelated ZIP receives an explicit
+  // "no recognized LinkedIn CSV" outcome rather than a generic binary skip.
+  if (ext === ".zip") {
+    return prepareLinkedInExport(file, buf, hash, { sourceName });
   }
 
   if (!canExtract(file.name)) {
@@ -503,7 +976,14 @@ export async function prepare(file, { sourceName, ocr = null }) {
   // for why an empty first pass is not proof of an empty document.
   const got = await extract(buf, file.name, {
     reread: () => {
-      try { return readFileSync(file.full); } catch { return null; }
+      try {
+        const reread = readApprovedLocalFile(file, { maxBytes: sizeLimit });
+        hash = sha(reread);
+        actualBytes = reread.length;
+        return reread;
+      } catch {
+        return null;
+      }
     },
     // Null on a dry run and whenever OCR is off, so the cheapest command stays
     // the cheapest command and nothing bills the owner without being asked.
@@ -540,12 +1020,14 @@ export async function prepare(file, { sourceName, ocr = null }) {
         ? { text_source: got.provenance.text_source, text_reliable: got.provenance.text_reliable }
         : {}),
       metadata: {
-        category: sourceName, extracted_as: got.how, bytes: file.size,
+        category: sourceName, extracted_as: got.how, bytes: actualBytes,
         ...(note ? { extraction_note: note } : {}),
+        ...(got.incomplete === true ? { extraction_incomplete: true } : {}),
         ...(got.provenance ? { ocr: got.provenance } : {}),
       },
     },
     note,
+    ...(got.incomplete === true ? { incomplete: true } : {}),
   };
 }
 
@@ -617,6 +1099,81 @@ export async function* batchStream(files, prepareOne, { maxDocs = 50, maxBytes =
     }
   }
   if (cur.length) yield cur;
+}
+
+/**
+ * Run `fn` over an iterable with a bounded number in flight, yielding results
+ * in the ORIGINAL order.
+ *
+ * Why this exists: a remote connector's per-item fetch (one Gmail
+ * `messages.get`, about 300 ms) was awaited serially inside batchStream, so a
+ * 190k-message mailbox took about twenty hours no matter how quickly the brain
+ * accepted batches. Measured on that mailbox, eight in flight was seven times
+ * faster with no errors. Overlapping the fetches is the whole gain; everything
+ * downstream (credential scan, batching, resume state) still sees one item at a
+ * time, in order, exactly as before.
+ *
+ * Order is not cosmetic. Resume state and the document family plan reason
+ * about "everything before this batch has landed". An out-of-order yield could
+ * record a later item as done while an earlier one was still in flight, and an
+ * interrupt at that moment would skip the earlier item on every future run.
+ *
+ * Errors: a rejection surfaces when its item's turn comes, so the caller sees
+ * the same failure at the same position it would have seen serially. Items
+ * already in flight are allowed to settle first, so none is left behind as an
+ * unhandled rejection, and no further items are started.
+ */
+export async function* prefetch(items, fn, { concurrency = 8 } = {}) {
+  const width = Math.max(1, Math.floor(Number(concurrency) || 1));
+  const iter = items[Symbol.asyncIterator] ? items[Symbol.asyncIterator]() : items[Symbol.iterator]();
+  const window = [];
+  let sourceDone = false; // the source reported done: nothing left to pull
+  let stopping = false;   // an item failed: pull nothing more, let in-flight settle
+
+  const fill = async () => {
+    while (!stopping && !sourceDone && window.length < width) {
+      const next = await iter.next();
+      if (next.done) {
+        sourceDone = true;
+        break;
+      }
+      if (stopping) break;
+      const p = Promise.resolve(next.value).then(fn);
+      // Observed later, in order. Without this a rejection that has not yet
+      // reached the head of the window would be reported as unhandled.
+      p.catch(() => {});
+      window.push(p);
+    }
+  };
+
+  try {
+    await fill();
+    while (window.length) {
+      // The head stays IN the window while awaited, so it still counts toward
+      // the width. Shifting it out first let one extra fetch start, which the
+      // test for the bound caught on the first run.
+      let value;
+      try {
+        value = await window[0];
+      } catch (error) {
+        stopping = true;
+        await Promise.allSettled(window);
+        throw error;
+      }
+      window.shift();
+      // Refill BEFORE yielding, so the freed slot is already fetching while the
+      // consumer works on this value.
+      await fill();
+      yield value;
+    }
+  } finally {
+    // The consumer may stop early (a `break`, or its own error), or an item may
+    // have failed. Close the source so a paginating async generator does not
+    // keep listing pages for nobody.
+    if (!sourceDone && typeof iter.return === "function") {
+      try { await iter.return(); } catch { /* the source is being abandoned anyway */ }
+    }
+  }
 }
 
 export function loadState(path) {

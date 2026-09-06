@@ -13,6 +13,7 @@
  */
 
 import { ownerActivityStatement } from "./owner-activity.js";
+import { parseScope, scopeIsUnrestricted } from "./grants.js";
 
 const MIGRATION_HINT = "passkey tables are missing; run `brain setup <manifest>` to apply migration 0014";
 
@@ -49,15 +50,28 @@ export async function issueChallenge(env, purpose, ttlMs = 5 * 60 * 1000) {
   return challenge;
 }
 
-/** Single use: consuming a challenge deletes it, atomically by primary key. */
+/** Read-only preflight before an expensive cryptographic ceremony. */
+export async function peekChallenge(env, challenge, purpose) {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT 1 AS valid FROM auth_challenges
+        WHERE challenge_hash = ? AND purpose = ? AND expires_at > ? AND used_at IS NULL`,
+    ).bind(await sha256Hex(challenge), purpose, Date.now()).first();
+    return Boolean(row);
+  } catch (error) {
+    guard(error);
+  }
+}
+
+/** Single use: the conditional delete is the decision, not a prior read. */
 export async function consumeChallenge(env, challenge, purpose) {
   try {
     const hash = await sha256Hex(challenge);
-    const row = await env.DB.prepare(
-      "SELECT purpose, expires_at FROM auth_challenges WHERE challenge_hash = ?",
-    ).bind(hash).first();
-    await env.DB.prepare("DELETE FROM auth_challenges WHERE challenge_hash = ?").bind(hash).run();
-    return Boolean(row && row.purpose === purpose && Number(row.expires_at) > Date.now());
+    const result = await env.DB.prepare(
+      `DELETE FROM auth_challenges
+        WHERE challenge_hash = ? AND purpose = ? AND expires_at > ? AND used_at IS NULL`,
+    ).bind(hash, purpose, Date.now()).run();
+    return Number(result?.meta?.changes || 0) === 1;
   } catch (error) {
     guard(error);
   }
@@ -102,13 +116,13 @@ export async function peekEnrollmentCode(env, code) {
 export async function consumeEnrollmentCode(env, code) {
   try {
     const hash = await sha256Hex(code);
+    const now = Date.now();
     const row = await env.DB.prepare(
-      "SELECT expires_at, used_at, grant_id, document_grant_id FROM enrollment_codes WHERE code_hash = ?",
-    ).bind(hash).first();
-    if (!row || row.used_at || Number(row.expires_at) <= Date.now()) return false;
-    await env.DB.prepare(
-      "UPDATE enrollment_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL",
-    ).bind(Date.now(), hash).run();
+      `UPDATE enrollment_codes SET used_at = ?
+        WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?
+        RETURNING grant_id, document_grant_id`,
+    ).bind(now, hash, now).first();
+    if (!row) return false;
     return { grantId: row.grant_id ?? null, documentGrantId: row.document_grant_id ?? null };
   } catch (error) {
     guard(error);
@@ -200,10 +214,13 @@ export async function listGrants(env) {
   try {
     const { results } = await env.DB.prepare(
       `SELECT grant_id, display_name, relationship, capabilities, expires_at,
-              created_at, revoked_at, last_used_at
+              created_at, revoked_at, last_used_at, scope_include, scope_exclude
          FROM grants ORDER BY created_at DESC`,
     ).all();
-    return results || [];
+    return (results || []).map((row) => {
+      const { scope_include: _include, scope_exclude: _exclude, ...grant } = row;
+      return { ...grant, scope: parseScope(row) };
+    });
   } catch (error) {
     guard(error);
   }
@@ -244,13 +261,36 @@ export async function findPasskey(env, credentialId) {
   }
 }
 
-export async function recordPasskeyUse(env, credentialId, signCount, securityEvent = null) {
+export async function recordPasskeyUse(
+  env, credentialId, previousSignCount, signCount, securityEvent = null,
+) {
   try {
+    const lastUsedAt = Date.now();
     const update = env.DB.prepare(
-      "UPDATE owner_passkeys SET sign_count = ?, last_used_at = ? WHERE credential_id = ?",
-    ).bind(signCount, Date.now(), credentialId);
-    if (securityEvent) await env.DB.batch([update, passkeyEventStatement(env, securityEvent)]);
-    else await update.run();
+      `UPDATE owner_passkeys SET sign_count = ?, last_used_at = ?
+        WHERE credential_id = ? AND sign_count = ?`,
+    ).bind(signCount, lastUsedAt, credentialId, previousSignCount);
+    const statements = [];
+    if (securityEvent) {
+      statements.push(env.DB.prepare(
+        `INSERT INTO passkey_security_events
+         (event_id, occurred_at, rp_id, ceremony, stage, outcome, reason_code, duration_ms,
+          principal_kind, grant_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           FROM owner_passkeys
+          WHERE credential_id = ? AND sign_count = ?`,
+      ).bind(
+        ...passkeyEventBindings(securityEvent), credentialId, previousSignCount,
+      ));
+    }
+    // D1 executes a batch as one transaction. Recording first against the
+    // pre-update counter means a later serialized loser cannot copy the
+    // winner's post-update state and emit a second success event. The event is
+    // not observable unless the following CAS update commits with it.
+    statements.push(update);
+    const results = await env.DB.batch(statements);
+    const updateResult = results?.[statements.length - 1];
+    return Number(updateResult?.meta?.changes || 0) === 1;
   } catch (error) {
     guard(error);
   }
@@ -304,27 +344,55 @@ export async function renamePasskey(env, credentialId, nickname) {
  */
 export async function revokePasskey(env, credentialId) {
   try {
-    const count = await env.DB.prepare("SELECT count(*) AS n FROM owner_passkeys").first();
-    if (Number(count?.n || 0) <= 1) {
-      return { removed: false, reason: "refusing to remove the last passkey; enroll another device or mint a new invite first" };
-    }
     const row = await env.DB.prepare(
       "SELECT credential_id, nickname, grant_id, document_grant_id FROM owner_passkeys WHERE credential_id = ?",
     ).bind(credentialId).first();
     if (!row) return { removed: false, reason: "passkey not found" };
     const passkeyKey = (await sha256Hex(credentialId)).slice(0, 24);
     const occurredAt = new Date().toISOString();
-    await env.DB.batch([
-      env.DB.prepare("DELETE FROM owner_passkeys WHERE credential_id = ?").bind(credentialId),
-      ownerActivityStatement(env, {
-        eventId: `activity:passkey-revoked:${passkeyKey}`,
-        eventType: "passkey_revoked",
-        subjectKind: "passkey",
-        subjectId: `passkey:${passkeyKey}`,
-        displayLabel: row.nickname || (row.document_grant_id || row.grant_id ? "Shared access passkey" : "Passkey device"),
-        occurredAt,
-      }),
-    ]);
+    // A scoped credential is never an owner lockout safeguard. For an owner
+    // credential, this predicate requires a different unrestricted owner
+    // credential to exist in the same atomic transaction. Two concurrent
+    // revocations can therefore remove at most one of the final two owners.
+    const safePredicate = `(
+      p.grant_id IS NOT NULL OR p.document_grant_id IS NOT NULL OR EXISTS (
+        SELECT 1 FROM owner_passkeys other
+         WHERE other.credential_id <> p.credential_id
+           AND other.grant_id IS NULL AND other.document_grant_id IS NULL
+      )
+    )`;
+    const activity = env.DB.prepare(
+      `INSERT OR IGNORE INTO owner_activity_events
+         (event_id, tenant_id, request_id, event_type, entity_slug,
+          subject_kind, subject_id, display_label, occurred_at)
+       SELECT ?, 'primary', NULL, 'passkey_revoked', NULL,
+              'passkey', ?,
+              COALESCE(NULLIF(p.nickname, ''),
+                CASE WHEN p.grant_id IS NOT NULL OR p.document_grant_id IS NOT NULL
+                     THEN 'Shared access passkey' ELSE 'Passkey device' END), ?
+         FROM owner_passkeys p
+        WHERE p.credential_id = ? AND ${safePredicate}`,
+    ).bind(
+      `activity:passkey-revoked:${passkeyKey}`, `passkey:${passkeyKey}`,
+      occurredAt, credentialId,
+    );
+    const removal = env.DB.prepare(
+      `DELETE FROM owner_passkeys
+        WHERE credential_id = ? AND (
+          grant_id IS NOT NULL OR document_grant_id IS NOT NULL OR EXISTS (
+            SELECT 1 FROM owner_passkeys other
+             WHERE other.credential_id <> owner_passkeys.credential_id
+               AND other.grant_id IS NULL AND other.document_grant_id IS NULL
+          )
+        )`,
+    ).bind(credentialId);
+    const results = await env.DB.batch([activity, removal]);
+    if (Number(results?.[1]?.meta?.changes || 0) !== 1) {
+      return {
+        removed: false,
+        reason: "refusing to remove the last owner passkey; enroll another owner device or mint a new invite first",
+      };
+    }
     return { removed: true };
   } catch (error) {
     guard(error);
@@ -368,21 +436,25 @@ export async function bumpSessionGeneration(env) {
 
 /* --------------------------------------------------- privacy-safe telemetry */
 
-function passkeyEventStatement(env, {
+function passkeyEventBindings({
   rpId, ceremony, stage, outcome, reasonCode, durationMs = null,
   principalKind = "unknown", grantId = null,
 }) {
+  return [
+    `pse_${randomToken(18)}`, Date.now(), String(rpId || "unknown").slice(0, 253),
+    ceremony, stage, outcome, String(reasonCode || "unspecified").slice(0, 80),
+    durationMs === null ? null : Math.max(0, Math.round(Number(durationMs) || 0)),
+    principalKind, grantId,
+  ];
+}
+
+function passkeyEventStatement(env, event) {
   return env.DB.prepare(
     `INSERT INTO passkey_security_events
      (event_id, occurred_at, rp_id, ceremony, stage, outcome, reason_code, duration_ms,
       principal_kind, grant_id)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(
-    `pse_${randomToken(18)}`, Date.now(), String(rpId || "unknown").slice(0, 253),
-    ceremony, stage, outcome, String(reasonCode || "unspecified").slice(0, 80),
-    durationMs === null ? null : Math.max(0, Math.round(Number(durationMs) || 0)),
-    principalKind, grantId,
-  );
+  ).bind(...passkeyEventBindings(event));
 }
 
 export async function recordPasskeySecurityEvent(env, {
@@ -449,22 +521,76 @@ export async function passkeySecurityStatus(env, rpId) {
 
 /* --------------------------------------------------------------- zones */
 
+export const ZONE_PROJECTION_REPAIR_BATCH_SIZE = 1000;
+
 export async function assignZone(env, { source, zone }) {
   try {
     const now = Date.now();
-    await env.DB.prepare(
-      "INSERT INTO zones (zone, label, created_at) VALUES (?, ?, ?) ON CONFLICT(zone) DO NOTHING",
-    ).bind(zone, zone, now).run();
-    await env.DB.prepare("UPDATE sources SET zone = ? WHERE name = ?").bind(zone, source).run();
-    const docs = await env.DB.prepare("UPDATE documents SET zone = ? WHERE source = ?")
-      .bind(zone, source).run();
-    const chunks = await env.DB.prepare("UPDATE chunks SET zone = ? WHERE source = ?")
-      .bind(zone, source).run();
+    // sources.zone is the authorization authority used by both reads and
+    // writes. Keep its small mutation atomic with zone registration, and make
+    // the insert conditional so a typo cannot create an orphan zone. Existing
+    // document and chunk projections are repaired in bounded pages: a mature
+    // source can contain millions of chunks, so one unbounded UPDATE would
+    // exceed a Worker request. Repeating the same idempotent command converges
+    // old rows, while migration 0033 keeps newly inserted rows in step.
+    const results = await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO zones (zone, label, created_at)
+         SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM sources WHERE name = ?)
+         ON CONFLICT(zone) DO NOTHING`,
+      ).bind(zone, zone, now, source),
+      env.DB.prepare("UPDATE sources SET zone = ? WHERE name = ?").bind(zone, source),
+      env.DB.prepare(
+        `UPDATE documents SET zone = ?
+          WHERE doc_uid IN (
+            SELECT doc_uid FROM documents
+             WHERE source = ? AND deleted_at IS NULL AND zone IS NOT ?
+               AND EXISTS (SELECT 1 FROM sources WHERE name = ?)
+             ORDER BY doc_uid LIMIT ${ZONE_PROJECTION_REPAIR_BATCH_SIZE}
+          )`,
+      ).bind(zone, source, zone, source),
+      env.DB.prepare(
+        `UPDATE chunks SET zone = ?
+          WHERE id IN (
+            SELECT id FROM chunks
+             WHERE source = ? AND zone IS NOT ?
+               AND EXISTS (SELECT 1 FROM sources WHERE name = ?)
+             ORDER BY id LIMIT ${ZONE_PROJECTION_REPAIR_BATCH_SIZE}
+          )`,
+      ).bind(zone, source, zone, source),
+      env.DB.prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM documents WHERE source = ? AND deleted_at IS NULL) AS documents,
+           (SELECT COUNT(*) FROM chunks WHERE source = ?) AS chunks,
+           (SELECT COUNT(*) FROM documents WHERE source = ? AND deleted_at IS NULL AND zone IS NOT ?) AS projection_documents,
+           (SELECT COUNT(*) FROM chunks WHERE source = ? AND zone IS NOT ?) AS projection_chunks`,
+      ).bind(source, source, source, zone, source, zone),
+    ]);
+    const sourceUpdate = results?.[1];
+    if (Number(sourceUpdate?.meta?.changes || 0) !== 1) {
+      const error = new Error("source is not registered");
+      error.code = "ZONE_SOURCE_NOT_FOUND";
+      throw error;
+    }
+    const repairedDocuments = Number(results?.[2]?.meta?.changes || 0);
+    const repairedChunks = Number(results?.[3]?.meta?.changes || 0);
+    const counts = results?.[4]?.results?.[0] || {};
+    const projectionDocuments = Number(counts.projection_documents || 0);
+    const projectionChunks = Number(counts.projection_chunks || 0);
     return {
       source,
       zone,
-      documents: docs?.meta?.changes ?? 0,
-      chunks: chunks?.meta?.changes ?? 0,
+      documents: Number(counts.documents || 0),
+      chunks: Number(counts.chunks || 0),
+      projection_repaired: {
+        documents: repairedDocuments,
+        chunks: repairedChunks,
+      },
+      projection_pending: {
+        documents: projectionDocuments,
+        chunks: projectionChunks,
+      },
+      projection_repair_required: projectionDocuments > 0 || projectionChunks > 0,
     };
   } catch (error) {
     guard(error);
@@ -474,9 +600,25 @@ export async function assignZone(env, { source, zone }) {
 export async function listZones(env) {
   try {
     const { results } = await env.DB.prepare(
-      `SELECT COALESCE(c.zone, '(unzoned)') AS zone, COUNT(*) AS chunks,
-              COUNT(DISTINCT c.source) AS sources
-         FROM chunks c GROUP BY COALESCE(c.zone, '(unzoned)') ORDER BY chunks DESC`,
+      `WITH document_counts AS (
+         SELECT source, COUNT(*) AS documents
+           FROM documents
+          WHERE deleted_at IS NULL
+          GROUP BY source
+       ), chunk_counts AS (
+         SELECT source, COUNT(*) AS chunks
+           FROM chunks
+          GROUP BY source
+       )
+       SELECT COALESCE(s.zone, '(unzoned)') AS zone,
+              COUNT(*) AS sources,
+              COALESCE(SUM(d.documents), 0) AS documents,
+              COALESCE(SUM(c.chunks), 0) AS chunks
+         FROM sources s
+         LEFT JOIN document_counts d ON d.source = s.name
+         LEFT JOIN chunk_counts c ON c.source = s.name
+        GROUP BY COALESCE(s.zone, '(unzoned)')
+        ORDER BY chunks DESC, zone`,
     ).all();
     return results || [];
   } catch (error) {
@@ -484,8 +626,116 @@ export async function listZones(env) {
   }
 }
 
+/**
+ * Aggregate proof for the owner-facing access-zone status.
+ *
+ * `sources.zone` remains the authorization authority. The document and chunk
+ * zone columns are derived projections, so readiness requires every live row
+ * to agree with its registered source rather than trusting those columns on
+ * their own. Counts stay aggregate-only: this route must not turn an access
+ * check into a source or document inventory.
+ */
+export async function accessZoneReadiness(env) {
+  try {
+    const row = await env.DB.prepare(
+      `WITH source_counts AS (
+         SELECT COUNT(*) AS registered,
+                SUM(CASE WHEN zone IS NOT NULL AND trim(zone) != '' THEN 1 ELSE 0 END) AS zoned,
+                SUM(CASE WHEN zone IS NULL OR trim(zone) = '' THEN 1 ELSE 0 END) AS unzoned
+           FROM sources
+       ), document_counts AS (
+         SELECT COUNT(*) AS total,
+                SUM(CASE WHEN s.name IS NULL THEN 1 ELSE 0 END) AS unregistered,
+                SUM(CASE WHEN s.name IS NOT NULL AND d.zone IS NOT s.zone THEN 1 ELSE 0 END) AS projection_drift
+           FROM documents d
+           LEFT JOIN sources s ON s.name = d.source
+          WHERE d.deleted_at IS NULL
+       ), chunk_counts AS (
+         SELECT COUNT(*) AS total,
+                SUM(CASE WHEN s.name IS NULL THEN 1 ELSE 0 END) AS unregistered,
+                SUM(CASE WHEN s.name IS NOT NULL AND c.zone IS NOT s.zone THEN 1 ELSE 0 END) AS projection_drift
+           FROM chunks c
+           LEFT JOIN sources s ON s.name = c.source
+       )
+       SELECT source_counts.registered AS registered_sources,
+              source_counts.zoned AS zoned_sources,
+              source_counts.unzoned AS unzoned_sources,
+              document_counts.total AS documents,
+              document_counts.unregistered AS unregistered_documents,
+              document_counts.projection_drift AS document_projection_drift,
+              chunk_counts.total AS chunks,
+              chunk_counts.unregistered AS unregistered_chunks,
+              chunk_counts.projection_drift AS chunk_projection_drift
+         FROM source_counts, document_counts, chunk_counts`,
+    ).first();
+
+    const counts = {
+      sources: {
+        registered: Number(row?.registered_sources || 0),
+        zoned: Number(row?.zoned_sources || 0),
+        unzoned: Number(row?.unzoned_sources || 0),
+      },
+      documents: {
+        total: Number(row?.documents || 0),
+        unregistered: Number(row?.unregistered_documents || 0),
+        projection_drift: Number(row?.document_projection_drift || 0),
+      },
+      chunks: {
+        total: Number(row?.chunks || 0),
+        unregistered: Number(row?.unregistered_chunks || 0),
+        projection_drift: Number(row?.chunk_projection_drift || 0),
+      },
+    };
+
+    const empty = counts.sources.registered === 0
+      && counts.documents.total === 0
+      && counts.chunks.total === 0;
+    const projectionGap = counts.documents.unregistered > 0
+      || counts.documents.projection_drift > 0
+      || counts.chunks.unregistered > 0
+      || counts.chunks.projection_drift > 0;
+
+    let state;
+    if (empty) {
+      state = "empty";
+    } else if (projectionGap) {
+      state = "needs_review";
+    } else if (counts.sources.zoned === 0) {
+      state = "not_configured";
+    } else if (counts.sources.unzoned > 0
+      || counts.sources.zoned !== counts.sources.registered) {
+      state = "needs_review";
+    } else {
+      state = "ready";
+    }
+
+    return {
+      state,
+      ready: state === "ready",
+      authorization_authority: "source_registry",
+      counts,
+    };
+  } catch (error) {
+    guard(error);
+  }
+}
+
+/** Zone names that currently protect at least one registered source. */
+export async function assignedZoneNames(env) {
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT DISTINCT zone FROM sources
+        WHERE zone IS NOT NULL AND trim(zone) != ''
+        ORDER BY zone`,
+    ).all();
+    return (results || []).map((row) => row.zone);
+  } catch (error) {
+    guard(error);
+  }
+}
+
 export async function sourcesInScope(env, scope) {
-  if (!scope || scope.all === true) {
+  if (scopeIsUnrestricted(scope)) {
     try {
       const { results } = await env.DB.prepare("SELECT name FROM sources").all();
       return (results || []).map((row) => row.name);
@@ -494,8 +744,21 @@ export async function sourcesInScope(env, scope) {
     }
   }
   const include = Array.isArray(scope.zones) ? scope.zones.filter(Boolean) : [];
-  if (!include.length) return [];
   const exclude = Array.isArray(scope.exclude) ? scope.exclude.filter(Boolean) : [];
+  if (scope.all === true) {
+    // Invalid exclusions must not turn an explicitly scoped grant into all.
+    if (!exclude.length) return [];
+    try {
+      const sql =
+        `SELECT name FROM sources ` +
+        `WHERE zone IS NOT NULL AND trim(zone) != '' AND zone NOT IN (${exclude.map(() => "?").join(",")})`;
+      const { results } = await env.DB.prepare(sql).bind(...exclude).all();
+      return (results || []).map((row) => row.name);
+    } catch (error) {
+      guard(error);
+    }
+  }
+  if (!include.length) return [];
   try {
     const inList = include.map(() => "?").join(",");
     let sql = `SELECT name FROM sources WHERE zone IN (${inList})`;

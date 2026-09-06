@@ -147,7 +147,11 @@ async function connected(server) {
  * state, stream the folder, build envelopes, and return the new watermark ONLY
  * after every message has been turned into a document or a named skip.
  */
-async function syncFolder(server, folderName, saved, { reset = false, policyChanged = false } = {}) {
+async function syncFolder(server, folderName, saved, {
+  reset = false,
+  policyChanged = false,
+  scannerPolicyChanged = false,
+} = {}) {
   const client = await connected(server);
   try {
     const before = await client.examine(folderName);
@@ -157,6 +161,7 @@ async function syncFolder(server, folderName, saved, { reset = false, policyChan
       lastUid: saved?.last_uid ?? 0,
       reset,
       policyChanged,
+      scannerPolicyChanged,
     });
     let highest = decision.resynced ? 0 : (saved?.last_uid ?? 0);
     const documents = [];
@@ -213,6 +218,17 @@ try {
   check("second sync with nothing new: the server WAS asked, and did return UID 3",
     server.log.some((l) => /SEARCH UID 4:\*/.test(l)), server.log.join(" | "));
 
+  server.log.length = 0;
+  const scannerChanged = await syncFolder(server, "INBOX", first.watermark, { scannerPolicyChanged: true });
+  check("a credential-scanner change forces a full folder reread before its version can be recorded",
+    scannerChanged.decision.mode === "full" && scannerChanged.decision.searchCriteria === "ALL" &&
+    /credential scanner changed/i.test(scannerChanged.decision.reason || ""),
+    JSON.stringify(scannerChanged.decision));
+  check("a credential-scanner change fetches every old message instead of starting after the watermark",
+    scannerChanged.documents.length + scannerChanged.skips.length === 3 &&
+    server.log.some((line) => /SEARCH ALL/.test(line)),
+    `documents=${scannerChanged.documents.length} skips=${scannerChanged.skips.length} log=${server.log.join(" | ")}`);
+
   server.folder("INBOX").add(REPLY, { internaldate: "26-Aug-2026 08:05:00 +0000" });
   const second = await syncFolder(server, "INBOX", first.watermark);
   check("second sync with one new message: exactly one document, and it is the new one",
@@ -264,6 +280,9 @@ try {
       internalDate: "1756051200000",
       threadId: "T-1",
       historyId: "H-1",
+      // A real messages.get always classifies. Without it the label policy
+      // refuses the message, and this parity check would compare nothing.
+      labelIds: ["INBOX"],
     }),
     sleep: async () => {},
   });

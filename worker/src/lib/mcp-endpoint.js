@@ -120,6 +120,28 @@ function toolError(message) {
   return { content: [{ type: "text", text: String(message) }], isError: true };
 }
 
+/** Keep evidence quality in the same text as the citation it qualifies. */
+function citationProvenance(citation) {
+  const parts = [];
+  if (citation?.source) parts.push(String(citation.source));
+  if (citation?.ts) {
+    const day = String(citation.ts).slice(0, 10);
+    parts.push(citation.date_reliable === true ? day : `possible date ${day}`);
+  }
+  if (citation?.text_source === "ocr_partial") {
+    parts.push("OCR text may be incomplete");
+  } else if (citation?.text_source === "ocr") {
+    parts.push("OCR text, verify key details");
+  } else if (citation?.text_reliable === false) {
+    parts.push("text may be incomplete");
+  }
+  if (citation?.ref) {
+    const ref = String(citation.ref).replace(/\s+/g, " ").slice(0, 200);
+    parts.push(`reference ${String(citation.source || "doc")}:${ref}`);
+  }
+  return parts;
+}
+
 /** The id scheme pairs search and fetch: "<source>:<source_id>". */
 function resultId(result) {
   return `${result.source || "doc"}:${result.ref_key || result.source_id || ""}`;
@@ -149,7 +171,8 @@ async function runAsk(deps, args) {
   if (citations.length) {
     lines.push("", "Sources:");
     for (const citation of citations) {
-      lines.push(`[${citation.n}] ${citation.title}${citation.ts ? ` · ${String(citation.ts).slice(0, 10)}` : ""}`);
+      const provenance = citationProvenance(citation);
+      lines.push(`[${citation.n}] ${citation.title}${provenance.length ? ` · ${provenance.join(" · ")}` : ""}`);
     }
   }
   return text(lines.join("\n"));
@@ -169,6 +192,12 @@ async function runSearch(deps, args, origin) {
     id: resultId(r),
     title: r.title || "untitled",
     url: `${origin}/app`,
+    source: r.source || null,
+    date: r.ts || null,
+    date_source: r.date_source || null,
+    date_reliable: typeof r.date_reliable === "boolean" ? r.date_reliable : null,
+    text_source: r.text_source || "native",
+    text_reliable: r.text_reliable !== false,
   }));
   return text(JSON.stringify({ results }));
 }
@@ -182,7 +211,9 @@ async function runFetch(env, args, origin) {
   let chunks;
   try {
     doc = await env.DB.prepare(
-      "SELECT title, uri FROM documents WHERE doc_uid = ?",
+      `SELECT title, uri, source, document_date, date_source, date_reliable,
+              text_source, text_reliable
+         FROM documents WHERE doc_uid = ?`,
     ).bind(docUid).first();
     chunks = await env.DB.prepare(
       "SELECT text FROM chunks WHERE doc_uid = ? ORDER BY chunk_ix",
@@ -196,12 +227,24 @@ async function runFetch(env, args, origin) {
   // Complete and slightly redundant beats trimmed and possibly wrong.
   let body = rows.map((row) => row.text).join("\n\n");
   if (body.length > MAX_FETCH_CHARS) body = `${body.slice(0, MAX_FETCH_CHARS)}\n\n[truncated]`;
+  const timestamp = Number(doc?.document_date);
+  const date = Number.isFinite(timestamp) && timestamp > 0
+    ? new Date(timestamp).toISOString()
+    : null;
   return text(JSON.stringify({
     id,
     title: doc?.title || "untitled",
     text: body,
     url: doc?.uri || `${origin}/app`,
-    metadata: { chunks: rows.length },
+    metadata: {
+      chunks: rows.length,
+      source: doc?.source || id.slice(0, separator),
+      date,
+      date_source: doc?.date_source || null,
+      date_reliable: doc?.date_reliable === true || doc?.date_reliable === 1,
+      text_source: doc?.text_source || "native",
+      text_reliable: doc?.text_reliable !== false && doc?.text_reliable !== 0,
+    },
   }));
 }
 

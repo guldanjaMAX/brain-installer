@@ -102,7 +102,7 @@ export function unavailableNotice(degraded) {
   return [
     "The search could not be completed, so this is not an answer about what your brain holds.",
     `Cause: ${degradedCause(degraded)}.`,
-    "Nothing here means your brain is empty on this question.",
+    "This does not mean your brain is empty on this question.",
     degradedRemedy(degraded),
   ].join(" ");
 }

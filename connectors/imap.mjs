@@ -809,7 +809,14 @@ function parseFetchItems(tokens) {
  * content-stable (see toEnvelope): every message resolves to `unchanged`, one
  * read each, no re-embedding.
  */
-export function folderSyncDecision({ storedUidvalidity = null, currentUidvalidity, lastUid = 0, reset = false, policyChanged = false } = {}) {
+export function folderSyncDecision({
+  storedUidvalidity = null,
+  currentUidvalidity,
+  lastUid = 0,
+  reset = false,
+  policyChanged = false,
+  scannerPolicyChanged = false,
+} = {}) {
   if (reset) {
     return { mode: "full", searchCriteria: "ALL", floor: 0, resynced: false, reason: "a reset was requested, so this folder is read in full" };
   }
@@ -825,6 +832,15 @@ export function folderSyncDecision({ storedUidvalidity = null, currentUidvalidit
       reason:
         `the server changed UIDVALIDITY from ${storedUidvalidity} to ${currentUidvalidity}, which means every saved ` +
         "message number in this folder is meaningless, so the whole folder is read again rather than resumed",
+    };
+  }
+  if (scannerPolicyChanged) {
+    return {
+      mode: "full",
+      searchCriteria: "ALL",
+      floor: 0,
+      resynced: false,
+      reason: "the credential scanner changed, so this folder is read again before the new scanner version is recorded",
     };
   }
   if (policyChanged) {
@@ -1035,16 +1051,29 @@ export function messageIdentity({ messageId, headers, occurredAt, from, subject,
 export async function toEnvelope(message, { sourceName = SOURCE_TYPE, host = "", policy = BULK_POLICY } = {}) {
   const where = `${message.folder}#${message.uid}`;
   if (message.missing) {
-    return { skip: { path: where, id: where, reason: "the message was deleted from the mailbox between being listed and being read" }, permanent: true };
+    return {
+      skip: { path: where, id: where, reason: "the message was deleted from the mailbox between being listed and being read" },
+      source_deleted: true,
+      retain_existing: false,
+    };
   }
   if (message.oversized) {
-    return { skip: { path: where, id: where, reason: `the message is ${Math.round(message.oversized / 1024 / 1024)}MB, over the ${Math.round(MAX_MESSAGE_BYTES / 1024 / 1024)}MB limit for one message` } };
+    return {
+      skip: { path: where, id: where, reason: `the message is ${Math.round(message.oversized / 1024 / 1024)}MB, over the ${Math.round(MAX_MESSAGE_BYTES / 1024 / 1024)}MB limit for one message` },
+      retain_existing: true,
+    };
   }
   if (!message.raw?.length) {
-    return { skip: { path: where, id: where, reason: "the message had no content" } };
+    return {
+      skip: { path: where, id: where, reason: "the message had no content" },
+      retain_existing: true,
+    };
   }
 
   const headers = parseHeaderBlock(message.raw);
+  const headerIdentity = headers.get("message-id")
+    ? messageIdentity({ headers })
+    : null;
   const signals = bulkSignals(headers);
   if (signals.length >= policy.min_signals) {
     return {
@@ -1055,15 +1084,20 @@ export async function toEnvelope(message, { sourceName = SOURCE_TYPE, host = "",
         // a wrong call rather than guess at one.
         reason: `bulk mail: ${signals.join(" + ")} (${signals.length} of the ${policy.min_signals} signals this filter requires)`,
       },
+      ...(headerIdentity ? { source_id: headerIdentity.id } : {}),
+      policy_skip: true,
+      retain_existing: false,
     };
   }
 
   const got = await extract(message.raw, "message.eml");
   if (got.error || got.text == null) {
-    return { skip: { path: where, id: where, reason: got.error || "the message could not be parsed" } };
+    return {
+      skip: { path: where, id: where, reason: got.error || "the message could not be parsed" },
+      ...(headerIdentity ? { source_id: headerIdentity.id } : {}),
+      retain_existing: true,
+    };
   }
-  const q = textQuality(got.text);
-  if (!q.ok) return { skip: { path: where, id: where, reason: q.reason, metrics: q.metrics } };
 
   let parsed = {};
   try { parsed = await parseEmailMessage(message.raw); } catch { /* the rendered text above is still good */ }
@@ -1084,6 +1118,15 @@ export async function toEnvelope(message, { sourceName = SOURCE_TYPE, host = "",
     subject: parsed.subject,
     text: got.text,
   });
+
+  const q = textQuality(got.text);
+  if (!q.ok) {
+    return {
+      skip: { path: where, id: where, reason: q.reason, metrics: q.metrics },
+      source_id: identity.id,
+      retain_existing: true,
+    };
+  }
 
   return {
     envelope: {

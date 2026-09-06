@@ -47,9 +47,39 @@ export function ownerError(error: unknown): { status: number | null; message: st
   return { status: null, message: error instanceof Error ? error.message : String(error) };
 }
 
-export type Citation = { n: number; title: string; source?: string; ts?: string | null };
+export type EvidenceAuthority = {
+  tier: "T0" | "T1" | "T2" | "T3" | "T4" | "T5";
+  rank: number;
+  name: string;
+  reason: string;
+  claim?: string;
+  eligible?: boolean;
+  authoritative?: boolean;
+  current?: boolean;
+  owner_confirmed?: boolean;
+  operative?: boolean;
+};
+export type Citation = {
+  n: number;
+  title: string;
+  source?: string;
+  ref?: string | null;
+  ts?: string | null;
+  date_source?: string | null;
+  date_reliable?: boolean;
+  text_source?: string;
+  text_reliable?: boolean;
+  authority?: EvidenceAuthority | null;
+};
 export type Confidence = { percent: number; band: string; basis: string[] };
 export type EntityScopeEcho = { entity_slug: string | null; applied: boolean };
+export type EvidenceGate = {
+  supported?: boolean;
+  complete?: boolean;
+  partial?: boolean;
+  reason?: string;
+  error?: string;
+};
 export type Answer = {
   answer: string | null;
   answer_error?: string;
@@ -60,7 +90,9 @@ export type Answer = {
   notice?: string;
   results?: unknown[];
   confidence?: Confidence;
+  evidence_authority?: Pick<EvidenceAuthority, "tier" | "name" | "reason" | "claim">;
   citations?: Citation[];
+  evidence_gate?: EvidenceGate;
   entity_scope?: EntityScopeEcho;
   filter_not_applied?: boolean;
   retrieval_scope?: "owner" | "exact_document_ids" | string;
@@ -143,7 +175,9 @@ export type WorkspaceAllowlist = {
   preferences: boolean;
 };
 export type RetrievalAccess = {
-  principal: "owner" | "grant";
+  principal: "owner" | "grant" | "proxy";
+  scope?: "all" | "zones";
+  read_only?: boolean;
   grant_id?: string;
   entity_slug?: string | null;
   document_count?: number;

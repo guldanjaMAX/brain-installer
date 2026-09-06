@@ -61,6 +61,7 @@ const provider = (impl) => createTokenProvider({ clientId: "cid", clientSecret: 
 
 const EVENT_KICKOFF = {
   kind: "calendar#event", id: "evt_kickoff_001", status: "confirmed",
+  htmlLink: "https://www.google.com/calendar/event?eid=ZXZ0X2tpY2tvZmY",
   summary: "Henderson project kickoff", updated: "2026-06-10T18:22:41.512Z",
   start: { dateTime: "2026-06-12T09:00:00-07:00", timeZone: "America/Phoenix" },
   end: { dateTime: "2026-06-12T10:30:00-07:00", timeZone: "America/Phoenix" },
@@ -139,6 +140,11 @@ try {
       JSON.stringify(sentEnvelopes.map((e) => e.source_id)));
     check("the sent event uses the receipt source namespace",
       sentEnvelopes[0]?.source_type === "calendar", sentEnvelopes[0]?.source_type);
+    check("the sent event keeps its explicit date provenance",
+      sentEnvelopes[0]?.date_source === "calendar:event_start" && sentEnvelopes[0]?.date_reliable === true,
+      JSON.stringify({ date_source: sentEnvelopes[0]?.date_source, date_reliable: sentEnvelopes[0]?.date_reliable }));
+    check("the sent event keeps its canonical citation link",
+      sentEnvelopes[0]?.uri === EVENT_KICKOFF.htmlLink, sentEnvelopes[0]?.uri);
     check("the cancelled event was forwarded to removal, not upsert",
       fakeRemovals.length === 1 && fakeRemovals[0][0] === "calendar:gcal:primary:evt_old_002",
       JSON.stringify(fakeRemovals));

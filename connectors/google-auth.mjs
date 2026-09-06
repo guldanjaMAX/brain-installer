@@ -267,6 +267,57 @@ export async function exchangeCode({ clientId, clientSecret, code, verifier, por
   };
 }
 
+/**
+ * Which Google account actually granted this token.
+ *
+ * The consent screen is the only place the account gets chosen, and a person
+ * with a personal and a work Google account picks the wrong one silently —
+ * then loads someone else's mailbox into the brain. Echoing the address back
+ * right after consent is the cheapest possible tripwire.
+ *
+ * The generic userinfo endpoint is NOT used, deliberately: it requires an
+ * identity scope (openid/email) this product never requests, and widening the
+ * consent screen for an echo would be backwards. Every granted scope already
+ * carries its own identity read — Drive answers /drive/v3/about?fields=user,
+ * Gmail answers users/me/profile — so the echo works with exactly what was
+ * consented to. calendar.events.readonly alone carries no identity read, and
+ * the echo says nothing rather than asking for more.
+ *
+ * Fail-soft on purpose: this runs immediately after a connect that just
+ * succeeded, and a hiccup here must never turn that success into a failure.
+ * Nothing read here is stored.
+ */
+export async function fetchConnectedAccountEmail(accessToken, scopeNames = [], fetchImpl = fetch) {
+  const names = Array.isArray(scopeNames) ? scopeNames : [];
+  const probes = [];
+  if (names.includes("drive")) {
+    probes.push({
+      url: "https://www.googleapis.com/drive/v3/about?fields=user",
+      pick: (json) => json?.user?.emailAddress,
+    });
+  }
+  if (names.includes("gmail")) {
+    probes.push({
+      url: "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+      pick: (json) => json?.emailAddress,
+    });
+  }
+  for (const probe of probes) {
+    try {
+      const res = await fetchImpl(probe.url, {
+        headers: { authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) continue;
+      const address = probe.pick(await res.json());
+      if (typeof address === "string" && address.includes("@")) return address;
+    } catch {
+      // The next probe, or null: never an error out of an echo.
+    }
+  }
+  return null;
+}
+
 /* ------------------------------------------------------------ token storage */
 
 export const tokenPath = (home = homedir()) => join(home, ".brain", "google-tokens.json");
@@ -1152,10 +1203,15 @@ export function loadTokens(value) {
     const path = filePath(options);
     const state = readFileStoreState(path, { ...options, strict: platform === "win32" });
     if (!state) return {};
-    if (platform === "win32" && !state.encrypted) {
+    if (platform === "win32" && !state.encrypted && options.migrateLegacy !== false) {
       // A pre-DPAPI Windows file remains readable, but never remains plaintext
       // after a successful use. The transactional writer retains or restores
       // its credential record if encryption cannot be verified.
+      //
+      // migrateLegacy:false is how a STATUS read or an ordinary inspection says
+      // "tell me what is there, do not rewrite it". The migration is a write,
+      // and a write belongs to the one caller holding the shared lock, not to
+      // every reader that happens to glance at the file first.
       return writeFileStore(path, state.store, options);
     }
     return state.store;
@@ -1305,18 +1361,53 @@ export function tokenStorageStatus(value) {
  * while Gmail scopes are attached. The message says so, because "400" alone
  * sends people looking in the wrong place.
  */
-export function createTokenProvider({ clientId, clientSecret, refreshToken, fetchImpl = fetch, skewMs = 60_000 }) {
+export function createTokenProvider({
+  clientId, clientSecret, refreshToken, fetchImpl = fetch, skewMs = 60_000,
+  // Every other Google call in this codebase bounds itself (connectors/
+  // google-drive.mjs api() uses 60s). This one did not, and a token POST that
+  // connects but never answers could therefore hang forever. Sharing a refresh
+  // across concurrent callers makes that missing bound especially costly: one
+  // unresolved request would hold every caller waiting on the shared result.
+  requestTimeoutMs = 30_000,
+} = {}) {
   let cached = null;
   let expiresAt = 0;
-  return async function getAccessToken({ force = false } = {}) {
-    if (!force && cached && Date.now() < expiresAt - skewMs) return cached;
+  // One refresh at a time. The Gmail lane now has several fetches in flight,
+  // and when the access token ages out they all notice in the same moment;
+  // without this each would POST its own refresh. Google tolerates that, but
+  // it is a burst of identical round trips for one answer, and any caller that
+  // arrives mid-refresh should simply share the result.
+  let inflight = null;
+  const refresh = async () => {
     const body = new URLSearchParams({ client_id: clientId, refresh_token: refreshToken, grant_type: "refresh_token" });
     if (clientSecret) body.set("client_secret", clientSecret);
-    const res = await fetchImpl(TOKEN_URL, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body,
-    });
+    const signal = Number(requestTimeoutMs) > 0 &&
+      typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(Number(requestTimeoutMs))
+      : undefined;
+    let res;
+    try {
+      res = await fetchImpl(TOKEN_URL, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body,
+        ...(signal ? { signal } : {}),
+      });
+    } catch (error) {
+      // A timeout here must SAY it was a timeout. "fetch failed" sent an
+      // operator looking for a network outage when the request was simply
+      // never answered.
+      const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
+      const e = new Error(
+        timedOut
+          ? `the Google token refresh did not answer within ${Math.round(Number(requestTimeoutMs) / 1000)}s. ` +
+            "This is usually a transient network fault; re-running the command is safe."
+          : `the Google token refresh could not be sent: ${error?.message || error}`
+      );
+      e.retryable = true;
+      e.cause = error;
+      throw e;
+    }
     const json = await res.json().catch(() => ({}));
     if (!res.ok) {
       if (json.error === "invalid_grant") {
@@ -1334,5 +1425,10 @@ export function createTokenProvider({ clientId, clientSecret, refreshToken, fetc
     cached = json.access_token;
     expiresAt = Date.now() + (json.expires_in || 3600) * 1000;
     return cached;
+  };
+  return async function getAccessToken({ force = false } = {}) {
+    if (!force && cached && Date.now() < expiresAt - skewMs) return cached;
+    if (!inflight) inflight = refresh().finally(() => { inflight = null; });
+    return inflight;
   };
 }

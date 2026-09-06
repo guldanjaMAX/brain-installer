@@ -32,8 +32,10 @@ const initialEvidence = () => ({
   failedRemovalFamilies: 0,
   failureInjected: false,
   inventoryReads: 0,
+  absenceMetadataReads: 0,
   ingestBatchWrites: 0,
   receipts: { indexing: 0, error: 0, ready: 0 },
+  lastErrorReceipt: null,
 });
 
 function readEvidence() {
@@ -111,6 +113,36 @@ globalThis.fetch = async (input, options = {}) => {
     return json({ startPageToken: "fixture-next-cursor" });
   }
 
+  // The rooted walk proves each reviewed root is a live folder first. This
+  // fixture models an EMPTY Drive, so the root exists and holds nothing.
+  if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files/root-fixture") {
+    return json({
+      id: "root-fixture",
+      name: "Reviewed Root",
+      mimeType: "application/vnd.google-apps.folder",
+      trashed: false,
+      parents: [],
+    });
+  }
+
+  const absentFamily = /^\/drive\/v3\/files\/guard-family-(\d{4})$/.exec(url.pathname);
+  if (url.hostname === "www.googleapis.com" && absentFamily) {
+    const index = Number(absentFamily[1]);
+    if (!Number.isInteger(index) || index < 0 || index >= FAMILY_COUNT) {
+      throw new Error("fixture received an invalid absence-classification request");
+    }
+    const evidence = readEvidence();
+    evidence.absenceMetadataReads++;
+    saveEvidence(evidence);
+    return json({
+      id: `guard-family-${absentFamily[1]}`,
+      name: "Deleted fixture file",
+      mimeType: "text/plain",
+      trashed: true,
+      parents: ["root-fixture"],
+    });
+  }
+
   if (url.hostname === "www.googleapis.com" && url.pathname === "/drive/v3/files") {
     return json({ files: [], nextPageToken: null, incompleteSearch: false });
   }
@@ -184,6 +216,13 @@ globalThis.fetch = async (input, options = {}) => {
     const receipt = parseBody(options);
     const evidence = readEvidence();
     if (Object.hasOwn(evidence.receipts, receipt.status)) evidence.receipts[receipt.status]++;
+    if (receipt.status === "error") {
+      evidence.lastErrorReceipt = {
+        issue_code: receipt.issue_code || null,
+        has_error: Object.hasOwn(receipt, "error"),
+        has_detail: Object.hasOwn(receipt, "detail"),
+      };
+    }
     saveEvidence(evidence);
     return json({ source: receipt.source, status: receipt.status, run_id: receipt.run_id });
   }

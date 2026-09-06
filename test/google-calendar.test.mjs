@@ -421,13 +421,15 @@ section("date handling");
   const multi = describeWhen({ start: { date: "2026-06-19" }, end: { date: "2026-06-22" } });
   check("a multi-day all-day event ends on the last INCLUSIVE day", /through Sunday, 21 June 2026/.test(multi), multi);
 
-  // 18:00 in Phoenix is the 13th in UTC. Filing it under the 13th would be wrong.
+  // 18:00 in Phoenix is the 13th in UTC. D1 stores occurred_at as an epoch and
+  // retrieval emits UTC, so the envelope must carry the local calendar day.
   const lateEnvelope = buildEnvelope(
     { id: "x", status: "confirmed", summary: "Evening call", start: { dateTime: "2026-06-12T18:00:00-07:00" }, end: { dateTime: "2026-06-12T19:00:00-07:00" } },
     { calendar: CAL }
   );
-  check("occurred_at keeps the original offset", lateEnvelope.envelope.occurred_at === "2026-06-12T18:00:00-07:00", lateEnvelope.envelope.occurred_at);
-  check("slicing occurred_at yields the LOCAL date", lateEnvelope.envelope.occurred_at.slice(0, 10) === "2026-06-12");
+  check("occurred_at is the local calendar day", lateEnvelope.envelope.occurred_at === "2026-06-12", lateEnvelope.envelope.occurred_at);
+  check("storage's epoch-to-UTC round trip keeps that local day", new Date(Date.parse(lateEnvelope.envelope.occurred_at)).toISOString().slice(0, 10) === "2026-06-12");
+  check("the exact event time and offset remain in metadata", lateEnvelope.envelope.metadata.start === "2026-06-12T18:00:00-07:00", lateEnvelope.envelope.metadata.start);
 }
 
 section("recurrence in words");
@@ -560,7 +562,10 @@ section("ingest envelopes");
   check("kind is upsert", out.kind === "upsert");
   check("source_type is calendar_event", e.source_type === SOURCE_TYPE, e.source_type);
   check("source_id is gcal:<key>:<event id>", e.source_id === "gcal:primary:evt_kickoff_001", e.source_id);
-  check("occurred_at is explicit", e.occurred_at === "2026-06-12T09:00:00-07:00", e.occurred_at);
+  check("occurred_at is the event's local calendar day", e.occurred_at === "2026-06-12", e.occurred_at);
+  check("a timed start names its date provenance", e.date_source === "calendar:event_start", e.date_source);
+  check("a Google event start is marked reliable", e.date_reliable === true, String(e.date_reliable));
+  check("the canonical event link is the top-level citation URI", e.uri === EVENT_KICKOFF.htmlLink, e.uri);
   check("title carries the date for readable citations", e.title === "Henderson project kickoff — 2026-06-12", e.title);
   check("metadata.category routes it to a calendar corpus", e.metadata.category === "calendar");
   check("metadata.attendees is the string the worker expects", typeof e.metadata.attendees === "string" && /Priya Raman/.test(e.metadata.attendees));
@@ -576,6 +581,10 @@ section("ingest envelopes");
   check("a series master is flagged", recEnv.metadata.is_recurring_master === true);
   check("the raw RRULE is preserved in metadata", recEnv.metadata.recurrence[0].startsWith("RRULE:FREQ=WEEKLY"));
 
+  const allDayEnv = buildEnvelope(EVENT_ALLDAY, { calendar: CAL }).envelope;
+  check("an all-day start names its date-only provenance", allDayEnv.date_source === "calendar:all_day_start", allDayEnv.date_source);
+  check("an event without an htmlLink has no invented citation URI", allDayEnv.uri === null, String(allDayEnv.uri));
+
   const excEnv = buildEnvelope(EVENT_RECURRING_EXCEPTION, { calendar: CAL }).envelope;
   check("an exception gets its OWN source_id", excEnv.source_id === "gcal:primary:evt_weekly_003_20260616T210000Z", excEnv.source_id);
   check("an exception points back at its series", excEnv.metadata.recurring_event_id === "evt_weekly_003");
@@ -583,7 +592,7 @@ section("ingest envelopes");
 
   const del = buildEnvelope(EVENT_CANCELLED, { calendar: CAL });
   check("a cancelled event becomes a deletion", del.kind === "delete", del.kind);
-  check("the deletion targets the same source_id the upsert used", del.source_id === buildEnvelope(EVENT_ALLDAY, { calendar: CAL }).envelope.source_id, del.source_id);
+  check("the deletion targets the same source_id the upsert used", del.source_id === allDayEnv.source_id, del.source_id);
   check("a cancelled event does NOT become a tombstone document", !("envelope" in del));
 
   const skip = buildEnvelope(EVENT_EMPTY, { calendar: CAL });
@@ -645,7 +654,8 @@ section("scenario: incremental sync with one change");
   check("no forbidden parameter was sent", SYNC_TOKEN_FORBIDDEN.every((p) => !impl.calls.calendar[0].params.has(p)));
   check("only the changed event came back", r.events_seen === 1 && r.documents.length === 1);
   check("the change is reflected in the document", /rescheduled/.test(r.documents[0].content), r.documents[0].content.split("\n")[0]);
-  check("the new start time is reflected", r.documents[0].occurred_at === "2026-06-12T14:00:00-07:00");
+  check("the rescheduled event keeps its local calendar day for retrieval", r.documents[0].occurred_at === "2026-06-12");
+  check("the new exact start time is reflected in metadata", r.documents[0].metadata.start === "2026-06-12T14:00:00-07:00");
   check("the source_id is UNCHANGED, so this upserts rather than duplicates", r.documents[0].source_id === "gcal:primary:evt_kickoff_001");
   check("the token advanced", r.state.sync_token === "SYNC_TOKEN_B", r.state.sync_token);
   check("full_syncs did NOT advance on an incremental run", r.state.full_syncs === 1, String(r.state.full_syncs));

@@ -64,6 +64,38 @@ absolute test-kit and manifest paths.
 - Preview every deletion or forget plan and wait for exact approval before the
   command that mutates data.
 
+## Updates and checkups
+
+- A brain that already exists is never fixed by `brain setup`. On an existing
+  Worker, setup re-enters the paused cutover it was written for, and every
+  error in that state suggests exactly that. The path is `brain doctor` and
+  its preview, then `brain update`, which resumes from its saved bookmark.
+- An update is its own appointment, not part of a loading session: the brain
+  refuses new material during its cutover pause. Run it in the foreground and
+  leave the window open. On a quiet brain the pause ends in under a minute;
+  on a busy one it can take the full twenty, and it says which.
+- Read WHICH lines fail at the end of an update. If every FAIL begins with
+  `freshness:`, the update succeeded and a source needs attention; anything
+  else is a stop. Keep the output either way.
+- One line during an update is a wait, not a stop: "N vector(s) accepted but
+  not yet visible; waiting for Vectorize". The index has the vectors and has
+  not exposed them yet; the update polls and finishes on its own. On builds
+  before 0.3.4 the same state ended the update with "reported N failed
+  aggregate operation(s)"; nothing was lost, and re-running the same update a
+  minute later resumes the same step.
+- Start the credential hour fresh. The `wrangler login` session lasts about an
+  hour and is renewed only after it has run out, so an update begun near the
+  end of that hour can stop partway with `403 9109 Invalid access token`,
+  worded as if the owner typed a bad token. Have the owner run
+  `npx wrangler@4 login` right before `brain update`, and again before
+  re-running if that line appears.
+- Before calling a brain proven, count `testing.probe_questions` in the
+  manifest. An empty list means the retrieval tier was not exercised.
+- For a loading or scoring call, start read-only: two `brain health`
+  readings two minutes apart, then `brain sources`. Pending falling means the
+  index is keeping up; pending and the vector count both flat means it is
+  paused, which the next release clears and a hand repair must not.
+
 ## Recovery and completion
 
 - A failed technician step is ready to retry after its named prerequisite is

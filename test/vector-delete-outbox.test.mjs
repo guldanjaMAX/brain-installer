@@ -188,8 +188,18 @@ const insertChunk = (db, uid, doc, ix, vectorId = uid) => db.prepare(
 
 async function drainFully(env, options = {}, maxRounds = 20) {
   const total = { drained: 0, deleted: 0, upserted: 0, submitted: 0, failed: 0, remaining: null };
+  // A failed row now carries a next_attempt_at on a backoff ladder rather than
+  // just an attempt count, so a fixture that hammers the drain on a frozen
+  // clock is asserting that the ladder does not exist. Step past its longest
+  // rung between rounds; the assertions themselves are unchanged.
+  let retryClock = Date.now();
   for (let round = 0; round < maxRounds; round++) {
-    const part = await drainOutbox(env, { maxBatches: 10, ...options });
+    retryClock += 3 * 60 * 60 * 1000;
+    const part = await drainOutbox(env, {
+      maxBatches: 10,
+      ...options,
+      now: options.now || (() => retryClock),
+    });
     for (const field of ["drained", "deleted", "upserted", "submitted", "failed"]) {
       total[field] += Number(part[field] || 0);
     }
@@ -955,7 +965,10 @@ const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
     drainBatchQueryUpperBound(100) === 212);
   check("a ten-batch request stops before the internal D1 query budget",
     drained.drained === 200 && drained.remaining === 400 &&
-      submitted === 421 && submitted < DRAIN_D1_QUERY_BUDGET,
+      // 421 before the drain proved the retry-state schema and swept its
+      // orphans; those are the two statements DRAIN_RETRY_STATE_QUERIES
+      // reserves, so the pin moves with them rather than being loosened.
+      submitted === 423 && submitted < DRAIN_D1_QUERY_BUDGET,
     JSON.stringify({ drained, submitted, budget: DRAIN_D1_QUERY_BUDGET }));
   check("query-budget exhaustion never strands the exclusive drain lease",
     leaseState.owner === null && leaseState.expires === null,
@@ -1267,6 +1280,68 @@ const markAllOutboxSubmitted = (env, db, submittedAt = 1_000) => {
   check("and preserves the delete operation for the next drain", db.prepare("SELECT count(*) n FROM vector_outbox WHERE op='delete'").get().n === 1);
 }
 
+/* A brain that loaded a lot before updating (0.2.0 shape: verified, protocol
+   unset, a large queued outbox) must not push every queued upsert through the
+   one-batch-per-confirmation drain during the update. Queued upserts are
+   handed to the bulk rebuild; deletes still drain first. 2026-09-03: 205,791
+   queued rows would have meant about a day of refusing new material. */
+{
+  const { env, db, visible, deleted, upserted } = makeEnv();
+  env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
+  const ids = ["drive:legacy-a#0", "drive:legacy-b#0", "drive:legacy-c#0"];
+  for (const uid of ids) {
+    insertDocument(db, uid.split("#")[0]);
+    insertChunk(db, uid, uid.split("#")[0], 0);
+  }
+  db.prepare("DELETE FROM vector_outbox").run();
+  for (const uid of ids) {
+    db.prepare(
+      "INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at) VALUES (?1, ?1, 'upsert', 1000)"
+    ).run(uid);
+  }
+  // A chunk that was deleted before the update: its vector still sits in the
+  // provider and nothing but this outbox row will remove it.
+  visible.set("drive:legacy-gone#0", { id: "drive:legacy-gone#0", values: [0.1] });
+  db.prepare(
+    "INSERT INTO vector_outbox (chunk_uid, vector_id, op, queued_at) VALUES ('drive:legacy-gone#0', 'drive:legacy-gone#0', 'delete', 1000)"
+  ).run();
+  db.prepare(
+    `UPDATE install_state
+        SET schema_version=22, vector_projection_status='verified',
+            vector_projection_bootstrap_epoch=1,
+            vector_projection_bootstrap_cursor=NULL,
+            vector_projection_bootstrap_high_water=NULL,
+            vector_projection_bootstrap_protocol=NULL,
+            vector_projection_bootstrap_base_count=(SELECT count(*) FROM chunks)
+      WHERE id=1`
+  ).run();
+  let clock = 20_000;
+  const options = {
+    now: () => (clock += 1_000),
+    embed: async () => [0.1],
+    embedBatch: async (texts) => texts.map(() => [0.1]),
+  };
+  const first = await acceleratedVectorBootstrap(env, options);
+  const afterFirst = db.prepare(
+    "SELECT sum(op='upsert') AS upserts, sum(op='delete') AS deletes FROM vector_outbox"
+  ).get();
+  const stateAfterFirst = db.prepare(
+    "SELECT vector_projection_status AS status, vector_projection_bootstrap_base_count AS base FROM install_state WHERE id=1"
+  ).get();
+  check("queued upserts are handed to the bulk rebuild on the first bootstrap call, deletes are kept",
+    Number(afterFirst.upserts || 0) === 0 && stateAfterFirst.status === "bootstrap_required" &&
+      Number(stateAfterFirst.base) === 0 && first.phase === "legacy_drain",
+    JSON.stringify({ afterFirst, stateAfterFirst, first }));
+  let receipt = first;
+  for (let i = 0; i < 12 && !receipt.complete; i++) receipt = await acceleratedVectorBootstrap(env, options);
+  const outboxLeft = db.prepare("SELECT count(*) AS n FROM vector_outbox").get();
+  check("the delete still reaches the provider and the bulk walk re-projects every chunk to completion",
+    receipt.complete === true && receipt.confirmed === 3 && receipt.total === 3 &&
+      deleted.includes("drive:legacy-gone#0") && Number(outboxLeft.n) === 0 &&
+      upserted.length >= 3,
+    JSON.stringify({ receipt, deleted, upserted: upserted.length, outboxLeft }));
+}
+
 /* The vector-id UPDATE is already desired state for this short identity. D1's
    rough receipt may be zero or include chunks_au's FTS writes; only exact
    mapping readback is a success receipt. */
@@ -1472,9 +1547,8 @@ for (const reportedChanges of [0, 9]) {
     JSON.stringify({ submitted, submittedRows, sizes: upsertBatches.map((batch) => batch.length) }));
   check("bootstrap responses expose aggregate progress only",
     JSON.stringify(Object.keys(submitted).sort()) === JSON.stringify([
-      "actual_vectors", "complete", "confirmed", "epoch", "expected_vectors", "failed",
-      "in_flight_batches", "phase", "protocol", "queued", "remaining", "submitted",
-      "total", "vector_ready",
+      
+      "actual_vectors", "complete", "confirmed", "epoch", "expected_vectors", "failed", "in_flight_batches", "phase", "protocol", "queued", "remaining", "retrying", "submitted", "total", "vector_ready",
     ]) && !JSON.stringify(submitted).includes("drive:accelerated-bootstrap"),
     JSON.stringify(submitted));
 

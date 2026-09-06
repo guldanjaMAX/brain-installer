@@ -20,8 +20,21 @@
  */
 
 import { jsonResponse, privateNoStore, validateAdminKey, validateReadKey, callLLM } from "./lib/core.js";
-import { resolvePrincipal, principalMay } from "./lib/grants.js";
-import { handleBankFeed } from "./lib/bank-feed.js";
+import { resolvePrincipal, principalMay, scopeIsUnrestricted } from "./lib/grants.js";
+import { handleBankFeed, bankFeedEnabled } from "./lib/bank-feed.js";
+import { handlePlaidWebhook, runPlaidMaintenance } from "./lib/plaid-bank-feed.js";
+import { handleSupportAccess } from "./lib/support-access.js";
+import {
+  AGENT_DELETION_PATH_PREFIX, handleAgentDeletion,
+} from "./lib/agent-action-receipts.js";
+import { ownerReliabilityAlerts } from "./lib/reliability-alerts.js";
+import {
+  cleanupQuickBooksOAuthIntents,
+  handleQuickBooksOAuthRoute,
+  QUICKBOOKS_OAUTH_PATH_PREFIX,
+  QUICKBOOKS_OAUTH_PATHS,
+} from "./lib/quickbooks-oauth-callback.js";
+import { cleanupPublicAuthState, guardPublicRequest } from "./lib/public-request-guard.js";
 import { handleBankExportImport, BANK_IMPORT_PATH } from "./lib/fin-upload.js";
 import { handleFinApi, FIN_PATH_PREFIX } from "./lib/fin-api.js";
 import {
@@ -33,12 +46,19 @@ import {
   scanEnvelope as scanEnvelopeSecrets,
   sanitizeEnvelope as sanitizeIngestEnvelope,
 } from "./lib/secret-scan.js";
-import { storeFor, backendOf, D1 } from "./lib/store.js";
-import { acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
+import { storeFor, backendOf, D1, TEXT_SOURCES } from "./lib/store.js";
+import { installedSchemaVersion, acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, retryQuarantinedVectorOps, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
-import { hasExplicitCurrentIntent, newestCurrentEvidence } from "./lib/query-intent.js";
+import {
+  currentEvidenceCandidates, hasExplicitCurrentIntent, newestCurrentEvidence, parseCanonicalEvidenceDate,
+} from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
+import {
+  answerUsesOperativeValue, answerUsesSupersededValue, authorityFor,
+  documentMatchesOperativeClaim, documentUsesOperativeValue,
+} from "./lib/evidence-authority.js";
 import { emptyRetrievalDisclosure } from "./lib/retrieval-status.js";
+import { answerGenerationError } from "./lib/answer-render.js";
 import {
   handleOwnerAuth, handleAdminInvite, handleAdminDevices, handleAdminGrants, handleZones,
   ownerSessionPrincipal,
@@ -49,7 +69,7 @@ import {
 import {
   findGrantByCredentialHash, recordPasskeySecurityEvent, sourcesInScope,
 } from "./lib/auth-store.js";
-import { handleZoomWebhook } from "./lib/zoom.js";
+import { handleZoomWebhook, runZoomDeliveryMaintenance } from "./lib/zoom.js";
 import {
   handleOAuthMetadata, handleProtectedResourceMetadata, handleRegister,
   handleAuthorizePage, handleAuthorizeDecision, handleToken, validateConnectorToken,
@@ -145,7 +165,23 @@ function normalizeRetrievedDocuments(results) {
   return demoteScaffolding([...byKey.values()]);
 }
 
-async function unifiedRetrieve(env, url, { limit, access = null, scope = { all: true } }) {
+function strongestEvidenceAuthority(results) {
+  const authorities = (Array.isArray(results) ? results : [])
+    .map((row) => row?.authority)
+    .filter((authority) => authority && authority.eligible !== false && Number.isFinite(Number(authority.rank)))
+    .sort((a, b) => Number(a.rank) - Number(b.rank));
+  const strongest = authorities[0];
+  return strongest ? {
+    tier: strongest.tier,
+    name: strongest.name,
+    reason: strongest.reason,
+    claim: strongest.claim,
+  } : null;
+}
+
+async function unifiedRetrieve(env, url, {
+  limit, access = null, scope = { all: true }, scopePrincipalKind = "owner",
+}) {
   const q = url.searchParams.get("q");
   const rrfK = Math.min(Math.max(parseInt(url.searchParams.get("rrf_k")) || 60, 1), 1e3);
 
@@ -169,14 +205,16 @@ async function unifiedRetrieve(env, url, { limit, access = null, scope = { all: 
     scope,
   });
 
+  const matches = normalizeRetrievedDocuments(r.results);
   return {
-    matches: normalizeRetrievedDocuments(r.results),
+    matches,
+    evidenceAuthority: strongestEvidenceAuthority(matches),
     degraded: r.degraded,
     degradedReason: r.degraded_reason || null,
     retrievalScope: access?.kind === "grant"
       ? "exact_document_ids"
-      : scope && scope.all !== true
-        ? "zones"
+      : scopePrincipalKind !== "owner"
+        ? (scopeIsUnrestricted(scope) ? "all" : "zones")
         : "owner",
     access: access?.kind === "grant"
       ? {
@@ -185,8 +223,12 @@ async function unifiedRetrieve(env, url, { limit, access = null, scope = { all: 
         entity_slug: access.entitySlug,
         document_count: access.documentCount,
       }
-      : scope && scope.all !== true
-        ? { principal: "grant", scope: "zones" }
+      : scopePrincipalKind !== "owner"
+        ? {
+          principal: scopePrincipalKind,
+          scope: scopeIsUnrestricted(scope) ? "all" : "zones",
+          ...(scopePrincipalKind === "proxy" ? { read_only: true } : {}),
+        }
         : { principal: "owner" },
     // A filter the backend cannot apply is surfaced, never dropped. Silently
     // ignoring `client=` returns every client's documents while looking narrowed,
@@ -360,12 +402,6 @@ const EXPLICIT_RELATIONSHIP_STATUS_CLAIM =
 const TRANSACTIONAL_CURRENT_SOURCES = new Set([
   "billing_system", "quickbooks", "stripe", "subscription_system", "xero",
 ]);
-const RELATIONSHIP_CURRENT_SOURCES = new Set([
-  "crm", "hubspot", "salesforce",
-]);
-const AUTHORITATIVE_CURRENT_SOURCES = new Set([
-  ...TRANSACTIONAL_CURRENT_SOURCES, ...RELATIONSHIP_CURRENT_SOURCES,
-]);
 
 function isRelationshipStatusClaim(sentence, question = "") {
   if (CLIENT_STATUS_CLAIM.test(sentence) || CUSTOMER_STATUS_CLAIM.test(sentence)) return true;
@@ -414,11 +450,7 @@ function documentDirectlySupportsStatus(sentence, doc, question = "") {
 }
 
 function authoritativeCurrentEvidence(sentence, doc, question = "") {
-  const source = String(doc?.source || "").toLowerCase();
-  // Authority is claim-scoped. A live Stripe snapshot is authoritative for its
-  // subscription/account state but cannot be upgraded into relationship proof.
-  if (isRelationshipStatusClaim(sentence, question)) return RELATIONSHIP_CURRENT_SOURCES.has(source);
-  return doc?.current_authoritative === true || AUTHORITATIVE_CURRENT_SOURCES.has(source);
+  return authorityFor(doc, { query: question, claimText: sentence, current: true }).authoritative;
 }
 
 function hasMatchingAsOfDate(sentence, docs) {
@@ -441,7 +473,9 @@ function hasMatchingAsOfDate(sentence, docs) {
 
 /* -------------------------------------------------------------- routes */
 
-async function handleUnified(env, request, access = null, grantScope = { all: true }) {
+async function handleUnified(
+  env, request, access = null, grantScope = { all: true }, scopePrincipalKind = "owner",
+) {
   const url = await privateRagParameters(request);
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
   const q = url.searchParams.get("q");
@@ -456,8 +490,8 @@ async function handleUnified(env, request, access = null, grantScope = { all: tr
   const doRerank = explicitlyEnabled(url.searchParams.get("rerank")) && !!env.ANTHROPIC_API_KEY;
 
   const {
-    matches: retrieved, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
-  } = await unifiedRetrieve(env, url, { limit, access, scope: grantScope });
+    matches: retrieved, evidenceAuthority, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
+  } = await unifiedRetrieve(env, url, { limit, access, scope: grantScope, scopePrincipalKind });
   const accessStatus = {
     retrieval_scope: retrievalScope,
     degraded_reason: degradedReason || undefined,
@@ -475,7 +509,7 @@ async function handleUnified(env, request, access = null, grantScope = { all: tr
 
   if (degraded === "fts") {
     const rows = retrieved.slice(0, limit);
-    return jsonResponse({ mode: "unified", entity_scope: entityScope, degraded, ...accessStatus, ...unavailable(rows), ...ignored, results: rows });
+    return jsonResponse({ mode: "unified", entity_scope: entityScope, degraded, evidence_authority: evidenceAuthority || undefined, ...accessStatus, ...unavailable(rows), ...ignored, results: rows });
   }
 
   let matches = retrieved;
@@ -488,11 +522,14 @@ async function handleUnified(env, request, access = null, grantScope = { all: tr
   return jsonResponse({
     mode: "unified", entity_scope: entityScope, reranked: doRerank,
     degraded: degraded || undefined, ...unavailable(Array.isArray(matches) ? matches : []),
+    evidence_authority: strongestEvidenceAuthority(matches) || evidenceAuthority || undefined,
     ...accessStatus, ...ignored, results: matches,
   });
 }
 
-async function handleThink(env, request, access = null, grantScope = { all: true }) {
+async function handleThink(
+  env, request, access = null, grantScope = { all: true }, scopePrincipalKind = "owner",
+) {
   const unsupportedAnswer = "The documents do not answer the question.";
   const url = await privateRagParameters(request);
   if (!url) return jsonResponse({ error: "Expected a JSON request body" }, 400);
@@ -504,8 +541,8 @@ async function handleThink(env, request, access = null, grantScope = { all: true
   const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit")) || 8, 1), 20);
 
   const {
-    matches, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
-  } = await unifiedRetrieve(env, url, { limit, access, scope: grantScope });
+    matches, evidenceAuthority, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
+  } = await unifiedRetrieve(env, url, { limit, access, scope: grantScope, scopePrincipalKind });
   const results = Array.isArray(matches) ? matches : [];
 
   if (results.length === 0) {
@@ -538,6 +575,7 @@ async function handleThink(env, request, access = null, grantScope = { all: true
       confidence: disclosure.unavailable
         ? undefined
         : refusalConfidence({ gaps: disclosure.gaps, degraded, resultCount: 0 }),
+      evidence_authority: evidenceAuthority || undefined,
     });
   }
 
@@ -562,10 +600,13 @@ async function handleThink(env, request, access = null, grantScope = { all: true
     });
   }
   if (degraded === "vector" || degraded === "scoped-vector") {
+    const scopedDetail = retrievalScope === "exact_document_ids"
+      ? "Exact document authorization was applied in D1. The unscoped semantic index was deliberately not queried, so differently phrased evidence inside the allowed documents may be missing; this is not proof that the allowed documents contain nothing."
+      : "Registered-source zone authorization was applied in D1. The unscoped semantic index was deliberately not queried, so differently phrased evidence inside the allowed zones may be missing; this is not proof that the allowed zones contain nothing.";
     gaps.unshift({
       type: degraded === "scoped-vector" ? "scoped_vector_unavailable" : "vector_unavailable",
       detail: degraded === "scoped-vector"
-        ? "Exact document authorization was applied in D1. The unscoped semantic index was deliberately not queried, so differently phrased evidence inside the allowed documents may be missing; this is not proof that the allowed documents contain nothing."
+        ? scopedDetail
         : "The vector index is not fully query-ready. Keyword evidence remains available, but new or differently phrased evidence may be missing until `brain drain` confirms the complete projection.",
     });
   }
@@ -575,11 +616,13 @@ async function handleThink(env, request, access = null, grantScope = { all: true
     source: r.source || "?",
     client: r.client || null,
     ts: r.ts || null,
+    occurred_at: r.occurred_at || null,
     date_reliable: r.date_reliable === true,
     date_source: r.date_source || null,
     text_source: r.text_source || "native",
     text_reliable: r.text_reliable !== false,
     current_authoritative: r.current_authoritative === true,
+    authority: r.authority || null,
     ref: r.ref_key || r.drive_file_id || null,
     snippet: (r.snippet || "").replace(/\s+/g, " ").slice(0, 900),
   }));
@@ -594,7 +637,13 @@ async function handleThink(env, request, access = null, grantScope = { all: true
       const read = d.text_source === "ocr" || d.text_source === "ocr_partial"
         ? "READ BY OCR FROM A SCAN, may be misread"
         : null;
-      const meta = [d.source, d.client ? `client: ${d.client}` : null, date, read]
+      const authority = d.authority
+        ? `authority ${d.authority.tier} ${d.authority.name}: ${d.authority.reason}`
+        : "authority unavailable";
+      const operative = d.authority?.operative_section
+        ? `OPERATIVE FOR THIS QUESTION: ${d.authority.operative_section.name} = ${d.authority.operative_section.value} as of ${d.authority.operative_section.as_of}. Values listed under Supersedes are historical, not current.`
+        : null;
+      const meta = [d.source, d.client ? `client: ${d.client}` : null, date, read, authority, operative]
         .filter(Boolean)
         .join(", ");
       return `[${d.n}] (${meta}) ${d.title}\n${d.snippet}`;
@@ -604,11 +653,61 @@ async function handleThink(env, request, access = null, grantScope = { all: true
   let approvedDocs = docs;
   let evidenceGate = null;
   const owner = env.BRAIN_OWNER || "the owner";
-  const currentEvidence = newestCurrentEvidence(q, docs, {
-    filters: filtersFrom(url), owner: env.BRAIN_OWNER || null,
-  });
+  const currentOptions = { filters: filtersFrom(url), owner: env.BRAIN_OWNER || null };
+  const allCurrentEvidence = currentEvidenceCandidates(q, docs, currentOptions);
+  const operativeCandidates = allCurrentEvidence.filter((doc) => doc.authority?.operative_section);
+  const newestOperativeCandidates = newestCurrentEvidence(q, operativeCandidates, currentOptions);
+  const operativeValues = new Set(newestOperativeCandidates.map((doc) =>
+    String(doc.authority?.operative_section?.value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
+  ).filter(Boolean));
+  const operativeConflict = operativeValues.size > 1;
+  const selectedOperativeEvidence = operativeConflict
+    ? null
+    : newestOperativeCandidates.slice().sort((a, b) => String(a.ref || "").localeCompare(String(b.ref || "")))[0] || null;
+  // A later email, invoice, or note is visible context, but it cannot silently
+  // supersede an explicit owner decision. Only another valid, later owner
+  // confirmation replaces the operative value for this matched section.
+  const currentEvidence = selectedOperativeEvidence
+    ? [selectedOperativeEvidence]
+    : operativeConflict
+      ? newestOperativeCandidates
+      : newestCurrentEvidence(q, docs, currentOptions);
   const currentEvidenceNumbers = new Set(currentEvidence.map((doc) => doc.n));
+  const operativeCurrentEvidence = selectedOperativeEvidence ? [selectedOperativeEvidence] : newestOperativeCandidates;
   const explicitCurrentIntent = hasExplicitCurrentIntent(q);
+  let newerAuthoritativeEvidence = [];
+  let newerSoftEvidence = [];
+  if (operativeConflict) {
+    gaps.unshift({
+      type: "operative_conflict",
+      detail: "Equally current owner-confirmed operative records disagree for this fact. The Brain will not choose between them.",
+    });
+  } else if (selectedOperativeEvidence) {
+    const operativeTime = Date.parse(selectedOperativeEvidence.ts || "");
+    const newerNonoperative = allCurrentEvidence.filter((doc) =>
+      !doc.authority?.operative_section && Number.isFinite(operativeTime) && Date.parse(doc.ts || "") > operativeTime
+    );
+    newerAuthoritativeEvidence = newerNonoperative.filter((doc) =>
+      doc.authority?.authoritative === true &&
+      documentMatchesOperativeClaim(doc, selectedOperativeEvidence.authority?.operative_section) &&
+      !documentUsesOperativeValue(doc, selectedOperativeEvidence.authority?.operative_section)
+    );
+    newerSoftEvidence = newerNonoperative.filter((doc) => doc.authority?.authoritative !== true);
+    if (newerAuthoritativeEvidence.length) {
+      gaps.unshift({
+        type: "newer_authoritative_evidence",
+        count: newerAuthoritativeEvidence.length,
+        detail: `${newerAuthoritativeEvidence.length} newer authoritative record${newerAuthoritativeEvidence.length === 1 ? " discusses" : "s discuss"} this fact without repeating the older owner-confirmed operative value. It may supersede that value, so the Brain will not choose until the evidence is reconciled.`,
+      });
+    }
+    if (newerSoftEvidence.length) {
+      gaps.unshift({
+        type: "newer_nonoperative_evidence",
+        count: newerSoftEvidence.length,
+        detail: `${newerSoftEvidence.length} newer non-operative record${newerSoftEvidence.length === 1 ? " exists" : "s exist"}. It remains visible for review but does not supersede the owner's operative value.`,
+      });
+    }
+  }
 
   // Owner name is templated per install. A hardcoded source-instance name here
   // would otherwise ship to every client.
@@ -627,7 +726,8 @@ async function handleThink(env, request, access = null, grantScope = { all: true
     "9. A planning interview, decisions-so-far note, proposal, template, or draft can describe intended legal terms, but it cannot establish what the owner is actually bound by. Only a final or executed governing agreement can do that.",
     "10. For an explicit current, latest, still, or going-on question, an older source establishes history only. A present-status claim must cite newest reliable-dated evidence that itself states that status. Billing or payment activity alone does not establish an ongoing client, customer, contract, or relationship status.",
     "11. A message, file, meeting note, or other non-authoritative source supports only an as-of statement tied to its exact reliable date. Authority is claim-specific: billing and subscription systems can establish their own account or subscription state, but only a relationship system such as a CRM can establish an unqualified current client or customer relationship. Otherwise state the exact as-of date or say current status cannot be confirmed.",
-    "12. When a claim rests on reliably dated evidence, weave that date into the sentence naturally, like: per the 2026-07-31 call transcript. A dated claim can be checked; an undated one has to be trusted. Never state a date the documents do not carry.",
+    "12. An OPERATIVE section records the owner's current decision for that one named fact. Use its Operative value. Every value under Supersedes is historical and must never be repeated as current or counted as supporting agreement.",
+    "13. When a claim rests on reliably dated evidence, weave that date into the sentence naturally, like: per the 2026-07-31 call transcript. A dated claim can be checked; an undated one has to be trusted. Never state a date the documents do not carry.",
     env.BRAIN_STYLE_RULE || "",
   ]
     .filter(Boolean)
@@ -636,7 +736,7 @@ async function handleThink(env, request, access = null, grantScope = { all: true
   const docBlock = renderDocs(docs);
   const gapBlock = gaps.length ? gaps.map((g) => `- ${g.detail}`).join("\n") : "- none detected";
   const currentBlock = currentEvidence.length
-    ? `\n\nCURRENT-STATUS CHECK:\nThe newest reliable-dated evidence for the named subject is document ${currentEvidence.map((doc) => `[${doc.n}]`).join(" and ")}. It may establish only the status it explicitly states. Older documents may explain history, and non-authoritative sources require an exact as-of date.`
+    ? `\n\nCURRENT-STATUS CHECK:\nThe controlling current evidence for the named subject is document ${currentEvidence.map((doc) => `[${doc.n}]`).join(" and ")}. It may establish only the status it explicitly states. Older documents may explain history, and non-authoritative sources require an exact as-of date.${operativeConflict ? " Equally current owner-confirmed operative sections disagree. Do not choose a current value." : newerAuthoritativeEvidence.length ? " A newer authoritative record discusses this fact without repeating the owner-confirmed operative value and may supersede it. Do not choose a current value until they are reconciled." : operativeCurrentEvidence.length ? ` Document ${operativeCurrentEvidence.map((doc) => `[${doc.n}]`).join(" and ")} contains the newest owner-confirmed operative section for this question. Use only its Operative value as current; every Supersedes value is historical. A newer non-operative record does not replace it.` : ""}`
     : "";
   const userMsg = `Question: ${q}\n\nDOCUMENTS:\n${docBlock}${currentBlock}\n\nKNOWN GAPS (computed from the data, not inferred, do not contradict these):\n${gapBlock}\n\nWrite the answer. Then, only if one of the gaps above materially affects how much the reader should trust that answer, add a final line starting with "Heads up:" naming that one gap in a single sentence. If none do, omit the Heads up line entirely.`;
 
@@ -665,11 +765,7 @@ async function handleThink(env, request, access = null, grantScope = { all: true
       }
     }
   } catch (e) {
-    answerError = e.no_key
-      ? "no LLM key configured"
-      : e.llm_cap_exceeded
-        ? "daily LLM spend cap reached"
-        : e.message;
+    answerError = answerGenerationError(e);
   }
 
   // Retrieval always returns the nearest candidates, even when none answers
@@ -707,6 +803,7 @@ async function handleThink(env, request, access = null, grantScope = { all: true
               "For an explicit current, latest, still, or going-on question, an older source establishes history only. When newer reliable-dated evidence for the named subject is supplied below, a present-status sentence must cite that newer evidence; a stale-only citation is unsupported.",
               "The newest cited document must itself explicitly support the claimed status. Merely co-citing a newest invoice, payment failure, scheduling message, or other activity record does not make an older client or relationship status current.",
               "A message, file, meeting note, or other non-authoritative source supports only a status qualified with its exact reliable as-of date. Authority is claim-specific: billing and subscription systems can establish their own account or subscription state, but only a relationship system such as a CRM can establish an unqualified current client or customer relationship. Otherwise require an as-of date or abstention.",
+              "When a cited document contains an OPERATIVE section for this question, only its Operative value is current. Values under Supersedes are historical. Reject an answer that substitutes or repeats a superseded value as current.",
               "A similar name, generic guidance, another entity's policy, another property's lease, a transaction, an account statement, or a draft does not establish the requested governing fact.",
               "When a question uses my, our, we, or an unnamed definite subject such as 'the term sheet', require the citation to explicitly connect that subject to the configured brain owner or to an organization, property, agreement, or project named in the question. First-person words inside an unrelated newsletter or third-party document refer to its author, not the brain owner.",
               "Example false: an answer gives our parental leave policy but cites another company's policy.",
@@ -810,15 +907,64 @@ async function handleThink(env, request, access = null, grantScope = { all: true
               evidenceGate.reason = temporalFailure;
             }
           }
-          if (!evidenceGate.supported || !evidenceGate.complete || !allowed.size) {
+          if (evidenceGate.supported && explicitCurrentIntent && operativeConflict) {
+            evidenceGate.supported = false;
+            evidenceGate.reason = "equally current owner-confirmed operative records disagree";
+          } else if (evidenceGate.supported && explicitCurrentIntent && newerAuthoritativeEvidence.length) {
+            evidenceGate.supported = false;
+            evidenceGate.reason = "newer authoritative evidence may supersede the older owner-confirmed operative value";
+          } else if (evidenceGate.supported && explicitCurrentIntent && selectedOperativeEvidence) {
+            const allowedNumbers = new Set(allowedDocs.map((doc) => doc.n));
+            if (!allowedNumbers.has(selectedOperativeEvidence.n)) {
+              evidenceGate.supported = false;
+              evidenceGate.reason = "current answer did not cite the matching owner-confirmed operative value";
+            } else if (!answerUsesOperativeValue(
+              answer, selectedOperativeEvidence.authority?.operative_section,
+            )) {
+              evidenceGate.supported = false;
+              evidenceGate.reason = "current answer did not use the matching owner-confirmed operative value";
+            } else if (answerUsesSupersededValue(
+              answer, selectedOperativeEvidence.authority?.operative_section,
+            )) {
+              evidenceGate.supported = false;
+              evidenceGate.reason = "current answer repeated a superseded value as current";
+            }
+          }
+          if (!evidenceGate.supported || !allowed.size) {
             answer = unsupportedAnswer;
             approvedDocs = [];
+          } else if (!evidenceGate.complete) {
+            // Supported but incomplete used to be thrown away whole. The
+            // verifier said every cited claim holds and one requested part is
+            // missing. Keep the sentences the verifier approved, drop any
+            // sentence that leans on an unapproved citation, and say in one
+            // plain sentence what the documents do not cover. A true absence
+            // still produces the verbatim refusal above; this path never does.
+            const headsUpAt = answer.search(/\n\s*Heads up:/i);
+            const bodyText = headsUpAt >= 0 ? answer.slice(0, headsUpAt) : answer;
+            const headsUp = headsUpAt >= 0 ? answer.slice(headsUpAt).trim() : "";
+            const kept = (bodyText.match(/[^.!?\n]+[.!?]+(?:\s*\[\d+\])*|[^.!?\n]+$/g) || [])
+              .map((sentence) => sentence.trim())
+              .filter((sentence) => {
+                const cites = [...sentence.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1]));
+                return cites.length > 0 && cites.every((n) => allowed.has(n));
+              });
+            if (!kept.length) {
+              answer = unsupportedAnswer;
+              approvedDocs = [];
+              evidenceGate.reason = evidenceGate.reason || "no sentence survived the citation check";
+            } else {
+              const missing = String(evidenceGate.reason || "one part of the question").replace(/\.$/, "");
+              answer = `${kept.join(" ")}\n\nNot covered by the documents: ${missing}.${headsUp ? `\n\n${headsUp}` : ""}`;
+              approvedDocs = citedDocs.filter((doc) => allowed.has(doc.n));
+              evidenceGate.partial = true;
+            }
           } else {
             approvedDocs = citedDocs.filter((doc) => allowed.has(doc.n));
           }
         } catch (e) {
           answer = null;
-          answerError = e.llm_cap_exceeded ? "daily LLM spend cap reached" : "evidence gate could not verify support";
+          answerError = answerGenerationError(e, { verification: true });
           approvedDocs = [];
           evidenceGate = { supported: false, complete: false, error: "verification unavailable" };
         }
@@ -838,7 +984,7 @@ async function handleThink(env, request, access = null, grantScope = { all: true
           resultCount: results.length,
           sources: [...new Set(results.map((r) => r.source).filter(Boolean))],
         })
-      : computeAnswerConfidence({ approvedDocs, gaps, degraded });
+      : computeAnswerConfidence({ approvedDocs, gaps, degraded, partial: evidenceGate?.partial === true ? (evidenceGate.reason || "one part not covered") : null });
 
   return jsonResponse({
     mode: "think",
@@ -853,6 +999,7 @@ async function handleThink(env, request, access = null, grantScope = { all: true
     evidence_gate: evidenceGate || undefined,
     gaps,
     confidence,
+    evidence_authority: approvedDocs.length ? strongestEvidenceAuthority(approvedDocs) || undefined : undefined,
     citations: approvedDocs.map((d) => ({
       n: d.n, title: d.title, source: d.source, ref: d.ref, ts: d.ts,
       date_reliable: d.date_reliable, date_source: d.date_source,
@@ -860,9 +1007,64 @@ async function handleThink(env, request, access = null, grantScope = { all: true
       // from a text layer. This is the field that makes the difference
       // visible at the point of reading, which is the only place it counts.
       text_source: d.text_source, text_reliable: d.text_reliable,
+      authority: d.authority,
     })),
     results: results.slice(0, limit),
   });
+}
+
+// This is the same source-name contract enforced by the CLI and provider
+// runner. `doc_uid` joins source_type and source_id with a colon, so allowing a
+// colon in source_type makes distinct pairs such as a:b/c and a/b:c address the
+// same document. source_id stays otherwise unrestricted because provider ids,
+// paths and split-family ids legitimately contain punctuation.
+const INGEST_SOURCE_TYPE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const INGEST_DATE_SOURCE_MAX_CHARS = 200;
+const INGEST_DATE_SOURCE_CONTROL = /[\u0000-\u001f\u007f]/;
+
+function ingestEnvelopeValidationError(envelope) {
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+    return "ingest body must be a document object";
+  }
+  if (typeof envelope.source_type !== "string" || !INGEST_SOURCE_TYPE.test(envelope.source_type)) {
+    return "source_type must be 1-64 lowercase letters, digits, hyphens or underscores, starting with a letter or digit";
+  }
+  if (typeof envelope.source_id !== "string" || !envelope.source_id.trim()) {
+    return "source_id must be a non-empty string";
+  }
+  if (typeof envelope.content !== "string") return "content must be a string";
+
+  const occurredAt = envelope.occurred_at;
+  const hasOccurredAt = occurredAt !== undefined && occurredAt !== null;
+  if (hasOccurredAt &&
+      (typeof occurredAt !== "string" || parseCanonicalEvidenceDate(occurredAt) === null)) {
+    return "occurred_at must be YYYY-MM-DD, an RFC 3339 timestamp, or null";
+  }
+
+  const dateSource = envelope.date_source;
+  const hasDateSource = dateSource !== undefined && dateSource !== null;
+  if (hasDateSource &&
+      (typeof dateSource !== "string" || !dateSource.trim() ||
+       dateSource.length > INGEST_DATE_SOURCE_MAX_CHARS || INGEST_DATE_SOURCE_CONTROL.test(dateSource))) {
+    return `date_source must be a non-empty string of at most ${INGEST_DATE_SOURCE_MAX_CHARS} characters or null`;
+  }
+
+  if (envelope.date_reliable !== undefined && typeof envelope.date_reliable !== "boolean") {
+    return "date_reliable must be a boolean when provided";
+  }
+  if (envelope.date_reliable === true &&
+      (!hasOccurredAt || !hasDateSource || dateSource.trim().toLowerCase() === "none")) {
+    return "date_reliable true requires occurred_at and a specific date_source";
+  }
+
+  if (envelope.text_source !== undefined && envelope.text_source !== null &&
+      (typeof envelope.text_source !== "string" || !TEXT_SOURCES.has(envelope.text_source))) {
+    return "text_source must be native, ocr, ocr_partial or null";
+  }
+  if (envelope.text_reliable !== undefined && typeof envelope.text_reliable !== "boolean") {
+    return "text_reliable must be a boolean when provided";
+  }
+  return null;
 }
 
 async function handleIngest(env, request, scope = { all: true }) {
@@ -916,12 +1118,11 @@ async function handleIngest(env, request, scope = { all: true }) {
   }
 
   envelope = sanitizeIngestEnvelope(envelope);
-  const { source_type, source_id, content } = envelope || {};
-  if (!source_type || !source_id || typeof content !== "string") {
-    return jsonResponse({ error: "source_type, source_id and content (string) are required" }, 400);
-  }
+  const validationError = ingestEnvelopeValidationError(envelope);
+  if (validationError) return jsonResponse({ error: validationError }, 400);
+  const { source_type } = envelope;
 
-  if (scope && scope.all !== true) {
+  if (!scopeIsUnrestricted(scope)) {
     const allowed = await sourcesInScope(env, scope);
     if (!allowed.includes(String(source_type))) {
       return jsonResponse({
@@ -999,7 +1200,7 @@ async function handleIngestBatch(env, request, scope = { all: true }) {
     );
   }
 
-  if (scope && scope.all !== true) {
+  if (!scopeIsUnrestricted(scope)) {
     const allowed = new Set(await sourcesInScope(env, scope));
     if (docs.some((doc) => !allowed.has(String(doc?.source_type || "")))) {
       return jsonResponse({
@@ -1058,9 +1259,10 @@ async function handleIngestBatch(env, request, scope = { all: true }) {
     const ref = envelope && envelope.source_id != null ? String(envelope.source_id) : null;
     const slot = { source_id: ref, source_type: envelope?.source_type ?? null };
 
-    if (!envelope?.source_type || envelope.source_id == null || typeof envelope.content !== "string") {
+    const validationError = ingestEnvelopeValidationError(envelope);
+    if (validationError) {
       tally.failed++;
-      results[inputIndex] = { ...slot, status: "failed", error: "source_type, source_id and content (string) are required" };
+      results[inputIndex] = { ...slot, status: "failed", error: validationError };
       continue;
     }
 
@@ -1177,6 +1379,7 @@ async function handleIngestBatch(env, request, scope = { all: true }) {
 
 const SOURCE_RECEIPT_STATUSES = new Set(["indexing", "ready", "error"]);
 const SOURCE_RUN_LANES = new Set(["incremental", "sweep", "manual"]);
+const SOURCE_REVIEW_ISSUE_CODE = "SAFETY_REVIEW_REQUIRED";
 const SOURCE_KINDS = new Set([
   "drive", "gmail", "calendar", "imessage", "whatsapp", "zoom",
   // A one-time history load out of an iPhone backup. Deliberately its own
@@ -1288,8 +1491,12 @@ async function handleSourceReceipt(env, request) {
   // false drift for both large files and message exports.
   const documents = Number(countRow?.logical_documents || 0);
   const storedDocuments = Number(countRow?.stored_documents || 0);
+  const reviewRequired = status === "error" &&
+    String(body?.issue_code || "").trim().toUpperCase() === SOURCE_REVIEW_ISSUE_CODE;
   const errorReason = status === "error"
-    ? String(body?.error || body?.reason || detail || "sync failed").replace(/\s+/g, " ").slice(0, 500)
+    ? reviewRequired
+      ? SOURCE_REVIEW_ISSUE_CODE
+      : String(body?.error || body?.reason || detail || "sync failed").replace(/\s+/g, " ").slice(0, 500)
     : null;
   const walkComplete = body?.walk_complete === true || (
     status === "ready" && body?.walk_complete === undefined && body?.complete_sweep === true
@@ -1353,7 +1560,7 @@ async function handleSourceReceipt(env, request) {
     source, kind, status, documents, logical_documents: documents,
     stored_documents: storedDocuments, completed_at: completedAt,
     ...(runId ? { run_id: runId } : {}),
-    ...(errorReason ? { error: errorReason } : {}),
+    ...(reviewRequired ? { issue_code: SOURCE_REVIEW_ISSUE_CODE } : errorReason ? { error: errorReason } : {}),
   });
 }
 
@@ -1521,6 +1728,7 @@ const PAUSED_CORPUS_MUTATION_PATHS = new Set([
   "/api/admin/brain/source-expectation",
   "/api/admin/brain/forget",
   "/api/admin/brain/reindex",
+  "/api/admin/brain/vector-retry",
   "/api/admin/brain/drain",
   // The ledger is not the corpus, but a paused upgrade means a migration is in
   // flight, and financial rows written against a half-migrated schema are the
@@ -1549,6 +1757,16 @@ export default {
       // purpose, because update's own paused-mode probe has to succeed while
       // the pause is deliberately in force.
       const paused = env.VECTOR_DRAIN_MODE === "paused-for-upgrade";
+      // Which migrations this brain has run. The number that decides whether a
+      // published update may touch it, readable without a key so a fleet can be
+      // checked from one place instead of one machine at a time.
+      //
+      // NOT while paused. A cutover pause means this Worker touches no database
+      // at all, and health is the one route that must answer during it; buying
+      // an integer at the cost of that invariant is the wrong trade, and a
+      // paused brain is not a candidate for an update anyway. Caught by the
+      // route suite's zero-call assertion rather than by review.
+      const schemaVersion = !paused && backendOf(env) === D1 ? await installedSchemaVersion(env) : null;
       return jsonResponse({
         ok: !paused,
         status: paused ? "paused-for-upgrade" : "ok",
@@ -1562,6 +1780,7 @@ export default {
           : { accepting_documents: true }),
         brain: env.BRAIN_NAME || "brain",
         version: env.BRAIN_VERSION || "0.1.0",
+        ...(schemaVersion === null ? {} : { schema_version: schemaVersion }),
         vector_writer_protocol: "lease-v1",
         vector_drain_mode: paused ? "paused-for-upgrade" : "active",
         ts: new Date().toISOString(),
@@ -1569,9 +1788,10 @@ export default {
     }
 
     // Owner surface: /app and the passkey ceremonies sit in FRONT of the key
-    // gate — their auth is the ceremony itself, or the session cookie a
-    // ceremony earned. Nothing routed there reaches past the read-only
-    // privilege class (see owner-auth.mjs).
+    // gate because their auth is the ceremony itself or the session cookie it
+    // earned. That cookie is a write-capable owner credential for the guarded
+    // owner routes below. It does not bypass /api/admin routes or execute corpus
+    // deletion without a fresh passkey ceremony (see owner-auth.js).
     // /brand/* is deliberately public and unauthenticated: it is the link
     // preview image, and the scraper that fetches it holds no credential.
     // It sat behind the key gate at first, so every shared invite would have
@@ -1579,7 +1799,42 @@ export default {
     if (path === "/app" || path.startsWith("/auth/") || path.startsWith("/api/app/") ||
         path.startsWith("/brand/") || path.startsWith("/app/assets/")) {
       const response = await handleOwnerAuth(env, request, url, path);
-      return path.startsWith("/api/app/") ? privateNoStore(response) : response;
+      // /auth/ carries WebAuthn challenges and the session cookie itself. A
+      // cached challenge is a replayable one, so it is no-store alongside the
+      // app's API rather than treated as an ordinary page.
+      return path.startsWith("/api/app/") || path.startsWith("/auth/")
+        ? privateNoStore(response)
+        : response;
+    }
+
+    // The QuickBooks return leg. Intuit sends the owner back with a code in the
+    // query string, so the callback is reachable without the whole-install
+    // admin key and is rate-limited by the public guard instead. Callback
+    // failures redirect away from Intuit's query string; claim failures stay
+    // private JSON for the local polling client.
+    if (path === QUICKBOOKS_OAUTH_PATH_PREFIX || path.startsWith(`${QUICKBOOKS_OAUTH_PATH_PREFIX}/`)) {
+      if (path === QUICKBOOKS_OAUTH_PATHS.callback || path === QUICKBOOKS_OAUTH_PATHS.claim) {
+        const guarded = await guardPublicRequest(env, request, url, path);
+        if (guarded.response) {
+          if (path !== QUICKBOOKS_OAUTH_PATHS.callback) return guarded.response;
+          return handleQuickBooksOAuthRoute(env, request, url, path, {
+            publicGuardDenied: true,
+          });
+        }
+        request = guarded.request;
+      }
+      return handleQuickBooksOAuthRoute(env, request, url, path, {
+        adminAuthorized: path !== QUICKBOOKS_OAUTH_PATHS.callback &&
+          path !== QUICKBOOKS_OAUTH_PATHS.claim && validateAdminKey(request, env),
+      });
+    }
+
+    // Support access is its own ceremony with its own short-lived session. Its
+    // cookie and companion header are not understood by owner, retrieval,
+    // financial, connector, OAuth, or admin routes. Every response, including
+    // ceremony errors, is private and non-cacheable.
+    if (path.startsWith("/api/support/")) {
+      return privateNoStore(await handleSupportAccess(env, request, url, path));
     }
 
     // The bank feed's owner surface sits in FRONT of the key gate for exactly
@@ -1616,6 +1871,21 @@ export default {
         },
       ));
       return handleOwnerActions(env, request, path, { ingestEnvelope });
+    }
+
+    // Destructive corpus execution is deliberately separate from ordinary
+    // owner actions. Its receipt and fresh passkey ceremony are enforced by a
+    // dedicated state machine before the shared D1-first forget primitive is
+    // reachable.
+    if (path.startsWith(AGENT_DELETION_PATH_PREFIX)) {
+      return handleAgentDeletion(env, request, path, { forget });
+    }
+
+    // Plaid signs the exact raw body with a short-lived ES256 verification JWT.
+    // The handler fetches only the named public key, records no payload, and
+    // turns the notification into durable reconciliation debt.
+    if (path === "/api/webhooks/plaid") {
+      return handlePlaidWebhook(env, request);
     }
 
     // The Zoom webhook sits in FRONT of the key gate because Zoom cannot send
@@ -1671,10 +1941,15 @@ export default {
     }
 
     const readRoute = path === "/api/rag/unified" || path === "/api/rag/think";
-    const keyAuthorized = readRoute ? validateReadKey(request, env) : validateAdminKey(request, env);
+    const ownerKeyAuthorized = validateAdminKey(request, env);
+    const keyAuthorized = readRoute ? validateReadKey(request, env) : ownerKeyAuthorized;
     let authorized = keyAuthorized;
     let readAccess = null;
     let scope = { all: true };
+    // validateReadKey intentionally accepts both env-held keys on the fast
+    // path. Preserve which one matched so a read-only proxy receipt cannot
+    // claim the caller was the owner merely because no grant lookup ran.
+    let scopePrincipalKind = readRoute && keyAuthorized && !ownerKeyAuthorized ? "proxy" : "owner";
     if (!authorized && readRoute) {
       let sessionPrincipal;
       try {
@@ -1697,6 +1972,7 @@ export default {
         } else if (principalMay(sessionPrincipal, path)) {
           authorized = true;
           scope = sessionPrincipal.scope || { zones: [] };
+          scopePrincipalKind = sessionPrincipal.kind;
         }
         if (authorized) {
           try {
@@ -1739,6 +2015,7 @@ export default {
       if (principal && principalMay(principal, path)) {
         authorized = true;
         scope = principal.scope || { zones: [] };
+        scopePrincipalKind = principal.kind;
       }
     }
 
@@ -1761,10 +2038,10 @@ export default {
         }, 405));
       }
       if (path === "/api/rag/unified" && request.method === "POST") {
-        return privateNoStore(await handleUnified(env, request, readAccess, scope));
+        return privateNoStore(await handleUnified(env, request, readAccess, scope, scopePrincipalKind));
       }
       if (path === "/api/rag/think" && request.method === "POST") {
-        return privateNoStore(await handleThink(env, request, readAccess, scope));
+        return privateNoStore(await handleThink(env, request, readAccess, scope, scopePrincipalKind));
       }
       if (path === "/api/admin/auth/invite" && request.method === "POST") {
         return handleAdminInvite(env, url);
@@ -1815,6 +2092,21 @@ export default {
       if (path === "/api/admin/brain/documents" && request.method === "GET") {
         return privateNoStore(await handleDocuments(env));
       }
+      if (path === "/api/admin/brain/reliability-alerts" && request.method === "GET") {
+        if (backendOf(env) !== D1) return jsonResponse({ error: "reliability alerts apply to the d1 backend only" }, 400);
+        return privateNoStore(jsonResponse(await ownerReliabilityAlerts(env)));
+      }
+      // Quarantined vector generations are released by an explicit operator
+      // decision, never automatically: a row that spent its attempts did so for
+      // a reason, and the preview names how many before anything is retried.
+      if (path === "/api/admin/brain/vector-retry" && request.method === "POST") {
+        if (backendOf(env) !== D1) return jsonResponse({ error: "vector retry applies to the d1 backend only" }, 400);
+        const body = await request.json().catch(() => ({}));
+        return jsonResponse(await retryQuarantinedVectorOps(env, {
+          confirm: body.confirm === true,
+          limit: body.limit,
+        }));
+      }
       // Per-source freshness. Separate from /documents on purpose: that endpoint
       // answers "how much is in here", this one answers "how much of it is
       // current", and conflating them is how staleness stayed invisible.
@@ -1829,7 +2121,7 @@ export default {
         // catalogue of the zones they cannot read, delivered by the health
         // endpoint. Refusing is honest; filtering findings one shape at a time
         // and getting one wrong is not.
-        if (scope && scope.all !== true) {
+        if (!scopeIsUnrestricted(scope)) {
           return jsonResponse({
             error: "diagnose reports on the whole corpus, including zones you cannot read. Ask the owner to run it.",
           }, 403);
@@ -1843,7 +2135,7 @@ export default {
         // unfiltered report names every source in the brain and hands over
         // `reason`, which is the raw connector error verbatim and routinely
         // contains paths and ids. Narrow it to what this caller can read.
-        if (scope && scope.all !== true && Array.isArray(report?.sources)) {
+        if (!scopeIsUnrestricted(scope) && Array.isArray(report?.sources)) {
           const allowed = new Set(await sourcesInScope(env, scope));
           return jsonResponse({ ...report, sources: report.sources.filter((r) => allowed.has(r.source ?? r.name)) });
         }
@@ -1871,13 +2163,21 @@ export default {
         if (!docUids.length && !families.length && !source) {
           return jsonResponse({ error: "pass doc_uids: [...], families: [...], or source: \"name\"" }, 400);
         }
-        if (scope && scope.all !== true) {
+        if (!scopeIsUnrestricted(scope)) {
+          // A source-scoped grant can safely delete one complete source after
+          // the registry proves that source is in scope. Document and family
+          // ids are separate union inputs to forget(), so accepting them beside
+          // an allowed source would let an arbitrary cross-zone id ride through
+          // the source check.
+          if (docUids.length || families.length) {
+            return jsonResponse({
+              error: "forgetting by document id or family needs access to every zone. Ask the owner.",
+            }, 403);
+          }
           const allowed = await sourcesInScope(env, scope);
           if (!source || !allowed.includes(source)) {
             return jsonResponse({
-              error: docUids.length || families.length
-                ? "forgetting by document id or family needs access to every zone. Ask the owner."
-                : `"${source}" is not in a zone you have access to.`,
+              error: `"${source}" is not in a zone you have access to.`,
             }, 403);
           }
         }
@@ -1993,17 +2293,68 @@ export default {
    */
   async scheduled(event, env, ctx) {
     if (backendOf(env) !== D1) return;
-    ctx.waitUntil(
+    // A compatibility cutover is a whole-database mutation barrier. The drain
+    // already no-ops while paused, but the TTL cleanups and the two
+    // maintenance passes would still write, so the whole cycle stands down.
+    // Expired auth state is inert and can wait for the first active cron.
+    if (env.VECTOR_DRAIN_MODE === "paused-for-upgrade") return;
+    // Promise.all, not three arguments: waitUntil takes ONE promise and would
+    // silently drop the rest, leaving both maintenance passes floating.
+    ctx.waitUntil(Promise.all([
       (async () => {
-        // Bounded, because a Worker invocation has a wall clock and an unbounded
-        // loop on a large backfill would be killed mid-batch every time.
-        const r = await drainOutbox(env, {
-          embed: (text) => embedText(env, text),
-          embedBatch: (texts) => embedTexts(env, texts),
-          maxBatches: 10,
-        });
-        if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
-      })()
-    );
+        // Every job here is bounded, because a Worker invocation has a wall
+        // clock and an unbounded loop on a large backfill would be killed
+        // mid-batch every time. allSettled, not all: the TTL cleanups must
+        // still run when the vector provider is failing, and a cleanup error
+        // must not stop the durable vector queue.
+        const [drainResult, cleanupResult, quickbooksCleanupResult] = await Promise.allSettled([
+          drainOutbox(env, {
+            embed: (text) => embedText(env, text),
+            embedBatch: (texts) => embedTexts(env, texts),
+            maxBatches: 10,
+          }),
+          cleanupPublicAuthState(env),
+          cleanupQuickBooksOAuthIntents(env),
+        ]);
+        if (drainResult.status === "fulfilled") {
+          const r = drainResult.value;
+          if (!r.paused && !r.busy && r.drained) console.log(`vector outbox: drained ${r.drained}`);
+          // A cycle that only waited used to log nothing at all, which let a
+          // stalled fence run silent for hours. Waiting a cycle or two is
+          // normal; the line exists so more than that is visible in a tail.
+          else if (!r.paused && !r.busy && !r.submitted && Number(r.waiting) > 0) {
+            console.log(`vector outbox: waiting on confirmation, ${r.remaining} queued`);
+          }
+        } else {
+          console.warn("vector outbox: scheduled drain failed");
+        }
+        if (cleanupResult.status === "rejected") {
+          console.warn("public auth state: scheduled TTL cleanup failed");
+        }
+        if (quickbooksCleanupResult.status === "rejected") {
+          console.warn("quickbooks oauth intents: scheduled TTL cleanup failed");
+        }
+      })(),
+      // Both durable queues need a scheduled pass or their retry ladders never
+      // advance: a webhook writes the debt, but only this clears it when the
+      // first attempt failed and no further webhook is coming.
+      runZoomDeliveryMaintenance(env).then((result) => {
+        const deliveries = Number(result?.deliveries?.claimed || 0);
+        const discovered = Number(result?.reconciliation?.recordings || 0);
+        if (deliveries || discovered) {
+          console.log(`zoom delivery maintenance: ${discovered} discovered, ${deliveries} claimed`);
+        }
+        if (!result?.skipped && result?.outcome?.kind !== "completed") {
+          console.warn(`zoom delivery maintenance: ${result?.outcome?.kind || "unavailable"}`);
+        }
+      }),
+      env.BANK_FEED_PROVIDER === "plaid" && bankFeedEnabled(env)
+        ? runPlaidMaintenance(env).then((result) => {
+          const synced = Number(result?.sync?.ran || 0);
+          const revoked = Number(result?.revocations?.ran || 0);
+          if (synced || revoked) console.log(`plaid maintenance: ${synced} synced, ${revoked} revocations`);
+        })
+        : Promise.resolve(),
+    ]));
   },
 };

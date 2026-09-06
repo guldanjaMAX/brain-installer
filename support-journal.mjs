@@ -76,13 +76,24 @@ export const SUPPORT_SOURCES = Object.freeze([
   "calendar",
   "cloudflare",
   "drive",
+  // The six scheduled providers. recordProviderSchedulerFailure passes the
+  // provider id straight through as the source and swallows the throw, so an id
+  // missing from this list means a scheduled failure loses its issue note in
+  // silence. All six are here rather than only the two a test names, because
+  // any member of SCHEDULED_PROVIDER_IDS can reach that path.
+  "dropbox",
   "gmail",
+  "hubspot",
   "imessage",
   "installer",
   "iphone-backup",
   "local",
+  "microsoft",
+  "notion",
   "obsidian",
+  "quickbooks",
   "scheduler",
+  "slack",
   "supabase",
   "zoom",
   "whatsapp",

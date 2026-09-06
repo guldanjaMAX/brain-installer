@@ -42,6 +42,7 @@ export function sourceOutcome(state: string): OutcomeKey | null {
   if (state === "manual" || state === "unscheduled") return null;
   if (state === "ok") return "CURRENT";
   if (state === "indexing") return "WORKING";
+  if (state === "review") return "NEEDS";
   if (state === "broken" || state === "stale" || state === "never_synced") return "PROBLEM";
   if (state) UNTRANSLATED_STATES.add(`source:${state}`);
   return "PROBLEM";

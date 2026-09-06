@@ -16,7 +16,7 @@ const mkEnv = (rows, upserted, deleted = [], updates = []) => ({
     prepare(q) {
       const shape = (b = []) => ({
         all: async () => ({ results:
-          /submitted_mutation_id IS NOT NULL/.test(q) || /WHERE op = 'delete'/.test(q) ? [] : rows }),
+          /submitted_mutation_id IS NOT NULL/.test(q) || /WHERE (?:o\.)?op = 'delete'/.test(q) ? [] : rows }),
         first: async () => ({ n: 1 }),
         run: async () => /UPDATE install_state/.test(q)
           ? ({ meta: { changes: 1 } })
@@ -28,7 +28,8 @@ const mkEnv = (rows, upserted, deleted = [], updates = []) => ({
     batch: async (stmts) => {
       for (const s of stmts) {
         if (/DELETE FROM vector_outbox/.test(s._q)) deleted.push(s._b[0]);
-        if (/UPDATE vector_outbox/.test(s._q)) updates.push(s._b[0]);
+        if (/UPDATE vector_outbox SET attempts/.test(s._q)) updates.push(s._b[2]);
+        else if (/UPDATE vector_outbox/.test(s._q)) updates.push(s._b[0]);
       }
       return stmts.map(() => ({ meta: { changes: 1 } }));
     },
@@ -100,7 +101,7 @@ const rows = (n) => Array.from({ length: n }, (_, i) => ({
     embedGroup: 50,
   });
   check("a failed group does NOT poison its innocent members", r.submitted === 2, JSON.stringify(r));
-  check("only the genuinely bad chunk is quarantined", r.failed === 1 && upd.includes("poison#0"), JSON.stringify(upd));
+  check("only the genuinely bad chunk is scheduled for bounded retry", r.failed === 1 && upd.includes("poison#0"), JSON.stringify(upd));
   check("and accepted rows stay queued until their exact generation is visible",
     del.length === 0 && upd.includes("ok1#0") && upd.includes("ok2#0"), JSON.stringify({ del, upd }));
 }
