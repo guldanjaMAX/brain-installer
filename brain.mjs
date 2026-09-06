@@ -14319,6 +14319,59 @@ async function cmdToken(manifestPath) {
     : `nothing stored (${storedTokenReference(accountId)}). The next interactive setup or update will prompt once and offer to remember it.`);
 }
 
+const UPDATE_SKILL_REFRESH_WARNING =
+  "The Brain software update is verified, but the local Financial Brain update guide could not be refreshed safely. " +
+  "Protected and unmanaged skill files were left unchanged. " +
+  "Keep using https://financialbrain.ai/update/agent.md in this session. " +
+  "Do not rerun brain update for this local guide warning.";
+
+function updateSkillAgentLabel(root) {
+  if (root === ".claude") return "Claude Code";
+  if (root === ".codex") return "Codex";
+  return "Local assistant";
+}
+
+/** Refresh only the managed local guide after the software update has succeeded. */
+export function refreshTechnicianSkillsAfterUpdate(options = {}) {
+  const installEverywhere = options.installTechnicianSkills ?? installTechnicianSkillEverywhere;
+  const skillOptions = options.claudeSkillOptions || { environment: process.env };
+  const reportOk = options.reportOk ?? ok;
+  const reportWarning = options.reportWarning ?? warn;
+  let results;
+  try {
+    results = installEverywhere(skillOptions);
+  } catch {
+    reportWarning(UPDATE_SKILL_REFRESH_WARNING);
+    return { status: "warning", results: [] };
+  }
+
+  if (!Array.isArray(results) || results.length === 0) {
+    reportWarning(UPDATE_SKILL_REFRESH_WARNING);
+    return { status: "warning", results: [] };
+  }
+
+  const succeeded = results.filter((result) =>
+    result?.status === "installed" || result?.status === "verified"
+  );
+  const failed = results.filter((result) =>
+    result?.status !== "installed" && result?.status !== "verified"
+  );
+
+  for (const result of succeeded) {
+    const label = updateSkillAgentLabel(result.root);
+    reportOk(`${label} /financial-brain-technician ${result.status} after update`);
+  }
+  for (const result of failed) {
+    const label = updateSkillAgentLabel(result?.root);
+    reportWarning(`${label}: ${UPDATE_SKILL_REFRESH_WARNING}`);
+  }
+
+  return {
+    status: failed.length ? (succeeded.length ? "partial" : "warning") : "ready",
+    results,
+  };
+}
+
 /** Beginner update path: verify custody first, then run the fully gated upgrade. */
 export async function cmdUpdate(manifestPath, options = {}) {
   let installed;
@@ -14339,7 +14392,7 @@ export async function cmdUpdate(manifestPath, options = {}) {
   }
   const pin = pinUpdateManifest(installed.path);
   assertUpgradeSourceCompatibility(pin.manifest);
-  return withCloudflareToken(async () => {
+  const upgradeResult = await withCloudflareToken(async () => {
     revalidateUpdateManifest(pin, "update verification");
     await (options.cmdVerify ?? cmdVerify)(pin.target);
     revalidateUpdateManifest(pin, "update verification");
@@ -14363,6 +14416,14 @@ export async function cmdUpdate(manifestPath, options = {}) {
     }
     return upgradeResult;
   }, { accountId: manifestAccountId(pin.target), ...options });
+
+  refreshTechnicianSkillsAfterUpdate({
+    installTechnicianSkills: options.installTechnicianSkills,
+    claudeSkillOptions: options.claudeSkillOptions,
+    reportOk: options.reportSkillRefreshOk,
+    reportWarning: options.reportSkillRefreshWarning,
+  });
+  return upgradeResult;
 }
 
 export async function cmdRollbackInteractive(manifestPath, bookmarkArg, options = {}) {
