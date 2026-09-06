@@ -230,6 +230,41 @@ The command prompts for the question so it does not enter your shell history.
 Ask something only your documents could answer, then something they definitely
 do not cover. The second answer matters as much as the first.
 
+## Check changing facts and access zones
+
+```bash
+brain check ./brain.manifest.json
+```
+
+`brain check` is read-only by default. It searches for returned records that
+give different values for changing facts such as a mailing address, phone
+number, email address, or recurring amount. Each value is shown beside the
+source rule that gave it an evidence tier. A source tier is a review aid, not
+an automatic winner. A partial or degraded search is labeled as unchecked, and
+an empty search result is never called proof that the corpus contains nothing.
+
+The same report reads the Brain's access-zone readiness proof. It shows the
+grouped source, document, and chunk counts for context, while the source
+registry remains the authorization authority. The aggregate proof also counts
+documents and chunks outside that registry, plus stored zone projections that
+disagree with it. Only an explicit `ready` state with none of those gaps is
+shown as complete. Missing, partial, or inconsistent proof is unavailable
+rather than clear. The command never assigns a zone. Use `brain zone` only
+after the owner decides that access boundary.
+
+The subject defaults to `client.display_name` in the manifest. If the Brain is
+about a different person or organization, state it explicitly:
+
+```bash
+brain check ./brain.manifest.json --subject "Example Organization"
+```
+
+Only add `--set` while the owner is present. It asks one question per returned
+conflict and writes one uniquely identified, dated confirmation record from
+the answers they give. Pressing Enter or choosing an invalid option leaves that
+item unresolved and writes nothing for it. If the owner resolves no item, no
+record is written.
+
 ---
 
 ## What it reads

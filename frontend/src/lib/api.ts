@@ -47,6 +47,18 @@ export function ownerError(error: unknown): { status: number | null; message: st
   return { status: null, message: error instanceof Error ? error.message : String(error) };
 }
 
+export type EvidenceAuthority = {
+  tier: "T0" | "T1" | "T2" | "T3" | "T4" | "T5";
+  rank: number;
+  name: string;
+  reason: string;
+  claim?: string;
+  eligible?: boolean;
+  authoritative?: boolean;
+  current?: boolean;
+  owner_confirmed?: boolean;
+  operative?: boolean;
+};
 export type Citation = {
   n: number;
   title: string;
@@ -57,6 +69,7 @@ export type Citation = {
   date_reliable?: boolean;
   text_source?: string;
   text_reliable?: boolean;
+  authority?: EvidenceAuthority | null;
 };
 export type Confidence = { percent: number; band: string; basis: string[] };
 export type EntityScopeEcho = { entity_slug: string | null; applied: boolean };
@@ -77,6 +90,7 @@ export type Answer = {
   notice?: string;
   results?: unknown[];
   confidence?: Confidence;
+  evidence_authority?: Pick<EvidenceAuthority, "tier" | "name" | "reason" | "claim">;
   citations?: Citation[];
   evidence_gate?: EvidenceGate;
   entity_scope?: EntityScopeEcho;

@@ -99,4 +99,35 @@ describe("citation provenance", () => {
     expect(html).toContain("Google Drive");
     expect(html).toContain("Apr 5, 2024");
   });
+
+  it("shows a valid short authority label for owner and scoped citation lists", () => {
+    const citation = {
+      n: 1,
+      title: "Owner-confirmed mailing address",
+      source: "curated",
+      authority: {
+        tier: "T1" as const,
+        rank: 1,
+        name: "primary",
+        reason: "owner-confirmed operative mailing address as of 2026-09-01",
+      },
+    };
+    expect(citationMeta(citation)).toBe("Files you uploaded · T1 primary");
+    const html = renderToStaticMarkup(<CitationSources citations={[citation]} />);
+    expect(html).toContain("T1 primary");
+    expect(html).not.toContain("owner-confirmed operative mailing address");
+  });
+
+  it("does not display an authority label when the tier and name disagree", () => {
+    expect(citationMeta({
+      n: 1,
+      title: "Untrusted authority payload",
+      authority: {
+        tier: "T1",
+        rank: 1,
+        name: "recollection",
+        reason: "malformed",
+      },
+    })).toBe("");
+  });
 });

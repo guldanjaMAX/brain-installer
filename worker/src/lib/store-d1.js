@@ -31,7 +31,8 @@
  * query.
  */
 
-import { currentEvidenceCandidates } from "./query-intent.js";
+import { currentEvidenceCandidates, hasExplicitCurrentIntent } from "./query-intent.js";
+import { authorityFor } from "./evidence-authority.js";
 import {
   PUBLIC_INSTALL_SMOKE_CHUNK,
   PUBLIC_INSTALL_SMOKE_DOC_UID,
@@ -48,6 +49,10 @@ const RRF_K = 60;
 const LEXICAL_CHAMPION_RATIO = 4;
 const LEXICAL_CHAMPION_TARGET_RANK = 5;
 const CURRENT_INTENT_RRF_WEIGHT = 1.25;
+// An owner-confirmed operative value is an explicit decision, not another vote
+// in the historical pile. It gets its own bounded lane only after the ordinary
+// current-intent and subject-match guard has selected it.
+const OPERATIVE_CURRENT_RRF_WEIGHT = 2;
 // The answer route reads at most 900 characters from a retrieved snippet. Keep
 // both modalities inside that window when their best chunks differ, rather than
 // letting either a keyword-heavy header or a semantically similar preamble erase
@@ -448,7 +453,9 @@ export async function searchKeyword(env, query, { limit, filters = {}, access = 
     SELECT c.chunk_uid, c.doc_uid, c.text, d.source AS source, c.title, c.document_date,
            c.client, c.category, c.top_folder, c.platform,
            d.source_id, d.uri, d.entity_slug, d.content_hash, d.date_source, d.date_reliable,
-           d.text_source, d.text_reliable,
+           d.text_source, d.text_reliable, d.meta AS authority_meta,
+           (SELECT head.text FROM chunks head
+             WHERE head.doc_uid = d.doc_uid AND head.chunk_ix = 0 LIMIT 1) AS authority_document_head,
            CASE WHEN d.date_source = 'calendar:event_start' AND json_valid(d.meta)
                 THEN json_extract(d.meta, '$.start') END AS occurred_at,
            bm25(chunks_fts) AS score
@@ -528,7 +535,9 @@ export async function searchVector(env, embedding, { limit, filters = {}, scope 
       `SELECT c.chunk_uid, c.doc_uid, c.text, d.source AS source, c.title, c.document_date,
               c.client, c.category, c.top_folder, c.platform,
               d.source_id, d.uri, d.entity_slug, d.content_hash, d.date_source, d.date_reliable,
-              d.text_source, d.text_reliable,
+              d.text_source, d.text_reliable, d.meta AS authority_meta,
+              (SELECT head.text FROM chunks head
+                WHERE head.doc_uid = d.doc_uid AND head.chunk_ix = 0 LIMIT 1) AS authority_document_head,
               CASE WHEN d.date_source = 'calendar:event_start' AND json_valid(d.meta)
                    THEN json_extract(d.meta, '$.start') END AS occurred_at
        FROM chunks c JOIN documents d ON d.doc_uid = c.doc_uid
@@ -657,6 +666,17 @@ export async function search(env, {
   if (currentDocuments.length) {
     rankLists.push({ items: currentDocuments, weight: CURRENT_INTENT_RRF_WEIGHT, itemWeight: sourceWeight });
   }
+  const operativeCurrentDocuments = currentDocuments.filter((row) => {
+    const authority = authorityFor(row, { query, current: true });
+    return authority.operative && authority.authoritative;
+  });
+  if (operativeCurrentDocuments.length) {
+    rankLists.push({
+      items: operativeCurrentDocuments,
+      weight: OPERATIVE_CURRENT_RRF_WEIGHT,
+      itemWeight: sourceWeight,
+    });
+  }
   let fused = fuseRRF(rankLists, { k: fusionK, keyOf: retrievalDocumentKey });
   if (hasSelectiveKeywordChampion) {
     const rankedDocuments = fused;
@@ -714,8 +734,16 @@ export async function search(env, {
   for (const row of fused) {
     // content_hash is an internal dedupe key, not part of the authenticated
     // search response contract or a stable source identifier for clients.
-    const { content_hash: _internalContentHash, ...publicRow } = row;
-    documents.push(publicRow);
+    const authority = authorityFor(row, { query, current: hasExplicitCurrentIntent(query) });
+    const {
+      content_hash: _internalContentHash,
+      authority_meta: _internalAuthorityMeta,
+      _authority_meta: _internalLegacyAuthorityMeta,
+      authority_document_head: _internalAuthorityDocumentHead,
+      _authority_document_head: _internalLegacyAuthorityDocumentHead,
+      ...publicRow
+    } = row;
+    documents.push({ ...publicRow, authority });
   }
 
   return {

@@ -50,9 +50,13 @@ import { storeFor, backendOf, D1, TEXT_SOURCES } from "./lib/store.js";
 import { installedSchemaVersion, acceleratedVectorBootstrap, drainOutbox, outboxDepth, vectorReadiness, retryQuarantinedVectorOps, forget, forgetFamilies, listSourceFamilies, sourceFamilyCounts, reindex, coverageGaps, freshnessReport, diagnose } from "./lib/store-d1.js";
 import { embedText, embedTexts } from "./lib/supabase.js";
 import {
-  hasExplicitCurrentIntent, newestCurrentEvidence, parseCanonicalEvidenceDate,
+  currentEvidenceCandidates, hasExplicitCurrentIntent, newestCurrentEvidence, parseCanonicalEvidenceDate,
 } from "./lib/query-intent.js";
 import { computeAnswerConfidence, refusalConfidence } from "./lib/confidence.js";
+import {
+  answerUsesOperativeValue, answerUsesSupersededValue, authorityFor,
+  documentMatchesOperativeClaim, documentUsesOperativeValue,
+} from "./lib/evidence-authority.js";
 import { emptyRetrievalDisclosure } from "./lib/retrieval-status.js";
 import { answerGenerationError } from "./lib/answer-render.js";
 import {
@@ -161,6 +165,20 @@ function normalizeRetrievedDocuments(results) {
   return demoteScaffolding([...byKey.values()]);
 }
 
+function strongestEvidenceAuthority(results) {
+  const authorities = (Array.isArray(results) ? results : [])
+    .map((row) => row?.authority)
+    .filter((authority) => authority && authority.eligible !== false && Number.isFinite(Number(authority.rank)))
+    .sort((a, b) => Number(a.rank) - Number(b.rank));
+  const strongest = authorities[0];
+  return strongest ? {
+    tier: strongest.tier,
+    name: strongest.name,
+    reason: strongest.reason,
+    claim: strongest.claim,
+  } : null;
+}
+
 async function unifiedRetrieve(env, url, {
   limit, access = null, scope = { all: true }, scopePrincipalKind = "owner",
 }) {
@@ -187,8 +205,10 @@ async function unifiedRetrieve(env, url, {
     scope,
   });
 
+  const matches = normalizeRetrievedDocuments(r.results);
   return {
-    matches: normalizeRetrievedDocuments(r.results),
+    matches,
+    evidenceAuthority: strongestEvidenceAuthority(matches),
     degraded: r.degraded,
     degradedReason: r.degraded_reason || null,
     retrievalScope: access?.kind === "grant"
@@ -382,12 +402,6 @@ const EXPLICIT_RELATIONSHIP_STATUS_CLAIM =
 const TRANSACTIONAL_CURRENT_SOURCES = new Set([
   "billing_system", "quickbooks", "stripe", "subscription_system", "xero",
 ]);
-const RELATIONSHIP_CURRENT_SOURCES = new Set([
-  "crm", "hubspot", "salesforce",
-]);
-const AUTHORITATIVE_CURRENT_SOURCES = new Set([
-  ...TRANSACTIONAL_CURRENT_SOURCES, ...RELATIONSHIP_CURRENT_SOURCES,
-]);
 
 function isRelationshipStatusClaim(sentence, question = "") {
   if (CLIENT_STATUS_CLAIM.test(sentence) || CUSTOMER_STATUS_CLAIM.test(sentence)) return true;
@@ -436,11 +450,7 @@ function documentDirectlySupportsStatus(sentence, doc, question = "") {
 }
 
 function authoritativeCurrentEvidence(sentence, doc, question = "") {
-  const source = String(doc?.source || "").toLowerCase();
-  // Authority is claim-scoped. A live Stripe snapshot is authoritative for its
-  // subscription/account state but cannot be upgraded into relationship proof.
-  if (isRelationshipStatusClaim(sentence, question)) return RELATIONSHIP_CURRENT_SOURCES.has(source);
-  return doc?.current_authoritative === true || AUTHORITATIVE_CURRENT_SOURCES.has(source);
+  return authorityFor(doc, { query: question, claimText: sentence, current: true }).authoritative;
 }
 
 function hasMatchingAsOfDate(sentence, docs) {
@@ -480,7 +490,7 @@ async function handleUnified(
   const doRerank = explicitlyEnabled(url.searchParams.get("rerank")) && !!env.ANTHROPIC_API_KEY;
 
   const {
-    matches: retrieved, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
+    matches: retrieved, evidenceAuthority, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
   } = await unifiedRetrieve(env, url, { limit, access, scope: grantScope, scopePrincipalKind });
   const accessStatus = {
     retrieval_scope: retrievalScope,
@@ -499,7 +509,7 @@ async function handleUnified(
 
   if (degraded === "fts") {
     const rows = retrieved.slice(0, limit);
-    return jsonResponse({ mode: "unified", entity_scope: entityScope, degraded, ...accessStatus, ...unavailable(rows), ...ignored, results: rows });
+    return jsonResponse({ mode: "unified", entity_scope: entityScope, degraded, evidence_authority: evidenceAuthority || undefined, ...accessStatus, ...unavailable(rows), ...ignored, results: rows });
   }
 
   let matches = retrieved;
@@ -512,6 +522,7 @@ async function handleUnified(
   return jsonResponse({
     mode: "unified", entity_scope: entityScope, reranked: doRerank,
     degraded: degraded || undefined, ...unavailable(Array.isArray(matches) ? matches : []),
+    evidence_authority: strongestEvidenceAuthority(matches) || evidenceAuthority || undefined,
     ...accessStatus, ...ignored, results: matches,
   });
 }
@@ -530,7 +541,7 @@ async function handleThink(
   const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit")) || 8, 1), 20);
 
   const {
-    matches, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
+    matches, evidenceAuthority, degraded, degradedReason, retrievalScope, access: accessSummary, ignoredFilters,
   } = await unifiedRetrieve(env, url, { limit, access, scope: grantScope, scopePrincipalKind });
   const results = Array.isArray(matches) ? matches : [];
 
@@ -564,6 +575,7 @@ async function handleThink(
       confidence: disclosure.unavailable
         ? undefined
         : refusalConfidence({ gaps: disclosure.gaps, degraded, resultCount: 0 }),
+      evidence_authority: evidenceAuthority || undefined,
     });
   }
 
@@ -610,6 +622,7 @@ async function handleThink(
     text_source: r.text_source || "native",
     text_reliable: r.text_reliable !== false,
     current_authoritative: r.current_authoritative === true,
+    authority: r.authority || null,
     ref: r.ref_key || r.drive_file_id || null,
     snippet: (r.snippet || "").replace(/\s+/g, " ").slice(0, 900),
   }));
@@ -624,7 +637,13 @@ async function handleThink(
       const read = d.text_source === "ocr" || d.text_source === "ocr_partial"
         ? "READ BY OCR FROM A SCAN, may be misread"
         : null;
-      const meta = [d.source, d.client ? `client: ${d.client}` : null, date, read]
+      const authority = d.authority
+        ? `authority ${d.authority.tier} ${d.authority.name}: ${d.authority.reason}`
+        : "authority unavailable";
+      const operative = d.authority?.operative_section
+        ? `OPERATIVE FOR THIS QUESTION: ${d.authority.operative_section.name} = ${d.authority.operative_section.value} as of ${d.authority.operative_section.as_of}. Values listed under Supersedes are historical, not current.`
+        : null;
+      const meta = [d.source, d.client ? `client: ${d.client}` : null, date, read, authority, operative]
         .filter(Boolean)
         .join(", ");
       return `[${d.n}] (${meta}) ${d.title}\n${d.snippet}`;
@@ -634,11 +653,61 @@ async function handleThink(
   let approvedDocs = docs;
   let evidenceGate = null;
   const owner = env.BRAIN_OWNER || "the owner";
-  const currentEvidence = newestCurrentEvidence(q, docs, {
-    filters: filtersFrom(url), owner: env.BRAIN_OWNER || null,
-  });
+  const currentOptions = { filters: filtersFrom(url), owner: env.BRAIN_OWNER || null };
+  const allCurrentEvidence = currentEvidenceCandidates(q, docs, currentOptions);
+  const operativeCandidates = allCurrentEvidence.filter((doc) => doc.authority?.operative_section);
+  const newestOperativeCandidates = newestCurrentEvidence(q, operativeCandidates, currentOptions);
+  const operativeValues = new Set(newestOperativeCandidates.map((doc) =>
+    String(doc.authority?.operative_section?.value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
+  ).filter(Boolean));
+  const operativeConflict = operativeValues.size > 1;
+  const selectedOperativeEvidence = operativeConflict
+    ? null
+    : newestOperativeCandidates.slice().sort((a, b) => String(a.ref || "").localeCompare(String(b.ref || "")))[0] || null;
+  // A later email, invoice, or note is visible context, but it cannot silently
+  // supersede an explicit owner decision. Only another valid, later owner
+  // confirmation replaces the operative value for this matched section.
+  const currentEvidence = selectedOperativeEvidence
+    ? [selectedOperativeEvidence]
+    : operativeConflict
+      ? newestOperativeCandidates
+      : newestCurrentEvidence(q, docs, currentOptions);
   const currentEvidenceNumbers = new Set(currentEvidence.map((doc) => doc.n));
+  const operativeCurrentEvidence = selectedOperativeEvidence ? [selectedOperativeEvidence] : newestOperativeCandidates;
   const explicitCurrentIntent = hasExplicitCurrentIntent(q);
+  let newerAuthoritativeEvidence = [];
+  let newerSoftEvidence = [];
+  if (operativeConflict) {
+    gaps.unshift({
+      type: "operative_conflict",
+      detail: "Equally current owner-confirmed operative records disagree for this fact. The Brain will not choose between them.",
+    });
+  } else if (selectedOperativeEvidence) {
+    const operativeTime = Date.parse(selectedOperativeEvidence.ts || "");
+    const newerNonoperative = allCurrentEvidence.filter((doc) =>
+      !doc.authority?.operative_section && Number.isFinite(operativeTime) && Date.parse(doc.ts || "") > operativeTime
+    );
+    newerAuthoritativeEvidence = newerNonoperative.filter((doc) =>
+      doc.authority?.authoritative === true &&
+      documentMatchesOperativeClaim(doc, selectedOperativeEvidence.authority?.operative_section) &&
+      !documentUsesOperativeValue(doc, selectedOperativeEvidence.authority?.operative_section)
+    );
+    newerSoftEvidence = newerNonoperative.filter((doc) => doc.authority?.authoritative !== true);
+    if (newerAuthoritativeEvidence.length) {
+      gaps.unshift({
+        type: "newer_authoritative_evidence",
+        count: newerAuthoritativeEvidence.length,
+        detail: `${newerAuthoritativeEvidence.length} newer authoritative record${newerAuthoritativeEvidence.length === 1 ? " discusses" : "s discuss"} this fact without repeating the older owner-confirmed operative value. It may supersede that value, so the Brain will not choose until the evidence is reconciled.`,
+      });
+    }
+    if (newerSoftEvidence.length) {
+      gaps.unshift({
+        type: "newer_nonoperative_evidence",
+        count: newerSoftEvidence.length,
+        detail: `${newerSoftEvidence.length} newer non-operative record${newerSoftEvidence.length === 1 ? " exists" : "s exist"}. It remains visible for review but does not supersede the owner's operative value.`,
+      });
+    }
+  }
 
   // Owner name is templated per install. A hardcoded source-instance name here
   // would otherwise ship to every client.
@@ -657,7 +726,8 @@ async function handleThink(
     "9. A planning interview, decisions-so-far note, proposal, template, or draft can describe intended legal terms, but it cannot establish what the owner is actually bound by. Only a final or executed governing agreement can do that.",
     "10. For an explicit current, latest, still, or going-on question, an older source establishes history only. A present-status claim must cite newest reliable-dated evidence that itself states that status. Billing or payment activity alone does not establish an ongoing client, customer, contract, or relationship status.",
     "11. A message, file, meeting note, or other non-authoritative source supports only an as-of statement tied to its exact reliable date. Authority is claim-specific: billing and subscription systems can establish their own account or subscription state, but only a relationship system such as a CRM can establish an unqualified current client or customer relationship. Otherwise state the exact as-of date or say current status cannot be confirmed.",
-    "12. When a claim rests on reliably dated evidence, weave that date into the sentence naturally, like: per the 2026-07-31 call transcript. A dated claim can be checked; an undated one has to be trusted. Never state a date the documents do not carry.",
+    "12. An OPERATIVE section records the owner's current decision for that one named fact. Use its Operative value. Every value under Supersedes is historical and must never be repeated as current or counted as supporting agreement.",
+    "13. When a claim rests on reliably dated evidence, weave that date into the sentence naturally, like: per the 2026-07-31 call transcript. A dated claim can be checked; an undated one has to be trusted. Never state a date the documents do not carry.",
     env.BRAIN_STYLE_RULE || "",
   ]
     .filter(Boolean)
@@ -666,7 +736,7 @@ async function handleThink(
   const docBlock = renderDocs(docs);
   const gapBlock = gaps.length ? gaps.map((g) => `- ${g.detail}`).join("\n") : "- none detected";
   const currentBlock = currentEvidence.length
-    ? `\n\nCURRENT-STATUS CHECK:\nThe newest reliable-dated evidence for the named subject is document ${currentEvidence.map((doc) => `[${doc.n}]`).join(" and ")}. It may establish only the status it explicitly states. Older documents may explain history, and non-authoritative sources require an exact as-of date.`
+    ? `\n\nCURRENT-STATUS CHECK:\nThe controlling current evidence for the named subject is document ${currentEvidence.map((doc) => `[${doc.n}]`).join(" and ")}. It may establish only the status it explicitly states. Older documents may explain history, and non-authoritative sources require an exact as-of date.${operativeConflict ? " Equally current owner-confirmed operative sections disagree. Do not choose a current value." : newerAuthoritativeEvidence.length ? " A newer authoritative record discusses this fact without repeating the owner-confirmed operative value and may supersede it. Do not choose a current value until they are reconciled." : operativeCurrentEvidence.length ? ` Document ${operativeCurrentEvidence.map((doc) => `[${doc.n}]`).join(" and ")} contains the newest owner-confirmed operative section for this question. Use only its Operative value as current; every Supersedes value is historical. A newer non-operative record does not replace it.` : ""}`
     : "";
   const userMsg = `Question: ${q}\n\nDOCUMENTS:\n${docBlock}${currentBlock}\n\nKNOWN GAPS (computed from the data, not inferred, do not contradict these):\n${gapBlock}\n\nWrite the answer. Then, only if one of the gaps above materially affects how much the reader should trust that answer, add a final line starting with "Heads up:" naming that one gap in a single sentence. If none do, omit the Heads up line entirely.`;
 
@@ -733,6 +803,7 @@ async function handleThink(
               "For an explicit current, latest, still, or going-on question, an older source establishes history only. When newer reliable-dated evidence for the named subject is supplied below, a present-status sentence must cite that newer evidence; a stale-only citation is unsupported.",
               "The newest cited document must itself explicitly support the claimed status. Merely co-citing a newest invoice, payment failure, scheduling message, or other activity record does not make an older client or relationship status current.",
               "A message, file, meeting note, or other non-authoritative source supports only a status qualified with its exact reliable as-of date. Authority is claim-specific: billing and subscription systems can establish their own account or subscription state, but only a relationship system such as a CRM can establish an unqualified current client or customer relationship. Otherwise require an as-of date or abstention.",
+              "When a cited document contains an OPERATIVE section for this question, only its Operative value is current. Values under Supersedes are historical. Reject an answer that substitutes or repeats a superseded value as current.",
               "A similar name, generic guidance, another entity's policy, another property's lease, a transaction, an account statement, or a draft does not establish the requested governing fact.",
               "When a question uses my, our, we, or an unnamed definite subject such as 'the term sheet', require the citation to explicitly connect that subject to the configured brain owner or to an organization, property, agreement, or project named in the question. First-person words inside an unrelated newsletter or third-party document refer to its author, not the brain owner.",
               "Example false: an answer gives our parental leave policy but cites another company's policy.",
@@ -836,6 +907,29 @@ async function handleThink(
               evidenceGate.reason = temporalFailure;
             }
           }
+          if (evidenceGate.supported && explicitCurrentIntent && operativeConflict) {
+            evidenceGate.supported = false;
+            evidenceGate.reason = "equally current owner-confirmed operative records disagree";
+          } else if (evidenceGate.supported && explicitCurrentIntent && newerAuthoritativeEvidence.length) {
+            evidenceGate.supported = false;
+            evidenceGate.reason = "newer authoritative evidence may supersede the older owner-confirmed operative value";
+          } else if (evidenceGate.supported && explicitCurrentIntent && selectedOperativeEvidence) {
+            const allowedNumbers = new Set(allowedDocs.map((doc) => doc.n));
+            if (!allowedNumbers.has(selectedOperativeEvidence.n)) {
+              evidenceGate.supported = false;
+              evidenceGate.reason = "current answer did not cite the matching owner-confirmed operative value";
+            } else if (!answerUsesOperativeValue(
+              answer, selectedOperativeEvidence.authority?.operative_section,
+            )) {
+              evidenceGate.supported = false;
+              evidenceGate.reason = "current answer did not use the matching owner-confirmed operative value";
+            } else if (answerUsesSupersededValue(
+              answer, selectedOperativeEvidence.authority?.operative_section,
+            )) {
+              evidenceGate.supported = false;
+              evidenceGate.reason = "current answer repeated a superseded value as current";
+            }
+          }
           if (!evidenceGate.supported || !allowed.size) {
             answer = unsupportedAnswer;
             approvedDocs = [];
@@ -905,6 +999,7 @@ async function handleThink(
     evidence_gate: evidenceGate || undefined,
     gaps,
     confidence,
+    evidence_authority: approvedDocs.length ? strongestEvidenceAuthority(approvedDocs) || undefined : undefined,
     citations: approvedDocs.map((d) => ({
       n: d.n, title: d.title, source: d.source, ref: d.ref, ts: d.ts,
       date_reliable: d.date_reliable, date_source: d.date_source,
@@ -912,6 +1007,7 @@ async function handleThink(
       // from a text layer. This is the field that makes the difference
       // visible at the point of reading, which is the only place it counts.
       text_source: d.text_source, text_reliable: d.text_reliable,
+      authority: d.authority,
     })),
     results: results.slice(0, limit),
   });

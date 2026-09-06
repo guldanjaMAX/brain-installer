@@ -10,6 +10,17 @@ This release joins two code lines that had drifted apart. Some brains were
 running a backend that never shipped, and could not be updated without going
 backwards. They can be updated now.
 
+- `brain check <manifest>` now gives the owner one read-only review of changing
+  facts and access-zone readiness. Conflicting returned values show the source
+  rule behind each evidence tier. Degraded searches and unreadable zone status
+  are labeled unchecked rather than clean. Zone readiness comes from the
+  authoritative source registry and detects unregistered rows and projection
+  drift. The command never assigns a zone.
+- `brain check <manifest> --set` asks the owner which returned value is current
+  and records only explicit answers. Blank or invalid answers remain unresolved.
+  Every saved pass has a unique identity, reliable owner-confirmed date
+  provenance, the manifest subject, and an exact ingest receipt before success
+  is reported.
 - Bank connections are protected by their own key. It is a separate secret,
   never derived from your admin or sign-in material, so restoring or rotating
   those can no longer strand a working bank connection. Existing connections

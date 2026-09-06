@@ -451,6 +451,10 @@ const d1Backend = {
           text_reliable: x.text_reliable === undefined || x.text_reliable === null
             ? true
             : x.text_reliable === true || x.text_reliable === 1 || x.text_reliable === "1",
+          // Query-time, claim-specific authority is derived from the durable D1
+          // row. It is additive public metadata, kept beside date and text
+          // provenance so a citation never presents a tier without its reason.
+          authority: x.authority || null,
           score: x.rrf_score,
         };
       }),

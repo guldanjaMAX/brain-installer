@@ -29,7 +29,7 @@ import {
   sessionGeneration, bumpSessionGeneration,
   recordPasskeySecurityEvent, passkeySecurityStatus,
   randomToken, createGrant, addGrantCredential, listGrants, revokeGrant,
-  assignZone, assignedZoneNames, listZones, findGrantById,
+  accessZoneReadiness, assignZone, assignedZoneNames, listZones, findGrantById,
 } from "./auth-store.js";
 import {
   CAPABILITIES, OWNER_CAPABILITIES, parseCapabilities, parseScope, grantIsLive, hashToken,
@@ -329,7 +329,11 @@ export async function handleZones(env, request) {
       throw error;
     }
   }
-  return jsonResponse({ zones: await listZones(env) });
+  const [zones, readiness] = await Promise.all([
+    listZones(env),
+    accessZoneReadiness(env),
+  ]);
+  return jsonResponse({ zones, readiness });
 }
 
 /** GET /api/admin/auth/devices + POST .../revoke — the CLI's device view. */

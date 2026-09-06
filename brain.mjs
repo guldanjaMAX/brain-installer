@@ -112,6 +112,17 @@ import {
   hasStoredCloudflareToken,
   storedTokenReference,
 } from "./operations/cloudflare-token-store.mjs";
+import {
+  assessZoneReadiness,
+  collectAnswers,
+  confirmationEnvelope,
+  gather,
+  normalizeCheckSubject,
+  renderConfirmations,
+  renderReport,
+  unavailableZoneReadiness,
+  validateConfirmationReceipt,
+} from "./operations/check-run.mjs";
 import { deriveRagProxyKey } from "./operations/rag-proxy-key.mjs";
 import { deriveSessionSigningKey } from "./operations/session-signing-key.mjs";
 import {
@@ -216,7 +227,7 @@ const die = (s) => {
 };
 
 const SUPPORT_REMOTE_COMMANDS = new Set([
-  "deploy", "diagnose", "drain", "health", "migrate", "provision",
+  "check", "deploy", "diagnose", "drain", "health", "migrate", "provision",
   "reindex", "rollback", "secrets", "update", "upgrade", "verify",
 ]);
 export const PROVIDER_CONNECTOR_IDS = Object.freeze([
@@ -2779,6 +2790,143 @@ export async function cmdMigrate(manifestPath, options = {}) {
   return { applied: pending.length, schemaVersion };
 }
 
+/**
+ * Read where the subject's returned records disagree and show access-zone
+ * readiness. Without --set this command cannot write. With --set it records
+ * only answers the owner supplies explicitly.
+ */
+export async function cmdCheck(manifestPath, options = {}) {
+  const { m } = loadManifest(manifestPath);
+  const flags = options.flags ?? parseFlags(process.argv.slice(4));
+  assertKnownFlags(flags, ["set", "subject"], "brain check");
+  if (Object.prototype.hasOwnProperty.call(flags, "set") && flags.set !== true) {
+    die("brain check --set is a switch and does not take a value.");
+  }
+  if (Object.prototype.hasOwnProperty.call(flags, "subject") && typeof flags.subject !== "string") {
+    die("brain check --subject needs a person or organization name.");
+  }
+  const subject = normalizeCheckSubject(
+    typeof flags.subject === "string"
+      ? flags.subject
+      : options.subject ?? m.client?.display_name,
+  );
+  if (!subject) {
+    die("brain check needs the person or organization being checked. Set client.display_name or pass --subject \"Name\".");
+  }
+
+  const acct = m.brain?.domain ? null : await (options.resolveAccount ?? resolveAccount)(m);
+  const base = options.baseUrl ?? await (options.resolveBaseUrl ?? resolveBaseUrl)(m, acct);
+  const adminKey = options.adminKey ?? resolveAdminKey(manifestPath);
+  if (!adminKey) {
+    die("no durable admin key was found. Repair it with `brain setup <manifest>` or `brain secrets <manifest>`.");
+  }
+  const request = options.http ?? http;
+
+  const search = options.search ?? (async (payload) => {
+    const response = await request(`${base}/api/rag/unified`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }, { timeoutMs: 60_000, what: "the provenance check" });
+    if (!response.ok) {
+      const detail = summariseResponseBody(await response.text());
+      throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+    }
+    return response.json();
+  });
+
+  const readZones = options.readZones ?? (async () => {
+    const response = await request(`${base}/api/admin/brain/zones`, {
+      method: "GET",
+      headers: { "X-Admin-Key": adminKey },
+    }, { timeoutMs: 60_000, what: "the access-zone inventory" });
+    if (!response.ok) {
+      const detail = summariseResponseBody(await response.text());
+      throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+    }
+    return response.json();
+  });
+
+  info(`reading returned records about ${subject} and the access-zone inventory. Nothing is written unless you say so.`);
+  const [gathered, zoneReadiness] = await Promise.all([
+    gather(search, { subject }),
+    (async () => {
+      try {
+        return assessZoneReadiness(await readZones());
+      } catch (error) {
+        return unavailableZoneReadiness(error);
+      }
+    })(),
+  ]);
+  const report = renderReport(gathered, { subject, zoneReadiness });
+  console.log("");
+  console.log(report.text);
+
+  const conflicts = report.assessed.filter((item) => item.conflict);
+  const resultBase = {
+    conflicts: conflicts.length,
+    zones_checked: zoneReadiness.checked === true,
+    zones_ready: zoneReadiness.checked === true ? zoneReadiness.ready : null,
+  };
+  if (!flags.set) return { ...resultBase, wrote: false };
+  if (!conflicts.length) {
+    ok("nothing to confirm from the returned records.");
+    return { ...resultBase, wrote: false };
+  }
+
+  console.log("");
+  let collected;
+  try {
+    collected = await collectAnswers(conflicts, options.ask ?? ask);
+  } finally {
+    closePrompts();
+  }
+  const { answers, unresolved } = collected;
+  if (unresolved.length) info(`left unresolved, and NOT guessed: ${unresolved.join(", ")}`);
+  if (!answers.length) {
+    info("you resolved none of them, so nothing was written.");
+    return { ...resultBase, wrote: false };
+  }
+
+  const confirmedAt = options.confirmedAt ?? new Date().toISOString();
+  const today = new Date(confirmedAt);
+  if (!Number.isFinite(today.getTime())) die("the confirmation time was invalid. Nothing was written.");
+  const markdown = renderConfirmations(answers, {
+    today: today.toISOString().slice(0, 10),
+    subject,
+  });
+  const envelope = confirmationEnvelope(markdown, {
+    confirmedAt: today.toISOString(),
+    confirmationId: options.confirmationId,
+    subject,
+  });
+  const write = options.write ?? (async (payload) => {
+    const response = await request(`${base}/api/admin/brain/ingest`, {
+      method: "POST",
+      headers: { "X-Admin-Key": adminKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }, { timeoutMs: 60_000, what: "the owner confirmation" });
+    if (!response.ok) {
+      const detail = summariseResponseBody(await response.text());
+      die(
+        `the confirmation returned HTTP ${response.status}${detail ? `: ${detail}` : ""}. ` +
+        "The command cannot confirm whether it was stored; run `brain check` before trying again.",
+      );
+    }
+    return response.json();
+  });
+  const receipt = await write(envelope);
+  try {
+    validateConfirmationReceipt(receipt, envelope);
+  } catch (error) {
+    die(
+      `${error.message}. Nothing was declared saved; run \`brain check\` before trying again.`,
+    );
+  }
+  ok(`recorded ${answers.length} owner confirmation(s) with explicit provenance.`);
+  return { ...resultBase, wrote: true, confirmed: answers.length, doc_uid: receipt.doc_uid };
+}
+
 async function cmdStatus(manifestPath) {
   const { m } = loadManifest(manifestPath);
   const acct = await resolveAccount(m);
@@ -4557,7 +4705,7 @@ export const VALUE_FLAGS = new Set([
   "path", "source", "limit", "from", "manifest", "scopes", "port", "host", "user", "run", "confirm-host", "kind", "add", "bookmark", "export", "explain", "backup",
   "golden", "profile", "k", "repeat", "baseline", "save", "artifacts",
   "corpus-contract", "approve-removals", "only", "skip",
-  "can", "zones", "exclude-zones", "until", "as",
+  "can", "zones", "exclude-zones", "until", "as", "subject",
   // brain import bank. `--file` with no value must die saying so rather than
   // being read as a boolean and then reported as "needs --file".
   "file", "format", "account", "account-kind", "name", "slug", "institution", "currency", "entity", "entity-label",
@@ -14367,6 +14515,13 @@ async function cmdUpgradeInteractive(manifestPath) {
 const withStoredCloudflareToken = (command) => (manifestPath) =>
   withCloudflareToken(() => command(manifestPath), { accountId: manifestAccountId(manifestPath) });
 
+/** A custom domain needs no Cloudflare control-plane credential to run check. */
+async function cmdCheckInteractive(manifestPath) {
+  const { m } = loadManifest(manifestPath);
+  if (m.brain?.domain) return cmdCheck(manifestPath);
+  return withStoredCloudflareToken(cmdCheck)(manifestPath);
+}
+
 /**
  * Guide one install-day account ceremony at a time without becoming a second
  * credential store. The default is a read-only plan. A selected step launches
@@ -15977,6 +16132,7 @@ const commands = {
   drain: cmdDrain,
   reindex: cmdReindex,
   diagnose: cmdDiagnose,
+  check: cmdCheckInteractive,
   eval: cmdEval,
   grant: cmdGrant,
   grants: cmdGrants,
@@ -16029,6 +16185,9 @@ if (IS_MAIN && (!cmd || helpRequested || !commands[cmd])) {
     brain drain      <manifest>            finish the vector embedding now, with a live ETA
     brain reindex    <manifest>            rebuild the vector index from D1, no source files needed
     brain diagnose   <manifest>            what is missing, stored wrong, or stored wastefully
+    brain check      <manifest>            read-only provenance conflicts and access-zone readiness;
+                                           --set records only the owner's explicit answers;
+                                           --subject NAME overrides the manifest owner
     brain eval       <manifest>            score YOUR questions; add --corpus-contract for source coverage
     brain eval       <manifest> --golden-20  build the 20-question set in a guided session, then score it
     brain token      <manifest>            is a Cloudflare token remembered on this Mac? --forget removes it

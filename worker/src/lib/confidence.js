@@ -76,15 +76,53 @@ export function computeAnswerConfidence({ approvedDocs = [], gaps = [], degraded
   let score = 65;
   basis.push(`evidence gate approved ${approvedDocs.length} citation${approvedDocs.length === 1 ? "" : "s"}`);
 
-  const distinctDocs = new Set(approvedDocs.map((doc) => doc.ref || doc.title)).size;
-  if (distinctDocs >= 3) {
-    score += 15;
-    basis.push(`${distinctDocs} independent documents agree`);
-  } else if (distinctDocs === 2) {
-    score += 10;
-    basis.push("two independent documents agree");
+  const authorityRows = approvedDocs
+    .map((doc) => ({ doc, authority: doc?.authority }))
+    .filter(({ authority }) => authority && Number.isFinite(Number(authority.rank)) && authority.tier);
+  if (authorityRows.length) {
+    const eligible = authorityRows.filter(({ authority }) => authority.eligible !== false);
+    const strongestPool = eligible.length ? eligible : authorityRows;
+    const strongest = strongestPool.slice().sort((a, b) =>
+      Number(a.authority.rank) - Number(b.authority.rank)
+    )[0].authority;
+    basis.push(`strongest evidence is ${strongest.tier} ${strongest.name}: ${strongest.reason}`);
+
+    // Agreement earns confidence only when the agreeing records are actually
+    // authoritative for this claim. Three meeting notes are three historical
+    // copies, not three independent current authorities.
+    const highAuthorityDocs = authorityRows.filter(({ authority }) =>
+      authority.eligible !== false && authority.authoritative === true && Number(authority.rank) <= 2
+    );
+    const distinctHighAuthority = new Set(highAuthorityDocs.map(({ doc }) => doc.ref || doc.title)).size;
+    if (distinctHighAuthority >= 3) {
+      score += 15;
+      basis.push(`${distinctHighAuthority} independent T1 or T2 documents agree`);
+    } else if (distinctHighAuthority === 2) {
+      score += 10;
+      basis.push("two independent T1 or T2 documents agree");
+    } else {
+      basis.push("no high-authority agreement bonus");
+    }
+
+    const currentClaim = authorityRows.some(({ authority }) => authority.current === true);
+    if (currentClaim && distinctHighAuthority === 0 && Number(strongest.rank) >= 4) {
+      score -= 10;
+      basis.push("current claim rests only on historical recollection, with no T1 or T2 authority");
+    }
   } else {
-    basis.push("single supporting document");
+    // Legacy comparison adapters do not carry D1 authority metadata. Preserve
+    // their established rubric while making the missing tier visible by its
+    // absence from the basis rather than inventing one.
+    const distinctDocs = new Set(approvedDocs.map((doc) => doc.ref || doc.title)).size;
+    if (distinctDocs >= 3) {
+      score += 15;
+      basis.push(`${distinctDocs} independent documents agree`);
+    } else if (distinctDocs === 2) {
+      score += 10;
+      basis.push("two independent documents agree");
+    } else {
+      basis.push("single supporting document");
+    }
   }
 
   const dated = approvedDocs.filter((doc) => doc.ts);

@@ -452,6 +452,12 @@ const expected = [
   "operations/claude-workspace.mjs",
   "operations/claude-skill.mjs",
   "operations/cloudflare-token-store.mjs",
+  // Generic brain check modules. Reviewed 2026-09-05: categories and fixtures
+  // are synthetic, with no client identity or credential material.
+  "operations/provenance.mjs",
+  "operations/contradiction-sweep.mjs",
+  "operations/check-probes.mjs",
+  "operations/check-run.mjs",
   // Release-line scripts, now shipped because scripts/ is in package files.
   "scripts/check-install-page-version.mjs",
   "scripts/customer-hiccup-lab.mjs",
@@ -567,6 +573,7 @@ const expected = [
   "worker/src/lib/connections.js",
   "worker/src/lib/core.js",
   "worker/src/lib/document-access.js",
+  "worker/src/lib/evidence-authority.js",
   "worker/src/lib/fin-api.js",
   "worker/src/lib/fin-d1.js",
   "worker/src/lib/fin-import.js",

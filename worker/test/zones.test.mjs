@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  assignZone, createGrant, listGrants, listZones, sourcesInScope,
+  accessZoneReadiness, assignZone, createGrant, listGrants, listZones, sourcesInScope,
   ZONE_PROJECTION_REPAIR_BATCH_SIZE,
 } from "../src/lib/auth-store.js";
 import { handleAdminGrants, handleZones } from "../src/lib/owner-auth.js";
@@ -217,6 +217,105 @@ test("listZones reports the authoritative source mapping when legacy row project
     { zone: "(unzoned)", sources: 1, documents: 1, chunks: 1 },
     { zone: "legal", sources: 1, documents: 1, chunks: 1 },
   ]);
+});
+
+test("access-zone readiness distinguishes empty, unconfigured and complete registries", async () => {
+  const { db, env } = makeEnv();
+
+  assert.deepEqual(await accessZoneReadiness(env), {
+    state: "empty",
+    ready: false,
+    authorization_authority: "source_registry",
+    counts: {
+      sources: { registered: 0, zoned: 0, unzoned: 0 },
+      documents: { total: 0, unregistered: 0, projection_drift: 0 },
+      chunks: { total: 0, unregistered: 0, projection_drift: 0 },
+    },
+  });
+
+  addSource(db, "archive");
+  addDocument(db, "archive", "one");
+  addChunk(db, "archive", "one");
+  assert.equal((await accessZoneReadiness(env)).state, "not_configured");
+
+  await assignZone(env, { source: "archive", zone: "legal" });
+  assert.deepEqual(await accessZoneReadiness(env), {
+    state: "ready",
+    ready: true,
+    authorization_authority: "source_registry",
+    counts: {
+      sources: { registered: 1, zoned: 1, unzoned: 0 },
+      documents: { total: 1, unregistered: 0, projection_drift: 0 },
+      chunks: { total: 1, unregistered: 0, projection_drift: 0 },
+    },
+  });
+});
+
+test("access-zone readiness requires every registered source to be zoned once configuration starts", async () => {
+  const { db, env } = makeEnv();
+  addSource(db, "archive", "legal");
+  addSource(db, "inbox");
+
+  const readiness = await accessZoneReadiness(env);
+  assert.equal(readiness.state, "needs_review");
+  assert.equal(readiness.ready, false);
+  assert.deepEqual(readiness.counts.sources, { registered: 2, zoned: 1, unzoned: 1 });
+});
+
+test("access-zone readiness detects corpus rows outside the source registry", async () => {
+  const { db, env } = makeEnv();
+  addDocument(db, "orphan", "unregistered");
+  addChunk(db, "orphan", "unregistered");
+
+  const readiness = await accessZoneReadiness(env);
+  assert.equal(readiness.state, "needs_review");
+  assert.equal(readiness.ready, false);
+  assert.equal(readiness.counts.documents.unregistered, 1);
+  assert.equal(readiness.counts.chunks.unregistered, 1);
+});
+
+test("access-zone readiness counts stale document and chunk projections", async () => {
+  const { db, env } = makeEnv();
+  addSource(db, "archive", "legal");
+  addDocument(db, "archive", "registered");
+  addChunk(db, "archive", "registered");
+  db.prepare("UPDATE documents SET zone = NULL WHERE source = 'archive'").run();
+  db.prepare("UPDATE chunks SET zone = NULL WHERE source = 'archive'").run();
+
+  assert.deepEqual(await accessZoneReadiness(env), {
+    state: "needs_review",
+    ready: false,
+    authorization_authority: "source_registry",
+    counts: {
+      sources: { registered: 1, zoned: 1, unzoned: 0 },
+      documents: { total: 1, unregistered: 0, projection_drift: 1 },
+      chunks: { total: 1, unregistered: 0, projection_drift: 1 },
+    },
+  });
+});
+
+test("the GET zone route preserves zones and adds aggregate readiness proof", async () => {
+  const { db, env } = makeEnv();
+  addSource(db, "archive", "legal");
+
+  const response = await handleZones(
+    env,
+    new Request("https://brain.invalid/api/admin/brain/zones"),
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    zones: [{ zone: "legal", sources: 1, documents: 0, chunks: 0 }],
+    readiness: {
+      state: "ready",
+      ready: true,
+      authorization_authority: "source_registry",
+      counts: {
+        sources: { registered: 1, zoned: 1, unzoned: 0 },
+        documents: { total: 0, unregistered: 0, projection_drift: 0 },
+        chunks: { total: 0, unregistered: 0, projection_drift: 0 },
+      },
+    },
+  });
 });
 
 test("all-zone source scope applies exclusions and fails closed on unzoned sources", async () => {

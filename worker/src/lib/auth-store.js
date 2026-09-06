@@ -626,6 +626,100 @@ export async function listZones(env) {
   }
 }
 
+/**
+ * Aggregate proof for the owner-facing access-zone status.
+ *
+ * `sources.zone` remains the authorization authority. The document and chunk
+ * zone columns are derived projections, so readiness requires every live row
+ * to agree with its registered source rather than trusting those columns on
+ * their own. Counts stay aggregate-only: this route must not turn an access
+ * check into a source or document inventory.
+ */
+export async function accessZoneReadiness(env) {
+  try {
+    const row = await env.DB.prepare(
+      `WITH source_counts AS (
+         SELECT COUNT(*) AS registered,
+                SUM(CASE WHEN zone IS NOT NULL AND trim(zone) != '' THEN 1 ELSE 0 END) AS zoned,
+                SUM(CASE WHEN zone IS NULL OR trim(zone) = '' THEN 1 ELSE 0 END) AS unzoned
+           FROM sources
+       ), document_counts AS (
+         SELECT COUNT(*) AS total,
+                SUM(CASE WHEN s.name IS NULL THEN 1 ELSE 0 END) AS unregistered,
+                SUM(CASE WHEN s.name IS NOT NULL AND d.zone IS NOT s.zone THEN 1 ELSE 0 END) AS projection_drift
+           FROM documents d
+           LEFT JOIN sources s ON s.name = d.source
+          WHERE d.deleted_at IS NULL
+       ), chunk_counts AS (
+         SELECT COUNT(*) AS total,
+                SUM(CASE WHEN s.name IS NULL THEN 1 ELSE 0 END) AS unregistered,
+                SUM(CASE WHEN s.name IS NOT NULL AND c.zone IS NOT s.zone THEN 1 ELSE 0 END) AS projection_drift
+           FROM chunks c
+           LEFT JOIN sources s ON s.name = c.source
+       )
+       SELECT source_counts.registered AS registered_sources,
+              source_counts.zoned AS zoned_sources,
+              source_counts.unzoned AS unzoned_sources,
+              document_counts.total AS documents,
+              document_counts.unregistered AS unregistered_documents,
+              document_counts.projection_drift AS document_projection_drift,
+              chunk_counts.total AS chunks,
+              chunk_counts.unregistered AS unregistered_chunks,
+              chunk_counts.projection_drift AS chunk_projection_drift
+         FROM source_counts, document_counts, chunk_counts`,
+    ).first();
+
+    const counts = {
+      sources: {
+        registered: Number(row?.registered_sources || 0),
+        zoned: Number(row?.zoned_sources || 0),
+        unzoned: Number(row?.unzoned_sources || 0),
+      },
+      documents: {
+        total: Number(row?.documents || 0),
+        unregistered: Number(row?.unregistered_documents || 0),
+        projection_drift: Number(row?.document_projection_drift || 0),
+      },
+      chunks: {
+        total: Number(row?.chunks || 0),
+        unregistered: Number(row?.unregistered_chunks || 0),
+        projection_drift: Number(row?.chunk_projection_drift || 0),
+      },
+    };
+
+    const empty = counts.sources.registered === 0
+      && counts.documents.total === 0
+      && counts.chunks.total === 0;
+    const projectionGap = counts.documents.unregistered > 0
+      || counts.documents.projection_drift > 0
+      || counts.chunks.unregistered > 0
+      || counts.chunks.projection_drift > 0;
+
+    let state;
+    if (empty) {
+      state = "empty";
+    } else if (projectionGap) {
+      state = "needs_review";
+    } else if (counts.sources.zoned === 0) {
+      state = "not_configured";
+    } else if (counts.sources.unzoned > 0
+      || counts.sources.zoned !== counts.sources.registered) {
+      state = "needs_review";
+    } else {
+      state = "ready";
+    }
+
+    return {
+      state,
+      ready: state === "ready",
+      authorization_authority: "source_registry",
+      counts,
+    };
+  } catch (error) {
+    guard(error);
+  }
+}
+
 /** Zone names that currently protect at least one registered source. */
 export async function assignedZoneNames(env) {
   try {

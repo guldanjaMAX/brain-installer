@@ -25,11 +25,28 @@ function citationDateLabel(ts: string | null | undefined, reliable?: boolean): s
   return reliable === true ? text : `around ${text}`;
 }
 
+const CITATION_AUTHORITY = Object.freeze({
+  T1: { name: "primary", rank: 1 },
+  T2: { name: "derived", rank: 2 },
+  T3: { name: "correspondence", rank: 3 },
+  T4: { name: "recollection", rank: 4 },
+  T5: { name: "verbal only", rank: 5 },
+});
+
 /** Keep the evidence quality beside the citation it qualifies. Older Workers
  *  omitted these optional fields, so missing date trust remains uncertain. */
 export function citationMeta(citation: Citation): string {
   const parts: string[] = [];
   if (citation.source) parts.push(sourceLabel(citation.source));
+  const authority = citation.authority;
+  const authorityDefinition = authority
+    ? CITATION_AUTHORITY[authority.tier as keyof typeof CITATION_AUTHORITY]
+    : null;
+  if (authority && authorityDefinition?.name === authority.name &&
+      authorityDefinition.rank === authority.rank &&
+      typeof authority.reason === "string" && authority.reason.trim()) {
+    parts.push(`${authority.tier} ${authority.name}`);
+  }
   const date = citationDateLabel(citation.ts, citation.date_reliable);
   if (date) parts.push(date);
   if (citation.text_source === "ocr_partial") {

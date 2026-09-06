@@ -9,6 +9,15 @@
 const STRONG_CURRENT_INTENT =
   /\b(?:current(?:ly)?|latest|most recent|right now|today|now)\b|\bwhat(?:'s| is) going on\b/i;
 const STILL_INTENT = /\bstill\b/i;
+// Present tense can ask for current state without saying "current". Keep the
+// shapes narrow and claim-specific so a generic "is this useful" question does
+// not turn recency into a global ranking signal.
+const PRESENT_RELATIONSHIP_INTENT =
+  /\b(?:is|are)\s+[a-z0-9][^?\n]{0,80}?\s+(?:still\s+)?(?:(?:an?|my|our)\s+)?(?:active\s+)?(?:clients?|customers?|members?|patients?|employees?|tenants?|vendors?|partners?)\s*\??(?:$|\n)|\bwho\s+(?:is|are)\s+(?:my|our)\s+(?:active\s+)?(?:clients?|customers?|members?|patients?|employees?|tenants?|vendors?|partners?)\b/i;
+const PRESENT_OWNER_FACT_INTENT =
+  /\bwhat(?:'s| is)\s+(?:my|our)\s+(?:(?:current|mailing|home|business|primary)\s+)*(?:address|phone(?:\s+number)?|mobile(?:\s+number)?|email(?:\s+address)?)\b/i;
+const HISTORICAL_STATE_ANCHOR =
+  /\b(?:ever|formerly|once|previously|used to)\b|\b(?:former|past|previous)\s+(?:client|customer|member|patient|employee|tenant|vendor|partner|address|phone|email)\b/i;
 const HISTORICAL_ANCHOR =
   /\b(?:yesterday|last\s+(?:week|month|quarter|year)|at that time|then)\b|\b(?:back in|during|as (?:of|at)|in|on|before|through|by|until|prior to)\s+(?:the\s+(?:end|start|beginning)\s+of\s+)?(?:(?:q[1-4](?:\s+of)?\s+)?(?:19|20)\d{2}\b|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2}(?:st|nd|rd|th)?)?(?:,?\s+(?:19|20)\d{2})?\b|(?:\d{1,2}[/-]){2}\d{2,4}\b)/i;
 
@@ -78,8 +87,9 @@ export function hasExplicitCurrentIntent(query) {
   // A bounded past question such as "latest in May 2025" is historical even
   // though it contains a word that normally requests the present. Suppressing
   // the recency lane is the conservative choice when both signals appear.
-  if (HISTORICAL_ANCHOR.test(text)) return false;
-  return STRONG_CURRENT_INTENT.test(text) || STILL_INTENT.test(text);
+  if (HISTORICAL_ANCHOR.test(text) || HISTORICAL_STATE_ANCHOR.test(text)) return false;
+  return STRONG_CURRENT_INTENT.test(text) || STILL_INTENT.test(text) ||
+    PRESENT_RELATIONSHIP_INTENT.test(text) || PRESENT_OWNER_FACT_INTENT.test(text);
 }
 
 /**
@@ -102,6 +112,12 @@ export function queryEntityAnchors(query, filters = {}, { owner = null } = {}) {
   // Health" as two OR alternatives lets any generic health document match.
   for (const match of text.matchAll(/\b[A-Z][A-Za-z0-9'’.-]{1,}(?:\s+[A-Z][A-Za-z0-9'’.-]{1,})*\b/g)) {
     add(normalizedTokens(match[0]));
+  }
+
+  // The narrow present relationship form supplies its own grammatical subject,
+  // including all-caps business names that are not title-cased proper nouns.
+  for (const match of text.matchAll(/\b(?:is|are)\s+([A-Za-z0-9][A-Za-z0-9'’&.-]*(?:\s+[A-Za-z0-9][A-Za-z0-9'’&.-]*){0,5}?)\s+(?:still\s+)?(?:(?:an?|my|our)\s+)?(?:active\s+)?(?:clients?|customers?|members?|patients?|employees?|tenants?|vendors?|partners?)\s*\??(?:$|\n)/gi)) {
+    add(normalizedTokens(match[1]));
   }
 
   // Lowercase names are accepted only in entity-shaped grammar. This finds
