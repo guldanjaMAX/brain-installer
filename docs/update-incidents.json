@@ -202,7 +202,7 @@
       "scripts/test-release-workflow-contract.mjs",
       "test/package-privacy.test.mjs"
     ],
-    "acceptance": "One tested package, six completed OS/Node jobs, planted traps, reviewed field evidence and immutable publication; no release before CI finishes.",
+    "acceptance": "Before publication: one tested package, six completed OS/Node jobs, planted traps, reviewed field evidence, immutable releases enabled and a verified enforcing workflow; no release before CI finishes. After publication, verify immutable tag and asset bytes before URL promotion.",
     "findings": [
       "F6"
     ],
@@ -276,11 +276,13 @@
     "tests": [
       "test/health-verify-exit.test.mjs",
       "worker/test/health-honesty.test.mjs",
-      "test/acceptance-version.test.mjs"
+      "test/acceptance-version.test.mjs",
+      "test/upgrade-verify.test.mjs"
     ],
     "acceptance": "Record executable/package/manifest/worker/D1 versions separately; verify ingestion, paused state, backlog trend and cited retrieval, never infer recovery from HTTP 200.",
     "findings": [
-      "HISTORY-FALSE-READY"
+      "HISTORY-FALSE-READY",
+      "FIELD-CREDENTIAL-CONTRACT"
     ],
     "evidence": []
   },

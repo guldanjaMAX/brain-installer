@@ -22,6 +22,10 @@ in this repository. Keep the source-message crosswalk in the private work folder
    First demonstrate the failure against the affected code. Do not bypass the
    CLI wrapper. Start from both clean OS-native configuration and migrated
    configuration, without the maintainer's cached credentials or environment.
+   Exercise acceptance probes through the actual Worker request handler. A
+   copied response object can keep an obsolete error contract green after the
+   deployed Worker changes. Prove the exact refusal, provider label, absence
+   of echoed secrets, and that the rejected request reaches no storage write.
 4. Run `npm test` and `npm run audit:regressions`. The second command runs each
    incident suite independently and retains every exit status, even after an
    earlier failure. CI runs this step even if the main suite fails. A missing,
@@ -57,6 +61,9 @@ in this repository. Keep the source-message crosswalk in the private work folder
 9. Run `npm run audit:updates`. Release publication runs this again on the
    exact tagged checkout, before any release write. Every incident must be
    verified. Full CI, immutable artifacts and owner field gates still apply.
+   Verify publication controls before publishing, then verify the immutable
+   published tag and asset bytes before URL promotion. A completed publication
+   cannot be a prerequisite for the gate that authorizes that publication.
 
 ## Dispositions
 

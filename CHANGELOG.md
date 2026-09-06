@@ -6,6 +6,10 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## 0.3.7
 
+- The update safety check now recognizes the current credential refusal. A
+  correctly blocked test credential no longer stops the update because its
+  refusal message changed.
+
 - Updates now distinguish current documents from queued index deletions when
   reporting rebuild progress. Adding, changing, or removing documents after an
   earlier rebuild must not make a later update reject its progress totals.
