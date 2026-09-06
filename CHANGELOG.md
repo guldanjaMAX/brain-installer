@@ -6,6 +6,9 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## 0.3.7
 
+- macOS browser sign-in and preflight now find Wrangler's native Preferences
+  folder without requiring an environment-variable workaround.
+
 - The downloaded package now contains the same read-only Mac and Windows
   preflight checked by release CI. It requires Node 22, finds every visible CLI
   copy, and checks the same Wrangler session locations the installer reads.

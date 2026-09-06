@@ -372,6 +372,8 @@ const expected = [
   "docs/ENGINEERING-STANDARDS.md",
   "docs/EVALUATION.md",
   "docs/MAINTAINER.md",
+  "docs/UPDATE-AUDIT.md",
+  "docs/update-incidents.json",
   "docs/OWNER-WORKSPACE-API.md",
   "docs/RECOVERY.md",
   "docs/LEGACY-SUPABASE-EXIT.md",

@@ -21,6 +21,7 @@ function runPreflight({ nodeVersion = "v22.0.0", brainCopies = 0, wranglerSessio
     const bin = join(fixture, "bin");
     mkdirSync(home);
     mkdirSync(bin);
+    executable(join(bin, "uname"), "printf '%s\\n' 'Darwin'");
 
     if (wranglerSession === "home-fallback") {
       // An existing but empty earlier directory must not hide a later file.
@@ -28,6 +29,10 @@ function runPreflight({ nodeVersion = "v22.0.0", brainCopies = 0, wranglerSessio
       const fallback = join(home, ".wrangler", "config");
       mkdirSync(fallback, { recursive: true });
       writeFileSync(join(fallback, "default.toml"), "fixture session marker only\n");
+    } else if (wranglerSession === "native" || wranglerSession === "native-encrypted") {
+      const config = join(home, "Library", "Preferences", ".wrangler", "config");
+      mkdirSync(config, { recursive: true });
+      writeFileSync(join(config, wranglerSession === "native" ? "default.toml" : "default.enc"), "fixture session marker only\n");
     } else if (wranglerSession === "xdg") {
       const xdg = join(fixture, "xdg config");
       const config = join(xdg, ".wrangler", "config");
@@ -64,6 +69,7 @@ esac`);
     };
     delete env.CLOUDFLARE_API_TOKEN;
     delete env.CLOUDFLARE_API_KEY;
+    if (wranglerSession !== "xdg") delete env.XDG_CONFIG_HOME;
 
     return spawnSync("/bin/bash", [PREFLIGHT], {
       cwd: ROOT,
@@ -95,10 +101,16 @@ test("POSIX preflight finds every Brain CLI on PATH", { skip: process.platform =
 });
 
 test("POSIX preflight follows Wrangler session precedence without directory masking", { skip: process.platform === "win32" }, () => {
-  for (const wranglerSession of ["home-fallback", "xdg"]) {
+  for (const wranglerSession of ["home-fallback", "xdg", "native"]) {
     const result = runPreflight({ wranglerSession });
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.match(result.stdout, /ok\s+wrangler session found/);
     assert.doesNotMatch(result.stdout, /no wrangler session yet/);
   }
+});
+
+test("macOS preflight identifies native encrypted sessions", { skip: process.platform === "win32" }, () => {
+  const result = runPreflight({ wranglerSession: "native-encrypted" });
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /wrangler wrote default.enc/);
 });

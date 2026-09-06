@@ -235,6 +235,12 @@ jobs:
       - name: unit and integration suite
         run: npm test
 
+      # Keep incident regressions visible even when the long npm test chain
+      # stops at an earlier failure. This is automated proof, not release clearance.
+      - name: independent incident regressions
+        if: ${{ !cancelled() }}
+        run: npm run audit:regressions
+
       # A runner may legitimately have no Wrangler session or manifest, so the
       # exit may be diagnostic. Require the packaged script to parse, execute,
       # and print its identifying header.

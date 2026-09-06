@@ -485,6 +485,11 @@ master credential and no support backdoor.
 
 ## Issue-note collection and regression tracking
 
+The required release incident review is [UPDATE-AUDIT.md](UPDATE-AUDIT.md).
+Run `npm run audit:regressions` for independent incident checks and
+`npm run audit:updates` for release clearance. Local-only fixes remain held
+until their reviewed field evidence is recorded.
+
 Recognized command failures already create immutable, sanitized local issue
 events under the current user's private Brain support directory. This is
 automatic local collection, not telemetry. Version 0.1.14 has no automatic

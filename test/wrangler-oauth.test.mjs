@@ -30,6 +30,8 @@ const win = wranglerConfigCandidates({ APPDATA: "C:\\Users\\m\\AppData\\Roaming"
 assert.ok(win.some((p) => p.includes("xdg.config")), "the Windows XDG layout must be searched");
 assert.ok(win.length >= 3, "Windows needs several candidate locations");
 const posix = wranglerConfigCandidates({ HOME: "/Users/m" }, "darwin");
+assert.ok(posix.includes("/Users/m/Library/Preferences/.wrangler/config/default.toml"),
+  "a clean Mac must discover the pinned Wrangler's native session location");
 assert.ok(posix.some((p) => p === "/Users/m/.wrangler/config/default.toml"));
 assert.ok(posix.some((p) => p.includes("/.config/")), "the XDG layout must be searched on POSIX too");
 
@@ -39,6 +41,26 @@ assert.equal(
   "/h/.wrangler/config/default.toml",
 );
 assert.equal(findWranglerConfig({ env: { HOME: "/h" }, platform: "darwin", existsSync: () => false }), null);
+
+// No old developer session and no XDG workaround: exactly the client's layout.
+for (const format of ["toml", "enc"]) {
+  const nativePath = `/Users/fixture/Library/Preferences/.wrangler/config/default.${format}`;
+  const session = readWranglerOAuthSession({
+    env: { HOME: "/Users/fixture" }, platform: "darwin",
+    existsSync: (path) => path === nativePath,
+    readFileSync: (path) => {
+      assert.equal(format, "toml", "encrypted native sessions must not be read");
+      assert.equal(path, nativePath);
+      return cfg("synthetic-native-session", Date.now() + HOUR);
+    },
+    refresh: () => { throw new Error("fresh native session must not require another login"); },
+  });
+  assert.equal(session.type, format === "toml" ? WRANGLER_SESSION_AVAILABLE : WRANGLER_SESSION_ENCRYPTED_UNSUPPORTED);
+  assert.equal(session.path, nativePath);
+}
+const custom = wranglerConfigCandidates({ HOME: "/Users/fixture", XDG_CONFIG_HOME: "/custom" }, "darwin");
+assert.ok(custom.indexOf("/custom/.wrangler/config/default.toml") < custom.indexOf("/Users/fixture/Library/Preferences/.wrangler/config/default.toml"));
+assert.ok(!wranglerConfigCandidates({ HOME: "/home/fixture" }, "linux").some((p) => p.includes("Library/Preferences")));
 
 // New Wrangler stores its browser session in default.enc. Detect that layout
 // without reading the encrypted bytes or reaching into an OS keyring.
