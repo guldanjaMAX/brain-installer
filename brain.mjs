@@ -14074,9 +14074,9 @@ export async function cmdLocalTools(options = {}) {
   for (const r of skillResults) {
     const label = r.root === ".codex" ? "Codex" : "Claude Code";
     if (r.status === "failed") warn(`${label} skill not installed: ${r.error}`);
-    else ok(`${label} skill /financial-brain-technician ${r.status}`);
+    else ok(`${label} Financial Brain guide ${r.status}`);
   }
-  info("In either tool, type `/financial-brain-technician` to begin the guided plan.");
+  info("In Claude Code, use `/financial-brain-technician`. In Codex, use `$financial-brain-technician` or ask to update your Brain.");
 
   // Persist the CLI's own bin directory before anything else can go wrong,
   // so a new terminal still has `brain` even if the rest of this stops.
@@ -14319,6 +14319,69 @@ async function cmdToken(manifestPath) {
     : `nothing stored (${storedTokenReference(accountId)}). The next interactive setup or update will prompt once and offer to remember it.`);
 }
 
+const UPDATE_SKILL_REFRESH_WARNING =
+  "The Brain software update is verified, but the local Financial Brain update guide could not be refreshed safely. " +
+  "Protected and unmanaged skill files were left unchanged. " +
+  "Keep using https://financialbrain.ai/update/agent.md in this session. " +
+  "Do not rerun brain update for this local guide warning.";
+
+function updateSkillAgentLabel(root) {
+  if (root === ".claude") return "Claude Code";
+  if (root === ".codex") return "Codex";
+  return "Local assistant";
+}
+
+function reportUpdateSkillRefreshWarning(reportWarning, message = UPDATE_SKILL_REFRESH_WARNING) {
+  try {
+    reportWarning(message);
+  } catch {
+    // Reporting must never turn a verified software update into a failed one.
+    if (reportWarning !== warn) {
+      try { warn(UPDATE_SKILL_REFRESH_WARNING); } catch { /* best-effort terminal warning */ }
+    }
+  }
+}
+
+/** Refresh only the managed local guide after the software update has succeeded. */
+export function refreshTechnicianSkillsAfterUpdate(options = {}) {
+  const installEverywhere = options.installTechnicianSkills ?? installTechnicianSkillEverywhere;
+  const skillOptions = options.claudeSkillOptions || { environment: process.env };
+  const reportOk = options.reportOk ?? ok;
+  const reportWarning = options.reportWarning ?? warn;
+  let results = [];
+  try {
+    results = installEverywhere(skillOptions);
+    if (!Array.isArray(results) || results.length === 0) {
+      reportUpdateSkillRefreshWarning(reportWarning);
+      return { status: "warning", results: [] };
+    }
+
+    const succeeded = results.filter((result) =>
+      result?.status === "installed" || result?.status === "verified"
+    );
+    const failed = results.filter((result) =>
+      result?.status !== "installed" && result?.status !== "verified"
+    );
+
+    for (const result of succeeded) {
+      const label = updateSkillAgentLabel(result.root);
+      reportOk(`${label} Financial Brain guide ${result.status} after update`);
+    }
+    for (const result of failed) {
+      const label = updateSkillAgentLabel(result?.root);
+      reportWarning(`${label}: ${UPDATE_SKILL_REFRESH_WARNING}`);
+    }
+
+    return {
+      status: failed.length ? (succeeded.length ? "partial" : "warning") : "ready",
+      results,
+    };
+  } catch {
+    reportUpdateSkillRefreshWarning(reportWarning);
+    return { status: "warning", results: Array.isArray(results) ? results : [] };
+  }
+}
+
 /** Beginner update path: verify custody first, then run the fully gated upgrade. */
 export async function cmdUpdate(manifestPath, options = {}) {
   let installed;
@@ -14339,7 +14402,7 @@ export async function cmdUpdate(manifestPath, options = {}) {
   }
   const pin = pinUpdateManifest(installed.path);
   assertUpgradeSourceCompatibility(pin.manifest);
-  return withCloudflareToken(async () => {
+  const upgradeResult = await withCloudflareToken(async () => {
     revalidateUpdateManifest(pin, "update verification");
     await (options.cmdVerify ?? cmdVerify)(pin.target);
     revalidateUpdateManifest(pin, "update verification");
@@ -14363,6 +14426,18 @@ export async function cmdUpdate(manifestPath, options = {}) {
     }
     return upgradeResult;
   }, { accountId: manifestAccountId(pin.target), ...options });
+
+  try {
+    refreshTechnicianSkillsAfterUpdate({
+      installTechnicianSkills: options.installTechnicianSkills,
+      claudeSkillOptions: options.claudeSkillOptions,
+      reportOk: options.reportSkillRefreshOk,
+      reportWarning: options.reportSkillRefreshWarning,
+    });
+  } catch {
+    reportUpdateSkillRefreshWarning(warn);
+  }
+  return upgradeResult;
 }
 
 export async function cmdRollbackInteractive(manifestPath, bookmarkArg, options = {}) {

@@ -621,10 +621,13 @@ for (const path of privateScanPaths) {
   }
 }
 
-// A packlist can name every file and still hide a broken relative import.
-// Build and unpack the actual tarball, then import the recovery adapter from
-// that isolated package tree. The probe invokes no CLI entry point or network.
+// A packlist can name every file and still hide a broken relative import or a
+// skill that cannot be installed from the packed tree. Build and unpack the
+// actual tarball, import the recovery adapter, then install the reviewed skill
+// for both assistants and compare each readback with the packed source. These
+// probes invoke no CLI entry point or network.
 let packedAdapterImportFailed = false;
+let packedSkillInstallFailed = false;
 const packageProbeDirectory = SCAN_ONLY ? null : mkdtempSync(join(tmpdir(), "brain-package-probe-"));
 if (packageProbeDirectory) try {
   const actualPack = spawnSync(
@@ -655,6 +658,14 @@ if (packageProbeDirectory) try {
       "operations",
       "cloudflare-recovery-adapter.mjs",
     );
+    const skillModulePath = join(packageProbeDirectory, "package", "operations", "claude-skill.mjs");
+    const skillSourcePath = join(
+      packageProbeDirectory,
+      "package",
+      "skills",
+      "financial-brain-technician",
+      "SKILL.md",
+    );
     const importProbe = extracted.status === 0
       ? spawnSync(process.execPath, [
           "--input-type=module",
@@ -672,6 +683,39 @@ if (packageProbeDirectory) try {
         })
       : { status: null };
     packedAdapterImportFailed = extracted.status !== 0 || importProbe.status !== 0;
+    const skillInstallProbe = extracted.status === 0
+      ? spawnSync(process.execPath, [
+          "--input-type=module",
+          "--eval",
+          [
+            "const {pathToFileURL}=await import('node:url')",
+            "const {mkdtempSync,readFileSync,rmSync}=await import('node:fs')",
+            "const {tmpdir}=await import('node:os')",
+            "const {join}=await import('node:path')",
+            "const skill=await import(pathToFileURL(process.env.PACK_SKILL_MODULE).href)",
+            "const home=mkdtempSync(join(tmpdir(),'brain-packed-skill-'))",
+            "try{",
+            "const first=skill.installTechnicianSkillEverywhere({home})",
+            "if(first.length!==2||first.some((x)=>x.status!=='installed'))throw new Error('packed skill did not install for both assistants')",
+            "const source=readFileSync(process.env.PACK_SKILL_SOURCE,'utf8')",
+            "for(const path of skill.technicianSkillPaths({home}))if(readFileSync(path,'utf8')!==source)throw new Error('installed skill differs from packed source')",
+            "const second=skill.installTechnicianSkillEverywhere({home})",
+            "if(second.some((x)=>x.status!=='verified'||x.changed!==false))throw new Error('packed skill reinstall was not idempotent')",
+            "}finally{rmSync(home,{recursive:true,force:true})}",
+          ].join(";"),
+        ], {
+          encoding: "utf-8",
+          env: {
+            PATH: process.env.PATH || "",
+            ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+            ...(process.env.WINDIR ? { WINDIR: process.env.WINDIR } : {}),
+            PACK_SKILL_MODULE: skillModulePath,
+            PACK_SKILL_SOURCE: skillSourcePath,
+          },
+          timeout: 60_000,
+        })
+      : { status: null };
+    packedSkillInstallFailed = extracted.status !== 0 || skillInstallProbe.status !== 0;
   }
 } finally {
   rmSync(packageProbeDirectory, { recursive: true, force: true });
@@ -681,7 +725,7 @@ if (packed.status !== 0 || (!SCAN_ONLY && !files.length) || forbidden.length || 
     bundleConfigMismatch || dependencyMismatch.length || gitIgnoreFailures.length ||
     canaryFailures.length || trackedEnumerationFailed || trackedRootNodeModules ||
     privateTextMatches.length || privatePathMatches.length ||
-    packedAdapterImportFailed) {
+    packedAdapterImportFailed || packedSkillInstallFailed) {
   console.error("FAIL  published package privacy allowlist");
   if (packed.status !== 0) {
     console.error(
@@ -717,6 +761,7 @@ if (packed.status !== 0 || (!SCAN_ONLY && !files.length) || forbidden.length || 
     console.error("and do not remove the rule: a hit here is a finding, not a false alarm to be tuned away.");
   }
   if (packedAdapterImportFailed) console.error("packed recovery adapter import probe failed");
+  if (packedSkillInstallFailed) console.error("packed technician skill install/readback probe failed");
   process.exit(1);
 }
 

@@ -32,6 +32,7 @@ import { fileURLToPath } from "node:url";
 import {
   ACCELERATED_BOOTSTRAP_MAX_MS,
   ACCELERATED_BOOTSTRAP_MAX_ROUNDS,
+  brainCliPrefix,
   cloudflareTokenAvailable,
   cmdAcceleratedBootstrap,
   cmdRollback,
@@ -58,6 +59,11 @@ import {
   readInstalledManifest,
   rememberInstalledManifest,
 } from "../operations/installed-manifest.mjs";
+import {
+  CLAUDE_TECHNICIAN_SKILL_MARKER,
+  installTechnicianSkillEverywhere,
+  technicianSkillPaths,
+} from "../operations/claude-skill.mjs";
 
 // Every fixture below that says "the running package version" means exactly
 // that, so it is read from package.json rather than hardcoded. A literal here
@@ -1919,11 +1925,27 @@ const bootstrapCompletion = () => ({
       home: sandbox,
       stateDirectory: join(sandbox, "installed-state"),
     };
+    const skillHome = join(sandbox, "skill-home");
+    const skillOptions = { home: skillHome };
+    const skillRefreshOk = [];
+    const skillRefreshWarnings = [];
+    const skillRefreshTokenStates = [];
+    const installTemporarySkills = (options) => {
+      skillRefreshTokenStates.push(cloudflareTokenAvailable());
+      return installTechnicianSkillEverywhere(options);
+    };
+    const updateSkillOptions = {
+      claudeSkillOptions: skillOptions,
+      installTechnicianSkills: installTemporarySkills,
+      reportSkillRefreshOk: (message) => skillRefreshOk.push(message),
+      reportSkillRefreshWarning: (message) => skillRefreshWarnings.push(message),
+    };
     process.chdir(sandbox);
     let failedVerifyError = null;
     let failedVerifyUpgrade = 0;
     try {
       await cmdUpdate(undefined, {
+        ...updateSkillOptions,
         installedManifestOptions,
         readCloudflareToken: async () => Buffer.from("f".repeat(24), "ascii"),
         cmdVerify: async () => { throw new Error("fixture custody refusal"); },
@@ -1934,12 +1956,14 @@ const bootstrapCompletion = () => ({
       "a failed custody check does not remember the wrong manifest",
       /fixture custody refusal/.test(failedVerifyError?.message || "") &&
         !existsSync(installedManifestPointerPath(installedManifestOptions)) &&
-        failedVerifyUpgrade === 0 && !cloudflareTokenAvailable(),
+        failedVerifyUpgrade === 0 && skillRefreshTokenStates.length === 0 && !cloudflareTokenAvailable(),
       failedVerifyError?.message,
     );
 
     const events = [];
-    await cmdUpdate(undefined, {
+    const upgradeResultSentinel = { updated: "fixture" };
+    const successfulUpdateResult = await cmdUpdate(undefined, {
+      ...updateSkillOptions,
       installedManifestOptions,
       readCloudflareToken: async () => Buffer.from("x".repeat(24), "ascii"),
       cmdVerify: async (path) => {
@@ -1949,12 +1973,33 @@ const bootstrapCompletion = () => ({
       cmdUpgrade: async (path) => {
         events.push(`upgrade:${path}`);
         check("update execution keeps the command-scoped token", cloudflareTokenAvailable());
+        return upgradeResultSentinel;
       },
     });
     check(
       "brain update discovers the local manifest once and verifies before upgrade",
       events.join(",") === `verify:${manifestPath},upgrade:${manifestPath}`,
       events.join(","),
+    );
+    const installedSkillPaths = technicianSkillPaths(skillOptions);
+    const installedSkillBytes = installedSkillPaths.map((path) => readFileSync(path, "utf8"));
+    check(
+      "a successful update returns its original result and refreshes both managed assistant skills",
+      successfulUpdateResult === upgradeResultSentinel &&
+        installedSkillBytes.length === 2 &&
+        installedSkillBytes.every((content) =>
+          content === installedSkillBytes[0] &&
+          content.includes(CLAUDE_TECHNICIAN_SKILL_MARKER) &&
+          /update my Brain/i.test(content)
+        ) &&
+        skillRefreshOk.filter((message) => /installed after update/.test(message)).length === 2 &&
+        skillRefreshWarnings.length === 0,
+      JSON.stringify({ successfulUpdateResult, skillRefreshOk, skillRefreshWarnings }),
+    );
+    check(
+      "the local skill refresh runs only after the command-scoped token is cleared",
+      skillRefreshTokenStates.length === 1 && skillRefreshTokenStates.every((available) => !available),
+      JSON.stringify(skillRefreshTokenStates),
     );
     check(
       "the first update remembers the canonical manifest without storing credentials",
@@ -2023,8 +2068,10 @@ const bootstrapCompletion = () => ({
     writeFileSync(unrelatedManifest, "{}\n");
     let unrelatedError = null;
     let unrelatedVerify = 0;
+    const refreshesBeforeRejectedUpgrade = skillRefreshTokenStates.length;
     try {
       await cmdUpdate(unrelatedManifest, {
+        ...updateSkillOptions,
         installedManifestOptions,
         readCloudflareToken: async () => Buffer.from("q".repeat(24), "ascii"),
         cmdVerify: async () => { unrelatedVerify++; },
@@ -2035,6 +2082,7 @@ const bootstrapCompletion = () => ({
       unrelatedVerify === 1 &&
         /no d1_database_id in the manifest/i.test(unrelatedError?.message || "") &&
         readInstalledManifest(installedManifestOptions) === manifestPath &&
+        skillRefreshTokenStates.length === refreshesBeforeRejectedUpgrade &&
         !cloudflareTokenAvailable(),
       unrelatedError?.message,
     );
@@ -2044,6 +2092,7 @@ const bootstrapCompletion = () => ({
     process.chdir(freshDirectory);
     const reopenedEvents = [];
     await cmdUpdate(undefined, {
+      ...updateSkillOptions,
       installedManifestOptions,
       readCloudflareToken: async () => Buffer.from("r".repeat(24), "ascii"),
       cmdVerify: async (path) => reopenedEvents.push(`verify:${path}`),
@@ -2054,8 +2103,141 @@ const bootstrapCompletion = () => ({
       reopenedEvents.join(",") === `verify:${manifestPath},upgrade:${manifestPath}`,
       reopenedEvents.join(","),
     );
+    check(
+      "repeating a successful update verifies the same managed skill bytes idempotently",
+      technicianSkillPaths(skillOptions).every((path) =>
+        readFileSync(path, "utf8") === installedSkillBytes[0]
+      ) &&
+        skillRefreshOk.filter((message) => /verified after update/.test(message)).length === 2 &&
+        skillRefreshWarnings.length === 0 &&
+        skillRefreshTokenStates.length === 2 &&
+        skillRefreshTokenStates.every((available) => !available),
+      JSON.stringify({ skillRefreshOk, skillRefreshWarnings, skillRefreshTokenStates }),
+    );
     check("the reopened update also clears its prompted token", !cloudflareTokenAvailable());
     process.chdir(sandbox);
+
+    const collisionSkillHome = join(sandbox, "collision-skill-home");
+    const [collisionClaudeSkill, collisionCodexSkill] = technicianSkillPaths({ home: collisionSkillHome });
+    const unmanagedSkillBytes = "# Owner's custom skill\n\nDo not replace this file.\n";
+    mkdirSync(dirname(collisionClaudeSkill), { recursive: true });
+    writeFileSync(collisionClaudeSkill, unmanagedSkillBytes);
+    const collisionWarnings = [];
+    const collisionSuccesses = [];
+    let collisionRefreshHadToken = null;
+    const collisionUpgradeResult = { updated: "collision-fixture" };
+    const collisionResult = await cmdUpdate(undefined, {
+      installedManifestOptions,
+      claudeSkillOptions: { home: collisionSkillHome },
+      installTechnicianSkills: (options) => {
+        collisionRefreshHadToken = cloudflareTokenAvailable();
+        return installTechnicianSkillEverywhere(options);
+      },
+      reportSkillRefreshOk: (message) => collisionSuccesses.push(message),
+      reportSkillRefreshWarning: (message) => collisionWarnings.push(message),
+      readCloudflareToken: async () => Buffer.from("c".repeat(24), "ascii"),
+      cmdVerify: async () => {},
+      cmdUpgrade: async () => collisionUpgradeResult,
+    });
+    const collisionWarning = collisionWarnings.join("\n");
+    check(
+      "a blocked unmanaged Claude skill is preserved while the Codex skill still refreshes",
+      collisionResult === collisionUpgradeResult && collisionRefreshHadToken === false &&
+        readFileSync(collisionClaudeSkill, "utf8") === unmanagedSkillBytes &&
+        readFileSync(collisionCodexSkill, "utf8").includes(CLAUDE_TECHNICIAN_SKILL_MARKER) &&
+        collisionSuccesses.length === 1 && /Codex/.test(collisionSuccesses[0]) &&
+        collisionWarnings.length === 1 && /Claude Code/.test(collisionWarning) &&
+        /software update is verified/i.test(collisionWarning) &&
+        /protected and unmanaged skill files were left unchanged/i.test(collisionWarning) &&
+        /financialbrain\.ai\/update\/agent\.md/.test(collisionWarning) &&
+        /do not rerun brain update/i.test(collisionWarning) &&
+        !collisionWarning.includes(collisionSkillHome),
+      JSON.stringify({ collisionSuccesses, collisionWarnings }),
+    );
+
+    const refreshExceptionWarnings = [];
+    let refreshExceptionHadToken = null;
+    const refreshExceptionUpgradeResult = { updated: "refresh-exception-fixture" };
+    const refreshExceptionResult = await cmdUpdate(undefined, {
+      installedManifestOptions,
+      claudeSkillOptions: { home: join(sandbox, "exception-skill-home") },
+      installTechnicianSkills: () => {
+        refreshExceptionHadToken = cloudflareTokenAvailable();
+        throw new Error(`private local path: ${sandbox}`);
+      },
+      reportSkillRefreshOk: () => {},
+      reportSkillRefreshWarning: (message) => refreshExceptionWarnings.push(message),
+      readCloudflareToken: async () => Buffer.from("e".repeat(24), "ascii"),
+      cmdVerify: async () => {},
+      cmdUpgrade: async () => refreshExceptionUpgradeResult,
+    });
+    check(
+      "a local skill refresh exception warns without changing a successful update result",
+      refreshExceptionResult === refreshExceptionUpgradeResult && refreshExceptionHadToken === false &&
+        refreshExceptionWarnings.length === 1 &&
+        /software update is verified/i.test(refreshExceptionWarnings[0]) &&
+        /do not rerun brain update/i.test(refreshExceptionWarnings[0]) &&
+        !refreshExceptionWarnings[0].includes(sandbox) && !cloudflareTokenAvailable(),
+      JSON.stringify(refreshExceptionWarnings),
+    );
+
+    const successReporterWarnings = [];
+    const successReporterUpgradeResult = { updated: "success-reporter-fixture" };
+    const successReporterResult = await cmdUpdate(undefined, {
+      installedManifestOptions,
+      claudeSkillOptions: { home: join(sandbox, "success-reporter-skill-home") },
+      reportSkillRefreshOk: () => {
+        throw new Error(`private success reporter detail: ${sandbox}`);
+      },
+      reportSkillRefreshWarning: (message) => successReporterWarnings.push(message),
+      readCloudflareToken: async () => Buffer.from("o".repeat(24), "ascii"),
+      cmdVerify: async () => {},
+      cmdUpgrade: async () => successReporterUpgradeResult,
+    });
+    check(
+      "a failing skill success reporter cannot reclassify the verified software update",
+      successReporterResult === successReporterUpgradeResult &&
+        successReporterWarnings.length === 1 &&
+        /software update is verified/i.test(successReporterWarnings[0]) &&
+        !successReporterWarnings[0].includes(sandbox) && !cloudflareTokenAvailable(),
+      JSON.stringify(successReporterWarnings),
+    );
+
+    const warningReporterOutput = [];
+    const warningReporterUpgradeResult = { updated: "warning-reporter-fixture" };
+    const priorLog = console.log;
+    let warningReporterResult;
+    try {
+      console.log = (...values) => warningReporterOutput.push(values.map(String).join(" "));
+      warningReporterResult = await cmdUpdate(undefined, {
+        installedManifestOptions,
+        claudeSkillOptions: { home: join(sandbox, "warning-reporter-skill-home") },
+        installTechnicianSkills: () => [{
+          root: ".claude",
+          status: "failed",
+          error: `private failed path: ${sandbox}`,
+        }],
+        reportSkillRefreshWarning: () => {
+          throw new Error(`private warning reporter detail: ${sandbox}`);
+        },
+        readCloudflareToken: async () => Buffer.from("w".repeat(24), "ascii"),
+        cmdVerify: async () => {},
+        cmdUpgrade: async () => warningReporterUpgradeResult,
+      });
+    } finally {
+      console.log = priorLog;
+    }
+    const renderedWarningReporterOutput = warningReporterOutput.join("\n")
+      .replace(/\x1b\[[0-9;]*m/g, "");
+    check(
+      "a failing skill warning reporter falls back safely without changing the update result",
+      warningReporterResult === warningReporterUpgradeResult &&
+        /warn\s+The Brain software update is verified/i.test(renderedWarningReporterOutput) &&
+        // The terminal renderer uses full PowerShell executable paths on Windows.
+        renderedWarningReporterOutput.includes(`Do not rerun ${brainCliPrefix()} update for this local guide warning.`) &&
+        !renderedWarningReporterOutput.includes(sandbox) && !cloudflareTokenAvailable(),
+      renderedWarningReporterOutput,
+    );
 
     if (process.platform !== "win32") {
       const pointerPath = installedManifestPointerPath(installedManifestOptions);
@@ -2065,6 +2247,7 @@ const bootstrapCompletion = () => ({
       let unsafeVerify = 0;
       try {
         await cmdUpdate(undefined, {
+          ...updateSkillOptions,
           installedManifestOptions,
           readCloudflareToken: async () => {
             unsafePrompts++;
@@ -2080,6 +2263,7 @@ const bootstrapCompletion = () => ({
         unsafeError?.message,
       );
       await cmdUpdate(manifestPath, {
+        ...updateSkillOptions,
         installedManifestOptions,
         readCloudflareToken: async () => Buffer.from("m".repeat(24), "ascii"),
         cmdVerify: async () => {},
@@ -2097,6 +2281,7 @@ const bootstrapCompletion = () => ({
       rmSync(pointerPath);
       symlinkSync(symlinkTarget, pointerPath);
       await cmdUpdate(manifestPath, {
+        ...updateSkillOptions,
         installedManifestOptions,
         readCloudflareToken: async () => Buffer.from("s".repeat(24), "ascii"),
         cmdVerify: async () => {},
@@ -2115,6 +2300,7 @@ const bootstrapCompletion = () => ({
     rememberInstalledManifest(staleManifest, installedManifestOptions);
     rmSync(staleManifest);
     await cmdUpdate(manifestPath, {
+      ...updateSkillOptions,
       installedManifestOptions,
       readCloudflareToken: async () => Buffer.from("p".repeat(24), "ascii"),
       cmdVerify: async () => {},
@@ -2160,6 +2346,7 @@ const bootstrapCompletion = () => ({
     let driftError = null;
     try {
       await cmdUpdate("./brain.manifest.json", {
+        ...updateSkillOptions,
         installedManifestOptions,
         readCloudflareToken: async () => Buffer.from("z".repeat(24), "ascii"),
         cmdVerify: async () => {
