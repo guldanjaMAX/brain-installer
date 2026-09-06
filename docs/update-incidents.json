@@ -53,13 +53,14 @@
       "test/bootstrap-retrying.test.mjs",
       "test/vector-delete-outbox.test.mjs"
     ],
-    "acceptance": "Complete a real bootstrap, add and delete corpus rows, interrupt and resume with historical batch rows; verify exact reconciliation.",
+    "acceptance": "Complete a real bootstrap, add, overwrite and delete corpus rows, interrupt and resume with historical batch rows and delayed provider visibility; pass every intermediate Worker receipt through the actual CLI validators, including deletion alone and deletion to an empty corpus, then verify exact reconciliation.",
     "findings": [
       "F1",
       "F2",
       "N4",
       "N5",
-      "N6"
+      "N6",
+      "FIELD-RESIDUE-RECEIPT"
     ],
     "evidence": []
   },

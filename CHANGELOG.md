@@ -6,9 +6,14 @@ the brain, not for whoever built it: what changed for them, and what to check.
 
 ## 0.3.7
 
+- Updates now distinguish current documents from queued index deletions when
+  reporting rebuild progress. Adding, changing, or removing documents after an
+  earlier rebuild must not make a later update reject its progress totals.
+
 - Recovery verification now recognizes the normal installer configuration,
-  including OCR settings and the owner-session signing key. Changed settings
-  and unexpected credentials still stop recovery before it can proceed.
+  including OCR settings, the owner-session signing key, and the deliberate
+  paused health response. Changed settings and unexpected credentials still
+  stop recovery before it can proceed.
 
 - Stalled search indexing can request a fresh provider confirmation after ten
   minutes. Queued changes stay pending until their exact contents are visible.

@@ -3287,7 +3287,9 @@ export function validateAcceleratedBootstrapReceipt(body) {
   }
   if (receipt.in_flight_batches > 3 || receipt.confirmed > receipt.total ||
       receipt.remaining !== receipt.total - receipt.confirmed ||
-      receipt.queued + receipt.submitted > receipt.remaining) {
+      // Legacy residue includes deletes for chunks no longer in the corpus.
+      // They are outstanding provider work, not remaining current chunks.
+      (receipt.phase !== "legacy_drain" && receipt.queued + receipt.submitted > receipt.remaining)) {
     die(`${label} counts did not reconcile. Nothing was declared complete.`);
   }
   if ((receipt.phase === "complete") !== receipt.complete) {

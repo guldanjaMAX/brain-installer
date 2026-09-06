@@ -28,11 +28,17 @@ in this repository. Keep the source-message crosswalk in the private work folder
    timed-out or signalled process is a failure; skipped hardware checks remain
    unproven. Never pipe the command being verified into an output filter.
 5. Prove the full lifecycle: bootstrap to actual confirmed batch history, add
-   and delete documents, upgrade, delay provider visibility, interrupt, restart,
+   overwrite and delete documents, upgrade, delay provider visibility, interrupt, restart,
    contend for the lease, attempt connector writes during pause, then verify
    ingestion and cited retrieval. Cover queued-only and submitted outbox rows,
    exact-generation replacements and delete absence. Small fixtures prove state
    transitions; they do not prove million-row recovery duration.
+   Feed every intermediate Worker receipt through the actual CLI receipt and
+   progress validators. Include mixed add/overwrite/delete work, deletion alone,
+   and deletion of the final document after confirmed bootstrap history. A
+   removed vector is pending work even though its chunk is absent from the
+   current corpus count. Immediate provider visibility and an eventual final
+   assertion can hide a receipt that would stop the installed updater.
 6. Test the same packaged bytes on Mac and Windows, Node 22 and 24. Record OS
    and architecture separately. Windows x64 CI is not Windows ARM64 proof.
    The Windows ARM64 Node 24 case needs a real packaged launch, DPAPI roundtrip,

@@ -2469,6 +2469,9 @@ async function acceleratedBootstrapReceipt(env, phase) {
       `SELECT count(*) AS n,
               sum(CASE WHEN submitted_mutation_id IS NULL THEN 1 ELSE 0 END) AS queued,
               sum(CASE WHEN submitted_mutation_id IS NOT NULL THEN 1 ELSE 0 END) AS submitted,
+              sum(CASE WHEN op='upsert' AND EXISTS (
+                SELECT 1 FROM chunks c WHERE c.chunk_uid=vector_outbox.chunk_uid
+              ) THEN 1 ELSE 0 END) AS pending_upserts,
               sum(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS failed,
               sum(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS retrying
          FROM vector_outbox`
@@ -2481,14 +2484,29 @@ async function acceleratedBootstrapReceipt(env, phase) {
     vectorReadiness(env),
   ]);
   const total = Number(counts?.n);
-  const confirmed = state.baseCount + Number(batches?.confirmed || 0);
+  const historicalConfirmed = state.baseCount + Number(batches?.confirmed || 0);
+  const pendingUpserts = Number(queue?.pending_upserts || 0);
   const queued = Number(queue?.queued || 0);
   const submitted = Number(queue?.submitted || 0);
   const failed = Number(queue?.failed || 0);
   const inFlight = Number(batches?.in_flight || 0);
-  if (![total, confirmed, queued, submitted, failed, inFlight].every(
+  if (![total, historicalConfirmed, pendingUpserts, queued, submitted, failed, inFlight].every(
     (value) => Number.isSafeInteger(value) && value >= 0,
-  ) || confirmed > total || inFlight > ACCELERATED_BOOTSTRAP_WINDOW) {
+  ) || pendingUpserts > total || inFlight > ACCELERATED_BOOTSTRAP_WINDOW) {
+    throw new Error("the accelerated vector bootstrap receipt is invalid");
+  }
+  // Confirmed batch rows describe the earlier corpus cut. Ordinary writes can
+  // replace or delete those chunks before the next upgrade pause, so that old
+  // count must not certify a current chunk whose upsert is still outstanding.
+  // Deletes are separate cleanup work: a zero-chunk corpus can still have many
+  // vectors waiting to be deleted. Keep their queued/submitted counts explicit.
+  // A pending projection stays in this phase even after its queue clears while
+  // the provider count catches up. No history, cursor, or epoch is rewritten.
+  const legacyDrain = phase === "legacy_drain" || state.status === "pending";
+  const confirmed = legacyDrain
+    ? Math.min(historicalConfirmed, total - pendingUpserts)
+    : historicalConfirmed;
+  if (confirmed > total) {
     throw new Error("the accelerated vector bootstrap receipt is invalid");
   }
   const complete = state.status === "verified" && confirmed === total &&
@@ -2497,7 +2515,7 @@ async function acceleratedBootstrapReceipt(env, phase) {
     readiness.actual_vectors === total;
   return {
     protocol: ACCELERATED_BOOTSTRAP_PROTOCOL,
-    phase: complete ? "complete" : phase,
+    phase: complete ? "complete" : legacyDrain ? "legacy_drain" : phase,
     epoch: state.epoch,
     total,
     confirmed,

@@ -112,6 +112,10 @@ Before preview, prepare all of these locally and out of band:
 - an empty disposable D1 database, zero-count Vectorize index, and two immutable
   Worker versions in the reviewed Cloudflare account. The paused version must be
   the sole version deployed at 100 percent before the first field-gate stage;
+- an HTTP 200 health response from the paused target with the exact Brain
+  identity/version and writer protocol, `status=paused-for-upgrade`, `ok=false`,
+  and `accepting_documents=false`. After promotion, active health must instead
+  report `status=ok`, `ok=true`, and `accepting_documents=true`;
 - one shared random nonce in the target Worker, D1, and Vectorize names. The
   Worker name must end in `recovery-gate-<nonce>` and its hostname must be the
   matching `*.workers.dev` hostname. Production-like names are refused;

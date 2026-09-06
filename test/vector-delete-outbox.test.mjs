@@ -25,6 +25,11 @@ import {
   vectorReadiness,
 } from "../worker/src/lib/store-d1.js";
 import { storeFor } from "../worker/src/lib/store.js";
+import {
+  runAcceleratedBootstrap,
+  validateAcceleratedBootstrapReceipt,
+  validateAcceleratedBootstrapProgress,
+} from "../brain.mjs";
 
 let fail = 0, ran = 0;
 const check = (name, condition, detail = "") => {
@@ -111,6 +116,7 @@ function makeEnv({
     _acceptVectorMutation: accept,
     _visibleVectors: visible,
     _setGetByIdsVisibilityLag: (calls) => { visibilityLagRemaining = calls; },
+    _setAutoProcessVectorMutations: (enabled) => { autoProcessVectorMutations = enabled; },
     _processNextVectorMutation: () => {
       const mutation = pendingVectorMutations.shift();
       if (!mutation) return null;
@@ -1569,6 +1575,124 @@ for (const reportedChanges of [0, 9]) {
       Number(state.base) === 3 && Number(state.current_batches) === 0 &&
       Number(state.all_batches) === Number(confirmedHistory.n),
     JSON.stringify({ upgraded, state }));
+}
+
+/* Historical receipts cover the old corpus cut. A later overwrite/delete/add
+   must survive more than one provider poll through the actual CLI validators.
+   Immediate provider fixtures hid the invalid intermediate aggregate. */
+for (const scenario of ["mixed", "overwrite", "delete", "delete_all", "rebased_overwrite"]) {
+  const { env, db, visible, upsertBatches } = makeEnv();
+  env.VECTOR_DRAIN_MODE = "paused-for-upgrade";
+  const originalCount = scenario === "mixed" ? 1001 : 3;
+  const doc = (i) => `drive:residue-${scenario}-${String(i).padStart(4, "0")}`;
+  for (let i = 0; i < originalCount; i++) {
+    insertDocument(db, doc(i));
+    insertChunk(db, `${doc(i)}#0`, doc(i), 0);
+  }
+  const { options } = await completeRealAcceleratedBootstrap(env, db, {
+    epoch: 60,
+    options: acceleratedOptions(100_000),
+  });
+  if (scenario === "rebased_overwrite") await acceleratedVectorBootstrap(env, options);
+  const history = db.prepare("SELECT * FROM vector_bootstrap_batches ORDER BY epoch,batch_no").all();
+  const originalBatches = upsertBatches.length;
+  env._setAutoProcessVectorMutations(false);
+
+  if (["mixed", "overwrite", "rebased_overwrite"].includes(scenario)) {
+    db.prepare("UPDATE chunks SET text='replacement fixture text' WHERE chunk_uid=?").run(`${doc(1)}#0`);
+    db.prepare("INSERT INTO vector_outbox (chunk_uid,vector_id,op,queued_at) VALUES (?1,?1,'upsert',?2)")
+      .run(`${doc(1)}#0`, 100_001);
+  }
+  if (scenario === "mixed") {
+    insertDocument(db, doc(originalCount));
+    insertChunk(db, `${doc(originalCount)}#0`, doc(originalCount), 0);
+    db.prepare("INSERT INTO vector_outbox (chunk_uid,vector_id,op,queued_at) VALUES (?1,?1,'upsert',?2)")
+      .run(`${doc(originalCount)}#0`, 100_002);
+  }
+  if (["mixed", "delete", "delete_all"].includes(scenario)) {
+    await forget(env, { docUids: scenario === "delete_all"
+      ? Array.from({ length: originalCount }, (_, i) => doc(i)) : [doc(0)], dryRun: false });
+  }
+  const expectedCount = Number(db.prepare("SELECT count(*) AS n FROM chunks").get().n);
+  const changedUpserts = Number(db.prepare("SELECT count(*) AS n FROM vector_outbox WHERE op='upsert'").get().n);
+  const expectedGenerations = db.prepare("SELECT vector_id,generation FROM vector_outbox WHERE op='upsert'").all();
+  const receipts = [];
+  let failure = null;
+  let previous = null;
+  let polls = 0;
+  let cliClock = 1_000_000;
+  let firstPendingAt = null;
+  let result = null;
+  let busyPolls = 0;
+  let countHoldUntil = null;
+  const describe = env.VECTORIZE.describe;
+  env.VECTORIZE.describe = async () => {
+    const observed = await describe();
+    if (scenario === "delete" && visible.size === expectedCount) {
+      if (countHoldUntil === null) countHoldUntil = polls + 2;
+      // Exact delete lookup can be ahead of the provider's aggregate count.
+      if (polls <= countHoldUntil) return { ...observed, vectorCount: originalCount };
+    }
+    return observed;
+  };
+  try {
+    result = await runAcceleratedBootstrap({
+      request: async () => {
+        polls++;
+        if (scenario === "delete_all" && polls === 2) {
+          await acquireDrainLease(env, { ownerToken: "fixture-residue-busy", now: options.now(), ttlMs: 1000 });
+        }
+        const receipt = await acceleratedVectorBootstrap(env, options);
+        if (receipt.busy) {
+          busyPolls++;
+          await releaseDrainLease(env, "fixture-residue-busy");
+          // The real HTTP route exposes this bounded projection of a busy
+          // coordinator receipt, not its internal counters or lease identity.
+          return new Response(JSON.stringify({ protocol: receipt.protocol, busy: true,
+            remaining: receipt.remaining, retry_after_seconds: receipt.retry_after_seconds }), { status: 409 });
+        }
+        validateAcceleratedBootstrapReceipt(receipt);
+        validateAcceleratedBootstrapProgress(previous, receipt);
+        receipts.push(receipt);
+        previous = receipt;
+        if (env._pendingVectorMutations.length && firstPendingAt === null) firstPendingAt = polls;
+        // Accept the provider write, keep it invisible for at least two complete
+        // HTTP receipts, then process it. Repeated updater calls reuse receipts.
+        if (firstPendingAt !== null && polls - firstPendingAt >= 2) {
+          while (env._processNextVectorMutation()) { /* process actual accepted work */ }
+          firstPendingAt = null;
+        }
+        return new Response(JSON.stringify(receipt), { status: 200 });
+      },
+      now: () => cliClock,
+      sleep: async (ms) => { cliClock += ms; },
+      maxRounds: 30,
+    });
+  } catch (error) { failure = error; }
+  const pending = Number(db.prepare("SELECT count(*) AS n FROM vector_outbox").get().n);
+  check(`${scenario}: delayed real bootstrap receipts pass the actual CLI and converge`,
+    !failure && result?.complete === true && result.total === expectedCount &&
+      result.confirmed === expectedCount && pending === 0 && visible.size === expectedCount &&
+      receipts.filter(r => r.phase === "legacy_drain" && !r.complete).length >= 2,
+    JSON.stringify({ error: failure?.message, result, pending, receipts: receipts.slice(0, 3) }));
+  check(`${scenario}: old batch history remains intact and only changed upserts are embedded`,
+    JSON.stringify(db.prepare("SELECT * FROM vector_bootstrap_batches ORDER BY epoch,batch_no").all()) === JSON.stringify(history) &&
+      upsertBatches.slice(originalBatches).reduce((sum, rows) => sum + rows.length, 0) === changedUpserts &&
+      expectedGenerations.every(row => visible.get(row.vector_id)?.metadata?.outbox_generation === String(row.generation)),
+    JSON.stringify({ historyRows: history.length, changedUpserts, newBatches: upsertBatches.length - originalBatches }));
+  if (scenario === "delete") check("delete residue survives a lagging provider count after the queue clears",
+    receipts.some(r => r.phase === "legacy_drain" && r.queued === 0 && r.submitted === 0 &&
+      r.actual_vectors > r.total && !r.complete), JSON.stringify(receipts));
+  if (scenario === "delete_all") {
+    check("zero-chunk deletion residue survives an intervening busy response", busyPolls === 1 && result?.complete === true);
+    const residue = receipts.find(r => r.queued + r.submitted > r.remaining);
+    let buildingRejected = false, falseCompleteRejected = false;
+    try { validateAcceleratedBootstrapReceipt({ ...residue, phase: "building" }); }
+    catch { buildingRejected = true; }
+    try { validateAcceleratedBootstrapReceipt({ ...residue, phase: "complete", complete: true, vector_ready: true }); }
+    catch { falseCompleteRejected = true; }
+    check("the deletion exception cannot admit building work or false completion", Boolean(residue) && buildingRejected && falseCompleteRejected);
+  }
 }
 
 /* A provider watermark can advance before getByIds exposes the accepted

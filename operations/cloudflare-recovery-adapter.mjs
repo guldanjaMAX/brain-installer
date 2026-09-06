@@ -1455,7 +1455,11 @@ function validateBootstrapReceipt(body, expectedTotal) {
       receipt.actualVectors > expectedTotal || receipt.inFlightBatches > 3 ||
       receipt.confirmed > receipt.total ||
       receipt.remaining !== receipt.total - receipt.confirmed ||
-      receipt.queued + receipt.submitted > receipt.remaining ||
+      // Legacy residue can contain deletes of chunks no longer in the corpus.
+      // Queue operations therefore need not fit within unconfirmed live chunks.
+      // Completion below still requires zero queued/submitted work and exact
+      // provider visibility; no receipt can use this phase to claim completion.
+      (receipt.phase !== "legacy_drain" && receipt.queued + receipt.submitted > receipt.remaining) ||
       (receipt.phase === "complete") !== receipt.complete ||
       (!receipt.complete && receipt.vectorReady) ||
       (receipt.complete && (
@@ -2094,9 +2098,16 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
       { method: "GET" },
       60_000,
     );
-    if (!response.ok) refuse("RECOVERY_HEALTH_FAILED");
+    if (response.status !== 200) refuse("RECOVERY_HEALTH_FAILED");
     const health = await boundedJsonResponse(response);
-    if (health?.ok !== true || health?.version !== pins.binding.target.productVersion ||
+    const active = expectedMode === "active";
+    // A paused Worker deliberately reports not-ok and refuses documents.
+    // Reachable paused code is the required compatibility boundary, not an
+    // active Brain; accepting ok:true here would hide a missing write barrier.
+    if (!["active", "paused-for-upgrade"].includes(expectedMode) ||
+        health?.ok !== active || health?.accepting_documents !== active ||
+        health?.status !== (active ? "ok" : "paused-for-upgrade") ||
+        health?.version !== pins.binding.target.productVersion ||
         health?.brain !== pins.binding.target.clientSlug ||
         health?.vector_writer_protocol !== "lease-v1" ||
         health?.vector_drain_mode !== expectedMode) {

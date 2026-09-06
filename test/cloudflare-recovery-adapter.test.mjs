@@ -18,6 +18,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cmdSecrets, withCloudflareToken, workerBindings } from "../brain.mjs";
+import worker from "../worker/src/index.js";
 
 import {
   CloudflareRecoveryAdapterError,
@@ -469,6 +470,7 @@ function providerHarness({
   failPromotionAfterApplyOnce = false,
   healthModeOverride = null,
   healthProtocolOverride = null,
+  transformHealthReceipt = (receipt) => receipt,
   initialTargetRestored = false,
   initialVectorCount = 0,
   missingVectorCount = false,
@@ -774,14 +776,19 @@ function providerHarness({
     const path = parsedUrl.pathname;
     if (path === "/health") {
       if (redirectHealth) return response({}, 302, { location: "https://redirected.fixture.invalid/health" });
-      return response({
-        ok: true,
-        brain: "fixture-brain",
-        version: "0.1.12",
-        vector_drain_mode: healthModeOverride ??
-          (currentTargetVersionId === pausedWorkerVersionId ? "paused-for-upgrade" : "active"),
-        vector_writer_protocol: healthProtocolOverride ?? "lease-v1",
-      });
+      const health = await worker.fetch(new Request(String(url)), {
+        BRAIN_NAME: targetManifest.client.slug,
+        BRAIN_VERSION: targetManifest.brain.version,
+        ...(currentTargetVersionId === pausedWorkerVersionId
+          ? { VECTOR_DRAIN_MODE: "paused-for-upgrade" }
+          : {}),
+      }, {});
+      const receipt = await health.json();
+      return response(transformHealthReceipt({
+        ...receipt,
+        vector_drain_mode: healthModeOverride ?? receipt.vector_drain_mode,
+        vector_writer_protocol: healthProtocolOverride ?? receipt.vector_writer_protocol,
+      }));
     }
     if (path === "/api/admin/brain/bootstrap") {
       assert.equal(options.headers["X-Admin-Key"], fixtureAdminKey);
@@ -1923,6 +1930,59 @@ try {
   assert.equal(residueRetryHarness.sleepCalls, 3);
   assert.equal(residueRetryHarness.promotionCalls, 1);
 
+  const mixedResidueHarness = providerHarness({
+    initialTargetRestored: true,
+    bootstrapPageSize: 3,
+    bootstrapResidueRetryAfterProgress: true,
+    bootstrapReceiptTransform: (receipt) => receipt.phase === "legacy_drain"
+      ? { ...receipt, queued: 2, submitted: 1 }
+      : receipt,
+  });
+  const mixedResidueGate = createCloudflareRecoveryFieldGateAdapters(approvedAdapterConfig, mixedResidueHarness.dependencies);
+  const mixedResidue = await mixedResidueGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 });
+  assert.equal(mixedResidue.vector_count, 5);
+  assert.equal(mixedResidueHarness.bootstrapCalls, 4,
+    "legacy deletes are queue operations, not unconfirmed current chunks");
+  assert.equal(mixedResidueHarness.promotionCalls, 1);
+
+  for (const chunkCount of [5, 0]) {
+    let firstReceipt = true;
+    const deleteResidueHarness = providerHarness({
+      initialTargetRestored: true,
+      targetChunkCount: chunkCount,
+      bootstrapReceiptTransform: (receipt) => {
+        if (!firstReceipt) return receipt;
+        firstReceipt = false;
+        return { ...receipt, phase: "legacy_drain", queued: 1, complete: false, vector_ready: false };
+      },
+    });
+    const deleteResidueGate = createCloudflareRecoveryFieldGateAdapters(approvedAdapterConfig, deleteResidueHarness.dependencies);
+    const deleteResidue = await deleteResidueGate.adapters.rebuild_vectorize({
+      ...rebuildContext, attempt: 1,
+      completed: [{ id: "verify_d1", evidence: snapshotForChunkCount(chunkCount) }],
+    });
+    assert.equal(deleteResidue.vector_count, chunkCount);
+    assert.equal(deleteResidueHarness.bootstrapCalls, 2,
+      "zero remaining chunks does not acknowledge an outstanding delete");
+    assert.equal(deleteResidueHarness.bootstrapEpoch, 1, "receipt validation does not reset the durable epoch");
+    assert.equal(deleteResidueHarness.promotionCalls, 1);
+  }
+
+  for (const phase of ["building", "waiting", "complete"]) {
+    const excessQueueHarness = providerHarness({
+      initialTargetRestored: true,
+      bootstrapReceiptTransform: (receipt) => ({
+        ...receipt, phase, queued: receipt.remaining + 1,
+        complete: phase === "complete", vector_ready: phase === "complete",
+      }),
+    });
+    const excessQueueGate = createCloudflareRecoveryFieldGateAdapters(approvedAdapterConfig, excessQueueHarness.dependencies);
+    await assert.rejects(excessQueueGate.adapters.rebuild_vectorize({ ...rebuildContext, attempt: 1 }),
+      (error) => error.code === "RECOVERY_BOOTSTRAP_RECEIPT_INVALID");
+    assert.equal(excessQueueHarness.promotionCalls, 0,
+      "only an incomplete legacy drain may report more queue work than remaining chunks");
+  }
+
   // The old active /drain loop could submit at most 79,200 restored rows. The
   // paused schema-13 bootstrap advances its durable provider-receipt cursor
   // until exact completion, with no corpus-sized adapter ceiling.
@@ -2006,6 +2066,30 @@ try {
     (error) => error.code === "RECOVERY_BOOTSTRAP_BUSY_RECEIPT_INVALID",
   );
   assert.equal(malformedBusyHarness.promotionCalls, 0);
+
+  for (const active of [false, true]) for (const alter of [
+    (receipt) => ({ ...receipt, ok: !active }),
+    (receipt) => ({ ...receipt, accepting_documents: !active }),
+    (receipt) => ({ ...receipt, status: active ? "paused-for-upgrade" : "ok" }),
+    (receipt) => { const changed = { ...receipt }; delete changed.accepting_documents; return changed; },
+  ]) {
+    const dishonestHealthHarness = providerHarness({
+      targetVersionId: active ? activeWorkerVersionId : pausedWorkerVersionId,
+      transformHealthReceipt: alter,
+    });
+    const dishonestHealthGate = createCloudflareRecoveryFieldGateAdapters(
+      approvedAdapterConfig, dishonestHealthHarness.dependencies,
+    );
+    const stage = active ? "verify_health" : "prove_target_clean";
+    await assert.rejects(dishonestHealthGate.adapters[stage]({
+      stage,
+      planFingerprint: initialized.plan.plan_fingerprint,
+      targetResourceFingerprint: initialized.plan.target_resource_fingerprint,
+      completed: [{ id: "rebuild_vectorize", evidence: { chunk_count: 5 } }],
+    }), (error) => error.code === "RECOVERY_HEALTH_IDENTITY_MISMATCH");
+    assert.equal(dishonestHealthHarness.adminReads, 0);
+    assert.equal(dishonestHealthHarness.promotionCalls, 0);
+  }
 
   const mutatedCorpusHarness = providerHarness({
     initialTargetRestored: true,
