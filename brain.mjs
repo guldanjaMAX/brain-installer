@@ -14331,45 +14331,55 @@ function updateSkillAgentLabel(root) {
   return "Local assistant";
 }
 
+function reportUpdateSkillRefreshWarning(reportWarning, message = UPDATE_SKILL_REFRESH_WARNING) {
+  try {
+    reportWarning(message);
+  } catch {
+    // Reporting must never turn a verified software update into a failed one.
+    if (reportWarning !== warn) {
+      try { warn(UPDATE_SKILL_REFRESH_WARNING); } catch { /* best-effort terminal warning */ }
+    }
+  }
+}
+
 /** Refresh only the managed local guide after the software update has succeeded. */
 export function refreshTechnicianSkillsAfterUpdate(options = {}) {
   const installEverywhere = options.installTechnicianSkills ?? installTechnicianSkillEverywhere;
   const skillOptions = options.claudeSkillOptions || { environment: process.env };
   const reportOk = options.reportOk ?? ok;
   const reportWarning = options.reportWarning ?? warn;
-  let results;
+  let results = [];
   try {
     results = installEverywhere(skillOptions);
+    if (!Array.isArray(results) || results.length === 0) {
+      reportUpdateSkillRefreshWarning(reportWarning);
+      return { status: "warning", results: [] };
+    }
+
+    const succeeded = results.filter((result) =>
+      result?.status === "installed" || result?.status === "verified"
+    );
+    const failed = results.filter((result) =>
+      result?.status !== "installed" && result?.status !== "verified"
+    );
+
+    for (const result of succeeded) {
+      const label = updateSkillAgentLabel(result.root);
+      reportOk(`${label} /financial-brain-technician ${result.status} after update`);
+    }
+    for (const result of failed) {
+      const label = updateSkillAgentLabel(result?.root);
+      reportWarning(`${label}: ${UPDATE_SKILL_REFRESH_WARNING}`);
+    }
+
+    return {
+      status: failed.length ? (succeeded.length ? "partial" : "warning") : "ready",
+      results,
+    };
   } catch {
-    reportWarning(UPDATE_SKILL_REFRESH_WARNING);
-    return { status: "warning", results: [] };
+    reportUpdateSkillRefreshWarning(reportWarning);
+    return { status: "warning", results: Array.isArray(results) ? results : [] };
   }
-
-  if (!Array.isArray(results) || results.length === 0) {
-    reportWarning(UPDATE_SKILL_REFRESH_WARNING);
-    return { status: "warning", results: [] };
-  }
-
-  const succeeded = results.filter((result) =>
-    result?.status === "installed" || result?.status === "verified"
-  );
-  const failed = results.filter((result) =>
-    result?.status !== "installed" && result?.status !== "verified"
-  );
-
-  for (const result of succeeded) {
-    const label = updateSkillAgentLabel(result.root);
-    reportOk(`${label} /financial-brain-technician ${result.status} after update`);
-  }
-  for (const result of failed) {
-    const label = updateSkillAgentLabel(result?.root);
-    reportWarning(`${label}: ${UPDATE_SKILL_REFRESH_WARNING}`);
-  }
-
-  return {
-    status: failed.length ? (succeeded.length ? "partial" : "warning") : "ready",
-    results,
-  };
 }
 
 /** Beginner update path: verify custody first, then run the fully gated upgrade. */
@@ -14417,12 +14427,16 @@ export async function cmdUpdate(manifestPath, options = {}) {
     return upgradeResult;
   }, { accountId: manifestAccountId(pin.target), ...options });
 
-  refreshTechnicianSkillsAfterUpdate({
-    installTechnicianSkills: options.installTechnicianSkills,
-    claudeSkillOptions: options.claudeSkillOptions,
-    reportOk: options.reportSkillRefreshOk,
-    reportWarning: options.reportSkillRefreshWarning,
-  });
+  try {
+    refreshTechnicianSkillsAfterUpdate({
+      installTechnicianSkills: options.installTechnicianSkills,
+      claudeSkillOptions: options.claudeSkillOptions,
+      reportOk: options.reportSkillRefreshOk,
+      reportWarning: options.reportSkillRefreshWarning,
+    });
+  } catch {
+    reportUpdateSkillRefreshWarning(warn);
+  }
   return upgradeResult;
 }
 

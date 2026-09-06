@@ -2180,6 +2180,63 @@ const bootstrapCompletion = () => ({
       JSON.stringify(refreshExceptionWarnings),
     );
 
+    const successReporterWarnings = [];
+    const successReporterUpgradeResult = { updated: "success-reporter-fixture" };
+    const successReporterResult = await cmdUpdate(undefined, {
+      installedManifestOptions,
+      claudeSkillOptions: { home: join(sandbox, "success-reporter-skill-home") },
+      reportSkillRefreshOk: () => {
+        throw new Error(`private success reporter detail: ${sandbox}`);
+      },
+      reportSkillRefreshWarning: (message) => successReporterWarnings.push(message),
+      readCloudflareToken: async () => Buffer.from("o".repeat(24), "ascii"),
+      cmdVerify: async () => {},
+      cmdUpgrade: async () => successReporterUpgradeResult,
+    });
+    check(
+      "a failing skill success reporter cannot reclassify the verified software update",
+      successReporterResult === successReporterUpgradeResult &&
+        successReporterWarnings.length === 1 &&
+        /software update is verified/i.test(successReporterWarnings[0]) &&
+        !successReporterWarnings[0].includes(sandbox) && !cloudflareTokenAvailable(),
+      JSON.stringify(successReporterWarnings),
+    );
+
+    const warningReporterOutput = [];
+    const warningReporterUpgradeResult = { updated: "warning-reporter-fixture" };
+    const priorLog = console.log;
+    let warningReporterResult;
+    try {
+      console.log = (...values) => warningReporterOutput.push(values.map(String).join(" "));
+      warningReporterResult = await cmdUpdate(undefined, {
+        installedManifestOptions,
+        claudeSkillOptions: { home: join(sandbox, "warning-reporter-skill-home") },
+        installTechnicianSkills: () => [{
+          root: ".claude",
+          status: "failed",
+          error: `private failed path: ${sandbox}`,
+        }],
+        reportSkillRefreshWarning: () => {
+          throw new Error(`private warning reporter detail: ${sandbox}`);
+        },
+        readCloudflareToken: async () => Buffer.from("w".repeat(24), "ascii"),
+        cmdVerify: async () => {},
+        cmdUpgrade: async () => warningReporterUpgradeResult,
+      });
+    } finally {
+      console.log = priorLog;
+    }
+    const renderedWarningReporterOutput = warningReporterOutput.join("\n")
+      .replace(/\x1b\[[0-9;]*m/g, "");
+    check(
+      "a failing skill warning reporter falls back safely without changing the update result",
+      warningReporterResult === warningReporterUpgradeResult &&
+        /warn\s+The Brain software update is verified/i.test(renderedWarningReporterOutput) &&
+        /do not rerun brain update/i.test(renderedWarningReporterOutput) &&
+        !renderedWarningReporterOutput.includes(sandbox) && !cloudflareTokenAvailable(),
+      renderedWarningReporterOutput,
+    );
+
     if (process.platform !== "win32") {
       const pointerPath = installedManifestPointerPath(installedManifestOptions);
       chmodSync(pointerPath, 0o644);
