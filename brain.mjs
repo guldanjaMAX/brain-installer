@@ -3170,7 +3170,14 @@ export async function waitForVectorDrainCutover(waiter, {
       return { waitedMs, proven: true };
     }
     if (!quiet) {
-      info(`an older writer is still active (${Number(reading?.inFlight || 0)} accepted batch(es) awaiting confirmation); checking again`);
+      if (reading?.leaseFree === true && Number(reading.inFlight || 0) > 0) {
+        // Provider acceptance is durable across invocations; a receipt can
+        // remain after its writer released the lease. Preserve the full grace
+        // without telling an owner that this proves an invocation is active.
+        info(`no active drain lease is recorded; ${Number(reading.inFlight)} accepted vector receipt(s) still await confirmation. Keeping the full ${minutes}-minute safety pause, then the update will resume confirmation`);
+      } else {
+        info(`an older writer is still active (${Number(reading?.inFlight || 0)} accepted batch(es) awaiting confirmation); checking again`);
+      }
     }
     const remaining = deadline - now();
     if (remaining <= 0) {

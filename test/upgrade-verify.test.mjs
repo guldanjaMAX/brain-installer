@@ -151,6 +151,37 @@ const cutoverBody = (v, mode, protocol = "lease-v1") => JSON.stringify({
     r4.proven === false && r4.waitedMs === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS, JSON.stringify(r4));
 }
 
+/* Accepted provider receipts can survive the invocation which created them.
+   Resuming a paused update must describe that wait honestly without shortening
+   its legacy writer-safety boundary or discarding the durable work. */
+{
+  const output = [];
+  const priorLog = console.log;
+  let clock = 0;
+  let result;
+  const durableReceipt = { leaseFree: true, inFlight: 1 };
+  try {
+    console.log = (...values) => output.push(values.map(String).join(" "));
+    result = await waitForVectorDrainCutover(async (ms) => { clock += ms; }, {
+      probe: async () => durableReceipt,
+      now: () => clock,
+      pollMs: 60_000,
+    });
+  } finally {
+    console.log = priorLog;
+  }
+  const rendered = output.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  check("a retained provider receipt is not described as an active writer and keeps the full safety pause",
+    result.proven === false && result.waitedMs === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS &&
+      clock === VECTOR_DRAIN_CUTOVER_QUIESCENCE_MS && durableReceipt.inFlight === 1 &&
+      /no active drain lease is recorded/i.test(rendered) &&
+      /1 accepted vector receipt\(s\) still await confirmation/i.test(rendered) &&
+      /full 20-minute safety pause/i.test(rendered) &&
+      /update will resume confirmation/i.test(rendered) &&
+      !/an older writer is still active/i.test(rendered),
+    JSON.stringify({ result, rendered: rendered.slice(0, 350) }));
+}
+
 const manifestFixture = (version = "0.1.9") => ({
   client: { slug: "fixture" },
   brain: { worker_name: "fixture-brain", version },
