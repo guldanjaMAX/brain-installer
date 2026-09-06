@@ -1724,7 +1724,7 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     const requiredBindingNames = [
       "AI", "ANSWER_MODEL", "BRAIN_NAME", "BRAIN_OWNER", "BRAIN_VERSION",
       "CHUNK_OVERLAP", "CHUNK_SIZE", "CREDENTIAL_SCANNER", "DAILY_LLM_CAP_USD",
-      "DB", "STORAGE", "VECTORIZE",
+      "DB", "OCR_ENABLED", "OCR_MODEL", "STORAGE", "VECTORIZE",
     ];
     const actualNonSecretNames = bindings
       .filter((entry) => entry.type !== "secret_text" && entry.name !== "VECTOR_DRAIN_MODE")
@@ -1774,14 +1774,29 @@ export function createCloudflareRecoveryFieldGateAdapters(configInput, dependenc
     }
     plainText("BRAIN_OWNER");
     plainText("ANSWER_MODEL");
+    // Both immutable target versions must carry the reviewed manifest's OCR
+    // policy, including the disabled default. A matching pair of altered
+    // versions must not silently enable charges or select another model.
+    if (plainText("OCR_ENABLED") !== binding.ocrEnabled ||
+        plainText("OCR_MODEL") !== binding.ocrModel) {
+      refuse("RECOVERY_WORKER_BINDINGS_INVALID");
+    }
     const secretNames = bindings
       .filter((entry) => entry.type === "secret_text")
-      .map((entry) => String(entry.name || ""))
+      .map((entry) => {
+        if (typeof entry.name !== "string") refuse("RECOVERY_WORKER_BINDINGS_INVALID");
+        return exactString(entry.name, "RECOVERY_WORKER_BINDINGS_INVALID");
+      })
       .sort();
+    // Normal setup derives both restricted retrieval and owner-session keys
+    // from ADMIN_KEY. Their presence on a source is expected; recovery never
+    // removes them to make this inspection pass. The isolated target retains
+    // its separately reviewed ADMIN_KEY-only contract.
     const allowedSecrets = role === "source"
-      ? new Set(["ADMIN_KEY", "RAG_PROXY_KEY"])
+      ? new Set(["ADMIN_KEY", "RAG_PROXY_KEY", "SESSION_SIGNING_KEY"])
       : new Set(["ADMIN_KEY"]);
     if (!secretNames.includes("ADMIN_KEY") ||
+        new Set(secretNames).size !== secretNames.length ||
         secretNames.some((name) => !allowedSecrets.has(name)) ||
         (role === "target" && canonical(secretNames) !== canonical(["ADMIN_KEY"]))) {
       refuse("RECOVERY_WORKER_BINDINGS_INVALID");

@@ -353,6 +353,10 @@ export function inspectVerifiedRecoveryManifestBindings(
     ...contract.identity,
     clientSlug: contract.slug,
     productVersion: contract.version,
+    // Match the deployment defaults using the same fingerprint-verified
+    // manifest bytes. These are runtime choices, never credential values.
+    ocrEnabled: loaded.manifest.safety?.ocr?.enabled === true ? "1" : "0",
+    ocrModel: String(loaded.manifest.safety?.ocr?.model || "@cf/google/gemma-4-26b-a4b-it"),
     adminKeySecret: loaded.manifest.operations?.admin_key_secret === undefined
       ? null
       : boundedIdentity(

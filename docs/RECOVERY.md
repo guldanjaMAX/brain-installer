@@ -96,6 +96,11 @@ Migration checksums bind the exact reviewed SQL bytes. Schema comparison then
 canonicalizes SQL comments and whitespace because D1 removes non-semantic
 comments from `sqlite_schema` while local SQLite preserves them.
 
+Source Worker inspection permits `ADMIN_KEY` and the normal setup-derived
+`RAG_PROXY_KEY` and `SESSION_SIGNING_KEY`. It rejects unknown, malformed, or
+duplicate secret names without changing any source secret. The disposable
+target contract remains exactly one `ADMIN_KEY` secret.
+
 Cloudflare's remote D1 export takes a blocking lock. Run the source export only
 in an approved maintenance window with source ingest and writes paused. The
 `source_export_blocking_approval_fingerprint` is the explicit acknowledgement
@@ -114,7 +119,9 @@ Before preview, prepare all of these locally and out of band:
   resources, the reviewed Brain identity and version, and only the `ADMIN_KEY`
   secret. Their bindings must be identical except that the paused version has
   exactly `VECTOR_DRAIN_MODE=paused-for-upgrade` and the active version has no
-  `VECTOR_DRAIN_MODE` binding;
+  `VECTOR_DRAIN_MODE` binding. Both versions must include `OCR_ENABLED` and
+  `OCR_MODEL` matching the fingerprint-pinned target manifest, including its
+  normal disabled/default-model values when OCR is not configured;
 - a fresh manual Cloudflare review that the target Worker has no routes and no
   custom domains. Record the immutable paused version as
   `paused_worker_version_id`, the immutable active version as
@@ -144,9 +151,11 @@ The normalized row is then hashed together with the remaining durable table
 export, so a retry cannot reuse a recovery artifact poisoned by an
 invocation-local lease, mutation fence, or old provider receipt. Older exact
 migration prefixes remain offline-inspectable, but the live field runner refuses
-a source or restored target below schema 13 because it cannot safely use the
-current lease, visibility, and durable bulk-bootstrap protocol without an
-explicit upgrade.
+a source or restored target whose schema is not exactly the reviewed current
+schema, currently 22. The schema-13 lease, visibility, and durable
+bulk-bootstrap protocol is necessary, but the newer durable tables and columns
+must also match the export contract. Complete the explicit upgrade before
+starting this recovery drill.
 
 The preview is local only. It reads and fingerprints those files but does not
 invoke Wrangler, read Keychain, or call either Brain:
